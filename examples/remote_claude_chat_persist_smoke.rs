@@ -223,6 +223,7 @@ fn session_config(
     resume: Option<String>,
 ) -> ClaudeSessionConfig {
     ClaudeSessionConfig {
+        snapshot_facts_dir: None,
         cwd: cwd.to_path_buf(),
         model: Some(model.to_string()),
         permission_mode: "default".into(),

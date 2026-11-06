@@ -334,6 +334,8 @@ impl AcpMcpServer {
 
 #[derive(Clone)]
 pub struct AcpSessionConfig {
+    /// Local turn snapshots; None for remote/test processes.
+    pub snapshot_facts_dir: Option<PathBuf>,
     pub agent: AcpAgent,
     pub cwd: PathBuf,
     /// Session id to continue through `session/load`.
@@ -1438,6 +1440,7 @@ fn rpc_error_text(error: &Value) -> String {
 
 /// Handle to a running ACP session. Dropping it shuts the process down.
 pub struct AcpSession {
+    snapshots_closed: tokio_util::sync::CancellationToken,
     commands: mpsc::UnboundedSender<HarnessCommand>,
 }
 
@@ -1446,6 +1449,8 @@ impl AcpSession {
     /// missing Gemini key) arrive on the event channel as `Error` followed
     /// by `ProcessExited`.
     pub fn spawn(config: AcpSessionConfig) -> (Self, mpsc::UnboundedReceiver<HarnessEvent>) {
+        let snapshots_closed = tokio_util::sync::CancellationToken::new();
+        let close_token = snapshots_closed.clone();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let spawn_result = std::thread::Builder::new()
@@ -1464,12 +1469,22 @@ impl AcpSession {
                         return;
                     }
                 };
-                rt.block_on(run_session(config, cmd_rx, ev_tx));
+                rt.block_on(run_session(config, cmd_rx, ev_tx, close_token));
             });
         if let Err(e) = spawn_result {
             acp_log(&format!("could not spawn session thread: {e}"));
         }
-        (Self { commands: cmd_tx }, ev_rx)
+        (
+            Self {
+                commands: cmd_tx,
+                snapshots_closed,
+            },
+            ev_rx,
+        )
+    }
+
+    pub fn close_turn_snapshots(&self) {
+        self.snapshots_closed.cancel();
     }
 
     pub fn send(&self, command: HarnessCommand) -> Result<(), String> {
@@ -1541,6 +1556,7 @@ impl WireLog {
 }
 
 struct Session {
+    snapshots: crate::turn_snapshots::Recorder,
     config: AcpSessionConfig,
     stdin: Option<ChildStdin>,
     wire: Option<WireLog>,
@@ -1757,6 +1773,8 @@ impl Session {
 
     async fn send_prompt(&mut self, prompt: UserPrompt) -> Result<(), String> {
         let session_id = self.session_id.clone().unwrap_or_default();
+        self.snapshots.bind(&session_id).await;
+        self.snapshots.begin().await;
         if !prompt.images.is_empty() && !self.images {
             self.error(format!(
                 "{} takes no images; this message went without its {} image(s).",
@@ -1801,7 +1819,8 @@ impl Session {
             )
             .await;
         if let Err(e) = &result {
-            self.end_turn(TurnStatus::Failed(e.clone()), Value::Null);
+            self.end_turn(TurnStatus::Failed(e.clone()), Value::Null)
+                .await;
         }
         result
     }
@@ -1813,7 +1832,8 @@ impl Session {
         }
     }
 
-    fn end_turn(&mut self, status: TurnStatus, usage: Value) {
+    async fn end_turn(&mut self, status: TurnStatus, usage: Value) {
+        self.snapshots.end().await;
         acp_log(&format!(
             "turn completed: {status:?} cost={:?}",
             self.mapper.cost_usd
@@ -1991,7 +2011,7 @@ impl Session {
             }
             Call::Prompt => {
                 let (status, usage) = prompt_reply(msg, self.interrupted);
-                self.end_turn(status, usage);
+                self.end_turn(status, usage).await;
                 self.pump_queue().await
             }
         }
@@ -2057,7 +2077,10 @@ impl Session {
                 continue;
             }
             match mapped {
-                Mapped::Event(ev) => self.emit(ev),
+                Mapped::Event(ev) => {
+                    self.snapshots.observe(&ev);
+                    self.emit(ev);
+                }
                 Mapped::UserChunk { .. } => {}
                 Mapped::Mode(mode) => {
                     if self.settings.current(Setting::Mode).as_deref() != Some(mode.as_str()) {
@@ -2243,6 +2266,7 @@ async fn run_session(
     config: AcpSessionConfig,
     mut commands: mpsc::UnboundedReceiver<HarnessCommand>,
     events: mpsc::UnboundedSender<HarnessEvent>,
+    close_token: tokio_util::sync::CancellationToken,
 ) {
     let label = config.agent.label();
     let fail = |msg: String| {
@@ -2338,6 +2362,12 @@ async fn run_session(
     }
 
     let mut session = Session {
+        snapshots: crate::turn_snapshots::Recorder::new(
+            config.cwd.clone(),
+            config.resume.clone(),
+            config.snapshot_facts_dir.clone(),
+        )
+        .with_close_token(close_token),
         config,
         stdin: Some(stdin),
         wire,
@@ -2455,11 +2485,14 @@ async fn run_session(
         }));
     }
     if session.in_turn {
-        session.end_turn(
-            TurnStatus::Failed(format!("{label} exited mid-turn")),
-            Value::Null,
-        );
+        session
+            .end_turn(
+                TurnStatus::Failed(format!("{label} exited mid-turn")),
+                Value::Null,
+            )
+            .await;
     }
+    session.snapshots.end().await;
     session.resolve_permissions();
     session.emit(HarnessEvent::ProcessExited { code });
 }
@@ -2982,6 +3015,7 @@ mod tests {
         assert!(!redact_frame(&frame).to_string().contains("secret-token"));
         assert!(!format!("{server:?}").contains("secret-token"));
         let config = AcpSessionConfig {
+            snapshot_facts_dir: None,
             agent: AcpAgent::Gemini,
             cwd: "/".into(),
             resume: None,

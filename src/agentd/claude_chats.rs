@@ -832,6 +832,7 @@ mod tests {
 
     fn config(resume: Option<&str>) -> ClaudeSessionConfig {
         ClaudeSessionConfig {
+            snapshot_facts_dir: None,
             cwd: PathBuf::from("/tmp"),
             model: Some("haiku".into()),
             permission_mode: "default".into(),

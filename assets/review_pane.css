@@ -129,3 +129,17 @@ table.d tr.hh td { color: var(--hunk); background: var(--bg-alt); padding: 3px 1
 .hljs-attr, .hljs-attribute, .hljs-property { color: var(--h-attr); }
 .hljs-variable, .hljs-params { color: var(--h-var); }
 .hljs-meta, .hljs-symbol, .hljs-regexp, .hljs-link { color: var(--h-meta); }
+/* Branch commit picker. The slot remains in the document across sources. */
+#commits { display: none; flex: none; width: 300px; overflow: auto; border-right: 1px solid var(--border); padding: 6px 0 20px; background: var(--bg-alt); }
+body[data-source="commits"] #commits { display: flex; flex-direction: column; }
+.commit-heading, .commit-cap { padding: 5px 9px; color: var(--fg-muted); font-size: 11px; }
+.commit-cap { color: var(--warn); }
+.commit { display: grid; grid-template-columns: auto 1fr; gap: 1px 8px; padding: 5px 9px; text-align: left; background: transparent; border: 0; }
+.commit:hover, .commit.selected { background: var(--bg-hover); }
+.commit code { grid-row: span 2; color: var(--accent); font-size: 11px; }
+.commit span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.commit small { color: var(--fg-muted); font-size: 10px; }
+
+#turns { display: flex; flex-direction: column; flex: none; width: 250px; overflow-y: auto; border-right: 1px solid var(--border); padding: 6px 0 20px; background: var(--bg-alt); }
+#turns .commit { grid-template-columns: 1fr; }
+#turns .commit small { grid-column: 1; }

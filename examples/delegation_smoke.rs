@@ -147,6 +147,7 @@ async fn smoke(workdir: &Path) -> Result<(), String> {
 
     // One Claude turn: it must call review_request and come back at once.
     let config = ClaudeSessionConfig {
+        snapshot_facts_dir: None,
         cwd: repo.clone(),
         model: Some(arg("--model").unwrap_or_else(|| "haiku".into())),
         permission_mode: "default".into(),

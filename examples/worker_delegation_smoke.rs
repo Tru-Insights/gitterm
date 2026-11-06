@@ -126,6 +126,7 @@ async fn smoke(workdir: &Path) -> Result<(), String> {
 
     // One Claude turn in the parent chat: it must call delegate_task.
     let config = ClaudeSessionConfig {
+        snapshot_facts_dir: None,
         cwd: repo.clone(),
         model: Some(arg("--model").unwrap_or_else(|| "haiku".into())),
         permission_mode: "default".into(),

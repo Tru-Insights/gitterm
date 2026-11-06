@@ -1921,7 +1921,11 @@ enum GitSelection {
 #[derive(Debug, Clone)]
 struct ReviewPaneState {
     target: review_pane::ReviewTarget,
-    source: overview::DiffSource,
+    source: review_pane::ReviewSource,
+    commits: Vec<review_pane::ReviewCommit>,
+    turns: Vec<gitterm::turn_snapshots::Turn>,
+    commits_truncated: bool,
+    commits_error: Option<String>,
     /// Which load this pane waits for.
     generation: u64,
     /// Stamped on every message from this page; others are dropped.
@@ -7269,6 +7273,7 @@ pub enum Event {
     PlanLimits(PlanLimitsEvent),
     /// Open the review pane on an owned checkout (TRU-178).
     ReviewOpen(PathBuf, overview::DiffSource),
+    TurnSnapshotsCleaned(Result<(), String>),
     /// A review load finished, for this generation.
     ReviewLoaded(u64, Box<Result<review_pane::ReviewLoad, String>>),
     /// A chat tab's Open in review resolved its file's checkout (TRU-179).
@@ -7712,6 +7717,7 @@ struct App {
     plan_limits: plan_limits_view::PlanLimitsState,
     /// `github-accounts.json` (shared config dir): gh account per GitHub owner.
     github_accounts: std::collections::BTreeMap<String, String>,
+    turn_snapshot_sweep_at: Option<Instant>,
     /// The review pane (TRU-178) while the Viewer shows it.
     review_pane: Option<ReviewPaneState>,
     /// Generation counter for review loads.
@@ -8851,6 +8857,74 @@ fn repos_common_parent_below_home(repos: &[PathBuf], home: &Path) -> Option<Path
         }
     }
     (common.starts_with(home) && common != home).then_some(common)
+}
+
+fn parked_snapshot_chats(
+    workspaces: &[Workspace],
+    closed: &[WorkspaceConfig],
+    key: &ParkedKey,
+) -> Vec<String> {
+    if let Some(idx) = running_parked_index(workspaces, key) {
+        return workspaces[idx]
+            .chats
+            .iter()
+            .cloned()
+            .chain(
+                workspaces[idx]
+                    .tabs
+                    .iter()
+                    .filter_map(turn_snapshot_chat_id),
+            )
+            .collect();
+    }
+    closed
+        .iter()
+        .find(|cfg| ParkedKey::of(cfg) == *key)
+        .map(|cfg| {
+            cfg.chats
+                .iter()
+                .cloned()
+                .chain(cfg.tabs.iter().filter_map(|tab| {
+                    tab.chat_session_id.clone().or_else(|| {
+                        matches!(tab.agent_config, Some(AgentBackendConfig::Pi { .. }))
+                            .then(|| tab.session_uid.clone())
+                            .flatten()
+                    })
+                }))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn task_snapshot_chats(workspaces: &[Workspace], task_id: &str) -> Vec<String> {
+    workspaces
+        .iter()
+        .flat_map(|ws| &ws.tabs)
+        .filter(|tab| tab.task_id.as_deref() == Some(task_id))
+        .filter_map(|tab| {
+            close_turn_snapshots(tab);
+            turn_snapshot_chat_id(tab)
+        })
+        .collect()
+}
+
+fn close_turn_snapshots(tab: &TabState) {
+    if let Some(session) = tab.agent_session() {
+        if let Some(harness) = &session.harness {
+            harness.close_turn_snapshots();
+        }
+        if let Some(handle) = &session.task_handle {
+            handle.close_turn_snapshots();
+        }
+    }
+}
+
+fn turn_snapshot_chat_id(tab: &TabState) -> Option<String> {
+    tab.chat_session_id.clone().or_else(|| {
+        tab.agent_session()
+            .is_some_and(|session| session.backend() == tab::AgentBackend::Pi)
+            .then(|| tab.session_uid.clone())
+    })
 }
 
 /// The Chats row's facts line (TRU-166): up to three issue keys, three
@@ -11464,6 +11538,11 @@ impl App {
         if !valid {
             return Task::none();
         }
+        let cleanup =
+            turn_snapshot_chat_id(&self.workspaces[prompt.workspace_idx].tabs[prompt.tab_idx])
+                .map(|chat| self.maintain_turn_snapshots(Some(vec![chat])))
+                .unwrap_or_else(Task::none);
+        close_turn_snapshots(&self.workspaces[prompt.workspace_idx].tabs[prompt.tab_idx]);
         let closed_live_session = self.workspaces[prompt.workspace_idx].tabs[prompt.tab_idx]
             .task_live_state
             .is_some();
@@ -11498,7 +11577,7 @@ impl App {
         }
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
-        self.scroll_to_active_tab()
+        Task::batch([cleanup, self.scroll_to_active_tab()])
     }
 
     /// Fold a session observation into the task's durable lifecycle. Callers
@@ -14118,8 +14197,12 @@ impl App {
     /// Done: the entry leaves the Parked list and stays in the file. A
     /// running parked one stops first, the way park stops (TRU-186).
     fn mark_parked_done(&mut self, key: &ParkedKey) -> Task<Event> {
+        let chats = parked_snapshot_chats(&self.workspaces, &self.closed_workspace_configs, key);
         let task = match running_parked_index(&self.workspaces, key) {
             Some(idx) => {
+                for tab in &self.workspaces[idx].tabs {
+                    close_turn_snapshots(tab);
+                }
                 let info = self.workspaces[idx]
                     .running_park
                     .clone()
@@ -14128,20 +14211,22 @@ impl App {
             }
             None => Task::none(),
         };
-        if finish_parked(
+        let cleanup = if finish_parked(
             &mut self.closed_workspace_configs,
             key,
             chrono::Utc::now().to_rfc3339(),
         ) {
             eprintln!("[workspace] {:?} marked done", key.name);
             self.mark_workspaces_dirty();
+            self.maintain_turn_snapshots(Some(chats))
         } else {
             eprintln!(
                 "[workspace] cannot mark {:?} ({}) done: not parked",
                 key.name, key.dir
             );
-        }
-        task
+            Task::none()
+        };
+        Task::batch([task, cleanup])
     }
 
     /// Close (TRU-190): park the workspace, stopping it, then mark that
@@ -14151,6 +14236,12 @@ impl App {
             eprintln!("[workspace] cannot close uid={uid}: no longer open");
             return self.apply_webview_surfaces();
         };
+        if self.workspaces[idx].running_park.is_none() && self.bar_workspace_count() <= 1 {
+            return self.park_workspace(uid, "", ParkMode::Stop);
+        }
+        for tab in &self.workspaces[idx].tabs {
+            close_turn_snapshots(tab);
+        }
         let cfg = self.workspace_config(&self.workspaces[idx]);
         let key = ParkedKey::of(&cfg);
         let before = self.closed_workspace_configs.len();
@@ -16028,7 +16119,7 @@ impl App {
             return Task::none();
         };
         let hide_noise = self.review_hide_noise(&checkout);
-        self.start_review(target, source, hide_noise, None)
+        self.start_review(target, source.into(), hide_noise, None)
     }
 
     /// The review target of the active workspace overview's owned row for
@@ -16112,7 +16203,12 @@ impl App {
                 // A test or generated file stays in sight.
                 let hide_noise = self.review_hide_noise(&open.target.checkout)
                     && !review_pane::classify_path(&open.focus).is_noise();
-                self.start_review(open.target, open.source, hide_noise, Some(open.focus))
+                self.start_review(
+                    open.target,
+                    open.source.into(),
+                    hide_noise,
+                    Some(open.focus),
+                )
             }
             Err(error) => {
                 eprintln!("[review] open_review from tab {tab_id}: {error}");
@@ -16122,12 +16218,54 @@ impl App {
         }
     }
 
-    /// Shows the review pane's loading page for `target` and starts reading
-    /// its diff for `source`. A newer start supersedes an older load.
+    /// Hidden-ref cleanup runs independently of the UI and the diff loader.
+    fn maintain_turn_snapshots(&self, chats: Option<Vec<String>>) -> Task<Event> {
+        if let Some(chats) = &chats {
+            for tab in self
+                .workspaces
+                .iter()
+                .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
+                .flat_map(|ws| &ws.tabs)
+            {
+                if turn_snapshot_chat_id(tab).is_some_and(|id| chats.contains(&id)) {
+                    close_turn_snapshots(tab);
+                }
+            }
+        }
+        let dirs = self
+            .workspaces
+            .iter()
+            .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
+            .flat_map(|ws| ws.tabs.iter())
+            .map(|tab| tab.repo_path.clone())
+            .chain(
+                self.closed_workspace_configs
+                    .iter()
+                    .filter(|cfg| {
+                        matches!(
+                            cfg.location,
+                            None | Some(config::WorkspaceLocationConfig::Local { .. })
+                        )
+                    })
+                    .flat_map(|cfg| cfg.tabs.iter())
+                    .map(|tab| PathBuf::from(tab.repo_dir.as_ref().unwrap_or(&tab.dir))),
+            )
+            .collect();
+        Task::perform(
+            gitterm::turn_snapshots::maintain(
+                chat_facts::facts_dir(&config::global_config_dir()),
+                dirs,
+                chats,
+            ),
+            Event::TurnSnapshotsCleaned,
+        )
+    }
+
+    /// Shows the loading page and asynchronously reads the selected diff.
     fn start_review(
         &mut self,
         target: review_pane::ReviewTarget,
-        source: overview::DiffSource,
+        source: review_pane::ReviewSource,
         hide_noise: bool,
         focus: Option<String>,
     ) -> Task<Event> {
@@ -16135,7 +16273,11 @@ impl App {
         let generation = self.review_generation;
         self.review_pane = Some(ReviewPaneState {
             target: target.clone(),
-            source,
+            source: source.clone(),
+            commits: Vec::new(),
+            turns: Vec::new(),
+            commits_truncated: false,
+            commits_error: None,
             generation,
             token: uuid::Uuid::new_v4().simple().to_string(),
             nonce: uuid::Uuid::new_v4().simple().to_string(),
@@ -16145,9 +16287,10 @@ impl App {
             error: None,
         });
         let show = self.show_review_page();
-        let load = Task::perform(review_pane::load_review(target, source), move |result| {
-            Event::ReviewLoaded(generation, Box::new(result))
-        });
+        let load = Task::perform(
+            review_pane::load_review_source(target, source),
+            move |result| Event::ReviewLoaded(generation, Box::new(result)),
+        );
         Task::batch([show, load])
     }
 
@@ -16175,6 +16318,12 @@ impl App {
         }
         let loaded = match result {
             Ok(load) => {
+                if let Some(pane) = self.review_pane.as_mut() {
+                    pane.commits = load.commits.clone();
+                    pane.turns = load.turns.clone();
+                    pane.commits_truncated = load.commits_truncated;
+                    pane.commits_error = load.commits_error.clone();
+                }
                 if let Some(live) = &load.live_paths {
                     match self.review_marks() {
                         Ok(marks) => {
@@ -16257,7 +16406,17 @@ impl App {
         };
         let html = review_pane::render_page(&review_pane::ReviewPage {
             target: &pane.target,
-            source: pane.source,
+            source: pane.source.clone(),
+            commits: &pane.commits,
+            turns: &pane.turns,
+            turns_available: self
+                .active_workspace()
+                .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
+                .and_then(|ws| ws.tabs.get(ws.active_tab))
+                .and_then(turn_snapshot_chat_id)
+                .is_some(),
+            commits_truncated: pane.commits_truncated,
+            commits_error: pane.commits_error.as_deref(),
             state,
             dark: self.theme == AppTheme::Dark,
             hide_noise: pane.hide_noise,
@@ -16297,7 +16456,86 @@ impl App {
                 }
                 let target = pane.target.clone();
                 let focus = pane.focus.clone();
-                self.start_review(target, source, hide_noise, focus)
+                self.start_review(target, source.into(), hide_noise, focus)
+            }
+            ReviewIpc::ShowTurns { .. } => {
+                let chat = self
+                    .active_workspace()
+                    .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
+                    .and_then(|ws| ws.tabs.get(ws.active_tab))
+                    .and_then(turn_snapshot_chat_id);
+                let Some(chat) = chat else {
+                    eprintln!("[review] Turns needs an active chat");
+                    return Task::none();
+                };
+                self.start_review(
+                    pane.target.clone(),
+                    review_pane::ReviewSource::Turns {
+                        chat,
+                        selected: None,
+                    },
+                    pane.hide_noise,
+                    pane.focus.clone(),
+                )
+            }
+            ReviewIpc::SelectTurn { number, .. } => {
+                let review_pane::ReviewSource::Turns { chat, .. } = &pane.source else {
+                    return Task::none();
+                };
+                if !pane
+                    .turns
+                    .iter()
+                    .any(|turn| turn.number == number && turn.start.is_some() && turn.end.is_some())
+                {
+                    return Task::none();
+                }
+                self.start_review(
+                    pane.target.clone(),
+                    review_pane::ReviewSource::Turns {
+                        chat: chat.clone(),
+                        selected: Some(number),
+                    },
+                    pane.hide_noise,
+                    pane.focus.clone(),
+                )
+            }
+            ReviewIpc::ShowCommits { .. } => {
+                if pane.target.base.is_none() {
+                    eprintln!("[review] commits unavailable without a branch base");
+                    return Task::none();
+                }
+                self.start_review(
+                    pane.target.clone(),
+                    review_pane::ReviewSource::Commits(None),
+                    pane.hide_noise,
+                    pane.focus.clone(),
+                )
+            }
+            ReviewIpc::SelectCommits {
+                first,
+                last,
+                pending,
+                ..
+            } => {
+                let first_index = pane.commits.iter().position(|commit| commit.sha == first);
+                let last_index = pane.commits.iter().position(|commit| commit.sha == last);
+                let (Some(first_index), Some(last_index)) = (first_index, last_index) else {
+                    eprintln!("[review] selected commit is not in the loaded branch commit list");
+                    return Task::none();
+                };
+                let older = first_index.max(last_index);
+                let newer = first_index.min(last_index);
+                let range = review_pane::CommitRange {
+                    first: pane.commits[older].sha.clone(),
+                    last: pane.commits[newer].sha.clone(),
+                    pending,
+                };
+                self.start_review(
+                    pane.target.clone(),
+                    review_pane::ReviewSource::Commits(Some(range)),
+                    pane.hide_noise,
+                    pane.focus.clone(),
+                )
             }
             ReviewIpc::SetViewed { path, viewed, .. } => {
                 let Some((file, canonical)) = pane.loaded.as_ref().and_then(|(diff, canonical)| {
@@ -19491,6 +19729,7 @@ impl App {
             issues: work_issues::IssuesState::load(&config::global_config_dir()),
             plan_limits: plan_limits_view::PlanLimitsState::load(&config::global_config_dir()),
             github_accounts: config::load_github_accounts(),
+            turn_snapshot_sweep_at: None,
             review_pane: None,
             review_generation: 0,
             review_marks: None,
@@ -23130,11 +23369,23 @@ fi
                     return task;
                 }
             }
+            Event::TurnSnapshotsCleaned(result) => {
+                if let Err(error) = result {
+                    eprintln!("[turns] cleanup failed: {error}");
+                }
+            }
             Event::TaskStartupChecked(task_id, session_id, result) => {
                 self.task_startup_checked(&task_id, &session_id, result);
             }
             Event::Tick => {
                 let mut tasks: Vec<Task<Event>> = Vec::new();
+                if self
+                    .turn_snapshot_sweep_at
+                    .is_none_or(|at| at.elapsed() >= Duration::from_secs(3600))
+                {
+                    self.turn_snapshot_sweep_at = Some(Instant::now());
+                    tasks.push(self.maintain_turn_snapshots(None));
+                }
                 self.watch_open_files();
                 // Remote running chats and CLI transcripts, only while the
                 // Chats overview shows.
@@ -23448,7 +23699,25 @@ fi
                     .active_workspace()
                     .filter(|ws| idx < ws.tabs.len() && ws.tabs.len() > 1)
                     .map(|ws| ws.tabs[idx].id);
+                let cleanup = closing
+                    .and_then(|id| {
+                        self.workspaces
+                            .iter()
+                            .flat_map(|ws| &ws.tabs)
+                            .find(|t| t.id == id)
+                    })
+                    .and_then(turn_snapshot_chat_id)
+                    .map(|chat| self.maintain_turn_snapshots(Some(vec![chat])))
+                    .unwrap_or_else(Task::none);
                 if let Some(tab_id) = closing {
+                    if let Some(tab) = self
+                        .workspaces
+                        .iter()
+                        .flat_map(|ws| &ws.tabs)
+                        .find(|tab| tab.id == tab_id)
+                    {
+                        close_turn_snapshots(tab);
+                    }
                     self.stop_remote_chat_for_closing_tab(tab_id);
                 }
                 if let Some(ws) = self.active_workspace_mut() {
@@ -23463,6 +23732,7 @@ fi
                 self.mark_log_server_dirty();
                 // Surfaces follow whichever tab is active now.
                 return Task::batch([
+                    cleanup,
                     self.scroll_to_active_tab(),
                     self.refresh_task_conversation_history(),
                     self.present_active_tab_surfaces(),
@@ -23780,6 +24050,10 @@ fi
                         t.attention = None;
                         let repo_path = t.repo_path.clone();
                         let tab_task_id = t.task_id.clone();
+                        let snapshot_chat = t
+                            .chat_session_id
+                            .clone()
+                            .unwrap_or_else(|| t.session_uid.clone());
                         let Some(session) = t.agent_session_mut() else {
                             eprintln!("AgentSubmitPrompt: tab {} is not an agent tab", tab_id);
                             return Task::none();
@@ -23992,6 +24266,7 @@ fi
                             )
                             .map(|guidelines| guidelines.path);
                             let handle = tab::spawn_agent_task(
+                                snapshot_chat,
                                 session.config.clone(),
                                 repo_path,
                                 guidelines_file,
@@ -27039,6 +27314,9 @@ fi
                 // Close every open session tab of the task, in any workspace,
                 // then record the task Stopped. The PTY children die with
                 // their tabs; the worktree and conversations stay resumable.
+                // Capture paths and cancel recorders before tabs (including exited chats) disappear.
+                let chats = task_snapshot_chats(&self.workspaces, &task_id);
+                let snapshot_cleanup = self.maintain_turn_snapshots(Some(chats));
                 for workspace_idx in 0..self.workspaces.len() {
                     while let Some(tab_idx) = self.workspaces[workspace_idx]
                         .tabs
@@ -27068,7 +27346,7 @@ fi
                 self.mark_log_server_dirty();
                 // Stopping frees a slot — hand it to the queue right away.
                 let promoted = self.promote_queued_tasks();
-                return Task::batch([self.scroll_to_active_tab(), promoted]);
+                return Task::batch([self.scroll_to_active_tab(), promoted, snapshot_cleanup]);
             }
             Event::TaskResume(task_id) => {
                 // Prefer resuming the most recent recorded conversation —
@@ -50913,6 +51191,128 @@ mod tests {
         assert_eq!(persisted_active_index(2, &[false, true, false]), 1);
         assert_eq!(persisted_active_index(0, &[true, false]), 0);
         assert_eq!(persisted_active_index(2, &[false, false, false]), 2);
+    }
+
+    fn snapshot_cleanup_test_child(name: &str) -> bool {
+        const CHILD: &str = "GITTERM_V6_SNAPSHOT_TEST_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let config = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(config::CONFIG_DIR_ENV, config.path())
+            .env(CHILD, name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    async fn snapshot_cleanup_fixture() -> (tempfile::TempDir, tempfile::TempDir) {
+        let repo = tempfile::tempdir().unwrap();
+        let facts = tempfile::tempdir().unwrap();
+        let g = |args: &[&str]| {
+            let out = gitterm::agentd::git::git_command()
+                .current_dir(repo.path())
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        g(&["init", "-qb", "main"]);
+        std::fs::write(repo.path().join("file"), "base").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "fixture"]);
+        let oid = gitterm::turn_snapshots::snapshot(repo.path())
+            .await
+            .unwrap()
+            .unwrap();
+        gitterm::turn_snapshots::save(repo.path(), "cleanup-chat", 1, "start", &oid)
+            .await
+            .unwrap();
+        (repo, facts)
+    }
+
+    #[tokio::test]
+    async fn task_stop_removal_cleans_completed_chat_snapshots_without_a_harness() {
+        if snapshot_cleanup_test_child(
+            "tests::task_stop_removal_cleans_completed_chat_snapshots_without_a_harness",
+        ) {
+            return;
+        }
+        let (repo, facts) = snapshot_cleanup_fixture().await;
+        let mut tab = TabState::new(1, repo.path().into());
+        tab.chat_session_id = Some("cleanup-chat".into());
+        tab.task_id = Some("task".into());
+        let mut ws = Workspace::new("task".into(), repo.path().into(), WorkspaceColor::Blue);
+        ws.tabs.push(tab);
+        let mut workspaces = vec![ws];
+        let chats = task_snapshot_chats(&workspaces, "task");
+        workspaces[0].tabs.remove(0);
+        gitterm::turn_snapshots::maintain(
+            facts.path().into(),
+            [repo.path().into()].into(),
+            Some(chats),
+        )
+        .await
+        .unwrap();
+        assert!(gitterm::turn_snapshots::turns(repo.path(), "cleanup-chat")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(workspaces[0].tabs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn running_parked_done_cleans_chat_snapshots_without_a_harness() {
+        if snapshot_cleanup_test_child(
+            "tests::running_parked_done_cleans_chat_snapshots_without_a_harness",
+        ) {
+            return;
+        }
+        let (repo, facts) = snapshot_cleanup_fixture().await;
+        let mut ws = Workspace::new("parked".into(), repo.path().into(), WorkspaceColor::Blue);
+        ws.running_park = Some(ParkedInfo {
+            note: String::new(),
+            parked_at: "now".into(),
+        });
+        let mut tab = TabState::new(1, repo.path().into());
+        tab.chat_session_id = Some("cleanup-chat".into());
+        ws.tabs.push(tab);
+        ws.chats.push("owned-exited-chat".into());
+        let key = ParkedKey {
+            name: ws.name.clone(),
+            dir: workspace_config_dir(&ws),
+        };
+        let chats = parked_snapshot_chats(&[ws], &[], &key);
+        assert!(chats.contains(&"owned-exited-chat".to_string()));
+        gitterm::turn_snapshots::maintain(
+            facts.path().into(),
+            [repo.path().into()].into(),
+            Some(chats),
+        )
+        .await
+        .unwrap();
+        assert!(gitterm::turn_snapshots::turns(repo.path(), "cleanup-chat")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

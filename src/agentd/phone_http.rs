@@ -1167,6 +1167,7 @@ mod tests {
         };
         let desktop = chats.start_or_attach(
             ClaudeSessionConfig {
+                snapshot_facts_dir: None,
                 cwd: dir.path().to_path_buf(),
                 model: None,
                 permission_mode: "default".into(),

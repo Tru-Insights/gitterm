@@ -25,7 +25,28 @@
   document.querySelectorAll('button[data-source]').forEach((button) => {
     button.addEventListener('click', () => {
       if (button.disabled || button.classList.contains('on')) return;
+      if (button.dataset.source === 'turns') { post({ type: 'review.turns' }); return; }
+      if (button.dataset.source === 'commits') {
+        post({ type: 'review.commits' });
+        return;
+      }
       post({ type: 'review.source', source: button.dataset.source, hide_noise: !!(hide && hide.checked) });
+    });
+  });
+  document.querySelectorAll('button[data-turn]').forEach((button) => {
+    button.addEventListener('click', () => post({ type: 'review.turn', number: Number(button.dataset.turn) }));
+  });
+  let firstCommit = body.dataset.firstCommit || null;
+  document.querySelectorAll('button[data-commit]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const sha = button.dataset.commit;
+      if (!firstCommit) {
+        firstCommit = sha;
+        post({ type: 'review.commit_range', first: sha, last: sha, pending: true });
+      } else {
+        post({ type: 'review.commit_range', first: firstCommit, last: sha, pending: false });
+        firstCommit = null;
+      }
     });
   });
   const close = document.getElementById('close');

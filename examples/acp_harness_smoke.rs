@@ -255,6 +255,7 @@ async fn main() {
     );
 
     let config = |resume: Option<String>| AcpSessionConfig {
+        snapshot_facts_dir: None,
         agent,
         cwd: workdir.clone(),
         resume,

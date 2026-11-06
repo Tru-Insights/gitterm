@@ -255,6 +255,13 @@ pub enum HarnessSession {
 }
 
 impl HarnessSession {
+    pub fn close_turn_snapshots(&self) {
+        match self {
+            Self::Claude(session) => session.close_turn_snapshots(),
+            Self::Acp(session) => session.close_turn_snapshots(),
+        }
+    }
+
     pub fn send(&self, command: HarnessCommand) -> Result<(), String> {
         match self {
             Self::Claude(session) => session.send(command),

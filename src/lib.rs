@@ -25,6 +25,7 @@ pub mod review_pane;
 pub mod task_mcp;
 pub mod task_worktree;
 pub mod tasks;
+pub mod turn_snapshots;
 pub mod usage;
 pub mod work_documents;
 pub mod work_notes;

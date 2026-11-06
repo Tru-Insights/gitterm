@@ -1,0 +1,73 @@
+{
+  "provenance": "Observed from the installed Claude Code 2.1.318 CLI in an isolated temp repo/config, using a localhost synthetic Messages API server, fixture credentials and only two permission-checked fixture writes. No real model call or GitTerm instance. Trace retains only hook names, queue states and synthetic file content.",
+  "cli": "2.1.318",
+  "trace": [
+    {
+      "initialize_hooks_applied": true
+    },
+    {
+      "message": "probe-1",
+      "state": "queued"
+    },
+    {
+      "message": "probe-1",
+      "state": "started"
+    },
+    {
+      "hook": "UserPromptSubmit",
+      "file": null
+    },
+    {
+      "hook": "PreToolUse",
+      "file": null
+    },
+    {
+      "permission": "allow"
+    },
+    {
+      "hook": "Stop",
+      "file": "one"
+    },
+    {
+      "send": "second prompt while Stop callback is unacknowledged"
+    },
+    {
+      "message": "probe-2",
+      "state": "queued"
+    },
+    {
+      "result": 1,
+      "subtype": "success",
+      "is_error": false
+    },
+    {
+      "message": "probe-1",
+      "state": "completed"
+    },
+    {
+      "message": "probe-2",
+      "state": "started"
+    },
+    {
+      "hook": "UserPromptSubmit",
+      "file": "one"
+    },
+    {
+      "hook": "PreToolUse",
+      "file": "one"
+    },
+    {
+      "permission": "allow"
+    },
+    {
+      "hook": "Stop",
+      "file": "two"
+    },
+    {
+      "result": 2,
+      "subtype": "success",
+      "is_error": false
+    }
+  ],
+  "results": 2
+}
