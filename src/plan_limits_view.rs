@@ -92,7 +92,7 @@ impl PlanLimitsState {
             return None;
         }
         self.file.pending_notices.get(chat).map(|lines| {
-            format!("GitTerm plan limits: {}\nRelay this heads-up to the user and follow `plan_limits` routing for new work. An explicit user model choice wins; never restart running workers to change routing.", lines.join("\n"))
+            gitterm::delegations::from_gitterm(&format!("GitTerm plan limits: {}\nRelay this heads-up to the user and follow `plan_limits` routing for new work. An explicit user model choice wins; never restart running workers to change routing.", lines.join("\n")))
         })
     }
 

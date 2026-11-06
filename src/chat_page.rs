@@ -51,7 +51,11 @@ pub fn agent_chat_html() -> String {
 
 /// The page's echo of a prompt the human submitted.
 pub fn user_prompt_payload(text: &str) -> Value {
-    serde_json::json!({"type": "user_prompt", "text": text})
+    let mut payload = serde_json::json!({"type": "user_prompt", "text": text});
+    if let Some(card) = crate::delegations::delivery_card(text) {
+        payload["delivery"] = serde_json::json!(card);
+    }
+    payload
 }
 
 /// A harness event as the page's `__appendEvent` receives it. `None` (and
@@ -139,6 +143,29 @@ pub fn history_payloads(entries: Vec<TimedEntry>) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_prompt_payload_classifies_only_footer_marked_deliveries_for_cards() {
+        let delivery = format!(
+            "{}\nWorker reports done: TRU-235\nDetails\nFull record: delegation_get d-7",
+            crate::delegations::DELIVERY_SOURCE_LINE
+        );
+        let payload = user_prompt_payload(&delivery);
+        assert_eq!(
+            payload["delivery"]["header"],
+            "Worker reports done: TRU-235"
+        );
+        assert_eq!(payload["delivery"]["delegation_id"], "d-7");
+        assert_eq!(
+            payload["delivery"]["body"],
+            "Details\nFull record: delegation_get d-7"
+        );
+        assert!(
+            user_prompt_payload("Please explain delegation_get in this paragraph")
+                .get("delivery")
+                .is_none()
+        );
+    }
 
     #[test]
     fn history_payloads_wrap_events_and_stamp_subagent_starts() {

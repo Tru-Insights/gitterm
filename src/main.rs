@@ -25654,6 +25654,7 @@ fi
                     id,
                     text,
                     image_count,
+                    ..
                 }),
             ) => {
                 return self.agent_prompt_echoed(tab_id, id, text, image_count);

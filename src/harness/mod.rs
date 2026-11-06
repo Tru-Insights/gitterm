@@ -245,6 +245,10 @@ pub enum HarnessEvent {
         text: String,
         #[serde(default)]
         image_count: usize,
+        /// Set when GitTerm, not the user, sent the message, so every
+        /// client draws it as a card (`delegations::delivery_card`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery: Option<crate::delegations::DeliveryCard>,
     },
 }
 
@@ -517,12 +521,29 @@ mod tests {
             id: Some("u1".into()),
             text: "hi".into(),
             image_count: 2,
+            delivery: None,
         };
         let value = serde_json::to_value(&echo).unwrap();
         assert_eq!(
             value,
             json!({"type": "user_message_echo",
                    "data": {"id": "u1", "text": "hi", "image_count": 2}})
+        );
+        assert_eq!(serde_json::from_value::<HarnessEvent>(value).unwrap(), echo);
+
+        // A GitTerm-sent message carries its card, so a phone draws it as one.
+        let text =
+            crate::delegations::from_gitterm("GitTerm PR watch: acme/api#12: checks failed.");
+        let echo = HarnessEvent::UserMessageEcho {
+            id: None,
+            delivery: crate::delegations::delivery_card(&text),
+            text,
+            image_count: 0,
+        };
+        let value = serde_json::to_value(&echo).unwrap();
+        assert_eq!(
+            value["data"]["delivery"]["header"],
+            "GitTerm PR watch: acme/api#12: checks failed."
         );
         assert_eq!(serde_json::from_value::<HarnessEvent>(value).unwrap(), echo);
     }

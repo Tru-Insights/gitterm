@@ -98,10 +98,7 @@ pub(crate) fn is_human_request(text: &str) -> bool {
     {
         return false;
     }
-    // A delegation result sent in as a user message ends with its pointer
-    // (`delegations::compose_send_message`).
-    let last = text.lines().last().unwrap_or("").trim();
-    !last.starts_with("Full record: delegation_get ")
+    !gitterm::delegations::is_delivery_message(text)
 }
 
 /// Whether a tool call writes the todo list (Claude's TodoWrite, OpenCode's

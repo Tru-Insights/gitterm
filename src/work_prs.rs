@@ -82,7 +82,7 @@ fn pr_url_for(key: &PrKey, watched_url: Option<&str>) -> String {
 
 /// The prompt that tells a coordinator its news: one line per item.
 fn tell_prompt(lines: &[String]) -> String {
-    lines.join("\n")
+    gitterm::delegations::from_gitterm(&lines.join("\n"))
 }
 
 /// Where a PR's work lives.
@@ -2838,7 +2838,8 @@ mod tests {
         // One item: the line a single news item has always sent.
         assert_eq!(
             tell_prompt(&[news_line(&watched, &failed)]),
-            "GitTerm PR watch: acme/api#12 \"PRJ-101: add the export\": checks failed: test. \
+            "GitTerm delivery (not typed by the user):\n\
+             GitTerm PR watch: acme/api#12 \"PRJ-101: add the export\": checks failed: test. \
              https://github.com/acme/api/pull/12"
         );
         // Several: one prompt, a line each. A PR without a read yet falls
@@ -2851,7 +2852,8 @@ mod tests {
                 news_line(&unread, &conflict),
             ]),
             format!(
-                "GitTerm PR watch: acme/api#12 \"PRJ-101: add the export\": checks failed: test. \
+                "GitTerm delivery (not typed by the user):\n\
+                 GitTerm PR watch: acme/api#12 \"PRJ-101: add the export\": checks failed: test. \
                  https://github.com/acme/api/pull/12\n\
                  GitTerm PR watch: acme/api#12 \"PRJ-101: add the export\": has merge conflicts. \
                  https://github.com/acme/api/pull/12\n\

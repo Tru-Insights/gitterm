@@ -328,6 +328,7 @@ impl Chat {
                     id: prompt.id.clone(),
                     text: prompt.text.clone(),
                     image_count: prompt.images.len(),
+                    delivery: crate::delegations::delivery_card(&prompt.text),
                 });
             }
             _ => {}
@@ -1075,6 +1076,7 @@ mod tests {
             id: Some("u1".into()),
             text: "look at this".into(),
             image_count: 1,
+            delivery: None,
         };
         for attachment in [&mut sender, &mut other] {
             let seen: Vec<SeqEvent> = (0..3)
