@@ -14,7 +14,7 @@
 //! touches the user's Chrome, GitTerm, or `~/.config/gitterm*`.
 //! `GITTERM_AGENT_BROWSER_PATH` names the binary (default
 //! `~/.local/agent-browser/agent-browser`); `GITTERM_V6_CHROME_PATH` names
-//! Chrome (default: the macOS install).
+//! Chrome (default: the newest cached Puppeteer chrome-headless-shell).
 
 use gitterm::agent_browser::PINNED_AGENT_BROWSER;
 use gitterm::browser_mcp::{self, BrowserMcpConnection};
@@ -97,13 +97,18 @@ fn spare_port() -> u16 {
 }
 
 fn launch_chrome(profile: &Path) -> TempChrome {
-    let chrome = std::env::var_os("GITTERM_V6_CHROME_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-        });
+    let chrome = chrome_path().unwrap_or_else(|| {
+        panic!(
+            "no Chrome binary found; set GITTERM_V6_CHROME_PATH or install one with: \
+             npx @puppeteer/browsers install chrome-headless-shell"
+        )
+    });
     let port = spare_port();
-    let child = Command::new(&chrome)
+    let mut command = Command::new(&chrome);
+    if std::env::var_os("CODEX_SANDBOX").is_some() {
+        command.args(["--no-sandbox", "--single-process"]);
+    }
+    let child = command
         .args([
             "--headless=new".to_string(),
             format!("--user-data-dir={}", profile.display()),
@@ -148,6 +153,68 @@ fn launch_chrome(profile: &Path) -> TempChrome {
     )
     .unwrap();
     chrome
+}
+
+fn chrome_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("GITTERM_V6_CHROME_PATH") {
+        return Some(PathBuf::from(path));
+    }
+
+    let root = dirs::home_dir()?.join(".cache/puppeteer/chrome-headless-shell");
+    let mut versions: Vec<_> = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .collect();
+    versions.sort_by(|a, b| {
+        natural_version_cmp(
+            &b.file_name().to_string_lossy(),
+            &a.file_name().to_string_lossy(),
+        )
+    });
+    versions
+        .into_iter()
+        .map(|version| {
+            version
+                .path()
+                .join("chrome-headless-shell-mac-arm64/chrome-headless-shell")
+        })
+        .find(|path| path.is_file())
+}
+
+fn natural_version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut ai, mut bi) = (0, 0);
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    while ai < a.len() && bi < b.len() {
+        let (start_a, start_b) = (ai, bi);
+        let digits_a = a[ai].is_ascii_digit();
+        let digits_b = b[bi].is_ascii_digit();
+        while ai < a.len() && a[ai].is_ascii_digit() == digits_a {
+            ai += 1;
+        }
+        while bi < b.len() && b[bi].is_ascii_digit() == digits_b {
+            bi += 1;
+        }
+        let left = &a[start_a..ai];
+        let right = &b[start_b..bi];
+        let ordering = if digits_a && digits_b {
+            let left = left
+                .iter()
+                .skip_while(|byte| **byte == b'0')
+                .collect::<Vec<_>>();
+            let right = right
+                .iter()
+                .skip_while(|byte| **byte == b'0')
+                .collect::<Vec<_>>();
+            left.len().cmp(&right.len()).then_with(|| left.cmp(&right))
+        } else {
+            left.cmp(right)
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    (a.len() - ai).cmp(&(b.len() - bi))
 }
 
 /// A minimal static server for the fixture pages.

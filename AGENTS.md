@@ -292,6 +292,9 @@ Windows CI exists.
   Never kill, signal, or replace the bundle of the running instance; prefer a
   headless example over driving the GUI to verify a change.
 
+- Workers never launch `/Applications/Google Chrome.app`. For page checks,
+  use the page-test harness or GitTerm's browser tools.
+
 ### Workspaces
 
 - `App` holds `Vec<Workspace>` + `active_workspace_idx`. `Workspace` =

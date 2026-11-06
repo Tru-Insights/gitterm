@@ -1,16 +1,39 @@
 // Run: node tests/html_render_chrome.mjs. Uses a temporary headless profile.
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { access, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 import assert from 'node:assert/strict';
+const installHint = 'npx @puppeteer/browsers install chrome-headless-shell';
+async function findChrome() {
+  if (process.env.GITTERM_V6_CHROME_PATH) return process.env.GITTERM_V6_CHROME_PATH;
+  const root = join(process.env.HOME, '.cache/puppeteer/chrome-headless-shell');
+  let versions;
+  try { versions = await readdir(root); } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    return null;
+  }
+  versions.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+  for (const version of versions) {
+    const candidate = join(root, version, 'chrome-headless-shell-mac-arm64', 'chrome-headless-shell');
+    try { await access(candidate); return candidate; } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
+  return null;
+}
+const chrome = await findChrome();
+if (!chrome) {
+  console.log(`SKIP: no Chrome binary found; set GITTERM_V6_CHROME_PATH or install one with: ${installHint}`);
+  process.exit(0);
+}
 let received = 0; const server = createServer((req,res) => { res.end('unexpected'); }); server.on('connection',()=>received++); server.listen(0, '127.0.0.1'); await once(server,'listening');
 const address = '127.0.0.1:' + server.address().port;
 const profile = await mkdtemp(join(tmpdir(), 'gitterm-v6-html-test-'));
-const chrome = process.env.GITTERM_V6_CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-const child = spawn(chrome, ['--headless=new', '--disable-features=IsolateSandboxedIframes', '--no-first-run', '--no-default-browser-check', '--disable-background-networking', '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0', '--user-data-dir=' + profile, 'about:blank'], { stdio: 'ignore' });
+const sandboxArgs = process.env.CODEX_SANDBOX ? ['--no-sandbox', '--single-process'] : [];
+const child = spawn(chrome, [...sandboxArgs, '--headless=new', '--disable-features=IsolateSandboxedIframes', '--no-first-run', '--no-default-browser-check', '--disable-background-networking', '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0', '--user-data-dir=' + profile, 'about:blank'], { stdio: 'ignore' });
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 let socket;
 try {
