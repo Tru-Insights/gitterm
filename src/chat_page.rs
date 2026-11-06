@@ -52,23 +52,8 @@ pub fn agent_chat_html() -> String {
 /// The page's echo of a prompt the human submitted.
 pub fn user_prompt_payload(text: &str) -> Value {
     let mut payload = serde_json::json!({"type": "user_prompt", "text": text});
-    if crate::delegations::is_delivery_message(text) {
-        let content = text
-            .trim()
-            .strip_prefix(crate::delegations::DELIVERY_SOURCE_LINE)
-            .and_then(|text| text.strip_prefix('\n'))
-            .unwrap_or(text.trim());
-        let header = content.lines().next().unwrap_or("Delegation delivery");
-        let delegation_id = content
-            .lines()
-            .last()
-            .and_then(|line| line.strip_prefix("Full record: delegation_get "))
-            .unwrap_or("");
-        payload["delivery"] = serde_json::json!({
-            "header": header,
-            "delegation_id": delegation_id,
-            "body": content.strip_prefix(header).unwrap_or(content).trim_start(),
-        });
+    if let Some(card) = crate::delegations::delivery_card(text) {
+        payload["delivery"] = serde_json::json!(card);
     }
     payload
 }

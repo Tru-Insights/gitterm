@@ -1532,13 +1532,62 @@ pub fn compose_send_message(
     Ok(with_delivery_source(message, id))
 }
 
-/// Whether text is a GitTerm-delivered delegation prompt, identified by its
-/// stable transcript footer.
+/// Text GitTerm itself sends into a chat (delegation results, PR watch news,
+/// plan-limit notices), led by the source line so the harness, the model and
+/// the chat view can tell it from the user's own words.
+pub fn from_gitterm(text: &str) -> String {
+    format!("{DELIVERY_SOURCE_LINE}\n{text}")
+}
+
+/// Whether text is a prompt GitTerm sent rather than the user: it starts
+/// with the source line, or (results delivered before the source line
+/// existed) it ends with the full-record footer.
 pub fn is_delivery_message(text: &str) -> bool {
-    text.trim()
+    let text = text.trim();
+    text.lines().next() == Some(DELIVERY_SOURCE_LINE)
+        || text
+            .lines()
+            .last()
+            .is_some_and(|line| line.starts_with(DELIVERY_FOOTER_PREFIX))
+}
+
+/// How the chat view shows a GitTerm-sent prompt: its first line as the
+/// header, the delegation id when it reports exactly one, and the rest
+/// folded.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeliveryCard {
+    pub header: String,
+    pub delegation_id: String,
+    pub body: String,
+}
+
+/// The card for `text`, or `None` when the user wrote it.
+pub fn delivery_card(text: &str) -> Option<DeliveryCard> {
+    if !is_delivery_message(text) {
+        return None;
+    }
+    let text = text.trim();
+    let content = text
+        .strip_prefix(DELIVERY_SOURCE_LINE)
+        .map(|rest| rest.trim_start_matches('\n'))
+        .unwrap_or(text);
+    let header = content.lines().next().unwrap_or("GitTerm delivery");
+    let mut ids = content
         .lines()
-        .last()
-        .is_some_and(|line| line.starts_with(DELIVERY_FOOTER_PREFIX))
+        .filter_map(|line| line.strip_prefix(DELIVERY_FOOTER_PREFIX));
+    let delegation_id = match (ids.next(), ids.next()) {
+        (Some(id), None) => id.to_string(),
+        _ => String::new(),
+    };
+    Some(DeliveryCard {
+        header: header.to_string(),
+        delegation_id,
+        body: content
+            .strip_prefix(header)
+            .unwrap_or(content)
+            .trim_start()
+            .to_string(),
+    })
 }
 
 fn with_delivery_source(message: String, id: &str) -> String {
@@ -1728,7 +1777,7 @@ pub fn next_held_send(held: &mut Vec<HeldSend>, streaming: bool) -> Option<SendB
             message: send.message,
         });
     }
-    let header = "Delegation results:\n";
+    let header = format!("{DELIVERY_SOURCE_LINE}\nDelegation results:\n");
     let mut count = 0;
     let mut reserved = header.len();
     for send in held.iter() {
@@ -1744,15 +1793,24 @@ pub fn next_held_send(held: &mut Vec<HeldSend>, streaming: bool) -> Option<SendB
         return None;
     }
     let budget = (MAX_SEND_BYTES - reserved) / count;
-    let mut message = header.to_string();
+    let mut message = header;
     let mut delegation_ids = Vec::new();
     for send in held.drain(..count) {
         let footer = format!("Full record: delegation_get {}", send.delegation_id);
         let body = send.message.strip_suffix(&footer).unwrap_or(&send.message);
+        // The batch carries the source line once, at the top.
+        let body = body
+            .strip_prefix(DELIVERY_SOURCE_LINE)
+            .and_then(|body| body.strip_prefix('\n'))
+            .unwrap_or(body);
         message.push('\n');
         message.push_str(cut_to_bytes(body, budget));
         if body.len() > budget {
             message.push_str("…\n");
+        } else if !message.ends_with('\n') {
+            // The footer stays on its own line, where readers look for it.
+            // The pointer reservation's unused "…" covers this byte.
+            message.push('\n');
         }
         message.push_str(&footer);
         message.push('\n');
@@ -2559,6 +2617,24 @@ mod tests {
         assert!(!is_delivery_message(
             "A user mentions delegation_get in the middle."
         ));
+        assert!(!is_delivery_message(
+            "I pasted this: GitTerm delivery (not typed by the user):"
+        ));
+    }
+
+    #[test]
+    fn gitterm_notices_without_a_delegation_are_delivery_cards() {
+        let notice = from_gitterm("GitTerm PR watch: acme/api#12: checks failed.\nsecond line");
+        assert!(notice.starts_with("GitTerm delivery (not typed by the user):\n"));
+        assert_eq!(
+            delivery_card(&notice),
+            Some(DeliveryCard {
+                header: "GitTerm PR watch: acme/api#12: checks failed.".into(),
+                delegation_id: String::new(),
+                body: "second line".into(),
+            })
+        );
+        assert_eq!(delivery_card("run the tests"), None);
     }
 
     #[test]
@@ -2568,7 +2644,7 @@ mod tests {
         assert_eq!(decide_send(true, false, &held, "a"), SendDecision::Hold);
         held.push(HeldSend {
             delegation_id: "a".into(),
-            message: "A".into(),
+            message: format!("{DELIVERY_SOURCE_LINE}\nA\nFull record: delegation_get a"),
             automatic: false,
         });
         held.push(HeldSend {
@@ -2589,6 +2665,14 @@ mod tests {
         let batch = next_held_send(&mut held, false).unwrap();
         assert_eq!(batch.delegation_ids, ["a", "b"]);
         assert!(batch.message.contains("A") && batch.message.contains("B"));
+        // The batch names GitTerm once, at the top, and reads as one card.
+        assert!(batch
+            .message
+            .starts_with(&format!("{DELIVERY_SOURCE_LINE}\nDelegation results:\n")));
+        assert_eq!(batch.message.matches(DELIVERY_SOURCE_LINE).count(), 1);
+        let card = delivery_card(&batch.message).unwrap();
+        assert_eq!(card.header, "Delegation results:");
+        assert_eq!(card.delegation_id, "");
         assert_eq!(next_held_send(&mut held, false), None);
     }
 

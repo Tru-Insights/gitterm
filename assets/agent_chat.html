@@ -3482,8 +3482,9 @@
       case 'user_message_echo':
         // A prompt any client of an agent-owned chat sent (TRU-151); the
         // sender's own bubble under the same id makes this a no-op.
-        // Sent while a turn runs, Claude queues it.
-        showUserPrompt({ text: d.text, id: d.id, image_count: d.image_count, queued: busy });
+        // Sent while a turn runs, Claude queues it. `delivery`: GitTerm
+        // sent it, so it draws as a card.
+        showUserPrompt({ text: d.text, id: d.id, image_count: d.image_count, queued: busy, delivery: d.delivery });
         break;
       case 'message_lifecycle':
         queuedLifecycle(d.id, d.state);
