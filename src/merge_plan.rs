@@ -330,6 +330,9 @@ impl MergePlan {
 /// case-insensitive repo name, then PR number ascending (oldest in that repo).
 /// Only open/draft PRs supply dependencies; closed/merged branches are roots.
 /// Unresolvable PRs remain in the normal plan, without a merge position.
+// Test-only since TRU-236 removed the button that built these plans; the
+// ordering tests still use it to build fixtures.
+#[cfg(test)]
 pub fn backfill_plan(
     root: &str,
     watched: &[(PrKey, PrBrief)],
