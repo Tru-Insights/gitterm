@@ -73,6 +73,8 @@ pub struct PullCore {
     pub state: Option<PrState>,
     pub url: String,
     pub author: String,
+    #[serde(default)]
+    pub head_repo: String,
     pub head_ref: String,
     pub head_sha: String,
     pub base_ref: String,
@@ -684,6 +686,7 @@ impl WatchedPr {
         let core = self.snapshot.core.as_ref()?;
         Some(PrBrief {
             state: core.state?,
+            head_repo: core.head_repo.clone(),
             head_ref: core.head_ref.clone(),
             base_ref: core.base_ref.clone(),
         })
@@ -1113,6 +1116,7 @@ pub fn parse_pull(value: &Value) -> Result<PullCore, String> {
         state: Some(state),
         url: str_at(value, &["html_url"]).to_string(),
         author: str_at(value, &["user", "login"]).to_string(),
+        head_repo: str_at(value, &["head", "repo", "full_name"]).to_string(),
         head_ref: str_at(value, &["head", "ref"]).to_string(),
         head_sha: str_at(value, &["head", "sha"]).to_string(),
         base_ref: str_at(value, &["base", "ref"]).to_string(),
@@ -1268,6 +1272,22 @@ pub struct Fetched {
     pub etags: BTreeMap<String, String>,
 }
 
+fn etags_for_pull(
+    key: &PrKey,
+    previous: &PrSnapshot,
+    etags: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut usable = etags.clone();
+    if previous
+        .core
+        .as_ref()
+        .is_none_or(|core| core.head_repo.is_empty())
+    {
+        usable.remove(&format!("repos/{}/pulls/{}", key.repo, key.number));
+    }
+    usable
+}
+
 /// Fetches `key` given its previous snapshot and ETags. Merged or closed,
 /// only the pull is read.
 pub async fn fetch_pr(
@@ -1277,13 +1297,14 @@ pub async fn fetch_pr(
     token: Option<&str>,
 ) -> Result<Fetched, String> {
     let repo = &key.repo;
+    let pull_path = format!("repos/{repo}/pulls/{}", key.number);
+    let usable_etags = etags_for_pull(key, previous, etags);
     let mut reader = Reader {
         token,
-        previous: etags,
+        previous: &usable_etags,
         etags: BTreeMap::new(),
     };
     let mut snapshot = previous.clone();
-    let pull_path = format!("repos/{repo}/pulls/{}", key.number);
     match reader.read(&pull_path).await? {
         Read::Changed(value) => snapshot.core = Some(parse_pull(&value)?),
         Read::Unchanged if previous.core.is_some() => {}
@@ -1496,6 +1517,7 @@ mod tests {
             state: Some(state),
             url: "https://github.com/acme/api/pull/12".to_string(),
             author: "dev".to_string(),
+            head_repo: "acme/api".to_string(),
             head_ref: "prj-101".to_string(),
             head_sha: sha.to_string(),
             base_ref: "main".to_string(),
@@ -1519,6 +1541,26 @@ mod tests {
             check_runs: checks,
             ..PrSnapshot::default()
         }
+    }
+
+    #[test]
+    fn missing_head_repo_invalidates_only_the_pull_etag() {
+        let key = PrKey::new("acme/api", 12);
+        let pull = "repos/acme/api/pulls/12".to_string();
+        let checks = "repos/acme/api/commits/sha/check-runs?per_page=100".to_string();
+        let etags = BTreeMap::from([
+            (pull.clone(), "pull-etag".to_string()),
+            (checks.clone(), "checks-etag".to_string()),
+        ]);
+        let mut previous = snapshot(PrState::Open, "sha", vec![]);
+        previous.core.as_mut().unwrap().head_repo.clear();
+
+        let usable = etags_for_pull(&key, &previous, &etags);
+        assert!(!usable.contains_key(&pull));
+        assert_eq!(usable.get(&checks).map(String::as_str), Some("checks-etag"));
+
+        previous.core.as_mut().unwrap().head_repo = "acme/api".to_string();
+        assert_eq!(etags_for_pull(&key, &previous, &etags), etags);
     }
 
     fn fetched(snapshot: PrSnapshot) -> Fetched {
@@ -2091,12 +2133,13 @@ mod tests {
         let pull: Value = serde_json::json!({
             "title": "PRJ-101: export", "state": "closed", "merged": true, "draft": false,
             "html_url": "https://github.com/acme/api/pull/12", "user": {"login": "dev"},
-            "head": {"ref": "prj-101", "sha": "a1"}, "base": {"ref": "main"},
+            "head": {"ref": "prj-101", "sha": "a1", "repo": {"full_name": "alice/api"}}, "base": {"ref": "main"},
             "mergeable": null, "mergeable_state": "unknown",
             "requested_reviewers": [{"login": "r"}], "requested_teams": []
         });
         let core = parse_pull(&pull).unwrap();
         assert_eq!(core.state, Some(PrState::Merged));
+        assert_eq!(core.head_repo, "alice/api");
         assert_eq!(core.mergeable, None);
         assert_eq!(core.requested_reviewers, 1);
         let draft = serde_json::json!({"state": "open", "draft": true});
