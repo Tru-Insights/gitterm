@@ -1,6 +1,6 @@
 """Check delegation cards against the real chat page in an isolated Chrome.
 
-Run: python3 tests/check_delegation_cards.py --chrome <headless Chrome binary>
+Run: python3 tests/check_delegation_cards.py --chrome <path-to-cached-chrome-headless-shell>
 Optional: --screenshot <output.png>
 """
 
