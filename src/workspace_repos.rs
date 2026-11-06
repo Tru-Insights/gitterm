@@ -387,6 +387,7 @@ mod tests {
             target: None,
             previous: None,
             status: DelegationStatus::Requested,
+            superseded_by: None,
             result: None,
             created_at: "2026-11-05T00:00:00Z".into(),
             updated_at: "2026-11-05T00:00:00Z".into(),

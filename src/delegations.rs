@@ -570,11 +570,12 @@ pub fn worker_card_info(
         "role": role,
         "worktree_path": task.and_then(|task| task.worktree.path.clone()),
         "branch": task.map(|task| task.branch.clone()),
-        "session_state": worker_session_state(
+        "session_state": if delegation.superseded_by.is_some() { "superseded" } else { worker_session_state(
             &delegation.status,
             task.map(|task| task.lifecycle),
             tab,
-        ),
+        ) },
+        "superseded_by": delegation.superseded_by,
         "tab_open": tab != WorkerTab::Closed,
         "progress": progress.as_ref().map(|(line, _)| line.clone()),
         "progress_at": progress.map(|(_, at)| at),

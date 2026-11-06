@@ -5060,6 +5060,8 @@ struct TabState {
     task_last_activity: Option<Instant>,
     task_prompt_watch: gitterm::workers::PromptWatch,
     task_watchdog_reported: bool,
+    worker_process: Option<gitterm::worker_process::WorkerProcess>,
+    worker_closing: bool,
     // Worktree this chat tab's agent works in, and whether the Git and
     // Files panels follow it (TRU-146). Derived from the tool stream; never
     // persisted. `repo_path` / `current_dir` stay on the workspace root.
@@ -5130,6 +5132,8 @@ impl TabState {
             task_last_activity: None,
             task_prompt_watch: Default::default(),
             task_watchdog_reported: false,
+            worker_process: None,
+            worker_closing: false,
             attention: None,
             claude_config: ClaudeConfig::default(),
             worktree_follow: WorktreeFollow::default(),
@@ -7102,6 +7106,7 @@ pub enum Event {
     /// A worker's time limit is up: delegation, worker task session
     /// (TRU-212).
     WorkerTimeLimitReached(String, String),
+    FinalWorkerStopped(String, Result<(), String>),
     /// A Codex delegation run ended.
     DelegationFinished(
         String,
@@ -7553,6 +7558,7 @@ struct App {
     next_tab_id: usize,
     // Durable task registry and cross-workspace Tasks UI state.
     task_store: Option<TaskStore>,
+    missing_task_worktrees_logged: HashSet<String>,
     /// Review… button defaults (config `review`, TRU-142).
     review_config: config::ReviewConfig,
     /// Worker role → model per provider, for `delegate_task` (TRU-142 S6).
@@ -11693,11 +11699,28 @@ impl App {
     /// the lifecycle when no other live session keeps the task active, but
     /// its failure detail is recorded either way.
     fn apply_task_session_signal(&mut self, task_id: &str, ended: Option<TaskSessionOutcome>) {
+        // A late PTY/title/exit observation from a final worker cannot
+        // replace its persisted handoff outcome or resurrect its lifecycle.
+        let final_session = |tab: &TabState| {
+            self.task_store.as_ref().is_some_and(|store| {
+                store.worker_session_is_final(task_id, tab.task_session_id.as_deref())
+            })
+        };
+        let tabs: Vec<_> = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| &ws.tabs)
+            .filter(|tab| tab.task_id.as_deref() == Some(task_id))
+            .collect();
+        if !tabs.is_empty() && tabs.iter().all(|tab| final_session(tab)) {
+            return;
+        }
         let live = aggregate_task_live_states(
             self.workspaces
                 .iter()
                 .flat_map(|workspace| workspace.tabs.iter())
                 .filter(|tab| tab.task_id.as_deref() == Some(task_id))
+                .filter(|tab| !final_session(tab))
                 .filter_map(|tab| tab.task_live_state),
         );
         let (target, detail) = match (live, ended) {
@@ -12540,6 +12563,7 @@ impl App {
         let Some(mut session) = task
             .sessions
             .iter()
+            .rev()
             .find(|session| {
                 session
                     .conversation
@@ -12554,6 +12578,15 @@ impl App {
             ));
             return Task::none();
         };
+        if let Some((ws, idx)) = self.find_chat_tab(&chats::ChatRef::local(chat_id)) {
+            let tab = &self.workspaces[ws].tabs[idx];
+            if self.task_store.as_ref().is_some_and(|store| {
+                store.worker_session_is_final(task_id, tab.task_session_id.as_deref())
+            }) {
+                self.task_ui_error = Some("This finished worker is closing. Reopen its conversation after its tab closes.".into());
+                return Task::none();
+            }
+        }
         // Claude ids are preassigned at launch but the transcript is only
         // written on the first message — a session that never got one has
         // nothing to resume. Unlink the phantom ref instead of letting
@@ -12611,8 +12644,8 @@ impl App {
             }
         }
         let timestamp = chrono::Utc::now().to_rfc3339();
-        session.updated_at = timestamp.clone();
         if let Some(store) = self.task_store.as_mut() {
+            renew_final_worker_session(store, task_id, &mut session, &timestamp);
             if let Err(error) = store.upsert_session(task_id, session.clone(), &timestamp) {
                 self.task_ui_error = Some(error.to_string());
                 return Task::none();
@@ -12905,7 +12938,13 @@ impl App {
                 store
                     .tasks()
                     .iter()
-                    .filter(|task| task_holds_local_slot(task))
+                    .filter(|task| {
+                        task_holds_local_slot(task)
+                            && self.workspaces.iter().flat_map(|ws| &ws.tabs).any(|tab| {
+                                tab.task_id.as_deref() == Some(task.task_id.as_str())
+                                    && task_session_is_working(tab, Some(store))
+                            })
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -18401,41 +18440,7 @@ impl App {
             });
             match owner {
                 Some(mut task) => {
-                    if task.archived_at.is_some() {
-                        return Err(format!(
-                            "checkout {} is the worktree of archived task \"{}\" ({}); \
-                             delegate to another checkout",
-                            checkout.display(),
-                            task.title,
-                            task.task_id
-                        ));
-                    }
-                    if let Some(open) = store.open_worker_delegations(&task.task_id).first() {
-                        return Err(format!(
-                            "checkout {} is task \"{}\"'s worktree, and worker delegation {} \
-                             is still open there; wait for its report, or stop tracking it, \
-                             before handing that checkout more work",
-                            checkout.display(),
-                            task.title,
-                            open.delegation_id
-                        ));
-                    }
-                    let live = self
-                        .workspaces
-                        .iter()
-                        .flat_map(|workspace| workspace.tabs.iter())
-                        .any(|open| {
-                            open.task_id.as_deref() == Some(task.task_id.as_str())
-                                && open.task_live_state.is_some()
-                        });
-                    if live {
-                        return Err(format!(
-                            "checkout {} is task \"{}\"'s worktree, and a session is still \
-                             running in it; stop it before handing that checkout more work",
-                            checkout.display(),
-                            task.title
-                        ));
-                    }
+                    validate_worker_checkout(store, &task, &checkout, &self.workspaces)?;
                     // The task now carries this work; its last handoff
                     // stays as the worker's context.
                     task.title = title;
@@ -18572,14 +18577,6 @@ impl App {
             .and_then(|task| task.worktree.path.clone());
         let message = gitterm::delegations::time_limit_message(minutes, place.as_deref(), true);
         eprintln!("[delegation] {delegation_id}: {message}");
-        let close = match find_task_session_tab(&self.workspaces, session_id) {
-            Some((workspace_idx, tab_idx)) => self.close_task_tab(TaskTabClosePrompt {
-                workspace_idx,
-                tab_idx,
-                task_id,
-            }),
-            None => Task::none(),
-        };
         let now = chrono::Utc::now().to_rfc3339();
         if let Some(store) = self.task_store.as_mut() {
             if let Err(error) = store.stop_delegation_at_time_limit(delegation_id, message, &now) {
@@ -18604,7 +18601,7 @@ impl App {
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
         self.push_delegation_card(delegation_id);
-        close
+        Task::none()
     }
 
     /// The delegated task's worktree is ready: record the worker delegation,
@@ -18909,6 +18906,88 @@ impl App {
         self.push_delegation_card(delegation_id);
     }
 
+    /// Called after durable results have been offered to the delivery queue.
+    /// Keep the terminal alive during TERM's grace period, then remove its tab.
+    fn close_final_workers(&mut self) -> Task<Event> {
+        let Some(store) = self.task_store.as_ref() else {
+            return Task::none();
+        };
+        let mut closing = Vec::new();
+        for tab in self.workspaces.iter_mut().flat_map(|ws| &mut ws.tabs) {
+            if let Some(close) = close_final_worker(store, tab, |session, process| {
+                (session.to_string(), process)
+            }) {
+                closing.push(close);
+            }
+        }
+        let mut ending_tasks = HashSet::new();
+        let ended: Vec<_> = store
+            .delegations()
+            .iter()
+            .rev()
+            .filter(|d| d.status.is_final())
+            .filter_map(|d| {
+                let gitterm::tasks::DelegationChild::TaskSession {
+                    task_id,
+                    task_session_id: Some(session),
+                    ..
+                } = &d.child
+                else {
+                    return None;
+                };
+                if !closing.iter().any(|(id, _)| id == session)
+                    || !store.open_worker_delegations(task_id).is_empty()
+                    || !ending_tasks.insert(task_id.clone())
+                {
+                    return None;
+                }
+                let state = match d.status {
+                    gitterm::tasks::DelegationStatus::Completed => TaskLifecycle::Completed,
+                    gitterm::tasks::DelegationStatus::Failed { .. }
+                        if d.time_limit_reached_at.is_none() =>
+                    {
+                        TaskLifecycle::Failed
+                    }
+                    _ => TaskLifecycle::Stopped,
+                };
+                Some((task_id.clone(), state))
+            })
+            .collect();
+        for (task_id, state) in ended {
+            let live = self.workspaces.iter().flat_map(|ws| &ws.tabs).any(|tab| {
+                tab.task_id.as_deref() == Some(&task_id)
+                    && !tab.worker_closing
+                    && tab.task_live_state.is_some()
+            });
+            if !live {
+                if let Some(store) = self.task_store.as_mut() {
+                    if let Err(error) = store.record_lifecycle_signal(
+                        &task_id,
+                        state,
+                        None,
+                        &chrono::Utc::now().to_rfc3339(),
+                    ) {
+                        eprintln!("[tasks] finalize worker task {task_id}: {error}");
+                    }
+                }
+            }
+        }
+        Task::batch(closing.into_iter().map(|(session, process)| {
+            Task::perform(
+                async move {
+                    let result = tokio::task::spawn_blocking(move || match process {
+                        Some(process) => process.stop(),
+                        None => Ok(()),
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("worker shutdown failed: {e}")));
+                    (session, result)
+                },
+                |(session, result)| Event::FinalWorkerStopped(session, result),
+            )
+        }))
+    }
+
     /// Pushes the cards of every worker delegation on `task_id`, after its
     /// sessions' live state or handoff changed.
     fn push_worker_cards(&self, task_id: &str) {
@@ -19201,6 +19280,149 @@ impl App {
     }
 }
 
+fn cancel_queued_worker_launch(
+    store: &mut TaskStore,
+    queue: &mut Vec<QueuedTaskLaunch>,
+    delegation_id: &str,
+    timestamp: &str,
+) -> Result<(), TaskStoreError> {
+    let task_id = store
+        .delegation(delegation_id)
+        .filter(|d| d.status == gitterm::tasks::DelegationStatus::Cancelled)
+        .and_then(|d| match &d.child {
+            gitterm::tasks::DelegationChild::TaskSession {
+                task_id,
+                task_session_id: None,
+                ..
+            } => Some(task_id.clone()),
+            _ => None,
+        });
+    if let Some(task_id) = task_id {
+        let before = queue.len();
+        queue.retain(|launch| launch.task_id != task_id);
+        if queue.len() != before {
+            store.record_lifecycle_signal(&task_id, TaskLifecycle::Stopped, None, timestamp)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_worker_checkout(
+    store: &TaskStore,
+    task: &TaskRecord,
+    checkout: &Path,
+    workspaces: &[Workspace],
+) -> Result<(), String> {
+    if task.archived_at.is_some() {
+        return Err(format!(
+            "checkout {} is the worktree of archived task \"{}\" ({}); \
+                             delegate to another checkout",
+            checkout.display(),
+            task.title,
+            task.task_id
+        ));
+    }
+    if let Some(open) = store
+        .open_worker_delegations(&task.task_id)
+        .iter()
+        .find(|d| d.status != gitterm::tasks::DelegationStatus::Blocked)
+    {
+        return Err(format!(
+            "checkout {} is task \"{}\"'s worktree, and worker delegation {} \
+                             is still open there; wait for its report, or stop tracking it, \
+                             before handing that checkout more work",
+            checkout.display(),
+            task.title,
+            open.delegation_id
+        ));
+    }
+    let blocked = store.open_worker_delegations(&task.task_id);
+    let live = workspaces.iter().flat_map(|workspace| &workspace.tabs).any(|tab| {
+        tab.task_id.as_deref() == Some(task.task_id.as_str())
+            && tab.task_live_state.is_some()
+            && !store.worker_session_is_final(&task.task_id, tab.task_session_id.as_deref())
+            && !blocked.iter().any(|d| {
+                d.status == gitterm::tasks::DelegationStatus::Blocked
+                    && matches!(&d.child, gitterm::tasks::DelegationChild::TaskSession {task_session_id:Some(id),..} if Some(id) == tab.task_session_id.as_ref())
+            })
+    });
+    if live {
+        return Err(format!(
+            "checkout {} is task \"{}\"'s worktree, and a session is still \
+                             running in it; stop it before handing that checkout more work",
+            checkout.display(),
+            task.title
+        ));
+    }
+    Ok(())
+}
+
+/// Reopening a finished worker's conversation is a fresh, user-owned view.
+/// Keep the old session identity attached to its immutable delegation result.
+fn renew_final_worker_session(
+    store: &TaskStore,
+    task: &str,
+    session: &mut TaskSessionRecord,
+    timestamp: &str,
+) {
+    if store.worker_session_is_final(task, Some(&session.task_session_id)) {
+        session.task_session_id = uuid::Uuid::new_v4().to_string();
+        session.created_at = timestamp.to_string();
+    }
+    session.updated_at = timestamp.to_string();
+}
+
+fn restore_task_tab(
+    store: Option<&TaskStore>,
+    tab: &WorkspaceTabConfig,
+    missing_logged: &mut HashSet<String>,
+) -> bool {
+    let Some(task_id) = tab.task_id.as_deref() else {
+        return true;
+    };
+    if store
+        .is_some_and(|store| store.worker_session_is_final(task_id, tab.task_session_id.as_deref()))
+    {
+        return false;
+    }
+    let launch_dir = Path::new(tab.repo_dir.as_deref().unwrap_or(&tab.dir));
+    if store.is_some_and(|store| store.task_worktree_missing(task_id)) || !launch_dir.is_dir() {
+        if missing_logged.insert(task_id.to_string()) {
+            eprintln!("[tasks] skip restoring task {task_id}: worktree is missing");
+        }
+        return false;
+    }
+    true
+}
+
+fn task_session_is_working(tab: &TabState, store: Option<&TaskStore>) -> bool {
+    tab.task_live_state == Some(TaskSessionLiveState::Working)
+        && !tab.worker_closing
+        && !tab.task_id.as_deref().is_some_and(|task| {
+            store.is_some_and(|store| {
+                store.worker_session_is_final(task, tab.task_session_id.as_deref())
+            })
+        })
+}
+
+/// Process seam: tests can observe the close request without starting a PTY
+/// or signalling a real agent. The callback runs only once per final session.
+fn close_final_worker<T>(
+    store: &TaskStore,
+    tab: &mut TabState,
+    close: impl FnOnce(&str, Option<gitterm::worker_process::WorkerProcess>) -> T,
+) -> Option<T> {
+    let (Some(task), Some(session)) = (&tab.task_id, &tab.task_session_id) else {
+        return None;
+    };
+    if tab.worker_closing || !store.worker_session_is_final(task, Some(session)) {
+        return None;
+    }
+    tab.worker_closing = true;
+    tab.task_live_state = None;
+    Some(close(session, tab.worker_process.take()))
+}
+
 fn load_task_store_for_startup(
     path: PathBuf,
     timestamp: &str,
@@ -19296,10 +19518,19 @@ impl App {
                 self.add_remote_agent_tab_to_workspace(&mut workspace, root, None);
             } else if default_tab && workspace.remote_session.is_none() {
                 // Always have at least one local tab.
-                self.add_tab_to_workspace(&mut workspace, dir);
+                self.add_tab_to_workspace(&mut workspace, dir.clone());
             }
         } else {
             for tab_config in &ws_config.tabs {
+                if !workspace_is_remote_agent
+                    && !restore_task_tab(
+                        self.task_store.as_ref(),
+                        tab_config,
+                        &mut self.missing_task_worktrees_logged,
+                    )
+                {
+                    continue;
+                }
                 // Tabs saved before caller identity existed get a
                 // fresh uid (TabState::new); save once so it sticks.
                 let restored_session_uid = tab_config.session_uid.clone();
@@ -19568,6 +19799,14 @@ impl App {
             }
         }
 
+        if default_tab
+            && workspace.tabs.is_empty()
+            && workspace.remote_session.is_none()
+            && !workspace_is_remote_agent
+        {
+            self.add_tab_to_workspace(&mut workspace, dir);
+        }
+
         // Restore the workspace's bottom terminals (TRU-180). A done entry
         // comes back without its old terminals.
         if ws_config.done_at.is_none() {
@@ -19813,6 +20052,7 @@ impl App {
             active_workspace_idx: 0,
             next_tab_id: 0,
             task_store,
+            missing_task_worktrees_logged: HashSet::new(),
             review_config: config.review.clone(),
             model_policy: config.policy.clone(),
             delegation_runs: HashMap::new(),
@@ -20566,6 +20806,8 @@ impl App {
 
         env.insert("GITTERM_PRECMD".to_string(), "1".to_string());
 
+        // A child GitTerm must never reuse its launching worker's PID file.
+        env.remove(gitterm::worker_process::PID_FILE_ENV);
         for (key, value) in extra_env {
             env.insert(key.to_string(), value.to_string());
         }
@@ -20577,6 +20819,11 @@ impl App {
                 .unwrap_or_else(|| command.to_string());
             env.get(task_mcp::TASK_MCP_URL_ENV)
                 .map(|endpoint| task_mcp::configure_task_command(&command, endpoint))
+                .unwrap_or(command)
+        });
+        let runtime_startup_command = runtime_startup_command.map(|command| {
+            env.get(gitterm::worker_process::PID_FILE_ENV)
+                .map(|path| gitterm::worker_process::record_shell(&command, &shell, path))
                 .unwrap_or(command)
         });
         if let Some(command) = &runtime_startup_command {
@@ -20826,11 +21073,26 @@ fi
         if let Some(connection) = &self.task_mcp {
             extra_env.extend(connection.terminal_environment(Some(&tab.session_uid)));
         }
+        if task_launch && startup_command.is_some() {
+            match gitterm::worker_process::WorkerProcess::new() {
+                Ok(process) => {
+                    extra_env.push((
+                        gitterm::worker_process::PID_FILE_ENV.to_string(),
+                        process.pid_file().to_string_lossy().into_owned(),
+                    ));
+                    tab.worker_process = Some(process);
+                }
+                Err(error) => {
+                    eprintln!("[tasks] prepare worker launch: {error}");
+                    self.task_ui_error = Some(error);
+                    return tab;
+                }
+            }
+        }
         let extra_env_refs: Vec<(&str, &str)> = extra_env
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-
         // Re-evaluate trust on every task process start, including restore.
         // The stored startup_command never contains GitTerm's trust overlay.
         let runtime_command = if task_launch
@@ -23654,6 +23916,7 @@ fi
                 // The PR watch (TRU-173): one background poll when PRs are due.
                 tasks.push(self.poll_pr_watch());
                 tasks.push(self.auto_deliver_delegations());
+                tasks.push(self.close_final_workers());
                 // Its actionable news, to idle coordinators (TRU-197).
                 tasks.push(self.auto_tell_coordinators());
                 // Titles of the shown Issues, from `linear` (TRU-203).
@@ -25093,6 +25356,47 @@ fi
             Event::DelegateTaskTargetsChecked(result, reply) => {
                 return self.delegate_task_targets_checked(result, reply);
             }
+            Event::FinalWorkerStopped(session_id, result) => {
+                if let Err(error) = result {
+                    eprintln!("[tasks] stop final worker {session_id}: {error}");
+                    self.task_ui_error = Some(format!("Stop worker {session_id}: {error}"));
+                }
+                if let Some((workspace_idx, tab_idx)) =
+                    find_task_session_tab(&self.workspaces, &session_id)
+                {
+                    let tab = &mut self.workspaces[workspace_idx].tabs[tab_idx];
+                    tab.task_live_state = None;
+                    if let Some(task_id) = tab.task_id.clone() {
+                        let workspace = &self.workspaces[workspace_idx];
+                        let active_id = workspace
+                            .tabs
+                            .get(workspace.active_tab)
+                            .filter(|t| t.id != workspace.tabs[tab_idx].id)
+                            .map(|t| t.id);
+                        let preserve_selection =
+                            active_id.is_some() || workspace_idx != self.active_workspace_idx;
+                        let selection = self.selected_task_id.clone();
+                        let close = self.close_task_tab(TaskTabClosePrompt {
+                            workspace_idx,
+                            tab_idx,
+                            task_id,
+                        });
+                        if let Some(active_id) = active_id {
+                            if let Some(idx) = self.workspaces[workspace_idx]
+                                .tabs
+                                .iter()
+                                .position(|t| t.id == active_id)
+                            {
+                                self.workspaces[workspace_idx].active_tab = idx;
+                            }
+                        }
+                        if preserve_selection {
+                            self.selected_task_id = selection;
+                        }
+                        return close;
+                    }
+                }
+            }
             Event::WorkerTimeLimitReached(delegation_id, session_id) => {
                 return self.worker_time_limit_reached(&delegation_id, &session_id);
             }
@@ -25190,6 +25494,14 @@ fi
                             Ok(())
                         };
                         cancelled
+                            .and_then(|()| {
+                                cancel_queued_worker_launch(
+                                    store,
+                                    &mut self.task_launch_queue,
+                                    &delegation_id,
+                                    &now,
+                                )
+                            })
                             .and_then(|()| store.dismiss_delegation(&delegation_id, &now))
                             .map_err(|error| error.to_string())
                     }
@@ -40135,7 +40447,16 @@ fi
                         text(if open {
                             "Open"
                         } else if worktree_ready {
-                            "Resume"
+                            if self.task_store.as_ref().is_some_and(|store| {
+                                store.worker_session_is_final(
+                                    &task.task_id,
+                                    Some(&session.task_session_id),
+                                )
+                            }) {
+                                "Reopen"
+                            } else {
+                                "Resume"
+                            }
                         } else {
                             "Transcript kept"
                         })
@@ -48320,6 +48641,287 @@ mod tests {
             preset_conversation_backend(&preset("Review shell", "zsh")),
             None
         );
+    }
+
+    fn final_worker_fixture(dir: &Path) -> (TaskStore, String, WorkspaceTabConfig) {
+        use gitterm::tasks::{
+            Delegation, DelegationChild, DelegationKind, DelegationParent, NewDelegation,
+        };
+        let mut store = TaskStore::load(dir.join("tasks.json")).unwrap();
+        let mut task = slot_task(ExecutorTarget::Local, TaskLifecycle::Ready);
+        task.worktree = TaskWorktree {
+            state: TaskWorktreeState::Ready,
+            path: Some(dir.to_path_buf()),
+        };
+        store.insert(task).unwrap();
+        let delegation = Delegation::new_requested(
+            NewDelegation {
+                kind: DelegationKind::Implement,
+                parent: DelegationParent {
+                    session_uid: "parent".into(),
+                    chat_session_id: None,
+                    workspace: "work".into(),
+                    cwd: dir.into(),
+                },
+                child: DelegationChild::TaskSession {
+                    task_id: "task-slot".into(),
+                    task_session_id: Some("worker".into()),
+                    conversation: None,
+                    preset_name: Some("Codex".into()),
+                    model: None,
+                    role: None,
+                },
+                brief: "Fix it".into(),
+                target: None,
+                previous: None,
+                options: Default::default(),
+            },
+            "2026-11-05T10:00:00Z",
+        );
+        let id = delegation.delegation_id.clone();
+        store.insert_delegation(delegation).unwrap();
+        let config = serde_json::from_value(serde_json::json!({"dir":dir,"task_id":"task-slot","task_session_id":"worker","startup_command":"codex"})).unwrap();
+        (store, id, config)
+    }
+
+    fn worker_test_handoff() -> TaskHandoff {
+        TaskHandoff {
+            summary: "Finished".into(),
+            decisions: vec![],
+            next_steps: vec![],
+            blockers: vec![],
+            updated_by_session_id: Some("worker".into()),
+            updated_at: "2026-11-05T10:01:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn final_delegations_do_not_restore_but_blocked_and_user_sessions_do() {
+        use gitterm::tasks::DelegationStatus;
+        for state in ["completed", "failed", "cancelled", "time_limit", "blocked"] {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut store, id, mut config) = final_worker_fixture(temp.path());
+            match state {
+                "completed" => store
+                    .complete_delegation(
+                        &id,
+                        gitterm::delegations::worker_result(worker_test_handoff()),
+                        "t2",
+                    )
+                    .unwrap(),
+                "blocked" => store
+                    .block_delegation(
+                        &id,
+                        gitterm::delegations::worker_result(worker_test_handoff()),
+                        "t2",
+                    )
+                    .unwrap(),
+                "cancelled" => store.cancel_delegation(&id, "t2").unwrap(),
+                "time_limit" => store
+                    .stop_delegation_at_time_limit(&id, "Stopped at time limit".into(), "t2")
+                    .unwrap(),
+                _ => store
+                    .set_delegation_status(
+                        &id,
+                        DelegationStatus::Failed {
+                            message: "Failed".into(),
+                        },
+                        "t2",
+                    )
+                    .unwrap(),
+            }
+            let (loaded, _) =
+                load_task_store_for_startup(temp.path().join("tasks.json"), "t3").unwrap();
+            let mut logged = HashSet::new();
+            assert_eq!(
+                restore_task_tab(Some(&loaded), &config, &mut logged),
+                state == "blocked",
+                "{state}"
+            );
+            config.task_session_id = Some("user-session".into());
+            assert!(restore_task_tab(Some(&loaded), &config, &mut logged));
+            assert!(logged.is_empty());
+        }
+    }
+
+    #[test]
+    fn missing_worktree_never_reaches_session_launch_and_logs_once_per_task() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut store, _, config) = final_worker_fixture(temp.path());
+        let mut task = store.get("task-slot").unwrap().clone();
+        task.worktree.path = Some(temp.path().join("removed"));
+        store.replace(task).unwrap();
+        let (loaded, _) =
+            load_task_store_for_startup(temp.path().join("tasks.json"), "t3").unwrap();
+        let mut logged = HashSet::new();
+        let mut launches = 0;
+        for _ in 0..5 {
+            if restore_task_tab(Some(&loaded), &config, &mut logged) {
+                launches += 1;
+            }
+        }
+        assert_eq!(launches, 0);
+        assert_eq!(logged.len(), 1);
+        assert!(logged.contains("task-slot"));
+    }
+
+    #[test]
+    fn cancelled_queued_workers_cannot_launch_later() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut store, id, _) = final_worker_fixture(temp.path());
+        let mut queued = store.delegation(&id).unwrap().clone();
+        queued.delegation_id = "queued-worker".into();
+        if let gitterm::tasks::DelegationChild::TaskSession {
+            task_session_id, ..
+        } = &mut queued.child
+        {
+            *task_session_id = None;
+        }
+        store.insert_delegation(queued).unwrap();
+        store.cancel_delegation(&id, "t2").unwrap();
+        store
+            .record_lifecycle_signal("task-slot", TaskLifecycle::Queued, None, "t2")
+            .unwrap();
+        let mut queue = vec![QueuedTaskLaunch {
+            task_id: "task-slot".into(),
+            preset_idx: Some(0),
+            origin: TaskLaunchOrigin::Agent,
+            user_model_choice: false,
+        }];
+        cancel_queued_worker_launch(&mut store, &mut queue, "queued-worker", "t3").unwrap();
+        assert_eq!(queue.len(), 1); // only a final cancellation removes it
+        store.cancel_delegation("queued-worker", "t3").unwrap();
+        cancel_queued_worker_launch(&mut store, &mut queue, "queued-worker", "t3").unwrap();
+        assert!(queue.is_empty());
+        assert_eq!(
+            store.get("task-slot").unwrap().lifecycle,
+            TaskLifecycle::Stopped
+        );
+    }
+
+    #[test]
+    fn blocked_checkout_accepts_a_new_worker_but_live_sibling_sessions_still_block_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut store, id, _) = final_worker_fixture(temp.path());
+        let mut workspace = Workspace::new("work".into(), temp.path().into(), WorkspaceColor::Blue);
+        let mut tab = TabState::new(1, temp.path().into());
+        tab.task_id = Some("task-slot".into());
+        tab.task_session_id = Some("worker".into());
+        tab.task_live_state = Some(TaskSessionLiveState::AwaitingInput);
+        workspace.tabs.push(tab);
+        let task = store.get("task-slot").unwrap().clone();
+        assert!(validate_worker_checkout(
+            &store,
+            &task,
+            temp.path(),
+            std::slice::from_ref(&workspace)
+        )
+        .is_err());
+        store
+            .block_delegation(
+                &id,
+                gitterm::delegations::worker_result(worker_test_handoff()),
+                "t2",
+            )
+            .unwrap();
+        assert!(validate_worker_checkout(
+            &store,
+            &task,
+            temp.path(),
+            std::slice::from_ref(&workspace)
+        )
+        .is_ok());
+        workspace.tabs[0].task_session_id = Some("user-sibling".into());
+        assert!(validate_worker_checkout(&store, &task, temp.path(), &[workspace]).is_err());
+    }
+
+    #[test]
+    fn explicit_reopen_keeps_the_conversation_and_gets_a_user_owned_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut store, id, mut config) = final_worker_fixture(temp.path());
+        store
+            .complete_delegation(
+                &id,
+                gitterm::delegations::worker_result(worker_test_handoff()),
+                "t2",
+            )
+            .unwrap();
+        let conversation = HarnessConversationRef {
+            backend: HarnessConversationBackend::Codex,
+            session_id: "conversation".into(),
+        };
+        let mut session = TaskSessionRecord {
+            task_session_id: "worker".into(),
+            label: "Codex".into(),
+            harness: None,
+            conversation: Some(conversation.clone()),
+            objective_delivery: ObjectiveDeliveryState::Delivered,
+            created_at: "t1".into(),
+            updated_at: "t1".into(),
+        };
+        renew_final_worker_session(&store, "task-slot", &mut session, "t3");
+        assert_ne!(session.task_session_id, "worker");
+        assert_eq!(session.conversation, Some(conversation));
+        store
+            .upsert_session("task-slot", session.clone(), "t3")
+            .unwrap();
+        config.task_session_id = Some(session.task_session_id.clone());
+        assert!(restore_task_tab(Some(&store), &config, &mut HashSet::new()));
+        let user_id = session.task_session_id.clone();
+        renew_final_worker_session(&store, "task-slot", &mut session, "t4");
+        assert_eq!(session.task_session_id, user_id);
+        assert!(store.worker_session_is_final("task-slot", Some("worker")));
+    }
+
+    #[test]
+    fn completed_handoff_requests_close_once_through_the_mock_process_seam() {
+        use gitterm::task_mcp::HandoffStatus;
+        let temp = tempfile::tempdir().unwrap();
+        let (mut store, _, _) = final_worker_fixture(temp.path());
+        let mut tab = TabState::new(1, temp.path().into());
+        tab.task_id = Some("task-slot".into());
+        tab.task_session_id = Some("worker".into());
+        assert!(!task_session_is_working(&tab, Some(&store))); // idle restore
+        tab.task_live_state = Some(TaskSessionLiveState::Working);
+        assert!(task_session_is_working(&tab, Some(&store)));
+        let mut closes = Vec::new();
+        for status in [
+            HandoffStatus::Progress,
+            HandoffStatus::Blocked,
+            HandoffStatus::Done,
+        ] {
+            gitterm::delegations::record_handoff(
+                &mut store,
+                "task-slot",
+                worker_test_handoff(),
+                status,
+                Some("worker"),
+                "t2",
+            )
+            .unwrap();
+            close_final_worker(&store, &mut tab, |session, process| {
+                assert!(process.is_none()); // no real agent is started or signalled
+                let persisted = TaskStore::load(temp.path().join("tasks.json")).unwrap();
+                assert_eq!(
+                    persisted
+                        .get("task-slot")
+                        .unwrap()
+                        .handoff
+                        .as_ref()
+                        .unwrap()
+                        .summary,
+                    "Finished"
+                );
+                closes.push(session.to_string());
+            });
+            assert_eq!(closes.len(), usize::from(status == HandoffStatus::Done));
+        }
+        assert_eq!(closes, ["worker"]);
+        assert!(close_final_worker(&store, &mut tab, |_, _| panic!("duplicate close")).is_none());
+        tab.task_live_state = Some(TaskSessionLiveState::Working); // late title signal
+        assert!(!task_session_is_working(&tab, Some(&store)));
+        tab.worker_closing = false;
+        assert!(!task_session_is_working(&tab, Some(&store))); // final status also excludes it
     }
 
     #[test]

@@ -711,6 +711,13 @@ impl DelegationStatus {
         matches!(self, Self::Requested | Self::Running)
     }
 
+    pub fn is_final(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed { .. } | Self::Cancelled
+        )
+    }
+
     /// Transitions allowed through `TaskStore::set_delegation_status`.
     /// `Completed` is reached only through `complete_delegation`, which
     /// carries the result. `Interrupted` may resume to `Running` because a
@@ -862,6 +869,11 @@ pub struct Delegation {
     /// The delegation this one re-runs or follows up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous: Option<String>,
+    /// The replacement delegation when this blocked worker was superseded.
+    /// Its report and delivery receipt stay intact; Completed keeps the
+    /// document readable by older builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
     pub status: DelegationStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<DelegationResult>,
@@ -977,6 +989,7 @@ impl Delegation {
             brief: input.brief,
             target: input.target,
             previous: input.previous,
+            superseded_by: None,
             status: DelegationStatus::Requested,
             result: None,
             created_at: timestamp.clone(),
@@ -1914,6 +1927,17 @@ impl TaskStore {
             }
         }
         let mut candidate = self.document.clone();
+        if let DelegationChild::TaskSession { task_id, .. } = &delegation.child {
+            for previous in &mut candidate.delegations {
+                if previous.status == DelegationStatus::Blocked
+                    && matches!(&previous.child, DelegationChild::TaskSession { task_id: child, .. } if child == task_id)
+                {
+                    previous.status = DelegationStatus::Completed;
+                    previous.superseded_by = Some(delegation.delegation_id.clone());
+                    previous.updated_at = delegation.created_at.clone();
+                }
+            }
+        }
         candidate.delegations.push(delegation);
         self.commit_candidate(candidate)
     }
@@ -2127,6 +2151,28 @@ impl TaskStore {
                 )
             })
             .collect()
+    }
+
+    /// Match the session, not the whole task: user-opened sibling sessions restore.
+    pub fn worker_session_is_final(&self, task_id: &str, session_id: Option<&str>) -> bool {
+        if session_id.is_none() {
+            return false;
+        }
+        self.document.delegations.iter().rev().find(|delegation| {
+            matches!(&delegation.child, DelegationChild::TaskSession { task_id: child, task_session_id, .. }
+                if child == task_id && task_session_id.as_deref() == session_id)
+        }).is_some_and(|delegation| delegation.status.is_final())
+    }
+
+    pub fn task_worktree_missing(&self, task_id: &str) -> bool {
+        self.get(task_id).is_some_and(|task| {
+            task.executor == ExecutorTarget::Local
+                && task
+                    .worktree
+                    .path
+                    .as_ref()
+                    .is_some_and(|path| !path.is_dir())
+        })
     }
 
     /// Marks an accepted batch in memory, then persists it atomically. A write
@@ -2502,6 +2548,15 @@ fn validate_delegation(delegation: &Delegation) -> Result<(), String> {
     }
     if delegation.previous.as_deref() == Some(id) {
         return Err(format!("delegation {id} names itself as previous"));
+    }
+    if let Some(next) = &delegation.superseded_by {
+        if next.trim().is_empty()
+            || next == id
+            || delegation.status != DelegationStatus::Completed
+            || delegation.kind != DelegationKind::Implement
+        {
+            return Err(format!("delegation {id} has invalid supersession {next:?}"));
+        }
     }
     if let DelegationStatus::Failed { message } = &delegation.status {
         if message.trim().is_empty() {
@@ -3464,6 +3519,44 @@ mod tests {
                 "t2",
             )
             .unwrap();
+    }
+
+    #[test]
+    fn a_new_worker_supersedes_a_blocked_worker_atomically_and_keeps_its_report() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        store
+            .insert_delegation(worker_delegation("old", "task-1"))
+            .unwrap();
+        add_session(&mut store, "task-1", "old-session");
+        store
+            .attach_worker_session("old", "old-session", None, "t2")
+            .unwrap();
+        let result = worker_result("Needs a decision", &["Human decision"]);
+        store.block_delegation("old", result.clone(), "t3").unwrap();
+        store.mark_delegation_delivered("old", "t4").unwrap();
+        assert_eq!(store.open_worker_delegations("task-1").len(), 1);
+        store
+            .insert_delegation(worker_delegation("replacement", "task-1"))
+            .unwrap();
+        let loaded = TaskStore::load(&path).unwrap();
+        let old = loaded.delegation("old").unwrap();
+        assert!(old.status.is_final());
+        assert_eq!(old.superseded_by.as_deref(), Some("replacement"));
+        assert_eq!(old.result.as_ref(), Some(&result));
+        assert!(old.is_delivered());
+        assert!(loaded.worker_session_is_final("task-1", Some("old-session")));
+        assert_eq!(
+            loaded
+                .open_worker_delegations("task-1")
+                .iter()
+                .map(|d| d.delegation_id.as_str())
+                .collect::<Vec<_>>(),
+            ["replacement"]
+        );
+        assert!(store.complete_delegation("old", result, "t5").is_err());
     }
 
     #[test]
