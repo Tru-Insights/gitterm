@@ -1792,6 +1792,7 @@ mod task_startup_tests {
             .unwrap()
         };
         assert!(probe().is_none());
+        assert!(!crate::workers::startup_timed_out(89, probe().is_some()));
         assert!(crate::workers::startup_timed_out(90, probe().is_some()));
         let slug = temp.path().join(".claude/projects/fixture");
         std::fs::create_dir_all(&slug).unwrap();

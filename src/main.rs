@@ -19605,7 +19605,7 @@ impl App {
         current_dir: Option<PathBuf>,
         startup_command: Option<String>,
         session_uid: Option<String>,
-        task_codex: bool,
+        task_launch: bool,
     ) {
         let startup_command_for_title = startup_command.clone();
         let mut tab = self.create_tab_with_session_uid(
@@ -19613,7 +19613,7 @@ impl App {
             startup_command,
             Some(&workspace.name.clone()),
             session_uid,
-            task_codex,
+            task_launch,
         );
         tab.set_local_dir(current_dir.unwrap_or(repo_path));
         if let Some(session) = self.remote_session_for_workspace(workspace) {
@@ -20124,7 +20124,7 @@ fi
         startup_command: Option<String>,
         workspace_name: Option<&str>,
         session_uid: Option<String>,
-        task_codex: bool,
+        task_launch: bool,
     ) -> TabState {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
@@ -20195,15 +20195,17 @@ fi
 
         // Re-evaluate trust on every task process start, including restore.
         // The stored startup_command never contains GitTerm's trust overlay.
-        let runtime_command = if task_codex
+        let runtime_command = if task_launch
             && startup_command.as_deref().is_some_and(|command| {
-                gitterm::workers::provider_for_command(command)
-                    == gitterm::workers::WorkerProvider::Codex
+                matches!(
+                    gitterm::workers::provider_for_command(command),
+                    gitterm::workers::WorkerProvider::Codex
+                        | gitterm::workers::WorkerProvider::Claude
+                )
             }) {
             let checked = (|| -> Result<Option<String>, String> {
                 let home = dirs::home_dir()
-                    .ok_or_else(|| "Cannot locate home for Codex trust list".to_string())?;
-                gitterm::workers::validate_codex_trust_home(&home, &extra_env)?;
+                    .ok_or_else(|| "Cannot locate home for worker trust".to_string())?;
                 let mut roots: Vec<PathBuf> = self
                     .workspaces
                     .iter()
@@ -20231,21 +20233,39 @@ fi
                     }
                 }
                 let command = startup_command.as_deref().expect("checked command").trim();
-                let overlay = gitterm::workers::codex_task_trust(
-                    command,
-                    &repo_path,
-                    &roots,
-                    &home.join(".codex/config.toml"),
-                )?;
-                Ok(Some(match overlay {
-                    Some(value) => gitterm::workers::with_codex_trust(command, &value)?,
-                    None => command.to_string(),
-                }))
+                if gitterm::workers::provider_for_command(command)
+                    == gitterm::workers::WorkerProvider::Claude
+                {
+                    gitterm::workers::validate_claude_trust_launch(command, &home, &extra_env)?;
+                    if let Some(main) = gitterm::workers::claude_task_trust(
+                        &repo_path,
+                        &roots,
+                        &home.join(".claude.json"),
+                    )? {
+                        eprintln!(
+                            "[tasks] accepted Claude workspace trust for {} in ~/.claude.json",
+                            main.display()
+                        );
+                    }
+                    Ok(Some(command.to_string()))
+                } else {
+                    gitterm::workers::validate_codex_trust_home(&home, &extra_env)?;
+                    let overlay = gitterm::workers::codex_task_trust(
+                        command,
+                        &repo_path,
+                        &roots,
+                        &home.join(".codex/config.toml"),
+                    )?;
+                    Ok(Some(match overlay {
+                        Some(value) => gitterm::workers::with_codex_trust(command, &value)?,
+                        None => command.to_string(),
+                    }))
+                }
             })();
             match checked {
                 Ok(command) => command,
                 Err(error) => {
-                    eprintln!("[tasks] refuse Codex launch: {error}");
+                    eprintln!("[tasks] refuse worker launch: {error}");
                     self.task_ui_error = Some(error);
                     return tab;
                 }
