@@ -814,9 +814,9 @@ impl PolicyEvaluation {
         if user_model_choice {
             return true;
         }
-        let (policy, report) = match provider {
-            Provider::Claude => (&self.policy.claude, &self.report.claude),
-            Provider::Codex => (&self.policy.codex, &self.report.codex),
+        let policy = match provider {
+            Provider::Claude => &self.policy.claude,
+            Provider::Codex => &self.policy.codex,
         };
         let (other_policy, other_report) = match provider {
             Provider::Claude => (&self.policy.codex, &self.report.codex),
@@ -824,8 +824,11 @@ impl PolicyEvaluation {
         };
         let other_available =
             weekly_available(other_report) && !held(other_policy) && !other_report.busy;
-        weekly_available(report)
-            && !held(policy)
+        // A stale or missing reading says nothing about exhaustion, and only
+        // a run writes a new one (Codex's rollout), so requiring a fresh
+        // reading deadlocks every launch once a provider is idle (TRU-232).
+        // Holds from the last reading still apply until their reset.
+        !held(policy)
             && !(policy.burst.busy
                 && (parallel
                     || (other_available
@@ -2680,14 +2683,27 @@ mod policy_tests {
     }
 
     #[test]
-    fn unknown_and_stale_capacity_do_not_release_automatic_jobs() {
+    fn unknown_and_stale_capacity_start_but_a_stale_hold_still_holds() {
+        // No reading at all, and an idle provider's stale one: the run
+        // starts and writes the fresh reading itself (TRU-232).
         let empty = evaluate_policy(&PlanLimitsFile::default(), NOW);
-        assert!(!empty.allows_start(Provider::Codex, false, false));
-        assert!(empty.allows_start(Provider::Codex, false, true));
+        assert!(empty.allows_start(Provider::Codex, false, false));
         let file = fixture(10.0, 2 * 86400);
         let stale = evaluate_policy(&file, NOW + STALE_AFTER_SECS + 1);
-        assert!(!stale.allows_start(Provider::Codex, false, false));
+        assert!(stale.allows_start(Provider::Codex, false, false));
         assert!(evaluate_policy(&file, NOW).allows_start(Provider::Codex, false, false));
+
+        // A reading that said the 5h window was used up holds even once it
+        // is stale, until a newer reading or its reset says otherwise.
+        let mut file = fixture(10.0, 2 * 86400);
+        file.codex.as_mut().unwrap().windows.push(LimitWindow {
+            label: "5h".into(),
+            used_percent: Some(100.0),
+            resets_at: Some(NOW + 3 * 3600),
+        });
+        step(&mut file, NOW);
+        let stale = step(&mut file, NOW + STALE_AFTER_SECS + 1);
+        assert!(!stale.allows_start(Provider::Codex, false, false));
     }
 
     #[test]
