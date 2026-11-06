@@ -14508,12 +14508,24 @@ impl App {
                 .filter_map(|task_id| self.task_store.as_ref()?.get(task_id))
                 .filter_map(|task| task_main_checkout(&task.repository.common_dir))
                 .collect();
+            let delegated = self.task_store.as_ref().map_or_else(Vec::new, |store| {
+                gitterm::workspace_repos::delegation_targets(
+                    &work,
+                    store.delegations(),
+                    store.tasks(),
+                )
+            });
             // A linked worktree (an agent-made one too) joins as its main
             // checkout (TRU-191); a checkout since deleted does not join.
             let candidates: Vec<PathBuf> = gitterm::workspace_repos::fold_worktrees(
-                gitterm::workspace_repos::auto_repo_candidates(&work, &workers, &task_worktrees)
-                    .into_iter()
-                    .filter(|dir| dir.is_dir()),
+                gitterm::workspace_repos::auto_repo_candidates(
+                    &work,
+                    &workers,
+                    &task_worktrees,
+                    &delegated,
+                )
+                .into_iter()
+                .filter(|dir| dir.is_dir()),
             );
             let listed: Vec<PathBuf> = ws
                 .repos
@@ -15234,6 +15246,12 @@ impl App {
         }
         let children = chat_facts::links_for_parent(&self.chat_child_links(), &session_id);
         let dir = chat_facts::facts_dir(&config::global_config_dir());
+        let repos: Vec<PathBuf> = self
+            .repos
+            .iter()
+            .filter(|repo| matches!(repo.location, WorkspaceLocation::Local { .. }))
+            .map(|repo| repo.dir.clone())
+            .collect();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
@@ -15256,7 +15274,7 @@ impl App {
                         pending,
                         children,
                         transcript.as_deref(),
-                        home.as_deref(),
+                        chat_facts::FactPaths { home: home.as_deref(), repos: &repos },
                     )
                 })
                 .await
@@ -15319,6 +15337,12 @@ impl App {
             .collect();
         let links = self.chat_child_links();
         let dir = chat_facts::facts_dir(&config::global_config_dir());
+        let repos: Vec<PathBuf> = self
+            .repos
+            .iter()
+            .filter(|repo| matches!(repo.location, WorkspaceLocation::Local { .. }))
+            .map(|repo| repo.dir.clone())
+            .collect();
         self.chat_backfill_running = true;
         self.chat_backfill_note = None;
         Task::perform(
@@ -15331,7 +15355,10 @@ impl App {
                         &hosted,
                         &links,
                         chat_facts::BACKFILL_BATCH,
-                        home.as_deref(),
+                        chat_facts::FactPaths {
+                            home: home.as_deref(),
+                            repos: &repos,
+                        },
                     )
                 })
                 .await
@@ -25607,7 +25634,11 @@ fi
                                 if t.agent_session().is_some_and(|session| {
                                     session.backend() == tab::AgentBackend::Claude
                                 }) {
-                                    t.chat_facts.observe(harness_event, home.as_deref());
+                                    t.chat_facts.observe_with_cwd(
+                                        harness_event,
+                                        home.as_deref(),
+                                        Some(&t.repo_path),
+                                    );
                                     facts_tab = true;
                                 }
                             }

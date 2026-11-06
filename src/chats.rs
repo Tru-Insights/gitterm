@@ -1600,6 +1600,7 @@ mod tests {
                 title: Some("Fable review of identity design".into()),
             }],
             prs: Vec::new(),
+            repo_work: Vec::new(),
             documents: Vec::new(),
             backfilled: false,
             documents_backfilled: false,
