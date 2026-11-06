@@ -35069,14 +35069,11 @@ fi
             );
         }
 
-        // PR news (TRU-173): the newest, e.g. "#841 checks failed".
-        if let Some((label, color)) = self.workspace_pr_badge(ws.uid) {
-            btn_content = btn_content.push(
-                text(label)
-                    .size(9)
-                    .color(color)
-                    .font(iced::Font::with_name("Menlo")),
-            );
+        // PR news (TRU-173): a dot in the news colour; the text, e.g.
+        // "#841 checks failed", is in the hover hint (TRU-227).
+        let pr_news = self.workspace_pr_badge(ws.uid);
+        if let Some((_, color)) = &pr_news {
+            btn_content = btn_content.push(Self::status_dot(*color, 6.0));
         }
 
         // Active workspace: colored top accent line above the button
@@ -35122,7 +35119,14 @@ fi
         if renaming.is_some() {
             return chip;
         }
-        self.bar_hint_area(chip, ws.name.clone())
+        // shortcut: if the news changes while the chip is hovered, the exit
+        // carries the new text and the old bubble stays until the next hover;
+        // key hints by item if that shows up in practice.
+        let hint = match pr_news {
+            Some((label, _)) => format!("{} \u{00B7} {label}", ws.name),
+            None => ws.name.clone(),
+        };
+        self.bar_hint_area(chip, hint)
     }
 
     /// A machine's display name and, for a remote agent, its connection
