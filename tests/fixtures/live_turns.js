@@ -1,5 +1,5 @@
 // Real streaming events against the chat page, without an agent process.
-(() => {
+(async () => {
   const results = [];
   const check = (name, ok) => results.push((ok ? 'PASS ' : 'FAIL ') + name);
   const H = (type, data) => ({ kind: 'harness', event: { type, data } });
@@ -16,6 +16,18 @@
   const runs = () => [...document.querySelectorAll('.live-tool-run')];
   const label = (run) => run?.querySelector(':scope > summary .tr-label')?.textContent;
   const reset = () => { window.__resetConversation(); send(prompt); };
+  // Drive paint callbacks explicitly: dump-dom's virtual clock does not
+  // reliably paint between timers. Toggle events still run on the real DOM.
+  const requestFrame = window.requestAnimationFrame;
+  const frames = [];
+  window.requestAnimationFrame = (callback) => frames.push(callback);
+  const settle = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    while (frames.length) frames.shift()(performance.now());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  };
+  const messages = document.getElementById('messages');
+  const jump = document.getElementById('jump');
   window.ipc = { postMessage: () => {} };
   window.__setTabId(1, 'default', null, false);
   try {
@@ -98,10 +110,51 @@
     check('running history replay keeps original cards and thinking closed', !runs().length && !document.querySelector('details.thinking').open && card('history').parentElement.id === 'messages');
     window.__resetConversation(); window.__replay(history);
     check('completed replay keeps original fold and summary wording', !runs().length && !document.querySelector('.turn-fold').open && document.querySelector('.tf-label').textContent === 'Worked for 2.0s' && document.querySelector('.tr-label').textContent === 'Ran 1 command');
+
+    // F1: replay can leave one ongoing turn across the history window boundary.
+    const longHistory = [prompt];
+    for (let i = 0; i < 250; i++) longHistory.push(start('replay-' + i), done('replay-' + i));
+    window.__resetConversation(); window.__replay(longHistory);
+    const visibleTools = [...messages.querySelectorAll('details.tool')];
+    send(start('after-replay'));
+    check('F1 live grouping preserves every visible replay card', runs().length === 1 && visibleTools.every((n) => n.isConnected && n.closest('.live-tool-run') === runs()[0]) && !!card('after-replay')?.isConnected);
+    document.querySelector('.earlier').click();
+    document.querySelector('.earlier')?.click();
+    check('F1 detached history stays ungrouped until restored', messages.querySelectorAll('details.tool').length === 251 && card('replay-0')?.parentElement === messages);
+
+    // F2: an automatic reveal must not be mistaken for a summary click.
+    reset();
+    send(H('text_delta', 'Earlier output.\n'.repeat(100)), start('resume-agent', 'Agent', { description: 'Check a file' }), done('resume-agent'), start('resume-tool'));
+    await settle();
+    send(H('subagent_event', { parent_tool_use_id: 'resume-agent', event: { type: 'turn_started', data: {} } }));
+    send(H('text_delta', 'More output.\n'.repeat(100)));
+    await settle();
+    check('F2 automatic subagent reveal preserves follow mode', !jump.classList.contains('visible'));
+    check('F2 later output still follows the bottom', messages.scrollHeight - messages.scrollTop - messages.clientHeight < 40);
+    runs()[0].open = true;
+    send(H('text_delta', 'Continuing output.\n'.repeat(100)));
+    await settle();
+    check('F2 direct programmatic open also preserves follow', !jump.classList.contains('visible') && messages.scrollHeight - messages.scrollTop - messages.clientHeight < 40);
+
+    // F3: the wrapper disappears at turn end, but its reader anchor must survive.
+    reset();
+    for (let i = 0; i < 30; i++) send(start('anchor-' + i), done('anchor-' + i));
+    send(H('text_delta', 'Final answer.\n'.repeat(100)));
+    await settle();
+    runs()[0].querySelector('summary').click();
+    await settle();
+    check('reader opening a live summary still pauses follow', jump.classList.contains('visible'));
+    messages.scrollTop = runs()[0].offsetTop + 300;
+    messages.dispatchEvent(new WheelEvent('wheel', { deltaY: -100 }));
+    messages.dispatchEvent(new Event('scroll'));
+    check('F3 reader is inside expanded live run', jump.classList.contains('visible') && messages.scrollTop > runs()[0].offsetTop && messages.scrollTop < runs()[0].offsetTop + runs()[0].offsetHeight);
+    send(end);
+    check('F3 turn end carries reader anchor to the finished fold', Math.abs(messages.scrollTop - document.querySelector('.turn-fold').offsetTop) < 2);
     check('no event-render errors', ![...document.querySelectorAll('.error-block')].some((n) => n.textContent.startsWith('Chat view could not render')));
   } catch (error) {
     results.push('FAIL ' + error.stack);
   }
+  window.requestAnimationFrame = requestFrame;
   const result = document.createElement('pre');
   result.id = 'live-turn-test-result';
   result.textContent = results.join('\n');

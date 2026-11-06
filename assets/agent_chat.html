@@ -1013,8 +1013,11 @@
       if (c.offsetTop + c.offsetHeight > top) { anchor = c; break; }
     }
     const offset = anchor ? anchor.offsetTop - top : 0;
+    // Live rows are removed before folding; their cards survive that move.
+    const liveAnchor = anchor && anchor.matches('.live-tool-run') ? anchor.querySelector('.tr-body').firstElementChild : null;
     change();
     if (!anchor) return;
+    if (!anchor.isConnected && liveAnchor) anchor = liveAnchor;
     if (anchor.parentNode === messagesEl) { messagesEl.scrollTop = anchor.offsetTop - offset; return; }
     const fold = anchor.closest('.turn-fold');
     if (fold && fold.parentNode === messagesEl) messagesEl.scrollTop = fold.offsetTop - Math.max(0, offset);
@@ -1072,6 +1075,7 @@
     let group = [];
     for (const { node } of turn.blocks) {
       if (!node.parentNode) continue;
+      if (!node.isConnected) { group = []; continue; }
       if (node.matches('details.tool') && !keepsOutOfFold(node)) {
         if (!group.length) groups.push(group);
         group.push(node);
@@ -1238,10 +1242,15 @@
   // block must not scroll it away, so following stops when the opened
   // content runs past the bottom (the Latest button brings it back).
   function watchOpen(details) {
-    details.addEventListener('toggle', () => {
-      if (!details.open || replaying || atBottom()) return;
-      follow = false;
-      jumpBtn.classList.add('visible');
+    details.addEventListener('click', (event) => {
+      if (event.target.closest('summary') !== details.querySelector(':scope > summary')) return;
+      // Wait for the summary's default action. Programmatic .open changes
+      // also dispatch toggle, but must not take the reader out of follow.
+      setTimeout(() => {
+        if (!details.open || replaying || atBottom()) return;
+        follow = false;
+        jumpBtn.classList.add('visible');
+      }, 0);
     });
   }
   // Open the folds holding `node` (a roster row's card).
