@@ -127,12 +127,17 @@ pub struct RepoGroup<'a> {
 
 /// One list from the repos the workspace lists (in its order), the repos the
 /// work edited, and the owned checkouts: listed repos come first even when
-/// untouched, then edited or branch-only repos; a repo appears once.
+/// untouched, then edited or branch-only repos; a repo appears once. A repo
+/// the user removed by hand (`removed`) stays out unless it is listed.
 pub fn merge_repo_groups<'a>(
     listed: &[PathBuf],
+    removed: &[PathBuf],
     touched: &[RepoTouched],
     branches: &'a [BranchStatus],
 ) -> Vec<RepoGroup<'a>> {
+    let hidden = |dir: &Path| {
+        removed.iter().any(|gone| gone == dir) && !listed.iter().any(|known| known == dir)
+    };
     fn slot(dir: &Path, groups: &mut Vec<RepoGroup<'_>>) -> usize {
         if let Some(idx) = groups.iter().position(|group| group.dir == dir) {
             return idx;
@@ -148,11 +153,11 @@ pub fn merge_repo_groups<'a>(
     for dir in listed {
         slot(dir, &mut groups);
     }
-    for repo in touched {
+    for repo in touched.iter().filter(|repo| !hidden(&repo.dir)) {
         let idx = slot(&repo.dir, &mut groups);
         groups[idx].edits = Some(repo.edits);
     }
-    for row in branches {
+    for row in branches.iter().filter(|row| !hidden(&row.owned.repo)) {
         let idx = slot(&row.owned.repo, &mut groups);
         groups[idx].rows.push(row);
     }
@@ -3651,9 +3656,19 @@ mod tests {
             branch_in("/r/c", "/r/c-wt"),
             branch_in("/r/e", "/r/e"),
         ];
-        let groups = merge_repo_groups(&listed, &touched, &branches);
+        let groups = merge_repo_groups(&listed, &[], &touched, &branches);
         let dirs: Vec<&str> = groups.iter().map(|g| g.dir.to_str().unwrap()).collect();
         assert_eq!(dirs, ["/r/a", "/r/b", "/r/c", "/r/d", "/r/e"]);
+        // Removed by hand (TRU-238): an edited or branch-only repo drops out,
+        // a listed one stays.
+        let removed = vec![
+            PathBuf::from("/r/d"),
+            PathBuf::from("/r/e"),
+            PathBuf::from("/r/a"),
+        ];
+        let kept = merge_repo_groups(&listed, &removed, &touched, &branches);
+        let kept: Vec<&str> = kept.iter().map(|g| g.dir.to_str().unwrap()).collect();
+        assert_eq!(kept, ["/r/a", "/r/b", "/r/c"]);
         assert_eq!(groups[0].edits, None);
         assert!(groups[0].rows.is_empty());
         assert_eq!(groups[2].edits, Some(4));
