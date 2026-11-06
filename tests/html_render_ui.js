@@ -96,6 +96,11 @@
     window.__resetConversation(); send(answerEvents(table));
     check('table-only short block stays visible', Array.from(document.querySelectorAll('#messages > .assistant'))
       .some((n) => n.textContent.includes('Paid') && !n.closest('.turn-fold')));
+    for (const [name, md, needle] of [['setext heading', 'Results\n=======', 'Results'], ['short-dash table', '| A | B |\n| - | - |\n| Due | 3 |', 'Due']]) {
+      window.__resetConversation(); send(answerEvents(md));
+      check(name + ' short block stays visible', Array.from(document.querySelectorAll('#messages > .assistant'))
+        .some((n) => n.textContent.includes(needle) && !n.closest('.turn-fold')));
+    }
     window.__resetConversation(); window.__replay(answerEvents(answer));
     check('replay matches live answer visibility and keeps folds closed', answerShape());
     check('byte and height limits in UI', !GitTermHtml.valid('é'.repeat(262145), 240) && !GitTermHtml.valid('ok', 99) && !GitTermHtml.valid('ok', 4001));

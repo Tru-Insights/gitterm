@@ -1075,12 +1075,19 @@
     for (const group of groups) foldNodes(group, label, failed);
     return true;
   }
+  const STRUCTURED_TOKENS = new Set(['heading', 'table', 'list', 'blockquote', 'code']);
   function isSubstantialAssistantText(node) {
     if (!node.classList.contains('assistant')) return false;
     const text = node.__assistantText;
     if (typeof text !== 'string') return false;
-    return text.length >= 280 || /(?:^|\n)\s*(?:#{1,6}\s+|>\s?|[-+*]\s+|\d+[.)]\s+|```|~~~)/m.test(text) ||
-      /(?:^|\n)\s*\|?[^|\n]*(?:\|[^|\n]*)+\n\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)*\|?\s*(?:\n|$)/m.test(text);
+    if (text.length >= 280) return true;
+    // Ask the renderer's own grammar, so every heading, table, list,
+    // blockquote and code form it draws counts as structure.
+    try {
+      return marked.lexer(text).some((t) => STRUCTURED_TOKENS.has(t.type));
+    } catch (e) {
+      return true; // can't tell: keep it visible rather than hide an answer
+    }
   }
   function foldNodes(nodes, label, failed) {
     const fold = el('details', 'turn-fold');
