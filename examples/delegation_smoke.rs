@@ -444,7 +444,9 @@ async fn request_review(
         home: bridge.repo.clone(),
         repos: Vec::new(),
     };
-    let new = delegations::review_delegation(request, &tab, None, None)?;
+    let mut new = delegations::review_delegation(request, &tab, None, None)?;
+    // Running this smoke test explicitly authorizes its one paid review.
+    new.options.user_model_choice = true;
     let cwd = tab.cwd.clone();
     tokio::task::spawn_blocking(move || delegations::check_checkout(&cwd))
         .await
@@ -468,7 +470,17 @@ fn start_queued(bridge: &Arc<Bridge>) {
             eprintln!("[bridge] state poisoned; nothing started");
             return;
         };
-        let ids = delegations::runs_to_start(store.delegations(), &running, MAX_CONCURRENT_REVIEWS);
+        let limits = gitterm::plan_limits::PlanLimitsFile::load(
+            &gitterm::plan_limits::PlanLimitsFile::path_in(&bridge.config_root),
+        );
+        let policy = gitterm::plan_limits::evaluate_policy(&limits, chrono::Utc::now().timestamp());
+        let ids = delegations::runs_to_start(
+            store.delegations(),
+            &running,
+            MAX_CONCURRENT_REVIEWS,
+            &policy,
+            0,
+        );
         let mut runs = Vec::new();
         for id in ids {
             let Some(delegation) = store.delegation(&id) else {

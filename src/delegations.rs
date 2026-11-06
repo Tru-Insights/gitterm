@@ -112,6 +112,13 @@ fn codex_model(
     }
 }
 
+fn user_model_choice(requested: bool, model: Option<&str>) -> Result<bool, String> {
+    if requested && clean(model).is_none() {
+        return Err("user_model_choice requires the model explicitly chosen by the user".into());
+    }
+    Ok(requested)
+}
+
 /// The review delegation `review_request` (or the Review… popover's Codex
 /// path) asks for. `configured_model` is `review.codex_model`.
 pub fn review_delegation(
@@ -177,12 +184,14 @@ pub fn review_delegation(
         return Err(format!("focus is longer than {MAX_FOCUS_CHARS} characters"));
     }
     let model = codex_model(request.model.as_deref(), configured_model)?;
-    let options = requested_options(
+    let mut options = requested_options(
         request.checkout.as_deref(),
         &[],
         request.effort,
         request.time_limit_minutes,
     )?;
+    options.user_model_choice =
+        user_model_choice(request.user_model_choice, request.model.as_deref())?;
     let target = ReviewTarget { mode, focus };
     Ok(NewDelegation {
         kind: DelegationKind::Review,
@@ -216,6 +225,14 @@ pub fn consult_delegation(
             "the brief is longer than {MAX_BRIEF_CHARS} characters; summarise it"
         ));
     }
+    let mut options = requested_options(
+        request.checkout.as_deref(),
+        &[],
+        request.effort,
+        request.time_limit_minutes,
+    )?;
+    options.user_model_choice =
+        user_model_choice(request.user_model_choice, request.model.as_deref())?;
     Ok(NewDelegation {
         kind: DelegationKind::Consult,
         parent: caller.parent(),
@@ -226,12 +243,7 @@ pub fn consult_delegation(
         brief: brief.to_string(),
         target: None,
         previous,
-        options: requested_options(
-            request.checkout.as_deref(),
-            &[],
-            request.effort,
-            request.time_limit_minutes,
-        )?,
+        options,
     })
 }
 
@@ -254,6 +266,7 @@ pub fn review_request_from_popover(
         focus: request.focus.clone(),
         reviewer: Some("codex".to_string()),
         model: Some(request.model.clone()),
+        user_model_choice: !request.model.trim().is_empty(),
         checkout: None,
         effort: None,
         time_limit_minutes: None,
@@ -641,6 +654,7 @@ pub fn requested_options(
         add_dirs: add_dirs.to_vec(),
         effort,
         time_limit_minutes,
+        user_model_choice: false,
     })
 }
 
@@ -689,12 +703,14 @@ pub fn worker_targets(
         WorkerPlace::Checkout(path) => Some(path.as_path()),
         _ => None,
     };
-    let options = requested_options(
+    let mut options = requested_options(
         checkout,
         &request.add_dirs,
         request.effort,
         request.time_limit_minutes,
     )?;
+    options.user_model_choice =
+        user_model_choice(request.user_model_choice, request.model.as_deref())?;
     Ok((place, options))
 }
 
@@ -1144,16 +1160,28 @@ pub fn runs_to_start(
     delegations: &[Delegation],
     running: &HashSet<String>,
     max_concurrent: usize,
+    policy: &crate::plan_limits::PolicyEvaluation,
+    running_workers: usize,
 ) -> Vec<String> {
     let free = max_concurrent.max(1).saturating_sub(running.len());
-    delegations
-        .iter()
-        .filter(|delegation| delegation.status == DelegationStatus::Requested)
-        .filter(|delegation| delegation.codex_child().is_some())
-        .filter(|delegation| !running.contains(&delegation.delegation_id))
-        .take(free)
-        .map(|delegation| delegation.delegation_id.clone())
-        .collect()
+    let mut selected = Vec::new();
+    for delegation in delegations.iter().filter(|delegation| {
+        delegation.status == DelegationStatus::Requested
+            && delegation.codex_child().is_some()
+            && !running.contains(&delegation.delegation_id)
+    }) {
+        if selected.len() >= free {
+            break;
+        }
+        if policy.allows_start(
+            crate::plan_limits::Provider::Codex,
+            running_workers > 0 || !running.is_empty() || !selected.is_empty(),
+            delegation.options.user_model_choice,
+        ) {
+            selected.push(delegation.delegation_id.clone());
+        }
+    }
+    selected
 }
 
 /// The full record `delegation_get` returns: the stored delegation plus
@@ -1965,6 +1993,7 @@ mod tests {
             focus: None,
             reviewer: None,
             model: None,
+            user_model_choice: false,
             checkout: None,
             effort: None,
             time_limit_minutes: None,
@@ -2128,7 +2157,192 @@ mod tests {
     }
 
     #[test]
+    fn queued_reviews_recheck_the_hold_when_a_running_review_finishes() {
+        use crate::plan_limits::{
+            evaluate_policy, LimitWindow, PlanLimits, PlanLimitsFile, Provider, RoutingState,
+        };
+        let now = 1_800_000_000;
+        let mut file = PlanLimitsFile::default();
+        file.absorb(PlanLimits {
+            provider: Provider::Codex,
+            observed_at: now,
+            local: Some(true),
+            windows: vec![LimitWindow {
+                label: "7d".into(),
+                used_percent: Some(94.0),
+                resets_at: Some(now + 86400),
+            }],
+            alerts: vec![],
+            plan_type: None,
+            credits: None,
+        });
+        let delegations = vec![delegation("queued", DelegationStatus::Requested)];
+        assert!(runs_to_start(
+            &delegations,
+            &HashSet::from(["running".into()]),
+            1,
+            &evaluate_policy(&file, now),
+            0
+        )
+        .is_empty());
+        let evaluation = evaluate_policy(&file, now);
+        file.policy = Some(evaluation.policy);
+        file.codex.as_mut().unwrap().windows[0].used_percent = Some(95.0);
+        assert_eq!(
+            evaluate_policy(&file, now).report.routing.state,
+            RoutingState::HoldCodex
+        );
+        // The running review finishes after the reading crosses the hold threshold.
+        assert!(runs_to_start(
+            &delegations,
+            &HashSet::new(),
+            1,
+            &evaluate_policy(&file, now),
+            0
+        )
+        .is_empty());
+        file.policy = Some(evaluate_policy(&file, now).policy);
+        assert!(runs_to_start(
+            &delegations,
+            &HashSet::new(),
+            1,
+            &evaluate_policy(&file, now + 3600),
+            0
+        )
+        .is_empty());
+        let reading = file.codex.as_mut().unwrap();
+        reading.observed_at = now + crate::plan_limits::STATE_DWELL_SECS;
+        reading.windows[0].resets_at = Some(now + crate::plan_limits::WEEK_SECS);
+        reading.windows[0].used_percent = Some(1.0);
+        let refreshed_at = reading.observed_at;
+        assert_eq!(
+            runs_to_start(
+                &delegations,
+                &HashSet::new(),
+                1,
+                &evaluate_policy(&file, refreshed_at),
+                0
+            ),
+            vec!["queued".to_string()]
+        );
+    }
+
+    #[test]
+    fn popover_default_model_keeps_configured_selection_without_an_override() {
+        let mut page = crate::review::ReviewRequest {
+            target: crate::review::ReviewTarget::Uncommitted,
+            focus: None,
+            reviewer: crate::review::PopoverReviewer::Codex,
+            model: String::new(),
+        };
+        let request = review_request_from_popover(&page);
+        let new = review_delegation(&request, &caller(), Some("gpt-6-astra"), None).unwrap();
+        assert!(!new.options.user_model_choice);
+        page.model = "gpt-6-astra".into();
+        assert!(review_request_from_popover(&page).user_model_choice);
+    }
+
+    #[test]
+    fn only_explicit_user_model_choices_bypass_a_hold_and_survive_round_trip() {
+        let mut request = review_request(ReviewTargetKind::Uncommitted);
+        let configured = review_delegation(&request, &caller(), Some("gpt-6-astra"), None).unwrap();
+        assert!(!configured.options.user_model_choice);
+        request.model = Some("gpt-6-astra".into());
+        let agent_choice = review_delegation(&request, &caller(), None, None).unwrap();
+        assert!(!agent_choice.options.user_model_choice);
+        request.user_model_choice = true;
+        let explicit = review_delegation(&request, &caller(), None, None).unwrap();
+        let explicit = Delegation::new_requested(explicit, "2026-11-05T12:00:00Z");
+        let encoded = serde_json::to_vec(&explicit).unwrap();
+        let decoded: Delegation = serde_json::from_slice(&encoded).unwrap();
+        assert!(decoded.options.user_model_choice);
+        assert!(
+            rerun_delegation(&decoded)
+                .unwrap()
+                .options
+                .user_model_choice
+        );
+        request.model = None;
+        assert!(
+            review_delegation(&request, &caller(), Some("gpt-6-astra"), None)
+                .unwrap_err()
+                .contains("requires the model")
+        );
+        let mut file = crate::plan_limits::PlanLimitsFile::default();
+        file.codex = Some(crate::plan_limits::PlanLimits {
+            provider: crate::plan_limits::Provider::Codex,
+            observed_at: 1_800_000_000,
+            local: Some(true),
+            windows: vec![crate::plan_limits::LimitWindow {
+                label: "7d".into(),
+                used_percent: Some(95.0),
+                resets_at: Some(1_800_086_400),
+            }],
+            alerts: vec![],
+            plan_type: None,
+            credits: None,
+        });
+        let policy = crate::plan_limits::evaluate_policy(&file, 1_800_000_000);
+        let configured = Delegation::new_requested(configured, "2026-11-05T12:00:00Z");
+        let agent_choice = Delegation::new_requested(agent_choice, "2026-11-05T12:00:00Z");
+        let explicit_id = decoded.delegation_id.clone();
+        assert_eq!(
+            runs_to_start(
+                &[configured, agent_choice, decoded],
+                &HashSet::new(),
+                1,
+                &policy,
+                0
+            ),
+            vec![explicit_id]
+        );
+    }
+
+    #[test]
+    fn busy_scheduler_counts_workers_and_reserves_capacity_for_the_same_batch() {
+        use crate::plan_limits::{claude_limits, evaluate_policy, PlanLimitsFile, Provider};
+        let mut file = PlanLimitsFile::default();
+        let mut codex = claude_limits(
+            &serde_json::json!({"unifiedWindows":{
+                "seven_day":{"utilization":0.1,"resetsAt":1_800_086_400},
+                "five_hour":{"utilization":0.8,"resetsAt":1_800_003_600}
+            }}),
+            1_800_000_000,
+        );
+        codex.provider = Provider::Codex;
+        codex.local = Some(true);
+        file.absorb(codex);
+        let policy = evaluate_policy(&file, 1_800_000_000);
+        let jobs = vec![
+            delegation("one", DelegationStatus::Requested),
+            delegation("two", DelegationStatus::Requested),
+        ];
+        assert_eq!(
+            runs_to_start(&jobs, &HashSet::new(), 2, &policy, 0),
+            vec!["one"]
+        );
+        assert!(runs_to_start(&jobs, &HashSet::new(), 2, &policy, 1).is_empty());
+        assert!(runs_to_start(
+            &jobs,
+            &HashSet::from(["running-review".into()]),
+            2,
+            &policy,
+            0
+        )
+        .is_empty());
+    }
+
+    #[test]
     fn queued_runs_start_oldest_first_up_to_the_cap() {
+        let mut file = crate::plan_limits::PlanLimitsFile::default();
+        let mut codex = crate::plan_limits::claude_limits(
+            &serde_json::json!({"unifiedWindows":{"seven_day":{"utilization":0.1,"resetsAt":1_800_086_400}}}),
+            1_800_000_000,
+        );
+        codex.provider = crate::plan_limits::Provider::Codex;
+        codex.local = Some(true);
+        file.absorb(codex);
+        let policy = crate::plan_limits::evaluate_policy(&file, 1_800_000_000);
         let delegations = vec![
             delegation("a", DelegationStatus::Running),
             delegation("b", DelegationStatus::Requested),
@@ -2138,21 +2352,24 @@ mod tests {
         ];
         let running: HashSet<String> = ["a".to_string()].into();
         assert_eq!(
-            runs_to_start(&delegations, &running, 2),
+            runs_to_start(&delegations, &running, 2, &policy, 0),
             vec!["b".to_string()]
         );
         assert_eq!(
-            runs_to_start(&delegations, &running, 3),
+            runs_to_start(&delegations, &running, 3, &policy, 0),
             vec!["b".to_string(), "d".to_string()]
         );
         // Zero counts as one slot, which "a" holds.
-        assert!(runs_to_start(&delegations, &running, 0).is_empty());
+        assert!(runs_to_start(&delegations, &running, 0, &policy, 0).is_empty());
         let none = HashSet::new();
-        assert_eq!(runs_to_start(&delegations, &none, 0), vec!["b".to_string()]);
+        assert_eq!(
+            runs_to_start(&delegations, &none, 0, &policy, 0),
+            vec!["b".to_string()]
+        );
         // A requested delegation already being started is not started twice.
         let starting: HashSet<String> = ["b".to_string()].into();
         assert_eq!(
-            runs_to_start(&delegations, &starting, 2),
+            runs_to_start(&delegations, &starting, 2, &policy, 0),
             vec!["d".to_string()]
         );
     }
@@ -3897,6 +4114,7 @@ mod tests {
                 add_dirs: Vec::new(),
                 effort: Some(ReasoningEffort::Xhigh),
                 time_limit_minutes: Some(45),
+                user_model_choice: false,
             }
         );
         for minutes in [0, MAX_TIME_LIMIT_MINUTES + 1] {
