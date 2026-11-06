@@ -1585,8 +1585,45 @@ impl BrowserController {
         let websocket_url = live_targets
             .iter()
             .filter(|target| target.kind == "page")
-            .find_map(|target| target.web_socket_debugger_url.clone())
-            .ok_or_else(|| BrowserControlError::new("Chrome has no page to bring forward"))?;
+            .find_map(|target| target.web_socket_debugger_url.clone());
+        let websocket_url = match websocket_url {
+            Some(websocket_url) => websocket_url,
+            None => {
+                eprintln!("Chrome has no page to bring forward; creating a window");
+                let browser_session = self.browser_session().await?;
+                let result = browser_session
+                    .command(
+                        "Target.createTarget",
+                        json!({ "url": "about:blank", "newWindow": true }),
+                    )
+                    .await?;
+                let target_id =
+                    result
+                        .get("targetId")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            BrowserControlError::new("Target.createTarget omitted its targetId")
+                        })?;
+                let deadline = Instant::now() + TARGET_STARTUP_TIMEOUT;
+                loop {
+                    let live_targets = list_page_targets(endpoint.port).await?;
+                    if let Some(websocket_url) = live_targets
+                        .iter()
+                        .find(|target| target.id == target_id && target.kind == "page")
+                        .and_then(|target| target.web_socket_debugger_url.clone())
+                    {
+                        break websocket_url;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(BrowserControlError::new(format!(
+                            "created browser window '{target_id}' but Chrome did not list it within {} seconds",
+                            TARGET_STARTUP_TIMEOUT.as_secs()
+                        )));
+                    }
+                    sleep(Duration::from_millis(25)).await;
+                }
+            }
+        };
         CdpSession::connect(&websocket_url)
             .await?
             .command("Page.bringToFront", json!({}))
@@ -2524,6 +2561,7 @@ pub(crate) mod test_support {
         pub pages: Arc<std::sync::Mutex<Vec<String>>>,
         /// Every CDP method received, with its `targetId` when it has one.
         pub calls: Arc<std::sync::Mutex<Vec<String>>>,
+        pub created_target_params: Arc<std::sync::Mutex<Vec<Value>>>,
         server: JoinHandle<()>,
     }
 
@@ -2544,20 +2582,30 @@ pub(crate) mod test_support {
                     .collect::<Vec<_>>(),
             ));
             let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let (server_pages, server_calls) = (Arc::clone(&pages), Arc::clone(&calls));
+            let created_target_params = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (server_pages, server_calls, server_created_target_params) = (
+                Arc::clone(&pages),
+                Arc::clone(&calls),
+                Arc::clone(&created_target_params),
+            );
             let server = tokio::spawn(async move {
                 loop {
                     let Ok((socket, _)) = listener.accept().await else {
                         return;
                     };
-                    let (pages, calls) = (Arc::clone(&server_pages), Arc::clone(&server_calls));
-                    tokio::spawn(serve(socket, port, pages, calls));
+                    let (pages, calls, created_target_params) = (
+                        Arc::clone(&server_pages),
+                        Arc::clone(&server_calls),
+                        Arc::clone(&server_created_target_params),
+                    );
+                    tokio::spawn(serve(socket, port, pages, calls, created_target_params));
                 }
             });
             Self {
                 port,
                 pages,
                 calls,
+                created_target_params,
                 server,
             }
         }
@@ -2568,6 +2616,7 @@ pub(crate) mod test_support {
         port: u16,
         pages: Arc<std::sync::Mutex<Vec<String>>>,
         calls: Arc<std::sync::Mutex<Vec<String>>>,
+        created_target_params: Arc<std::sync::Mutex<Vec<Value>>>,
     ) {
         let mut head = [0_u8; 16];
         let Ok(read) = socket.peek(&mut head).await else {
@@ -2613,6 +2662,14 @@ pub(crate) mod test_support {
                 ("Target.closeTarget", Some(target_id)) => {
                     pages.lock().unwrap().retain(|page| *page != target_id);
                     json!({ "success": true })
+                }
+                ("Target.createTarget", None) => {
+                    created_target_params
+                        .lock()
+                        .unwrap()
+                        .push(request["params"].clone());
+                    pages.lock().unwrap().push("created-page".to_string());
+                    json!({ "targetId": "created-page" })
                 }
                 _ => json!({}),
             };
@@ -5379,6 +5436,37 @@ mod tests {
         assert!(registry.infos("chat-a", &live).is_empty());
         // The other chat keeps its target.
         assert_eq!(registry.infos("chat-b", &live).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn focus_creates_and_brings_forward_a_window_when_no_pages_exist() {
+        let devtools = test_support::FakeDevTools::start(&[]).await;
+        let temp = tempdir().unwrap();
+        let mut controller = BrowserController::new(temp.path());
+        controller.endpoint = Some(DevToolsEndpoint {
+            port: devtools.port,
+            browser_websocket_path: "/devtools/browser/fake".to_string(),
+        });
+
+        controller.focus().await.unwrap();
+
+        assert_eq!(
+            *devtools.created_target_params.lock().unwrap(),
+            vec![json!({ "url": "about:blank", "newWindow": true })]
+        );
+        assert_eq!(
+            *devtools.calls.lock().unwrap(),
+            vec![
+                "Target.createTarget".to_string(),
+                "Page.bringToFront".to_string()
+            ]
+        );
+        assert_eq!(
+            *devtools.pages.lock().unwrap(),
+            vec!["created-page".to_string()]
+        );
+        assert!(controller.registry.targets.is_empty());
+        assert!(controller.registry.window.is_none());
     }
 
     #[tokio::test]
