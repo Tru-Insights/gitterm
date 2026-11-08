@@ -173,24 +173,52 @@ fn mark_scanned(marker: &Path) -> Result<(), String> {
         .map_err(|error| format!("cannot write {}: {error}", marker.display()))
 }
 
-/// Adapters retain only actual shell inputs keyed by call id. Both formats
-/// use `created_prs`, the live facts recogniser, when their output arrives.
+/// Adapters pair actual shell inputs with their output, including Codex's
+/// completed command events. All formats use the live facts recogniser.
 fn scan_transcript(
     path: &Path,
     backend: HarnessConversationBackend,
 ) -> std::io::Result<Vec<PrRef>> {
     let mut calls: HashMap<String, String> = HashMap::new();
     let mut prs = Vec::new();
+    let mut seen = HashSet::new();
+    let mut record_prs = |command: &str, output: &str| {
+        for pr in chat_facts::created_prs(command, output) {
+            if seen.insert(pr.key().id()) {
+                prs.push(pr);
+            }
+        }
+    };
+    let mut invalid_lines = 0;
     for line in BufReader::new(std::fs::File::open(path)?).lines() {
         let line = line?;
-        let value: Value = serde_json::from_str(&line)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => {
+                invalid_lines += 1;
+                continue;
+            }
+        };
         match backend {
             HarnessConversationBackend::Codex => {
+                let payload = &value["payload"];
+                if value["type"] == "event_msg" && payload["type"] == "item_completed" {
+                    let item = &payload["item"];
+                    if item["type"] == "CommandExecution" && item["exit_code"].as_i64() == Some(0) {
+                        if let (Some(command), Some(output)) = (
+                            item["command"]
+                                .as_array()
+                                .and_then(|args| args.last())
+                                .and_then(Value::as_str),
+                            item["aggregated_output"].as_str(),
+                        ) {
+                            record_prs(command, output);
+                        }
+                    }
+                }
                 if value["type"] != "response_item" {
                     continue;
                 }
-                let payload = &value["payload"];
                 let Some(id) = payload["call_id"].as_str() else {
                     continue;
                 };
@@ -225,7 +253,7 @@ fn scan_transcript(
                         if let (Some(command), Some(output)) =
                             (calls.remove(id), payload["output"].as_str())
                         {
-                            prs.extend(chat_facts::created_prs(&command, output));
+                            record_prs(&command, output);
                         }
                     }
                     _ => {}
@@ -249,10 +277,10 @@ fn scan_transcript(
                                 .as_str()
                                 .and_then(|id| calls.remove(id))
                             {
-                                prs.extend(chat_facts::created_prs(
+                                record_prs(
                                     &command,
                                     &chat_facts::tool_result_text(&block["content"]),
-                                ));
+                                );
                             }
                         }
                         _ => {}
@@ -261,6 +289,12 @@ fn scan_transcript(
             }
             HarnessConversationBackend::Pi => {}
         }
+    }
+    if invalid_lines > 0 {
+        eprintln!(
+            "[worker-prs] {}: skipped {invalid_lines} invalid JSON lines",
+            path.display()
+        );
     }
     Ok(prs)
 }
@@ -394,6 +428,112 @@ mod tests {
         json!({"type":"response_item","payload":{"type":"function_call_output","call_id":id,"output":text}})
     }
 
+    const CREATE_SCRIPT: &str = r#"python3 - <<'PY'
+from pathlib import Path
+Path('/tmp/example-pr-body.md').write_text('Update documentation.\n')
+PY
+GH_TOKEN="$(gh auth token --user example-user)" gh pr create --draft --base develop --title "Update docs" --body-file /tmp/example-pr-body.md
+"#;
+
+    fn command_execution(exit_code: Value) -> Value {
+        json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "CommandExecution",
+                    "command": ["/bin/zsh", "-lc", CREATE_SCRIPT],
+                    "aggregated_output": "Creating draft pull request\nhttps://github.com/example/docs/pull/181\n",
+                    "exit_code": exit_code,
+                    "status": "completed"
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn codex_command_execution_records_code_mode_create_and_dedupes_function_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut lines = vec![
+            json!({"type":"response_item","payload":{
+                "type":"custom_tool_call", "name":"exec", "call_id":"code-mode",
+                "input": format!("await tools.exec_command({{cmd: {}}});", json!(CREATE_SCRIPT))
+            }}),
+            command_execution(json!(0)),
+            command_execution(json!(0)),
+        ];
+        let path = transcript(temp.path(), HarnessConversationBackend::Codex, &lines);
+        let prs = scan_transcript(&path, HarnessConversationBackend::Codex).unwrap();
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].key().id(), "example/docs#181");
+
+        lines.extend([
+            call("duplicate", CREATE_SCRIPT),
+            output("duplicate", "https://github.com/Example/Docs/pull/181"),
+            call("other", "gh pr create --title Other --body Update"),
+            output("other", "https://github.com/example/app/pull/182"),
+        ]);
+        transcript(temp.path(), HarnessConversationBackend::Codex, &lines);
+        let prs = scan_transcript(&path, HarnessConversationBackend::Codex).unwrap();
+        assert_eq!(
+            prs.iter().map(|pr| pr.key().id()).collect::<Vec<_>>(),
+            ["example/docs#181", "example/app#182"]
+        );
+    }
+
+    #[test]
+    fn codex_command_execution_requires_successful_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut missing_exit = command_execution(json!(0));
+        missing_exit["payload"]["item"]
+            .as_object_mut()
+            .unwrap()
+            .remove("exit_code");
+        let path = transcript(
+            temp.path(),
+            HarnessConversationBackend::Codex,
+            &[
+                command_execution(json!(1)),
+                command_execution(Value::Null),
+                missing_exit,
+            ],
+        );
+        assert!(scan_transcript(&path, HarnessConversationBackend::Codex)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn malformed_json_lines_and_partial_tail_do_not_discard_valid_prs() {
+        let temp = tempfile::tempdir().unwrap();
+        for (backend, lines) in [
+            (
+                HarnessConversationBackend::Codex,
+                vec![
+                    call("create", "gh pr create"),
+                    output("create", "https://github.com/example/docs/pull/181"),
+                ],
+            ),
+            (
+                HarnessConversationBackend::Claude,
+                vec![
+                    json!({"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","id":"create","input":{"command":"gh pr create"}}]}}),
+                    json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"create","content":"https://github.com/example/docs/pull/181"}]}}),
+                ],
+            ),
+        ] {
+            let path = transcript(temp.path(), backend, &[]);
+            std::fs::write(
+                &path,
+                format!("{}\ninvalid json\n{}\n{{\"type\":", lines[0], lines[1]),
+            )
+            .unwrap();
+            let prs = scan_transcript(&path, backend).unwrap();
+            assert_eq!(prs.len(), 1);
+            assert_eq!(prs[0].key().id(), "example/docs#181");
+        }
+    }
+
     #[test]
     fn codex_worker_records_other_repo_pr_on_parent_and_is_scanned_once() {
         let temp = tempfile::tempdir().unwrap();
@@ -433,15 +573,15 @@ mod tests {
         assert!(scans
             .take_due(std::slice::from_ref(&worker), &tasks, now())
             .is_empty());
-        // Even across launches, no transcript read (invalid input would fail
-        // parsing) and no write of the marker or facts occurs on a second pass.
-        std::fs::write(&source, "invalid json").unwrap();
+        // Even across launches, no transcript read (invalid UTF-8 would fail)
+        // and no write of the marker or facts occurs on a second pass.
+        std::fs::write(&source, b"\xff").unwrap();
         let marker = config.join("worker-pr-scans").join(&worker.delegation_id);
         let marked_at = std::fs::metadata(&marker).unwrap().modified().unwrap();
         let due = Scans::default().take_due(&[worker], &tasks, now());
         assert_eq!(due.len(), 1);
-        // Unlike `run`, this propagates a parsing error, so the assertion
-        // fails if the invalid transcript is ever read again.
+        // Unlike `run`, this propagates a read error, so the assertion fails
+        // if the invalid transcript is ever read again.
         assert!(scan_one(&due[0], &config, temp.path()).unwrap().is_none());
         assert_eq!(
             std::fs::metadata(marker).unwrap().modified().unwrap(),
@@ -555,7 +695,7 @@ mod tests {
             .append(true)
             .open(&source)
             .unwrap()
-            .write_all(b"\ninvalid\n")
+            .write_all(b"\n\xff\n")
             .unwrap();
         let worker = worker(HarnessConversationBackend::Codex);
         let mut scans = Scans::default();
