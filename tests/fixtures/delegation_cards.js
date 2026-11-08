@@ -21,6 +21,12 @@
   };
   const send = (card) => [...card.querySelectorAll('button')].find((button) => button.textContent === 'Send to Claude');
   try {
+    {
+      const long = append(record('long-head', 'implement', 'running', { child: { runner: 'task_session', model: 'model · in ' + 'very-long-worktree-name-'.repeat(8) } }));
+      const head = long.querySelector('summary').getBoundingClientRect();
+      const stateEl = long.querySelector('.dlg-state').getBoundingClientRect();
+      check('a long worker head keeps the state inside the card', stateEl.right <= head.right + 0.5 && stateEl.width > 0);
+    }
     for (const kind of ['review', 'consult', 'implement']) {
       const d = record('delivered-' + kind, kind, 'completed', { delivered: true });
       const card = append(d);
