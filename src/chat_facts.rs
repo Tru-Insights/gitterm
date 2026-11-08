@@ -1441,8 +1441,15 @@ pub(crate) fn record_worker_prs(
             continue;
         };
         let before = facts.prs.clone();
+        let before_protected = facts.live_created_prs.len();
         for pr in prs {
             facts.add_pr(pr.clone());
+            // A worker's verified create is as certain as a live one: a later
+            // parent `gh pr view` of it must never count against it.
+            let id = pr.key().id();
+            if !facts.live_created_prs.contains(&id) {
+                facts.live_created_prs.push(id);
+            }
         }
         let added: Vec<_> = facts
             .prs
@@ -1450,7 +1457,7 @@ pub(crate) fn record_worker_prs(
             .filter(|pr| !before.iter().any(|known| known.key().id() == pr.key().id()))
             .cloned()
             .collect();
-        if !added.is_empty() {
+        if !added.is_empty() || facts.live_created_prs.len() != before_protected {
             let written = std::fs::metadata(&path)
                 .and_then(|meta| meta.modified())
                 .map_err(|error| {
@@ -1504,35 +1511,19 @@ fn is_known_read_only(command: &str) -> bool {
         let words = &command.words;
         match words.first().map(String::as_str) {
             Some(
-                "grep" | "rg" | "egrep" | "fgrep" | "cat" | "echo" | "printf" | "head" | "tail"
-                | "less" | "wc" | "sort" | "uniq" | "jq" | "awk" | "ls" | "find",
+                "grep" | "egrep" | "fgrep" | "cat" | "echo" | "printf" | "head" | "tail" | "wc"
+                | "sort" | "uniq" | "jq" | "ls",
             ) => true,
-            Some("sed") => {
-                let mut args = words.iter().skip(1);
-                while let Some(arg) = args.next() {
-                    match arg.as_str() {
-                        "-n" => return true,
-                        "-e" | "-f" => {
-                            if args.next().is_none() {
-                                return false;
-                            }
-                        }
-                        "-E" | "-r" | "-u" => {}
-                        // Unknown options or a script end our flag knowledge.
-                        _ => return false,
-                    }
-                }
-                false
-            }
+            // `rg --pre <cmd>` runs a command on every file.
+            Some("rg") => !words.iter().any(|word| word.starts_with("--pre")),
+            // Not sed or awk (scripts can run commands), not find (-exec),
+            // not less, not git diff (external diff tools), and not
+            // `gh pr view/list/search`: they print real PRs, so their output
+            // is never evidence that a saved PR is wrong.
             Some("git") => matches!(
                 words.get(1).map(String::as_str),
-                Some("log" | "show" | "grep" | "diff")
+                Some("log" | "show" | "grep")
             ),
-            Some("gh") => {
-                words.get(1).is_some_and(|word| word == "search")
-                    || (words.get(1).is_some_and(|word| word == "pr")
-                        && matches!(words.get(2).map(String::as_str), Some("view" | "list")))
-            }
             _ => false,
         }
     })
@@ -3899,6 +3890,24 @@ branch refs/heads/tracey/tru-12-thing
     }
 
     #[test]
+    fn worker_created_pr_survives_read_only_mentions_in_the_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = facts_path(temp.path(), ChatBackend::Claude, "parent").unwrap();
+        write_facts(&path, &ChatFacts::default()).unwrap();
+        let pr = merge_plan::pr_urls_in("https://github.com/acme/docs/pull/7");
+        record_worker_prs(temp.path(), "parent", &pr).unwrap();
+        let mut facts = load_facts(&path).unwrap().unwrap();
+        assert_eq!(facts.live_created_prs, vec![pr[0].key().id()]);
+        // The parent later only greps or views it: never evidence against it.
+        let raw = RawFacts {
+            read_only_prs: pr.clone(),
+            ..Default::default()
+        };
+        raw.reconcile_prs(&mut facts);
+        assert_eq!(facts.prs, pr);
+    }
+
+    #[test]
     fn removal_evidence_requires_only_allowlisted_simple_commands() {
         for command in [
             "grep",
@@ -3910,23 +3919,14 @@ branch refs/heads/tracey/tru-12-thing
             "printf",
             "head",
             "tail",
-            "less",
             "wc",
             "sort",
             "uniq",
             "jq",
-            "awk",
             "ls",
-            "find",
-            "sed -n '1p' file",
-            "sed -E -n '1p' file",
             "git log",
             "git show",
             "git grep",
-            "git diff",
-            "gh pr view",
-            "gh pr list",
-            "gh search prs query",
             "grep -rn 'gh pr create' . | head",
             "rg create file && cat file; printf '%s' done",
             "echo '$(gh pr create)'",
@@ -3964,6 +3964,16 @@ branch refs/heads/tracey/tru-12-thing
             "echo \0",
             "",
             "/tmp/grep file",
+            "less file",
+            "awk 'BEGIN { system(\"gh pr create --fill\") }'",
+            "find . -prune -exec gh pr create --fill \\;",
+            "sed -n '1p' file",
+            "sed -n '1e gh pr create --fill' file",
+            "rg --pre ./script create .",
+            "git diff",
+            "gh pr view 42",
+            "gh pr list",
+            "gh search prs query",
         ] {
             assert!(!is_known_read_only(command), "{command}");
         }
