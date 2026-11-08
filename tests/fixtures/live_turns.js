@@ -295,6 +295,7 @@
     await settle();
     const originalText = messages.textContent;
     const originalCode = messages.querySelector('pre code').textContent;
+    const originalFolds = new Map([...messages.querySelectorAll('details')].map((node) => [node, node.open]));
     const cmdF = key(document.getElementById('prompt'), 'f', { metaKey: true });
     check('Cmd+F forwards through hostkey and opens a labelled focused input', cmdF.defaultPrevented && findPosts.at(-1)?.key === 'f' && !findBar.hidden && document.activeElement === query && !!query.getAttribute('aria-label') && count.getAttribute('aria-live') === 'polite');
     search('needle');
@@ -328,23 +329,48 @@
     check('range highlights leave code copy text unchanged', messages.querySelector('pre code').textContent === originalCode);
     const beforeEscape = findPosts.length;
     key(query, 'Escape');
+    check('Esc restores exactly the folds find opened, preserving user-open folds', [...originalFolds].every(([node, open]) => node.open === open) && [...originalFolds.values()].some(Boolean));
     check('Esc clears every highlight, restores exact transcript text and focuses composer', findBar.hidden && !CSS.highlights.has('chat-find') && !CSS.highlights.has('chat-find-current') && messages.textContent === originalText && document.activeElement.id === 'prompt' && findPosts.length === beforeEscape);
 
     reset();
     const historyForFind = [];
-    for (let i = 0; i < 220; i++) historyForFind.push({ type: 'user_prompt', text: i === 0 ? 'Earlier [a.*] needle' : 'Historical message ' + i });
+    for (let i = 0; i < 1050; i++) historyForFind.push({ type: 'user_prompt', text: i === 0 ? 'Earlier [a.*] needle' : 'Historical message ' + i + (i === 300 || i === 1000 ? ' needle' : '') });
     window.__replay(historyForFind);
     check('history find fixture starts with unloaded earlier messages', !!document.querySelector('.earlier') && !messages.textContent.includes('Earlier [a.*] needle'));
-    window.__openFind(); search('[a.*]');
-    check('find loads earlier chunks and deferred content and treats query literally', !document.querySelector('.earlier') && count.textContent === '1 of 1' && current().toString() === '[a.*]' && messages.textContent.includes('Earlier [a.*] needle'));
+    const historyNodes = [...messages.children];
+    const earlierControl = messages.querySelector('.earlier');
+    const earlierText = earlierControl.textContent;
+    window.__openFind(); search('no such history text');
+    check('zero-match search leaves all detached history out of layout', messages.childElementCount === historyNodes.length && earlierControl.textContent === earlierText);
+    search('Historical message');
+    check('all matches in the selected history chunk retain their ranges after attachment', highlights().length === 199 && highlights().every((range) => range.toString() === 'Historical message'));
+    search('[a.*]');
+    check('find attaches only the current history chunk and treats query literally', messages.childElementCount === historyNodes.length + 50 && count.textContent === '1 of 1' && current().toString() === '[a.*]' && earlierControl.textContent === earlierText);
+    search('needle');
+    key(query, 'Enter');
+    check('navigating distant history replaces rather than accumulates chunks', count.textContent === '2 of 3' && messages.childElementCount === historyNodes.length + 50 && !messages.textContent.includes('Earlier [a.*] needle'));
+    key(query, 'Enter');
+    check('navigating back to live history detaches the temporary chunk', count.textContent === '3 of 3' && messages.childElementCount === historyNodes.length);
+    key(query, 'Enter');
     key(query, 'Escape');
+    check('closing restores exact history window and earlier control', messages.childElementCount === historyNodes.length && [...messages.children].every((node, i) => node === historyNodes[i]) && earlierControl.textContent === earlierText && !earlierControl.disabled);
+    earlierControl.click();
+    check('normal history paging works after find closes', messages.childElementCount === historyNodes.length + 50 && messages.textContent.includes('Historical message 899') && !messages.textContent.includes('Earlier [a.*] needle'));
+    // Trimming resumes after find, including when the user has paged back.
+    jump.click();
+    check('following after find trims to the original live window', messages.childElementCount === historyNodes.length);
 
     reset();
     const replayForFind = [];
     for (let i = 0; i < 220; i++) replayForFind.push({ type: 'user_prompt', text: 'Question ' + i }, H('text_delta', i === 0 ? '**deferredneedle**' : 'Answer ' + i), end);
     window.__resetConversation(); window.__replay(replayForFind);
     window.__openFind(); search('deferredneedle');
-    check('find renders deferred markdown in earlier assistant messages', count.textContent === '1 of 1' && current().startContainer.parentElement.tagName === 'STRONG');
+    const deferredRoot = current().startContainer.parentElement.closest('.assistant');
+    check('find renders only the selected deferred block in its chunk', count.textContent === '1 of 1' && current().startContainer.parentElement.tagName === 'STRONG' && [...messages.querySelectorAll('.assistant')].filter((node) => node !== deferredRoot && !node.textContent).length > 0);
+    key(query, 'Escape');
+    check('closing restores deferred markdown and detached block state', !deferredRoot.isConnected && !deferredRoot.textContent);
+    window.__openFind(); search('deferredneedle');
+    check('restored deferred source is searchable on a later find', count.textContent === '1 of 1' && current().toString() === 'deferredneedle');
     key(query, 'Escape');
 
     reset();
@@ -375,6 +401,51 @@
     card('find-subagent').querySelector('.subagent').open = false;
     window.__openFind(); search('subagentneedle');
     check('default scope searches subagent writing inside closed tool cards', count.textContent === '1 of 1' && card('find-subagent').open && card('find-subagent').querySelector('.subagent').open);
+    key(query, 'Escape');
+
+    reset();
+    send({ kind: 'delegation', delegation: {
+      delegation_id: 'find-review', kind: 'review', brief: 'Check the project',
+      child: { model: 'test-model' }, status: { state: 'completed' },
+      created_at: '2026-11-01T10:00:00Z', updated_at: '2026-11-01T10:00:00Z',
+      result: { findings: { verdict: 'needs_changes', summary: 'Review complete', structured: true,
+        findings: [{ id: 'F1', severity: 'P2', title: 'Reviewtitleneedle', body: 'Details' }] } },
+    } });
+    window.__openFind(); search('reviewtitleneedle');
+    check('review finding title counts once despite nested search roots', count.textContent === '1 of 1' && highlights().length === 1);
+    key(query, 'Escape');
+
+    reset();
+    send({ type: 'turn_end', message: { content: [
+      { type: 'thinking', thinking: 'Pi thinkingneedle' },
+      { type: 'toolCall', name: 'Bash', arguments: { command: 'Pi toolneedle' } },
+    ] }, toolResults: ['Pi toolneedle result'] });
+    window.__openFind(); search('thinkingneedle');
+    check('Pi thinking is included in default search scope', count.textContent === '1 of 1');
+    search('toolneedle');
+    check('Pi tool calls and results are excluded by default', count.textContent === '0 of 0');
+    tools.checked = true; tools.dispatchEvent(new Event('change'));
+    check('Pi tool calls and results are included with the toggle', count.textContent === '1 of 2');
+    key(query, 'Escape');
+
+    reset();
+    send(H('text_delta', 'needle [link](https://needle.test) needle chosen needle last'));
+    await settle();
+    window.__openFind(); search('needle'); key(query, 'Enter'); key(query, 'Enter');
+    check('streaming markdown fixture selects the occurrence before chosen', count.textContent === '3 of 4' && current().startContainer.textContent.slice(current().startOffset).startsWith('needle chosen'));
+    send(H('text_delta', '\n'));
+    await settle(); await settle();
+    check('markdown conversion preserves the selected occurrence when URL offsets disappear', count.textContent === '2 of 3' && current().startContainer.textContent.slice(current().startOffset).startsWith('needle chosen'));
+    key(query, 'Escape');
+
+    reset();
+    send(H('text_delta', 'needle repeated '.repeat(12)));
+    await settle();
+    window.__openFind(); search('needle');
+    for (let i = 0; i < 5; i++) key(query, 'Enter');
+    send(H('text_delta', '\n'));
+    await settle(); await settle();
+    check('identical streaming context keeps the nearest occurrence in its block', count.textContent === '6 of 12');
     key(query, 'Escape');
 
     reset(); tools.checked = false;
@@ -409,6 +480,27 @@
     const codeHit = current().getBoundingClientRect(), codeBox = codeScroller.getBoundingClientRect();
     check('find scrolls long code lines horizontally into view', codeScroller.scrollLeft > 0 && codeHit.left >= codeBox.left && codeHit.right <= codeBox.right);
     key(query, 'Escape');
+
+    check('closing restores horizontal code scroll', codeScroller.scrollLeft === 0);
+
+    reset();
+    send(H('text_delta', 'Follow test line.\n'.repeat(100)));
+    await settle();
+    jump.click();
+    window.__openFind(); search('Follow test'); key(query, 'Escape');
+    await settle();
+    send(H('text_delta', 'New followed line.\n'.repeat(20)));
+    await settle();
+    check('following before find resumes following after Esc and stream growth', messages.scrollHeight - messages.clientHeight - messages.scrollTop < 2 && !jump.classList.contains('visible'));
+    messages.dispatchEvent(new Event('wheel'));
+    messages.scrollTop = 100;
+    messages.dispatchEvent(new Event('scroll'));
+    const readerTop = messages.scrollTop;
+    window.__openFind(); search('New followed'); key(query, 'Escape');
+    await settle();
+    send(H('text_delta', 'Additional line.\n'.repeat(20)));
+    await settle();
+    check('a reader not following before find keeps their original position after Esc', readerTop === 100 && messages.scrollTop === readerTop && jump.classList.contains('visible'));
 
     // Older supported WebKit must search without the CSS Highlight API.
     reset();

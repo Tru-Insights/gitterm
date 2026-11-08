@@ -1046,15 +1046,69 @@
   // CSS ranges leave markdown, code, copy text and the stream's DOM handles
   // untouched. Only truncated results need temporary expansion for searching.
   const findOutputs = new Map();
+  const findOpenedDetails = new Set();
+  const findScrolls = new Map();
+  const findMarkdown = new Map(); // temporarily displayed deferred markdown -> original children
+  // Session-only search text DOM: never enters layout. A changed source replaces
+  // its entry; close discards it. Streaming need not parse old markdown again.
+  const findDeferred = new Map();
+  let findChunk = null, findWasFollowing = false;
+  function findChunkNodes() {
+    const nodes = [];
+    if (findChunk) {
+      for (let node = findChunk.start.nextSibling; node && node !== findChunk.end; node = node.nextSibling) {
+        if (node.nodeType === Node.ELEMENT_NODE) nodes.push(node);
+      }
+    }
+    return nodes;
+  }
+  function restoreFindChunk() {
+    if (!findChunk) return;
+    // Boundaries follow replacements/folds made by streaming; never resurrect
+    // a removed block or pull a card back out of a newly completed turn.
+    for (const node of findChunkNodes()) findChunk.fragment.appendChild(node);
+    findChunk.start.remove(); findChunk.end.remove();
+    findChunk = null;
+  }
+  function findScopes() {
+    const scopes = [];
+    const attached = findChunkNodes();
+    for (const fragment of earlier) {
+      if (findChunk && findChunk.fragment === fragment) scopes.push(...attached);
+      else scopes.push(...fragment.children);
+    }
+    for (const node of messagesEl.children) {
+      if (node !== earlierEl && !attached.includes(node)) scopes.push(node);
+    }
+    return scopes;
+  }
+  function rememberFindScroll(node) {
+    if (!findScrolls.has(node)) findScrolls.set(node, [node.scrollTop, node.scrollLeft]);
+  }
+  function openFindDetails(node) {
+    for (let p = node; p && p !== messagesEl; p = p.parentElement) {
+      if (p.tagName === 'DETAILS' && !p.open) {
+        findOpenedDetails.add(p);
+        p.open = true;
+      }
+    }
+  }
   function restoreFindOutputs() {
     for (const [node, text] of findOutputs) node.textContent = text;
     findOutputs.clear();
   }
   function paintFind() {
     findOverlay.replaceChildren();
+    // Moving a history block collapses its DOM ranges. Its text-node handles
+    // survive, so restore all visible hits, not just the selected occurrence.
+    for (const match of findMatches) {
+      if (!match.node.isConnected) continue;
+      match.range.setStart(match.node, match.offset);
+      match.range.setEnd(match.endNode, match.endOffset);
+    }
     if (hasFindHighlights()) {
       const all = new Highlight();
-      for (const match of findMatches) all.add(match.range);
+      for (const match of findMatches) if (match.node.isConnected) all.add(match.range);
       CSS.highlights.set('chat-find', all);
       const current = new Highlight();
       current.priority = 1;
@@ -1072,7 +1126,8 @@
     findOverlay.replaceChildren();
     if (findBar.hidden) return;
     const origin = findOverlay.getBoundingClientRect();
-    findMatches.forEach(({ range }, index) => {
+    findMatches.forEach(({ root, range }, index) => {
+      if (!root.isConnected || !root.contains(range.startContainer)) return;
       const node = range.startContainer.parentElement;
       if (node.closest('details:not([open])')) return;
       const bounds = messagesEl.getBoundingClientRect();
@@ -1108,14 +1163,13 @@
     if (findIndex < 0) return;
     const { range } = findMatches[findIndex];
     const node = range.startContainer.parentElement;
-    for (let p = node; p && p !== messagesEl; p = p.parentElement) {
-      if (p.tagName === 'DETAILS') p.open = true;
-    }
+    openFindDetails(node);
     follow = false;
     jumpBtn.classList.add('visible');
     // Scroll the matching line, including within a long tool result/code
     // block, rather than the top of its potentially very tall element.
     for (let p = node; p; p = p.parentElement) {
+      rememberFindScroll(p);
       const style = getComputedStyle(p);
       const hit = range.getBoundingClientRect(), box = p.getBoundingClientRect();
       if (p === messagesEl || ['auto', 'scroll'].includes(style.overflowY)) {
@@ -1128,16 +1182,88 @@
     }
     scheduleFindOverlay();
   }
+  function findRootMatches(root, pattern) {
+    const parts = [];
+    let text = '';
+    function collect(node) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        parts.push({ node, start: text.length }); text += node.data; return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE || node.matches('button, .lang, .label, .user-note, .user-images')) return;
+      const raw = unrenderedMd.get(node);
+      if (raw != null && !findMarkdown.has(node)) {
+        let source = findDeferred.get(node);
+        if (!source || source.raw !== raw) {
+          const rendered = el('div');
+          rendered.innerHTML = renderMarkdown(raw);
+          source = { raw, rendered };
+          findDeferred.set(node, source);
+        }
+        collect(source.rendered);
+        return;
+      }
+      const block = /^(P|DIV|PRE|LI|H[1-6]|TR|BLOCKQUOTE|BR)$/.test(node.tagName);
+      if (block && text && !text.endsWith('\n')) text += '\n';
+      for (const child of node.childNodes) collect(child);
+      if (block && text && !text.endsWith('\n')) text += '\n';
+    }
+    for (const child of root.childNodes) collect(child);
+    const matches = [];
+    pattern.lastIndex = 0;
+    let partIndex = 0;
+    for (const match of text.matchAll(pattern)) {
+      const start = match.index, end = start + match[0].length;
+      while (partIndex < parts.length && parts[partIndex].start + parts[partIndex].node.length <= start) partIndex++;
+      const first = parts[partIndex];
+      let lastIndex = partIndex;
+      while (lastIndex < parts.length && parts[lastIndex].start + parts[lastIndex].node.length < end) lastIndex++;
+      const last = parts[lastIndex];
+      if (!first || !last) continue;
+      const range = document.createRange();
+      range.setStart(first.node, start - first.start);
+      range.setEnd(last.node, end - last.start);
+      matches.push({ root, start, range, context: text.slice(end, end + 32), node: first.node, offset: start - first.start, endNode: last.node, endOffset: end - last.start });
+    }
+    return matches;
+  }
+  function findPattern() {
+    // Literal, case-insensitive text with UTF-16 offsets for DOM ranges.
+    return new RegExp(findQuery.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'giu');
+  }
+  function prepareFindMatch() {
+    if (findIndex < 0) { restoreFindChunk(); return; }
+    const match = findMatches[findIndex];
+    if (findChunk && !findChunkNodes().some((node) => node.contains(match.root))) restoreFindChunk();
+    if (!match.root.isConnected) {
+      const fragment = earlier.find((chunk) => chunk.contains(match.root));
+      if (fragment) {
+        findChunk = { fragment, start: document.createComment('find history'), end: document.createComment('/find history') };
+        const before = firstBlock();
+        messagesEl.insertBefore(findChunk.start, before);
+        messagesEl.insertBefore(fragment, before);
+        messagesEl.insertBefore(findChunk.end, before);
+      }
+    }
+    // Only the selected block needs real markdown. Keep the deferred source
+    // and original DOM so closing find restores the same paging state.
+    for (const md of match.root.querySelectorAll('div')) {
+      if (!unrenderedMd.has(md) || findMarkdown.has(md)) continue;
+      findMarkdown.set(md, Array.from(md.childNodes));
+      md.innerHTML = renderMarkdown(unrenderedMd.get(md));
+    }
+    const replacements = findRootMatches(match.root, findPattern());
+    for (let i = 0, j = 0; i < findMatches.length; i++) {
+      if (findMatches[i].root === match.root) findMatches[i] = replacements[j++];
+    }
+    openFindDetails(findMatches[findIndex].range.startContainer.parentElement);
+  }
   function refreshFind(reveal = false, reset = false) {
     if (findBar.hidden) return;
     const previous = !reset && findMatches[findIndex];
-    const oldIndex = findIndex;
     findMatches = [];
     const query = findQuery.value;
     if (!findTools.checked || !query) restoreFindOutputs();
     if (query) {
-      showEarlier(earlier.length);
-      renderPendingMarkdown(messagesEl);
       if (findTools.checked) {
         for (const item of items.values()) {
           if (!item.outputEl || !item.done || item.done.output.length <= MAX_TOOL_OUTPUT) continue;
@@ -1145,71 +1271,78 @@
           if (item.outputEl.textContent !== item.done.output) item.outputEl.textContent = item.done.output;
         }
       }
-      // Escape every metacharacter: the UI accepts literal text only. The
-      // case-insensitive matcher preserves UTF-16 offsets for DOM ranges.
-      const pattern = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'giu');
-      let selector = '.user-msg, .delivery-body, .assistant, details.thinking > .body, .sa-text, .dlg-summary, .dlg-ftitle, .dlg-fbody, .dlg-body > ul > li';
-      if (findTools.checked) selector += ', .tool-body > pre, .ed-text';
-      for (const root of messagesEl.querySelectorAll(selector)) {
-        if (root.hidden) continue; // Edit cards show a diff instead of JSON.
-        const parts = [];
-        let text = '';
-        function collect(node) {
-          if (node.nodeType === Node.TEXT_NODE) {
-            parts.push({ node, start: text.length }); text += node.data; return;
-          }
-          if (node.nodeType !== Node.ELEMENT_NODE || node.matches('button, .lang, .user-note, .user-images')) return;
-          const block = /^(P|DIV|PRE|LI|H[1-6]|TR|BLOCKQUOTE|BR)$/.test(node.tagName);
-          if (block && text && !text.endsWith('\n')) text += '\n';
-          for (const child of node.childNodes) collect(child);
-          if (block && text && !text.endsWith('\n')) text += '\n';
-        }
-        for (const child of root.childNodes) collect(child);
-        pattern.lastIndex = 0;
-        let partIndex = 0;
-        for (const match of text.matchAll(pattern)) {
-          const start = match.index, end = start + match[0].length;
-          while (partIndex < parts.length && parts[partIndex].start + parts[partIndex].node.length <= start) partIndex++;
-          const first = parts[partIndex];
-          let lastIndex = partIndex;
-          while (lastIndex < parts.length && parts[lastIndex].start + parts[lastIndex].node.length < end) lastIndex++;
-          const last = parts[lastIndex];
-          if (!first || !last) continue;
-          const range = document.createRange();
-          range.setStart(first.node, start - first.start);
-          range.setEnd(last.node, end - last.start);
-          findMatches.push({ root, start, range });
+      const pattern = findPattern();
+      let selector = '.user-msg, .delivery-body, .assistant, details.thinking > .body, .block.thinking, .sa-text, .dlg-summary, .dlg-body > ul > li';
+      if (findTools.checked) selector += ', .tool-body > pre, .ed-text, .block.tool, .block.tool_result';
+      for (const scope of findScopes()) {
+        const roots = scope.matches(selector) ? [scope] : Array.from(scope.querySelectorAll(selector));
+        for (const root of roots) {
+          if (root.hidden || roots.some((other) => other !== root && other.contains(root))) continue;
+          findMatches.push(...findRootMatches(root, pattern));
         }
       }
     }
-    findIndex = previous ? findMatches.findIndex((m) => m.root === previous.root && m.start === previous.start) : -1;
-    if (findIndex < 0 && findMatches.length) findIndex = reset ? 0 : Math.max(0, Math.min(oldIndex, findMatches.length - 1));
-    if (findIndex >= 0) {
-      for (let p = findMatches[findIndex].range.startContainer.parentElement; p && p !== messagesEl; p = p.parentElement) {
-        if (p.tagName === 'DETAILS') p.open = true;
+    findIndex = -1;
+    if (previous) {
+      const candidates = findMatches.filter((m) => m.root === previous.root);
+      let anchored = candidates.filter((m) => m.node === previous.node && m.offset === previous.offset);
+      if (!anchored.length) {
+        let bestScore = 0;
+        for (const m of candidates) {
+          // Following text identifies an occurrence when markdown replaces its
+          // text nodes and removes syntax/URLs before the selected word.
+          let score = 0;
+          while (score < m.context.length && score < previous.context.length && m.context[score] === previous.context[score]) score++;
+          if (score > bestScore) { anchored = []; bestScore = score; }
+          if (score === bestScore) anchored.push(m);
+        }
       }
+      // Repeated context falls back to position within this block, never to
+      // the transcript-wide ordinal (which changes as markdown is rendered).
+      const best = anchored.find((m) => m.start >= previous.start) || anchored.at(-1);
+      if (best) findIndex = findMatches.indexOf(best);
     }
+    if (findIndex < 0 && findMatches.length) findIndex = 0;
+    prepareFindMatch();
     paintFind();
     if (reveal) revealFind();
   }
   function stepFind(delta) {
-    refreshFind();
     if (!findMatches.length) return;
     findIndex = (findIndex + delta + findMatches.length) % findMatches.length;
+    prepareFindMatch();
     paintFind(); revealFind();
   }
   window.__openFind = function () {
+    if (findBar.hidden) {
+      findWasFollowing = follow;
+      rememberFindScroll(messagesEl);
+      earlierEl.disabled = true;
+    }
     findBar.hidden = false;
     follow = false;
     refreshFind(true);
     findQuery.focus(); findQuery.select();
   };
   function closeFind() {
+    if (findBar.hidden) return;
     findBar.hidden = true;
     CSS.highlights?.delete('chat-find'); CSS.highlights?.delete('chat-find-current');
     findOverlay.replaceChildren();
     findMatches = []; findIndex = -1;
     restoreFindOutputs();
+    for (const details of findOpenedDetails) details.open = false;
+    findOpenedDetails.clear();
+    restoreFindChunk();
+    for (const [md, children] of findMarkdown) md.replaceChildren(...children);
+    findMarkdown.clear(); findDeferred.clear();
+    earlierEl.disabled = false;
+    retallyEarlier();
+    for (const [node, [top, left]] of findScrolls) { node.scrollTop = top; node.scrollLeft = left; }
+    findScrolls.clear();
+    follow = findWasFollowing;
+    jumpBtn.classList.toggle('visible', !follow);
+    scrollIfFollowing();
     promptEl.focus();
   }
   findQuery.addEventListener('input', () => refreshFind(true, true));
@@ -1296,7 +1429,7 @@
     segments.push(seg);
     let folded = false;
     for (const s of segments) folded = foldSegment(s) || folded;
-    if (!folded || !earlier.length) return;
+    if (!folded || !earlier.length || !findBar.hidden) return;
     retallyEarlier();
     // The fold freed room in the document: bring back the chunks that fit.
     let n = 0, room = WINDOW_KEEP - liveBlocks();
