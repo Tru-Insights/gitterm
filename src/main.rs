@@ -15347,9 +15347,13 @@ impl App {
         let Some(store) = self.task_store.as_ref() else {
             return Task::none();
         };
-        let scans =
-            self.worker_pr_scans
-                .take_due(store.delegations(), store.tasks(), chrono::Utc::now());
+        let uid_to_chat = self.chat_uid_to_chat();
+        let scans = self.worker_pr_scans.take_due(
+            store.delegations(),
+            store.tasks(),
+            &uid_to_chat,
+            chrono::Utc::now(),
+        );
         if scans.is_empty() {
             return Task::none();
         }

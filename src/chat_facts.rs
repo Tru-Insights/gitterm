@@ -4717,7 +4717,7 @@ branch refs/heads/tracey/tru-12-thing
         )
         .unwrap();
         let mut known = ChatFacts::default();
-        known.prs = merge_plan::pr_urls_in("https://github.com/example/app/pull/42");
+        known.prs = merge_plan::pr_urls_in("https://github.com/acme/api/pull/42");
         let (caught, added) = catch_up_from_transcript(
             Some(known.clone()),
             &temp.path().join("facts.json"),

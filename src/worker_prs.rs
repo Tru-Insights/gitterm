@@ -36,6 +36,7 @@ impl Scans {
         &mut self,
         delegations: &[Delegation],
         tasks: &[TaskRecord],
+        uid_to_chat: &HashMap<String, String>,
         now: DateTime<Utc>,
     ) -> Vec<Scan> {
         if self.running {
@@ -55,7 +56,6 @@ impl Scans {
             if !matches!(
                 delegation.status,
                 DelegationStatus::Completed
-                    | DelegationStatus::Blocked
                     | DelegationStatus::Cancelled
                     | DelegationStatus::Failed { .. }
             ) || self.attempted.contains(&delegation.delegation_id)
@@ -90,7 +90,11 @@ impl Scans {
                 .or_else(|| conversation.clone());
             scans.push(Scan {
                 delegation_id: delegation.delegation_id.clone(),
-                parent: delegation.parent.chat_session_id.clone(),
+                parent: delegation
+                    .parent
+                    .chat_session_id
+                    .clone()
+                    .or_else(|| uid_to_chat.get(&delegation.parent.session_uid).cloned()),
                 conversation: recorded,
             });
             self.attempted.insert(delegation.delegation_id.clone());
@@ -253,7 +257,9 @@ fn scan_transcript(
                         if let (Some(command), Some(output)) =
                             (calls.remove(id), payload["output"].as_str())
                         {
-                            record_prs(&command, output);
+                            if codex_output_succeeded(output) {
+                                record_prs(&command, output);
+                            }
                         }
                     }
                     _ => {}
@@ -277,10 +283,12 @@ fn scan_transcript(
                                 .as_str()
                                 .and_then(|id| calls.remove(id))
                             {
-                                record_prs(
-                                    &command,
-                                    &chat_facts::tool_result_text(&block["content"]),
-                                );
+                                if block["is_error"].as_bool() != Some(true) {
+                                    record_prs(
+                                        &command,
+                                        &chat_facts::tool_result_text(&block["content"]),
+                                    );
+                                }
                             }
                         }
                         _ => {}
@@ -297,6 +305,30 @@ fn scan_transcript(
         );
     }
     Ok(prs)
+}
+
+/// Shell outputs use JSON metadata in older Codex versions and status headers
+/// in newer ones. Plain legacy outputs have no reported exit code.
+fn codex_output_succeeded(output: &str) -> bool {
+    if let Ok(value) = serde_json::from_str::<Value>(output) {
+        if let Some(code) = value
+            .get("exit_code")
+            .or_else(|| value["metadata"].get("exit_code"))
+        {
+            return code.as_i64() == Some(0);
+        }
+    }
+    output
+        .lines()
+        .take_while(|line| !matches!(*line, "Output:" | "Final output:"))
+        .all(|line| {
+            if line.starts_with("Process running with session ID ") {
+                return false;
+            }
+            line.strip_prefix("Process exited with code ")
+                .or_else(|| line.strip_prefix("Exit code: "))
+                .is_none_or(|code| code.trim().parse::<i64>() == Ok(0))
+        })
 }
 
 #[cfg(test)]
@@ -504,6 +536,164 @@ GH_TOKEN="$(gh auth token --user example-user)" gh pr create --draft --base deve
     }
 
     #[test]
+    fn worker_creates_require_an_executable_command_in_both_adapters() {
+        let temp = tempfile::tempdir().unwrap();
+        for backend in [
+            HarnessConversationBackend::Codex,
+            HarnessConversationBackend::Claude,
+        ] {
+            let mut lines = Vec::new();
+            for (i, command) in [
+                "echo gh pr create https://github.com/example/docs/pull/20",
+                "printf '%s' 'gh pr create'",
+                "'gh pr create'",
+                "cat <<'EOF'\ngh pr create\nEOF",
+                "# gh pr create\necho output",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let id = format!("mention-{i}");
+                match backend {
+                    HarnessConversationBackend::Codex => {
+                        lines.extend([call(&id, command), output(&id, "https://github.com/example/docs/pull/20")]);
+                        let mut event = command_execution(json!(0));
+                        event["payload"]["item"]["command"] = json!(["/bin/zsh", "-lc", command]);
+                        lines.push(event);
+                    }
+                    HarnessConversationBackend::Claude => lines.extend([
+                        json!({"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","id":id,"input":{"command":command}}]}}),
+                        json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":id,"content":"https://github.com/example/docs/pull/20"}]}}),
+                    ]),
+                    HarnessConversationBackend::Pi => unreachable!(),
+                }
+            }
+            let path = transcript(temp.path(), backend, &lines);
+            assert!(
+                scan_transcript(&path, backend).unwrap().is_empty(),
+                "{backend:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_function_outputs_require_success_when_an_exit_code_is_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let url = "https://github.com/example/docs/pull/20";
+        for text in [
+            format!("Process exited with code 1\nFinal output:\n{url}"),
+            format!("Exit code: 2\nOutput:\n{url}"),
+            format!("Process running with session ID 123\nOutput:\n{url}"),
+            json!({"exit_code":1,"output":url}).to_string(),
+            json!({"metadata":{"exit_code":1},"output":url}).to_string(),
+            json!({"metadata":{"exit_code":null},"output":url}).to_string(),
+        ] {
+            let path = transcript(
+                temp.path(),
+                HarnessConversationBackend::Codex,
+                &[call("create", "gh pr create"), output("create", &text)],
+            );
+            assert!(
+                scan_transcript(&path, HarnessConversationBackend::Codex)
+                    .unwrap()
+                    .is_empty(),
+                "{text}"
+            );
+        }
+        for text in [
+            format!("Process exited with code 0\nFinal output:\n{url}"),
+            format!("Exit code: 0\nOutput:\n{url}\nExit code: 1"),
+            json!({"exit_code":0,"output":url}).to_string(),
+            json!({"metadata":{"exit_code":0},"output":url}).to_string(),
+        ] {
+            let path = transcript(
+                temp.path(),
+                HarnessConversationBackend::Codex,
+                &[call("create", "gh pr create"), output("create", &text)],
+            );
+            assert_eq!(
+                scan_transcript(&path, HarnessConversationBackend::Codex)
+                    .unwrap()
+                    .len(),
+                1,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_error_results_do_not_record_prs() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = transcript(
+            temp.path(),
+            HarnessConversationBackend::Claude,
+            &[
+                json!({"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","id":"create","input":{"command":"gh pr create"}}]}}),
+                json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"create","is_error":true,"content":"https://github.com/example/docs/pull/20"}]}}),
+            ],
+        );
+        assert!(scan_transcript(&path, HarnessConversationBackend::Claude)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn blocked_worker_remains_eligible_after_completing_in_the_same_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        let facts = parent(&config);
+        let mut worker = worker(HarnessConversationBackend::Codex);
+        worker.status = DelegationStatus::Blocked;
+        transcript(
+            temp.path(),
+            HarnessConversationBackend::Codex,
+            &[
+                call("create", "gh pr create"),
+                output("create", "https://github.com/example/docs/pull/20"),
+            ],
+        );
+        let mut scans = Scans::default();
+        let due = scans.take_due(std::slice::from_ref(&worker), &[], &HashMap::new(), now());
+        run(due, &config, temp.path());
+        assert!(!scans.attempted.contains(&worker.delegation_id));
+        assert!(!config
+            .join("worker-pr-scans")
+            .join(&worker.delegation_id)
+            .exists());
+        scans.running = false;
+        worker.status = DelegationStatus::Completed;
+        let due = scans.take_due(&[worker], &[], &HashMap::new(), now());
+        assert_eq!(run(due, &config, temp.path())[0].1.len(), 1);
+        assert_eq!(load_facts(&facts).unwrap().unwrap().prs.len(), 2);
+    }
+
+    #[test]
+    fn worker_parent_falls_back_to_tab_identity_and_explicit_chat_wins() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        let facts = parent(&config);
+        transcript(
+            temp.path(),
+            HarnessConversationBackend::Codex,
+            &[
+                call("create", "gh pr create"),
+                output("create", "https://github.com/example/docs/pull/20"),
+            ],
+        );
+        let mut worker = worker(HarnessConversationBackend::Codex);
+        let uid_to_chat = HashMap::from([("tab-parent".into(), "parent-chat".into())]);
+        worker.parent.chat_session_id = None;
+        let due =
+            Scans::default().take_due(std::slice::from_ref(&worker), &[], &uid_to_chat, now());
+        assert_eq!(due[0].parent.as_deref(), Some("parent-chat"));
+        assert_eq!(run(due, &config, temp.path())[0].1.len(), 1);
+        assert_eq!(load_facts(&facts).unwrap().unwrap().prs.len(), 2);
+        worker.parent.chat_session_id = Some("explicit-chat".into());
+        let due = Scans::default().take_due(&[worker], &[], &uid_to_chat, now());
+        assert_eq!(due[0].parent.as_deref(), Some("explicit-chat"));
+    }
+
+    #[test]
     fn malformed_json_lines_and_partial_tail_do_not_discard_valid_prs() {
         let temp = tempfile::tempdir().unwrap();
         for (backend, lines) in [
@@ -553,7 +743,12 @@ GH_TOKEN="$(gh auth token --user example-user)" gh pr create --draft --base deve
         }
         let tasks = [task("worker-chat")];
         let mut scans = Scans::default();
-        let due = scans.take_due(std::slice::from_ref(&worker), &tasks, now());
+        let due = scans.take_due(
+            std::slice::from_ref(&worker),
+            &tasks,
+            &HashMap::new(),
+            now(),
+        );
         let result = run(due, &config, temp.path());
         assert_eq!(result[0].0, "parent-chat");
         assert_eq!(result[0].1.len(), 1);
@@ -571,14 +766,19 @@ GH_TOKEN="$(gh auth token --user example-user)" gh pr create --draft --base deve
             .is_file());
         scans.running = false;
         assert!(scans
-            .take_due(std::slice::from_ref(&worker), &tasks, now())
+            .take_due(
+                std::slice::from_ref(&worker),
+                &tasks,
+                &HashMap::new(),
+                now()
+            )
             .is_empty());
         // Even across launches, no transcript read (invalid UTF-8 would fail)
         // and no write of the marker or facts occurs on a second pass.
         std::fs::write(&source, b"\xff").unwrap();
         let marker = config.join("worker-pr-scans").join(&worker.delegation_id);
         let marked_at = std::fs::metadata(&marker).unwrap().modified().unwrap();
-        let due = Scans::default().take_due(&[worker], &tasks, now());
+        let due = Scans::default().take_due(&[worker], &tasks, &HashMap::new(), now());
         assert_eq!(due.len(), 1);
         // Unlike `run`, this propagates a read error, so the assertion fails
         // if the invalid transcript is ever read again.
@@ -613,7 +813,7 @@ GH_TOKEN="$(gh auth token --user example-user)" gh pr create --draft --base deve
             .unwrap()
             .is_empty());
         let worker = worker(HarnessConversationBackend::Codex);
-        let due = Scans::default().take_due(&[worker], &[], now());
+        let due = Scans::default().take_due(&[worker], &[], &HashMap::new(), now());
         let result = run(due, &config, temp.path());
         assert!(result[0].1.is_empty());
         assert_eq!(std::fs::read(facts_path).unwrap(), before);
@@ -633,7 +833,7 @@ GH_TOKEN="$(gh auth token --user example-user)" gh pr create --draft --base deve
             ],
         );
         let worker = worker(HarnessConversationBackend::Claude);
-        let due = Scans::default().take_due(&[worker], &[], now());
+        let due = Scans::default().take_due(&[worker], &[], &HashMap::new(), now());
         assert_eq!(run(due, &config, temp.path())[0].1.len(), 1);
         assert_eq!(load_facts(&path).unwrap().unwrap().prs.len(), 2);
     }
@@ -643,7 +843,6 @@ GH_TOKEN="$(gh auth token --user example-user)" gh pr create --draft --base deve
         let mut worker = worker(HarnessConversationBackend::Codex);
         for status in [
             DelegationStatus::Completed,
-            DelegationStatus::Blocked,
             DelegationStatus::Cancelled,
             DelegationStatus::Failed {
                 message: "exited".into(),
@@ -652,24 +851,25 @@ GH_TOKEN="$(gh auth token --user example-user)" gh pr create --draft --base deve
             worker.status = status;
             assert_eq!(
                 Scans::default()
-                    .take_due(std::slice::from_ref(&worker), &[], now())
+                    .take_due(std::slice::from_ref(&worker), &[], &HashMap::new(), now())
                     .len(),
                 1
             );
         }
         worker.updated_at = "2026-10-24T10:00:00Z".into();
         assert!(Scans::default()
-            .take_due(std::slice::from_ref(&worker), &[], now())
+            .take_due(std::slice::from_ref(&worker), &[], &HashMap::new(), now())
             .is_empty());
         worker.updated_at = "2026-11-08T10:00:00Z".into();
         for status in [
             DelegationStatus::Running,
             DelegationStatus::Requested,
             DelegationStatus::Interrupted,
+            DelegationStatus::Blocked,
         ] {
             worker.status = status;
             assert!(Scans::default()
-                .take_due(std::slice::from_ref(&worker), &[], now())
+                .take_due(std::slice::from_ref(&worker), &[], &HashMap::new(), now())
                 .is_empty());
         }
     }
@@ -699,7 +899,7 @@ GH_TOKEN="$(gh auth token --user example-user)" gh pr create --draft --base deve
             .unwrap();
         let worker = worker(HarnessConversationBackend::Codex);
         let mut scans = Scans::default();
-        let due = scans.take_due(std::slice::from_ref(&worker), &[], now());
+        let due = scans.take_due(std::slice::from_ref(&worker), &[], &HashMap::new(), now());
         assert!(run(due, &config, temp.path()).is_empty());
         assert_eq!(std::fs::read(path).unwrap(), before);
         assert!(!config
@@ -708,9 +908,14 @@ GH_TOKEN="$(gh auth token --user example-user)" gh pr create --draft --base deve
             .exists());
         scans.running = false;
         assert!(scans
-            .take_due(std::slice::from_ref(&worker), &[], now())
+            .take_due(std::slice::from_ref(&worker), &[], &HashMap::new(), now())
             .is_empty());
-        assert_eq!(Scans::default().take_due(&[worker], &[], now()).len(), 1);
+        assert_eq!(
+            Scans::default()
+                .take_due(&[worker], &[], &HashMap::new(), now())
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -718,14 +923,15 @@ GH_TOKEN="$(gh auth token --user example-user)" gh pr create --draft --base deve
         let temp = tempfile::tempdir().unwrap();
         let config = temp.path().join("config");
         let worker = worker(HarnessConversationBackend::Codex);
-        let due = Scans::default().take_due(std::slice::from_ref(&worker), &[], now());
+        let due =
+            Scans::default().take_due(std::slice::from_ref(&worker), &[], &HashMap::new(), now());
         assert!(run(due, &config, temp.path()).is_empty());
         assert!(config
             .join("worker-pr-scans")
             .join(&worker.delegation_id)
             .exists());
         assert!(!facts_dir(&config).exists());
-        let due = Scans::default().take_due(&[worker], &[], now());
+        let due = Scans::default().take_due(&[worker], &[], &HashMap::new(), now());
         assert!(run(due, &config, temp.path()).is_empty());
     }
 }
