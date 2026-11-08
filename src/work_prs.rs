@@ -190,11 +190,12 @@ pub type TaskBranchResult = (TaskBranch, Result<Vec<PrRef>, String>);
 fn task_branches(
     store: &TaskStore,
     now: chrono::DateTime<chrono::Utc>,
+    uid_to_chat: &HashMap<String, String>,
 ) -> Vec<(String, TaskBranch)> {
     store
         .delegations()
         .iter()
-        .filter_map(|delegation| task_branch(store, delegation, now))
+        .filter_map(|delegation| task_branch(store, delegation, now, uid_to_chat))
         .collect()
 }
 
@@ -202,6 +203,7 @@ fn task_branch(
     store: &TaskStore,
     delegation: &gitterm::tasks::Delegation,
     now: chrono::DateTime<chrono::Utc>,
+    uid_to_chat: &HashMap<String, String>,
 ) -> Option<(String, TaskBranch)> {
     let created = chrono::DateTime::parse_from_rfc3339(&delegation.created_at).ok()?;
     if created < now - TASK_PR_MAX_AGE || created > now {
@@ -210,7 +212,11 @@ fn task_branch(
     let gitterm::tasks::DelegationChild::TaskSession { task_id, .. } = &delegation.child else {
         return None;
     };
-    let parent = delegation.parent.chat_session_id.as_ref()?;
+    let parent = delegation
+        .parent
+        .chat_session_id
+        .as_ref()
+        .or_else(|| uid_to_chat.get(&delegation.parent.session_uid))?;
     let task = store.get(task_id)?;
     let slug = gitterm::gh_identity::parse_repository_slug(task.repository.remote_url.as_deref()?)?;
     // PR identities and the watch currently support github.com only.
@@ -491,12 +497,13 @@ impl PrsState {
         store: &TaskStore,
         delegation_id: &str,
         now: chrono::DateTime<chrono::Utc>,
+        uid_to_chat: &HashMap<String, String>,
     ) {
         let Some(delegation) = store.delegation(delegation_id) else {
             return;
         };
         if delegation.status.is_sendable() {
-            if let Some((_, branch)) = task_branch(store, delegation, now) {
+            if let Some((_, branch)) = task_branch(store, delegation, now, uid_to_chat) {
                 self.task_branches_pending.insert(branch);
             }
         }
@@ -701,7 +708,7 @@ impl App {
         let branches = self
             .task_store
             .as_ref()
-            .map(|store| task_branches(store, chrono::Utc::now()))
+            .map(|store| task_branches(store, chrono::Utc::now(), &self.chat_uid_to_chat()))
             .unwrap_or_default();
         collect_root_prs(&self.chat_index, root, &self.prs, &branches, |chat| {
             self.root_chat_of(chat)
@@ -950,8 +957,12 @@ impl App {
 
     pub(super) fn request_finished_task_prs(&mut self, delegation_id: &str) {
         if let Some(store) = &self.task_store {
-            self.prs
-                .request_finished_task_branch(store, delegation_id, chrono::Utc::now());
+            self.prs.request_finished_task_branch(
+                store,
+                delegation_id,
+                chrono::Utc::now(),
+                &self.chat_uid_to_chat(),
+            );
         }
     }
 
@@ -962,7 +973,7 @@ impl App {
         let branches = self
             .task_store
             .as_ref()
-            .map(|store| task_branches(store, chrono::Utc::now()))
+            .map(|store| task_branches(store, chrono::Utc::now(), &self.chat_uid_to_chat()))
             .unwrap_or_default();
         let branches = self.prs.take_task_branches_due(branches);
         if branches.is_empty() {
@@ -2794,7 +2805,7 @@ mod tests {
                         kind: DelegationKind::Implement,
                         parent: DelegationParent {
                             session_uid: parent.into(),
-                            chat_session_id: Some(parent.into()),
+                            chat_session_id: None,
                             workspace: "workspace".into(),
                             cwd: dir.path().to_path_buf(),
                         },
@@ -2818,6 +2829,13 @@ mod tests {
         (dir, store, now)
     }
 
+    fn fixture_parent_chats() -> HashMap<String, String> {
+        HashMap::from([
+            ("chat-a".into(), "chat-a".into()),
+            ("chat-b".into(), "chat-b".into()),
+        ])
+    }
+
     fn task_root(chat: &str) -> String {
         match chat {
             "chat-a" | "claude-worker" => "root-a".into(),
@@ -2829,7 +2847,7 @@ mod tests {
     #[tokio::test]
     async fn task_branch_prs_belong_to_the_delegating_chats_root() {
         let (_dir, store, now) = delegated_task_fixture();
-        let branches = task_branches(&store, now);
+        let branches = task_branches(&store, now, &fixture_parent_chats());
         assert_eq!(branches.len(), 3);
         assert!(!branches
             .iter()
@@ -2863,10 +2881,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn task_branch_parent_resolves_from_tab_uid_and_skips_unknown_uid() {
+        let (_dir, store, now) = delegated_task_fixture();
+        let uid_to_chat = HashMap::from([("chat-a".into(), "chat-a".into())]);
+        let branches = task_branches(&store, now, &uid_to_chat);
+        assert!(branches.iter().any(|(_, branch)| branch.branch == "task/X"));
+        assert!(!branches.iter().any(|(_, branch)| branch.branch == "task/Y"));
+
+        let results = lookup_task_branches(
+            branches.iter().map(|(_, branch)| branch.clone()).collect(),
+            BTreeMap::new(),
+            |branch, _| async move {
+                Ok(if branch.branch == "task/X" {
+                    vec![task_pr(7)]
+                } else {
+                    vec![]
+                })
+            },
+        )
+        .await;
+        let mut prs = PrsState::default();
+        prs.apply_task_branches(results, |_| {});
+        assert_eq!(
+            collect_root_prs(&[], "root-a", &prs, &branches, task_root),
+            vec![task_pr(7)]
+        );
+    }
+
     #[test]
     fn task_branch_prs_deduplicate_claude_facts_and_live_prs() {
         let (_dir, store, now) = delegated_task_fixture();
-        let branches = task_branches(&store, now);
+        let branches = task_branches(&store, now, &fixture_parent_chats());
         let branch = branches
             .iter()
             .find(|(_, branch)| branch.branch == "task/X")
@@ -2906,7 +2952,7 @@ mod tests {
     #[tokio::test]
     async fn task_branch_lookup_error_logs_context_and_preserves_known_prs() {
         let (_dir, store, now) = delegated_task_fixture();
-        let branches = task_branches(&store, now);
+        let branches = task_branches(&store, now, &fixture_parent_chats());
         let branch = branches[0].1.clone();
         let mut prs = PrsState::default();
         prs.apply_task_branches(vec![(branch.clone(), Ok(vec![task_pr(7)]))], |_| {});
@@ -2930,7 +2976,7 @@ mod tests {
     #[test]
     fn discovered_task_branches_are_never_due_again_in_this_run() {
         let (_dir, store, now) = delegated_task_fixture();
-        let branches = task_branches(&store, now);
+        let branches = task_branches(&store, now, &fixture_parent_chats());
         let mut prs = PrsState::default();
         let first = prs.take_task_branches_due(branches.clone());
         let found = first[0].clone();
@@ -2944,7 +2990,7 @@ mod tests {
     #[tokio::test]
     async fn empty_task_branch_answers_retry_on_refresh_but_not_periodic_polls() {
         let (_dir, store, now) = delegated_task_fixture();
-        let branches = task_branches(&store, now);
+        let branches = task_branches(&store, now, &fixture_parent_chats());
         let mut prs = PrsState::default();
         let first = prs.take_task_branches_due(branches.clone());
         let results =
@@ -2968,11 +3014,11 @@ mod tests {
             },
         ] {
             let (_dir, mut store, now) = delegated_task_fixture();
-            let branches = task_branches(&store, now);
+            let branches = task_branches(&store, now, &fixture_parent_chats());
             let mut prs = PrsState::default();
             prs.take_task_branches_due(branches.clone());
             let delegation_id = store.delegations()[0].delegation_id.clone();
-            prs.request_finished_task_branch(&store, &delegation_id, now);
+            prs.request_finished_task_branch(&store, &delegation_id, now, &fixture_parent_chats());
             assert!(!prs.task_branches_due());
             let result = DelegationResult {
                 handoff: Some(TaskHandoff {
@@ -2996,7 +3042,7 @@ mod tests {
             .unwrap();
             // A completion that arrives while startup/Refresh is still running must wait.
             prs.task_branches_in_flight = true;
-            prs.request_finished_task_branch(&store, &delegation_id, now);
+            prs.request_finished_task_branch(&store, &delegation_id, now, &fixture_parent_chats());
             assert!(prs.take_task_branches_due(branches.clone()).is_empty());
             prs.apply_task_branches(vec![], |_| {});
             let due = prs.take_task_branches_due(branches.clone());
@@ -3004,7 +3050,7 @@ mod tests {
             assert!(prs.take_task_branches_due(branches.clone()).is_empty());
             // Once discovered, even a new completion request cannot re-read it.
             prs.apply_task_branches(vec![(due[0].clone(), Ok(vec![task_pr(7)]))], |_| {});
-            prs.request_finished_task_branch(&store, &delegation_id, now);
+            prs.request_finished_task_branch(&store, &delegation_id, now, &fixture_parent_chats());
             assert!(prs.take_task_branches_due(branches).is_empty());
         }
     }
@@ -3012,7 +3058,7 @@ mod tests {
     #[test]
     fn task_branch_refresh_requested_during_a_lookup_is_not_lost() {
         let (_dir, store, now) = delegated_task_fixture();
-        let branches = task_branches(&store, now);
+        let branches = task_branches(&store, now, &fixture_parent_chats());
         let mut prs = PrsState::default();
         let first = prs.take_task_branches_due(branches.clone());
         prs.task_branches_in_flight = true;

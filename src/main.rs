@@ -15280,23 +15280,30 @@ impl App {
     /// Child sessions GitTerm's own records name (delegations, tasks a
     /// coordinator created), keyed by parent chat (TRU-166). Tabs map a
     /// caller `session_uid` to the chat it hosts.
-    fn chat_child_links(&self) -> Vec<chat_facts::ChildLink> {
-        let Some(store) = self.task_store.as_ref() else {
-            return Vec::new();
-        };
+    fn chat_uid_to_chat(&self) -> HashMap<String, String> {
         let mut uid_to_chat: HashMap<String, String> = self
             .workspaces
             .iter()
             .flat_map(|ws| ws.tabs.iter())
             .filter_map(|tab| Some((tab.session_uid.clone(), tab.chat_session_id.clone()?)))
             .collect();
-        for delegation in store.delegations() {
-            if let Some(chat) = &delegation.parent.chat_session_id {
-                uid_to_chat
-                    .entry(delegation.parent.session_uid.clone())
-                    .or_insert_with(|| chat.clone());
+        if let Some(store) = self.task_store.as_ref() {
+            for delegation in store.delegations() {
+                if let Some(chat) = &delegation.parent.chat_session_id {
+                    uid_to_chat
+                        .entry(delegation.parent.session_uid.clone())
+                        .or_insert_with(|| chat.clone());
+                }
             }
         }
+        uid_to_chat
+    }
+
+    fn chat_child_links(&self) -> Vec<chat_facts::ChildLink> {
+        let Some(store) = self.task_store.as_ref() else {
+            return Vec::new();
+        };
+        let uid_to_chat = self.chat_uid_to_chat();
         chat_facts::store_links(store.delegations(), store.tasks(), &uid_to_chat)
     }
 
