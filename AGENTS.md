@@ -31,23 +31,27 @@ Configured commands:
 ## Resume Checkpoints
 
 The cross-agent checkpoint file is `.agents/checkpoint.md` in the current
-project. Claude, Codex, and Pi should all use this same file.
+project. Claude, Codex, and Pi should all use this same file, unless GitTerm's
+instructions name a workspace checkpoint with a line starting
+`- Workspace checkpoint:`; in that case, use the named file.
 
 At the start of a new session, resumed session, fork, or after compaction, check
-whether `.agents/checkpoint.md` exists.
+whether the selected checkpoint file exists: use the workspace checkpoint
+named by a line starting `- Workspace checkpoint:` in GitTerm's instructions,
+or `.agents/checkpoint.md` when no workspace checkpoint is named.
 
 If it exists:
 
-- Read `.agents/checkpoint.md` before doing substantive work.
+- Read the selected checkpoint file before doing substantive work.
 - Use it as tactical orientation for branch state, recent work, hot files, and
   the immediate next step.
 - Treat the user's current request and this file as higher priority than the
   checkpoint if they conflict.
 - Mention the checkpoint only when it affects what you are about to do.
 
-Do not create, modify, or delete `.agents/checkpoint.md` unless the user asks to
-checkpoint or save progress. Do not write new checkpoints to harness-specific
-paths such as `.codex/resume.md`, `.claude/resume.md`, or
+Do not create, modify, or delete the selected checkpoint file unless the user
+asks to checkpoint or save progress. Do not write new checkpoints to
+harness-specific paths such as `.codex/resume.md`, `.claude/resume.md`, or
 `.plans/CHECKPOINT.md`.
 
 ## Code Safety Rules
@@ -97,7 +101,7 @@ commands.
 
 Use the smallest command that matches the job:
 
-- `/checkpoint` writes only `.agents/checkpoint.md`.
+- `/checkpoint` writes only the selected checkpoint file.
 - `/done` writes a human-facing session log only, when configured locally.
 - `/review` performs a quick local pre-commit review. It is not PR readiness.
 - `/pr-ready` is the strict readiness gate. Current-branch mode is author
@@ -225,8 +229,8 @@ Windows CI exists.
 
 ### Architecture
 
-- **Single-file app** by convention: most logic lives in `src/main.rs` (~14k
-  lines). Don't split into submodules unless the change is large and contained.
+- **Single-file app** by convention: most logic lives in `src/main.rs`. Don't
+  split into submodules unless the change is large and contained.
 - **Supporting modules**: `src/log_server.rs` (warp localhost server),
   `src/plans_viewer.rs` (plans viewer routes), `src/markdown.rs`,
   `src/webview.rs` (wry WebView surfaces), `src/services.rs`,
@@ -248,8 +252,8 @@ Windows CI exists.
   (`visible_webview_surface` in `main.rs`). See
   `webview::set_pending_content`, `set_pending_url`, `navigate_to_url`.
 - **Terminal**: uses `iced_term` fork at `../iced_term_fork`. The Windows CI
-  workflow clones from `https://github.com/Tru-Insights/iced_term.git` master
-  fresh — push local fork changes before triggering Windows CI.
+  Windows CI workflow clones `Tru-Insights/iced_term` master fresh —
+  push local fork changes before triggering Windows CI.
 - **Theme**: Catppuccin Mocha (dark) / Latte (light) via
   `theme::AppTheme::{Dark, Light}` and `markdown::ThemeColors`.
 
@@ -269,8 +273,9 @@ Windows CI exists.
   artifact names, or browser profiles. The one sanctioned read of V5 state is
   the first-launch import (`src/config_import.rs`), which copies from
   `~/.config/gitterm-v5` (or `GITTERM_V5_CONFIG_DIR`) and never writes there.
-- **A second instance must never share the real config dir.** Tracey runs the
-  installed V5 all day. `workspaces.json`, `settings.json`, `tasks.json`,
+- **A second instance must never share the real config dir.** The user may run
+  an installed earlier version at the same time. `workspaces.json`,
+  `settings.json`, `tasks.json`,
   `profiles.json`, `remote-agents.json`, `browser-profile/`, `worktrees/` and
   `task-briefs/` are shared across instances and each instance writes back its whole view
   (last writer wins), so a dev or test launch against `~/.config/gitterm-v6`
@@ -318,22 +323,26 @@ Windows CI exists.
 - Voice is enabled by default (the `stt` default feature pulls `whisper-rs` +
   `cpal`). Use `--no-default-features` only for a build without voice.
 - macOS bundle: `cargo bundle --release` produces
-  `target/release/bundle/osx/GitTerm V6.app`. Install via `cp -R` to
+  `target/release/bundle/osx/GitTerm V6.app`. The custom bundle script produces
+  `target/GitTerm V6.app`. Install via `cp -R` to
   `/Applications/`.
 - Excalidraw is an optional feature: add `--features excalidraw` to enable.
 
 ### CI Gates
 
-`.github/workflows/*.yml` runs the configured `check`, `test`, and release
-build with all features. Clippy is `-D warnings` — there is one justified
+`.github/workflows/*.yml` runs formatting, Clippy with and without the
+`excalidraw` feature, tests with and without `excalidraw`, release builds, and
+the macOS bundle script on their configured platforms. The pre-commit hook
+(`.githooks/pre-commit`) runs Clippy, formatting, and `cargo test`. Clippy is
+`-D warnings` — there is one justified
 `#[allow(clippy::large_enum_variant)]` on `TabKind` (rationale in the source).
 Don't "fix" it.
 
 ### Linear
 
-Default team is **TRU** (Truinsights workspace), not the GIT (Git Term) team —
-that's a deliberate user preference. Create issues with
-`linear --workspace truinsights issue create --team TRU ...`.
+Issues go to the `TRU` team in the `truinsights` Linear workspace; commit
+messages need a `TRU-` key. Pass the workspace explicitly when using the Linear
+CLI: `linear --workspace truinsights issue create --team TRU ...`.
 
 ### Design Roadmap
 

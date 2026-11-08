@@ -13,12 +13,12 @@ Use `/pr-ready` in one of two modes:
 
 Configured defaults:
 
-- Base branch: `master`
+- Base branch: `v6`
 - Issue provider: `linear`
 - Issue key pattern: `[A-Z][A-Z0-9]{1,9}-[0-9]{1,7}`
 - Verification before PR-ready: `check, test, build`
 - Current-head PR attestation required: `true`
 
 Do not mark a PR ready, request reviewers, approve, or merge unless explicit PR
-mode returns `ACCEPT-READY` and any required current-head readiness attestation
-has been recorded in the PR body.
+mode returns `ACCEPT-READY` and the required current-head readiness attestation
+has been recorded in the PR body. Never merge without the user's instruction.

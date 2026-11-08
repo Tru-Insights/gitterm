@@ -1,28 +1,15 @@
 ### gitterm-v2 PR-Readiness Notes
 
-#### Pre-flight: gh active account
+#### Pre-flight: GitHub push access
 
-Pushing to `Tru-Insights/*` repos requires the **`traceyt`** (work) `gh`
-account to be active. Verify before push:
-
-```bash
-gh auth status                # look for "Active account: true" next to traceyt
-gh auth switch -u traceyt     # if active is traceyt-cree8 (personal)
-```
-
-A `403 Permission denied to traceyt-cree8` on push almost always means the
-active gh account silently flipped back to personal — not an actual
-permission problem.
-
-Commit author metadata is independent: commits stay
-`Tracey Trewin <tracey@trewin.com>` regardless of which gh account is active.
-That's intentional — `gh` controls push authorization only, not authorship.
+Before pushing, check `gh auth status` and use a GitHub account that has push
+access to the repository's organization.
 
 #### Pre-flight: iced_term_fork sync
 
-All three GitHub workflows (`build.yml`, `ci.yml`, `windows-build.yml`) clone
-`Tru-Insights/iced_term` master fresh. If you've made local commits to
-`../iced_term_fork` that gitterm depends on, push them first or CI fails with
+The GitHub workflows clone `Tru-Insights/iced_term` master fresh. If
+you've made local commits to `../iced_term_fork` that gitterm depends on, push
+them first or CI fails with
 `no method named X found`-style errors:
 
 ```bash
@@ -44,18 +31,17 @@ cargo clippy -- -D warnings
 cargo clippy --features excalidraw -- -D warnings
 cargo test
 cargo test --features excalidraw
-cargo build --release --features stt
+cargo build --release
 ```
 
-The pre-commit hook (`.githooks/pre-commit`) runs a subset — `clippy +
-fmt-check + test` — automatically when activated via
-`git config core.hooksPath .githooks`. CI is still the authoritative gate.
+The pre-commit hook (`.githooks/pre-commit`) runs Clippy, formatting, and
+`cargo test`; see the hook for the exact commands. CI is still the authoritative
+gate.
 
-#### Linear: TRU, not GIT
+#### Linear workspace
 
-New issues default to the **`TRU`** team in the `truinsights` workspace even
-though a dedicated `GIT` (Git Term) team exists. This is a deliberate user
-preference. Create with:
+Issues go to the `TRU` team in the `truinsights` Linear workspace. Pass the
+workspace explicitly when using the Linear CLI:
 
 ```bash
 linear --workspace truinsights issue create --team TRU \
@@ -63,12 +49,10 @@ linear --workspace truinsights issue create --team TRU \
   --assignee self --no-interactive
 ```
 
-Without `--workspace truinsights`, the CLI defaults to `cree8` and the
-command fails or lands the issue in the wrong place.
-
 #### Branch + PR Conventions
 
-Branch names: `tracey/tru-<NN>-<short-slug>`. Base branch: `master` (the only
-protected branch). PRs default to **draft**; flip to ready only after
+Branches carry the issue key. The configured default base is `v6`. PRs default
+to **draft**; flip to ready only after
 `/pr-ready --pr <number>` returns `ACCEPT-READY` and the attestation block is
-filled in the PR body (per `github.requirePrReadyBeforeReview: true`).
+filled in the PR body (per `github.requirePrReadyBeforeReview: true`). Never
+merge without the user's instruction.
