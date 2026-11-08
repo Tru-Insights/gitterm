@@ -70,6 +70,37 @@
     check('page clamps text size to 11px', getComputedStyle(document.body).fontSize === '11px');
     window.__setChatFontSize(99);
     check('page clamps text size to 22px', getComputedStyle(document.body).fontSize === '22px');
+    {
+      // Resizing keeps the reader's place: at the bottom when following,
+      // the same block at the same height when scrolled back.
+      window.__setChatFontSize(14);
+      const fillers = [];
+      for (let i = 0; i < 60; i++) {
+        const div = document.createElement('div');
+        div.className = 'assistant';
+        div.textContent = 'Filler paragraph ' + i + ' with enough words to wrap at larger text sizes in the column.';
+        messages.appendChild(div);
+        fillers.push(div);
+      }
+      await settle();
+      messages.scrollTop = messages.scrollHeight;
+      messages.dispatchEvent(new Event('scroll'));
+      await settle();
+      window.__setChatFontSize(22);
+      await settle();
+      check('following view stays at the bottom after a text-size change', messages.scrollHeight - messages.scrollTop - messages.clientHeight < 2);
+      messages.dispatchEvent(new WheelEvent('wheel', { deltaY: -400 }));
+      messages.scrollTop = Math.floor(messages.scrollHeight / 3);
+      messages.dispatchEvent(new Event('scroll'));
+      await settle();
+      const top = messages.scrollTop;
+      const block = [...messages.children].find((c) => c.offsetTop + c.offsetHeight > top);
+      const before = block.offsetTop - messages.scrollTop;
+      window.__setChatFontSize(15);
+      await settle();
+      check('scrolled-back view keeps its block in place after a text-size change', Math.abs(block.offsetTop - messages.scrollTop - before) < 2);
+      for (const div of fillers) div.remove();
+    }
     window.__setChatFontSize(15);
     const posted = [];
     window.ipc = { postMessage: (message) => posted.push(JSON.parse(message)) };

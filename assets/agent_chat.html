@@ -789,13 +789,14 @@
   const htmlRenders = new Set();
   window.__setChatFontSize = (value) => {
     if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error('Invalid chat font size: ' + value);
-    document.body.style.setProperty('--chat-font-size', Math.min(22, Math.max(11, value)) + 'px');
+    // Text size and width rewrap the timeline; keep what the reader sees in place.
+    keepView(() => document.body.style.setProperty('--chat-font-size', Math.min(22, Math.max(11, value)) + 'px'));
     autoGrow();
   };
   window.__setChatWidth = (value) => {
     const widths = { narrow: '46rem', medium: '60rem', wide: '72rem', full: '100%' };
     if (!Object.hasOwn(widths, value)) throw new Error('Unknown chat width: ' + value);
-    document.documentElement.style.setProperty('--chat-width', widths[value]);
+    keepView(() => document.documentElement.style.setProperty('--chat-width', widths[value]));
   };
   let appearance = 'dark';
   window.__setAppearance = (value) => {
