@@ -68,6 +68,10 @@ pub struct ChatFacts {
     /// result naming a GitHub PR URL (TRU-173, TRU-257).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prs: Vec<PrRef>,
+    /// PR keys observed as creates by a running tab. Reconciliation never
+    /// removes these, even when a transcript lags or has been compacted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub live_created_prs: Vec<String>,
     /// Repositories where the chat ran a recognized git/GitHub write
     /// command (TRU-222). Paths are resolved to the main checkout.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -341,6 +345,11 @@ impl ChatFacts {
         }
         for pr in scan.prs {
             self.add_pr(pr);
+        }
+        for id in scan.live_created_prs {
+            if !self.live_created_prs.contains(&id) {
+                self.live_created_prs.push(id);
+            }
         }
         for dir in scan.repo_work {
             if !self.repo_work.contains(&dir) {
@@ -620,7 +629,12 @@ pub struct RawFacts {
     pub prs: Vec<PrRef>,
     /// Transcript-only evidence for repairing old false positives. Absence
     /// from a transcript is never evidence that a saved PR was wrong.
-    non_create_prs: Vec<PrRef>,
+    read_only_prs: Vec<PrRef>,
+    /// Output from every other command protects its PRs from removal.
+    protected_prs: Vec<PrRef>,
+    live_created_prs: Vec<String>,
+    /// Any skipped line makes removal evidence incomplete.
+    scan_incomplete: bool,
     /// Invocation-specific write targets, resolved off the UI thread.
     repo_work: Vec<RepoWorkTarget>,
     /// Markdown files written or edited, in call order (TRU-191).
@@ -711,7 +725,10 @@ impl RawFacts {
     fn append(&mut self, other: RawFacts) {
         self.touches.extend(other.touches);
         self.prs.extend(other.prs);
-        self.non_create_prs.extend(other.non_create_prs);
+        self.read_only_prs.extend(other.read_only_prs);
+        self.protected_prs.extend(other.protected_prs);
+        self.live_created_prs.extend(other.live_created_prs);
+        self.scan_incomplete |= other.scan_incomplete;
         self.repo_work.extend(other.repo_work);
         self.documents.extend(other.documents);
         for key in other.issue_keys {
@@ -724,15 +741,21 @@ impl RawFacts {
         }
     }
 
-    /// Reconcile only after every transcript input was read successfully.
-    /// Real creates win over search/echo output across parent and child files.
+    /// Remove only with complete, exclusively read-only output evidence across
+    /// parent and child files. Live provenance and all other output win.
     fn reconcile_prs(&self, facts: &mut ChatFacts) -> Vec<PrRef> {
         let created: HashSet<_> = self.prs.iter().map(|pr| pr.key().id()).collect();
-        let other: HashSet<_> = self.non_create_prs.iter().map(|pr| pr.key().id()).collect();
-        facts.prs.retain(|pr| {
-            let id = pr.key().id();
-            created.contains(&id) || !other.contains(&id)
-        });
+        let read_only: HashSet<_> = self.read_only_prs.iter().map(|pr| pr.key().id()).collect();
+        let protected: HashSet<_> = self.protected_prs.iter().map(|pr| pr.key().id()).collect();
+        if !self.scan_incomplete {
+            facts.prs.retain(|pr| {
+                let id = pr.key().id();
+                facts.live_created_prs.contains(&id)
+                    || created.contains(&id)
+                    || protected.contains(&id)
+                    || !read_only.contains(&id)
+            });
+        }
         let mut added = Vec::new();
         for pr in &self.prs {
             if !facts
@@ -777,6 +800,11 @@ impl RawFacts {
         }
         for pr in self.prs {
             facts.add_pr(pr);
+        }
+        for id in self.live_created_prs {
+            if !facts.live_created_prs.contains(&id) {
+                facts.live_created_prs.push(id);
+            }
         }
         for key in &self.issue_keys {
             facts.add_issue_key(key);
@@ -1053,7 +1081,11 @@ impl LiveFacts {
             HarnessEvent::SubagentEvent { event, .. } => self.observe_results(event),
             HarnessEvent::ItemCompleted { id, output, .. } => {
                 if let Some(command) = self.bash_commands.remove(id) {
-                    self.pending.prs.extend(created_prs(&command, output));
+                    let prs = created_prs(&command, output);
+                    self.pending
+                        .live_created_prs
+                        .extend(prs.iter().map(|pr| pr.key().id()));
+                    self.pending.prs.extend(prs);
                     self.pending
                         .issue_keys
                         .extend(created_linear_issue_keys(&command, output));
@@ -1214,7 +1246,7 @@ fn catch_up_from_transcript(
     };
     let mut facts = existing.unwrap_or_default();
     let added = raw.reconcile_prs(&mut facts);
-    if !stale {
+    if !stale || raw.scan_incomplete {
         if added.is_empty() {
             return (facts, added);
         }
@@ -1448,9 +1480,67 @@ pub fn is_gh_pr_create(command: &str) -> bool {
     pr_create_command_kind(command) == Some(true)
 }
 
-/// Unknown shell syntax is not positive evidence for deleting a saved PR.
+/// Only this allowlist supplies positive removal evidence. The lexical pass
+/// rejects evaluation, nesting, redirection and expansions before classification.
+fn is_known_read_only(command: &str) -> bool {
+    if command.contains('\0') {
+        return false;
+    }
+    let mut scanner = ShellScanner(command.chars().peekable(), 0, false);
+    let Some(commands) = scanner.commands(false) else {
+        return false;
+    };
+    if scanner.2 || commands.is_empty() {
+        return false;
+    }
+    commands.iter().enumerate().all(|(index, command)| {
+        if command.nested
+            || command.environment
+            || !matches!(command.separator.as_str(), "" | "|" | "&&" | ";" | "\n")
+            || (index + 1 == commands.len() && matches!(command.separator.as_str(), "|" | "&&"))
+        {
+            return false;
+        }
+        let words = &command.words;
+        match words.first().map(String::as_str) {
+            Some(
+                "grep" | "rg" | "egrep" | "fgrep" | "cat" | "echo" | "printf" | "head" | "tail"
+                | "less" | "wc" | "sort" | "uniq" | "jq" | "awk" | "ls" | "find",
+            ) => true,
+            Some("sed") => {
+                let mut args = words.iter().skip(1);
+                while let Some(arg) = args.next() {
+                    match arg.as_str() {
+                        "-n" => return true,
+                        "-e" | "-f" => {
+                            if args.next().is_none() {
+                                return false;
+                            }
+                        }
+                        "-E" | "-r" | "-u" => {}
+                        // Unknown options or a script end our flag knowledge.
+                        _ => return false,
+                    }
+                }
+                false
+            }
+            Some("git") => matches!(
+                words.get(1).map(String::as_str),
+                Some("log" | "show" | "grep" | "diff")
+            ),
+            Some("gh") => {
+                words.get(1).is_some_and(|word| word == "search")
+                    || (words.get(1).is_some_and(|word| word == "pr")
+                        && matches!(words.get(2).map(String::as_str), Some("view" | "list")))
+            }
+            _ => false,
+        }
+    })
+}
+
+/// Unknown wrapper options cannot establish a literal create invocation.
 fn pr_create_command_kind(command: &str) -> Option<bool> {
-    let commands = ShellScanner(command.chars().peekable(), 0).commands(false)?;
+    let commands = ShellScanner(command.chars().peekable(), 0, false).commands(false)?;
     let mut unknown = false;
     for command in &commands {
         match shell_command_creates_pr(command) {
@@ -1474,7 +1564,10 @@ fn shell_command_creates_pr(command: &ShellCommand) -> Option<bool> {
         if command.quoted[at] {
             return Some(false);
         }
-        if matches!(word.as_str(), "then" | "do" | "else" | "elif" | "!" | "{") {
+        if matches!(
+            word.as_str(),
+            "if" | "while" | "until" | "then" | "do" | "else" | "elif" | "!" | "{"
+        ) {
             at += 1;
             continue;
         }
@@ -1537,7 +1630,7 @@ fn created_linear_issue_keys(command: &str, output: &str) -> Vec<String> {
     if keys.len() != 1 {
         return Vec::new();
     }
-    let Some(commands) = ShellScanner(command.chars().peekable(), 0).commands(false) else {
+    let Some(commands) = ShellScanner(command.chars().peekable(), 0, false).commands(false) else {
         return Vec::new();
     };
     let mut linear = commands.iter().filter_map(|command| {
@@ -1617,7 +1710,7 @@ fn repo_write_targets(
     cwd: Option<&Path>,
     home: Option<&Path>,
 ) -> Vec<RepoWorkTarget> {
-    let Some(commands) = ShellScanner(command.chars().peekable(), 0).commands(false) else {
+    let Some(commands) = ShellScanner(command.chars().peekable(), 0, false).commands(false) else {
         return Vec::new();
     };
     let changes_directory = commands
@@ -2040,7 +2133,8 @@ struct ShellWord {
 /// both words and heredocs. Nested substitutions get their own shell context.
 /// shortcut: this identifies literal invocations, not full Bash execution;
 /// dynamic executables, backticks and arithmetic require a full shell parser.
-struct ShellScanner<'a>(std::iter::Peekable<std::str::Chars<'a>>, usize);
+// The final flag records syntax outside simple commands, pipelines and lists.
+struct ShellScanner<'a>(std::iter::Peekable<std::str::Chars<'a>>, usize, bool);
 
 impl ShellScanner<'_> {
     fn commands(&mut self, nested: bool) -> Option<Vec<ShellCommand>> {
@@ -2056,6 +2150,9 @@ impl ShellScanner<'_> {
         while let Some(&ch) = self.0.peek() {
             match ch {
                 ch if ch.is_whitespace() && ch != '\n' => {
+                    if !matches!(ch, ' ' | '\t') {
+                        self.2 = true;
+                    }
                     self.0.next();
                 }
                 '#' => {
@@ -2076,6 +2173,9 @@ impl ShellScanner<'_> {
                     if ch == '&' && self.0.peek() == Some(&'>') {
                         self.redirect(&mut current, &mut heredocs, Some(1))?;
                     } else {
+                        if current.words.is_empty() {
+                            self.2 = true;
+                        }
                         current.separator = ch.to_string();
                         if self.0.peek() == Some(&ch) {
                             self.0.next();
@@ -2085,6 +2185,7 @@ impl ShellScanner<'_> {
                     }
                 }
                 '(' => {
+                    self.2 = true;
                     self.0.next();
                     children.extend(self.commands(true)?);
                 }
@@ -2158,6 +2259,7 @@ impl ShellScanner<'_> {
                 quote = Some(ch);
                 word.quoted = true;
             } else if expand && ch == '$' && self.0.peek() == Some(&'(') {
+                self.2 = true;
                 self.0.next();
                 if self.0.peek() == Some(&'(') {
                     return None;
@@ -2168,6 +2270,9 @@ impl ShellScanner<'_> {
             } else if expand && ch == '`' {
                 return None;
             } else {
+                if expand && ch == '$' {
+                    self.2 = true;
+                }
                 word.text.push(ch);
                 if ch == '=' && !word.quoted && shell_assignment(&word.text) {
                     word.assignment = true;
@@ -2183,6 +2288,7 @@ impl ShellScanner<'_> {
         heredocs: &mut Vec<(String, bool, bool)>,
         fd: Option<u32>,
     ) -> Option<()> {
+        self.2 = true;
         let operator = self.0.next()?;
         let mut heredoc = false;
         let mut strip_tabs = false;
@@ -2340,7 +2446,7 @@ fn observe_claude_line_with(
         }
     }
     let user_line = main && record_type == Some("user");
-    let create_result = !bash_commands.is_empty() && line.contains("\"tool_result\"");
+    let create_result = line.contains("\"tool_result\"");
     if !user_line && !create_result && !line.contains("\"tool_use\"") {
         return;
     }
@@ -2354,18 +2460,20 @@ fn observe_claude_line_with(
                 continue;
             }
             let id = block.get("tool_use_id").and_then(Value::as_str);
-            if let Some(command) = id.and_then(|id| bash_commands.remove(id)) {
-                let output = block.get("content").map(tool_result_text);
-                raw.prs
-                    .extend(created_prs(&command, output.as_deref().unwrap_or("")));
-                if pr_create_command_kind(&command) == Some(false) {
-                    raw.non_create_prs
-                        .extend(merge_plan::pr_urls_in(output.as_deref().unwrap_or("")));
-                }
-                raw.issue_keys.extend(created_linear_issue_keys(
-                    &command,
-                    output.as_deref().unwrap_or(""),
-                ));
+            let output = block
+                .get("content")
+                .map(tool_result_text)
+                .unwrap_or_default();
+            let command = id.and_then(|id| bash_commands.remove(id));
+            if command.as_deref().is_some_and(is_known_read_only) {
+                raw.read_only_prs.extend(merge_plan::pr_urls_in(&output));
+            } else {
+                raw.protected_prs.extend(merge_plan::pr_urls_in(&output));
+            }
+            if let Some(command) = command {
+                raw.prs.extend(created_prs(&command, &output));
+                raw.issue_keys
+                    .extend(created_linear_issue_keys(&command, &output));
             }
         }
     }
@@ -2443,19 +2551,25 @@ fn scan_lines(
     main: bool,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(std::fs::File::open(path)?);
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut bash_commands = HashMap::new();
     let mut cwd = None;
+    let mut line_number = 0;
     loop {
         line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => return Ok(()),
-            Ok(_) => {
-                serde_json::from_str::<Value>(&line)
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-                observe_claude_line_with(raw, &mut bash_commands, &line, home, main, &mut cwd);
-            }
-            Err(error) => return Err(error),
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(());
+        }
+        line_number += 1;
+        let text = std::str::from_utf8(&line).ok();
+        if let Some(text) = text.filter(|text| serde_json::from_str::<Value>(text).is_ok()) {
+            observe_claude_line_with(raw, &mut bash_commands, text, home, main, &mut cwd);
+        } else {
+            raw.scan_incomplete = true;
+            eprintln!(
+                "[chat-facts] {}:{line_number}: skipped invalid UTF-8/JSON; PR removal disabled",
+                path.display()
+            );
         }
     }
 }
@@ -2632,14 +2746,19 @@ pub fn backfill_claude(
         };
         let mut facts = existing.unwrap_or_default();
         raw.reconcile_prs(&mut facts);
-        let mut scan = ChatFacts::default();
-        raw.resolve_into(&mut scan, &mut resolver);
-        facts.absorb_scan(scan);
+        let complete = !raw.scan_incomplete;
+        if complete {
+            let mut scan = ChatFacts::default();
+            raw.resolve_into(&mut scan, &mut resolver);
+            facts.absorb_scan(scan);
+        }
         for link in links.iter().filter(|link| link.parent == target.id) {
             facts.add_child(link.child.clone());
         }
-        facts.backfilled = true;
-        facts.documents_backfilled = true;
+        if complete {
+            facts.backfilled = true;
+            facts.documents_backfilled = true;
+        }
         match write_facts(&path, &facts) {
             Ok(()) => report.scanned += 1,
             Err(error) => {
@@ -3780,6 +3899,77 @@ branch refs/heads/tracey/tru-12-thing
     }
 
     #[test]
+    fn removal_evidence_requires_only_allowlisted_simple_commands() {
+        for command in [
+            "grep",
+            "rg",
+            "egrep",
+            "fgrep",
+            "cat",
+            "echo",
+            "printf",
+            "head",
+            "tail",
+            "less",
+            "wc",
+            "sort",
+            "uniq",
+            "jq",
+            "awk",
+            "ls",
+            "find",
+            "sed -n '1p' file",
+            "sed -E -n '1p' file",
+            "git log",
+            "git show",
+            "git grep",
+            "git diff",
+            "gh pr view",
+            "gh pr list",
+            "gh search prs query",
+            "grep -rn 'gh pr create' . | head",
+            "rg create file && cat file; printf '%s' done",
+            "echo '$(gh pr create)'",
+        ] {
+            assert!(is_known_read_only(command), "{command}");
+        }
+        for command in [
+            "bash -lc 'gh pr create --fill'",
+            "sh -c 'cat file'",
+            "eval 'cat file'",
+            "env rg create file",
+            "command rg create file",
+            "custom-script",
+            "(cat file)",
+            "()",
+            "f() { cat file; }; f",
+            "{ cat file; }",
+            "rg create file | custom-script",
+            "rg create file; gh pr create",
+            "sed '1p' file",
+            "sed -e '-n' file",
+            "cat $(custom-script)",
+            "echo \"$PR\"",
+            "cat >file",
+            "cat <<EOF\nurl\nEOF",
+            "cat `custom-script`",
+            "cat file || echo ok",
+            "cat file &",
+            "cat file |",
+            "cat file &&",
+            "cat file;; cat file",
+            "cat 'unterminated",
+            "grep\u{a0}file",
+            "grep\rfile",
+            "echo \0",
+            "",
+            "/tmp/grep file",
+        ] {
+            assert!(!is_known_read_only(command), "{command}");
+        }
+    }
+
+    #[test]
     fn pr_creates_use_shell_command_words_live_and_in_transcripts() {
         let output = "https://github.com/acme/api/pull/42";
         let cases = [
@@ -3807,6 +3997,9 @@ branch refs/heads/tracey/tru-12-thing
             (r#"env 'GH_REPO=acme/api' gh pr create --fill"#, true),
             (r#"if true; then GH_REPO="acme/api" gh pr create; fi"#, true),
             ("if true; then gh pr create --fill; fi", true),
+            ("if gh pr create --fill; then echo ok; fi", true),
+            ("while gh pr create --fill; do break; done", true),
+            ("until gh pr create --fill; do break; done", true),
             (
                 "env -i -u GH_TOKEN GH_REPO=acme/api command -p gh pr create",
                 true,
@@ -4304,6 +4497,7 @@ branch refs/heads/tracey/tru-12-thing
         let old = r#"{"issue_keys":["PRJ-101"],"repos_touched":[],"checkouts":[],"children":[]}"#;
         let facts: ChatFacts = serde_json::from_str(old).unwrap();
         assert!(facts.prs.is_empty());
+        assert!(facts.live_created_prs.is_empty());
         let written = serde_json::to_string(&facts).unwrap();
         assert_eq!(written, old);
         let mut with_pr = facts;
@@ -4474,55 +4668,61 @@ branch refs/heads/tracey/tru-12-thing
     }
 
     #[test]
-    fn live_pr_missing_from_transcript_survives_two_catch_ups() {
-        let temp = tempfile::tempdir().unwrap();
-        let transcript = temp.path().join("session.jsonl");
-        std::fs::write(&transcript, "").unwrap();
-        let mut live = LiveFacts::default();
-        live.observe(
-            &HarnessEvent::ItemStarted {
-                id: "create".into(),
-                kind: ItemKind::ToolCall {
-                    name: "Bash".into(),
-                    input: json!({"command": "gh pr create --fill"}),
+    fn live_pr_in_grep_output_survives_two_catch_ups() {
+        for transcript_text in [
+            String::new(),
+            pr_result_lines("grep", "grep -rn create . | head", 42),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let transcript = temp.path().join("session.jsonl");
+            std::fs::write(&transcript, transcript_text).unwrap();
+            let mut live = LiveFacts::default();
+            live.observe(
+                &HarnessEvent::ItemStarted {
+                    id: "create".into(),
+                    kind: ItemKind::ToolCall {
+                        name: "Bash".into(),
+                        input: json!({"command": "gh pr create --fill"}),
+                    },
                 },
-            },
-            None,
-        );
-        live.observe(
-            &HarnessEvent::ItemCompleted {
-                id: "create".into(),
-                output: "https://github.com/acme/api/pull/42".into(),
-                is_error: false,
-            },
-            None,
-        );
-        let pending = live.take_due(Instant::now(), true).unwrap();
-        flush_live(
-            temp.path(),
-            ChatBackend::Claude,
-            "session",
-            pending,
-            vec![],
-            None,
-            FactPaths::default(),
-        )
-        .unwrap();
-        let path = facts_path(temp.path(), ChatBackend::Claude, "session").unwrap();
-        let before = load_facts(&path).unwrap().unwrap();
-        for _ in 0..2 {
-            let added = flush_live(
+                None,
+            );
+            live.observe(
+                &HarnessEvent::ItemCompleted {
+                    id: "create".into(),
+                    output: "https://github.com/acme/api/pull/42".into(),
+                    is_error: false,
+                },
+                None,
+            );
+            let pending = live.take_due(Instant::now(), true).unwrap();
+            flush_live(
                 temp.path(),
                 ChatBackend::Claude,
                 "session",
-                RawFacts::default(),
+                pending,
                 vec![],
-                Some(&transcript),
+                None,
                 FactPaths::default(),
             )
             .unwrap();
-            assert!(added.is_empty());
-            assert_eq!(load_facts(&path).unwrap().unwrap().prs, before.prs);
+            let path = facts_path(temp.path(), ChatBackend::Claude, "session").unwrap();
+            let before = load_facts(&path).unwrap().unwrap();
+            assert_eq!(before.live_created_prs, vec!["acme/api#42"]);
+            for _ in 0..2 {
+                let added = flush_live(
+                    temp.path(),
+                    ChatBackend::Claude,
+                    "session",
+                    RawFacts::default(),
+                    vec![],
+                    Some(&transcript),
+                    FactPaths::default(),
+                )
+                .unwrap();
+                assert!(added.is_empty());
+                assert_eq!(load_facts(&path).unwrap().unwrap().prs, before.prs);
+            }
         }
     }
 
@@ -4533,15 +4733,19 @@ branch refs/heads/tracey/tru-12-thing
             let transcript = temp.path().join("session.jsonl");
             // 41 is wrong, 42 is also created in a child, 43 is absent (rotated
             // or not yet written), 44 is a newly discovered real create, and
-            // 45/46 use syntax whose command provenance we cannot establish.
+            // 45–47 use unknown syntax; 48 has read-only output in the parent
+            // and unknown output in a child, which must protect it.
             std::fs::write(
                 &transcript,
                 [
-                    pr_result_lines("search-only", "grep create x.rs", 41),
+                    pr_result_lines("search-only", "grep -rn create . | head", 41),
                     pr_result_lines("search-and-create", "rg create x.rs", 42),
                     pr_result_lines("new", "gh pr create --fill", 44),
                     pr_result_lines("split", "env -S 'gh pr create --fill'", 45),
                     pr_result_lines("arithmetic", "gh pr create; n=$((1+1))", 46),
+                    pr_result_lines("shell", "bash -lc 'gh pr create --fill'", 47),
+                    pr_result_lines("mixed-search", "grep -n create .", 48),
+                    pr_result_lines("live", "grep -n create .", 49),
                 ]
                 .join("\n"),
             )
@@ -4550,18 +4754,23 @@ branch refs/heads/tracey/tru-12-thing
             std::fs::create_dir_all(&subagents).unwrap();
             std::fs::write(
                 subagents.join("agent-create.jsonl"),
-                pr_result_lines("create", "gh pr create --fill", 42),
+                [
+                    pr_result_lines("create", "gh pr create --fill", 42),
+                    pr_result_lines("unknown", "custom-script", 48),
+                ]
+                .join("\n"),
             )
             .unwrap();
             let dir = temp.path().join("facts");
             let path = facts_path(&dir, ChatBackend::Claude, "session").unwrap();
             let mut known = ChatFacts::default();
-            for number in [41, 42, 43, 45, 46] {
+            for number in [41, 42, 43, 45, 46, 47, 48, 49] {
                 known.add_pr(
                     merge_plan::pr_urls_in(&format!("https://github.com/acme/api/pull/{number}"))
                         .remove(0),
                 );
             }
+            known.live_created_prs.push("acme/api#49".into());
             write_facts(&path, &known).unwrap();
             if mode == "chat" {
                 flush_live(
@@ -4604,7 +4813,7 @@ branch refs/heads/tracey/tru-12-thing
             }
             let facts = load_facts(&path).unwrap().unwrap();
             let numbers: Vec<_> = facts.prs.iter().map(|pr| pr.number).collect();
-            assert_eq!(numbers, vec![42, 43, 45, 46, 44], "{mode}");
+            assert_eq!(numbers, vec![42, 43, 45, 46, 47, 48, 49, 44], "{mode}");
         }
     }
 
@@ -4704,7 +4913,7 @@ branch refs/heads/tracey/tru-12-thing
     }
 
     #[test]
-    fn malformed_transcript_json_preserves_all_recorded_facts() {
+    fn malformed_transcript_json_adds_prs_but_removes_none() {
         let temp = tempfile::tempdir().unwrap();
         let transcript = temp.path().join("session.jsonl");
         std::fs::write(
@@ -4725,8 +4934,46 @@ branch refs/heads/tracey/tru-12-thing
             None,
             &mut GitResolver::default(),
         );
-        assert_eq!(caught, known);
-        assert!(added.is_empty());
+        assert_eq!(
+            caught.prs.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            vec![42, 43]
+        );
+        assert_eq!(
+            added.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            vec![43]
+        );
+        assert!(!caught.backfilled);
+        assert!(!caught.documents_backfilled);
+    }
+
+    #[test]
+    fn partial_child_scan_protects_parent_prs_and_adds_valid_creates() {
+        for invalid in [b"invalid json\n".as_slice(), b"\xff\n".as_slice()] {
+            let temp = tempfile::tempdir().unwrap();
+            let transcript = temp.path().join("session.jsonl");
+            std::fs::write(
+                &transcript,
+                pr_result_lines("search", "grep create file", 42),
+            )
+            .unwrap();
+            let children = temp.path().join("session/subagents");
+            std::fs::create_dir_all(&children).unwrap();
+            let mut bytes = invalid.to_vec();
+            bytes.extend_from_slice(pr_result_lines("create", "gh pr create", 43).as_bytes());
+            std::fs::write(children.join("agent-partial.jsonl"), bytes).unwrap();
+            let scan = scan_claude_transcript(&transcript, None).unwrap();
+            let mut known = ChatFacts::default();
+            known.prs = merge_plan::pr_urls_in("https://github.com/acme/api/pull/42");
+            let added = scan.reconcile_prs(&mut known);
+            assert_eq!(
+                known.prs.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+                vec![42, 43]
+            );
+            assert_eq!(
+                added.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+                vec![43]
+            );
+        }
     }
 
     #[test]
