@@ -194,36 +194,39 @@ fn task_branches(
     store
         .delegations()
         .iter()
-        .filter_map(|delegation| {
-            let created = chrono::DateTime::parse_from_rfc3339(&delegation.created_at).ok()?;
-            if created < now - TASK_PR_MAX_AGE || created > now {
-                return None;
-            }
-            let gitterm::tasks::DelegationChild::TaskSession { task_id, .. } = &delegation.child
-            else {
-                return None;
-            };
-            let parent = delegation.parent.chat_session_id.as_ref()?;
-            let task = store.get(task_id)?;
-            let slug = gitterm::gh_identity::parse_repository_slug(
-                task.repository.remote_url.as_deref()?,
-            )?;
-            // PR identities and the watch currently support github.com only.
-            if !slug.host.eq_ignore_ascii_case("github.com")
-                || !merge_plan::valid_repo(&slug.full_name())
-                || task.branch.is_empty()
-            {
-                return None;
-            }
-            Some((
-                parent.clone(),
-                TaskBranch {
-                    repo: slug.full_name(),
-                    branch: task.branch.clone(),
-                },
-            ))
-        })
+        .filter_map(|delegation| task_branch(store, delegation, now))
         .collect()
+}
+
+fn task_branch(
+    store: &TaskStore,
+    delegation: &gitterm::tasks::Delegation,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<(String, TaskBranch)> {
+    let created = chrono::DateTime::parse_from_rfc3339(&delegation.created_at).ok()?;
+    if created < now - TASK_PR_MAX_AGE || created > now {
+        return None;
+    }
+    let gitterm::tasks::DelegationChild::TaskSession { task_id, .. } = &delegation.child else {
+        return None;
+    };
+    let parent = delegation.parent.chat_session_id.as_ref()?;
+    let task = store.get(task_id)?;
+    let slug = gitterm::gh_identity::parse_repository_slug(task.repository.remote_url.as_deref()?)?;
+    // PR identities and the watch currently support github.com only.
+    if !slug.host.eq_ignore_ascii_case("github.com")
+        || !merge_plan::valid_repo(&slug.full_name())
+        || task.branch.is_empty()
+    {
+        return None;
+    }
+    Some((
+        parent.clone(),
+        TaskBranch {
+            repo: slug.full_name(),
+            branch: task.branch.clone(),
+        },
+    ))
 }
 
 async fn lookup_task_branches<F, Fut>(
@@ -463,20 +466,59 @@ pub struct PrsState {
     pub done_open: HashSet<String>,
     /// The index was asked for once for the watch.
     pub index_requested: bool,
-    /// In-memory discovery, refreshed even for branches that had no PR.
+    /// Keep successful discoveries for this run; only unresolved branches retry.
     task_branch_prs: HashMap<TaskBranch, Vec<PrRef>>,
     task_branches_in_flight: bool,
-    task_branches_read_at: Option<Instant>,
+    task_branches_started: bool,
+    task_branches_pending: HashSet<TaskBranch>,
     task_branches_refresh: bool,
 }
 
 impl PrsState {
-    fn task_branches_due(&self, now: Instant) -> bool {
+    fn task_branches_due(&self) -> bool {
         !self.task_branches_in_flight
-            && (self.task_branches_refresh
-                || self
-                    .task_branches_read_at
-                    .is_none_or(|at| now.duration_since(at) >= pr_watch::OPEN_INTERVAL))
+            && (!self.task_branches_started
+                || self.task_branches_refresh
+                || !self.task_branches_pending.is_empty())
+    }
+
+    pub(super) fn request_task_branch_refresh(&mut self) {
+        self.task_branches_refresh = true;
+    }
+
+    fn request_finished_task_branch(
+        &mut self,
+        store: &TaskStore,
+        delegation_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        let Some(delegation) = store.delegation(delegation_id) else {
+            return;
+        };
+        if delegation.status.is_sendable() {
+            if let Some((_, branch)) = task_branch(store, delegation, now) {
+                self.task_branches_pending.insert(branch);
+            }
+        }
+    }
+
+    fn take_task_branches_due(&mut self, branches: Vec<(String, TaskBranch)>) -> Vec<TaskBranch> {
+        if !self.task_branches_due() {
+            return Vec::new();
+        }
+        let all = !self.task_branches_started || self.task_branches_refresh;
+        let pending = std::mem::take(&mut self.task_branches_pending);
+        let mut seen = HashSet::new();
+        let branches = branches
+            .into_iter()
+            .map(|(_, branch)| branch)
+            .filter(|branch| all || pending.contains(branch))
+            .filter(|branch| self.task_branch_prs.get(branch).is_none_or(Vec::is_empty))
+            .filter(|branch| seen.insert(branch.clone()))
+            .collect();
+        self.task_branches_started = true;
+        self.task_branches_refresh = false;
+        branches
     }
 
     fn apply_task_branches(&mut self, results: Vec<TaskBranchResult>, mut log: impl FnMut(&str)) {
@@ -554,7 +596,6 @@ impl PrsState {
 
     pub(super) fn request_row_refresh(&mut self, id: String, opened: bool, now: Instant) {
         if opened {
-            self.task_branches_refresh = true;
             self.request_immediate_refresh(id, now);
         }
     }
@@ -791,7 +832,6 @@ impl App {
     /// A window focus refreshes open-workspace PRs, while parked work remains
     /// on its slower schedule.
     pub(super) fn request_open_pr_refreshes(&mut self) {
-        self.prs.task_branches_refresh = true;
         if self
             .prs
             .homes_built
@@ -908,8 +948,15 @@ impl App {
         Task::batch(tasks)
     }
 
+    pub(super) fn request_finished_task_prs(&mut self, delegation_id: &str) {
+        if let Some(store) = &self.task_store {
+            self.prs
+                .request_finished_task_branch(store, delegation_id, chrono::Utc::now());
+        }
+    }
+
     fn poll_task_branch_prs(&mut self) -> Task<Event> {
-        if !self.prs.task_branches_due(Instant::now()) {
+        if !self.prs.task_branches_due() {
             return Task::none();
         }
         let branches = self
@@ -917,17 +964,10 @@ impl App {
             .as_ref()
             .map(|store| task_branches(store, chrono::Utc::now()))
             .unwrap_or_default();
-        let mut seen = HashSet::new();
-        let branches: Vec<_> = branches
-            .into_iter()
-            .map(|(_, branch)| branch)
-            .filter(|branch| seen.insert(branch.clone()))
-            .collect();
-        self.prs
-            .task_branch_prs
-            .retain(|branch, _| seen.contains(branch));
-        self.prs.task_branches_refresh = false;
-        self.prs.task_branches_read_at = Some(Instant::now());
+        let branches = self.prs.take_task_branches_due(branches);
+        if branches.is_empty() {
+            return Task::none();
+        }
         self.prs.task_branches_in_flight = true;
         Task::perform(
             lookup_task_branches(
@@ -2887,40 +2927,99 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn empty_task_branch_answers_are_looked_up_again() {
-        let branch = TaskBranch {
-            repo: "acme/api".into(),
-            branch: "task/X".into(),
-        };
+    #[test]
+    fn discovered_task_branches_are_never_due_again_in_this_run() {
+        let (_dir, store, now) = delegated_task_fixture();
+        let branches = task_branches(&store, now);
         let mut prs = PrsState::default();
-        let first = lookup_task_branches(vec![branch.clone()], BTreeMap::new(), |_, _| async {
-            Ok(vec![])
-        })
-        .await;
-        prs.apply_task_branches(first, |_| {});
-        let second = lookup_task_branches(vec![branch.clone()], BTreeMap::new(), |_, _| async {
-            Ok(vec![task_pr(7)])
-        })
-        .await;
-        prs.apply_task_branches(second, |_| {});
-        assert_eq!(prs.task_branch_prs[&branch], vec![task_pr(7)]);
-        prs.request_row_refresh("acme/api#7".into(), true, Instant::now());
-        assert!(prs.task_branches_refresh);
+        let first = prs.take_task_branches_due(branches.clone());
+        let found = first[0].clone();
+        prs.apply_task_branches(vec![(found.clone(), Ok(vec![task_pr(7)]))], |_| {});
+        prs.request_task_branch_refresh();
+        let next = prs.take_task_branches_due(branches);
+        assert_eq!(next.len(), first.len() - 1);
+        assert!(!next.contains(&found));
+    }
+
+    #[tokio::test]
+    async fn empty_task_branch_answers_retry_on_refresh_but_not_periodic_polls() {
+        let (_dir, store, now) = delegated_task_fixture();
+        let branches = task_branches(&store, now);
+        let mut prs = PrsState::default();
+        let first = prs.take_task_branches_due(branches.clone());
+        let results =
+            lookup_task_branches(first.clone(), BTreeMap::new(), |_, _| async { Ok(vec![]) }).await;
+        prs.apply_task_branches(results, |_| {});
+        // The watch's next two-minute poll has no new discovery request.
+        assert!(!prs.task_branches_due());
+        assert!(prs.take_task_branches_due(branches.clone()).is_empty());
+        prs.request_task_branch_refresh();
+        assert_eq!(prs.take_task_branches_due(branches), first);
     }
 
     #[test]
-    fn task_branch_discovery_runs_on_start_and_refresh_without_overlapping() {
+    fn finishing_a_delegation_queues_only_its_task_branch() {
+        use gitterm::tasks::{DelegationResult, DelegationStatus};
+        for status in [
+            DelegationStatus::Completed,
+            DelegationStatus::Blocked,
+            DelegationStatus::Failed {
+                message: "worker failed".into(),
+            },
+        ] {
+            let (_dir, mut store, now) = delegated_task_fixture();
+            let branches = task_branches(&store, now);
+            let mut prs = PrsState::default();
+            prs.take_task_branches_due(branches.clone());
+            let delegation_id = store.delegations()[0].delegation_id.clone();
+            prs.request_finished_task_branch(&store, &delegation_id, now);
+            assert!(!prs.task_branches_due());
+            let result = DelegationResult {
+                handoff: Some(TaskHandoff {
+                    summary: "Worker report".into(),
+                    decisions: vec![],
+                    next_steps: vec![],
+                    blockers: vec![],
+                    updated_by_session_id: None,
+                    updated_at: now.to_rfc3339(),
+                }),
+                ..Default::default()
+            };
+            let at = now.to_rfc3339();
+            match status {
+                DelegationStatus::Completed => {
+                    store.complete_delegation(&delegation_id, result, &at)
+                }
+                DelegationStatus::Blocked => store.block_delegation(&delegation_id, result, &at),
+                _ => store.set_delegation_status(&delegation_id, status, &at),
+            }
+            .unwrap();
+            // A completion that arrives while startup/Refresh is still running must wait.
+            prs.task_branches_in_flight = true;
+            prs.request_finished_task_branch(&store, &delegation_id, now);
+            assert!(prs.take_task_branches_due(branches.clone()).is_empty());
+            prs.apply_task_branches(vec![], |_| {});
+            let due = prs.take_task_branches_due(branches.clone());
+            assert_eq!(due, vec![branches[0].1.clone()]);
+            assert!(prs.take_task_branches_due(branches.clone()).is_empty());
+            // Once discovered, even a new completion request cannot re-read it.
+            prs.apply_task_branches(vec![(due[0].clone(), Ok(vec![task_pr(7)]))], |_| {});
+            prs.request_finished_task_branch(&store, &delegation_id, now);
+            assert!(prs.take_task_branches_due(branches).is_empty());
+        }
+    }
+
+    #[test]
+    fn task_branch_refresh_requested_during_a_lookup_is_not_lost() {
+        let (_dir, store, now) = delegated_task_fixture();
+        let branches = task_branches(&store, now);
         let mut prs = PrsState::default();
-        let now = Instant::now();
-        assert!(prs.task_branches_due(now));
-        prs.task_branches_read_at = Some(now);
-        assert!(!prs.task_branches_due(now));
-        assert!(prs.task_branches_due(now + pr_watch::OPEN_INTERVAL));
-        prs.request_row_refresh("acme/api#7".into(), true, now);
-        assert!(prs.task_branches_due(now));
+        let first = prs.take_task_branches_due(branches.clone());
         prs.task_branches_in_flight = true;
-        assert!(!prs.task_branches_due(now + pr_watch::OPEN_INTERVAL));
+        prs.request_task_branch_refresh();
+        assert!(prs.take_task_branches_due(branches.clone()).is_empty());
+        prs.apply_task_branches(vec![], |_| {});
+        assert_eq!(prs.take_task_branches_due(branches), first);
     }
 
     #[test]

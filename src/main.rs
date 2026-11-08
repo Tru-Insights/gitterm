@@ -18150,6 +18150,7 @@ impl App {
                 self.mark_log_server_dirty();
             }
         }
+        self.request_finished_task_prs(delegation_id);
         self.push_delegation_card(delegation_id);
         let head =
             parent_tab.map_or_else(Task::none, |tab_id| self.refresh_delegation_head(tab_id));
@@ -18603,6 +18604,7 @@ impl App {
         }
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
+        self.request_finished_task_prs(delegation_id);
         self.push_delegation_card(delegation_id);
         close
     }
@@ -18685,6 +18687,7 @@ impl App {
                         eprintln!("[delegation] {delegation_id}: {store_error}");
                     }
                 }
+                self.request_finished_task_prs(&delegation_id);
                 self.push_delegation_card(&delegation_id);
                 reply.send(Err(format!(
                     "Created task {task_id} at {}, but {message}",
@@ -18906,6 +18909,7 @@ impl App {
         }
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
+        self.request_finished_task_prs(delegation_id);
         self.push_delegation_card(delegation_id);
     }
 
@@ -29348,6 +29352,7 @@ fi
                 let refresh =
                     self.start_workspace_overview_refresh(&dir, overview::RefreshMode::Full);
                 let documents = self.start_work_documents_scan();
+                self.prs.request_task_branch_refresh();
                 self.request_open_pr_refreshes();
                 let prs = self.poll_pr_watch();
                 return Task::batch([index, refresh, documents, prs]);
