@@ -64,9 +64,8 @@ pub struct ChatFacts {
     pub checkouts: Vec<CheckoutTouch>,
     #[serde(default)]
     pub children: Vec<ChatChild>,
-    /// PRs the chat created (TRU-173): a `gh pr create` Bash result naming
-    /// a GitHub PR URL. Written by the hosting tab only: live, or from the
-    /// transcript when it picks the chat up (TRU-201).
+    /// PRs the chat or its delegated workers created: a `gh pr create`
+    /// result naming a GitHub PR URL (TRU-173, TRU-257).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prs: Vec<PrRef>,
     /// Repositories where the chat ran a recognized git/GitHub write
@@ -982,11 +981,8 @@ fn facts_write_lock(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
 pub struct LiveFacts {
     tracker: ToolInputTracker,
     pending: RawFacts,
-    /// Bash calls running `gh pr create` whose result has not arrived
-    /// (TRU-173); their result names the PR.
-    pr_create_calls: HashSet<String>,
-    /// Pending Bash inputs, matched with their own results for Linear creates
-    /// (TRU-219). Keeping the command lets both collectors use one matcher.
+    /// Pending Bash inputs, matched with their own results for PR and
+    /// Linear creates (TRU-219, TRU-257).
     bash_commands: HashMap<String, String>,
     last_flush: Option<Instant>,
     in_flight: bool,
@@ -1015,15 +1011,6 @@ impl LiveFacts {
                 cwd,
                 &now_stamp(),
             );
-            let creates_pr = call.name == "Bash"
-                && call
-                    .input
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .is_some_and(merge_plan::is_gh_pr_create);
-            if creates_pr {
-                self.pr_create_calls.insert(call.id.clone());
-            }
             if call.name == "Bash" {
                 if let Some(command) = call.input.get("command").and_then(Value::as_str) {
                     self.bash_commands.insert(call.id, command.to_string());
@@ -1039,17 +1026,14 @@ impl LiveFacts {
         match event {
             HarnessEvent::SubagentEvent { event, .. } => self.observe_results(event),
             HarnessEvent::ItemCompleted { id, output, .. } => {
-                if self.pr_create_calls.remove(id) {
-                    self.pending.prs.extend(merge_plan::pr_urls_in(output));
-                }
                 if let Some(command) = self.bash_commands.remove(id) {
+                    self.pending.prs.extend(created_prs(&command, output));
                     self.pending
                         .issue_keys
                         .extend(created_linear_issue_keys(&command, output));
                 }
             }
             HarnessEvent::ProcessExited { .. } => {
-                self.pr_create_calls.clear();
                 self.bash_commands.clear();
             }
             _ => {}
@@ -1387,15 +1371,65 @@ pub fn catch_up_workspace_prs(
 /// subagent transcript, whose user lines are the coordinator's brief, not
 /// the human's words.
 pub fn observe_claude_line(raw: &mut RawFacts, line: &str, home: Option<&Path>, main: bool) {
-    observe_claude_line_with(
-        raw,
-        &mut HashSet::new(),
-        &mut HashMap::new(),
-        line,
-        home,
-        main,
-        &mut None,
-    );
+    observe_claude_line_with(raw, &mut HashMap::new(), line, home, main, &mut None);
+}
+
+/// Shared PR recognition for live facts and worker/Claude transcript adapters.
+/// Keep the command paired with its own output; URL mentions alone are not facts.
+pub(crate) fn created_prs(command: &str, output: &str) -> Vec<PrRef> {
+    if merge_plan::is_gh_pr_create(command) {
+        merge_plan::pr_urls_in(output)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Add a worker's PRs only to an existing parent's facts, under the same
+/// lock as live/backfill writers. Preserve the full-scan time: adding PRs
+/// must not make a stale transcript's other facts appear current.
+pub(crate) fn record_worker_prs(
+    dir: &Path,
+    parent: &str,
+    prs: &[PrRef],
+) -> Result<Option<Vec<PrRef>>, String> {
+    for backend in [ChatBackend::Claude, ChatBackend::Codex, ChatBackend::Pi] {
+        let path = facts_path(dir, backend, parent)?;
+        let lock = facts_write_lock(&path);
+        let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(mut facts) = load_facts(&path)? else {
+            continue;
+        };
+        let before = facts.prs.clone();
+        for pr in prs {
+            facts.add_pr(pr.clone());
+        }
+        let added: Vec<_> = facts
+            .prs
+            .iter()
+            .filter(|pr| !before.iter().any(|known| known.key().id() == pr.key().id()))
+            .cloned()
+            .collect();
+        if !added.is_empty() {
+            let written = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .map_err(|error| {
+                    format!("cannot read {} modification time: {error}", path.display())
+                })?;
+            write_facts(&path, &facts)?;
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_modified(written))
+                .map_err(|error| {
+                    format!(
+                        "cannot preserve {} modification time: {error}",
+                        path.display()
+                    )
+                })?;
+        }
+        return Ok(Some(added));
+    }
+    Ok(None)
 }
 
 /// Match a create invocation and its own Bash result together. A combined
@@ -2185,7 +2219,6 @@ fn linear_issue_keys_in(text: &str) -> Vec<String> {
 /// as the live tab would (TRU-201, TRU-219).
 fn observe_claude_line_with(
     raw: &mut RawFacts,
-    pr_create_calls: &mut HashSet<String>,
     bash_commands: &mut HashMap<String, String>,
     line: &str,
     home: Option<&Path>,
@@ -2205,8 +2238,7 @@ fn observe_claude_line_with(
         }
     }
     let user_line = main && record_type == Some("user");
-    let create_result = (!pr_create_calls.is_empty() || !bash_commands.is_empty())
-        && line.contains("\"tool_result\"");
+    let create_result = !bash_commands.is_empty() && line.contains("\"tool_result\"");
     if !user_line && !create_result && !line.contains("\"tool_use\"") {
         return;
     }
@@ -2220,13 +2252,10 @@ fn observe_claude_line_with(
                 continue;
             }
             let id = block.get("tool_use_id").and_then(Value::as_str);
-            if id.is_some_and(|id| pr_create_calls.remove(id)) {
-                let output = block.get("content").map(tool_result_text);
-                raw.prs
-                    .extend(merge_plan::pr_urls_in(output.as_deref().unwrap_or("")));
-            }
             if let Some(command) = id.and_then(|id| bash_commands.remove(id)) {
                 let output = block.get("content").map(tool_result_text);
+                raw.prs
+                    .extend(created_prs(&command, output.as_deref().unwrap_or("")));
                 raw.issue_keys.extend(created_linear_issue_keys(
                     &command,
                     output.as_deref().unwrap_or(""),
@@ -2276,14 +2305,6 @@ fn observe_claude_line_with(
                     continue;
                 };
                 raw.observe_tool_call_with_cwd(id, name, input, home, cwd.as_deref(), &at);
-                let creates_pr = name == "Bash"
-                    && input
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .is_some_and(merge_plan::is_gh_pr_create);
-                if creates_pr {
-                    pr_create_calls.insert(id.to_string());
-                }
                 if name == "Bash" {
                     if let Some(command) = input.get("command").and_then(Value::as_str) {
                         bash_commands.insert(id.to_string(), command.to_string());
@@ -2296,7 +2317,7 @@ fn observe_claude_line_with(
 }
 
 /// A tool result's text: a string, or the text blocks of a list.
-fn tool_result_text(content: &Value) -> String {
+pub(crate) fn tool_result_text(content: &Value) -> String {
     match content {
         Value::String(text) => text.clone(),
         Value::Array(blocks) => blocks
@@ -2317,22 +2338,13 @@ fn scan_lines(
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(std::fs::File::open(path)?);
     let mut line = String::new();
-    let mut pr_create_calls = HashSet::new();
     let mut bash_commands = HashMap::new();
     let mut cwd = None;
     loop {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => return Ok(()),
-            Ok(_) => observe_claude_line_with(
-                raw,
-                &mut pr_create_calls,
-                &mut bash_commands,
-                &line,
-                home,
-                main,
-                &mut cwd,
-            ),
+            Ok(_) => observe_claude_line_with(raw, &mut bash_commands, &line, home, main, &mut cwd),
             // A line that is not UTF-8 is skipped, not fatal.
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
             Err(error) => return Err(error),

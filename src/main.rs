@@ -7273,6 +7273,7 @@ pub enum Event {
     /// "Index older chats" in the Chats panel (TRU-166).
     ChatFactsBackfill,
     ChatFactsBackfilled(Result<chat_facts::BackfillReport, String>),
+    WorkerPrsScanned(Result<gitterm::worker_prs::RecordedPrs, String>),
     /// A ~/Work git job ended (TRU-201).
     WorkNotesDone(gitterm::work_notes::JobResult),
     /// Workspace overview (TRU-167): rebuild from the index and reread git.
@@ -7590,6 +7591,7 @@ struct App {
     delegation_runs: HashMap<String, iced::task::Handle>,
     /// Latest Codex activity line per running delegation (not persisted).
     delegation_activity: HashMap<String, String>,
+    worker_pr_scans: gitterm::worker_prs::Scans,
     /// Send-to-Claude messages held per chat tab until its turn ends.
     delegation_held: HashMap<usize, Vec<gitterm::delegations::HeldSend>>,
     /// New-chat model/effort defaults and the last selection (config
@@ -15322,6 +15324,30 @@ impl App {
         chat_facts::store_links(store.delegations(), store.tasks(), &uid_to_chat)
     }
 
+    fn poll_worker_prs(&mut self) -> Task<Event> {
+        let Some(store) = self.task_store.as_ref() else {
+            return Task::none();
+        };
+        let scans =
+            self.worker_pr_scans
+                .take_due(store.delegations(), store.tasks(), chrono::Utc::now());
+        if scans.is_empty() {
+            return Task::none();
+        }
+        let config_dir = config::global_config_dir();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let home = dirs::home_dir().ok_or("cannot locate home for worker PR scans")?;
+                    Ok(gitterm::worker_prs::run(scans, &config_dir, &home))
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("worker PR scan task failed: {error}")))
+            },
+            Event::WorkerPrsScanned,
+        )
+    }
+
     /// Write a chat tab's facts when they are due (TRU-166): debounced while
     /// a turn runs, at once when `force` (the turn ended). The write runs
     /// on a blocking thread; one per tab at a time. A requested catch-up
@@ -20202,6 +20228,7 @@ impl App {
             model_policy: config.policy.clone(),
             delegation_runs: HashMap::new(),
             delegation_activity: HashMap::new(),
+            worker_pr_scans: gitterm::worker_prs::Scans::default(),
             delegation_held: HashMap::new(),
             chat_config: config.chat.clone(),
             task_store_error,
@@ -23226,7 +23253,18 @@ fi
 
     fn update(&mut self, event: Event) -> Task<Event> {
         let overlay_was_open = self.webview_overlay_open();
+        // Reports/time limits scan immediately; the tick also catches every
+        // other terminal worker outcome and performs startup catch-up once.
+        let check_worker_prs = matches!(
+            &event,
+            Event::Tick | Event::TaskControlRequested(_) | Event::WorkerTimeLimitReached(..)
+        );
         let task = self.update_event(event);
+        let task = if check_worker_prs {
+            Task::batch([task, self.poll_worker_prs()])
+        } else {
+            task
+        };
         let task = match self.settle_active_workspace() {
             Some(settle) => Task::batch([task, settle]),
             None => task,
@@ -29801,6 +29839,18 @@ fi
                 self.work_notes.finish(result, Instant::now());
                 // A commit asked for meanwhile (a park) runs now.
                 return self.poll_work_notes();
+            }
+            Event::WorkerPrsScanned(result) => {
+                self.worker_pr_scans.running = false;
+                match result {
+                    Ok(recorded) => {
+                        for (parent, prs) in recorded {
+                            self.prs.note_live_prs(&parent, &prs);
+                        }
+                    }
+                    Err(error) => eprintln!("[worker-prs] {error}"),
+                }
+                return self.poll_worker_prs();
             }
             Event::ChatFactsBackfilled(result) => {
                 self.chat_backfill_running = false;

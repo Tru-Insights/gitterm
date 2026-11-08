@@ -894,6 +894,41 @@ fn claude_session_path_under(projects: &Path, session_id: &str) -> Option<PathBu
         .find(|path| path.is_file())
 }
 
+/// Find a worker transcript by its recorded harness id, without reading
+/// unrelated conversations. Blocking; `home` may be a fixture home.
+pub(crate) fn task_conversation_path_under(
+    home: &Path,
+    conversation: &crate::tasks::HarnessConversationRef,
+) -> Result<PathBuf, String> {
+    use crate::tasks::HarnessConversationBackend as Backend;
+    let id = &conversation.session_id;
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!("invalid worker conversation id {id:?}"));
+    }
+    let (root, depth) = match conversation.backend {
+        Backend::Claude => (home.join(".claude/projects"), 1),
+        Backend::Codex => (home.join(".codex/sessions"), 3),
+        Backend::Pi => return Err("worker PR scans do not support Pi transcripts".into()),
+    };
+    let expected = format!("{id}.jsonl");
+    let suffix = format!("-{expected}");
+    jsonl_files_under(&root, depth)
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| match conversation.backend {
+                    Backend::Codex => name.starts_with("rollout-") && name.ends_with(&suffix),
+                    _ => name == expected,
+                })
+        })
+        .ok_or_else(|| format!("no transcript for {id} under {}", root.display()))
+}
+
 /// Which of these codex conversation ids belong to subagent rollouts
 /// (approval arbiters and similar harness-internal sessions). Matches
 /// rollout files by name and reads one head line per matched id, so the
