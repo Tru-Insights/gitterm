@@ -1517,13 +1517,9 @@ fn is_known_read_only(command: &str) -> bool {
             // `rg --pre <cmd>` runs a command on every file.
             Some("rg") => !words.iter().any(|word| word.starts_with("--pre")),
             // Not sed or awk (scripts can run commands), not find (-exec),
-            // not less, not git diff (external diff tools), and not
-            // `gh pr view/list/search`: they print real PRs, so their output
-            // is never evidence that a saved PR is wrong.
-            Some("git") => matches!(
-                words.get(1).map(String::as_str),
-                Some("log" | "show" | "grep")
-            ),
+            // not less, not git (helpers via -O, --ext-diff, --textconv), and
+            // not `gh pr view/list/search`: they print real PRs, so their
+            // output is never evidence that a saved PR is wrong.
             _ => false,
         }
     })
@@ -3924,9 +3920,6 @@ branch refs/heads/tracey/tru-12-thing
             "uniq",
             "jq",
             "ls",
-            "git log",
-            "git show",
-            "git grep",
             "grep -rn 'gh pr create' . | head",
             "rg create file && cat file; printf '%s' done",
             "echo '$(gh pr create)'",
@@ -3971,6 +3964,9 @@ branch refs/heads/tracey/tru-12-thing
             "sed -n '1e gh pr create --fill' file",
             "rg --pre ./script create .",
             "git diff",
+            "git log",
+            "git show --ext-diff",
+            "git grep -O./helper needle",
             "gh pr view 42",
             "gh pr list",
             "gh search prs query",
