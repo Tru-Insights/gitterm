@@ -253,6 +253,67 @@ where
     results
 }
 
+/// Read saved facts by id, including descendants absent from the index.
+/// Called only when PR homes rebuild, never from a view.
+fn load_root_prs(
+    dir: &Path,
+    index: &[chats::ChatIndexEntry],
+    links: &[chat_facts::ChildLink],
+    root: &str,
+    mut log: impl FnMut(&str),
+) -> Vec<PrRef> {
+    let mut pending = vec![root.to_string()];
+    pending.extend(
+        overview::chats_under(index, &[root.to_string()])
+            .into_iter()
+            .map(|entry| entry.id.clone()),
+    );
+    let mut seen = HashSet::new();
+    let mut prs = Vec::new();
+    while let Some(chat) = pending.pop() {
+        if !seen.insert(chat.clone()) {
+            continue;
+        }
+        pending.extend(
+            chat_facts::links_for_parent(links, &chat)
+                .into_iter()
+                .map(|child| child.session_id),
+        );
+        for entry in index.iter().filter(|entry| entry.id == chat) {
+            if let Some(facts) = &entry.facts {
+                prs.extend(facts.prs.iter().cloned());
+                pending.extend(facts.children.iter().map(|child| child.session_id.clone()));
+            }
+        }
+        // Owned lists carry ids without a backend. Probe the supported facts
+        // names so an unindexed chat needs no transcript or index entry.
+        for backend in chats::ChatBackend::ALL {
+            let path = match chat_facts::facts_path(dir, backend, &chat) {
+                Ok(path) => path,
+                Err(error) => {
+                    log(&format!(
+                        "[pr-watch] facts for chat {chat:?} in {}: {error}",
+                        dir.display()
+                    ));
+                    break;
+                }
+            };
+            match chat_facts::load_facts(&path) {
+                Ok(Some(facts)) => {
+                    prs.extend(facts.prs);
+                    pending.extend(facts.children.into_iter().map(|child| child.session_id));
+                }
+                Ok(None) => {}
+                Err(error) => log(&format!(
+                    "[pr-watch] facts for chat {chat:?} at {}: {error}",
+                    path.display()
+                )),
+            }
+        }
+    }
+    prs
+}
+
 /// Facts, live tabs and cached task branches share one PR identity set.
 fn collect_root_prs(
     index: &[chats::ChatIndexEntry],
@@ -272,6 +333,9 @@ fn collect_root_prs(
         for pr in entry.facts.iter().flat_map(|facts| &facts.prs) {
             push(pr);
         }
+    }
+    for pr in prs.saved_root_prs.get(root).into_iter().flatten() {
+        push(pr);
     }
     for (chat, live) in &prs.live_prs {
         if chat == root || root_of(chat) == root {
@@ -466,6 +530,8 @@ pub struct PrsState {
     /// PRs live tabs recorded in this process, by chat, until the index
     /// carries them.
     pub live_prs: HashMap<String, Vec<PrRef>>,
+    /// Saved facts read at the last PR-home rebuild, including unindexed chats.
+    saved_root_prs: HashMap<String, Vec<PrRef>>,
     pub action: Option<PrActionConfirm>,
     pub ready_open: bool,
     /// Roots whose merged and closed PRs are expanded (not persisted).
@@ -702,7 +768,7 @@ impl App {
         current
     }
 
-    /// The PRs root `root`'s chats recorded: facts in the index, and what
+    /// The PRs root `root`'s chats recorded: indexed and saved facts, what
     /// live tabs saw since, plus delegated tasks' cached branch PRs.
     fn root_fact_prs(&self, root: &str) -> Vec<PrRef> {
         let branches = self
@@ -721,7 +787,7 @@ impl App {
             app.pr_roots_of(owned, dir)
                 .into_iter()
                 .map(|(root, title)| RootPrs {
-                    facts: app.root_fact_prs(&root),
+                    facts: Vec::new(),
                     root,
                     title,
                 })
@@ -742,6 +808,18 @@ impl App {
                     PrHome::Parked(ParkedKey::of(cfg)),
                     roots_of(self, &cfg.chats, Path::new(&cfg.dir)),
                 ));
+            }
+        }
+        let dir = chat_facts::facts_dir(&config::global_config_dir());
+        let links = self.chat_child_links();
+        self.prs.saved_root_prs.clear();
+        for (_, roots) in &mut homes {
+            for root in roots {
+                let saved = load_root_prs(&dir, &self.chat_index, &links, &root.root, |message| {
+                    eprintln!("{message}");
+                });
+                self.prs.saved_root_prs.insert(root.root.clone(), saved);
+                root.facts = self.root_fact_prs(&root.root);
             }
         }
         // A root a tab here hosts, with a plan or PRs the index does not
@@ -873,7 +951,7 @@ impl App {
         let mut tasks: Vec<Task<Event>> = Vec::new();
         tasks.push(self.poll_task_branch_prs());
         self.prs.promote_deferred(Instant::now());
-        // Facts PRs come from the index; load it once if nothing has.
+        // The index also contributes PRs and fallback roots; load it once.
         if !self.prs.index_requested
             && self.chat_index_loaded_at.is_none()
             && !self.chat_index_loading
@@ -2844,6 +2922,106 @@ mod tests {
         }
     }
 
+    fn save_pr_facts(
+        dir: &Path,
+        backend: chats::ChatBackend,
+        chat: &str,
+        facts: chat_facts::ChatFacts,
+    ) {
+        let path = chat_facts::facts_path(dir, backend, chat).unwrap();
+        chat_facts::write_facts(&path, &facts).unwrap();
+    }
+
+    #[test]
+    fn owned_chat_prs_are_loaded_without_an_index_entry() {
+        for backend in chats::ChatBackend::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            let mut prs = PrsState::default();
+            save_pr_facts(
+                dir.path(),
+                backend,
+                "owned-root",
+                chat_facts::ChatFacts {
+                    prs: vec![task_pr(7)],
+                    ..Default::default()
+                },
+            );
+            prs.saved_root_prs.insert(
+                "owned-root".into(),
+                load_root_prs(dir.path(), &[], &[], "owned-root", |message| {
+                    panic!("{message}")
+                }),
+            );
+            assert_eq!(
+                collect_root_prs(&[], "owned-root", &prs, &[], task_root),
+                vec![task_pr(7)]
+            );
+        }
+    }
+
+    #[test]
+    fn unindexed_roots_keep_saved_and_linked_descendants_with_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = |id: &str| chat_facts::ChatChild {
+            session_id: id.into(),
+            kind: chat_facts::ChildKind::Worker,
+            delegation_id: None,
+            task_id: None,
+            title: None,
+        };
+        for (id, number, children) in [
+            ("owned-root", 7, vec![child("saved-child")]),
+            ("saved-child", 8, vec![child("owned-root")]),
+            ("linked-child", 9, vec![]),
+        ] {
+            save_pr_facts(
+                dir.path(),
+                chats::ChatBackend::Claude,
+                id,
+                chat_facts::ChatFacts {
+                    prs: vec![task_pr(number)],
+                    children,
+                    ..Default::default()
+                },
+            );
+        }
+        let links = vec![chat_facts::ChildLink {
+            parent: "saved-child".into(),
+            child: child("linked-child"),
+        }];
+        let mut found = load_root_prs(dir.path(), &[], &links, "owned-root", |message| {
+            panic!("{message}")
+        });
+        found.sort_by_key(|pr| pr.number);
+        assert_eq!(found, vec![task_pr(7), task_pr(8), task_pr(9)]);
+    }
+
+    #[test]
+    fn missing_saved_facts_are_empty_and_invalid_facts_log_chat_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut logs = Vec::new();
+        assert!(
+            load_root_prs(dir.path(), &[], &[], "owned-root", |message| {
+                logs.push(message.to_string())
+            })
+            .is_empty()
+        );
+        assert!(logs.is_empty());
+        let path =
+            chat_facts::facts_path(dir.path(), chats::ChatBackend::Claude, "owned-root").unwrap();
+        std::fs::write(&path, "invalid JSON").unwrap();
+        assert!(
+            load_root_prs(dir.path(), &[], &[], "owned-root", |message| {
+                logs.push(message.to_string())
+            })
+            .is_empty()
+        );
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].contains("owned-root"));
+        assert!(logs[0].contains(&path.display().to_string()));
+        assert!(logs[0].contains("not a facts file"));
+    }
+
     #[tokio::test]
     async fn task_branch_prs_belong_to_the_delegating_chats_root() {
         let (_dir, store, now) = delegated_task_fixture();
@@ -2944,6 +3122,19 @@ mod tests {
             }),
             root_id: Some("root-a".into()),
         }];
+        let dir = tempfile::tempdir().unwrap();
+        save_pr_facts(
+            dir.path(),
+            chats::ChatBackend::Claude,
+            "claude-worker",
+            index[0].facts.clone().unwrap(),
+        );
+        prs.saved_root_prs.insert(
+            "root-a".into(),
+            load_root_prs(dir.path(), &index, &[], "root-a", |message| {
+                panic!("{message}")
+            }),
+        );
         let found = collect_root_prs(&index, "root-a", &prs, &branches, task_root);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].key().id(), "acme/api#7");

@@ -38830,7 +38830,11 @@ fi
                 .active_workspace()
                 .map(|ws| overview::folder_name(&ws.dir))
                 .unwrap_or_default();
-            let roots = summary.coordinators.len();
+            let roots = self
+                .active_workspace()
+                .filter(|ws| !ws.chats.is_empty())
+                .map(|ws| ws.chats.len())
+                .unwrap_or(summary.coordinators.len());
             content = content.push(
                 text(format!(
                     "owns {roots} chat{} \u{00B7} new chats start in {home}",
