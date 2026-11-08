@@ -267,6 +267,175 @@
     send(end);
     check('F1 turn end folds restored and detached runs without losing cards', !document.querySelector('.earlier') && !runs().length && messages.querySelectorAll('.turn-fold details.tool').length === 300 && !messages.querySelector('.tool-run .tool-run') && [...document.querySelectorAll('#messages > .assistant')].some((n) => n.textContent.includes('Finished checking.')));
 
+    // TRU-256: exercise the real find controls and native-key IPC seam.
+    reset();
+    const findBar = document.getElementById('chat-find');
+    const query = document.getElementById('find-query');
+    const count = document.getElementById('find-count');
+    const tools = document.getElementById('find-tools');
+    const findPosts = [];
+    window.ipc = { postMessage: (message) => {
+      const value = JSON.parse(message);
+      findPosts.push(value);
+      if (value.type === 'hostkey' && value.key === 'f') window.__openFind();
+    } };
+    const key = (target, value, options = {}) => {
+      const event = new KeyboardEvent('keydown', { key: value, bubbles: true, cancelable: true, ...options });
+      target.dispatchEvent(event);
+      return event;
+    };
+    const search = (text) => { query.value = text; query.dispatchEvent(new Event('input', { bubbles: true })); };
+    const highlights = () => [...(CSS.highlights.get('chat-find') || [])];
+    const current = () => [...(CSS.highlights.get('chat-find-current') || [])][0];
+    send({ type: 'user_prompt', text: 'Needle first' },
+      H('text_delta', 'An earlier paragraph.\n\n'.repeat(70) + 'A **nee**dle and `NEEDLE`.\n\n```js\nconst needle = 1;\n```'),
+      start('find-tool', 'Bash', { command: 'echo tool-only' }),
+      H('item_completed', { id: 'find-tool', output: 'Needle tool-only', is_error: false }),
+      H('thinking_delta', 'Needle thought'), H('text_delta', 'Needle final'), end);
+    await settle();
+    const originalText = messages.textContent;
+    const originalCode = messages.querySelector('pre code').textContent;
+    const cmdF = key(document.getElementById('prompt'), 'f', { metaKey: true });
+    check('Cmd+F forwards through hostkey and opens a labelled focused input', cmdF.defaultPrevented && findPosts.at(-1)?.key === 'f' && !findBar.hidden && document.activeElement === query && !!query.getAttribute('aria-label') && count.getAttribute('aria-live') === 'polite');
+    search('needle');
+    check('find highlights prose, thinking and code across inline markup with a live count', highlights().length === 6 && highlights().every((r) => r.toString().toLowerCase() === 'needle') && count.textContent === '1 of 6');
+    const firstFind = current().startContainer;
+    const foldedFind = document.querySelector('.turn-fold');
+    check('first match leaves later folded content closed', !foldedFind.open);
+    key(query, 'Enter');
+    const secondFind = current().startContainer;
+    const hitRect = current().getBoundingClientRect(), messageRect = messages.getBoundingClientRect();
+    check('Enter advances in conversation order', count.textContent === '2 of 6' && secondFind !== firstFind);
+    check('navigation scrolls the matching line into view', messages.scrollTop > 0 && hitRect.top >= messageRect.top && hitRect.bottom <= messageRect.bottom);
+    key(query, 'Enter', { shiftKey: true });
+    check('Shift+Enter returns to previous match', count.textContent === '1 of 6' && current().startContainer === firstFind);
+    key(query, 'Enter', { shiftKey: true });
+    check('previous wraps to the last match', count.textContent === '6 of 6' && current().startContainer.parentElement.closest('.assistant')?.textContent.trim() === 'Needle final');
+    key(query, 'Enter');
+    check('next wraps to the first match', count.textContent === '1 of 6');
+    search('Needle thought');
+    check('a match inside a folded turn and thinking card opens both', count.textContent === '1 of 1' && foldedFind.open && current().startContainer.parentElement.closest('details.thinking').open);
+    search('tool-only');
+    check('tool input and result excluded by default', count.textContent === '0 of 0' && !highlights().length && document.getElementById('find-next').disabled);
+    tools.checked = true; tools.dispatchEvent(new Event('change'));
+    check('toggle includes tool input and result and opens nested cards', count.textContent === '1 of 2' && highlights().length === 2 && card('find-tool').open && card('find-tool').closest('.tool-run').open);
+    for (const size of [11, 22]) {
+      window.__setChatFontSize(size);
+      check('find controls scale with chat text at ' + size, [query, count, findBar.querySelector('label'), document.getElementById('find-next')].every((n) => Math.abs(parseFloat(getComputedStyle(n).fontSize) - size * 12 / 14) < 0.01));
+    }
+    window.__setChatFontSize(15);
+    search('needle');
+    check('range highlights leave code copy text unchanged', messages.querySelector('pre code').textContent === originalCode);
+    const beforeEscape = findPosts.length;
+    key(query, 'Escape');
+    check('Esc clears every highlight, restores exact transcript text and focuses composer', findBar.hidden && !CSS.highlights.has('chat-find') && !CSS.highlights.has('chat-find-current') && messages.textContent === originalText && document.activeElement.id === 'prompt' && findPosts.length === beforeEscape);
+
+    reset();
+    const historyForFind = [];
+    for (let i = 0; i < 220; i++) historyForFind.push({ type: 'user_prompt', text: i === 0 ? 'Earlier [a.*] needle' : 'Historical message ' + i });
+    window.__replay(historyForFind);
+    check('history find fixture starts with unloaded earlier messages', !!document.querySelector('.earlier') && !messages.textContent.includes('Earlier [a.*] needle'));
+    window.__openFind(); search('[a.*]');
+    check('find loads earlier chunks and deferred content and treats query literally', !document.querySelector('.earlier') && count.textContent === '1 of 1' && current().toString() === '[a.*]' && messages.textContent.includes('Earlier [a.*] needle'));
+    key(query, 'Escape');
+
+    reset();
+    const replayForFind = [];
+    for (let i = 0; i < 220; i++) replayForFind.push({ type: 'user_prompt', text: 'Question ' + i }, H('text_delta', i === 0 ? '**deferredneedle**' : 'Answer ' + i), end);
+    window.__resetConversation(); window.__replay(replayForFind);
+    window.__openFind(); search('deferredneedle');
+    check('find renders deferred markdown in earlier assistant messages', count.textContent === '1 of 1' && current().startContainer.parentElement.tagName === 'STRONG');
+    key(query, 'Escape');
+
+    reset();
+    const longOutput = 'x'.repeat(21000) + ' beyondneedle';
+    send(start('long-find'), H('item_completed', { id: 'long-find', output: longOutput, is_error: false }), end);
+    const truncatedText = messages.textContent;
+    window.__openFind(); search('beyondneedle');
+    check('long tool result stays excluded by default', count.textContent === '0 of 0');
+    // Scope is retained across opening/closing find, so set explicitly here.
+    tools.checked = true; tools.dispatchEvent(new Event('change'));
+    check('find includes full tool output beyond display truncation', count.textContent === '1 of 1' && current().toString() === 'beyondneedle' && card('long-find').open);
+    key(query, 'Escape');
+    check('closing restores truncated tool result text exactly', messages.textContent === truncatedText);
+
+    reset();
+    send({ kind: 'delegation', delegation: {
+      delegation_id: 'find-report', kind: 'implement', brief: 'Check the project',
+      child: { model: 'test-model' }, status: { state: 'completed' },
+      created_at: '2026-11-01T10:00:00Z', updated_at: '2026-11-01T10:00:00Z',
+      result: { handoff: { summary: 'Cardneedle summary', decisions: ['Cardneedle decision'], next_steps: ['Cardneedle next step'], blockers: [] } },
+    } });
+    const report = messages.querySelector('.dlg'); report.open = false;
+    window.__openFind(); search('cardneedle');
+    check('default scope searches agent reports inside closed delegation cards', count.textContent === '1 of 3' && report.open);
+    key(query, 'Escape');
+    send(start('find-subagent', 'Agent', { description: 'Check the project' }), H('subagent_event', { parent_tool_use_id: 'find-subagent', event: { type: 'text_delta', data: 'Subagentneedle response' } }));
+    card('find-subagent').open = false;
+    card('find-subagent').querySelector('.subagent').open = false;
+    window.__openFind(); search('subagentneedle');
+    check('default scope searches subagent writing inside closed tool cards', count.textContent === '1 of 1' && card('find-subagent').open && card('find-subagent').querySelector('.subagent').open);
+    key(query, 'Escape');
+
+    reset(); tools.checked = false;
+    send(H('text_delta', 'Needle first\nNeedle second'));
+    await settle();
+    window.__openFind(); search('needle'); key(query, 'Enter');
+    const streamRoot = current().startContainer.parentElement.closest('.assistant');
+    const streamTop = messages.scrollTop;
+    send(H('text_delta', '\nNeedle third'));
+    await settle(); await settle();
+    check('streaming updates count without losing selected match or scroll', count.textContent === '2 of 3' && current().startContainer.parentElement.closest('.assistant') === streamRoot && messages.scrollTop === streamTop && current().toString() === 'Needle');
+    send(start('stream-find'), done('stream-find'), H('text_delta', 'All finished.'), end);
+    await settle();
+    check('turn folding keeps the current streaming match expanded', count.textContent === '2 of 3' && streamRoot.closest('.turn-fold')?.open);
+    key(query, 'Escape');
+
+    reset();
+    send(H('text_delta', 'Earlier line.\n'.repeat(100) + 'needle at the end'));
+    await settle();
+    window.__openFind(); search('needle');
+    const beforeGrowth = messages.scrollTop;
+    messages.dispatchEvent(new Event('scroll')); // Reaching bottom must not restart live follow.
+    send(H('text_delta', '\nNew streaming line.'.repeat(100)));
+    await settle(); await settle();
+    check('stream growth at the bottom cannot scroll the selected match away', beforeGrowth > 0 && messages.scrollTop === beforeGrowth && count.textContent === '1 of 1' && current().getBoundingClientRect().bottom <= messages.getBoundingClientRect().bottom);
+    key(query, 'Escape');
+
+    reset();
+    send(H('text_delta', '```js\nconst ' + 'x'.repeat(300) + ' = "horizontalneedle";\n```'), end);
+    window.__openFind(); search('horizontalneedle');
+    const codeScroller = current().startContainer.parentElement.closest('pre');
+    const codeHit = current().getBoundingClientRect(), codeBox = codeScroller.getBoundingClientRect();
+    check('find scrolls long code lines horizontally into view', codeScroller.scrollLeft > 0 && codeHit.left >= codeBox.left && codeHit.right <= codeBox.right);
+    key(query, 'Escape');
+
+    // Older supported WebKit must search without the CSS Highlight API.
+    reset();
+    send(H('text_delta', 'Legacyneedle first and legacyneedle second.'), end);
+    const oldWebkitText = messages.textContent;
+    const highlightApi = window.Highlight;
+    const highlightRegistry = Object.getOwnPropertyDescriptor(CSS, 'highlights');
+    window.Highlight = undefined;
+    Object.defineProperty(CSS, 'highlights', { value: undefined, configurable: true });
+    window.__openFind(); search('legacyneedle');
+    await settle();
+    check('older WebKit paints range overlays without altering transcript text', count.textContent === '1 of 2' && document.querySelectorAll('.find-hit').length >= 2 && !!document.querySelector('.find-hit.current') && messages.textContent === oldWebkitText);
+    key(query, 'Enter');
+    check('older WebKit retains keyboard navigation', count.textContent === '2 of 2');
+    key(query, 'Escape');
+    check('older WebKit clears overlays and preserves exact transcript text', !document.querySelector('.find-hit') && findBar.hidden && messages.textContent === oldWebkitText);
+    window.Highlight = highlightApi;
+    Object.defineProperty(CSS, 'highlights', highlightRegistry);
+
+    // Leave a compact synthetic example for --screenshot.
+    reset();
+    send({ type: 'user_prompt', text: 'Where is the chat search implemented?' },
+      H('text_delta', 'The **chat search** lives in the current conversation.\n\nIt finds text in earlier messages, folded turns, and code:\n\n```js\nconst search = "plain text";\n```'),
+      start('screenshot-search'), done('screenshot-search'), H('text_delta', 'Use Enter to move to the next search match, or Shift+Enter to go back.'), end);
+    await settle();
+    window.__openFind(); search('search'); key(query, 'Enter');
+
     check('no event-render errors', ![...document.querySelectorAll('.error-block')].some((n) => n.textContent.startsWith('Chat view could not render')));
   } catch (error) {
     results.push('FAIL ' + error.stack);
@@ -274,6 +443,7 @@
   window.requestAnimationFrame = requestFrame;
   const result = document.createElement('pre');
   result.id = 'live-turn-test-result';
+  result.hidden = true;
   result.textContent = results.join('\n');
   document.body.appendChild(result);
 })();
