@@ -405,7 +405,8 @@ impl LineMeta {
 /// Harness-injected user content (command wrappers, caveats, reminders)
 /// that must not become a chat title.
 fn is_synthetic_user_text(text: &str) -> bool {
-    text.starts_with('<')
+    // Codex prepends this harness wrapper when replaying a prior request.
+    text.starts_with('<') || text.starts_with("You previously asked the user:")
 }
 
 fn title_from_text(text: &str) -> String {
@@ -511,11 +512,7 @@ fn scan_claude_title(path: &Path) -> std::io::Result<Option<String>> {
         if reader.read_line(&mut line)? == 0 {
             break;
         }
-        if !(line.contains("\"type\":\"user\"")
-            || line.contains("\"type\": \"user\"")
-            || line.contains("\"type\":\"summary\"")
-            || line.contains("\"type\": \"summary\""))
-        {
+        if !(line.contains("\"user\"") || line.contains("\"summary\"")) {
             continue;
         }
         let Ok(meta) = serde_json::from_str::<LineMeta>(&line) else {
@@ -551,10 +548,7 @@ fn scan_codex_title(path: &Path) -> std::io::Result<Option<String>> {
         if reader.read_line(&mut line)? == 0 {
             break;
         }
-        if !(line.contains("\"type\":\"response_item\"")
-            || line.contains("\"type\": \"response_item\""))
-            || !(line.contains("\"role\":\"user\"") || line.contains("\"role\": \"user\""))
-        {
+        if !line.contains("\"user\"") {
             continue;
         }
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
@@ -579,9 +573,7 @@ fn scan_pi_title(path: &Path) -> std::io::Result<Option<String>> {
         if reader.read_line(&mut line)? == 0 {
             break;
         }
-        if !(line.contains("\"type\":\"message\"") || line.contains("\"type\": \"message\""))
-            || !(line.contains("\"role\":\"user\"") || line.contains("\"role\": \"user\""))
-        {
+        if !line.contains("\"user\"") {
             continue;
         }
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
@@ -1346,6 +1338,103 @@ mod tests {
 
         let entry = index_transcript(&path, ChatBackend::Claude).unwrap();
         assert_eq!(entry.title, "message after large tool output");
+    }
+
+    #[test]
+    fn title_scans_accept_whitespace_variants_after_large_lines_for_all_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        let padding = serde_json::json!({
+            "type": "tool-result",
+            "content": "x".repeat(80 * 1024)
+        })
+        .to_string();
+
+        let claude_user = user_line("/tmp/x", "main", "Claude title past the head limit")
+            .replace("\"type\":\"user\"", "\"type\" : \"user\"");
+        let mut claude_lines =
+            vec![r#"{"type":"system","cwd":"/tmp/x","gitBranch":"main"}"#.to_string()];
+        claude_lines.extend(std::iter::repeat_n(padding.clone(), 4));
+        claude_lines.push(claude_user);
+        let claude_path = dir.path().join("claude-whitespace.jsonl");
+        let claude_transcript = claude_lines.join("\n");
+        assert!(
+            claude_transcript
+                .find("Claude title past the head limit")
+                .unwrap()
+                > 300 * 1024
+        );
+        std::fs::write(&claude_path, claude_transcript).unwrap();
+        assert_eq!(
+            index_transcript(&claude_path, ChatBackend::Claude)
+                .unwrap()
+                .title,
+            "Claude title past the head limit"
+        );
+
+        let mut codex_lines = vec![codex_meta_line(
+            "019e-white-codex",
+            "/tmp/x",
+            "main",
+            "codex-tui",
+        )];
+        codex_lines.extend(std::iter::repeat_n(padding.clone(), 4));
+        codex_lines.push(
+            codex_user_line("Codex title past the head limit")
+                .replace("\"role\":\"user\"", "\"role\":  \"user\""),
+        );
+        let codex_transcript = codex_lines.join("\n");
+        assert!(
+            codex_transcript
+                .find("Codex title past the head limit")
+                .unwrap()
+                > 300 * 1024
+        );
+        let codex_path = dir.path().join("codex-whitespace.jsonl");
+        std::fs::write(&codex_path, codex_transcript).unwrap();
+        assert_eq!(
+            index_codex_transcript(&codex_path).unwrap().title,
+            "Codex title past the head limit"
+        );
+
+        let pi_session = serde_json::json!({
+            "type": "session", "version": 3, "id": "019e-white-pi", "cwd": "/tmp/x"
+        })
+        .to_string();
+        let pi_user = serde_json::json!({
+            "type": "message",
+            "message": {"role": "user", "content": "Pi title past the head limit"}
+        })
+        .to_string()
+        .replace("\"role\":\"user\"", "\"role\":  \"user\"");
+        let mut pi_lines = vec![pi_session];
+        pi_lines.extend(std::iter::repeat_n(padding, 4));
+        pi_lines.push(pi_user);
+        let pi_transcript = pi_lines.join("\n");
+        assert!(pi_transcript.find("Pi title past the head limit").unwrap() > 300 * 1024);
+        let pi_path = dir.path().join("pi-whitespace.jsonl");
+        std::fs::write(&pi_path, pi_transcript).unwrap();
+        assert_eq!(
+            index_pi_transcript(&pi_path).unwrap().title,
+            "Pi title past the head limit"
+        );
+    }
+
+    #[test]
+    fn codex_index_skips_synthetic_previous_request_wrapper_for_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = codex_meta_line("019e-wrapper", "/tmp/x", "main", "codex-tui");
+        let wrapper = codex_user_line(
+            "You previously asked the user: please continue from this generated context",
+        );
+        let real = codex_user_line("Use the real user request as the title");
+        let path = write_transcript(
+            dir.path(),
+            "rollout-wrapper.jsonl",
+            &[meta.as_str(), wrapper.as_str(), real.as_str()],
+        );
+
+        let entry = index_codex_transcript(&path).unwrap();
+        assert_eq!(entry.title, "Use the real user request as the title");
     }
 
     #[test]
