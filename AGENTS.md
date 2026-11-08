@@ -252,7 +252,7 @@ Windows CI exists.
   (`visible_webview_surface` in `main.rs`). See
   `webview::set_pending_content`, `set_pending_url`, `navigate_to_url`.
 - **Terminal**: uses `iced_term` fork at `../iced_term_fork`. The Windows CI
-  Windows CI workflow clones the upstream `iced_term` master branch fresh —
+  Windows CI workflow clones `Tru-Insights/iced_term` master fresh —
   push local fork changes before triggering Windows CI.
 - **Theme**: Catppuccin Mocha (dark) / Latte (light) via
   `theme::AppTheme::{Dark, Light}` and `markdown::ThemeColors`.
@@ -340,7 +340,9 @@ Don't "fix" it.
 
 ### Linear
 
-Pass the intended Linear workspace explicitly when using the Linear CLI.
+Issues go to the `TRU` team in the `truinsights` Linear workspace; commit
+messages need a `TRU-` key. Pass the workspace explicitly when using the Linear
+CLI: `linear --workspace truinsights issue create --team TRU ...`.
 
 ### Design Roadmap
 

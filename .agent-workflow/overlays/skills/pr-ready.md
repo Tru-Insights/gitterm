@@ -7,7 +7,7 @@ access to the repository's organization.
 
 #### Pre-flight: iced_term_fork sync
 
-The GitHub workflows clone the upstream `iced_term` master branch fresh. If
+The GitHub workflows clone `Tru-Insights/iced_term` master fresh. If
 you've made local commits to `../iced_term_fork` that gitterm depends on, push
 them first or CI fails with
 `no method named X found`-style errors:
@@ -40,11 +40,11 @@ gate.
 
 #### Linear workspace
 
-Pass the intended Linear workspace explicitly when using the Linear CLI. For
-example:
+Issues go to the `TRU` team in the `truinsights` Linear workspace. Pass the
+workspace explicitly when using the Linear CLI:
 
 ```bash
-linear --workspace <workspace> issue create --team <team> \
+linear --workspace truinsights issue create --team TRU \
   --title "..." --description-file <path> \
   --assignee self --no-interactive
 ```
