@@ -41,6 +41,45 @@
     const footer = document.getElementById('footer');
     const rem = parseFloat(getComputedStyle(document.documentElement).fontSize);
     check('chat width defaults to Medium', Math.abs(column() - 60 * rem) < 1);
+    check('chat text defaults to 15px with a fixed 14px rem', getComputedStyle(document.body).fontSize === '15px' && rem === 14);
+    reset();
+    send(H('text_delta', 'A message with `inline code`.\n\n```js\nconst size = 15;\n```'), start('font-size', 'Bash', { command: 'cargo test' }));
+    card('font-size').open = true;
+    send({ kind: 'delegation', delegation: {
+      delegation_id: 'font-delegation', kind: 'consult', brief: 'Check text scaling',
+      child: { runner: 'codex_consult', model: 'test-model' }, status: { state: 'running' },
+      created_at: '2026-11-01T10:00:00Z', updated_at: '2026-11-01T10:00:00Z',
+    } });
+    const textNodes = ['.dlg-kind', '.ro-row', '.assistant p', '.assistant p code', '.codeblock pre code', '.live-tool-run > summary', '.tool-name', '.tool-brief', '#prompt', '#submit', '#mode'];
+    const sizes = () => textNodes.map((selector) => {
+      const node = document.querySelector(selector);
+      if (!node) throw new Error('Missing text-size fixture: ' + selector);
+      return parseFloat(getComputedStyle(node).fontSize);
+    });
+    window.__setChatFontSize(14);
+    const oldSizes = sizes();
+    const oldColumn = column();
+    const oldFooter = footer.getBoundingClientRect().width;
+    for (const size of [11, 15, 22]) {
+      window.__setChatFontSize(size);
+      const scaled = sizes();
+      check('all sampled text scales proportionally at ' + size + 'px', scaled.every((value, i) => Math.abs(value / oldSizes[i] - size / 14) < 0.001));
+      check('column and composer width stay fixed at ' + size + 'px', Math.abs(column() - oldColumn) < 1 && footer.getBoundingClientRect().width === oldFooter && getComputedStyle(document.documentElement).fontSize === '14px');
+    }
+    window.__setChatFontSize(1);
+    check('page clamps text size to 11px', getComputedStyle(document.body).fontSize === '11px');
+    window.__setChatFontSize(99);
+    check('page clamps text size to 22px', getComputedStyle(document.body).fontSize === '22px');
+    window.__setChatFontSize(15);
+    const posted = [];
+    window.ipc = { postMessage: (message) => posted.push(JSON.parse(message)) };
+    for (const [key, shiftKey] of [['=', false], ['-', false], ['+', true], ['_', true]]) {
+      const event = new KeyboardEvent('keydown', { key, metaKey: true, shiftKey, bubbles: true, cancelable: true });
+      document.getElementById('prompt').dispatchEvent(event);
+      check('focused composer forwards text-size key ' + key, event.defaultPrevented && posted.at(-1)?.type === 'hostkey' && posted.at(-1)?.key === key && posted.at(-1)?.shift === shiftKey);
+    }
+    window.ipc = { postMessage: () => {} };
+
     for (const [preset, size] of [['narrow', 46], ['medium', 60], ['wide', 72]]) {
       window.__setChatWidth(preset);
       check(preset + ' changes the column immediately', Math.abs(column() - size * rem) < 1);
