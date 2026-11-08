@@ -29348,7 +29348,9 @@ fi
                 let refresh =
                     self.start_workspace_overview_refresh(&dir, overview::RefreshMode::Full);
                 let documents = self.start_work_documents_scan();
-                return Task::batch([index, refresh, documents]);
+                self.request_open_pr_refreshes();
+                let prs = self.poll_pr_watch();
+                return Task::batch([index, refresh, documents, prs]);
             }
             Event::WorkDocumentsRefresh => {
                 return self.start_work_documents_scan();
