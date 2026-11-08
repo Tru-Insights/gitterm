@@ -51,7 +51,7 @@ pub const BACKFILL_BATCH: usize = 200;
 /// Child titles kept per child (subagent descriptions, review briefs).
 const CHILD_TITLE_MAX_CHARS: usize = 90;
 
-/// What one conversation touched. Additive: every field defaults.
+/// What one conversation touched. Every field defaults for older facts files.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatFacts {
     /// Issue keys the chat mentioned or created through a `linear issue
@@ -1108,8 +1108,8 @@ pub struct FactPaths<'a> {
 /// chat up (TRU-201). If there is no facts file yet, or the transcript is
 /// newer than it (the rule "Index older chats" uses), the transcript is
 /// scanned and merged as a backfill would ([`ChatFacts::absorb_scan`]);
-/// otherwise only the transcript's PRs missing from the file are added
-/// (TRU-238). Then the observations are added, all in this one read, merge
+/// otherwise only PRs are recomputed from the transcript (TRU-252).
+/// Then the observations are added, all in this one read, merge
 /// and write. Returns the PRs the scan added, which the tab did not see live.
 pub fn flush_live(
     dir: &Path,
@@ -1152,8 +1152,8 @@ fn transcript_is_newer(path: &Path, transcript_mtime: SystemTime) -> bool {
 
 /// The catch-up for [`flush_live`]: `existing` (the facts file at `path`,
 /// if any) with the transcript absorbed when the file is missing or older
-/// than the transcript, else unchanged. Returns the facts and the PRs the
-/// scan added. An unreadable transcript is logged and changes nothing.
+/// than the transcript; PRs are always recomputed. Returns the facts and
+/// the PRs the scan added. An unreadable transcript is logged and changes nothing.
 fn catch_up_from_transcript(
     existing: Option<ChatFacts>,
     path: &Path,
@@ -1171,9 +1171,9 @@ fn catch_up_from_transcript(
             return (existing.unwrap_or_default(), Vec::new());
         }
     };
-    // A current facts file still gets the transcript's PRs: the live
-    // watcher can miss a `gh pr create` (TRU-238), and nothing else would
-    // ever add it back. Everything else is absorbed only when stale.
+    // Recompute PRs even for a current facts file: this repairs missed creates
+    // and false positives from older matchers. Pending live facts merge afterward.
+    // Everything else is absorbed only when stale.
     let stale = existing.is_none() || transcript_is_newer(path, mtime);
     let scan = match facts_from_claude_transcript(transcript, home, resolver) {
         Ok(scan) => scan,
@@ -1195,12 +1195,10 @@ fn catch_up_from_transcript(
         })
         .cloned()
         .collect();
+    facts.prs = scan.prs.clone();
     if !stale {
         if added.is_empty() {
             return (facts, added);
-        }
-        for pr in &added {
-            facts.add_pr(pr.clone());
         }
         eprintln!(
             "[chat-facts] {} PRs caught up from {} ({} new PRs)",
@@ -1262,9 +1260,9 @@ fn prs_checked() -> &'static std::sync::Mutex<HashMap<PathBuf, SystemTime>> {
 /// PRs belong to the workspace, not the chat (TRU-238): a chat a workspace
 /// owns keeps its PRs after a `/clear` moves the work to a new chat. For each
 /// Claude chat in `owned` that no tab hosts (`hosted` tabs catch up their own
-/// chat when they pick it up), adds the transcript's `gh pr create` PRs that
-/// the facts file lacks, so a PR the live watcher missed is never left
-/// behind. Blocking; run off the UI thread. Returns how many PRs it added.
+/// chat when they pick it up), recomputes PRs from the transcript's actual
+/// `gh pr create` results, repairing missed creates and old false positives.
+/// Blocking; run off the UI thread. Returns how many PRs it added.
 pub fn catch_up_workspace_prs(
     entries: &[ChatIndexEntry],
     owned: &HashSet<String>,
@@ -1317,24 +1315,27 @@ pub fn catch_up_workspace_prs(
                 continue;
             }
         };
-        let added: Vec<PrRef> = scan
+        let previous = facts.prs.clone();
+        facts.prs.clear();
+        for pr in scan.prs {
+            facts.add_pr(pr);
+        }
+        let added = facts
             .prs
-            .into_iter()
+            .iter()
             .filter(|pr| {
-                let id = pr.key().id();
-                !facts.prs.iter().any(|known| known.key().id() == id)
+                !previous
+                    .iter()
+                    .any(|known| known.key().id() == pr.key().id())
             })
-            .collect();
-        if !added.is_empty() {
+            .count();
+        if facts.prs != previous {
             // Only PRs were recorded, so the file must not look as current
             // as a full scan: keep its old time (a new file gets the epoch),
             // and a later catch-up or backfill still absorbs the rest.
             let written = std::fs::metadata(&path)
                 .and_then(|meta| meta.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
-            for pr in &added {
-                facts.add_pr(pr.clone());
-            }
             if let Err(error) = write_facts(&path, &facts) {
                 eprintln!("[chat-facts] PR catch-up {error}");
                 continue;
@@ -1353,9 +1354,9 @@ pub fn catch_up_workspace_prs(
                 "[chat-facts] {} PRs caught up from {} ({} new PRs)",
                 path.display(),
                 entry.path.display(),
-                added.len()
+                added
             );
-            total += added.len();
+            total += added;
         }
         if let Ok(mut checked) = prs_checked().lock() {
             checked.insert(entry.path.clone(), inputs);
@@ -1377,7 +1378,7 @@ pub fn observe_claude_line(raw: &mut RawFacts, line: &str, home: Option<&Path>, 
 /// Shared PR recognition for live facts and worker/Claude transcript adapters.
 /// Keep the command paired with its own output; URL mentions alone are not facts.
 pub(crate) fn created_prs(command: &str, output: &str) -> Vec<PrRef> {
-    if merge_plan::is_gh_pr_create(command) {
+    if is_gh_pr_create(command) {
         merge_plan::pr_urls_in(output)
     } else {
         Vec::new()
@@ -1430,6 +1431,25 @@ pub(crate) fn record_worker_prs(
         return Ok(Some(added));
     }
     Ok(None)
+}
+
+/// Whether the shell actually invokes `gh pr create`, including chains,
+/// environment assignments, executable paths and command substitutions.
+/// Quoted arguments, comments and heredoc bodies are not command words.
+pub fn is_gh_pr_create(command: &str) -> bool {
+    ShellScanner(command.chars().peekable(), 0)
+        .commands(false)
+        .is_some_and(|commands| {
+            commands.iter().any(|command| {
+                command
+                    .words
+                    .first()
+                    .and_then(|word| word.rsplit('/').next())
+                    == Some("gh")
+                    && command.words.get(1).map(String::as_str) == Some("pr")
+                    && command.words.get(2).map(String::as_str) == Some("create")
+            })
+        })
 }
 
 /// Match a create invocation and its own Bash result together. A combined
@@ -2382,10 +2402,16 @@ pub fn scan_claude_transcript(path: &Path, home: Option<&Path>) -> std::io::Resu
     let mut raw = RawFacts::default();
     scan_lines(path, &mut raw, home, true)?;
     let subagents = path.with_extension("").join("subagents");
-    if let Ok(read) = std::fs::read_dir(&subagents) {
+    let read = match std::fs::read_dir(&subagents) {
+        Ok(read) => Some(read),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(read) = read {
         let mut files: Vec<PathBuf> = read
-            .flatten()
-            .map(|entry| entry.path())
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
             .collect();
         files.sort();
@@ -2394,9 +2420,12 @@ pub fn scan_claude_transcript(path: &Path, home: Option<&Path>) -> std::io::Resu
             if let Some(child) = subagent_from_meta(&file) {
                 sub.add_child(child);
             }
-            if let Err(error) = scan_lines(&file, &mut sub, home, false) {
-                eprintln!("[chat-facts] cannot read {}: {error}", file.display());
-            }
+            scan_lines(&file, &mut sub, home, false).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("cannot read {}: {error}", file.display()),
+                )
+            })?;
             raw.append(sub);
         }
     }
@@ -2515,8 +2544,13 @@ pub fn backfill_claude(
         };
         // PRs stay a hosting tab's record (TRU-173): indexing old chats
         // does not fill the PRs lists with their history.
-        scan.prs.clear();
         let mut facts = existing.unwrap_or_default();
+        facts.prs.retain(|pr| {
+            scan.prs
+                .iter()
+                .any(|known| known.key().id() == pr.key().id())
+        });
+        scan.prs.clear();
         facts.absorb_scan(scan);
         for link in links.iter().filter(|link| link.parent == target.id) {
             facts.add_child(link.child.clone());
@@ -3663,6 +3697,78 @@ branch refs/heads/tracey/tru-12-thing
     }
 
     #[test]
+    fn pr_creates_use_shell_command_words_live_and_in_transcripts() {
+        let output = "https://github.com/acme/api/pull/42";
+        let cases = [
+            (r#"grep -n "gh pr create" x.rs"#, false),
+            (r#"rg 'gh pr create' x.rs"#, false),
+            (r#"echo "gh pr create""#, false),
+            ("echo gh pr create", false),
+            ("printf '%s' gh pr create", false),
+            ("# gh pr create\necho result", false),
+            ("cat <<'EOF'\ngh pr create\nEOF", false),
+            ("cat <<EOF\ngh pr create\nEOF", false),
+            (r#"bash -c 'echo "gh pr create"'"#, false),
+            ("git push && gh pr create --fill", true),
+            ("gh pr create --title 'A title' --body 'Details'", true),
+            ("cd /tmp; /usr/local/bin/gh pr create --fill", true),
+            ("GH_REPO=acme/api gh pr create --fill", true),
+            ("pr=$(gh pr create --fill); echo \"$pr\"", true),
+            ("git push; gh \\\npr create --fill", true),
+            ("cat <<'EOF'\ngh pr create\nEOF\ngh pr create --fill", true),
+        ];
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        for (command, expected) in cases {
+            assert_eq!(is_gh_pr_create(command), expected, "{command}");
+            let mut live = LiveFacts::default();
+            live.observe(
+                &HarnessEvent::ItemStarted {
+                    id: "call".into(),
+                    kind: ItemKind::ToolCall {
+                        name: "Bash".into(),
+                        input: json!({"command": command}),
+                    },
+                },
+                None,
+            );
+            live.observe(
+                &HarnessEvent::ItemCompleted {
+                    id: "call".into(),
+                    output: output.into(),
+                    is_error: false,
+                },
+                None,
+            );
+            let pending = live.take_due(Instant::now(), true).unwrap_or_default();
+            assert_eq!(pending.prs.len(), usize::from(expected), "live: {command}");
+            let lines = [
+                json!({"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "call", "name": "Bash", "input": {"command": command}}
+                ]}}),
+                json!({"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "call", "content": output}
+                ]}}),
+            ];
+            std::fs::write(
+                &transcript,
+                lines
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+            let scan = scan_claude_transcript(&transcript, None).unwrap();
+            assert_eq!(
+                scan.prs.len(),
+                usize::from(expected),
+                "transcript: {command}"
+            );
+        }
+    }
+
+    #[test]
     fn live_frames_record_prs_from_gh_pr_create_results_only() {
         let mut live = LiveFacts::default();
         let bash = |id: &str, command: &str| HarnessEvent::ItemStarted {
@@ -4162,6 +4268,11 @@ branch refs/heads/tracey/tru-12-thing
             e.mtime = SystemTime::now();
             let mut known = ChatFacts::default();
             known.add_issue_key("LIVE-1");
+            if id == "owned" {
+                known.add_pr(
+                    merge_plan::pr_urls_in("https://github.com/fake/repo/pull/42").remove(0),
+                );
+            }
             let path = facts_dir.join(format!("claude-{id}.json"));
             write_facts(&path, &known).unwrap();
             set_time(&path, long_ago);
@@ -4214,6 +4325,85 @@ branch refs/heads/tracey/tru-12-thing
         );
         let numbers: Vec<u64> = read("owned").prs.iter().map(|pr| pr.number).collect();
         assert_eq!(numbers, vec![81, 82]);
+        // Removal-only reconciliation must also write, even with no new PRs.
+        std::fs::write(&entries[0].path, "").unwrap();
+        std::fs::remove_file(&sub).unwrap();
+        set_time(
+            &entries[0].path,
+            SystemTime::now() + Duration::from_secs(120),
+        );
+        assert_eq!(
+            catch_up_workspace_prs(&entries, &owned, &hosted, &facts_dir, None),
+            0
+        );
+        assert!(read("owned").prs.is_empty());
+    }
+
+    #[test]
+    fn current_chat_catch_up_removes_a_search_result_pr_without_new_prs() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        let output = "https://github.com/fake/repo/pull/42";
+        let lines = [
+            json!({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "search", "name": "Bash",
+                    "input": {"command": "grep -n \"gh pr create\" x.rs"}}
+            ]}}),
+            json!({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "search", "content": output}
+            ]}}),
+        ];
+        std::fs::write(
+            &transcript,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let mut known = ChatFacts::default();
+        known.add_issue_key("DEMO-42");
+        known.prs = merge_plan::pr_urls_in(output);
+        let path = facts_path(temp.path(), ChatBackend::Claude, "session").unwrap();
+        write_facts(&path, &known).unwrap();
+        set_mtime(&transcript, SystemTime::UNIX_EPOCH);
+        let added = flush_live(
+            temp.path(),
+            ChatBackend::Claude,
+            "session",
+            RawFacts::default(),
+            vec![],
+            Some(&transcript),
+            FactPaths::default(),
+        )
+        .unwrap();
+        assert!(added.is_empty());
+        let caught = load_facts(&path).unwrap().unwrap();
+        assert!(caught.prs.is_empty());
+        assert_eq!(caught.issue_keys, known.issue_keys);
+    }
+
+    #[test]
+    fn failed_transcript_scan_preserves_recorded_prs() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let subagents = temp.path().join("session/subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        // A directory in place of a child transcript cannot be read as lines.
+        std::fs::create_dir(subagents.join("agent-broken.jsonl")).unwrap();
+        let mut known = ChatFacts::default();
+        known.prs = merge_plan::pr_urls_in("https://github.com/acme/api/pull/42");
+        let (caught, added) = catch_up_from_transcript(
+            Some(known.clone()),
+            &temp.path().join("facts.json"),
+            &transcript,
+            None,
+            &mut GitResolver::default(),
+        );
+        assert_eq!(caught, known);
+        assert!(added.is_empty());
     }
 
     fn child(id: &str, kind: ChildKind) -> ChatChild {
@@ -4562,7 +4752,7 @@ branch refs/heads/tracey/tru-12-thing
         let path = facts_dir.join("claude-s9.json");
         let mut known = ChatFacts::default();
         known.add_issue_key("LIVE-1");
-        known.add_pr(merge_plan::pr_urls_in("https://github.com/acme/web/pull/7").remove(0));
+        known.add_pr(merge_plan::pr_urls_in("https://github.com/fake/repo/pull/42").remove(0));
         write_facts(&path, &known).unwrap();
         let now = SystemTime::now();
         set_mtime(&path, now - Duration::from_secs(7200));
@@ -4570,6 +4760,9 @@ branch refs/heads/tracey/tru-12-thing
 
         let mut pending = RawFacts::default();
         pending.observe_user_text("then LIVE-2");
+        pending
+            .prs
+            .extend(merge_plan::pr_urls_in("https://github.com/acme/web/pull/7"));
         let added = flush_live(
             &facts_dir,
             ChatBackend::Claude,
@@ -4589,14 +4782,13 @@ branch refs/heads/tracey/tru-12-thing
         );
         let facts = load_facts(&path).unwrap().unwrap();
         assert_eq!(facts.issue_keys, vec!["LIVE-1", "ACME-12", "LIVE-2"]);
-        assert_eq!(facts.prs.len(), 2, "{:?}", facts.prs);
+        assert_eq!(ids(&facts.prs), vec!["acme/launch#42", "acme/web#7"]);
         assert_eq!(facts.documents, vec![plan.clone()]);
         assert_eq!(facts.children.len(), 1);
         assert_eq!(facts.children[0].title.as_deref(), Some("Draft the brief"));
         assert!(facts.backfilled && facts.documents_backfilled);
 
-        // The file is now newer than the transcript: picked up again, it is
-        // not scanned again, and live facts still land.
+        // The file is newer: only PRs are recomputed, and live facts still land.
         let mut pending = RawFacts::default();
         pending.observe_user_text("LIVE-3");
         let added = flush_live(
@@ -4622,6 +4814,7 @@ branch refs/heads/tracey/tru-12-thing
         let fresh = facts_dir.join("claude-s10.json");
         let mut live_only = ChatFacts::default();
         live_only.add_issue_key("LIVE-9");
+        live_only.add_pr(merge_plan::pr_urls_in("https://github.com/fake/repo/pull/42").remove(0));
         write_facts(&fresh, &live_only).unwrap();
         set_mtime(&transcript, now - Duration::from_secs(9000));
         let added = flush_live(
