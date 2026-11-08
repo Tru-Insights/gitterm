@@ -1502,6 +1502,7 @@ struct MenuIds {
     increase_ui_font: muda::MenuId,
     decrease_ui_font: muda::MenuId,
     toggle_theme: muda::MenuId,
+    chat_width: Vec<(muda::MenuId, config::ChatWidth)>,
     toggle_terminal_log_mirroring: muda::MenuId,
     clear_terminal: muda::MenuId,
     open_plans_viewer: muda::MenuId,
@@ -1586,6 +1587,15 @@ fn setup_menu_bar() {
         .append_items(&[&increase_ui_font, &decrease_ui_font])
         .unwrap();
 
+    let chat_width_menu = Submenu::new("Chat width", true);
+    let chat_width_items: Vec<_> = config::ChatWidth::ALL
+        .into_iter()
+        .map(|width| (MenuItem::new(width.to_string(), true, None), width))
+        .collect();
+    for (item, _) in &chat_width_items {
+        chat_width_menu.append(item).unwrap();
+    }
+
     let toggle_theme = MenuItem::new(
         "Toggle Light/Dark Theme",
         true,
@@ -1615,6 +1625,7 @@ fn setup_menu_bar() {
         .append_items(&[
             &terminal_font_menu,
             &ui_font_menu,
+            &chat_width_menu,
             &PredefinedMenuItem::separator(),
             &toggle_theme,
             &toggle_terminal_log_mirroring,
@@ -1649,6 +1660,10 @@ fn setup_menu_bar() {
         increase_ui_font: increase_ui_font.id().clone(),
         decrease_ui_font: decrease_ui_font.id().clone(),
         toggle_theme: toggle_theme.id().clone(),
+        chat_width: chat_width_items
+            .into_iter()
+            .map(|(item, width)| (item.id().clone(), width))
+            .collect(),
         toggle_terminal_log_mirroring: toggle_terminal_log_mirroring.id().clone(),
         clear_terminal: clear_terminal.id().clone(),
         open_plans_viewer: open_plans_viewer.id().clone(),
@@ -6957,6 +6972,7 @@ pub enum Event {
     FileBrowserSnapshotReady(usize),
     // Theme
     ToggleTheme,
+    SetChatWidth(config::ChatWidth),
     ToggleTerminalLogMirroring,
     // Font size - Terminal
     IncreaseTerminalFont,
@@ -7650,6 +7666,7 @@ struct App {
     theme: AppTheme,
     terminal_font_size: f32,
     ui_font_size: f32,
+    chat_width: config::ChatWidth,
     sidebar_width: f32,
     scrollback_lines: usize,
     sidebar_collapsed: bool,
@@ -9872,6 +9889,7 @@ impl App {
             editor: self.editor.clone(),
             terminal_font_size: self.terminal_font_size,
             ui_font_size: self.ui_font_size,
+            chat_width: self.chat_width,
             sidebar_width: self.sidebar_width,
             scrollback_lines: self.scrollback_lines,
             font_size: None,
@@ -20262,6 +20280,7 @@ impl App {
             theme,
             terminal_font_size: terminal_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
             ui_font_size: ui_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
+            chat_width: config.chat_width,
             sidebar_width: config.sidebar_width.clamp(150.0, 600.0),
             scrollback_lines: config.scrollback_lines,
             sidebar_collapsed: false,
@@ -24300,6 +24319,11 @@ fi
                 if let Ok(event) = MenuEvent::receiver().try_recv() {
                     freeze_debug!("native menu event received: {:?}", event.id);
                     if let Some(ids) = MENU_IDS.get() {
+                        if let Some((_, width)) =
+                            ids.chat_width.iter().find(|(id, _)| *id == event.id)
+                        {
+                            return self.update(Event::SetChatWidth(*width));
+                        }
                         if event.id == ids.increase_terminal_font {
                             freeze_debug!("dispatching native menu: increase_terminal_font");
                             return self.update(Event::IncreaseTerminalFont);
@@ -26073,6 +26097,10 @@ fi
                             "light"
                         }
                     ),
+                );
+                webview::evaluate_script(
+                    WebviewSurface::Agent(tab_id),
+                    &format!("window.__setChatWidth({:?})", self.chat_width.as_str()),
                 );
                 let composer = self.chat_composer_state(tab_id);
                 set_agent_webview_tab_id(
@@ -29304,6 +29332,16 @@ fi
                 } else {
                     eprintln!("Cannot open file preview: local content server is not running");
                 }
+            }
+            Event::SetChatWidth(width) => {
+                self.chat_width = width;
+                for tab_id in &self.agent_pages {
+                    webview::evaluate_script(
+                        WebviewSurface::Agent(*tab_id),
+                        &format!("window.__setChatWidth({:?})", width.as_str()),
+                    );
+                }
+                self.save_config();
             }
             Event::ToggleTheme => {
                 self.theme = self.theme.toggle();
