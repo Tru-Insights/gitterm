@@ -426,7 +426,8 @@
                      border: 1px solid var(--border); }
   #toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   #toolbar .tb-chips { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; flex: 1 1 auto; min-width: 0; }
-  #toolbar .tb-send { display: flex; gap: 6px; margin-left: auto; }
+  /* Send and Stop get their own row under the message box; the options follow on the next. */
+  #toolbar .tb-send { display: flex; gap: 6px; flex-basis: 100%; justify-content: flex-end; }
   #toolbar .tb-send button { padding: 5px 14px; }
   .chip svg, #mode svg, #review svg { width: 12px; height: 12px; flex: none; }
   button {
@@ -653,6 +654,11 @@
     <div class="chip-menu" id="slash-menu"></div>
     <textarea id="prompt" placeholder="Message Claude... (Enter to send, Shift+Enter for newline)" rows="2"></textarea>
     <div id="toolbar">
+      <!-- First after the message box, so Tab then Enter sends. -->
+      <div class="tb-send">
+        <button id="submit" class="primary">Send</button>
+        <button id="stop" class="danger" disabled>Stop</button>
+      </div>
       <div class="tb-chips">
         <div class="review-wrap">
           <div id="review-pop"></div>
@@ -675,10 +681,6 @@
           <button class="chip" id="checkout"></button>
         </div>
         <span class="chip" id="guidelines-mark" title="GitTerm adds its change guidelines to this agent's system prompt (workspace settings switch them off)">guidelines</span>
-      </div>
-      <div class="tb-send">
-        <button id="submit" class="primary">Send</button>
-        <button id="stop" class="danger" disabled>Stop</button>
       </div>
     </div>
   </div>
