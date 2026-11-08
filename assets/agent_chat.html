@@ -59,6 +59,8 @@
   }
   /* Status line, roster and composer share one grey panel. */
   #footer { display: flex; flex-direction: column; gap: 6px; padding: 6px 8px 8px; background: var(--bg-footer); border: 1px solid var(--border); border-radius: 10px; }
+  /* The input lines up with the conversation's centred column (see #messages). */
+  #footer { box-sizing: border-box; width: 100%; max-width: calc(46rem + 28px); margin-left: auto; margin-right: auto; }
   #timeline-wrap { flex: 1; position: relative; min-height: 0; }
   #messages {
     position: absolute;
@@ -66,7 +68,9 @@
     overflow-y: auto;
     background: var(--bg-alt);
     border-radius: 8px;
-    padding: 12px 14px;
+    /* Wide panes keep the conversation in a centred column, at most 46rem
+       of text, so lines stay readable; narrow panes keep the 14px edge. */
+    padding: 12px max(14px, calc((100% - 46rem) / 2));
     line-height: 1.5;
     /* The page keeps the view still itself when "Show earlier" restores
        blocks above it (TRU-157); a second, engine-side adjustment would
