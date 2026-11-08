@@ -1000,6 +1000,20 @@
   // Put the newest `n` detached chunks back above the first block, keeping
   // what is on screen where it is.
   function showEarlier(n) {
+    if (n < 1) return;
+    // Roster jumps can page while find owns a chunk. Return that loan before
+    // paging, and keep additional pages registered so Esc restores the window.
+    if (!findBar.hidden) {
+      restoreFindChunk();
+      const chunks = earlier.filter((fragment) => !findPages.has(fragment)).slice(-n);
+      const before = earlierEl.nextSibling;
+      for (const fragment of chunks) {
+        const page = attachFindChunk(fragment, before);
+        findPages.set(fragment, page);
+        for (const node of findChunkNodes(page)) renderFindMarkdown(node);
+      }
+      return;
+    }
     n = Math.min(n, earlier.length);
     if (n < 1) return;
     const restored = document.createDocumentFragment();
@@ -1017,8 +1031,9 @@
   // Bring a detached block (a roster row's card) back into the document.
   function showEarlierUntil(node) {
     if (node.isConnected) return;
-    const i = earlier.findIndex((frag) => frag.contains(node));
-    if (i >= 0) showEarlier(earlier.length - i);
+    const chunks = earlier.filter((fragment) => !findPages.has(fragment));
+    const i = chunks.findIndex((frag) => frag.contains(node));
+    if (i >= 0) showEarlier(chunks.length - i);
   }
   function resetWindow() {
     earlier.length = 0;
@@ -1053,28 +1068,37 @@
   // its entry; close discards it. Streaming need not parse old markdown again.
   const findDeferred = new Map();
   let findChunk = null, findWasFollowing = false;
-  function findChunkNodes() {
+  const findPages = new Map();
+  function findChunkNodes(chunk = findChunk) {
     const nodes = [];
-    if (findChunk) {
-      for (let node = findChunk.start.nextSibling; node && node !== findChunk.end; node = node.nextSibling) {
+    if (chunk) {
+      for (let node = chunk.start.nextSibling; node && node !== chunk.end; node = node.nextSibling) {
         if (node.nodeType === Node.ELEMENT_NODE) nodes.push(node);
       }
     }
     return nodes;
   }
-  function restoreFindChunk() {
-    if (!findChunk) return;
+  function attachFindChunk(fragment, before = earlierEl.nextSibling) {
+    const chunk = { fragment, start: document.createComment('find history'), end: document.createComment('/find history') };
+    messagesEl.insertBefore(chunk.start, before);
+    messagesEl.insertBefore(fragment, before);
+    messagesEl.insertBefore(chunk.end, before);
+    return chunk;
+  }
+  function restoreFindChunk(chunk = findChunk) {
+    if (!chunk) return;
     // Boundaries follow replacements/folds made by streaming; never resurrect
     // a removed block or pull a card back out of a newly completed turn.
-    for (const node of findChunkNodes()) findChunk.fragment.appendChild(node);
-    findChunk.start.remove(); findChunk.end.remove();
-    findChunk = null;
+    for (const node of findChunkNodes(chunk)) chunk.fragment.appendChild(node);
+    chunk.start.remove(); chunk.end.remove();
+    if (chunk === findChunk) findChunk = null;
   }
   function findScopes() {
     const scopes = [];
-    const attached = findChunkNodes();
+    const attached = [...findChunkNodes(), ...[...findPages.values()].flatMap((page) => findChunkNodes(page))];
     for (const fragment of earlier) {
-      if (findChunk && findChunk.fragment === fragment) scopes.push(...attached);
+      const page = findPages.get(fragment) || (findChunk?.fragment === fragment && findChunk);
+      if (page) scopes.push(...findChunkNodes(page));
       else scopes.push(...fragment.children);
     }
     for (const node of messagesEl.children) {
@@ -1222,7 +1246,7 @@
       const range = document.createRange();
       range.setStart(first.node, start - first.start);
       range.setEnd(last.node, end - last.start);
-      matches.push({ root, start, range, context: text.slice(end, end + 32), node: first.node, offset: start - first.start, endNode: last.node, endOffset: end - last.start });
+      matches.push({ root, start, ordinal: matches.length, range, context: text.slice(end, end + 32), node: first.node, offset: start - first.start, endNode: last.node, endOffset: end - last.start });
     }
     return matches;
   }
@@ -1237,29 +1261,39 @@
     if (!match.root.isConnected) {
       const fragment = earlier.find((chunk) => chunk.contains(match.root));
       if (fragment) {
-        findChunk = { fragment, start: document.createComment('find history'), end: document.createComment('/find history') };
-        const before = firstBlock();
-        messagesEl.insertBefore(findChunk.start, before);
-        messagesEl.insertBefore(fragment, before);
-        messagesEl.insertBefore(findChunk.end, before);
+        findChunk = attachFindChunk(fragment);
       }
     }
-    // Only the selected block needs real markdown. Keep the deferred source
-    // and original DOM so closing find restores the same paging state.
-    for (const md of match.root.querySelectorAll('div')) {
-      if (!unrenderedMd.has(md) || findMarkdown.has(md)) continue;
-      findMarkdown.set(md, Array.from(md.childNodes));
-      md.innerHTML = renderMarkdown(unrenderedMd.get(md));
-    }
-    const replacements = findRootMatches(match.root, findPattern());
-    for (let i = 0, j = 0; i < findMatches.length; i++) {
-      if (findMatches[i].root === match.root) findMatches[i] = replacements[j++];
+    if (renderFindMarkdown(match.root)) {
+      const replacements = findRootMatches(match.root, findPattern());
+      for (let i = 0, j = 0; i < findMatches.length; i++) {
+        if (findMatches[i].root === match.root) findMatches[i] = replacements[j++];
+      }
     }
     openFindDetails(findMatches[findIndex].range.startContainer.parentElement);
   }
-  function refreshFind(reveal = false, reset = false) {
+  function renderFindMarkdown(root) {
+    // Keep deferred sources and original DOM for exact restoration on Esc.
+    let changed = false;
+    for (const md of root.querySelectorAll('div')) {
+      if (!unrenderedMd.has(md) || findMarkdown.has(md)) continue;
+      findMarkdown.set(md, Array.from(md.childNodes));
+      md.innerHTML = renderMarkdown(unrenderedMd.get(md));
+      changed = true;
+    }
+    return changed;
+  }
+  function refreshFind(reveal = false, reset = false, changed = null) {
     if (findBar.hidden) return;
     const previous = !reset && findMatches[findIndex];
+    const unchanged = new Map();
+    if (changed) for (const match of findMatches) {
+      if (!unchanged.has(match.root)) unchanged.set(match.root, []);
+      unchanged.get(match.root).push(match);
+    }
+    findChanges.clear();
+    const pending = findObserver.takeRecords();
+    if (changed) changed.push(...pending.map((record) => record.target));
     findMatches = [];
     const query = findQuery.value;
     if (!findTools.checked || !query) restoreFindOutputs();
@@ -1278,7 +1312,8 @@
         const roots = scope.matches(selector) ? [scope] : Array.from(scope.querySelectorAll(selector));
         for (const root of roots) {
           if (root.hidden || roots.some((other) => other !== root && other.contains(root))) continue;
-          findMatches.push(...findRootMatches(root, pattern));
+          const dirty = !changed || changed.some((node) => root.contains(node) || node.contains(root));
+          findMatches.push(...(dirty ? findRootMatches(root, pattern) : (unchanged.get(root) || [])));
         }
       }
     }
@@ -1297,17 +1332,22 @@
           if (score === bestScore) anchored.push(m);
         }
       }
-      // Repeated context falls back to position within this block, never to
-      // the transcript-wide ordinal (which changes as markdown is rendered).
-      const best = anchored.find((m) => m.start >= previous.start) || anchored.at(-1);
+      // Raw markdown offsets and rendered offsets are different coordinates.
+      // When contexts tie, preserve the occurrence ordinal within its block.
+      const best = anchored.reduce((best, m) => !best || Math.abs(m.ordinal - previous.ordinal) < Math.abs(best.ordinal - previous.ordinal) ? m : best, null);
       if (best) findIndex = findMatches.indexOf(best);
     }
     if (findIndex < 0 && findMatches.length) findIndex = 0;
     prepareFindMatch();
     paintFind();
     if (reveal) revealFind();
+    findObserver.takeRecords(); // discard mutations made by find itself
   }
   function stepFind(delta) {
+    // Mutation delivery (and its scheduled frame) can lag a streaming paint.
+    // Drain it now and search only affected blocks before using the ordinal.
+    for (const record of findObserver.takeRecords()) findChanges.add(record.target);
+    if (findChanges.size) refreshFind(false, false, [...findChanges]);
     if (!findMatches.length) return;
     findIndex = (findIndex + delta + findMatches.length) % findMatches.length;
     prepareFindMatch();
@@ -1334,6 +1374,9 @@
     for (const details of findOpenedDetails) details.open = false;
     findOpenedDetails.clear();
     restoreFindChunk();
+    for (const page of findPages.values()) restoreFindChunk(page);
+    findPages.clear();
+    findChanges.clear();
     for (const [md, children] of findMarkdown) md.replaceChildren(...children);
     findMarkdown.clear(); findDeferred.clear();
     earlierEl.disabled = false;
@@ -1352,14 +1395,18 @@
   document.getElementById('find-close').addEventListener('click', closeFind);
   // Includes streamed markdown paints and changes inside folded cards. No
   // attribute observation: opening a fold cannot trigger a search loop.
-  new MutationObserver(() => {
-    if (findBar.hidden || findQueued) return;
+  const findChanges = new Set();
+  const findObserver = new MutationObserver((records) => {
+    if (findBar.hidden) return;
+    for (const record of records) findChanges.add(record.target);
+    if (findQueued) return;
     findQueued = true;
     requestAnimationFrame(() => {
       findQueued = false;
-      refreshFind();
+      if (findChanges.size) refreshFind(false, false, [...findChanges]);
     });
-  }).observe(messagesEl, { childList: true, characterData: true, subtree: true });
+  });
+  findObserver.observe(messagesEl, { childList: true, characterData: true, subtree: true });
 
   // ---- turn folds (TRU-209) ------------------------------------------------
   // A finished turn folds into one "Worked for <duration>" row: everything

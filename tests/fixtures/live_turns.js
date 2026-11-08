@@ -360,6 +360,46 @@
     jump.click();
     check('following after find trims to the original live window', messages.childElementCount === historyNodes.length);
 
+    // A roster jump pages across the chunk temporarily borrowed by find.
+    window.__resetConversation();
+    const rosterHistory = [];
+    for (let i = 0; i < 1050; i++) {
+      rosterHistory.push({ type: 'user_prompt', text: 'Roster history message ' + i });
+      if (i === 250) rosterHistory.push(H('text_delta', '**rosterdeferredneedle**'), end);
+      if (i === 10) rosterHistory.push({ kind: 'delegation', delegation: {
+        delegation_id: 'history-worker', kind: 'implement', brief: 'Check history',
+        child: { model: 'test-model' }, status: { state: 'completed' },
+        created_at: '2026-11-01T10:00:00Z', updated_at: '2026-11-01T10:01:00Z',
+        result: { handoff: { summary: 'Historical report', decisions: [], next_steps: [], blockers: [] } },
+      } });
+    }
+    window.__replay(rosterHistory);
+    const rosterWindow = [...messages.children];
+    const rosterEarlierText = messages.querySelector('.earlier').textContent;
+    window.__openFind(); search('Roster history message 300');
+    document.querySelector('#roster [data-key="dlg:history-worker"]').click();
+    check('roster jump during find reveals an older worker across the borrowed chunk', !!messages.querySelector('[data-delegation-id="history-worker"]'));
+    key(query, 'Escape');
+    check('Esc after roster paging restores the exact history window', [...messages.children].length === rosterWindow.length && [...messages.children].every((node, i) => node === rosterWindow[i]) && messages.querySelector('.earlier')?.textContent === rosterEarlierText);
+    window.__openFind(); search('Roster history message 300');
+    // Exercise the shared paging handler even though the visible button is
+    // disabled during find, then borrow another chunk before the roster jump.
+    messages.querySelector('.earlier').dispatchEvent(new Event('click'));
+    search('Roster history message 200');
+    document.querySelector('#roster [data-key="dlg:history-worker"]').click();
+    jump.click();
+    key(query, 'Escape');
+    check('multiple paging paths and trimming during find restore the same window', [...messages.children].length === rosterWindow.length && [...messages.children].every((node, i) => node === rosterWindow[i]) && messages.querySelector('.earlier')?.textContent === rosterEarlierText);
+    window.__openFind(); search('rosterdeferredneedle');
+    check('deferred markdown remains searchable after roster paging restoration', count.textContent === '1 of 1' && current().startContainer.parentElement.tagName === 'STRONG');
+    key(query, 'Escape');
+    window.__openFind(); search('Roster history message ');
+    check('search after roster paging still finds every historical message', count.textContent === '1 of 1050');
+    key(query, 'Escape');
+    while (messages.querySelector('.earlier')) messages.querySelector('.earlier').click();
+    const pagedHistory = [...messages.querySelectorAll('.user-msg')].map((node) => node.textContent);
+    check('paging after roster find reaches every message in transcript order', pagedHistory.length === 1050 && pagedHistory.every((text, i) => text === 'Roster history message ' + i));
+
     reset();
     const replayForFind = [];
     for (let i = 0; i < 220; i++) replayForFind.push({ type: 'user_prompt', text: 'Question ' + i }, H('text_delta', i === 0 ? '**deferredneedle**' : 'Answer ' + i), end);
@@ -436,6 +476,40 @@
     send(H('text_delta', '\n'));
     await settle(); await settle();
     check('markdown conversion preserves the selected occurrence when URL offsets disappear', count.textContent === '2 of 3' && current().startContainer.textContent.slice(current().startOffset).startsWith('needle chosen'));
+    key(query, 'Escape');
+
+    // Run only the streaming paint, then navigate before the find frame.
+    for (const backwards of [false, true]) {
+      reset();
+      send(H('text_delta', 'needle [link](https://needle.test) needle chosen needle last'));
+      await settle();
+      window.__openFind(); search('needle'); key(query, 'Enter'); key(query, 'Enter');
+      await settle(); await settle();
+      const quietNode = messages.querySelector('.user-msg').firstChild;
+      const dataProperty = Object.getOwnPropertyDescriptor(CharacterData.prototype, 'data');
+      let quietReads = 0;
+      Object.defineProperty(quietNode, 'data', { configurable: true, get() { quietReads++; return dataProperty.get.call(this); } });
+      send(H('text_delta', '\n'));
+      frames.shift()(performance.now());
+      // Cover both undelivered records and a delivered observer callback whose
+      // refresh frame has not run yet.
+      if (backwards) await Promise.resolve();
+      key(query, 'Enter', { shiftKey: backwards });
+      check('navigation leaves unchanged blocks unscanned (' + (backwards ? 'previous' : 'next') + ')', quietReads === 0);
+      delete quietNode.data;
+      check('navigation refreshes streamed matches before the observer frame (' + (backwards ? 'previous' : 'next') + ')', count.textContent === (backwards ? '1 of 3' : '3 of 3') && current().startContainer.textContent.slice(current().startOffset).startsWith(backwards ? 'needle ' : 'needle last'));
+      key(query, 'Escape');
+      await settle();
+    }
+
+    reset();
+    send(H('text_delta', '**prefix** ' + 'needle repeated '.repeat(12)));
+    await settle();
+    window.__openFind(); search('needle');
+    for (let i = 0; i < 5; i++) key(query, 'Enter');
+    send(H('text_delta', '\n'));
+    await settle(); await settle();
+    check('identical context after a markdown prefix preserves occurrence six', count.textContent === '6 of 12');
     key(query, 'Escape');
 
     reset();
