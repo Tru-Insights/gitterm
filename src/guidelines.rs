@@ -245,7 +245,8 @@ pub fn documents_note(places: &DocumentPlaces) -> String {
     let mut note = format!(
         "# Documents for this work (added by GitTerm)\n\n\
          - Working notes for this work (status, plans, scratch) go in \
-         `{}`. That folder is private and not in git.\n",
+         `{}`. It is outside the project repos. When the folder above it is a git repo with a remote, \
+         GitTerm commits and pushes it there, so keep secrets out of it.\n",
         places.docs_dir.display()
     );
     note.push_str(&format!(
@@ -283,13 +284,14 @@ const CHECKPOINT_LINE: &str = "- Workspace checkpoint: `";
 
 /// The workspace's own checkpoint (TRU-237): repos are shared between
 /// workspaces, so a repo's `.agents/checkpoint.md` cannot say whose work it
-/// is. Code names the file; the agent only reads and writes it. Read from
-/// disk each time, so a chat that wrote it before `/clear` gets it back.
+/// is. Code names the file; the agent only reads and writes it. Its status
+/// comes from disk each time, so `/clear` cannot leave it stale.
 fn checkpoint_note(resume: &Path) -> String {
-    let mut note = format!(
+    let note = format!(
         "{CHECKPOINT_LINE}{}` ({}). `/checkpoint` writes here and `/resume` \
          reads here, never a repo's `.agents/checkpoint.md`.\n\
-         Resume only this workspace's work; if unsure which work to continue, ask.\n",
+         Read it at the start of the chat and after a clear or compaction; resume only this \
+         workspace's work; if unsure which work to continue, ask.\n",
         resume.display(),
         if resume.is_file() {
             "exists"
@@ -297,69 +299,29 @@ fn checkpoint_note(resume: &Path) -> String {
             "not written yet"
         }
     );
-    if let Some(start) = checkpoint_start(resume) {
-        // A fence longer than any backtick run in the checkpoint.
-        let longest = start.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-        let fence = "`".repeat((longest + 1).max(4));
-        note.push_str(&format!(
-            "\nThe start of the workspace checkpoint:\n\n{fence}markdown\n{start}\n{fence}\n"
-        ));
-    }
     note
-}
-
-/// How much of the workspace checkpoint a chat starts with: checkpoints put
-/// the newest state first, and a whole file can be long.
-const CHECKPOINT_START_BYTES: usize = 12 * 1024;
-
-/// The first [`CHECKPOINT_START_BYTES`] of the checkpoint at `path`, cut at
-/// a line end, with a note when cut; `None` when missing, empty or
-/// unreadable (logged).
-fn checkpoint_start(path: &Path) -> Option<String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(error) => {
-            eprintln!("[guidelines] cannot read {}: {error}", path.display());
-            return None;
-        }
-    };
-    let text = text.trim_end();
-    if text.is_empty() {
-        return None;
-    }
-    if text.len() <= CHECKPOINT_START_BYTES {
-        return Some(text.to_string());
-    }
-    let mut end = CHECKPOINT_START_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    let end = text[..end].rfind('\n').unwrap_or(end);
-    Some(format!(
-        "{}\n\n(cut at {} KB; read the file for the rest)",
-        &text[..end],
-        CHECKPOINT_START_BYTES / 1024
-    ))
 }
 
 /// The workspace section of appended instructions, also supplied by Claude's
 /// SessionStart callback after a clear or compaction. The checkpoint status
-/// and start are read from disk on each call, not taken from the text.
+/// is read from disk on each call, not taken from the text.
 pub fn workspace_context(instructions: &str) -> Option<String> {
     let start = instructions.find("# Documents for this work (added by GitTerm)\n")?;
     let section = &instructions[start..];
-    // The checkpoint line ends the note's fixed part; what follows it (the
-    // checkpoint's own text, which may hold any heading) is read again.
+    // The checkpoint line ends the note's fixed part; parse its path and
+    // rebuild the status and re-read instruction from disk.
     let at = section.find(CHECKPOINT_LINE)?;
     let path_start = at + CHECKPOINT_LINE.len();
     let path_end = path_start + section[path_start..].find('`')?;
     let resume = Path::new(&section[path_start..path_end]);
-    Some(
-        format!("{}{}", &section[..at], checkpoint_note(resume))
-            .trim_end()
-            .to_string(),
-    )
+    let mut context = format!("{}{}", &section[..at], checkpoint_note(resume));
+    if resume.is_file() {
+        context.push_str(&format!(
+            "Re-read the workspace checkpoint `{}` now, before continuing: it may have changed since this chat started.\n",
+            resume.display()
+        ));
+    }
+    Some(context.trim_end().to_string())
 }
 
 /// How agents in GitTerm start Codex (TRU-212): through GitTerm's task
@@ -726,64 +688,50 @@ mod tests {
         assert!(missing.contains("Workspace: `Example workspace`"));
         assert!(missing.contains("`/code/example-api`, `/code/example-web`"));
         assert!(missing
-            .contains("Resume only this workspace's work; if unsure which work to continue, ask."));
+            .contains("resume only this workspace's work; if unsure which work to continue, ask."));
         let checkpoint = places.docs_dir.join("checkpoint.md");
         assert!(missing.contains(&format!(
             "Workspace checkpoint: `{}` (not written yet)",
             checkpoint.display()
         )));
-        assert!(!missing.contains("The start of the workspace checkpoint"));
+        assert!(
+            missing.contains("Read it at the start of the chat and after a clear or compaction")
+        );
+        assert!(missing.contains("never a repo's `.agents/checkpoint.md`"));
+        assert!(missing.contains("It is outside the project repos. When the folder above it is a git repo with a remote, GitTerm commits and pushes it there, so keep secrets out of it."));
         std::fs::create_dir_all(&places.docs_dir).unwrap();
-        std::fs::write(&checkpoint, "Example resume notes").unwrap();
+        let marker = "UNIQUE_CHECKPOINT_MARKER_TRU259";
+        std::fs::write(&checkpoint, marker).unwrap();
         let note = documents_note(&places);
         assert!(note.contains(&format!(
             "Workspace checkpoint: `{}` (exists)",
             checkpoint.display()
         )));
-        assert!(note.contains("The start of the workspace checkpoint:"));
-        assert!(note.contains("Example resume notes"));
-        // A long checkpoint is cut at a line end and says so.
-        let long = "line of notes\n".repeat(2000);
-        std::fs::write(&checkpoint, &long).unwrap();
-        let cut = checkpoint_start(&checkpoint).unwrap();
-        assert!(cut.len() < long.len());
-        assert!(cut.contains("(cut at 12 KB; read the file for the rest)"));
-        std::fs::write(&checkpoint, "Example resume notes").unwrap();
+        assert!(!note.contains(marker));
         let launch =
             launch_instructions(Some(sample()), Some(&places), true, fixture.path()).unwrap();
-        assert_eq!(
-            workspace_context(&launch.text).as_deref(),
-            Some(note.trim_end())
-        );
-        assert!(!workspace_context(&launch.text)
-            .unwrap()
-            .contains("Starting Codex"));
+        assert!(launch.text.contains(&checkpoint.display().to_string()));
+        assert!(!launch.text.contains(marker));
+        let context = workspace_context(&launch.text).unwrap();
+        assert!(context.contains(&checkpoint.display().to_string()));
+        assert!(!context.contains(marker));
+        assert!(context.contains(&format!("Re-read the workspace checkpoint `{}` now, before continuing: it may have changed since this chat started.", checkpoint.display())));
+        assert!(!context.contains("Starting Codex"));
         assert_eq!(workspace_context("Other instructions"), None);
 
-        // A checkpoint with its own top-level heading and code fence comes
-        // back whole, and the rest of the section with it (review F1).
-        std::fs::write(
-            &checkpoint,
-            "# Resume: example\n\n```sh\ncargo test\n```\n\n# Next\n- ship it",
-        )
-        .unwrap();
-        let launch =
-            launch_instructions(Some(sample()), Some(&places), true, fixture.path()).unwrap();
-        let context = workspace_context(&launch.text).unwrap();
-        assert!(context.contains("# Resume: example"), "{context}");
-        assert!(context.ends_with("- ship it\n````"), "{context}");
-        assert!(context.contains("No decisions repo is set"), "{context}");
-
-        // The checkpoint is read again on each call: a chat that writes it
-        // after launch and then clears gets the new one (review F2).
+        // The checkpoint status and hook instruction follow disk changes.
         std::fs::remove_file(&checkpoint).unwrap();
+        let context = workspace_context(&launch.text).unwrap();
+        assert!(context.contains("(not written yet)"), "{context}");
+        assert!(!context.contains("Re-read the workspace checkpoint"));
         let launch =
             launch_instructions(Some(sample()), Some(&places), true, fixture.path()).unwrap();
         assert!(launch.text.contains("(not written yet)"));
-        std::fs::write(&checkpoint, "Written before /clear").unwrap();
+        std::fs::write(&checkpoint, marker).unwrap();
         let context = workspace_context(&launch.text).unwrap();
         assert!(context.contains("(exists)"), "{context}");
-        assert!(context.contains("Written before /clear"), "{context}");
+        assert!(context.contains("Re-read the workspace checkpoint"));
+        assert!(!context.contains(marker));
     }
 
     #[test]
