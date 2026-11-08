@@ -405,8 +405,17 @@ impl LineMeta {
 /// Harness-injected user content (command wrappers, caveats, reminders)
 /// that must not become a chat title.
 fn is_synthetic_user_text(text: &str) -> bool {
-    // Codex prepends this harness wrapper when replaying a prior request.
-    text.starts_with('<') || text.starts_with("You previously asked the user:")
+    text.starts_with('<')
+}
+
+/// Codex user-role items that are not typed by the user, so never a title:
+/// the AGENTS.md preamble and the wrapper Codex prepends when replaying a
+/// prior request. Only for Codex title selection; an assistant reply may
+/// legitimately start with the same words.
+fn is_codex_non_title(text: &str) -> bool {
+    is_synthetic_user_text(text)
+        || text.starts_with("# AGENTS.md instructions")
+        || text.starts_with("You previously asked the user:")
 }
 
 fn title_from_text(text: &str) -> String {
@@ -555,7 +564,7 @@ fn scan_codex_title(path: &Path) -> std::io::Result<Option<String>> {
             continue;
         };
         if let Some((true, text)) = codex_message(&value) {
-            if !is_synthetic_user_text(&text) && !text.starts_with("# AGENTS.md instructions") {
+            if !is_codex_non_title(&text) {
                 return Ok(Some(title_from_text(&text)));
             }
         }
@@ -820,7 +829,7 @@ fn index_codex_transcript(path: &Path) -> Option<ChatIndexEntry> {
             if let Some((true, text)) = codex_message(&value) {
                 // Codex injects project docs as a plain user message
                 // ("# AGENTS.md instructions for <path>"); never a title.
-                if !is_synthetic_user_text(&text) && !text.starts_with("# AGENTS.md instructions") {
+                if !is_codex_non_title(&text) {
                     title = Some(title_from_text(&text));
                 }
             }
@@ -1158,6 +1167,16 @@ fn preview_from_lines(lines: &[String], backend: ChatBackend) -> ChatPreview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_wrapper_is_excluded_only_from_codex_titles() {
+        let wrapper = "You previously asked the user: which branch?";
+        // Previews and snippets keep an assistant reply with these words.
+        assert!(!is_synthetic_user_text(wrapper));
+        assert!(is_codex_non_title(wrapper));
+        assert!(is_codex_non_title("# AGENTS.md instructions for /repo"));
+        assert!(!is_codex_non_title("do we need to run the checks?"));
+    }
 
     fn write_transcript(dir: &Path, name: &str, lines: &[&str]) -> PathBuf {
         let path = dir.join(name);
