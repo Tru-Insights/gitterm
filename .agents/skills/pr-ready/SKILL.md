@@ -20,8 +20,8 @@ generic workflow when they are stricter.
 ## Config
 
 - Project: `gitterm-v2`
-- Default base branch: `master`
-- Protected branches: `master`
+- Default base branch: `v6`
+- Protected branches: `v4`, `v5`, `v6`
 - Issue provider: `linear`
 - Issue key pattern: `[A-Z][A-Z0-9]{1,9}-[0-9]{1,7}`
 - Issue required in PR: `true`
@@ -64,9 +64,9 @@ For current-branch mode:
 
 ```bash
 git status --short --branch
-git merge-base HEAD origin/master
-git diff --name-status origin/master...HEAD
-git log --oneline origin/master..HEAD
+git merge-base HEAD origin/v6
+git diff --name-status origin/v6...HEAD
+git log --oneline origin/v6..HEAD
 ```
 
 Adjust the base branch if repo instructions, branch naming, or the PR target
@@ -112,8 +112,6 @@ case is acceptable:
 - Security basics regress: secrets, unsafe logging, XSS/injection risk,
   overbroad permissions, auth bypass, missing authorization boundary, or
   sensitive data exposure.
-- The repo requires a current-head readiness attestation and the PR body lacks
-  one for the current head SHA.
 
 Add repo-specific blockers from `AGENTS.md` and treat them as equally
 authoritative.
@@ -155,10 +153,11 @@ them. If a configured verification command is not available, stop and call out
 the config/repo mismatch instead of substituting an unrelated package-manager
 default.
 
-### 6. Record Explicit PR Attestation
+### 6. Record Explicit PR Attestation Before Accepting
 
-Only do this in explicit PR mode, only after all blockers are cleared, and only
-for the current PR head SHA.
+Do this in explicit PR mode after all other blockers are cleared and before
+returning `ACCEPT-READY`. Record the attestation for the current PR head SHA as
+the final step before returning `ACCEPT-READY`.
 
 If `github.requirePrReadyBeforeReview` is true, update the PR body so it
 contains a current-head block:
@@ -206,29 +205,16 @@ ready, or merge when status is not `ACCEPT-READY`.
 
 ### gitterm-v2 PR-Readiness Notes
 
-#### Pre-flight: gh active account
+#### Pre-flight: GitHub push access
 
-Pushing to `Tru-Insights/*` repos requires the **`traceyt`** (work) `gh`
-account to be active. Verify before push:
-
-```bash
-gh auth status                # look for "Active account: true" next to traceyt
-gh auth switch -u traceyt     # if active is traceyt-cree8 (personal)
-```
-
-A `403 Permission denied to traceyt-cree8` on push almost always means the
-active gh account silently flipped back to personal — not an actual
-permission problem.
-
-Commit author metadata is independent: commits stay
-`Tracey Trewin <tracey@trewin.com>` regardless of which gh account is active.
-That's intentional — `gh` controls push authorization only, not authorship.
+Before pushing, check `gh auth status` and use a GitHub account that has push
+access to the repository's organization.
 
 #### Pre-flight: iced_term_fork sync
 
-All three GitHub workflows (`build.yml`, `ci.yml`, `windows-build.yml`) clone
-`Tru-Insights/iced_term` master fresh. If you've made local commits to
-`../iced_term_fork` that gitterm depends on, push them first or CI fails with
+The GitHub workflows clone the upstream `iced_term` master branch fresh. If
+you've made local commits to `../iced_term_fork` that gitterm depends on, push
+them first or CI fails with
 `no method named X found`-style errors:
 
 ```bash
@@ -250,31 +236,28 @@ cargo clippy -- -D warnings
 cargo clippy --features excalidraw -- -D warnings
 cargo test
 cargo test --features excalidraw
-cargo build --release --features stt
+cargo build --release
 ```
 
-The pre-commit hook (`.githooks/pre-commit`) runs a subset — `clippy +
-fmt-check + test` — automatically when activated via
-`git config core.hooksPath .githooks`. CI is still the authoritative gate.
+The pre-commit hook (`.githooks/pre-commit`) runs Clippy, formatting, and
+`cargo test`; see the hook for the exact commands. CI is still the authoritative
+gate.
 
-#### Linear: TRU, not GIT
+#### Linear workspace
 
-New issues default to the **`TRU`** team in the `truinsights` workspace even
-though a dedicated `GIT` (Git Term) team exists. This is a deliberate user
-preference. Create with:
+Pass the intended Linear workspace explicitly when using the Linear CLI. For
+example:
 
 ```bash
-linear --workspace truinsights issue create --team TRU \
+linear --workspace <workspace> issue create --team <team> \
   --title "..." --description-file <path> \
   --assignee self --no-interactive
 ```
 
-Without `--workspace truinsights`, the CLI defaults to `cree8` and the
-command fails or lands the issue in the wrong place.
-
 #### Branch + PR Conventions
 
-Branch names: `tracey/tru-<NN>-<short-slug>`. Base branch: `master` (the only
-protected branch). PRs default to **draft**; flip to ready only after
+Branches carry the issue key. The configured default base is `v6`. PRs default
+to **draft**; flip to ready only after
 `/pr-ready --pr <number>` returns `ACCEPT-READY` and the attestation block is
-filled in the PR body (per `github.requirePrReadyBeforeReview: true`).
+filled in the PR body (per `github.requirePrReadyBeforeReview: true`). Never
+merge without the user's instruction.

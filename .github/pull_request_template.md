@@ -28,7 +28,7 @@ Repo rules: see AGENTS.md. PR readiness gates are enforced via
 
 - [ ] `cargo fmt -- --check && cargo clippy -- -D warnings`
 - [ ] `cargo test`
-- [ ] `cargo build --release --features stt`
+- [ ] `cargo build`
 
 ## Notes
 

@@ -2,8 +2,8 @@
 
 #### Feature Coverage
 
-`cargo test` covers the default feature set (~96 tests). `cargo test --features
-excalidraw` adds the diagram-viewer tests (~108 total). CI runs both — run both
+`cargo test` covers the default feature set. `cargo test --features excalidraw`
+also covers the optional diagram-viewer feature. CI runs both — run both
 locally for parity:
 
 ```bash
@@ -11,12 +11,8 @@ cargo test
 cargo test --features excalidraw
 ```
 
-#### Test Canaries
+#### Test Coverage
 
-- **`tests::collect_file_tree_hides_dotfiles`** (`src/main.rs:14184`) is the
-  canary for `services::collect_file_tree` correctly honoring `show_hidden`.
-  Pre-TRU-69 this test was failing because the parameter was accepted but
-  ignored. If it ever fails again, suspect the same root cause first.
 - **`plans_viewer::tests::*`** cover path-traversal safety on
   `/plans/raw/{name}`. Don't regress these without scrutiny — they protect
   against directory escapes and non-`.md` requests.
@@ -29,6 +25,6 @@ launch the Iced GUI.
 
 #### Test Layout
 
-Most tests live inline in `src/main.rs` under `#[cfg(test)] mod tests`. The
-plans-viewer tests live in `src/plans_viewer.rs::tests`. There's no separate
-`tests/` integration directory.
+Tests primarily live inline in source modules under `#[cfg(test)]`. The
+`tests/` directory holds fixtures and page-check scripts, alongside an
+integration test.

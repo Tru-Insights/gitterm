@@ -97,14 +97,14 @@ shipping has more flags and a bundle step.
 |-----------------------|---------------------------------------------------|
 | Dev loop              | `cargo run`                                       |
 | Quick debug build     | `cargo build`                                     |
-| Release binary        | `cargo build --release --features stt`            |
+| Release binary        | `cargo build --release`                           |
 | Ship macOS .app       | `./scripts/bundle.sh`                             |
-| Install bundle        | `cp -r target/GitTerm.app /Applications/`         |
-| Launch installed app  | `open /Applications/GitTerm.app`                  |
+| Install bundle        | `cp -r 'target/GitTerm V6.app' /Applications/`    |
+| Launch installed app  | `open '/Applications/GitTerm V6.app'`             |
 
 #### Feature Flags
 
-- `stt` — voice (whisper-rs + cpal). Required for shipping. Off by default.
+- `stt` — voice (whisper-rs + cpal). Enabled by default.
 - `excalidraw` — diagram viewer surface. Optional. Off by default.
 
 `./scripts/bundle.sh` builds with both (`stt excalidraw`).
@@ -124,8 +124,8 @@ git push origin master          # if it's not
 
 #### Output Locations
 
-- `cargo build` → `target/debug/gitterm`
-- `cargo build --release ...` → `target/release/gitterm`
-- `./scripts/bundle.sh` → `target/GitTerm.app` (custom bundle, multi-instance launcher)
-- `cargo bundle --release --features stt` → `target/release/bundle/osx/GitTerm.app`
+- `cargo build` → `target/debug/gitterm-v6`
+- `cargo build --release` → `target/release/gitterm-v6`
+- `./scripts/bundle.sh` → `target/GitTerm V6.app` (custom bundle, multi-instance launcher)
+- `cargo bundle --release` → `target/release/bundle/osx/GitTerm V6.app`
   (cargo-bundle crate output; use `bundle.sh` instead for the multi-instance launcher)
