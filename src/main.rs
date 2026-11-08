@@ -7610,6 +7610,7 @@ struct App {
     worker_pr_scans: gitterm::worker_prs::Scans,
     /// Send-to-Claude messages held per chat tab until its turn ends.
     delegation_held: HashMap<usize, Vec<gitterm::delegations::HeldSend>>,
+    delegation_waiting_counts: HashMap<String, usize>,
     /// New-chat model/effort defaults and the last selection (config
     /// `chat`, TRU-143).
     chat_config: config::ChatDefaults,
@@ -19260,16 +19261,17 @@ impl App {
             })
             .unwrap_or_default();
         let mut tabs: HashSet<usize> = self.delegation_held.keys().copied().collect();
+        let mut waiting = Vec::new();
         for parent in parents {
             match self.delegation_chat_tab_id(&parent) {
                 Some(tab_id) => {
                     tabs.insert(tab_id);
                 }
-                None => eprintln!(
-                    "[delegation] results for {} not sent: requesting chat tab is gone",
-                    parent.session_uid
-                ),
+                None => waiting.push(parent.session_uid),
             }
+        }
+        for line in waiting_delegation_log_lines(&mut self.delegation_waiting_counts, waiting) {
+            eprintln!("{line}");
         }
         Task::batch(
             tabs.into_iter()
@@ -19610,6 +19612,26 @@ fn worker_delivery_allows_close(
         .and_then(|result| result.handoff.as_ref())
         .is_some();
     handoff_stored && (d.is_delivered() || held || !auto_tell || !parent_present)
+}
+
+fn waiting_delegation_log_lines(
+    previous: &mut HashMap<String, usize>,
+    waiting: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut counts = HashMap::new();
+    for chat in waiting {
+        *counts.entry(chat).or_insert(0) += 1;
+    }
+    let mut lines = Vec::new();
+    for (chat, count) in &counts {
+        if previous.get(chat) != Some(count) {
+            lines.push(format!(
+                "[delegation] {count} finished results wait for chat {chat} until it is open"
+            ));
+        }
+    }
+    *previous = counts;
+    lines
 }
 
 fn load_task_store_for_startup(
@@ -20248,6 +20270,7 @@ impl App {
             delegation_activity: HashMap::new(),
             worker_pr_scans: gitterm::worker_prs::Scans::default(),
             delegation_held: HashMap::new(),
+            delegation_waiting_counts: HashMap::new(),
             chat_config: config.chat.clone(),
             task_store_error,
             task_ui_error: None,
@@ -51457,6 +51480,33 @@ mod tests {
     }
 
     // === AppTheme::toggle ===
+
+    #[test]
+    fn closed_chat_results_log_once_until_the_count_changes() {
+        let mut previous = HashMap::new();
+        let waiting = || vec!["closed-chat".to_string(); 3];
+        assert_eq!(
+            waiting_delegation_log_lines(&mut previous, waiting()),
+            vec!["[delegation] 3 finished results wait for chat closed-chat until it is open"]
+        );
+        assert!(waiting_delegation_log_lines(&mut previous, waiting()).is_empty());
+        let mut more = waiting();
+        more.push("closed-chat".into());
+        more.push("other-chat".into());
+        let lines = waiting_delegation_log_lines(&mut previous, more);
+        assert_eq!(lines.len(), 2);
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("4 finished results wait for chat closed-chat")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("1 finished results wait for chat other-chat")));
+        assert!(waiting_delegation_log_lines(&mut previous, Vec::new()).is_empty());
+        assert_eq!(
+            waiting_delegation_log_lines(&mut previous, waiting()).len(),
+            1
+        );
+    }
 
     #[test]
     fn theme_toggle_dark_to_light() {
