@@ -1,13 +1,13 @@
 #!/bin/sh
-# Pre-commit hook — runs the configured verification.beforeCommit set
-# (lint, check, test) to catch CI failures before they ship.
+# Pre-commit hook — runs Clippy, the format check and the tests to catch CI
+# failures before they ship.
 #
 # Checked into the repo so every dev runs the same gate. To activate after
 # cloning (or after pulling this change for the first time):
 #
 #     git config core.hooksPath .githooks
 #
-# The project's AGENTS.md records this as the setup step.
+# BUILD.md records this as the setup step.
 
 set -e
 

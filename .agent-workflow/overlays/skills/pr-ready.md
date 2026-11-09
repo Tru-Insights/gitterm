@@ -22,7 +22,7 @@ See `BUILD.md` for full cross-platform build context.
 
 #### Full Verification Set
 
-`verification.beforePrReady` resolves to `check + test + build`. The actual
+The skill's checks above are format, lint, test and build. The actual
 command set CI runs (mirror locally for parity):
 
 ```bash
@@ -52,7 +52,5 @@ linear --workspace truinsights issue create --team TRU \
 #### Branch + PR Conventions
 
 Branches carry the issue key. The configured default base is `v6`. PRs default
-to **draft**; flip to ready only after
-`/pr-ready --pr <number>` returns `ACCEPT-READY` and the attestation block is
-filled in the PR body (per `github.requirePrReadyBeforeReview: true`). Never
+to **draft**; flip to ready only after this skill reports **Ready**. Never
 merge without the user's instruction.

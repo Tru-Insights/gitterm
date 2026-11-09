@@ -1,7 +1,7 @@
 /target
 .DS_Store
 
-# agent-workflow-kit runtime state (personal/runtime, not repo source)
+# Agent runtime state (personal/runtime, not repo source)
 .agents/checkpoint.md
 .agents/memory.md
 .agents/preferences.md

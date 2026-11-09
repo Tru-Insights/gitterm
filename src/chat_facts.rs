@@ -463,8 +463,8 @@ fn normalize_stamp(raw: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Issue keys: the repo's key pattern `[A-Z][A-Z0-9]{1,9}-[0-9]{1,7}`
-// (agent-workflow.config.json), on word boundaries.
+// Issue keys: the generic Linear/Jira key shape `[A-Z][A-Z0-9]{1,9}-[0-9]{1,7}`,
+// on word boundaries.
 
 /// Prefixes that match the key shape but name encodings, hashes and
 /// standards, never issues (`UTF-8`, `SHA-256`).
