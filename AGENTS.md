@@ -99,7 +99,7 @@ Windows CI exists.
   (`visible_webview_surface` in `main.rs`). See
   `webview::set_pending_content`, `set_pending_url`, `navigate_to_url`.
 - **Terminal**: uses `iced_term` fork at `../iced_term_fork`. The Windows CI
-  Windows CI workflow clones `Tru-Insights/iced_term` master fresh —
+  workflow clones `Tru-Insights/iced_term` master fresh —
   push local fork changes before triggering Windows CI.
 - **Theme**: Catppuccin Mocha (dark) / Latte (light) via
   `theme::AppTheme::{Dark, Light}` and `markdown::ThemeColors`.

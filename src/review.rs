@@ -238,7 +238,9 @@ pub struct ReviewContext {
     pub error: Option<String>,
 }
 
-/// `git.defaultBaseBranch` from the repository's `agent-workflow.config.json`.
+/// The base branch from the repository's `agent-workflow.config.json`:
+/// `git.baseBranch` (agent kit 0.2+), else `git.defaultBaseBranch` (the
+/// earlier kit's key, still in repos that have not moved to the agent kit).
 fn workflow_default_base(top_level: &Path) -> Option<String> {
     let path = top_level.join("agent-workflow.config.json");
     let text = match std::fs::read_to_string(&path) {
@@ -250,11 +252,14 @@ fn workflow_default_base(top_level: &Path) -> Option<String> {
         }
     };
     match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(v) => v
-            .pointer("/git/defaultBaseBranch")
-            .and_then(|b| b.as_str())
-            .map(str::trim)
-            .filter(|b| !b.is_empty())
+        Ok(v) => ["/git/baseBranch", "/git/defaultBaseBranch"]
+            .iter()
+            .find_map(|key| {
+                v.pointer(key)
+                    .and_then(|b| b.as_str())
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+            })
             .map(str::to_string),
         Err(e) => {
             eprintln!("[review] {} is not valid JSON: {e}", path.display());
@@ -282,7 +287,7 @@ fn git_stdout(dir: &Path, args: &[&str]) -> Result<String, String> {
 /// The git facts for a review of the checkout at `repo_path`. The base for
 /// "branch vs base" is, in order: the base recorded on the tab's task
 /// (`task_base`), the repository's `agent-workflow.config.json`
-/// `git.defaultBaseBranch`, then the base GitTerm infers when adopting an
+/// `git.baseBranch` (or the older `git.defaultBaseBranch`), then the base GitTerm infers when adopting an
 /// existing branch (`infer_branch_base`). A candidate that does not resolve
 /// or names the current branch is skipped. Blocking: call off the UI thread.
 pub fn review_context(repo_path: &Path, task_base: Option<&str>) -> ReviewContext {
@@ -542,6 +547,16 @@ mod tests {
         assert_eq!(ctx.base.as_deref(), Some("v6"));
         assert_eq!(ctx.base_source.as_deref(), Some("agent-workflow"));
         assert!(ctx.dirty);
+
+        // The agent kit's `git.baseBranch` is read, and wins over the older key.
+        std::fs::write(
+            tmp.join("agent-workflow.config.json"),
+            r#"{"git": {"baseBranch": "v6", "defaultBaseBranch": "main"}}"#,
+        )
+        .unwrap();
+        let ctx = review_context(&tmp, None);
+        assert_eq!(ctx.base.as_deref(), Some("v6"));
+        assert_eq!(ctx.base_source.as_deref(), Some("agent-workflow"));
 
         // A task's recorded base wins; one naming the current branch or a
         // missing ref is skipped.
