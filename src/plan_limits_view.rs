@@ -418,7 +418,11 @@ impl App {
     /// no height while there is nothing to show, so the rail keeps its
     /// tree when a reading arrives.
     pub(super) fn view_plan_limits_badge(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        let badge = plan_limits::badge(self.plan_limits.file.readings(), now_unix());
+        let badge = plan_limits::badge(
+            self.plan_limits.file.readings(),
+            &self.plan_limits.file.history,
+            now_unix(),
+        );
         let (label, color, height) = match &badge {
             Some(badge) => (
                 badge.text.clone(),
@@ -445,7 +449,12 @@ impl App {
         let now = now_unix();
         let mut lines = vec!["Usage  ⌘⇧U".to_string()];
         for reading in self.plan_limits.file.readings() {
-            lines.extend(plan_limits::tooltip_lines(reading, now, &chrono::Local));
+            lines.extend(plan_limits::tooltip_lines(
+                reading,
+                &self.plan_limits.file.history,
+                now,
+                &chrono::Local,
+            ));
         }
         lines.join("\n")
     }
@@ -595,10 +604,12 @@ impl App {
         }
         let track = theme.surface0();
         for window in &reading.windows {
-            let percent = window.percent_at(now);
-            let (figure, fill_color) = match percent {
-                Some(p) => (
-                    format!("{}{}%", if stale { "≥" } else { "" }, p.round()),
+            let figure =
+                plan_limits::window_figure(reading, window, &self.plan_limits.file.history, now);
+            let percent = figure.map(|(p, _)| p);
+            let (figure, fill_color) = match figure {
+                Some((p, mark)) => (
+                    format!("{mark}{}%", p.round()),
                     self.plan_level_color(plan_limits::level(p), theme.accent()),
                 ),
                 None if window.has_reset(now) => ("–".to_string(), track),
