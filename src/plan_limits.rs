@@ -1141,11 +1141,17 @@ fn provider_evaluation(
             });
         }
         if let Some(state) = &mut policy.weekly {
+            // Only a real reading (or an alert) holds a provider: a held
+            // provider never runs, so it never sends the fresh reading that
+            // would release a hold set by an estimate. An estimate past the
+            // line only makes the week hot.
             let next = if weekly_alert
-                || weekly_used.is_some_and(|p| p >= ALMOST_OUT_PERCENT)
+                || weekly.used_percent.is_some_and(|p| p >= ALMOST_OUT_PERCENT)
                 || state.state == WeeklyState::AlmostOut
             {
                 WeeklyState::AlmostOut
+            } else if weekly.estimated && weekly_used.is_some_and(|p| p >= ALMOST_OUT_PERCENT) {
+                WeeklyState::Hot
             } else if state.state == WeeklyState::Hot {
                 // Leaving hot needs a fresh reading; an estimate only adds.
                 if fresh
@@ -3094,7 +3100,7 @@ mod policy_tests {
     }
 
     #[test]
-    fn an_estimate_past_the_thresholds_makes_the_week_hot_or_almost_out() {
+    fn an_estimate_past_the_thresholds_makes_the_week_hot_but_never_holds() {
         // 30% at 60 points a day: on track when read, hot twelve hours on.
         let mut file = idle_codex(30.0);
         codex_samples(&mut file, &[(NOW - 12 * 3600, 0.0), (NOW, 30.0)]);
@@ -3111,25 +3117,25 @@ mod policy_tests {
             e.notices
         );
 
-        // 90% at 120 points a day: two hours on the estimate is used up,
-        // although the reading itself was under the almost-out line.
+        // 90% at 120 points a day: two hours on, the estimate is used up,
+        // but the reading itself was under the almost-out line. An estimate
+        // never holds (a held provider would never send the reading that
+        // releases it): the week is hot and Codex may still start.
         let mut file = idle_codex(90.0);
         codex_samples(&mut file, &[(NOW - 6 * 3600, 60.0), (NOW, 90.0)]);
         assert!(step(&mut file, NOW).allows_start(Provider::Codex, false, false));
         let e = step(&mut file, NOW + 2 * 3600);
         assert!(!e.report.codex.stale_exhausted);
         assert_eq!(codex_weekly(&e).estimated_percent, Some(100.0));
+        assert_eq!(codex_weekly(&e).state, Some(WeeklyState::Hot));
+        assert_ne!(e.report.routing.state, RoutingState::HoldCodex);
+        assert!(e.allows_start(Provider::Codex, false, false));
+
+        // A real reading at the line still holds.
+        let mut file = idle_codex(96.0);
+        let e = step(&mut file, NOW);
         assert_eq!(codex_weekly(&e).state, Some(WeeklyState::AlmostOut));
         assert_eq!(e.report.routing.state, RoutingState::HoldCodex);
-        assert!(!e.allows_start(Provider::Codex, false, false));
-        assert!(
-            e.report
-                .routing
-                .reason
-                .starts_with("Routing: Codex ≈100% (7d,"),
-            "{}",
-            e.report.routing.reason
-        );
     }
 
     #[test]
