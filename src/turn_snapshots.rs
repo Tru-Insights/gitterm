@@ -225,13 +225,17 @@ async fn text(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<String,
         .map(|s| s.trim().to_string())
         .map_err(|e| format!("snapshot git output: {e}"))
 }
+/// One root per test thread. `maintain` cleans every store under the root,
+/// so a root shared by the whole test binary let one test's maintenance lock
+/// and rewrite the stores of tests running beside it (TRU-245). Each
+/// `#[tokio::test]` runs on its own thread with a current-thread runtime, so
+/// its tasks see the same root.
 #[cfg(test)]
 fn store_root() -> Result<PathBuf, String> {
-    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    Ok(ROOT
-        .get_or_init(|| tempfile::tempdir().expect("private snapshot test root"))
-        .path()
-        .join("turn-snapshots"))
+    thread_local! {
+        static ROOT: tempfile::TempDir = tempfile::tempdir().expect("private snapshot test root");
+    }
+    Ok(ROOT.with(|root| root.path().join("turn-snapshots")))
 }
 #[cfg(not(test))]
 fn store_root() -> Result<PathBuf, String> {
@@ -2041,7 +2045,12 @@ mod tests {
             .unwrap();
         assert!(turns(d, "a").await.unwrap().is_empty());
         assert_eq!(turns(d, "ab").await.unwrap().len(), 1);
-        let now = chrono::Utc::now().timestamp();
+        // Expiry counts from the snapshot commit's date, not from when this
+        // line runs: the saves and gc above can take over 10s under load.
+        let store = store_path(d).await.unwrap();
+        let now: i64 = g(&store, &["show", "-s", "--format=%ct", &oid])
+            .parse()
+            .unwrap();
         cleanup(d, None, now + RETENTION_SECS - 10).await.unwrap();
         assert_eq!(turns(d, "keep").await.unwrap().len(), 1);
         cleanup(d, None, now + RETENTION_SECS + 10).await.unwrap();

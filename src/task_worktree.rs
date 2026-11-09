@@ -555,6 +555,24 @@ fn infer_adoption_base(
     Ok(base)
 }
 
+/// Serializes this process's `git worktree add/remove/prune` per repository.
+/// Git is not safe to run two of these at once on one repository: `add` lists
+/// every worktree and fails on one another `add` has half-written ("failed to
+/// read .git/worktrees/<name>/commondir"), so tasks created together could
+/// fail at random (TRU-245).
+/// shortcut: covers GitTerm's own calls only, not git run by hand or by another
+/// process at the same moment; take git's lock files too if that ever shows up.
+fn worktree_admin_lock(common_dir: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.entry(common_dir.to_path_buf()).or_default().clone()
+}
+
 pub fn prepare_task_worktree_blocking(
     request: &PrepareTaskWorktreeRequest,
 ) -> Result<PreparedTaskWorktree, TaskWorktreeError> {
@@ -572,6 +590,10 @@ where
     let repository = resolved.repository;
     let base = resolved.base;
     let proposal = resolved.proposal;
+    let admin = worktree_admin_lock(&repository.identity.common_dir);
+    let _admin = admin
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if request.worktree_root.starts_with(&repository.top_level) {
         return Err(TaskWorktreeError::new(
             "validate worktree root",
@@ -904,6 +926,10 @@ pub fn remove_task_worktree_blocking(
     force: bool,
 ) -> Result<(), TaskWorktreeError> {
     let repository = resolve_repository(repository_path)?;
+    let admin = worktree_admin_lock(&repository.identity.common_dir);
+    let _admin = admin
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let registered = registered_worktrees(&repository.top_level)?
         .iter()
         .any(|path| paths_equal(path, worktree_path));
@@ -954,6 +980,10 @@ pub async fn remove_task_worktree(
 
 pub fn prune_worktrees_blocking(repository_path: &Path) -> Result<(), TaskWorktreeError> {
     let repository = resolve_repository(repository_path)?;
+    let admin = worktree_admin_lock(&repository.identity.common_dir);
+    let _admin = admin
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let output = git_command()
         .args(["worktree", "prune"])
         .current_dir(&repository.top_level)
