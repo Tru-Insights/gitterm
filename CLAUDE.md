@@ -1,13 +1,8 @@
 # Claude Code Instructions
 
-The canonical instruction source for this repository is
-[`AGENTS.md`](./AGENTS.md). Read it before doing any substantive work.
+The instructions for this repository are in `AGENTS.md`; this line loads them:
 
-This file exists only as a pointer for Claude Code and any other harness that
-defaults to `CLAUDE.md`. Repo rules, workflow facts, build commands, issue
-conventions, and PR readiness gates all live in `AGENTS.md`, and they are
-generated/governed by [`agent-workflow-kit`](https://github.com/Tru-Insights/agent-workflow-kit)
-via the checked-in `agent-workflow.config.json`.
+@AGENTS.md
 
-Do not add rules here. Promote anything durable to `AGENTS.md`'s
-`Repo-Specific Rules` section instead.
+Do not add rules here. Put repo rules in `AGENTS.md` (outside the agent kit
+section) and workflow facts in `agent-workflow.config.json`.

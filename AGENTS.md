@@ -1,182 +1,46 @@
 # Repository Agent Instructions
 
-This file is the canonical instruction source for this repository. It starts
-from `agent-workflow-kit`; keep durable repo rules here, keep workflow facts in
-`agent-workflow.config.json`, and keep personal/runtime state out of git.
+This file is the canonical instruction source for this repository. The repo's
+own rules come first; the agent kit section at the end is rendered from
+`agent-workflow.config.json` (commands, base branch, issue keys, workflow
+skills and change guidelines). Keep personal/runtime state out of git.
 
 If another local instruction file, generated wrapper, skill, command, memory
 file, or checklist conflicts with this file, follow this file and call out the
 conflict.
 
-## Workflow Facts
-
-- Project: `gitterm-v6`
-- Default base branch: `v6`
-- Protected branches: `v4`, `v5`, `v6`
-- Issue provider: `linear`
-- Issue key pattern: `[A-Z][A-Z0-9]{1,9}-[0-9]{1,7}`
-- Issue required in commits: `true`
-- Issue required in PRs: `true`
-- Draft PRs by default: `true`
-- PR-ready attestation required: `true`
-
-Configured commands:
-
-- dev: `cargo run`
-- lint: `cargo clippy -- -D warnings`
-- check: `cargo fmt -- --check && cargo clippy -- -D warnings`
-- test: `cargo test`
-- build: `cargo build`
-
-## Resume Checkpoints
-
-The cross-agent checkpoint file is `.agents/checkpoint.md` in the current
-project. Claude, Codex, and Pi should all use this same file, unless GitTerm's
-instructions name a workspace checkpoint with a line starting
-`- Workspace checkpoint:`; in that case, use the named file.
-
-At the start of a new session, resumed session, fork, or after compaction, check
-whether the selected checkpoint file exists: use the workspace checkpoint
-named by a line starting `- Workspace checkpoint:` in GitTerm's instructions,
-or `.agents/checkpoint.md` when no workspace checkpoint is named.
-
-If it exists:
-
-- Read the selected checkpoint file before doing substantive work.
-- Use it as tactical orientation for branch state, recent work, hot files, and
-  the immediate next step.
-- Treat the user's current request and this file as higher priority than the
-  checkpoint if they conflict.
-- Mention the checkpoint only when it affects what you are about to do.
-
-Do not create, modify, or delete the selected checkpoint file unless the user
-asks to checkpoint or save progress. Do not write new checkpoints to
-harness-specific paths such as `.codex/resume.md`, `.claude/resume.md`, or
-`.plans/CHECKPOINT.md`.
-
 ## Code Safety Rules
 
-- Read the existing working code before modifying it. Preserve behavior unless
-  the requested change explicitly requires different behavior.
-- Do not guess field names, response shapes, endpoint paths, status values,
-  environment variables, or data contracts. Verify against existing code, docs,
-  tests, or backend contracts.
-- Do not add silent fallback logic for required values. Missing required data
-  should fail loudly with useful context.
-- Do not swallow errors. Every catch block must either rethrow or log useful
-  operation/input context and surface an observable state when action is needed.
+These add to the kit's change guidelines below.
+
 - Do not add caching unless explicitly requested and reviewed for invalidation,
   scope, and stale-data behavior.
-- Keep edits scoped to the requested behavior. Avoid unrelated refactors,
-  formatting churn, dependency changes, generated output, or broad rewrites.
 - Do not run destructive production, data, git, or filesystem operations without
   explicit approval and a clear statement of what will be affected.
-
-## Build, Test, And Development
-
-Use the configured repo commands as the source of truth:
-
-- dev: `cargo run`
-- lint: `cargo clippy -- -D warnings`
-- check: `cargo fmt -- --check && cargo clippy -- -D warnings`
-- test: `cargo test`
-- build: `cargo build`
-
-If a command is missing, unavailable, or contradicted by repo-specific
-instructions, stop and call out the conflict before guessing a package-manager
-default.
-
-Run focused tests for behavior changes. Broaden verification when the change
-touches shared contracts, runtime boundaries, security, data migrations,
-generated artifacts, or user-facing workflows.
-
-## Skill And Command Routing
-
-Canonical skill source lives in `.agents/skills`. Edit skills there rather than
-in harness-specific global locations.
-
-Repo-local commands should be thin wrappers around this file, `.agents/skills`,
-and configured repo commands. Do not put repo workflow rules in global harness
-commands.
-
-Use the smallest command that matches the job:
-
-- `/checkpoint` writes only the selected checkpoint file.
-- `/done` writes a human-facing session log only, when configured locally.
-- `/review` performs a quick local pre-commit review. It is not PR readiness.
-- `/pr-ready` is the strict readiness gate. Current-branch mode is author
-  preflight; explicit PR mode is required before requesting review, approving,
-  marking ready, or merging an existing PR.
-- `/pr` creates or updates a PR. Default to draft when `github.draftPrByDefault`
-  is true.
-- `/commit` creates focused commits following the issue policy below.
-
-Avoid overlapping review commands for the same decision. If the question is "can
-this PR request review or merge?", use `/pr-ready`.
-
-## Commit Guidelines
-
-Commit subjects should be short, imperative, and action-led.
-
-When `issueTracking.requireIssueInCommit` is true, commit messages must include
-an issue key matching `[A-Z][A-Z0-9]{1,9}-[0-9]{1,7}`. If the issue cannot be
-inferred from branch name, current PR, or recent context, ask the user to choose
-or create an issue before committing.
-
-Keep commits focused. Do not bundle unrelated cleanup, refactors, generated
-changes, or dependency bumps with behavior fixes unless the user explicitly
-approved that scope.
 
 ## Pull Request Guidelines
 
 PRs should include:
 
 - a clear summary
-- linked issue keys when required by config or repo rules
+- linked issue keys
 - tests and verification performed
 - screenshots or recordings for visual changes
 - environment, migration, deployment, or rollout notes when relevant
 
 Draft PRs are allowed for early CI or collaboration, but they must not request
-review until `/pr-ready` accepts the current state.
-
-## PR Submission Gate
-
-Before opening a ready-for-review PR, requesting review, marking a draft PR
-ready, approving, or merging, run `/pr-ready`.
-
-For an existing PR, use explicit PR mode:
-
-```text
-/pr-ready --pr <number>
-```
-
-If `github.requirePrReadyBeforeReview` is true, the PR body must contain a
-current-head readiness block before review or merge:
-
-```markdown
-## Review readiness
-
-- [x] `/pr-ready --pr <number>` returned `ACCEPT-READY`
-- Head SHA: <current 40-character PR head SHA>
-- Reviewed at: <ISO-8601 UTC timestamp>
-```
-
-Any new commit makes the attestation stale and requires rerunning explicit PR
-mode.
+review until the `pr-ready` skill reports Ready.
 
 ### Hard Blockers
 
-Any one of these blocks review or merge:
+In addition to the `pr-ready` skill's checks, any one of these blocks review or
+merge:
 
-- Missing required issue reference in the PR title, body, branch, commit, or
-  linked issue.
+- Missing issue reference in the PR title, body, branch, commit, or linked
+  issue.
 - PR scope is not atomic.
-- Base branch does not match the intended lane.
 - Prior requested changes or unresolved review threads are not explicitly
   addressed.
-- Behavior changed without targeted automated regression coverage, unless the
-  repo explicitly permits manual-only verification and the risk is stated.
 - Required verification commands, targeted tests, or build checks are failing,
   skipped, or only assumed.
 - CI is failing, pending too long to judge, or attached to a stale head SHA.
@@ -184,15 +48,12 @@ Any one of these blocks review or merge:
   are unexplained.
 - Repo ownership boundaries are crossed without the documented upstream change.
 - Required data contracts are guessed instead of verified.
-- Error handling swallows failures or omits useful operation/input context.
 - Build/runtime risks are unverified after touching bundlers, SSR/client
   boundaries, dynamic imports, environment variables, assets, or production-only
   paths.
 - Security basics regress: secrets, unsafe logs, injection risk, overbroad
   permissions, auth bypass, missing authorization boundary, or sensitive data
   exposure.
-- The repo requires a current-head `/pr-ready --pr <number>` attestation and the
-  PR body lacks one for the current head SHA.
 
 ### Required Review Posture
 
@@ -203,20 +64,6 @@ Any one of these blocks review or merge:
   coverage gaps.
 - Do not request review, approve, mark ready, or merge based on intent, PR
   summary, or manual notes alone.
-
-## Memory And Preferences
-
-Agent memory is private runtime state, not repository source of truth.
-
-- Do not write repo rules, durable technical docs, backlog snapshots, or secrets
-  to memory.
-- Runtime memory belongs in ignored files such as `.agents/memory.md`.
-- Personal repo workflow preferences belong in ignored files such as
-  `.agents/preferences.md`.
-- Promote shareable repo rules to this file and durable technical context to
-  checked-in docs only when explicitly asked.
-- Never store secrets, credentials, tokens, or connection strings in memory or
-  preference files.
 
 ## Repo-Specific Rules
 
@@ -319,7 +166,7 @@ Windows CI exists.
 
 ### Build & Bundling
 
-- Debug: `cargo run` (the configured `dev` command). Log server defaults on.
+- Debug: `cargo run`. Log server defaults on.
 - Voice is enabled by default (the `stt` default feature pulls `whisper-rs` +
   `cpal`). Use `--no-default-features` only for a build without voice.
 - macOS bundle: `cargo bundle --release` produces
@@ -350,3 +197,101 @@ See `.plans/` for active design docs (the in-app **Work** page's Documents secti
 them). Notable: `plans-viewer-integration.md` (the viewer itself),
 `agent-tab-integration.md` (Claude Code / pi tab kind), and
 `design/WORKSPACE_DESIGN.md` for the multi-phase workspace plan.
+
+<!-- agent-kit:begin v0.2.0 sha256:0807aa126676618b404fd7ebf21cc040bf21116aec2ee8f1c8f4bb4bc0f9a9b5 -->
+
+# Agent instructions (agent kit)
+
+This section is rendered by the agent kit from `agent-workflow.config.json`.
+Change the config and re-run the kit's install rather than editing it here; a
+hand edit stops the next install until it is resolved.
+
+## Project facts
+
+- Project: gitterm-v6
+- Base branch: `v6`
+- Every commit message contains an issue key matching `TRU-[0-9]+`.
+- Protected branches: `v4`, `v5`, `v6`.
+
+## Commands
+
+Use these, not a package-manager default. Report their real exit codes.
+
+| Task | Command |
+| ---- | ------- |
+| Build | `cargo build` |
+| Test | `cargo test` |
+| Lint | `cargo clippy -- -D warnings` |
+| Format check | `cargo fmt -- --check` |
+
+## Workflow skills
+
+Skills live in `.agents/skills/<name>/SKILL.md` (Claude Code reads them through `.claude/skills/<name>/SKILL.md`):
+`build`, `test`, `lint`, `checkpoint`, `commit`, `pr`, `pr-ready`. Use the matching skill
+for those tasks.
+
+## Change guidelines
+
+These apply to every change you make. Where this repository's own rules
+outside this section conflict with them, the repository's rules win.
+
+### Before you write
+
+- Read the task and the code it touches before changing anything.
+- List every place the change must reach: callers, tests, fixtures, config,
+  exports. That is the scope. Extra features are not.
+- Check what the change could break for users: data it could destroy or
+  expose, callers that stop working.
+- Never invent API endpoints, field names, response shapes, data contracts
+  or tool commands. Verify them from code, docs or the command's help.
+
+### The smallest complete change
+
+Take the first option that fully works:
+
+1. Does it need to exist? Skip features, options and flexibility nobody
+   asked for, and name what you skipped in one line.
+2. Is it already in this codebase (a helper, component, pattern)? Use it the
+   way the surrounding code does.
+3. Does the standard library or platform do it? Use that, unless the project
+   has its own.
+4. Does an installed dependency do it? Use it. Never add a dependency for a
+   few lines.
+5. Otherwise, write the minimum code that works.
+
+- Be lazy about the solution, never about the change: finish every part the
+  task needs, including the callers, tests and fixtures it breaks.
+- No abstraction, wrapper, option, config or "for later" code nobody asked
+  for. Deleting beats adding. Keep the structure, layers and conventions the
+  codebase already has. Prefer focused edits over rewrites.
+- Preserve behaviour unless the task requires a change.
+- Bug fix: grep every caller of the function you touch, then fix the root
+  cause once, in the shared code.
+- Code you move or merge keeps its error handling and validation.
+- Between options of equal size, take the one that is correct on edge cases.
+- Comment only the why the code cannot show.
+- A shortcut with a known limit gets a comment:
+  `shortcut: <the limit>, <when to upgrade>`.
+
+### Never cut
+
+- Validation at trust boundaries.
+- Error handling that prevents data loss. Do not swallow errors; surface
+  them with the operation and input that failed.
+- Silent fallbacks for required values: fail loudly instead.
+- Security and secrets handling, and accessibility.
+- Anything the user asked for.
+
+### Done means checked
+
+- New non-trivial logic (a branch, a loop, a parser, money, security, data
+  writes, a bug fix) leaves one small test that fails when it breaks.
+  Trivial changes need none.
+- Run the repository's own checks with their real exit codes. Never claim
+  success without that evidence; if a check cannot run, say why.
+- Review your own diff before saying the work is done.
+- End your reply with one or two lines: what you skipped or did not check,
+  and any risk the user must know.
+
+Adapted in part from ponytail (MIT, https://github.com/dietrichgebert/ponytail).
+<!-- agent-kit:end -->

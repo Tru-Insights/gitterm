@@ -1,6 +1,5 @@
 <!--
-Repo rules: see AGENTS.md. PR readiness gates are enforced via
-`/pr-ready --pr <number>` per agent-workflow.config.json.
+Repo rules: see AGENTS.md. Run the `pr-ready` skill before requesting review.
 -->
 
 ## Summary
@@ -10,8 +9,6 @@ Repo rules: see AGENTS.md. PR readiness gates are enforced via
 -
 
 ## Linked Issue
-
-<!-- Required when issueTracking.requireIssueInPr is true. -->
 
 - TRU-
 
@@ -24,7 +21,7 @@ Repo rules: see AGENTS.md. PR readiness gates are enforced via
 
 ## Verification Run
 
-<!-- Configured verification.beforePrReady: check, test, build. -->
+<!-- The pr-ready skill's checks; CI also runs the excalidraw feature set. -->
 
 - [ ] `cargo fmt -- --check && cargo clippy -- -D warnings`
 - [ ] `cargo test`
@@ -33,15 +30,3 @@ Repo rules: see AGENTS.md. PR readiness gates are enforced via
 ## Notes
 
 <!-- Migrations, env vars, screenshots, follow-ups, rollout concerns. -->
-
-## Review readiness
-
-<!--
-Filled in by `/pr-ready --pr <number>` once all blockers are clear.
-Any new commit after this block lands stales the attestation and requires
-rerunning explicit PR mode.
--->
-
-- [ ] `/pr-ready --pr <number>` returned `ACCEPT-READY`
-- Head SHA: <current 40-character PR head SHA>
-- Reviewed at: <ISO-8601 UTC timestamp>
