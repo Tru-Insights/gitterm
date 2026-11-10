@@ -215,6 +215,8 @@ pub fn for_launch(config_dir: &Path, cwd: &Path, workspace_off: bool) -> Option<
 /// decisions go to, when one is set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentPlaces {
+    pub workspace_name: String,
+    pub repos: Vec<PathBuf>,
     pub docs_dir: PathBuf,
     pub decisions_repo: Option<PathBuf>,
 }
@@ -227,8 +229,12 @@ pub fn document_places(
     local: bool,
     home: &Path,
     decisions_repo: Option<&Path>,
+    workspace_name: &str,
+    repos: &[PathBuf],
 ) -> Option<DocumentPlaces> {
     (is_work && local).then(|| DocumentPlaces {
+        workspace_name: workspace_name.to_string(),
+        repos: repos.to_vec(),
         docs_dir: home.join("docs"),
         decisions_repo: decisions_repo.map(Path::to_path_buf),
     })
@@ -242,6 +248,20 @@ pub fn documents_note(places: &DocumentPlaces) -> String {
          `{}`. That folder is private and not in git.\n",
         places.docs_dir.display()
     );
+    note.push_str(&format!(
+        "- Workspace: `{}`.\n- Workspace repos: {}.\n",
+        places.workspace_name,
+        if places.repos.is_empty() {
+            "none".to_string()
+        } else {
+            places
+                .repos
+                .iter()
+                .map(|repo| format!("`{}`", repo.display()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    ));
     match &places.decisions_repo {
         Some(repo) => note.push_str(&format!(
             "- Decisions the team should see go in the decisions repo, `{}`, \
@@ -254,7 +274,92 @@ pub fn documents_note(places: &DocumentPlaces) -> String {
              its conventions, through a PR.\n",
         ),
     }
+    // Last, so the SessionStart hook can re-read it (`workspace_context`).
+    note.push_str(&checkpoint_note(&places.docs_dir.join("checkpoint.md")));
     note
+}
+
+const CHECKPOINT_LINE: &str = "- Workspace checkpoint: `";
+
+/// The workspace's own checkpoint (TRU-237): repos are shared between
+/// workspaces, so a repo's `.agents/checkpoint.md` cannot say whose work it
+/// is. Code names the file; the agent only reads and writes it. Read from
+/// disk each time, so a chat that wrote it before `/clear` gets it back.
+fn checkpoint_note(resume: &Path) -> String {
+    let mut note = format!(
+        "{CHECKPOINT_LINE}{}` ({}). `/checkpoint` writes here and `/resume` \
+         reads here, never a repo's `.agents/checkpoint.md`.\n\
+         Resume only this workspace's work; if unsure which work to continue, ask.\n",
+        resume.display(),
+        if resume.is_file() {
+            "exists"
+        } else {
+            "not written yet"
+        }
+    );
+    if let Some(start) = checkpoint_start(resume) {
+        // A fence longer than any backtick run in the checkpoint.
+        let longest = start.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+        let fence = "`".repeat((longest + 1).max(4));
+        note.push_str(&format!(
+            "\nThe start of the workspace checkpoint:\n\n{fence}markdown\n{start}\n{fence}\n"
+        ));
+    }
+    note
+}
+
+/// How much of the workspace checkpoint a chat starts with: checkpoints put
+/// the newest state first, and a whole file can be long.
+const CHECKPOINT_START_BYTES: usize = 12 * 1024;
+
+/// The first [`CHECKPOINT_START_BYTES`] of the checkpoint at `path`, cut at
+/// a line end, with a note when cut; `None` when missing, empty or
+/// unreadable (logged).
+fn checkpoint_start(path: &Path) -> Option<String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            eprintln!("[guidelines] cannot read {}: {error}", path.display());
+            return None;
+        }
+    };
+    let text = text.trim_end();
+    if text.is_empty() {
+        return None;
+    }
+    if text.len() <= CHECKPOINT_START_BYTES {
+        return Some(text.to_string());
+    }
+    let mut end = CHECKPOINT_START_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let end = text[..end].rfind('\n').unwrap_or(end);
+    Some(format!(
+        "{}\n\n(cut at {} KB; read the file for the rest)",
+        &text[..end],
+        CHECKPOINT_START_BYTES / 1024
+    ))
+}
+
+/// The workspace section of appended instructions, also supplied by Claude's
+/// SessionStart callback after a clear or compaction. The checkpoint status
+/// and start are read from disk on each call, not taken from the text.
+pub fn workspace_context(instructions: &str) -> Option<String> {
+    let start = instructions.find("# Documents for this work (added by GitTerm)\n")?;
+    let section = &instructions[start..];
+    // The checkpoint line ends the note's fixed part; what follows it (the
+    // checkpoint's own text, which may hold any heading) is read again.
+    let at = section.find(CHECKPOINT_LINE)?;
+    let path_start = at + CHECKPOINT_LINE.len();
+    let path_end = path_start + section[path_start..].find('`')?;
+    let resume = Path::new(&section[path_start..path_end]);
+    Some(
+        format!("{}{}", &section[..at], checkpoint_note(resume))
+            .trim_end()
+            .to_string(),
+    )
 }
 
 /// How agents in GitTerm start Codex (TRU-212): through GitTerm's task
@@ -609,10 +714,91 @@ mod tests {
     }
 
     #[test]
+    fn workspace_identity_names_only_its_existing_resume_file() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("example-work");
+        let repos = vec![
+            PathBuf::from("/code/example-api"),
+            PathBuf::from("/code/example-web"),
+        ];
+        let places = document_places(true, true, &home, None, "Example workspace", &repos).unwrap();
+        let missing = documents_note(&places);
+        assert!(missing.contains("Workspace: `Example workspace`"));
+        assert!(missing.contains("`/code/example-api`, `/code/example-web`"));
+        assert!(missing
+            .contains("Resume only this workspace's work; if unsure which work to continue, ask."));
+        let checkpoint = places.docs_dir.join("checkpoint.md");
+        assert!(missing.contains(&format!(
+            "Workspace checkpoint: `{}` (not written yet)",
+            checkpoint.display()
+        )));
+        assert!(!missing.contains("The start of the workspace checkpoint"));
+        std::fs::create_dir_all(&places.docs_dir).unwrap();
+        std::fs::write(&checkpoint, "Example resume notes").unwrap();
+        let note = documents_note(&places);
+        assert!(note.contains(&format!(
+            "Workspace checkpoint: `{}` (exists)",
+            checkpoint.display()
+        )));
+        assert!(note.contains("The start of the workspace checkpoint:"));
+        assert!(note.contains("Example resume notes"));
+        // A long checkpoint is cut at a line end and says so.
+        let long = "line of notes\n".repeat(2000);
+        std::fs::write(&checkpoint, &long).unwrap();
+        let cut = checkpoint_start(&checkpoint).unwrap();
+        assert!(cut.len() < long.len());
+        assert!(cut.contains("(cut at 12 KB; read the file for the rest)"));
+        std::fs::write(&checkpoint, "Example resume notes").unwrap();
+        let launch =
+            launch_instructions(Some(sample()), Some(&places), true, fixture.path()).unwrap();
+        assert_eq!(
+            workspace_context(&launch.text).as_deref(),
+            Some(note.trim_end())
+        );
+        assert!(!workspace_context(&launch.text)
+            .unwrap()
+            .contains("Starting Codex"));
+        assert_eq!(workspace_context("Other instructions"), None);
+
+        // A checkpoint with its own top-level heading and code fence comes
+        // back whole, and the rest of the section with it (review F1).
+        std::fs::write(
+            &checkpoint,
+            "# Resume: example\n\n```sh\ncargo test\n```\n\n# Next\n- ship it",
+        )
+        .unwrap();
+        let launch =
+            launch_instructions(Some(sample()), Some(&places), true, fixture.path()).unwrap();
+        let context = workspace_context(&launch.text).unwrap();
+        assert!(context.contains("# Resume: example"), "{context}");
+        assert!(context.ends_with("- ship it\n````"), "{context}");
+        assert!(context.contains("No decisions repo is set"), "{context}");
+
+        // The checkpoint is read again on each call: a chat that writes it
+        // after launch and then clears gets the new one (review F2).
+        std::fs::remove_file(&checkpoint).unwrap();
+        let launch =
+            launch_instructions(Some(sample()), Some(&places), true, fixture.path()).unwrap();
+        assert!(launch.text.contains("(not written yet)"));
+        std::fs::write(&checkpoint, "Written before /clear").unwrap();
+        let context = workspace_context(&launch.text).unwrap();
+        assert!(context.contains("(exists)"), "{context}");
+        assert!(context.contains("Written before /clear"), "{context}");
+    }
+
+    #[test]
     fn work_launches_name_the_docs_folder_and_the_decisions_repo() {
         let home = Path::new("/work/example-work");
         let repo = Path::new("/code/team-decisions");
-        let places = document_places(true, true, home, Some(repo)).unwrap();
+        let places = document_places(
+            true,
+            true,
+            home,
+            Some(repo),
+            "Example work",
+            &[repo.to_path_buf()],
+        )
+        .unwrap();
         let launch = tempfile::tempdir().unwrap();
         let combined =
             launch_instructions(Some(sample()), Some(&places), false, launch.path()).unwrap();
@@ -635,7 +821,7 @@ mod tests {
 
         // Without a decisions repo it says so; with the guidelines off the
         // note still goes in, alone.
-        let no_repo = document_places(true, true, home, None).unwrap();
+        let no_repo = document_places(true, true, home, None, "Example work", &[]).unwrap();
         let alone = launch_instructions(None, Some(&no_repo), false, launch.path()).unwrap();
         assert!(alone.text.starts_with("# Documents for this work"));
         assert!(alone.text.contains("`/work/example-work/docs`"));
@@ -660,7 +846,8 @@ mod tests {
             assert!(CODEX_TOOLS_NOTE.contains(word), "{word}");
         }
         let launch = tempfile::tempdir().unwrap();
-        let places = document_places(true, true, Path::new("/work/w"), None).unwrap();
+        let places =
+            document_places(true, true, Path::new("/work/w"), None, "Example work", &[]).unwrap();
 
         // Guidelines only, nothing else appended (the coordinator chat of
         // 2026-11-04 had only these): the note follows them.
@@ -708,8 +895,14 @@ mod tests {
     #[test]
     fn folder_and_remote_workspaces_get_no_documents_note() {
         let home = Path::new("/code/api");
-        assert_eq!(document_places(false, true, home, None), None);
-        assert_eq!(document_places(true, false, home, None), None);
+        assert_eq!(
+            document_places(false, true, home, None, "Example work", &[]),
+            None
+        );
+        assert_eq!(
+            document_places(true, false, home, None, "Example work", &[]),
+            None
+        );
         let launch = tempfile::tempdir().unwrap();
         assert_eq!(
             launch_instructions(Some(sample()), None, false, launch.path()),

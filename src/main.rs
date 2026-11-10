@@ -715,8 +715,10 @@ fn config_document_places(cfg: &WorkspaceConfig) -> Option<gitterm::guidelines::
     gitterm::guidelines::document_places(
         !cfg.chats.is_empty(),
         local,
-        Path::new(cfg.home_dir()),
+        Path::new(&cfg.dir),
         cfg.decisions_repo.as_deref().map(Path::new),
+        &cfg.name,
+        &cfg.repos.iter().map(PathBuf::from).collect::<Vec<_>>(),
     )
 }
 
@@ -5175,6 +5177,23 @@ impl TabState {
         self.current_dir = dir;
     }
 
+    /// A discovered root is panel identity; chat launch directories are
+    /// explicit and must survive polls before first launch and after restore.
+    fn adopt_git_root(&mut self, root: &Path) {
+        if self.agent_session().is_some()
+            || self.chat_session_id.is_some()
+            || self
+                .startup_command()
+                .is_some_and(gitterm::guidelines::starts_a_harness)
+        {
+            return;
+        }
+        self.repo_path = root.to_path_buf();
+        self.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
+        self.git_unchanged_streak = 0;
+        self.last_git_status_hash = None;
+    }
+
     // ---- Tab-kind accessors -------------------------------------------------
     //
     // Agent tabs don't have a terminal, terminal title, or startup command —
@@ -6532,20 +6551,6 @@ impl Workspace {
     /// piece of work and claims the chats started in it.
     fn is_work(&self) -> bool {
         self.owns_chats() || self.claims_new_chats
-    }
-
-    /// Where agents started in this work keep documents (TRU-191): its
-    /// docs folder and decisions repo. `None` for a folder workspace or
-    /// one on another machine.
-    fn document_places(&self) -> Option<gitterm::guidelines::DocumentPlaces> {
-        let local = matches!(self.location, WorkspaceLocation::Local { .. })
-            && self.remote_session.is_none();
-        gitterm::guidelines::document_places(
-            self.is_work(),
-            local,
-            &self.dir,
-            self.decisions_repo.as_deref(),
-        )
     }
 
     fn backend_ref(&self) -> WorkspaceBackendRef {
@@ -11264,13 +11269,32 @@ impl App {
         }))
     }
 
+    fn document_places(&self, ws: &Workspace) -> Option<gitterm::guidelines::DocumentPlaces> {
+        let local =
+            matches!(ws.location, WorkspaceLocation::Local { .. }) && ws.remote_session.is_none();
+        let repos = ws
+            .repos
+            .iter()
+            .filter_map(|id| self.repo(*id))
+            .map(|repo| repo.dir.clone())
+            .collect::<Vec<_>>();
+        gitterm::guidelines::document_places(
+            ws.is_work(),
+            local,
+            &ws.dir,
+            ws.decisions_repo.as_deref(),
+            &ws.name,
+            &repos,
+        )
+    }
+
     /// Whether the workspace named `name` switched the change guidelines
     /// off (TRU-174); a workspace that is not open reads its saved entry.
     /// Where agents started for the workspace named `name` keep documents
     /// (TRU-191); a workspace that is not open reads its saved entry.
     fn workspace_document_places(&self, name: &str) -> Option<gitterm::guidelines::DocumentPlaces> {
         match self.workspaces.iter().find(|ws| ws.name == name) {
-            Some(ws) => ws.document_places(),
+            Some(ws) => self.document_places(ws),
             None => self
                 .closed_workspace_configs
                 .iter()
@@ -14490,6 +14514,14 @@ impl App {
         if matches!(ws.location, WorkspaceLocation::Local { .. }) {
             pending = gitterm::workspace_repos::fold_worktrees(pending);
         }
+        let (listed, _) = gitterm::workspace_repos::derive_repo_list(
+            &ws.dir,
+            &pending,
+            &[],
+            &ws.repos_added,
+            &ws.repos_removed,
+        );
+        pending = listed.into_iter().filter(|dir| dir != &ws.dir).collect();
         for dir in pending {
             if let Some(id) = self.list_repo(&ws.name, &ws.location, dir) {
                 if !ws.repos.contains(&id) {
@@ -16045,6 +16077,17 @@ impl App {
             self.workspaces[from].tabs.push(replacement);
         }
         let tab = self.workspaces[from].tabs.remove(tab_idx);
+        if let TabKind::Agent(session) = &tab.kind {
+            if let Some(gitterm::harness::HarnessSession::Claude(claude)) = &session.harness {
+                let context = self
+                    .document_places(&self.workspaces[to])
+                    .as_ref()
+                    .map(gitterm::guidelines::documents_note);
+                if let Err(error) = claude.send(HarnessCommand::SetWorkspaceContext(context)) {
+                    eprintln!("[workspace] cannot update moved chat's workspace context: {error}");
+                }
+            }
+        }
         let source = &mut self.workspaces[from];
         source.active_tab = active_tab_after_removal(source.active_tab, tab_idx, source.tabs.len());
         let target = &mut self.workspaces[to];
@@ -20755,7 +20798,6 @@ impl App {
             client,
         }) = remote
         else {
-            // Local flow, unchanged.
             if let Some(ws) = self.active_workspace() {
                 let dir = ws
                     .active_tab()
@@ -21216,7 +21258,7 @@ fi
             .as_deref()
             .and_then(|name| self.workspaces.iter().find(|ws| ws.name == name))
         {
-            Some(ws) => ws.document_places(),
+            Some(ws) => self.document_places(ws),
             None => saved_ws.and_then(config_document_places),
         };
         // The env of the repo holding the tab's folder, with the
@@ -24742,10 +24784,13 @@ fi
                             )
                             .collect()
                     };
+                let document_places = self
+                    .workspaces
+                    .iter()
+                    .find(|ws| ws.tabs.iter().any(|tab| tab.id == tab_id))
+                    .and_then(|ws| self.document_places(ws));
                 'outer_submit: for ws in &mut self.workspaces {
                     let guidelines_off = ws.guidelines_off;
-                    // Named to an agent this prompt starts (TRU-191).
-                    let document_places = ws.document_places();
                     // Read as the process starts; a running chat keeps
                     // what it started with (TRU-181).
                     let claude_in_chrome = ws.claude_in_chrome;
@@ -30373,10 +30418,7 @@ fi
                                 .followed_paths()
                                 .any(|path| paths_equal(path, &snapshot.repo_path))
                         {
-                            tab.repo_path = snapshot.repo_path.clone();
-                            tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
-                            tab.git_unchanged_streak = 0;
-                            tab.last_git_status_hash = None;
+                            tab.adopt_git_root(&snapshot.repo_path);
                         }
 
                         // Apply the git status from the worker (which already ran
@@ -32640,7 +32682,7 @@ fi
                     t.repo_path.clone(),
                     t.session_uid.clone(),
                     ws.guidelines_off,
-                    ws.document_places(),
+                    self.document_places(ws),
                 )
             })
         });
@@ -53212,6 +53254,52 @@ mod tests {
             run_tab_action(&terminals, api, "npm run start"),
             RunTabAction::Restart(1)
         );
+    }
+
+    #[test]
+    fn chat_tabs_below_a_git_root_keep_their_folder() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("notes");
+        let home = repo.join("example-work");
+        std::fs::create_dir_all(&home).unwrap();
+        Repository::init(&repo).unwrap();
+        let status = gitterm::agentd::git::collect_repo_status(&home);
+        assert!(status.is_git_repo);
+        assert_eq!(
+            std::fs::canonicalize(&status.root).unwrap(),
+            std::fs::canonicalize(&repo).unwrap()
+        );
+        let mut native = TabState::new(1, home.clone());
+        native.kind = TabKind::Agent(AgentSession::new(new_claude_chat_config(
+            &config::ChatDefaults::default(),
+        )));
+        native.adopt_git_root(&status.root);
+        assert_eq!(native.repo_path, home);
+        let mut terminal = TabState::new(2, home.clone());
+        terminal.set_startup_command(Some("codex".into()));
+        terminal.adopt_git_root(&status.root);
+        assert_eq!(terminal.repo_path, home);
+        let mut shell = TabState::new(3, home.clone());
+        shell.adopt_git_root(&status.root);
+        assert_eq!(shell.repo_path, status.root);
+        // A Codex chat, new or resumed, keeps its folder too.
+        for command in ["codex", "codex resume example-session"] {
+            let mut codex = TabState::new(4, home.clone());
+            codex.set_startup_command(Some(command.into()));
+            codex.adopt_git_root(&status.root);
+            assert_eq!(codex.repo_path, home);
+        }
+        // A resumed Claude chat starts where it was recorded, even when an
+        // older save recorded the parent: its history lives under that
+        // folder, so moving it could lose the conversation.
+        let mut resumed =
+            AgentSession::new(new_claude_chat_config(&config::ChatDefaults::default()));
+        resumed.session_id = Some("example-session".into());
+        let spawn = resumed
+            .claude_session_config(status.root.clone(), Vec::new(), false, None)
+            .unwrap();
+        assert_eq!(spawn.cwd, status.root);
+        assert!(spawn.resume.is_some());
     }
 
     #[test]

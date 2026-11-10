@@ -67,9 +67,13 @@ pub fn collect_repo_status(repo_path: &Path) -> RepoStatus {
         untracked: Vec::new(),
     };
 
+    // Diff paths and the git2 fallback use the repo root, even when a
+    // chat's cwd is a subfolder.
     let cli_result = git_command()
         .args([
             "--no-optional-locks",
+            "-c",
+            "status.relativePaths=false",
             "status",
             "--porcelain=v2",
             "--branch",
@@ -214,9 +218,12 @@ pub fn collect_file_diff(
     max_untracked_preview_lines: usize,
 ) -> Vec<FileDiffLine> {
     let mut lines = Vec::new();
-    let Ok(repo) = Repository::open(repo_root) else {
+    // A chat tab keeps the folder it started in, which can be below the
+    // repo root (TRU-237); `file_path` is relative to the repo root.
+    let Ok(repo) = Repository::open(repo_root).or_else(|_| Repository::discover(repo_root)) else {
         return lines;
     };
+    let repo_root = repo.workdir().unwrap_or(repo_root).to_path_buf();
 
     // Use no_refresh + pathspec so status doesn't rewrite .git/index.lock
     // (would contend with concurrent git commands) and only inspects this file.
@@ -224,6 +231,7 @@ pub fn collect_file_diff(
     untracked_opts
         .no_refresh(true)
         .include_untracked(true)
+        .recurse_untracked_dirs(true)
         .pathspec(file_path);
     let is_untracked = repo
         .statuses(Some(&mut untracked_opts))
@@ -498,6 +506,56 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l.kind == DiffLineKind::Addition && l.content == "hello"));
+        // A chat tab rooted below the repo root still gets the diff of a
+        // repo-relative path (TRU-237 review F3).
+        let sub = dir.path().join("notes");
+        std::fs::create_dir_all(&sub).unwrap();
+        let lines = collect_file_diff(&sub, "a.txt", false, 100);
+        assert!(lines
+            .iter()
+            .any(|l| l.kind == DiffLineKind::Addition && l.content == "changed"));
+        let lines = collect_file_diff(&sub, "new.txt", false, 100);
+        assert!(lines
+            .iter()
+            .any(|l| l.kind == DiffLineKind::Addition && l.content == "hello"));
+    }
+
+    #[test]
+    fn subdir_status_paths_select_the_matching_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "t@example.com"]);
+        git(dir.path(), &["config", "user.name", "T"]);
+        let sub = dir.path().join("work");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("a.txt"), "before\n").unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-q", "-m", "init"]);
+        std::fs::write(sub.join("a.txt"), "after\n").unwrap();
+        std::fs::write(sub.join("b.txt"), "inside work\n").unwrap();
+        std::fs::write(sub.join("staged.txt"), "staged inside work\n").unwrap();
+        git(dir.path(), &["add", "work/staged.txt"]);
+        // A same-named root file must never be selected for work/b.txt.
+        std::fs::write(dir.path().join("b.txt"), "at root\n").unwrap();
+
+        let status = collect_repo_status(&sub);
+        let root_status = collect_repo_status(dir.path());
+        assert_eq!(status.staged, root_status.staged);
+        assert_eq!(status.unstaged, root_status.unstaged);
+        assert_eq!(status.untracked, root_status.untracked);
+        for (entries, path, content) in [
+            (&status.unstaged, "work/a.txt", "after"),
+            (&status.untracked, "work/b.txt", "inside work"),
+            (&status.staged, "work/staged.txt", "staged inside work"),
+        ] {
+            let file = entries.iter().find(|f| f.path == path).unwrap();
+            let diff = collect_file_diff(&sub, &file.path, file.is_staged, 100);
+            assert!(
+                diff.iter()
+                    .any(|line| line.kind == DiffLineKind::Addition && line.content == content),
+                "{path}: {diff:?}"
+            );
+        }
     }
 
     #[test]
