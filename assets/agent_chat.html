@@ -135,7 +135,13 @@
   .delivery-kind { color: var(--result); font-weight: 600; }
   .delivery-id { color: var(--fg-muted); font-family: var(--mono); font-size: calc(var(--chat-font-size) * 11 / 14); }
   .delivery-body { padding: 0 10px 8px 22px; white-space: pre-wrap; word-break: break-word; }
-  .assistant { margin: 6px 0 10px; word-break: break-word; }
+  .assistant { position: relative; margin: 6px 0 10px; word-break: break-word; }
+  .assistant .copy-markdown {
+    position: absolute; right: 0; top: 0;
+    font-size: 11px; padding: 2px 8px; opacity: 0;
+    transition: opacity 0.12s;
+  }
+  .assistant:hover .copy-markdown, .assistant:focus-within .copy-markdown, .assistant .copy-markdown.done { opacity: 1; }
   /* Claude bolds freely; semibold keeps emphasis without shouting. */
   .assistant strong { font-weight: 600; }
   .assistant .tail { white-space: pre-wrap; }
@@ -1745,7 +1751,8 @@
 
   // Copy buttons and links (delegated).
   function copyText(text, btn) {
-    const done = () => { btn.textContent = 'Copied'; btn.classList.add('done'); setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('done'); }, 1200); };
+    const label = btn.textContent;
+    const done = () => { btn.textContent = 'Copied'; btn.classList.add('done'); setTimeout(() => { btn.textContent = label; btn.classList.remove('done'); }, 1200); };
     const fallback = () => {
       const ta = el('textarea');
       ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
@@ -1762,6 +1769,11 @@
     }
   }
   document.addEventListener('click', (e) => {
+    const markdownCopy = e.target.closest('.assistant .copy-markdown');
+    if (markdownCopy) {
+      copyText(markdownCopy.parentElement.__assistantText || '', markdownCopy);
+      return;
+    }
     const copy = e.target.closest('.codeblock .copy');
     if (copy) {
       const code = copy.parentElement.querySelector('code');
@@ -1782,7 +1794,7 @@
   function renderSegment(final) {
     if (!segment) return;
     const raw = segment.raw;
-    if (final) segment.root.__assistantText = raw;
+    segment.root.__assistantText = raw;
     const cut = final ? raw.length : raw.lastIndexOf('\n') + 1;
     if (replaying && final) {
       // Rendered when the block first is in the document (TRU-157).
@@ -1799,9 +1811,13 @@
     if (!segment) {
       endThinking();
       const root = append(el('div', 'assistant'));
+      const copy = root.appendChild(el('button', 'copy-markdown', 'Copy markdown'));
+      copy.type = 'button';
+      copy.setAttribute('aria-label', 'Copy reply markdown');
       segment = { raw: '', renderedUpTo: -1, root, mdEl: root.appendChild(el('div')), tailEl: root.appendChild(el('span', 'tail')), queued: false };
     }
     segment.raw += text;
+    segment.root.__assistantText = segment.raw;
     if (replaying) return; // rendered once at segment end
     if (!segment.queued) {
       segment.queued = true;

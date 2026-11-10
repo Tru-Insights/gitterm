@@ -28,6 +28,10 @@
   };
   const messages = document.getElementById('messages');
   const jump = document.getElementById('jump');
+  let copiedMarkdown = null;
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+    writeText: (text) => { copiedMarkdown = text; return Promise.resolve(); },
+  } });
   window.ipc = { postMessage: () => {} };
   window.__setTabId(1, 'default', null, false);
   try {
@@ -127,6 +131,18 @@
     document.body.style.width = originalWidth;
     window.__setChatWidth('medium');
     reset();
+    const markdown = '# **A reply**\n\n- Parent\n  - Nested\n\n[Link](https://example.com)\n\n| Name | Value |\n| --- | --- |\n| One | Two |';
+    send(H('text_delta', markdown));
+    await settle();
+    const markdownReply = messages.querySelector(':scope > .assistant');
+    const markdownButton = markdownReply?.querySelector('.copy-markdown');
+    check('assistant reply has an accessible Copy markdown button', markdownButton?.type === 'button' && markdownButton.getAttribute('aria-label') === 'Copy reply markdown');
+    check('reply renders bold, heading, nested list, link, and table markdown', markdownReply?.querySelector('h1 strong') && markdownReply.querySelector('ul ul') && markdownReply.querySelector('a[href="https://example.com"]') && markdownReply.querySelector('table'));
+    markdownButton?.click();
+    await settle();
+    check('Copy markdown writes the exact original source as plain text', copiedMarkdown === markdown);
+
+    reset();
     send(H('thinking_delta', ''));
     check('redacted thinking stays activity-only', !document.querySelector('details.thinking'));
     send(H('thinking_delta', 'Planning '), H('thinking_delta', 'the checks'));
@@ -155,7 +171,7 @@
     check('new thinking splits runs and all thinking stays open', runs().length === 3 && [...document.querySelectorAll('details.thinking')].every((n) => n.open && !n.closest('.tool-run')));
     send({ kind: 'turn_timing', start_ms: 1000, end_ms: 6000 }, H('text_delta', 'Finished.'), end);
     const fold = document.querySelector('.turn-fold');
-    check('turn end uses closed existing duration fold with final answer outside', !runs().length && fold && !fold.open && fold.querySelector('.tf-label').textContent === 'Worked for 5.0s' && document.querySelector('#messages > .assistant')?.textContent.trim() === 'Finished.');
+    check('turn end uses closed existing duration fold with final answer outside', !runs().length && fold && !fold.open && fold.querySelector('.tf-label').textContent === 'Worked for 5.0s' && document.querySelector('#messages > .assistant p')?.textContent.trim() === 'Finished.');
     check('finished runs retain existing thinking grouping with no live suffix or nested runs', [...fold.querySelectorAll('.tool-run')].length === 2 && !fold.querySelector('.tool-run .tool-run') && !fold.textContent.includes('now:'));
 
     reset();
