@@ -16068,6 +16068,13 @@ impl App {
         )
     }
 
+    /// A rename is running inside the workspace settings dialog.
+    fn workspace_rename_in_settings(&self) -> bool {
+        self.workspace_rename
+            .as_ref()
+            .is_some_and(|rename| rename.site == RenameSite::Settings)
+    }
+
     /// Commits the rename draft (trimmed; an empty one changes nothing)
     /// through the debounced `workspaces.json` save.
     fn submit_workspace_rename(&mut self) {
@@ -29553,12 +29560,24 @@ fi
                 }
             }
             Event::WorkspaceRenameSubmit => {
+                let in_settings = self.workspace_rename_in_settings();
                 self.submit_workspace_rename();
-                return self.focus_main_terminal();
+                // Settings stays open: keep focus there, not on the
+                // terminal behind it.
+                return if in_settings {
+                    Task::none()
+                } else {
+                    self.focus_main_terminal()
+                };
             }
             Event::WorkspaceRenameCancel => {
+                let in_settings = self.workspace_rename_in_settings();
                 self.workspace_rename = None;
-                return self.focus_main_terminal();
+                return if in_settings {
+                    Task::none()
+                } else {
+                    self.focus_main_terminal()
+                };
             }
             Event::NewWorkOpen => {
                 self.bar_menu = None;
