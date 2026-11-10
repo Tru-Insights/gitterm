@@ -148,12 +148,16 @@ fn is_plan_limit_coordinator(tab: &TabState, children: &HashSet<String>) -> bool
     .any(|id| children.contains(id))
 }
 
-fn running_plan_limit_workers(workspaces: &[Workspace], provider: Provider) -> usize {
+fn running_plan_limit_workers(
+    workspaces: &[Workspace],
+    provider: Provider,
+    store: Option<&TaskStore>,
+) -> usize {
     workspaces
         .iter()
         .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
         .flat_map(|ws| &ws.tabs)
-        .filter(|tab| tab.task_live_state == Some(TaskSessionLiveState::Working))
+        .filter(|tab| task_session_is_working(tab, store))
         .filter(|tab| {
             let worker_provider = tab
                 .startup_command()
@@ -179,7 +183,7 @@ fn running_plan_limit_workers(workspaces: &[Workspace], provider: Provider) -> u
 
 impl App {
     pub(super) fn plan_limit_running_workers(&self, provider: Provider) -> usize {
-        running_plan_limit_workers(&self.workspaces, provider)
+        running_plan_limit_workers(&self.workspaces, provider, self.task_store.as_ref())
     }
 
     pub(super) fn plan_limits_routing(&self) -> plan_limits::RoutingReport {
@@ -943,16 +947,16 @@ mod tests {
         codex.task_live_state = Some(TaskSessionLiveState::Working);
         ws.tabs.push(codex);
         assert_eq!(
-            running_plan_limit_workers(std::slice::from_ref(&ws), Provider::Codex),
+            running_plan_limit_workers(std::slice::from_ref(&ws), Provider::Codex, None),
             1
         );
         assert_eq!(
-            running_plan_limit_workers(std::slice::from_ref(&ws), Provider::Claude),
+            running_plan_limit_workers(std::slice::from_ref(&ws), Provider::Claude, None),
             0
         );
         ws.tabs[0].task_live_state = Some(TaskSessionLiveState::AwaitingInput);
         assert_eq!(
-            running_plan_limit_workers(std::slice::from_ref(&ws), Provider::Codex),
+            running_plan_limit_workers(std::slice::from_ref(&ws), Provider::Codex, None),
             0
         );
     }

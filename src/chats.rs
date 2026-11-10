@@ -1794,6 +1794,7 @@ mod task_startup_tests {
             harness: None,
             conversation: Some(conversation.clone()),
             objective_delivery: ObjectiveDeliveryState::Pending,
+            launch_identity: None,
             created_at: "2026-11-05T10:00:00Z".into(),
             updated_at: "2026-11-05T10:00:00Z".into(),
         };
@@ -1830,6 +1831,7 @@ mod task_startup_tests {
             harness: None,
             conversation: None,
             objective_delivery: ObjectiveDeliveryState::Pending,
+            launch_identity: None,
             created_at: "2026-11-05T23:59:00Z".into(),
             updated_at: "2026-11-05T23:59:00Z".into(),
         };

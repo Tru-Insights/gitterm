@@ -295,6 +295,9 @@ pub struct TaskSessionRecord {
     pub conversation: Option<HarnessConversationRef>,
     #[serde(default)]
     pub objective_delivery: ObjectiveDeliveryState,
+    /// Captured by the launch wrapper, never inferred from a PID at shutdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_identity: Option<crate::worker_process::LaunchIdentity>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -399,7 +402,8 @@ impl TaskLifecycle {
             ),
             Self::Running | Self::WaitingForInput => matches!(
                 next,
-                Self::Running
+                Self::Queued
+                    | Self::Running
                     | Self::WaitingForInput
                     | Self::Completed
                     | Self::Failed
@@ -711,6 +715,13 @@ impl DelegationStatus {
         matches!(self, Self::Requested | Self::Running)
     }
 
+    pub fn is_final(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed { .. } | Self::Cancelled
+        )
+    }
+
     /// Transitions allowed through `TaskStore::set_delegation_status`.
     /// `Completed` is reached only through `complete_delegation`, which
     /// carries the result. `Interrupted` may resume to `Running` because a
@@ -862,6 +873,11 @@ pub struct Delegation {
     /// The delegation this one re-runs or follows up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous: Option<String>,
+    /// The replacement delegation when this blocked worker was superseded.
+    /// Its report and delivery receipt stay intact; Completed keeps the
+    /// document readable by older builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
     pub status: DelegationStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<DelegationResult>,
@@ -977,6 +993,7 @@ impl Delegation {
             brief: input.brief,
             target: input.target,
             previous: input.previous,
+            superseded_by: None,
             status: DelegationStatus::Requested,
             result: None,
             created_at: timestamp.clone(),
@@ -1005,6 +1022,32 @@ impl Delegation {
                 Some((thread_id.as_deref(), model.as_deref()))
             }
             _ => None,
+        }
+    }
+
+    fn record_worker_failure(&mut self, timestamp: &str) {
+        if let (
+            DelegationChild::TaskSession {
+                task_session_id, ..
+            },
+            DelegationStatus::Failed { message },
+        ) = (&self.child, &self.status)
+        {
+            // A timeout/launch failure may have no worker-authored report.
+            // Persist its outcome before delivery and automatic shutdown.
+            self.result.get_or_insert_with(|| DelegationResult {
+                handoff: Some(TaskHandoff {
+                    summary: message.clone(),
+                    decisions: vec![],
+                    next_steps: vec![],
+                    blockers: vec![],
+                    updated_by_session_id: task_session_id.clone(),
+                    updated_at: timestamp.to_string(),
+                }),
+                ..Default::default()
+            });
+            self.delivered = false;
+            self.delivered_at = None;
         }
     }
 }
@@ -1914,6 +1957,17 @@ impl TaskStore {
             }
         }
         let mut candidate = self.document.clone();
+        if let DelegationChild::TaskSession { task_id, .. } = &delegation.child {
+            for previous in &mut candidate.delegations {
+                if previous.status == DelegationStatus::Blocked
+                    && matches!(&previous.child, DelegationChild::TaskSession { task_id: child, .. } if child == task_id)
+                {
+                    previous.status = DelegationStatus::Completed;
+                    previous.superseded_by = Some(delegation.delegation_id.clone());
+                    previous.updated_at = delegation.created_at.clone();
+                }
+            }
+        }
         candidate.delegations.push(delegation);
         self.commit_candidate(candidate)
     }
@@ -1940,6 +1994,7 @@ impl TaskStore {
             ));
         }
         delegation.status = status;
+        delegation.record_worker_failure(timestamp);
         delegation.updated_at = timestamp.to_string();
         self.commit_delegation(index, delegation)
     }
@@ -1966,6 +2021,7 @@ impl TaskStore {
             ));
         }
         delegation.status = status;
+        delegation.record_worker_failure(timestamp);
         delegation.time_limit_reached_at = Some(timestamp.to_string());
         delegation.updated_at = timestamp.to_string();
         self.commit_delegation(index, delegation)
@@ -2127,6 +2183,29 @@ impl TaskStore {
                 )
             })
             .collect()
+    }
+
+    /// Match the session, not the whole task: user-opened siblings restore.
+    /// Cancelled means Stop tracking, so its terminal stays user-owned.
+    pub fn worker_session_is_final(&self, task_id: &str, session_id: Option<&str>) -> bool {
+        if session_id.is_none() {
+            return false;
+        }
+        self.document.delegations.iter().rev().find(|delegation| {
+            matches!(&delegation.child, DelegationChild::TaskSession { task_id: child, task_session_id, .. }
+                if child == task_id && task_session_id.as_deref() == session_id)
+        }).is_some_and(|delegation| matches!(delegation.status, DelegationStatus::Completed | DelegationStatus::Failed { .. }))
+    }
+
+    pub fn task_worktree_missing(&self, task_id: &str) -> bool {
+        self.get(task_id).is_some_and(|task| {
+            task.executor == ExecutorTarget::Local
+                && task
+                    .worktree
+                    .path
+                    .as_ref()
+                    .is_some_and(|path| !path.is_dir())
+        })
     }
 
     /// Marks an accepted batch in memory, then persists it atomically. A write
@@ -2503,6 +2582,15 @@ fn validate_delegation(delegation: &Delegation) -> Result<(), String> {
     if delegation.previous.as_deref() == Some(id) {
         return Err(format!("delegation {id} names itself as previous"));
     }
+    if let Some(next) = &delegation.superseded_by {
+        if next.trim().is_empty()
+            || next == id
+            || delegation.status != DelegationStatus::Completed
+            || delegation.kind != DelegationKind::Implement
+        {
+            return Err(format!("delegation {id} has invalid supersession {next:?}"));
+        }
+    }
     if let DelegationStatus::Failed { message } = &delegation.status {
         if message.trim().is_empty() {
             return Err(format!("delegation {id} failed without a message"));
@@ -2519,6 +2607,11 @@ fn validate_delegation(delegation: &Delegation) -> Result<(), String> {
             return Err(format!("delegation {id} is blocked but only workers block"));
         }
         (DelegationStatus::Completed | DelegationStatus::Blocked, Some(result)) => {
+            validate_delegation_result(delegation, result)?
+        }
+        (DelegationStatus::Failed { .. }, Some(result))
+            if matches!(delegation.child, DelegationChild::TaskSession { .. }) =>
+        {
             validate_delegation_result(delegation, result)?
         }
         (_, Some(_)) => {
@@ -2817,6 +2910,7 @@ mod tests {
                     harness: None,
                     conversation: None,
                     objective_delivery: ObjectiveDeliveryState::Pending,
+                    launch_identity: None,
                     created_at: start.into(),
                     updated_at: start.into(),
                 },
@@ -3458,12 +3552,51 @@ mod tests {
                     harness: None,
                     conversation: None,
                     objective_delivery: ObjectiveDeliveryState::Delivered,
+                    launch_identity: None,
                     created_at: "t2".to_string(),
                     updated_at: "t2".to_string(),
                 },
                 "t2",
             )
             .unwrap();
+    }
+
+    #[test]
+    fn a_new_worker_supersedes_a_blocked_worker_atomically_and_keeps_its_report() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        store
+            .insert_delegation(worker_delegation("old", "task-1"))
+            .unwrap();
+        add_session(&mut store, "task-1", "old-session");
+        store
+            .attach_worker_session("old", "old-session", None, "t2")
+            .unwrap();
+        let result = worker_result("Needs a decision", &["Human decision"]);
+        store.block_delegation("old", result.clone(), "t3").unwrap();
+        store.mark_delegation_delivered("old", "t4").unwrap();
+        assert_eq!(store.open_worker_delegations("task-1").len(), 1);
+        store
+            .insert_delegation(worker_delegation("replacement", "task-1"))
+            .unwrap();
+        let loaded = TaskStore::load(&path).unwrap();
+        let old = loaded.delegation("old").unwrap();
+        assert!(old.status.is_final());
+        assert_eq!(old.superseded_by.as_deref(), Some("replacement"));
+        assert_eq!(old.result.as_ref(), Some(&result));
+        assert!(old.is_delivered());
+        assert!(loaded.worker_session_is_final("task-1", Some("old-session")));
+        assert_eq!(
+            loaded
+                .open_worker_delegations("task-1")
+                .iter()
+                .map(|d| d.delegation_id.as_str())
+                .collect::<Vec<_>>(),
+            ["replacement"]
+        );
+        assert!(store.complete_delegation("old", result, "t5").is_err());
     }
 
     #[test]
@@ -3553,6 +3686,7 @@ mod tests {
             harness: None,
             conversation: None,
             objective_delivery: ObjectiveDeliveryState::Delivered,
+            launch_identity: None,
             created_at: "2026-10-20T10:00:00Z".into(),
             updated_at: "2026-10-20T10:00:30Z".into(),
         });
@@ -3876,6 +4010,7 @@ mod tests {
             harness: None,
             conversation: None,
             objective_delivery: ObjectiveDeliveryState::Delivered,
+            launch_identity: None,
             created_at: "2026-08-19T08:01:00Z".to_string(),
             updated_at: "2026-08-19T08:01:00Z".to_string(),
         });
@@ -3916,6 +4051,7 @@ mod tests {
                 session_id: "codex-chat-1".to_string(),
             }),
             objective_delivery: ObjectiveDeliveryState::Delivered,
+            launch_identity: None,
             created_at: "2026-08-19T08:01:00Z".to_string(),
             updated_at: "2026-08-19T08:01:00Z".to_string(),
         };
@@ -4007,6 +4143,7 @@ mod tests {
                 session_id: "codex-chat-1".to_string(),
             }),
             objective_delivery: ObjectiveDeliveryState::Delivered,
+            launch_identity: None,
             created_at: "2026-08-22T09:01:00Z".to_string(),
             updated_at: "2026-08-22T09:01:00Z".to_string(),
         };
