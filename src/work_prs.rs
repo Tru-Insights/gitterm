@@ -253,7 +253,7 @@ where
     results
 }
 
-/// Prefer indexed ancestry, stopping at the owned root when it is reached.
+/// Follow direct parents so flattened indexed ancestry cannot skip an owned root.
 fn saved_chat_root<'a>(
     chat: &'a str,
     index: &'a [chats::ChatIndexEntry],
@@ -266,11 +266,12 @@ fn saved_chat_root<'a>(
         if current == root {
             return Some(current);
         }
-        let parent = index
-            .iter()
-            .find(|entry| entry.id == current)
-            .and_then(|entry| entry.root_id.as_ref())
-            .or_else(|| parents.get(current));
+        let parent = parents.get(current).or_else(|| {
+            index
+                .iter()
+                .find(|entry| entry.id == current)
+                .and_then(|entry| entry.root_id.as_ref())
+        });
         let Some(parent) = parent else {
             return Some(current);
         };
@@ -3155,6 +3156,18 @@ mod tests {
         });
         chat_facts::resolve_tree(&mut index, &normal_links);
         assert_eq!(index[0].root_id, None);
+        let mut found = load_root_prs(dir.path(), &index, &normal_links, "root-a", |message| {
+            panic!("{message}")
+        });
+        found.sort_by_key(|pr| pr.number);
+        assert_eq!(found, vec![task_pr(7), task_pr(9), task_pr(10)]);
+
+        // Indexing the ancestor flattens every descendant's root_id past
+        // the owned root, but must not remove any PRs from its subtree.
+        index.insert(0, entry("unindexed-ancestor"));
+        chat_facts::resolve_tree(&mut index, &normal_links);
+        assert_eq!(index[1].root_id.as_deref(), Some("unindexed-ancestor"));
+        assert_eq!(index[2].root_id.as_deref(), Some("unindexed-ancestor"));
         let mut found = load_root_prs(dir.path(), &index, &normal_links, "root-a", |message| {
             panic!("{message}")
         });
