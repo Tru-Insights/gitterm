@@ -23,10 +23,23 @@ const BADGE_FONT: f32 = 9.0;
 const BADGE_HEIGHT: f32 = 12.0;
 
 fn daily_usage(samples: &[plan_limits::UsageSample], now: i64) -> [Option<f64>; 7] {
+    let Some(today) = chrono::DateTime::from_timestamp(now, 0)
+        .map(|at| at.with_timezone(&chrono::Local).date_naive())
+    else {
+        return [None; 7];
+    };
     let mut last_by_day: [Option<(i64, f64)>; 7] = [None; 7];
     let mut prior = None;
     for sample in samples {
-        let age = (now - sample.observed_at).div_euclid(86_400);
+        if sample.observed_at > now {
+            continue;
+        }
+        let Some(date) = chrono::DateTime::from_timestamp(sample.observed_at, 0)
+            .map(|at| at.with_timezone(&chrono::Local).date_naive())
+        else {
+            continue;
+        };
+        let age = (today - date).num_days();
         if age >= 7 {
             if prior.is_none_or(|(at, _)| sample.observed_at > at) {
                 prior = Some((sample.observed_at, sample.used_percent));
@@ -737,9 +750,13 @@ impl App {
                                 ..Default::default()
                             });
                         let bar = if let Some(value) = value {
-                            let age = 6 - day as i64;
-                            let weekday = chrono::DateTime::from_timestamp(now - age * 86_400, 0)
-                                .map(|at| at.with_timezone(&chrono::Local).format("%a").to_string())
+                            let weekday = chrono::DateTime::from_timestamp(now, 0)
+                                .and_then(|at| {
+                                    at.with_timezone(&chrono::Local)
+                                        .date_naive()
+                                        .checked_sub_days(chrono::Days::new((6 - day) as u64))
+                                })
+                                .map(|date| date.format("%a").to_string())
                                 .unwrap_or_else(|| "Day".into());
                             iced::widget::tooltip(
                                 bar,
@@ -1037,6 +1054,28 @@ mod tests {
         assert!(!state.finish_save(Err("disk full".into()), Path::new("plan-limits.json")));
         assert!(state.dirty);
         assert!(!state.save_in_flight);
+    }
+
+    #[test]
+    fn daily_usage_places_monday_evening_before_tuesday_afternoon() {
+        use chrono::TimeZone;
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 11, 10, 16, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        let monday = chrono::Local
+            .with_ymd_and_hms(2026, 11, 9, 20, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        let samples = [plan_limits::UsageSample {
+            observed_at: monday,
+            used_percent: 12.0,
+        }];
+        let daily = daily_usage(&samples, now);
+        assert_eq!(daily[5], Some(12.0));
+        assert_eq!(daily[6], None);
     }
 
     #[test]
