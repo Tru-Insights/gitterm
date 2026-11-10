@@ -27,6 +27,7 @@
     await new Promise((resolve) => setTimeout(resolve, 0));
   };
   const messages = document.getElementById('messages');
+  const replyContent = (reply) => [...reply.children].filter((node) => !node.matches('button')).map((node) => node.textContent).join('');
   const jump = document.getElementById('jump');
   let copiedMarkdown = null;
   Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
@@ -141,6 +142,100 @@
     markdownButton?.click();
     await settle();
     check('Copy markdown writes the exact original source as plain text', copiedMarkdown === markdown);
+
+    const context = (target) => {
+      const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 80, clientY: 100 });
+      target.dispatchEvent(event);
+      return event.defaultPrevented;
+    };
+    const copyKey = (target, name, options = {}) => {
+      const event = new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: name, ...options });
+      target.dispatchEvent(event);
+      return event.defaultPrevented;
+    };
+    const menu = document.getElementById('reply-menu');
+    const select = (first, last = first) => {
+      const range = document.createRange();
+      range.setStartBefore(first); range.setEndAfter(last);
+      const selection = window.getSelection();
+      selection.removeAllRanges(); selection.addRange(range);
+    };
+    window.getSelection().removeAllRanges();
+    check('right click on reply opens an accessible page menu', context(markdownReply.querySelector('h1')) && !menu.hidden && menu.getAttribute('role') === 'menu' && document.activeElement === menu.firstElementChild);
+    menu.firstElementChild.click();
+    await settle();
+    check('menu Copy markdown writes source and closes', copiedMarkdown === markdown && menu.hidden);
+    context(markdownReply);
+    menu.lastElementChild.click();
+    await settle();
+    check('menu Copy text uses rendered reply without copy controls', copiedMarkdown.includes('A reply') && copiedMarkdown.includes('Parent') && !copiedMarkdown.includes('Copy markdown') && !copiedMarkdown.includes('Copied') && !copiedMarkdown.includes('**'));
+    select(markdownReply.querySelector('h1'));
+    const selectionText = window.getSelection().toString();
+    context(markdownReply);
+    menu.lastElementChild.click();
+    await settle();
+    check('menu Copy text preserves the current selection', copiedMarkdown === selectionText);
+    window.getSelection().removeAllRanges();
+    markdownButton.focus();
+    copyKey(markdownButton, 'F10', { shiftKey: true });
+    check('Shift+F10 opens menu from a focused reply control', !menu.hidden && document.activeElement === menu.firstElementChild);
+    copyKey(document.activeElement, 'ArrowDown');
+    check('menu supports arrow navigation', document.activeElement === menu.lastElementChild);
+    copyKey(document.activeElement, 'Home');
+    check('menu supports Home', document.activeElement === menu.firstElementChild);
+    copyKey(document.activeElement, 'Escape');
+    check('Escape closes menu and restores focus', menu.hidden && document.activeElement === markdownButton);
+    context(markdownReply);
+    document.getElementById('prompt').click();
+    check('click away closes reply menu', menu.hidden);
+    check('right click outside reply keeps native behavior', !context(document.getElementById('prompt')) && menu.hidden);
+    let copyHostKeys = 0;
+    window.ipc = { postMessage: (raw) => { if (JSON.parse(raw).type === 'hostkey') copyHostKeys++; } };
+    copyKey(document.getElementById('prompt'), 'C', { metaKey: true, shiftKey: true });
+    await settle();
+    check('Cmd+Shift+C without selection copies latest source and stays in page', copiedMarkdown === markdown && copyHostKeys === 0);
+    send(end, prompt, H('text_delta', 'Second **source** with `code`.'), end);
+    await settle();
+    const secondReply = [...messages.querySelectorAll('.assistant')].at(-1);
+    context(markdownReply);
+    menu.firstElementChild.click();
+    await settle();
+    check('context menu copies its reply even when a newer reply exists', copiedMarkdown === markdown);
+    context(secondReply);
+    menu.lastElementChild.click();
+    await settle();
+    check('Copy text payload equals rendered text', copiedMarkdown === 'Second source with code.');
+    select(markdownReply.querySelector('h1'));
+    copyKey(messages, 'c', { metaKey: true, shiftKey: true });
+    await settle();
+    check('Cmd+Shift+C copies selected reply source rather than latest', copiedMarkdown === markdown);
+    select(markdownReply.querySelector('h1'), secondReply.querySelector('p'));
+    copyKey(messages, 'C', { metaKey: true, shiftKey: true });
+    await settle();
+    check('Cmd+Shift+C joins selected reply sources with a blank line', copiedMarkdown === markdown + '\n\nSecond **source** with `code`.');
+    window.getSelection().removeAllRanges();
+    copyKey(messages, 'C', { metaKey: true, shiftKey: true });
+    await settle();
+    check('Cmd+Shift+C latest tracks newly completed replies', copiedMarkdown === 'Second **source** with `code`.');
+    send({ kind: 'delegation', delegation: {
+      delegation_id: 'copy-summary', kind: 'consult', brief: 'Check copy behavior',
+      child: { model: 'test-model' }, status: { state: 'completed' },
+      created_at: '2026-11-01T10:00:00Z', updated_at: '2026-11-01T10:01:00Z',
+      result: { handoff: { summary: 'Delegated **summary**', decisions: [], next_steps: [], blockers: [] } },
+    } });
+    const delegatedSummary = messages.querySelector('.dlg-body .assistant');
+    check('delegation summary keeps its existing context menu', delegatedSummary && !context(delegatedSummary) && menu.hidden);
+    copyKey(messages, 'C', { metaKey: true, shiftKey: true });
+    await settle();
+    check('latest reply shortcut skips delegation summary styling', copiedMarkdown === 'Second **source** with `code`.');
+    window.__openFind();
+    const copyQuery = document.getElementById('find-query');
+    copyQuery.value = 'Copy markdown';
+    copyQuery.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    check('find excludes reply copy controls', document.getElementById('find-count').textContent === '0 of 0');
+    document.getElementById('find-close').click();
+    window.ipc = { postMessage: () => {} };
 
     reset();
     send(H('thinking_delta', ''));
@@ -327,7 +422,7 @@
     key(query, 'Enter', { shiftKey: true });
     check('Shift+Enter returns to previous match', count.textContent === '1 of 6' && current().startContainer === firstFind);
     key(query, 'Enter', { shiftKey: true });
-    check('previous wraps to the last match', count.textContent === '6 of 6' && current().startContainer.parentElement.closest('.assistant')?.textContent.trim() === 'Needle final');
+    check('previous wraps to the last match', count.textContent === '6 of 6' && replyContent(current().startContainer.parentElement.closest('.assistant')).trim() === 'Needle final');
     key(query, 'Enter');
     check('next wraps to the first match', count.textContent === '1 of 6');
     search('Needle thought');
@@ -422,9 +517,11 @@
     window.__resetConversation(); window.__replay(replayForFind);
     window.__openFind(); search('deferredneedle');
     const deferredRoot = current().startContainer.parentElement.closest('.assistant');
-    check('find renders only the selected deferred block in its chunk', count.textContent === '1 of 1' && current().startContainer.parentElement.tagName === 'STRONG' && [...messages.querySelectorAll('.assistant')].filter((node) => node !== deferredRoot && !node.textContent).length > 0);
+    check('find renders only the selected deferred block in its chunk', count.textContent === '1 of 1' && current().startContainer.parentElement.tagName === 'STRONG' && [...messages.querySelectorAll('.assistant')].filter((node) => node !== deferredRoot && !replyContent(node)).length > 0);
     key(query, 'Escape');
-    check('closing restores deferred markdown and detached block state', !deferredRoot.isConnected && !deferredRoot.textContent);
+    check('closing restores deferred markdown and detached block state', !deferredRoot.isConnected && !replyContent(deferredRoot));
+    const deferredCopy = deferredRoot.querySelector('.copy-markdown');
+    check('find preserves deferred reply copy control and source', deferredCopy?.getAttribute('aria-label') === 'Copy reply markdown' && deferredRoot.__assistantText.includes('deferredneedle'));
     window.__openFind(); search('deferredneedle');
     check('restored deferred source is searchable on a later find', count.textContent === '1 of 1' && current().toString() === 'deferredneedle');
     key(query, 'Escape');
