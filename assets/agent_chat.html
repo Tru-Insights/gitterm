@@ -135,7 +135,19 @@
   .delivery-kind { color: var(--result); font-weight: 600; }
   .delivery-id { color: var(--fg-muted); font-family: var(--mono); font-size: calc(var(--chat-font-size) * 11 / 14); }
   .delivery-body { padding: 0 10px 8px 22px; white-space: pre-wrap; word-break: break-word; }
-  .assistant { margin: 6px 0 10px; word-break: break-word; }
+  .assistant { position: relative; margin: 6px 0 10px; word-break: break-word; }
+  .assistant .copy-markdown {
+    display: block; margin: 0 0 4px auto;
+    -webkit-user-select: none; user-select: none;
+    font-size: 11px; padding: 2px 8px; opacity: 0;
+    transition: opacity 0.12s;
+  }
+  /* Generated labels stay out of selections spanning multiple replies. */
+  .assistant .copy-markdown::before { content: attr(data-copy-label); }
+  .assistant:hover .copy-markdown, .assistant:focus-within .copy-markdown, .assistant .copy-markdown.done { opacity: 1; }
+  #reply-menu { position: fixed; z-index: 100; padding: 4px; background: var(--bg-footer); border: 1px solid var(--border-strong); border-radius: 6px; box-shadow: 0 4px 16px #0004; }
+  #reply-menu button { display: block; width: 100%; text-align: left; }
+  #reply-menu button:focus { outline: 2px solid var(--fg-muted); outline-offset: -2px; }
   /* Claude bolds freely; semibold keeps emphasis without shouting. */
   .assistant strong { font-weight: 600; }
   .assistant .tail { white-space: pre-wrap; }
@@ -1764,15 +1776,32 @@
 
   // Copy buttons and links (delegated).
   function copyText(text, btn) {
-    const done = () => { btn.textContent = 'Copied'; btn.classList.add('done'); setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('done'); }, 1200); };
+    const label = btn.dataset.copyLabel ?? btn.textContent;
+    const setLabel = (value) => {
+      if (btn.matches('.copy-markdown')) btn.dataset.copyLabel = value;
+      else btn.textContent = value;
+    };
+    const done = () => { setLabel('Copied'); btn.classList.add('done'); setTimeout(() => { setLabel(label); btn.classList.remove('done'); }, 1200); };
     const fallback = () => {
+      const active = document.activeElement;
+      const selection = window.getSelection();
+      const ranges = Array.from({ length: selection.rangeCount }, (_, i) => selection.getRangeAt(i).cloneRange());
+      // A transcript range can remain selected while the composer has focus.
+      const inputSelection = ranges.every((range) => range.collapsed) && (active instanceof HTMLTextAreaElement || active instanceof HTMLInputElement)
+        ? { start: active.selectionStart, end: active.selectionEnd, direction: active.selectionDirection } : null;
       const ta = el('textarea');
       ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
       document.body.appendChild(ta); ta.select();
       let ok = false;
       try { ok = document.execCommand('copy'); } catch (e) { console.error('copy failed', e); }
-      ta.remove();
-      if (ok) done(); else btn.textContent = 'Copy failed';
+      finally {
+        ta.remove();
+        if (active?.isConnected) active.focus({ preventScroll: true });
+        selection.removeAllRanges();
+        ranges.forEach((range) => selection.addRange(range));
+        if (active?.isConnected && inputSelection?.start != null) active.setSelectionRange(inputSelection.start, inputSelection.end, inputSelection.direction);
+      }
+      if (ok) done(); else setLabel('Copy failed');
     };
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text).then(done, fallback);
@@ -1780,7 +1809,75 @@
       fallback();
     }
   }
+  const replyMenu = el('div');
+  replyMenu.id = 'reply-menu';
+  replyMenu.hidden = true;
+  replyMenu.setAttribute('role', 'menu');
+  replyMenu.setAttribute('aria-label', 'Copy reply');
+  document.body.appendChild(replyMenu);
+  let menuReply = null, menuSelection = '', menuFocus = null;
+  function closeReplyMenu(restoreFocus = false) {
+    replyMenu.hidden = true;
+    menuReply = null;
+    if (restoreFocus && menuFocus?.isConnected) menuFocus.focus({ preventScroll: true });
+  }
+  function renderedReplyText(reply) {
+    // Read layout text without copy controls or code language labels.
+    const clone = reply.cloneNode(true);
+    clone.querySelectorAll('button, .lang').forEach((node) => node.remove());
+    clone.style.position = 'fixed'; clone.style.left = '-10000px';
+    document.body.appendChild(clone);
+    const text = clone.innerText;
+    clone.remove();
+    return text;
+  }
+  for (const [label, markdown] of [['Copy markdown', true], ['Copy text', false]]) {
+    const button = replyMenu.appendChild(el('button', '', label));
+    button.type = 'button';
+    button.setAttribute('role', 'menuitem');
+    button.addEventListener('click', () => {
+      if (!menuReply) return;
+      copyText(markdown ? menuReply.__assistantText : (menuSelection || renderedReplyText(menuReply)), menuReply.querySelector('.copy-markdown'));
+      closeReplyMenu(true);
+    });
+  }
+  document.addEventListener('contextmenu', (e) => {
+    closeReplyMenu();
+    const reply = e.target.closest('.assistant');
+    if (!reply || typeof reply.__assistantText !== 'string') return;
+    e.preventDefault();
+    menuReply = reply;
+    menuSelection = window.getSelection().toString();
+    menuFocus = document.activeElement;
+    replyMenu.hidden = false;
+    const box = reply.getBoundingClientRect();
+    const keyboard = e.clientX === 0 && e.clientY === 0;
+    replyMenu.style.left = Math.max(0, Math.min(keyboard ? box.left : e.clientX, innerWidth - replyMenu.offsetWidth)) + 'px';
+    replyMenu.style.top = Math.max(0, Math.min(keyboard ? box.top : e.clientY, innerHeight - replyMenu.offsetHeight)) + 'px';
+    replyMenu.firstElementChild.focus({ preventScroll: true });
+  });
+  document.addEventListener('pointerdown', (e) => {
+    if (!replyMenu.contains(e.target)) closeReplyMenu();
+  }, true);
   document.addEventListener('click', (e) => {
+    if (!replyMenu.contains(e.target)) closeReplyMenu();
+  });
+  replyMenu.addEventListener('focusout', (e) => {
+    if (!replyMenu.contains(e.relatedTarget)) closeReplyMenu();
+  });
+  function copySelectedMarkdown() {
+    const replies = findScopes().flatMap((scope) => scope.matches('.assistant') ? [scope] : [...scope.querySelectorAll('.assistant')]).filter((reply) => typeof reply.__assistantText === 'string');
+    const selection = window.getSelection();
+    const selected = !selection.isCollapsed && selection.rangeCount
+      ? replies.filter((reply) => reply.isConnected && Array.from({ length: selection.rangeCount }, (_, i) => selection.getRangeAt(i)).some((range) => range.intersectsNode(reply))) : replies.slice(-1);
+    if (selected.length) copyText(selected.map((reply) => reply.__assistantText).join('\n\n'), selected[selected.length - 1].querySelector('.copy-markdown'));
+  }
+  document.addEventListener('click', (e) => {
+    const markdownCopy = e.target.closest('.assistant .copy-markdown');
+    if (markdownCopy) {
+      copyText(markdownCopy.parentElement.__assistantText || '', markdownCopy);
+      return;
+    }
     const copy = e.target.closest('.codeblock .copy');
     if (copy) {
       const code = copy.parentElement.querySelector('code');
@@ -1801,7 +1898,7 @@
   function renderSegment(final) {
     if (!segment) return;
     const raw = segment.raw;
-    if (final) segment.root.__assistantText = raw;
+    segment.root.__assistantText = raw;
     const cut = final ? raw.length : raw.lastIndexOf('\n') + 1;
     if (replaying && final) {
       // Rendered when the block first is in the document (TRU-157).
@@ -1818,9 +1915,14 @@
     if (!segment) {
       endThinking();
       const root = append(el('div', 'assistant'));
+      const copy = root.appendChild(el('button', 'copy-markdown'));
+      copy.dataset.copyLabel = 'Copy markdown';
+      copy.type = 'button';
+      copy.setAttribute('aria-label', 'Copy reply markdown');
       segment = { raw: '', renderedUpTo: -1, root, mdEl: root.appendChild(el('div')), tailEl: root.appendChild(el('span', 'tail')), queued: false };
     }
     segment.raw += text;
+    segment.root.__assistantText = segment.raw;
     if (replaying) return; // rendered once at segment end
     if (!segment.queued) {
       segment.queued = true;
@@ -4224,6 +4326,7 @@
   };
 
   window.__resetConversation = function () {
+    closeReplyMenu();
     closeFind();
     findQuery.value = ''; findTools.checked = false;
     for (const render of htmlRenders) render.dispose();
@@ -4278,7 +4381,7 @@
   // paste: action to this page's WKWebView. The page then gets a real paste
   // event (text, or image files for the composer's paste handler).
   function pageHasOpenLayer() {
-    return !findBar.hidden || modeMenuEl.classList.contains('visible')
+    return !replyMenu.hidden || !findBar.hidden || modeMenuEl.classList.contains('visible')
       || slashMenuEl.classList.contains('visible')
       || CHIP_MENUS.some((m) => m.classList.contains('visible'))
       || reviewPopEl.classList.contains('visible')
@@ -4313,6 +4416,27 @@
   }
   document.addEventListener('keydown', (e) => {
     if (e.isComposing) return;
+    if ((e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey)) && typeof e.target.closest('.assistant')?.__assistantText === 'string') {
+      e.preventDefault(); e.stopImmediatePropagation();
+      e.target.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+      return;
+    }
+    if (!replyMenu.hidden && ['Escape', 'ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) {
+      e.preventDefault(); e.stopImmediatePropagation();
+      if (e.key === 'Escape') closeReplyMenu(true);
+      else {
+        const buttons = [...replyMenu.children];
+        const index = buttons.indexOf(document.activeElement);
+        const next = e.key === 'Home' ? 0 : e.key === 'End' ? buttons.length - 1 : (index + (e.key === 'ArrowUp' ? -1 : 1) + buttons.length) % buttons.length;
+        buttons[next].focus();
+      }
+      return;
+    }
+    if (e.metaKey && e.shiftKey && !e.ctrlKey && !e.altKey && e.key.toLowerCase() === 'c') {
+      e.preventDefault(); e.stopImmediatePropagation();
+      if (!e.repeat) copySelectedMarkdown();
+      return;
+    }
     if (!findBar.hidden && !e.metaKey && !e.ctrlKey && !e.altKey && (e.key === 'Escape' || (e.key === 'Enter' && e.target === findQuery))) {
       e.preventDefault(); e.stopImmediatePropagation();
       if (e.key === 'Escape') closeFind(); else stepFind(e.shiftKey ? -1 : 1);
