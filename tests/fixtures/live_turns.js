@@ -444,6 +444,28 @@
     key(query, 'Escape');
 
     reset();
+    const detachedWorker = {
+      delegation_id: 'detached-find-report', kind: 'implement', brief: 'Check history',
+      child: { model: 'test-model' }, status: { state: 'running' },
+      created_at: '2026-11-01T10:00:00Z', updated_at: '2026-11-01T10:00:00Z',
+    };
+    window.__replay([
+      { kind: 'delegation', delegation: detachedWorker },
+      ...Array.from({ length: 250 }, (_, i) => ({ type: 'user_prompt', text: 'Later prompt ' + i })),
+    ]);
+    check('late worker fixture starts in detached history', !!messages.querySelector('.earlier') && !messages.querySelector('[data-delegation-id="detached-find-report"]'));
+    window.__openFind(); search('lateworkerneedle');
+    check('unfinished detached report has no matches', count.textContent === '0 of 0');
+    await settle(); await settle();
+    send({ kind: 'delegation', delegation: {
+      ...detachedWorker, status: { state: 'completed' },
+      result: { handoff: { summary: 'lateworkerneedle report', decisions: [], next_steps: [], blockers: [] } },
+    } });
+    await settle(); await settle();
+    check('completion in detached history refreshes find without retyping', count.textContent === '1 of 1' && current()?.toString() === 'lateworkerneedle');
+    key(query, 'Escape');
+
+    reset();
     send({ kind: 'delegation', delegation: {
       delegation_id: 'find-review', kind: 'review', brief: 'Check the project',
       child: { model: 'test-model' }, status: { state: 'completed' },
@@ -476,6 +498,16 @@
     send(H('text_delta', '\n'));
     await settle(); await settle();
     check('markdown conversion preserves the selected occurrence when URL offsets disappear', count.textContent === '2 of 3' && current().startContainer.textContent.slice(current().startOffset).startsWith('needle chosen'));
+    key(query, 'Escape');
+
+    reset();
+    send(H('text_delta', 'needle [link](https://needle.test) **needle** chosen needle last'));
+    await settle();
+    window.__openFind(); search('needle'); key(query, 'Enter'); key(query, 'Enter');
+    check('inline markdown fixture selects the bold source occurrence', count.textContent === '3 of 4' && current().startContainer.textContent.slice(current().startOffset).startsWith('needle** chosen'));
+    send(H('text_delta', '\n'));
+    await settle(); await settle();
+    check('inline markdown conversion preserves the selected bold occurrence', count.textContent === '2 of 3' && current().startContainer.parentElement.tagName === 'STRONG' && current().toString() === 'needle');
     key(query, 'Escape');
 
     // Run only the streaming paint, then navigate before the find frame.

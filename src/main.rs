@@ -917,6 +917,14 @@ fn find_shortcut(key: &Key, modifiers: Modifiers, chat_active: bool) -> Option<E
     }
 }
 
+fn chat_find_allowed(
+    surface: VisibleSurface,
+    terminal_focused: bool,
+    native_input_focused: bool,
+) -> bool {
+    matches!(surface, VisibleSurface::AgentChat(_)) && !terminal_focused && !native_input_focused
+}
+
 /// Shared by the native key handler and the WebView forwarding allow-list.
 fn font_shortcut(key: &Key, modifiers: Modifiers, chat_active: bool) -> Option<Event> {
     if !modifiers.command() {
@@ -6954,6 +6962,7 @@ pub enum Event {
     },
     WorktreeRemoveCompleted(PathBuf, Result<(), String>),
     KeyPressed(Key, Modifiers),
+    AgentFindFocusChecked(bool),
     // Sidebar
     ToggleSidebar,
     SetSidebarMode(SidebarMode),
@@ -24790,6 +24799,11 @@ fi
                         Task::done(Event::AgentOpenCheckout(tab_id, path))
                     }
                     AgentIpcMessage::HostKey { key, modifiers } => {
+                        // The page forwarding Cmd+F has keyboard focus. Native
+                        // widget focus state can still describe the last app view.
+                        if find_shortcut(&key, modifiers, true).is_some() {
+                            return self.update(Event::AgentFindOpen);
+                        }
                         // Run the chord through the Iced key handler, so it
                         // means exactly what it means anywhere else. The
                         // handler records the chord's modifiers as held;
@@ -27609,6 +27623,23 @@ fi
                                 modifiers,
                                 matches!(tab.kind, TabKind::Agent(_)),
                             ) {
+                                if matches!(event, Event::AgentFindOpen) {
+                                    if !chat_find_allowed(
+                                        self.visible_webview_surface(),
+                                        self.bottom_panel_focused,
+                                        false,
+                                    ) {
+                                        return Task::none();
+                                    }
+                                    // Include unnamed native inputs: find_focused
+                                    // only reports widgets with explicit IDs.
+                                    return iced::advanced::widget::operate(
+                                        iced::advanced::widget::operation::focusable::count(),
+                                    )
+                                    .map(|focus| {
+                                        Event::AgentFindFocusChecked(focus.focused.is_some())
+                                    });
+                                }
                                 return Task::done(event);
                             }
                             // Cmd+G / Cmd+Shift+G - Next/Prev match
@@ -29570,14 +29601,21 @@ fi
                 }
             }
             // Search events
+            Event::AgentFindFocusChecked(native_input_focused) => {
+                if chat_find_allowed(
+                    self.visible_webview_surface(),
+                    self.bottom_panel_focused,
+                    native_input_focused,
+                ) {
+                    return self.update(Event::AgentFindOpen);
+                }
+            }
             Event::AgentFindOpen => {
-                if let Some(tab) = self.active_tab() {
-                    if matches!(tab.kind, TabKind::Agent(_)) {
-                        webview::evaluate_script(
-                            webview::WebviewSurface::Agent(tab.id),
-                            "window.__openFind && window.__openFind()",
-                        );
-                    }
+                if let VisibleSurface::AgentChat(tab_id) = self.visible_webview_surface() {
+                    webview::evaluate_script(
+                        webview::WebviewSurface::Agent(tab_id),
+                        "window.__openFind && window.__openFind()",
+                    );
                 }
             }
             Event::ToggleSearch => {
@@ -50113,6 +50151,37 @@ mod tests {
             assert!(find_shortcut(&key, modifiers, true).is_none());
         }
         assert!(find_shortcut(&ch("g"), Modifiers::COMMAND, true).is_none());
+    }
+
+    #[test]
+    fn chat_find_requires_visible_chat_without_native_focus() {
+        for terminal in [false, true] {
+            for input in [false, true] {
+                for surface in [
+                    VisibleSurface::None,
+                    VisibleSurface::Viewer,
+                    VisibleSurface::Page,
+                    VisibleSurface::AgentChat(3),
+                ] {
+                    assert_eq!(
+                        chat_find_allowed(surface, terminal, input),
+                        surface == VisibleSurface::AgentChat(3) && !terminal && !input,
+                        "surface={surface:?}, terminal={terminal}, input={input}",
+                    );
+                }
+            }
+        }
+        // Settings and file viewers can cover a still-selected agent tab.
+        for (viewer, overlay) in [
+            (ViewerWebview::None, true),
+            (ViewerWebview::PlansViewer, false),
+        ] {
+            assert!(!chat_find_allowed(
+                visible_webview_surface(viewer, ActiveTabSurface::AgentChat(3), overlay),
+                false,
+                false,
+            ));
+        }
     }
 
     #[test]

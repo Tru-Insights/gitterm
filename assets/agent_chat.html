@@ -1270,7 +1270,20 @@
         if (findMatches[i].root === match.root) findMatches[i] = replacements[j++];
       }
     }
-    openFindDetails(findMatches[findIndex].range.startContainer.parentElement);
+    const selected = findMatches[findIndex];
+    if (selected.node === selected.endNode && selected.node.parentElement?.classList.contains('tail')) {
+      // Remember just the selected unfinished occurrence in rendered coordinates.
+      // A marker keeps surrounding inline syntax intact (including a closing
+      // ** after this hit); parsing only its suffix cannot do that.
+      const raw = selected.node.data, offset = selected.endOffset;
+      let marker = '\uE000find\uE001';
+      while (raw.includes(marker)) marker += '\uE001';
+      const rendered = el('div');
+      rendered.innerHTML = renderMarkdown(raw.slice(0, offset) + marker + raw.slice(offset));
+      const normalized = rendered.textContent, boundary = normalized.indexOf(marker);
+      if (boundary >= 0) selected.context = normalized.slice(boundary + marker.length, boundary + marker.length + 32);
+    }
+    openFindDetails(selected.range.startContainer.parentElement);
   }
   function renderFindMarkdown(root) {
     // Keep deferred sources and original DOM for exact restoration on Esc.
@@ -1355,6 +1368,9 @@
   }
   window.__openFind = function () {
     if (findBar.hidden) {
+      // Late worker/tool events update their original nodes even when history
+      // has been detached. Trimming is paused until find closes.
+      for (const fragment of earlier) findObserver.observe(fragment, { childList: true, characterData: true, subtree: true });
       findWasFollowing = follow;
       rememberFindScroll(messagesEl);
       earlierEl.disabled = true;
@@ -1367,6 +1383,9 @@
   function closeFind() {
     if (findBar.hidden) return;
     findBar.hidden = true;
+    // Release detached history roots once the session stops searching them.
+    findObserver.disconnect();
+    findObserver.observe(messagesEl, { childList: true, characterData: true, subtree: true });
     CSS.highlights?.delete('chat-find'); CSS.highlights?.delete('chat-find-current');
     findOverlay.replaceChildren();
     findMatches = []; findIndex = -1;
