@@ -501,6 +501,19 @@
     key(query, 'Escape');
 
     reset();
+    send(H('text_delta', 'needle **needle** chosen needle last'));
+    await settle();
+    window.__openFind(); search('needle'); key(query, 'Enter');
+    check('raw streaming fixture selects the middle occurrence', count.textContent === '2 of 3' && current().startContainer.textContent.slice(current().startOffset).startsWith('needle** chosen'));
+    send(H('text_delta', ' more'));
+    await settle(); await settle();
+    check('non-newline delta preserves the selected raw markdown occurrence', count.textContent === '2 of 3' && current().startContainer.parentElement.classList.contains('tail') && current().startContainer.textContent.slice(current().startOffset).startsWith('needle** chosen'));
+    send(H('text_delta', '\n'));
+    await settle(); await settle();
+    check('newline after a raw delta preserves the selected bold occurrence', count.textContent === '2 of 3' && current().startContainer.parentElement.tagName === 'STRONG' && current().toString() === 'needle');
+    key(query, 'Escape');
+
+    reset();
     send(H('text_delta', 'needle [link](https://needle.test) **needle** chosen needle last'));
     await settle();
     window.__openFind(); search('needle'); key(query, 'Enter'); key(query, 'Enter');

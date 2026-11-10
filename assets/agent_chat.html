@@ -1272,7 +1272,8 @@
     }
     const selected = findMatches[findIndex];
     if (selected.node === selected.endNode && selected.node.parentElement?.classList.contains('tail')) {
-      // Remember just the selected unfinished occurrence in rendered coordinates.
+      // Keep both contexts: deltas replace the raw tail's text node, and a
+      // completed line replaces it with rendered markdown.
       // A marker keeps surrounding inline syntax intact (including a closing
       // ** after this hit); parsing only its suffix cannot do that.
       const raw = selected.node.data, offset = selected.endOffset;
@@ -1281,7 +1282,7 @@
       const rendered = el('div');
       rendered.innerHTML = renderMarkdown(raw.slice(0, offset) + marker + raw.slice(offset));
       const normalized = rendered.textContent, boundary = normalized.indexOf(marker);
-      if (boundary >= 0) selected.context = normalized.slice(boundary + marker.length, boundary + marker.length + 32);
+      if (boundary >= 0) selected.renderedContext = normalized.slice(boundary + marker.length, boundary + marker.length + 32);
     }
     openFindDetails(selected.range.startContainer.parentElement);
   }
@@ -1339,8 +1340,9 @@
         for (const m of candidates) {
           // Following text identifies an occurrence when markdown replaces its
           // text nodes and removes syntax/URLs before the selected word.
+          const context = m.node.parentElement?.classList.contains('tail') ? previous.context : (previous.renderedContext ?? previous.context);
           let score = 0;
-          while (score < m.context.length && score < previous.context.length && m.context[score] === previous.context[score]) score++;
+          while (score < m.context.length && score < context.length && m.context[score] === context[score]) score++;
           if (score > bestScore) { anchored = []; bestScore = score; }
           if (score === bestScore) anchored.push(m);
         }
