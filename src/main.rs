@@ -15280,23 +15280,30 @@ impl App {
     /// Child sessions GitTerm's own records name (delegations, tasks a
     /// coordinator created), keyed by parent chat (TRU-166). Tabs map a
     /// caller `session_uid` to the chat it hosts.
-    fn chat_child_links(&self) -> Vec<chat_facts::ChildLink> {
-        let Some(store) = self.task_store.as_ref() else {
-            return Vec::new();
-        };
+    fn chat_uid_to_chat(&self) -> HashMap<String, String> {
         let mut uid_to_chat: HashMap<String, String> = self
             .workspaces
             .iter()
             .flat_map(|ws| ws.tabs.iter())
             .filter_map(|tab| Some((tab.session_uid.clone(), tab.chat_session_id.clone()?)))
             .collect();
-        for delegation in store.delegations() {
-            if let Some(chat) = &delegation.parent.chat_session_id {
-                uid_to_chat
-                    .entry(delegation.parent.session_uid.clone())
-                    .or_insert_with(|| chat.clone());
+        if let Some(store) = self.task_store.as_ref() {
+            for delegation in store.delegations() {
+                if let Some(chat) = &delegation.parent.chat_session_id {
+                    uid_to_chat
+                        .entry(delegation.parent.session_uid.clone())
+                        .or_insert_with(|| chat.clone());
+                }
             }
         }
+        uid_to_chat
+    }
+
+    fn chat_child_links(&self) -> Vec<chat_facts::ChildLink> {
+        let Some(store) = self.task_store.as_ref() else {
+            return Vec::new();
+        };
+        let uid_to_chat = self.chat_uid_to_chat();
         chat_facts::store_links(store.delegations(), store.tasks(), &uid_to_chat)
     }
 
@@ -18150,6 +18157,7 @@ impl App {
                 self.mark_log_server_dirty();
             }
         }
+        self.request_finished_task_prs(delegation_id);
         self.push_delegation_card(delegation_id);
         let head =
             parent_tab.map_or_else(Task::none, |tab_id| self.refresh_delegation_head(tab_id));
@@ -18603,6 +18611,7 @@ impl App {
         }
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
+        self.request_finished_task_prs(delegation_id);
         self.push_delegation_card(delegation_id);
         close
     }
@@ -18685,6 +18694,7 @@ impl App {
                         eprintln!("[delegation] {delegation_id}: {store_error}");
                     }
                 }
+                self.request_finished_task_prs(&delegation_id);
                 self.push_delegation_card(&delegation_id);
                 reply.send(Err(format!(
                     "Created task {task_id} at {}, but {message}",
@@ -18906,6 +18916,7 @@ impl App {
         }
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
+        self.request_finished_task_prs(delegation_id);
         self.push_delegation_card(delegation_id);
     }
 
@@ -29348,7 +29359,10 @@ fi
                 let refresh =
                     self.start_workspace_overview_refresh(&dir, overview::RefreshMode::Full);
                 let documents = self.start_work_documents_scan();
-                return Task::batch([index, refresh, documents]);
+                self.prs.request_task_branch_refresh();
+                self.request_open_pr_refreshes();
+                let prs = self.poll_pr_watch();
+                return Task::batch([index, refresh, documents, prs]);
             }
             Event::WorkDocumentsRefresh => {
                 return self.start_work_documents_scan();

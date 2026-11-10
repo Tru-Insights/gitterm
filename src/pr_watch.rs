@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::merge_plan::{MergeMethod, PrBrief, PrKey, PrState};
+use crate::merge_plan::{MergeMethod, PrBrief, PrKey, PrRef, PrState};
 
 /// Poll interval for PRs of open workspaces.
 pub const OPEN_INTERVAL: Duration = Duration::from_secs(120);
@@ -966,6 +966,93 @@ pub async fn run_action(
     }
 }
 
+/// A branch discovery retains creation time for delegation attribution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchPr {
+    pub pr: PrRef,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// PRs on a delegated task's head branch, using the watch's account and
+/// command isolation. An empty answer is successful and may be read again.
+pub async fn branch_prs(
+    repo: &str,
+    branch: &str,
+    account: Option<String>,
+) -> Result<Vec<BranchPr>, String> {
+    if !crate::merge_plan::valid_repo(repo) || branch.is_empty() {
+        return Err(format!(
+            "invalid PR lookup repo {repo:?} or branch {branch:?}"
+        ));
+    }
+    let token = match account.as_deref() {
+        Some(user) => Some(account_token(user).await?),
+        None => None,
+    };
+    let mut command = gh_async(token.as_deref())?;
+    command.args([
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--head",
+        branch,
+        "--state",
+        "all",
+        "--json",
+        "number,url,createdAt,headRepository",
+    ]);
+    let what = format!("gh pr list --repo {repo} --head {branch}");
+    let output = output_within(command, &what).await?;
+    if !output.status.success() {
+        return Err(format!(
+            "{what}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_branch_prs(repo, &output.stdout).map_err(|error| format!("{what}: {error}"))
+}
+
+fn parse_branch_prs(repo: &str, bytes: &[u8]) -> Result<Vec<BranchPr>, String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct HeadRepository {
+        name_with_owner: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct BranchPrAnswer {
+        number: u64,
+        url: String,
+        created_at: chrono::DateTime<chrono::Utc>,
+        head_repository: Option<HeadRepository>,
+    }
+    let prs: Vec<BranchPrAnswer> =
+        serde_json::from_slice(bytes).map_err(|error| format!("decode PRs: {error}"))?;
+    prs.into_iter()
+        // --repo selects the base repository; --head alone also matches forks.
+        .filter(|pr| {
+            pr.head_repository
+                .as_ref()
+                .is_some_and(|head| head.name_with_owner.eq_ignore_ascii_case(repo))
+        })
+        .map(|pr| {
+            let key = PrKey::new(repo, pr.number);
+            if pr.number == 0 || !pr.url.eq_ignore_ascii_case(&key.url()) {
+                return Err(format!("invalid PR number or URL for {}", key.label()));
+            }
+            Ok(BranchPr {
+                pr: PrRef {
+                    repo: repo.to_string(),
+                    number: pr.number,
+                    url: pr.url,
+                },
+                created_at: pr.created_at,
+            })
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Conditional REST through `gh api -i`.
 
@@ -1510,6 +1597,53 @@ pub async fn poll(request: PollRequest) -> PollOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn branch_answer(number: u64, head: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "number": number,
+            "url": format!("https://github.com/acme/api/pull/{number}"),
+            "createdAt": "2026-10-20T00:00:00Z",
+            "headRepository": head,
+        })
+    }
+
+    #[test]
+    fn branch_pr_answers_require_valid_numbers_and_matching_urls() {
+        let valid = branch_answer(7, serde_json::json!({"nameWithOwner": "acme/api"}));
+        let parse =
+            |answer| parse_branch_prs("acme/api", &serde_json::to_vec(&vec![answer]).unwrap());
+        let prs = parse(valid.clone()).unwrap();
+        assert_eq!(prs[0].pr.key(), PrKey::new("acme/api", 7));
+        assert_eq!(prs[0].created_at.to_rfc3339(), "2026-10-20T00:00:00+00:00");
+        assert!(parse_branch_prs("acme/api", b"[]").unwrap().is_empty());
+        for (field, value) in [
+            ("number", serde_json::json!(0)),
+            (
+                "url",
+                serde_json::json!("https://github.com/other/api/pull/7"),
+            ),
+            ("createdAt", serde_json::json!("invalid")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            assert!(parse(invalid).is_err());
+        }
+        assert!(parse_branch_prs("acme/api", br#"[{"number":7}]"#).is_err());
+        assert!(parse_branch_prs("acme/api", b"not json").is_err());
+    }
+
+    #[test]
+    fn branch_pr_answers_exclude_forks_and_unknown_heads() {
+        let answers = serde_json::json!([
+            branch_answer(7, serde_json::json!({"nameWithOwner": "Acme/API"})),
+            branch_answer(8, serde_json::json!({"nameWithOwner": "other/api"})),
+            branch_answer(9, serde_json::json!({"nameWithOwner": "acme/other"})),
+            branch_answer(10, serde_json::Value::Null),
+        ]);
+        let prs = parse_branch_prs("acme/api", &serde_json::to_vec(&answers).unwrap()).unwrap();
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].pr.key(), PrKey::new("acme/api", 7));
+    }
 
     fn core(state: PrState, sha: &str) -> PullCore {
         PullCore {
