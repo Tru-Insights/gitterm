@@ -22,6 +22,32 @@ const BADGE_FONT: f32 = 9.0;
 /// The badge row's height when there is a badge.
 const BADGE_HEIGHT: f32 = 12.0;
 
+fn daily_usage(samples: &[plan_limits::UsageSample], now: i64) -> [Option<f64>; 7] {
+    let mut last_by_day: [Option<(i64, f64)>; 7] = [None; 7];
+    let mut prior = None;
+    for sample in samples {
+        let age = (now - sample.observed_at).div_euclid(86_400);
+        if age >= 7 {
+            if prior.is_none_or(|(at, _)| sample.observed_at > at) {
+                prior = Some((sample.observed_at, sample.used_percent));
+            }
+        } else if age >= 0 {
+            let day = 6 - age as usize;
+            if last_by_day[day].is_none_or(|(at, _)| sample.observed_at > at) {
+                last_by_day[day] = Some((sample.observed_at, sample.used_percent));
+            }
+        }
+    }
+
+    let mut previous = prior.map(|(_, value)| value);
+    std::array::from_fn(|day| {
+        let (_, value) = last_by_day[day]?;
+        let used = (value - previous.unwrap_or(0.0)).max(0.0);
+        previous = Some(value);
+        Some(used)
+    })
+}
+
 #[derive(Debug, Clone)]
 pub enum PlanLimitsEvent {
     /// A Codex read finished: the newest account-wide reading, if any.
@@ -682,47 +708,54 @@ impl App {
                     && history.resets_at == window.resets_at
             });
             if let Some(history) = history {
-                let mut daily = [0.0_f64; 7];
-                let mut seen = [false; 7];
-                for sample in &history.samples {
-                    let age = (now - sample.observed_at).div_euclid(86_400);
-                    if (0..7).contains(&age) {
-                        let day = 6 - age as usize;
-                        daily[day] = sample.used_percent;
-                        seen[day] = true;
-                    }
-                }
                 let bars = Row::new()
                     .spacing(3)
                     .align_y(iced::Alignment::End)
-                    .push(text("7d").size(font_tiny).color(muted));
+                    .push(text("by day").size(font_tiny).color(muted));
+                let daily = daily_usage(&history.samples, now);
                 let bars = daily
                     .into_iter()
-                    .zip(seen)
-                    .fold(bars, |row, (value, seen)| {
-                        let height = if seen {
-                            (value.clamp(0.0, 100.0) * 0.32).max(2.0) as f32
-                        } else {
-                            2.0
-                        };
-                        let color = if seen {
-                            self.plan_level_color(plan_limits::level(value), theme.accent())
+                    .enumerate()
+                    .fold(bars, |row, (day, value)| {
+                        let height = value
+                            .map(|value| (value.clamp(0.0, 20.0) * 1.2).max(2.0) as f32)
+                            .unwrap_or(2.0);
+                        let color = if value.is_some() {
+                            theme.accent()
                         } else {
                             track
                         };
-                        row.push(
-                            container(iced::widget::Space::new())
-                                .width(Length::FillPortion(1))
-                                .height(Length::Fixed(height))
-                                .style(move |_| container::Style {
-                                    background: Some(color.into()),
-                                    border: iced::Border {
-                                        radius: 2.0.into(),
-                                        ..Default::default()
-                                    },
+                        let bar = container(iced::widget::Space::new())
+                            .width(Length::Fill)
+                            .height(Length::Fixed(height))
+                            .style(move |_| container::Style {
+                                background: Some(color.into()),
+                                border: iced::Border {
+                                    radius: 2.0.into(),
                                     ..Default::default()
-                                }),
-                        )
+                                },
+                                ..Default::default()
+                            });
+                        let bar = if let Some(value) = value {
+                            let age = 6 - day as i64;
+                            let weekday = chrono::DateTime::from_timestamp(now - age * 86_400, 0)
+                                .map(|at| at.with_timezone(&chrono::Local).format("%a").to_string())
+                                .unwrap_or_else(|| "Day".into());
+                            iced::widget::tooltip(
+                                bar,
+                                text(format!("{weekday}: +{value:.0}%"))
+                                    .size(font_tiny)
+                                    .color(theme.text_primary()),
+                                iced::widget::tooltip::Position::Top,
+                            )
+                        } else {
+                            iced::widget::tooltip(
+                                bar,
+                                text("").size(font_tiny),
+                                iced::widget::tooltip::Position::Top,
+                            )
+                        };
+                        row.push(container(bar).width(Length::FillPortion(1)))
                     });
                 col = col.push(container(bars).height(Length::Fixed(34.0)));
             }
@@ -1004,5 +1037,62 @@ mod tests {
         assert!(!state.finish_save(Err("disk full".into()), Path::new("plan-limits.json")));
         assert!(state.dirty);
         assert!(!state.save_in_flight);
+    }
+
+    #[test]
+    fn daily_usage_uses_day_deltas_and_respects_missing_days_and_window_start() {
+        use plan_limits::UsageSample;
+
+        let now = 10 * 86_400;
+        let samples = [
+            UsageSample {
+                observed_at: now - 6 * 86_400,
+                used_percent: 10.0,
+            },
+            UsageSample {
+                observed_at: now - 5 * 86_400,
+                used_percent: 15.0,
+            },
+            UsageSample {
+                observed_at: now - 3 * 86_400,
+                used_percent: 23.0,
+            },
+        ];
+        let daily = daily_usage(&samples, now);
+        assert_eq!(daily[0], Some(10.0));
+        assert_eq!(daily[1], Some(5.0));
+        assert_eq!(daily[2], None);
+        assert_eq!(daily[3], Some(8.0));
+        assert_eq!(daily[4], None);
+
+        let first_day_after_reset = [UsageSample {
+            observed_at: now - 6 * 86_400,
+            used_percent: 3.0,
+        }];
+        assert_eq!(daily_usage(&first_day_after_reset, now)[0], Some(3.0));
+
+        let reset_drop = [
+            UsageSample {
+                observed_at: now - 6 * 86_400,
+                used_percent: 90.0,
+            },
+            UsageSample {
+                observed_at: now - 5 * 86_400,
+                used_percent: 3.0,
+            },
+        ];
+        assert_eq!(daily_usage(&reset_drop, now)[1], Some(0.0));
+
+        let first_day_with_prior = [
+            UsageSample {
+                observed_at: now - 7 * 86_400,
+                used_percent: 8.0,
+            },
+            UsageSample {
+                observed_at: now - 6 * 86_400,
+                used_percent: 10.0,
+            },
+        ];
+        assert_eq!(daily_usage(&first_day_with_prior, now)[0], Some(2.0));
     }
 }
