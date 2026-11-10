@@ -790,13 +790,13 @@
   window.__setChatFontSize = (value) => {
     if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error('Invalid chat font size: ' + value);
     // Text size and width rewrap the timeline; keep what the reader sees in place.
-    keepView(() => document.body.style.setProperty('--chat-font-size', Math.min(22, Math.max(11, value)) + 'px'));
+    keepView(() => document.body.style.setProperty('--chat-font-size', Math.min(22, Math.max(11, value)) + 'px'), true);
     autoGrow();
   };
   window.__setChatWidth = (value) => {
     const widths = { narrow: '46rem', medium: '60rem', wide: '72rem', full: '100%' };
     if (!Object.hasOwn(widths, value)) throw new Error('Unknown chat width: ' + value);
-    keepView(() => document.documentElement.style.setProperty('--chat-width', widths[value]));
+    keepView(() => document.documentElement.style.setProperty('--chat-width', widths[value]), true);
   };
   let appearance = 'dark';
   window.__setAppearance = (value) => {
@@ -1042,10 +1042,37 @@
       if (fold) foldTurn(t, t.endMs != null ? t.endMs : (replaying ? null : Date.now()));
     });
   }
-  // Run `change` to the timeline without moving what the human reads: a
-  // view following the latest stays at the bottom; one scrolled back keeps
-  // its top block where it is (the fold row, when that block folded).
-  function keepView(change) {
+  // Locate text independently of its container's geometry: reflow can move
+  // the visible line by many screens within a single reply or paragraph.
+  function visibleTextAnchor(root) {
+    if (!root) return null;
+    const viewport = messagesEl.getBoundingClientRect();
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const range = document.createRange();
+    for (let node; (node = walker.nextNode());) {
+      if (!node.textContent.trim()) continue;
+      range.selectNodeContents(node);
+      if (![...range.getClientRects()].some((r) => r.width > 0 && r.bottom > viewport.top && r.top < viewport.bottom)) continue;
+      // Find the first character on the visible line, even in a paragraph
+      // that started many screens above. Its character offset survives reflow.
+      let lo = 0, hi = node.length - 1;
+      while (lo < hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        range.setStart(node, mid);
+        range.setEnd(node, mid + 1);
+        if (range.getBoundingClientRect().bottom <= viewport.top) lo = mid + 1;
+        else hi = mid;
+      }
+      range.setStart(node, lo);
+      range.setEnd(node, lo + 1);
+      return { node, start: lo, top: range.getBoundingClientRect().top };
+    }
+    return null;
+  }
+  // Run `change` without moving what the human reads: follow the bottom,
+  // retain a text line during reflow, or retain the top block during grouping
+  // (the fold row, when that block folded).
+  function keepView(change, reflow = false) {
     if (replaying || follow) { change(); scrollIfFollowing(); return; }
     const top = messagesEl.scrollTop;
     let anchor = null;
@@ -1053,9 +1080,19 @@
       if (c.offsetTop + c.offsetHeight > top) { anchor = c; break; }
     }
     const offset = anchor ? anchor.offsetTop - top : 0;
+    const text = reflow ? visibleTextAnchor(anchor) : null;
     // Live rows are removed before folding; their cards survive that move.
     const liveAnchor = anchor && anchor.matches('.live-tool-run') ? anchor.querySelector('.tr-body').firstElementChild : null;
     change();
+    if (text && text.node.isConnected) {
+      const range = document.createRange();
+      range.setStart(text.node, text.start);
+      range.setEnd(text.node, text.start + 1);
+      if (range.getClientRects().length) {
+        messagesEl.scrollTop += range.getBoundingClientRect().top - text.top;
+        return;
+      }
+    }
     if (!anchor) return;
     if (!anchor.isConnected && liveAnchor) anchor = liveAnchor;
     if (anchor.parentNode === messagesEl) { messagesEl.scrollTop = anchor.offsetTop - offset; return; }

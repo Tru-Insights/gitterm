@@ -71,8 +71,7 @@
     window.__setChatFontSize(99);
     check('page clamps text size to 22px', getComputedStyle(document.body).fontSize === '22px');
     {
-      // Resizing keeps the reader's place: at the bottom when following,
-      // the same block at the same height when scrolled back.
+      // Both reflow controls retain live-follow at the bottom.
       window.__setChatFontSize(14);
       const fillers = [];
       for (let i = 0; i < 60; i++) {
@@ -89,17 +88,57 @@
       window.__setChatFontSize(22);
       await settle();
       check('following view stays at the bottom after a text-size change', messages.scrollHeight - messages.scrollTop - messages.clientHeight < 2);
-      messages.dispatchEvent(new WheelEvent('wheel', { deltaY: -400 }));
-      messages.scrollTop = Math.floor(messages.scrollHeight / 3);
-      messages.dispatchEvent(new Event('scroll'));
+      window.__setChatWidth('narrow');
       await settle();
-      const top = messages.scrollTop;
-      const block = [...messages.children].find((c) => c.offsetTop + c.offsetHeight > top);
-      const before = block.offsetTop - messages.scrollTop;
-      window.__setChatFontSize(15);
-      await settle();
-      check('scrolled-back view keeps its block in place after a text-size change', Math.abs(block.offsetTop - messages.scrollTop - before) < 2);
+      check('following view stays at the bottom after a width change', messages.scrollHeight - messages.scrollTop - messages.clientHeight < 2);
       for (const div of fillers) div.remove();
+    }
+    {
+      // One reply can span many screens, including within a single paragraph.
+      // Its container's pixel offset cannot identify the line being read.
+      reset();
+      const paragraph = 'The reading position should survive text reflow through the same reply. '.repeat(30);
+      send(H('text_delta', Array.from({ length: 60 }, (_, i) => 'Paragraph ' + i + ': ' + paragraph).join('\n\n')), end);
+      const reply = messages.querySelector('.assistant');
+      const text = reply.querySelectorAll('p')[30].firstChild;
+      check('reflow fixture is one long reply', messages.querySelectorAll('.assistant').length === 1 && reply.querySelectorAll('p').length === 60);
+      for (const withinParagraph of [false, true]) {
+        for (const [name, width, size, change] of [
+          ['15px to 22px', 'wide', 15, () => window.__setChatFontSize(22)],
+          ['22px to 11px', 'wide', 22, () => window.__setChatFontSize(11)],
+          ['Wide to Narrow', 'wide', 15, () => window.__setChatWidth('narrow')],
+          ['Narrow to Wide', 'narrow', 15, () => window.__setChatWidth('wide')],
+        ]) {
+          window.__setChatWidth(width);
+          window.__setChatFontSize(size);
+          await settle();
+          const range = document.createRange();
+          let offset = withinParagraph ? Math.floor(text.length / 2) : 0;
+          const rect = () => {
+            range.setStart(text, offset);
+            range.setEnd(text, offset + 1);
+            return range.getBoundingClientRect();
+          };
+          // Identify the first character of this rendered line independently
+          // of keepView, then leave that line partially visible at the top.
+          const lineTop = rect().top;
+          while (offset > 0) {
+            offset--;
+            if (rect().top !== lineTop) { offset++; break; }
+          }
+          const line = rect();
+          messages.dispatchEvent(new WheelEvent('wheel', { deltaY: -400 }));
+          messages.scrollTop += line.top - messages.getBoundingClientRect().top + line.height / 2;
+          messages.dispatchEvent(new Event('scroll'));
+          await settle();
+          const before = rect().top;
+          change();
+          await settle();
+          check('long reply retains ' + (withinParagraph ? 'mid-paragraph line' : 'paragraph') + ' after ' + name,
+            Math.abs(rect().top - before) < 2 && jump.classList.contains('visible'));
+        }
+      }
+      reset();
     }
     window.__setChatFontSize(15);
     const posted = [];
