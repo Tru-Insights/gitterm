@@ -1979,6 +1979,7 @@ impl std::fmt::Display for DecisionsRepoChoice {
 pub enum RenameSite {
     Chip,
     Overview,
+    Settings,
 }
 
 #[derive(Debug, Clone)]
@@ -26759,6 +26760,7 @@ fi
                     && matches!(key.as_ref(), Key::Named(key::Named::Escape))
                 {
                     self.workspace_settings_open = false;
+                    self.workspace_rename = None;
                     return Task::none();
                 }
 
@@ -29540,7 +29542,9 @@ fi
                 let Some(uid) = self.workspaces.get(idx).map(|ws| ws.uid) else {
                     return Task::none();
                 };
-                self.workspace_settings_open = false;
+                if site != RenameSite::Settings {
+                    self.workspace_settings_open = false;
+                }
                 return self.start_workspace_rename(uid, site);
             }
             Event::WorkspaceRenameInput(draft) => {
@@ -31110,6 +31114,7 @@ fi
                 match gitterm::guidelines::ensure_guidelines_file(&config::global_config_dir()) {
                     Ok(path) => {
                         self.workspace_settings_open = false;
+                        self.workspace_rename = None;
                         return Task::done(Event::ViewFile(SourcePath::Local(path)));
                     }
                     Err(error) => eprintln!("[guidelines] cannot open the guidelines: {error}"),
@@ -31117,6 +31122,7 @@ fi
             }
             Event::WorkspaceSettingsClose => {
                 self.workspace_settings_open = false;
+                self.workspace_rename = None;
             }
             Event::WorkspaceSettingsNewKeyChanged(s) => {
                 self.workspace_settings_new_key = s;
@@ -34588,18 +34594,34 @@ fi
         // The env its terminals get: the home repo's, with its overrides.
         let ws_env = self.workspace_repo_env(ws, ws.home);
 
-        // --- Title --- (✎ renames inline on the bar chip, TRU-169)
-        let title = row![
-            text(format!("Workspace: {}", ws.name))
+        // --- Title ---
+        let title: Element<'_, Event, Theme, iced::Renderer> = match self
+            .workspace_rename
+            .as_ref()
+            .filter(|rename| rename.site == RenameSite::Settings && rename.uid == ws.uid)
+        {
+            Some(rename) => text_input("Workspace name", &rename.draft)
+                .id(workspace_rename_input_id())
+                .on_input(Event::WorkspaceRenameInput)
+                .on_submit(Event::WorkspaceRenameSubmit)
                 .size(16)
-                .color(text_primary),
-            button(text("\u{270E} Rename").size(12).color(accent))
-                .style(self.ghost_button_style())
-                .padding([2, 6])
-                .on_press(Event::WorkspaceRenameStart(idx, RenameSite::Chip)),
-        ]
-        .spacing(10)
-        .align_y(iced::Alignment::Center);
+                .padding([3, 6])
+                .width(Length::Fixed(260.0))
+                .style(self.input_style())
+                .into(),
+            None => row![
+                text(format!("Workspace: {}", ws.name))
+                    .size(16)
+                    .color(text_primary),
+                button(text("\u{270E} Rename").size(12).color(accent))
+                    .style(self.ghost_button_style())
+                    .padding([2, 6])
+                    .on_press(Event::WorkspaceRenameStart(idx, RenameSite::Settings)),
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center)
+            .into(),
+        };
 
         // --- Color swatches ---
         let mut color_row = Row::new().spacing(6).align_y(iced::Alignment::Center);
@@ -35611,7 +35633,7 @@ fi
         self.bar_hint_area(btn, tip.to_string())
     }
 
-    /// One workspace chip on the bar: dot, name (double-click renames),
+    /// One workspace chip on the bar: dot and name,
     /// the active one's gear, attention and PR news. An inactive chip
     /// shows its short label (TRU-192); every chip shows the full name on
     /// hover.
@@ -35665,7 +35687,7 @@ fi
                 ..Default::default()
             });
 
-        // Double-click the name to rename inline (TRU-169).
+        // New-work naming can still edit at the chip site (TRU-169).
         let renaming = self
             .workspace_rename
             .as_ref()
@@ -35692,7 +35714,6 @@ fi
                 .font(iced::Font::with_name("Menlo")),
             )
             .on_press(Event::WorkspaceSelect(idx))
-            .on_double_click(Event::WorkspaceRenameStart(idx, RenameSite::Chip))
             .into(),
         };
 
@@ -38674,7 +38695,7 @@ fi
         if state.is_some() && !reading {
             refresh = refresh.on_press(Event::WorkspaceOverviewRefresh);
         }
-        // The name renames inline: double-click it or press ✎ (TRU-169).
+        // Rename inline with ✎ (TRU-169).
         let active_idx = self.active_workspace_idx;
         let renaming = self.workspace_rename.as_ref().filter(|rename| {
             rename.site == RenameSite::Overview
@@ -38693,16 +38714,10 @@ fi
                 .style(self.input_style())
                 .into(),
             None => row![
-                iced::widget::mouse_area(
-                    text(name)
-                        .size(self.ui_font())
-                        .color(text_primary)
-                        .font(bold),
-                )
-                .on_double_click(Event::WorkspaceRenameStart(
-                    active_idx,
-                    RenameSite::Overview
-                )),
+                text(name)
+                    .size(self.ui_font())
+                    .color(text_primary)
+                    .font(bold),
                 iced::widget::Space::new().width(Length::Fill),
                 button(text("\u{270E}").size(10).color(text_muted))
                     .style(self.flat_button_style())
