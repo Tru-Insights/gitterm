@@ -15,11 +15,14 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// Max bytes of a transcript head scanned for title/cwd/branch. A single
-/// pasted-content line can be huge; this bounds the worst case.
+/// Max bytes scanned for cwd/branch and the initial title scan. A single
+/// pasted-content line can be huge; this bounds the metadata scan.
 const HEAD_SCAN_BYTES: u64 = 256 * 1024;
-/// Max lines of the head scanned before giving up on a title.
+/// Max lines scanned for metadata and the initial title.
 const HEAD_SCAN_LINES: usize = 60;
+/// Max bytes searched for a transcript title. Metadata remains limited to
+/// `HEAD_SCAN_BYTES` and `HEAD_SCAN_LINES`.
+const TITLE_SCAN_BYTES: u64 = 2 * 1024 * 1024;
 /// Bytes read from the end of a transcript for the preview tail.
 const TAIL_READ_BYTES: u64 = 128 * 1024;
 /// Bytes read from the end of a transcript for Claude's own title. The
@@ -405,6 +408,16 @@ fn is_synthetic_user_text(text: &str) -> bool {
     text.starts_with('<')
 }
 
+/// Codex user-role items that are not typed by the user, so never a title:
+/// the AGENTS.md preamble and the wrapper Codex prepends when replaying a
+/// prior request. Only for Codex title selection; an assistant reply may
+/// legitimately start with the same words.
+fn is_codex_non_title(text: &str) -> bool {
+    is_synthetic_user_text(text)
+        || text.starts_with("# AGENTS.md instructions")
+        || text.starts_with("You previously asked the user:")
+}
+
 fn title_from_text(text: &str) -> String {
     let first_line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or(text);
     let mut title: String = first_line.trim().chars().take(TITLE_MAX_CHARS).collect();
@@ -414,8 +427,8 @@ fn title_from_text(text: &str) -> String {
     title
 }
 
-/// Head-of-file metadata scan: bounded read, stops as soon as it has a
-/// title (cwd/branch usually arrive on the same early lines).
+/// Head-of-file metadata scan: cwd, branch, headless state, and any early
+/// title, all within the existing byte and line limits.
 struct HeadScan {
     title: Option<String>,
     cwd: Option<PathBuf>,
@@ -494,6 +507,94 @@ fn scan_head(path: &Path) -> std::io::Result<HeadScan> {
         }
     }
     Ok(out)
+}
+
+/// Find a Claude title beyond the metadata head scan. Only lines that may
+/// contain a summary or user message are JSON-parsed; tool output can be
+/// large, and title search stops at the first title or 2 MiB.
+fn scan_claude_title(path: &Path) -> std::io::Result<Option<String>> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(file.take(TITLE_SCAN_BYTES));
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        if !(line.contains("\"user\"") || line.contains("\"summary\"")) {
+            continue;
+        }
+        let Ok(meta) = serde_json::from_str::<LineMeta>(&line) else {
+            continue;
+        };
+        if meta.kind.as_deref() == Some("summary") {
+            if let Some(summary) = meta
+                .summary
+                .as_deref()
+                .filter(|summary| !summary.is_empty())
+            {
+                return Ok(Some(summary.to_string()));
+            }
+        }
+        if meta.kind.as_deref() == Some("user") && meta.is_real_message() {
+            if let Some(text) = meta.message_text() {
+                if !is_synthetic_user_text(&text) {
+                    return Ok(Some(title_from_text(&text)));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Find a Codex rollout title beyond its metadata head scan.
+fn scan_codex_title(path: &Path) -> std::io::Result<Option<String>> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(file.take(TITLE_SCAN_BYTES));
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        if !line.contains("\"user\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if let Some((true, text)) = codex_message(&value) {
+            if !is_codex_non_title(&text) {
+                return Ok(Some(title_from_text(&text)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Find a pi session title beyond its metadata head scan.
+fn scan_pi_title(path: &Path) -> std::io::Result<Option<String>> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(file.take(TITLE_SCAN_BYTES));
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        if !line.contains("\"user\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if let Some((true, text)) = pi_message(&value) {
+            if !is_synthetic_user_text(&text) {
+                return Ok(Some(title_from_text(&text)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// The latest title Claude generated for a session (`{"type":"ai-title",
@@ -580,7 +681,10 @@ fn index_transcript(path: &Path, backend: ChatBackend) -> Option<ChatIndexEntry>
     }
     // A session with no real user message is an empty shell, even if
     // Claude titled it.
-    let first_message_title = head.title?;
+    let first_message_title = match head.title {
+        Some(title) => title,
+        None => scan_claude_title(path).ok()??,
+    };
     let tail = read_tail_lines_bounded(path, TITLE_TAIL_BYTES).unwrap_or_default();
     let title = claude_ai_title(&tail).unwrap_or(first_message_title);
     let latest = latest_user_title(&tail).filter(|line| *line != title);
@@ -725,7 +829,7 @@ fn index_codex_transcript(path: &Path) -> Option<ChatIndexEntry> {
             if let Some((true, text)) = codex_message(&value) {
                 // Codex injects project docs as a plain user message
                 // ("# AGENTS.md instructions for <path>"); never a title.
-                if !is_synthetic_user_text(&text) && !text.starts_with("# AGENTS.md instructions") {
+                if !is_codex_non_title(&text) {
                     title = Some(title_from_text(&text));
                 }
             }
@@ -733,6 +837,9 @@ fn index_codex_transcript(path: &Path) -> Option<ChatIndexEntry> {
         if id.is_some() && title.is_some() {
             break;
         }
+    }
+    if title.is_none() {
+        title = scan_codex_title(path).ok().flatten();
     }
     let cwd = cwd?;
     let dead_cwd = !cwd.exists();
@@ -788,6 +895,9 @@ fn index_pi_transcript(path: &Path) -> Option<ChatIndexEntry> {
         if id.is_some() && title.is_some() {
             break;
         }
+    }
+    if title.is_none() {
+        title = scan_pi_title(path).ok().flatten();
     }
     let cwd = cwd?;
     let dead_cwd = !cwd.exists();
@@ -1058,6 +1168,16 @@ fn preview_from_lines(lines: &[String], backend: ChatBackend) -> ChatPreview {
 mod tests {
     use super::*;
 
+    #[test]
+    fn replay_wrapper_is_excluded_only_from_codex_titles() {
+        let wrapper = "You previously asked the user: which branch?";
+        // Previews and snippets keep an assistant reply with these words.
+        assert!(!is_synthetic_user_text(wrapper));
+        assert!(is_codex_non_title(wrapper));
+        assert!(is_codex_non_title("# AGENTS.md instructions for /repo"));
+        assert!(!is_codex_non_title("do we need to run the checks?"));
+    }
+
     fn write_transcript(dir: &Path, name: &str, lines: &[&str]) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, lines.join("\n")).unwrap();
@@ -1213,6 +1333,152 @@ mod tests {
     }
 
     #[test]
+    fn index_finds_first_user_title_after_large_tool_result_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let large_result = serde_json::json!({
+            "type": "tool-result",
+            "content": "x".repeat(80 * 1024)
+        })
+        .to_string();
+        let real = user_line("/tmp/x", "main", "message after large tool output");
+        let mut transcript = vec![
+            r#"{"type":"system","cwd":"/tmp/x","gitBranch":"main"}"#.to_string(),
+            large_result.clone(),
+            large_result.clone(),
+            large_result.clone(),
+            large_result,
+            real,
+        ]
+        .join("\n");
+        transcript.push('\n');
+        assert!(transcript.find("message after large tool output").unwrap() > 300 * 1024);
+        let path = dir.path().join("large.jsonl");
+        std::fs::write(&path, transcript).unwrap();
+
+        let entry = index_transcript(&path, ChatBackend::Claude).unwrap();
+        assert_eq!(entry.title, "message after large tool output");
+    }
+
+    #[test]
+    fn title_scans_accept_whitespace_variants_after_large_lines_for_all_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        let padding = serde_json::json!({
+            "type": "tool-result",
+            "content": "x".repeat(80 * 1024)
+        })
+        .to_string();
+
+        let claude_user = user_line("/tmp/x", "main", "Claude title past the head limit")
+            .replace("\"type\":\"user\"", "\"type\" : \"user\"");
+        let mut claude_lines =
+            vec![r#"{"type":"system","cwd":"/tmp/x","gitBranch":"main"}"#.to_string()];
+        claude_lines.extend(std::iter::repeat_n(padding.clone(), 4));
+        claude_lines.push(claude_user);
+        let claude_path = dir.path().join("claude-whitespace.jsonl");
+        let claude_transcript = claude_lines.join("\n");
+        assert!(
+            claude_transcript
+                .find("Claude title past the head limit")
+                .unwrap()
+                > 300 * 1024
+        );
+        std::fs::write(&claude_path, claude_transcript).unwrap();
+        assert_eq!(
+            index_transcript(&claude_path, ChatBackend::Claude)
+                .unwrap()
+                .title,
+            "Claude title past the head limit"
+        );
+
+        let mut codex_lines = vec![codex_meta_line(
+            "019e-white-codex",
+            "/tmp/x",
+            "main",
+            "codex-tui",
+        )];
+        codex_lines.extend(std::iter::repeat_n(padding.clone(), 4));
+        codex_lines.push(
+            codex_user_line("Codex title past the head limit")
+                .replace("\"role\":\"user\"", "\"role\":  \"user\""),
+        );
+        let codex_transcript = codex_lines.join("\n");
+        assert!(
+            codex_transcript
+                .find("Codex title past the head limit")
+                .unwrap()
+                > 300 * 1024
+        );
+        let codex_path = dir.path().join("codex-whitespace.jsonl");
+        std::fs::write(&codex_path, codex_transcript).unwrap();
+        assert_eq!(
+            index_codex_transcript(&codex_path).unwrap().title,
+            "Codex title past the head limit"
+        );
+
+        let pi_session = serde_json::json!({
+            "type": "session", "version": 3, "id": "019e-white-pi", "cwd": "/tmp/x"
+        })
+        .to_string();
+        let pi_user = serde_json::json!({
+            "type": "message",
+            "message": {"role": "user", "content": "Pi title past the head limit"}
+        })
+        .to_string()
+        .replace("\"role\":\"user\"", "\"role\":  \"user\"");
+        let mut pi_lines = vec![pi_session];
+        pi_lines.extend(std::iter::repeat_n(padding, 4));
+        pi_lines.push(pi_user);
+        let pi_transcript = pi_lines.join("\n");
+        assert!(pi_transcript.find("Pi title past the head limit").unwrap() > 300 * 1024);
+        let pi_path = dir.path().join("pi-whitespace.jsonl");
+        std::fs::write(&pi_path, pi_transcript).unwrap();
+        assert_eq!(
+            index_pi_transcript(&pi_path).unwrap().title,
+            "Pi title past the head limit"
+        );
+    }
+
+    #[test]
+    fn codex_index_skips_synthetic_previous_request_wrapper_for_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = codex_meta_line("019e-wrapper", "/tmp/x", "main", "codex-tui");
+        let wrapper = codex_user_line(
+            "You previously asked the user: please continue from this generated context",
+        );
+        let real = codex_user_line("Use the real user request as the title");
+        let path = write_transcript(
+            dir.path(),
+            "rollout-wrapper.jsonl",
+            &[meta.as_str(), wrapper.as_str(), real.as_str()],
+        );
+
+        let entry = index_codex_transcript(&path).unwrap();
+        assert_eq!(entry.title, "Use the real user request as the title");
+    }
+
+    #[test]
+    fn index_skips_empty_shell_with_large_non_message_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let large_result = serde_json::json!({
+            "type": "tool-result",
+            "content": "x".repeat(80 * 1024)
+        })
+        .to_string();
+        let mut lines = vec![
+            r#"{"type":"system","cwd":"/tmp/x","gitBranch":"main"}"#.to_string(),
+            r#"{"type":"queue-operation","content":"/resume"}"#.to_string(),
+        ];
+        for _ in 0..28 {
+            lines.push(large_result.clone());
+        }
+        lines.push(r#"{"type":"command","content":"/clear"}"#.to_string());
+        let path = dir.path().join("empty-large.jsonl");
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        assert!(index_transcript(&path, ChatBackend::Claude).is_none());
+    }
+
+    #[test]
     fn index_skips_headless_sdk_sessions() {
         let dir = tempfile::tempdir().unwrap();
         let sdk_user = serde_json::json!({
@@ -1299,6 +1565,63 @@ mod tests {
         assert_eq!(entry.branch.as_deref(), Some("feat/thing"));
         assert_eq!(entry.title, "why is the backfill wrong");
         assert_eq!(entry.resume_command(), "codex resume 019e-abc");
+    }
+
+    #[test]
+    fn codex_and_pi_title_search_pass_the_head_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let large_codex_line = serde_json::json!({
+            "type": "function_call_output",
+            "output": "x".repeat(80 * 1024)
+        })
+        .to_string();
+        let mut codex_lines = vec![codex_meta_line("019e-large", "/tmp/x", "main", "codex-tui")];
+        for _ in 0..4 {
+            codex_lines.push(large_codex_line.clone());
+        }
+        codex_lines.push(codex_user_line("Codex message after large tool output"));
+        assert!(
+            codex_lines
+                .join("\n")
+                .find("Codex message after large tool output")
+                .unwrap()
+                > 300 * 1024
+        );
+        let codex_path = dir.path().join("rollout-large.jsonl");
+        std::fs::write(&codex_path, codex_lines.join("\n")).unwrap();
+        let codex_entry = index_codex_transcript(&codex_path).unwrap();
+        assert_eq!(codex_entry.title, "Codex message after large tool output");
+
+        let pi_session = serde_json::json!({
+            "type": "session", "version": 3, "id": "019f-large", "cwd": "/tmp/x"
+        })
+        .to_string();
+        let large_pi_line = serde_json::json!({
+            "type": "toolResult",
+            "content": "x".repeat(80 * 1024)
+        })
+        .to_string();
+        let pi_user = serde_json::json!({
+            "type": "message",
+            "message": {"role": "user", "content": "Pi message after large tool output"}
+        })
+        .to_string();
+        let mut pi_lines = vec![pi_session];
+        for _ in 0..4 {
+            pi_lines.push(large_pi_line.clone());
+        }
+        pi_lines.push(pi_user);
+        assert!(
+            pi_lines
+                .join("\n")
+                .find("Pi message after large tool output")
+                .unwrap()
+                > 300 * 1024
+        );
+        let pi_path = dir.path().join("pi-large.jsonl");
+        std::fs::write(&pi_path, pi_lines.join("\n")).unwrap();
+        let pi_entry = index_pi_transcript(&pi_path).unwrap();
+        assert_eq!(pi_entry.title, "Pi message after large tool output");
     }
 
     #[test]
