@@ -137,10 +137,13 @@
   .delivery-body { padding: 0 10px 8px 22px; white-space: pre-wrap; word-break: break-word; }
   .assistant { position: relative; margin: 6px 0 10px; word-break: break-word; }
   .assistant .copy-markdown {
-    position: absolute; right: 0; top: 0;
+    display: block; margin: 0 0 4px auto;
+    -webkit-user-select: none; user-select: none;
     font-size: 11px; padding: 2px 8px; opacity: 0;
     transition: opacity 0.12s;
   }
+  /* Generated labels stay out of selections spanning multiple replies. */
+  .assistant .copy-markdown::before { content: attr(data-copy-label); }
   .assistant:hover .copy-markdown, .assistant:focus-within .copy-markdown, .assistant .copy-markdown.done { opacity: 1; }
   #reply-menu { position: fixed; z-index: 100; padding: 4px; background: var(--bg-footer); border: 1px solid var(--border-strong); border-radius: 6px; box-shadow: 0 4px 16px #0004; }
   #reply-menu button { display: block; width: 100%; text-align: left; }
@@ -1754,16 +1757,32 @@
 
   // Copy buttons and links (delegated).
   function copyText(text, btn) {
-    const label = btn.textContent;
-    const done = () => { btn.textContent = 'Copied'; btn.classList.add('done'); setTimeout(() => { btn.textContent = label; btn.classList.remove('done'); }, 1200); };
+    const label = btn.dataset.copyLabel ?? btn.textContent;
+    const setLabel = (value) => {
+      if (btn.matches('.copy-markdown')) btn.dataset.copyLabel = value;
+      else btn.textContent = value;
+    };
+    const done = () => { setLabel('Copied'); btn.classList.add('done'); setTimeout(() => { setLabel(label); btn.classList.remove('done'); }, 1200); };
     const fallback = () => {
+      const active = document.activeElement;
+      const selection = window.getSelection();
+      const ranges = Array.from({ length: selection.rangeCount }, (_, i) => selection.getRangeAt(i).cloneRange());
+      // A transcript range can remain selected while the composer has focus.
+      const inputSelection = ranges.every((range) => range.collapsed) && (active instanceof HTMLTextAreaElement || active instanceof HTMLInputElement)
+        ? { start: active.selectionStart, end: active.selectionEnd, direction: active.selectionDirection } : null;
       const ta = el('textarea');
       ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
       document.body.appendChild(ta); ta.select();
       let ok = false;
       try { ok = document.execCommand('copy'); } catch (e) { console.error('copy failed', e); }
-      ta.remove();
-      if (ok) done(); else btn.textContent = 'Copy failed';
+      finally {
+        ta.remove();
+        if (active?.isConnected) active.focus({ preventScroll: true });
+        selection.removeAllRanges();
+        ranges.forEach((range) => selection.addRange(range));
+        if (active?.isConnected && inputSelection?.start != null) active.setSelectionRange(inputSelection.start, inputSelection.end, inputSelection.direction);
+      }
+      if (ok) done(); else setLabel('Copy failed');
     };
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text).then(done, fallback);
@@ -1877,7 +1896,8 @@
     if (!segment) {
       endThinking();
       const root = append(el('div', 'assistant'));
-      const copy = root.appendChild(el('button', 'copy-markdown', 'Copy markdown'));
+      const copy = root.appendChild(el('button', 'copy-markdown'));
+      copy.dataset.copyLabel = 'Copy markdown';
       copy.type = 'button';
       copy.setAttribute('aria-label', 'Copy reply markdown');
       segment = { raw: '', renderedUpTo: -1, root, mdEl: root.appendChild(el('div')), tailEl: root.appendChild(el('span', 'tail')), queued: false };
