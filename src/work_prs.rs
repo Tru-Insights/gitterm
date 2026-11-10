@@ -43,6 +43,9 @@ use std::collections::BTreeMap;
 const PR_HOMES_FRESH: Duration = Duration::from_secs(30);
 /// PRs one poll reads at most; the rest are read by the next.
 const PR_POLL_MAX_ITEMS: usize = 25;
+/// Publish each branch before starting another; a slow backlog cannot hold
+/// completed workers behind more than the currently running lookup.
+const TASK_PR_BATCH_MAX_ITEMS: usize = 1;
 /// An immediate user-triggered refresh is coalesced per PR within this window.
 const PR_IMMEDIATE_DEBOUNCE: Duration = Duration::from_secs(10);
 /// A PR no workspace lists is forgotten this long after its last read.
@@ -183,7 +186,14 @@ pub struct TaskBranch {
     branch: String,
 }
 
-pub type TaskBranchResult = (TaskBranch, Result<Vec<PrRef>, String>);
+pub type TaskBranchResult = (TaskBranch, Result<Vec<pr_watch::BranchPr>, String>);
+
+#[derive(Debug, Clone)]
+struct TaskPrOrigin {
+    chat: String,
+    started_at: chrono::DateTime<chrono::Utc>,
+    before: Option<chrono::DateTime<chrono::Utc>>,
+}
 
 /// Only recent task delegations can contribute branch PRs. The parent is
 /// resolved to its current root when collecting the list, not when gh runs.
@@ -191,7 +201,7 @@ fn task_branches(
     store: &TaskStore,
     now: chrono::DateTime<chrono::Utc>,
     uid_to_chat: &HashMap<String, String>,
-) -> Vec<(String, TaskBranch)> {
+) -> Vec<(TaskPrOrigin, TaskBranch)> {
     store
         .delegations()
         .iter()
@@ -204,8 +214,10 @@ fn task_branch(
     delegation: &gitterm::tasks::Delegation,
     now: chrono::DateTime<chrono::Utc>,
     uid_to_chat: &HashMap<String, String>,
-) -> Option<(String, TaskBranch)> {
-    let created = chrono::DateTime::parse_from_rfc3339(&delegation.created_at).ok()?;
+) -> Option<(TaskPrOrigin, TaskBranch)> {
+    let created = chrono::DateTime::parse_from_rfc3339(&delegation.created_at)
+        .ok()?
+        .with_timezone(&chrono::Utc);
     if created < now - TASK_PR_MAX_AGE || created > now {
         return None;
     }
@@ -226,8 +238,28 @@ fn task_branch(
     {
         return None;
     }
+    // Reusing a task starts a new ownership window, even if the next parent
+    // is no longer open. Later PRs must not leak back into the earlier chat.
+    let before = store
+        .delegations()
+        .iter()
+        .filter(|next| {
+            matches!(
+                &next.child,
+                gitterm::tasks::DelegationChild::TaskSession { task_id: next_id, .. }
+                    if next_id == task_id
+            )
+        })
+        .filter_map(|next| chrono::DateTime::parse_from_rfc3339(&next.created_at).ok())
+        .map(|at| at.with_timezone(&chrono::Utc))
+        .filter(|at| *at > created && *at <= now)
+        .min();
     Some((
-        parent.clone(),
+        TaskPrOrigin {
+            chat: parent.clone(),
+            started_at: created,
+            before,
+        },
         TaskBranch {
             repo: slug.full_name(),
             branch: task.branch.clone(),
@@ -242,7 +274,7 @@ async fn lookup_task_branches<F, Fut>(
 ) -> Vec<TaskBranchResult>
 where
     F: FnMut(TaskBranch, Option<String>) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<PrRef>, String>>,
+    Fut: std::future::Future<Output = Result<Vec<pr_watch::BranchPr>, String>>,
 {
     let mut results = Vec::new();
     for branch in branches {
@@ -258,7 +290,7 @@ fn collect_root_prs(
     index: &[chats::ChatIndexEntry],
     root: &str,
     prs: &PrsState,
-    branches: &[(String, TaskBranch)],
+    branches: &[(TaskPrOrigin, TaskBranch)],
     root_of: impl Fn(&str) -> String,
 ) -> Vec<PrRef> {
     let mut found = Vec::new();
@@ -281,9 +313,13 @@ fn collect_root_prs(
         }
     }
     for (parent, branch) in branches {
-        if root_of(parent) == root {
-            for pr in prs.task_branch_prs.get(branch).into_iter().flatten() {
-                push(pr);
+        if root_of(&parent.chat) == root {
+            for found in prs.task_branch_prs.get(branch).into_iter().flatten() {
+                if found.created_at >= parent.started_at
+                    && parent.before.is_none_or(|before| found.created_at < before)
+                {
+                    push(&found.pr);
+                }
             }
         }
     }
@@ -472,11 +508,11 @@ pub struct PrsState {
     pub done_open: HashSet<String>,
     /// The index was asked for once for the watch.
     pub index_requested: bool,
-    /// Keep successful discoveries for this run; only unresolved branches retry.
-    task_branch_prs: HashMap<TaskBranch, Vec<PrRef>>,
+    /// Reused until explicit Refresh or a worker finishes; never periodically read.
+    task_branch_prs: HashMap<TaskBranch, Vec<pr_watch::BranchPr>>,
     task_branches_in_flight: bool,
     task_branches_started: bool,
-    task_branches_pending: HashSet<TaskBranch>,
+    task_branches_pending: VecDeque<TaskBranch>,
     task_branches_refresh: bool,
 }
 
@@ -504,28 +540,37 @@ impl PrsState {
         };
         if delegation.status.is_sendable() {
             if let Some((_, branch)) = task_branch(store, delegation, now, uid_to_chat) {
-                self.task_branches_pending.insert(branch);
+                self.task_branches_pending
+                    .retain(|queued| queued != &branch);
+                self.task_branches_pending.push_front(branch);
             }
         }
     }
 
-    fn take_task_branches_due(&mut self, branches: Vec<(String, TaskBranch)>) -> Vec<TaskBranch> {
+    fn take_task_branches_due(
+        &mut self,
+        branches: Vec<(TaskPrOrigin, TaskBranch)>,
+    ) -> Vec<TaskBranch> {
         if !self.task_branches_due() {
             return Vec::new();
         }
-        let all = !self.task_branches_started || self.task_branches_refresh;
-        let pending = std::mem::take(&mut self.task_branches_pending);
-        let mut seen = HashSet::new();
-        let branches = branches
-            .into_iter()
-            .map(|(_, branch)| branch)
-            .filter(|branch| all || pending.contains(branch))
-            .filter(|branch| self.task_branch_prs.get(branch).is_none_or(Vec::is_empty))
-            .filter(|branch| seen.insert(branch.clone()))
-            .collect();
+        let wanted: HashSet<_> = branches.iter().map(|(_, branch)| branch.clone()).collect();
+        self.task_branches_pending
+            .retain(|branch| wanted.contains(branch));
+        if !self.task_branches_started || self.task_branches_refresh {
+            for (_, branch) in branches {
+                if !self.task_branches_pending.contains(&branch) {
+                    self.task_branches_pending.push_back(branch);
+                }
+            }
+        }
         self.task_branches_started = true;
         self.task_branches_refresh = false;
-        branches
+        let count = self
+            .task_branches_pending
+            .len()
+            .min(TASK_PR_BATCH_MAX_ITEMS);
+        self.task_branches_pending.drain(..count).collect()
     }
 
     fn apply_task_branches(&mut self, results: Vec<TaskBranchResult>, mut log: impl FnMut(&str)) {
@@ -2753,6 +2798,19 @@ mod tests {
         }
     }
 
+    fn discovered_pr(number: u64) -> pr_watch::BranchPr {
+        pr_watch::BranchPr {
+            pr: task_pr(number),
+            created_at: "2026-10-20T00:00:00Z".parse().unwrap(),
+        }
+    }
+
+    fn finish_initial_discovery(prs: &mut PrsState, branches: &[(TaskPrOrigin, TaskBranch)]) {
+        while !prs.take_task_branches_due(branches.to_vec()).is_empty() {
+            prs.apply_task_branches(vec![], |_| {});
+        }
+    }
+
     fn delegated_task_fixture() -> (tempfile::TempDir, TaskStore, chrono::DateTime<chrono::Utc>) {
         use gitterm::tasks::{
             Delegation, DelegationChild, DelegationKind, DelegationParent, GitBase, NewDelegation,
@@ -2862,8 +2920,8 @@ mod tests {
                 assert_eq!(branch.repo, "acme/api");
                 assert_eq!(account.as_deref(), Some("acme-bot"));
                 Ok(match branch.branch.as_str() {
-                    "task/X" => vec![task_pr(7)],
-                    "task/Y" => vec![task_pr(8)],
+                    "task/X" => vec![discovered_pr(7)],
+                    "task/Y" => vec![discovered_pr(8)],
                     _ => vec![],
                 })
             },
@@ -2894,7 +2952,7 @@ mod tests {
             BTreeMap::new(),
             |branch, _| async move {
                 Ok(if branch.branch == "task/X" {
-                    vec![task_pr(7)]
+                    vec![discovered_pr(7)]
                 } else {
                     vec![]
                 })
@@ -2920,7 +2978,7 @@ mod tests {
             .1
             .clone();
         let mut prs = PrsState::default();
-        prs.apply_task_branches(vec![(branch, Ok(vec![task_pr(7)]))], |_| {});
+        prs.apply_task_branches(vec![(branch, Ok(vec![discovered_pr(7)]))], |_| {});
         prs.note_live_prs("claude-worker", &[task_pr(7)]);
         let index = vec![chats::ChatIndexEntry {
             id: "claude-worker".into(),
@@ -2955,7 +3013,7 @@ mod tests {
         let branches = task_branches(&store, now, &fixture_parent_chats());
         let branch = branches[0].1.clone();
         let mut prs = PrsState::default();
-        prs.apply_task_branches(vec![(branch.clone(), Ok(vec![task_pr(7)]))], |_| {});
+        prs.apply_task_branches(vec![(branch.clone(), Ok(vec![discovered_pr(7)]))], |_| {});
         let before = collect_root_prs(&[], "root-a", &prs, &branches, task_root);
         let results = lookup_task_branches(vec![branch], BTreeMap::new(), |_, _| async {
             Err("lookup unavailable".into())
@@ -2974,17 +3032,25 @@ mod tests {
     }
 
     #[test]
-    fn discovered_task_branches_are_never_due_again_in_this_run() {
+    fn discovered_task_branches_retry_on_refresh_but_not_periodic_polls() {
         let (_dir, store, now) = delegated_task_fixture();
         let branches = task_branches(&store, now, &fixture_parent_chats());
+        let branch = branches[0].1.clone();
         let mut prs = PrsState::default();
-        let first = prs.take_task_branches_due(branches.clone());
-        let found = first[0].clone();
-        prs.apply_task_branches(vec![(found.clone(), Ok(vec![task_pr(7)]))], |_| {});
+        finish_initial_discovery(&mut prs, &branches);
+        prs.apply_task_branches(vec![(branch.clone(), Ok(vec![discovered_pr(7)]))], |_| {});
+        assert!(prs.take_task_branches_due(branches.clone()).is_empty());
         prs.request_task_branch_refresh();
-        let next = prs.take_task_branches_due(branches);
-        assert_eq!(next.len(), first.len() - 1);
-        assert!(!next.contains(&found));
+        let next = prs.take_task_branches_due(branches.clone());
+        assert_eq!(next, vec![branch.clone()]);
+        prs.apply_task_branches(
+            vec![(branch, Ok(vec![discovered_pr(7), discovered_pr(8)]))],
+            |_| {},
+        );
+        assert_eq!(
+            collect_root_prs(&[], "root-a", &prs, &branches, task_root),
+            vec![task_pr(7), task_pr(8)]
+        );
     }
 
     #[tokio::test]
@@ -2996,7 +3062,7 @@ mod tests {
         let results =
             lookup_task_branches(first.clone(), BTreeMap::new(), |_, _| async { Ok(vec![]) }).await;
         prs.apply_task_branches(results, |_| {});
-        // The watch's next two-minute poll has no new discovery request.
+        finish_initial_discovery(&mut prs, &branches);
         assert!(!prs.task_branches_due());
         assert!(prs.take_task_branches_due(branches.clone()).is_empty());
         prs.request_task_branch_refresh();
@@ -3004,7 +3070,7 @@ mod tests {
     }
 
     #[test]
-    fn finishing_a_delegation_queues_only_its_task_branch() {
+    fn finishing_a_delegation_rediscovers_only_its_task_branch() {
         use gitterm::tasks::{DelegationResult, DelegationStatus};
         for status in [
             DelegationStatus::Completed,
@@ -3015,8 +3081,10 @@ mod tests {
         ] {
             let (_dir, mut store, now) = delegated_task_fixture();
             let branches = task_branches(&store, now, &fixture_parent_chats());
+            let branch = branches[0].1.clone();
             let mut prs = PrsState::default();
-            prs.take_task_branches_due(branches.clone());
+            finish_initial_discovery(&mut prs, &branches);
+            prs.apply_task_branches(vec![(branch.clone(), Ok(vec![discovered_pr(7)]))], |_| {});
             let delegation_id = store.delegations()[0].delegation_id.clone();
             prs.request_finished_task_branch(&store, &delegation_id, now, &fixture_parent_chats());
             assert!(!prs.task_branches_due());
@@ -3040,17 +3108,23 @@ mod tests {
                 _ => store.set_delegation_status(&delegation_id, status, &at),
             }
             .unwrap();
-            // A completion that arrives while startup/Refresh is still running must wait.
+            // Requests arriving during a read survive that read's completion.
             prs.task_branches_in_flight = true;
             prs.request_finished_task_branch(&store, &delegation_id, now, &fixture_parent_chats());
             assert!(prs.take_task_branches_due(branches.clone()).is_empty());
             prs.apply_task_branches(vec![], |_| {});
-            let due = prs.take_task_branches_due(branches.clone());
-            assert_eq!(due, vec![branches[0].1.clone()]);
-            assert!(prs.take_task_branches_due(branches.clone()).is_empty());
-            // Once discovered, even a new completion request cannot re-read it.
-            prs.apply_task_branches(vec![(due[0].clone(), Ok(vec![task_pr(7)]))], |_| {});
-            prs.request_finished_task_branch(&store, &delegation_id, now, &fixture_parent_chats());
+            assert_eq!(
+                prs.take_task_branches_due(branches.clone()),
+                vec![branch.clone()]
+            );
+            prs.apply_task_branches(
+                vec![(branch, Ok(vec![discovered_pr(7), discovered_pr(8)]))],
+                |_| {},
+            );
+            assert_eq!(
+                collect_root_prs(&[], "root-a", &prs, &branches, task_root),
+                vec![task_pr(7), task_pr(8)]
+            );
             assert!(prs.take_task_branches_due(branches).is_empty());
         }
     }
@@ -3065,7 +3139,110 @@ mod tests {
         prs.request_task_branch_refresh();
         assert!(prs.take_task_branches_due(branches.clone()).is_empty());
         prs.apply_task_branches(vec![], |_| {});
-        assert_eq!(prs.take_task_branches_due(branches), first);
+        let mut refreshed = Vec::new();
+        while prs.task_branches_due() {
+            refreshed.extend(prs.take_task_branches_due(branches.clone()));
+        }
+        assert_eq!(refreshed.len(), branches.len());
+        assert!(refreshed.contains(&first[0]));
+    }
+
+    #[test]
+    fn task_branch_batches_publish_before_the_backlog_and_prioritize_completions() {
+        let (_dir, mut store, now) = delegated_task_fixture();
+        let branches = task_branches(&store, now, &fixture_parent_chats());
+        let mut prs = PrsState::default();
+        let first = prs.take_task_branches_due(branches.clone());
+        assert_eq!(first.len(), 1);
+        prs.task_branches_in_flight = true;
+        // The last queued branch finishes while startup is reading the first.
+        let id = store
+            .delegations()
+            .iter()
+            .find(|d| {
+                matches!(
+                    &d.child, gitterm::tasks::DelegationChild::TaskSession { task_id, .. }
+                        if task_id == "boundary"
+                )
+            })
+            .unwrap()
+            .delegation_id
+            .clone();
+        store
+            .complete_delegation(
+                &id,
+                gitterm::tasks::DelegationResult {
+                    handoff: Some(TaskHandoff {
+                        summary: "Worker finished".into(),
+                        decisions: vec![],
+                        next_steps: vec![],
+                        blockers: vec![],
+                        updated_by_session_id: None,
+                        updated_at: now.to_rfc3339(),
+                    }),
+                    ..Default::default()
+                },
+                &now.to_rfc3339(),
+            )
+            .unwrap();
+        prs.request_finished_task_branch(&store, &id, now, &fixture_parent_chats());
+        prs.apply_task_branches(vec![(first[0].clone(), Ok(vec![discovered_pr(7)]))], |_| {});
+        assert_eq!(
+            collect_root_prs(&[], "root-a", &prs, &branches, task_root),
+            vec![task_pr(7)]
+        );
+        let second = prs.take_task_branches_due(branches.clone());
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].branch, "task/boundary");
+        let third = prs.take_task_branches_due(branches.clone());
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].branch, "task/Y");
+        assert!(prs.take_task_branches_due(branches).is_empty());
+    }
+
+    #[test]
+    fn reused_task_prs_stay_in_the_delegation_that_created_them() {
+        let (_dir, mut store, now) = delegated_task_fixture();
+        let original = store.delegations()[0].clone();
+        let mut reused = original.clone();
+        reused.delegation_id = "reused".into();
+        reused.parent.chat_session_id = Some("chat-b".into());
+        let later = now + chrono::Duration::hours(1);
+        reused.created_at = later.to_rfc3339();
+        store.insert_delegation(reused).unwrap();
+        let branches = task_branches(&store, later, &fixture_parent_chats());
+        let branch = branches
+            .iter()
+            .find(|(_, b)| b.branch == "task/X")
+            .unwrap()
+            .1
+            .clone();
+        let mut prs = PrsState::default();
+        prs.apply_task_branches(
+            vec![(
+                branch,
+                Ok(vec![
+                    pr_watch::BranchPr {
+                        created_at: now - chrono::Duration::seconds(1),
+                        ..discovered_pr(6)
+                    },
+                    discovered_pr(7),
+                    pr_watch::BranchPr {
+                        created_at: later,
+                        ..discovered_pr(8)
+                    },
+                ]),
+            )],
+            |_| {},
+        );
+        assert_eq!(
+            collect_root_prs(&[], "root-a", &prs, &branches, task_root),
+            vec![task_pr(7)]
+        );
+        assert_eq!(
+            collect_root_prs(&[], "root-b", &prs, &branches, task_root),
+            vec![task_pr(8)]
+        );
     }
 
     #[test]
