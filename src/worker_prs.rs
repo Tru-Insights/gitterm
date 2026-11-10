@@ -183,11 +183,47 @@ fn scan_transcript(
     path: &Path,
     backend: HarnessConversationBackend,
 ) -> std::io::Result<Vec<PrRef>> {
+    let mut prs = scan_transcript_file(path, backend)?;
+    if backend != HarnessConversationBackend::Claude {
+        return Ok(prs);
+    }
+    let children = path.with_extension("").join("subagents");
+    let read = match std::fs::read_dir(&children) {
+        Ok(read) => read,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(prs),
+        Err(error) => return Err(error),
+    };
+    let mut files = read
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    files.retain(|file| file.extension().and_then(|ext| ext.to_str()) == Some("jsonl"));
+    files.sort();
+    let mut seen: HashSet<_> = prs.iter().map(|pr| pr.key().id()).collect();
+    for file in files {
+        let child_prs = scan_transcript_file(&file, backend).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("cannot read {}: {error}", file.display()),
+            )
+        })?;
+        for pr in child_prs {
+            if seen.insert(pr.key().id()) {
+                prs.push(pr);
+            }
+        }
+    }
+    Ok(prs)
+}
+
+fn scan_transcript_file(
+    path: &Path,
+    backend: HarnessConversationBackend,
+) -> std::io::Result<Vec<PrRef>> {
     let mut calls: HashMap<String, String> = HashMap::new();
     let mut prs = Vec::new();
     let mut seen = HashSet::new();
-    let mut record_prs = |command: &str, output: &str| {
-        for pr in chat_facts::created_prs(command, output) {
+    let mut record_prs = |created: Vec<PrRef>| {
+        for pr in created {
             if seen.insert(pr.key().id()) {
                 prs.push(pr);
             }
@@ -209,14 +245,13 @@ fn scan_transcript(
                 if value["type"] == "event_msg" && payload["type"] == "item_completed" {
                     let item = &payload["item"];
                     if item["type"] == "CommandExecution" && item["exit_code"].as_i64() == Some(0) {
-                        if let (Some(command), Some(output)) = (
-                            item["command"]
-                                .as_array()
-                                .and_then(|args| args.last())
-                                .and_then(Value::as_str),
+                        if let (Some(argv), Some(output)) = (
+                            item["command"].as_array(),
                             item["aggregated_output"].as_str(),
                         ) {
-                            record_prs(command, output);
+                            if argv_creates_pr(argv) {
+                                record_prs(crate::merge_plan::pr_urls_in(output));
+                            }
                         }
                     }
                 }
@@ -238,14 +273,7 @@ fn scan_transcript(
                                     "shell_command" => args["command"].as_str().map(str::to_owned),
                                     "shell" => {
                                         let argv = args["command"].as_array()?;
-                                        match argv.as_slice() {
-                                            [_, flag, script]
-                                                if matches!(flag.as_str(), Some("-lc" | "-c")) =>
-                                            {
-                                                script.as_str().map(str::to_owned)
-                                            }
-                                            _ => None,
-                                        }
+                                        shell_script(argv).map(str::to_owned)
                                     }
                                     _ => None,
                                 });
@@ -258,7 +286,7 @@ fn scan_transcript(
                             (calls.remove(id), payload["output"].as_str())
                         {
                             if codex_output_succeeded(output) {
-                                record_prs(&command, output);
+                                record_prs(chat_facts::created_prs(&command, output));
                             }
                         }
                     }
@@ -284,10 +312,10 @@ fn scan_transcript(
                                 .and_then(|id| calls.remove(id))
                             {
                                 if block["is_error"].as_bool() != Some(true) {
-                                    record_prs(
+                                    record_prs(chat_facts::created_prs(
                                         &command,
                                         &chat_facts::tool_result_text(&block["content"]),
-                                    );
+                                    ));
                                 }
                             }
                         }
@@ -305,6 +333,31 @@ fn scan_transcript(
         );
     }
     Ok(prs)
+}
+
+/// Only a shell's command-string argument is shell syntax. Other argv
+/// vectors must name gh and its subcommands as separate literal arguments.
+fn argv_creates_pr(argv: &[Value]) -> bool {
+    if let Some(script) = shell_script(argv) {
+        return chat_facts::is_gh_pr_create(script);
+    }
+    argv.first()
+        .and_then(Value::as_str)
+        .and_then(|exe| exe.rsplit('/').next())
+        == Some("gh")
+        && argv.get(1).and_then(Value::as_str) == Some("pr")
+        && argv.get(2).and_then(Value::as_str) == Some("create")
+}
+
+fn shell_script(argv: &[Value]) -> Option<&str> {
+    let executable = argv.first()?.as_str()?.rsplit('/').next()?;
+    if matches!(executable, "bash" | "sh" | "zsh" | "dash" | "ksh")
+        && matches!(argv.get(1)?.as_str()?, "-c" | "-lc" | "-cl")
+    {
+        argv.get(2)?.as_str()
+    } else {
+        None
+    }
 }
 
 /// Shell outputs use JSON metadata in older Codex versions and status headers
@@ -511,6 +564,77 @@ GH_TOKEN="$(gh auth token --user example-user)" gh pr create --draft --base deve
             prs.iter().map(|pr| pr.key().id()).collect::<Vec<_>>(),
             ["example/docs#181", "example/app#182"]
         );
+    }
+
+    #[test]
+    fn review_regression_codex_command_argv_only_interprets_shell_scripts() {
+        let temp = tempfile::tempdir().unwrap();
+        for (argv, expected) in [
+            (
+                json!([
+                    "printf",
+                    "%s\n",
+                    "gh pr create https://github.com/fake/repo/pull/42"
+                ]),
+                0,
+            ),
+            (json!(["printf", "-c", "gh pr create"]), 0),
+            (json!(["/opt/homebrew/bin/gh", "pr", "create", "--fill"]), 1),
+            (json!(["gh", "pr create"]), 0),
+            (
+                json!(["/bin/bash", "-c", "gh pr create --fill", "argv0"]),
+                1,
+            ),
+            (json!(["sh", "-lc", "gh pr create --fill"]), 1),
+        ] {
+            let mut event = command_execution(json!(0));
+            event["payload"]["item"]["command"] = argv.clone();
+            let path = transcript(temp.path(), HarnessConversationBackend::Codex, &[event]);
+            assert_eq!(
+                scan_transcript(&path, HarnessConversationBackend::Codex)
+                    .unwrap()
+                    .len(),
+                expected,
+                "{argv}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_regression_claude_worker_scans_child_transcripts_before_marking_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        let facts_path = parent(&config);
+        let root = transcript(temp.path(), HarnessConversationBackend::Claude, &[]);
+        let children = root.with_extension("").join("subagents");
+        std::fs::create_dir_all(&children).unwrap();
+        let child = children.join("agent-create.jsonl");
+        let lines = [
+            json!({"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","id":"create","input":{"command":"gh pr create --fill"}}]}}),
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"create","content":"https://github.com/example/docs/pull/20"}]}}),
+        ];
+        let worker = worker(HarnessConversationBackend::Claude);
+        let marker = config.join("worker-pr-scans").join(&worker.delegation_id);
+        let due = || {
+            Scans::default().take_due(std::slice::from_ref(&worker), &[], &HashMap::new(), now())
+        };
+        std::fs::write(&child, b"\xff").unwrap();
+        assert!(scan_one(&due()[0], &config, temp.path()).is_err());
+        assert!(!marker.exists());
+        std::fs::write(
+            &child,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(run(due(), &config, temp.path())[0].1.len(), 1);
+        let facts = load_facts(&facts_path).unwrap().unwrap();
+        assert_eq!(facts.prs[1].key().id(), "example/docs#20");
+        assert_eq!(facts.live_created_prs, ["example/docs#20"]);
+        assert!(marker.is_file());
     }
 
     #[test]
