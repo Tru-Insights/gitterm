@@ -16058,6 +16058,17 @@ impl App {
             self.workspaces[from].tabs.push(replacement);
         }
         let tab = self.workspaces[from].tabs.remove(tab_idx);
+        if let TabKind::Agent(session) = &tab.kind {
+            if let Some(gitterm::harness::HarnessSession::Claude(claude)) = &session.harness {
+                let context = self
+                    .document_places(&self.workspaces[to])
+                    .as_ref()
+                    .map(gitterm::guidelines::documents_note);
+                if let Err(error) = claude.send(HarnessCommand::SetWorkspaceContext(context)) {
+                    eprintln!("[workspace] cannot update moved chat's workspace context: {error}");
+                }
+            }
+        }
         let source = &mut self.workspaces[from];
         source.active_tab = active_tab_after_removal(source.active_tab, tab_idx, source.tabs.len());
         let target = &mut self.workspaces[to];

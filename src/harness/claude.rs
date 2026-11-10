@@ -2062,7 +2062,7 @@ async fn run_session_program(
         .as_ref()
         .map(|file| file.path())
         .or(config.guidelines_file.as_deref());
-    let workspace_instructions = match guidelines_file {
+    let mut workspace_instructions = match guidelines_file {
         Some(path) => match std::fs::read_to_string(path) {
             // Kept whole: each SessionStart rebuilds the section, so the
             // checkpoint it carries is the one on disk then (TRU-237).
@@ -2181,7 +2181,8 @@ async fn run_session_program(
     let mut in_turn = false;
     let mut snapshot_hooks_applied = false;
 
-    // Handshake. Its reply becomes `Ready`.
+    // Handshake. Its reply becomes `Ready`. Register SessionStart even
+    // without a workspace note: this chat can move into a work workspace.
     let init_id = new_request_id();
     parser.register_host_request(
         init_id.clone(),
@@ -2193,7 +2194,7 @@ async fn run_session_program(
         .write(control_request_frame(
             &init_id,
             json!({"subtype": "initialize", "hooks": session_hooks(
-                config.snapshot_facts_dir.is_some(), workspace_instructions.is_some()
+                config.snapshot_facts_dir.is_some(), true
             )}),
         ))
         .await
@@ -2463,6 +2464,10 @@ async fn run_session_program(
                             json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": effort}}),
                         ))
                         .await
+                    }
+                    HarnessCommand::SetWorkspaceContext(context) => {
+                        workspace_instructions = context;
+                        Ok(())
                     }
                     HarnessCommand::Shutdown => {
                         harness_log(&format!("shutdown requested (pid {pid})"));
@@ -3505,7 +3510,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn session_start_reinjects_workspace_context_after_clear_and_compact() {
+    async fn session_start_reinjects_workspace_context_after_clear_compact_and_move() {
         use std::os::unix::fs::PermissionsExt;
         let fixture = tempfile::tempdir().unwrap();
         let home = fixture.path().join("notes/example-work");
@@ -3556,6 +3561,14 @@ for source in ['startup', 'clear', 'compact', 'resume']:
     assert "Resume only this workspace's work; if unsure which work to continue, ask." in text
     assert 'Starting Codex' not in text
 emit({'type':'result','subtype':'success'})
+read() # the host moves this running chat, then sends /clear
+emit({'type':'control_request','request_id':'moved-clear','request':{'subtype':'hook_callback','callback_id':'gitterm_workspace_context','input':{'hook_event_name':'SessionStart','source':'clear','session_id':'example-session'}}})
+text = read()['response']['response']['hookSpecificOutput']['additionalContext']
+assert 'Workspace: `Destination workspace`' in text
+assert str(Path.cwd().parent / 'destination/docs/checkpoint.md') in text
+assert 'Destination checkpoint written after move' in text
+assert 'Example workspace' not in text and 'Example work' not in text
+emit({'type':'result','subtype':'success'})
 for line in sys.stdin:
     pass
 "#).unwrap();
@@ -3564,7 +3577,7 @@ for line in sys.stdin:
         let (tx, mut events) = mpsc::unbounded_channel();
         let task = tokio::spawn(run_session_program(
             ClaudeSessionConfig {
-                cwd: std::fs::canonicalize(home).unwrap(),
+                cwd: home.clone(),
                 snapshot_facts_dir: None,
                 model: None,
                 permission_mode: "default".into(),
@@ -3582,12 +3595,40 @@ for line in sys.stdin:
             program,
             std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         ));
+        let destination = home.parent().unwrap().join("destination");
+        std::fs::create_dir_all(destination.join("docs")).unwrap();
+        let places = crate::guidelines::document_places(
+            true,
+            true,
+            &destination,
+            None,
+            "Destination workspace",
+            &[],
+        )
+        .unwrap();
+        let mut moved = false;
         loop {
             match tokio::time::timeout(Duration::from_secs(20), events.recv())
                 .await
                 .unwrap()
                 .unwrap()
             {
+                HarnessEvent::TurnCompleted { .. } if !moved => {
+                    commands
+                        .send(HarnessCommand::SetWorkspaceContext(Some(
+                            crate::guidelines::documents_note(&places),
+                        )))
+                        .unwrap();
+                    std::fs::write(
+                        destination.join("docs/checkpoint.md"),
+                        "Destination checkpoint written after move",
+                    )
+                    .unwrap();
+                    commands
+                        .send(HarnessCommand::SendUserMessage(UserPrompt::from("/clear")))
+                        .unwrap();
+                    moved = true;
+                }
                 HarnessEvent::TurnCompleted { .. } => break,
                 HarnessEvent::Error(error) => panic!("mock SessionStart callback: {error}"),
                 HarnessEvent::ProcessExited { code } => {

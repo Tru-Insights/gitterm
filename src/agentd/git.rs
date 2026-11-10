@@ -67,9 +67,13 @@ pub fn collect_repo_status(repo_path: &Path) -> RepoStatus {
         untracked: Vec::new(),
     };
 
+    // Diff paths and the git2 fallback use the repo root, even when a
+    // chat's cwd is a subfolder.
     let cli_result = git_command()
         .args([
             "--no-optional-locks",
+            "-c",
+            "status.relativePaths=false",
             "status",
             "--porcelain=v2",
             "--branch",
@@ -227,6 +231,7 @@ pub fn collect_file_diff(
     untracked_opts
         .no_refresh(true)
         .include_untracked(true)
+        .recurse_untracked_dirs(true)
         .pathspec(file_path);
     let is_untracked = repo
         .statuses(Some(&mut untracked_opts))
@@ -513,6 +518,44 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l.kind == DiffLineKind::Addition && l.content == "hello"));
+    }
+
+    #[test]
+    fn subdir_status_paths_select_the_matching_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "t@example.com"]);
+        git(dir.path(), &["config", "user.name", "T"]);
+        let sub = dir.path().join("work");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("a.txt"), "before\n").unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-q", "-m", "init"]);
+        std::fs::write(sub.join("a.txt"), "after\n").unwrap();
+        std::fs::write(sub.join("b.txt"), "inside work\n").unwrap();
+        std::fs::write(sub.join("staged.txt"), "staged inside work\n").unwrap();
+        git(dir.path(), &["add", "work/staged.txt"]);
+        // A same-named root file must never be selected for work/b.txt.
+        std::fs::write(dir.path().join("b.txt"), "at root\n").unwrap();
+
+        let status = collect_repo_status(&sub);
+        let root_status = collect_repo_status(dir.path());
+        assert_eq!(status.staged, root_status.staged);
+        assert_eq!(status.unstaged, root_status.unstaged);
+        assert_eq!(status.untracked, root_status.untracked);
+        for (entries, path, content) in [
+            (&status.unstaged, "work/a.txt", "after"),
+            (&status.untracked, "work/b.txt", "inside work"),
+            (&status.staged, "work/staged.txt", "staged inside work"),
+        ] {
+            let file = entries.iter().find(|f| f.path == path).unwrap();
+            let diff = collect_file_diff(&sub, &file.path, file.is_staged, 100);
+            assert!(
+                diff.iter()
+                    .any(|line| line.kind == DiffLineKind::Addition && line.content == content),
+                "{path}: {diff:?}"
+            );
+        }
     }
 
     #[test]
