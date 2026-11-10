@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::merge_plan::{MergeMethod, PrBrief, PrKey, PrState};
+use crate::merge_plan::{MergeMethod, PrBrief, PrKey, PrRef, PrState};
 
 /// Poll interval for PRs of open workspaces.
 pub const OPEN_INTERVAL: Duration = Duration::from_secs(120);
@@ -966,6 +966,69 @@ pub async fn run_action(
     }
 }
 
+/// PRs on a delegated task's head branch, using the watch's account and
+/// command isolation. An empty answer is successful and may be read again.
+pub async fn branch_prs(
+    repo: &str,
+    branch: &str,
+    account: Option<String>,
+) -> Result<Vec<PrRef>, String> {
+    if !crate::merge_plan::valid_repo(repo) || branch.is_empty() {
+        return Err(format!(
+            "invalid PR lookup repo {repo:?} or branch {branch:?}"
+        ));
+    }
+    let token = match account.as_deref() {
+        Some(user) => Some(account_token(user).await?),
+        None => None,
+    };
+    let mut command = gh_async(token.as_deref())?;
+    command.args([
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--head",
+        branch,
+        "--state",
+        "all",
+        "--json",
+        "number,url",
+    ]);
+    let what = format!("gh pr list --repo {repo} --head {branch}");
+    let output = output_within(command, &what).await?;
+    if !output.status.success() {
+        return Err(format!(
+            "{what}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_branch_prs(repo, &output.stdout).map_err(|error| format!("{what}: {error}"))
+}
+
+fn parse_branch_prs(repo: &str, bytes: &[u8]) -> Result<Vec<PrRef>, String> {
+    #[derive(Deserialize)]
+    struct BranchPr {
+        number: u64,
+        url: String,
+    }
+    let prs: Vec<BranchPr> =
+        serde_json::from_slice(bytes).map_err(|error| format!("decode PRs: {error}"))?;
+    prs.into_iter()
+        .map(|pr| {
+            let key = PrKey::new(repo, pr.number);
+            if pr.number == 0 || !pr.url.eq_ignore_ascii_case(&key.url()) {
+                return Err(format!("invalid PR number or URL for {}", key.label()));
+            }
+            Ok(PrRef {
+                repo: repo.to_string(),
+                number: pr.number,
+                url: pr.url,
+            })
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Conditional REST through `gh api -i`.
 
@@ -1510,6 +1573,25 @@ pub async fn poll(request: PollRequest) -> PollOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branch_pr_answers_require_valid_numbers_and_matching_urls() {
+        let prs = parse_branch_prs(
+            "acme/api",
+            br#"[{"number":7,"url":"https://github.com/acme/api/pull/7"}]"#,
+        )
+        .unwrap();
+        assert_eq!(prs[0].key(), PrKey::new("acme/api", 7));
+        assert!(parse_branch_prs("acme/api", b"[]").unwrap().is_empty());
+        for invalid in [
+            br#"[{"number":7}]"#.as_slice(),
+            br#"[{"number":0,"url":"https://github.com/acme/api/pull/0"}]"#,
+            br#"[{"number":7,"url":"https://github.com/other/api/pull/7"}]"#,
+            b"not json",
+        ] {
+            assert!(parse_branch_prs("acme/api", invalid).is_err());
+        }
+    }
 
     fn core(state: PrState, sha: &str) -> PullCore {
         PullCore {
