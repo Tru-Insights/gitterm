@@ -816,7 +816,6 @@ pub struct ProviderReport {
     /// reached) and has not reset since. Holds are only set from fresh
     /// readings, so this is what stops a launch on a reading first seen
     /// stale (TRU-232).
-    #[serde(skip)]
     pub stale_exhausted: bool,
 }
 
@@ -1141,12 +1140,12 @@ fn provider_evaluation(
             });
         }
         if let Some(state) = &mut policy.weekly {
-            // Only a real reading (or an alert) holds a provider: a held
+            // Only a fresh reading (or an alert) holds a provider: a held
             // provider never runs, so it never sends the fresh reading that
             // would release a hold set by an estimate. An estimate past the
             // line only makes the week hot.
             let next = if weekly_alert
-                || weekly.used_percent.is_some_and(|p| p >= ALMOST_OUT_PERCENT)
+                || (fresh && weekly.used_percent.is_some_and(|p| p >= ALMOST_OUT_PERCENT))
                 || state.state == WeeklyState::AlmostOut
             {
                 WeeklyState::AlmostOut
@@ -1325,10 +1324,11 @@ fn held(policy: &ProviderPolicy) -> bool {
 }
 
 fn weekly_available(report: &ProviderReport) -> bool {
-    report
-        .windows
-        .iter()
-        .any(|w| w.label == "7d" && w.pace.is_some() && (!report.stale || w.estimated))
+    !report.stale_exhausted
+        && report
+            .windows
+            .iter()
+            .any(|w| w.label == "7d" && w.pace.is_some() && (!report.stale || w.estimated))
 }
 
 /// "Codex weekly ≈31% is an estimate from a 25% reading as of 15:02 UTC."
@@ -1408,7 +1408,10 @@ pub fn evaluate_policy(file: &PlanLimitsFile, now: i64) -> PolicyEvaluation {
         now,
     );
     notices.extend(codex_notices);
-    let held_state = match (held(&claude), held(&codex)) {
+    let held_state = match (
+        held(&claude) || claude_report.stale_exhausted,
+        held(&codex) || codex_report.stale_exhausted,
+    ) {
         (true, true) => RoutingState::Conserve,
         (true, false) => RoutingState::HoldClaude,
         (false, true) => RoutingState::HoldCodex,
@@ -3053,6 +3056,65 @@ mod policy_tests {
             .iter()
             .find(|w| w.label == "7d")
             .unwrap()
+    }
+
+    #[test]
+    fn stale_weekly_96_first_seen_releases_after_reset_but_fresh_hold_persists() {
+        let mut stale = idle_codex(96.0);
+        let before = step(&mut stale, NOW + 3600);
+        assert!(before.report.codex.stale_exhausted);
+        assert!(!before.allows_start(Provider::Codex, false, false));
+        let after = step(&mut stale, NOW + 4 * 86400 + 1);
+        assert!(!after.report.codex.stale_exhausted);
+        assert!(after.allows_start(Provider::Codex, false, false));
+        assert_ne!(after.report.routing.state, RoutingState::HoldCodex);
+        assert_eq!(
+            before.policy.codex.weekly.as_ref().unwrap().state,
+            WeeklyState::Hot
+        );
+
+        let mut fresh = idle_codex(96.0);
+        let before = step(&mut fresh, NOW);
+        assert_eq!(before.report.routing.state, RoutingState::HoldCodex);
+        assert!(!before.allows_start(Provider::Codex, false, false));
+        // A hold established fresh still needs a fresh reset reading.
+        let after = step(&mut fresh, NOW + 4 * 86400 + 1);
+        assert_eq!(after.report.routing.state, RoutingState::HoldCodex);
+        assert!(!after.allows_start(Provider::Codex, false, false));
+    }
+
+    fn stale_exhausted_burst() -> PolicyEvaluation {
+        let mut file = idle_codex(25.0);
+        file.codex.as_mut().unwrap().windows.push(LimitWindow {
+            label: "5h".into(),
+            used_percent: Some(100.0),
+            resets_at: Some(NOW + 3 * 3600),
+        });
+        evaluate_policy(&file, NOW + 3600)
+    }
+
+    #[test]
+    fn stale_exhausted_provider_is_held_in_routing_and_unavailable() {
+        let e = stale_exhausted_burst();
+        assert!(e.report.codex.stale_exhausted);
+        assert!(!e.allows_start(Provider::Codex, false, false));
+        assert_eq!(e.report.routing.state, RoutingState::HoldCodex);
+        assert!(e.report.routing.constrained);
+        assert!(e
+            .report
+            .routing
+            .reason
+            .contains("start nothing new on Codex"));
+        assert!(!e.report.routing.reason.contains("Flexible jobs to Codex"));
+        assert!(!weekly_available(&e.report.codex));
+    }
+
+    #[test]
+    fn stale_exhausted_is_in_the_plan_limits_report() {
+        let e = stale_exhausted_burst();
+        let json = serde_json::to_value(&e.report).unwrap();
+        assert_eq!(json["codex"]["stale_exhausted"], true);
+        assert_eq!(json["claude"]["stale_exhausted"], false);
     }
 
     #[test]
