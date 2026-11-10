@@ -953,9 +953,9 @@ pub struct ClaudeSessionConfig {
     /// own browser tools are the agents' browser. Always explicit, so the
     /// CLI's own default never decides.
     pub chrome: bool,
-    /// GitTerm's launch instructions (TRU-174). The static part is appended
-    /// with `--append-system-prompt-file`; the workspace note goes through
-    /// SessionStart so a move can replace it. The caller checks readability.
+    /// GitTerm's change guidelines (TRU-174), appended to Claude's system
+    /// prompt with `--append-system-prompt-file`. The caller checks the
+    /// file is readable: a missing one makes the CLI refuse to start.
     pub guidelines_file: Option<PathBuf>,
     /// Remote-start guidelines supplied by the desktop. Written to a
     /// temporary file for the Claude process lifetime on the agent.
@@ -1022,12 +1022,12 @@ pub fn chrome_flag(chrome: bool) -> &'static str {
     }
 }
 
-struct SessionGuidelinesFile(PathBuf);
+struct RemoteGuidelinesFile(PathBuf);
 
-impl SessionGuidelinesFile {
+impl RemoteGuidelinesFile {
     fn create(text: &str) -> Result<Self, String> {
         let path = std::env::temp_dir().join(format!(
-            "gitterm-v6-session-guidelines-{}.md",
+            "gitterm-v6-remote-guidelines-{}.md",
             uuid::Uuid::new_v4()
         ));
         let mut file = std::fs::OpenOptions::new()
@@ -1047,12 +1047,12 @@ impl SessionGuidelinesFile {
     }
 }
 
-impl Drop for SessionGuidelinesFile {
+impl Drop for RemoteGuidelinesFile {
     fn drop(&mut self) {
         if let Err(error) = std::fs::remove_file(&self.0) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 harness_log(&format!(
-                    "remove temporary session guidelines {}: {error}",
+                    "remove temporary remote guidelines {}: {error}",
                     self.0.display()
                 ));
             }
@@ -2052,7 +2052,7 @@ async fn run_session_program(
     )
     .with_close_token(close_token.clone());
     let remote_guidelines = match config.guidelines_content.as_deref() {
-        Some(text) => match SessionGuidelinesFile::create(text) {
+        Some(text) => match RemoteGuidelinesFile::create(text) {
             Ok(file) => Some(file),
             Err(error) => return fail(error),
         },
@@ -2076,22 +2076,6 @@ async fn run_session_program(
         },
         None => None,
     };
-    // The CLI retains appended system text across /clear. Keep mutable
-    // workspace instructions exclusively in the SessionStart callback.
-    let system_guidelines = match workspace_instructions.as_deref() {
-        Some(text) => {
-            match SessionGuidelinesFile::create(&crate::guidelines::without_workspace_context(text))
-            {
-                Ok(file) => Some(file),
-                Err(error) => return fail(error),
-            }
-        }
-        None => None,
-    };
-    let guidelines_file = system_guidelines
-        .as_ref()
-        .map(|file| file.path())
-        .or(guidelines_file);
     let args = config.args_with_guidelines_file(guidelines_file);
     let mut cmd = Command::new(&program);
     cmd.args(&args)
@@ -3547,20 +3531,13 @@ mod tests {
         let guidelines = fixture.path().join("instructions.md");
         std::fs::write(
             &guidelines,
-            format!(
-                "Change guidelines stay in system.\n\n{note}\n\n{}",
-                crate::guidelines::CODEX_TOOLS_NOTE
-            ),
+            format!("{note}\n{}", crate::guidelines::CODEX_TOOLS_NOTE),
         )
         .unwrap();
         let program = fixture.path().join("mock-claude");
         std::fs::write(&program, r#"#!/usr/bin/env python3
 import json, sys
 from pathlib import Path
-system_file = Path(sys.argv[sys.argv.index('--append-system-prompt-file') + 1])
-system = system_file.read_text()
-assert system == 'Change guidelines stay in system.\n\n' + Path('expected-tools-note.md').read_text(), system
-assert 'Example workspace' not in system and 'docs/checkpoint.md' not in system
 def emit(value):
     print(json.dumps(value), flush=True)
 def read():
@@ -3583,7 +3560,6 @@ for source in ['startup', 'clear', 'compact', 'resume']:
     assert str(Path.cwd() / 'docs/checkpoint.md') in text
     assert "Resume only this workspace's work; if unsure which work to continue, ask." in text
     assert 'Starting Codex' not in text
-    assert text == Path('expected-workspace-note.md').read_text().rstrip()
 emit({'type':'result','subtype':'success'})
 read() # the host moves this running chat, then sends /clear
 emit({'type':'control_request','request_id':'moved-clear','request':{'subtype':'hook_callback','callback_id':'gitterm_workspace_context','input':{'hook_event_name':'SessionStart','source':'clear','session_id':'example-session'}}})
@@ -3592,17 +3568,10 @@ assert 'Workspace: `Destination workspace`' in text
 assert str(Path.cwd().parent / 'destination/docs/checkpoint.md') in text
 assert 'Destination checkpoint written after move' in text
 assert 'Example workspace' not in text and 'Example work' not in text
-assert system_file.read_text() == system
 emit({'type':'result','subtype':'success'})
 for line in sys.stdin:
     pass
 "#).unwrap();
-        std::fs::write(home.join("expected-workspace-note.md"), &note).unwrap();
-        std::fs::write(
-            home.join("expected-tools-note.md"),
-            crate::guidelines::CODEX_TOOLS_NOTE,
-        )
-        .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         let (commands, rx) = mpsc::unbounded_channel();
         let (tx, mut events) = mpsc::unbounded_channel();
@@ -4029,7 +3998,7 @@ for line in sys.stdin:
     #[test]
     fn remote_guidelines_use_a_temporary_prompt_file() {
         let text = "Guidelines supplied by the desktop.";
-        let file = SessionGuidelinesFile::create(text).unwrap();
+        let file = RemoteGuidelinesFile::create(text).unwrap();
         assert_eq!(std::fs::read_to_string(file.path()).unwrap(), text);
         let config = ClaudeSessionConfig {
             cwd: PathBuf::from("/tmp"),

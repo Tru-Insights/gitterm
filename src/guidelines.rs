@@ -26,10 +26,9 @@
 //!
 //! An agent started in a piece of work also gets a short documents note
 //! (TRU-191, [`launch_instructions`]) naming the work's docs folder and its
-//! decisions repo. It goes in through the same options, except Claude chat
-//! supplies it through SessionStart so a workspace move can replace it. For
-//! the harnesses that read a file, the guidelines and the note are written
-//! together to a per-launch file.
+//! decisions repo. It goes in through the same options; for the harnesses
+//! that read a file, the guidelines and the note are written together to a
+//! per-launch file.
 //!
 //! Every agent given GitTerm's task tools also gets a short note on
 //! starting Codex through them (TRU-212, [`CODEX_TOOLS_NOTE`]), with or
@@ -244,7 +243,7 @@ pub fn document_places(
 /// The text appended for `places`, naming both locations as paths.
 pub fn documents_note(places: &DocumentPlaces) -> String {
     let mut note = format!(
-        "{DOCUMENTS_HEADING}\n\
+        "# Documents for this work (added by GitTerm)\n\n\
          - Working notes for this work (status, plans, scratch) go in \
          `{}`. That folder is private and not in git.\n",
         places.docs_dir.display()
@@ -280,7 +279,6 @@ pub fn documents_note(places: &DocumentPlaces) -> String {
     note
 }
 
-const DOCUMENTS_HEADING: &str = "# Documents for this work (added by GitTerm)\n";
 const CHECKPOINT_LINE: &str = "- Workspace checkpoint: `";
 
 /// The workspace's own checkpoint (TRU-237): repos are shared between
@@ -345,11 +343,11 @@ fn checkpoint_start(path: &Path) -> Option<String> {
     ))
 }
 
-/// The workspace section of launch instructions, supplied by Claude's
-/// SessionStart callback at startup, clear, compact and resume. The checkpoint status
+/// The workspace section of appended instructions, also supplied by Claude's
+/// SessionStart callback after a clear or compaction. The checkpoint status
 /// and start are read from disk on each call, not taken from the text.
 pub fn workspace_context(instructions: &str) -> Option<String> {
-    let start = instructions.find(DOCUMENTS_HEADING)?;
+    let start = instructions.find("# Documents for this work (added by GitTerm)\n")?;
     let section = &instructions[start..];
     // The checkpoint line ends the note's fixed part; what follows it (the
     // checkpoint's own text, which may hold any heading) is read again.
@@ -362,22 +360,6 @@ pub fn workspace_context(instructions: &str) -> Option<String> {
             .trim_end()
             .to_string(),
     )
-}
-
-/// Claude keeps appended system instructions across `/clear`. Only
-/// SessionStart may carry the workspace note, which a tab move can replace.
-pub fn without_workspace_context(instructions: &str) -> String {
-    let Some(start) = instructions.find(DOCUMENTS_HEADING) else {
-        return instructions.to_string();
-    };
-    // launch_instructions puts the documents note last, except for this
-    // optional suffix. Do not split at headings inside the checkpoint.
-    let suffix = if instructions.ends_with(CODEX_TOOLS_NOTE) {
-        CODEX_TOOLS_NOTE
-    } else {
-        ""
-    };
-    format!("{}{suffix}", &instructions[..start])
 }
 
 /// How agents in GitTerm start Codex (TRU-212): through GitTerm's task
@@ -928,40 +910,6 @@ mod tests {
         );
         assert_eq!(launch_instructions(None, None, false, launch.path()), None);
         assert_eq!(std::fs::read_dir(launch.path()).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn claude_system_instructions_preserve_everything_except_workspace_context() {
-        let fixture = tempfile::tempdir().unwrap();
-        let places =
-            document_places(true, true, fixture.path(), None, "Example work", &[]).unwrap();
-        std::fs::create_dir_all(&places.docs_dir).unwrap();
-        std::fs::write(
-            places.docs_dir.join("checkpoint.md"),
-            "# Arbitrary checkpoint heading\n\n```sh\necho checkpoint\n```",
-        )
-        .unwrap();
-        for guidelines in [None, Some(sample())] {
-            for task_tools in [false, true] {
-                let launch = launch_instructions(
-                    guidelines.clone(),
-                    Some(&places),
-                    task_tools,
-                    fixture.path(),
-                )
-                .unwrap();
-                let mut expected = guidelines
-                    .as_ref()
-                    .map(|g| format!("{}\n\n", g.text.trim_end()))
-                    .unwrap_or_default();
-                if task_tools {
-                    expected.push_str(CODEX_TOOLS_NOTE);
-                }
-                assert_eq!(without_workspace_context(&launch.text), expected);
-            }
-        }
-        let static_text = format!("{}\n\n{}", sample().text, CODEX_TOOLS_NOTE);
-        assert_eq!(without_workspace_context(&static_text), static_text);
     }
 
     fn sample() -> Guidelines {
