@@ -68,7 +68,8 @@ pub struct ChatFacts {
     /// result naming a GitHub PR URL (TRU-173, TRU-257).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prs: Vec<PrRef>,
-    /// PR keys observed as creates by a running tab. Reconciliation never
+    /// Confirmed create PR keys from live tabs, transcripts or workers.
+    /// The historical field name is retained for saved facts. Reconciliation never
     /// removes these, even when a transcript lags or has been compacted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub live_created_prs: Vec<String>,
@@ -742,7 +743,7 @@ impl RawFacts {
     }
 
     /// Remove only with complete, exclusively read-only output evidence across
-    /// parent and child files. Live provenance and all other output win.
+    /// parent and child files. Confirmed provenance and all other output win.
     fn reconcile_prs(&self, facts: &mut ChatFacts) -> Vec<PrRef> {
         let created: HashSet<_> = self.prs.iter().map(|pr| pr.key().id()).collect();
         let read_only: HashSet<_> = self.read_only_prs.iter().map(|pr| pr.key().id()).collect();
@@ -758,6 +759,10 @@ impl RawFacts {
         }
         let mut added = Vec::new();
         for pr in &self.prs {
+            let id = pr.key().id();
+            if !facts.live_created_prs.contains(&id) {
+                facts.live_created_prs.push(id);
+            }
             if !facts
                 .prs
                 .iter()
@@ -799,6 +804,10 @@ impl RawFacts {
             facts.add_child(child);
         }
         for pr in self.prs {
+            let id = pr.key().id();
+            if !facts.live_created_prs.contains(&id) {
+                facts.live_created_prs.push(id);
+            }
             facts.add_pr(pr);
         }
         for id in self.live_created_prs {
@@ -1368,8 +1377,9 @@ pub fn catch_up_workspace_prs(
             }
         };
         let previous = facts.prs.clone();
+        let confirmed = facts.live_created_prs.len();
         let added = scan.reconcile_prs(&mut facts).len();
-        if facts.prs != previous {
+        if facts.prs != previous || facts.live_created_prs.len() != confirmed {
             // Only PRs were recorded, so the file must not look as current
             // as a full scan: keep its old time (a new file gets the epoch),
             // and a later catch-up or backfill still absorbs the rest.
@@ -1482,7 +1492,8 @@ pub(crate) fn record_worker_prs(
 
 /// Whether the shell actually invokes `gh pr create`, including chains,
 /// environment assignments, executable paths and command substitutions.
-/// Quoted arguments, comments and heredoc bodies are not command words.
+/// Quoting preserves literal executable tokens; quoted phrases, comments and
+/// heredoc bodies are not separate command words.
 pub fn is_gh_pr_create(command: &str) -> bool {
     pr_create_command_kind(command) == Some(true)
 }
@@ -1548,7 +1559,7 @@ fn shell_command_creates_pr(command: &ShellCommand) -> Option<bool> {
             at += 1;
             continue;
         }
-        if command.quoted[at] {
+        if command.quoted[at] && word.rsplit('/').next() != Some("gh") {
             return Some(false);
         }
         if matches!(
@@ -4583,7 +4594,7 @@ branch refs/heads/tracey/tru-12-thing
             known.add_issue_key("LIVE-1");
             if id == "owned" {
                 known.add_pr(
-                    merge_plan::pr_urls_in("https://github.com/fake/repo/pull/42").remove(0),
+                    merge_plan::pr_urls_in("https://github.com/acme/api/pull/42").remove(0),
                 );
             }
             let path = facts_dir.join(format!("claude-{id}.json"));
@@ -4641,7 +4652,11 @@ branch refs/heads/tracey/tru-12-thing
         // Removal-only reconciliation must also write, even with no new PRs.
         std::fs::write(
             &entries[0].path,
-            pr_lines(81).replace("CO=$(gh pr create --fill); echo $CO", "grep create x.rs"),
+            [
+                pr_lines(42).replace("CO=$(gh pr create --fill); echo $CO", "grep create x.rs"),
+                pr_lines(81).replace("CO=$(gh pr create --fill); echo $CO", "grep create x.rs"),
+            ]
+            .join("\n"),
         )
         .unwrap();
         std::fs::remove_file(&sub).unwrap();
@@ -4654,7 +4669,7 @@ branch refs/heads/tracey/tru-12-thing
             0
         );
         let numbers: Vec<u64> = read("owned").prs.iter().map(|pr| pr.number).collect();
-        assert_eq!(numbers, vec![42, 82]);
+        assert_eq!(numbers, vec![81, 82]);
     }
 
     fn pr_result_lines(id: &str, command: &str, number: u64) -> String {
@@ -4671,6 +4686,104 @@ branch refs/heads/tracey/tru-12-thing
         .map(Value::to_string)
         .collect::<Vec<_>>()
         .join("\n")
+    }
+
+    #[test]
+    fn review_regression_transcript_created_pr_survives_rotation_after_each_scan_path() {
+        for mode in ["chat", "workspace", "backfill"] {
+            let temp = tempfile::tempdir().unwrap();
+            let transcript = temp.path().join("session.jsonl");
+            std::fs::write(
+                &transcript,
+                pr_result_lines("create", "gh pr create --fill", 42),
+            )
+            .unwrap();
+            let dir = temp.path().join("facts");
+            let path = facts_path(&dir, ChatBackend::Claude, "session").unwrap();
+            // Existing unconfirmed records must gain provenance too, even
+            // when the workspace scan adds no new PRs.
+            let mut known = ChatFacts::default();
+            known.prs = merge_plan::pr_urls_in("https://github.com/acme/api/pull/42");
+            write_facts(&path, &known).unwrap();
+            match mode {
+                "workspace" => {
+                    let mut chat = entry("session", "Session");
+                    chat.path = transcript.clone();
+                    catch_up_workspace_prs(
+                        &[chat],
+                        &HashSet::from(["session".into()]),
+                        &HashSet::new(),
+                        &dir,
+                        None,
+                    );
+                }
+                "backfill" => {
+                    let report = backfill_claude(
+                        vec![BackfillTarget {
+                            id: "session".into(),
+                            path: transcript.clone(),
+                            mtime: SystemTime::now(),
+                        }],
+                        &dir,
+                        &HashSet::new(),
+                        &[],
+                        10,
+                        FactPaths::default(),
+                    );
+                    assert_eq!(report.scanned, 1);
+                }
+                _ => {
+                    flush_live(
+                        &dir,
+                        ChatBackend::Claude,
+                        "session",
+                        RawFacts::default(),
+                        vec![],
+                        Some(&transcript),
+                        FactPaths::default(),
+                    )
+                    .unwrap();
+                }
+            }
+            std::fs::write(
+                &transcript,
+                pr_result_lines("grep", "grep -rn create . | head", 42),
+            )
+            .unwrap();
+            for _ in 0..2 {
+                flush_live(
+                    &dir,
+                    ChatBackend::Claude,
+                    "session",
+                    RawFacts::default(),
+                    vec![],
+                    Some(&transcript),
+                    FactPaths::default(),
+                )
+                .unwrap();
+                let facts = load_facts(&path).unwrap().unwrap();
+                assert_eq!(facts.prs, known.prs, "{mode}");
+                assert_eq!(facts.live_created_prs, vec!["acme/api#42"], "{mode}");
+            }
+        }
+    }
+
+    #[test]
+    fn review_regression_quoted_literal_gh_executable_records_a_create() {
+        for command in [
+            r#""/opt/homebrew/bin/gh" pr create --fill"#,
+            "'gh' pr create --fill",
+        ] {
+            assert!(is_gh_pr_create(command), "{command}");
+            let temp = tempfile::tempdir().unwrap();
+            let transcript = temp.path().join("session.jsonl");
+            std::fs::write(&transcript, pr_result_lines("create", command, 42)).unwrap();
+            assert_eq!(
+                scan_claude_transcript(&transcript, None).unwrap().prs.len(),
+                1
+            );
+        }
+        assert!(!is_gh_pr_create("'gh pr create'"));
     }
 
     #[test]
