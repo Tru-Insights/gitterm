@@ -677,9 +677,14 @@ fn push_guidelines_marker(tab_id: usize, on: bool) {
 fn launch_guidelines(
     cwd: &Path,
     workspace_off: bool,
-    claude: bool,
+    instruction_file: gitterm::guidelines::InstructionFile,
 ) -> Option<gitterm::guidelines::Guidelines> {
-    gitterm::guidelines::for_launch(&config::global_config_dir(), cwd, workspace_off, claude)
+    gitterm::guidelines::for_launch(
+        &config::global_config_dir(),
+        cwd,
+        workspace_off,
+        instruction_file,
+    )
 }
 
 /// What an agent starting now in `cwd` gets appended: the guidelines and,
@@ -689,7 +694,7 @@ fn launch_guidelines(
 /// the agent starts; a failure is logged and the note still names it.
 fn launch_instructions(
     cwd: &Path,
-    claude: bool,
+    instruction_file: gitterm::guidelines::InstructionFile,
     workspace_off: bool,
     places: Option<&gitterm::guidelines::DocumentPlaces>,
     task_tools: bool,
@@ -703,7 +708,7 @@ fn launch_instructions(
         }
     }
     gitterm::guidelines::launch_instructions(
-        launch_guidelines(cwd, workspace_off, claude),
+        launch_guidelines(cwd, workspace_off, instruction_file),
         places,
         task_tools,
         &config::instance_config_dir(),
@@ -750,7 +755,7 @@ fn terminal_command_with_guidelines(
     }
     match launch_instructions(
         cwd,
-        gitterm::guidelines::is_claude_command(command),
+        gitterm::guidelines::instruction_file_for_command(command),
         workspace_off,
         places,
         task_tools,
@@ -11337,7 +11342,11 @@ impl App {
             && launch_guidelines(
                 &tab.repo_path,
                 ws.guidelines_off,
-                session.backend() == tab::AgentBackend::Claude,
+                match session.backend() {
+                    tab::AgentBackend::Claude => gitterm::guidelines::InstructionFile::ClaudeMd,
+                    tab::AgentBackend::Pi => gitterm::guidelines::InstructionFile::AgentsMd,
+                    tab::AgentBackend::Acp(_) => gitterm::guidelines::InstructionFile::Unknown,
+                },
             )
             .is_some()
     }
@@ -18045,7 +18054,7 @@ impl App {
                     // tools, so it is not told to use them.
                     run.guidelines = launch_instructions(
                         &run.cwd,
-                        false,
+                        gitterm::guidelines::InstructionFile::AgentsMd,
                         self.workspace_guidelines_off(&delegation.parent.workspace),
                         self.workspace_document_places(&delegation.parent.workspace)
                             .as_ref(),
@@ -24388,7 +24397,7 @@ fi
                                     .any(|server| server.name == "gitterm_tasks");
                                 let guidelines = launch_instructions(
                                     &repo_path,
-                                    false,
+                                    gitterm::guidelines::InstructionFile::Unknown,
                                     guidelines_off,
                                     document_places.as_ref(),
                                     task_tools,
@@ -24480,7 +24489,7 @@ fi
                                 });
                                 let guidelines_file = launch_instructions(
                                     &repo_path,
-                                    true,
+                                    gitterm::guidelines::InstructionFile::ClaudeMd,
                                     guidelines_off,
                                     document_places.as_ref(),
                                     task_tools,
@@ -24570,7 +24579,7 @@ fi
                             // A per-turn pi process gets no MCP servers.
                             let guidelines_file = launch_instructions(
                                 &repo_path,
-                                false,
+                                gitterm::guidelines::InstructionFile::AgentsMd,
                                 guidelines_off,
                                 document_places.as_ref(),
                                 false,
@@ -32230,7 +32239,7 @@ fi
                 .any(|server| server.name == "gitterm_tasks");
             let guidelines = launch_instructions(
                 &repo_path,
-                false,
+                gitterm::guidelines::InstructionFile::Unknown,
                 guidelines_off,
                 document_places.as_ref(),
                 task_tools,

@@ -3042,7 +3042,12 @@ mod tests {
             "Follow the repository rules.\n",
         )
         .unwrap();
-        let on = crate::guidelines::for_launch(config_dir.path(), repo.path(), false, false);
+        let on = crate::guidelines::for_launch(
+            config_dir.path(),
+            repo.path(),
+            false,
+            crate::guidelines::InstructionFile::Unknown,
+        );
         assert!(on.is_some());
         let off_settings = crate::guidelines::GuidelinesSettings {
             enabled: true,
@@ -3051,9 +3056,13 @@ mod tests {
                 .into_owned()],
         };
         crate::guidelines::save_settings(config_dir.path(), &off_settings).unwrap();
-        assert!(
-            crate::guidelines::for_launch(config_dir.path(), repo.path(), false, false).is_none()
-        );
+        assert!(crate::guidelines::for_launch(
+            config_dir.path(),
+            repo.path(),
+            false,
+            crate::guidelines::InstructionFile::Unknown,
+        )
+        .is_none());
 
         let on = on.unwrap();
         assert_eq!(on.text, "Follow the repository rules.\n");

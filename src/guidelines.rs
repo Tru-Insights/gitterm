@@ -170,9 +170,17 @@ pub fn applies(settings: &GuidelinesSettings, cwd: &Path, workspace_off: bool) -
     settings.enabled && !workspace_off && !settings.repo_is_off(cwd)
 }
 
+/// The instruction file a harness reads by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructionFile {
+    ClaudeMd,
+    AgentsMd,
+    Unknown,
+}
+
 /// Whether the launch's own checkout supplies the kit rules. Do not use
 /// `repo_key`: linked worktrees can have different instruction files.
-pub fn repo_provides_guidelines(cwd: &Path, claude: bool) -> bool {
+pub fn repo_provides_guidelines(cwd: &Path, instruction_file: InstructionFile) -> bool {
     let Ok(repo) = git2::Repository::discover(cwd) else {
         return false;
     };
@@ -194,13 +202,14 @@ pub fn repo_provides_guidelines(cwd: &Path, claude: bool) -> bool {
     if !read("AGENTS.md").is_some_and(|text| text.contains("<!-- agent-kit:begin")) {
         return false;
     }
-    if !claude {
-        return true;
-    }
-    match std::fs::symlink_metadata(root.join("CLAUDE.md")) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        _ => read("CLAUDE.md")
-            .is_some_and(|text| text.lines().any(|line| line.trim() == "@AGENTS.md")),
+    match instruction_file {
+        InstructionFile::AgentsMd => true,
+        InstructionFile::Unknown => false,
+        InstructionFile::ClaudeMd => match std::fs::symlink_metadata(root.join("CLAUDE.md")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            _ => read("CLAUDE.md")
+                .is_some_and(|text| text.lines().any(|line| line.trim() == "@AGENTS.md")),
+        },
     }
 }
 
@@ -218,10 +227,10 @@ pub fn for_launch(
     config_dir: &Path,
     cwd: &Path,
     workspace_off: bool,
-    claude: bool,
+    instruction_file: InstructionFile,
 ) -> Option<Guidelines> {
     if !applies(&load_settings(config_dir), cwd, workspace_off)
-        || repo_provides_guidelines(cwd, claude)
+        || repo_provides_guidelines(cwd, instruction_file)
     {
         return None;
     }
@@ -489,9 +498,13 @@ fn split_command(command: &str) -> (&str, &str, &str) {
     (executable, name, rest)
 }
 
-/// Whether a terminal startup command needs Claude's AGENTS.md import check.
-pub fn is_claude_command(command: &str) -> bool {
-    split_command(command).1 == "claude"
+/// The default instruction file read by a supported terminal harness.
+pub fn instruction_file_for_command(command: &str) -> InstructionFile {
+    match split_command(command).1 {
+        "claude" => InstructionFile::ClaudeMd,
+        "codex" | "pi" => InstructionFile::AgentsMd,
+        _ => InstructionFile::Unknown,
+    }
 }
 
 /// Whether a terminal startup command starts `claude`, `pi` or `codex`.
@@ -697,9 +710,9 @@ mod tests {
     #[test]
     fn for_launch_reads_the_file_and_honours_the_settings() {
         let dir = tempfile::tempdir().unwrap();
-        let launch = for_launch(dir.path(), dir.path(), false, false).unwrap();
+        let launch = for_launch(dir.path(), dir.path(), false, InstructionFile::Unknown).unwrap();
         assert_eq!(launch.text, DEFAULT_GUIDELINES);
-        assert!(for_launch(dir.path(), dir.path(), true, false).is_none());
+        assert!(for_launch(dir.path(), dir.path(), true, InstructionFile::Unknown).is_none());
         save_settings(
             dir.path(),
             &GuidelinesSettings {
@@ -708,20 +721,57 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(for_launch(dir.path(), dir.path(), false, false).is_none());
+        assert!(for_launch(dir.path(), dir.path(), false, InstructionFile::Unknown).is_none());
     }
 
     #[test]
     fn kit_detection_keeps_workspace_notes_for_every_launch() {
-        for (git, marker, claude_file, claude, skip) in [
-            (true, true, Some("@AGENTS.md\n"), true, true),
-            (true, true, None, true, true),
-            (true, false, Some("@AGENTS.md\n"), true, false),
-            (true, true, Some("Read AGENTS.md\n"), true, false),
-            (true, true, Some("# @AGENTS.md\n"), true, false),
-            (true, true, Some("Read AGENTS.md\n"), false, true),
-            (true, true, None, false, true),
-            (false, true, Some("@AGENTS.md\n"), true, false),
+        for (git, marker, claude_file, instruction_file, skip) in [
+            (
+                true,
+                true,
+                Some("@AGENTS.md\n"),
+                InstructionFile::ClaudeMd,
+                true,
+            ),
+            (true, true, None, InstructionFile::ClaudeMd, true),
+            (
+                true,
+                false,
+                Some("@AGENTS.md\n"),
+                InstructionFile::ClaudeMd,
+                false,
+            ),
+            (
+                true,
+                true,
+                Some("Read AGENTS.md\n"),
+                InstructionFile::ClaudeMd,
+                false,
+            ),
+            (
+                true,
+                true,
+                Some("# @AGENTS.md\n"),
+                InstructionFile::ClaudeMd,
+                false,
+            ),
+            (
+                true,
+                true,
+                Some("Read AGENTS.md\n"),
+                InstructionFile::AgentsMd,
+                true,
+            ),
+            (true, true, None, InstructionFile::AgentsMd, true),
+            (true, true, None, InstructionFile::Unknown, false),
+            (
+                false,
+                true,
+                Some("@AGENTS.md\n"),
+                InstructionFile::ClaudeMd,
+                false,
+            ),
         ] {
             let fixture = tempfile::tempdir().unwrap();
             let repo = fixture.path().join("repo");
@@ -745,11 +795,11 @@ mod tests {
             // Only the top-level marker decides, even from a subfolder.
             std::fs::write(cwd.join("AGENTS.md"), "<!-- agent-kit:begin -->").unwrap();
             let config = fixture.path().join("config");
-            let guidelines = for_launch(&config, &cwd, false, claude);
+            let guidelines = for_launch(&config, &cwd, false, instruction_file);
             assert_eq!(
                 guidelines.is_none(),
                 skip,
-                "git={git}, marker={marker}, claude_file={claude_file:?}, claude={claude}"
+                "git={git}, marker={marker}, claude_file={claude_file:?}, instruction_file={instruction_file:?}"
             );
             let places = document_places(
                 true,
@@ -787,10 +837,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A directory where the file should be cannot be read as text.
         std::fs::create_dir_all(dir.path().join(GUIDELINES_FILE)).unwrap();
-        assert!(for_launch(dir.path(), dir.path(), false, false).is_none());
+        assert!(for_launch(dir.path(), dir.path(), false, InstructionFile::Unknown).is_none());
         let empty = tempfile::tempdir().unwrap();
         std::fs::write(empty.path().join(GUIDELINES_FILE), "  \n").unwrap();
-        assert!(for_launch(empty.path(), empty.path(), false, false).is_none());
+        assert!(for_launch(empty.path(), empty.path(), false, InstructionFile::Unknown).is_none());
     }
 
     #[test]
@@ -1026,8 +1076,14 @@ mod tests {
             configure_terminal_command("claude", &spaced),
             "claude --append-system-prompt-file '/My Config/agent-guidelines.md'"
         );
-        assert!(is_claude_command("/opt/bin/claude --resume abc"));
-        assert!(!is_claude_command("codex"));
+        assert_eq!(
+            instruction_file_for_command("/opt/bin/claude --resume abc"),
+            InstructionFile::ClaudeMd
+        );
+        assert_eq!(
+            instruction_file_for_command("codex"),
+            InstructionFile::AgentsMd
+        );
         assert!(starts_a_harness("/opt/bin/codex resume"));
         assert!(!starts_a_harness("zsh"));
         for unchanged in [
