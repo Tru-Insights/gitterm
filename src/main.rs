@@ -715,6 +715,15 @@ fn launch_instructions(
     )
 }
 
+fn claude_chat_instruction_file(remote: bool) -> gitterm::guidelines::InstructionFile {
+    if remote {
+        // A desktop path cannot verify the remote checkout's instructions.
+        gitterm::guidelines::InstructionFile::Unknown
+    } else {
+        gitterm::guidelines::InstructionFile::ClaudeMd
+    }
+}
+
 /// The document places of a saved workspace entry (a workspace not open
 /// yet): a work entry owns chats; its home is where they start.
 fn config_document_places(cfg: &WorkspaceConfig) -> Option<gitterm::guidelines::DocumentPlaces> {
@@ -24489,7 +24498,7 @@ fi
                                 });
                                 let guidelines_file = launch_instructions(
                                     &repo_path,
-                                    gitterm::guidelines::InstructionFile::ClaudeMd,
+                                    claude_chat_instruction_file(remote_chat.is_some()),
                                     guidelines_off,
                                     document_places.as_ref(),
                                     task_tools,
@@ -47421,6 +47430,28 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::Arc;
+
+    #[test]
+    fn regression_remote_claude_keeps_fallback_for_local_kit_path() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("repo");
+        git2::Repository::init(&repo).unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "<!-- agent-kit:begin -->").unwrap();
+        std::fs::write(repo.join("CLAUDE.md"), "@AGENTS.md\n").unwrap();
+        let config = fixture.path().join("config");
+        for remote in [false, true] {
+            let guidelines = gitterm::guidelines::for_launch(
+                &config,
+                &repo,
+                false,
+                claude_chat_instruction_file(remote),
+            );
+            assert_eq!(guidelines.is_some(), remote, "remote={remote}");
+            if let Some(guidelines) = guidelines {
+                assert_eq!(guidelines.text, gitterm::guidelines::DEFAULT_GUIDELINES);
+            }
+        }
+    }
 
     #[test]
     fn plain_vertical_wheel_moves_horizontal_and_preserves_other_deltas() {

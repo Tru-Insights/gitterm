@@ -187,19 +187,30 @@ pub fn repo_provides_guidelines(cwd: &Path, instruction_file: InstructionFile) -
     let Some(root) = repo.workdir() else {
         return false;
     };
-    let read = |name: &str| match std::fs::read_to_string(root.join(name)) {
-        Ok(text) => Some(text),
-        Err(error) => {
+    let read = |name: &str| {
+        let result = std::fs::read_to_string(root.join(name));
+        if let Err(error) = &result {
             if error.kind() != std::io::ErrorKind::NotFound {
                 log(&format!(
                     "cannot read {}: {error}; keeping fallback guidelines",
                     root.join(name).display()
                 ));
             }
-            None
         }
+        result
     };
-    if !read("AGENTS.md").is_some_and(|text| text.contains("<!-- agent-kit:begin")) {
+    let agents = match instruction_file {
+        // Codex/Pi load only the first nonempty instruction file per directory.
+        InstructionFile::AgentsMd => match read("AGENTS.override.md") {
+            Ok(text) if text.trim().is_empty() => read("AGENTS.md"),
+            Ok(text) => Ok(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => read("AGENTS.md"),
+            Err(_) => return false,
+        },
+        InstructionFile::ClaudeMd => read("AGENTS.md"),
+        InstructionFile::Unknown => return false,
+    };
+    if !agents.is_ok_and(|text| text.contains("<!-- agent-kit:begin")) {
         return false;
     }
     match instruction_file {
@@ -208,7 +219,7 @@ pub fn repo_provides_guidelines(cwd: &Path, instruction_file: InstructionFile) -
         InstructionFile::ClaudeMd => match std::fs::symlink_metadata(root.join("CLAUDE.md")) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
             _ => read("CLAUDE.md")
-                .is_some_and(|text| text.lines().any(|line| line.trim() == "@AGENTS.md")),
+                .is_ok_and(|text| text.lines().any(|line| line.trim() == "@AGENTS.md")),
         },
     }
 }
@@ -726,6 +737,57 @@ mod tests {
         )
         .unwrap();
         assert!(for_launch(dir.path(), dir.path(), false, InstructionFile::Unknown).is_none());
+    }
+
+    #[test]
+    fn regression_agents_override_decides_whether_fallback_is_needed() {
+        for (agents, override_text, skip) in [
+            (Some("<!-- agent-kit:begin -->"), "Other rules", false),
+            (Some("Other rules"), "<!-- agent-kit:begin -->", true),
+            (None, "<!-- agent-kit:begin -->", true),
+            (Some("<!-- agent-kit:begin -->"), "", true),
+            (Some("<!-- agent-kit:begin -->"), " \n\t", true),
+            (Some("Other rules"), "", false),
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let repo = fixture.path().join("repo");
+            git2::Repository::init(&repo).unwrap();
+            if let Some(text) = agents {
+                std::fs::write(repo.join("AGENTS.md"), text).unwrap();
+            }
+            std::fs::write(repo.join("AGENTS.override.md"), override_text).unwrap();
+            for command in ["codex", "pi"] {
+                assert_eq!(
+                    for_launch(
+                        &fixture.path().join("config"),
+                        &repo,
+                        false,
+                        instruction_file_for_command(command),
+                    )
+                    .is_none(),
+                    skip,
+                    "command={command}, agents={agents:?}, override={override_text:?}"
+                );
+            }
+            // Claude's AGENTS.md import does not use the Codex/Pi override.
+            assert_eq!(
+                repo_provides_guidelines(&repo, InstructionFile::ClaudeMd),
+                agents.is_some_and(|text| text.contains("<!-- agent-kit:begin"))
+            );
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("repo");
+        git2::Repository::init(&repo).unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "<!-- agent-kit:begin -->").unwrap();
+        std::fs::create_dir(repo.join("AGENTS.override.md")).unwrap();
+        assert!(for_launch(
+            &fixture.path().join("config"),
+            &repo,
+            false,
+            InstructionFile::AgentsMd,
+        )
+        .is_some());
     }
 
     #[test]
