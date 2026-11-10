@@ -875,6 +875,8 @@ enum ForwardedKey {
     /// in the terminal Cmd+V is the terminal's own paste, which the Iced
     /// key handler leaves to iced_term.
     Paste,
+    /// Cmd +/- and Cmd+Shift +/-: chat/terminal or sidebar text.
+    FontSize,
 }
 
 /// Which forwarded chord `key` with `modifiers` is, if any: the chat page's
@@ -890,7 +892,34 @@ fn forwarded_key(key: &Key, modifiers: Modifiers) -> Option<ForwardedKey> {
             return Some(ForwardedKey::Paste);
         }
     }
+    if !modifiers.control() && !modifiers.alt() && font_shortcut(key, modifiers, false).is_some() {
+        return Some(ForwardedKey::FontSize);
+    }
     global_shortcut(key, modifiers).map(ForwardedKey::Global)
+}
+
+/// Shared by the native key handler and the WebView forwarding allow-list.
+fn font_shortcut(key: &Key, modifiers: Modifiers, chat_active: bool) -> Option<Event> {
+    if !modifiers.command() {
+        return None;
+    }
+    match key.as_ref() {
+        Key::Character("=" | "+") => Some(if modifiers.shift() {
+            Event::IncreaseUiFont
+        } else if chat_active {
+            Event::IncreaseChatFont
+        } else {
+            Event::IncreaseTerminalFont
+        }),
+        Key::Character("-" | "_") => Some(if modifiers.shift() {
+            Event::DecreaseUiFont
+        } else if chat_active {
+            Event::DecreaseChatFont
+        } else {
+            Event::DecreaseTerminalFont
+        }),
+        _ => None,
+    }
 }
 
 /// Read a chord a chat page forwarded (`{type: "hostkey", key, code, meta,
@@ -1150,7 +1179,9 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                     }
                 };
                 match forwarded_key(&key, modifiers) {
-                    Some(ForwardedKey::Global(_)) => AgentIpcMessage::HostKey { key, modifiers },
+                    Some(ForwardedKey::Global(_) | ForwardedKey::FontSize) => {
+                        AgentIpcMessage::HostKey { key, modifiers }
+                    }
                     Some(ForwardedKey::Paste) => AgentIpcMessage::PastePage { tab_id },
                     None => {
                         eprintln!(
@@ -1501,6 +1532,8 @@ struct MenuIds {
     decrease_terminal_font: muda::MenuId,
     increase_ui_font: muda::MenuId,
     decrease_ui_font: muda::MenuId,
+    increase_chat_font: muda::MenuId,
+    decrease_chat_font: muda::MenuId,
     toggle_theme: muda::MenuId,
     chat_width: Vec<(muda::MenuId, config::ChatWidth)>,
     toggle_terminal_log_mirroring: muda::MenuId,
@@ -1587,6 +1620,9 @@ fn setup_menu_bar() {
         .append_items(&[&increase_ui_font, &decrease_ui_font])
         .unwrap();
 
+    let increase_chat_font = MenuItem::new("Increase Chat Text", true, None);
+    let decrease_chat_font = MenuItem::new("Decrease Chat Text", true, None);
+
     let chat_width_menu = Submenu::new("Chat width", true);
     let chat_width_items: Vec<_> = config::ChatWidth::ALL
         .into_iter()
@@ -1625,6 +1661,8 @@ fn setup_menu_bar() {
         .append_items(&[
             &terminal_font_menu,
             &ui_font_menu,
+            &increase_chat_font,
+            &decrease_chat_font,
             &chat_width_menu,
             &PredefinedMenuItem::separator(),
             &toggle_theme,
@@ -1659,6 +1697,8 @@ fn setup_menu_bar() {
         decrease_terminal_font: decrease_terminal_font.id().clone(),
         increase_ui_font: increase_ui_font.id().clone(),
         decrease_ui_font: decrease_ui_font.id().clone(),
+        increase_chat_font: increase_chat_font.id().clone(),
+        decrease_chat_font: decrease_chat_font.id().clone(),
         toggle_theme: toggle_theme.id().clone(),
         chat_width: chat_width_items
             .into_iter()
@@ -6978,6 +7018,8 @@ pub enum Event {
     IncreaseTerminalFont,
     DecreaseTerminalFont,
     ClearTerminal,
+    IncreaseChatFont,
+    DecreaseChatFont,
     // Font size - UI
     IncreaseUiFont,
     DecreaseUiFont,
@@ -7667,6 +7709,7 @@ struct App {
     theme: AppTheme,
     terminal_font_size: f32,
     ui_font_size: f32,
+    chat_font_size: f32,
     chat_width: config::ChatWidth,
     sidebar_width: f32,
     scrollback_lines: usize,
@@ -8521,6 +8564,24 @@ const ESTIMATED_WS_BTN_WIDTH: f32 = 180.0;
 const MIN_FONT_SIZE: f32 = 10.0;
 const MAX_FONT_SIZE: f32 = 24.0;
 const FONT_SIZE_STEP: f32 = 1.0;
+
+/// Cmd +/- follows the active tab; the chat menu selects chat explicitly.
+fn resize_tab_font(chat: bool, step: f32, terminal: &mut f32, chat_font: &mut f32) -> bool {
+    let (size, min, max) = if chat {
+        (
+            chat_font,
+            config::MIN_CHAT_FONT_SIZE,
+            config::MAX_CHAT_FONT_SIZE,
+        )
+    } else {
+        (terminal, MIN_FONT_SIZE, MAX_FONT_SIZE)
+    };
+    let next = (*size + step).clamp(min, max);
+    let changed = next != *size;
+    *size = next;
+    changed
+}
+
 const WORKSPACES_SAVE_DEBOUNCE_MS: u64 = 1500;
 const LOG_SERVER_SYNC_INTERVAL_MS: u64 = 15000;
 const LOG_SERVER_STARTUP_RETRY_MS: u64 = 500;
@@ -9890,6 +9951,7 @@ impl App {
             editor: self.editor.clone(),
             terminal_font_size: self.terminal_font_size,
             ui_font_size: self.ui_font_size,
+            chat_font_size: self.chat_font_size,
             chat_width: self.chat_width,
             sidebar_width: self.sidebar_width,
             scrollback_lines: self.scrollback_lines,
@@ -20307,6 +20369,7 @@ impl App {
             theme,
             terminal_font_size: terminal_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
             ui_font_size: ui_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
+            chat_font_size: config.chat_font_size,
             chat_width: config.chat_width,
             sidebar_width: config.sidebar_width.clamp(150.0, 600.0),
             scrollback_lines: config.scrollback_lines,
@@ -24357,6 +24420,10 @@ fi
                         } else if event.id == ids.decrease_terminal_font {
                             freeze_debug!("dispatching native menu: decrease_terminal_font");
                             return self.update(Event::DecreaseTerminalFont);
+                        } else if event.id == ids.increase_chat_font {
+                            return self.update(Event::IncreaseChatFont);
+                        } else if event.id == ids.decrease_chat_font {
+                            return self.update(Event::DecreaseChatFont);
                         } else if event.id == ids.increase_ui_font {
                             freeze_debug!("dispatching native menu: increase_ui_font");
                             return self.update(Event::IncreaseUiFont);
@@ -26129,6 +26196,10 @@ fi
                     WebviewSurface::Agent(tab_id),
                     &format!("window.__setChatWidth({:?})", self.chat_width.as_str()),
                 );
+                webview::evaluate_script(
+                    WebviewSurface::Agent(tab_id),
+                    &format!("window.__setChatFontSize({})", self.chat_font_size),
+                );
                 let composer = self.chat_composer_state(tab_id);
                 set_agent_webview_tab_id(
                     tab_id,
@@ -27637,18 +27708,13 @@ fi
                         return Task::done(Event::TaskContextBack);
                     }
                     if let Key::Character(c) = key.as_ref() {
-                        if c == "=" || c == "+" {
-                            if modifiers.shift() {
-                                return Task::done(Event::IncreaseUiFont);
-                            } else {
-                                return Task::done(Event::IncreaseTerminalFont);
-                            }
-                        } else if c == "-" || c == "_" {
-                            if modifiers.shift() {
-                                return Task::done(Event::DecreaseUiFont);
-                            } else {
-                                return Task::done(Event::DecreaseTerminalFont);
-                            }
+                        if let Some(event) = font_shortcut(
+                            &key,
+                            modifiers,
+                            self.active_tab()
+                                .is_some_and(|tab| matches!(tab.kind, TabKind::Agent(_))),
+                        ) {
+                            return Task::done(event);
                         } else if c == "0" && self.active_task_context_id().is_some() {
                             return Task::done(Event::TaskOverview);
                         } else if let Some(GlobalShortcut::SelectTab(num)) =
@@ -29420,20 +29486,38 @@ fi
                 let enabled = !self.terminal_log_mirroring_enabled;
                 return self.set_terminal_log_mirroring_enabled(enabled);
             }
-            Event::IncreaseTerminalFont => {
-                let new_size = (self.terminal_font_size + FONT_SIZE_STEP).min(MAX_FONT_SIZE);
-                if new_size != self.terminal_font_size {
-                    self.terminal_font_size = new_size;
+            Event::IncreaseTerminalFont
+            | Event::DecreaseTerminalFont
+            | Event::IncreaseChatFont
+            | Event::DecreaseChatFont => {
+                let chat_active =
+                    matches!(event, Event::IncreaseChatFont | Event::DecreaseChatFont)
+                        || self
+                            .active_tab()
+                            .is_some_and(|tab| matches!(tab.kind, TabKind::Agent(_)));
+                let step = if matches!(event, Event::IncreaseTerminalFont | Event::IncreaseChatFont)
+                {
+                    FONT_SIZE_STEP
+                } else {
+                    -FONT_SIZE_STEP
+                };
+                if resize_tab_font(
+                    chat_active,
+                    step,
+                    &mut self.terminal_font_size,
+                    &mut self.chat_font_size,
+                ) {
                     self.save_config();
-                    self.recreate_terminals();
-                }
-            }
-            Event::DecreaseTerminalFont => {
-                let new_size = (self.terminal_font_size - FONT_SIZE_STEP).max(MIN_FONT_SIZE);
-                if new_size != self.terminal_font_size {
-                    self.terminal_font_size = new_size;
-                    self.save_config();
-                    self.recreate_terminals();
+                    if chat_active {
+                        for tab_id in &self.agent_pages {
+                            webview::evaluate_script(
+                                WebviewSurface::Agent(*tab_id),
+                                &format!("window.__setChatFontSize({})", self.chat_font_size),
+                            );
+                        }
+                    } else {
+                        self.recreate_terminals();
+                    }
                 }
             }
             Event::ClearTerminal => {
@@ -49976,6 +50060,71 @@ mod tests {
 
     fn ch(c: &str) -> Key {
         Key::Character(c.into())
+    }
+
+    #[test]
+    fn font_shortcuts_resize_chat_or_terminal_and_preserve_the_other() {
+        let mut terminal = 14.0;
+        let mut chat = 15.0;
+        let chat_tab = TabKind::Agent(AgentSession::new(new_claude_chat_config(
+            &config::ChatDefaults::default(),
+        )));
+        for (key, shift) in [("=", false), ("+", true), ("-", false), ("_", true)] {
+            let (key, modifiers) = hostkey_chord(&hostkey(key, true, false, shift, false)).unwrap();
+            assert_eq!(forwarded_key(&key, modifiers), Some(ForwardedKey::FontSize));
+        }
+        let event = font_shortcut(
+            &ch("="),
+            Modifiers::COMMAND,
+            matches!(chat_tab, TabKind::Agent(_)),
+        )
+        .unwrap();
+        assert!(matches!(event, Event::IncreaseChatFont));
+        assert!(matches!(
+            font_shortcut(&ch("+"), Modifiers::COMMAND | Modifiers::SHIFT, true),
+            Some(Event::IncreaseUiFont)
+        ));
+        assert!(matches!(
+            font_shortcut(&ch("_"), Modifiers::COMMAND | Modifiers::SHIFT, true),
+            Some(Event::DecreaseUiFont)
+        ));
+        assert!(resize_tab_font(
+            matches!(event, Event::IncreaseChatFont),
+            FONT_SIZE_STEP,
+            &mut terminal,
+            &mut chat
+        ));
+        assert_eq!((terminal, chat), (14.0, 16.0));
+        let event = font_shortcut(&ch("="), Modifiers::COMMAND, false).unwrap();
+        assert!(matches!(event, Event::IncreaseTerminalFont));
+        assert!(resize_tab_font(
+            matches!(event, Event::IncreaseChatFont),
+            FONT_SIZE_STEP,
+            &mut terminal,
+            &mut chat
+        ));
+        assert_eq!((terminal, chat), (15.0, 16.0));
+        assert!(resize_tab_font(
+            true,
+            -FONT_SIZE_STEP,
+            &mut terminal,
+            &mut chat
+        ));
+        assert_eq!((terminal, chat), (15.0, 15.0));
+        chat = 22.0;
+        assert!(!resize_tab_font(
+            true,
+            FONT_SIZE_STEP,
+            &mut terminal,
+            &mut chat
+        ));
+        chat = 11.0;
+        assert!(!resize_tab_font(
+            true,
+            -FONT_SIZE_STEP,
+            &mut terminal,
+            &mut chat
+        ));
     }
 
     #[test]
