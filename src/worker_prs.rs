@@ -350,14 +350,26 @@ fn argv_creates_pr(argv: &[Value]) -> bool {
 }
 
 fn shell_script(argv: &[Value]) -> Option<&str> {
-    let executable = argv.first()?.as_str()?.rsplit('/').next()?;
-    if matches!(executable, "bash" | "sh" | "zsh" | "dash" | "ksh")
-        && matches!(argv.get(1)?.as_str()?, "-c" | "-lc" | "-cl")
-    {
-        argv.get(2)?.as_str()
-    } else {
-        None
+    let executable = argv.first()?.as_str()?.rsplit(['/', '\\']).next()?;
+    let executable = executable.to_ascii_lowercase();
+    let executable = executable.strip_suffix(".exe").unwrap_or(&executable);
+    let args = argv.get(1..)?;
+    if matches!(executable, "bash" | "sh" | "zsh" | "dash" | "ksh" | "fish") {
+        if matches!(args.first()?.as_str()?, "-c" | "-lc" | "-cl") {
+            return args.get(1)?.as_str();
+        }
+        return None;
     }
+    if matches!(executable, "pwsh" | "powershell") {
+        // PowerShell options such as -NoProfile can come before -Command.
+        let flag = args.iter().position(|arg| {
+            arg.as_str().is_some_and(|arg| {
+                arg.eq_ignore_ascii_case("-command") || arg.eq_ignore_ascii_case("-c")
+            })
+        })?;
+        return args.get(flag + 1)?.as_str();
+    }
+    None
 }
 
 /// Shell outputs use JSON metadata in older Codex versions and status headers
@@ -586,6 +598,19 @@ GH_TOKEN="$(gh auth token --user example-user)" gh pr create --draft --base deve
                 1,
             ),
             (json!(["sh", "-lc", "gh pr create --fill"]), 1),
+            (json!(["fish", "-lc", "gh pr create --fill"]), 1),
+            (json!(["pwsh", "-Command", "gh pr create --fill"]), 1),
+            (
+                json!([
+                    "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+                    "-NoProfile",
+                    "-c",
+                    "gh pr create --fill"
+                ]),
+                1,
+            ),
+            (json!(["powershell.exe", "-File", "gh pr create"]), 0),
+            (json!(["fish", "gh pr create"]), 0),
         ] {
             let mut event = command_execution(json!(0));
             event["payload"]["item"]["command"] = argv.clone();
