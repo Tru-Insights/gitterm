@@ -325,6 +325,10 @@ pub fn documents_note(places: &DocumentPlaces) -> String {
              its conventions, through a PR.\n",
         ),
     }
+    note.push_str(
+        "- GitTerm's chat shows markdown tables as tables, and they paste into \
+         Slack as tables: use a table for items that share several attributes.\n",
+    );
     // Last, so the SessionStart hook can re-read it (`workspace_context`).
     note.push_str(&checkpoint_note(&places.docs_dir.join("checkpoint.md")));
     note
