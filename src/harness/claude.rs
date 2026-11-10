@@ -3558,7 +3558,8 @@ for source in ['startup', 'clear', 'compact', 'resume']:
     assert 'Workspace: `Example workspace`' in text
     assert '/code/example-api' in text
     assert str(Path.cwd() / 'docs/checkpoint.md') in text
-    assert "Resume only this workspace's work; if unsure which work to continue, ask." in text
+    assert "resume only this workspace's work; if unsure which work to continue, ask." in text
+    assert 'Re-read the workspace checkpoint' in text
     assert 'Starting Codex' not in text
 emit({'type':'result','subtype':'success'})
 read() # the host moves this running chat, then sends /clear
