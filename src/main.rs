@@ -7969,6 +7969,7 @@ struct App {
     viewer_page_generation: u64,
     /// Store identity bound to the current remote page surface.
     viewer_page_store: Option<webview::PageDataStore>,
+    viewer_page_navigation_context: Option<std::rc::Rc<std::cell::RefCell<PageNavigationContext>>>,
     /// Agent tabs that own a chat page (`WebviewSurface::Agent(tab_id)`),
     /// most recently shown first, at most `MAX_AGENT_PAGES`. A page keeps
     /// receiving its tab's events while hidden, so showing it again needs no
@@ -8139,11 +8140,46 @@ enum PageNavigationDecision {
     Cancel,
 }
 
+impl PageNavigationDecision {
+    fn log_line(&self, url: &str) -> String {
+        let decision = match self {
+            Self::Allow => "Allow",
+            Self::Reopen(_) => "Reopen",
+            Self::External => "External",
+            Self::Cancel => "Cancel",
+        };
+        format!("[page] {decision} {}", webview::page_log_url(url))
+    }
+}
+
 struct PageNavigationContext {
     url: String,
     store: webview::PageDataStore,
     github_accounts: std::collections::BTreeMap<String, String>,
     linear_workspaces: std::collections::BTreeSet<String>,
+}
+
+impl PageNavigationContext {
+    fn refresh_routes(&mut self, refreshed: Self) {
+        // Host notifications may describe an older URL than the native policy.
+        self.github_accounts = refreshed.github_accounts;
+        self.linear_workspaces = refreshed.linear_workspaces;
+    }
+}
+
+fn github_sign_in_url(url: &url::Url) -> bool {
+    url.host_str() == Some("github.com")
+        && matches!(
+            url.path_segments().and_then(|mut segments| segments.next()),
+            Some("login" | "session" | "sessions")
+        )
+}
+
+fn page_sign_in_provider(url: &url::Url) -> bool {
+    matches!(
+        url.host_str(),
+        Some("accounts.google.com" | "appleid.apple.com" | "idmsa.apple.com")
+    )
 }
 
 fn page_navigation_decision(url: &str, context: &PageNavigationContext) -> PageNavigationDecision {
@@ -8165,6 +8201,20 @@ fn page_navigation_decision(url: &str, context: &PageNavigationContext) -> PageN
     // Encoded or empty identity prefixes are ambiguous; let the browser resolve them.
     if destination.path() != "/" && (first.is_empty() || first.contains('%')) {
         return External;
+    }
+    if let Some(origin) = origin.as_ref().filter(|origin| {
+        origin.scheme() == "https"
+            && origin.username().is_empty()
+            && origin.password().is_none()
+            && origin.port().is_none()
+    }) {
+        // Social sign-in redirects must keep GitHub's OAuth state in this store.
+        if (page_sign_in_provider(&destination)
+            && (github_sign_in_url(origin) || page_sign_in_provider(origin)))
+            || (page_sign_in_provider(origin) && github_sign_in_url(&destination))
+        {
+            return Allow;
+        }
     }
     let store = match destination.host_str() {
         Some("github.com") => {
@@ -8249,6 +8299,45 @@ fn effective_page_navigation_decision(
             PageNavigationDecision::Allow
         }
         decision => decision,
+    }
+}
+
+fn dispatch_page_navigation(
+    url: &str,
+    context: &mut PageNavigationContext,
+    generation: u64,
+    tx: Option<&tokio::sync::mpsc::UnboundedSender<AgentIpcMessage>>,
+) -> PageNavigationDecision {
+    let decision = effective_page_navigation_decision(url, context);
+    let reopen = match &decision {
+        PageNavigationDecision::Allow => false,
+        PageNavigationDecision::Reopen(_) => true,
+        _ => return decision,
+    };
+    let message = AgentIpcMessage::PageNavigation {
+        generation,
+        url: url.to_string(),
+        reopen,
+    };
+    match tx.map(|tx| tx.send(message)) {
+        Some(Ok(())) => {
+            if !reopen {
+                // Redirects can arrive before the host drains its notifications.
+                context.url = url.to_string();
+            }
+            decision
+        }
+        failure => {
+            let reason = if failure.is_none() {
+                "host channel is uninitialized"
+            } else {
+                "host channel is closed"
+            };
+            eprintln!(
+                "[webview] cannot dispatch page navigation for generation {generation}: {reason}"
+            );
+            PageNavigationDecision::Cancel
+        }
     }
 }
 
@@ -20390,6 +20479,7 @@ impl App {
             viewer_page_url: None,
             viewer_page_generation: 0,
             viewer_page_store: None,
+            viewer_page_navigation_context: None,
             agent_pages: Vec::new(),
             chat_index: Vec::new(),
             workspace_overviews: HashMap::new(),
@@ -24535,7 +24625,10 @@ fi
                             return Task::none();
                         }
                         if reopen {
-                            match page_navigation_decision(&url, &self.page_navigation_context()) {
+                            let decision =
+                                page_navigation_decision(&url, &self.page_navigation_context());
+                            eprintln!("{}", decision.log_line(&url));
+                            match decision {
                                 PageNavigationDecision::Reopen(store) => {
                                     self.open_page_in_store(url, store)
                                 }
@@ -31949,6 +32042,7 @@ fi
         self.viewer_webview = viewer;
         if viewer != ViewerWebview::Page {
             self.viewer_page_url = None;
+            self.viewer_page_navigation_context = None;
             self.viewer_page_generation += 1;
         }
         if viewer != ViewerWebview::Review {
@@ -32407,6 +32501,7 @@ fi
             webview::destroy(WebviewSurface::Page);
         }
         self.viewer_page_store = Some(store.clone());
+        self.viewer_page_navigation_context = None;
         self.install_page_navigation_handler();
         if action == webview::PageStoreAction::Navigate && webview::is_active(WebviewSurface::Page)
         {
@@ -32445,39 +32540,33 @@ fi
         }
     }
 
-    fn install_page_navigation_handler(&self) {
-        let context = self.page_navigation_context();
+    fn install_page_navigation_handler(&mut self) {
+        let refreshed = self.page_navigation_context();
+        let context = if let Some(context) = &self.viewer_page_navigation_context {
+            context.borrow_mut().refresh_routes(refreshed);
+            context.clone()
+        } else {
+            let context = std::rc::Rc::new(std::cell::RefCell::new(refreshed));
+            self.viewer_page_navigation_context = Some(context.clone());
+            context
+        };
         let generation = self.viewer_page_generation;
         let tx = AGENT_IPC_TX.get().cloned();
         webview::set_page_navigation_handler(move |url| {
-            let reopen = match effective_page_navigation_decision(url, &context) {
-                PageNavigationDecision::Allow => false,
-                PageNavigationDecision::Reopen(_) => true,
+            let decision =
+                dispatch_page_navigation(url, &mut context.borrow_mut(), generation, tx.as_ref());
+            eprintln!("{}", decision.log_line(url));
+            match decision {
+                PageNavigationDecision::Allow => true,
+                PageNavigationDecision::Reopen(_) => false,
                 PageNavigationDecision::External => {
                     webview::open_url_in_browser(url);
-                    return false;
+                    false
                 }
                 PageNavigationDecision::Cancel => {
                     if let Err(error) = webview::browser_url(url) {
                         eprintln!("[webview] page navigation refused: {error}");
                     }
-                    return false;
-                }
-            };
-            let message = AgentIpcMessage::PageNavigation {
-                generation,
-                url: url.to_string(),
-                reopen,
-            };
-            match tx.as_ref().map(|tx| tx.send(message)) {
-                Some(Ok(())) => !reopen,
-                failure => {
-                    let reason = if failure.is_none() {
-                        "host channel is uninitialized"
-                    } else {
-                        "host channel is closed"
-                    };
-                    eprintln!("[webview] cannot dispatch page navigation for generation {generation}: {reason}");
                     false
                 }
             }
@@ -32494,7 +32583,8 @@ fi
                         webview::try_create_with_window(WebviewSurface::Page, window)
                     {
                         eprintln!(
-                            "[webview] page creation failed for {url} ({store_label}): {error}"
+                            "[webview] page creation failed for {} ({store_label}): {error}",
+                            webview::page_log_url(&url)
                         );
                     }
                 })
@@ -48018,6 +48108,231 @@ mod tests {
             ]
             .into(),
         }
+    }
+
+    #[test]
+    fn github_social_sign_in_keeps_the_current_store_across_redirects() {
+        use PageNavigationDecision::Allow;
+        let providers = [
+            "https://accounts.google.com/v3/signin/identifier",
+            "https://appleid.apple.com/auth/authorize",
+            "https://idmsa.apple.com/appleauth/auth/authorize",
+        ];
+        for store in [
+            webview::PageDataStore::GitHub("acme-login".to_string()),
+            webview::PageDataStore::GitHub("other-login".to_string()),
+            webview::PageDataStore::Default,
+        ] {
+            let mut context = page_context();
+            context.store = store;
+            for origin in [
+                "https://github.com/login",
+                "https://github.com/session",
+                "https://github.com/sessions/two-factor/app",
+            ] {
+                context.url = origin.to_string();
+                for destination in providers {
+                    assert_eq!(page_navigation_decision(destination, &context), Allow);
+                }
+            }
+            for origin in providers {
+                context.url = origin.to_string();
+                for destination in providers.into_iter().chain([
+                    "https://github.com/login",
+                    "https://github.com/session",
+                    "https://github.com/sessions/social/google/callback?code=x",
+                    "https://github.com/sessions/social/apple/callback?code=x",
+                ]) {
+                    assert_eq!(page_navigation_decision(destination, &context), Allow);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn social_sign_in_exception_requires_a_trusted_sign_in_origin_and_destination() {
+        use PageNavigationDecision::{External, Reopen};
+        let mut context = page_context();
+        for origin in [
+            "https://github.com/acme/api/pull/1",
+            "https://github.com/",
+            "https://github.com/settings",
+            "https://github.com/logout",
+            "https://github.com/login-extra",
+            "https://github.com/%6cogin",
+            "https://github.com//login",
+            "https://linear.app/login",
+            "https://example.com/login",
+            "http://github.com/login",
+            "https://github.com:8443/login",
+            "https://user:password@github.com/login",
+            "http://accounts.google.com/",
+            "https://accounts.google.com:8443/",
+            "https://user:password@accounts.google.com/",
+            "https://accounts.google.com.example.com/",
+            "malformed",
+        ] {
+            context.url = origin.to_string();
+            for destination in [
+                "https://accounts.google.com/",
+                "https://appleid.apple.com/",
+                "https://idmsa.apple.com/",
+            ] {
+                assert_eq!(
+                    page_navigation_decision(destination, &context),
+                    External,
+                    "{origin}"
+                );
+            }
+        }
+        for origin in ["https://github.com/login", "https://accounts.google.com/"] {
+            context.url = origin.to_string();
+            for destination in [
+                "https://example.com/",
+                "https://accounts.google.com.example.com/",
+                "https://accounts.google.com./",
+                "https://sub.accounts.google.com/",
+                "http://accounts.google.com/",
+                "https://accounts.google.com:8443/",
+                "https://user:password@accounts.google.com/",
+                "https://appleid.apple.com.example.com/",
+            ] {
+                assert_eq!(page_navigation_decision(destination, &context), External);
+            }
+        }
+        context.url = "https://accounts.google.com/".to_string();
+        for destination in ["https://github.com/", "https://github.com/settings"] {
+            assert_eq!(
+                page_navigation_decision(destination, &context),
+                Reopen(webview::PageDataStore::Default)
+            );
+        }
+    }
+
+    #[test]
+    fn native_redirect_policy_advances_before_host_notifications_are_processed() {
+        use PageNavigationDecision::{Allow, External};
+        let mut context = page_context();
+        context
+            .github_accounts
+            .insert("acme".to_string(), "sample-login-a".to_string());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let redirects = [
+            "https://github.com/login",
+            "https://accounts.google.com/v3/signin/identifier",
+            "https://accounts.google.com/signin/oauth/consent",
+            "https://github.com/sessions/social/google/callback?code=x",
+            "https://github.com/acme/api/pull/1",
+        ];
+        // Leave every host notification queued while native redirects arrive.
+        for url in redirects {
+            assert_eq!(
+                dispatch_page_navigation(url, &mut context, 7, Some(&tx)),
+                Allow
+            );
+            assert_eq!(context.url, url);
+        }
+        assert_eq!(
+            dispatch_page_navigation("https://accounts.google.com/", &mut context, 7, Some(&tx)),
+            External
+        );
+        for expected in redirects {
+            match rx.try_recv().unwrap() {
+                AgentIpcMessage::PageNavigation {
+                    generation,
+                    url,
+                    reopen,
+                } => {
+                    assert_eq!(generation, 7);
+                    assert_eq!(url, expected);
+                    assert!(!reopen);
+                    let mut refreshed = page_context();
+                    refreshed.url = url;
+                    context.refresh_routes(refreshed);
+                    assert_eq!(context.url, redirects[4]);
+                    assert_eq!(
+                        page_navigation_decision("https://accounts.google.com/", &context),
+                        External
+                    );
+                }
+                _ => panic!("expected page navigation"),
+            }
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(context.url, redirects[4]);
+    }
+
+    #[test]
+    fn route_refresh_discovers_linear_workspaces_without_resetting_the_native_page() {
+        let mut context = page_context();
+        context.url = "https://linear.app/acme/issue/ABC-1/example".to_string();
+        context.store = webview::PageDataStore::Linear("acme".to_string());
+        let origin = context.url.clone();
+        let store = context.store.clone();
+        let destination = "https://linear.app/new-workspace/team/example";
+        assert_eq!(
+            page_navigation_decision(destination, &context),
+            PageNavigationDecision::External
+        );
+        let mut refreshed = page_context();
+        refreshed
+            .linear_workspaces
+            .insert("new-workspace".to_string());
+        context.refresh_routes(refreshed);
+        assert_eq!(context.url, origin);
+        assert_eq!(context.store, store);
+        assert_eq!(
+            page_navigation_decision(destination, &context),
+            PageNavigationDecision::Reopen(webview::PageDataStore::Linear(
+                "new-workspace".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn failed_navigation_dispatch_cancels_without_advancing_the_origin() {
+        let mut context = page_context();
+        let origin = context.url.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        for sender in [None, Some(&tx)] {
+            assert_eq!(
+                dispatch_page_navigation("https://github.com/login", &mut context, 7, sender),
+                PageNavigationDecision::Cancel
+            );
+            assert_eq!(context.url, origin);
+        }
+    }
+
+    #[test]
+    fn page_navigation_logs_exclude_oauth_secrets_and_store_identity() {
+        for decision in [
+            PageNavigationDecision::Allow,
+            PageNavigationDecision::Reopen(webview::PageDataStore::GitHub(
+                "secret-login".to_string(),
+            )),
+            PageNavigationDecision::External,
+            PageNavigationDecision::Cancel,
+        ] {
+            let line = decision.log_line(
+                "https://secret-user:secret-password@github.com/sessions/social/google/callback?code=secret#secret",
+            );
+            assert!(line.starts_with("[page] "));
+            assert!(line.ends_with(" https://github.com/sessions/social/google/callback"));
+            assert!(!line.contains("secret"));
+            for url in [
+                "malformed?code=secret",
+                "data:text/plain,secret",
+                "javascript:secret",
+            ] {
+                assert!(decision.log_line(url).ends_with(" <invalid-url>"));
+            }
+        }
+        assert_eq!(
+            PageNavigationDecision::Allow
+                .log_line("https://accounts.google.com/signin?code=secret#secret"),
+            "[page] Allow https://accounts.google.com/signin"
+        );
     }
 
     #[test]
