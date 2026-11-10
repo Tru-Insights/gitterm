@@ -347,6 +347,20 @@ fn checkpoint_start(path: &Path) -> Option<String> {
 /// SessionStart callback after a clear or compaction. The checkpoint status
 /// and start are read from disk on each call, not taken from the text.
 pub fn workspace_context(instructions: &str) -> Option<String> {
+    let (section, resume) = workspace_section(instructions)?;
+    Some(
+        format!("{}{}", section, checkpoint_note(resume))
+            .trim_end()
+            .to_string(),
+    )
+}
+
+/// Identifies the workspace independently of its checkpoint's current contents.
+pub fn workspace_checkpoint(instructions: &str) -> Option<&Path> {
+    workspace_section(instructions).map(|(_, path)| path)
+}
+
+fn workspace_section(instructions: &str) -> Option<(&str, &Path)> {
     let start = instructions.find("# Documents for this work (added by GitTerm)\n")?;
     let section = &instructions[start..];
     // The checkpoint line ends the note's fixed part; what follows it (the
@@ -355,11 +369,7 @@ pub fn workspace_context(instructions: &str) -> Option<String> {
     let path_start = at + CHECKPOINT_LINE.len();
     let path_end = path_start + section[path_start..].find('`')?;
     let resume = Path::new(&section[path_start..path_end]);
-    Some(
-        format!("{}{}", &section[..at], checkpoint_note(resume))
-            .trim_end()
-            .to_string(),
-    )
+    Some((&section[..at], resume))
 }
 
 /// How agents in GitTerm start Codex (TRU-212): through GitTerm's task
