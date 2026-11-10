@@ -5084,6 +5084,7 @@ struct TabState {
     task_watchdog_reported: bool,
     worker_process: Option<gitterm::worker_process::WorkerProcess>,
     worker_closing: bool,
+    worker_shutdown_refused: bool,
     // Worktree this chat tab's agent works in, and whether the Git and
     // Files panels follow it (TRU-146). Derived from the tool stream; never
     // persisted. `repo_path` / `current_dir` stay on the workspace root.
@@ -5156,6 +5157,7 @@ impl TabState {
             task_watchdog_reported: false,
             worker_process: None,
             worker_closing: false,
+            worker_shutdown_refused: false,
             attention: None,
             claude_config: ClaudeConfig::default(),
             worktree_follow: WorktreeFollow::default(),
@@ -9974,6 +9976,7 @@ impl App {
                     chat_session_id: tab.chat_session_id.clone(),
                     task_id: tab.task_id.clone(),
                     task_session_id: tab.task_session_id.clone(),
+                    worker_shutdown_refused: tab.worker_shutdown_refused,
                     session_uid: Some(tab.session_uid.clone()),
                 })
                 .collect(),
@@ -19448,8 +19451,10 @@ fn restore_task_tab(
     let Some(task_id) = tab.task_id.as_deref() else {
         return true;
     };
-    if store
-        .is_some_and(|store| store.worker_session_is_final(task_id, tab.task_session_id.as_deref()))
+    if !tab.worker_shutdown_refused
+        && store.is_some_and(|store| {
+            store.worker_session_is_final(task_id, tab.task_session_id.as_deref())
+        })
     {
         return false;
     }
@@ -19464,16 +19469,19 @@ fn restore_task_tab(
 }
 
 fn task_session_is_working(tab: &TabState, store: Option<&TaskStore>) -> bool {
-    tab.task_live_state == Some(TaskSessionLiveState::Working) && worker_accepts_input(tab, store)
+    tab.task_live_state == Some(TaskSessionLiveState::Working)
+        && !tab.worker_shutdown_refused
+        && worker_accepts_input(tab, store)
 }
 
 fn worker_accepts_input(tab: &TabState, store: Option<&TaskStore>) -> bool {
     !tab.worker_closing
-        && !tab.task_id.as_deref().is_some_and(|task| {
-            store.is_some_and(|store| {
-                store.worker_session_is_final(task, tab.task_session_id.as_deref())
-            })
-        })
+        && (tab.worker_shutdown_refused
+            || !tab.task_id.as_deref().is_some_and(|task| {
+                store.is_some_and(|store| {
+                    store.worker_session_is_final(task, tab.task_session_id.as_deref())
+                })
+            }))
 }
 
 /// Process seam: tests can observe the close request without starting a PTY
@@ -19492,6 +19500,7 @@ fn close_final_worker<T>(
             if task_id == task && id == session)
     })?;
     if tab.worker_closing
+        || tab.worker_shutdown_refused
         || !store.worker_session_is_final(task, Some(session))
         || !ready.contains(&delegation.delegation_id)
         || (delegation.superseded_by.is_some()
@@ -19505,12 +19514,18 @@ fn close_final_worker<T>(
 }
 
 /// Closing a tab drops its PTY, which SIGHUPs whatever the terminal runs, so
-/// a refused or failed stop keeps the tab. `worker_closing` stays set, so the
-/// stop is never retried and this logs once per session.
-fn final_worker_stop_closes_tab(session_id: &str, result: Result<(), String>) -> bool {
+/// a refused or failed stop keeps the tab usable. Remember the refusal so
+/// the stop is never retried, including after restoring the saved tab.
+fn final_worker_stop_closes_tab(
+    session_id: &str,
+    tab: &mut TabState,
+    result: Result<(), String>,
+) -> bool {
     match result {
         Ok(()) => true,
         Err(error) => {
+            tab.worker_closing = false;
+            tab.worker_shutdown_refused = true;
             eprintln!("[tasks] keep final worker {session_id} open: {error}");
             false
         }
@@ -19928,6 +19943,7 @@ impl App {
                     if let Some(tab) = workspace.tabs.last_mut() {
                         tab.task_id = Some(task_id.clone());
                         tab.task_session_id = restored_task_session_id.clone();
+                        tab.worker_shutdown_refused = tab_config.worker_shutdown_refused;
                     }
                 }
             }
@@ -25520,13 +25536,14 @@ fi
                 return self.delegate_task_targets_checked(result, reply);
             }
             Event::FinalWorkerStopped(session_id, result) => {
-                if !final_worker_stop_closes_tab(&session_id, result) {
-                    return Task::none();
-                }
                 if let Some((workspace_idx, tab_idx)) =
                     find_task_session_tab(&self.workspaces, &session_id)
                 {
                     let tab = &mut self.workspaces[workspace_idx].tabs[tab_idx];
+                    if !final_worker_stop_closes_tab(&session_id, tab, result) {
+                        self.mark_workspaces_dirty();
+                        return Task::none();
+                    }
                     tab.task_live_state = None;
                     if let Some(task_id) = tab.task_id.clone() {
                         let workspace = &self.workspaces[workspace_idx];
@@ -49093,21 +49110,106 @@ mod tests {
                 (session.to_string(), process)
             })
             .unwrap();
+        assert!(!worker_accepts_input(&tab, Some(&store)));
         let result = process.unwrap().stop();
         assert!(
             result.as_ref().is_err_and(|e| e.contains("refuse")),
             "{result:?}"
         );
-        assert!(!final_worker_stop_closes_tab(&session, result));
+        assert!(!final_worker_stop_closes_tab(&session, &mut tab, result));
+        assert!(!tab.worker_closing);
+        assert!(worker_accepts_input(&tab, Some(&store)));
+        tab.task_live_state = Some(TaskSessionLiveState::Working); // late terminal title
+        assert!(!task_session_is_working(&tab, Some(&store)));
         assert!(!final_worker_stop_closes_tab(
             &session,
+            &mut tab,
             Err("refuse worker shutdown: no launch record for this tab".into())
         ));
-        assert!(final_worker_stop_closes_tab(&session, Ok(())));
+        assert!(final_worker_stop_closes_tab(&session, &mut tab, Ok(())));
         assert!(close_final_worker(&store, &mut tab, &ready, |_, _| panic!(
             "a refused stop is logged once, never retried"
         ))
         .is_none());
+    }
+
+    #[test]
+    fn refused_final_worker_tabs_survive_saved_config_roundtrips() {
+        for failed in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut store, id, mut config) = final_worker_fixture(temp.path());
+            if failed {
+                store
+                    .set_delegation_status(
+                        &id,
+                        gitterm::tasks::DelegationStatus::Failed {
+                            message: "Failed".into(),
+                        },
+                        "t2",
+                    )
+                    .unwrap();
+            } else {
+                store
+                    .complete_delegation(
+                        &id,
+                        gitterm::delegations::worker_result(worker_test_handoff()),
+                        "t2",
+                    )
+                    .unwrap();
+            }
+            // Old configs still load, and a successful shutdown still
+            // excludes a stale saved entry for a final worker.
+            assert!(!config.worker_shutdown_refused);
+            let mut tab = TabState::new(1, temp.path().into());
+            tab.task_id = config.task_id.clone();
+            tab.task_session_id = config.task_session_id.clone();
+            let ready = HashSet::from([id]);
+            close_final_worker(&store, &mut tab, &ready, |_, _| ()).unwrap();
+            assert!(final_worker_stop_closes_tab("worker", &mut tab, Ok(())));
+            assert!(!tab.worker_shutdown_refused);
+            assert!(!restore_task_tab(
+                Some(&store),
+                &config,
+                &mut HashSet::new()
+            ));
+
+            assert!(!final_worker_stop_closes_tab(
+                "worker",
+                &mut tab,
+                Err("refuse worker shutdown: no launch record for this tab".into())
+            ));
+            config.worker_shutdown_refused = tab.worker_shutdown_refused;
+            let (loaded, _) =
+                load_task_store_for_startup(temp.path().join("tasks.json"), "t3").unwrap();
+            for _ in 0..2 {
+                config = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+                assert!(restore_task_tab(
+                    Some(&loaded),
+                    &config,
+                    &mut HashSet::new()
+                ));
+            }
+            let mut restored = TabState::new(2, temp.path().into());
+            restored.task_id = config.task_id;
+            restored.task_session_id = config.task_session_id;
+            restored.worker_shutdown_refused = config.worker_shutdown_refused;
+            assert!(worker_accepts_input(&restored, Some(&loaded)));
+            assert!(
+                close_final_worker(&loaded, &mut restored, &ready, |_, _| panic!(
+                    "restored refusal must not retry"
+                ))
+                .is_none()
+            );
+            // Refusal does not bypass the existing missing-worktree guard.
+            config.dir = temp.path().join("removed").to_string_lossy().into_owned();
+            config.task_id = restored.task_id;
+            config.task_session_id = restored.task_session_id;
+            assert!(!restore_task_tab(
+                Some(&loaded),
+                &config,
+                &mut HashSet::new()
+            ));
+        }
     }
 
     #[test]

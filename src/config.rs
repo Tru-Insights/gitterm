@@ -2204,6 +2204,10 @@ pub struct WorkspaceTabConfig {
     /// share one task id; this id distinguishes their sessions across restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_session_id: Option<String>,
+    /// Automatic shutdown was refused; keep this final worker tab usable
+    /// and restore it without retrying the shutdown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worker_shutdown_refused: bool,
     /// Durable caller identity of this tab (uuid v4). Every tab carries one
     /// on its task MCP URL (`?caller=<uid>`) so the task server can tell
     /// which tab made a call. Older files predate it; a missing value is
