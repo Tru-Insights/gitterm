@@ -170,6 +170,40 @@ pub fn applies(settings: &GuidelinesSettings, cwd: &Path, workspace_off: bool) -
     settings.enabled && !workspace_off && !settings.repo_is_off(cwd)
 }
 
+/// Whether the launch's own checkout supplies the kit rules. Do not use
+/// `repo_key`: linked worktrees can have different instruction files.
+pub fn repo_provides_guidelines(cwd: &Path, claude: bool) -> bool {
+    let Ok(repo) = git2::Repository::discover(cwd) else {
+        return false;
+    };
+    let Some(root) = repo.workdir() else {
+        return false;
+    };
+    let read = |name: &str| match std::fs::read_to_string(root.join(name)) {
+        Ok(text) => Some(text),
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                log(&format!(
+                    "cannot read {}: {error}; keeping fallback guidelines",
+                    root.join(name).display()
+                ));
+            }
+            None
+        }
+    };
+    if !read("AGENTS.md").is_some_and(|text| text.contains("<!-- agent-kit:begin")) {
+        return false;
+    }
+    if !claude {
+        return true;
+    }
+    match std::fs::symlink_metadata(root.join("CLAUDE.md")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        _ => read("CLAUDE.md")
+            .is_some_and(|text| text.lines().any(|line| line.trim() == "@AGENTS.md")),
+    }
+}
+
 /// The guidelines a launch carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Guidelines {
@@ -178,10 +212,17 @@ pub struct Guidelines {
 }
 
 /// The guidelines for an agent starting now in `cwd`, or `None` when the
-/// settings switch them off or the file cannot be read (logged with the
-/// path and error; the agent starts without them).
-pub fn for_launch(config_dir: &Path, cwd: &Path, workspace_off: bool) -> Option<Guidelines> {
-    if !applies(&load_settings(config_dir), cwd, workspace_off) {
+/// settings switch them off, the repo supplies kit rules, or the file cannot
+/// be read (logged with the path and error; the agent starts without them).
+pub fn for_launch(
+    config_dir: &Path,
+    cwd: &Path,
+    workspace_off: bool,
+    claude: bool,
+) -> Option<Guidelines> {
+    if !applies(&load_settings(config_dir), cwd, workspace_off)
+        || repo_provides_guidelines(cwd, claude)
+    {
         return None;
     }
     let path = match ensure_guidelines_file(config_dir) {
@@ -334,7 +375,7 @@ or an existing worktree of this workspace, pass `checkout` (or, for `delegate_ta
 make a new worktree from that repository); pass `time_limit_minutes` and `effort` when the job \
 needs them. Do not run `codex exec` in a background shell: GitTerm cannot see those runs, so the \
 user cannot follow or stop them.\n\
-Check `plan_limits` before starting workers or reviewers, follow `routing`, and relay warnings to the user.\n";
+Check `plan_limits` before starting workers or reviewers.\n";
 
 /// The instructions a launch carries: the guidelines (when they apply),
 /// the documents note (when the workspace has places, TRU-191) and, for an
@@ -446,6 +487,11 @@ fn split_command(command: &str) -> (&str, &str, &str) {
         .next()
         .unwrap_or(executable);
     (executable, name, rest)
+}
+
+/// Whether a terminal startup command needs Claude's AGENTS.md import check.
+pub fn is_claude_command(command: &str) -> bool {
+    split_command(command).1 == "claude"
 }
 
 /// Whether a terminal startup command starts `claude`, `pi` or `codex`.
@@ -642,6 +688,7 @@ mod tests {
         let path = ensure_guidelines_file(&dir).unwrap();
         assert_eq!(path, dir.join(GUIDELINES_FILE));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), DEFAULT_GUIDELINES);
+        assert!(!DEFAULT_GUIDELINES.contains("## Documents"));
         std::fs::write(&path, "edited").unwrap();
         ensure_guidelines_file(&dir).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited");
@@ -650,9 +697,9 @@ mod tests {
     #[test]
     fn for_launch_reads_the_file_and_honours_the_settings() {
         let dir = tempfile::tempdir().unwrap();
-        let launch = for_launch(dir.path(), dir.path(), false).unwrap();
+        let launch = for_launch(dir.path(), dir.path(), false, false).unwrap();
         assert_eq!(launch.text, DEFAULT_GUIDELINES);
-        assert!(for_launch(dir.path(), dir.path(), true).is_none());
+        assert!(for_launch(dir.path(), dir.path(), true, false).is_none());
         save_settings(
             dir.path(),
             &GuidelinesSettings {
@@ -661,7 +708,78 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(for_launch(dir.path(), dir.path(), false).is_none());
+        assert!(for_launch(dir.path(), dir.path(), false, false).is_none());
+    }
+
+    #[test]
+    fn kit_detection_keeps_workspace_notes_for_every_launch() {
+        for (git, marker, claude_file, claude, skip) in [
+            (true, true, Some("@AGENTS.md\n"), true, true),
+            (true, true, None, true, true),
+            (true, false, Some("@AGENTS.md\n"), true, false),
+            (true, true, Some("Read AGENTS.md\n"), true, false),
+            (true, true, Some("# @AGENTS.md\n"), true, false),
+            (true, true, Some("Read AGENTS.md\n"), false, true),
+            (true, true, None, false, true),
+            (false, true, Some("@AGENTS.md\n"), true, false),
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let repo = fixture.path().join("repo");
+            let cwd = repo.join("src");
+            std::fs::create_dir_all(&cwd).unwrap();
+            if git {
+                git2::Repository::init(&repo).unwrap();
+            }
+            std::fs::write(
+                repo.join("AGENTS.md"),
+                if marker {
+                    "<!-- agent-kit:begin guidelines -->\nKit rules\n<!-- agent-kit:end -->\n"
+                } else {
+                    "Repository rules\n"
+                },
+            )
+            .unwrap();
+            if let Some(text) = claude_file {
+                std::fs::write(repo.join("CLAUDE.md"), text).unwrap();
+            }
+            // Only the top-level marker decides, even from a subfolder.
+            std::fs::write(cwd.join("AGENTS.md"), "<!-- agent-kit:begin -->").unwrap();
+            let config = fixture.path().join("config");
+            let guidelines = for_launch(&config, &cwd, false, claude);
+            assert_eq!(
+                guidelines.is_none(),
+                skip,
+                "git={git}, marker={marker}, claude_file={claude_file:?}, claude={claude}"
+            );
+            let places = document_places(
+                true,
+                true,
+                &fixture.path().join("work"),
+                None,
+                "Example work",
+                &[repo],
+            )
+            .unwrap();
+            let launch = launch_instructions(
+                guidelines,
+                Some(&places),
+                true,
+                &fixture.path().join("launch"),
+            )
+            .unwrap();
+            assert_eq!(launch.text.contains("# Change guidelines"), !skip);
+            assert!(launch.text.contains("# Documents for this work"));
+            assert!(launch.text.contains("- Workspace: `Example work`"));
+            assert!(launch.text.contains(&format!(
+                "- Workspace checkpoint: `{}`",
+                places.docs_dir.join("checkpoint.md").display()
+            )));
+            assert!(launch.text.contains(CODEX_TOOLS_NOTE));
+            let refreshed = workspace_context(&launch.text).unwrap();
+            assert!(refreshed.contains("Workspace checkpoint:"));
+            assert!(!refreshed.contains("Change guidelines"));
+            assert!(!refreshed.contains("Starting Codex"));
+        }
     }
 
     #[test]
@@ -669,10 +787,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A directory where the file should be cannot be read as text.
         std::fs::create_dir_all(dir.path().join(GUIDELINES_FILE)).unwrap();
-        assert!(for_launch(dir.path(), dir.path(), false).is_none());
+        assert!(for_launch(dir.path(), dir.path(), false, false).is_none());
         let empty = tempfile::tempdir().unwrap();
         std::fs::write(empty.path().join(GUIDELINES_FILE), "  \n").unwrap();
-        assert!(for_launch(empty.path(), empty.path(), false).is_none());
+        assert!(for_launch(empty.path(), empty.path(), false, false).is_none());
     }
 
     #[test]
@@ -788,8 +906,6 @@ mod tests {
             "effort",
             "codex exec",
             "plan_limits",
-            "follow `routing`",
-            "relay warnings",
         ] {
             assert!(CODEX_TOOLS_NOTE.contains(word), "{word}");
         }
@@ -910,6 +1026,8 @@ mod tests {
             configure_terminal_command("claude", &spaced),
             "claude --append-system-prompt-file '/My Config/agent-guidelines.md'"
         );
+        assert!(is_claude_command("/opt/bin/claude --resume abc"));
+        assert!(!is_claude_command("codex"));
         assert!(starts_a_harness("/opt/bin/codex resume"));
         assert!(!starts_a_harness("zsh"));
         for unchanged in [
