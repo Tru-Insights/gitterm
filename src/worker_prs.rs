@@ -2,6 +2,7 @@
 //! All transcript and facts I/O runs on a blocking thread. Empty per-delegation
 //! marker files under `<config>/worker-pr-scans/` leave existing schemas intact.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -273,7 +274,7 @@ fn scan_transcript_file(
                                     "shell_command" => args["command"].as_str().map(str::to_owned),
                                     "shell" => {
                                         let argv = args["command"].as_array()?;
-                                        shell_script(argv).map(str::to_owned)
+                                        shell_script(argv).map(Cow::into_owned)
                                     }
                                     _ => None,
                                 });
@@ -339,7 +340,7 @@ fn scan_transcript_file(
 /// vectors must name gh and its subcommands as separate literal arguments.
 fn argv_creates_pr(argv: &[Value]) -> bool {
     if let Some(script) = shell_script(argv) {
-        return chat_facts::is_gh_pr_create(script);
+        return chat_facts::is_gh_pr_create(&script);
     }
     argv.first()
         .and_then(Value::as_str)
@@ -349,27 +350,69 @@ fn argv_creates_pr(argv: &[Value]) -> bool {
         && argv.get(2).and_then(Value::as_str) == Some("create")
 }
 
-fn shell_script(argv: &[Value]) -> Option<&str> {
+fn shell_script(argv: &[Value]) -> Option<Cow<'_, str>> {
     let executable = argv.first()?.as_str()?.rsplit(['/', '\\']).next()?;
     let executable = executable.to_ascii_lowercase();
     let executable = executable.strip_suffix(".exe").unwrap_or(&executable);
     let args = argv.get(1..)?;
     if matches!(executable, "bash" | "sh" | "zsh" | "dash" | "ksh" | "fish") {
         if matches!(args.first()?.as_str()?, "-c" | "-lc" | "-cl") {
-            return args.get(1)?.as_str();
+            return args.get(1)?.as_str().map(Cow::Borrowed);
         }
         return None;
     }
     if matches!(executable, "pwsh" | "powershell") {
-        // PowerShell options such as -NoProfile can come before -Command.
-        let flag = args.iter().position(|arg| {
-            arg.as_str().is_some_and(|arg| {
-                arg.eq_ignore_ascii_case("-command") || arg.eq_ignore_ascii_case("-c")
-            })
-        })?;
-        return args.get(flag + 1)?.as_str();
+        return powershell_command(args)
+            .map(|script| Cow::Owned(strip_powershell_block_comments(script)));
     }
     None
+}
+
+/// The -Command string, read only from PowerShell's own options. A script
+/// file (-File or a bare path) ends option parsing: what follows is the
+/// script's arguments, so a later `-c` is not a command string.
+fn powershell_command(args: &[Value]) -> Option<&str> {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let arg = arg.as_str()?;
+        if !arg.starts_with('-') {
+            return None;
+        }
+        let flag = arg.to_ascii_lowercase();
+        match flag.as_str() {
+            "-command" | "-c" => return args.next()?.as_str(),
+            // Options that take a value; skip it.
+            "-executionpolicy" | "-ex" | "-ep" | "-workingdirectory" | "-wd" | "-windowstyle"
+            | "-w" | "-configurationname" | "-config" | "-outputformat" | "-of" | "-o"
+            | "-inputformat" | "-if" | "-in" | "-settingsfile" | "-settings" => {
+                args.next()?;
+            }
+            // Switches without a value.
+            "-noprofile" | "-nop" | "-noninteractive" | "-noni" | "-nologo" | "-login" | "-l"
+            | "-mta" | "-sta" | "-noexit" | "-noe" => {}
+            // -File, -EncodedCommand and anything unknown: no readable command.
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// PowerShell `<# ... #>` block comments are not commands; the shared
+/// scanner only knows `#` line comments. An unclosed block comments out
+/// the rest of the script.
+fn strip_powershell_block_comments(script: &str) -> String {
+    let mut out = String::with_capacity(script.len());
+    let mut rest = script;
+    while let Some(start) = rest.find("<#") {
+        out.push_str(&rest[..start]);
+        out.push('\n');
+        match rest[start + 2..].find("#>") {
+            Some(end) => rest = &rest[start + 2 + end + 2..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Shell outputs use JSON metadata in older Codex versions and status headers
@@ -610,6 +653,37 @@ GH_TOKEN="$(gh auth token --user example-user)" gh pr create --draft --base deve
                 1,
             ),
             (json!(["powershell.exe", "-File", "gh pr create"]), 0),
+            (
+                json!([
+                    "pwsh",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    "gh pr create --fill"
+                ]),
+                1,
+            ),
+            (
+                json!(["pwsh", "-File", "echo.ps1", "-c", "gh pr create"]),
+                0,
+            ),
+            (json!(["pwsh", "echo.ps1", "-c", "gh pr create"]), 0),
+            (
+                json!([
+                    "pwsh",
+                    "-Command",
+                    "<#\ngh pr create\n#>\nWrite-Output 'https://github.com/fake/repo/pull/42'"
+                ]),
+                0,
+            ),
+            (
+                json!([
+                    "pwsh",
+                    "-Command",
+                    "<# create the PR #> gh pr create --fill"
+                ]),
+                1,
+            ),
             (json!(["fish", "gh pr create"]), 0),
         ] {
             let mut event = command_execution(json!(0));
