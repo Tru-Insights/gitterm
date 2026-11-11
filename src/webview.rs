@@ -489,6 +489,9 @@ pub fn try_create_with_window(
             .build_as_child(&wrapper)
             .map_err(|e| format!("Failed to create {surface:?} WebView: {}", e))?;
 
+        #[cfg(target_os = "macos")]
+        markdown_menu::install(&webview);
+
         slot.webview = Some(webview);
         slot.data_store_identifier = data_store_identifier;
         Ok(true)
@@ -708,6 +711,198 @@ fn native_paste(_webview: &WebView, tab_id: usize) {
     eprintln!("[agent-webview] paste for tab={tab_id} ignored: native paste is macOS only");
 }
 
+/// Write only a string representation: clearing first prevents rich clipboard
+/// formats from a previous copy from taking precedence in Slack.
+pub fn copy_markdown_to_pasteboard(text: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    return markdown_menu::write(text);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = text;
+        Err("Copy as Markdown requires macOS".into())
+    }
+}
+
+// Kept as a two-operation seam so the test verifies both ordering and the sole
+// advertised clipboard type without touching the user's system pasteboard.
+#[cfg(any(target_os = "macos", test))]
+fn write_plain_text(
+    text: &str,
+    mut clear: impl FnMut() -> Result<(), String>,
+    mut set_string: impl FnMut(&str, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    if text.is_empty() {
+        return Err("Copy as Markdown received empty text".into());
+    }
+    clear()?;
+    set_string(text, "public.utf8-plain-text")
+}
+
+#[cfg(target_os = "macos")]
+mod markdown_menu {
+    use super::*;
+    use objc2::{
+        class, msg_send, msg_send_id,
+        rc::{Allocated, Retained},
+        runtime::{AnyClass, AnyObject, Bool, Sel},
+        sel,
+    };
+    use wry::WebViewExtMacOS;
+
+    unsafe fn string(text: &str) -> Retained<AnyObject> {
+        let allocated: Allocated<AnyObject> = msg_send_id![class!(NSString), alloc];
+        msg_send_id![allocated, initWithBytes: text.as_ptr().cast::<std::ffi::c_void>() length: text.len() encoding: 4usize]
+    }
+
+    pub(super) fn write(text: &str) -> Result<(), String> {
+        // All callers run in the UI update loop (or the native smoke loop).
+        unsafe {
+            let board: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+            if board.is_null() {
+                return Err("NSPasteboard.generalPasteboard unavailable".into());
+            }
+            write_plain_text(
+                text,
+                || {
+                    let _: isize = msg_send![board, clearContents];
+                    Ok(())
+                },
+                |text, kind| {
+                    let ok: Bool =
+                        msg_send![board, setString: &*string(text) forType: &*string(kind)];
+                    if ok.as_bool() {
+                        Ok(())
+                    } else {
+                        Err("NSPasteboard.setString failed for Copy as Markdown".into())
+                    }
+                },
+            )
+        }
+    }
+
+    // wry's Darwin evaluation callback is invoked/dropped on the main thread.
+    // Hold the supplied NSMenu and target alive until that callback completes;
+    // the integer can cross wry's Send bound, but is dereferenced only there.
+    struct MenuObject(usize);
+    impl MenuObject {
+        unsafe fn retain(object: &AnyObject) -> Self {
+            let retained = Retained::retain((object as *const AnyObject).cast_mut()).unwrap();
+            Self(Retained::into_raw(retained) as usize)
+        }
+        unsafe fn get(&self) -> &AnyObject {
+            &*(self.0 as *const AnyObject)
+        }
+    }
+    impl Drop for MenuObject {
+        fn drop(&mut self) {
+            unsafe {
+                let _: () = msg_send![self.get(), release];
+            }
+        }
+    }
+
+    fn tab_for(view: &AnyObject) -> Option<usize> {
+        AGENT_PAGES.with(|pages| {
+            pages.borrow().iter().find_map(|(id, slot)| {
+                slot.webview
+                    .as_ref()
+                    .filter(|webview| {
+                        std::ptr::eq(&*webview.webview() as *const _ as *const AnyObject, view)
+                    })
+                    .map(|_| *id)
+            })
+        })
+    }
+
+    unsafe extern "C" fn copy(view: &AnyObject, _selector: Sel, _sender: *mut AnyObject) {
+        let Some(tab_id) = tab_for(view) else {
+            return;
+        };
+        with_existing_slot(WebviewSurface::Agent(tab_id), |slot| {
+            if let Some(webview) = &slot.webview {
+                if let Err(error) = webview.evaluate_script("window.__copySelectionMarkdown(true)")
+                {
+                    eprintln!("[agent-webview] Copy as Markdown evaluation failed: {error}");
+                }
+            }
+        });
+    }
+
+    unsafe extern "C" fn will_open(
+        view: &AnyObject,
+        _selector: Sel,
+        menu: &AnyObject,
+        _event: *mut AnyObject,
+    ) {
+        // Preserve inherited WKWebView/NSView menu preparation as well.
+        if let Some(superclass) = AnyClass::get("WryWebView").and_then(AnyClass::superclass) {
+            let _: () = msg_send![super(view, superclass), willOpenMenu: menu withEvent: _event];
+        }
+        let Some(tab_id) = tab_for(view) else {
+            return;
+        };
+        let menu = MenuObject::retain(menu);
+        let target = MenuObject::retain(view);
+        with_existing_slot(WebviewSurface::Agent(tab_id), |slot| {
+            let Some(webview) = &slot.webview else {
+                return;
+            };
+            if let Err(error) = webview.evaluate_script_with_callback("window.__prepareCopyMarkdownMenu()", move |result| {
+                if result != "true" { return; }
+                // Cocoa runs this completion on the main thread, including during
+                // menu tracking. Mutate only the supplied menu; keep its items.
+                let item: Allocated<AnyObject> = msg_send_id![class!(NSMenuItem), alloc];
+                let item: Retained<AnyObject> = msg_send_id![item, initWithTitle: &*string("Copy as Markdown") action: sel!(gittermCopySelectionMarkdown:) keyEquivalent: &*string("")];
+                let _: () = msg_send![&*item, setTarget: target.get()];
+                let _: () = msg_send![&*item, setEnabled: Bool::YES];
+                let _: () = msg_send![menu.get(), addItem: &*item];
+                let _: () = msg_send![menu.get(), update];
+            }) {
+                eprintln!("[agent-webview] Copy as Markdown menu evaluation failed: {error}");
+            }
+        });
+    }
+
+    pub(super) fn install(webview: &WebView) -> bool {
+        static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *INSTALLED.get_or_init(|| unsafe {
+            let wk = webview.webview();
+            let Some(class) = AnyClass::get("WryWebView") else {
+                eprintln!("[agent-webview] Copy as Markdown hook skipped: WryWebView class unavailable");
+                return false;
+            };
+            // WebKit may dynamically wrap the instance in NSKVONotifying_*.
+            // Install on wry's class, never on that per-instance KVO subclass.
+            let belongs: Bool = msg_send![&*wk, isKindOfClass: class];
+            if !belongs.as_bool() {
+                eprintln!("[agent-webview] Copy as Markdown hook skipped: webview is not a WryWebView");
+                return false;
+            }
+            if class.instance_methods().iter().any(|method| method.name() == sel!(willOpenMenu:withEvent:)) {
+                eprintln!("[agent-webview] Copy as Markdown hook skipped: willOpenMenu:withEvent: already implemented");
+                return false;
+            }
+            if class.instance_method(sel!(gittermCopySelectionMarkdown:)).is_some() {
+                eprintln!("[agent-webview] Copy as Markdown hook skipped: action already implemented");
+                return false;
+            }
+            let class_ptr = (class as *const AnyClass).cast_mut().cast();
+            // objc2's runtime FFI adds methods to the existing wry class; no
+            // replacement, swizzling, superclass modification or wry fork.
+            let action = objc2::ffi::class_addMethod(class_ptr, sel!(gittermCopySelectionMarkdown:).as_ptr().cast(),
+                Some(std::mem::transmute::<unsafe extern "C" fn(&AnyObject, Sel, *mut AnyObject), unsafe extern "C" fn()>(copy)), c"v@:@".as_ptr());
+            let hook = objc2::ffi::class_addMethod(class_ptr, sel!(willOpenMenu:withEvent:).as_ptr().cast(),
+                Some(std::mem::transmute::<unsafe extern "C" fn(&AnyObject, Sel, &AnyObject, *mut AnyObject), unsafe extern "C" fn()>(will_open)), c"v@:@@".as_ptr());
+            if action && hook {
+                eprintln!("[agent-webview] Copy as Markdown hook installed on WryWebView");
+            } else {
+                eprintln!("[agent-webview] Copy as Markdown hook unavailable (runtime refused method addition)");
+            }
+            action && hook
+        })
+    }
+}
+
 /// Give keyboard focus back to GitTerm's own view, the window view every
 /// webview is a child of. Called when the user clicks a terminal, in case a
 /// webview still holds first responder: a chat page takes Cmd+V for itself
@@ -762,6 +957,51 @@ pub fn destroy(surface: WebviewSurface) {
 #[cfg(test)]
 mod tests {
     use super::{insert_composer_text_script, page_store_action, PageDataStore, PageStoreAction};
+
+    #[test]
+    fn markdown_pasteboard_clears_then_writes_only_plain_text() {
+        let operations = std::cell::RefCell::new(Vec::new());
+        let text = "**selected** 😀\n`code`";
+        super::write_plain_text(
+            text,
+            || {
+                operations
+                    .borrow_mut()
+                    .push(("clear".to_string(), String::new()));
+                Ok(())
+            },
+            |value, kind| {
+                operations
+                    .borrow_mut()
+                    .push((kind.to_string(), value.to_string()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *operations.borrow(),
+            vec![
+                ("clear".into(), "".into()),
+                ("public.utf8-plain-text".into(), text.into())
+            ]
+        );
+        assert!(super::write_plain_text(
+            "",
+            || panic!("empty copy cleared clipboard"),
+            |_, _| panic!("empty copy wrote clipboard")
+        )
+        .is_err());
+        assert!(super::write_plain_text(
+            text,
+            || Err("clear failed".into()),
+            |_, _| panic!("write after failed clear")
+        )
+        .is_err());
+        assert_eq!(
+            super::write_plain_text(text, || Ok(()), |_, _| Err("set failed".into())),
+            Err("set failed".into())
+        );
+    }
 
     #[test]
     fn page_policy_can_run_under_slot_borrow_and_old_surfaces_keep_their_own_policy() {
