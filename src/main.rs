@@ -6586,6 +6586,20 @@ fn task_tab_indices(workspace: &Workspace, task_id: &str) -> Vec<usize> {
         .collect()
 }
 
+fn finished_task_ids_for_workspace(
+    store: &TaskStore,
+    belongs_to_workspace: impl Fn(&TaskRecord) -> bool,
+) -> Vec<String> {
+    store
+        .tasks()
+        .iter()
+        .filter(|task| belongs_to_workspace(task))
+        .filter(|task| !task.lifecycle.is_active() && task.lifecycle != TaskLifecycle::Archived)
+        .filter(|task| store.task_worktree_missing(&task.task_id))
+        .map(|task| task.task_id.clone())
+        .collect()
+}
+
 /// Who wrote a `task_update_handoff`, as recorded in
 /// `TaskHandoff.updated_by_session_id`. An explicit `session_id` must be one
 /// of the task's sessions. Without one the calling tab (`caller`, its
@@ -6942,6 +6956,8 @@ pub enum Event {
     TaskArchive(String),
     /// Archive every failed task in the active workspace in one click.
     TaskArchiveAllFailed,
+    /// Archive every settled task with a missing worktree in the active workspace.
+    TaskArchiveFinished,
     TaskSwitcherOpen,
     TaskSwitcherClose,
     TaskSwitcherQueryChanged(String),
@@ -28463,6 +28479,46 @@ fi
                     }
                 }
             }
+            Event::TaskArchiveFinished => {
+                let task_ids = match (self.task_store.as_ref(), self.active_workspace()) {
+                    (Some(store), Some(workspace)) => {
+                        finished_task_ids_for_workspace(store, |task| {
+                            self.task_belongs_to_workspace(task, workspace)
+                        })
+                    }
+                    _ => Vec::new(),
+                };
+                if !task_ids.is_empty() {
+                    let timestamp = chrono::Utc::now().to_rfc3339();
+                    let focused = self.active_task_context_id().map(str::to_string);
+                    let mut focused_archived = false;
+                    let mut archive_error = None;
+                    match self.task_store.as_mut() {
+                        Some(store) => {
+                            for task_id in task_ids {
+                                match store.archive(&task_id, &timestamp) {
+                                    Ok(()) => {
+                                        if focused.as_deref() == Some(task_id.as_str()) {
+                                            focused_archived = true;
+                                        }
+                                        self.task_rows_seen.insert(task_id);
+                                    }
+                                    Err(error) => archive_error = Some(error.to_string()),
+                                }
+                            }
+                        }
+                        None => {
+                            archive_error = Some("GitTerm's task store is unavailable".to_string());
+                        }
+                    }
+                    if let Some(error) = archive_error {
+                        self.task_ui_error = Some(error);
+                    }
+                    if focused_archived {
+                        return self.update(Event::TaskContextBack);
+                    }
+                }
+            }
             Event::TaskWorktreeDeleteOpen(task_id) => {
                 let Some(task) = self
                     .task_store
@@ -40060,6 +40116,13 @@ fi
             .iter()
             .filter(|task| task.lifecycle == TaskLifecycle::Failed)
             .count();
+        let finished_count = match (self.task_store.as_ref(), workspace) {
+            (Some(store), Some(workspace)) => finished_task_ids_for_workspace(store, |task| {
+                self.task_belongs_to_workspace(task, workspace)
+            })
+            .len(),
+            _ => 0,
+        };
 
         let header = row![
             text(workspace_name).size(10).color(text_muted).font(mono),
@@ -40202,6 +40265,35 @@ fi
                 })
                 .padding([2, 6])
                 .on_press(Event::TaskArchiveAllFailed),
+            );
+        }
+        if finished_count > 0 {
+            let danger = theme.danger();
+            filters = filters.push(
+                button(
+                    text(format!("Archive {finished_count} finished"))
+                        .size(9)
+                        .font(mono),
+                )
+                .style(move |_, status| button::Style {
+                    background: Some(
+                        if matches!(status, button::Status::Hovered) {
+                            theme.bg_overlay()
+                        } else {
+                            iced::Color::TRANSPARENT
+                        }
+                        .into(),
+                    ),
+                    text_color: danger,
+                    border: iced::Border {
+                        color: danger,
+                        width: 1.0,
+                        radius: 10.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .padding([2, 6])
+                .on_press(Event::TaskArchiveFinished),
             );
         }
         let mut content = Column::new()
@@ -48022,8 +48114,133 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gitterm::tasks::{GitBase, RepositoryIdentity};
     use std::path::Path;
     use std::sync::Arc;
+
+    #[test]
+    fn archive_finished_selects_only_settled_missing_worktrees_in_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_a = temp.path().join("workspace-a");
+        let workspace_b = temp.path().join("workspace-b");
+        let present_path = temp.path().join("present-worktree");
+        std::fs::create_dir(&present_path).unwrap();
+        let mut store = TaskStore::load(temp.path().join("tasks.json")).unwrap();
+
+        let mut add_task = |id: &str, workspace: &std::path::Path, lifecycle, worktree_path| {
+            let mut task = TaskRecord::new_draft(
+                NewTaskRecord {
+                    task_id: id.to_string(),
+                    title: id.to_string(),
+                    objective: "Test archive finished".to_string(),
+                    workspace: TaskWorkspaceIdentity {
+                        name: workspace
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                        location: WorkspaceLocationIdentity::Local {
+                            directory: workspace.to_path_buf(),
+                        },
+                    },
+                    repository: RepositoryIdentity {
+                        common_dir: workspace.join(".git"),
+                        remote_url: None,
+                    },
+                    issue: None,
+                    base: GitBase {
+                        reference: "v6".to_string(),
+                        commit: "0123456789abcdef".to_string(),
+                    },
+                    branch: format!("task/{id}"),
+                    executor: ExecutorTarget::Local,
+                    harness: None,
+                    stopping_boundary: StoppingBoundary::ImplementUntilTestsPass,
+                },
+                "2026-11-10T00:00:00Z",
+            );
+            task.lifecycle = lifecycle;
+            task.worktree = TaskWorktree {
+                state: TaskWorktreeState::Ready,
+                path: Some(worktree_path),
+            };
+            if lifecycle == TaskLifecycle::Archived {
+                task.archived_at = Some("2026-11-09T00:00:00Z".to_string());
+            }
+            store.insert(task).unwrap();
+        };
+
+        let missing_path = temp.path().join("missing-worktree");
+        add_task(
+            "active",
+            &workspace_a,
+            TaskLifecycle::Preparing,
+            missing_path.clone(),
+        );
+        add_task(
+            "settled-with-worktree",
+            &workspace_a,
+            TaskLifecycle::Completed,
+            present_path,
+        );
+        add_task(
+            "settled-without-worktree",
+            &workspace_a,
+            TaskLifecycle::Completed,
+            missing_path.clone(),
+        );
+        add_task(
+            "failed-without-worktree",
+            &workspace_a,
+            TaskLifecycle::Failed,
+            missing_path.clone(),
+        );
+        add_task(
+            "already-archived",
+            &workspace_a,
+            TaskLifecycle::Archived,
+            missing_path.clone(),
+        );
+        add_task(
+            "other-workspace",
+            &workspace_b,
+            TaskLifecycle::Completed,
+            missing_path,
+        );
+
+        let selected = finished_task_ids_for_workspace(&store, |task| {
+            matches!(
+                &task.workspace.location,
+                WorkspaceLocationIdentity::Local { directory } if directory == &workspace_a
+            )
+        });
+        assert_eq!(
+            selected,
+            ["settled-without-worktree", "failed-without-worktree"]
+        );
+
+        for task_id in &selected {
+            store.archive(task_id, "2026-11-10T01:00:00Z").unwrap();
+        }
+        for id in ["settled-without-worktree", "failed-without-worktree"] {
+            assert_eq!(store.get(id).unwrap().lifecycle, TaskLifecycle::Archived);
+        }
+        for id in ["active", "settled-with-worktree", "other-workspace"] {
+            assert_ne!(
+                store.get(id).unwrap().lifecycle,
+                TaskLifecycle::Archived,
+                "{id}"
+            );
+        }
+        assert_eq!(
+            store
+                .get("already-archived")
+                .unwrap()
+                .archived_at
+                .as_deref(),
+            Some("2026-11-09T00:00:00Z")
+        );
+    }
 
     #[test]
     fn plain_vertical_wheel_moves_horizontal_and_preserves_other_deltas() {
