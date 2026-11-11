@@ -170,6 +170,60 @@ pub fn applies(settings: &GuidelinesSettings, cwd: &Path, workspace_off: bool) -
     settings.enabled && !workspace_off && !settings.repo_is_off(cwd)
 }
 
+/// The instruction file a harness reads by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructionFile {
+    ClaudeMd,
+    AgentsMd,
+    Unknown,
+}
+
+/// Whether the launch's own checkout supplies the kit rules. Do not use
+/// `repo_key`: linked worktrees can have different instruction files.
+pub fn repo_provides_guidelines(cwd: &Path, instruction_file: InstructionFile) -> bool {
+    let Ok(repo) = git2::Repository::discover(cwd) else {
+        return false;
+    };
+    let Some(root) = repo.workdir() else {
+        return false;
+    };
+    let read = |name: &str| {
+        let result = std::fs::read_to_string(root.join(name));
+        if let Err(error) = &result {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                log(&format!(
+                    "cannot read {}: {error}; keeping fallback guidelines",
+                    root.join(name).display()
+                ));
+            }
+        }
+        result
+    };
+    let agents = match instruction_file {
+        // Codex/Pi load only the first nonempty instruction file per directory.
+        InstructionFile::AgentsMd => match read("AGENTS.override.md") {
+            Ok(text) if text.trim().is_empty() => read("AGENTS.md"),
+            Ok(text) => Ok(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => read("AGENTS.md"),
+            Err(_) => return false,
+        },
+        InstructionFile::ClaudeMd => read("AGENTS.md"),
+        InstructionFile::Unknown => return false,
+    };
+    if !agents.is_ok_and(|text| text.contains("<!-- agent-kit:begin")) {
+        return false;
+    }
+    match instruction_file {
+        InstructionFile::AgentsMd => true,
+        InstructionFile::Unknown => false,
+        InstructionFile::ClaudeMd => match std::fs::symlink_metadata(root.join("CLAUDE.md")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            _ => read("CLAUDE.md")
+                .is_ok_and(|text| text.lines().any(|line| line.trim() == "@AGENTS.md")),
+        },
+    }
+}
+
 /// The guidelines a launch carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Guidelines {
@@ -178,10 +232,17 @@ pub struct Guidelines {
 }
 
 /// The guidelines for an agent starting now in `cwd`, or `None` when the
-/// settings switch them off or the file cannot be read (logged with the
-/// path and error; the agent starts without them).
-pub fn for_launch(config_dir: &Path, cwd: &Path, workspace_off: bool) -> Option<Guidelines> {
-    if !applies(&load_settings(config_dir), cwd, workspace_off) {
+/// settings switch them off, the repo supplies kit rules, or the file cannot
+/// be read (logged with the path and error; the agent starts without them).
+pub fn for_launch(
+    config_dir: &Path,
+    cwd: &Path,
+    workspace_off: bool,
+    instruction_file: InstructionFile,
+) -> Option<Guidelines> {
+    if !applies(&load_settings(config_dir), cwd, workspace_off)
+        || repo_provides_guidelines(cwd, instruction_file)
+    {
         return None;
     }
     let path = match ensure_guidelines_file(config_dir) {
@@ -245,7 +306,8 @@ pub fn documents_note(places: &DocumentPlaces) -> String {
     let mut note = format!(
         "# Documents for this work (added by GitTerm)\n\n\
          - Working notes for this work (status, plans, scratch) go in \
-         `{}`. That folder is private and not in git.\n",
+         `{}`. It is outside the project repos. When the folder above it is a git repo with a remote, \
+         GitTerm commits and pushes it there, so keep secrets out of it.\n",
         places.docs_dir.display()
     );
     note.push_str(&format!(
@@ -274,6 +336,10 @@ pub fn documents_note(places: &DocumentPlaces) -> String {
              its conventions, through a PR.\n",
         ),
     }
+    note.push_str(
+        "- GitTerm's chat shows markdown tables as tables, and they paste into \
+         Slack as tables: use a table for items that share several attributes.\n",
+    );
     // Last, so the SessionStart hook can re-read it (`workspace_context`).
     note.push_str(&checkpoint_note(&places.docs_dir.join("checkpoint.md")));
     note
@@ -283,13 +349,14 @@ const CHECKPOINT_LINE: &str = "- Workspace checkpoint: `";
 
 /// The workspace's own checkpoint (TRU-237): repos are shared between
 /// workspaces, so a repo's `.agents/checkpoint.md` cannot say whose work it
-/// is. Code names the file; the agent only reads and writes it. Read from
-/// disk each time, so a chat that wrote it before `/clear` gets it back.
+/// is. Code names the file; the agent only reads and writes it. Its status
+/// comes from disk each time, so `/clear` cannot leave it stale.
 fn checkpoint_note(resume: &Path) -> String {
-    let mut note = format!(
+    let note = format!(
         "{CHECKPOINT_LINE}{}` ({}). `/checkpoint` writes here and `/resume` \
          reads here, never a repo's `.agents/checkpoint.md`.\n\
-         Resume only this workspace's work; if unsure which work to continue, ask.\n",
+         Read it at the start of the chat and after a clear or compaction; resume only this \
+         workspace's work; if unsure which work to continue, ask.\n",
         resume.display(),
         if resume.is_file() {
             "exists"
@@ -297,62 +364,22 @@ fn checkpoint_note(resume: &Path) -> String {
             "not written yet"
         }
     );
-    if let Some(start) = checkpoint_start(resume) {
-        // A fence longer than any backtick run in the checkpoint.
-        let longest = start.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-        let fence = "`".repeat((longest + 1).max(4));
-        note.push_str(&format!(
-            "\nThe start of the workspace checkpoint:\n\n{fence}markdown\n{start}\n{fence}\n"
-        ));
-    }
     note
-}
-
-/// How much of the workspace checkpoint a chat starts with: checkpoints put
-/// the newest state first, and a whole file can be long.
-const CHECKPOINT_START_BYTES: usize = 12 * 1024;
-
-/// The first [`CHECKPOINT_START_BYTES`] of the checkpoint at `path`, cut at
-/// a line end, with a note when cut; `None` when missing, empty or
-/// unreadable (logged).
-fn checkpoint_start(path: &Path) -> Option<String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(error) => {
-            eprintln!("[guidelines] cannot read {}: {error}", path.display());
-            return None;
-        }
-    };
-    let text = text.trim_end();
-    if text.is_empty() {
-        return None;
-    }
-    if text.len() <= CHECKPOINT_START_BYTES {
-        return Some(text.to_string());
-    }
-    let mut end = CHECKPOINT_START_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    let end = text[..end].rfind('\n').unwrap_or(end);
-    Some(format!(
-        "{}\n\n(cut at {} KB; read the file for the rest)",
-        &text[..end],
-        CHECKPOINT_START_BYTES / 1024
-    ))
 }
 
 /// The workspace section of appended instructions, also supplied by Claude's
 /// SessionStart callback after a clear or compaction. The checkpoint status
-/// and start are read from disk on each call, not taken from the text.
+/// is read from disk on each call, not taken from the text.
 pub fn workspace_context(instructions: &str) -> Option<String> {
     let (section, resume) = workspace_section(instructions)?;
-    Some(
-        format!("{}{}", section, checkpoint_note(resume))
-            .trim_end()
-            .to_string(),
-    )
+    let mut context = format!("{}{}", section, checkpoint_note(resume));
+    if resume.is_file() {
+        context.push_str(&format!(
+            "Re-read the workspace checkpoint `{}` now, before continuing: it may have changed since this chat started.\n",
+            resume.display()
+        ));
+    }
+    Some(context.trim_end().to_string())
 }
 
 /// Identifies the workspace independently of its checkpoint's current contents.
@@ -363,8 +390,8 @@ pub fn workspace_checkpoint(instructions: &str) -> Option<&Path> {
 fn workspace_section(instructions: &str) -> Option<(&str, &Path)> {
     let start = instructions.find("# Documents for this work (added by GitTerm)\n")?;
     let section = &instructions[start..];
-    // The checkpoint line ends the note's fixed part; what follows it (the
-    // checkpoint's own text, which may hold any heading) is read again.
+    // The checkpoint line ends the note's fixed part; parse its path and
+    // rebuild the status and re-read instruction from disk.
     let at = section.find(CHECKPOINT_LINE)?;
     let path_start = at + CHECKPOINT_LINE.len();
     let path_end = path_start + section[path_start..].find('`')?;
@@ -382,7 +409,7 @@ or an existing worktree of this workspace, pass `checkout` (or, for `delegate_ta
 make a new worktree from that repository); pass `time_limit_minutes` and `effort` when the job \
 needs them. Do not run `codex exec` in a background shell: GitTerm cannot see those runs, so the \
 user cannot follow or stop them.\n\
-Check `plan_limits` before starting workers or reviewers, follow `routing`, and relay warnings to the user.\n";
+Check `plan_limits` before starting workers or reviewers.\n";
 
 /// The instructions a launch carries: the guidelines (when they apply),
 /// the documents note (when the workspace has places, TRU-191) and, for an
@@ -494,6 +521,15 @@ fn split_command(command: &str) -> (&str, &str, &str) {
         .next()
         .unwrap_or(executable);
     (executable, name, rest)
+}
+
+/// The default instruction file read by a supported terminal harness.
+pub fn instruction_file_for_command(command: &str) -> InstructionFile {
+    match split_command(command).1 {
+        "claude" => InstructionFile::ClaudeMd,
+        "codex" | "pi" => InstructionFile::AgentsMd,
+        _ => InstructionFile::Unknown,
+    }
 }
 
 /// Whether a terminal startup command starts `claude`, `pi` or `codex`.
@@ -690,6 +726,7 @@ mod tests {
         let path = ensure_guidelines_file(&dir).unwrap();
         assert_eq!(path, dir.join(GUIDELINES_FILE));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), DEFAULT_GUIDELINES);
+        assert!(!DEFAULT_GUIDELINES.contains("## Documents"));
         std::fs::write(&path, "edited").unwrap();
         ensure_guidelines_file(&dir).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited");
@@ -698,9 +735,9 @@ mod tests {
     #[test]
     fn for_launch_reads_the_file_and_honours_the_settings() {
         let dir = tempfile::tempdir().unwrap();
-        let launch = for_launch(dir.path(), dir.path(), false).unwrap();
+        let launch = for_launch(dir.path(), dir.path(), false, InstructionFile::Unknown).unwrap();
         assert_eq!(launch.text, DEFAULT_GUIDELINES);
-        assert!(for_launch(dir.path(), dir.path(), true).is_none());
+        assert!(for_launch(dir.path(), dir.path(), true, InstructionFile::Unknown).is_none());
         save_settings(
             dir.path(),
             &GuidelinesSettings {
@@ -709,7 +746,166 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(for_launch(dir.path(), dir.path(), false).is_none());
+        assert!(for_launch(dir.path(), dir.path(), false, InstructionFile::Unknown).is_none());
+    }
+
+    #[test]
+    fn regression_agents_override_decides_whether_fallback_is_needed() {
+        for (agents, override_text, skip) in [
+            (Some("<!-- agent-kit:begin -->"), "Other rules", false),
+            (Some("Other rules"), "<!-- agent-kit:begin -->", true),
+            (None, "<!-- agent-kit:begin -->", true),
+            (Some("<!-- agent-kit:begin -->"), "", true),
+            (Some("<!-- agent-kit:begin -->"), " \n\t", true),
+            (Some("Other rules"), "", false),
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let repo = fixture.path().join("repo");
+            git2::Repository::init(&repo).unwrap();
+            if let Some(text) = agents {
+                std::fs::write(repo.join("AGENTS.md"), text).unwrap();
+            }
+            std::fs::write(repo.join("AGENTS.override.md"), override_text).unwrap();
+            for command in ["codex", "pi"] {
+                assert_eq!(
+                    for_launch(
+                        &fixture.path().join("config"),
+                        &repo,
+                        false,
+                        instruction_file_for_command(command),
+                    )
+                    .is_none(),
+                    skip,
+                    "command={command}, agents={agents:?}, override={override_text:?}"
+                );
+            }
+            // Claude's AGENTS.md import does not use the Codex/Pi override.
+            assert_eq!(
+                repo_provides_guidelines(&repo, InstructionFile::ClaudeMd),
+                agents.is_some_and(|text| text.contains("<!-- agent-kit:begin"))
+            );
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("repo");
+        git2::Repository::init(&repo).unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "<!-- agent-kit:begin -->").unwrap();
+        std::fs::create_dir(repo.join("AGENTS.override.md")).unwrap();
+        assert!(for_launch(
+            &fixture.path().join("config"),
+            &repo,
+            false,
+            InstructionFile::AgentsMd,
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn kit_detection_keeps_workspace_notes_for_every_launch() {
+        for (git, marker, claude_file, instruction_file, skip) in [
+            (
+                true,
+                true,
+                Some("@AGENTS.md\n"),
+                InstructionFile::ClaudeMd,
+                true,
+            ),
+            (true, true, None, InstructionFile::ClaudeMd, true),
+            (
+                true,
+                false,
+                Some("@AGENTS.md\n"),
+                InstructionFile::ClaudeMd,
+                false,
+            ),
+            (
+                true,
+                true,
+                Some("Read AGENTS.md\n"),
+                InstructionFile::ClaudeMd,
+                false,
+            ),
+            (
+                true,
+                true,
+                Some("# @AGENTS.md\n"),
+                InstructionFile::ClaudeMd,
+                false,
+            ),
+            (
+                true,
+                true,
+                Some("Read AGENTS.md\n"),
+                InstructionFile::AgentsMd,
+                true,
+            ),
+            (true, true, None, InstructionFile::AgentsMd, true),
+            (true, true, None, InstructionFile::Unknown, false),
+            (
+                false,
+                true,
+                Some("@AGENTS.md\n"),
+                InstructionFile::ClaudeMd,
+                false,
+            ),
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let repo = fixture.path().join("repo");
+            let cwd = repo.join("src");
+            std::fs::create_dir_all(&cwd).unwrap();
+            if git {
+                git2::Repository::init(&repo).unwrap();
+            }
+            std::fs::write(
+                repo.join("AGENTS.md"),
+                if marker {
+                    "<!-- agent-kit:begin guidelines -->\nKit rules\n<!-- agent-kit:end -->\n"
+                } else {
+                    "Repository rules\n"
+                },
+            )
+            .unwrap();
+            if let Some(text) = claude_file {
+                std::fs::write(repo.join("CLAUDE.md"), text).unwrap();
+            }
+            // Only the top-level marker decides, even from a subfolder.
+            std::fs::write(cwd.join("AGENTS.md"), "<!-- agent-kit:begin -->").unwrap();
+            let config = fixture.path().join("config");
+            let guidelines = for_launch(&config, &cwd, false, instruction_file);
+            assert_eq!(
+                guidelines.is_none(),
+                skip,
+                "git={git}, marker={marker}, claude_file={claude_file:?}, instruction_file={instruction_file:?}"
+            );
+            let places = document_places(
+                true,
+                true,
+                &fixture.path().join("work"),
+                None,
+                "Example work",
+                &[repo],
+            )
+            .unwrap();
+            let launch = launch_instructions(
+                guidelines,
+                Some(&places),
+                true,
+                &fixture.path().join("launch"),
+            )
+            .unwrap();
+            assert_eq!(launch.text.contains("# Change guidelines"), !skip);
+            assert!(launch.text.contains("# Documents for this work"));
+            assert!(launch.text.contains("- Workspace: `Example work`"));
+            assert!(launch.text.contains(&format!(
+                "- Workspace checkpoint: `{}`",
+                places.docs_dir.join("checkpoint.md").display()
+            )));
+            assert!(launch.text.contains(CODEX_TOOLS_NOTE));
+            let refreshed = workspace_context(&launch.text).unwrap();
+            assert!(refreshed.contains("Workspace checkpoint:"));
+            assert!(!refreshed.contains("Change guidelines"));
+            assert!(!refreshed.contains("Starting Codex"));
+        }
     }
 
     #[test]
@@ -717,10 +913,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A directory where the file should be cannot be read as text.
         std::fs::create_dir_all(dir.path().join(GUIDELINES_FILE)).unwrap();
-        assert!(for_launch(dir.path(), dir.path(), false).is_none());
+        assert!(for_launch(dir.path(), dir.path(), false, InstructionFile::Unknown).is_none());
         let empty = tempfile::tempdir().unwrap();
         std::fs::write(empty.path().join(GUIDELINES_FILE), "  \n").unwrap();
-        assert!(for_launch(empty.path(), empty.path(), false).is_none());
+        assert!(for_launch(empty.path(), empty.path(), false, InstructionFile::Unknown).is_none());
     }
 
     #[test]
@@ -736,64 +932,50 @@ mod tests {
         assert!(missing.contains("Workspace: `Example workspace`"));
         assert!(missing.contains("`/code/example-api`, `/code/example-web`"));
         assert!(missing
-            .contains("Resume only this workspace's work; if unsure which work to continue, ask."));
+            .contains("resume only this workspace's work; if unsure which work to continue, ask."));
         let checkpoint = places.docs_dir.join("checkpoint.md");
         assert!(missing.contains(&format!(
             "Workspace checkpoint: `{}` (not written yet)",
             checkpoint.display()
         )));
-        assert!(!missing.contains("The start of the workspace checkpoint"));
+        assert!(
+            missing.contains("Read it at the start of the chat and after a clear or compaction")
+        );
+        assert!(missing.contains("never a repo's `.agents/checkpoint.md`"));
+        assert!(missing.contains("It is outside the project repos. When the folder above it is a git repo with a remote, GitTerm commits and pushes it there, so keep secrets out of it."));
         std::fs::create_dir_all(&places.docs_dir).unwrap();
-        std::fs::write(&checkpoint, "Example resume notes").unwrap();
+        let marker = "UNIQUE_CHECKPOINT_MARKER_TRU259";
+        std::fs::write(&checkpoint, marker).unwrap();
         let note = documents_note(&places);
         assert!(note.contains(&format!(
             "Workspace checkpoint: `{}` (exists)",
             checkpoint.display()
         )));
-        assert!(note.contains("The start of the workspace checkpoint:"));
-        assert!(note.contains("Example resume notes"));
-        // A long checkpoint is cut at a line end and says so.
-        let long = "line of notes\n".repeat(2000);
-        std::fs::write(&checkpoint, &long).unwrap();
-        let cut = checkpoint_start(&checkpoint).unwrap();
-        assert!(cut.len() < long.len());
-        assert!(cut.contains("(cut at 12 KB; read the file for the rest)"));
-        std::fs::write(&checkpoint, "Example resume notes").unwrap();
+        assert!(!note.contains(marker));
         let launch =
             launch_instructions(Some(sample()), Some(&places), true, fixture.path()).unwrap();
-        assert_eq!(
-            workspace_context(&launch.text).as_deref(),
-            Some(note.trim_end())
-        );
-        assert!(!workspace_context(&launch.text)
-            .unwrap()
-            .contains("Starting Codex"));
+        assert!(launch.text.contains(&checkpoint.display().to_string()));
+        assert!(!launch.text.contains(marker));
+        let context = workspace_context(&launch.text).unwrap();
+        assert!(context.contains(&checkpoint.display().to_string()));
+        assert!(!context.contains(marker));
+        assert!(context.contains(&format!("Re-read the workspace checkpoint `{}` now, before continuing: it may have changed since this chat started.", checkpoint.display())));
+        assert!(!context.contains("Starting Codex"));
         assert_eq!(workspace_context("Other instructions"), None);
 
-        // A checkpoint with its own top-level heading and code fence comes
-        // back whole, and the rest of the section with it (review F1).
-        std::fs::write(
-            &checkpoint,
-            "# Resume: example\n\n```sh\ncargo test\n```\n\n# Next\n- ship it",
-        )
-        .unwrap();
-        let launch =
-            launch_instructions(Some(sample()), Some(&places), true, fixture.path()).unwrap();
-        let context = workspace_context(&launch.text).unwrap();
-        assert!(context.contains("# Resume: example"), "{context}");
-        assert!(context.ends_with("- ship it\n````"), "{context}");
-        assert!(context.contains("No decisions repo is set"), "{context}");
-
-        // The checkpoint is read again on each call: a chat that writes it
-        // after launch and then clears gets the new one (review F2).
+        // The checkpoint status and hook instruction follow disk changes.
         std::fs::remove_file(&checkpoint).unwrap();
+        let context = workspace_context(&launch.text).unwrap();
+        assert!(context.contains("(not written yet)"), "{context}");
+        assert!(!context.contains("Re-read the workspace checkpoint"));
         let launch =
             launch_instructions(Some(sample()), Some(&places), true, fixture.path()).unwrap();
         assert!(launch.text.contains("(not written yet)"));
-        std::fs::write(&checkpoint, "Written before /clear").unwrap();
+        std::fs::write(&checkpoint, marker).unwrap();
         let context = workspace_context(&launch.text).unwrap();
         assert!(context.contains("(exists)"), "{context}");
-        assert!(context.contains("Written before /clear"), "{context}");
+        assert!(context.contains("Re-read the workspace checkpoint"));
+        assert!(!context.contains(marker));
     }
 
     #[test]
@@ -850,8 +1032,6 @@ mod tests {
             "effort",
             "codex exec",
             "plan_limits",
-            "follow `routing`",
-            "relay warnings",
         ] {
             assert!(CODEX_TOOLS_NOTE.contains(word), "{word}");
         }
@@ -971,6 +1151,14 @@ mod tests {
         assert_eq!(
             configure_terminal_command("claude", &spaced),
             "claude --append-system-prompt-file '/My Config/agent-guidelines.md'"
+        );
+        assert_eq!(
+            instruction_file_for_command("/opt/bin/claude --resume abc"),
+            InstructionFile::ClaudeMd
+        );
+        assert_eq!(
+            instruction_file_for_command("codex"),
+            InstructionFile::AgentsMd
         );
         assert!(starts_a_harness("/opt/bin/codex resume"));
         assert!(!starts_a_harness("zsh"));

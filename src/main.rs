@@ -674,8 +674,17 @@ fn push_guidelines_marker(tab_id: usize, on: bool) {
 
 /// GitTerm's change guidelines for an agent starting now in `cwd`
 /// (TRU-174); `None` when switched off or unreadable (logged).
-fn launch_guidelines(cwd: &Path, workspace_off: bool) -> Option<gitterm::guidelines::Guidelines> {
-    gitterm::guidelines::for_launch(&config::global_config_dir(), cwd, workspace_off)
+fn launch_guidelines(
+    cwd: &Path,
+    workspace_off: bool,
+    instruction_file: gitterm::guidelines::InstructionFile,
+) -> Option<gitterm::guidelines::Guidelines> {
+    gitterm::guidelines::for_launch(
+        &config::global_config_dir(),
+        cwd,
+        workspace_off,
+        instruction_file,
+    )
 }
 
 /// What an agent starting now in `cwd` gets appended: the guidelines and,
@@ -685,6 +694,7 @@ fn launch_guidelines(cwd: &Path, workspace_off: bool) -> Option<gitterm::guideli
 /// the agent starts; a failure is logged and the note still names it.
 fn launch_instructions(
     cwd: &Path,
+    instruction_file: gitterm::guidelines::InstructionFile,
     workspace_off: bool,
     places: Option<&gitterm::guidelines::DocumentPlaces>,
     task_tools: bool,
@@ -698,11 +708,20 @@ fn launch_instructions(
         }
     }
     gitterm::guidelines::launch_instructions(
-        launch_guidelines(cwd, workspace_off),
+        launch_guidelines(cwd, workspace_off, instruction_file),
         places,
         task_tools,
         &config::instance_config_dir(),
     )
+}
+
+fn claude_chat_instruction_file(remote: bool) -> gitterm::guidelines::InstructionFile {
+    if remote {
+        // A desktop path cannot verify the remote checkout's instructions.
+        gitterm::guidelines::InstructionFile::Unknown
+    } else {
+        gitterm::guidelines::InstructionFile::ClaudeMd
+    }
 }
 
 /// The document places of a saved workspace entry (a workspace not open
@@ -743,7 +762,13 @@ fn terminal_command_with_guidelines(
     if !gitterm::guidelines::starts_a_harness(command) {
         return command.to_string();
     }
-    match launch_instructions(cwd, workspace_off, places, task_tools) {
+    match launch_instructions(
+        cwd,
+        gitterm::guidelines::instruction_file_for_command(command),
+        workspace_off,
+        places,
+        task_tools,
+    ) {
         Some(guidelines) => gitterm::guidelines::configure_terminal_command(command, &guidelines),
         None => command.to_string(),
     }
@@ -11322,7 +11347,17 @@ impl App {
             tab::AgentBackend::Pi => true,
             tab::AgentBackend::Acp(_) => false,
         };
-        supported && launch_guidelines(&tab.repo_path, ws.guidelines_off).is_some()
+        supported
+            && launch_guidelines(
+                &tab.repo_path,
+                ws.guidelines_off,
+                match session.backend() {
+                    tab::AgentBackend::Claude => gitterm::guidelines::InstructionFile::ClaudeMd,
+                    tab::AgentBackend::Pi => gitterm::guidelines::InstructionFile::AgentsMd,
+                    tab::AgentBackend::Acp(_) => gitterm::guidelines::InstructionFile::Unknown,
+                },
+            )
+            .is_some()
     }
 
     /// Re-mark every built chat page after a guidelines setting changed.
@@ -18039,6 +18074,7 @@ impl App {
                     // tools, so it is not told to use them.
                     run.guidelines = launch_instructions(
                         &run.cwd,
+                        gitterm::guidelines::InstructionFile::AgentsMd,
                         self.workspace_guidelines_off(&delegation.parent.workspace),
                         self.workspace_document_places(&delegation.parent.workspace)
                             .as_ref(),
@@ -24381,6 +24417,7 @@ fi
                                     .any(|server| server.name == "gitterm_tasks");
                                 let guidelines = launch_instructions(
                                     &repo_path,
+                                    gitterm::guidelines::InstructionFile::Unknown,
                                     guidelines_off,
                                     document_places.as_ref(),
                                     task_tools,
@@ -24472,6 +24509,7 @@ fi
                                 });
                                 let guidelines_file = launch_instructions(
                                     &repo_path,
+                                    claude_chat_instruction_file(remote_chat.is_some()),
                                     guidelines_off,
                                     document_places.as_ref(),
                                     task_tools,
@@ -24561,6 +24599,7 @@ fi
                             // A per-turn pi process gets no MCP servers.
                             let guidelines_file = launch_instructions(
                                 &repo_path,
+                                gitterm::guidelines::InstructionFile::AgentsMd,
                                 guidelines_off,
                                 document_places.as_ref(),
                                 false,
@@ -32220,6 +32259,7 @@ fi
                 .any(|server| server.name == "gitterm_tasks");
             let guidelines = launch_instructions(
                 &repo_path,
+                gitterm::guidelines::InstructionFile::Unknown,
                 guidelines_off,
                 document_places.as_ref(),
                 task_tools,
@@ -47401,6 +47441,28 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::Arc;
+
+    #[test]
+    fn regression_remote_claude_keeps_fallback_for_local_kit_path() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("repo");
+        git2::Repository::init(&repo).unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "<!-- agent-kit:begin -->").unwrap();
+        std::fs::write(repo.join("CLAUDE.md"), "@AGENTS.md\n").unwrap();
+        let config = fixture.path().join("config");
+        for remote in [false, true] {
+            let guidelines = gitterm::guidelines::for_launch(
+                &config,
+                &repo,
+                false,
+                claude_chat_instruction_file(remote),
+            );
+            assert_eq!(guidelines.is_some(), remote, "remote={remote}");
+            if let Some(guidelines) = guidelines {
+                assert_eq!(guidelines.text, gitterm::guidelines::DEFAULT_GUIDELINES);
+            }
+        }
+    }
 
     #[test]
     fn plain_vertical_wheel_moves_horizontal_and_preserves_other_deltas() {
