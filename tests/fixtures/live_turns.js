@@ -514,10 +514,45 @@
     key(query, 'Escape');
 
     reset();
+    send(H('text_delta', 'needle **needle** chosen needle last'));
+    await settle();
+    window.__openFind(); search('needle'); key(query, 'Enter');
+    const selectedReply = current().startContainer.parentElement.closest('.assistant');
+    send(H('text_delta', '\nneedle **needle** chosen needle last'));
+    await settle(); await settle();
+    check('completing a line and repeating it in the raw tail keeps occurrence two', count.textContent === '2 of 6' && current().startContainer.parentElement.tagName === 'STRONG' && current().startContainer.parentElement.closest('.assistant') === selectedReply);
+    send(H('text_delta', '\n'), end, H('text_delta', 'needle **needle** chosen needle last'));
+    await settle(); await settle();
+    check('later rendered lines and replies cannot move the selected occurrence', count.textContent === '2 of 9' && current().startContainer.parentElement.tagName === 'STRONG' && current().startContainer.parentElement.closest('.assistant') === selectedReply);
+    key(query, 'Escape');
+
+    reset();
+    send(H('text_delta', 'needle earlier'), end,
+      H('text_delta', 'needle first needle second needle third'), end,
+      H('text_delta', 'needle later'), end);
+    await settle();
+    window.__openFind(); search('needle');
+    for (let i = 0; i < 3; i++) key(query, 'Enter');
+    const rewrittenReply = current().startContainer.parentElement.closest('.assistant');
+    rewrittenReply.textContent = 'needle remaining';
+    await settle(); await settle();
+    check('removing the selected occurrence uses the nearest remaining one in the reply', count.textContent === '2 of 3' && current().startContainer.parentElement === rewrittenReply);
+    rewrittenReply.textContent = 'No matches remain in this reply';
+    await settle(); await settle();
+    check('removing all reply matches uses the nearest occurrence in another reply', count.textContent === '2 of 2' && current().startContainer.textContent.startsWith('needle later'));
+    current().startContainer.parentElement.closest('.assistant').remove();
+    await settle(); await settle();
+    check('removing the selected reply falls back to the preceding surviving match', count.textContent === '1 of 1' && current().startContainer.textContent.startsWith('needle earlier'));
+    key(query, 'Escape');
+
+    reset();
     send(H('text_delta', 'needle [link](https://needle.test) **needle** chosen needle last'));
     await settle();
     window.__openFind(); search('needle'); key(query, 'Enter'); key(query, 'Enter');
     check('inline markdown fixture selects the bold source occurrence', count.textContent === '3 of 4' && current().startContainer.textContent.slice(current().startOffset).startsWith('needle** chosen'));
+    send(H('text_delta', ' more'));
+    await settle(); await settle();
+    check('raw delta keeps the visible source ordinal even with a URL-only hit before it', count.textContent === '3 of 4' && current().startContainer.textContent.slice(current().startOffset).startsWith('needle** chosen'));
     send(H('text_delta', '\n'));
     await settle(); await settle();
     check('inline markdown conversion preserves the selected bold occurrence', count.textContent === '2 of 3' && current().startContainer.parentElement.tagName === 'STRONG' && current().toString() === 'needle');

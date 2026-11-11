@@ -1206,7 +1206,7 @@
     }
     scheduleFindOverlay();
   }
-  function findRootMatches(root, pattern) {
+  function findRootText(root) {
     const parts = [];
     let text = '';
     function collect(node) {
@@ -1232,6 +1232,10 @@
       if (block && text && !text.endsWith('\n')) text += '\n';
     }
     for (const child of root.childNodes) collect(child);
+    return { text, parts };
+  }
+  function findRootMatches(root, pattern) {
+    const { text, parts } = findRootText(root);
     const matches = [];
     pattern.lastIndex = 0;
     let partIndex = 0;
@@ -1246,7 +1250,7 @@
       const range = document.createRange();
       range.setStart(first.node, start - first.start);
       range.setEnd(last.node, end - last.start);
-      matches.push({ root, start, ordinal: matches.length, range, context: text.slice(end, end + 32), node: first.node, offset: start - first.start, endNode: last.node, endOffset: end - last.start });
+      matches.push({ root, ordinal: matches.length, range, node: first.node, offset: start - first.start, endNode: last.node, endOffset: end - last.start });
     }
     return matches;
   }
@@ -1272,17 +1276,20 @@
     }
     const selected = findMatches[findIndex];
     if (selected.node === selected.endNode && selected.node.parentElement?.classList.contains('tail')) {
-      // Keep both contexts: deltas replace the raw tail's text node, and a
-      // completed line replaces it with rendered markdown.
-      // A marker keeps surrounding inline syntax intact (including a closing
-      // ** after this hit); parsing only its suffix cannot do that.
+      // Raw URLs/syntax can contain hits that disappear on rendering. Map
+      // this raw occurrence to its rendered ordinal before the line completes.
+      selected.tail = selected.node.parentElement;
+      selected.renderedHead = selected.tail.previousSibling?.firstChild;
       const raw = selected.node.data, offset = selected.endOffset;
       let marker = '\uE000find\uE001';
       while (raw.includes(marker)) marker += '\uE001';
       const rendered = el('div');
       rendered.innerHTML = renderMarkdown(raw.slice(0, offset) + marker + raw.slice(offset));
-      const normalized = rendered.textContent, boundary = normalized.indexOf(marker);
-      if (boundary >= 0) selected.renderedContext = normalized.slice(boundary + marker.length, boundary + marker.length + 32);
+      const { text } = findRootText(rendered), boundary = text.indexOf(marker);
+      if (boundary >= 0) {
+        const firstTail = findMatches.find((m) => m.root === selected.root && m.node === selected.node);
+        selected.renderedOrdinal = firstTail.ordinal + Math.max(0, [...text.slice(0, boundary).matchAll(findPattern())].length - 1);
+      }
     }
     openFindDetails(selected.range.startContainer.parentElement);
   }
@@ -1300,6 +1307,7 @@
   function refreshFind(reveal = false, reset = false, changed = null) {
     if (findBar.hidden) return;
     const previous = !reset && findMatches[findIndex];
+    const previousMatches = findMatches, previousIndex = findIndex;
     const unchanged = new Map();
     if (changed) for (const match of findMatches) {
       if (!unchanged.has(match.root)) unchanged.set(match.root, []);
@@ -1334,23 +1342,25 @@
     findIndex = -1;
     if (previous) {
       const candidates = findMatches.filter((m) => m.root === previous.root);
-      let anchored = candidates.filter((m) => m.node === previous.node && m.offset === previous.offset);
-      if (!anchored.length) {
-        let bestScore = 0;
-        for (const m of candidates) {
-          // Following text identifies an occurrence when markdown replaces its
-          // text nodes and removes syntax/URLs before the selected word.
-          const context = m.node.parentElement?.classList.contains('tail') ? previous.context : (previous.renderedContext ?? previous.context);
-          let score = 0;
-          while (score < m.context.length && score < context.length && m.context[score] === context[score]) score++;
-          if (score > bestScore) { anchored = []; bestScore = score; }
-          if (score === bestScore) anchored.push(m);
+      // The reply element survives stream paints and turn/history moves.
+      // A replaced markdown head means the old raw tail has been rendered;
+      // otherwise its visible raw occurrence number is still valid.
+      const converted = previous.tail && previous.tail.previousSibling?.firstChild !== previous.renderedHead;
+      const ordinal = converted ? (previous.renderedOrdinal ?? previous.ordinal) : previous.ordinal;
+      let best = candidates[Math.min(ordinal, candidates.length - 1)];
+      // If the reply lost all hits, use the nearest surviving old occurrence
+      // in transcript order, rather than jumping to the start of the chat.
+      for (let distance = 1; !best && distance < previousMatches.length; distance++) {
+        for (const index of [previousIndex + distance, previousIndex - distance]) {
+          const neighbor = previousMatches[index];
+          if (!neighbor) continue;
+          const remaining = findMatches.filter((m) => m.root === neighbor.root);
+          best = remaining[Math.min(neighbor.ordinal, remaining.length - 1)];
+          if (best) break;
         }
       }
-      // Raw markdown offsets and rendered offsets are different coordinates.
-      // When contexts tie, preserve the occurrence ordinal within its block.
-      const best = anchored.reduce((best, m) => !best || Math.abs(m.ordinal - previous.ordinal) < Math.abs(best.ordinal - previous.ordinal) ? m : best, null);
       if (best) findIndex = findMatches.indexOf(best);
+      else if (findMatches.length) findIndex = Math.min(previousIndex, findMatches.length - 1);
     }
     if (findIndex < 0 && findMatches.length) findIndex = 0;
     prepareFindMatch();
