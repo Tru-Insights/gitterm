@@ -2608,7 +2608,7 @@ struct WorkspaceOverviewState {
     summary: overview::WorkSummary,
     /// Summary has not caught up with the current index.
     summary_stale: bool,
-    /// Invalidates summary work after another index, ownership or focus change.
+    /// App-wide request token; zero invalidates pending summary work.
     summary_generation: u64,
     summary_in_flight: bool,
     branches: Vec<overview::BranchStatus>,
@@ -7770,6 +7770,8 @@ struct App {
     /// one that owns its chats (TRU-169); built when the panel first opens
     /// in that workspace.
     workspace_overviews: HashMap<OverviewKey, WorkspaceOverviewState>,
+    /// Survives overview removal so a recreated owner cannot accept an old job.
+    workspace_overview_summary_generation: u64,
     /// Fold and row disclosure state belongs to a workspace, even when its
     /// overview summary is shared with another folder-scoped workspace.
     workspace_overview_presentations: HashMap<u64, WorkspaceOverviewPresentation>,
@@ -9665,6 +9667,7 @@ fn workspace_overview_summary_plan(
     task_store: Option<&TaskStore>,
     focus_picks: &overview::FocusPicks,
     workspace_overviews: &mut HashMap<OverviewKey, WorkspaceOverviewState>,
+    summary_generation: &mut u64,
     key: &OverviewKey,
 ) -> Option<(u64, WorkspaceOverviewSummaryPlan)> {
     let (owned, focus) = match key {
@@ -9690,7 +9693,10 @@ fn workspace_overview_summary_plan(
     state.focus = focus.clone();
     state.summary_stale = true;
     state.summary_in_flight = true;
-    state.summary_generation += 1;
+    *summary_generation = summary_generation
+        .checked_add(1)
+        .expect("workspace overview summary generation exhausted");
+    state.summary_generation = *summary_generation;
     Some((
         state.summary_generation,
         WorkspaceOverviewSummaryPlan {
@@ -9712,12 +9718,13 @@ fn reload_workspace_overviews(
     task_store: Option<&TaskStore>,
     focus_picks: &overview::FocusPicks,
     workspace_overviews: &mut HashMap<OverviewKey, WorkspaceOverviewState>,
+    summary_generation: &mut u64,
     visible: Option<&OverviewKey>,
 ) -> Option<(u64, WorkspaceOverviewSummaryPlan)> {
     workspace_overviews.retain(|key, state| {
         state.summary_stale = true;
         state.summary_in_flight = false;
-        state.summary_generation += 1;
+        state.summary_generation = 0;
         match key {
             OverviewKey::Owner(uid) => workspaces
                 .iter()
@@ -9731,6 +9738,7 @@ fn reload_workspace_overviews(
             task_store,
             focus_picks,
             workspace_overviews,
+            summary_generation,
             key,
         )
     })
@@ -9766,6 +9774,7 @@ fn rebuild_workspace_overview(
     task_store: Option<&TaskStore>,
     focus_picks: &overview::FocusPicks,
     workspace_overviews: &mut HashMap<OverviewKey, WorkspaceOverviewState>,
+    summary_generation: &mut u64,
     key: &OverviewKey,
 ) {
     if let Some((generation, plan)) = workspace_overview_summary_plan(
@@ -9773,6 +9782,7 @@ fn rebuild_workspace_overview(
         task_store,
         focus_picks,
         workspace_overviews,
+        summary_generation,
         key,
     ) {
         let summary = plan.build(chat_index);
@@ -16469,6 +16479,7 @@ impl App {
             self.task_store.as_ref(),
             &self.overview_focus_picks,
             &mut self.workspace_overviews,
+            &mut self.workspace_overview_summary_generation,
             key,
         );
     }
@@ -20661,6 +20672,7 @@ impl App {
             agent_pages: Vec::new(),
             chat_index: Arc::default(),
             workspace_overviews: HashMap::new(),
+            workspace_overview_summary_generation: 0,
             workspace_overview_presentations: HashMap::new(),
             work_documents: HashMap::new(),
             work_document_copies_open: None,
@@ -29961,6 +29973,7 @@ fi
                             self.task_store.as_ref(),
                             &self.overview_focus_picks,
                             &mut self.workspace_overviews,
+                            &mut self.workspace_overview_summary_generation,
                             visible.as_ref(),
                         ) {
                             Some((generation, plan)) => {
@@ -48260,18 +48273,125 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn overview_summary_rejects_old_job_after_owner_state_recreation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::new("Work".into(), temp.path().into(), WorkspaceColor::Blue);
+        ws.chats = vec!["old-root".into()];
+        let key = OverviewKey::Owner(ws.uid);
+        let mut workspaces = vec![ws];
+        let index: Vec<_> = ["old-root", "new-root", "new-second"]
+            .into_iter()
+            .map(|id| {
+                let mut entry = chat_entry(chats::ChatBackend::Codex, false);
+                entry.id = id.into();
+                entry
+            })
+            .collect();
+        let picks = overview::FocusPicks::default();
+        let mut summary_generation = 0;
+        let mut states = HashMap::new();
+        rebuild_workspace_overview(
+            &index,
+            &workspaces,
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            &key,
+        );
+        let (old_generation, old_plan) = reload_workspace_overviews(
+            &workspaces,
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            Some(&key),
+        )
+        .unwrap();
+
+        // workspace_chats_changed rebuilds and removes an owner's state when
+        // its last chat moves out, even while that owner's old job is running.
+        workspaces[0].chats.clear();
+        rebuild_workspace_overview(
+            &index,
+            &workspaces,
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            &key,
+        );
+        assert!(!states.contains_key(&key));
+        workspaces[0].chats = vec!["new-root".into(), "new-second".into()];
+        rebuild_workspace_overview(
+            &index,
+            &workspaces,
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            &key,
+        );
+        let (new_generation, new_plan) = reload_workspace_overviews(
+            &workspaces,
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            Some(&key),
+        )
+        .unwrap();
+
+        let current = new_plan.build(&index);
+        assert_eq!(current.chat_count, 2);
+        assert!(apply_workspace_overview_summary(
+            &mut states,
+            &key,
+            new_generation,
+            current.clone()
+        ));
+        let old = old_plan.build(&index);
+        assert_eq!(old.chat_count, 1);
+        assert!(!apply_workspace_overview_summary(
+            &mut states,
+            &key,
+            old_generation,
+            old
+        ));
+        assert_eq!(states[&key].summary, current);
+        assert!(!states[&key].summary_in_flight);
+        assert!(!states[&key].summary_stale);
+    }
+
+    #[test]
     fn overview_summary_rejects_old_focus_and_prunes_closed_owners() {
         let temp = tempfile::tempdir().unwrap();
         let key = OverviewKey::Folder(temp.path().into());
         let closed = OverviewKey::Owner(u64::MAX);
         let mut states = HashMap::from([(closed.clone(), WorkspaceOverviewState::default())]);
         let picks = overview::FocusPicks::default();
-        let (old_generation, old_plan) =
-            reload_workspace_overviews(&[], None, &picks, &mut states, Some(&key)).unwrap();
+        let mut summary_generation = 0;
+        let (old_generation, old_plan) = reload_workspace_overviews(
+            &[],
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            Some(&key),
+        )
+        .unwrap();
         assert!(!states.contains_key(&closed));
         states.get_mut(&key).unwrap().focus = overview::Focus::AllRecent;
         // The synchronous show/focus path supersedes an in-flight reload.
-        rebuild_workspace_overview(&[], &[], None, &picks, &mut states, &key);
+        rebuild_workspace_overview(
+            &[],
+            &[],
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            &key,
+        );
         let current = states[&key].summary.clone();
         assert_eq!(current.focus, overview::Focus::AllRecent);
         assert!(!apply_workspace_overview_summary(
@@ -48461,6 +48581,7 @@ mod tests {
         .unwrap();
         let mut store = Some(TaskStore::load(&path).unwrap());
         let picks = overview::FocusPicks::default();
+        let mut summary_generation = 0;
         let mut overviews = HashMap::new();
         for ws in &workspaces {
             overviews.insert(
@@ -48519,6 +48640,7 @@ mod tests {
                 store.as_ref(),
                 &picks,
                 &mut overviews,
+                &mut summary_generation,
                 Some(&visible),
             )
             .unwrap()
@@ -48553,7 +48675,14 @@ mod tests {
         assert!(!overviews[&visible].summary_stale);
         assert_eq!(overviews[&visible].summary.chat_count, 520);
         // A later reload invalidates even a completion that found no new claims.
-        reload_workspace_overviews(&workspaces, store.as_ref(), &picks, &mut overviews, None);
+        reload_workspace_overviews(
+            &workspaces,
+            store.as_ref(),
+            &picks,
+            &mut overviews,
+            &mut summary_generation,
+            None,
+        );
         assert!(!apply_workspace_overview_summary(
             &mut overviews,
             &visible,
@@ -48581,6 +48710,7 @@ mod tests {
             store.as_ref(),
             &picks,
             &mut overviews,
+            &mut summary_generation,
             &hidden,
         );
         assert!(!overviews[&hidden].summary_stale);
