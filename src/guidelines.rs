@@ -200,9 +200,14 @@ pub fn repo_provides_guidelines(cwd: &Path, instruction_file: InstructionFile) -
         result
     };
     let agents = match instruction_file {
-        // Codex/Pi load only the first nonempty instruction file per directory.
+        // Codex skips an empty AGENTS.override.md and reads AGENTS.md; Pi
+        // loads the override even when empty, so it never sees the kit
+        // rules. Both share InstructionFile::AgentsMd, so an empty override
+        // keeps the fallback.
+        // shortcut: Codex gets the fallback on top of kit rules in that
+        // case; split Pi from Codex if empty overrides become common.
         InstructionFile::AgentsMd => match read("AGENTS.override.md") {
-            Ok(text) if text.trim().is_empty() => read("AGENTS.md"),
+            Ok(text) if text.trim().is_empty() => return false,
             Ok(text) => Ok(text),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => read("AGENTS.md"),
             Err(_) => return false,
@@ -755,8 +760,8 @@ mod tests {
             (Some("<!-- agent-kit:begin -->"), "Other rules", false),
             (Some("Other rules"), "<!-- agent-kit:begin -->", true),
             (None, "<!-- agent-kit:begin -->", true),
-            (Some("<!-- agent-kit:begin -->"), "", true),
-            (Some("<!-- agent-kit:begin -->"), " \n\t", true),
+            (Some("<!-- agent-kit:begin -->"), "", false),
+            (Some("<!-- agent-kit:begin -->"), " \n\t", false),
             (Some("Other rules"), "", false),
         ] {
             let fixture = tempfile::tempdir().unwrap();
