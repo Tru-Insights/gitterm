@@ -1413,6 +1413,16 @@ fn heartbeat(event_name: &str) {
     }
 }
 
+fn freeze_watchdog_event_label(event: &Event) -> String {
+    match event {
+        Event::AgentWebviewIpc(AgentIpcMessage::CopyMarkdown { tab_id, text }) => format!(
+            "AgentWebviewIpc(CopyMarkdown {{ tab_id: {tab_id}, text_len: {} }})",
+            text.len()
+        ),
+        _ => format!("{event:?}"),
+    }
+}
+
 /// Truncate a string to at most `max_bytes` bytes at a valid UTF-8 char boundary.
 fn truncate_str(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
@@ -23422,7 +23432,8 @@ fi
                 heartbeat("LoadingUiTick");
             }
             other => {
-                heartbeat(&format!("{:?}", other).chars().take(80).collect::<String>());
+                let label = freeze_watchdog_event_label(other);
+                heartbeat(&label.chars().take(80).collect::<String>());
             }
         }
         self.record_task_session_focus();
@@ -24792,12 +24803,21 @@ fi
                         task
                     }
                     AgentIpcMessage::CopyMarkdown { tab_id, text } => {
+                        eprintln!(
+                            "[copy-markdown] IPC received tab={tab_id} bytes={}",
+                            text.len()
+                        );
                         if webview::is_active(webview::WebviewSurface::Agent(tab_id)) {
-                            if let Err(error) = webview::copy_markdown_to_pasteboard(&text) {
-                                eprintln!("[agent-webview] Copy as Markdown failed for tab={tab_id}: {error}");
+                            match webview::copy_markdown_to_pasteboard(&text) {
+                                Ok(()) => {
+                                    eprintln!("[copy-markdown] pasteboard write ok tab={tab_id}")
+                                }
+                                Err(error) => eprintln!(
+                                    "[copy-markdown] pasteboard write err tab={tab_id}: {error}"
+                                ),
                             }
                         } else {
-                            eprintln!("[agent-webview] Copy as Markdown dropped: tab={tab_id} has no chat page");
+                            eprintln!("[copy-markdown] pasteboard write err tab={tab_id}: no active chat page");
                         }
                         Task::none()
                     }
@@ -48053,6 +48073,19 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::Arc;
+
+    #[test]
+    fn copy_markdown_freeze_label_redacts_copied_text() {
+        let event = Event::AgentWebviewIpc(AgentIpcMessage::CopyMarkdown {
+            tab_id: 7,
+            text: "secret copied text".into(),
+        });
+
+        let label = freeze_watchdog_event_label(&event);
+        assert!(label.contains("tab_id: 7"));
+        assert!(label.contains("text_len: 18"));
+        assert!(!label.contains("secret copied text"));
+    }
 
     #[test]
     fn plain_vertical_wheel_moves_horizontal_and_preserves_other_deltas() {

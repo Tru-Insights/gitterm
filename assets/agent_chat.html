@@ -3831,6 +3831,8 @@
       if (!node.parentElement || !range.intersectsNode(node)) return false;
       const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
       if (element.closest('button, input, textarea, select, script, style, [hidden], [aria-hidden="true"], .codeblock > .lang')) return false;
+      const closedDetails = element.closest('details:not([open])');
+      if (closedDetails && element !== closedDetails && !element.closest('summary')) return false;
       const style = getComputedStyle(element);
       return style.visibility !== 'hidden' && style.visibility !== 'collapse' && element.getClientRects().length > 0;
     }
@@ -3844,7 +3846,8 @@
       if (node.nodeType === Node.TEXT_NODE) return literal ? textPart(node) : escape(textPart(node));
       if (node.nodeType !== Node.ELEMENT_NODE) return '';
       const tag = node.tagName;
-      const plain = literal || node.matches('.user-msg') || !node.closest('.assistant');
+      const structuralFold = node.matches('.turn-fold, .tf-body');
+      const plain = literal || node.matches('.user-msg') || (!node.closest('.assistant') && !structuralFold);
       const children = (raw = plain) => ((tag === 'PRE' || tag === 'CODE') ? [...node.childNodes].map((n) => walk(n, raw)).join('')
         : join([...node.childNodes].map((n) => walk(n, raw))));
       if (node.matches('.user-msg')) return '\n\n' + children(true) + '\n\n';
@@ -3858,7 +3861,8 @@
         return '\n\n' + fence + language + '\n' + text + (text.endsWith('\n') ? '' : '\n') + fence + '\n\n';
       }
       if (!plain && tag === 'CODE') {
-        const text = children(true);
+        const rawText = children(true);
+        const text = node.closest('table') ? rawText.replace(/\|/g, '\\|') : rawText;
         if (!text) return '';
         const ticks = delimiter(text, 1);
         const pad = /^[` ]|[` ]$/.test(text) && !/^ +$/.test(text) ? ' ' : '';

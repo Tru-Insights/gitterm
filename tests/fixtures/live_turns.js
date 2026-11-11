@@ -209,6 +209,12 @@
     select(leaf('#inline'), 1, leaf('#inline'), 5); equalCopy('partial code safe delimiter', '``` `b`` ```');
     fixture('<div class="assistant"><pre><code class="language-rust" id="fence">first\n```\n\n\nlast</code></pre></div>');
     select(leaf('#fence'), 3); equalCopy('safe fence language and literal blank lines', '````rust\nst\n```\n\n\nlast\n````');
+    fixture('<div class="assistant"><p id="before-fold">before</p><details class="tool"><summary>visible summary</summary><div>hidden tool payload</div></details><p id="after-fold">after</p></div>');
+    select(leaf('#before-fold'), 0, leaf('#after-fold'));
+    const closedFoldCopy = copied();
+    check('markdown excludes content in a closed details element', !closedFoldCopy.includes('hidden tool payload') && closedFoldCopy.includes('visible summary') && closedFoldCopy.includes('before') && closedFoldCopy.includes('after'));
+    fixture('<details class="turn-fold" open><summary>worked</summary><div class="tf-body"><div class="assistant"><p><strong id="fold-bold">bold in fold</strong></p></div></div></details>');
+    select(leaf('#fold-bold'), 0); equalCopy('expanded turn fold keeps assistant formatting', '**bold in fold**');
     fixture('<div class="assistant"><h2 id="heading">Heading</h2><blockquote><p><s id="strike">deleted</s><br><em id="break">line</em></p></blockquote></div>');
     select(leaf('#heading'), 2, leaf('#break'), 2); equalCopy('heading quote strike and hard break', '## ading\n\n> ~~deleted~~  \n> *li*');
     fixture('<div class="assistant"><ul><li>omit</li><li id="outer">parent<ul><li id="inner">nested</li><li>omit too</li></ul></li></ul></div>');
@@ -225,6 +231,12 @@
     const table = '<div class="assistant"><table><thead><tr><th id="h1">Name</th><th id="h2">Value</th></tr></thead><tbody><tr><td id="c1">alpha</td><td id="c2">beta</td></tr><tr><td id="c3">gamma</td><td id="c4">delta</td></tr></tbody></table></div>';
     fixture(table); select(leaf('#h1'), 0, leaf('#c4'), 5);
     equalCopy('complete table with header', '| Name | Value |\n| --- | --- |\n| alpha | beta |\n| gamma | delta |');
+    fixture('<div class="assistant"><table><thead><tr><th>Value</th></tr></thead><tbody><tr><td><code id="pipe-code">a|b</code></td></tr></tbody></table></div>');
+    const pipeTable = document.querySelector('table');
+    const pipeRange = document.createRange(); pipeRange.selectNodeContents(pipeTable);
+    selection.removeAllRanges(); selection.addRange(pipeRange);
+    equalCopy('table inline code escapes a pipe', '| Value |\n| --- |\n| `a\\|b` |');
+    fixture(table);
     select(leaf('#c1'), 2, leaf('#c4'), 3); equalCopy('partial table TSV', 'pha\tbeta\ngamma\tdel');
     select(leaf('#h1'), 1, leaf('#h2'), 3); equalCopy('partial table header TSV', 'ame\tVal');
     fixture('<div class="assistant"><p id="reply1">first <b>bold</b></p></div><div class="user-msg" id="user">literal **user**</div><details class="tool" open><summary>tool label<button>no button</button></summary><div id="tool">visible <b>tool</b><span hidden>secret</span><span style="display:none">payload</span></div></details><div class="assistant"><p id="reply2">last reply</p></div>');

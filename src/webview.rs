@@ -818,12 +818,23 @@ mod markdown_menu {
         let Some(tab_id) = tab_for(view) else {
             return;
         };
+        eprintln!("[copy-markdown] menu item action fired tab={tab_id}");
         with_existing_slot(WebviewSurface::Agent(tab_id), |slot| {
             if let Some(webview) = &slot.webview {
-                if let Err(error) = webview.evaluate_script("window.__copySelectionMarkdown(true)")
-                {
-                    eprintln!("[agent-webview] Copy as Markdown evaluation failed: {error}");
+                if let Err(error) = webview.evaluate_script_with_callback(
+                    "window.__copySelectionMarkdown(true)",
+                    move |result| {
+                        eprintln!(
+                            "[copy-markdown] page function evaluated tab={tab_id} result={result}"
+                        )
+                    },
+                ) {
+                    eprintln!("[copy-markdown] page function evaluation err tab={tab_id}: {error}");
                 }
+            } else {
+                eprintln!(
+                    "[copy-markdown] page function evaluation err tab={tab_id}: no chat page"
+                );
             }
         });
     }
