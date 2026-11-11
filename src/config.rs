@@ -155,6 +155,51 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_issue_groups_default_per_workspace_and_survive_config_reload() {
+        use gitterm::issue_titles::IssueGroup;
+        let old = r#"{
+            "name":"first", "abbrev":"F", "dir":"/tmp/first", "color":"blue", "tabs":[]
+        }"#;
+        let first: WorkspaceConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(first.collapsed_issue_groups, [IssueGroup::Done]);
+        for group in [
+            IssueGroup::InProgress,
+            IssueGroup::InDevForTesting,
+            IssueGroup::Backlog,
+        ] {
+            assert!(!first.collapsed_issue_groups.contains(&group));
+        }
+        let mut second = first.clone();
+        second.name = "second".into();
+        second.dir = "/tmp/second".into();
+        let mut file: WorkspacesFile = serde_json::from_str(&format!(
+            r#"{{"workspaces":[{old}], "active_workspace":0}}"#
+        ))
+        .unwrap();
+        file.workspaces.push(second);
+        // Collapse active work and expand Done in only the first workspace.
+        file.workspaces[0].collapsed_issue_groups = vec![IssueGroup::InProgress];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspaces.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+        let reloaded: WorkspacesFile =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            reloaded.workspaces[0].collapsed_issue_groups,
+            [IssueGroup::InProgress]
+        );
+        assert_eq!(
+            reloaded.workspaces[1].collapsed_issue_groups,
+            [IssueGroup::Done]
+        );
+        // An explicitly empty list means all open, including Done.
+        file.workspaces[0].collapsed_issue_groups.clear();
+        let reloaded: WorkspacesFile =
+            serde_json::from_str(&serde_json::to_string(&file).unwrap()).unwrap();
+        assert!(reloaded.workspaces[0].collapsed_issue_groups.is_empty());
+    }
+
+    #[test]
     fn decisions_repo_is_additive_and_round_trips() {
         // An entry from before TRU-191 loads with none and writes no key.
         let old = r#"{
@@ -2045,6 +2090,9 @@ pub enum WorkspaceLocationConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
+    /// Collapsed Issues groups (TRU-243), independently saved for each workspace.
+    #[serde(default = "gitterm::issue_titles::IssueGroup::default_collapsed")]
+    pub collapsed_issue_groups: Vec<gitterm::issue_titles::IssueGroup>,
     pub name: String,
     pub abbrev: String,
     pub dir: String,

@@ -2442,6 +2442,65 @@ mod tests {
     }
 
     #[test]
+    fn issues_group_by_state_then_mentions_without_changing_source_keys() {
+        use crate::issue_titles::{CachedIssue, IssueGroup, IssueTitlesFile};
+        // Done is the most mentioned overall; active work still goes first.
+        let a = keys(&["PRJ-1", "PRJ-2", "PRJ-3", "PRJ-4", "PRJ-5", "PRJ-6"]);
+        let b = keys(&["PRJ-2", "PRJ-5", "PRJ-6"]);
+        let c = keys(&["PRJ-6"]);
+        let ordered = work_issue_keys(&[&a, &b, &c], &["work/prj-1-groups"]);
+        assert_eq!(
+            ordered,
+            ["PRJ-6", "PRJ-2", "PRJ-5", "PRJ-1", "PRJ-3", "PRJ-4"]
+        );
+        let mut cache = IssueTitlesFile::default();
+        for (key, state) in a.iter().zip([
+            "In Progress",
+            "Waiting for deploy to DEV",
+            "In DEV for Testing",
+            "Backlog",
+            "An unknown state",
+            "Done",
+        ]) {
+            let mut entry = CachedIssue {
+                state: Some(state.to_string()),
+                ..CachedIssue::default()
+            };
+            entry.observe_done("2026-11-11T10:00:00Z");
+            cache.issues.insert(key.clone(), entry);
+        }
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-11T11:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let groups: Vec<_> = cache
+            .grouped_keys(&ordered, now)
+            .into_iter()
+            .map(|(group, keys)| {
+                (
+                    group,
+                    keys.into_iter().map(String::as_str).collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            groups,
+            vec![
+                (IssueGroup::InProgress, vec!["PRJ-2", "PRJ-1"]),
+                (IssueGroup::InDevForTesting, vec!["PRJ-3"]),
+                (IssueGroup::Backlog, vec!["PRJ-5", "PRJ-4"]),
+                (IssueGroup::Done, vec!["PRJ-6"]),
+            ]
+        );
+        // Missing cache entries join Backlog, empty groups never get headers.
+        assert_eq!(
+            cache.grouped_keys(&["PRJ-99".to_string()], now)[0].0,
+            IssueGroup::Backlog
+        );
+        assert_eq!(cache.grouped_keys(&a[..1], now).len(), 1);
+        assert_eq!(a.len(), 6);
+    }
+
+    #[test]
     fn issue_keys_need_a_prefix_on_an_owned_name() {
         let a = keys(&[
             "PRJ-101",

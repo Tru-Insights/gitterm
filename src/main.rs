@@ -6401,6 +6401,8 @@ impl RepoRegistry {
 
 // Workspace groups tabs by project
 struct Workspace {
+    /// Issues disclosures belong to this workspace, even when overviews share data.
+    collapsed_issue_groups: Vec<gitterm::issue_titles::IssueGroup>,
     uid: u64,
     name: String,
     abbrev: String,
@@ -6463,6 +6465,7 @@ impl Workspace {
         let abbrev = Self::derive_abbrev(&name);
         let run_command = detect_run_command(&dir);
         Self {
+            collapsed_issue_groups: gitterm::issue_titles::IssueGroup::default_collapsed(),
             uid: next_workspace_uid(),
             name,
             abbrev,
@@ -6497,6 +6500,7 @@ impl Workspace {
         let abbrev = Self::derive_abbrev(&name);
         let dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         Self {
+            collapsed_issue_groups: gitterm::issue_titles::IssueGroup::default_collapsed(),
             uid: next_workspace_uid(),
             name,
             abbrev,
@@ -10038,6 +10042,7 @@ impl App {
     fn workspace_config(&self, ws: &Workspace) -> WorkspaceConfig {
         let home = self.repo(ws.home);
         WorkspaceConfig {
+            collapsed_issue_groups: ws.collapsed_issue_groups.clone(),
             name: ws.name.clone(),
             abbrev: ws.abbrev.clone(),
             dir: workspace_config_dir(ws),
@@ -15037,6 +15042,7 @@ impl App {
             ws.chats = cfg.chats.clone();
             ws.guidelines_off = cfg.guidelines_off;
             ws.claude_in_chrome = cfg.claude_in_chrome;
+            ws.collapsed_issue_groups = cfg.collapsed_issue_groups.clone();
             ws.decisions_repo = cfg.decisions_repo.as_ref().map(PathBuf::from);
             if let Some(config::WorkspaceLocationConfig::RemoteAgent {
                 remote_id,
@@ -19790,6 +19796,7 @@ impl App {
         workspace.chats = ws_config.chats.clone();
         workspace.guidelines_off = ws_config.guidelines_off;
         workspace.claude_in_chrome = ws_config.claude_in_chrome;
+        workspace.collapsed_issue_groups = ws_config.collapsed_issue_groups.clone();
         workspace.decisions_repo = ws_config.decisions_repo.as_ref().map(PathBuf::from);
         // The home repo's saved env and run command (TRU-180).
         self.seed_from_saved(&mut workspace, ws_config);
@@ -22076,6 +22083,7 @@ fi
             workspace.chats = saved.chats.clone();
             workspace.guidelines_off = saved.guidelines_off;
             workspace.claude_in_chrome = saved.claude_in_chrome;
+            workspace.collapsed_issue_groups = saved.collapsed_issue_groups.clone();
             workspace.decisions_repo = saved.decisions_repo.as_ref().map(PathBuf::from);
             self.seed_from_saved(&mut workspace, saved);
             workspace
@@ -31673,6 +31681,7 @@ fi
                     workspace.abbrev = cfg.abbrev.clone();
                     workspace.guidelines_off = cfg.guidelines_off;
                     workspace.claude_in_chrome = cfg.claude_in_chrome;
+                    workspace.collapsed_issue_groups = cfg.collapsed_issue_groups.clone();
                     workspace.decisions_repo = cfg.decisions_repo.as_ref().map(PathBuf::from);
                     self.seed_from_saved(&mut workspace, cfg);
                 }
@@ -39682,16 +39691,17 @@ fi
             content = content.push(also);
         }
 
-        if !summary.issue_keys.is_empty() {
+        let issue_groups = self
+            .issues
+            .cache
+            .grouped_keys(&summary.issue_keys, chrono::Utc::now());
+        let issue_count: usize = issue_groups.iter().map(|(_, keys)| keys.len()).sum();
+        if issue_count > 0 {
             content = content.push(
                 Column::new()
                     .spacing(2)
-                    .push(self.overview_section_header(
-                        "Issues",
-                        summary.issue_keys.len().to_string(),
-                        None,
-                    ))
-                    .push(self.view_work_issues(&summary.issue_keys)),
+                    .push(self.overview_section_header("Issues", issue_count.to_string(), None))
+                    .push(self.view_work_issues(issue_groups)),
             );
         }
         for error in &state.errors {
@@ -53367,6 +53377,7 @@ mod tests {
 
     fn closed_config(name: &str, parked_at: Option<&str>) -> WorkspaceConfig {
         WorkspaceConfig {
+            collapsed_issue_groups: gitterm::issue_titles::IssueGroup::default_collapsed(),
             name: name.to_string(),
             abbrev: "AC".to_string(),
             dir: format!("/tmp/{name}"),
