@@ -61,6 +61,17 @@
     padding: 10px;
     gap: 8px;
   }
+  #chat-find { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 6px 10px; background: var(--bg-footer); border: 1px solid var(--border); border-radius: 8px; font-size: calc(var(--chat-font-size) * 12 / 14); }
+  #chat-find[hidden] { display: none; }
+  #chat-find input[type="search"] { flex: 1; min-width: 8em; padding: 4px 6px; background: var(--bg-input); color: var(--fg); border: 1px solid var(--border-strong); border-radius: 4px; font: inherit; }
+  #chat-find button { font-size: inherit; }
+  #chat-find label { display: flex; align-items: center; gap: 4px; }
+  #find-count { min-width: 5em; text-align: center; }
+  #find-overlay { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+  .find-hit { position: absolute; background: rgba(249, 226, 175, 0.35); }
+  .find-hit.current { background: rgba(250, 179, 135, 0.5); outline: 1px solid #fab387; outline-offset: -1px; }
+  ::highlight(chat-find) { background-color: #f9e2af; color: #181825; }
+  ::highlight(chat-find-current) { background-color: #fab387; color: #181825; text-decoration: underline; }
   /* Status line, roster and composer share one grey panel. */
   #footer { display: flex; flex-direction: column; gap: 6px; padding: 6px 8px 8px; background: var(--bg-footer); border: 1px solid var(--border); border-radius: 10px; }
   /* The input lines up with the conversation's centred column (see #messages). */
@@ -641,8 +652,17 @@
 <script>/*__VENDOR_JS__*/</script>
 </head>
 <body>
+  <div id="chat-find" role="search" aria-label="Find in current chat" hidden>
+    <input id="find-query" type="search" aria-label="Find in current chat" placeholder="Find in chat" autocomplete="off" />
+    <span id="find-count" role="status" aria-live="polite" aria-atomic="true">0 of 0</span>
+    <button id="find-prev" type="button" aria-label="Previous match (Shift+Enter)" title="Previous match (Shift+Enter)">↑</button>
+    <button id="find-next" type="button" aria-label="Next match (Enter)" title="Next match (Enter)">↓</button>
+    <label><input id="find-tools" type="checkbox" /> Include tool output</label>
+    <button id="find-close" type="button" aria-label="Close find (Esc)" title="Close find (Esc)">×</button>
+  </div>
   <div id="timeline-wrap">
     <div id="messages"></div>
+    <div id="find-overlay" aria-hidden="true"></div>
     <button id="jump">&darr; Latest</button>
   </div>
   <div id="footer">
@@ -894,17 +914,18 @@
     messagesEl.addEventListener(type, () => { scrollIntentAt = performance.now(); }, { passive: true });
   }
   messagesEl.addEventListener('scroll', () => {
-    if (atBottom()) follow = true;
+    if (!findBar.hidden) follow = false;
+    else if (atBottom()) follow = true;
     else if (performance.now() - scrollIntentAt < 1000) follow = false;
     jumpBtn.classList.toggle('visible', !follow);
   });
   let scrollQueued = false;
   function scrollIfFollowing() {
-    if (replaying || !follow || scrollQueued) return;
+    if (replaying || !follow || !findBar.hidden || scrollQueued) return;
     scrollQueued = true;
     requestAnimationFrame(() => {
       scrollQueued = false;
-      if (!follow) return;
+      if (!follow || !findBar.hidden) return;
       trimWindow();
       messagesEl.scrollTop = messagesEl.scrollHeight;
     });
@@ -965,6 +986,7 @@
   // Detach the oldest blocks in whole chunks once the document holds a
   // chunk more than WINDOW_KEEP.
   function trimWindow() {
+    if (!findBar.hidden) return;
     const chunks = Math.floor((liveBlocks() - WINDOW_KEEP) / WINDOW_CHUNK);
     if (chunks < 1) return;
     for (let c = 0; c < chunks; c++) {
@@ -978,6 +1000,20 @@
   // Put the newest `n` detached chunks back above the first block, keeping
   // what is on screen where it is.
   function showEarlier(n) {
+    if (n < 1) return;
+    // Roster jumps can page while find owns a chunk. Return that loan before
+    // paging, and keep additional pages registered so Esc restores the window.
+    if (!findBar.hidden) {
+      restoreFindChunk();
+      const chunks = earlier.filter((fragment) => !findPages.has(fragment)).slice(-n);
+      const before = earlierEl.nextSibling;
+      for (const fragment of chunks) {
+        const page = attachFindChunk(fragment, before);
+        findPages.set(fragment, page);
+        for (const node of findChunkNodes(page)) renderFindMarkdown(node);
+      }
+      return;
+    }
     n = Math.min(n, earlier.length);
     if (n < 1) return;
     const restored = document.createDocumentFragment();
@@ -995,8 +1031,9 @@
   // Bring a detached block (a roster row's card) back into the document.
   function showEarlierUntil(node) {
     if (node.isConnected) return;
-    const i = earlier.findIndex((frag) => frag.contains(node));
-    if (i >= 0) showEarlier(earlier.length - i);
+    const chunks = earlier.filter((fragment) => !findPages.has(fragment));
+    const i = chunks.findIndex((frag) => frag.contains(node));
+    if (i >= 0) showEarlier(chunks.length - i);
   }
   function resetWindow() {
     earlier.length = 0;
@@ -1010,6 +1047,397 @@
     earlierBlocks = earlier.reduce((n, frag) => n + frag.childElementCount, 0);
     renderEarlierControl();
   }
+
+  // ---- find in this conversation (TRU-256) --------------------------------
+  const findBar = document.getElementById('chat-find');
+  const findQuery = document.getElementById('find-query');
+  const findTools = document.getElementById('find-tools');
+  const findCount = document.getElementById('find-count');
+  const findPrev = document.getElementById('find-prev');
+  const findNext = document.getElementById('find-next');
+  const findOverlay = document.getElementById('find-overlay');
+  const hasFindHighlights = () => typeof Highlight === 'function' && !!CSS.highlights;
+  let findMatches = [], findIndex = -1, findQueued = false;
+  // CSS ranges leave markdown, code, copy text and the stream's DOM handles
+  // untouched. Only truncated results need temporary expansion for searching.
+  const findOutputs = new Map();
+  const findOpenedDetails = new Set();
+  const findScrolls = new Map();
+  const findMarkdown = new Map(); // temporarily displayed deferred markdown -> original children
+  // Session-only search text DOM: never enters layout. A changed source replaces
+  // its entry; close discards it. Streaming need not parse old markdown again.
+  const findDeferred = new Map();
+  let findChunk = null, findWasFollowing = false;
+  const findPages = new Map();
+  function findChunkNodes(chunk = findChunk) {
+    const nodes = [];
+    if (chunk) {
+      for (let node = chunk.start.nextSibling; node && node !== chunk.end; node = node.nextSibling) {
+        if (node.nodeType === Node.ELEMENT_NODE) nodes.push(node);
+      }
+    }
+    return nodes;
+  }
+  function attachFindChunk(fragment, before = earlierEl.nextSibling) {
+    const chunk = { fragment, start: document.createComment('find history'), end: document.createComment('/find history') };
+    messagesEl.insertBefore(chunk.start, before);
+    messagesEl.insertBefore(fragment, before);
+    messagesEl.insertBefore(chunk.end, before);
+    return chunk;
+  }
+  function restoreFindChunk(chunk = findChunk) {
+    if (!chunk) return;
+    // Boundaries follow replacements/folds made by streaming; never resurrect
+    // a removed block or pull a card back out of a newly completed turn.
+    for (const node of findChunkNodes(chunk)) chunk.fragment.appendChild(node);
+    chunk.start.remove(); chunk.end.remove();
+    if (chunk === findChunk) findChunk = null;
+  }
+  function findScopes() {
+    const scopes = [];
+    const attached = [...findChunkNodes(), ...[...findPages.values()].flatMap((page) => findChunkNodes(page))];
+    for (const fragment of earlier) {
+      const page = findPages.get(fragment) || (findChunk?.fragment === fragment && findChunk);
+      if (page) scopes.push(...findChunkNodes(page));
+      else scopes.push(...fragment.children);
+    }
+    for (const node of messagesEl.children) {
+      if (node !== earlierEl && !attached.includes(node)) scopes.push(node);
+    }
+    return scopes;
+  }
+  function rememberFindScroll(node) {
+    if (!findScrolls.has(node)) findScrolls.set(node, [node.scrollTop, node.scrollLeft]);
+  }
+  function openFindDetails(node) {
+    for (let p = node; p && p !== messagesEl; p = p.parentElement) {
+      if (p.tagName === 'DETAILS' && !p.open) {
+        findOpenedDetails.add(p);
+        p.open = true;
+      }
+    }
+  }
+  function restoreFindOutputs() {
+    for (const [node, text] of findOutputs) node.textContent = text;
+    findOutputs.clear();
+  }
+  function paintFind() {
+    findOverlay.replaceChildren();
+    // Moving a history block collapses its DOM ranges. Its text-node handles
+    // survive, so restore all visible hits, not just the selected occurrence.
+    for (const match of findMatches) {
+      if (!match.node.isConnected) continue;
+      match.range.setStart(match.node, match.offset);
+      match.range.setEnd(match.endNode, match.endOffset);
+    }
+    if (hasFindHighlights()) {
+      const all = new Highlight();
+      for (const match of findMatches) if (match.node.isConnected) all.add(match.range);
+      CSS.highlights.set('chat-find', all);
+      const current = new Highlight();
+      current.priority = 1;
+      if (findIndex >= 0) current.add(findMatches[findIndex].range);
+      CSS.highlights.set('chat-find-current', current);
+    } else {
+      paintFindOverlay();
+    }
+    findCount.textContent = (findIndex + 1) + ' of ' + findMatches.length;
+    findPrev.disabled = findNext.disabled = !findMatches.length;
+  }
+  // macOS 13 can have WebKit older than Safari 17.2's Highlight API.
+  // Paint non-interactive range rectangles there, outside the transcript.
+  function paintFindOverlay() {
+    findOverlay.replaceChildren();
+    if (findBar.hidden) return;
+    const origin = findOverlay.getBoundingClientRect();
+    findMatches.forEach(({ root, range }, index) => {
+      if (!root.isConnected || !root.contains(range.startContainer)) return;
+      const node = range.startContainer.parentElement;
+      if (node.closest('details:not([open])')) return;
+      const bounds = messagesEl.getBoundingClientRect();
+      let left = bounds.left, right = bounds.right, top = bounds.top, bottom = bounds.bottom;
+      for (let p = node; p && p !== messagesEl; p = p.parentElement) {
+        const style = getComputedStyle(p), box = p.getBoundingClientRect();
+        if (style.overflowX !== 'visible') { left = Math.max(left, box.left); right = Math.min(right, box.right); }
+        if (style.overflowY !== 'visible') { top = Math.max(top, box.top); bottom = Math.min(bottom, box.bottom); }
+      }
+      const seen = new Set();
+      for (const rect of range.getClientRects()) {
+        const x = Math.max(left, rect.left), y = Math.max(top, rect.top);
+        const width = Math.min(right, rect.right) - x, height = Math.min(bottom, rect.bottom) - y;
+        const key = [x, y, width, height].join(',');
+        if (width <= 0 || height <= 0 || seen.has(key)) continue;
+        seen.add(key);
+        const hit = el('span', 'find-hit' + (index === findIndex ? ' current' : ''));
+        Object.assign(hit.style, { left: (x - origin.left) + 'px', top: (y - origin.top) + 'px', width: width + 'px', height: height + 'px' });
+        findOverlay.appendChild(hit);
+      }
+    });
+  }
+  let findPaintQueued = false;
+  function scheduleFindOverlay() {
+    if (findBar.hidden || hasFindHighlights() || findPaintQueued) return;
+    findPaintQueued = true;
+    requestAnimationFrame(() => { findPaintQueued = false; paintFindOverlay(); });
+  }
+  messagesEl.addEventListener('scroll', scheduleFindOverlay, true);
+  messagesEl.addEventListener('toggle', scheduleFindOverlay, true);
+  new ResizeObserver(scheduleFindOverlay).observe(messagesEl);
+  function revealFind() {
+    if (findIndex < 0) return;
+    const { range } = findMatches[findIndex];
+    const node = range.startContainer.parentElement;
+    openFindDetails(node);
+    follow = false;
+    jumpBtn.classList.add('visible');
+    // Scroll the matching line, including within a long tool result/code
+    // block, rather than the top of its potentially very tall element.
+    for (let p = node; p; p = p.parentElement) {
+      rememberFindScroll(p);
+      const style = getComputedStyle(p);
+      const hit = range.getBoundingClientRect(), box = p.getBoundingClientRect();
+      if (p === messagesEl || ['auto', 'scroll'].includes(style.overflowY)) {
+        if (hit.top < box.top || hit.bottom > box.bottom) p.scrollTop += hit.top - box.top - (p.clientHeight - hit.height) / 2;
+      }
+      if (['auto', 'scroll'].includes(style.overflowX)) {
+        if (hit.left < box.left || hit.right > box.right) p.scrollLeft += hit.left - box.left - (p.clientWidth - hit.width) / 2;
+      }
+      if (p === messagesEl) break;
+    }
+    scheduleFindOverlay();
+  }
+  function findRootText(root) {
+    const parts = [];
+    let text = '';
+    function collect(node) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        parts.push({ node, start: text.length }); text += node.data; return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE || node.matches('button, .lang, .label, .user-note, .user-images')) return;
+      const raw = unrenderedMd.get(node);
+      if (raw != null && !findMarkdown.has(node)) {
+        let source = findDeferred.get(node);
+        if (!source || source.raw !== raw) {
+          const rendered = el('div');
+          rendered.innerHTML = renderMarkdown(raw);
+          source = { raw, rendered };
+          findDeferred.set(node, source);
+        }
+        collect(source.rendered);
+        return;
+      }
+      const block = /^(P|DIV|PRE|LI|H[1-6]|TR|BLOCKQUOTE|BR)$/.test(node.tagName);
+      if (block && text && !text.endsWith('\n')) text += '\n';
+      for (const child of node.childNodes) collect(child);
+      if (block && text && !text.endsWith('\n')) text += '\n';
+    }
+    for (const child of root.childNodes) collect(child);
+    return { text, parts };
+  }
+  function findRootMatches(root, pattern) {
+    const { text, parts } = findRootText(root);
+    const matches = [];
+    pattern.lastIndex = 0;
+    let partIndex = 0;
+    for (const match of text.matchAll(pattern)) {
+      const start = match.index, end = start + match[0].length;
+      while (partIndex < parts.length && parts[partIndex].start + parts[partIndex].node.length <= start) partIndex++;
+      const first = parts[partIndex];
+      let lastIndex = partIndex;
+      while (lastIndex < parts.length && parts[lastIndex].start + parts[lastIndex].node.length < end) lastIndex++;
+      const last = parts[lastIndex];
+      if (!first || !last) continue;
+      const range = document.createRange();
+      range.setStart(first.node, start - first.start);
+      range.setEnd(last.node, end - last.start);
+      matches.push({ root, ordinal: matches.length, range, node: first.node, offset: start - first.start, endNode: last.node, endOffset: end - last.start });
+    }
+    return matches;
+  }
+  function findPattern() {
+    // Literal, case-insensitive text with UTF-16 offsets for DOM ranges.
+    return new RegExp(findQuery.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'giu');
+  }
+  function prepareFindMatch() {
+    if (findIndex < 0) { restoreFindChunk(); return; }
+    const match = findMatches[findIndex];
+    if (findChunk && !findChunkNodes().some((node) => node.contains(match.root))) restoreFindChunk();
+    if (!match.root.isConnected) {
+      const fragment = earlier.find((chunk) => chunk.contains(match.root));
+      if (fragment) {
+        findChunk = attachFindChunk(fragment);
+      }
+    }
+    if (renderFindMarkdown(match.root)) {
+      const replacements = findRootMatches(match.root, findPattern());
+      for (let i = 0, j = 0; i < findMatches.length; i++) {
+        if (findMatches[i].root === match.root) findMatches[i] = replacements[j++];
+      }
+    }
+    const selected = findMatches[findIndex];
+    if (selected.node === selected.endNode && selected.node.parentElement?.classList.contains('tail')) {
+      // Raw URLs/syntax can contain hits that disappear on rendering. Map
+      // this raw occurrence to its rendered ordinal before the line completes.
+      selected.tail = selected.node.parentElement;
+      selected.renderedHead = selected.tail.previousSibling?.firstChild;
+      const raw = selected.node.data, offset = selected.endOffset;
+      let marker = '\uE000find\uE001';
+      while (raw.includes(marker)) marker += '\uE001';
+      const rendered = el('div');
+      rendered.innerHTML = renderMarkdown(raw.slice(0, offset) + marker + raw.slice(offset));
+      const { text } = findRootText(rendered), boundary = text.indexOf(marker);
+      if (boundary >= 0) {
+        const firstTail = findMatches.find((m) => m.root === selected.root && m.node === selected.node);
+        selected.renderedOrdinal = firstTail.ordinal + Math.max(0, [...text.slice(0, boundary).matchAll(findPattern())].length - 1);
+      }
+    }
+    openFindDetails(selected.range.startContainer.parentElement);
+  }
+  function renderFindMarkdown(root) {
+    // Keep deferred sources and original DOM for exact restoration on Esc.
+    let changed = false;
+    for (const md of root.querySelectorAll('div')) {
+      if (!unrenderedMd.has(md) || findMarkdown.has(md)) continue;
+      findMarkdown.set(md, Array.from(md.childNodes));
+      md.innerHTML = renderMarkdown(unrenderedMd.get(md));
+      changed = true;
+    }
+    return changed;
+  }
+  function refreshFind(reveal = false, reset = false, changed = null) {
+    if (findBar.hidden) return;
+    const previous = !reset && findMatches[findIndex];
+    const previousMatches = findMatches, previousIndex = findIndex;
+    const unchanged = new Map();
+    if (changed) for (const match of findMatches) {
+      if (!unchanged.has(match.root)) unchanged.set(match.root, []);
+      unchanged.get(match.root).push(match);
+    }
+    findChanges.clear();
+    const pending = findObserver.takeRecords();
+    if (changed) changed.push(...pending.map((record) => record.target));
+    findMatches = [];
+    const query = findQuery.value;
+    if (!findTools.checked || !query) restoreFindOutputs();
+    if (query) {
+      if (findTools.checked) {
+        for (const item of items.values()) {
+          if (!item.outputEl || !item.done || item.done.output.length <= MAX_TOOL_OUTPUT) continue;
+          if (!findOutputs.has(item.outputEl)) findOutputs.set(item.outputEl, item.outputEl.textContent);
+          if (item.outputEl.textContent !== item.done.output) item.outputEl.textContent = item.done.output;
+        }
+      }
+      const pattern = findPattern();
+      let selector = '.user-msg, .delivery-body, .assistant, details.thinking > .body, .block.thinking, .sa-text, .dlg-summary, .dlg-body > ul > li';
+      if (findTools.checked) selector += ', .tool-body > pre, .ed-text, .block.tool, .block.tool_result';
+      for (const scope of findScopes()) {
+        const roots = scope.matches(selector) ? [scope] : Array.from(scope.querySelectorAll(selector));
+        for (const root of roots) {
+          if (root.hidden || roots.some((other) => other !== root && other.contains(root))) continue;
+          const dirty = !changed || changed.some((node) => root.contains(node) || node.contains(root));
+          findMatches.push(...(dirty ? findRootMatches(root, pattern) : (unchanged.get(root) || [])));
+        }
+      }
+    }
+    findIndex = -1;
+    if (previous) {
+      const candidates = findMatches.filter((m) => m.root === previous.root);
+      // The reply element survives stream paints and turn/history moves.
+      // A replaced markdown head means the old raw tail has been rendered;
+      // otherwise its visible raw occurrence number is still valid.
+      const converted = previous.tail && previous.tail.previousSibling?.firstChild !== previous.renderedHead;
+      const ordinal = converted ? (previous.renderedOrdinal ?? previous.ordinal) : previous.ordinal;
+      let best = candidates[Math.min(ordinal, candidates.length - 1)];
+      // If the reply lost all hits, use the nearest surviving old occurrence
+      // in transcript order, rather than jumping to the start of the chat.
+      for (let distance = 1; !best && distance < previousMatches.length; distance++) {
+        for (const index of [previousIndex + distance, previousIndex - distance]) {
+          const neighbor = previousMatches[index];
+          if (!neighbor) continue;
+          const remaining = findMatches.filter((m) => m.root === neighbor.root);
+          best = remaining[Math.min(neighbor.ordinal, remaining.length - 1)];
+          if (best) break;
+        }
+      }
+      if (best) findIndex = findMatches.indexOf(best);
+      else if (findMatches.length) findIndex = Math.min(previousIndex, findMatches.length - 1);
+    }
+    if (findIndex < 0 && findMatches.length) findIndex = 0;
+    prepareFindMatch();
+    paintFind();
+    if (reveal) revealFind();
+    findObserver.takeRecords(); // discard mutations made by find itself
+  }
+  function stepFind(delta) {
+    // Mutation delivery (and its scheduled frame) can lag a streaming paint.
+    // Drain it now and search only affected blocks before using the ordinal.
+    for (const record of findObserver.takeRecords()) findChanges.add(record.target);
+    if (findChanges.size) refreshFind(false, false, [...findChanges]);
+    if (!findMatches.length) return;
+    findIndex = (findIndex + delta + findMatches.length) % findMatches.length;
+    prepareFindMatch();
+    paintFind(); revealFind();
+  }
+  window.__openFind = function () {
+    if (findBar.hidden) {
+      // Late worker/tool events update their original nodes even when history
+      // has been detached. Trimming is paused until find closes.
+      for (const fragment of earlier) findObserver.observe(fragment, { childList: true, characterData: true, subtree: true });
+      findWasFollowing = follow;
+      rememberFindScroll(messagesEl);
+      earlierEl.disabled = true;
+    }
+    findBar.hidden = false;
+    follow = false;
+    refreshFind(true);
+    findQuery.focus(); findQuery.select();
+  };
+  function closeFind() {
+    if (findBar.hidden) return;
+    findBar.hidden = true;
+    // Release detached history roots once the session stops searching them.
+    findObserver.disconnect();
+    findObserver.observe(messagesEl, { childList: true, characterData: true, subtree: true });
+    CSS.highlights?.delete('chat-find'); CSS.highlights?.delete('chat-find-current');
+    findOverlay.replaceChildren();
+    findMatches = []; findIndex = -1;
+    restoreFindOutputs();
+    for (const details of findOpenedDetails) details.open = false;
+    findOpenedDetails.clear();
+    restoreFindChunk();
+    for (const page of findPages.values()) restoreFindChunk(page);
+    findPages.clear();
+    findChanges.clear();
+    for (const [md, children] of findMarkdown) md.replaceChildren(...children);
+    findMarkdown.clear(); findDeferred.clear();
+    earlierEl.disabled = false;
+    retallyEarlier();
+    for (const [node, [top, left]] of findScrolls) { node.scrollTop = top; node.scrollLeft = left; }
+    findScrolls.clear();
+    follow = findWasFollowing;
+    jumpBtn.classList.toggle('visible', !follow);
+    scrollIfFollowing();
+    promptEl.focus();
+  }
+  findQuery.addEventListener('input', () => refreshFind(true, true));
+  findTools.addEventListener('change', () => refreshFind(true, true));
+  findPrev.addEventListener('click', () => stepFind(-1));
+  findNext.addEventListener('click', () => stepFind(1));
+  document.getElementById('find-close').addEventListener('click', closeFind);
+  // Includes streamed markdown paints and changes inside folded cards. No
+  // attribute observation: opening a fold cannot trigger a search loop.
+  const findChanges = new Set();
+  const findObserver = new MutationObserver((records) => {
+    if (findBar.hidden) return;
+    for (const record of records) findChanges.add(record.target);
+    if (findQueued) return;
+    findQueued = true;
+    requestAnimationFrame(() => {
+      findQueued = false;
+      if (findChanges.size) refreshFind(false, false, [...findChanges]);
+    });
+  });
+  findObserver.observe(messagesEl, { childList: true, characterData: true, subtree: true });
 
   // ---- turn folds (TRU-209) ------------------------------------------------
   // A finished turn folds into one "Worked for <duration>" row: everything
@@ -1116,7 +1544,7 @@
     segments.push(seg);
     let folded = false;
     for (const s of segments) folded = foldSegment(s) || folded;
-    if (!folded || !earlier.length) return;
+    if (!folded || !earlier.length || !findBar.hidden) return;
     retallyEarlier();
     // The fold freed room in the document: bring back the chunks that fit.
     let n = 0, room = WINDOW_KEEP - liveBlocks();
@@ -3845,6 +4273,8 @@
   };
 
   window.__resetConversation = function () {
+    closeFind();
+    findQuery.value = ''; findTools.checked = false;
     for (const render of htmlRenders) render.dispose();
     htmlRenders.clear();
     messagesEl.innerHTML = '';
@@ -3878,7 +4308,7 @@
   // While this page has keyboard focus its keys never reach GitTerm's own
   // key handler, so the app-wide chords are handed to it instead. The list
   // (isHostShortcut) is fixed and matches `forwarded_key` in main.rs:
-  // `global_shortcut`'s chords plus Cmd+V and the text-size chords.
+  // `global_shortcut`'s chords plus Cmd+V, Cmd+F and the text-size chords.
   // Every other key (Enter, Shift+Enter, Cmd+Enter, Shift+Tab, the editing chords below) stays
   // here. Escape goes to GitTerm only when nothing on this page is open for
   // it to close. Capture phase, so this sees the page's state before the
@@ -3897,7 +4327,7 @@
   // paste: action to this page's WKWebView. The page then gets a real paste
   // event (text, or image files for the composer's paste handler).
   function pageHasOpenLayer() {
-    return modeMenuEl.classList.contains('visible')
+    return !findBar.hidden || modeMenuEl.classList.contains('visible')
       || slashMenuEl.classList.contains('visible')
       || CHIP_MENUS.some((m) => m.classList.contains('visible'))
       || reviewPopEl.classList.contains('visible')
@@ -3911,6 +4341,7 @@
     if (ctrlOnly && (k === ' ' || digit)) return true; // Ctrl+Space, Ctrl+1…9
     if (cmdOnly && (digit || k.toLowerCase() === 't')) return true; // Cmd+1…9, Cmd+T
     if (e.metaKey && !e.ctrlKey && !e.altKey && ['=', '+', '-', '_'].includes(k)) return true; // Chat/sidebar text size
+    if (cmdOnly && k.toLowerCase() === 'f') return true; // Cmd+F: find in this chat
     if (cmdOnly && k.toLowerCase() === 'v') return true; // Cmd+V: paste, sent back as the native paste: action
     if (e.metaKey && e.shiftKey && !e.ctrlKey && !e.altKey && k.toLowerCase() === 'u') return true; // Cmd+Shift+U
     if (e.metaKey && e.shiftKey && !e.ctrlKey && !e.altKey && k.toLowerCase() === 'o') return true; // Cmd+Shift+O
@@ -3931,6 +4362,11 @@
   }
   document.addEventListener('keydown', (e) => {
     if (e.isComposing) return;
+    if (!findBar.hidden && !e.metaKey && !e.ctrlKey && !e.altKey && (e.key === 'Escape' || (e.key === 'Enter' && e.target === findQuery))) {
+      e.preventDefault(); e.stopImmediatePropagation();
+      if (e.key === 'Escape') closeFind(); else stepFind(e.shiftKey ? -1 : 1);
+      return;
+    }
     const command = editingCommand(e);
     if (command) {
       // Always taken: WebKit hands a key the page leaves alone back to

@@ -877,6 +877,8 @@ enum ForwardedKey {
     Paste,
     /// Cmd +/- and Cmd+Shift +/-: chat/terminal or sidebar text.
     FontSize,
+    /// Cmd+F: open find in the current chat.
+    Find,
 }
 
 /// Which forwarded chord `key` with `modifiers` is, if any: the chat page's
@@ -895,7 +897,32 @@ fn forwarded_key(key: &Key, modifiers: Modifiers) -> Option<ForwardedKey> {
     if !modifiers.control() && !modifiers.alt() && font_shortcut(key, modifiers, false).is_some() {
         return Some(ForwardedKey::FontSize);
     }
+    if find_shortcut(key, modifiers, true).is_some() {
+        return Some(ForwardedKey::Find);
+    }
     global_shortcut(key, modifiers).map(ForwardedKey::Global)
+}
+
+fn find_shortcut(key: &Key, modifiers: Modifiers, chat_active: bool) -> Option<Event> {
+    if modifiers == Modifiers::COMMAND
+        && matches!(key.as_ref(), Key::Character(c) if c.eq_ignore_ascii_case("f"))
+    {
+        Some(if chat_active {
+            Event::AgentFindOpen
+        } else {
+            Event::ToggleSearch
+        })
+    } else {
+        None
+    }
+}
+
+fn chat_find_allowed(
+    surface: VisibleSurface,
+    terminal_focused: bool,
+    native_input_focused: bool,
+) -> bool {
+    matches!(surface, VisibleSurface::AgentChat(_)) && !terminal_focused && !native_input_focused
 }
 
 /// Shared by the native key handler and the WebView forwarding allow-list.
@@ -1179,7 +1206,7 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                     }
                 };
                 match forwarded_key(&key, modifiers) {
-                    Some(ForwardedKey::Global(_) | ForwardedKey::FontSize) => {
+                    Some(ForwardedKey::Global(_) | ForwardedKey::FontSize | ForwardedKey::Find) => {
                         AgentIpcMessage::HostKey { key, modifiers }
                     }
                     Some(ForwardedKey::Paste) => AgentIpcMessage::PastePage { tab_id },
@@ -6935,6 +6962,7 @@ pub enum Event {
     },
     WorktreeRemoveCompleted(PathBuf, Result<(), String>),
     KeyPressed(Key, Modifiers),
+    AgentFindFocusChecked(bool),
     // Sidebar
     ToggleSidebar,
     SetSidebarMode(SidebarMode),
@@ -7031,6 +7059,7 @@ pub enum Event {
     MouseMoved(f32, f32),
     // Search events
     ToggleSearch,
+    AgentFindOpen,
     SearchQueryChanged(String),
     SearchExecute,
     SearchNext,
@@ -24770,6 +24799,11 @@ fi
                         Task::done(Event::AgentOpenCheckout(tab_id, path))
                     }
                     AgentIpcMessage::HostKey { key, modifiers } => {
+                        // The page forwarding Cmd+F has keyboard focus. Native
+                        // widget focus state can still describe the last app view.
+                        if find_shortcut(&key, modifiers, true).is_some() {
+                            return self.update(Event::AgentFindOpen);
+                        }
                         // Run the chord through the Iced key handler, so it
                         // means exactly what it means anywhere else. The
                         // handler records the chord's modifiers as held;
@@ -27583,9 +27617,30 @@ fi
                     // Search shortcuts
                     if modifiers.command() {
                         if let Key::Character(c) = key.as_ref() {
-                            // Cmd+F - Toggle search
-                            if c == "f" {
-                                return Task::done(Event::ToggleSearch);
+                            // Cmd+F - Open chat find or toggle terminal search
+                            if let Some(event) = find_shortcut(
+                                &key,
+                                modifiers,
+                                matches!(tab.kind, TabKind::Agent(_)),
+                            ) {
+                                if matches!(event, Event::AgentFindOpen) {
+                                    if !chat_find_allowed(
+                                        self.visible_webview_surface(),
+                                        self.bottom_panel_focused,
+                                        false,
+                                    ) {
+                                        return Task::none();
+                                    }
+                                    // Include unnamed native inputs: find_focused
+                                    // only reports widgets with explicit IDs.
+                                    return iced::advanced::widget::operate(
+                                        iced::advanced::widget::operation::focusable::count(),
+                                    )
+                                    .map(|focus| {
+                                        Event::AgentFindFocusChecked(focus.focused.is_some())
+                                    });
+                                }
+                                return Task::done(event);
                             }
                             // Cmd+G / Cmd+Shift+G - Next/Prev match
                             if c == "g" && tab.search.is_active {
@@ -29546,6 +29601,23 @@ fi
                 }
             }
             // Search events
+            Event::AgentFindFocusChecked(native_input_focused) => {
+                if chat_find_allowed(
+                    self.visible_webview_surface(),
+                    self.bottom_panel_focused,
+                    native_input_focused,
+                ) {
+                    return self.update(Event::AgentFindOpen);
+                }
+            }
+            Event::AgentFindOpen => {
+                if let VisibleSurface::AgentChat(tab_id) = self.visible_webview_surface() {
+                    webview::evaluate_script(
+                        webview::WebviewSurface::Agent(tab_id),
+                        "window.__openFind && window.__openFind()",
+                    );
+                }
+            }
             Event::ToggleSearch => {
                 if let Some(tab) = self.active_tab_mut() {
                     tab.search.is_active = !tab.search.is_active;
@@ -50060,6 +50132,56 @@ mod tests {
 
     fn ch(c: &str) -> Key {
         Key::Character(c.into())
+    }
+
+    #[test]
+    fn find_shortcut_routes_chat_and_other_tabs() {
+        let mac = cfg!(target_os = "macos");
+        let (key, modifiers) = hostkey_chord(&hostkey("f", mac, !mac, false, false)).unwrap();
+        assert_eq!(forwarded_key(&key, modifiers), Some(ForwardedKey::Find));
+        assert!(matches!(
+            find_shortcut(&key, modifiers, true),
+            Some(Event::AgentFindOpen)
+        ));
+        assert!(matches!(
+            find_shortcut(&key, modifiers, false),
+            Some(Event::ToggleSearch)
+        ));
+        for modifiers in [Modifiers::empty(), Modifiers::COMMAND | Modifiers::SHIFT] {
+            assert!(find_shortcut(&key, modifiers, true).is_none());
+        }
+        assert!(find_shortcut(&ch("g"), Modifiers::COMMAND, true).is_none());
+    }
+
+    #[test]
+    fn chat_find_requires_visible_chat_without_native_focus() {
+        for terminal in [false, true] {
+            for input in [false, true] {
+                for surface in [
+                    VisibleSurface::None,
+                    VisibleSurface::Viewer,
+                    VisibleSurface::Page,
+                    VisibleSurface::AgentChat(3),
+                ] {
+                    assert_eq!(
+                        chat_find_allowed(surface, terminal, input),
+                        surface == VisibleSurface::AgentChat(3) && !terminal && !input,
+                        "surface={surface:?}, terminal={terminal}, input={input}",
+                    );
+                }
+            }
+        }
+        // Settings and file viewers can cover a still-selected agent tab.
+        for (viewer, overlay) in [
+            (ViewerWebview::None, true),
+            (ViewerWebview::PlansViewer, false),
+        ] {
+            assert!(!chat_find_allowed(
+                visible_webview_surface(viewer, ActiveTabSurface::AgentChat(3), overlay),
+                false,
+                false,
+            ));
+        }
     }
 
     #[test]
