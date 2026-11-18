@@ -12,6 +12,27 @@ use serde_json::Value;
 use crate::harness::transcript::{TimedEntry, TranscriptEntry};
 use crate::harness::HarnessEvent;
 
+/// The sole clipboard payload accepted from the guarded agent page.
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+enum MarkdownClipboardMessage {
+    #[serde(rename = "copy_markdown")]
+    Copy {
+        #[serde(rename = "tabId")]
+        tab_id: usize,
+        text: String,
+    },
+}
+
+pub fn markdown_clipboard_message(value: Value) -> Result<(usize, String), String> {
+    let MarkdownClipboardMessage::Copy { tab_id, text } = serde_json::from_value(value)
+        .map_err(|_| "invalid Copy as Markdown message".to_string())?;
+    if text.is_empty() {
+        return Err("empty Copy as Markdown message".into());
+    }
+    Ok((tab_id, text))
+}
+
 /// Embedded HTML scaffold for the agent chat surface (Step 4 of TRU-29).
 pub const AGENT_CHAT_HTML: &str = include_str!("../assets/agent_chat.html");
 /// Vendored renderers inlined into the chat page (no network at runtime).
@@ -143,6 +164,50 @@ pub fn history_payloads(entries: Vec<TimedEntry>) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validates_markdown_clipboard_payload_without_coercion() {
+        let valid =
+            serde_json::json!({"type":"copy_markdown", "tabId":7, "text":"**selected** 😀"});
+        assert_eq!(
+            markdown_clipboard_message(valid.clone()).unwrap(),
+            (7, "**selected** 😀".into())
+        );
+        for field in ["text", "tabId", "type"] {
+            let mut invalid = valid.clone();
+            invalid.as_object_mut().unwrap().remove(field);
+            assert!(
+                markdown_clipboard_message(invalid).is_err(),
+                "missing {field}"
+            );
+        }
+        for text in [
+            Value::Null,
+            serde_json::json!(42),
+            serde_json::json!({}),
+            serde_json::json!(""),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["text"] = text;
+            assert!(markdown_clipboard_message(invalid).is_err());
+        }
+        for tab in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("7"),
+            Value::Null,
+        ] {
+            let mut invalid = valid.clone();
+            invalid["tabId"] = tab;
+            assert!(markdown_clipboard_message(invalid).is_err());
+        }
+        let mut invalid = valid.clone();
+        invalid["html"] = serde_json::json!("<b>rich</b>");
+        assert!(markdown_clipboard_message(invalid).is_err());
+        let mut invalid = valid;
+        invalid["type"] = serde_json::json!("copy");
+        assert!(markdown_clipboard_message(invalid).is_err());
+    }
 
     #[test]
     fn user_prompt_payload_classifies_only_footer_marked_deliveries_for_cards() {

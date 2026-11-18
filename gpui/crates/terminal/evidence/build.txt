@@ -1,0 +1,3 @@
+   Compiling gitterm-terminal v0.0.0 (/Users/t.trewin/.config/gitterm-v6/worktrees/gitterm-v2/TRU-278-tru-278-gpui-terminal-route-fork-backend-gpui-re/gpui/crates/terminal)
+   Compiling gitterm-gpui v0.0.0 (/Users/t.trewin/.config/gitterm-v6/worktrees/gitterm-v2/TRU-278-tru-278-gpui-terminal-route-fork-backend-gpui-re/gpui)
+    Finished `dev` profile [unoptimized] target(s) in 2.69s

@@ -13,7 +13,7 @@
 
 use super::*;
 
-use gitterm::issue_titles::{self, IssueTitlesFile, KeyResult, RoundOutcome};
+use gitterm::issue_titles::{self, IssueGroup, IssueTitlesFile, KeyResult, RoundOutcome};
 
 /// A key whose read failed (not "not found") is tried again after this.
 const FAILED_RETRY: Duration = Duration::from_secs(10 * 60);
@@ -25,8 +25,8 @@ const TITLE_CHARS: usize = 60;
 pub enum IssueEvent {
     Fetched(Box<RoundOutcome>),
     Saved(Result<(), String>),
-    /// "▸ n more" / "▾ show fewer".
-    AllToggle,
+    /// Toggle one group's disclosure in this workspace.
+    GroupToggle(IssueGroup),
     /// Open an issue's URL (from the cache) in the Viewer.
     Open(String, Option<String>),
 }
@@ -42,16 +42,20 @@ pub struct IssuesState {
     failed: HashMap<String, Instant>,
     save_in_flight: bool,
     save_again: bool,
-    /// Issues lists every key, not just the first
-    /// [`issue_titles::ISSUES_SHOWN`].
-    pub all: bool,
 }
 
 impl IssuesState {
     /// The cache from the config dir (a small read).
     pub fn load(config_dir: &Path) -> Self {
+        let mut cache = IssueTitlesFile::load(&IssueTitlesFile::path_in(config_dir));
+        let at = chat_facts::now_stamp();
+        let mut save_again = false;
+        for entry in cache.issues.values_mut() {
+            save_again |= entry.observe_done(&at);
+        }
         Self {
-            cache: IssueTitlesFile::load(&IssueTitlesFile::path_in(config_dir)),
+            cache,
+            save_again,
             ..Self::default()
         }
     }
@@ -88,6 +92,12 @@ impl App {
     /// Tick: one background round for the shown keys that are due, unless
     /// one runs.
     pub(super) fn poll_issue_titles(&mut self) -> Task<Event> {
+        // Older cache entries get their first-observed stamp at load, and
+        // the ordinary background writer persists it on the first tick.
+        if self.issues.save_again && !self.issues.save_in_flight {
+            self.issues.save_again = false;
+            return self.save_issue_titles();
+        }
         if self.issues.in_flight {
             return Task::none();
         }
@@ -194,7 +204,20 @@ impl App {
                     return self.save_issue_titles();
                 }
             }
-            IssueEvent::AllToggle => self.issues.all = !self.issues.all,
+            IssueEvent::GroupToggle(group) => {
+                if let Some(ws) = self.workspaces.get_mut(self.active_workspace_idx) {
+                    if let Some(index) = ws
+                        .collapsed_issue_groups
+                        .iter()
+                        .position(|item| *item == group)
+                    {
+                        ws.collapsed_issue_groups.remove(index);
+                    } else {
+                        ws.collapsed_issue_groups.push(group);
+                    }
+                    self.mark_workspaces_dirty();
+                }
+            }
             IssueEvent::Open(url, workspace) => {
                 return self.open_linear_issue_page(url, workspace.as_deref());
             }
@@ -202,13 +225,12 @@ impl App {
         Task::none()
     }
 
-    /// The Issues section's rows: key, title (cut) and state per line, the
-    /// first [`issue_titles::ISSUES_SHOWN`] then "▸ n more". Without a
-    /// Linear entry the state slot says why ("not read yet", ...). A line
-    /// whose URL is cached opens it on a click; there is no hover card.
+    /// Visible Issues in state groups, retaining mention order within each.
+    /// Without a Linear entry the state slot says why ("not read yet", ...).
+    /// A row whose URL is cached opens it on a click.
     pub(super) fn view_work_issues<'a>(
         &'a self,
-        keys: &'a [String],
+        groups: Vec<(IssueGroup, Vec<&'a String>)>,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let mono = iced::Font::with_name("Menlo");
@@ -217,63 +239,106 @@ impl App {
         let text_secondary = theme.text_secondary();
         let text_muted = theme.text_muted();
         let linear_missing = matches!(self.issues.linear, Some(None));
-        let (shown, fold_label) = issue_titles::fold(keys.len(), self.issues.all);
         let mut col = Column::new().spacing(1);
-        for key in keys.iter().take(shown) {
-            let cached = self.issues.cache.issues.get(key);
-            let found = cached.filter(|entry| !entry.not_found);
-            let title = found.and_then(|entry| entry.title.as_deref());
-            // The muted slot: the issue's state, or why there is none
-            // (TRU-208; this used to be only in a hover card).
-            let state = match (found, cached) {
-                (Some(entry), _) => entry.state.clone().unwrap_or_default(),
-                (None, Some(_)) => "no Linear workspace knows this key".to_string(),
-                (None, None) if linear_missing => "no linear CLI".to_string(),
-                (None, None) => "not read yet".to_string(),
-            };
-            let url = found.and_then(|entry| entry.url.clone());
-            let workspace = found.and_then(|entry| {
-                entry.workspace.clone().or_else(|| {
-                    entry
-                        .url
-                        .as_deref()
-                        .and_then(issue_titles::workspace_from_issue_url)
-                })
-            });
-            let line = row![
-                text(key.clone())
+        for (group, keys) in groups {
+            let open = self
+                .active_workspace()
+                .is_none_or(|ws| !ws.collapsed_issue_groups.contains(&group));
+            col = col.push(self.overview_fold_header(
+                group.label(),
+                keys.len(),
+                open,
+                Event::Issue(IssueEvent::GroupToggle(group)),
+            ));
+            if !open {
+                continue;
+            }
+            for key in keys {
+                let cached = self.issues.cache.issues.get(key);
+                let found = cached.filter(|entry| !entry.not_found);
+                let title = found.and_then(|entry| entry.title.as_deref());
+                // The muted slot: the issue's state, or why there is none
+                // (TRU-208; this used to be only in a hover card).
+                let state = match (found, cached) {
+                    (Some(entry), _) => entry.state.clone().unwrap_or_default(),
+                    (None, Some(_)) => "no Linear workspace knows this key".to_string(),
+                    (None, None) if linear_missing => "no linear CLI".to_string(),
+                    (None, None) => "not read yet".to_string(),
+                };
+                let url = found.and_then(|entry| entry.url.clone());
+                let workspace = found.and_then(|entry| {
+                    entry.workspace.clone().or_else(|| {
+                        entry
+                            .url
+                            .as_deref()
+                            .and_then(issue_titles::workspace_from_issue_url)
+                    })
+                });
+                let line = row![
+                    text(key.clone())
+                        .size(font_small)
+                        .color(text_secondary)
+                        .font(mono),
+                    text(title.map_or_else(String::new, |title| {
+                        issue_titles::shorten(title, TITLE_CHARS)
+                    }))
                     .size(font_small)
-                    .color(text_secondary)
-                    .font(mono),
-                text(title.map_or_else(String::new, |title| {
-                    issue_titles::shorten(title, TITLE_CHARS)
-                }))
-                .size(font_small)
-                .color(text_primary)
-                .width(Length::Fill),
-                text(state).size(10).color(text_muted),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center);
-            let line: Element<'a, Event, Theme, iced::Renderer> = match url {
-                Some(url) => button(line)
-                    .style(self.flat_button_style())
-                    .padding([3, 6])
-                    .width(Length::Fill)
-                    .on_press(Event::Issue(IssueEvent::Open(url, workspace)))
-                    .into(),
-                None => container(line).padding([3, 6]).width(Length::Fill).into(),
-            };
-            col = col.push(line);
-        }
-        if let Some(label) = fold_label {
-            col = col.push(
-                button(text(label).size(10).color(text_muted).font(mono))
-                    .style(self.flat_button_style())
-                    .padding([2, 6])
-                    .on_press(Event::Issue(IssueEvent::AllToggle)),
-            );
+                    .color(text_primary)
+                    .width(Length::Fill),
+                    text(state).size(10).color(text_muted),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center);
+                let line: Element<'a, Event, Theme, iced::Renderer> = match url {
+                    Some(url) => button(line)
+                        .style(self.flat_button_style())
+                        .padding([3, 6])
+                        .width(Length::Fill)
+                        .on_press(Event::Issue(IssueEvent::Open(url, workspace)))
+                        .into(),
+                    None => container(line).padding([3, 6]).width(Length::Fill).into(),
+                };
+                col = col.push(line);
+            }
         }
         col.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loading_old_done_cache_queues_stamp_save_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = IssueTitlesFile::path_in(dir.path());
+        let mut cache = IssueTitlesFile::default();
+        cache.issues.insert(
+            "TRU-243".into(),
+            issue_titles::CachedIssue {
+                state: Some("Done".into()),
+                fetched_at: "2026-01-01T10:00:00Z".into(),
+                ..Default::default()
+            },
+        );
+        cache.save(&path).unwrap();
+        let state = IssuesState::load(dir.path());
+        assert!(state.save_again);
+        let stamp = state.cache.issues["TRU-243"]
+            .first_seen_done_at
+            .clone()
+            .unwrap();
+        assert_ne!(stamp, "2026-01-01T10:00:00Z");
+        assert!(state.cache.issues["TRU-243"].visible_in_issues(chrono::Utc::now()));
+        state.cache.save(&path).unwrap();
+        let reloaded = IssuesState::load(dir.path());
+        assert!(!reloaded.save_again);
+        assert_eq!(
+            reloaded.cache.issues["TRU-243"]
+                .first_seen_done_at
+                .as_deref(),
+            Some(stamp.as_str())
+        );
     }
 }

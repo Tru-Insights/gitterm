@@ -314,6 +314,137 @@
     window.__setTabId(3, 'default', { model: 'gemini-4-argon-medium', harness: { name: 'Antigravity', acp: true } }, false);
     check('Antigravity remains writable after leaving legacy Gemini', !document.getElementById('prompt').disabled && !document.getElementById('submit').disabled && document.getElementById('read-only-note').hidden);
 
+    // TRU-270: exercise the actual action/shortcut, never a separate serializer.
+    const markdownIpc = [];
+    window.ipc = { postMessage: (body) => markdownIpc.push(JSON.parse(body)) };
+    const selection = window.getSelection();
+    const fixture = (html) => {
+      window.__resetConversation();
+      messages.innerHTML = html;
+      document.activeElement.blur();
+      selection.removeAllRanges();
+      markdownIpc.length = 0;
+    };
+    const leaf = (selector) => document.querySelector(selector).firstChild;
+    const select = (start, from, end = start, to = end.length) => {
+      const range = document.createRange(); range.setStart(start, from); range.setEnd(end, to);
+      selection.removeAllRanges(); selection.addRange(range);
+      return range;
+    };
+    const copied = () => {
+      markdownIpc.length = 0;
+      window.__copySelectionMarkdown(false);
+      return markdownIpc.find((m) => m.type === 'copy_markdown')?.text;
+    };
+    const equalCopy = (name, expected) => {
+      const actual = copied();
+      check('markdown ' + name + (actual === expected ? '' : ' got ' + JSON.stringify(actual)), actual === expected);
+    };
+    fixture('<div class="assistant"><p>Before <strong id="bold">bold text</strong> after</p></div>');
+    select(leaf('#bold'), 1, leaf('#bold'), 7); equalCopy('partial bold', '**old te**');
+    fixture('<div class="assistant"><p><strong id="nested">bold <em id="italic">italic</em> end</strong></p></div>');
+    select(leaf('#nested'), 2, leaf('#italic'), 3); equalCopy('nested formatting clipped both ends', '**ld *ita***');
+    fixture('<div class="assistant"><p><a id="link" href="https://example.org/a(b)">Unicode 😀 café</a></p></div>');
+    select(leaf('#link'), 8, leaf('#link'), 15); equalCopy('partial link Unicode', '[😀 café](https://example.org/a%28b%29)');
+    selection.setBaseAndExtent(leaf('#link'), 15, leaf('#link'), 8); equalCopy('backward selection', '[😀 café](https://example.org/a%28b%29)');
+    fixture('<div class="assistant"><p><code id="inline">a`b``c</code></p></div>');
+    select(leaf('#inline'), 1, leaf('#inline'), 5); equalCopy('partial code safe delimiter', '``` `b`` ```');
+    fixture('<div class="assistant"><pre><code class="language-rust" id="fence">first\n```\n\n\nlast</code></pre></div>');
+    select(leaf('#fence'), 3); equalCopy('safe fence language and literal blank lines', '````rust\nst\n```\n\n\nlast\n````');
+    fixture('<div class="assistant"><p id="before-fold">before</p><details class="tool"><summary>visible summary</summary><div>hidden tool payload</div></details><p id="after-fold">after</p></div>');
+    select(leaf('#before-fold'), 0, leaf('#after-fold'));
+    const closedFoldCopy = copied();
+    check('markdown excludes content in a closed details element', !closedFoldCopy.includes('hidden tool payload') && closedFoldCopy.includes('visible summary') && closedFoldCopy.includes('before') && closedFoldCopy.includes('after'));
+    fixture('<details class="turn-fold" open><summary>worked</summary><div class="tf-body"><div class="assistant"><p><strong id="fold-bold">bold in fold</strong></p></div></div></details>');
+    select(leaf('#fold-bold'), 0); equalCopy('expanded turn fold keeps assistant formatting', '**bold in fold**');
+    fixture('<div class="assistant"><h2 id="heading">Heading</h2><blockquote><p><s id="strike">deleted</s><br><em id="break">line</em></p></blockquote></div>');
+    select(leaf('#heading'), 2, leaf('#break'), 2); equalCopy('heading quote strike and hard break', '## ading\n\n> ~~deleted~~  \n> *li*');
+    fixture('<div class="assistant"><ul><li>omit</li><li id="outer">parent<ul><li id="inner">nested</li><li>omit too</li></ul></li></ul></div>');
+    select(leaf('#outer'), 2, leaf('#inner'), 4); equalCopy('nested selected list items', '- rent\n  - nest');
+    select(leaf('#inner'), 0, leaf('#inner'), 4); equalCopy('nested item alone omits unselected parent', '  - nest');
+    fixture('<div class="assistant"><ol start="4"><li>omit</li><li id="ordered">second</li><li>omit</li></ol></div>');
+    select(leaf('#ordered'), 1, leaf('#ordered'), 4); equalCopy('ordered selected item', '5. eco');
+    reset(); send(H('text_delta', '```rust\nlet value = true;\n```'), end);
+    document.activeElement.blur();
+    const renderedCode = document.querySelector('.assistant .codeblock code');
+    const codeRange = document.createRange(); codeRange.selectNodeContents(renderedCode);
+    selection.removeAllRanges(); selection.addRange(codeRange);
+    equalCopy('real renderer preserves code language without UI label', '```rust\nlet value = true;\n```');
+    const table = '<div class="assistant"><table><thead><tr><th id="h1">Name</th><th id="h2">Value</th></tr></thead><tbody><tr><td id="c1">alpha</td><td id="c2">beta</td></tr><tr><td id="c3">gamma</td><td id="c4">delta</td></tr></tbody></table></div>';
+    fixture(table); select(leaf('#h1'), 0, leaf('#c4'), 5);
+    equalCopy('complete table with header', '| Name | Value |\n| --- | --- |\n| alpha | beta |\n| gamma | delta |');
+    fixture('<div class="assistant"><table><thead><tr><th>Value</th></tr></thead><tbody><tr><td><code id="pipe-code">a|b</code></td></tr></tbody></table></div>');
+    const pipeTable = document.querySelector('table');
+    const pipeRange = document.createRange(); pipeRange.selectNodeContents(pipeTable);
+    selection.removeAllRanges(); selection.addRange(pipeRange);
+    equalCopy('table inline code escapes a pipe', '| Value |\n| --- |\n| `a\\|b` |');
+    fixture(table);
+    select(leaf('#c1'), 2, leaf('#c4'), 3); equalCopy('partial table TSV', 'pha\tbeta\ngamma\tdel');
+    select(leaf('#h1'), 1, leaf('#h2'), 3); equalCopy('partial table header TSV', 'ame\tVal');
+    fixture('<div class="assistant"><p id="reply1">first <b>bold</b></p></div><div class="user-msg" id="user">literal **user**</div><details class="tool" open><summary>tool label<button>no button</button></summary><div id="tool">visible <b>tool</b><span hidden>secret</span><span style="display:none">payload</span></div></details><div class="assistant"><p id="reply2">last reply</p></div>');
+    select(leaf('#reply1'), 2, leaf('#reply2'), 4);
+    equalCopy('several replies with literal user and visible tool text', 'rst **bold**\n\nliteral **user**\n\ntool label\n\nvisible tool\n\nlast');
+    fixture('<div class="user-msg" id="literal-user">\n\nliteral **user**\n\n</div>');
+    select(leaf('#literal-user'), 0); equalCopy('user message retains literal boundary newlines', '\n\nliteral **user**\n\n');
+    fixture('<div class="assistant"><p id="reply1">first <b>bold</b></p></div><div class="user-msg" id="user">literal **user**</div><div class="assistant"><p id="reply2">last reply</p></div>');
+    // Native context menus remain unmodified by the page over every target.
+    const promptInput = document.getElementById('prompt');
+    const originalExec = document.execCommand.bind(document);
+    promptInput.focus(); promptInput.value = 'draft'; promptInput.setSelectionRange(5, 5);
+    originalExec('insertText', false, ' edit');
+    promptInput.blur();
+    const selected = select(leaf('#reply1'), 1, leaf('#reply2'), 3);
+    const focusBefore = document.activeElement;
+    const unchanged = () => document.activeElement === focusBefore && selection.rangeCount === 1
+      && selection.getRangeAt(0).startContainer === selected.startContainer && selection.getRangeAt(0).startOffset === selected.startOffset
+      && selection.getRangeAt(0).endContainer === selected.endContainer && selection.getRangeAt(0).endOffset === selected.endOffset;
+    for (const target of [document.querySelector('#reply1'), document.querySelector('#reply1 b'), document.querySelector('#user'), promptInput]) {
+      const markup = document.body.innerHTML;
+      const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+      target.dispatchEvent(event);
+      check('native contextmenu kept over ' + target.tagName, !event.defaultPrevented && unchanged() && document.body.innerHTML === markup);
+      check('menu eligibility follows transcript target ' + target.tagName, window.__prepareCopyMarkdownMenu() === (target !== promptInput));
+    }
+    document.querySelector('#reply1').dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+    markdownIpc.length = 0; window.__copySelectionMarkdown(true);
+    check('menu action keeps focus range draft', markdownIpc.length === 1 && unchanged() && promptInput.value === 'draft edit');
+    let copyCommands = 0;
+    document.execCommand = (command, ...args) => command === 'copy' ? (++copyCommands, true) : originalExec(command, ...args);
+    markdownIpc.length = 0;
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'c', metaKey: true, bubbles: true, cancelable: true }));
+    check('Cmd+C existing copy exactly once and no markdown IPC', copyCommands === 1 && markdownIpc.length === 0);
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'C', metaKey: true, shiftKey: true, bubbles: true, cancelable: true }));
+    check('Cmd+Shift+C only selected text and no execCommand', markdownIpc.length === 1 && markdownIpc[0].type === 'copy_markdown' && copyCommands === 1 && unchanged());
+    promptInput.focus(); originalExec('undo');
+    check('markdown leaves composer undo history intact', promptInput.value === 'draft');
+    const findInput = document.body.appendChild(document.createElement('input')); findInput.id = 'test-find';
+    const richInput = document.body.appendChild(document.createElement('div')); richInput.contentEditable = 'true'; richInput.id = 'test-editable';
+    for (const input of [promptInput, findInput, richInput]) {
+      input.focus(); markdownIpc.length = 0;
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'C', metaKey: true, shiftKey: true, bubbles: true, cancelable: true }));
+      check('markdown shortcut ignored in ' + input.id, markdownIpc.length === 0);
+    }
+    findInput.remove(); richInput.remove();
+    document.execCommand = originalExec;
+    fixture('<div class="assistant"><p><code id="code-menu">code</code> <a id="link-menu" href="https://example.org">link</a></p><span class="tail" id="tail">streaming tail</span></div>');
+    for (const selector of ['#code-menu', '#link-menu']) {
+      select(leaf(selector), 0);
+      const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+      const target = document.querySelector(selector); target.dispatchEvent(event);
+      check('code/link native menu not cancelled ' + selector, !event.defaultPrevented && window.__prepareCopyMarkdownMenu());
+    }
+    select(leaf('#tail'), 2, leaf('#tail'), 9);
+    document.querySelector('#tail').dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+    leaf('#tail').appendData(' changed after opening');
+    markdownIpc.length = 0; window.__copySelectionMarkdown(true);
+    check('streaming snapshot at menu open', markdownIpc[0]?.text === 'reaming');
+    select(leaf('#tail'), 0, leaf('#tail'), 9); equalCopy('streaming shortcut snapshot', 'streaming');
+    selection.removeAllRanges(); equalCopy('empty selection copies nothing', undefined);
+    markdownIpc.length = 0;
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'C', metaKey: true, shiftKey: true, bubbles: true, cancelable: true }));
+    check('empty shortcut has no whole-reply fallback', markdownIpc.length === 0);
+    window.__resetConversation();
+
     // TRU-256: exercise the real find controls and native-key IPC seam.
     reset();
     const findBar = document.getElementById('chat-find');

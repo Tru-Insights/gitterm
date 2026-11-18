@@ -1,0 +1,17 @@
+{
+  "iced_term/src/backend.rs": "531249f1ce888d4dbe6cad62071868a30e67927587f58d6d8f78d1e66d6fc24f",
+  "iced_term/src/settings.rs": "1a70e2fc3d25e2217df19bb7f2d347f920615c5708321b83dbefbfeaba2c127f",
+  "iced_term/LICENSE": "6cb96d90cd6ee8bb5293bec5f7e0b5026de9178590d0bcca3ba55951b68fe958",
+  "gpui_xterm-0.3.0/src/render.rs": "3b1702fea1eca39615312598d57d30d3d6c07bdcff4896f34e6f87b811243d6d",
+  "gpui_xterm-0.3.0/src/colors.rs": "e0dc0121922b2c850a62654f12b0b40a0c1352f3534412b9e239e6a82de1d139",
+  "gpui_xterm-0.3.0/src/glyphs.rs": "c50da98ea296b9462401768f5bab9c81d95a2c9f05ba4e1a3510294d22ac49b5",
+  "gpui_xterm-0.3.0/src/input.rs": "b59e82818c05ac5ccdc372bc4bfa644303a4955991f0618dafaeec289e6b4eef",
+  "gpui_xterm-0.3.0/src/mouse.rs": "78a10d8090eec6cf9d7fa00e2da2d09a7057f9c1ec1e8d5e0ed2ff7c15cbf482",
+  "gpui_xterm-0.3.0/src/view.rs": "79d1c7e595d3d8b73aceeeb9de559990c9903de69518a6486e282e164882c324",
+  "iced_term/src/view.rs": "7e6fc11dbcf3946449b59f6ed316c4611cf33036713f4d82db5f48198383b784",
+  "gpui_xterm-0.3.0/LICENSE": "23010a8e207d46e8fca744b697919b335045ac7bc8dc2cb1028e025291a3030b",
+  "TRU-276/terminal-gate/src/pty_counter.rs": "f144fea5e4ec7e9d72ea6562064fbae58530a75419038cf8e6285dccf0044be8",
+  "TRU-276/terminal-gate/src/pty.rs": "fad408dffeba6b7028d60806f0f3e4d6258c125057d7ba237216a4ba543a9398",
+  "TRU-276/terminal-gate/src/fork_probes.rs": "1fd3e0921e270b0a55d00103c5450432db44a855f91b5a3a79e4a43f64c2032d",
+  "TRU-276/terminal-gate/src/view_probes.rs": "6a7c6309c187a096d54e06a66df33c766d521d740885c35d51194ddb311e5072"
+}

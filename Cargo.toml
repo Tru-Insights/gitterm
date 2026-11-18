@@ -5,6 +5,10 @@ edition = "2021"
 default-run = "gitterm-v6"
 description = "A Git status viewer with integrated terminal, built with Iced"
 
+[workspace]
+exclude = ["gpui"]
+resolver = "2"
+
 [lib]
 name = "gitterm"
 path = "src/lib.rs"

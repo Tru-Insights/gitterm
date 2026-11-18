@@ -508,17 +508,13 @@ struct PrColumns {
     position: bool,
     /// Characters of the widest "#n".
     number_chars: usize,
-    /// The list spans several repos, so a closed row names its repo.
+    /// A closed row names its repo.
     show_repo: bool,
 }
 
-/// Whether a list of PRs names the repo on each row: only when the list
-/// has PRs of more than one repo (TRU-208).
+/// Whether a list of PRs names the repo on each closed row.
 fn show_repo_names<'a>(repos: impl IntoIterator<Item = &'a str>) -> bool {
-    let mut repos = repos.into_iter();
-    repos
-        .next()
-        .is_some_and(|first| repos.any(|repo| repo != first))
+    repos.into_iter().next().is_some()
 }
 
 /// The repo's short name: the part after the last slash.
@@ -3763,10 +3759,10 @@ mod tests {
     }
 
     #[test]
-    fn the_repo_is_named_only_when_a_list_spans_repos() {
+    fn a_nonempty_list_names_the_repo_on_closed_rows() {
         assert!(!show_repo_names([]));
-        assert!(!show_repo_names(["acme/api"]));
-        assert!(!show_repo_names(["acme/api", "acme/api"]));
+        assert!(show_repo_names(["acme/api"]));
+        assert!(show_repo_names(["acme/api", "acme/api"]));
         assert!(show_repo_names(["acme/api", "acme/api", "acme/web"]));
         assert_eq!(repo_short_name("acme/bebop-server"), "bebop-server");
     }

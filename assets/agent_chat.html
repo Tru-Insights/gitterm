@@ -4312,6 +4312,141 @@
     promptEl.focus();
   };
 
+  // ---- selected transcript as Markdown (TRU-270) --------------------------
+  function editable(node) {
+    const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+    return !!element?.closest('input, textarea, [contenteditable]:not([contenteditable="false"])');
+  }
+  function serializeSelectionMarkdown() {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || !selection.rangeCount || editable(document.activeElement)) return '';
+    const range = selection.getRangeAt(0).cloneRange();
+    if (!messagesEl.contains(range.startContainer) || !messagesEl.contains(range.endContainer)
+        || editable(range.startContainer) || editable(range.endContainer)) return '';
+    const escape = (text) => text.replace(/([\\`*_\[\]<>~|])/g, '\\$1').replace(/^(\s*)([#>+\-]|\d+\.) /gm, '$1\\$2 ');
+    const trimBreaks = (text) => text.replace(/^\n{1,2}|\n{1,2}$/g, '');
+    const join = (parts) => parts.reduce((a, b) => a.endsWith('\n\n') && b.startsWith('\n\n')
+      ? a.slice(0, -2) + b : a + b, '');
+    const delimiter = (text, min) => '`'.repeat(Math.max(min, ...[...text.matchAll(/`+/g)].map((m) => m[0].length + 1)));
+    function visible(node) {
+      if (!node.parentElement || !range.intersectsNode(node)) return false;
+      const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+      if (element.closest('button, input, textarea, select, script, style, [hidden], [aria-hidden="true"], .codeblock > .lang')) return false;
+      const closedDetails = element.closest('details:not([open])');
+      if (closedDetails && element !== closedDetails && !element.closest('summary')) return false;
+      const style = getComputedStyle(element);
+      return style.visibility !== 'hidden' && style.visibility !== 'collapse' && element.getClientRects().length > 0;
+    }
+    function textPart(node) {
+      let start = range.startContainer === node ? range.startOffset : 0;
+      let end = range.endContainer === node ? range.endOffset : node.length;
+      return node.data.slice(start, end);
+    }
+    function walk(node, literal = false) {
+      if (!visible(node)) return '';
+      if (node.nodeType === Node.TEXT_NODE) return literal ? textPart(node) : escape(textPart(node));
+      if (node.nodeType !== Node.ELEMENT_NODE) return '';
+      const tag = node.tagName;
+      const structuralFold = node.matches('.turn-fold, .tf-body');
+      const plain = literal || node.matches('.user-msg') || (!node.closest('.assistant') && !structuralFold);
+      const children = (raw = plain) => ((tag === 'PRE' || tag === 'CODE') ? [...node.childNodes].map((n) => walk(n, raw)).join('')
+        : join([...node.childNodes].map((n) => walk(n, raw))));
+      if (node.matches('.user-msg')) return '\n\n' + children(true) + '\n\n';
+      if (tag === 'BR') return plain ? '\n' : '  \n';
+      if (!plain && tag === 'PRE') {
+        const text = children(true);
+        if (!text) return '';
+        const fence = delimiter(text, 3);
+        const language = node.querySelector('code')?.className.match(/(?:^|\s)language-([\w+-]+)/)?.[1]
+          || node.closest('.codeblock')?.querySelector(':scope > .lang')?.textContent.match(/^[\w+-]+$/)?.[0] || '';
+        return '\n\n' + fence + language + '\n' + text + (text.endsWith('\n') ? '' : '\n') + fence + '\n\n';
+      }
+      if (!plain && tag === 'CODE') {
+        const rawText = children(true);
+        const text = node.closest('table') ? rawText.replace(/\|/g, '\\|') : rawText;
+        if (!text) return '';
+        const ticks = delimiter(text, 1);
+        const pad = /^[` ]|[` ]$/.test(text) && !/^ +$/.test(text) ? ' ' : '';
+        return ticks + pad + text + pad + ticks;
+      }
+      if (!plain && tag === 'TABLE') {
+        const cells = [...node.querySelectorAll('th, td')];
+        const coversText = cells.every((cell) => {
+          if (!range.intersectsNode(cell)) return false;
+          const walker = document.createTreeWalker(cell, NodeFilter.SHOW_TEXT);
+          let text; while ((text = walker.nextNode())) {
+            if (!range.intersectsNode(text) || (range.startContainer === text && range.startOffset !== 0)
+                || (range.endContainer === text && range.endOffset !== text.length)) return false;
+          }
+          return true;
+        });
+        const markdown = !!node.querySelector('thead th') && coversText;
+        const rows = [...node.rows].map((row) => [...row.cells].filter((cell) => range.intersectsNode(cell))
+          .map((cell) => trimBreaks(walk(cell, !markdown))))
+          .filter((row) => row.length);
+        if (!rows.length) return '';
+        if (!markdown) return '\n\n' + rows.map((row) => row.join('\t')).join('\n') + '\n\n';
+        return '\n\n' + rows.map((row, i) => '| ' + row.join(' | ') + ' |'
+          + (i === 0 ? '\n| ' + row.map(() => '---').join(' | ') + ' |' : '')).join('\n') + '\n\n';
+      }
+      if (!plain && (tag === 'UL' || tag === 'OL')) {
+        const entries = [...node.children].filter((li) => li.tagName === 'LI');
+        const lines = entries.map((li, index) => {
+          if (!visible(li)) return '';
+          const content = trimBreaks(walk(li, false));
+          if (!content) return '';
+          const marker = tag === 'OL' ? (Number(node.getAttribute('start') || 1) + index) + '. ' : '- ';
+          const ownText = [...li.childNodes].filter((n) => !['UL', 'OL'].includes(n.tagName))
+            .map((n) => walk(n, false)).join('').trim();
+          return content.split('\n').map((line, i) => (i === 0 && ownText ? marker : ' '.repeat(marker.length)) + line).join('\n');
+        }).filter(Boolean);
+        return lines.length ? '\n' + lines.join('\n') + '\n' : '';
+      }
+      let content = children();
+      if (!content) return '';
+      if (!plain) {
+        const mark = { STRONG: '**', B: '**', EM: '*', I: '*', DEL: '~~', S: '~~', STRIKE: '~~' }[tag];
+        if (mark) {
+          // CommonMark delimiters must touch the selected non-whitespace text.
+          content = content.replace(/^(\s*)([\s\S]*?)(\s*)$/, (_, a, b, c) => b ? a + mark + b + mark + c : a + c);
+        }
+        if (tag === 'A' && node.getAttribute('href')) content = '[' + content + '](' + node.getAttribute('href').replace(/[\\()\s]/g, (c) => encodeURIComponent(c).replace(/[()]/g, (c) => '%' + c.charCodeAt(0).toString(16))) + ')';
+        if (/^H[1-6]$/.test(tag)) content = '#'.repeat(Number(tag[1])) + ' ' + content;
+        if (tag === 'BLOCKQUOTE') content = trimBreaks(content).split('\n').map((line) => '> ' + line).join('\n');
+      }
+      if (/^(P|DIV|H[1-6]|BLOCKQUOTE|SECTION|DETAILS|SUMMARY)$/.test(tag)) return '\n\n' + trimBreaks(content) + '\n\n';
+      return content;
+    }
+    return trimBreaks(join([...messagesEl.childNodes].map((node) => walk(node))));
+  }
+  function selectedMarkdown() {
+    try { return serializeSelectionMarkdown(); }
+    catch (_) { postIpc({ type: 'copy_markdown_error' }); return ''; }
+  }
+  let menuMarkdown = '';
+  // Observe the native context menu; never cancel it or touch focus/selection.
+  document.addEventListener('contextmenu', (event) => {
+    menuMarkdown = messagesEl.contains(event.target) && !editable(event.target) ? selectedMarkdown() : '';
+  }, true);
+  window.__prepareCopyMarkdownMenu = () => !!menuMarkdown;
+  window.__copySelectionMarkdown = function (fromMenu) {
+    try {
+      const text = fromMenu ? menuMarkdown : selectedMarkdown();
+      if (!text) return false;
+      postIpc({ type: 'copy_markdown', text });
+      return true;
+    } catch (_) {
+      postIpc({ type: 'copy_markdown_error' });
+      return false;
+    }
+  };
+  document.addEventListener('keydown', (event) => {
+    if (!event.isComposing && event.metaKey && event.shiftKey && !event.ctrlKey && !event.altKey
+        && event.key.toLowerCase() === 'c' && !editable(event.target) && !editable(document.activeElement)) {
+      if (!event.repeat && window.__copySelectionMarkdown(false)) event.preventDefault();
+    }
+  }, true);
+
   // ---- global shortcuts and editing chords (TRU-140) ----------------------
   // While this page has keyboard focus its keys never reach GitTerm's own
   // key handler, so the app-wide chords are handed to it instead. The list
