@@ -424,6 +424,9 @@ pub enum HarnessCommand {
     /// Pin the running session's effort level, or `None` to return to the
     /// model's default.
     SetEffort(Option<String>),
+    /// Replace the workspace note used by Claude's next SessionStart hook
+    /// when a running chat moves to another workspace.
+    SetWorkspaceContext(Option<String>),
     Shutdown,
 }
 

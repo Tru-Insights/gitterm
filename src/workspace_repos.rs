@@ -179,7 +179,9 @@ pub fn delegation_targets(
 
 /// A workspace's repo list after applying what joined: `home` first,
 /// then `current` in its order, then manual adds and auto `candidates`
-/// not yet listed. A dir in `removed` is never listed (home excepted).
+/// not yet listed. Ancestors of home only appear when manually added: a
+/// shared notes repo does not join through notes writes. A dir in `removed`
+/// is never listed (home excepted).
 /// Returns the list and the candidates that joined by this call.
 pub fn derive_repo_list(
     home: &Path,
@@ -195,13 +197,15 @@ pub fn derive_repo_list(
             && !list.iter().any(|known| known == dir)
     };
     for dir in current.iter().chain(added) {
-        if listable(dir, &list) {
+        if listable(dir, &list) && (!home.starts_with(dir) || added.contains(dir)) {
             list.push(dir.clone());
         }
     }
     let mut joined = Vec::new();
     for dir in candidates {
-        if listable(dir, &list) {
+        // Notes written below a workspace home belong to its parent notes
+        // repo for git identity, but never auto-join that repo to the work.
+        if listable(dir, &list) && !home.starts_with(dir) {
             list.push(dir.clone());
             joined.push(dir.clone());
         }
@@ -351,6 +355,38 @@ mod tests {
             auto_repo_candidates(&[&chat], &[], &[], &[]),
             paths(&["/w/commit", "/w/pr"])
         );
+    }
+
+    #[test]
+    fn notes_parent_does_not_join_from_writes_delegations_or_an_old_save() {
+        let fixture = tempfile::tempdir().unwrap();
+        let parent = fixture.path().join("notes");
+        let home = parent.join("example-work");
+        std::fs::create_dir_all(home.join("docs")).unwrap();
+        git2::Repository::init(&parent).unwrap();
+        let parent = std::fs::canonicalize(parent).unwrap();
+        let home = std::fs::canonicalize(home).unwrap();
+        let chat = entry(
+            "notes-writer",
+            1,
+            ChatFacts {
+                repos_touched: vec![RepoTouch {
+                    dir: parent.clone(),
+                    edits: 1,
+                }],
+                repo_work: vec![parent.clone()],
+                ..ChatFacts::default()
+            },
+        );
+        let candidates = auto_repo_candidates(&[&chat], &[], &[], std::slice::from_ref(&home));
+        assert_eq!(candidates, vec![parent.clone()]);
+        let (repos, joined) =
+            derive_repo_list(&home, std::slice::from_ref(&parent), &candidates, &[], &[]);
+        assert_eq!(repos, vec![home.clone()]);
+        assert!(joined.is_empty());
+        // An explicit manual add remains a deliberate choice.
+        let (repos, _) = derive_repo_list(&home, &[], &[], std::slice::from_ref(&parent), &[]);
+        assert_eq!(repos, vec![home, parent]);
     }
 
     #[test]

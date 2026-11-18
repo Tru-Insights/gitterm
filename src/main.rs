@@ -715,8 +715,10 @@ fn config_document_places(cfg: &WorkspaceConfig) -> Option<gitterm::guidelines::
     gitterm::guidelines::document_places(
         !cfg.chats.is_empty(),
         local,
-        Path::new(cfg.home_dir()),
+        Path::new(&cfg.dir),
         cfg.decisions_repo.as_deref().map(Path::new),
+        &cfg.name,
+        &cfg.repos.iter().map(PathBuf::from).collect::<Vec<_>>(),
     )
 }
 
@@ -2016,6 +2018,7 @@ impl std::fmt::Display for DecisionsRepoChoice {
 pub enum RenameSite {
     Chip,
     Overview,
+    Settings,
 }
 
 #[derive(Debug, Clone)]
@@ -2618,6 +2621,11 @@ const WORK_DOCUMENTS_SHOWN: usize = 5;
 #[derive(Debug, Default)]
 struct WorkspaceOverviewState {
     summary: overview::WorkSummary,
+    /// Summary has not caught up with the current index.
+    summary_stale: bool,
+    /// App-wide request token; zero invalidates pending summary work.
+    summary_generation: u64,
+    summary_in_flight: bool,
     branches: Vec<overview::BranchStatus>,
     /// Repo-level read failures of the last full refresh.
     errors: Vec<String>,
@@ -5099,6 +5107,7 @@ struct TabState {
     task_watchdog_reported: bool,
     worker_process: Option<gitterm::worker_process::WorkerProcess>,
     worker_closing: bool,
+    worker_shutdown_refused: bool,
     // Worktree this chat tab's agent works in, and whether the Git and
     // Files panels follow it (TRU-146). Derived from the tool stream; never
     // persisted. `repo_path` / `current_dir` stay on the workspace root.
@@ -5171,6 +5180,7 @@ impl TabState {
             task_watchdog_reported: false,
             worker_process: None,
             worker_closing: false,
+            worker_shutdown_refused: false,
             attention: None,
             claude_config: ClaudeConfig::default(),
             worktree_follow: WorktreeFollow::default(),
@@ -5185,6 +5195,23 @@ impl TabState {
     fn set_local_dir(&mut self, dir: PathBuf) {
         self.files = FilesState::at(SourcePath::Local(dir.clone()));
         self.current_dir = dir;
+    }
+
+    /// A discovered root is panel identity; chat launch directories are
+    /// explicit and must survive polls before first launch and after restore.
+    fn adopt_git_root(&mut self, root: &Path) {
+        if self.agent_session().is_some()
+            || self.chat_session_id.is_some()
+            || self
+                .startup_command()
+                .is_some_and(gitterm::guidelines::starts_a_harness)
+        {
+            return;
+        }
+        self.repo_path = root.to_path_buf();
+        self.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
+        self.git_unchanged_streak = 0;
+        self.last_git_status_hash = None;
     }
 
     // ---- Tab-kind accessors -------------------------------------------------
@@ -6546,20 +6573,6 @@ impl Workspace {
         self.owns_chats() || self.claims_new_chats
     }
 
-    /// Where agents started in this work keep documents (TRU-191): its
-    /// docs folder and decisions repo. `None` for a folder workspace or
-    /// one on another machine.
-    fn document_places(&self) -> Option<gitterm::guidelines::DocumentPlaces> {
-        let local = matches!(self.location, WorkspaceLocation::Local { .. })
-            && self.remote_session.is_none();
-        gitterm::guidelines::document_places(
-            self.is_work(),
-            local,
-            &self.dir,
-            self.decisions_repo.as_deref(),
-        )
-    }
-
     fn backend_ref(&self) -> WorkspaceBackendRef {
         WorkspaceBackendRef::from_location(&self.location)
     }
@@ -7306,6 +7319,7 @@ pub enum Event {
     WorkDocumentsAllToggle,
     /// A background refresh finished: workspace dir, generation, result.
     WorkspaceOverviewRefreshed(OverviewKey, u64, Box<overview::RefreshOutcome>),
+    WorkspaceOverviewSummaryBuilt(OverviewKey, u64, Box<Result<overview::WorkSummary, String>>),
     /// Open a coordinator's conversation in the main area; the sidebar
     /// stays on the overview.
     WorkspaceOverviewOpenChat(String),
@@ -7771,11 +7785,13 @@ struct App {
     remote_sessions_error: Option<String>,
     // Chats panel (TRU-78): machine-wide conversation index + UI state.
     // App-level because the index spans workspaces; selection is per-tab.
-    chat_index: Vec<chats::ChatIndexEntry>,
+    chat_index: Arc<Vec<chats::ChatIndexEntry>>,
     /// Workspace overviews (TRU-167) by workspace dir, or by workspace for
     /// one that owns its chats (TRU-169); built when the panel first opens
     /// in that workspace.
     workspace_overviews: HashMap<OverviewKey, WorkspaceOverviewState>,
+    /// Survives overview removal so a recreated owner cannot accept an old job.
+    workspace_overview_summary_generation: u64,
     /// Fold and row disclosure state belongs to a workspace, even when its
     /// overview summary is shared with another folder-scoped workspace.
     workspace_overview_presentations: HashMap<u64, WorkspaceOverviewPresentation>,
@@ -7981,6 +7997,7 @@ struct App {
     viewer_page_generation: u64,
     /// Store identity bound to the current remote page surface.
     viewer_page_store: Option<webview::PageDataStore>,
+    viewer_page_navigation_context: Option<std::rc::Rc<std::cell::RefCell<PageNavigationContext>>>,
     /// Agent tabs that own a chat page (`WebviewSurface::Agent(tab_id)`),
     /// most recently shown first, at most `MAX_AGENT_PAGES`. A page keeps
     /// receiving its tab's events while hidden, so showing it again needs no
@@ -8151,11 +8168,46 @@ enum PageNavigationDecision {
     Cancel,
 }
 
+impl PageNavigationDecision {
+    fn log_line(&self, url: &str) -> String {
+        let decision = match self {
+            Self::Allow => "Allow",
+            Self::Reopen(_) => "Reopen",
+            Self::External => "External",
+            Self::Cancel => "Cancel",
+        };
+        format!("[page] {decision} {}", webview::page_log_url(url))
+    }
+}
+
 struct PageNavigationContext {
     url: String,
     store: webview::PageDataStore,
     github_accounts: std::collections::BTreeMap<String, String>,
     linear_workspaces: std::collections::BTreeSet<String>,
+}
+
+impl PageNavigationContext {
+    fn refresh_routes(&mut self, refreshed: Self) {
+        // Host notifications may describe an older URL than the native policy.
+        self.github_accounts = refreshed.github_accounts;
+        self.linear_workspaces = refreshed.linear_workspaces;
+    }
+}
+
+fn github_sign_in_url(url: &url::Url) -> bool {
+    url.host_str() == Some("github.com")
+        && matches!(
+            url.path_segments().and_then(|mut segments| segments.next()),
+            Some("login" | "session" | "sessions")
+        )
+}
+
+fn page_sign_in_provider(url: &url::Url) -> bool {
+    matches!(
+        url.host_str(),
+        Some("accounts.google.com" | "appleid.apple.com" | "idmsa.apple.com")
+    )
 }
 
 fn page_navigation_decision(url: &str, context: &PageNavigationContext) -> PageNavigationDecision {
@@ -8177,6 +8229,20 @@ fn page_navigation_decision(url: &str, context: &PageNavigationContext) -> PageN
     // Encoded or empty identity prefixes are ambiguous; let the browser resolve them.
     if destination.path() != "/" && (first.is_empty() || first.contains('%')) {
         return External;
+    }
+    if let Some(origin) = origin.as_ref().filter(|origin| {
+        origin.scheme() == "https"
+            && origin.username().is_empty()
+            && origin.password().is_none()
+            && origin.port().is_none()
+    }) {
+        // Social sign-in redirects must keep GitHub's OAuth state in this store.
+        if (page_sign_in_provider(&destination)
+            && (github_sign_in_url(origin) || page_sign_in_provider(origin)))
+            || (page_sign_in_provider(origin) && github_sign_in_url(&destination))
+        {
+            return Allow;
+        }
     }
     let store = match destination.host_str() {
         Some("github.com") => {
@@ -8261,6 +8327,45 @@ fn effective_page_navigation_decision(
             PageNavigationDecision::Allow
         }
         decision => decision,
+    }
+}
+
+fn dispatch_page_navigation(
+    url: &str,
+    context: &mut PageNavigationContext,
+    generation: u64,
+    tx: Option<&tokio::sync::mpsc::UnboundedSender<AgentIpcMessage>>,
+) -> PageNavigationDecision {
+    let decision = effective_page_navigation_decision(url, context);
+    let reopen = match &decision {
+        PageNavigationDecision::Allow => false,
+        PageNavigationDecision::Reopen(_) => true,
+        _ => return decision,
+    };
+    let message = AgentIpcMessage::PageNavigation {
+        generation,
+        url: url.to_string(),
+        reopen,
+    };
+    match tx.map(|tx| tx.send(message)) {
+        Some(Ok(())) => {
+            if !reopen {
+                // Redirects can arrive before the host drains its notifications.
+                context.url = url.to_string();
+            }
+            decision
+        }
+        failure => {
+            let reason = if failure.is_none() {
+                "host channel is uninitialized"
+            } else {
+                "host channel is closed"
+            };
+            eprintln!(
+                "[webview] cannot dispatch page navigation for generation {generation}: {reason}"
+            );
+            PageNavigationDecision::Cancel
+        }
     }
 }
 
@@ -9380,6 +9485,331 @@ fn task_holds_local_slot(task: &TaskRecord) -> bool {
     task.executor == ExecutorTarget::Local && task.lifecycle == TaskLifecycle::Running
 }
 
+fn sync_task_sessions_from_chat_index(
+    chat_index: &[chats::ChatIndexEntry],
+    workspaces: &[Workspace],
+    task_store: &mut Option<TaskStore>,
+    task_store_error: &mut Option<String>,
+) {
+    // Borrow the fact-bearing index; grouping retains its per-worktree order.
+    let mut entries_by_worktree: HashMap<&Path, Vec<&chats::ChatIndexEntry>> = HashMap::new();
+    for entry in chat_index {
+        entries_by_worktree
+            .entry(&entry.cwd)
+            .or_default()
+            .push(entry);
+    }
+    let open_conversations = workspaces
+        .iter()
+        .flat_map(|workspace| workspace.tabs.iter())
+        .filter_map(|tab| {
+            Some((
+                tab.chat_session_id.clone()?,
+                (tab.task_id.clone()?, tab.task_session_id.clone()?),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    let tasks = task_store
+        .as_ref()
+        .map(|store| store.tasks().to_vec())
+        .unwrap_or_default();
+    let timestamp = chrono::Utc::now().to_rfc3339();
+
+    let mut changed_tasks = Vec::new();
+    for mut task in tasks {
+        let Some(worktree_path) = task.worktree.path.as_ref() else {
+            continue;
+        };
+        let mut changed = false;
+        for entry in entries_by_worktree
+            .get(worktree_path.as_path())
+            .into_iter()
+            .flatten()
+        {
+            let conversation = HarnessConversationRef {
+                backend: task_conversation_backend(entry.backend),
+                session_id: entry.id.clone(),
+            };
+            if task
+                .sessions
+                .iter()
+                .any(|session| session.conversation.as_ref() == Some(&conversation))
+            {
+                continue;
+            }
+            let task_session_id = open_conversations
+                .get(&entry.id)
+                .filter(|(open_task_id, _)| open_task_id == &task.task_id)
+                .map(|(_, session_id)| session_id.clone())
+                .unwrap_or_else(|| format!("chat-{}-{}", entry.backend.label(), entry.id));
+            let preset_name = conversation_backend_label(conversation.backend).to_string();
+            task.sessions.push(TaskSessionRecord {
+                task_session_id,
+                label: if entry.title.trim().is_empty() {
+                    preset_name.clone()
+                } else {
+                    entry.title.clone()
+                },
+                harness: Some(HarnessSelection {
+                    kind: HarnessKind::TerminalPreset { preset_name },
+                    model: None,
+                }),
+                conversation: Some(conversation),
+                objective_delivery: ObjectiveDeliveryState::Unknown,
+                launch_identity: None,
+                created_at: timestamp.clone(),
+                updated_at: timestamp.clone(),
+            });
+            changed = true;
+        }
+        if !changed {
+            continue;
+        }
+        task.updated_at = timestamp.clone();
+        changed_tasks.push(task);
+    }
+    if let Some(store) = task_store.as_mut() {
+        if let Err(error) = store.replace_many(changed_tasks) {
+            let message = error.to_string();
+            eprintln!("GitTerm V6 could not link task conversation history: {message}");
+            *task_store_error = Some(message);
+        }
+    }
+}
+
+fn workspace_repo_joins(
+    chat_index: &[chats::ChatIndexEntry],
+    workspaces: &[Workspace],
+    repos: &RepoRegistry,
+    task_store: Option<&TaskStore>,
+) -> Vec<(u64, Vec<PathBuf>)> {
+    let task_worktrees = task_store
+        .map(|store| {
+            store
+                .tasks()
+                .iter()
+                .filter_map(|task| task.worktree.path.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let canonical = |dir: &Path| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut joins: Vec<(u64, Vec<PathBuf>)> = Vec::new();
+    for ws in workspaces {
+        if !ws.is_work() || !matches!(ws.location, WorkspaceLocation::Local { .. }) {
+            continue;
+        }
+        let work = if ws.owns_chats() {
+            overview::chats_under(chat_index, &ws.chats)
+        } else {
+            overview::work_chats(chat_index, &ws.dir)
+        };
+        let workers: Vec<PathBuf> = work
+            .iter()
+            .filter_map(|entry| entry.facts.as_ref())
+            .flat_map(|facts| facts.children.iter())
+            .filter(|child| child.kind == chat_facts::ChildKind::Worker)
+            .filter_map(|child| child.task_id.as_deref())
+            .filter_map(|task_id| task_store?.get(task_id))
+            .filter_map(|task| task_main_checkout(&task.repository.common_dir))
+            .collect();
+        let delegated = task_store.map_or_else(Vec::new, |store| {
+            gitterm::workspace_repos::delegation_targets(&work, store.delegations(), store.tasks())
+        });
+        // A linked worktree (an agent-made one too) joins as its main
+        // checkout (TRU-191); a checkout since deleted does not join.
+        let candidates: Vec<PathBuf> = gitterm::workspace_repos::fold_worktrees(
+            gitterm::workspace_repos::auto_repo_candidates(
+                &work,
+                &workers,
+                &task_worktrees,
+                &delegated,
+            )
+            .into_iter()
+            .filter(|dir| dir.is_dir()),
+        );
+        let listed: Vec<PathBuf> = ws
+            .repos
+            .iter()
+            .filter_map(|id| repos.get(*id))
+            .map(|repo| canonical(&repo.dir))
+            .collect();
+        let removed: Vec<PathBuf> = ws.repos_removed.iter().map(|d| canonical(d)).collect();
+        let (_, joined) = gitterm::workspace_repos::derive_repo_list(
+            &canonical(&ws.dir),
+            &listed,
+            &candidates,
+            &[],
+            &removed,
+        );
+        if !joined.is_empty() {
+            joins.push((ws.uid, joined));
+        }
+    }
+    joins
+}
+
+/// An owned snapshot for the summary's CPU work; the index itself is shared.
+struct WorkspaceOverviewSummaryPlan {
+    key: OverviewKey,
+    owned: Vec<String>,
+    tasks: Vec<overview::TaskInfo>,
+    focus: overview::Focus,
+    now: std::time::SystemTime,
+}
+
+impl WorkspaceOverviewSummaryPlan {
+    fn build(self, chat_index: &[chats::ChatIndexEntry]) -> overview::WorkSummary {
+        let now = self.now;
+        freeze_time!("workspace_overview_summary", {
+            match self.key {
+                OverviewKey::Folder(dir) => {
+                    overview::WorkSummary::build(chat_index, &dir, &self.tasks, &self.focus, now)
+                }
+                OverviewKey::Owner(_) => {
+                    overview::WorkSummary::build_owned(chat_index, &self.owned, &self.tasks, now)
+                }
+            }
+        })
+    }
+}
+
+async fn build_workspace_overview_summary(
+    plan: WorkspaceOverviewSummaryPlan,
+    chat_index: Arc<Vec<chats::ChatIndexEntry>>,
+) -> Result<overview::WorkSummary, String> {
+    tokio::task::spawn_blocking(move || plan.build(&chat_index))
+        .await
+        .map_err(|error| format!("build workspace overview summary: {error}"))
+}
+
+fn workspace_overview_summary_plan(
+    workspaces: &[Workspace],
+    task_store: Option<&TaskStore>,
+    focus_picks: &overview::FocusPicks,
+    workspace_overviews: &mut HashMap<OverviewKey, WorkspaceOverviewState>,
+    summary_generation: &mut u64,
+    key: &OverviewKey,
+) -> Option<(u64, WorkspaceOverviewSummaryPlan)> {
+    let (owned, focus) = match key {
+        OverviewKey::Folder(dir) => (
+            Vec::new(),
+            workspace_overviews
+                .get(key)
+                .map(|state| state.focus.clone())
+                .unwrap_or_else(|| focus_picks.focus_for(dir)),
+        ),
+        OverviewKey::Owner(uid) => {
+            let Some(ws) = workspaces
+                .iter()
+                .find(|ws| ws.uid == *uid && ws.owns_chats())
+            else {
+                workspace_overviews.remove(key);
+                return None;
+            };
+            (ws.chats.clone(), overview::Focus::Latest)
+        }
+    };
+    let state = workspace_overviews.entry(key.clone()).or_default();
+    state.focus = focus.clone();
+    state.summary_stale = true;
+    state.summary_in_flight = true;
+    *summary_generation = summary_generation
+        .checked_add(1)
+        .expect("workspace overview summary generation exhausted");
+    state.summary_generation = *summary_generation;
+    Some((
+        state.summary_generation,
+        WorkspaceOverviewSummaryPlan {
+            key: key.clone(),
+            owned,
+            focus,
+            now: std::time::SystemTime::now(),
+            tasks: task_store
+                .map(|store| store.tasks().iter().map(overview::TaskInfo::from).collect())
+                .unwrap_or_default(),
+        },
+    ))
+}
+
+/// Hidden summaries are rebuilt when shown. Only the visible one gets a
+/// background build on reload; old completions cannot overwrite newer state.
+fn reload_workspace_overviews(
+    workspaces: &[Workspace],
+    task_store: Option<&TaskStore>,
+    focus_picks: &overview::FocusPicks,
+    workspace_overviews: &mut HashMap<OverviewKey, WorkspaceOverviewState>,
+    summary_generation: &mut u64,
+    visible: Option<&OverviewKey>,
+) -> Option<(u64, WorkspaceOverviewSummaryPlan)> {
+    workspace_overviews.retain(|key, state| {
+        state.summary_stale = true;
+        state.summary_in_flight = false;
+        state.summary_generation = 0;
+        match key {
+            OverviewKey::Owner(uid) => workspaces
+                .iter()
+                .any(|ws| ws.uid == *uid && ws.owns_chats()),
+            OverviewKey::Folder(_) => true,
+        }
+    });
+    visible.and_then(|key| {
+        workspace_overview_summary_plan(
+            workspaces,
+            task_store,
+            focus_picks,
+            workspace_overviews,
+            summary_generation,
+            key,
+        )
+    })
+}
+
+fn apply_workspace_overview_summary(
+    workspace_overviews: &mut HashMap<OverviewKey, WorkspaceOverviewState>,
+    key: &OverviewKey,
+    generation: u64,
+    summary: overview::WorkSummary,
+) -> bool {
+    let Some(state) = workspace_overviews
+        .get_mut(key)
+        .filter(|state| state.summary_generation == generation)
+    else {
+        return false;
+    };
+    if state.summary.candidates != summary.candidates
+        || state.summary.issue_keys != summary.issue_keys
+        || state.summary.key_repos != summary.key_repos
+    {
+        state.needs_full = true;
+    }
+    state.summary = summary;
+    state.summary_stale = false;
+    state.summary_in_flight = false;
+    true
+}
+
+fn rebuild_workspace_overview(
+    chat_index: &[chats::ChatIndexEntry],
+    workspaces: &[Workspace],
+    task_store: Option<&TaskStore>,
+    focus_picks: &overview::FocusPicks,
+    workspace_overviews: &mut HashMap<OverviewKey, WorkspaceOverviewState>,
+    summary_generation: &mut u64,
+    key: &OverviewKey,
+) {
+    if let Some((generation, plan)) = workspace_overview_summary_plan(
+        workspaces,
+        task_store,
+        focus_picks,
+        workspace_overviews,
+        summary_generation,
+        key,
+    ) {
+        let summary = plan.build(chat_index);
+        apply_workspace_overview_summary(workspace_overviews, key, generation, summary);
+    }
+}
+
 impl App {
     /// UI font size
     fn ui_font(&self) -> f32 {
@@ -9995,6 +10425,7 @@ impl App {
                     chat_session_id: tab.chat_session_id.clone(),
                     task_id: tab.task_id.clone(),
                     task_session_id: tab.task_session_id.clone(),
+                    worker_shutdown_refused: tab.worker_shutdown_refused,
                     session_uid: Some(tab.session_uid.clone()),
                 })
                 .collect(),
@@ -11281,13 +11712,32 @@ impl App {
         }))
     }
 
+    fn document_places(&self, ws: &Workspace) -> Option<gitterm::guidelines::DocumentPlaces> {
+        let local =
+            matches!(ws.location, WorkspaceLocation::Local { .. }) && ws.remote_session.is_none();
+        let repos = ws
+            .repos
+            .iter()
+            .filter_map(|id| self.repo(*id))
+            .map(|repo| repo.dir.clone())
+            .collect::<Vec<_>>();
+        gitterm::guidelines::document_places(
+            ws.is_work(),
+            local,
+            &ws.dir,
+            ws.decisions_repo.as_deref(),
+            &ws.name,
+            &repos,
+        )
+    }
+
     /// Whether the workspace named `name` switched the change guidelines
     /// off (TRU-174); a workspace that is not open reads its saved entry.
     /// Where agents started for the workspace named `name` keep documents
     /// (TRU-191); a workspace that is not open reads its saved entry.
     fn workspace_document_places(&self, name: &str) -> Option<gitterm::guidelines::DocumentPlaces> {
         match self.workspaces.iter().find(|ws| ws.name == name) {
-            Some(ws) => ws.document_places(),
+            Some(ws) => self.document_places(ws),
             None => self
                 .closed_workspace_configs
                 .iter()
@@ -12520,79 +12970,12 @@ impl App {
     }
 
     fn sync_task_sessions_from_chat_index(&mut self) {
-        let entries = self.chat_index.clone();
-        let open_conversations = self
-            .workspaces
-            .iter()
-            .flat_map(|workspace| workspace.tabs.iter())
-            .filter_map(|tab| {
-                Some((
-                    tab.chat_session_id.clone()?,
-                    (tab.task_id.clone()?, tab.task_session_id.clone()?),
-                ))
-            })
-            .collect::<HashMap<_, _>>();
-        let tasks = self
-            .task_store
-            .as_ref()
-            .map(|store| store.tasks().to_vec())
-            .unwrap_or_default();
-        let timestamp = chrono::Utc::now().to_rfc3339();
-
-        for mut task in tasks {
-            let Some(worktree_path) = task.worktree.path.as_ref() else {
-                continue;
-            };
-            let mut changed = false;
-            for entry in entries.iter().filter(|entry| entry.cwd == *worktree_path) {
-                let conversation = HarnessConversationRef {
-                    backend: task_conversation_backend(entry.backend),
-                    session_id: entry.id.clone(),
-                };
-                if task
-                    .sessions
-                    .iter()
-                    .any(|session| session.conversation.as_ref() == Some(&conversation))
-                {
-                    continue;
-                }
-                let task_session_id = open_conversations
-                    .get(&entry.id)
-                    .filter(|(open_task_id, _)| open_task_id == &task.task_id)
-                    .map(|(_, session_id)| session_id.clone())
-                    .unwrap_or_else(|| format!("chat-{}-{}", entry.backend.label(), entry.id));
-                let preset_name = conversation_backend_label(conversation.backend).to_string();
-                task.sessions.push(TaskSessionRecord {
-                    task_session_id,
-                    label: if entry.title.trim().is_empty() {
-                        preset_name.clone()
-                    } else {
-                        entry.title.clone()
-                    },
-                    harness: Some(HarnessSelection {
-                        kind: HarnessKind::TerminalPreset { preset_name },
-                        model: None,
-                    }),
-                    conversation: Some(conversation),
-                    objective_delivery: ObjectiveDeliveryState::Unknown,
-                    launch_identity: None,
-                    created_at: timestamp.clone(),
-                    updated_at: timestamp.clone(),
-                });
-                changed = true;
-            }
-            if !changed {
-                continue;
-            }
-            task.updated_at = timestamp.clone();
-            if let Some(store) = self.task_store.as_mut() {
-                if let Err(error) = store.replace(task) {
-                    let message = error.to_string();
-                    eprintln!("GitTerm V6 could not link task conversation history: {message}");
-                    self.task_store_error = Some(message);
-                }
-            }
-        }
+        sync_task_sessions_from_chat_index(
+            &self.chat_index,
+            &self.workspaces,
+            &mut self.task_store,
+            &mut self.task_store_error,
+        );
     }
 
     fn resume_task_conversation(&mut self, task_id: &str, chat_id: &str) -> Task<Event> {
@@ -14507,6 +14890,14 @@ impl App {
         if matches!(ws.location, WorkspaceLocation::Local { .. }) {
             pending = gitterm::workspace_repos::fold_worktrees(pending);
         }
+        let (listed, _) = gitterm::workspace_repos::derive_repo_list(
+            &ws.dir,
+            &pending,
+            &[],
+            &ws.repos_added,
+            &ws.repos_removed,
+        );
+        pending = listed.into_iter().filter(|dir| dir != &ws.dir).collect();
         for dir in pending {
             if let Some(id) = self.list_repo(&ws.name, &ws.location, dir) {
                 if !ws.repos.contains(&id) {
@@ -14613,61 +15004,12 @@ impl App {
     /// chat index lands; a folder-scoped workspace lists only its home
     /// and what was added by hand.
     fn sync_workspace_repos(&mut self) {
-        let task_worktrees = self.task_worktree_dirs();
-        let canonical =
-            |dir: &Path| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        let mut joins: Vec<(u64, Vec<PathBuf>)> = Vec::new();
-        for ws in &self.workspaces {
-            if !ws.is_work() || !matches!(ws.location, WorkspaceLocation::Local { .. }) {
-                continue;
-            }
-            let work = self.workspace_chat_entries(ws);
-            let workers: Vec<PathBuf> = work
-                .iter()
-                .filter_map(|entry| entry.facts.as_ref())
-                .flat_map(|facts| facts.children.iter())
-                .filter(|child| child.kind == chat_facts::ChildKind::Worker)
-                .filter_map(|child| child.task_id.as_deref())
-                .filter_map(|task_id| self.task_store.as_ref()?.get(task_id))
-                .filter_map(|task| task_main_checkout(&task.repository.common_dir))
-                .collect();
-            let delegated = self.task_store.as_ref().map_or_else(Vec::new, |store| {
-                gitterm::workspace_repos::delegation_targets(
-                    &work,
-                    store.delegations(),
-                    store.tasks(),
-                )
-            });
-            // A linked worktree (an agent-made one too) joins as its main
-            // checkout (TRU-191); a checkout since deleted does not join.
-            let candidates: Vec<PathBuf> = gitterm::workspace_repos::fold_worktrees(
-                gitterm::workspace_repos::auto_repo_candidates(
-                    &work,
-                    &workers,
-                    &task_worktrees,
-                    &delegated,
-                )
-                .into_iter()
-                .filter(|dir| dir.is_dir()),
-            );
-            let listed: Vec<PathBuf> = ws
-                .repos
-                .iter()
-                .filter_map(|id| self.repo(*id))
-                .map(|repo| canonical(&repo.dir))
-                .collect();
-            let removed: Vec<PathBuf> = ws.repos_removed.iter().map(|d| canonical(d)).collect();
-            let (_, joined) = gitterm::workspace_repos::derive_repo_list(
-                &canonical(&ws.dir),
-                &listed,
-                &candidates,
-                &[],
-                &removed,
-            );
-            if !joined.is_empty() {
-                joins.push((ws.uid, joined));
-            }
-        }
+        let joins = workspace_repo_joins(
+            &self.chat_index,
+            &self.workspaces,
+            &self.repos,
+            self.task_store.as_ref(),
+        );
         for (uid, dirs) in joins {
             for dir in dirs {
                 let Some(id) = self.add_repo_to_workspace(uid, dir.clone()) else {
@@ -16097,6 +16439,17 @@ impl App {
             self.workspaces[from].tabs.push(replacement);
         }
         let tab = self.workspaces[from].tabs.remove(tab_idx);
+        if let TabKind::Agent(session) = &tab.kind {
+            if let Some(gitterm::harness::HarnessSession::Claude(claude)) = &session.harness {
+                let context = self
+                    .document_places(&self.workspaces[to])
+                    .as_ref()
+                    .map(gitterm::guidelines::documents_note);
+                if let Err(error) = claude.send(HarnessCommand::SetWorkspaceContext(context)) {
+                    eprintln!("[workspace] cannot update moved chat's workspace context: {error}");
+                }
+            }
+        }
         let source = &mut self.workspaces[from];
         source.active_tab = active_tab_after_removal(source.active_tab, tab_idx, source.tabs.len());
         let target = &mut self.workspaces[to];
@@ -16138,6 +16491,13 @@ impl App {
         )
     }
 
+    /// A rename is running inside the workspace settings dialog.
+    fn workspace_rename_in_settings(&self) -> bool {
+        self.workspace_rename
+            .as_ref()
+            .is_some_and(|rename| rename.site == RenameSite::Settings)
+    }
+
     /// Commits the rename draft (trimmed; an empty one changes nothing)
     /// through the debounced `workspaces.json` save.
     fn submit_workspace_rename(&mut self) {
@@ -16169,54 +16529,15 @@ impl App {
     /// over the index, no I/O. A changed branch claim asks for a full
     /// refresh. The overview of a workspace that closed is dropped.
     fn rebuild_workspace_overview(&mut self, key: &OverviewKey) {
-        let tasks: Vec<overview::TaskInfo> = self
-            .task_store
-            .as_ref()
-            .map(|store| store.tasks().iter().map(overview::TaskInfo::from).collect())
-            .unwrap_or_default();
-        let now = std::time::SystemTime::now();
-        let (summary, focus) = match key {
-            OverviewKey::Folder(dir) => {
-                let focus = self
-                    .workspace_overviews
-                    .get(key)
-                    .map(|state| state.focus.clone())
-                    .unwrap_or_else(|| self.overview_focus_picks.focus_for(dir));
-                let summary = freeze_time!("workspace_overview_summary", {
-                    overview::WorkSummary::build(&self.chat_index, dir, &tasks, &focus, now)
-                });
-                (summary, focus)
-            }
-            OverviewKey::Owner(uid) => {
-                let Some(owned) = self
-                    .workspaces
-                    .iter()
-                    .find(|ws| ws.uid == *uid && ws.owns_chats())
-                    .map(|ws| ws.chats.clone())
-                else {
-                    self.workspace_overviews.remove(key);
-                    return;
-                };
-                let summary = freeze_time!("workspace_overview_summary", {
-                    overview::WorkSummary::build_owned(&self.chat_index, &owned, &tasks, now)
-                });
-                (summary, overview::Focus::Latest)
-            }
-        };
-        let state = self
-            .workspace_overviews
-            .entry(key.clone())
-            .or_insert_with(|| WorkspaceOverviewState {
-                focus: focus.clone(),
-                ..Default::default()
-            });
-        if state.summary.candidates != summary.candidates
-            || state.summary.issue_keys != summary.issue_keys
-            || state.summary.key_repos != summary.key_repos
-        {
-            state.needs_full = true;
-        }
-        state.summary = summary;
+        rebuild_workspace_overview(
+            &self.chat_index,
+            &self.workspaces,
+            self.task_store.as_ref(),
+            &self.overview_focus_picks,
+            &mut self.workspace_overviews,
+            &mut self.workspace_overview_summary_generation,
+            key,
+        );
     }
 
     /// Starts a background refresh of `dir`'s overview unless one runs.
@@ -16230,7 +16551,7 @@ impl App {
         let Some(state) = self.workspace_overviews.get_mut(key) else {
             return Task::none();
         };
-        if state.in_flight {
+        if state.in_flight || state.summary_stale {
             return Task::none();
         }
         let mode = if state.last_full_refresh.is_none() || state.needs_full {
@@ -16268,6 +16589,7 @@ impl App {
         let recent = self
             .workspace_overviews
             .get(&dir)
+            .filter(|state| !state.needs_full)
             .and_then(|state| state.last_full_refresh)
             .is_some_and(|at| at.elapsed() < OVERVIEW_REOPEN_FRESH);
         let refresh = if recent {
@@ -16298,6 +16620,16 @@ impl App {
                 Task::none()
             };
         };
+        if state.summary_in_flight {
+            return Task::none();
+        }
+        if state.summary_stale {
+            return if visible {
+                self.open_workspace_overview()
+            } else {
+                Task::none()
+            };
+        }
         let (interval, mode) = if visible {
             let interval = if state.unchanged_streak >= 2 {
                 OVERVIEW_VISIBLE_SLOW_POLL
@@ -19509,8 +19841,10 @@ fn restore_task_tab(
     let Some(task_id) = tab.task_id.as_deref() else {
         return true;
     };
-    if store
-        .is_some_and(|store| store.worker_session_is_final(task_id, tab.task_session_id.as_deref()))
+    if !tab.worker_shutdown_refused
+        && store.is_some_and(|store| {
+            store.worker_session_is_final(task_id, tab.task_session_id.as_deref())
+        })
     {
         return false;
     }
@@ -19525,16 +19859,19 @@ fn restore_task_tab(
 }
 
 fn task_session_is_working(tab: &TabState, store: Option<&TaskStore>) -> bool {
-    tab.task_live_state == Some(TaskSessionLiveState::Working) && worker_accepts_input(tab, store)
+    tab.task_live_state == Some(TaskSessionLiveState::Working)
+        && !tab.worker_shutdown_refused
+        && worker_accepts_input(tab, store)
 }
 
 fn worker_accepts_input(tab: &TabState, store: Option<&TaskStore>) -> bool {
     !tab.worker_closing
-        && !tab.task_id.as_deref().is_some_and(|task| {
-            store.is_some_and(|store| {
-                store.worker_session_is_final(task, tab.task_session_id.as_deref())
-            })
-        })
+        && (tab.worker_shutdown_refused
+            || !tab.task_id.as_deref().is_some_and(|task| {
+                store.is_some_and(|store| {
+                    store.worker_session_is_final(task, tab.task_session_id.as_deref())
+                })
+            }))
 }
 
 /// Process seam: tests can observe the close request without starting a PTY
@@ -19553,6 +19890,7 @@ fn close_final_worker<T>(
             if task_id == task && id == session)
     })?;
     if tab.worker_closing
+        || tab.worker_shutdown_refused
         || !store.worker_session_is_final(task, Some(session))
         || !ready.contains(&delegation.delegation_id)
         || (delegation.superseded_by.is_some()
@@ -19566,12 +19904,18 @@ fn close_final_worker<T>(
 }
 
 /// Closing a tab drops its PTY, which SIGHUPs whatever the terminal runs, so
-/// a refused or failed stop keeps the tab. `worker_closing` stays set, so the
-/// stop is never retried and this logs once per session.
-fn final_worker_stop_closes_tab(session_id: &str, result: Result<(), String>) -> bool {
+/// a refused or failed stop keeps the tab usable. Remember the refusal so
+/// the stop is never retried, including after restoring the saved tab.
+fn final_worker_stop_closes_tab(
+    session_id: &str,
+    tab: &mut TabState,
+    result: Result<(), String>,
+) -> bool {
     match result {
         Ok(()) => true,
         Err(error) => {
+            tab.worker_closing = false;
+            tab.worker_shutdown_refused = true;
             eprintln!("[tasks] keep final worker {session_id} open: {error}");
             false
         }
@@ -20009,6 +20353,7 @@ impl App {
                     if let Some(tab) = workspace.tabs.last_mut() {
                         tab.task_id = Some(task_id.clone());
                         tab.task_session_id = restored_task_session_id.clone();
+                        tab.worker_shutdown_refused = tab_config.worker_shutdown_refused;
                     }
                 }
             }
@@ -20407,9 +20752,11 @@ impl App {
             viewer_page_url: None,
             viewer_page_generation: 0,
             viewer_page_store: None,
+            viewer_page_navigation_context: None,
             agent_pages: Vec::new(),
-            chat_index: Vec::new(),
+            chat_index: Arc::default(),
             workspace_overviews: HashMap::new(),
+            workspace_overview_summary_generation: 0,
             workspace_overview_presentations: HashMap::new(),
             work_documents: HashMap::new(),
             work_document_copies_open: None,
@@ -20815,7 +21162,6 @@ impl App {
             client,
         }) = remote
         else {
-            // Local flow, unchanged.
             if let Some(ws) = self.active_workspace() {
                 let dir = ws
                     .active_tab()
@@ -21276,7 +21622,7 @@ fi
             .as_deref()
             .and_then(|name| self.workspaces.iter().find(|ws| ws.name == name))
         {
-            Some(ws) => ws.document_places(),
+            Some(ws) => self.document_places(ws),
             None => saved_ws.and_then(config_document_places),
         };
         // The env of the repo holding the tab's folder, with the
@@ -24569,7 +24915,10 @@ fi
                             return Task::none();
                         }
                         if reopen {
-                            match page_navigation_decision(&url, &self.page_navigation_context()) {
+                            let decision =
+                                page_navigation_decision(&url, &self.page_navigation_context());
+                            eprintln!("{}", decision.log_line(&url));
+                            match decision {
                                 PageNavigationDecision::Reopen(store) => {
                                     self.open_page_in_store(url, store)
                                 }
@@ -24818,10 +25167,13 @@ fi
                             )
                             .collect()
                     };
+                let document_places = self
+                    .workspaces
+                    .iter()
+                    .find(|ws| ws.tabs.iter().any(|tab| tab.id == tab_id))
+                    .and_then(|ws| self.document_places(ws));
                 'outer_submit: for ws in &mut self.workspaces {
                     let guidelines_off = ws.guidelines_off;
-                    // Named to an agent this prompt starts (TRU-191).
-                    let document_places = ws.document_places();
                     // Read as the process starts; a running chat keeps
                     // what it started with (TRU-181).
                     let claude_in_chrome = ws.claude_in_chrome;
@@ -25620,13 +25972,14 @@ fi
                 return self.delegate_task_targets_checked(result, reply);
             }
             Event::FinalWorkerStopped(session_id, result) => {
-                if !final_worker_stop_closes_tab(&session_id, result) {
-                    return Task::none();
-                }
                 if let Some((workspace_idx, tab_idx)) =
                     find_task_session_tab(&self.workspaces, &session_id)
                 {
                     let tab = &mut self.workspaces[workspace_idx].tabs[tab_idx];
+                    if !final_worker_stop_closes_tab(&session_id, tab, result) {
+                        self.mark_workspaces_dirty();
+                        return Task::none();
+                    }
                     tab.task_live_state = None;
                     if let Some(task_id) = tab.task_id.clone() {
                         let workspace = &self.workspaces[workspace_idx];
@@ -27337,6 +27690,7 @@ fi
                     && matches!(key.as_ref(), Key::Named(key::Named::Escape))
                 {
                     self.workspace_settings_open = false;
+                    self.workspace_rename = None;
                     return Task::none();
                 }
 
@@ -29703,43 +30057,70 @@ fi
                 return self.request_chat_index();
             }
             Event::ChatIndexLoaded(entries) => {
-                self.chat_index = entries;
-                self.chat_index_loading = false;
-                self.chat_index_loaded_at = Some(Instant::now());
-                self.sync_task_sessions_from_chat_index();
-                self.refill_park_note();
-                // Work workspaces list the repos their chats touched (TRU-180).
-                self.sync_workspace_repos();
-                // PR homes read the index's facts (TRU-173).
-                self.prs.homes_built = None;
-                // Workspace overviews read the index (TRU-167).
-                let dirs: Vec<OverviewKey> = self.workspace_overviews.keys().cloned().collect();
-                for dir in &dirs {
-                    self.rebuild_workspace_overview(dir);
-                }
-                let overview_refresh = match self.overview_key() {
-                    Some(dir)
-                        if self.workspace_overview_visible()
-                            && self
-                                .workspace_overviews
-                                .get(&dir)
-                                .is_some_and(|state| state.needs_full) =>
-                    {
-                        self.start_workspace_overview_refresh(&dir, overview::RefreshMode::Full)
-                    }
-                    _ => Task::none(),
-                };
-                // Offers that were waiting for conversation titles.
-                let retitled: Vec<usize> = self.v5_offer_awaiting_titles.drain().collect();
-                let offers: Vec<Task<Event>> = retitled
-                    .into_iter()
-                    .map(|tab_id| self.request_v5_offer(tab_id))
-                    .collect();
-                return Task::batch([
-                    self.request_chat_rank(),
-                    overview_refresh,
-                    Task::batch(offers),
-                ]);
+                return freeze_time!("chat_index_loaded", {
+                    freeze_time!("chat_index_apply", {
+                        self.chat_index = Arc::new(entries);
+                    });
+                    self.chat_index_loading = false;
+                    self.chat_index_loaded_at = Some(Instant::now());
+                    freeze_time!("chat_index_task_sessions", {
+                        self.sync_task_sessions_from_chat_index();
+                    });
+                    freeze_time!("chat_index_park_note", {
+                        self.refill_park_note();
+                    });
+                    // Work workspaces list the repos their chats touched (TRU-180).
+                    freeze_time!("chat_index_repo_joins", {
+                        self.sync_workspace_repos();
+                    });
+                    // PR homes read the index's facts (TRU-173).
+                    freeze_time!("chat_index_pr_homes", {
+                        self.prs.homes_built = None;
+                    });
+                    // Workspace overviews read the index (TRU-167).
+                    let overview_summary = freeze_time!("chat_index_overviews", {
+                        let visible = self
+                            .overview_key()
+                            .filter(|_| self.workspace_overview_visible());
+                        match reload_workspace_overviews(
+                            &self.workspaces,
+                            self.task_store.as_ref(),
+                            &self.overview_focus_picks,
+                            &mut self.workspace_overviews,
+                            &mut self.workspace_overview_summary_generation,
+                            visible.as_ref(),
+                        ) {
+                            Some((generation, plan)) => {
+                                let key = plan.key.clone();
+                                Task::perform(
+                                    build_workspace_overview_summary(
+                                        plan,
+                                        Arc::clone(&self.chat_index),
+                                    ),
+                                    move |result| {
+                                        Event::WorkspaceOverviewSummaryBuilt(
+                                            key.clone(),
+                                            generation,
+                                            Box::new(result),
+                                        )
+                                    },
+                                )
+                            }
+                            None => Task::none(),
+                        }
+                    });
+                    // Offers that were waiting for conversation titles.
+                    let offers = freeze_time!("chat_index_offers", {
+                        let retitled: Vec<usize> = self.v5_offer_awaiting_titles.drain().collect();
+                        let offers: Vec<Task<Event>> = retitled
+                            .into_iter()
+                            .map(|tab_id| self.request_v5_offer(tab_id))
+                            .collect();
+                        offers
+                    });
+                    let rank = freeze_time!("chat_index_rank", { self.request_chat_rank() });
+                    Task::batch([rank, overview_summary, Task::batch(offers)])
+                });
             }
             Event::ChatsQueryChanged(query) => {
                 self.chat_query = query;
@@ -29979,6 +30360,36 @@ fi
                     != Some(key.as_str()))
                 .then_some(key);
             }
+            Event::WorkspaceOverviewSummaryBuilt(key, generation, result) => match *result {
+                Ok(summary) => {
+                    if apply_workspace_overview_summary(
+                        &mut self.workspace_overviews,
+                        &key,
+                        generation,
+                        summary,
+                    ) && self.workspace_overview_visible()
+                        && self.overview_key().as_ref() == Some(&key)
+                        && self
+                            .workspace_overviews
+                            .get(&key)
+                            .is_some_and(|state| state.needs_full)
+                    {
+                        return self
+                            .start_workspace_overview_refresh(&key, overview::RefreshMode::Full);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[workspace-overview] {key:?}: {error}");
+                    if let Some(state) = self
+                        .workspace_overviews
+                        .get_mut(&key)
+                        .filter(|state| state.summary_generation == generation)
+                    {
+                        state.summary_in_flight = false;
+                        state.errors.push(error);
+                    }
+                }
+            },
             Event::WorkspaceOverviewRefreshed(dir, generation, outcome) => {
                 let Some(state) = self.workspace_overviews.get_mut(&dir) else {
                     return Task::none();
@@ -30141,7 +30552,9 @@ fi
                 let Some(uid) = self.workspaces.get(idx).map(|ws| ws.uid) else {
                     return Task::none();
                 };
-                self.workspace_settings_open = false;
+                if site != RenameSite::Settings {
+                    self.workspace_settings_open = false;
+                }
                 return self.start_workspace_rename(uid, site);
             }
             Event::WorkspaceRenameInput(draft) => {
@@ -30150,12 +30563,24 @@ fi
                 }
             }
             Event::WorkspaceRenameSubmit => {
+                let in_settings = self.workspace_rename_in_settings();
                 self.submit_workspace_rename();
-                return self.focus_main_terminal();
+                // Settings stays open: keep focus there, not on the
+                // terminal behind it.
+                return if in_settings {
+                    Task::none()
+                } else {
+                    self.focus_main_terminal()
+                };
             }
             Event::WorkspaceRenameCancel => {
+                let in_settings = self.workspace_rename_in_settings();
                 self.workspace_rename = None;
-                return self.focus_main_terminal();
+                return if in_settings {
+                    Task::none()
+                } else {
+                    self.focus_main_terminal()
+                };
             }
             Event::NewWorkOpen => {
                 self.bar_menu = None;
@@ -30462,10 +30887,7 @@ fi
                                 .followed_paths()
                                 .any(|path| paths_equal(path, &snapshot.repo_path))
                         {
-                            tab.repo_path = snapshot.repo_path.clone();
-                            tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
-                            tab.git_unchanged_streak = 0;
-                            tab.last_git_status_hash = None;
+                            tab.adopt_git_root(&snapshot.repo_path);
                         }
 
                         // Apply the git status from the worker (which already ran
@@ -31712,6 +32134,7 @@ fi
                 match gitterm::guidelines::ensure_guidelines_file(&config::global_config_dir()) {
                     Ok(path) => {
                         self.workspace_settings_open = false;
+                        self.workspace_rename = None;
                         return Task::done(Event::ViewFile(SourcePath::Local(path)));
                     }
                     Err(error) => eprintln!("[guidelines] cannot open the guidelines: {error}"),
@@ -31719,6 +32142,7 @@ fi
             }
             Event::WorkspaceSettingsClose => {
                 self.workspace_settings_open = false;
+                self.workspace_rename = None;
             }
             Event::WorkspaceSettingsNewKeyChanged(s) => {
                 self.workspace_settings_new_key = s;
@@ -31994,6 +32418,7 @@ fi
         self.viewer_webview = viewer;
         if viewer != ViewerWebview::Page {
             self.viewer_page_url = None;
+            self.viewer_page_navigation_context = None;
             self.viewer_page_generation += 1;
         }
         if viewer != ViewerWebview::Review {
@@ -32452,6 +32877,7 @@ fi
             webview::destroy(WebviewSurface::Page);
         }
         self.viewer_page_store = Some(store.clone());
+        self.viewer_page_navigation_context = None;
         self.install_page_navigation_handler();
         if action == webview::PageStoreAction::Navigate && webview::is_active(WebviewSurface::Page)
         {
@@ -32490,39 +32916,33 @@ fi
         }
     }
 
-    fn install_page_navigation_handler(&self) {
-        let context = self.page_navigation_context();
+    fn install_page_navigation_handler(&mut self) {
+        let refreshed = self.page_navigation_context();
+        let context = if let Some(context) = &self.viewer_page_navigation_context {
+            context.borrow_mut().refresh_routes(refreshed);
+            context.clone()
+        } else {
+            let context = std::rc::Rc::new(std::cell::RefCell::new(refreshed));
+            self.viewer_page_navigation_context = Some(context.clone());
+            context
+        };
         let generation = self.viewer_page_generation;
         let tx = AGENT_IPC_TX.get().cloned();
         webview::set_page_navigation_handler(move |url| {
-            let reopen = match effective_page_navigation_decision(url, &context) {
-                PageNavigationDecision::Allow => false,
-                PageNavigationDecision::Reopen(_) => true,
+            let decision =
+                dispatch_page_navigation(url, &mut context.borrow_mut(), generation, tx.as_ref());
+            eprintln!("{}", decision.log_line(url));
+            match decision {
+                PageNavigationDecision::Allow => true,
+                PageNavigationDecision::Reopen(_) => false,
                 PageNavigationDecision::External => {
                     webview::open_url_in_browser(url);
-                    return false;
+                    false
                 }
                 PageNavigationDecision::Cancel => {
                     if let Err(error) = webview::browser_url(url) {
                         eprintln!("[webview] page navigation refused: {error}");
                     }
-                    return false;
-                }
-            };
-            let message = AgentIpcMessage::PageNavigation {
-                generation,
-                url: url.to_string(),
-                reopen,
-            };
-            match tx.as_ref().map(|tx| tx.send(message)) {
-                Some(Ok(())) => !reopen,
-                failure => {
-                    let reason = if failure.is_none() {
-                        "host channel is uninitialized"
-                    } else {
-                        "host channel is closed"
-                    };
-                    eprintln!("[webview] cannot dispatch page navigation for generation {generation}: {reason}");
                     false
                 }
             }
@@ -32539,7 +32959,8 @@ fi
                         webview::try_create_with_window(WebviewSurface::Page, window)
                     {
                         eprintln!(
-                            "[webview] page creation failed for {url} ({store_label}): {error}"
+                            "[webview] page creation failed for {} ({store_label}): {error}",
+                            webview::page_log_url(&url)
                         );
                     }
                 })
@@ -32727,7 +33148,7 @@ fi
                     t.repo_path.clone(),
                     t.session_uid.clone(),
                     ws.guidelines_off,
-                    ws.document_places(),
+                    self.document_places(ws),
                 )
             })
         });
@@ -35190,18 +35611,34 @@ fi
         // The env its terminals get: the home repo's, with its overrides.
         let ws_env = self.workspace_repo_env(ws, ws.home);
 
-        // --- Title --- (✎ renames inline on the bar chip, TRU-169)
-        let title = row![
-            text(format!("Workspace: {}", ws.name))
+        // --- Title ---
+        let title: Element<'_, Event, Theme, iced::Renderer> = match self
+            .workspace_rename
+            .as_ref()
+            .filter(|rename| rename.site == RenameSite::Settings && rename.uid == ws.uid)
+        {
+            Some(rename) => text_input("Workspace name", &rename.draft)
+                .id(workspace_rename_input_id())
+                .on_input(Event::WorkspaceRenameInput)
+                .on_submit(Event::WorkspaceRenameSubmit)
                 .size(16)
-                .color(text_primary),
-            button(text("\u{270E} Rename").size(12).color(accent))
-                .style(self.ghost_button_style())
-                .padding([2, 6])
-                .on_press(Event::WorkspaceRenameStart(idx, RenameSite::Chip)),
-        ]
-        .spacing(10)
-        .align_y(iced::Alignment::Center);
+                .padding([3, 6])
+                .width(Length::Fixed(260.0))
+                .style(self.input_style())
+                .into(),
+            None => row![
+                text(format!("Workspace: {}", ws.name))
+                    .size(16)
+                    .color(text_primary),
+                button(text("\u{270E} Rename").size(12).color(accent))
+                    .style(self.ghost_button_style())
+                    .padding([2, 6])
+                    .on_press(Event::WorkspaceRenameStart(idx, RenameSite::Settings)),
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center)
+            .into(),
+        };
 
         // --- Color swatches ---
         let mut color_row = Row::new().spacing(6).align_y(iced::Alignment::Center);
@@ -36213,7 +36650,7 @@ fi
         self.bar_hint_area(btn, tip.to_string())
     }
 
-    /// One workspace chip on the bar: dot, name (double-click renames),
+    /// One workspace chip on the bar: dot and name,
     /// the active one's gear, attention and PR news. An inactive chip
     /// shows its short label (TRU-192); every chip shows the full name on
     /// hover.
@@ -36267,7 +36704,7 @@ fi
                 ..Default::default()
             });
 
-        // Double-click the name to rename inline (TRU-169).
+        // New-work naming can still edit at the chip site (TRU-169).
         let renaming = self
             .workspace_rename
             .as_ref()
@@ -36294,7 +36731,6 @@ fi
                 .font(iced::Font::with_name("Menlo")),
             )
             .on_press(Event::WorkspaceSelect(idx))
-            .on_double_click(Event::WorkspaceRenameStart(idx, RenameSite::Chip))
             .into(),
         };
 
@@ -39276,7 +39712,7 @@ fi
         if state.is_some() && !reading {
             refresh = refresh.on_press(Event::WorkspaceOverviewRefresh);
         }
-        // The name renames inline: double-click it or press ✎ (TRU-169).
+        // Rename inline with ✎ (TRU-169).
         let active_idx = self.active_workspace_idx;
         let renaming = self.workspace_rename.as_ref().filter(|rename| {
             rename.site == RenameSite::Overview
@@ -39295,16 +39731,10 @@ fi
                 .style(self.input_style())
                 .into(),
             None => row![
-                iced::widget::mouse_area(
-                    text(name)
-                        .size(self.ui_font())
-                        .color(text_primary)
-                        .font(bold),
-                )
-                .on_double_click(Event::WorkspaceRenameStart(
-                    active_idx,
-                    RenameSite::Overview
-                )),
+                text(name)
+                    .size(self.ui_font())
+                    .color(text_primary)
+                    .font(bold),
                 iced::widget::Space::new().width(Length::Fill),
                 button(text("\u{270E}").size(10).color(text_muted))
                     .style(self.flat_button_style())
@@ -39418,7 +39848,11 @@ fi
                 .active_workspace()
                 .map(|ws| overview::folder_name(&ws.dir))
                 .unwrap_or_default();
-            let roots = summary.coordinators.len();
+            let roots = self
+                .active_workspace()
+                .filter(|ws| !ws.chats.is_empty())
+                .map(|ws| ws.chats.len())
+                .unwrap_or(summary.coordinators.len());
             content = content.push(
                 text(format!(
                     "owns {roots} chat{} \u{00B7} new chats start in {home}",
@@ -47972,6 +48406,476 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn overview_summary_rejects_old_job_after_owner_state_recreation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::new("Work".into(), temp.path().into(), WorkspaceColor::Blue);
+        ws.chats = vec!["old-root".into()];
+        let key = OverviewKey::Owner(ws.uid);
+        let mut workspaces = vec![ws];
+        let index: Vec<_> = ["old-root", "new-root", "new-second"]
+            .into_iter()
+            .map(|id| {
+                let mut entry = chat_entry(chats::ChatBackend::Codex, false);
+                entry.id = id.into();
+                entry
+            })
+            .collect();
+        let picks = overview::FocusPicks::default();
+        let mut summary_generation = 0;
+        let mut states = HashMap::new();
+        rebuild_workspace_overview(
+            &index,
+            &workspaces,
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            &key,
+        );
+        let (old_generation, old_plan) = reload_workspace_overviews(
+            &workspaces,
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            Some(&key),
+        )
+        .unwrap();
+
+        // workspace_chats_changed rebuilds and removes an owner's state when
+        // its last chat moves out, even while that owner's old job is running.
+        workspaces[0].chats.clear();
+        rebuild_workspace_overview(
+            &index,
+            &workspaces,
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            &key,
+        );
+        assert!(!states.contains_key(&key));
+        workspaces[0].chats = vec!["new-root".into(), "new-second".into()];
+        rebuild_workspace_overview(
+            &index,
+            &workspaces,
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            &key,
+        );
+        let (new_generation, new_plan) = reload_workspace_overviews(
+            &workspaces,
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            Some(&key),
+        )
+        .unwrap();
+
+        let current = new_plan.build(&index);
+        assert_eq!(current.chat_count, 2);
+        assert!(apply_workspace_overview_summary(
+            &mut states,
+            &key,
+            new_generation,
+            current.clone()
+        ));
+        let old = old_plan.build(&index);
+        assert_eq!(old.chat_count, 1);
+        assert!(!apply_workspace_overview_summary(
+            &mut states,
+            &key,
+            old_generation,
+            old
+        ));
+        assert_eq!(states[&key].summary, current);
+        assert!(!states[&key].summary_in_flight);
+        assert!(!states[&key].summary_stale);
+    }
+
+    #[test]
+    fn overview_summary_rejects_old_focus_and_prunes_closed_owners() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = OverviewKey::Folder(temp.path().into());
+        let closed = OverviewKey::Owner(u64::MAX);
+        let mut states = HashMap::from([(closed.clone(), WorkspaceOverviewState::default())]);
+        let picks = overview::FocusPicks::default();
+        let mut summary_generation = 0;
+        let (old_generation, old_plan) = reload_workspace_overviews(
+            &[],
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            Some(&key),
+        )
+        .unwrap();
+        assert!(!states.contains_key(&closed));
+        states.get_mut(&key).unwrap().focus = overview::Focus::AllRecent;
+        // The synchronous show/focus path supersedes an in-flight reload.
+        rebuild_workspace_overview(
+            &[],
+            &[],
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            &key,
+        );
+        let current = states[&key].summary.clone();
+        assert_eq!(current.focus, overview::Focus::AllRecent);
+        assert!(!apply_workspace_overview_summary(
+            &mut states,
+            &key,
+            old_generation,
+            old_plan.build(&[])
+        ));
+        assert_eq!(states[&key].summary, current);
+        assert!(!states[&key].summary_in_flight);
+        assert!(!states[&key].summary_stale);
+    }
+
+    #[test]
+    fn task_history_links_keep_open_session_ids_and_skip_duplicates() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("tasks.json");
+        let mut task = slot_task(ExecutorTarget::Local, TaskLifecycle::Draft);
+        task.worktree = gitterm::tasks::TaskWorktree {
+            state: gitterm::tasks::TaskWorktreeState::Ready,
+            path: Some(temp.path().into()),
+        };
+        let mut store = Some(TaskStore::load(&path).unwrap());
+        store.as_mut().unwrap().insert(task.clone()).unwrap();
+        let mut ws = Workspace::new("fixture".into(), temp.path().into(), WorkspaceColor::Blue);
+        let mut tab = TabState::new(0, temp.path().into());
+        tab.chat_session_id = Some("open-chat".into());
+        tab.task_id = Some(task.task_id.clone());
+        tab.task_session_id = Some("open-session".into());
+        ws.tabs.push(tab);
+        let mut entry = chat_entry(chats::ChatBackend::Pi, false);
+        entry.id = "open-chat".into();
+        entry.cwd = temp.path().into();
+        entry.title.clear();
+        let mut other_backend = entry.clone();
+        other_backend.id = "other-chat".into();
+        other_backend.backend = chats::ChatBackend::Codex;
+        other_backend.title = "Codex title".into();
+        let entries = vec![entry.clone(), entry, other_backend];
+        let mut error = None;
+        sync_task_sessions_from_chat_index(&entries, &[ws], &mut store, &mut error);
+        assert_eq!(error, None);
+        let sessions = &store.as_ref().unwrap().get(&task.task_id).unwrap().sessions;
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].task_session_id, "open-session");
+        assert_eq!(sessions[0].label, "Pi");
+        assert_eq!(sessions[1].task_session_id, "chat-codex-other-chat");
+        assert_eq!(
+            sessions[0].conversation.as_ref().unwrap().backend,
+            HarnessConversationBackend::Pi
+        );
+        assert_eq!(sessions[1].label, "Codex title");
+        let saved = std::fs::read(&path).unwrap();
+        sync_task_sessions_from_chat_index(&entries, &[], &mut store, &mut error);
+        assert_eq!(error, None);
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        assert_eq!(
+            TaskStore::load(path).unwrap().tasks(),
+            store.unwrap().tasks()
+        );
+    }
+
+    /// Run with --nocapture to record the reload's synchronous work without
+    /// starting Iced, terminals, or using the user's config directory.
+    #[tokio::test]
+    async fn chat_index_reload_realistic_fixture() {
+        use gitterm::tasks::*;
+        let temp = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now();
+        let timestamp = "2026-11-10T20:00:00Z";
+        let mut repos = RepoRegistry::default();
+        let mut workspaces = Vec::new();
+        for n in 0..8 {
+            let dir = temp.path().join(format!("repo-{n}"));
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            let mut ws = Workspace::new(format!("Work {n}"), dir.clone(), WorkspaceColor::Blue);
+            ws.claims_new_chats = true;
+            let (id, _) = repos.attach(dir.clone(), local(&dir), RepoSeed::new(None));
+            ws.home = id;
+            ws.repos.push(id);
+            workspaces.push(ws);
+        }
+        let mut entries = Vec::new();
+        let mut tasks = Vec::new();
+        for n in 0..100 {
+            let repo = workspaces[n % 8].dir.clone();
+            let cwd = temp.path().join(format!("worker-{n}"));
+            std::fs::create_dir_all(&cwd).unwrap();
+            let mut task = TaskRecord::new_draft(
+                NewTaskRecord {
+                    task_id: format!("task-{n}"),
+                    title: format!("Worker {n}"),
+                    objective: "Realistic reload fixture".repeat(20),
+                    workspace: WorkspaceIdentity {
+                        name: "fixture".into(),
+                        location: WorkspaceLocationIdentity::Local {
+                            directory: repo.clone(),
+                        },
+                    },
+                    repository: RepositoryIdentity {
+                        common_dir: repo.join(".git"),
+                        remote_url: None,
+                    },
+                    issue: None,
+                    base: GitBase {
+                        reference: "v6".into(),
+                        commit: "fixture".into(),
+                    },
+                    branch: format!("task/TRU-268-{n}"),
+                    executor: ExecutorTarget::Local,
+                    harness: None,
+                    stopping_boundary: StoppingBoundary::ImplementUntilTestsPass,
+                },
+                timestamp,
+            );
+            task.worktree.path = Some(cwd.clone());
+            task.worktree.state = TaskWorktreeState::Ready;
+            for c in 0..40 {
+                let id = format!("chat-{n}-{c}");
+                if c == 0 {
+                    workspaces[n % 8].chats.push(id.clone());
+                }
+                entries.push(chats::ChatIndexEntry {
+                    id: id.clone(),
+                    backend: chats::ChatBackend::Codex,
+                    path: cwd.join(format!("{id}.jsonl")),
+                    cwd: cwd.clone(),
+                    repo_root: Some(repo.clone()),
+                    is_worktree: true,
+                    branch: Some(task.branch.clone()),
+                    title: format!("Investigate worker {n}, conversation {c}"),
+                    latest: Some("Continuing implementation and verification".into()),
+                    mtime: now,
+                    size: 50_000,
+                    dead_cwd: false,
+                    root_id: (c > 0).then(|| format!("chat-{n}-0")),
+                    facts: Some(chat_facts::ChatFacts {
+                        issue_keys: vec!["TRU-268".into(), format!("TRU-{}", 300 + n)],
+                        repos_touched: vec![chat_facts::RepoTouch {
+                            dir: repo.clone(),
+                            edits: 8,
+                        }],
+                        checkouts: vec![chat_facts::CheckoutTouch {
+                            repo: repo.clone(),
+                            dir: cwd.clone(),
+                            branch: Some(task.branch.clone()),
+                            edits: 4,
+                            last: timestamp.into(),
+                        }],
+                        documents: (0..8).map(|d| repo.join(format!("doc-{d}.md"))).collect(),
+                        ..Default::default()
+                    }),
+                });
+                // Existing history plus one newly indexed conversation per task.
+                if c < 39 {
+                    task.sessions.push(TaskSessionRecord {
+                        task_session_id: format!("chat-codex-{id}"),
+                        label: entries.last().unwrap().title.clone(),
+                        harness: Some(HarnessSelection {
+                            kind: HarnessKind::TerminalPreset {
+                                preset_name: "Codex".into(),
+                            },
+                            model: None,
+                        }),
+                        conversation: Some(HarnessConversationRef {
+                            backend: HarnessConversationBackend::Codex,
+                            session_id: id,
+                        }),
+                        objective_delivery: ObjectiveDeliveryState::Unknown,
+                        launch_identity: None,
+                        created_at: timestamp.into(),
+                        updated_at: timestamp.into(),
+                    });
+                }
+            }
+            tasks.push(task);
+        }
+        let path = temp.path().join("tasks.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&TaskStoreDocument {
+                tasks,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut store = Some(TaskStore::load(&path).unwrap());
+        let picks = overview::FocusPicks::default();
+        let mut summary_generation = 0;
+        let mut overviews = HashMap::new();
+        for ws in &workspaces {
+            overviews.insert(
+                OverviewKey::Owner(ws.uid),
+                WorkspaceOverviewState::default(),
+            );
+            overviews.insert(
+                OverviewKey::Folder(ws.dir.clone()),
+                WorkspaceOverviewState::default(),
+            );
+        }
+        let mut index = Arc::new(entries.clone());
+        assert_eq!(index.len(), 4000);
+        let total = Instant::now();
+        macro_rules! timed {
+            ($label:expr, $body:block) => {{
+                let start = Instant::now();
+                let result = $body;
+                eprintln!(
+                    "TRU-268 {}: {:.3} ms",
+                    $label,
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
+                result
+            }};
+        }
+        timed!("apply", {
+            index = Arc::new(entries);
+        });
+        let mut error = None;
+        timed!("task_sessions", {
+            sync_task_sessions_from_chat_index(&index, &workspaces, &mut store, &mut error);
+        });
+        assert_eq!(error, None);
+        timed!("park_note", {
+            let roots = &workspaces[0].chats;
+            let other_roots = workspaces
+                .iter()
+                .skip(1)
+                .flat_map(|ws| ws.chats.clone())
+                .collect::<Vec<_>>();
+            let note = park_note_prefill(&park_note_chats(&index, roots, &[], &other_roots));
+            assert!(!note.is_empty());
+        });
+        timed!("repo_joins", {
+            assert!(workspace_repo_joins(&index, &workspaces, &repos, store.as_ref()).is_empty());
+        });
+        let mut homes_built = Some(Instant::now());
+        timed!("pr_homes", {
+            assert!(homes_built.take().is_some());
+        });
+        let visible = OverviewKey::Owner(workspaces[0].uid);
+        let (generation, plan) = timed!("overviews", {
+            reload_workspace_overviews(
+                &workspaces,
+                store.as_ref(),
+                &picks,
+                &mut overviews,
+                &mut summary_generation,
+                Some(&visible),
+            )
+            .unwrap()
+        });
+        eprintln!(
+            "TRU-268 total: {:.3} ms",
+            total.elapsed().as_secs_f64() * 1000.0
+        );
+        assert!(store
+            .as_ref()
+            .unwrap()
+            .tasks()
+            .iter()
+            .all(|task| task.sessions.len() == 40));
+        // No summary was computed on the reload's thread, including the visible one.
+        for (key, state) in &overviews {
+            assert!(
+                state.summary_stale,
+                "overview rebuilt synchronously: {key:?}"
+            );
+            assert_eq!(state.summary, overview::WorkSummary::default());
+        }
+        let summary = build_workspace_overview_summary(plan, Arc::clone(&index))
+            .await
+            .unwrap();
+        assert!(apply_workspace_overview_summary(
+            &mut overviews,
+            &visible,
+            generation,
+            summary
+        ));
+        assert!(!overviews[&visible].summary_stale);
+        assert_eq!(overviews[&visible].summary.chat_count, 520);
+        // A later reload invalidates even a completion that found no new claims.
+        reload_workspace_overviews(
+            &workspaces,
+            store.as_ref(),
+            &picks,
+            &mut overviews,
+            &mut summary_generation,
+            None,
+        );
+        assert!(!apply_workspace_overview_summary(
+            &mut overviews,
+            &visible,
+            generation,
+            overview::WorkSummary::default()
+        ));
+        assert_eq!(overviews[&visible].summary.chat_count, 520);
+        // Showing a deferred overview produces the same result as the old eager path.
+        let hidden = OverviewKey::Owner(workspaces[1].uid);
+        let expected = overview::WorkSummary::build_owned(
+            &index,
+            &workspaces[1].chats,
+            &store
+                .as_ref()
+                .unwrap()
+                .tasks()
+                .iter()
+                .map(overview::TaskInfo::from)
+                .collect::<Vec<_>>(),
+            std::time::SystemTime::now(),
+        );
+        rebuild_workspace_overview(
+            &index,
+            &workspaces,
+            store.as_ref(),
+            &picks,
+            &mut overviews,
+            &mut summary_generation,
+            &hidden,
+        );
+        assert!(!overviews[&hidden].summary_stale);
+        assert_eq!(overviews[&hidden].summary, expected);
+        // Repo joins still use the same first-touch candidates and manual removals.
+        let joined = temp.path().join("joined-repo");
+        std::fs::create_dir(&joined).unwrap();
+        Arc::make_mut(&mut index)[0]
+            .facts
+            .as_mut()
+            .unwrap()
+            .repos_touched
+            .push(chat_facts::RepoTouch {
+                dir: joined.clone(),
+                edits: 1,
+            });
+        assert_eq!(
+            workspace_repo_joins(&index, &workspaces, &repos, store.as_ref()),
+            vec![(
+                workspaces[0].uid,
+                vec![std::fs::canonicalize(&joined).unwrap()]
+            )]
+        );
+        workspaces[0].repos_removed.push(joined);
+        assert!(workspace_repo_joins(&index, &workspaces, &repos, store.as_ref()).is_empty());
+        assert_eq!(
+            TaskStore::load(path).unwrap().tasks(),
+            store.as_ref().unwrap().tasks()
+        );
+    }
+
+    #[test]
     fn plain_vertical_wheel_moves_horizontal_and_preserves_other_deltas() {
         assert_eq!(
             plain_vertical_wheel_offset(iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }),
@@ -48054,6 +48958,231 @@ mod tests {
             ]
             .into(),
         }
+    }
+
+    #[test]
+    fn github_social_sign_in_keeps_the_current_store_across_redirects() {
+        use PageNavigationDecision::Allow;
+        let providers = [
+            "https://accounts.google.com/v3/signin/identifier",
+            "https://appleid.apple.com/auth/authorize",
+            "https://idmsa.apple.com/appleauth/auth/authorize",
+        ];
+        for store in [
+            webview::PageDataStore::GitHub("acme-login".to_string()),
+            webview::PageDataStore::GitHub("other-login".to_string()),
+            webview::PageDataStore::Default,
+        ] {
+            let mut context = page_context();
+            context.store = store;
+            for origin in [
+                "https://github.com/login",
+                "https://github.com/session",
+                "https://github.com/sessions/two-factor/app",
+            ] {
+                context.url = origin.to_string();
+                for destination in providers {
+                    assert_eq!(page_navigation_decision(destination, &context), Allow);
+                }
+            }
+            for origin in providers {
+                context.url = origin.to_string();
+                for destination in providers.into_iter().chain([
+                    "https://github.com/login",
+                    "https://github.com/session",
+                    "https://github.com/sessions/social/google/callback?code=x",
+                    "https://github.com/sessions/social/apple/callback?code=x",
+                ]) {
+                    assert_eq!(page_navigation_decision(destination, &context), Allow);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn social_sign_in_exception_requires_a_trusted_sign_in_origin_and_destination() {
+        use PageNavigationDecision::{External, Reopen};
+        let mut context = page_context();
+        for origin in [
+            "https://github.com/acme/api/pull/1",
+            "https://github.com/",
+            "https://github.com/settings",
+            "https://github.com/logout",
+            "https://github.com/login-extra",
+            "https://github.com/%6cogin",
+            "https://github.com//login",
+            "https://linear.app/login",
+            "https://example.com/login",
+            "http://github.com/login",
+            "https://github.com:8443/login",
+            "https://user:password@github.com/login",
+            "http://accounts.google.com/",
+            "https://accounts.google.com:8443/",
+            "https://user:password@accounts.google.com/",
+            "https://accounts.google.com.example.com/",
+            "malformed",
+        ] {
+            context.url = origin.to_string();
+            for destination in [
+                "https://accounts.google.com/",
+                "https://appleid.apple.com/",
+                "https://idmsa.apple.com/",
+            ] {
+                assert_eq!(
+                    page_navigation_decision(destination, &context),
+                    External,
+                    "{origin}"
+                );
+            }
+        }
+        for origin in ["https://github.com/login", "https://accounts.google.com/"] {
+            context.url = origin.to_string();
+            for destination in [
+                "https://example.com/",
+                "https://accounts.google.com.example.com/",
+                "https://accounts.google.com./",
+                "https://sub.accounts.google.com/",
+                "http://accounts.google.com/",
+                "https://accounts.google.com:8443/",
+                "https://user:password@accounts.google.com/",
+                "https://appleid.apple.com.example.com/",
+            ] {
+                assert_eq!(page_navigation_decision(destination, &context), External);
+            }
+        }
+        context.url = "https://accounts.google.com/".to_string();
+        for destination in ["https://github.com/", "https://github.com/settings"] {
+            assert_eq!(
+                page_navigation_decision(destination, &context),
+                Reopen(webview::PageDataStore::Default)
+            );
+        }
+    }
+
+    #[test]
+    fn native_redirect_policy_advances_before_host_notifications_are_processed() {
+        use PageNavigationDecision::{Allow, External};
+        let mut context = page_context();
+        context
+            .github_accounts
+            .insert("acme".to_string(), "sample-login-a".to_string());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let redirects = [
+            "https://github.com/login",
+            "https://accounts.google.com/v3/signin/identifier",
+            "https://accounts.google.com/signin/oauth/consent",
+            "https://github.com/sessions/social/google/callback?code=x",
+            "https://github.com/acme/api/pull/1",
+        ];
+        // Leave every host notification queued while native redirects arrive.
+        for url in redirects {
+            assert_eq!(
+                dispatch_page_navigation(url, &mut context, 7, Some(&tx)),
+                Allow
+            );
+            assert_eq!(context.url, url);
+        }
+        assert_eq!(
+            dispatch_page_navigation("https://accounts.google.com/", &mut context, 7, Some(&tx)),
+            External
+        );
+        for expected in redirects {
+            match rx.try_recv().unwrap() {
+                AgentIpcMessage::PageNavigation {
+                    generation,
+                    url,
+                    reopen,
+                } => {
+                    assert_eq!(generation, 7);
+                    assert_eq!(url, expected);
+                    assert!(!reopen);
+                    let mut refreshed = page_context();
+                    refreshed.url = url;
+                    context.refresh_routes(refreshed);
+                    assert_eq!(context.url, redirects[4]);
+                    assert_eq!(
+                        page_navigation_decision("https://accounts.google.com/", &context),
+                        External
+                    );
+                }
+                _ => panic!("expected page navigation"),
+            }
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(context.url, redirects[4]);
+    }
+
+    #[test]
+    fn route_refresh_discovers_linear_workspaces_without_resetting_the_native_page() {
+        let mut context = page_context();
+        context.url = "https://linear.app/acme/issue/ABC-1/example".to_string();
+        context.store = webview::PageDataStore::Linear("acme".to_string());
+        let origin = context.url.clone();
+        let store = context.store.clone();
+        let destination = "https://linear.app/new-workspace/team/example";
+        assert_eq!(
+            page_navigation_decision(destination, &context),
+            PageNavigationDecision::External
+        );
+        let mut refreshed = page_context();
+        refreshed
+            .linear_workspaces
+            .insert("new-workspace".to_string());
+        context.refresh_routes(refreshed);
+        assert_eq!(context.url, origin);
+        assert_eq!(context.store, store);
+        assert_eq!(
+            page_navigation_decision(destination, &context),
+            PageNavigationDecision::Reopen(webview::PageDataStore::Linear(
+                "new-workspace".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn failed_navigation_dispatch_cancels_without_advancing_the_origin() {
+        let mut context = page_context();
+        let origin = context.url.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        for sender in [None, Some(&tx)] {
+            assert_eq!(
+                dispatch_page_navigation("https://github.com/login", &mut context, 7, sender),
+                PageNavigationDecision::Cancel
+            );
+            assert_eq!(context.url, origin);
+        }
+    }
+
+    #[test]
+    fn page_navigation_logs_exclude_oauth_secrets_and_store_identity() {
+        for decision in [
+            PageNavigationDecision::Allow,
+            PageNavigationDecision::Reopen(webview::PageDataStore::GitHub(
+                "secret-login".to_string(),
+            )),
+            PageNavigationDecision::External,
+            PageNavigationDecision::Cancel,
+        ] {
+            let line = decision.log_line(
+                "https://secret-user:secret-password@github.com/sessions/social/google/callback?code=secret#secret",
+            );
+            assert!(line.starts_with("[page] "));
+            assert!(line.ends_with(" https://github.com/sessions/social/google/callback"));
+            assert!(!line.contains("secret"));
+            for url in [
+                "malformed?code=secret",
+                "data:text/plain,secret",
+                "javascript:secret",
+            ] {
+                assert!(decision.log_line(url).ends_with(" <invalid-url>"));
+            }
+        }
+        assert_eq!(
+            PageNavigationDecision::Allow
+                .log_line("https://accounts.google.com/signin?code=secret#secret"),
+            "[page] Allow https://accounts.google.com/signin"
+        );
     }
 
     #[test]
@@ -49222,21 +50351,106 @@ mod tests {
                 (session.to_string(), process)
             })
             .unwrap();
+        assert!(!worker_accepts_input(&tab, Some(&store)));
         let result = process.unwrap().stop();
         assert!(
             result.as_ref().is_err_and(|e| e.contains("refuse")),
             "{result:?}"
         );
-        assert!(!final_worker_stop_closes_tab(&session, result));
+        assert!(!final_worker_stop_closes_tab(&session, &mut tab, result));
+        assert!(!tab.worker_closing);
+        assert!(worker_accepts_input(&tab, Some(&store)));
+        tab.task_live_state = Some(TaskSessionLiveState::Working); // late terminal title
+        assert!(!task_session_is_working(&tab, Some(&store)));
         assert!(!final_worker_stop_closes_tab(
             &session,
+            &mut tab,
             Err("refuse worker shutdown: no launch record for this tab".into())
         ));
-        assert!(final_worker_stop_closes_tab(&session, Ok(())));
+        assert!(final_worker_stop_closes_tab(&session, &mut tab, Ok(())));
         assert!(close_final_worker(&store, &mut tab, &ready, |_, _| panic!(
             "a refused stop is logged once, never retried"
         ))
         .is_none());
+    }
+
+    #[test]
+    fn refused_final_worker_tabs_survive_saved_config_roundtrips() {
+        for failed in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut store, id, mut config) = final_worker_fixture(temp.path());
+            if failed {
+                store
+                    .set_delegation_status(
+                        &id,
+                        gitterm::tasks::DelegationStatus::Failed {
+                            message: "Failed".into(),
+                        },
+                        "t2",
+                    )
+                    .unwrap();
+            } else {
+                store
+                    .complete_delegation(
+                        &id,
+                        gitterm::delegations::worker_result(worker_test_handoff()),
+                        "t2",
+                    )
+                    .unwrap();
+            }
+            // Old configs still load, and a successful shutdown still
+            // excludes a stale saved entry for a final worker.
+            assert!(!config.worker_shutdown_refused);
+            let mut tab = TabState::new(1, temp.path().into());
+            tab.task_id = config.task_id.clone();
+            tab.task_session_id = config.task_session_id.clone();
+            let ready = HashSet::from([id]);
+            close_final_worker(&store, &mut tab, &ready, |_, _| ()).unwrap();
+            assert!(final_worker_stop_closes_tab("worker", &mut tab, Ok(())));
+            assert!(!tab.worker_shutdown_refused);
+            assert!(!restore_task_tab(
+                Some(&store),
+                &config,
+                &mut HashSet::new()
+            ));
+
+            assert!(!final_worker_stop_closes_tab(
+                "worker",
+                &mut tab,
+                Err("refuse worker shutdown: no launch record for this tab".into())
+            ));
+            config.worker_shutdown_refused = tab.worker_shutdown_refused;
+            let (loaded, _) =
+                load_task_store_for_startup(temp.path().join("tasks.json"), "t3").unwrap();
+            for _ in 0..2 {
+                config = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+                assert!(restore_task_tab(
+                    Some(&loaded),
+                    &config,
+                    &mut HashSet::new()
+                ));
+            }
+            let mut restored = TabState::new(2, temp.path().into());
+            restored.task_id = config.task_id;
+            restored.task_session_id = config.task_session_id;
+            restored.worker_shutdown_refused = config.worker_shutdown_refused;
+            assert!(worker_accepts_input(&restored, Some(&loaded)));
+            assert!(
+                close_final_worker(&loaded, &mut restored, &ready, |_, _| panic!(
+                    "restored refusal must not retry"
+                ))
+                .is_none()
+            );
+            // Refusal does not bypass the existing missing-worktree guard.
+            config.dir = temp.path().join("removed").to_string_lossy().into_owned();
+            config.task_id = restored.task_id;
+            config.task_session_id = restored.task_session_id;
+            assert!(!restore_task_tab(
+                Some(&loaded),
+                &config,
+                &mut HashSet::new()
+            ));
+        }
     }
 
     #[test]
@@ -53232,6 +54446,52 @@ mod tests {
             run_tab_action(&terminals, api, "npm run start"),
             RunTabAction::Restart(1)
         );
+    }
+
+    #[test]
+    fn chat_tabs_below_a_git_root_keep_their_folder() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("notes");
+        let home = repo.join("example-work");
+        std::fs::create_dir_all(&home).unwrap();
+        Repository::init(&repo).unwrap();
+        let status = gitterm::agentd::git::collect_repo_status(&home);
+        assert!(status.is_git_repo);
+        assert_eq!(
+            std::fs::canonicalize(&status.root).unwrap(),
+            std::fs::canonicalize(&repo).unwrap()
+        );
+        let mut native = TabState::new(1, home.clone());
+        native.kind = TabKind::Agent(AgentSession::new(new_claude_chat_config(
+            &config::ChatDefaults::default(),
+        )));
+        native.adopt_git_root(&status.root);
+        assert_eq!(native.repo_path, home);
+        let mut terminal = TabState::new(2, home.clone());
+        terminal.set_startup_command(Some("codex".into()));
+        terminal.adopt_git_root(&status.root);
+        assert_eq!(terminal.repo_path, home);
+        let mut shell = TabState::new(3, home.clone());
+        shell.adopt_git_root(&status.root);
+        assert_eq!(shell.repo_path, status.root);
+        // A Codex chat, new or resumed, keeps its folder too.
+        for command in ["codex", "codex resume example-session"] {
+            let mut codex = TabState::new(4, home.clone());
+            codex.set_startup_command(Some(command.into()));
+            codex.adopt_git_root(&status.root);
+            assert_eq!(codex.repo_path, home);
+        }
+        // A resumed Claude chat starts where it was recorded, even when an
+        // older save recorded the parent: its history lives under that
+        // folder, so moving it could lose the conversation.
+        let mut resumed =
+            AgentSession::new(new_claude_chat_config(&config::ChatDefaults::default()));
+        resumed.session_id = Some("example-session".into());
+        let spawn = resumed
+            .claude_session_config(status.root.clone(), Vec::new(), false, None)
+            .unwrap();
+        assert_eq!(spawn.cwd, status.root);
+        assert!(spawn.resume.is_some());
     }
 
     #[test]

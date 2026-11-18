@@ -336,7 +336,10 @@ pub fn navigate_to_url(surface: WebviewSurface, url: &str) {
     with_existing_slot(surface, |slot| {
         if let Some(webview) = slot.webview.as_ref() {
             if let Err(e) = webview.load_url(url) {
-                eprintln!("[webview] {surface:?} load_url({url}) failed: {e}");
+                eprintln!(
+                    "[webview] {surface:?} load_url({}) failed: {e}",
+                    page_log_url(url)
+                );
             }
         }
     });
@@ -406,6 +409,15 @@ pub fn try_create_with_window(
 
         if matches!(surface, WebviewSurface::Viewer | WebviewSurface::Page) {
             builder = builder.with_new_window_req_handler(|url| {
+                // shortcut: wry 0.48.1 conflates iframes and real popups. Keep
+                // opening externally; sign-in iframes may remain incomplete.
+                // Revisit when upstream exposes frame identity.
+                let decision = if browser_url(&url).is_ok() {
+                    "External"
+                } else {
+                    "Cancel"
+                };
+                eprintln!("[page] {decision} {}", page_log_url(&url));
                 open_url_in_browser(&url);
                 false
             });
@@ -418,9 +430,13 @@ pub fn try_create_with_window(
             // upstream exposes it. macOS/Windows call this for the main frame.
             let handler = slot.page_navigation_handler.clone();
             builder = builder.with_navigation_handler(move |url| {
-                handler
+                let allowed = handler
                     .as_ref()
-                    .is_some_and(|handler| (handler.borrow())(&url))
+                    .is_some_and(|handler| (handler.borrow())(&url));
+                if handler.is_none() {
+                    eprintln!("[page] Cancel {}", page_log_url(&url));
+                }
+                allowed
             });
         }
 
@@ -489,6 +505,17 @@ pub fn browser_url(url: &str) -> Result<url::Url, String> {
     Ok(parsed)
 }
 
+/// Log only network URL components, never OAuth query/fragment or userinfo.
+pub fn page_log_url(url: &str) -> String {
+    match browser_url(url) {
+        Ok(url) => match url.host_str() {
+            Some(host) => format!("{}://{host}{}", url.scheme(), url.path()),
+            None => "<invalid-url>".to_string(),
+        },
+        Err(_) => "<invalid-url>".to_string(),
+    }
+}
+
 #[cfg(any(target_os = "windows", test))]
 fn windows_browser_command(url: &str) -> std::process::Command {
     let mut command = std::process::Command::new("rundll32.exe");
@@ -515,7 +542,10 @@ pub fn open_url_in_browser(url: &str) {
         .spawn();
 
     if let Err(error) = result {
-        eprintln!("[webview] cannot open {url} in the browser: {error}");
+        eprintln!(
+            "[webview] cannot open {} in the browser: {error}",
+            page_log_url(url.as_str())
+        );
     }
 }
 
