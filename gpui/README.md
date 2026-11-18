@@ -110,3 +110,11 @@ Excalidraw, with 14 existing ignored tests in each run. Builds used `-j 4`
 and separate temporary target directories. The environment denied `nice`,
 so it was omitted. Neither app was launched; no CI run or visual check is
 claimed. See the TRU-275 task handoff for commands and complete exit codes.
+
+## Native chat fixture viewer (TRU-281)
+
+`gitterm-gpui --chat <fixture.jsonl>` opens the display-only native chat viewer
+in the `gitterm-gpui-chat` workspace member. See
+[`crates/chat/README.md`](crates/chat/README.md) for synthetic fixtures, the
+harness event boundary, behavior parity, headless interaction tests and the
+5,000-row performance budget. The root Iced dependency graph is unchanged.
