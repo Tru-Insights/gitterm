@@ -131,6 +131,10 @@ static MAIN_THREAD_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 // or stop signal to the right tab.
 #[derive(Debug, Clone)]
 pub enum AgentIpcMessage {
+    CopyMarkdown {
+        tab_id: usize,
+        text: String,
+    },
     Submit {
         tab_id: usize,
         text: String,
@@ -1010,11 +1014,14 @@ fn hostkey_chord(value: &serde_json::Value) -> Result<(Key, Modifiers), String> 
 fn agent_ipc_handler() -> webview::IpcHandler {
     Box::new(|body: String| {
         let Some(tx) = AGENT_IPC_TX.get() else {
-            eprintln!("[agent-ipc] tx not initialized; dropping {}", body);
+            eprintln!(
+                "[agent-ipc] tx not initialized; dropping message ({} bytes)",
+                body.len()
+            );
             return;
         };
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
-            eprintln!("[agent-ipc] non-JSON body: {}", body);
+            eprintln!("[agent-ipc] non-JSON body ({} bytes)", body.len());
             return;
         };
         let tab_id = value
@@ -1023,10 +1030,22 @@ fn agent_ipc_handler() -> webview::IpcHandler {
             .map(|n| n as usize);
         let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let Some(tab_id) = tab_id else {
-            eprintln!("[agent-ipc] missing tabId in {}", body);
+            eprintln!("[agent-ipc] missing tabId ({} bytes)", body.len());
             return;
         };
         let msg = match kind {
+            "copy_markdown" => match gitterm::chat_page::markdown_clipboard_message(value) {
+                Ok((tab_id, text)) => AgentIpcMessage::CopyMarkdown { tab_id, text },
+                Err(error) => {
+                    eprintln!("[agent-ipc] {error}");
+                    return;
+                }
+            },
+            "copy_markdown_error" => {
+                eprintln!("[agent-ipc] Copy as Markdown selection serialization failed");
+                return;
+            }
+
             "submit" => {
                 let text = value
                     .get("text")
@@ -1474,6 +1493,16 @@ fn heartbeat(event_name: &str) {
         if let Ok(mut guard) = MAIN_THREAD_LAST_EVENT.try_lock() {
             *guard = Some(event_name.to_string());
         }
+    }
+}
+
+fn freeze_watchdog_event_label(event: &Event) -> String {
+    match event {
+        Event::AgentWebviewIpc(AgentIpcMessage::CopyMarkdown { tab_id, text }) => format!(
+            "AgentWebviewIpc(CopyMarkdown {{ tab_id: {tab_id}, text_len: {} }})",
+            text.len()
+        ),
+        _ => format!("{event:?}"),
     }
 }
 
@@ -23840,7 +23869,8 @@ fi
                 heartbeat("LoadingUiTick");
             }
             other => {
-                heartbeat(&format!("{:?}", other).chars().take(80).collect::<String>());
+                let label = freeze_watchdog_event_label(other);
+                heartbeat(&label.chars().take(80).collect::<String>());
             }
         }
         self.record_task_session_focus();
@@ -25222,6 +25252,25 @@ fi
                         let task = self.update(Event::KeyPressed(key, modifiers));
                         self.current_modifiers = held;
                         task
+                    }
+                    AgentIpcMessage::CopyMarkdown { tab_id, text } => {
+                        eprintln!(
+                            "[copy-markdown] IPC received tab={tab_id} bytes={}",
+                            text.len()
+                        );
+                        if webview::is_active(webview::WebviewSurface::Agent(tab_id)) {
+                            match webview::copy_markdown_to_pasteboard(&text) {
+                                Ok(()) => {
+                                    eprintln!("[copy-markdown] pasteboard write ok tab={tab_id}")
+                                }
+                                Err(error) => eprintln!(
+                                    "[copy-markdown] pasteboard write err tab={tab_id}: {error}"
+                                ),
+                            }
+                        } else {
+                            eprintln!("[copy-markdown] pasteboard write err tab={tab_id}: no active chat page");
+                        }
+                        Task::none()
                     }
                     AgentIpcMessage::PastePage { tab_id } => {
                         webview::paste_into_agent_page(tab_id);
@@ -48703,6 +48752,19 @@ mod tests {
     use gitterm::tasks::{GitBase, RepositoryIdentity};
     use std::path::Path;
     use std::sync::Arc;
+
+    #[test]
+    fn copy_markdown_freeze_label_redacts_copied_text() {
+        let event = Event::AgentWebviewIpc(AgentIpcMessage::CopyMarkdown {
+            tab_id: 7,
+            text: "secret copied text".into(),
+        });
+
+        let label = freeze_watchdog_event_label(&event);
+        assert!(label.contains("tab_id: 7"));
+        assert!(label.contains("text_len: 18"));
+        assert!(!label.contains("secret copied text"));
+    }
 
     #[test]
     fn regression_remote_claude_keeps_fallback_for_local_kit_path() {
