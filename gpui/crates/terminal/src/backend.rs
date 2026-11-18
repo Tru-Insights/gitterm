@@ -1,9 +1,10 @@
 // Adapted from iced_term 261234b; see README.md and licenses/iced_term-MIT.
+use crate::events::SessionState;
 use crate::events::{Action, EventProxy};
+use crate::session::Session;
 use crate::settings::BackendSettings;
 use crate::settings::LayoutSize as Size;
 use alacritty_terminal::event::{Event, EventListener, OnResize, WindowSize};
-use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
@@ -197,7 +198,7 @@ pub struct Backend {
     pub(crate) term: Arc<FairMutex<Term<EventProxy>>>,
     size: TerminalSize,
     applied_size: TerminalSize,
-    notifier: Option<Notifier>,
+    session: Option<Session>,
     pending_settings: Option<BackendSettings>,
     startup_output_pending: bool,
     deferred_resize: Option<(usize, usize)>,
@@ -238,6 +239,8 @@ impl Backend {
             escape_args: true,
         };
         let pty = tty::new(&pty_config, size.into(), 278)?;
+        #[cfg(unix)]
+        let pty = crate::session::OwnedPty::new(pty);
         Self::with_pty_sized(settings, pty, size)
     }
 
@@ -253,7 +256,7 @@ impl Backend {
             term: Arc::new(FairMutex::new(term)),
             size,
             applied_size: size,
-            notifier: None,
+            session: None,
             pending_settings: Some(settings),
             startup_output_pending: false,
             deferred_resize: None,
@@ -292,6 +295,8 @@ impl Backend {
             escape_args: true,
         };
         let pty = tty::new(&pty_config, size.into(), 278)?;
+        #[cfg(unix)]
+        let pty = crate::session::OwnedPty::new(pty);
         let config = term::Config {
             scrolling_history: settings.scrollback_lines,
             ..Default::default()
@@ -306,11 +311,7 @@ impl Backend {
         self.deferred_resize = None;
         self.last_content = RenderableContent::default();
         self.last_content.sync_from(&self.term.lock_unfair(), size);
-        let event_loop = EventLoop::new(self.term.clone(), self.events.clone(), pty, true, false)?;
-        let channel = event_loop.channel();
-        self.notifier = Some(Notifier(channel.clone()));
-        self.events.set_notifier(channel);
-        let _ = event_loop.spawn();
+        self.session = Some(Session::start(self.term.clone(), self.events.clone(), pty)?);
         Ok(true)
     }
 
@@ -343,16 +344,12 @@ impl Backend {
         let mut initial_content = RenderableContent::default();
         initial_content.sync_from(&term, size);
         let term = Arc::new(FairMutex::new(term));
-        let event_loop = EventLoop::new(term.clone(), events.clone(), pty, true, false)?;
-        let channel = event_loop.channel();
-        let notifier = Notifier(channel.clone());
-        events.set_notifier(channel);
-        let _ = event_loop.spawn();
+        let session = Session::start(term.clone(), events.clone(), pty)?;
         Ok(Self {
             term,
             size,
             applied_size: size,
-            notifier: Some(notifier),
+            session: Some(session),
             pending_settings: None,
             startup_output_pending: false,
             deferred_resize: None,
@@ -446,6 +443,14 @@ impl Backend {
 
     /// The same mode-aware path is used by keyboard, menu, and programmatic paste.
     pub fn paste(&self, text: &str) -> bool {
+        if self.state() != SessionState::Running {
+            return false;
+        }
+        // Reject before normalization/copying; foreground work and allocation are bounded.
+        if text.len() > crate::session::INPUT_LIMIT.saturating_sub(12) {
+            self.events.reject_input(true);
+            return false;
+        }
         let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
         // Strip ESC so clipboard content cannot close the bracketed-paste envelope.
         let normalized = normalized.replace('\x1b', "");
@@ -459,6 +464,17 @@ impl Backend {
             input.extend_from_slice(b"\x1b[201~");
         }
         self.input(input)
+    }
+
+    pub(crate) fn input_bytes(&self, input: &[u8]) -> bool {
+        if self.state() != SessionState::Running {
+            return false;
+        }
+        if input.len() > crate::session::INPUT_LIMIT {
+            self.events.reject_input(true);
+            return false;
+        }
+        self.input(input.to_vec())
     }
 
     pub(crate) fn input(&self, input: Vec<u8>) -> bool {
@@ -503,13 +519,18 @@ impl Backend {
                 self.resize(layout_size, font_measure);
                 return Action::default();
             }
-            Command::ProcessLink(LinkAction::Open, _) => {
+            Command::ProcessLink(LinkAction::Open, point) => {
+                self.update_link(Some(point));
                 return self
                     .last_content
                     .hovered_url
                     .clone()
                     .map(Action::OpenUrl)
                     .unwrap_or_default();
+            }
+            Command::ProcessLink(LinkAction::Clear, _) => {
+                self.update_link(None);
+                return Action::default();
             }
             Command::Scroll(delta) => {
                 self.pending_scroll = self.pending_scroll.saturating_add(delta);
@@ -554,6 +575,18 @@ impl Backend {
         // retained and applied by the next successful sync.
 
         Action::default()
+    }
+
+    /// A busy parser clears stale hover/click state; the view retries hover on render.
+    pub(crate) fn update_link(&mut self, point: Option<Point>) {
+        self.last_content.hovered_hyperlink = None;
+        self.last_content.hovered_url = None;
+        if let Some(point) = point {
+            let term = self.term.clone();
+            if let Some(term) = term.try_lock_unfair() {
+                self.process_link_action(&term, LinkAction::Hover, point);
+            }
+        }
     }
 
     fn process_link_action(
@@ -754,8 +787,8 @@ impl Backend {
             return;
         }
 
-        if let Some(notifier) = &mut self.notifier {
-            notifier.on_resize(self.size.into());
+        if let Some(session) = &self.session {
+            session.control.resize(self.size.into());
         }
         if self.size.num_cols != self.applied_size.num_cols
             || self.size.num_lines != self.applied_size.num_lines
@@ -770,19 +803,38 @@ impl Backend {
 
     pub(crate) fn write<I: Into<Cow<'static, [u8]>>>(&self, input: I) -> bool {
         let input = input.into();
+        if self.state() != SessionState::Running {
+            return false;
+        }
         if input.is_empty() {
             return true;
         }
-        let Some(notifier) = &self.notifier else {
+        let Some(session) = &self.session else {
             return false;
         };
-        match notifier.0.send(Msg::Input(input)) {
-            Ok(()) => true,
-            Err(error) => {
-                self.events
-                    .record_error(format!("PTY input write: {error}"));
-                false
-            }
+        let accepted = session.control.input(input, false);
+        self.events.reject_input(!accepted);
+        accepted
+    }
+
+    pub fn state(&self) -> SessionState {
+        self.events.state()
+    }
+
+    pub fn status_message(&self) -> Option<String> {
+        self.state().message().or_else(|| {
+            self.events
+                .input_rejected()
+                .then(|| "Input queue full: input was not sent; retry a smaller paste".into())
+        })
+    }
+
+    /// Idempotent: stops and joins the reader, and reaps the owned child.
+    pub fn cancel(&mut self) {
+        self.pending_settings = None;
+        self.events.set_state(SessionState::Cancelled);
+        if let Some(mut session) = self.session.take() {
+            session.cancel();
         }
     }
 
@@ -1125,9 +1177,7 @@ mod tests {
 
 impl Drop for Backend {
     fn drop(&mut self) {
-        if let Some(notifier) = &self.notifier {
-            let _ = notifier.0.send(Msg::Shutdown);
-        }
+        self.cancel();
     }
 }
 

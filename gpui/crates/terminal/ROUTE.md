@@ -1,8 +1,8 @@
 # TRU-278 — terminal route decision
 
 **Recommend Route A: committed iced_term backend + GPUI snapshot renderer.**
-The implemented prototype passes the required real-PTY gates. Budget **10–16
-worker-days remaining for stage 3**, compared with Route B's **18–27** from
+The implemented prototype passes the required real-PTY gates. Budget **7–12
+worker-days remaining for stage 3 after TRU-282**, compared with Route B's **18–27** from
 TRU-276. Both routes reuse Alacritty 0.25.1; no emulator rewrite is needed.
 
 This recommendation is based on the code and automated tests in this crate,
@@ -25,10 +25,10 @@ was not patched here. Route A tests assert the required working behavior.
 | 100k history / search / export | PASS: exactly 100,000 retained lines after 100,100; literal `[.]` query and scroll-to-match; first retained cell included. Busy returns `None`, not an empty success. Snapshot remains viewport-sized. | FAIL widget: ignores 100k config and retains 10k; standalone emulator has working primitives, but private view state lacks service/search/export hooks. |
 | Selection / resize | PASS: drag/semantic/line paths retained, Shift extends anchor, copy waits through parser contention. Headless paint resizes snapshot; real PTY child observes 103×31 via ioctl. | Existing local selection/resize foundation reusable; Shift currently resets anchor. PTY resize needs app-owned callback wiring. |
 | IME / Unicode | PASS at automated scope: original UTF16 EntityInputHandler/preedit path retained, commit reaches child once, CJK/wide spacer/combining cells survive serial UTF8; geometric box/block glyph tests and headless preedit paint pass. | Existing view/render path is the source used by A; manual IME/font/Retina/feel verification still needed for either route. |
-| URLs / app services | Committed fork regex/search APIs retained and URL opening returned to app policy; no URL click UI yet. Add background service jobs and cheap tail snapshots. | Add widget hooks plus GitTerm link detection/opener and all history/service hooks. |
+| URLs / app services | Committed fork regex/search APIs retained and URL opening returned to app policy; Cmd-hover pointer and Cmd-click app callback in TRU-282. Add background service jobs and cheap tail snapshots. | Add widget hooks plus GitTerm link detection/opener and all history/service hooks. |
 | Ownership / licences | MIT copying permitted with notices; one local crate owns fork-derived backend and xterm-derived presentation. No dependency on Iced. Future fixes need explicit synchronization with upstream/fork. | Maintain a widget patch/upstream changes, including its internal PTY scheduling architecture. Same permissive source licences. |
 | Effort spent in TRU-278 | One local judgment-role implementation session: backend extraction, snapshot renderer/view integration, real-PTY/headless regressions, provenance and checks. Elapsed time is recorded under verification; it is not a worker-day productivity measure. | Estimate only; no implementation work spent on B in this task. TRU-276 supplied the comparison evidence. |
-| Remaining stage-3 allowance | **10–16 worker-days** after this prototype; breakdown below. | **18–27 worker-days** for the full patched-widget route, as sized in TRU-276. |
+| Remaining stage-3 allowance | **7–12 worker-days** after TRU-282; breakdown below. | **18–27 worker-days** for the full patched-widget route, as sized in TRU-276. |
 
 A avoids replacing the widget's reader/queue/parser ownership while preserving
 its GPUI presentation and IME implementation. Copying the backend was necessary
@@ -82,11 +82,12 @@ xterm; grapheme-aware preedit placement and advanced editing remain future work.
 
 OSC52 stays copy-only by default. Reads are not enabled. Clipboard-store/title
 callbacks are coalesced and delivered on render; the example does not install
-an OS-clipboard callback. Error reporting, close/cancellation fairness and input
-backpressure still need sustained/hostile-child coverage. Alacritty's notifier
-input channel can grow if a child refuses input; the output path tested here
-has no such UI queue. Color/size query responses, legacy mouse encodings, link
-boundaries and representative TUIs need broader stage-3 fixtures. No indefinite
+an OS-clipboard callback. TRU-282 adds persistent exit/error banners, idempotent
+reader join and owned-child reaping, bounded whole-message input admission, and duplex flood fairness gates.
+The per-session worker replaces Alacritty's unbounded notifier queue. CPR/DA,
+OSC title/bell and legacy mouse fixtures run headlessly against real PTYs.
+Color/size query responses, broader link boundaries and representative TUIs
+still need stage-3 fixtures. No indefinite
 soak, production integration, visible smoke, or manual Unicode/IME testing is claimed.
 
 ## Revised stage-3 work, Route A
@@ -96,12 +97,12 @@ times or calendar promises. They exclude other GPUI migration stages.
 
 | Remaining work | Worker-days |
 | --- | ---: |
-| Close/reap/cancellation and error UX, input backpressure, reply/protocol/legacy-mouse fixtures, multi-session fairness | 2–3 |
-| Link interaction/app policy, asynchronous search/export service jobs, efficient watchdog/log tail snapshots and eviction handling | 2–3 |
+| Close/reap/cancellation and error UX, bounded input, protocol/legacy-mouse fixtures, duplex multi-session fairness — completed in TRU-282 | 0 |
+| Asynchronous search/export service jobs, efficient watchdog/log tail snapshots and eviction handling (link interaction/app policy completed in TRU-282) | 1–2 |
 | Main/bottom/run integration: cwd/env/startup, ownership/session lifecycle, hidden sessions and service consumers | 3–4 |
 | Real shell/Claude/Codex/mouse-TUI checks, Unicode/IME/font/Retina/accessibility and resize under load | 2–4 |
 | Contingency for GPUI scheduling, copied-code maintenance and integration discoveries | 1–2 |
-| **Remaining total** | **10–16** |
+| **Remaining total** | **7–12** |
 
 Do not count the prototype as complete stage 3. It establishes the route and
 removes the main scheduling/reply/paste uncertainty; it does not wire the
@@ -133,3 +134,38 @@ The root pre-commit hook invokes Iced checks, which conflict with this task's
 explicit GPUI-only build scope. The commit uses a command-local disabled hook
 path after the equivalent GPUI checks pass. No root checks, push, PR, consults,
 other agents, or installed-app replacement were performed.
+
+## TRU-282 verification
+
+The first stage-3 slice replaces the upstream unbounded I/O channel with a
+per-session worker, bounded admission and fixed duplex budgets. Its public
+`Backend::cancel` joins the reader and reaps the child, including a child that
+ignores HUP. `SessionState` survives coalesced-event consumption; the view paints
+an exit/error banner and stops accepting input. Cmd-hover shows a pointer and
+Cmd-click resolves the current URL through the retained regex APIs before
+calling the app's opener. The example supplies an asynchronous macOS opener.
+
+New regressions cover:
+
+- `cancel_is_idempotent_joins_reader_and_reaps_hup_ignoring_child`
+- `dropping_view_joins_reader_and_reaps_child`
+- `child_exit_status_persists_after_events_are_consumed_and_ignores_input`
+- `pty_read_and_registration_errors_stop_worker_reap_child_and_persist`
+- `exited_and_failed_views_paint_persistent_status_and_ignore_input`
+- `blocked_child_input_is_bounded_atomic_and_preserves_reply_reserve`
+- `protocol_cpr_da_osc_title_and_bell_survive_without_ui_delivery`
+- `legacy_mouse_press_release_and_wheel_use_non_sgr_bytes`
+- `flooding_session_cannot_starve_its_input_or_a_second_session`
+- `cmd_hover_and_click_resolve_current_url_and_call_only_app_opener`
+
+No running app, OS input or visible window was used. Search/export and shell/dock
+integration remain separate work. Only the terminal crate, its lockfile dependency
+record, and the permitted `--terminal` opener callback change. `libc` and `polling`
+were already locked; no package versions or root lockfile changed.
+
+Final checks all exited **0**: workspace format, Clippy (`--all-targets`,
+`-D warnings`), locked workspace tests (**65 passed**, including all 55 existing
+terminal tests), dependency boundaries and locked workspace build. Commands and
+limits are in [evidence/tru282-checks.txt](evidence/tru282-checks.txt). The existing
+deferred-layout test now pumps a headless frame while waiting for a title
+callback, rather than relying on the child replying during the first frame.

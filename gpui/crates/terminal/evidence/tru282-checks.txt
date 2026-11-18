@@ -1,0 +1,33 @@
+TRU-282 final verification, 2026-11-18, macOS / rustup stable 1.99
+
+Environment:
+CARGO_HOME=/private/tmp/gpui-mockup-cargo
+CARGO_TARGET_DIR=/private/tmp/gt-target-tru282
+
+All Cargo invocations used scripts/cargo.sh. nice -n 10 was attempted;
+the sandbox reported setpriority: Operation not permitted, then ran the command.
+
+Exit 0: scripts/cargo.sh fmt --manifest-path gpui/Cargo.toml --all -- --check
+Exit 0: scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --workspace --locked --all-targets -j 4 -- -D warnings
+Exit 0: scripts/cargo.sh test --manifest-path gpui/Cargo.toml --workspace --locked -j 4
+        65 terminal tests passed, 0 failed; all 55 prior tests retained.
+Exit 0: scripts/check-gpui-deps.sh (CARGO_BUILD_JOBS=4)
+Exit 0: scripts/cargo.sh build --manifest-path gpui/Cargo.toml --workspace --locked -j 4
+Exit 0: git diff --check
+Exit 0: git diff --exit-code HEAD -- Cargo.lock
+
+New tests (all passed):
+cancel_is_idempotent_joins_reader_and_reaps_hup_ignoring_child
+child_exit_status_persists_after_events_are_consumed_and_ignores_input
+blocked_child_input_is_bounded_atomic_and_preserves_reply_reserve
+protocol_cpr_da_osc_title_and_bell_survive_without_ui_delivery
+flooding_session_cannot_starve_its_input_or_a_second_session
+pty_read_and_registration_errors_stop_worker_reap_child_and_persist
+dropping_view_joins_reader_and_reaps_child
+exited_and_failed_views_paint_persistent_status_and_ignore_input
+legacy_mouse_press_release_and_wheel_use_non_sgr_bytes
+cmd_hover_and_click_resolve_current_url_and_call_only_app_opener
+
+Verification was headless with owned real-PTY children only. No running GitTerm
+processes, installed bundles, OS input, or visible apps were touched. No push.
+Manual native link/IME/font/Retina/accessibility checks and long soaks were not run.

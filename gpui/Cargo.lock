@@ -2588,6 +2588,7 @@ dependencies = [
  "arboard",
  "gpui-kit",
  "gpui-pre",
+ "libc",
  "mach2",
  "parking_lot",
  "polling",

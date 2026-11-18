@@ -1,5 +1,5 @@
+use crate::session::IoControl;
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::event_loop::{EventLoopSender, Msg};
 use parking_lot::Mutex;
 use std::sync::{
     Arc, OnceLock,
@@ -27,9 +27,33 @@ pub struct PendingEvents {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SessionState {
+    #[default]
+    Running,
+    Exited(Option<i32>),
+    Error(String),
+    Cancelled,
+}
+impl SessionState {
+    pub fn message(&self) -> Option<String> {
+        match self {
+            Self::Running => None,
+            Self::Exited(Some(code)) => Some(format!("Shell exited (status {code})")),
+            Self::Exited(None) => Some("Shell exited (signal / status unavailable)".into()),
+            Self::Error(error) => {
+                Some(format!("Terminal error: {error} (exit status unavailable)"))
+            }
+            Self::Cancelled => Some("Session closed".into()),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Shared {
-    notifier: OnceLock<EventLoopSender>,
+    control: OnceLock<Arc<IoControl>>,
+    state: Mutex<SessionState>,
+    input_rejected: AtomicBool,
     dirty: AtomicBool,
     effects_dirty: AtomicBool,
     output_ready: AtomicBool,
@@ -40,8 +64,28 @@ struct Shared {
 pub(crate) struct EventProxy(Arc<Shared>);
 
 impl EventProxy {
-    pub fn set_notifier(&self, notifier: EventLoopSender) {
-        assert!(self.0.notifier.set(notifier).is_ok());
+    pub fn set_control(&self, control: Arc<IoControl>) {
+        let _ = self.0.control.set(control);
+    }
+    pub fn state(&self) -> SessionState {
+        self.0.state.lock().clone()
+    }
+    pub fn set_state(&self, state: SessionState) {
+        let mut current = self.0.state.lock();
+        if *current != SessionState::Running {
+            return;
+        }
+        *current = state;
+        drop(current);
+        self.queue_effect(|pending| pending.exited = true);
+        self.mark_dirty();
+    }
+    pub fn reject_input(&self, rejected: bool) {
+        self.0.input_rejected.store(rejected, Ordering::Release);
+        self.mark_dirty();
+    }
+    pub fn input_rejected(&self) -> bool {
+        self.0.input_rejected.load(Ordering::Acquire)
     }
     pub fn is_dirty(&self) -> bool {
         self.0.dirty.load(Ordering::Acquire) || self.0.effects_dirty.load(Ordering::Acquire)
@@ -56,6 +100,10 @@ impl EventProxy {
         self.0.dirty.store(true, Ordering::Release);
     }
     pub fn record_error(&self, error: String) {
+        self.set_state(SessionState::Error(error.clone()));
+        if let Some(control) = self.0.control.get() {
+            control.stop();
+        }
         self.queue_effect(|pending| pending.error = Some(error));
         self.mark_dirty();
     }
@@ -77,9 +125,12 @@ impl EventListener for EventProxy {
         // bypass UI delivery entirely, so hiding/pausing the view cannot lose them.
         match event {
             Event::PtyWrite(text) => {
-                if let Some(notifier) = self.0.notifier.get() {
-                    if let Err(error) = notifier.send(Msg::Input(text.into_bytes().into())) {
-                        self.record_error(format!("terminal reply write: {error}"));
+                if let Some(control) = self.0.control.get() {
+                    if !control.input(text.into_bytes().into(), true)
+                        && !control.is_closed()
+                        && self.state() == SessionState::Running
+                    {
+                        self.record_error("terminal reply queue exhausted".into());
                     }
                 } else {
                     self.record_error("terminal reply before PTY initialization".into());
@@ -91,7 +142,8 @@ impl EventListener for EventProxy {
             Event::ClipboardStore(_, text) => {
                 self.queue_effect(|pending| pending.clipboard_store = Some(text))
             }
-            Event::Exit | Event::ChildExit(_) => self.queue_effect(|pending| pending.exited = true),
+            Event::ChildExit(code) => self.set_state(SessionState::Exited(Some(code))),
+            Event::Exit => self.set_state(SessionState::Exited(None)),
             Event::Wakeup => self.0.output_ready.store(true, Ordering::Release),
             // Config keeps Alacritty's copy-only OSC52 policy. No clipboard reads.
             Event::ClipboardLoad(..) => {}
