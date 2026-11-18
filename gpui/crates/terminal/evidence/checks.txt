@@ -1,0 +1,26 @@
+TRU-278 final verification — 2026-11-18, arm64 macOS
+Worktree base: 71ca620f45c88351a42d29259f94838f2ccb0778
+Environment for all Cargo commands:
+  CARGO_HOME=/private/tmp/gpui-mockup-cargo
+  CARGO_TARGET_DIR=/private/tmp/gt-target-tru278
+Toolchain: installed rustup stable through scripts/cargo.sh
+nice -n 10: attempted; sandbox denied setpriority; omitted afterward.
+
+Exit 0: scripts/cargo.sh build --manifest-path gpui/Cargo.toml --locked -j 4
+Exit 0: scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --locked -j 4 -- -D warnings
+Exit 0: scripts/cargo.sh fmt --manifest-path gpui/Cargo.toml --all -- --check
+Exit 0: scripts/cargo.sh test --manifest-path gpui/Cargo.toml --locked -j 4 -- --nocapture --test-threads=1
+        50 passed, 0 failed, 0 ignored; app has 0 tests; 0 doc tests.
+Exit 0: scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --tests --locked -j 4 -- -D warnings
+Exit 0: scripts/check-gpui-deps.sh
+Exit 0: git diff --exit-code 71ca620f45c88351a42d29259f94838f2ccb0778 -- Cargo.lock
+Exit 0: git diff --check
+
+Source/behaviour self-review completed before commit. Changes restricted to gpui/.
+Root Iced commands and the Iced pre-commit hook were excluded by explicit task scope;
+equivalent GPUI checks above were run before a command-local hook bypass.
+No visible app/window, OS input injection, real clipboard, running GitTerm interaction,
+push, PR, other agent or consultation. Owned test PTYs only.
+
+Initial compile/API adaptations, title-reset probe filtering and lint/format findings
+were resolved before these final runs; no failing or skipped gate is counted as passing.

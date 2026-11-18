@@ -4,8 +4,9 @@ This macOS-only app opens a 1440×900 window titled
 “GitTerm · GPUI shell · Sample data”. The default dispatch opens the stage 2
 shell in `crates/shell`: workspace/repository sidebar, session tabs, and a
 gpui-component `DockArea`. Terminal and chat panes are placeholders; Git status
-and the expandable file tree use sample data. It never reads GitTerm settings
+and the expandable file tree use sample data. By default it never reads GitTerm settings
 or starts terminals or services.
+`--terminal` opens the TRU-278 terminal route prototype instead (see below).
 The repository root is the Iced workspace. `gpui/` is a separate workspace
 with package `gitterm-gpui`, its own `Cargo.toml` and `Cargo.lock`, and is
 explicitly excluded from the root workspace. Root Cargo commands (including
@@ -176,3 +177,15 @@ Excalidraw, with 14 existing ignored tests in each run. Builds used `-j 4`
 and separate temporary target directories. The environment denied `nice`,
 so it was omitted. Neither app was launched; no CI run or visual check is
 claimed. See the TRU-275 task handoff for commands and complete exit codes.
+
+## Terminal route prototype (TRU-278)
+
+`gitterm-gpui --terminal` opens a real `$SHELL` PTY in the new
+[`gitterm-terminal`](crates/terminal/README.md) workspace member. It reuses the
+committed iced_term fork backend without Iced, and adapts gpui_xterm's render
+path to bounded snapshots. See [ROUTE.md](crates/terminal/ROUTE.md) for the
+Route A recommendation, automated gates and remaining stage-3 work.
+
+Build/test/lint from this workspace now include that member by default; use
+`fmt --manifest-path gpui/Cargo.toml --all -- --check` to include its sources.
+All terminal fixtures use owned PTYs and GPUI's headless test platform.
