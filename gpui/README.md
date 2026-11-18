@@ -189,3 +189,11 @@ Route A recommendation, automated gates and remaining stage-3 work.
 Build/test/lint from this workspace now include that member by default; use
 `fmt --manifest-path gpui/Cargo.toml --all -- --check` to include its sources.
 All terminal fixtures use owned PTYs and GPUI's headless test platform.
+
+## Native chat fixture viewer (TRU-281)
+
+`gitterm-gpui --chat <fixture.jsonl>` opens the display-only native chat viewer
+in the `gitterm-gpui-chat` workspace member. See
+[`crates/chat/README.md`](crates/chat/README.md) for synthetic fixtures, the
+harness event boundary, behavior parity, headless interaction tests and the
+5,000-row performance budget. The root Iced dependency graph is unchanged.
