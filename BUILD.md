@@ -1,5 +1,15 @@
 # Building GitTerm
 
+The Iced app builds with any current stable Rust. The GPUI app (`gpui/`) needs
+**rustup stable, Rust 1.99 or newer**, declared in its `rust-version`.
+`rust-toolchain.toml` selects stable for rustup proxies. If Homebrew's Cargo comes first on PATH, invoke `scripts/cargo.sh`
+instead of plain `cargo`; it calls rustup by absolute path and does not install
+or update a toolchain. Bundle scripts and macOS CI use this selection too.
+
+The root workspace contains only the Iced app, including on Windows. The macOS
+GPUI app has a separate workspace, lockfile, executable and app bundle under
+`gpui/`; see [`gpui/README.md`](gpui/README.md).
+
 ## First-Time Setup (Any Platform)
 
 After cloning, activate the local git hooks once so commits run the same

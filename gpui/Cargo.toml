@@ -1,0 +1,30 @@
+[package]
+name = "gitterm-gpui"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+description = "GitTerm GPUI stage 0 build and packaging gate"
+
+[workspace]
+resolver = "3"
+members = ["crates/terminal"]
+default-members = [".", "crates/terminal"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui-component = { version = "=0.9.1", features = ["syntect"] }
+gpui-webview = "=0.9.1"
+gpui_xterm = "=0.3.0"
+gpui-kit = "=0.9.1"
+gpui-pre = "=0.3.12"
+
+gitterm-terminal = { path = "crates/terminal" }
+
+[profile.dev]
+debug = 0
+
+[profile.dev.package.alacritty_terminal]
+opt-level = 3
+
+[profile.dev.package.vte]
+opt-level = 3

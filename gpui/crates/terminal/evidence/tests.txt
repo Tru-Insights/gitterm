@@ -1,0 +1,73 @@
+   Compiling gitterm-terminal v0.0.0 (/Users/t.trewin/.config/gitterm-v6/worktrees/gitterm-v2/TRU-278-tru-278-gpui-terminal-route-fork-backend-gpui-re/gpui/crates/terminal)
+   Compiling gitterm-gpui v0.0.0 (/Users/t.trewin/.config/gitterm-v6/worktrees/gitterm-v2/TRU-278-tru-278-gpui-terminal-route-fork-backend-gpui-re/gpui)
+    Finished `test` profile [unoptimized] target(s) in 2.03s
+     Running unittests src/main.rs (/private/tmp/gt-target-tru278/debug/deps/gitterm_gpui-7c15701a90255339)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/private/tmp/gt-target-tru278/debug/deps/gitterm_terminal-f1ec39dfc6dd8625)
+
+running 50 tests
+test backend::gate::cpr_and_da_reach_waiting_child_without_foreground_pumping ... ok
+test backend::gate::deferred_selection_and_resize_survive_parser_lock_contention ... ok
+test backend::gate::first_retained_cell_extraction_and_unicode_regression ... ok
+test backend::gate::history_100k_literal_search_scroll_and_contention_are_explicit ... ok
+test backend::tests::terminal_size_tracks_only_effective_geometry_changes ... ok
+test backend::tests::text_for_range_includes_each_cell_once ... ok
+test backend::tests::viewport_snapshot_normalizes_wide_character_spacer_cursor ... ok
+test backend::tests::viewport_snapshot_reuses_capacity_at_the_same_size ... ok
+test backend::tests::viewport_snapshot_size_is_independent_of_history ... ok
+test backend::tests::viewport_snapshot_uses_vi_mode_cursor ... ok
+test colors::tests::test_color_palette_default ... ok
+test colors::tests::test_resolve_indexed_color ... ok
+test colors::tests::test_resolve_named_color ... ok
+test colors::tests::test_resolve_spec_color ... ok
+test colors::tests::test_rgb_to_hsla_black ... ok
+test colors::tests::test_rgb_to_hsla_red ... ok
+test colors::tests::test_rgb_to_hsla_white ... ok
+test events::tests::ui_effects_coalesce_and_survive_snapshot_dirty_reset ... ok
+test glyphs::tests::banner_glyphs_are_geometric_but_text_keeps_font_rendering ... ok
+test glyphs::tests::double_box_junctions_keep_their_rails_connected_and_separate ... ok
+test glyphs::tests::double_corner_rails_join_the_horizontal_and_vertical_edges ... ok
+test glyphs::tests::full_blocks_share_edges_at_fractional_scales ... ok
+test glyphs::tests::upper_and_lower_blocks_fill_the_cell_without_a_gap ... ok
+test input::tests::test_alt_combinations ... ok
+test input::tests::test_arrow_keys_app_cursor_mode ... ok
+test input::tests::test_arrow_keys_normal_mode ... ok
+test input::tests::test_backspace_key ... ok
+test input::tests::test_ctrl_combinations ... ok
+test input::tests::test_enter_key ... ok
+test input::tests::test_escape_key ... ok
+test input::tests::test_function_keys ... ok
+test input::tests::test_navigation_keys ... ok
+test input::tests::test_regular_characters ... ok
+test input::tests::test_shift_tab ... ok
+test input::tests::test_space_key ... ok
+test input::tests::test_tab_key ... ok
+test render::tests::cell_metrics_can_shrink_after_font_and_line_height_changes ... ok
+test render::tests::layout_row_keeps_same_style_text_in_one_run ... ok
+test render::tests::selection_segments_cover_spaces_contiguously ... ok
+test render::tests::test_background_rect_merge ... ok
+test render::tests::test_merge_backgrounds ... ok
+test render::tests::test_renderer_creation ... ok
+test view::gate::actual_view_sgr_press_release_wheel_reach_child ... PASS actual view mouse handlers: exact SGR press/release/wheel
+ok
+test view::gate::drag_shift_copy_and_native_copy_survive_parser_contention ... ok
+test view::gate::headless_paint_selection_preedit_and_resize_use_bounded_snapshot ... ok
+test view::gate::hidden_view_200mb_no_render_no_foreground_drain_bounds_memory_and_verifies_all_bytes ... PASS hidden TerminalView: bytes=200000034 mismatches=0 history=100000 snapshot=4000 wall_s=9.118 rss_start_kib=249760 warm_rss_kib=Some(249936) max_after_warm_kib=249936
+ok
+test view::gate::ime_preedit_utf16_commit_selection_and_unicode_snapshots ... ok
+test view::gate::multiline_clipboard_paste_waits_for_enter_in_real_zsh ... PASS real zsh: multiline clipboard paste executes only after Enter
+ok
+test view::gate::real_pty_resize_reaches_child_and_grid ... ok
+test view::tests::test_terminal_config_default_uses_compact_line_height ... ok
+
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.74s
+
+   Doc-tests gitterm_terminal
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
