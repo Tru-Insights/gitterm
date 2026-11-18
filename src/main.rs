@@ -4765,6 +4765,15 @@ fn backend_accepts_initial_prompt(backend: Option<HarnessConversationBackend>) -
     )
 }
 
+fn command_accepts_initial_prompt(
+    command: &str,
+    backend: Option<HarnessConversationBackend>,
+) -> bool {
+    backend_accepts_initial_prompt(backend)
+        || gitterm::workers::provider_for_command(command)
+            == gitterm::workers::WorkerProvider::Antigravity
+}
+
 /// Writes the composed brief for one task session and returns its path, or a
 /// launch-safe error. Refuses paths containing a single quote — the path is
 /// embedded single-quoted in the launch command. `report_back` as in
@@ -4795,10 +4804,17 @@ fn write_task_brief(
     Ok(path)
 }
 
-/// Appends the brief file as the harness's positional initial prompt. The
+/// Appends the brief file as the harness's initial prompt. The
 /// brief content stays in the file; only its quote-checked path is embedded.
 fn command_with_initial_prompt(command: &str, brief_path: &Path) -> String {
-    format!("{command} \"$(cat '{}')\"", brief_path.display())
+    let flag = if gitterm::workers::provider_for_command(command)
+        == gitterm::workers::WorkerProvider::Antigravity
+    {
+        " --prompt-interactive"
+    } else {
+        ""
+    };
+    format!("{command}{flag} \"$(cat '{}')\"", brief_path.display())
 }
 
 #[derive(Debug, Clone)]
@@ -5010,6 +5026,68 @@ struct QueuedTaskLaunch {
     preset_idx: Option<usize>,
     origin: TaskLaunchOrigin,
     user_model_choice: bool,
+}
+
+fn restored_task_preset_index(
+    harness: Option<&HarnessSelection>,
+    presets: &[AgentPreset],
+) -> Result<usize, String> {
+    let Some(HarnessSelection {
+        kind: HarnessKind::TerminalPreset { preset_name },
+        ..
+    }) = harness
+    else {
+        return Err(
+            "Queued task has no supported terminal preset; select an agent to restart it".into(),
+        );
+    };
+    presets
+        .iter()
+        .position(|preset| &preset.name == preset_name)
+        .ok_or_else(|| format!("Queued task agent preset {preset_name:?} is unavailable; select an agent to restart it"))
+}
+
+fn restore_task_launch_queue(
+    store: &mut TaskStore,
+    presets: &[AgentPreset],
+) -> Result<Vec<QueuedTaskLaunch>, TaskStoreError> {
+    // A customized Gemini preset may have survived the exact-command migration.
+    if !presets.iter().any(|preset| preset.name == "Gemini") {
+        store.migrate_queued_gemini_presets()?;
+    }
+    let mut queued: Vec<_> = store
+        .tasks()
+        .iter()
+        .filter(|task| task.lifecycle == TaskLifecycle::Queued)
+        .map(|task| {
+            (
+                task.task_id.clone(),
+                task.updated_at.clone(),
+                task.harness.clone(),
+            )
+        })
+        .collect();
+    queued.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut launches = Vec::new();
+    for (task_id, _, harness) in queued {
+        match restored_task_preset_index(harness.as_ref(), presets) {
+            Ok(index) => launches.push(QueuedTaskLaunch {
+                task_id,
+                preset_idx: Some(index),
+                origin: TaskLaunchOrigin::Agent,
+                user_model_choice: false,
+            }),
+            Err(error) => {
+                store.record_lifecycle_signal(
+                    &task_id,
+                    TaskLifecycle::Failed,
+                    Some(error),
+                    &chrono::Utc::now().to_rfc3339(),
+                )?;
+            }
+        }
+    }
+    Ok(launches)
 }
 
 fn update_queued_task_request(
@@ -13667,6 +13745,7 @@ impl App {
                         }
                     }
                     self.record_task_ui_error(&entry.task_id, error);
+                    self.push_worker_cards(&entry.task_id);
                 }
             }
         }
@@ -13732,6 +13811,7 @@ impl App {
             let Some(preset) = self.agent_presets.get(index) else {
                 return Err("The selected agent preset is unavailable".to_string());
             };
+            gitterm::workers::require_task_tools(&preset.command)?;
             (
                 Some(preset.command.clone()),
                 preset.name.clone(),
@@ -13874,7 +13954,7 @@ impl App {
         // re-submit the objective into a fresh conversation.
         let pre_injection_command = command.clone();
         let (command, objective_delivery) = match command {
-            Some(launch) if backend_accepts_initial_prompt(conversation_backend) => {
+            Some(launch) if command_accepts_initial_prompt(&launch, conversation_backend) => {
                 match write_task_brief(
                     &session_id,
                     &task,
@@ -20495,7 +20575,7 @@ impl App {
         } = Config::load();
         let task_commands = init_task_control_channel();
         let task_store_path = TaskStore::path_for_config_root(&config::global_config_dir());
-        let (mut task_store, task_store_error) = match load_task_store_for_startup(
+        let (mut task_store, mut task_store_error) = match load_task_store_for_startup(
             task_store_path,
             &chrono::Utc::now().to_rfc3339(),
         ) {
@@ -20597,48 +20677,19 @@ impl App {
                 }
             }
         }
-        // Tasks left Queued by a previous run rejoin the launch queue in
-        // dispatch order; the preset comes from the recorded harness, falling
-        // back to the first configured preset.
-        let task_launch_queue = task_store
-            .as_ref()
-            .map(|store| {
-                let mut queued: Vec<_> = store
-                    .tasks()
-                    .iter()
-                    .filter(|task| task.lifecycle == TaskLifecycle::Queued)
-                    .collect();
-                queued.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
-                queued
-                    .into_iter()
-                    .map(|task| {
-                        let preset_idx = task
-                            .harness
-                            .as_ref()
-                            .and_then(|harness| match &harness.kind {
-                                HarnessKind::TerminalPreset { preset_name } => config
-                                    .agent_presets
-                                    .iter()
-                                    .position(|preset| &preset.name == preset_name),
-                                HarnessKind::NativeClaude | HarnessKind::NativePi => None,
-                            })
-                            .or(if config.agent_presets.is_empty() {
-                                None
-                            } else {
-                                Some(0)
-                            });
-                        QueuedTaskLaunch {
-                            task_id: task.task_id.clone(),
-                            preset_idx,
-                            // Restored launches are automatic; a new UI choice can
-                            // override policy again after restart.
-                            origin: TaskLaunchOrigin::Agent,
-                            user_model_choice: false,
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Restore only the recorded provider; unresolved requests become visible failures.
+        let task_launch_queue = match task_store.as_mut() {
+            Some(store) => match restore_task_launch_queue(store, &config.agent_presets) {
+                Ok(queue) => queue,
+                Err(error) => {
+                    let message = format!("Could not restore queued tasks: {error}");
+                    eprintln!("GitTerm V6 {message}");
+                    task_store_error = Some(message);
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
         let (browser_mcp, browser_mcp_server, browser_error) =
             match browser_mcp::prepare(config::global_config_dir(), config::instance_id()) {
                 Ok((connection, server)) => {
@@ -49983,6 +50034,79 @@ mod tests {
     }
 
     #[test]
+    fn queued_restore_refuses_unresolved_presets_instead_of_switching_provider() {
+        let configured = Config::default().agent_presets;
+        for presets in [configured, Vec::new()] {
+            for kind in [
+                None,
+                Some(HarnessKind::NativeClaude),
+                Some(HarnessKind::NativePi),
+                Some(HarnessKind::TerminalPreset {
+                    preset_name: "Removed".into(),
+                }),
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let mut store = TaskStore::load(temp.path().join("tasks.json")).unwrap();
+                let mut task = slot_task(ExecutorTarget::Local, TaskLifecycle::Ready);
+                task.harness = kind.map(|kind| HarnessSelection { kind, model: None });
+                store.insert(task).unwrap();
+                store
+                    .record_lifecycle_signal("task-slot", TaskLifecycle::Queued, None, "t1")
+                    .unwrap();
+                assert!(restore_task_launch_queue(&mut store, &presets)
+                    .unwrap()
+                    .is_empty());
+                let failed = store.get("task-slot").unwrap();
+                assert_eq!(failed.lifecycle, TaskLifecycle::Failed);
+                assert_eq!(
+                    failed.attempts.last().unwrap().state,
+                    gitterm::tasks::AttemptState::Failed
+                );
+                assert!(failed.last_error.as_ref().unwrap().contains("preset"));
+                assert!(failed.attention.unread);
+            }
+        }
+    }
+
+    #[test]
+    fn queued_restore_migrates_retired_gemini_but_keeps_a_custom_gemini_preset() {
+        for custom in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut store = TaskStore::load(temp.path().join("tasks.json")).unwrap();
+            let mut task = slot_task(ExecutorTarget::Local, TaskLifecycle::Ready);
+            task.harness = Some(HarnessSelection {
+                kind: HarnessKind::TerminalPreset {
+                    preset_name: "Gemini".into(),
+                },
+                model: None,
+            });
+            store.insert(task).unwrap();
+            store
+                .record_lifecycle_signal("task-slot", TaskLifecycle::Queued, None, "t1")
+                .unwrap();
+            let mut presets = Config::default().agent_presets;
+            if custom {
+                let mut preset = presets[0].clone();
+                preset.name = "Gemini".into();
+                preset.command = "gemini --model custom".into();
+                presets.push(preset);
+            }
+            let queue = restore_task_launch_queue(&mut store, &presets).unwrap();
+            assert_eq!(queue.len(), 1);
+            let selected = &presets[queue[0].preset_idx.unwrap()];
+            assert_eq!(selected.name, if custom { "Gemini" } else { "Antigravity" });
+            assert_eq!(
+                selected.command,
+                if custom {
+                    "gemini --model custom"
+                } else {
+                    "agy"
+                }
+            );
+        }
+    }
+
+    #[test]
     fn task_launch_honors_manual_preset_choices_under_hold() {
         use gitterm::plan_limits::{self, LimitWindow, PlanLimits, PlanLimitsFile, Provider};
         let now = 1_800_000_000;
@@ -51132,6 +51256,39 @@ mod tests {
             command,
             "claude --session-id abc \"$(cat '/cfg/task-briefs/abc.md')\""
         );
+    }
+
+    #[test]
+    fn antigravity_receives_an_interactive_initial_brief_without_a_conversation_backend() {
+        let command = "/opt/bin/agy --model gemini-3.8-flash-low";
+        assert!(command_accepts_initial_prompt(command, None));
+        assert_eq!(
+            command_with_initial_prompt(command, Path::new("/cfg/task briefs/abc.md")),
+            "/opt/bin/agy --model gemini-3.8-flash-low --prompt-interactive \"$(cat '/cfg/task briefs/abc.md')\""
+        );
+        assert!(!command_accepts_initial_prompt("zsh", None));
+        #[cfg(unix)]
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let brief_path = temp.path().join("brief.md");
+            let brief =
+                "Keep 'quotes', \"quotes\", $variables, `commands`, and newlines\n".repeat(1000);
+            std::fs::write(&brief_path, &brief).unwrap();
+            let launch = command_with_initial_prompt("agy", &brief_path);
+            let output = std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &format!("agy() {{ printf '%s\\n' \"$1\"; printf '%s' \"$2\"; }}; {launch}"),
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            // Shell substitution removes trailing newlines, as for Claude/Codex.
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!("--prompt-interactive\n{}", brief.trim_end_matches('\n'))
+            );
+        }
     }
 
     /// Claude in Chrome is off unless the workspace switches it on

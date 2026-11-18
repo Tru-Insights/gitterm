@@ -86,6 +86,16 @@ pub fn provider_for_command(command: &str) -> WorkerProvider {
     }
 }
 
+/// agy 1.5.11 accepts session settings, but MCP servers live in a separate,
+/// persistent config. Refuse task launches until it supports per-process MCP
+/// without putting GitTerm's bearer token on argv or in saved settings.
+pub fn require_task_tools(command: &str) -> Result<(), String> {
+    if provider_for_command(command) == WorkerProvider::Antigravity {
+        return Err("Antigravity workers can't reach GitTerm's task tools yet".to_string());
+    }
+    Ok(())
+}
+
 /// One provider's model per role. A missing role means the CLI's own
 /// default model. `coordinator` is recorded for reference only: GitTerm
 /// never launches the coordinator.
@@ -276,6 +286,7 @@ pub fn resolve_worker(
         })?,
     };
     let preset = presets[preset_index];
+    require_task_tools(preset.command)?;
     let provider = provider_for_command(preset.command);
     let role = role.unwrap_or_default();
     let requested = model.map(str::trim).filter(|model| !model.is_empty());
@@ -578,12 +589,10 @@ mod tests {
         assert!(with_launch_options("codex", Some(ReasoningEffort::Max), &[]).is_err());
         let policy: ModelPolicy = serde_json::from_str("{}").unwrap();
         assert_eq!(policy.antigravity, antigravity_seed());
-        let choices = [PresetRef {
-            name: "Antigravity",
-            command: "agy",
-        }];
-        let choice = resolve_worker(&choices, Some("Antigravity"), None, None, &policy).unwrap();
-        assert_eq!(choice.model.as_deref(), Some("gemini-4-hydrogen-high"));
+        assert_eq!(
+            policy.model_for(WorkerProvider::Antigravity, WorkerRole::Scoped),
+            Some("gemini-4-hydrogen-high")
+        );
         assert_eq!(
             policy.antigravity.coordinator.as_deref(),
             Some("gemini-4-argon-high")
@@ -596,6 +605,30 @@ mod tests {
             policy.antigravity.specialist.as_deref(),
             Some("gemini-4-argon-high")
         );
+    }
+
+    #[test]
+    fn antigravity_workers_refuse_to_launch_without_process_scoped_task_tools() {
+        for command in ["agy", "/opt/bin/agy --model gemini-4-argon-high"] {
+            let choices = [PresetRef {
+                name: "Antigravity",
+                command,
+            }];
+            assert_eq!(
+                resolve_worker(
+                    &choices,
+                    Some("Antigravity"),
+                    None,
+                    None,
+                    &ModelPolicy::default()
+                )
+                .unwrap_err(),
+                "Antigravity workers can't reach GitTerm's task tools yet"
+            );
+            assert!(require_task_tools(command).is_err());
+        }
+        assert!(require_task_tools("claude").is_ok());
+        assert!(require_task_tools("codex").is_ok());
     }
 
     #[test]

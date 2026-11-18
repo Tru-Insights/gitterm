@@ -1152,6 +1152,55 @@ impl TaskStore {
             .find(|task| task.task_id == task_id)
     }
 
+    /// Called after preset migration, when no configured Gemini preset remains.
+    /// Historical executions and conversations keep their original provider.
+    pub fn migrate_queued_gemini_presets(&mut self) -> Result<(), TaskStoreError> {
+        let mut candidate = self.document.clone();
+        let mut migrated = HashSet::new();
+        let migrate = |harness: &mut Option<HarnessSelection>| {
+            if let Some(HarnessSelection {
+                kind: HarnessKind::TerminalPreset { preset_name },
+                ..
+            }) = harness
+            {
+                if preset_name == "Gemini" {
+                    *preset_name = "Antigravity".into();
+                    return true;
+                }
+            }
+            false
+        };
+        for task in &mut candidate.tasks {
+            if task.lifecycle == TaskLifecycle::Queued && migrate(&mut task.harness) {
+                migrated.insert(task.task_id.clone());
+                for attempt in &mut task.attempts {
+                    if attempt.state == AttemptState::Queued {
+                        migrate(&mut attempt.harness);
+                    }
+                }
+            }
+        }
+        if migrated.is_empty() {
+            return Ok(());
+        }
+        for delegation in &mut candidate.delegations {
+            if delegation.status.accepts_completion() {
+                if let DelegationChild::TaskSession {
+                    task_id,
+                    task_session_id: None,
+                    preset_name: Some(name),
+                    ..
+                } = &mut delegation.child
+                {
+                    if migrated.contains(task_id) && name == "Gemini" {
+                        *name = "Antigravity".into();
+                    }
+                }
+            }
+        }
+        self.commit_candidate(candidate)
+    }
+
     pub fn insert(&mut self, task: TaskRecord) -> Result<(), TaskStoreError> {
         if self.get(&task.task_id).is_some() {
             return Err(TaskStoreError::new(
@@ -1683,6 +1732,25 @@ impl TaskStore {
             }
         }
         task.updated_at = timestamp.to_string();
+        if current == TaskLifecycle::Queued && target == TaskLifecycle::Failed {
+            let message = task
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "Queued worker could not start".into());
+            for delegation in &mut candidate.delegations {
+                if delegation.status.accepts_completion()
+                    && matches!(&delegation.child, DelegationChild::TaskSession {
+                        task_id: child, ..
+                    } if child == task_id)
+                {
+                    delegation.status = DelegationStatus::Failed {
+                        message: message.clone(),
+                    };
+                    delegation.updated_at = timestamp.to_string();
+                    delegation.record_worker_failure(timestamp);
+                }
+            }
+        }
         self.commit_candidate(candidate)?;
         Ok(true)
     }
@@ -4314,6 +4382,86 @@ mod tests {
                 .last()
                 .and_then(|attempt| attempt.harness.as_ref()),
             Some(&requested)
+        );
+    }
+
+    #[test]
+    fn startup_migrates_queued_gemini_references_and_preserves_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        let mut task = sample_task("queued");
+        task.harness = Some(HarnessSelection {
+            kind: HarnessKind::TerminalPreset {
+                preset_name: "Gemini".into(),
+            },
+            model: None,
+        });
+        store.insert(task.clone()).unwrap();
+        task.task_id = "history".into();
+        store.insert(task.clone()).unwrap();
+        make_ready(&mut store, "queued");
+        store
+            .record_lifecycle_signal("queued", TaskLifecycle::Queued, None, "t1")
+            .unwrap();
+        let mut worker = sample_delegation("worker", "parent", "t1");
+        worker.kind = DelegationKind::Implement;
+        worker.target = None;
+        worker.child = DelegationChild::TaskSession {
+            task_id: "queued".into(),
+            task_session_id: None,
+            conversation: None,
+            preset_name: Some("Gemini".into()),
+            model: None,
+            role: None,
+        };
+        store.insert_delegation(worker).unwrap();
+
+        let mut store = TaskStore::load(&path).unwrap();
+        store.migrate_queued_gemini_presets().unwrap();
+        let reloaded = TaskStore::load(&path).unwrap();
+        let queued = reloaded.get("queued").unwrap();
+        let expected = Some(HarnessSelection {
+            kind: HarnessKind::TerminalPreset {
+                preset_name: "Antigravity".into(),
+            },
+            model: None,
+        });
+        assert_eq!(queued.harness, expected);
+        assert_eq!(queued.attempts.last().unwrap().harness, expected);
+        assert_eq!(reloaded.get("history").unwrap(), &task);
+        assert!(matches!(
+            &reloaded.delegation("worker").unwrap().child,
+            DelegationChild::TaskSession { preset_name: Some(name), .. } if name == "Antigravity"
+        ));
+        let before = std::fs::read(&path).unwrap();
+        store.migrate_queued_gemini_presets().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let error = "Antigravity workers can't reach GitTerm's task tools yet";
+        store
+            .record_lifecycle_signal("queued", TaskLifecycle::Failed, Some(error.into()), "t4")
+            .unwrap();
+        let store = TaskStore::load(&path).unwrap();
+        let task = store.get("queued").unwrap();
+        assert_eq!(task.lifecycle, TaskLifecycle::Failed);
+        assert_eq!(task.last_error.as_deref(), Some(error));
+        assert_eq!(task.attempts.last().unwrap().state, AttemptState::Failed);
+        let worker = store.delegation("worker").unwrap();
+        assert_eq!(
+            worker.status,
+            DelegationStatus::Failed {
+                message: error.into()
+            }
+        );
+        assert!(store.open_worker_delegations("queued").is_empty());
+        assert_eq!(
+            crate::delegations::worker_session_state(
+                &worker.status,
+                Some(task.lifecycle),
+                crate::delegations::WorkerTab::Closed,
+            ),
+            "failed"
         );
     }
 
