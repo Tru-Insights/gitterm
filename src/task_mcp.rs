@@ -730,7 +730,7 @@ pub fn missing_caller_error(tool: &str) -> String {
 #[tool_router]
 impl TaskMcpTools {
     #[tool(
-        description = "Read subscription windows, usage pace, warnings and shared routing. Check before starting workers or reviewers; follow routing and relay its reason and warnings to the user. Stale or missing readings are not spare capacity.",
+        description = "Read subscription windows, usage pace, warnings and shared routing. Check before starting workers or reviewers; follow routing and relay its reason and warnings to the user. Stale or missing readings are not spare capacity, except an old weekly reading before its reset: it counts at its estimate (estimated, estimated_percent).",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
