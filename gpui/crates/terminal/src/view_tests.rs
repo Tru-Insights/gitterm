@@ -1,0 +1,475 @@
+use super::{LayoutMetrics, TerminalConfig, TerminalView, should_defer_text_input_to_ime};
+use crate::Backend;
+use crate::{
+    BackendSettings,
+    test_support::{self, python, query_script, wait},
+};
+use ::gpui::TestAppContext;
+use alacritty_terminal::term::TermMode;
+use alacritty_terminal::{
+    grid::Dimensions,
+    index::{Column, Line, Point as Cell},
+    tty,
+};
+use gpui_kit::{
+    AppContext, EntityInputHandler, KeyDownEvent, Keystroke, MouseDownEvent, MouseUpEvent,
+    ScrollDelta, ScrollEvent, point, px,
+};
+use std::time::Instant;
+use std::{sync::Arc, time::Duration};
+
+#[::gpui::test]
+fn multiline_clipboard_paste_waits_for_enter_in_real_zsh(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
+    let mut settings = BackendSettings {
+        program: "/bin/zsh".into(),
+        args: vec!["-d".into(), "-f".into(), "-i".into()],
+        ..Default::default()
+    };
+    settings.env.insert("PROMPT".into(), "GATE> ".into());
+    let backend = Backend::new(settings).unwrap();
+    let entity = cx.new(|cx| TerminalView::new(backend, TerminalConfig::default(), cx));
+    wait(|| {
+        entity.update(cx, |view, _| {
+            view.backend.sync() && view.backend.mode().contains(TermMode::BRACKETED_PASTE)
+        })
+    });
+    entity.update(cx, |view, _| {
+        crate::clipboard::Clipboard::new()
+            .unwrap()
+            .set_text("printf 'EXEC_%s\\n' ONE\nprintf 'EXEC_%s\\n' TWO\n".into())
+            .unwrap();
+        assert!(view.paste_from_clipboard());
+    });
+    std::thread::sleep(Duration::from_millis(700));
+    entity.update(cx, |view, _| {
+        let text = view.backend.get_all_text().expect("zsh idle lock");
+        assert!(
+            !text.contains("EXEC_ONE") && !text.contains("EXEC_TWO"),
+            "paste executed before Enter: {text:?}"
+        );
+        assert!(view.write_input_bytes(b"\r"));
+    });
+    wait(|| {
+        entity.read_with(cx, |view, _| {
+            view.backend
+                .get_all_text()
+                .is_some_and(|text| text.contains("EXEC_ONE") && text.contains("EXEC_TWO"))
+        })
+    });
+    println!("PASS real zsh: multiline clipboard paste executes only after Enter");
+}
+
+#[::gpui::test]
+fn actual_view_sgr_press_release_wheel_reach_child(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
+    let backend = python(query_script(
+        b"\x1b[?1049h\x1b[?1000h\x1b[?1006h",
+        b"\x1b[<0;2;2M\x1b[<0;2;2m\x1b[<64;2;2M",
+    ));
+    let entity = cx.new(|cx| TerminalView::new(backend, TerminalConfig::default(), cx));
+    wait(|| {
+        entity.update(cx, |view, _| {
+            view.backend.sync()
+                && view.backend.mode().contains(
+                    TermMode::ALT_SCREEN | TermMode::SGR_MOUSE | TermMode::MOUSE_REPORT_CLICK,
+                )
+        })
+    });
+    entity.update(cx, |view, _| {
+        *view.layout_metrics.lock() = LayoutMetrics {
+            origin: point(px(0.), px(0.)),
+            cell_width: px(10.),
+            cell_height: px(20.),
+            cols: 80,
+            rows: 24,
+        };
+        let position = point(px(15.), px(25.));
+        view.mouse_down(&MouseDownEvent {
+            position,
+            click_count: 1,
+            ..Default::default()
+        });
+        view.mouse_up(&MouseUpEvent {
+            position,
+            ..Default::default()
+        });
+        view.scroll(&ScrollEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0., 1.)),
+            ..Default::default()
+        });
+        assert!(view.backend.term.lock_unfair().selection.is_none());
+    });
+    let mut result = None;
+    wait(|| {
+        entity.read_with(cx, |view, _| {
+            let title = view.backend.take_events().title;
+            result = title
+                .filter(|title| title == "OK" || title.starts_with("FAIL:"))
+                .or(result.take());
+            result.is_some()
+        })
+    });
+    assert_eq!(result.as_deref(), Some("OK"));
+    println!("PASS actual view mouse handlers: exact SGR press/release/wheel");
+}
+
+#[::gpui::test]
+fn ime_preedit_utf16_commit_selection_and_unicode_snapshots(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
+    let backend = python(query_script(b"\x1b]2;READY\x07", "界😀e\u{301}".as_bytes()));
+    let handle = cx.add_window(|_, cx| TerminalView::new(backend, TerminalConfig::default(), cx));
+    let mut ready = false;
+    wait(|| {
+        handle
+            .update(cx, |view, _, _| {
+                ready |= view.backend.take_events().title.as_deref() == Some("READY");
+                ready
+            })
+            .unwrap()
+    });
+    handle
+        .update(cx, |view, window, cx| {
+            let event = KeyDownEvent {
+                is_held: false,
+                prefer_character_input: false,
+                keystroke: Keystroke {
+                    key: "a".into(),
+                    key_char: Some("a".into()),
+                    ..Default::default()
+                },
+            };
+            assert!(should_defer_text_input_to_ime(&event));
+            view.replace_and_mark_text_in_range(None, "界😀", Some(1..3), window, cx);
+            assert_eq!(view.marked_text_range(window, cx), Some(1..3));
+            let mut adjusted = None;
+            assert_eq!(
+                view.text_for_range(0..3, &mut adjusted, window, cx)
+                    .as_deref(),
+                Some("界😀")
+            );
+            assert_eq!(adjusted, Some(1..3));
+            view.unmark_text(window, cx);
+            assert!(view.ime_text.is_empty());
+            view.replace_text_in_range(None, "界😀e\u{301}", window, cx);
+            assert!(view.marked_text_range(window, cx).is_none());
+        })
+        .unwrap();
+    let mut result = None;
+    wait(|| {
+        handle
+            .update(cx, |view, _, _| {
+                result = view.backend.take_events().title.or(result.take());
+                result.is_some()
+            })
+            .unwrap()
+    });
+    assert_eq!(result.as_deref(), Some("OK"));
+}
+
+#[::gpui::test]
+fn real_pty_resize_reaches_child_and_grid(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
+    let backend = python(
+        r#"import os,tty,time
+tty.setraw(0)
+os.write(1,b'\x1b]2;READY\x07')
+os.read(0,1)
+s=os.get_terminal_size(0)
+os.write(1,b'\x1b]2;' + ('SIZE:%d:%d' % (s.columns,s.lines)).encode() + b'\x07')
+"#
+        .into(),
+    );
+    let entity = cx.new(|cx| TerminalView::new(backend, TerminalConfig::default(), cx));
+    let mut ready = false;
+    wait(|| {
+        entity.read_with(cx, |view, _| {
+            ready |= view.backend.take_events().title.as_deref() == Some("READY");
+            ready
+        })
+    });
+    entity.update(cx, |view, _| {
+        view.resize(103, 31);
+        assert!(view.backend.sync());
+        view.write_input_bytes(b"!");
+    });
+    let mut result = None;
+    wait(|| {
+        entity.read_with(cx, |view, _| {
+            let title = view.backend.take_events().title;
+            result = title
+                .filter(|title| title.starts_with("SIZE:"))
+                .or(result.take());
+            result.is_some()
+        })
+    });
+    assert_eq!(result.as_deref(), Some("SIZE:103:31"));
+    entity.read_with(cx, |view, _| {
+        let term = view.backend.term.lock_unfair();
+        assert_eq!((term.columns(), term.screen_lines()), (103, 31));
+    });
+}
+
+#[::gpui::test]
+fn hidden_view_200mb_no_render_no_foreground_drain_bounds_memory_and_verifies_all_bytes(
+    cx: &mut TestAppContext,
+) {
+    use std::sync::atomic::Ordering;
+    use test_support::{Counts, ObservedPty, PATTERN, TAIL, TOTAL, hex, rss_kib};
+    cx.background_executor.allow_parking();
+    let script = format!(
+        r#"import os,tty
+tty.setraw(0)
+pattern=bytes.fromhex('{pattern}')
+block=pattern*1024
+left={total}
+while left:
+    chunk=block[:min(left,len(block))]
+    offset=0
+    while offset<len(chunk): offset+=os.write(1,chunk[offset:])
+    left-=len(chunk)
+os.write(1,bytes.fromhex('{tail}'))
+"#,
+        pattern = hex(PATTERN),
+        total = TOTAL,
+        tail = hex(TAIL)
+    );
+    let options = tty::Options {
+        shell: Some(tty::Shell::new(
+            "/usr/bin/python3".into(),
+            vec!["-u".into(), "-c".into(), script],
+        )),
+        ..Default::default()
+    };
+    let counts = Arc::new(Counts::default());
+    let pty = tty::new(
+        &options,
+        crate::backend::TerminalSize::default().into(),
+        278,
+    )
+    .unwrap();
+    let backend = Backend::with_pty(
+        BackendSettings::default(),
+        ObservedPty::new(pty, counts.clone()),
+    )
+    .unwrap();
+    let entity = cx.new(|cx| {
+        TerminalView::new(
+            backend,
+            TerminalConfig {
+                rows: 50,
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+    let started = Instant::now();
+    let start_rss = rss_kib();
+    let mut warm_rss = None;
+    let mut max_after_warm = 0;
+    // Deliberately never pump GPUI or render. Byte observation happens directly
+    // inside Alacritty's real PTY reader; it cannot hide a foreground byte queue.
+    while counts.bytes.load(Ordering::Acquire) < TOTAL + TAIL.len() {
+        let bytes = counts.bytes.load(Ordering::Acquire);
+        let rss = rss_kib();
+        if bytes >= 50_000_000 {
+            let warm = *warm_rss.get_or_insert(rss);
+            max_after_warm = max_after_warm.max(rss);
+            assert!(
+                rss < warm + 64 * 1024,
+                "memory grew after history cap: {warm} -> {rss} KiB"
+            );
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "hidden parser deadline"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(counts.bytes.load(Ordering::Acquire), TOTAL + TAIL.len());
+    assert_eq!(counts.bad.load(Ordering::Relaxed), 0);
+    entity.update(cx, |view, _| {
+        // First snapshot is still the initial viewport: no foreground updates.
+        assert_eq!(view.backend.renderable_content().cells.len(), 80 * 50);
+        assert_eq!(view.backend.renderable_content().cells[0].cell.c, ' ');
+        let term = view.backend.term.clone();
+        {
+            let guard = term.lock_unfair();
+            assert_eq!(guard.grid().history_size(), 100_000);
+            assert_eq!(guard.grid()[Cell::new(Line(0), Column(0))].c, 'F');
+        }
+        wait(|| view.backend.sync());
+        assert_eq!(view.backend.renderable_content().cells[0].cell.c, 'F');
+        assert_eq!(view.backend.renderable_content().cells.len(), 80 * 50);
+        assert_eq!(view.backend.take_events().title.as_deref(), Some("DONE"));
+    });
+    println!(
+        "PASS hidden TerminalView: bytes={} mismatches=0 history=100000 snapshot=4000 wall_s={:.3} rss_start_kib={start_rss} warm_rss_kib={warm_rss:?} max_after_warm_kib={max_after_warm}",
+        TOTAL + TAIL.len(),
+        started.elapsed().as_secs_f64()
+    );
+}
+
+#[::gpui::test]
+fn headless_paint_selection_preedit_and_resize_use_bounded_snapshot(cx: &mut TestAppContext) {
+    use gpui_kit::{AvailableSpace, IntoElement, ParentElement, Styled, div, size};
+    cx.background_executor.allow_parking();
+    cx.update(gpui_kit::init);
+    let backend = Backend::new(BackendSettings {
+        program: "/bin/cat".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    {
+        let mut term = backend.term.lock_unfair();
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        for byte in "A界e\u{301} █╬\r\nsecond".as_bytes() {
+            parser.advance(&mut *term, &[*byte]);
+        }
+    }
+    let (entity, cx) =
+        cx.add_window_view(|_, cx| TerminalView::new(backend, Default::default(), cx));
+    entity.update(cx, |view, _| {
+        view.backend.select(
+            Cell::new(Line(0), Column(0)),
+            alacritty_terminal::selection::SelectionType::Simple,
+            false,
+        );
+        view.backend.extend_selection(Cell::new(Line(0), Column(4)));
+        assert!(view.backend.sync());
+        let snapshot = view.backend.renderable_content();
+        assert_eq!(snapshot.cells[1].cell.c, '界');
+        assert!(
+            snapshot.cells[2]
+                .cell
+                .flags
+                .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER)
+        );
+        assert_eq!(
+            snapshot.cells[3].cell.zerowidth(),
+            Some(['\u{301}'].as_slice())
+        );
+        assert_eq!(
+            view.backend.selectable_content().as_deref(),
+            Some("A界e\u{301} ")
+        );
+        view.ime_text = "日本😀".into();
+        view.ime_marked_range = Some(0..2);
+    });
+    for (width, height) in [(800., 480.), (640., 360.)] {
+        let view = entity.clone();
+        cx.draw(
+            point(px(0.), px(0.)),
+            size(
+                AvailableSpace::Definite(px(width)),
+                AvailableSpace::Definite(px(height)),
+            ),
+            move |_, _| div().size_full().child(view).into_any_element(),
+        );
+        entity.update(cx, |view, _| {
+            assert!(view.backend.sync());
+            let (cols, rows) = view.dimensions();
+            assert!(cols > 2 && rows > 1);
+            assert_eq!(view.backend.renderable_content().cells.len(), cols * rows);
+            assert!(view.layout_metrics.lock().cell_width > px(0.));
+        });
+    }
+}
+
+#[::gpui::test]
+fn drag_shift_copy_and_native_copy_survive_parser_contention(cx: &mut TestAppContext) {
+    use gpui_kit::Modifiers;
+    cx.background_executor.allow_parking();
+    let backend = Backend::new(BackendSettings {
+        program: "/bin/cat".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    {
+        let mut term = backend.term.lock_unfair();
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        parser.advance(&mut *term, b"abcdefghij");
+    }
+    let handle = cx.add_window(|_, cx| TerminalView::new(backend, Default::default(), cx));
+    handle
+        .update(cx, |view, window, cx| {
+            assert!(view.backend.sync());
+            *view.layout_metrics.lock() = LayoutMetrics {
+                origin: point(px(0.), px(0.)),
+                cell_width: px(10.),
+                cell_height: px(20.),
+                cols: 80,
+                rows: 24,
+            };
+            view.mouse_down(&MouseDownEvent {
+                position: point(px(15.), px(5.)),
+                click_count: 1,
+                ..Default::default()
+            });
+            let term = view.backend.term.clone();
+            let guard = term.lock_unfair();
+            view.mouse_up(&MouseUpEvent {
+                position: point(px(35.), px(5.)),
+                ..Default::default()
+            });
+            assert!(view.pending_copy);
+            drop(guard);
+            assert!(view.copy_selection());
+            assert_eq!(
+                crate::clipboard::Clipboard::new()
+                    .unwrap()
+                    .get_text()
+                    .unwrap(),
+                "bcd"
+            );
+            view.mouse_down(&MouseDownEvent {
+                position: point(px(65.), px(5.)),
+                click_count: 1,
+                modifiers: Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            view.mouse_up(&MouseUpEvent {
+                position: point(px(65.), px(5.)),
+                ..Default::default()
+            });
+            assert_eq!(
+                crate::clipboard::Clipboard::new()
+                    .unwrap()
+                    .get_text()
+                    .unwrap(),
+                "bcdefg"
+            );
+            let guard = term.lock_unfair();
+            view.on_key_down(
+                &KeyDownEvent {
+                    keystroke: Keystroke {
+                        key: "c".into(),
+                        modifiers: Modifiers {
+                            platform: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                },
+                window,
+                cx,
+            );
+            assert!(view.pending_copy);
+            drop(guard);
+            assert!(view.copy_selection());
+            assert_eq!(
+                crate::clipboard::Clipboard::new()
+                    .unwrap()
+                    .get_text()
+                    .unwrap(),
+                "bcdefg"
+            );
+        })
+        .unwrap();
+}
