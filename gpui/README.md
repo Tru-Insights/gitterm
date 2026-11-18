@@ -1,9 +1,12 @@
-# GitTerm GPUI stage 0 (TRU-275, parent TRU-274)
+# GitTerm GPUI preview (TRU-275 / TRU-280, parent TRU-274)
 
-This macOS-only build gate opens one 1440×900 window titled
-“GitTerm · GPUI stage 0”, containing an empty gpui-component `DockArea`.
-By default it does not read GitTerm settings or start terminals. TRU-278 adds an
-opt-in `--terminal` route prototype; see below.
+This macOS-only app opens a 1440×900 window titled
+“GitTerm · GPUI shell · Sample data”. The default dispatch opens the stage 2
+shell in `crates/shell`: workspace/repository sidebar, session tabs, and a
+gpui-component `DockArea`. Terminal and chat panes are placeholders; Git status
+and the expandable file tree use sample data. By default it never reads GitTerm settings
+or starts terminals or services.
+`--terminal` opens the TRU-278 terminal route prototype instead (see below).
 The repository root is the Iced workspace. `gpui/` is a separate workspace
 with package `gitterm-gpui`, its own `Cargo.toml` and `Cargo.lock`, and is
 explicitly excluded from the root workspace. Root Cargo commands (including
@@ -29,10 +32,10 @@ toolchains. `rust-toolchain.toml` also selects stable for rustup proxies.
 From the repository root:
 
 ```sh
-CARGO_TARGET_DIR=/private/tmp/gt-target-tru275-gpui nice -n 10 scripts/cargo.sh build --manifest-path gpui/Cargo.toml --release --locked -j 4
-CARGO_TARGET_DIR=/private/tmp/gt-target-tru275-gpui nice -n 10 scripts/bundle-gpui.sh
+CARGO_TARGET_DIR=/private/tmp/gt-target-tru280 nice -n 10 scripts/cargo.sh build --manifest-path gpui/Cargo.toml --release --locked -j 4
+CARGO_TARGET_DIR=/private/tmp/gt-target-tru280 nice -n 10 scripts/bundle-gpui.sh
 scripts/cargo.sh fmt --manifest-path gpui/Cargo.toml -- --check
-CARGO_TARGET_DIR=/private/tmp/gt-target-tru275-gpui nice -n 10 scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --locked -j 4 -- -D warnings
+CARGO_TARGET_DIR=/private/tmp/gt-target-tru280 nice -n 10 scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --locked -j 4 -- -D warnings
 scripts/check-gpui-deps.sh
 ```
 
@@ -44,6 +47,69 @@ with identifier `com.cree8.gitterm.gpui`. It does not replace GitTerm V6.
 The pinned stack is gpui-component/gpui-webview/gpui-kit 0.9.1,
 gpui_xterm 0.3.0, and gpui-pre 0.3.12. Cargo tree may print repeated `(*)`
 references; compare distinct package versions, as the dependency check does.
+
+## Stage 2 shell (TRU-280)
+
+`gitterm-gpui-shell::data::ShellData` is the frontend-neutral port for workspace,
+session, status and file facts. `SampleData` implements it today. The later core
+adapter belongs behind this port; GPUI does not depend on the root Iced package.
+The stage 1 design is in the planning repository's
+`docs/gpui-stage1-core-design.md` sections 1–2: dock entities do not own service
+jobs or recreate sessions.
+
+Every workspace retains its own dock and entity map. Session IDs and persisted
+pane IDs are independent of dock positions. The panel registry resolves layout
+IDs to these existing entities. Drag pane tabs to move, split or group them;
+drag dividers to resize. More → Show pane reopens a closed pane using the same
+entity. Session tabs also reopen/reveal their pane. Draft text, sample output
+count and expanded file directories remain in the pane when hidden or moved.
+These are in-process identities; only layout, not draft text, persists on disk.
+
+Layouts save atomically on dock changes to `layout-<workspace-id>.json` under
+`GITTERM_GPUI_CONFIG_DIR` (absolute), defaulting to
+`~/.config/gitterm-gpui`. Real V3–V6 config directories, their descendants and
+symlink aliases are rejected. Unknown IDs, duplicate IDs, malformed geometry,
+unsupported versions and corrupt JSON are reported with the full file path in
+stderr and an on-screen banner. That workspace starts with the default layout
+and refuses saves for the launch; repair or move the file before restarting.
+Other workspace layouts can still save.
+
+Mocha/Latte use `origin/v6`'s `src/theme.rs` palette and `src/config.rs` defaults
+(13px UI, 14px terminal). Toggle the palette from More. Ctrl+1–9 selects a
+workspace; Cmd+1–9 selects its session; Option+/ opens shortcut help. The More
+menu and New task dialog follow the approved private mockup. All task/browser
+actions are samples and create no processes, tasks, branches or worktrees.
+
+From the repository root, build and launch manually with an isolated directory:
+
+```sh
+CARGO_TARGET_DIR=/private/tmp/gt-target-tru280 scripts/cargo.sh build --manifest-path gpui/Cargo.toml --release --workspace --locked -j 4
+GITTERM_GPUI_CONFIG_DIR=/private/tmp/gitterm-gpui-tru280 /private/tmp/gt-target-tru280/release/gitterm-gpui
+```
+
+Headless verification (does not open an app or send synthetic input):
+
+```sh
+CARGO_TARGET_DIR=/private/tmp/gt-target-tru280 scripts/cargo.sh test --manifest-path gpui/Cargo.toml --workspace --locked -j 4
+CARGO_TARGET_DIR=/private/tmp/gt-target-tru280 scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --workspace --locked -j 4 -- -D warnings
+scripts/cargo.sh fmt --manifest-path gpui/Cargo.toml --all -- --check
+scripts/check-gpui-deps.sh
+```
+
+The test feature is enabled directly on `gpui-pre` and `gpui-component`, following
+the mockup. Enabling `gpui-kit/test-support` instead pulls conflicting optional
+`gpui-fast-web` resolution constraints into this pinned graph. The added GPUI
+lockfile entries are the shell and headless test dependencies; the root lockfile
+stays untouched. No terminal/chat crate changes are needed for this slice.
+
+On 18 November 2026, the GPUI workspace release build, Clippy with
+`-D warnings`, formatting, tests (7 passed) and dependency check above all
+exited 0 on arm64 macOS. Builds used `-j 4`; `nice` was denied. Root `Cargo.lock`
+remained unchanged.
+
+Visual, VoiceOver, keyboard/IME and interactive docking feel-tests remain manual
+acceptance; headless tests prove entity lifetime and layout persistence only.
+No GUI was launched or driven for stage 2 verification.
 
 ## Wry finding: resolution, linking, and runtime are separate gates
 
@@ -88,7 +154,7 @@ A runtime backend switch or separate dylibs does not solve the process-wide
 Objective-C collision. Full WebView construction was unnecessary once class
 registration failed, and no GUI was launched.
 
-## Verification
+## Stage 0 verification (historical)
 
 The preserved native probe release link exited 0; its four outcomes above
 were executed on arm64 macOS, not inferred from source. The probe is retained
@@ -123,3 +189,11 @@ Route A recommendation, automated gates and remaining stage-3 work.
 Build/test/lint from this workspace now include that member by default; use
 `fmt --manifest-path gpui/Cargo.toml --all -- --check` to include its sources.
 All terminal fixtures use owned PTYs and GPUI's headless test platform.
+
+## Native chat fixture viewer (TRU-281)
+
+`gitterm-gpui --chat <fixture.jsonl>` opens the display-only native chat viewer
+in the `gitterm-gpui-chat` workspace member. See
+[`crates/chat/README.md`](crates/chat/README.md) for synthetic fixtures, the
+harness event boundary, behavior parity, headless interaction tests and the
+5,000-row performance budget. The root Iced dependency graph is unchanged.
