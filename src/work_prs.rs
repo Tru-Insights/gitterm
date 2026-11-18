@@ -8,7 +8,8 @@
 //! PR is due and applied by [`PrEvent::Polled`]; `update()` never waits on
 //! GitHub. Which PRs: for every open local workspace and every parked one,
 //! its root chats (the chats it owns, else its recent coordinators), each
-//! root's plan entries and the PRs its chats' facts recorded. Open
+//! root's plan entries, the PRs its chats' facts recorded, and PRs found
+//! on recent delegated task branches. Open
 //! workspaces' PRs are due every `pr_watch::OPEN_INTERVAL`, parked ones'
 //! every `pr_watch::PARKED_INTERVAL`; a merged or closed PR is never read
 //! again.
@@ -35,16 +36,21 @@ use gitterm::merge_plan::{
 use gitterm::pr_watch::{self, NewsItem, NewsKind, PrAction, WatchedPr};
 use gitterm::task_mcp::MergePlanSetRequest;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// How long the PR homes (workspace -> roots -> PRs) are reused before the
 /// tick rebuilds them; plan and index changes rebuild sooner.
 const PR_HOMES_FRESH: Duration = Duration::from_secs(30);
 /// PRs one poll reads at most; the rest are read by the next.
 const PR_POLL_MAX_ITEMS: usize = 25;
+/// Publish each branch before starting another; a slow backlog cannot hold
+/// completed workers behind more than the currently running lookup.
+const TASK_PR_BATCH_MAX_ITEMS: usize = 1;
 /// An immediate user-triggered refresh is coalesced per PR within this window.
 const PR_IMMEDIATE_DEBOUNCE: Duration = Duration::from_secs(10);
 /// A PR no workspace lists is forgotten this long after its last read.
 const PR_FORGET_AFTER: Duration = Duration::from_secs(30 * 24 * 3600);
+const TASK_PR_MAX_AGE: chrono::Duration = chrono::Duration::days(14);
 /// Prefix of every line of a prompt that tells the coordinator news.
 const TELL_PREFIX: &str = "GitTerm PR watch";
 
@@ -148,6 +154,7 @@ pub struct MergePlanWrite {
 #[derive(Debug, Clone)]
 pub enum PrEvent {
     Polled(Box<pr_watch::PollOutcome>),
+    TaskBranchesRead(Vec<TaskBranchResult>),
     Saved(Result<(), String>),
     PlanWritten(Box<MergePlanWrite>),
     /// The user cleared a hold: root chat, PR.
@@ -171,6 +178,274 @@ pub enum PrEvent {
     ReadyGo(PrHome),
     /// Fold or expand a root's merged and closed PRs: root chat.
     DoneToggle(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TaskBranch {
+    repo: String,
+    branch: String,
+}
+
+pub type TaskBranchResult = (TaskBranch, Result<Vec<pr_watch::BranchPr>, String>);
+
+#[derive(Debug, Clone)]
+struct TaskPrOrigin {
+    chat: String,
+    started_at: chrono::DateTime<chrono::Utc>,
+    before: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Only recent task delegations can contribute branch PRs. The parent is
+/// resolved to its current root when collecting the list, not when gh runs.
+fn task_branches(
+    store: &TaskStore,
+    now: chrono::DateTime<chrono::Utc>,
+    uid_to_chat: &HashMap<String, String>,
+) -> Vec<(TaskPrOrigin, TaskBranch)> {
+    store
+        .delegations()
+        .iter()
+        .filter_map(|delegation| task_branch(store, delegation, now, uid_to_chat))
+        .collect()
+}
+
+fn task_branch(
+    store: &TaskStore,
+    delegation: &gitterm::tasks::Delegation,
+    now: chrono::DateTime<chrono::Utc>,
+    uid_to_chat: &HashMap<String, String>,
+) -> Option<(TaskPrOrigin, TaskBranch)> {
+    let created = chrono::DateTime::parse_from_rfc3339(&delegation.created_at)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    if created < now - TASK_PR_MAX_AGE || created > now {
+        return None;
+    }
+    let gitterm::tasks::DelegationChild::TaskSession { task_id, .. } = &delegation.child else {
+        return None;
+    };
+    let parent = delegation
+        .parent
+        .chat_session_id
+        .as_ref()
+        .or_else(|| uid_to_chat.get(&delegation.parent.session_uid))?;
+    let task = store.get(task_id)?;
+    let slug = gitterm::gh_identity::parse_repository_slug(task.repository.remote_url.as_deref()?)?;
+    // PR identities and the watch currently support github.com only.
+    if !slug.host.eq_ignore_ascii_case("github.com")
+        || !merge_plan::valid_repo(&slug.full_name())
+        || task.branch.is_empty()
+    {
+        return None;
+    }
+    // Reusing a task starts a new ownership window, even if the next parent
+    // is no longer open. Later PRs must not leak back into the earlier chat.
+    let before = store
+        .delegations()
+        .iter()
+        .filter(|next| {
+            matches!(
+                &next.child,
+                gitterm::tasks::DelegationChild::TaskSession { task_id: next_id, .. }
+                    if next_id == task_id
+            )
+        })
+        .filter_map(|next| chrono::DateTime::parse_from_rfc3339(&next.created_at).ok())
+        .map(|at| at.with_timezone(&chrono::Utc))
+        .filter(|at| *at > created && *at <= now)
+        .min();
+    Some((
+        TaskPrOrigin {
+            chat: parent.clone(),
+            started_at: created,
+            before,
+        },
+        TaskBranch {
+            repo: slug.full_name(),
+            branch: task.branch.clone(),
+        },
+    ))
+}
+
+async fn lookup_task_branches<F, Fut>(
+    branches: Vec<TaskBranch>,
+    accounts: BTreeMap<String, String>,
+    mut lookup: F,
+) -> Vec<TaskBranchResult>
+where
+    F: FnMut(TaskBranch, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<pr_watch::BranchPr>, String>>,
+{
+    let mut results = Vec::new();
+    for branch in branches {
+        let account = pr_watch::account_for(PrKey::new(&branch.repo, 1).owner(), &accounts);
+        let result = lookup(branch.clone(), account).await;
+        results.push((branch, result));
+    }
+    results
+}
+
+/// Follow direct parents so flattened indexed ancestry cannot skip an owned root.
+fn saved_chat_root<'a>(
+    chat: &'a str,
+    index: &'a [chats::ChatIndexEntry],
+    parents: &'a HashMap<String, String>,
+    root: &str,
+) -> Option<&'a str> {
+    let mut current = chat;
+    let mut seen = HashSet::new();
+    while seen.insert(current) {
+        if current == root {
+            return Some(current);
+        }
+        let parent = parents.get(current).or_else(|| {
+            index
+                .iter()
+                .find(|entry| entry.id == current)
+                .and_then(|entry| entry.root_id.as_ref())
+        });
+        let Some(parent) = parent else {
+            return Some(current);
+        };
+        current = parent;
+    }
+    None
+}
+
+/// Read saved facts by id, including descendants absent from the index.
+/// Called only when PR homes rebuild, never from a view.
+fn load_root_prs(
+    dir: &Path,
+    index: &[chats::ChatIndexEntry],
+    links: &[chat_facts::ChildLink],
+    root: &str,
+    mut log: impl FnMut(&str),
+) -> Vec<PrRef> {
+    let mut parents = HashMap::new();
+    // Match resolve_tree's first indexed parent before using raw links for
+    // chats whose parents are also absent from the index.
+    for entry in index {
+        for child in entry.facts.iter().flat_map(|facts| &facts.children) {
+            if child.session_id != entry.id {
+                parents
+                    .entry(child.session_id.clone())
+                    .or_insert_with(|| entry.id.clone());
+            }
+        }
+    }
+    for link in links {
+        if link.child.session_id != link.parent {
+            parents
+                .entry(link.child.session_id.clone())
+                .or_insert_with(|| link.parent.clone());
+        }
+    }
+    let mut pending = vec![root.to_string()];
+    pending.extend(
+        overview::chats_under(index, &[root.to_string()])
+            .into_iter()
+            .map(|entry| entry.id.clone()),
+    );
+    let mut seen = HashSet::new();
+    let mut prs = Vec::new();
+    while let Some(chat) = pending.pop() {
+        if !seen.insert(chat.clone()) {
+            continue;
+        }
+        if chat != root
+            && saved_chat_root(&chat, index, &parents, root).is_some_and(|owner| owner != root)
+        {
+            continue;
+        }
+        pending.extend(
+            chat_facts::links_for_parent(links, &chat)
+                .into_iter()
+                .map(|child| child.session_id),
+        );
+        for entry in index.iter().filter(|entry| entry.id == chat) {
+            if let Some(facts) = &entry.facts {
+                prs.extend(facts.prs.iter().cloned());
+                pending.extend(facts.children.iter().map(|child| child.session_id.clone()));
+            }
+        }
+        // Owned lists carry ids without a backend. Probe the supported facts
+        // names so an unindexed chat needs no transcript or index entry.
+        for backend in chats::ChatBackend::ALL {
+            let path = match chat_facts::facts_path(dir, backend, &chat) {
+                Ok(path) => path,
+                Err(error) => {
+                    log(&format!(
+                        "[pr-watch] facts for chat {chat:?} in {}: {error}",
+                        dir.display()
+                    ));
+                    break;
+                }
+            };
+            match chat_facts::load_facts(&path) {
+                Ok(Some(facts)) => {
+                    prs.extend(facts.prs);
+                    for child in facts.children {
+                        if child.session_id != chat {
+                            parents
+                                .entry(child.session_id.clone())
+                                .or_insert_with(|| chat.clone());
+                        }
+                        pending.push(child.session_id);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => log(&format!(
+                    "[pr-watch] facts for chat {chat:?} at {}: {error}",
+                    path.display()
+                )),
+            }
+        }
+    }
+    prs
+}
+
+/// Facts, live tabs and cached task branches share one PR identity set.
+fn collect_root_prs(
+    index: &[chats::ChatIndexEntry],
+    root: &str,
+    prs: &PrsState,
+    branches: &[(TaskPrOrigin, TaskBranch)],
+    root_of: impl Fn(&str) -> String,
+) -> Vec<PrRef> {
+    let mut found = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |pr: &PrRef| {
+        if seen.insert(pr.key().id()) {
+            found.push(pr.clone());
+        }
+    };
+    for entry in overview::chats_under(index, &[root.to_string()]) {
+        for pr in entry.facts.iter().flat_map(|facts| &facts.prs) {
+            push(pr);
+        }
+    }
+    for pr in prs.saved_root_prs.get(root).into_iter().flatten() {
+        push(pr);
+    }
+    for (chat, live) in &prs.live_prs {
+        if chat == root || root_of(chat) == root {
+            for pr in live {
+                push(pr);
+            }
+        }
+    }
+    for (parent, branch) in branches {
+        if root_of(&parent.chat) == root {
+            for found in prs.task_branch_prs.get(branch).into_iter().flatten() {
+                if found.created_at >= parent.started_at
+                    && parent.before.is_none_or(|before| found.created_at < before)
+                {
+                    push(&found.pr);
+                }
+            }
+        }
+    }
+    found
 }
 
 /// Splits `keys` into the open ones (state unknown counts as open) and the
@@ -345,15 +620,95 @@ pub struct PrsState {
     /// PRs live tabs recorded in this process, by chat, until the index
     /// carries them.
     pub live_prs: HashMap<String, Vec<PrRef>>,
+    /// Saved facts read at the last PR-home rebuild, including unindexed chats.
+    saved_root_prs: HashMap<String, Vec<PrRef>>,
     pub action: Option<PrActionConfirm>,
     pub ready_open: bool,
     /// Roots whose merged and closed PRs are expanded (not persisted).
     pub done_open: HashSet<String>,
     /// The index was asked for once for the watch.
     pub index_requested: bool,
+    /// Reused until explicit Refresh or a worker finishes; never periodically read.
+    task_branch_prs: HashMap<TaskBranch, Vec<pr_watch::BranchPr>>,
+    task_branches_in_flight: bool,
+    task_branches_started: bool,
+    task_branches_pending: VecDeque<TaskBranch>,
+    task_branches_refresh: bool,
 }
 
 impl PrsState {
+    fn task_branches_due(&self) -> bool {
+        !self.task_branches_in_flight
+            && (!self.task_branches_started
+                || self.task_branches_refresh
+                || !self.task_branches_pending.is_empty())
+    }
+
+    pub(super) fn request_task_branch_refresh(&mut self) {
+        self.task_branches_refresh = true;
+    }
+
+    fn request_finished_task_branch(
+        &mut self,
+        store: &TaskStore,
+        delegation_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        uid_to_chat: &HashMap<String, String>,
+    ) {
+        let Some(delegation) = store.delegation(delegation_id) else {
+            return;
+        };
+        if delegation.status.is_sendable() {
+            if let Some((_, branch)) = task_branch(store, delegation, now, uid_to_chat) {
+                self.task_branches_pending
+                    .retain(|queued| queued != &branch);
+                self.task_branches_pending.push_front(branch);
+            }
+        }
+    }
+
+    fn take_task_branches_due(
+        &mut self,
+        branches: Vec<(TaskPrOrigin, TaskBranch)>,
+    ) -> Vec<TaskBranch> {
+        if !self.task_branches_due() {
+            return Vec::new();
+        }
+        let wanted: HashSet<_> = branches.iter().map(|(_, branch)| branch.clone()).collect();
+        self.task_branches_pending
+            .retain(|branch| wanted.contains(branch));
+        if !self.task_branches_started || self.task_branches_refresh {
+            for (_, branch) in branches {
+                if !self.task_branches_pending.contains(&branch) {
+                    self.task_branches_pending.push_back(branch);
+                }
+            }
+        }
+        self.task_branches_started = true;
+        self.task_branches_refresh = false;
+        let count = self
+            .task_branches_pending
+            .len()
+            .min(TASK_PR_BATCH_MAX_ITEMS);
+        self.task_branches_pending.drain(..count).collect()
+    }
+
+    fn apply_task_branches(&mut self, results: Vec<TaskBranchResult>, mut log: impl FnMut(&str)) {
+        self.task_branches_in_flight = false;
+        for (branch, result) in results {
+            match result {
+                Ok(prs) => {
+                    self.task_branch_prs.insert(branch, prs);
+                }
+                Err(error) => log(&format!(
+                    "[pr-watch] task PRs for {} head {}: not read: {error}",
+                    branch.repo, branch.branch
+                )),
+            }
+        }
+        self.homes_built = None;
+    }
+
     /// Queue a refresh, deferring a coalesced request until its debounce ends.
     pub fn request_immediate_refresh(&mut self, id: String, now: Instant) -> bool {
         let Some(last) = self.immediate_requested_at.get(&id).copied() else {
@@ -512,28 +867,17 @@ impl App {
         current
     }
 
-    /// The PRs root `root`'s chats recorded: facts in the index, and what
-    /// live tabs saw since.
+    /// The PRs root `root`'s chats recorded: indexed and saved facts, what
+    /// live tabs saw since, plus delegated tasks' cached branch PRs.
     fn root_fact_prs(&self, root: &str) -> Vec<PrRef> {
-        let mut prs: Vec<PrRef> = Vec::new();
-        let mut push = |pr: &PrRef| {
-            if !prs.iter().any(|known| known.key().id() == pr.key().id()) {
-                prs.push(pr.clone());
-            }
-        };
-        for entry in overview::chats_under(&self.chat_index, &[root.to_string()]) {
-            for pr in entry.facts.iter().flat_map(|facts| facts.prs.iter()) {
-                push(pr);
-            }
-        }
-        for (chat, live) in &self.prs.live_prs {
-            if chat == root || self.root_chat_of(chat) == root {
-                for pr in live {
-                    push(pr);
-                }
-            }
-        }
-        prs
+        let branches = self
+            .task_store
+            .as_ref()
+            .map(|store| task_branches(store, chrono::Utc::now(), &self.chat_uid_to_chat()))
+            .unwrap_or_default();
+        collect_root_prs(&self.chat_index, root, &self.prs, &branches, |chat| {
+            self.root_chat_of(chat)
+        })
     }
 
     fn rebuild_pr_homes(&mut self) {
@@ -542,7 +886,7 @@ impl App {
             app.pr_roots_of(owned, dir)
                 .into_iter()
                 .map(|(root, title)| RootPrs {
-                    facts: app.root_fact_prs(&root),
+                    facts: Vec::new(),
                     root,
                     title,
                 })
@@ -563,6 +907,18 @@ impl App {
                     PrHome::Parked(ParkedKey::of(cfg)),
                     roots_of(self, &cfg.chats, Path::new(&cfg.dir)),
                 ));
+            }
+        }
+        let dir = chat_facts::facts_dir(&config::global_config_dir());
+        let links = self.chat_child_links();
+        self.prs.saved_root_prs.clear();
+        for (_, roots) in &mut homes {
+            for root in roots {
+                let saved = load_root_prs(&dir, &self.chat_index, &links, &root.root, |message| {
+                    eprintln!("{message}");
+                });
+                self.prs.saved_root_prs.insert(root.root.clone(), saved);
+                root.facts = self.root_fact_prs(&root.root);
             }
         }
         // A root a tab here hosts, with a plan or PRs the index does not
@@ -692,8 +1048,9 @@ impl App {
     /// the due PRs unless one runs.
     pub(super) fn poll_pr_watch(&mut self) -> Task<Event> {
         let mut tasks: Vec<Task<Event>> = Vec::new();
+        tasks.push(self.poll_task_branch_prs());
         self.prs.promote_deferred(Instant::now());
-        // Facts PRs come from the index; load it once if nothing has.
+        // The index also contributes PRs and fallback roots; load it once.
         if !self.prs.index_requested
             && self.chat_index_loaded_at.is_none()
             && !self.chat_index_loading
@@ -773,6 +1130,43 @@ impl App {
             |outcome| Event::Pr(PrEvent::Polled(Box::new(outcome))),
         ));
         Task::batch(tasks)
+    }
+
+    pub(super) fn request_finished_task_prs(&mut self, delegation_id: &str) {
+        if let Some(store) = &self.task_store {
+            self.prs.request_finished_task_branch(
+                store,
+                delegation_id,
+                chrono::Utc::now(),
+                &self.chat_uid_to_chat(),
+            );
+        }
+    }
+
+    fn poll_task_branch_prs(&mut self) -> Task<Event> {
+        if !self.prs.task_branches_due() {
+            return Task::none();
+        }
+        let branches = self
+            .task_store
+            .as_ref()
+            .map(|store| task_branches(store, chrono::Utc::now(), &self.chat_uid_to_chat()))
+            .unwrap_or_default();
+        let branches = self.prs.take_task_branches_due(branches);
+        if branches.is_empty() {
+            return Task::none();
+        }
+        self.prs.task_branches_in_flight = true;
+        Task::perform(
+            lookup_task_branches(
+                branches,
+                self.github_accounts.clone(),
+                |branch, account| async move {
+                    pr_watch::branch_prs(&branch.repo, &branch.branch, account).await
+                },
+            ),
+            |results| Event::Pr(PrEvent::TaskBranchesRead(results)),
+        )
     }
 
     fn apply_pr_poll(&mut self, outcome: pr_watch::PollOutcome) -> Task<Event> {
@@ -1085,6 +1479,11 @@ impl App {
     pub(super) fn update_prs(&mut self, event: PrEvent) -> Task<Event> {
         match event {
             PrEvent::Polled(outcome) => return self.apply_pr_poll(*outcome),
+            PrEvent::TaskBranchesRead(results) => {
+                self.prs
+                    .apply_task_branches(results, |message| eprintln!("{message}"));
+                return self.poll_pr_watch();
+            }
             PrEvent::Saved(result) => {
                 self.prs.save_in_flight = false;
                 if let Err(error) = result {
@@ -2521,6 +2920,696 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn task_pr(number: u64) -> PrRef {
+        let key = PrKey::new("acme/api", number);
+        PrRef {
+            repo: key.repo.clone(),
+            number,
+            url: key.url(),
+        }
+    }
+
+    fn discovered_pr(number: u64) -> pr_watch::BranchPr {
+        pr_watch::BranchPr {
+            pr: task_pr(number),
+            created_at: "2026-10-20T00:00:00Z".parse().unwrap(),
+        }
+    }
+
+    fn finish_initial_discovery(prs: &mut PrsState, branches: &[(TaskPrOrigin, TaskBranch)]) {
+        while !prs.take_task_branches_due(branches.to_vec()).is_empty() {
+            prs.apply_task_branches(vec![], |_| {});
+        }
+    }
+
+    fn delegated_task_fixture() -> (tempfile::TempDir, TaskStore, chrono::DateTime<chrono::Utc>) {
+        use gitterm::tasks::{
+            Delegation, DelegationChild, DelegationKind, DelegationParent, GitBase, NewDelegation,
+            RepositoryIdentity,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(dir.path().join("tasks.json")).unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-20T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for (id, parent, age) in [
+            ("X", "chat-a", 0),
+            ("Y", "chat-b", 1),
+            ("old", "chat-a", 15),
+            ("boundary", "chat-a", 14),
+        ] {
+            let at = (now - chrono::Duration::days(age)).to_rfc3339();
+            store
+                .insert(TaskRecord::new_draft(
+                    NewTaskRecord {
+                        task_id: id.into(),
+                        title: "Worker task".into(),
+                        objective: "Implement a change".into(),
+                        workspace: TaskWorkspaceIdentity {
+                            name: "workspace".into(),
+                            location: WorkspaceLocationIdentity::Local {
+                                directory: dir.path().to_path_buf(),
+                            },
+                        },
+                        repository: RepositoryIdentity {
+                            common_dir: dir.path().join(".git"),
+                            remote_url: Some("git@github.com:acme/api.git".into()),
+                        },
+                        issue: None,
+                        base: GitBase {
+                            reference: "v6".into(),
+                            commit: "0123456789abcdef".into(),
+                        },
+                        branch: format!("task/{id}"),
+                        executor: ExecutorTarget::Local,
+                        harness: None,
+                        stopping_boundary: StoppingBoundary::ImplementUntilTestsPass,
+                    },
+                    &at,
+                ))
+                .unwrap();
+            store
+                .insert_delegation(Delegation::new_requested(
+                    NewDelegation {
+                        kind: DelegationKind::Implement,
+                        parent: DelegationParent {
+                            session_uid: parent.into(),
+                            chat_session_id: None,
+                            workspace: "workspace".into(),
+                            cwd: dir.path().to_path_buf(),
+                        },
+                        child: DelegationChild::TaskSession {
+                            task_id: id.into(),
+                            task_session_id: None,
+                            conversation: None,
+                            preset_name: Some("Codex".into()),
+                            model: None,
+                            role: None,
+                        },
+                        brief: "Implement a change".into(),
+                        target: None,
+                        previous: None,
+                        options: Default::default(),
+                    },
+                    &at,
+                ))
+                .unwrap();
+        }
+        (dir, store, now)
+    }
+
+    fn fixture_parent_chats() -> HashMap<String, String> {
+        HashMap::from([
+            ("chat-a".into(), "chat-a".into()),
+            ("chat-b".into(), "chat-b".into()),
+        ])
+    }
+
+    fn task_root(chat: &str) -> String {
+        match chat {
+            "chat-a" | "claude-worker" => "root-a".into(),
+            "chat-b" => "root-b".into(),
+            _ => chat.into(),
+        }
+    }
+
+    fn save_pr_facts(
+        dir: &Path,
+        backend: chats::ChatBackend,
+        chat: &str,
+        facts: chat_facts::ChatFacts,
+    ) {
+        let path = chat_facts::facts_path(dir, backend, chat).unwrap();
+        chat_facts::write_facts(&path, &facts).unwrap();
+    }
+
+    #[test]
+    fn owned_chat_prs_are_loaded_without_an_index_entry() {
+        for backend in chats::ChatBackend::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            let mut prs = PrsState::default();
+            save_pr_facts(
+                dir.path(),
+                backend,
+                "owned-root",
+                chat_facts::ChatFacts {
+                    prs: vec![task_pr(7)],
+                    ..Default::default()
+                },
+            );
+            prs.saved_root_prs.insert(
+                "owned-root".into(),
+                load_root_prs(dir.path(), &[], &[], "owned-root", |message| {
+                    panic!("{message}")
+                }),
+            );
+            assert_eq!(
+                collect_root_prs(&[], "owned-root", &prs, &[], task_root),
+                vec![task_pr(7)]
+            );
+        }
+    }
+
+    #[test]
+    fn unindexed_roots_keep_saved_and_linked_descendants_with_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = |id: &str| chat_facts::ChatChild {
+            session_id: id.into(),
+            kind: chat_facts::ChildKind::Worker,
+            delegation_id: None,
+            task_id: None,
+            title: None,
+        };
+        for (id, number, children) in [
+            ("owned-root", 7, vec![child("saved-child")]),
+            ("saved-child", 8, vec![child("owned-root")]),
+            ("linked-child", 9, vec![]),
+        ] {
+            save_pr_facts(
+                dir.path(),
+                chats::ChatBackend::Claude,
+                id,
+                chat_facts::ChatFacts {
+                    prs: vec![task_pr(number)],
+                    children,
+                    ..Default::default()
+                },
+            );
+        }
+        let links = vec![chat_facts::ChildLink {
+            parent: "saved-child".into(),
+            child: child("linked-child"),
+        }];
+        let mut found = load_root_prs(dir.path(), &[], &links, "owned-root", |message| {
+            panic!("{message}")
+        });
+        found.sort_by_key(|pr| pr.number);
+        assert_eq!(found, vec![task_pr(7), task_pr(8), task_pr(9)]);
+    }
+
+    #[test]
+    fn taken_over_workers_prs_belong_only_to_the_resolved_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = |id: &str| chat_facts::ChatChild {
+            session_id: id.into(),
+            kind: chat_facts::ChildKind::Worker,
+            delegation_id: None,
+            task_id: None,
+            title: None,
+        };
+        for (id, number, children) in [
+            ("root-a", 7, vec![]),
+            ("root-b", 8, vec![]),
+            ("worker", 9, vec![child("saved-child")]),
+            ("saved-child", 10, vec![]),
+        ] {
+            save_pr_facts(
+                dir.path(),
+                chats::ChatBackend::Codex,
+                id,
+                chat_facts::ChatFacts {
+                    prs: vec![task_pr(number)],
+                    children,
+                    ..Default::default()
+                },
+            );
+        }
+        // A takeover's delegation link can precede the task creator's link.
+        // resolve_tree chooses the first indexed parent, not the first link.
+        let links = vec![
+            chat_facts::ChildLink {
+                parent: "root-b".into(),
+                child: child("worker"),
+            },
+            chat_facts::ChildLink {
+                parent: "root-a".into(),
+                child: child("worker"),
+            },
+        ];
+        let entry = |id: &str| chats::ChatIndexEntry {
+            id: id.into(),
+            backend: chats::ChatBackend::Codex,
+            path: PathBuf::new(),
+            cwd: PathBuf::new(),
+            repo_root: None,
+            is_worktree: false,
+            branch: None,
+            title: id.into(),
+            latest: None,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            size: 0,
+            dead_cwd: false,
+            facts: None,
+            root_id: None,
+        };
+        for indexed_worker in [false, true] {
+            let mut index = Vec::new();
+            for id in ["root-a", "root-b", "worker"] {
+                if id == "worker" && !indexed_worker {
+                    continue;
+                }
+                index.push(entry(id));
+            }
+            chat_facts::resolve_tree(&mut index, &links);
+            if indexed_worker {
+                assert_eq!(index[2].root_id.as_deref(), Some("root-a"));
+            }
+            for (root, expected) in [
+                ("root-a", vec![task_pr(7), task_pr(9), task_pr(10)]),
+                ("root-b", vec![task_pr(8)]),
+            ] {
+                let mut found = load_root_prs(dir.path(), &index, &links, root, |message| {
+                    panic!("{message}")
+                });
+                found.sort_by_key(|pr| pr.number);
+                assert_eq!(found, expected, "{root}, indexed worker: {indexed_worker}");
+            }
+        }
+        // A single-parent tree still reaches indexed descendants when the
+        // owned coordinator itself is absent from the index.
+        let mut index = vec![entry("worker"), entry("saved-child")];
+        index[0].facts = Some(chat_facts::ChatFacts {
+            children: vec![child("saved-child")],
+            ..Default::default()
+        });
+        chat_facts::resolve_tree(&mut index, &links[1..]);
+        assert_eq!(index[1].root_id.as_deref(), Some("worker"));
+        let mut found = load_root_prs(dir.path(), &index, &links[1..], "root-a", |message| {
+            panic!("{message}")
+        });
+        found.sort_by_key(|pr| pr.number);
+        assert_eq!(found, vec![task_pr(7), task_pr(9), task_pr(10)]);
+        // An owned indexed root also keeps its single-parent subtree when a
+        // raw link names an ancestor that resolve_tree cannot index.
+        index.insert(0, entry("root-a"));
+        let mut normal_links = links[1..].to_vec();
+        normal_links.push(chat_facts::ChildLink {
+            parent: "unindexed-ancestor".into(),
+            child: child("root-a"),
+        });
+        chat_facts::resolve_tree(&mut index, &normal_links);
+        assert_eq!(index[0].root_id, None);
+        let mut found = load_root_prs(dir.path(), &index, &normal_links, "root-a", |message| {
+            panic!("{message}")
+        });
+        found.sort_by_key(|pr| pr.number);
+        assert_eq!(found, vec![task_pr(7), task_pr(9), task_pr(10)]);
+
+        // Indexing the ancestor flattens every descendant's root_id past
+        // the owned root, but must not remove any PRs from its subtree.
+        index.insert(0, entry("unindexed-ancestor"));
+        chat_facts::resolve_tree(&mut index, &normal_links);
+        assert_eq!(index[1].root_id.as_deref(), Some("unindexed-ancestor"));
+        assert_eq!(index[2].root_id.as_deref(), Some("unindexed-ancestor"));
+        let mut found = load_root_prs(dir.path(), &index, &normal_links, "root-a", |message| {
+            panic!("{message}")
+        });
+        found.sort_by_key(|pr| pr.number);
+        assert_eq!(found, vec![task_pr(7), task_pr(9), task_pr(10)]);
+    }
+
+    #[test]
+    fn missing_saved_facts_are_empty_and_invalid_facts_log_chat_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut logs = Vec::new();
+        assert!(
+            load_root_prs(dir.path(), &[], &[], "owned-root", |message| {
+                logs.push(message.to_string())
+            })
+            .is_empty()
+        );
+        assert!(logs.is_empty());
+        let path =
+            chat_facts::facts_path(dir.path(), chats::ChatBackend::Claude, "owned-root").unwrap();
+        std::fs::write(&path, "invalid JSON").unwrap();
+        assert!(
+            load_root_prs(dir.path(), &[], &[], "owned-root", |message| {
+                logs.push(message.to_string())
+            })
+            .is_empty()
+        );
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].contains("owned-root"));
+        assert!(logs[0].contains(&path.display().to_string()));
+        assert!(logs[0].contains("not a facts file"));
+    }
+
+    #[tokio::test]
+    async fn task_branch_prs_belong_to_the_delegating_chats_root() {
+        let (_dir, store, now) = delegated_task_fixture();
+        let branches = task_branches(&store, now, &fixture_parent_chats());
+        assert_eq!(branches.len(), 3);
+        assert!(!branches
+            .iter()
+            .any(|(_, branch)| branch.branch == "task/old"));
+        assert!(branches
+            .iter()
+            .any(|(_, branch)| branch.branch == "task/boundary"));
+        let results = lookup_task_branches(
+            branches.iter().map(|(_, branch)| branch.clone()).collect(),
+            BTreeMap::from([("ACME".into(), "acme-bot".into())]),
+            |branch, account| async move {
+                assert_eq!(branch.repo, "acme/api");
+                assert_eq!(account.as_deref(), Some("acme-bot"));
+                Ok(match branch.branch.as_str() {
+                    "task/X" => vec![discovered_pr(7)],
+                    "task/Y" => vec![discovered_pr(8)],
+                    _ => vec![],
+                })
+            },
+        )
+        .await;
+        let mut prs = PrsState::default();
+        prs.apply_task_branches(results, |message| panic!("{message}"));
+        assert_eq!(
+            collect_root_prs(&[], "root-a", &prs, &branches, task_root),
+            vec![task_pr(7)]
+        );
+        assert_eq!(
+            collect_root_prs(&[], "root-b", &prs, &branches, task_root),
+            vec![task_pr(8)]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_branch_parent_resolves_from_tab_uid_and_skips_unknown_uid() {
+        let (_dir, store, now) = delegated_task_fixture();
+        let uid_to_chat = HashMap::from([("chat-a".into(), "chat-a".into())]);
+        let branches = task_branches(&store, now, &uid_to_chat);
+        assert!(branches.iter().any(|(_, branch)| branch.branch == "task/X"));
+        assert!(!branches.iter().any(|(_, branch)| branch.branch == "task/Y"));
+
+        let results = lookup_task_branches(
+            branches.iter().map(|(_, branch)| branch.clone()).collect(),
+            BTreeMap::new(),
+            |branch, _| async move {
+                Ok(if branch.branch == "task/X" {
+                    vec![discovered_pr(7)]
+                } else {
+                    vec![]
+                })
+            },
+        )
+        .await;
+        let mut prs = PrsState::default();
+        prs.apply_task_branches(results, |_| {});
+        assert_eq!(
+            collect_root_prs(&[], "root-a", &prs, &branches, task_root),
+            vec![task_pr(7)]
+        );
+    }
+
+    #[test]
+    fn task_branch_prs_deduplicate_claude_facts_and_live_prs() {
+        let (_dir, store, now) = delegated_task_fixture();
+        let branches = task_branches(&store, now, &fixture_parent_chats());
+        let branch = branches
+            .iter()
+            .find(|(_, branch)| branch.branch == "task/X")
+            .unwrap()
+            .1
+            .clone();
+        let mut prs = PrsState::default();
+        prs.apply_task_branches(vec![(branch, Ok(vec![discovered_pr(7)]))], |_| {});
+        prs.note_live_prs("claude-worker", &[task_pr(7)]);
+        let index = vec![chats::ChatIndexEntry {
+            id: "claude-worker".into(),
+            backend: chats::ChatBackend::Claude,
+            path: PathBuf::new(),
+            cwd: PathBuf::new(),
+            repo_root: None,
+            is_worktree: true,
+            branch: Some("task/X".into()),
+            title: "Worker".into(),
+            latest: None,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            size: 0,
+            dead_cwd: false,
+            facts: Some(chat_facts::ChatFacts {
+                prs: vec![PrRef {
+                    repo: "Acme/API".into(),
+                    ..task_pr(7)
+                }],
+                ..Default::default()
+            }),
+            root_id: Some("root-a".into()),
+        }];
+        let dir = tempfile::tempdir().unwrap();
+        save_pr_facts(
+            dir.path(),
+            chats::ChatBackend::Claude,
+            "claude-worker",
+            index[0].facts.clone().unwrap(),
+        );
+        prs.saved_root_prs.insert(
+            "root-a".into(),
+            load_root_prs(dir.path(), &index, &[], "root-a", |message| {
+                panic!("{message}")
+            }),
+        );
+        let found = collect_root_prs(&index, "root-a", &prs, &branches, task_root);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].key().id(), "acme/api#7");
+    }
+
+    #[tokio::test]
+    async fn task_branch_lookup_error_logs_context_and_preserves_known_prs() {
+        let (_dir, store, now) = delegated_task_fixture();
+        let branches = task_branches(&store, now, &fixture_parent_chats());
+        let branch = branches[0].1.clone();
+        let mut prs = PrsState::default();
+        prs.apply_task_branches(vec![(branch.clone(), Ok(vec![discovered_pr(7)]))], |_| {});
+        let before = collect_root_prs(&[], "root-a", &prs, &branches, task_root);
+        let results = lookup_task_branches(vec![branch], BTreeMap::new(), |_, _| async {
+            Err("lookup unavailable".into())
+        })
+        .await;
+        let mut logs = Vec::new();
+        prs.apply_task_branches(results, |message| logs.push(message.to_string()));
+        assert_eq!(
+            logs,
+            vec!["[pr-watch] task PRs for acme/api head task/X: not read: lookup unavailable"]
+        );
+        assert_eq!(
+            collect_root_prs(&[], "root-a", &prs, &branches, task_root),
+            before
+        );
+    }
+
+    #[test]
+    fn discovered_task_branches_retry_on_refresh_but_not_periodic_polls() {
+        let (_dir, store, now) = delegated_task_fixture();
+        let branches = task_branches(&store, now, &fixture_parent_chats());
+        let branch = branches[0].1.clone();
+        let mut prs = PrsState::default();
+        finish_initial_discovery(&mut prs, &branches);
+        prs.apply_task_branches(vec![(branch.clone(), Ok(vec![discovered_pr(7)]))], |_| {});
+        assert!(prs.take_task_branches_due(branches.clone()).is_empty());
+        prs.request_task_branch_refresh();
+        let next = prs.take_task_branches_due(branches.clone());
+        assert_eq!(next, vec![branch.clone()]);
+        prs.apply_task_branches(
+            vec![(branch, Ok(vec![discovered_pr(7), discovered_pr(8)]))],
+            |_| {},
+        );
+        assert_eq!(
+            collect_root_prs(&[], "root-a", &prs, &branches, task_root),
+            vec![task_pr(7), task_pr(8)]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_task_branch_answers_retry_on_refresh_but_not_periodic_polls() {
+        let (_dir, store, now) = delegated_task_fixture();
+        let branches = task_branches(&store, now, &fixture_parent_chats());
+        let mut prs = PrsState::default();
+        let first = prs.take_task_branches_due(branches.clone());
+        let results =
+            lookup_task_branches(first.clone(), BTreeMap::new(), |_, _| async { Ok(vec![]) }).await;
+        prs.apply_task_branches(results, |_| {});
+        finish_initial_discovery(&mut prs, &branches);
+        assert!(!prs.task_branches_due());
+        assert!(prs.take_task_branches_due(branches.clone()).is_empty());
+        prs.request_task_branch_refresh();
+        assert_eq!(prs.take_task_branches_due(branches), first);
+    }
+
+    #[test]
+    fn finishing_a_delegation_rediscovers_only_its_task_branch() {
+        use gitterm::tasks::{DelegationResult, DelegationStatus};
+        for status in [
+            DelegationStatus::Completed,
+            DelegationStatus::Blocked,
+            DelegationStatus::Failed {
+                message: "worker failed".into(),
+            },
+        ] {
+            let (_dir, mut store, now) = delegated_task_fixture();
+            let branches = task_branches(&store, now, &fixture_parent_chats());
+            let branch = branches[0].1.clone();
+            let mut prs = PrsState::default();
+            finish_initial_discovery(&mut prs, &branches);
+            prs.apply_task_branches(vec![(branch.clone(), Ok(vec![discovered_pr(7)]))], |_| {});
+            let delegation_id = store.delegations()[0].delegation_id.clone();
+            prs.request_finished_task_branch(&store, &delegation_id, now, &fixture_parent_chats());
+            assert!(!prs.task_branches_due());
+            let result = DelegationResult {
+                handoff: Some(TaskHandoff {
+                    summary: "Worker report".into(),
+                    decisions: vec![],
+                    next_steps: vec![],
+                    blockers: vec![],
+                    updated_by_session_id: None,
+                    updated_at: now.to_rfc3339(),
+                }),
+                ..Default::default()
+            };
+            let at = now.to_rfc3339();
+            match status {
+                DelegationStatus::Completed => {
+                    store.complete_delegation(&delegation_id, result, &at)
+                }
+                DelegationStatus::Blocked => store.block_delegation(&delegation_id, result, &at),
+                _ => store.set_delegation_status(&delegation_id, status, &at),
+            }
+            .unwrap();
+            // Requests arriving during a read survive that read's completion.
+            prs.task_branches_in_flight = true;
+            prs.request_finished_task_branch(&store, &delegation_id, now, &fixture_parent_chats());
+            assert!(prs.take_task_branches_due(branches.clone()).is_empty());
+            prs.apply_task_branches(vec![], |_| {});
+            assert_eq!(
+                prs.take_task_branches_due(branches.clone()),
+                vec![branch.clone()]
+            );
+            prs.apply_task_branches(
+                vec![(branch, Ok(vec![discovered_pr(7), discovered_pr(8)]))],
+                |_| {},
+            );
+            assert_eq!(
+                collect_root_prs(&[], "root-a", &prs, &branches, task_root),
+                vec![task_pr(7), task_pr(8)]
+            );
+            assert!(prs.take_task_branches_due(branches).is_empty());
+        }
+    }
+
+    #[test]
+    fn task_branch_refresh_requested_during_a_lookup_is_not_lost() {
+        let (_dir, store, now) = delegated_task_fixture();
+        let branches = task_branches(&store, now, &fixture_parent_chats());
+        let mut prs = PrsState::default();
+        let first = prs.take_task_branches_due(branches.clone());
+        prs.task_branches_in_flight = true;
+        prs.request_task_branch_refresh();
+        assert!(prs.take_task_branches_due(branches.clone()).is_empty());
+        prs.apply_task_branches(vec![], |_| {});
+        let mut refreshed = Vec::new();
+        while prs.task_branches_due() {
+            refreshed.extend(prs.take_task_branches_due(branches.clone()));
+        }
+        assert_eq!(refreshed.len(), branches.len());
+        assert!(refreshed.contains(&first[0]));
+    }
+
+    #[test]
+    fn task_branch_batches_publish_before_the_backlog_and_prioritize_completions() {
+        let (_dir, mut store, now) = delegated_task_fixture();
+        let branches = task_branches(&store, now, &fixture_parent_chats());
+        let mut prs = PrsState::default();
+        let first = prs.take_task_branches_due(branches.clone());
+        assert_eq!(first.len(), 1);
+        prs.task_branches_in_flight = true;
+        // The last queued branch finishes while startup is reading the first.
+        let id = store
+            .delegations()
+            .iter()
+            .find(|d| {
+                matches!(
+                    &d.child, gitterm::tasks::DelegationChild::TaskSession { task_id, .. }
+                        if task_id == "boundary"
+                )
+            })
+            .unwrap()
+            .delegation_id
+            .clone();
+        store
+            .complete_delegation(
+                &id,
+                gitterm::tasks::DelegationResult {
+                    handoff: Some(TaskHandoff {
+                        summary: "Worker finished".into(),
+                        decisions: vec![],
+                        next_steps: vec![],
+                        blockers: vec![],
+                        updated_by_session_id: None,
+                        updated_at: now.to_rfc3339(),
+                    }),
+                    ..Default::default()
+                },
+                &now.to_rfc3339(),
+            )
+            .unwrap();
+        prs.request_finished_task_branch(&store, &id, now, &fixture_parent_chats());
+        prs.apply_task_branches(vec![(first[0].clone(), Ok(vec![discovered_pr(7)]))], |_| {});
+        assert_eq!(
+            collect_root_prs(&[], "root-a", &prs, &branches, task_root),
+            vec![task_pr(7)]
+        );
+        let second = prs.take_task_branches_due(branches.clone());
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].branch, "task/boundary");
+        let third = prs.take_task_branches_due(branches.clone());
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].branch, "task/Y");
+        assert!(prs.take_task_branches_due(branches).is_empty());
+    }
+
+    #[test]
+    fn reused_task_prs_stay_in_the_delegation_that_created_them() {
+        let (_dir, mut store, now) = delegated_task_fixture();
+        let original = store.delegations()[0].clone();
+        let mut reused = original.clone();
+        reused.delegation_id = "reused".into();
+        reused.parent.chat_session_id = Some("chat-b".into());
+        let later = now + chrono::Duration::hours(1);
+        reused.created_at = later.to_rfc3339();
+        store.insert_delegation(reused).unwrap();
+        let branches = task_branches(&store, later, &fixture_parent_chats());
+        let branch = branches
+            .iter()
+            .find(|(_, b)| b.branch == "task/X")
+            .unwrap()
+            .1
+            .clone();
+        let mut prs = PrsState::default();
+        prs.apply_task_branches(
+            vec![(
+                branch,
+                Ok(vec![
+                    pr_watch::BranchPr {
+                        created_at: now - chrono::Duration::seconds(1),
+                        ..discovered_pr(6)
+                    },
+                    discovered_pr(7),
+                    pr_watch::BranchPr {
+                        created_at: later,
+                        ..discovered_pr(8)
+                    },
+                ]),
+            )],
+            |_| {},
+        );
+        assert_eq!(
+            collect_root_prs(&[], "root-a", &prs, &branches, task_root),
+            vec![task_pr(7)]
+        );
+        assert_eq!(
+            collect_root_prs(&[], "root-b", &prs, &branches, task_root),
+            vec![task_pr(8)]
+        );
+    }
 
     #[test]
     fn focus_marks_open_workspace_prs_due_but_not_parked_prs() {
