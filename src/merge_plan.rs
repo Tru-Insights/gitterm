@@ -113,18 +113,8 @@ impl PrRef {
 // ---------------------------------------------------------------------------
 // Collection from `gh pr create` results.
 
-/// Whether a Bash command runs `gh pr create` (anywhere in a pipeline or
-/// `&&` chain, with or without env assignments or a path to `gh`).
-pub fn is_gh_pr_create(command: &str) -> bool {
-    let words: Vec<&str> = command
-        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')'))
-        .filter(|word| !word.is_empty())
-        .collect();
-    words.windows(3).any(|window| {
-        let program = window[0].trim_matches(|c| c == '"' || c == '\'');
-        (program == "gh" || program.ends_with("/gh")) && window[1] == "pr" && window[2] == "create"
-    })
-}
+// Keep the public matcher at its original path; the shell scanner lives with facts.
+pub use crate::chat_facts::is_gh_pr_create;
 
 /// Every `https://github.com/<owner>/<repo>/pull/<n>` URL in `text`, in
 /// order, each once. The number must end the URL path (`/pull/12/files`
