@@ -40,16 +40,24 @@ jobs:
         shared-key: "gitterm-v6-ci"
 
     - name: Check formatting
-      run: cargo fmt -- --check
+      run: scripts/cargo.sh fmt --all -- --check
 
     - name: Clippy
-      run: cargo clippy -- -D warnings
+      run: scripts/cargo.sh clippy -- -D warnings
 
     - name: Clippy (excalidraw)
-      run: cargo clippy --features excalidraw -- -D warnings
+      run: scripts/cargo.sh clippy --features excalidraw -- -D warnings
 
     - name: Tests
-      run: cargo test
+      run: scripts/cargo.sh test
 
     - name: Tests (excalidraw)
-      run: cargo test --features excalidraw
+      run: scripts/cargo.sh test --features excalidraw
+
+    - name: GPUI release and bundle (macOS only)
+      run: |
+        tests/check-gpui-deps.sh
+        scripts/check-gpui-deps.sh
+        scripts/cargo.sh fmt --manifest-path gpui/Cargo.toml -- --check
+        scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --locked -- -D warnings
+        scripts/bundle-gpui.sh

@@ -2,8 +2,13 @@
 name = "gitterm-v6"
 version = "6.0.0"
 edition = "2021"
+rust-version = "1.99"
 default-run = "gitterm-v6"
 description = "A Git status viewer with integrated terminal, built with Iced"
+
+[workspace]
+exclude = ["gpui"]
+resolver = "2"
 
 [lib]
 name = "gitterm"
