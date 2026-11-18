@@ -2079,8 +2079,8 @@ async fn run_session_program(
         .or(config.guidelines_file.as_deref());
     let mut workspace_instructions = match guidelines_file {
         Some(path) => match std::fs::read_to_string(path) {
-            // Kept whole: each SessionStart rebuilds the section, so the
-            // checkpoint it carries is the one on disk then (TRU-237).
+            // Kept whole: each SessionStart rebuilds the checkpoint status
+            // and fresh-read instruction from disk (TRU-237/TRU-259).
             Ok(text) => crate::guidelines::workspace_context(&text).map(|_| text),
             Err(error) => {
                 return fail(format!(
@@ -3551,7 +3551,11 @@ mod tests {
         std::fs::create_dir_all(home.join("docs")).unwrap();
         git2::Repository::init(home.parent().unwrap()).unwrap();
         let home = std::fs::canonicalize(home).unwrap();
-        std::fs::write(home.join("docs/checkpoint.md"), "Example work").unwrap();
+        std::fs::write(
+            home.join("docs/checkpoint.md"),
+            "INITIAL_CHECKPOINT_CONTENT_TRU259",
+        )
+        .unwrap();
         let places = crate::guidelines::document_places(
             true,
             true,
@@ -3571,8 +3575,9 @@ mod tests {
             fixture.path(),
         )
         .unwrap();
-        // Frozen from origin/v6 (936976d): both launch and callback bytes
-        // must stay unchanged for a chat that has not moved.
+        // Frozen from origin/v6 (936976d), with TRU-259/265's intentional
+        // wording changes. Never-moved chats retain this launch prompt;
+        // callbacks add only the fresh checkpoint read instruction.
         let expected = include_str!("../../tests/fixtures/claude/workspace-prompt-v6.md")
             .replace("@HOME@", home.to_str().unwrap());
         assert_eq!(launch.text, expected);
@@ -3593,6 +3598,7 @@ assert system == Path('expected-system.md').read_bytes()
 assert ('--resume=example-session' in sys.argv) == Path('resuming').exists()
 expected_context = system.decode().split('# Documents for this work (added by GitTerm)\n', 1)[1]
 expected_context = '# Documents for this work (added by GitTerm)\n' + expected_context.split('# Starting Codex in GitTerm', 1)[0].rstrip()
+expected_context += f'\nRe-read the workspace checkpoint `{Path.cwd() / "docs/checkpoint.md"}` now, before continuing: it may have changed since this chat started.'
 def emit(value):
     print(json.dumps(value), flush=True)
 def read():
@@ -3614,7 +3620,10 @@ for source in ['clear', 'compact']:
     assert 'Workspace: `Example workspace`' in text
     assert '/code/example-api' in text
     assert str(Path.cwd() / 'docs/checkpoint.md') in text
-    assert "Resume only this workspace's work; if unsure which work to continue, ask." in text
+    assert "resume only this workspace's work; if unsure which work to continue, ask." in text
+    assert text.count('Re-read the workspace checkpoint') == 1
+    assert 'The start of the workspace checkpoint' not in text
+    assert 'INITIAL_CHECKPOINT_CONTENT_TRU259' not in text
     assert 'Starting Codex' not in text
     assert text == expected_context
 emit({'type':'result','subtype':'success'})
@@ -3625,7 +3634,10 @@ if Path('move-chat').exists():
         text = read()['response']['response']['hookSpecificOutput']['additionalContext']
         assert 'Workspace: `Destination workspace`' in text
         assert str(Path.cwd().parent / 'destination/docs/checkpoint.md') in text
-        assert 'Destination checkpoint written after move' in text
+        assert 'Destination checkpoint written after move' not in text
+        assert 'docs/checkpoint.md` (exists)' in text
+        assert text.count('Re-read the workspace checkpoint') == 1
+        assert f'Re-read the workspace checkpoint `{Path.cwd().parent / "destination/docs/checkpoint.md"}` now' in text
         assert 'This chat now belongs to the following workspace' in text
         assert 'replaces the workspace section in the system prompt' in text
         assert 'Example workspace' not in text and 'Example work' not in text
