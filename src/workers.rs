@@ -40,7 +40,8 @@ impl WorkerRole {
 pub enum WorkerProvider {
     Claude,
     Codex,
-    /// pi, gemini or a user-defined command: GitTerm does not know its
+    Antigravity,
+    /// pi or a user-defined command: GitTerm does not know its
     /// model flag, so it gets no model.
     Other,
 }
@@ -50,16 +51,16 @@ impl WorkerProvider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Antigravity => "antigravity",
             Self::Other => "other",
         }
     }
 
-    /// The CLI's model option: `claude --model <m>`, `codex -m <m>`
-    /// (both checked against `--help` of claude 2.1.295 and codex-cli
-    /// 0.161.0).
+    /// The CLI's model option: `claude --model <m>`, `codex -m <m>`,
+    /// `agy --model <id>` (checked against their installed `--help`).
     pub fn model_flag(self) -> Option<&'static str> {
         match self {
-            Self::Claude => Some("--model"),
+            Self::Claude | Self::Antigravity => Some("--model"),
             Self::Codex => Some("-m"),
             Self::Other => None,
         }
@@ -80,8 +81,19 @@ pub fn provider_for_command(command: &str) -> WorkerProvider {
     match executable_name(command).as_str() {
         "claude" => WorkerProvider::Claude,
         "codex" => WorkerProvider::Codex,
+        "agy" => WorkerProvider::Antigravity,
         _ => WorkerProvider::Other,
     }
+}
+
+/// agy 1.5.11 accepts session settings, but MCP servers live in a separate,
+/// persistent config. Refuse task launches until it supports per-process MCP
+/// without putting GitTerm's bearer token on argv or in saved settings.
+pub fn require_task_tools(command: &str) -> Result<(), String> {
+    if provider_for_command(command) == WorkerProvider::Antigravity {
+        return Err("Antigravity workers can't reach GitTerm's task tools yet".to_string());
+    }
+    Ok(())
 }
 
 /// One provider's model per role. A missing role means the CLI's own
@@ -130,15 +142,24 @@ fn codex_seed() -> RoleModels {
     seed("gpt-6.1-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra")
 }
 
+fn antigravity_seed() -> RoleModels {
+    seed(
+        "gemini-4-argon-high",
+        "gemini-4-hydrogen-high",
+        "gemini-4-argon-high",
+        "gemini-4-argon-high",
+    )
+}
+
 /// Which model each worker role gets, per provider (`policy` in
-/// `settings.json`). Seeded with Tracey's table (2026-10-08): coordinator
-/// Opus 5.5 / GPT-6.1 Sol; scoped worker Sonnet / GPT-6 Luna; judgment
-/// worker Opus 5.5 / GPT-6.1 Sol; specialist Fable / GPT-6 Astra.
+/// `settings.json`). Claude and Codex follow the shared routing table;
+/// Antigravity follows the TRU-273 role contract.
 ///
 /// ```json
 /// "policy": {
 ///   "claude": { "coordinator": "opus", "scoped": "sonnet", "judgment": "opus", "specialist": "fable" },
-///   "codex":  { "coordinator": "gpt-6.1-sol", "scoped": "gpt-6-luna", "judgment": "gpt-6.1-sol", "specialist": "gpt-6-astra" }
+///   "codex":  { "coordinator": "gpt-6.1-sol", "scoped": "gpt-6-luna", "judgment": "gpt-6.1-sol", "specialist": "gpt-6-astra" },
+///   "antigravity": { "coordinator": "gemini-4-argon-high", "scoped": "gemini-4-hydrogen-high", "judgment": "gemini-4-argon-high", "specialist": "gemini-4-argon-high" }
 /// }
 /// ```
 ///
@@ -150,6 +171,8 @@ pub struct ModelPolicy {
     pub claude: RoleModels,
     #[serde(default = "codex_seed")]
     pub codex: RoleModels,
+    #[serde(default = "antigravity_seed")]
+    pub antigravity: RoleModels,
 }
 
 impl Default for ModelPolicy {
@@ -157,6 +180,7 @@ impl Default for ModelPolicy {
         Self {
             claude: claude_seed(),
             codex: codex_seed(),
+            antigravity: antigravity_seed(),
         }
     }
 }
@@ -166,6 +190,7 @@ impl ModelPolicy {
         match provider {
             WorkerProvider::Claude => self.claude.for_role(role),
             WorkerProvider::Codex => self.codex.for_role(role),
+            WorkerProvider::Antigravity => self.antigravity.for_role(role),
             WorkerProvider::Other => None,
         }
     }
@@ -261,6 +286,7 @@ pub fn resolve_worker(
         })?,
     };
     let preset = presets[preset_index];
+    require_task_tools(preset.command)?;
     let provider = provider_for_command(preset.command);
     let role = role.unwrap_or_default();
     let requested = model.map(str::trim).filter(|model| !model.is_empty());
@@ -275,7 +301,7 @@ pub fn resolve_worker(
             if provider == WorkerProvider::Other {
                 return Err(format!(
                     "preset {:?} runs {:?}, whose model flag GitTerm does not know; drop model, \
-                     or pick a Claude or Codex preset",
+                     or pick a Claude, Codex or Antigravity preset",
                     preset.name,
                     executable_name(preset.command)
                 ));
@@ -348,6 +374,7 @@ pub enum ReasoningEffort {
     Medium,
     High,
     Xhigh,
+    Max,
 }
 
 impl ReasoningEffort {
@@ -357,6 +384,7 @@ impl ReasoningEffort {
             Self::Medium => "medium",
             Self::High => "high",
             Self::Xhigh => "xhigh",
+            Self::Max => "max",
         }
     }
 
@@ -372,6 +400,7 @@ impl ReasoningEffort {
 /// after the executable (TRU-212). Codex: `-c model_reasoning_effort="…"`
 /// and `--add-dir <dir>` (codex-cli 0.164.0 `--help`); Claude:
 /// `--effort <level>` and `--add-dir <dir>` (claude 2.1.318 `--help`).
+/// Antigravity accepts the same effort/add-dir flags (agy 1.5.11).
 /// Other CLIs: an error, since GitTerm does not know their options. The
 /// folders are shell-quoted; with neither option the command is unchanged.
 pub fn with_launch_options(
@@ -407,26 +436,29 @@ fn with_launch_options_for_shell(
     let mut options: Vec<String> = Vec::new();
     match (provider, effort) {
         (_, None) => {}
+        (WorkerProvider::Codex, Some(ReasoningEffort::Max)) => {
+            return Err("Codex does not support max effort; use low, medium, high or xhigh".into());
+        }
         (WorkerProvider::Codex, Some(effort)) => {
             options.push("-c".to_string());
             options.push(crate::guidelines::shell_word(&effort.codex_config_value()));
         }
-        (WorkerProvider::Claude, Some(effort)) => {
+        (WorkerProvider::Claude | WorkerProvider::Antigravity, Some(effort)) => {
             options.push("--effort".to_string());
             options.push(effort.label().to_string());
         }
         (WorkerProvider::Other, Some(_)) => {
             return Err(format!(
                 "GitTerm does not know the reasoning effort option of {:?}; effort works with \
-                 Codex and Claude Code presets",
+                 Codex, Claude Code and Antigravity presets",
                 executable_name(command)
             ))
         }
     }
     if !add_dirs.is_empty() && provider == WorkerProvider::Other {
         return Err(format!(
-            "GitTerm does not know the extra folder option of {:?}; add_dirs works with Codex \
-             and Claude Code presets",
+            "GitTerm does not know the extra folder option of {:?}; add_dirs works with Codex, \
+             Claude Code and Antigravity presets",
             executable_name(command)
         ));
     }
@@ -505,7 +537,10 @@ mod tests {
             .contains("add_dirs"));
         let effort: ReasoningEffort = serde_json::from_str("\"xhigh\"").unwrap();
         assert_eq!(effort, ReasoningEffort::Xhigh);
-        assert!(serde_json::from_str::<ReasoningEffort>("\"max\"").is_err());
+        assert_eq!(
+            serde_json::from_str::<ReasoningEffort>("\"max\"").unwrap(),
+            ReasoningEffort::Max
+        );
     }
 
     fn presets() -> Vec<PresetRef<'static>> {
@@ -527,6 +562,73 @@ mod tests {
                 command: "gemini",
             },
         ]
+    }
+
+    #[test]
+    fn antigravity_models_effort_and_policy() {
+        assert_eq!(
+            provider_for_command("/opt/bin/agy --continue"),
+            WorkerProvider::Antigravity
+        );
+        assert_eq!(
+            with_model_flag("agy", "gemini-4-argon-high").unwrap(),
+            "agy --model gemini-4-argon-high"
+        );
+        for (level, effort) in [
+            ("low", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            ("high", ReasoningEffort::High),
+            ("xhigh", ReasoningEffort::Xhigh),
+            ("max", ReasoningEffort::Max),
+        ] {
+            assert_eq!(
+                with_launch_options("agy", Some(effort), &[]).unwrap(),
+                format!("agy --effort {level}")
+            );
+        }
+        assert!(with_launch_options("codex", Some(ReasoningEffort::Max), &[]).is_err());
+        let policy: ModelPolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(policy.antigravity, antigravity_seed());
+        assert_eq!(
+            policy.model_for(WorkerProvider::Antigravity, WorkerRole::Scoped),
+            Some("gemini-4-hydrogen-high")
+        );
+        assert_eq!(
+            policy.antigravity.coordinator.as_deref(),
+            Some("gemini-4-argon-high")
+        );
+        assert_eq!(
+            policy.antigravity.judgment.as_deref(),
+            Some("gemini-4-argon-high")
+        );
+        assert_eq!(
+            policy.antigravity.specialist.as_deref(),
+            Some("gemini-4-argon-high")
+        );
+    }
+
+    #[test]
+    fn antigravity_workers_refuse_to_launch_without_process_scoped_task_tools() {
+        for command in ["agy", "/opt/bin/agy --model gemini-4-argon-high"] {
+            let choices = [PresetRef {
+                name: "Antigravity",
+                command,
+            }];
+            assert_eq!(
+                resolve_worker(
+                    &choices,
+                    Some("Antigravity"),
+                    None,
+                    None,
+                    &ModelPolicy::default()
+                )
+                .unwrap_err(),
+                "Antigravity workers can't reach GitTerm's task tools yet"
+            );
+            assert!(require_task_tools(command).is_err());
+        }
+        assert!(require_task_tools("claude").is_ok());
+        assert!(require_task_tools("codex").is_ok());
     }
 
     #[test]

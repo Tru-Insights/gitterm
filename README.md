@@ -101,7 +101,7 @@ GitTerm V6 ships with configurable AI coding agent presets. Option+click the `+`
   "agent_presets": [
     { "name": "Claude Code", "command": "claude", "resume_command": "claude --resume", "icon": "❯", "color": "peach" },
     { "name": "Codex", "command": "codex", "resume_command": "codex resume", "icon": "≡", "color": "green" },
-    { "name": "Gemini", "command": "gemini", "resume_command": "gemini --resume", "icon": "G", "color": "blue" }
+    { "name": "Antigravity", "command": "agy", "resume_command": "agy --continue", "icon": "✧", "color": "blue" }
   ]
 }
 ```

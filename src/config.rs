@@ -389,7 +389,7 @@ mod tests {
         config.chat.default_model = "sonnet".into();
         config.chat.default_effort = Some("high".into());
         config.chat.remember_model("haiku");
-        config.chat.gemini_model = "gemini-test".into();
+        config.chat.antigravity_model = "gemini-test".into();
         config.notifications.needs_you = false;
         config.review.default_reviewer = ReviewerKind::Codex;
         save_settings_to(dir.path(), &config).unwrap();
@@ -1042,7 +1042,8 @@ mod tests {
             serialized["policy"],
             serde_json::json!({
                 "claude": {"coordinator": "opus", "scoped": "sonnet", "judgment": "opus", "specialist": "fable"},
-                "codex": {"coordinator": "gpt-6.1-sol", "scoped": "gpt-6-luna", "judgment": "gpt-6.1-sol", "specialist": "gpt-6-astra"}
+                "codex": {"coordinator": "gpt-6.1-sol", "scoped": "gpt-6-luna", "judgment": "gpt-6.1-sol", "specialist": "gpt-6-astra"},
+                "antigravity": {"coordinator": "gemini-4-argon-high", "scoped": "gemini-4-hydrogen-high", "judgment": "gemini-4-argon-high", "specialist": "gemini-4-argon-high"}
             })
         );
         serialized.as_object_mut().unwrap().remove("policy");
@@ -1171,7 +1172,7 @@ mod tests {
     #[test]
     fn acp_chat_models_default_and_parse() {
         let chat: ChatDefaults = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert_eq!(chat.gemini_model, "gemini-4-argon");
+        assert_eq!(chat.antigravity_model, "gemini-4-argon-medium");
         // The global Claude in Chrome switch of earlier builds is ignored
         // (it is per workspace now) and not written back.
         let earlier: ChatDefaults =
@@ -1183,12 +1184,64 @@ mod tests {
             .is_none());
         assert_eq!(chat.opencode_model, "");
         let chat: ChatDefaults = serde_json::from_value(serde_json::json!({
-            "gemini_model": "gemini-3.8-flash",
+            "antigravity_model": "gemini-3.8-flash",
             "opencode_model": "openrouter/google/gemini-3.6-flash",
         }))
         .unwrap();
-        assert_eq!(chat.gemini_model, "gemini-3.8-flash");
+        assert_eq!(chat.antigravity_model, "gemini-3.8-flash");
         assert_eq!(chat.opencode_model, "openrouter/google/gemini-3.6-flash");
+    }
+
+    #[test]
+    fn legacy_gemini_settings_load_without_selecting_the_old_model() {
+        let old: ChatDefaults =
+            serde_json::from_value(serde_json::json!({"gemini_model":"retired-model"})).unwrap();
+        assert_eq!(old.antigravity_model, "gemini-4-argon-medium");
+        let both: ChatDefaults = serde_json::from_value(serde_json::json!({"gemini_model":"retired-model", "antigravity_model":"new-model-high"})).unwrap();
+        assert_eq!(both.antigravity_model, "new-model-high");
+        assert!(serde_json::to_value(old)
+            .unwrap()
+            .get("gemini_model")
+            .is_none());
+    }
+
+    #[test]
+    fn only_exact_gemini_presets_migrate_on_deserialization() {
+        let old = serde_json::json!({"agent_presets":[
+            {"name":"Old", "command":"gemini", "resume_command":"gemini --resume", "icon":"G", "color":"blue"},
+            {"name":"Custom", "command":"gemini --model custom", "icon":"G", "color":"blue"},
+            {"name":"Existing", "command":"agy", "icon":"A", "color":"blue"}
+        ]});
+        let config: Config = serde_json::from_value(old).unwrap();
+        assert_eq!(config.agent_presets[0].name, "Antigravity");
+        assert_eq!(config.agent_presets[0].command, "agy");
+        assert_eq!(
+            config.agent_presets[0].resume_command.as_deref(),
+            Some("agy --continue")
+        );
+        assert_eq!(config.agent_presets[1].command, "gemini --model custom");
+        assert_eq!(config.agent_presets[2].name, "Existing");
+        let saved = serde_json::to_value(&config).unwrap();
+        let again: Config = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&again).unwrap(), saved);
+    }
+
+    #[test]
+    fn gemini_presets_migrate_in_shared_and_carried_over_settings() {
+        let json = r#"{"theme":"dark","agent_presets":[{"name":"Gemini","command":"gemini","icon":"G","color":"blue"}]}"#;
+        let shared = tempfile::tempdir().unwrap();
+        std::fs::write(shared.path().join(SETTINGS_FILE), json).unwrap();
+        let loaded = load_settings_from(shared.path());
+        assert!(loaded.refused.is_none());
+        assert_eq!(loaded.config.agent_presets[0].command, "agy");
+        let carried = tempfile::tempdir().unwrap();
+        write_instance_config(carried.path(), "old", json, 1);
+        let loaded = load_settings_from(carried.path());
+        assert!(loaded.refused.is_none());
+        assert_eq!(loaded.config.agent_presets[0].command, "agy");
+        assert!(std::fs::read_to_string(carried.path().join(SETTINGS_FILE))
+            .unwrap()
+            .contains("agy --continue"));
     }
 
     #[test]
@@ -1265,13 +1318,31 @@ fn default_agent_presets() -> Vec<AgentPreset> {
             color: WorkspaceColor::Green,
         },
         AgentPreset {
-            name: "Gemini".to_string(),
-            command: "gemini".to_string(),
-            resume_command: Some("gemini --resume".to_string()),
-            icon: "G".to_string(),
+            name: "Antigravity".to_string(),
+            command: "agy".to_string(),
+            resume_command: Some("agy --continue".to_string()),
+            icon: "\u{2727}".to_string(),
             color: WorkspaceColor::Blue,
         },
     ]
+}
+
+/// Field-level migration also covers older instance settings carried over
+/// on first load. Only the exact retired executable is replaced.
+fn deserialize_agent_presets<'de, D>(deserializer: D) -> Result<Vec<AgentPreset>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut presets = Vec::<AgentPreset>::deserialize(deserializer)?;
+    for preset in &mut presets {
+        if preset.command == "gemini" {
+            *preset = default_agent_presets()
+                .into_iter()
+                .find(|preset| preset.command == "agy")
+                .expect("default Antigravity preset");
+        }
+    }
+    Ok(presets)
 }
 
 pub fn default_task_worktree_root() -> PathBuf {
@@ -1434,7 +1505,10 @@ pub struct Config {
     #[cfg(feature = "stt")]
     #[serde(default)]
     pub stt_model_path: Option<String>,
-    #[serde(default = "default_agent_presets")]
+    #[serde(
+        default = "default_agent_presets",
+        deserialize_with = "deserialize_agent_presets"
+    )]
     pub agent_presets: Vec<AgentPreset>,
     #[serde(default)]
     pub quick_commands: Vec<QuickCommand>,
@@ -1566,9 +1640,9 @@ fn default_chat_model() -> String {
     "opus".to_string()
 }
 
-/// Gemini's flagship model, the Gemini chat default (TRU-153).
-fn default_gemini_model() -> String {
-    "gemini-4-argon".to_string()
+/// Antigravity's effort-qualified chat default (TRU-273).
+fn default_antigravity_model() -> String {
+    "gemini-4-argon-medium".to_string()
 }
 
 /// What a new chat tab starts with (TRU-143). The app has no settings
@@ -1589,9 +1663,9 @@ fn default_gemini_model() -> String {
 /// TRU-181); a `claude_in_chrome` key here, from an earlier build, is
 /// ignored.
 ///
-/// `gemini_model` and `opencode_model` are what new Gemini and OpenCode
+/// `antigravity_model` and `opencode_model` are what new Antigravity and OpenCode
 /// chats start on (TRU-153): a model id as the agent lists it, such as
-/// `gemini-4-argon` or `openrouter/google/gemini-3.6-flash`. An empty
+/// `gemini-4-argon-medium` or `openrouter/google/gemini-3.6-flash`. An empty
 /// `opencode_model` (the default) keeps the model OpenCode itself picks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatDefaults {
@@ -1605,8 +1679,8 @@ pub struct ChatDefaults {
     /// not per workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<ChatSelection>,
-    #[serde(default = "default_gemini_model")]
-    pub gemini_model: String,
+    #[serde(default = "default_antigravity_model")]
+    pub antigravity_model: String,
     #[serde(default)]
     pub opencode_model: String,
 }
@@ -1626,7 +1700,7 @@ impl Default for ChatDefaults {
             default_effort: None,
             remember_last: true,
             last: None,
-            gemini_model: default_gemini_model(),
+            antigravity_model: default_antigravity_model(),
             opencode_model: String::new(),
         }
     }
@@ -1871,7 +1945,7 @@ const INSTANCE_CONFIG_FILE: &str = "config.json";
 
 /// The keys that mark an instance `config.json` as one a build with these
 /// settings wrote; any one of them is enough.
-const CARRY_OVER_KEYS: [&str; 4] = ["chat", "notifications", "usage", "policy"];
+const CARRY_OVER_KEYS: [&str; 5] = ["chat", "notifications", "usage", "policy", "agent_presets"];
 
 fn settings_log(msg: &str) {
     eprintln!("[settings] {msg}");

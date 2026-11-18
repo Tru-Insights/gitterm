@@ -117,7 +117,7 @@ impl BrowserMcpConnection {
         }
     }
 
-    /// The browser server for an ACP chat (Gemini, OpenCode; TRU-153),
+    /// The browser server for an ACP chat (Antigravity, OpenCode; TRU-153),
     /// with its bearer header carried literally in `session/new`.
     pub fn acp_mcp_server(&self, caller: Option<&str>) -> AcpMcpServer {
         AcpMcpServer {

@@ -4604,14 +4604,8 @@ fn is_harness_token(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && !value.contains(char::is_whitespace)
 }
 
-/// Where ACP chats keep the agents' support files (Gemini's system
-/// settings), inside this instance's config dir.
-fn acp_support_dir() -> PathBuf {
-    config::global_config_dir().join("acp")
-}
-
-/// The config a new Gemini or OpenCode chat tab starts with (TRU-153): the
-/// configured model (`chat.gemini_model` / `chat.opencode_model`; empty
+/// The config a new Antigravity or OpenCode chat tab starts with (TRU-153): the
+/// configured model (`chat.antigravity_model` / `chat.opencode_model`; empty
 /// keeps the agent's own) and the agent's default mode, which asks before
 /// edits and shell commands.
 fn new_acp_chat_config(
@@ -4620,7 +4614,8 @@ fn new_acp_chat_config(
 ) -> AgentBackendConfig {
     use gitterm::harness::acp::AcpAgent;
     let model = match agent {
-        AcpAgent::Gemini => chat_config.gemini_model.trim().to_string(),
+        AcpAgent::Antigravity => chat_config.antigravity_model.trim().to_string(),
+        AcpAgent::Gemini => String::new(),
         AcpAgent::OpenCode => chat_config.opencode_model.trim().to_string(),
     };
     AgentBackendConfig::Acp {
@@ -4824,6 +4819,15 @@ fn backend_accepts_initial_prompt(backend: Option<HarnessConversationBackend>) -
     )
 }
 
+fn command_accepts_initial_prompt(
+    command: &str,
+    backend: Option<HarnessConversationBackend>,
+) -> bool {
+    backend_accepts_initial_prompt(backend)
+        || gitterm::workers::provider_for_command(command)
+            == gitterm::workers::WorkerProvider::Antigravity
+}
+
 /// Writes the composed brief for one task session and returns its path, or a
 /// launch-safe error. Refuses paths containing a single quote — the path is
 /// embedded single-quoted in the launch command. `report_back` as in
@@ -4854,10 +4858,17 @@ fn write_task_brief(
     Ok(path)
 }
 
-/// Appends the brief file as the harness's positional initial prompt. The
+/// Appends the brief file as the harness's initial prompt. The
 /// brief content stays in the file; only its quote-checked path is embedded.
 fn command_with_initial_prompt(command: &str, brief_path: &Path) -> String {
-    format!("{command} \"$(cat '{}')\"", brief_path.display())
+    let flag = if gitterm::workers::provider_for_command(command)
+        == gitterm::workers::WorkerProvider::Antigravity
+    {
+        " --prompt-interactive"
+    } else {
+        ""
+    };
+    format!("{command}{flag} \"$(cat '{}')\"", brief_path.display())
 }
 
 #[derive(Debug, Clone)]
@@ -5069,6 +5080,68 @@ struct QueuedTaskLaunch {
     preset_idx: Option<usize>,
     origin: TaskLaunchOrigin,
     user_model_choice: bool,
+}
+
+fn restored_task_preset_index(
+    harness: Option<&HarnessSelection>,
+    presets: &[AgentPreset],
+) -> Result<usize, String> {
+    let Some(HarnessSelection {
+        kind: HarnessKind::TerminalPreset { preset_name },
+        ..
+    }) = harness
+    else {
+        return Err(
+            "Queued task has no supported terminal preset; select an agent to restart it".into(),
+        );
+    };
+    presets
+        .iter()
+        .position(|preset| &preset.name == preset_name)
+        .ok_or_else(|| format!("Queued task agent preset {preset_name:?} is unavailable; select an agent to restart it"))
+}
+
+fn restore_task_launch_queue(
+    store: &mut TaskStore,
+    presets: &[AgentPreset],
+) -> Result<Vec<QueuedTaskLaunch>, TaskStoreError> {
+    // A customized Gemini preset may have survived the exact-command migration.
+    if !presets.iter().any(|preset| preset.name == "Gemini") {
+        store.migrate_queued_gemini_presets()?;
+    }
+    let mut queued: Vec<_> = store
+        .tasks()
+        .iter()
+        .filter(|task| task.lifecycle == TaskLifecycle::Queued)
+        .map(|task| {
+            (
+                task.task_id.clone(),
+                task.updated_at.clone(),
+                task.harness.clone(),
+            )
+        })
+        .collect();
+    queued.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut launches = Vec::new();
+    for (task_id, _, harness) in queued {
+        match restored_task_preset_index(harness.as_ref(), presets) {
+            Ok(index) => launches.push(QueuedTaskLaunch {
+                task_id,
+                preset_idx: Some(index),
+                origin: TaskLaunchOrigin::Agent,
+                user_model_choice: false,
+            }),
+            Err(error) => {
+                store.record_lifecycle_signal(
+                    &task_id,
+                    TaskLifecycle::Failed,
+                    Some(error),
+                    &chrono::Utc::now().to_rfc3339(),
+                )?;
+            }
+        }
+    }
+    Ok(launches)
 }
 
 fn update_queued_task_request(
@@ -7342,7 +7415,7 @@ pub enum Event {
     /// Open a native Claude chat tab in the active workspace (TRU-140),
     /// the + menu's "New chat".
     NewClaudeChatTab,
-    /// Open a Gemini or OpenCode chat tab in the active (local) workspace
+    /// Open an Antigravity or OpenCode chat tab in the active (local) workspace
     /// (TRU-153).
     NewAcpChatTab(gitterm::harness::acp::AcpAgent),
     /// The + menu's "CLI" entry: show the agent presets (TRU-143).
@@ -11809,7 +11882,9 @@ impl App {
         );
         // A session that has spawned (or has a conversation to resume) is
         // bound to the directory it started in.
-        let reason = if tab.task_id.is_some() {
+        let reason = if let Some(note) = session.config.read_only_note() {
+            Some(note)
+        } else if tab.task_id.is_some() {
             Some("This chat belongs to a task and runs in the task's worktree")
         } else if session.harness.is_some() || session.session_id.is_some() {
             Some("Set when the chat started; start a new chat to change it")
@@ -11852,7 +11927,7 @@ impl App {
 
     /// The composer chips' starting state for a native chat page: the tab's
     /// configured model and effort, its checkout, and which harness drives
-    /// it (`harness`: name, and `acp` for Gemini/OpenCode, whose modes the
+    /// it (`harness`: name, and `acp` for Antigravity/OpenCode, whose modes the
     /// page takes from `ready` and whose messages wait for the turn to end).
     /// `None` for pi tabs.
     fn chat_composer_state(&self, tab_id: usize) -> Option<serde_json::Value> {
@@ -11875,6 +11950,7 @@ impl App {
             "effort": session.config.chat_effort(),
             "checkout": self.chat_checkout_state(tab_id)?,
             "harness": harness,
+            "readOnlyReason": session.config.read_only_note(),
         }))
     }
 
@@ -13754,6 +13830,7 @@ impl App {
                         }
                     }
                     self.record_task_ui_error(&entry.task_id, error);
+                    self.push_worker_cards(&entry.task_id);
                 }
             }
         }
@@ -13819,6 +13896,7 @@ impl App {
             let Some(preset) = self.agent_presets.get(index) else {
                 return Err("The selected agent preset is unavailable".to_string());
             };
+            gitterm::workers::require_task_tools(&preset.command)?;
             (
                 Some(preset.command.clone()),
                 preset.name.clone(),
@@ -13899,7 +13977,8 @@ impl App {
             let provider = match gitterm::workers::provider_for_command(command) {
                 gitterm::workers::WorkerProvider::Claude => gitterm::plan_limits::Provider::Claude,
                 gitterm::workers::WorkerProvider::Codex => gitterm::plan_limits::Provider::Codex,
-                gitterm::workers::WorkerProvider::Other => return false,
+                gitterm::workers::WorkerProvider::Other
+                | gitterm::workers::WorkerProvider::Antigravity => return false,
             };
             origin.policy_blocked(
                 &self.plan_limits.evaluation_for_launch(),
@@ -13960,7 +14039,7 @@ impl App {
         // re-submit the objective into a fresh conversation.
         let pre_injection_command = command.clone();
         let (command, objective_delivery) = match command {
-            Some(launch) if backend_accepts_initial_prompt(conversation_backend) => {
+            Some(launch) if command_accepts_initial_prompt(&launch, conversation_backend) => {
                 match write_task_brief(
                     &session_id,
                     &task,
@@ -20584,7 +20663,7 @@ impl App {
         } = Config::load();
         let task_commands = init_task_control_channel();
         let task_store_path = TaskStore::path_for_config_root(&config::global_config_dir());
-        let (mut task_store, task_store_error) = match load_task_store_for_startup(
+        let (mut task_store, mut task_store_error) = match load_task_store_for_startup(
             task_store_path,
             &chrono::Utc::now().to_rfc3339(),
         ) {
@@ -20686,48 +20765,19 @@ impl App {
                 }
             }
         }
-        // Tasks left Queued by a previous run rejoin the launch queue in
-        // dispatch order; the preset comes from the recorded harness, falling
-        // back to the first configured preset.
-        let task_launch_queue = task_store
-            .as_ref()
-            .map(|store| {
-                let mut queued: Vec<_> = store
-                    .tasks()
-                    .iter()
-                    .filter(|task| task.lifecycle == TaskLifecycle::Queued)
-                    .collect();
-                queued.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
-                queued
-                    .into_iter()
-                    .map(|task| {
-                        let preset_idx = task
-                            .harness
-                            .as_ref()
-                            .and_then(|harness| match &harness.kind {
-                                HarnessKind::TerminalPreset { preset_name } => config
-                                    .agent_presets
-                                    .iter()
-                                    .position(|preset| &preset.name == preset_name),
-                                HarnessKind::NativeClaude | HarnessKind::NativePi => None,
-                            })
-                            .or(if config.agent_presets.is_empty() {
-                                None
-                            } else {
-                                Some(0)
-                            });
-                        QueuedTaskLaunch {
-                            task_id: task.task_id.clone(),
-                            preset_idx,
-                            // Restored launches are automatic; a new UI choice can
-                            // override policy again after restart.
-                            origin: TaskLaunchOrigin::Agent,
-                            user_model_choice: false,
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Restore only the recorded provider; unresolved requests become visible failures.
+        let task_launch_queue = match task_store.as_mut() {
+            Some(store) => match restore_task_launch_queue(store, &config.agent_presets) {
+                Ok(queue) => queue,
+                Err(error) => {
+                    let message = format!("Could not restore queued tasks: {error}");
+                    eprintln!("GitTerm V6 {message}");
+                    task_store_error = Some(message);
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
         let (browser_mcp, browser_mcp_server, browser_error) =
             match browser_mcp::prepare(config::global_config_dir(), config::instance_id()) {
                 Ok((connection, server)) => {
@@ -23265,6 +23315,9 @@ fi
                     Some(session) => TabRuns::Chat(SessionInput {
                         harness: match session.backend() {
                             tab::AgentBackend::Claude => Harness::Claude,
+                            tab::AgentBackend::Acp(
+                                gitterm::harness::acp::AcpAgent::Antigravity,
+                            ) => Harness::Antigravity,
                             tab::AgentBackend::Acp(gitterm::harness::acp::AcpAgent::Gemini) => {
                                 Harness::Gemini
                             }
@@ -25293,6 +25346,17 @@ fi
                     }
                     _ => unreachable!(),
                 };
+                if let Some(note) = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| ws.tabs.iter())
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.agent_session())
+                    .and_then(|s| s.config.read_only_note())
+                {
+                    agent_webview_note(tab_id, note);
+                    return Task::none();
+                }
                 let mut submitted = false;
                 // Find the tab. If it's an Agent tab, ensure a subprocess
                 // manager is spawned (lazy on first prompt) and forward the
@@ -25432,7 +25496,6 @@ fi
                                 let Some(config) = session.acp_session_config(
                                     repo_path,
                                     std::mem::take(&mut acp_mcp_servers),
-                                    acp_support_dir(),
                                     guidelines,
                                 ) else {
                                     return Task::none();
@@ -25748,6 +25811,10 @@ fi
                     eprintln!("AgentSetPermissionMode: tab {tab_id} is not an agent tab");
                     return Task::none();
                 };
+                if let Some(note) = session.config.read_only_note() {
+                    agent_webview_note(tab_id, note);
+                    return Task::none();
+                }
                 // Claude's modes are known here; an ACP agent lists its own
                 // and refuses one it does not offer.
                 let permission_mode = match &mut session.config {
@@ -25825,6 +25892,10 @@ fi
                     eprintln!("AgentSetModel: tab {tab_id} is not an agent tab");
                     return Task::none();
                 };
+                if let Some(note) = session.config.read_only_note() {
+                    agent_webview_note(tab_id, note);
+                    return Task::none();
+                }
                 let is_claude = session.backend() == tab::AgentBackend::Claude;
                 let configured = match &mut session.config {
                     tab::AgentBackendConfig::Claude {
@@ -25879,6 +25950,10 @@ fi
                     eprintln!("AgentSetEffort: tab {tab_id} is not an agent tab");
                     return Task::none();
                 };
+                if let Some(note) = session.config.read_only_note() {
+                    agent_webview_note(tab_id, note);
+                    return Task::none();
+                }
                 let is_claude = session.backend() == tab::AgentBackend::Claude;
                 let configured = match &mut session.config {
                     tab::AgentBackendConfig::Claude {
@@ -26588,6 +26663,9 @@ fi
                 return Task::batch([scroll_task, self.present_active_tab_surfaces()]);
             }
             Event::NewAcpChatTab(agent) => {
+                if !gitterm::harness::acp::AcpAgent::ALL.contains(&agent) {
+                    return Task::none();
+                }
                 self.tab_picker_visible = false;
                 // ACP chats run on this Mac only in this slice (TRU-153);
                 // the picker does not offer them in a remote workspace.
@@ -27033,7 +27111,7 @@ fi
                                             // respawn starts on this model,
                                             // and new Claude chats may start
                                             // on it too (ACP chats start on
-                                            // `chat.gemini_model` /
+                                            // `chat.antigravity_model` /
                                             // `chat.opencode_model`).
                                             match &mut session.config {
                                                 tab::AgentBackendConfig::Claude {
@@ -33486,6 +33564,10 @@ fi
         else {
             return Task::none();
         };
+        if session.config.read_only_note().is_some() {
+            session.history = tab::HistoryLoad::Loaded;
+            return Task::none();
+        }
         let Some(session_id) = session.history_to_load().map(str::to_string) else {
             return Task::none();
         };
@@ -33515,12 +33597,8 @@ fi
                 document_places.as_ref(),
                 task_tools,
             );
-            let Some(config) = session.acp_session_config(
-                repo_path,
-                acp_mcp_servers,
-                acp_support_dir(),
-                guidelines,
-            ) else {
+            let Some(config) = session.acp_session_config(repo_path, acp_mcp_servers, guidelines)
+            else {
                 return Task::none();
             };
             eprintln!(
@@ -35036,7 +35114,7 @@ fi
                 theme.accent(),
                 Event::NewClaudeChatTab,
             ));
-            // Gemini and OpenCode chats run on this Mac only (TRU-153).
+            // Antigravity and OpenCode chats run on this Mac only (TRU-153).
             let local_workspace = self
                 .active_workspace()
                 .is_some_and(|ws| remote_agent_root(&ws.location).is_none());
@@ -35050,7 +35128,8 @@ fi
                         format!("New {} chat", agent.label()),
                         format!("{} · {model}", agent.label()),
                         match agent {
-                            gitterm::harness::acp::AcpAgent::Gemini => "\u{2727}", // ✧
+                            gitterm::harness::acp::AcpAgent::Antigravity
+                            | gitterm::harness::acp::AcpAgent::Gemini => "\u{2727}", // ✧
                             gitterm::harness::acp::AcpAgent::OpenCode => "\u{25c7}", // ◇
                         }
                         .to_string(),
@@ -50306,6 +50385,79 @@ mod tests {
     }
 
     #[test]
+    fn queued_restore_refuses_unresolved_presets_instead_of_switching_provider() {
+        let configured = Config::default().agent_presets;
+        for presets in [configured, Vec::new()] {
+            for kind in [
+                None,
+                Some(HarnessKind::NativeClaude),
+                Some(HarnessKind::NativePi),
+                Some(HarnessKind::TerminalPreset {
+                    preset_name: "Removed".into(),
+                }),
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let mut store = TaskStore::load(temp.path().join("tasks.json")).unwrap();
+                let mut task = slot_task(ExecutorTarget::Local, TaskLifecycle::Ready);
+                task.harness = kind.map(|kind| HarnessSelection { kind, model: None });
+                store.insert(task).unwrap();
+                store
+                    .record_lifecycle_signal("task-slot", TaskLifecycle::Queued, None, "t1")
+                    .unwrap();
+                assert!(restore_task_launch_queue(&mut store, &presets)
+                    .unwrap()
+                    .is_empty());
+                let failed = store.get("task-slot").unwrap();
+                assert_eq!(failed.lifecycle, TaskLifecycle::Failed);
+                assert_eq!(
+                    failed.attempts.last().unwrap().state,
+                    gitterm::tasks::AttemptState::Failed
+                );
+                assert!(failed.last_error.as_ref().unwrap().contains("preset"));
+                assert!(failed.attention.unread);
+            }
+        }
+    }
+
+    #[test]
+    fn queued_restore_migrates_retired_gemini_but_keeps_a_custom_gemini_preset() {
+        for custom in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut store = TaskStore::load(temp.path().join("tasks.json")).unwrap();
+            let mut task = slot_task(ExecutorTarget::Local, TaskLifecycle::Ready);
+            task.harness = Some(HarnessSelection {
+                kind: HarnessKind::TerminalPreset {
+                    preset_name: "Gemini".into(),
+                },
+                model: None,
+            });
+            store.insert(task).unwrap();
+            store
+                .record_lifecycle_signal("task-slot", TaskLifecycle::Queued, None, "t1")
+                .unwrap();
+            let mut presets = Config::default().agent_presets;
+            if custom {
+                let mut preset = presets[0].clone();
+                preset.name = "Gemini".into();
+                preset.command = "gemini --model custom".into();
+                presets.push(preset);
+            }
+            let queue = restore_task_launch_queue(&mut store, &presets).unwrap();
+            assert_eq!(queue.len(), 1);
+            let selected = &presets[queue[0].preset_idx.unwrap()];
+            assert_eq!(selected.name, if custom { "Gemini" } else { "Antigravity" });
+            assert_eq!(
+                selected.command,
+                if custom {
+                    "gemini --model custom"
+                } else {
+                    "agy"
+                }
+            );
+        }
+    }
+
+    #[test]
     fn task_launch_honors_manual_preset_choices_under_hold() {
         use gitterm::plan_limits::{self, LimitWindow, PlanLimits, PlanLimitsFile, Provider};
         let now = 1_800_000_000;
@@ -51457,6 +51609,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn antigravity_receives_an_interactive_initial_brief_without_a_conversation_backend() {
+        let command = "/opt/bin/agy --model gemini-3.8-flash-low";
+        assert!(command_accepts_initial_prompt(command, None));
+        assert_eq!(
+            command_with_initial_prompt(command, Path::new("/cfg/task briefs/abc.md")),
+            "/opt/bin/agy --model gemini-3.8-flash-low --prompt-interactive \"$(cat '/cfg/task briefs/abc.md')\""
+        );
+        assert!(!command_accepts_initial_prompt("zsh", None));
+        #[cfg(unix)]
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let brief_path = temp.path().join("brief.md");
+            let brief =
+                "Keep 'quotes', \"quotes\", $variables, `commands`, and newlines\n".repeat(1000);
+            std::fs::write(&brief_path, &brief).unwrap();
+            let launch = command_with_initial_prompt("agy", &brief_path);
+            let output = std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &format!("agy() {{ printf '%s\\n' \"$1\"; printf '%s' \"$2\"; }}; {launch}"),
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            // Shell substitution removes trailing newlines, as for Claude/Codex.
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!("--prompt-interactive\n{}", brief.trim_end_matches('\n'))
+            );
+        }
+    }
+
     /// Claude in Chrome is off unless the workspace switches it on
     /// (TRU-181), on every path GitTerm starts Claude by.
     #[test]
@@ -52048,9 +52233,11 @@ mod tests {
     fn agent_chat_page_sends_while_claude_works() {
         let html = agent_chat_html();
         // Claude tabs send mid-turn; a pending request still blocks.
-        assert!(html.contains("submitBtn.disabled = !sendAllowed(busy, pending.size, steerable);"));
+        assert!(html.contains(
+            "submitBtn.disabled = !!readOnlyReason || !sendAllowed(busy, pending.size, steerable);"
+        ));
         assert!(html.contains("return pendingCount === 0 && (!isBusy || canSteer);"));
-        assert!(html.contains("steerable = permissionMode != null;"));
+        assert!(html.contains("steerable = !readOnlyReason && permissionMode != null;"));
         // Queued markers: withdraw, lifecycle, refused withdraw, exit.
         assert!(html.contains("postIpc({ type: 'withdraw', id });"));
         assert!(html.contains("case 'message_lifecycle':"));
@@ -52062,15 +52249,15 @@ mod tests {
     fn new_acp_chats_start_on_the_configured_model_and_default_mode() {
         use gitterm::harness::acp::AcpAgent;
         let chat = config::ChatDefaults::default();
-        match new_acp_chat_config(&chat, AcpAgent::Gemini) {
+        match new_acp_chat_config(&chat, AcpAgent::Antigravity) {
             AgentBackendConfig::Acp {
                 agent,
                 model,
                 mode,
                 effort,
             } => {
-                assert_eq!(agent, AcpAgent::Gemini);
-                assert_eq!(model, "gemini-4-argon");
+                assert_eq!(agent, AcpAgent::Antigravity);
+                assert_eq!(model, "gemini-4-argon-medium");
                 assert_eq!(mode.as_deref(), Some("default"));
                 assert_eq!(effort, None);
             }

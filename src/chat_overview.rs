@@ -37,6 +37,7 @@ const ASKED_CHARS: usize = 100;
 pub(crate) enum Harness {
     /// A native Claude chat tab.
     Claude,
+    Antigravity,
     Gemini,
     OpenCode,
     Pi,
@@ -52,7 +53,8 @@ impl Harness {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Claude => "Claude",
-            Self::Gemini => "Gemini",
+            Self::Antigravity => "Antigravity",
+            Self::Gemini => "Gemini (read-only)",
             Self::OpenCode => "OpenCode",
             Self::Pi => "Pi",
             Self::CodexCli => "Codex CLI",

@@ -1,0 +1,2 @@
+antigravity_initialize.jsonl and antigravity_session_new.jsonl record protocol metadata from agy 1.5.11. The session id is synthetic. They contain no account details or conversations.
+antigravity_turn_tools.jsonl keeps real tool/permission/usage frame shapes from the headless smoke with synthetic session/tool ids and replacement reply text. Task data and the instruction token are synthetic; no account details are retained.

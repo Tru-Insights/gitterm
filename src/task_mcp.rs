@@ -447,7 +447,7 @@ impl TaskMcpConnection {
         }
     }
 
-    /// The task server for an ACP chat (Gemini, OpenCode; TRU-153): the
+    /// The task server for an ACP chat (Antigravity, OpenCode; TRU-153): the
     /// same URL and caller attribution as `claude_mcp_server`. ACP carries
     /// header values literally, so the bearer token rides in the
     /// `session/new` frame on the agent's stdin.

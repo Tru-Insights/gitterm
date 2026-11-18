@@ -52,7 +52,7 @@ const CLAUDE_WIRE_LOG_ENV: &str = "GITTERM_V6_CLAUDE_WIRE_LOG_DIR";
 pub(crate) enum AgentBackend {
     Pi,
     Claude,
-    /// An Agent Client Protocol agent (Gemini CLI, OpenCode; TRU-153).
+    /// An Agent Client Protocol agent (Antigravity, OpenCode; TRU-153).
     Acp(AcpAgent),
 }
 
@@ -84,8 +84,8 @@ pub(crate) enum AgentBackendConfig {
         effort: Option<String>,
     },
     /// An ACP agent's chat (TRU-153). `model` empty keeps the agent's own
-    /// choice; `mode` is the agent's session mode (Gemini `default`,
-    /// `autoEdit`, `yolo`, `plan`; OpenCode `build`, `plan`).
+    /// choice; `mode` is the agent's session mode (Antigravity `default`,
+    /// `accept-edits`, `auto`, `plan`; OpenCode `build`, `plan`).
     Acp {
         agent: AcpAgent,
         #[serde(default)]
@@ -104,6 +104,17 @@ impl AgentBackendConfig {
             Self::Claude { .. } => AgentBackend::Claude,
             Self::Acp { agent, .. } => AgentBackend::Acp(*agent),
         }
+    }
+
+    pub(crate) fn read_only_note(&self) -> Option<&'static str> {
+        matches!(
+            self,
+            Self::Acp {
+                agent: AcpAgent::Gemini,
+                ..
+            }
+        )
+        .then_some(gitterm::harness::acp::GEMINI_REPLACED_NOTE)
     }
 
     /// The chat's model as configured (Claude and ACP tabs).
@@ -353,7 +364,8 @@ impl AgentSession {
     /// tab reads it back by starting its agent, which replays the session
     /// through `session/load`.
     pub(crate) fn history_to_load(&self) -> Option<&str> {
-        (self.backend().is_native()
+        (self.config.read_only_note().is_none()
+            && self.backend().is_native()
             && self.history == HistoryLoad::NotLoaded
             && self.conversation.is_empty())
         .then_some(self.session_id.as_deref())
@@ -488,12 +500,10 @@ impl AgentSession {
     }
 
     /// The ACP agent settings for this tab (`None` for other backends).
-    /// `support_dir` is where the adapter writes the agent's support files.
     pub(crate) fn acp_session_config(
         &self,
         cwd: PathBuf,
         mcp_servers: Vec<AcpMcpServer>,
-        support_dir: PathBuf,
         guidelines: Option<gitterm::guidelines::Guidelines>,
     ) -> Option<AcpSessionConfig> {
         let AgentBackendConfig::Acp {
@@ -505,6 +515,9 @@ impl AgentSession {
         else {
             return None;
         };
+        if self.config.read_only_note().is_some() {
+            return None;
+        }
         let model = model.trim();
         Some(AcpSessionConfig {
             snapshot_facts_dir: Some(gitterm::chat_facts::facts_dir(
@@ -521,7 +534,6 @@ impl AgentSession {
             effort: effort.clone(),
             mcp_servers,
             env: Vec::new(),
-            support_dir,
             wire_log_dir: std::env::var_os(ACP_WIRE_LOG_ENV).map(PathBuf::from),
             guidelines,
         })
@@ -1132,20 +1144,39 @@ mod tests {
     }
 
     #[test]
+    fn saved_gemini_is_read_only_and_cannot_start_or_load_a_harness() {
+        let json = serde_json::json!({"backend":"acp", "agent":"gemini", "model":"gemini-4-argon"});
+        let config: AgentBackendConfig = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&config).unwrap(), json);
+        assert!(config
+            .read_only_note()
+            .unwrap()
+            .contains("can't be continued"));
+        let mut session = AgentSession::new(config);
+        session.session_id = Some("legacy-session".into());
+        assert_eq!(session.history_to_load(), None);
+        assert!(session
+            .acp_session_config(PathBuf::from("/tmp"), Vec::new(), None)
+            .is_none());
+        assert_eq!(session.backend(), AgentBackend::Acp(AcpAgent::Gemini));
+        assert!(!AcpAgent::ALL.contains(&AcpAgent::Gemini));
+    }
+
+    #[test]
     fn acp_tab_config_round_trips_and_builds_the_session_config() {
         let config = AgentBackendConfig::Acp {
-            agent: AcpAgent::Gemini,
-            model: "gemini-4-argon".into(),
+            agent: AcpAgent::Antigravity,
+            model: "gemini-4-argon-medium".into(),
             mode: None,
             effort: None,
         };
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({"backend": "acp", "agent": "gemini", "model": "gemini-4-argon"})
+            serde_json::json!({"backend": "acp", "agent": "antigravity", "model": "gemini-4-argon-medium"})
         );
         let back: AgentBackendConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(back.backend(), AgentBackend::Acp(AcpAgent::Gemini));
+        assert_eq!(back.backend(), AgentBackend::Acp(AcpAgent::Antigravity));
         let mut session = AgentSession::new(back);
         session.session_id = Some("g-1".into());
         assert_eq!(session.history_to_load(), Some("g-1"));
@@ -1154,15 +1185,10 @@ mod tests {
             Some("default")
         );
         let acp = session
-            .acp_session_config(
-                PathBuf::from("/tmp/repo"),
-                Vec::new(),
-                PathBuf::from("/tmp/s"),
-                None,
-            )
+            .acp_session_config(PathBuf::from("/tmp/repo"), Vec::new(), None)
             .unwrap();
         assert_eq!(acp.resume.as_deref(), Some("g-1"));
-        assert_eq!(acp.model.as_deref(), Some("gemini-4-argon"));
+        assert_eq!(acp.model.as_deref(), Some("gemini-4-argon-medium"));
         assert_eq!(acp.mode.as_deref(), Some("default"));
         // An empty OpenCode model keeps OpenCode's own choice.
         let opencode = AgentSession::new(AgentBackendConfig::Acp {
@@ -1172,12 +1198,7 @@ mod tests {
             effort: Some("high".into()),
         });
         let acp = opencode
-            .acp_session_config(
-                PathBuf::from("/tmp"),
-                Vec::new(),
-                PathBuf::from("/tmp/s"),
-                None,
-            )
+            .acp_session_config(PathBuf::from("/tmp"), Vec::new(), None)
             .unwrap();
         assert_eq!(acp.model, None);
         assert_eq!(acp.mode.as_deref(), Some("plan"));

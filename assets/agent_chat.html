@@ -673,6 +673,7 @@
   </div>
   <div id="v5-offer"></div>
   <div id="request-panel"></div>
+  <div id="read-only-note" class="note" role="status" hidden></div>
   <div id="composer">
     <div id="attachments"></div>
     <div class="chip-menu" id="slash-menu"></div>
@@ -730,18 +731,24 @@
   window.__setTabId = function (id, permissionMode, composer, guidelines) {
     window.__currentTabId = id;
     window.__setGuidelines(guidelines);
-    // Which harness drives the chat: Claude, or an ACP agent (Gemini,
+    // Which harness drives the chat: Claude, or an ACP agent (Antigravity,
     // OpenCode; TRU-153) whose modes come from its `ready` and whose
     // messages sent mid-turn wait for the turn to end. Pi tabs: null.
     harness = composer && composer.harness ? composer.harness : (permissionMode != null ? { name: 'Claude', acp: false } : null);
     // Claude and ACP chats take a message while they work (Claude reads it
     // at its next step; an ACP chat sends it when the turn ends). Pi waits.
-    steerable = permissionMode != null;
-    resetMode(permissionMode == null ? null : permissionMode);
+    readOnlyReason = composer && composer.readOnlyReason ? composer.readOnlyReason : null;
+    const readOnlyNote = document.getElementById('read-only-note');
+    readOnlyNote.textContent = readOnlyReason || '';
+    readOnlyNote.hidden = !readOnlyReason;
+    promptEl.disabled = !!readOnlyReason;
+    steerable = !readOnlyReason && permissionMode != null;
+    resetMode(readOnlyReason || permissionMode == null ? null : permissionMode);
     // Only Claude tabs can review (the review runs as a Claude subagent).
     setReviewAvailable(permissionMode != null && !(harness && harness.acp));
-    resetComposerChips(composer || null);
-    promptEl.placeholder = 'Message ' + harnessName() + '... (Enter to send, Shift+Enter for newline)';
+    resetComposerChips(readOnlyReason ? null : (composer || null));
+    promptEl.placeholder = readOnlyReason ? 'Read-only chat' : 'Message ' + harnessName() + '... (Enter to send, Shift+Enter for newline)';
+    refreshComposer();
   };
 
   const messagesEl = document.getElementById('messages');
@@ -759,6 +766,7 @@
   // ---- state -------------------------------------------------------------
   let busy = false;           // a turn is in flight
   let steerable = false;      // the harness takes messages mid-turn (Claude, ACP)
+  let readOnlyReason = null;
   let harness = null;         // {name, acp}: the native harness, null for pi
   function harnessName() { return harness ? harness.name : 'the agent'; }
   function isAcp() { return !!(harness && harness.acp); }
@@ -824,7 +832,7 @@
     for (const render of htmlRenders) render.setTheme(appearance);
   };
   function showHtmlRender(item, output) {
-    // Claude's MCP prefix, Gemini's FQN, OpenCode's server_tool name, and
+    // Claude's MCP prefix, Antigravity's FQN, OpenCode's server_tool name, and
     // the unprefixed MCP name. Arbitrary tool/file output is never published.
     if (item.render || !['html_render', 'mcp__gitterm_tasks__html_render', 'mcp_gitterm-tasks_html_render', 'gitterm_tasks_html_render'].includes(item.name) || typeof output !== 'string') return;
     let result;
@@ -2339,12 +2347,12 @@
   }
   function refreshComposer() {
     // Typing stays possible while a request is pending; sending waits.
-    submitBtn.disabled = !sendAllowed(busy, pending.size, steerable);
+    submitBtn.disabled = !!readOnlyReason || !sendAllowed(busy, pending.size, steerable);
     submitBtn.title = busy && !submitBtn.disabled
       ? (isAcp() ? harnessName() + ' is working: the message is queued and sent when this turn ends'
                  : 'Claude is working: the message is queued and Claude reads it at its next step')
       : '';
-    stopBtn.disabled = !busy;
+    stopBtn.disabled = !!readOnlyReason || !busy;
     if (typeof refreshReviewSubmit === 'function') refreshReviewSubmit();
     for (const card of cards.values()) refreshCardSend(card);
   }

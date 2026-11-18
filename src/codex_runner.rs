@@ -365,6 +365,15 @@ async fn run_inner(
     progress: &mpsc::UnboundedSender<CodexRunEvent>,
     environment: &CodexEnvironment,
 ) -> Result<CodexRunOutcome, CodexRunError> {
+    if run.effort == Some(crate::workers::ReasoningEffort::Max) {
+        return Err(CodexRunError::Io {
+            context: "configure Codex effort".into(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Codex does not support max effort; use low, medium, high or xhigh",
+            ),
+        });
+    }
     let program = resolve_codex(&environment.search_path)?;
     let git = git_state(&run.cwd).await?;
     let last_message_path = run.log_path.with_extension("last.md");
@@ -1553,6 +1562,30 @@ mod tests {
         let text = tail.into_string();
         assert!(text.len() <= STDERR_TAIL_BYTES);
         assert!(text.ends_with("line 499 \u{00e9}"));
+    }
+
+    #[tokio::test]
+    async fn max_effort_is_refused_before_direct_codex_execution() {
+        let (progress, _events) = mpsc::unbounded_channel();
+        let run = CodexRun {
+            kind: CodexRunKind::Consult {
+                brief: "synthetic".into(),
+            },
+            cwd: PathBuf::from("/nonexistent"),
+            model: None,
+            guidelines: None,
+            effort: Some(crate::workers::ReasoningEffort::Max),
+            time_limit: None,
+            log_path: PathBuf::from("/nonexistent/log.jsonl"),
+        };
+        let env = CodexEnvironment {
+            search_path: OsString::new(),
+            sessions_root: PathBuf::from("/nonexistent"),
+        };
+        let error = run_with(run, progress, &env).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Codex does not support max effort"));
     }
 
     #[test]

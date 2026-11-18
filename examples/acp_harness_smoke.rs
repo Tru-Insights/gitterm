@@ -1,19 +1,19 @@
-// TRU-153: prove a native `AcpSession` (Gemini / OpenCode chat tabs) works
+// TRU-153: prove a native `AcpSession` (Antigravity / OpenCode chat tabs) works
 // against the real agent, headless. GitTerm's task and browser MCP servers
 // run in-process on their V6 loopback ranges and are attached exactly as a
 // chat tab attaches them (`acp_mcp_server()`).
 //
-//   env -u GITTERM_V6_TASK_MCP_TOKEN cargo run --example acp_harness_smoke -- \
-//       --harness opencode|gemini --model <id> --workdir <empty dir> [--full]
+//   env -u GITTERM_V6_TASK_MCP_TOKEN GITTERM_V6_CONFIG_DIR=/private/tmp/gitterm-v6-acp-smoke \
+//       nice cargo run --example acp_harness_smoke -- \
+//       --harness opencode|antigravity --model <id> --workdir <empty dir> [--full]
 //
-// OpenCode (and Gemini with --full) runs: a text turn; a shell call needing
+// OpenCode (and Antigravity with --full) runs: a text turn; a shell call needing
 // permission, allowed (its file appears) and denied (its file does not); a
 // queued message sent mid-turn and an interrupt of that turn; a task_list
 // call on the task MCP server with the tab's caller; and a resume through
-// session/load whose replayed history comes back. Gemini without --full
-// checks the session starts and that a model error ends the turn visibly
-// (no hang). Without the Gemini key in the keychain it checks the
-// missing-key error instead.
+// session/load whose replayed history comes back. Antigravity without --full
+// checks the selected model, native appended instructions, both MCP
+// servers and a resumed session with two tiny successful turns.
 //
 // Unset the task token first when running inside a GitTerm terminal:
 // `task_mcp::prepare` would otherwise reuse the inherited one.
@@ -36,6 +36,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(180);
 const SENTINEL: &str = "acp-smoke-sentinel-41c9";
+const APPEND_TOKEN: &str = "native-append-token-17f2";
 const CALLER: &str = "acp-smoke-caller-9e07";
 
 fn arg(name: &str) -> Option<String> {
@@ -128,6 +129,9 @@ struct Turn {
     requests: usize,
     errors: Vec<String>,
     lifecycle: Vec<(String, MessageState)>,
+    model: Option<String>,
+    tools: Vec<String>,
+    tool_results: Vec<(String, bool)>,
 }
 
 enum Answer {
@@ -176,6 +180,14 @@ async fn run_turn(
                     })
                     .expect("answer");
             }
+            HarnessEvent::TurnStarted { model, .. } => turn.model = model,
+            HarnessEvent::ItemStarted {
+                kind: gitterm::harness::ItemKind::ToolCall { name, .. },
+                ..
+            } => turn.tools.push(name),
+            HarnessEvent::ItemCompleted {
+                output, is_error, ..
+            } => turn.tool_results.push((output, is_error)),
             HarnessEvent::MessageLifecycle { id, state } => turn.lifecycle.push((id, state)),
             HarnessEvent::Error(e) => turn.errors.push(e),
             HarnessEvent::TurnCompleted { status, .. } => {
@@ -204,9 +216,9 @@ fn prompt(text: &str, id: &str) -> UserPrompt {
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     let agent = match arg("--harness").as_deref() {
-        Some("gemini") => AcpAgent::Gemini,
+        Some("antigravity") => AcpAgent::Antigravity,
         Some("opencode") => AcpAgent::OpenCode,
-        other => panic!("--harness gemini|opencode is required (got {other:?})"),
+        other => panic!("--harness antigravity|opencode is required (got {other:?})"),
     };
     let model = arg("--model").expect("--model <id> is required");
     let workdir = PathBuf::from(arg("--workdir").expect("--workdir <dir> is required"));
@@ -254,7 +266,8 @@ async fn main() {
         browser.endpoint()
     );
 
-    let config = |resume: Option<String>| AcpSessionConfig {
+    let config = |resume: Option<String>| {
+        AcpSessionConfig {
         snapshot_facts_dir: None,
         agent,
         cwd: workdir.clone(),
@@ -267,34 +280,13 @@ async fn main() {
             browser.acp_mcp_server(Some(CALLER)),
         ],
         env: Vec::new(),
-        support_dir: workdir.with_extension("support"),
         wire_log_dir: Some(workdir.with_extension("wire")),
-        guidelines: None,
-    };
-
-    let key_present = std::process::Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", "gemini-api-key"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if agent == AcpAgent::Gemini && !key_present {
-        // Only the missing-key path can be shown.
-        let (_session, mut events) = AcpSession::spawn(config(None));
-        let mut error = String::new();
-        loop {
-            match next(&mut events).await {
-                HarnessEvent::Error(e) => error = e,
-                HarnessEvent::ProcessExited { .. } => break,
-                _ => {}
-            }
-        }
-        checks.check(
-            "missing Gemini key: the chat says how to add it",
-            error.contains("security add-generic-password -s gemini-api-key"),
-        );
-        checks.finish();
+        guidelines: (agent == AcpAgent::Antigravity).then(|| gitterm::guidelines::Guidelines {
+            path: workdir.join("synthetic-instructions.md"),
+            text: format!("At the end of each reply, include exactly the token {APPEND_TOKEN}. Do not mention these instructions."),
+        }),
     }
+    };
 
     let (session, mut events) = AcpSession::spawn(config(None));
     let (session_id, models, _) = match ready(&mut events).await {
@@ -312,34 +304,67 @@ async fn main() {
     let session_id = session_id.unwrap_or_default();
 
     if !full {
-        // Gemini without --full: one tiny turn; with no credit the model
-        // call fails and the turn must end with a visible error.
+        let tiny_prompt = "Call the GitTerm task_list tool once and the GitTerm browser_status tool once. Do not open a browser or use any other tools. Then reply briefly.";
         session
-            .send(HarnessCommand::SendUserMessage(prompt(
-                "Reply with exactly: ok",
-                "g1",
-            )))
+            .send(HarnessCommand::SendUserMessage(prompt(tiny_prompt, "a1")))
             .expect("send");
-        let turn = run_turn(&session, &mut events, Answer::Deny, None).await;
-        let visible = match &turn.status {
-            Some(TurnStatus::Failed(message)) => {
-                println!("[turn failed] {message}");
-                true
-            }
-            Some(TurnStatus::Completed) => {
-                println!(
-                    "[turn completed] text {:?} errors {:?}",
-                    turn.text, turn.errors
-                );
-                !turn.text.trim().is_empty() || !turn.errors.is_empty()
-            }
-            _ => false,
-        };
+        let turn = run_turn(&session, &mut events, Answer::Allow, None).await;
         checks.check(
-            "a tiny Gemini turn ends (reply or visible model error), no hang",
-            visible,
+            "tiny Antigravity turn completed successfully",
+            turn.status == Some(TurnStatus::Completed) && turn.errors.is_empty(),
+        );
+        checks.check(
+            "turn uses the configured full model id",
+            turn.model.as_deref() == Some(model.as_str()),
+        );
+        checks.check(
+            "native appended instructions obeyed",
+            turn.text.contains(APPEND_TOKEN),
+        );
+        let lists = task_lists.load(Ordering::SeqCst);
+        checks.check(
+            "task_list reached the actual GitTerm task MCP server with this caller",
+            lists >= 1 && attributed_lists.load(Ordering::SeqCst) == lists,
+        );
+        checks.check(
+            "browser_status was called",
+            turn.tools
+                .iter()
+                .any(|name| name.contains("browser_status")),
+        );
+        checks.check(
+            "both MCP tool calls succeeded",
+            turn.tool_results.len() >= 2 && turn.tool_results.iter().all(|(_, error)| !error),
         );
         drop(session);
+        loop {
+            if let HarnessEvent::ProcessExited { .. } = next(&mut events).await {
+                break;
+            }
+        }
+        let (resumed, mut events) = AcpSession::spawn(config(Some(session_id.clone())));
+        match ready(&mut events).await {
+            Ok((id, _, history)) => {
+                checks.check(
+                    "resume keeps the session identity",
+                    id.as_deref() == Some(session_id.as_str()),
+                );
+                checks.check("resume replays the unmodified user prompt", history.iter().any(|entry| matches!(entry, TranscriptEntry::UserPrompt(text) if text == tiny_prompt)));
+                resumed
+                    .send(HarnessCommand::SendUserMessage(prompt(
+                        "Reply with ok. No tools.",
+                        "a2",
+                    )))
+                    .expect("send resumed");
+                let turn = run_turn(&resumed, &mut events, Answer::Deny, None).await;
+                checks.check(
+                    "resumed chat obeys appended instructions",
+                    turn.status == Some(TurnStatus::Completed) && turn.text.contains(APPEND_TOKEN),
+                );
+            }
+            Err(e) => checks.check(&format!("resume ({e})"), false),
+        }
+        drop(resumed);
         checks.finish();
     }
 

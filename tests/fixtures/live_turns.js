@@ -306,6 +306,14 @@
     send(end);
     check('F1 turn end folds restored and detached runs without losing cards', !document.querySelector('.earlier') && !runs().length && messages.querySelectorAll('.turn-fold details.tool').length === 300 && !messages.querySelector('.tool-run .tool-run') && [...document.querySelectorAll('#messages > .assistant')].some((n) => n.textContent.includes('Finished checking.')));
 
+    const legacyReason = "Gemini was replaced by Antigravity; this chat can't be continued.";
+    window.__setTabId(2, 'default', { model: 'old-model', harness: { name: 'Gemini', acp: true }, readOnlyReason: legacyReason }, false);
+    check('legacy Gemini keeps a visible read-only explanation', !document.getElementById('read-only-note').hidden && document.getElementById('read-only-note').textContent === legacyReason);
+    send(end);
+    check('legacy Gemini composer stays disabled after turn events', document.getElementById('prompt').disabled && document.getElementById('submit').disabled && document.getElementById('stop').disabled);
+    window.__setTabId(3, 'default', { model: 'gemini-4-argon-medium', harness: { name: 'Antigravity', acp: true } }, false);
+    check('Antigravity remains writable after leaving legacy Gemini', !document.getElementById('prompt').disabled && !document.getElementById('submit').disabled && document.getElementById('read-only-note').hidden);
+
     // TRU-270: exercise the actual action/shortcut, never a separate serializer.
     const markdownIpc = [];
     window.ipc = { postMessage: (body) => markdownIpc.push(JSON.parse(body)) };
