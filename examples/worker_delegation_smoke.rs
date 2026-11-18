@@ -622,6 +622,7 @@ async fn delegate_task(
                 harness: None,
                 conversation: None,
                 objective_delivery: ObjectiveDeliveryState::Delivered,
+                launch_identity: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },

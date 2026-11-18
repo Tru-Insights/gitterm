@@ -549,24 +549,32 @@ fn unix_secs(at: SystemTime) -> i64 {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Badge {
-    /// "14%", "≥92%" for a stale reading (use only grows inside a window,
-    /// so an old % is a floor), or "LIMIT" / "OVER".
+    /// "14%", "≈31%" for an old weekly reading's estimate, "≥92%" for any
+    /// other stale one (use only grows inside a window, so an old % is a
+    /// floor), or "LIMIT" / "OVER".
     pub text: String,
     pub level: Level,
 }
 
 /// The highest current % across `readings`, or an alert in words. None
-/// when nothing still means something.
-pub fn badge<'a>(readings: impl IntoIterator<Item = &'a PlanLimits>, now: i64) -> Option<Badge> {
-    let mut peak: Option<(f64, bool)> = None;
+/// when nothing still means something. `histories` feed the estimate for
+/// an old weekly reading.
+pub fn badge<'a>(
+    readings: impl IntoIterator<Item = &'a PlanLimits>,
+    histories: &[WindowHistory],
+    now: i64,
+) -> Option<Badge> {
+    let mut peak: Option<(f64, &'static str)> = None;
     let mut alert: Option<&'static str> = None;
     for reading in readings {
         if let Some(first) = reading.active_alerts(now).first() {
             alert = alert.or(Some(first.short()));
         }
-        if let Some(percent) = reading.peak_percent(now) {
-            if peak.is_none_or(|(best, _)| percent > best) {
-                peak = Some((percent, reading.is_stale(now)));
+        for window in &reading.windows {
+            if let Some((percent, mark)) = window_figure(reading, window, histories, now) {
+                if peak.is_none_or(|(best, _)| percent > best) {
+                    peak = Some((percent, mark));
+                }
             }
         }
     }
@@ -576,10 +584,29 @@ pub fn badge<'a>(readings: impl IntoIterator<Item = &'a PlanLimits>, now: i64) -
             level: Level::Danger,
         });
     }
-    let (percent, stale) = peak?;
+    let (percent, mark) = peak?;
     Some(Badge {
-        text: format!("{}{}%", if stale { "≥" } else { "" }, percent.round()),
+        text: format!("{mark}{}%", percent.round()),
         level: level(percent),
+    })
+}
+
+/// A window's % to show and the mark before it: none for a current
+/// reading, "≈" for an old weekly reading's estimate, "≥" for any other
+/// old one. None once unknown or reset since the reading.
+pub fn window_figure(
+    reading: &PlanLimits,
+    window: &LimitWindow,
+    histories: &[WindowHistory],
+    now: i64,
+) -> Option<(f64, &'static str)> {
+    let percent = window.percent_at(now)?;
+    if !reading.is_stale(now) {
+        return Some((percent, ""));
+    }
+    Some(match estimated_percent(reading, window, histories, now) {
+        Some(estimate) => (estimate, "≈"),
+        None => (percent, "≥"),
     })
 }
 
@@ -652,16 +679,20 @@ where
 
 /// One line per window for the rail tooltip: "Claude Code 5h  3% · resets
 /// in 2h 10m", then the alerts and, when stale, "as of".
-pub fn tooltip_lines<Tz: TimeZone>(reading: &PlanLimits, now: i64, tz: &Tz) -> Vec<String>
+pub fn tooltip_lines<Tz: TimeZone>(
+    reading: &PlanLimits,
+    histories: &[WindowHistory],
+    now: i64,
+    tz: &Tz,
+) -> Vec<String>
 where
     Tz::Offset: std::fmt::Display,
 {
     let name = reading.provider.label();
     let mut lines = Vec::new();
     for window in &reading.windows {
-        let floor = if reading.is_stale(now) { "≥" } else { "" };
-        let percent = match window.percent_at(now) {
-            Some(p) => format!("{floor}{}%", p.round()),
+        let percent = match window_figure(reading, window, histories, now) {
+            Some((p, mark)) => format!("{mark}{}%", p.round()),
             None if window.has_reset(now) => "no reading since".to_string(),
             None => "unknown".to_string(),
         };
@@ -766,6 +797,11 @@ pub struct WindowReport {
     pub ahead: Option<f64>,
     pub days_left: Option<f64>,
     pub state: Option<WeeklyState>,
+    /// An old weekly reading whose window has not reset: routing uses
+    /// `estimated_percent` in place of `used_percent` (TRU-262).
+    pub estimated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_percent: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -776,6 +812,11 @@ pub struct ProviderReport {
     pub stale: bool,
     pub windows: Vec<WindowReport>,
     pub busy: bool,
+    /// A stale reading that said a window was used up (or a limit was
+    /// reached) and has not reset since. Holds are only set from fresh
+    /// readings, so this is what stops a launch on a reading first seen
+    /// stale (TRU-232).
+    pub stale_exhausted: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -814,9 +855,9 @@ impl PolicyEvaluation {
         if user_model_choice {
             return true;
         }
-        let (policy, report) = match provider {
-            Provider::Claude => (&self.policy.claude, &self.report.claude),
-            Provider::Codex => (&self.policy.codex, &self.report.codex),
+        let policy = match provider {
+            Provider::Claude => &self.policy.claude,
+            Provider::Codex => &self.policy.codex,
         };
         let (other_policy, other_report) = match provider {
             Provider::Claude => (&self.policy.codex, &self.report.codex),
@@ -824,8 +865,17 @@ impl PolicyEvaluation {
         };
         let other_available =
             weekly_available(other_report) && !held(other_policy) && !other_report.busy;
-        weekly_available(report)
-            && !held(policy)
+        // A stale or missing reading says nothing about exhaustion, and only
+        // a run writes a new one (Codex's rollout), so requiring a fresh
+        // reading deadlocks every launch once a provider is idle (TRU-232).
+        // Holds from the last reading still apply until their reset, and so
+        // does a used-up window in a reading first seen stale.
+        let report = match provider {
+            Provider::Claude => &self.report.claude,
+            Provider::Codex => &self.report.codex,
+        };
+        !held(policy)
+            && !report.stale_exhausted
             && !(policy.burst.busy
                 && (parallel
                     || (other_available
@@ -834,6 +884,49 @@ impl PolicyEvaluation {
                             .as_ref()
                             .is_some_and(|pin| pin.provider == provider))))
     }
+}
+
+/// The history of `reading`'s `window`, within the same reset.
+fn window_history<'a>(
+    histories: &'a [WindowHistory],
+    reading: &PlanLimits,
+    window: &LimitWindow,
+) -> Option<&'a WindowHistory> {
+    histories.iter().find(|h| {
+        h.provider == reading.provider && h.label == window.label && h.resets_at == window.resets_at
+    })
+}
+
+/// The use now of an old (stale) weekly reading whose window has not reset
+/// (TRU-262). Only a run writes a reading (Codex's rollout), so an idle
+/// provider's weekly reading goes stale although it is still good evidence:
+/// its % plus the larger of the latest 24-hour rate and the window's
+/// average rate, for the time since the reading, capped at 100. None for a
+/// current reading, a 5h window, or once the window has reset.
+pub fn estimated_percent(
+    reading: &PlanLimits,
+    window: &LimitWindow,
+    histories: &[WindowHistory],
+    now: i64,
+) -> Option<f64> {
+    if window.label != "7d" || !reading.is_stale(now) {
+        return None;
+    }
+    let resets_at = window.resets_at.filter(|at| *at > now)?;
+    let used = window.used_percent.filter(|p| p.is_finite() && *p >= 0.0)?;
+    let (recent, _) = history_metrics(
+        window_history(histories, reading, window),
+        now,
+        window.resets_at,
+    );
+    // Floored like pace, so a reading early in the week does not project
+    // a few points in its first hour onto the whole week.
+    let elapsed_days = ((WEEK_SECS - (resets_at - reading.observed_at)) as f64 / 86_400.0)
+        .max(ELAPSED_FLOOR * WEEK_SECS as f64 / 86_400.0);
+    let average = used / elapsed_days;
+    let rate = recent.map_or(average, |recent| recent.max(average));
+    let since_days = (now - reading.observed_at) as f64 / 86_400.0;
+    Some((used + rate * since_days).min(used.max(100.0)))
 }
 
 fn history_metrics(
@@ -900,6 +993,7 @@ fn window_report(
     fresh: bool,
     now: i64,
     history: Option<&WindowHistory>,
+    estimate: Option<f64>,
 ) -> WindowReport {
     let duration = match window.label.as_str() {
         "7d" => Some(WEEK_SECS),
@@ -912,25 +1006,29 @@ fn window_report(
     let (recent_24h_rate, projected_at_reset) = history_metrics(history, now, window.resets_at);
     let f = duration
         .zip(window.resets_at)
-        .filter(|(_, at)| fresh && *at > now)
+        .filter(|(_, at)| (fresh || estimate.is_some()) && *at > now)
         .map(|(duration, at)| {
             (1.0 - (at - now) as f64 / duration as f64).clamp(ELAPSED_FLOOR, 1.0)
         });
+    // Pace and run-out come from the estimate when the reading is old.
+    let current = estimate.or(used);
     WindowReport {
         label: window.label.clone(),
         used_percent: used,
         resets_at: window.resets_at,
         resets_in: window.resets_at.map(|at| (at - now).max(0)),
         elapsed_fraction: f,
-        pace: used.zip(f).map(|(used, f)| used / f),
+        pace: current.zip(f).map(|(used, f)| used / f),
         recent_24h_rate,
         projected_at_reset,
-        ahead: used.zip(f).map(|(used, f)| used - TARGET_PERCENT * f),
-        days_left: used
+        ahead: current.zip(f).map(|(used, f)| used - TARGET_PERCENT * f),
+        days_left: current
             .zip(f)
             .filter(|(used, _)| window.label == "7d" && *used > 0.0)
             .map(|(used, f)| (100.0 - used) * f * 7.0 / used),
         state: None,
+        estimated: estimate.is_some(),
+        estimated_percent: estimate,
     }
 }
 
@@ -956,10 +1054,13 @@ fn provider_evaluation(
             r.windows
                 .iter()
                 .map(|w| {
-                    let history = histories.iter().find(|h| {
-                        h.provider == r.provider && h.label == w.label && h.resets_at == w.resets_at
-                    });
-                    window_report(w, fresh, now, history)
+                    window_report(
+                        w,
+                        fresh,
+                        now,
+                        window_history(histories, r, w),
+                        estimated_percent(r, w, histories, now),
+                    )
                 })
                 .collect::<Vec<_>>()
         })
@@ -974,6 +1075,7 @@ fn provider_evaluation(
                 },
                 false,
                 now,
+                None,
                 None,
             ));
         }
@@ -994,8 +1096,11 @@ fn provider_evaluation(
         .weekly
         .as_ref()
         .is_some_and(|w| w.state == WeeklyState::AlmostOut);
+    // An old weekly reading counts at its estimate (TRU-262).
+    let weekly_used = weekly.estimated_percent.or(weekly.used_percent);
+    let weekly_mark = if weekly.estimated { "≈" } else { "" };
     let usable_weekly =
-        weekly.pace.is_some() || weekly.used_percent.is_some_and(|p| p >= ALMOST_OUT_PERCENT);
+        weekly.pace.is_some() || weekly_used.is_some_and(|p| p >= ALMOST_OUT_PERCENT);
     let changed_anchor = policy.weekly.as_ref().is_some_and(|w| {
         w.resets_at
             .zip(weekly.resets_at)
@@ -1020,8 +1125,10 @@ fn provider_evaluation(
             notices.push(format!("{} weekly window reset; usage is unknown. Refresh readings before treating it as spare capacity.", provider.label()));
         }
     }
-    // Never adopt a changed anchor from a stale/expired/unknown reading.
-    if fresh && (usable_weekly || weekly_alert) {
+    // Never adopt a changed anchor from a stale/expired/unknown reading. An
+    // estimate moves the state like a fresh value, and may start the first
+    // window from its reading's real reset time, but never replaces one.
+    if (fresh || (weekly.estimated && !changed_anchor)) && (usable_weekly || weekly_alert) {
         let new_window = policy.weekly.is_none() || changed_anchor;
         if new_window {
             policy.weekly = Some(WeeklyPolicy {
@@ -1033,13 +1140,21 @@ fn provider_evaluation(
             });
         }
         if let Some(state) = &mut policy.weekly {
+            // Only a fresh reading (or an alert) holds a provider: a held
+            // provider never runs, so it never sends the fresh reading that
+            // would release a hold set by an estimate. An estimate past the
+            // line only makes the week hot.
             let next = if weekly_alert
-                || weekly.used_percent.is_some_and(|p| p >= ALMOST_OUT_PERCENT)
+                || (fresh && weekly.used_percent.is_some_and(|p| p >= ALMOST_OUT_PERCENT))
                 || state.state == WeeklyState::AlmostOut
             {
                 WeeklyState::AlmostOut
+            } else if weekly.estimated && weekly_used.is_some_and(|p| p >= ALMOST_OUT_PERCENT) {
+                WeeklyState::Hot
             } else if state.state == WeeklyState::Hot {
-                if weekly.pace.is_some_and(|p| p <= RECOVERED_PACE)
+                // Leaving hot needs a fresh reading; an estimate only adds.
+                if fresh
+                    && weekly.pace.is_some_and(|p| p <= RECOVERED_PACE)
                     && now - state.since >= STATE_DWELL_SECS
                 {
                     WeeklyState::OnTrack
@@ -1074,7 +1189,7 @@ fn provider_evaluation(
                     .is_some_and(|days| days <= URGENT_RUNOUT_DAYS);
                 if let (true, Some(used), Some(left)) = (
                     !state.hot_warned || (urgent && !state.urgent_warned),
-                    weekly.used_percent,
+                    weekly_used,
                     weekly.resets_in,
                 ) {
                     let left = left as f64 / 86400.0;
@@ -1101,7 +1216,7 @@ fn provider_evaluation(
                             )
                         })
                         .unwrap_or_default();
-                    warning = Some(format!("{} {used:.0}% with {left:.1} days left; at this rate it runs out {runout} UTC{recent}. Want me to send work to {other} until it settles? Tell the coordinator to send flexible work there until reset.", provider.label()));
+                    warning = Some(format!("{} {weekly_mark}{used:.0}% with {left:.1} days left; at this rate it runs out {runout} UTC{recent}. Want me to send work to {other} until it settles? Tell the coordinator to send flexible work there until reset.", provider.label()));
                     state.hot_warned = true;
                     state.urgent_warned |= urgent;
                 }
@@ -1162,6 +1277,7 @@ fn provider_evaluation(
             window.resets_in = policy.burst.resets_at.map(|at| (at - now).max(0));
         }
     }
+    let stale_exhausted = !fresh && reading.is_some_and(|r| stale_reading_exhausted(r, now));
     let report = ProviderReport {
         plan_type: reading.and_then(|r| r.plan_type.clone()),
         credits: reading.and_then(|r| r.credits.clone()),
@@ -1169,8 +1285,34 @@ fn provider_evaluation(
         stale: !fresh,
         windows,
         busy: policy.burst.busy,
+        stale_exhausted,
     };
     (policy, report, notices, warning)
+}
+
+/// Whether `reading` said a window was used up, or a limit was reached,
+/// that has not reset by `now`. A window with no reset time is taken to
+/// have reset once its whole length has passed since the reading.
+fn stale_reading_exhausted(reading: &PlanLimits, now: i64) -> bool {
+    let window_open = |window: &LimitWindow, length: i64| match window.resets_at {
+        Some(at) => at > now,
+        None => reading.observed_at + length > now,
+    };
+    let used_up = reading.windows.iter().any(|window| {
+        let (limit, length) = match window.label.as_str() {
+            "5h" => (BURST_LIMIT_PERCENT, BURST_SECS),
+            "7d" => (ALMOST_OUT_PERCENT, WEEK_SECS),
+            _ => return false,
+        };
+        window.used_percent.is_some_and(|used| used >= limit) && window_open(window, length)
+    });
+    used_up
+        || reading.active_alerts(now).iter().any(|alert| {
+            matches!(
+                alert.kind,
+                AlertKind::LimitReached { .. } | AlertKind::Overage
+            ) && alert.until.is_some_and(|until| until > now)
+        })
 }
 
 fn held(policy: &ProviderPolicy) -> bool {
@@ -1182,11 +1324,22 @@ fn held(policy: &ProviderPolicy) -> bool {
 }
 
 fn weekly_available(report: &ProviderReport) -> bool {
-    !report.stale
+    !report.stale_exhausted
         && report
             .windows
             .iter()
-            .any(|w| w.label == "7d" && w.pace.is_some())
+            .any(|w| w.label == "7d" && w.pace.is_some() && (!report.stale || w.estimated))
+}
+
+/// "Codex weekly ≈31% is an estimate from a 25% reading as of 15:02 UTC."
+fn estimate_note(name: &str, report: &ProviderReport, now: i64) -> Option<String> {
+    let window = report.windows.iter().find(|w| w.label == "7d")?;
+    let estimate = window.estimated_percent?;
+    let used = window.used_percent?;
+    let observed = format_observed(report.observed_at?, now, &chrono::Utc);
+    Some(format!(
+        "{name} weekly ≈{estimate:.0}% is an estimate from a {used:.0}% reading as of {observed} UTC."
+    ))
 }
 
 fn provider_summary(
@@ -1205,10 +1358,16 @@ fn provider_summary(
         "7d"
     };
     let window = report.windows.iter().find(|w| w.label == label);
-    let used = window
-        .and_then(|w| w.used_percent)
-        .map(|p| format!("{p:.0}%"))
-        .unwrap_or_else(|| "unknown use".into());
+    let used = match window {
+        Some(WindowReport {
+            estimated_percent: Some(p),
+            ..
+        }) => format!("≈{p:.0}%"),
+        _ => window
+            .and_then(|w| w.used_percent)
+            .map(|p| format!("{p:.0}%"))
+            .unwrap_or_else(|| "unknown use".into()),
+    };
     let held_reset = if label == "5h" {
         policy.burst.resets_at
     } else {
@@ -1249,7 +1408,10 @@ pub fn evaluate_policy(file: &PlanLimitsFile, now: i64) -> PolicyEvaluation {
         now,
     );
     notices.extend(codex_notices);
-    let held_state = match (held(&claude), held(&codex)) {
+    let held_state = match (
+        held(&claude) || claude_report.stale_exhausted,
+        held(&codex) || codex_report.stale_exhausted,
+    ) {
         (true, true) => RoutingState::Conserve,
         (true, false) => RoutingState::HoldClaude,
         (false, true) => RoutingState::HoldCodex,
@@ -1348,6 +1510,12 @@ pub fn evaluate_policy(file: &PlanLimitsFile, now: i64) -> PolicyEvaluation {
             format!("Routing: balanced. {preference}")
         }
     };
+    for (name, report) in [("Claude", &claude_report), ("Codex", &codex_report)] {
+        if let Some(note) = estimate_note(name, report, now) {
+            reason.push(' ');
+            reason.push_str(&note);
+        }
+    }
     if matches!(state, RoutingState::LeanClaude | RoutingState::LeanCodex) {
         if let Some(pin) = &pin {
             let busy = match pin.provider {
@@ -1616,7 +1784,7 @@ mod tests {
         assert_eq!(limits.windows.len(), 2);
         assert!(limits.windows.iter().all(|w| w.used_percent.is_none()));
         assert_eq!(limits.peak_percent(NOW), None);
-        assert_eq!(badge([&limits], NOW), None);
+        assert_eq!(badge([&limits], &[], NOW), None);
         // One window missing, the other without utilization.
         let limits = claude_limits(
             &json!({"unifiedWindows": {"seven_day": {"resetsAt": NOW + 10}}}),
@@ -1646,7 +1814,7 @@ mod tests {
         assert_eq!(limits.alerts[0].kind, AlertKind::Overage);
         assert_eq!(limits.alerts[0].text(), "Using overage");
         assert_eq!(limits.alerts[0].until, Some(NOW + 7_800));
-        let b = badge([&limits], NOW).unwrap();
+        let b = badge([&limits], &[], NOW).unwrap();
         assert_eq!(b.text, "OVER");
         assert_eq!(b.level, Level::Danger);
 
@@ -1654,7 +1822,7 @@ mod tests {
         info["status"] = json!("rejected");
         let limits = claude_limits(&info, NOW);
         assert_eq!(limits.alerts[0].text(), "Limit reached (5h)");
-        assert_eq!(badge([&limits], NOW).unwrap().text, "LIMIT");
+        assert_eq!(badge([&limits], &[], NOW).unwrap().text, "LIMIT");
         // It holds until the window resets, stale or not.
         assert_eq!(limits.active_alerts(NOW + 7_799).len(), 1);
         assert!(limits.active_alerts(NOW + 7_800).is_empty());
@@ -1663,7 +1831,7 @@ mod tests {
         info["status"] = json!("allowed_warning");
         let limits = claude_limits(&info, NOW);
         assert_eq!(limits.alerts[0].text(), "Limit status: allowed_warning");
-        assert_eq!(badge([&limits], NOW).unwrap().level, Level::Danger);
+        assert_eq!(badge([&limits], &[], NOW).unwrap().level, Level::Danger);
     }
 
     #[test]
@@ -1725,7 +1893,7 @@ mod tests {
         let limits = codex_limits(&raw, NOW).unwrap();
         assert_eq!(limits.alerts[0].text(), "Limit reached (primary)");
         assert_eq!(limits.alerts[0].until, Some(NOW + 300_000));
-        assert_eq!(badge([&limits], NOW).unwrap().text, "LIMIT");
+        assert_eq!(badge([&limits], &[], NOW).unwrap().text, "LIMIT");
     }
 
     #[test]
@@ -1952,16 +2120,17 @@ mod tests {
         assert!(!limits.is_stale(NOW + STALE_AFTER_SECS));
         assert!(limits.is_stale(NOW + STALE_AFTER_SECS + 1));
         // Current: the plain %.
-        let b = badge([&limits], NOW + 60).unwrap();
+        let b = badge([&limits], &[], NOW + 60).unwrap();
         assert_eq!(b.text, "42%");
         assert_eq!(b.level, Level::Normal);
         // Stale: a floor, not a current value.
-        assert_eq!(badge([&limits], NOW + 3_600).unwrap().text, "≥42%");
-        // Once the 5h window resets its % means nothing; the 7d one is left.
+        assert_eq!(badge([&limits], &[], NOW + 3_600).unwrap().text, "≥42%");
+        // Once the 5h window resets its % means nothing; the 7d one is
+        // left, as an estimate: 18% plus its window average for 2h10m.
         assert_eq!(limits.windows[0].percent_at(NOW + 7_800), None);
-        assert_eq!(badge([&limits], NOW + 7_800).unwrap().text, "≥18%");
+        assert_eq!(badge([&limits], &[], NOW + 7_800).unwrap().text, "≈19%");
         // Both reset: no badge.
-        assert_eq!(badge([&limits], NOW + 400_000), None);
+        assert_eq!(badge([&limits], &[], NOW + 400_000), None);
     }
 
     #[test]
@@ -1970,14 +2139,15 @@ mod tests {
         let mut raw = codex_rate_limits();
         raw["primary"]["used_percent"] = json!(91.0);
         let codex = codex_limits(&raw, NOW - 3_600).unwrap();
-        let b = badge([&claude, &codex], NOW).unwrap();
-        assert_eq!(b.text, "≥91%");
+        // An hour-old weekly 91%: estimated at its window average.
+        let b = badge([&claude, &codex], &[], NOW).unwrap();
+        assert_eq!(b.text, "≈92%");
         assert_eq!(b.level, Level::Danger);
         raw["primary"]["used_percent"] = json!(80.0);
         let codex = codex_limits(&raw, NOW).unwrap();
-        let b = badge([&claude, &codex], NOW).unwrap();
+        let b = badge([&claude, &codex], &[], NOW).unwrap();
         assert_eq!((b.text.as_str(), b.level), ("80%", Level::Warning));
-        assert_eq!(badge(std::iter::empty::<&PlanLimits>(), NOW), None);
+        assert_eq!(badge(std::iter::empty::<&PlanLimits>(), &[], NOW), None);
     }
 
     #[test]
@@ -1995,9 +2165,9 @@ mod tests {
         assert_eq!(freshness(&limits, NOW + 180, &tz), "updated 3m ago");
         assert_eq!(freshness(&limits, NOW + 3_600, &tz), "as of 08:00");
         assert_eq!(freshness(&limits, NOW + 86_400, &tz), "as of Fri 08:00");
-        let lines = tooltip_lines(&limits, NOW + 3_600, &tz);
+        let lines = tooltip_lines(&limits, &[], NOW + 3_600, &tz);
         assert_eq!(lines[0], "Claude Code 5h  ≥42% · resets in 1h 10m");
-        let lines = tooltip_lines(&limits, NOW + 60, &tz);
+        let lines = tooltip_lines(&limits, &[], NOW + 60, &tz);
         assert_eq!(
             lines,
             [
@@ -2005,7 +2175,7 @@ mod tests {
                 "Claude Code 7d  18% · resets Tue 23:06"
             ]
         );
-        let lines = tooltip_lines(&limits, NOW + 8_000, &tz);
+        let lines = tooltip_lines(&limits, &[], NOW + 8_000, &tz);
         assert_eq!(
             lines[0],
             "Claude Code 5h  no reading since · reset Fri 10:10"
@@ -2680,14 +2850,63 @@ mod policy_tests {
     }
 
     #[test]
-    fn unknown_and_stale_capacity_do_not_release_automatic_jobs() {
+    fn unknown_and_stale_capacity_start_but_a_stale_hold_still_holds() {
+        // No reading at all, and an idle provider's stale one: the run
+        // starts and writes the fresh reading itself (TRU-232).
         let empty = evaluate_policy(&PlanLimitsFile::default(), NOW);
-        assert!(!empty.allows_start(Provider::Codex, false, false));
-        assert!(empty.allows_start(Provider::Codex, false, true));
+        assert!(empty.allows_start(Provider::Codex, false, false));
         let file = fixture(10.0, 2 * 86400);
         let stale = evaluate_policy(&file, NOW + STALE_AFTER_SECS + 1);
-        assert!(!stale.allows_start(Provider::Codex, false, false));
+        assert!(stale.allows_start(Provider::Codex, false, false));
         assert!(evaluate_policy(&file, NOW).allows_start(Provider::Codex, false, false));
+
+        // A reading that said the 5h window was used up holds even once it
+        // is stale, until a newer reading or its reset says otherwise.
+        let mut file = fixture(10.0, 2 * 86400);
+        file.codex.as_mut().unwrap().windows.push(LimitWindow {
+            label: "5h".into(),
+            used_percent: Some(100.0),
+            resets_at: Some(NOW + 3 * 3600),
+        });
+        step(&mut file, NOW);
+        let stale = step(&mut file, NOW + STALE_AFTER_SECS + 1);
+        assert!(!stale.allows_start(Provider::Codex, false, false));
+
+        // A reading first seen already stale (usage while GitTerm was
+        // closed) set no holds, but its used-up windows still hold until
+        // they reset (review 1c2a5554 F1).
+        let later = NOW + STALE_AFTER_SECS + 1;
+        let mut burst = fixture(10.0, 2 * 86400);
+        burst.codex.as_mut().unwrap().windows.push(LimitWindow {
+            label: "5h".into(),
+            used_percent: Some(100.0),
+            resets_at: Some(NOW + 3 * 3600),
+        });
+        assert!(!evaluate_policy(&burst, later).allows_start(Provider::Codex, false, false));
+        // Once the window resets, the old reading no longer holds.
+        assert!(evaluate_policy(&burst, NOW + 3 * 3600 + 1).allows_start(
+            Provider::Codex,
+            false,
+            false
+        ));
+        let mut weekly = fixture(10.0, 2 * 86400);
+        weekly.codex.as_mut().unwrap().windows[0].used_percent = Some(96.0);
+        assert!(!evaluate_policy(&weekly, later).allows_start(Provider::Codex, false, false));
+        // A used-up 5h window with no reset time holds for one window length.
+        let mut unknown = fixture(10.0, 2 * 86400);
+        unknown.codex.as_mut().unwrap().windows.push(LimitWindow {
+            label: "5h".into(),
+            used_percent: Some(100.0),
+            resets_at: None,
+        });
+        assert!(!evaluate_policy(&unknown, later).allows_start(Provider::Codex, false, false));
+        assert!(
+            evaluate_policy(&unknown, NOW + BURST_SECS + 1).allows_start(
+                Provider::Codex,
+                false,
+                false
+            )
+        );
     }
 
     #[test]
@@ -2804,5 +3023,255 @@ mod policy_tests {
             .notices
             .iter()
             .any(|line| line.contains("usage is unknown")));
+    }
+
+    /// Claude read just now; Codex last read an hour ago, at `used` with
+    /// four days to its weekly reset (three days into the window).
+    fn idle_codex(used: f64) -> PlanLimitsFile {
+        let mut file = PlanLimitsFile::default();
+        let mut claude = reading(Provider::Claude, 20.0, 4 * 86400);
+        claude.observed_at = NOW + 3600;
+        file.absorb(claude);
+        file.absorb(reading(Provider::Codex, used, 4 * 86400));
+        file
+    }
+    fn codex_samples(file: &mut PlanLimitsFile, samples: &[(i64, f64)]) {
+        let history = file
+            .history
+            .iter_mut()
+            .find(|h| h.provider == Provider::Codex && h.label == "7d")
+            .unwrap();
+        history.samples = samples
+            .iter()
+            .map(|&(observed_at, used_percent)| UsageSample {
+                observed_at,
+                used_percent,
+            })
+            .collect();
+    }
+    fn codex_weekly(e: &PolicyEvaluation) -> &WindowReport {
+        e.report
+            .codex
+            .windows
+            .iter()
+            .find(|w| w.label == "7d")
+            .unwrap()
+    }
+
+    #[test]
+    fn stale_weekly_96_first_seen_releases_after_reset_but_fresh_hold_persists() {
+        let mut stale = idle_codex(96.0);
+        let before = step(&mut stale, NOW + 3600);
+        assert!(before.report.codex.stale_exhausted);
+        assert!(!before.allows_start(Provider::Codex, false, false));
+        let after = step(&mut stale, NOW + 4 * 86400 + 1);
+        assert!(!after.report.codex.stale_exhausted);
+        assert!(after.allows_start(Provider::Codex, false, false));
+        assert_ne!(after.report.routing.state, RoutingState::HoldCodex);
+        assert_eq!(
+            before.policy.codex.weekly.as_ref().unwrap().state,
+            WeeklyState::Hot
+        );
+
+        let mut fresh = idle_codex(96.0);
+        let before = step(&mut fresh, NOW);
+        assert_eq!(before.report.routing.state, RoutingState::HoldCodex);
+        assert!(!before.allows_start(Provider::Codex, false, false));
+        // A hold established fresh still needs a fresh reset reading.
+        let after = step(&mut fresh, NOW + 4 * 86400 + 1);
+        assert_eq!(after.report.routing.state, RoutingState::HoldCodex);
+        assert!(!after.allows_start(Provider::Codex, false, false));
+    }
+
+    fn stale_exhausted_burst() -> PolicyEvaluation {
+        let mut file = idle_codex(25.0);
+        file.codex.as_mut().unwrap().windows.push(LimitWindow {
+            label: "5h".into(),
+            used_percent: Some(100.0),
+            resets_at: Some(NOW + 3 * 3600),
+        });
+        evaluate_policy(&file, NOW + 3600)
+    }
+
+    #[test]
+    fn stale_exhausted_provider_is_held_in_routing_and_unavailable() {
+        let e = stale_exhausted_burst();
+        assert!(e.report.codex.stale_exhausted);
+        assert!(!e.allows_start(Provider::Codex, false, false));
+        assert_eq!(e.report.routing.state, RoutingState::HoldCodex);
+        assert!(e.report.routing.constrained);
+        assert!(e
+            .report
+            .routing
+            .reason
+            .contains("start nothing new on Codex"));
+        assert!(!e.report.routing.reason.contains("Flexible jobs to Codex"));
+        assert!(!weekly_available(&e.report.codex));
+    }
+
+    #[test]
+    fn stale_exhausted_is_in_the_plan_limits_report() {
+        let e = stale_exhausted_burst();
+        let json = serde_json::to_value(&e.report).unwrap();
+        assert_eq!(json["codex"]["stale_exhausted"], true);
+        assert_eq!(json["claude"]["stale_exhausted"], false);
+    }
+
+    #[test]
+    fn an_hour_old_weekly_reading_is_an_estimate_and_codex_stays_available() {
+        let mut file = idle_codex(25.0);
+        step(&mut file, NOW);
+        let e = step(&mut file, NOW + 3600);
+        let weekly = codex_weekly(&e);
+        assert!(e.report.codex.stale);
+        assert!(weekly.estimated);
+        // No 24h history: 25% over 3 days is the rate, for one hour.
+        let expected = 25.0 + 25.0 / 3.0 / 24.0;
+        assert!((weekly.estimated_percent.unwrap() - expected).abs() < 1e-9);
+        assert_eq!(weekly.used_percent, Some(25.0));
+        assert!(weekly.pace.is_some());
+        assert_eq!(weekly.state, Some(WeeklyState::OnTrack));
+        assert!(e.allows_start(Provider::Codex, false, false));
+        let reason = &e.report.routing.reason;
+        assert!(!reason.contains("unknown/stale"), "{reason}");
+        assert!(!e.report.routing.constrained);
+        assert!(
+            reason.contains("Codex weekly ≈25% is an estimate from a 25% reading as of 08:00 UTC."),
+            "{reason}"
+        );
+        let json = serde_json::to_value(&e.report).unwrap();
+        assert_eq!(json["codex"]["stale"], true);
+        assert_eq!(json["codex"]["windows"][0]["estimated"], true);
+        assert!(json["codex"]["windows"][0]["estimated_percent"].is_f64());
+    }
+
+    #[test]
+    fn the_estimate_takes_the_larger_of_the_24h_rate_and_the_window_average() {
+        // The latest 24 hours ran at 20 points a day, above the window's
+        // 8.3 a day: the faster rate counts.
+        let mut file = idle_codex(25.0);
+        codex_samples(&mut file, &[(NOW - 12 * 3600, 15.0), (NOW, 25.0)]);
+        let e = evaluate_policy(&file, NOW + 3600);
+        let expected = 25.0 + 20.0 / 24.0;
+        assert!((codex_weekly(&e).estimated_percent.unwrap() - expected).abs() < 1e-9);
+        // A slower latest day does not lower it below the window average.
+        codex_samples(&mut file, &[(NOW - 12 * 3600, 24.0), (NOW, 25.0)]);
+        let e = evaluate_policy(&file, NOW + 3600);
+        let expected = 25.0 + 25.0 / 3.0 / 24.0;
+        assert!((codex_weekly(&e).estimated_percent.unwrap() - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_estimate_past_the_thresholds_makes_the_week_hot_but_never_holds() {
+        // 30% at 60 points a day: on track when read, hot twelve hours on.
+        let mut file = idle_codex(30.0);
+        codex_samples(&mut file, &[(NOW - 12 * 3600, 0.0), (NOW, 30.0)]);
+        assert_eq!(
+            codex_weekly(&step(&mut file, NOW)).state,
+            Some(WeeklyState::OnTrack)
+        );
+        let e = step(&mut file, NOW + 12 * 3600);
+        assert!((codex_weekly(&e).estimated_percent.unwrap() - 60.0).abs() < 1e-9);
+        assert_eq!(codex_weekly(&e).state, Some(WeeklyState::Hot));
+        assert!(
+            e.notices.iter().any(|n| n.starts_with("Codex ≈60% with")),
+            "{:?}",
+            e.notices
+        );
+
+        // 90% at 120 points a day: two hours on, the estimate is used up,
+        // but the reading itself was under the almost-out line. An estimate
+        // never holds (a held provider would never send the reading that
+        // releases it): the week is hot and Codex may still start.
+        let mut file = idle_codex(90.0);
+        codex_samples(&mut file, &[(NOW - 6 * 3600, 60.0), (NOW, 90.0)]);
+        assert!(step(&mut file, NOW).allows_start(Provider::Codex, false, false));
+        let e = step(&mut file, NOW + 2 * 3600);
+        assert!(!e.report.codex.stale_exhausted);
+        assert_eq!(codex_weekly(&e).estimated_percent, Some(100.0));
+        assert_eq!(codex_weekly(&e).state, Some(WeeklyState::Hot));
+        assert_ne!(e.report.routing.state, RoutingState::HoldCodex);
+        assert!(e.allows_start(Provider::Codex, false, false));
+
+        // A real reading at the line still holds.
+        let mut file = idle_codex(96.0);
+        let e = step(&mut file, NOW);
+        assert_eq!(codex_weekly(&e).state, Some(WeeklyState::AlmostOut));
+        assert_eq!(e.report.routing.state, RoutingState::HoldCodex);
+    }
+
+    #[test]
+    fn a_weekly_reading_past_its_reset_is_unknown_not_an_estimate() {
+        let mut file = idle_codex(25.0);
+        file.codex.as_mut().unwrap().windows[0].resets_at = Some(NOW + 1800);
+        let e = evaluate_policy(&file, NOW + 3600);
+        let weekly = codex_weekly(&e);
+        assert!(!weekly.estimated);
+        assert_eq!(weekly.estimated_percent, None);
+        assert_eq!(weekly.used_percent, None);
+        assert!(e
+            .report
+            .routing
+            .reason
+            .contains("Codex is busy or has unknown/stale weekly capacity"));
+        assert!(!e.report.routing.reason.contains("estimate"));
+    }
+
+    #[test]
+    fn an_old_five_hour_window_stays_unknown_and_a_fresh_reading_is_not_estimated() {
+        let mut file = idle_codex(25.0);
+        file.codex.as_mut().unwrap().windows.push(LimitWindow {
+            label: "5h".into(),
+            used_percent: Some(50.0),
+            resets_at: Some(NOW + 3 * 3600),
+        });
+        let fresh = evaluate_policy(&file, NOW);
+        assert!(fresh.report.codex.windows.iter().all(|w| !w.estimated));
+        let json = serde_json::to_value(&fresh.report).unwrap();
+        assert_eq!(json["codex"]["windows"][0]["estimated"], false);
+        assert!(json["codex"]["windows"][0]
+            .get("estimated_percent")
+            .is_none());
+
+        let e = evaluate_policy(&file, NOW + 3600);
+        let burst = e
+            .report
+            .codex
+            .windows
+            .iter()
+            .find(|w| w.label == "5h")
+            .unwrap();
+        assert!(!burst.estimated);
+        assert_eq!(burst.pace, None);
+        let lines = tooltip_lines(
+            file.codex.as_ref().unwrap(),
+            &file.history,
+            NOW + 3600,
+            &chrono::Utc,
+        );
+        assert!(lines[0].starts_with("Codex 7d  ≈25% · resets"), "{lines:?}");
+        assert!(lines[1].starts_with("Codex 5h  ≥50% · resets"), "{lines:?}");
+        assert_eq!(lines.last().unwrap(), "Codex as of 08:00");
+        // The badge is the higher figure: the 5h floor here.
+        let codex = file.codex.as_ref().unwrap();
+        assert_eq!(
+            badge([codex], &file.history, NOW + 3600).unwrap().text,
+            "≥50%"
+        );
+    }
+
+    #[test]
+    fn an_estimate_never_writes_history_or_replaces_a_weekly_anchor() {
+        let mut file = idle_codex(25.0);
+        step(&mut file, NOW);
+        let history = file.history.clone();
+        let anchor = file.policy.as_ref().unwrap().codex.weekly.clone();
+        // A reading first seen stale with a different reset time is
+        // estimated, but does not move the anchor.
+        file.codex.as_mut().unwrap().windows[0].resets_at = Some(NOW + 5 * 86400);
+        let e = step(&mut file, NOW + 3600);
+        assert!(codex_weekly(&e).estimated);
+        assert_eq!(file.history, history);
+        assert_eq!(e.policy.codex.weekly, anchor);
     }
 }

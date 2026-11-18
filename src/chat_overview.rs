@@ -1957,6 +1957,7 @@ mod tests {
             target: None,
             previous: None,
             status,
+            superseded_by: None,
             result: None,
             created_at: "2026-10-20T10:00:00Z".into(),
             updated_at: "2026-10-20T10:05:00Z".into(),
