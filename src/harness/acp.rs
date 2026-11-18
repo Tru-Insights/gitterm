@@ -2230,6 +2230,9 @@ impl Session {
             HarnessCommand::SetPermissionMode(mode) => self.change(Setting::Mode, Some(mode)).await,
             HarnessCommand::SetModel(model) => self.change(Setting::Model, Some(model)).await,
             HarnessCommand::SetEffort(effort) => self.change(Setting::Effort, effort).await,
+            HarnessCommand::SetWorkspaceContext(_) => {
+                Err("Workspace SessionStart context is only supported by Claude".into())
+            }
             HarnessCommand::Shutdown => {
                 acp_log(&format!("shutdown requested (pid {})", self.pid));
                 self.stdin = None;
