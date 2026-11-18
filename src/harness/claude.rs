@@ -2021,7 +2021,22 @@ fn session_hooks(snapshots: bool, workspace_context: bool) -> Value {
     hooks
 }
 
-fn workspace_context_response(context: Option<&str>) -> Value {
+fn workspace_context_response(
+    instructions: Option<&str>,
+    system_checkpoint: Option<&Path>,
+) -> Value {
+    let context = instructions
+        .and_then(crate::guidelines::workspace_context)
+        .map(|text| {
+            if instructions.and_then(crate::guidelines::workspace_checkpoint) != system_checkpoint {
+                format!(
+                    "This chat now belongs to the following workspace. This note, including its \
+                     checkpoint, replaces the workspace section in the system prompt.\n\n{text}"
+                )
+            } else {
+                text
+            }
+        });
     context.map_or_else(
         || json!({}),
         |text| {
@@ -2076,6 +2091,12 @@ async fn run_session_program(
         },
         None => None,
     };
+    // Claude retains this workspace section in its system prompt across
+    // /clear; a moved chat's callback must explicitly supersede it.
+    let system_workspace_checkpoint = workspace_instructions
+        .as_deref()
+        .and_then(crate::guidelines::workspace_checkpoint)
+        .map(Path::to_path_buf);
     let args = config.args_with_guidelines_file(guidelines_file);
     let mut cmd = Command::new(&program);
     cmd.args(&args)
@@ -2273,7 +2294,7 @@ async fn run_session_program(
                         }
                         ParsedFrame::WorkspaceContext { request_id } => {
                             if let Err(error) = io.write(control_response_frame(ControlResponseBody::Success {
-                                request_id, response: workspace_context_response(workspace_instructions.as_deref().and_then(crate::guidelines::workspace_context).as_deref()),
+                                request_id, response: workspace_context_response(workspace_instructions.as_deref(), system_workspace_checkpoint.as_deref()),
                             })).await {
                                 io.emit(HarnessEvent::Error(error));
                             }
@@ -3511,6 +3532,19 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn session_start_reinjects_workspace_context_after_clear_compact_and_move() {
+        check_session_start_workspace_context(true, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn never_moved_workspace_prompt_and_session_start_match_v6() {
+        for resume in [false, true] {
+            check_session_start_workspace_context(false, resume).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn check_session_start_workspace_context(move_chat: bool, resume: bool) {
         use std::os::unix::fs::PermissionsExt;
         let fixture = tempfile::tempdir().unwrap();
         let home = fixture.path().join("notes/example-work");
@@ -3527,17 +3561,38 @@ mod tests {
             &[PathBuf::from("/code/example-api")],
         )
         .unwrap();
-        let note = crate::guidelines::documents_note(&places);
-        let guidelines = fixture.path().join("instructions.md");
-        std::fs::write(
-            &guidelines,
-            format!("{note}\n{}", crate::guidelines::CODEX_TOOLS_NOTE),
+        let launch = crate::guidelines::launch_instructions(
+            Some(crate::guidelines::Guidelines {
+                path: fixture.path().join("guidelines.md"),
+                text: "Static change guidelines.".into(),
+            }),
+            Some(&places),
+            true,
+            fixture.path(),
         )
         .unwrap();
+        // Frozen from origin/v6 (936976d): both launch and callback bytes
+        // must stay unchanged for a chat that has not moved.
+        let expected = include_str!("../../tests/fixtures/claude/workspace-prompt-v6.md")
+            .replace("@HOME@", home.to_str().unwrap());
+        assert_eq!(launch.text, expected);
+        std::fs::write(home.join("expected-system.md"), expected).unwrap();
+        if move_chat {
+            std::fs::write(home.join("move-chat"), "").unwrap();
+        }
+        if resume {
+            std::fs::write(home.join("resuming"), "").unwrap();
+        }
         let program = fixture.path().join("mock-claude");
         std::fs::write(&program, r#"#!/usr/bin/env python3
 import json, sys
 from pathlib import Path
+system_file = Path(sys.argv[sys.argv.index('--append-system-prompt-file') + 1])
+system = system_file.read_bytes()
+assert system == Path('expected-system.md').read_bytes()
+assert ('--resume=example-session' in sys.argv) == Path('resuming').exists()
+expected_context = system.decode().split('# Documents for this work (added by GitTerm)\n', 1)[1]
+expected_context = '# Documents for this work (added by GitTerm)\n' + expected_context.split('# Starting Codex in GitTerm', 1)[0].rstrip()
 def emit(value):
     print(json.dumps(value), flush=True)
 def read():
@@ -3548,7 +3603,8 @@ init = read()
 assert init['request']['hooks']['SessionStart'][0]['hookCallbackIds'] == ['gitterm_workspace_context']
 assert 'UserPromptSubmit' not in init['request']['hooks'] # independent of snapshots
 emit({'type':'control_response','response':{'subtype':'success','request_id':init['request_id'],'response':{'hooks_applied':True}}})
-for source in ['startup', 'clear', 'compact', 'resume']:
+# Real Claude 2.1.322 sends these callbacks only for clear/compact.
+for source in ['clear', 'compact']:
     emit({'type':'control_request','request_id':source,'request':{'subtype':'hook_callback','callback_id':'gitterm_workspace_context','input':{'hook_event_name':'SessionStart','source':source,'session_id':'example-session'}}})
     response = read()['response']
     assert response['request_id'] == source
@@ -3560,15 +3616,25 @@ for source in ['startup', 'clear', 'compact', 'resume']:
     assert str(Path.cwd() / 'docs/checkpoint.md') in text
     assert "Resume only this workspace's work; if unsure which work to continue, ask." in text
     assert 'Starting Codex' not in text
+    assert text == expected_context
 emit({'type':'result','subtype':'success'})
-read() # the host moves this running chat, then sends /clear
-emit({'type':'control_request','request_id':'moved-clear','request':{'subtype':'hook_callback','callback_id':'gitterm_workspace_context','input':{'hook_event_name':'SessionStart','source':'clear','session_id':'example-session'}}})
-text = read()['response']['response']['hookSpecificOutput']['additionalContext']
-assert 'Workspace: `Destination workspace`' in text
-assert str(Path.cwd().parent / 'destination/docs/checkpoint.md') in text
-assert 'Destination checkpoint written after move' in text
-assert 'Example workspace' not in text and 'Example work' not in text
-emit({'type':'result','subtype':'success'})
+if Path('move-chat').exists():
+    read() # the host moves this running chat, then sends /clear
+    for source in ['clear', 'compact']:
+        emit({'type':'control_request','request_id':'moved-' + source,'request':{'subtype':'hook_callback','callback_id':'gitterm_workspace_context','input':{'hook_event_name':'SessionStart','source':source,'session_id':'example-session'}}})
+        text = read()['response']['response']['hookSpecificOutput']['additionalContext']
+        assert 'Workspace: `Destination workspace`' in text
+        assert str(Path.cwd().parent / 'destination/docs/checkpoint.md') in text
+        assert 'Destination checkpoint written after move' in text
+        assert 'This chat now belongs to the following workspace' in text
+        assert 'replaces the workspace section in the system prompt' in text
+        assert 'Example workspace' not in text and 'Example work' not in text
+        assert system_file.read_bytes() == system
+    emit({'type':'result','subtype':'success'})
+    read() # moving back to the launch workspace removes the override
+    emit({'type':'control_request','request_id':'returned-clear','request':{'subtype':'hook_callback','callback_id':'gitterm_workspace_context','input':{'hook_event_name':'SessionStart','source':'clear','session_id':'example-session'}}})
+    assert read()['response']['response']['hookSpecificOutput']['additionalContext'] == expected_context
+    emit({'type':'result','subtype':'success'})
 for line in sys.stdin:
     pass
 "#).unwrap();
@@ -3582,11 +3648,11 @@ for line in sys.stdin:
                 model: None,
                 permission_mode: "default".into(),
                 effort: None,
-                resume: Some("example-session".into()),
+                resume: resume.then(|| "example-session".into()),
                 wire_log_dir: None,
                 mcp_servers: Vec::new(),
                 chrome: false,
-                guidelines_file: Some(guidelines),
+                guidelines_file: Some(launch.path),
                 guidelines_content: None,
             },
             rx,
@@ -3606,14 +3672,14 @@ for line in sys.stdin:
             &[],
         )
         .unwrap();
-        let mut moved = false;
+        let mut completed = 0;
         loop {
             match tokio::time::timeout(Duration::from_secs(20), events.recv())
                 .await
                 .unwrap()
                 .unwrap()
             {
-                HarnessEvent::TurnCompleted { .. } if !moved => {
+                HarnessEvent::TurnCompleted { .. } if move_chat && completed == 0 => {
                     commands
                         .send(HarnessCommand::SetWorkspaceContext(Some(
                             crate::guidelines::documents_note(&places),
@@ -3627,7 +3693,18 @@ for line in sys.stdin:
                     commands
                         .send(HarnessCommand::SendUserMessage(UserPrompt::from("/clear")))
                         .unwrap();
-                    moved = true;
+                    completed += 1;
+                }
+                HarnessEvent::TurnCompleted { .. } if move_chat && completed == 1 => {
+                    commands
+                        .send(HarnessCommand::SetWorkspaceContext(Some(
+                            launch.text.clone(),
+                        )))
+                        .unwrap();
+                    commands
+                        .send(HarnessCommand::SendUserMessage(UserPrompt::from("/clear")))
+                        .unwrap();
+                    completed += 1;
                 }
                 HarnessEvent::TurnCompleted { .. } => break,
                 HarnessEvent::Error(error) => panic!("mock SessionStart callback: {error}"),

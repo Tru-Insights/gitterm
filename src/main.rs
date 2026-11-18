@@ -881,6 +881,10 @@ enum ForwardedKey {
     /// in the terminal Cmd+V is the terminal's own paste, which the Iced
     /// key handler leaves to iced_term.
     Paste,
+    /// Cmd +/- and Cmd+Shift +/-: chat/terminal or sidebar text.
+    FontSize,
+    /// Cmd+F: open find in the current chat.
+    Find,
 }
 
 /// Which forwarded chord `key` with `modifiers` is, if any: the chat page's
@@ -896,7 +900,59 @@ fn forwarded_key(key: &Key, modifiers: Modifiers) -> Option<ForwardedKey> {
             return Some(ForwardedKey::Paste);
         }
     }
+    if !modifiers.control() && !modifiers.alt() && font_shortcut(key, modifiers, false).is_some() {
+        return Some(ForwardedKey::FontSize);
+    }
+    if find_shortcut(key, modifiers, true).is_some() {
+        return Some(ForwardedKey::Find);
+    }
     global_shortcut(key, modifiers).map(ForwardedKey::Global)
+}
+
+fn find_shortcut(key: &Key, modifiers: Modifiers, chat_active: bool) -> Option<Event> {
+    if modifiers == Modifiers::COMMAND
+        && matches!(key.as_ref(), Key::Character(c) if c.eq_ignore_ascii_case("f"))
+    {
+        Some(if chat_active {
+            Event::AgentFindOpen
+        } else {
+            Event::ToggleSearch
+        })
+    } else {
+        None
+    }
+}
+
+fn chat_find_allowed(
+    surface: VisibleSurface,
+    terminal_focused: bool,
+    native_input_focused: bool,
+) -> bool {
+    matches!(surface, VisibleSurface::AgentChat(_)) && !terminal_focused && !native_input_focused
+}
+
+/// Shared by the native key handler and the WebView forwarding allow-list.
+fn font_shortcut(key: &Key, modifiers: Modifiers, chat_active: bool) -> Option<Event> {
+    if !modifiers.command() {
+        return None;
+    }
+    match key.as_ref() {
+        Key::Character("=" | "+") => Some(if modifiers.shift() {
+            Event::IncreaseUiFont
+        } else if chat_active {
+            Event::IncreaseChatFont
+        } else {
+            Event::IncreaseTerminalFont
+        }),
+        Key::Character("-" | "_") => Some(if modifiers.shift() {
+            Event::DecreaseUiFont
+        } else if chat_active {
+            Event::DecreaseChatFont
+        } else {
+            Event::DecreaseTerminalFont
+        }),
+        _ => None,
+    }
 }
 
 /// Read a chord a chat page forwarded (`{type: "hostkey", key, code, meta,
@@ -1171,7 +1227,9 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                     }
                 };
                 match forwarded_key(&key, modifiers) {
-                    Some(ForwardedKey::Global(_)) => AgentIpcMessage::HostKey { key, modifiers },
+                    Some(ForwardedKey::Global(_) | ForwardedKey::FontSize | ForwardedKey::Find) => {
+                        AgentIpcMessage::HostKey { key, modifiers }
+                    }
                     Some(ForwardedKey::Paste) => AgentIpcMessage::PastePage { tab_id },
                     None => {
                         eprintln!(
@@ -1532,7 +1590,10 @@ struct MenuIds {
     decrease_terminal_font: muda::MenuId,
     increase_ui_font: muda::MenuId,
     decrease_ui_font: muda::MenuId,
+    increase_chat_font: muda::MenuId,
+    decrease_chat_font: muda::MenuId,
     toggle_theme: muda::MenuId,
+    chat_width: Vec<(muda::MenuId, config::ChatWidth)>,
     toggle_terminal_log_mirroring: muda::MenuId,
     clear_terminal: muda::MenuId,
     open_plans_viewer: muda::MenuId,
@@ -1617,6 +1678,18 @@ fn setup_menu_bar() {
         .append_items(&[&increase_ui_font, &decrease_ui_font])
         .unwrap();
 
+    let increase_chat_font = MenuItem::new("Increase Chat Text", true, None);
+    let decrease_chat_font = MenuItem::new("Decrease Chat Text", true, None);
+
+    let chat_width_menu = Submenu::new("Chat width", true);
+    let chat_width_items: Vec<_> = config::ChatWidth::ALL
+        .into_iter()
+        .map(|width| (MenuItem::new(width.to_string(), true, None), width))
+        .collect();
+    for (item, _) in &chat_width_items {
+        chat_width_menu.append(item).unwrap();
+    }
+
     let toggle_theme = MenuItem::new(
         "Toggle Light/Dark Theme",
         true,
@@ -1646,6 +1719,9 @@ fn setup_menu_bar() {
         .append_items(&[
             &terminal_font_menu,
             &ui_font_menu,
+            &increase_chat_font,
+            &decrease_chat_font,
+            &chat_width_menu,
             &PredefinedMenuItem::separator(),
             &toggle_theme,
             &toggle_terminal_log_mirroring,
@@ -1679,7 +1755,13 @@ fn setup_menu_bar() {
         decrease_terminal_font: decrease_terminal_font.id().clone(),
         increase_ui_font: increase_ui_font.id().clone(),
         decrease_ui_font: decrease_ui_font.id().clone(),
+        increase_chat_font: increase_chat_font.id().clone(),
+        decrease_chat_font: decrease_chat_font.id().clone(),
         toggle_theme: toggle_theme.id().clone(),
+        chat_width: chat_width_items
+            .into_iter()
+            .map(|(item, width)| (item.id().clone(), width))
+            .collect(),
         toggle_terminal_log_mirroring: toggle_terminal_log_mirroring.id().clone(),
         clear_terminal: clear_terminal.id().clone(),
         open_plans_viewer: open_plans_viewer.id().clone(),
@@ -2635,6 +2717,11 @@ const WORK_DOCUMENTS_SHOWN: usize = 5;
 #[derive(Debug, Default)]
 struct WorkspaceOverviewState {
     summary: overview::WorkSummary,
+    /// Summary has not caught up with the current index.
+    summary_stale: bool,
+    /// App-wide request token; zero invalidates pending summary work.
+    summary_generation: u64,
+    summary_in_flight: bool,
     branches: Vec<overview::BranchStatus>,
     /// Repo-level read failures of the last full refresh.
     errors: Vec<String>,
@@ -6917,6 +7004,7 @@ pub enum Event {
     },
     WorktreeRemoveCompleted(PathBuf, Result<(), String>),
     KeyPressed(Key, Modifiers),
+    AgentFindFocusChecked(bool),
     // Sidebar
     ToggleSidebar,
     SetSidebarMode(SidebarMode),
@@ -6994,11 +7082,14 @@ pub enum Event {
     FileBrowserSnapshotReady(usize),
     // Theme
     ToggleTheme,
+    SetChatWidth(config::ChatWidth),
     ToggleTerminalLogMirroring,
     // Font size - Terminal
     IncreaseTerminalFont,
     DecreaseTerminalFont,
     ClearTerminal,
+    IncreaseChatFont,
+    DecreaseChatFont,
     // Font size - UI
     IncreaseUiFont,
     DecreaseUiFont,
@@ -7010,6 +7101,7 @@ pub enum Event {
     MouseMoved(f32, f32),
     // Search events
     ToggleSearch,
+    AgentFindOpen,
     SearchQueryChanged(String),
     SearchExecute,
     SearchNext,
@@ -7310,6 +7402,7 @@ pub enum Event {
     /// "Index older chats" in the Chats panel (TRU-166).
     ChatFactsBackfill,
     ChatFactsBackfilled(Result<chat_facts::BackfillReport, String>),
+    WorkerPrsScanned(Result<gitterm::worker_prs::RecordedPrs, String>),
     /// A ~/Work git job ended (TRU-201).
     WorkNotesDone(gitterm::work_notes::JobResult),
     /// Workspace overview (TRU-167): rebuild from the index and reread git.
@@ -7326,6 +7419,7 @@ pub enum Event {
     WorkDocumentsAllToggle,
     /// A background refresh finished: workspace dir, generation, result.
     WorkspaceOverviewRefreshed(OverviewKey, u64, Box<overview::RefreshOutcome>),
+    WorkspaceOverviewSummaryBuilt(OverviewKey, u64, Box<Result<overview::WorkSummary, String>>),
     /// Open a coordinator's conversation in the main area; the sidebar
     /// stays on the overview.
     WorkspaceOverviewOpenChat(String),
@@ -7627,8 +7721,10 @@ struct App {
     delegation_runs: HashMap<String, iced::task::Handle>,
     /// Latest Codex activity line per running delegation (not persisted).
     delegation_activity: HashMap<String, String>,
+    worker_pr_scans: gitterm::worker_prs::Scans,
     /// Send-to-Claude messages held per chat tab until its turn ends.
     delegation_held: HashMap<usize, Vec<gitterm::delegations::HeldSend>>,
+    delegation_waiting_counts: HashMap<String, usize>,
     /// New-chat model/effort defaults and the last selection (config
     /// `chat`, TRU-143).
     chat_config: config::ChatDefaults,
@@ -7685,6 +7781,8 @@ struct App {
     theme: AppTheme,
     terminal_font_size: f32,
     ui_font_size: f32,
+    chat_font_size: f32,
+    chat_width: config::ChatWidth,
     sidebar_width: f32,
     scrollback_lines: usize,
     sidebar_collapsed: bool,
@@ -7788,11 +7886,13 @@ struct App {
     remote_sessions_error: Option<String>,
     // Chats panel (TRU-78): machine-wide conversation index + UI state.
     // App-level because the index spans workspaces; selection is per-tab.
-    chat_index: Vec<chats::ChatIndexEntry>,
+    chat_index: Arc<Vec<chats::ChatIndexEntry>>,
     /// Workspace overviews (TRU-167) by workspace dir, or by workspace for
     /// one that owns its chats (TRU-169); built when the panel first opens
     /// in that workspace.
     workspace_overviews: HashMap<OverviewKey, WorkspaceOverviewState>,
+    /// Survives overview removal so a recreated owner cannot accept an old job.
+    workspace_overview_summary_generation: u64,
     /// Fold and row disclosure state belongs to a workspace, even when its
     /// overview summary is shared with another folder-scoped workspace.
     workspace_overview_presentations: HashMap<u64, WorkspaceOverviewPresentation>,
@@ -8627,6 +8727,24 @@ const ESTIMATED_WS_BTN_WIDTH: f32 = 180.0;
 const MIN_FONT_SIZE: f32 = 10.0;
 const MAX_FONT_SIZE: f32 = 24.0;
 const FONT_SIZE_STEP: f32 = 1.0;
+
+/// Cmd +/- follows the active tab; the chat menu selects chat explicitly.
+fn resize_tab_font(chat: bool, step: f32, terminal: &mut f32, chat_font: &mut f32) -> bool {
+    let (size, min, max) = if chat {
+        (
+            chat_font,
+            config::MIN_CHAT_FONT_SIZE,
+            config::MAX_CHAT_FONT_SIZE,
+        )
+    } else {
+        (terminal, MIN_FONT_SIZE, MAX_FONT_SIZE)
+    };
+    let next = (*size + step).clamp(min, max);
+    let changed = next != *size;
+    *size = next;
+    changed
+}
+
 const WORKSPACES_SAVE_DEBOUNCE_MS: u64 = 1500;
 const LOG_SERVER_SYNC_INTERVAL_MS: u64 = 15000;
 const LOG_SERVER_STARTUP_RETRY_MS: u64 = 500;
@@ -9486,6 +9604,331 @@ fn task_holds_local_slot(task: &TaskRecord) -> bool {
     task.executor == ExecutorTarget::Local && task.lifecycle == TaskLifecycle::Running
 }
 
+fn sync_task_sessions_from_chat_index(
+    chat_index: &[chats::ChatIndexEntry],
+    workspaces: &[Workspace],
+    task_store: &mut Option<TaskStore>,
+    task_store_error: &mut Option<String>,
+) {
+    // Borrow the fact-bearing index; grouping retains its per-worktree order.
+    let mut entries_by_worktree: HashMap<&Path, Vec<&chats::ChatIndexEntry>> = HashMap::new();
+    for entry in chat_index {
+        entries_by_worktree
+            .entry(&entry.cwd)
+            .or_default()
+            .push(entry);
+    }
+    let open_conversations = workspaces
+        .iter()
+        .flat_map(|workspace| workspace.tabs.iter())
+        .filter_map(|tab| {
+            Some((
+                tab.chat_session_id.clone()?,
+                (tab.task_id.clone()?, tab.task_session_id.clone()?),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    let tasks = task_store
+        .as_ref()
+        .map(|store| store.tasks().to_vec())
+        .unwrap_or_default();
+    let timestamp = chrono::Utc::now().to_rfc3339();
+
+    let mut changed_tasks = Vec::new();
+    for mut task in tasks {
+        let Some(worktree_path) = task.worktree.path.as_ref() else {
+            continue;
+        };
+        let mut changed = false;
+        for entry in entries_by_worktree
+            .get(worktree_path.as_path())
+            .into_iter()
+            .flatten()
+        {
+            let conversation = HarnessConversationRef {
+                backend: task_conversation_backend(entry.backend),
+                session_id: entry.id.clone(),
+            };
+            if task
+                .sessions
+                .iter()
+                .any(|session| session.conversation.as_ref() == Some(&conversation))
+            {
+                continue;
+            }
+            let task_session_id = open_conversations
+                .get(&entry.id)
+                .filter(|(open_task_id, _)| open_task_id == &task.task_id)
+                .map(|(_, session_id)| session_id.clone())
+                .unwrap_or_else(|| format!("chat-{}-{}", entry.backend.label(), entry.id));
+            let preset_name = conversation_backend_label(conversation.backend).to_string();
+            task.sessions.push(TaskSessionRecord {
+                task_session_id,
+                label: if entry.title.trim().is_empty() {
+                    preset_name.clone()
+                } else {
+                    entry.title.clone()
+                },
+                harness: Some(HarnessSelection {
+                    kind: HarnessKind::TerminalPreset { preset_name },
+                    model: None,
+                }),
+                conversation: Some(conversation),
+                objective_delivery: ObjectiveDeliveryState::Unknown,
+                launch_identity: None,
+                created_at: timestamp.clone(),
+                updated_at: timestamp.clone(),
+            });
+            changed = true;
+        }
+        if !changed {
+            continue;
+        }
+        task.updated_at = timestamp.clone();
+        changed_tasks.push(task);
+    }
+    if let Some(store) = task_store.as_mut() {
+        if let Err(error) = store.replace_many(changed_tasks) {
+            let message = error.to_string();
+            eprintln!("GitTerm V6 could not link task conversation history: {message}");
+            *task_store_error = Some(message);
+        }
+    }
+}
+
+fn workspace_repo_joins(
+    chat_index: &[chats::ChatIndexEntry],
+    workspaces: &[Workspace],
+    repos: &RepoRegistry,
+    task_store: Option<&TaskStore>,
+) -> Vec<(u64, Vec<PathBuf>)> {
+    let task_worktrees = task_store
+        .map(|store| {
+            store
+                .tasks()
+                .iter()
+                .filter_map(|task| task.worktree.path.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let canonical = |dir: &Path| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut joins: Vec<(u64, Vec<PathBuf>)> = Vec::new();
+    for ws in workspaces {
+        if !ws.is_work() || !matches!(ws.location, WorkspaceLocation::Local { .. }) {
+            continue;
+        }
+        let work = if ws.owns_chats() {
+            overview::chats_under(chat_index, &ws.chats)
+        } else {
+            overview::work_chats(chat_index, &ws.dir)
+        };
+        let workers: Vec<PathBuf> = work
+            .iter()
+            .filter_map(|entry| entry.facts.as_ref())
+            .flat_map(|facts| facts.children.iter())
+            .filter(|child| child.kind == chat_facts::ChildKind::Worker)
+            .filter_map(|child| child.task_id.as_deref())
+            .filter_map(|task_id| task_store?.get(task_id))
+            .filter_map(|task| task_main_checkout(&task.repository.common_dir))
+            .collect();
+        let delegated = task_store.map_or_else(Vec::new, |store| {
+            gitterm::workspace_repos::delegation_targets(&work, store.delegations(), store.tasks())
+        });
+        // A linked worktree (an agent-made one too) joins as its main
+        // checkout (TRU-191); a checkout since deleted does not join.
+        let candidates: Vec<PathBuf> = gitterm::workspace_repos::fold_worktrees(
+            gitterm::workspace_repos::auto_repo_candidates(
+                &work,
+                &workers,
+                &task_worktrees,
+                &delegated,
+            )
+            .into_iter()
+            .filter(|dir| dir.is_dir()),
+        );
+        let listed: Vec<PathBuf> = ws
+            .repos
+            .iter()
+            .filter_map(|id| repos.get(*id))
+            .map(|repo| canonical(&repo.dir))
+            .collect();
+        let removed: Vec<PathBuf> = ws.repos_removed.iter().map(|d| canonical(d)).collect();
+        let (_, joined) = gitterm::workspace_repos::derive_repo_list(
+            &canonical(&ws.dir),
+            &listed,
+            &candidates,
+            &[],
+            &removed,
+        );
+        if !joined.is_empty() {
+            joins.push((ws.uid, joined));
+        }
+    }
+    joins
+}
+
+/// An owned snapshot for the summary's CPU work; the index itself is shared.
+struct WorkspaceOverviewSummaryPlan {
+    key: OverviewKey,
+    owned: Vec<String>,
+    tasks: Vec<overview::TaskInfo>,
+    focus: overview::Focus,
+    now: std::time::SystemTime,
+}
+
+impl WorkspaceOverviewSummaryPlan {
+    fn build(self, chat_index: &[chats::ChatIndexEntry]) -> overview::WorkSummary {
+        let now = self.now;
+        freeze_time!("workspace_overview_summary", {
+            match self.key {
+                OverviewKey::Folder(dir) => {
+                    overview::WorkSummary::build(chat_index, &dir, &self.tasks, &self.focus, now)
+                }
+                OverviewKey::Owner(_) => {
+                    overview::WorkSummary::build_owned(chat_index, &self.owned, &self.tasks, now)
+                }
+            }
+        })
+    }
+}
+
+async fn build_workspace_overview_summary(
+    plan: WorkspaceOverviewSummaryPlan,
+    chat_index: Arc<Vec<chats::ChatIndexEntry>>,
+) -> Result<overview::WorkSummary, String> {
+    tokio::task::spawn_blocking(move || plan.build(&chat_index))
+        .await
+        .map_err(|error| format!("build workspace overview summary: {error}"))
+}
+
+fn workspace_overview_summary_plan(
+    workspaces: &[Workspace],
+    task_store: Option<&TaskStore>,
+    focus_picks: &overview::FocusPicks,
+    workspace_overviews: &mut HashMap<OverviewKey, WorkspaceOverviewState>,
+    summary_generation: &mut u64,
+    key: &OverviewKey,
+) -> Option<(u64, WorkspaceOverviewSummaryPlan)> {
+    let (owned, focus) = match key {
+        OverviewKey::Folder(dir) => (
+            Vec::new(),
+            workspace_overviews
+                .get(key)
+                .map(|state| state.focus.clone())
+                .unwrap_or_else(|| focus_picks.focus_for(dir)),
+        ),
+        OverviewKey::Owner(uid) => {
+            let Some(ws) = workspaces
+                .iter()
+                .find(|ws| ws.uid == *uid && ws.owns_chats())
+            else {
+                workspace_overviews.remove(key);
+                return None;
+            };
+            (ws.chats.clone(), overview::Focus::Latest)
+        }
+    };
+    let state = workspace_overviews.entry(key.clone()).or_default();
+    state.focus = focus.clone();
+    state.summary_stale = true;
+    state.summary_in_flight = true;
+    *summary_generation = summary_generation
+        .checked_add(1)
+        .expect("workspace overview summary generation exhausted");
+    state.summary_generation = *summary_generation;
+    Some((
+        state.summary_generation,
+        WorkspaceOverviewSummaryPlan {
+            key: key.clone(),
+            owned,
+            focus,
+            now: std::time::SystemTime::now(),
+            tasks: task_store
+                .map(|store| store.tasks().iter().map(overview::TaskInfo::from).collect())
+                .unwrap_or_default(),
+        },
+    ))
+}
+
+/// Hidden summaries are rebuilt when shown. Only the visible one gets a
+/// background build on reload; old completions cannot overwrite newer state.
+fn reload_workspace_overviews(
+    workspaces: &[Workspace],
+    task_store: Option<&TaskStore>,
+    focus_picks: &overview::FocusPicks,
+    workspace_overviews: &mut HashMap<OverviewKey, WorkspaceOverviewState>,
+    summary_generation: &mut u64,
+    visible: Option<&OverviewKey>,
+) -> Option<(u64, WorkspaceOverviewSummaryPlan)> {
+    workspace_overviews.retain(|key, state| {
+        state.summary_stale = true;
+        state.summary_in_flight = false;
+        state.summary_generation = 0;
+        match key {
+            OverviewKey::Owner(uid) => workspaces
+                .iter()
+                .any(|ws| ws.uid == *uid && ws.owns_chats()),
+            OverviewKey::Folder(_) => true,
+        }
+    });
+    visible.and_then(|key| {
+        workspace_overview_summary_plan(
+            workspaces,
+            task_store,
+            focus_picks,
+            workspace_overviews,
+            summary_generation,
+            key,
+        )
+    })
+}
+
+fn apply_workspace_overview_summary(
+    workspace_overviews: &mut HashMap<OverviewKey, WorkspaceOverviewState>,
+    key: &OverviewKey,
+    generation: u64,
+    summary: overview::WorkSummary,
+) -> bool {
+    let Some(state) = workspace_overviews
+        .get_mut(key)
+        .filter(|state| state.summary_generation == generation)
+    else {
+        return false;
+    };
+    if state.summary.candidates != summary.candidates
+        || state.summary.issue_keys != summary.issue_keys
+        || state.summary.key_repos != summary.key_repos
+    {
+        state.needs_full = true;
+    }
+    state.summary = summary;
+    state.summary_stale = false;
+    state.summary_in_flight = false;
+    true
+}
+
+fn rebuild_workspace_overview(
+    chat_index: &[chats::ChatIndexEntry],
+    workspaces: &[Workspace],
+    task_store: Option<&TaskStore>,
+    focus_picks: &overview::FocusPicks,
+    workspace_overviews: &mut HashMap<OverviewKey, WorkspaceOverviewState>,
+    summary_generation: &mut u64,
+    key: &OverviewKey,
+) {
+    if let Some((generation, plan)) = workspace_overview_summary_plan(
+        workspaces,
+        task_store,
+        focus_picks,
+        workspace_overviews,
+        summary_generation,
+        key,
+    ) {
+        let summary = plan.build(chat_index);
+        apply_workspace_overview_summary(workspace_overviews, key, generation, summary);
+    }
+}
+
 impl App {
     /// UI font size
     fn ui_font(&self) -> f32 {
@@ -9996,6 +10439,8 @@ impl App {
             editor: self.editor.clone(),
             terminal_font_size: self.terminal_font_size,
             ui_font_size: self.ui_font_size,
+            chat_font_size: self.chat_font_size,
+            chat_width: self.chat_width,
             sidebar_width: self.sidebar_width,
             scrollback_lines: self.scrollback_lines,
             font_size: None,
@@ -12645,79 +13090,12 @@ impl App {
     }
 
     fn sync_task_sessions_from_chat_index(&mut self) {
-        let entries = self.chat_index.clone();
-        let open_conversations = self
-            .workspaces
-            .iter()
-            .flat_map(|workspace| workspace.tabs.iter())
-            .filter_map(|tab| {
-                Some((
-                    tab.chat_session_id.clone()?,
-                    (tab.task_id.clone()?, tab.task_session_id.clone()?),
-                ))
-            })
-            .collect::<HashMap<_, _>>();
-        let tasks = self
-            .task_store
-            .as_ref()
-            .map(|store| store.tasks().to_vec())
-            .unwrap_or_default();
-        let timestamp = chrono::Utc::now().to_rfc3339();
-
-        for mut task in tasks {
-            let Some(worktree_path) = task.worktree.path.as_ref() else {
-                continue;
-            };
-            let mut changed = false;
-            for entry in entries.iter().filter(|entry| entry.cwd == *worktree_path) {
-                let conversation = HarnessConversationRef {
-                    backend: task_conversation_backend(entry.backend),
-                    session_id: entry.id.clone(),
-                };
-                if task
-                    .sessions
-                    .iter()
-                    .any(|session| session.conversation.as_ref() == Some(&conversation))
-                {
-                    continue;
-                }
-                let task_session_id = open_conversations
-                    .get(&entry.id)
-                    .filter(|(open_task_id, _)| open_task_id == &task.task_id)
-                    .map(|(_, session_id)| session_id.clone())
-                    .unwrap_or_else(|| format!("chat-{}-{}", entry.backend.label(), entry.id));
-                let preset_name = conversation_backend_label(conversation.backend).to_string();
-                task.sessions.push(TaskSessionRecord {
-                    task_session_id,
-                    label: if entry.title.trim().is_empty() {
-                        preset_name.clone()
-                    } else {
-                        entry.title.clone()
-                    },
-                    harness: Some(HarnessSelection {
-                        kind: HarnessKind::TerminalPreset { preset_name },
-                        model: None,
-                    }),
-                    conversation: Some(conversation),
-                    objective_delivery: ObjectiveDeliveryState::Unknown,
-                    launch_identity: None,
-                    created_at: timestamp.clone(),
-                    updated_at: timestamp.clone(),
-                });
-                changed = true;
-            }
-            if !changed {
-                continue;
-            }
-            task.updated_at = timestamp.clone();
-            if let Some(store) = self.task_store.as_mut() {
-                if let Err(error) = store.replace(task) {
-                    let message = error.to_string();
-                    eprintln!("GitTerm V6 could not link task conversation history: {message}");
-                    self.task_store_error = Some(message);
-                }
-            }
-        }
+        sync_task_sessions_from_chat_index(
+            &self.chat_index,
+            &self.workspaces,
+            &mut self.task_store,
+            &mut self.task_store_error,
+        );
     }
 
     fn resume_task_conversation(&mut self, task_id: &str, chat_id: &str) -> Task<Event> {
@@ -14746,61 +15124,12 @@ impl App {
     /// chat index lands; a folder-scoped workspace lists only its home
     /// and what was added by hand.
     fn sync_workspace_repos(&mut self) {
-        let task_worktrees = self.task_worktree_dirs();
-        let canonical =
-            |dir: &Path| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        let mut joins: Vec<(u64, Vec<PathBuf>)> = Vec::new();
-        for ws in &self.workspaces {
-            if !ws.is_work() || !matches!(ws.location, WorkspaceLocation::Local { .. }) {
-                continue;
-            }
-            let work = self.workspace_chat_entries(ws);
-            let workers: Vec<PathBuf> = work
-                .iter()
-                .filter_map(|entry| entry.facts.as_ref())
-                .flat_map(|facts| facts.children.iter())
-                .filter(|child| child.kind == chat_facts::ChildKind::Worker)
-                .filter_map(|child| child.task_id.as_deref())
-                .filter_map(|task_id| self.task_store.as_ref()?.get(task_id))
-                .filter_map(|task| task_main_checkout(&task.repository.common_dir))
-                .collect();
-            let delegated = self.task_store.as_ref().map_or_else(Vec::new, |store| {
-                gitterm::workspace_repos::delegation_targets(
-                    &work,
-                    store.delegations(),
-                    store.tasks(),
-                )
-            });
-            // A linked worktree (an agent-made one too) joins as its main
-            // checkout (TRU-191); a checkout since deleted does not join.
-            let candidates: Vec<PathBuf> = gitterm::workspace_repos::fold_worktrees(
-                gitterm::workspace_repos::auto_repo_candidates(
-                    &work,
-                    &workers,
-                    &task_worktrees,
-                    &delegated,
-                )
-                .into_iter()
-                .filter(|dir| dir.is_dir()),
-            );
-            let listed: Vec<PathBuf> = ws
-                .repos
-                .iter()
-                .filter_map(|id| self.repo(*id))
-                .map(|repo| canonical(&repo.dir))
-                .collect();
-            let removed: Vec<PathBuf> = ws.repos_removed.iter().map(|d| canonical(d)).collect();
-            let (_, joined) = gitterm::workspace_repos::derive_repo_list(
-                &canonical(&ws.dir),
-                &listed,
-                &candidates,
-                &[],
-                &removed,
-            );
-            if !joined.is_empty() {
-                joins.push((ws.uid, joined));
-            }
-        }
+        let joins = workspace_repo_joins(
+            &self.chat_index,
+            &self.workspaces,
+            &self.repos,
+            self.task_store.as_ref(),
+        );
         for (uid, dirs) in joins {
             for dir in dirs {
                 let Some(id) = self.add_repo_to_workspace(uid, dir.clone()) else {
@@ -15449,24 +15778,59 @@ impl App {
     /// Child sessions GitTerm's own records name (delegations, tasks a
     /// coordinator created), keyed by parent chat (TRU-166). Tabs map a
     /// caller `session_uid` to the chat it hosts.
-    fn chat_child_links(&self) -> Vec<chat_facts::ChildLink> {
-        let Some(store) = self.task_store.as_ref() else {
-            return Vec::new();
-        };
+    fn chat_uid_to_chat(&self) -> HashMap<String, String> {
         let mut uid_to_chat: HashMap<String, String> = self
             .workspaces
             .iter()
             .flat_map(|ws| ws.tabs.iter())
             .filter_map(|tab| Some((tab.session_uid.clone(), tab.chat_session_id.clone()?)))
             .collect();
-        for delegation in store.delegations() {
-            if let Some(chat) = &delegation.parent.chat_session_id {
-                uid_to_chat
-                    .entry(delegation.parent.session_uid.clone())
-                    .or_insert_with(|| chat.clone());
+        if let Some(store) = self.task_store.as_ref() {
+            for delegation in store.delegations() {
+                if let Some(chat) = &delegation.parent.chat_session_id {
+                    uid_to_chat
+                        .entry(delegation.parent.session_uid.clone())
+                        .or_insert_with(|| chat.clone());
+                }
             }
         }
+        uid_to_chat
+    }
+
+    fn chat_child_links(&self) -> Vec<chat_facts::ChildLink> {
+        let Some(store) = self.task_store.as_ref() else {
+            return Vec::new();
+        };
+        let uid_to_chat = self.chat_uid_to_chat();
         chat_facts::store_links(store.delegations(), store.tasks(), &uid_to_chat)
+    }
+
+    fn poll_worker_prs(&mut self) -> Task<Event> {
+        let Some(store) = self.task_store.as_ref() else {
+            return Task::none();
+        };
+        let uid_to_chat = self.chat_uid_to_chat();
+        let scans = self.worker_pr_scans.take_due(
+            store.delegations(),
+            store.tasks(),
+            &uid_to_chat,
+            chrono::Utc::now(),
+        );
+        if scans.is_empty() {
+            return Task::none();
+        }
+        let config_dir = config::global_config_dir();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let home = dirs::home_dir().ok_or("cannot locate home for worker PR scans")?;
+                    Ok(gitterm::worker_prs::run(scans, &config_dir, &home))
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("worker PR scan task failed: {error}")))
+            },
+            Event::WorkerPrsScanned,
+        )
     }
 
     /// Write a chat tab's facts when they are due (TRU-166): debounced while
@@ -16285,54 +16649,15 @@ impl App {
     /// over the index, no I/O. A changed branch claim asks for a full
     /// refresh. The overview of a workspace that closed is dropped.
     fn rebuild_workspace_overview(&mut self, key: &OverviewKey) {
-        let tasks: Vec<overview::TaskInfo> = self
-            .task_store
-            .as_ref()
-            .map(|store| store.tasks().iter().map(overview::TaskInfo::from).collect())
-            .unwrap_or_default();
-        let now = std::time::SystemTime::now();
-        let (summary, focus) = match key {
-            OverviewKey::Folder(dir) => {
-                let focus = self
-                    .workspace_overviews
-                    .get(key)
-                    .map(|state| state.focus.clone())
-                    .unwrap_or_else(|| self.overview_focus_picks.focus_for(dir));
-                let summary = freeze_time!("workspace_overview_summary", {
-                    overview::WorkSummary::build(&self.chat_index, dir, &tasks, &focus, now)
-                });
-                (summary, focus)
-            }
-            OverviewKey::Owner(uid) => {
-                let Some(owned) = self
-                    .workspaces
-                    .iter()
-                    .find(|ws| ws.uid == *uid && ws.owns_chats())
-                    .map(|ws| ws.chats.clone())
-                else {
-                    self.workspace_overviews.remove(key);
-                    return;
-                };
-                let summary = freeze_time!("workspace_overview_summary", {
-                    overview::WorkSummary::build_owned(&self.chat_index, &owned, &tasks, now)
-                });
-                (summary, overview::Focus::Latest)
-            }
-        };
-        let state = self
-            .workspace_overviews
-            .entry(key.clone())
-            .or_insert_with(|| WorkspaceOverviewState {
-                focus: focus.clone(),
-                ..Default::default()
-            });
-        if state.summary.candidates != summary.candidates
-            || state.summary.issue_keys != summary.issue_keys
-            || state.summary.key_repos != summary.key_repos
-        {
-            state.needs_full = true;
-        }
-        state.summary = summary;
+        rebuild_workspace_overview(
+            &self.chat_index,
+            &self.workspaces,
+            self.task_store.as_ref(),
+            &self.overview_focus_picks,
+            &mut self.workspace_overviews,
+            &mut self.workspace_overview_summary_generation,
+            key,
+        );
     }
 
     /// Starts a background refresh of `dir`'s overview unless one runs.
@@ -16346,7 +16671,7 @@ impl App {
         let Some(state) = self.workspace_overviews.get_mut(key) else {
             return Task::none();
         };
-        if state.in_flight {
+        if state.in_flight || state.summary_stale {
             return Task::none();
         }
         let mode = if state.last_full_refresh.is_none() || state.needs_full {
@@ -16384,6 +16709,7 @@ impl App {
         let recent = self
             .workspace_overviews
             .get(&dir)
+            .filter(|state| !state.needs_full)
             .and_then(|state| state.last_full_refresh)
             .is_some_and(|at| at.elapsed() < OVERVIEW_REOPEN_FRESH);
         let refresh = if recent {
@@ -16414,6 +16740,16 @@ impl App {
                 Task::none()
             };
         };
+        if state.summary_in_flight {
+            return Task::none();
+        }
+        if state.summary_stale {
+            return if visible {
+                self.open_workspace_overview()
+            } else {
+                Task::none()
+            };
+        }
         let (interval, mode) = if visible {
             let interval = if state.unchanged_streak >= 2 {
                 OVERVIEW_VISIBLE_SLOW_POLL
@@ -18337,6 +18673,7 @@ impl App {
                 self.mark_log_server_dirty();
             }
         }
+        self.request_finished_task_prs(delegation_id);
         self.push_delegation_card(delegation_id);
         let head =
             parent_tab.map_or_else(Task::none, |tab_id| self.refresh_delegation_head(tab_id));
@@ -18748,6 +19085,7 @@ impl App {
         }
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
+        self.request_finished_task_prs(delegation_id);
         self.push_delegation_card(delegation_id);
         Task::none()
     }
@@ -18830,6 +19168,7 @@ impl App {
                         eprintln!("[delegation] {delegation_id}: {store_error}");
                     }
                 }
+                self.request_finished_task_prs(&delegation_id);
                 self.push_delegation_card(&delegation_id);
                 reply.send(Err(format!(
                     "Created task {task_id} at {}, but {message}",
@@ -19051,6 +19390,7 @@ impl App {
         }
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
+        self.request_finished_task_prs(delegation_id);
         self.push_delegation_card(delegation_id);
     }
 
@@ -19377,16 +19717,17 @@ impl App {
             })
             .unwrap_or_default();
         let mut tabs: HashSet<usize> = self.delegation_held.keys().copied().collect();
+        let mut waiting = Vec::new();
         for parent in parents {
             match self.delegation_chat_tab_id(&parent) {
                 Some(tab_id) => {
                     tabs.insert(tab_id);
                 }
-                None => eprintln!(
-                    "[delegation] results for {} not sent: requesting chat tab is gone",
-                    parent.session_uid
-                ),
+                None => waiting.push(parent.session_uid),
             }
+        }
+        for line in waiting_delegation_log_lines(&mut self.delegation_waiting_counts, waiting) {
+            eprintln!("{line}");
         }
         Task::batch(
             tabs.into_iter()
@@ -19739,6 +20080,26 @@ fn worker_delivery_allows_close(
         .and_then(|result| result.handoff.as_ref())
         .is_some();
     handoff_stored && (d.is_delivered() || held || !auto_tell || !parent_present)
+}
+
+fn waiting_delegation_log_lines(
+    previous: &mut HashMap<String, usize>,
+    waiting: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut counts = HashMap::new();
+    for chat in waiting {
+        *counts.entry(chat).or_insert(0) += 1;
+    }
+    let mut lines = Vec::new();
+    for (chat, count) in &counts {
+        if previous.get(chat) != Some(count) {
+            lines.push(format!(
+                "[delegation] {count} finished results wait for chat {chat} until it is open"
+            ));
+        }
+    }
+    *previous = counts;
+    lines
 }
 
 fn load_task_store_for_startup(
@@ -20376,7 +20737,9 @@ impl App {
             model_policy: config.policy.clone(),
             delegation_runs: HashMap::new(),
             delegation_activity: HashMap::new(),
+            worker_pr_scans: gitterm::worker_prs::Scans::default(),
             delegation_held: HashMap::new(),
+            delegation_waiting_counts: HashMap::new(),
             chat_config: config.chat.clone(),
             task_store_error,
             task_ui_error: None,
@@ -20409,6 +20772,8 @@ impl App {
             theme,
             terminal_font_size: terminal_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
             ui_font_size: ui_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
+            chat_font_size: config.chat_font_size,
+            chat_width: config.chat_width,
             sidebar_width: config.sidebar_width.clamp(150.0, 600.0),
             scrollback_lines: config.scrollback_lines,
             sidebar_collapsed: false,
@@ -20510,8 +20875,9 @@ impl App {
             viewer_page_store: None,
             viewer_page_navigation_context: None,
             agent_pages: Vec::new(),
-            chat_index: Vec::new(),
+            chat_index: Arc::default(),
             workspace_overviews: HashMap::new(),
+            workspace_overview_summary_generation: 0,
             workspace_overview_presentations: HashMap::new(),
             work_documents: HashMap::new(),
             work_document_copies_open: None,
@@ -23400,7 +23766,18 @@ fi
 
     fn update(&mut self, event: Event) -> Task<Event> {
         let overlay_was_open = self.webview_overlay_open();
+        // Reports/time limits scan immediately; the tick also catches every
+        // other terminal worker outcome and performs startup catch-up once.
+        let check_worker_prs = matches!(
+            &event,
+            Event::Tick | Event::TaskControlRequested(_) | Event::WorkerTimeLimitReached(..)
+        );
         let task = self.update_event(event);
+        let task = if check_worker_prs {
+            Task::batch([task, self.poll_worker_prs()])
+        } else {
+            task
+        };
         let task = match self.settle_active_workspace() {
             Some(settle) => Task::batch([task, settle]),
             None => task,
@@ -24437,12 +24814,21 @@ fi
                 if let Ok(event) = MenuEvent::receiver().try_recv() {
                     freeze_debug!("native menu event received: {:?}", event.id);
                     if let Some(ids) = MENU_IDS.get() {
+                        if let Some((_, width)) =
+                            ids.chat_width.iter().find(|(id, _)| *id == event.id)
+                        {
+                            return self.update(Event::SetChatWidth(*width));
+                        }
                         if event.id == ids.increase_terminal_font {
                             freeze_debug!("dispatching native menu: increase_terminal_font");
                             return self.update(Event::IncreaseTerminalFont);
                         } else if event.id == ids.decrease_terminal_font {
                             freeze_debug!("dispatching native menu: decrease_terminal_font");
                             return self.update(Event::DecreaseTerminalFont);
+                        } else if event.id == ids.increase_chat_font {
+                            return self.update(Event::IncreaseChatFont);
+                        } else if event.id == ids.decrease_chat_font {
+                            return self.update(Event::DecreaseChatFont);
                         } else if event.id == ids.increase_ui_font {
                             freeze_debug!("dispatching native menu: increase_ui_font");
                             return self.update(Event::IncreaseUiFont);
@@ -24792,6 +25178,11 @@ fi
                         Task::done(Event::AgentOpenCheckout(tab_id, path))
                     }
                     AgentIpcMessage::HostKey { key, modifiers } => {
+                        // The page forwarding Cmd+F has keyboard focus. Native
+                        // widget focus state can still describe the last app view.
+                        if find_shortcut(&key, modifiers, true).is_some() {
+                            return self.update(Event::AgentFindOpen);
+                        }
                         // Run the chord through the Iced key handler, so it
                         // means exactly what it means anywhere else. The
                         // handler records the chord's modifiers as held;
@@ -26237,6 +26628,14 @@ fi
                         }
                     ),
                 );
+                webview::evaluate_script(
+                    WebviewSurface::Agent(tab_id),
+                    &format!("window.__setChatWidth({:?})", self.chat_width.as_str()),
+                );
+                webview::evaluate_script(
+                    WebviewSurface::Agent(tab_id),
+                    &format!("window.__setChatFontSize({})", self.chat_font_size),
+                );
                 let composer = self.chat_composer_state(tab_id);
                 set_agent_webview_tab_id(
                     tab_id,
@@ -27621,9 +28020,30 @@ fi
                     // Search shortcuts
                     if modifiers.command() {
                         if let Key::Character(c) = key.as_ref() {
-                            // Cmd+F - Toggle search
-                            if c == "f" {
-                                return Task::done(Event::ToggleSearch);
+                            // Cmd+F - Open chat find or toggle terminal search
+                            if let Some(event) = find_shortcut(
+                                &key,
+                                modifiers,
+                                matches!(tab.kind, TabKind::Agent(_)),
+                            ) {
+                                if matches!(event, Event::AgentFindOpen) {
+                                    if !chat_find_allowed(
+                                        self.visible_webview_surface(),
+                                        self.bottom_panel_focused,
+                                        false,
+                                    ) {
+                                        return Task::none();
+                                    }
+                                    // Include unnamed native inputs: find_focused
+                                    // only reports widgets with explicit IDs.
+                                    return iced::advanced::widget::operate(
+                                        iced::advanced::widget::operation::focusable::count(),
+                                    )
+                                    .map(|focus| {
+                                        Event::AgentFindFocusChecked(focus.focused.is_some())
+                                    });
+                                }
+                                return Task::done(event);
                             }
                             // Cmd+G / Cmd+Shift+G - Next/Prev match
                             if c == "g" && tab.search.is_active {
@@ -27746,18 +28166,13 @@ fi
                         return Task::done(Event::TaskContextBack);
                     }
                     if let Key::Character(c) = key.as_ref() {
-                        if c == "=" || c == "+" {
-                            if modifiers.shift() {
-                                return Task::done(Event::IncreaseUiFont);
-                            } else {
-                                return Task::done(Event::IncreaseTerminalFont);
-                            }
-                        } else if c == "-" || c == "_" {
-                            if modifiers.shift() {
-                                return Task::done(Event::DecreaseUiFont);
-                            } else {
-                                return Task::done(Event::DecreaseTerminalFont);
-                            }
+                        if let Some(event) = font_shortcut(
+                            &key,
+                            modifiers,
+                            self.active_tab()
+                                .is_some_and(|tab| matches!(tab.kind, TabKind::Agent(_))),
+                        ) {
+                            return Task::done(event);
                         } else if c == "0" && self.active_task_context_id().is_some() {
                             return Task::done(Event::TaskOverview);
                         } else if let Some(GlobalShortcut::SelectTab(num)) =
@@ -29469,6 +29884,16 @@ fi
                     eprintln!("Cannot open file preview: local content server is not running");
                 }
             }
+            Event::SetChatWidth(width) => {
+                self.chat_width = width;
+                for tab_id in &self.agent_pages {
+                    webview::evaluate_script(
+                        WebviewSurface::Agent(*tab_id),
+                        &format!("window.__setChatWidth({:?})", width.as_str()),
+                    );
+                }
+                self.save_config();
+            }
             Event::ToggleTheme => {
                 self.theme = self.theme.toggle();
                 for tab_id in &self.agent_pages {
@@ -29519,20 +29944,38 @@ fi
                 let enabled = !self.terminal_log_mirroring_enabled;
                 return self.set_terminal_log_mirroring_enabled(enabled);
             }
-            Event::IncreaseTerminalFont => {
-                let new_size = (self.terminal_font_size + FONT_SIZE_STEP).min(MAX_FONT_SIZE);
-                if new_size != self.terminal_font_size {
-                    self.terminal_font_size = new_size;
+            Event::IncreaseTerminalFont
+            | Event::DecreaseTerminalFont
+            | Event::IncreaseChatFont
+            | Event::DecreaseChatFont => {
+                let chat_active =
+                    matches!(event, Event::IncreaseChatFont | Event::DecreaseChatFont)
+                        || self
+                            .active_tab()
+                            .is_some_and(|tab| matches!(tab.kind, TabKind::Agent(_)));
+                let step = if matches!(event, Event::IncreaseTerminalFont | Event::IncreaseChatFont)
+                {
+                    FONT_SIZE_STEP
+                } else {
+                    -FONT_SIZE_STEP
+                };
+                if resize_tab_font(
+                    chat_active,
+                    step,
+                    &mut self.terminal_font_size,
+                    &mut self.chat_font_size,
+                ) {
                     self.save_config();
-                    self.recreate_terminals();
-                }
-            }
-            Event::DecreaseTerminalFont => {
-                let new_size = (self.terminal_font_size - FONT_SIZE_STEP).max(MIN_FONT_SIZE);
-                if new_size != self.terminal_font_size {
-                    self.terminal_font_size = new_size;
-                    self.save_config();
-                    self.recreate_terminals();
+                    if chat_active {
+                        for tab_id in &self.agent_pages {
+                            webview::evaluate_script(
+                                WebviewSurface::Agent(*tab_id),
+                                &format!("window.__setChatFontSize({})", self.chat_font_size),
+                            );
+                        }
+                    } else {
+                        self.recreate_terminals();
+                    }
                 }
             }
             Event::ClearTerminal => {
@@ -29561,6 +30004,23 @@ fi
                 }
             }
             // Search events
+            Event::AgentFindFocusChecked(native_input_focused) => {
+                if chat_find_allowed(
+                    self.visible_webview_surface(),
+                    self.bottom_panel_focused,
+                    native_input_focused,
+                ) {
+                    return self.update(Event::AgentFindOpen);
+                }
+            }
+            Event::AgentFindOpen => {
+                if let VisibleSurface::AgentChat(tab_id) = self.visible_webview_surface() {
+                    webview::evaluate_script(
+                        webview::WebviewSurface::Agent(tab_id),
+                        "window.__openFind && window.__openFind()",
+                    );
+                }
+            }
             Event::ToggleSearch => {
                 if let Some(tab) = self.active_tab_mut() {
                     tab.search.is_active = !tab.search.is_active;
@@ -29802,43 +30262,70 @@ fi
                 return self.request_chat_index();
             }
             Event::ChatIndexLoaded(entries) => {
-                self.chat_index = entries;
-                self.chat_index_loading = false;
-                self.chat_index_loaded_at = Some(Instant::now());
-                self.sync_task_sessions_from_chat_index();
-                self.refill_park_note();
-                // Work workspaces list the repos their chats touched (TRU-180).
-                self.sync_workspace_repos();
-                // PR homes read the index's facts (TRU-173).
-                self.prs.homes_built = None;
-                // Workspace overviews read the index (TRU-167).
-                let dirs: Vec<OverviewKey> = self.workspace_overviews.keys().cloned().collect();
-                for dir in &dirs {
-                    self.rebuild_workspace_overview(dir);
-                }
-                let overview_refresh = match self.overview_key() {
-                    Some(dir)
-                        if self.workspace_overview_visible()
-                            && self
-                                .workspace_overviews
-                                .get(&dir)
-                                .is_some_and(|state| state.needs_full) =>
-                    {
-                        self.start_workspace_overview_refresh(&dir, overview::RefreshMode::Full)
-                    }
-                    _ => Task::none(),
-                };
-                // Offers that were waiting for conversation titles.
-                let retitled: Vec<usize> = self.v5_offer_awaiting_titles.drain().collect();
-                let offers: Vec<Task<Event>> = retitled
-                    .into_iter()
-                    .map(|tab_id| self.request_v5_offer(tab_id))
-                    .collect();
-                return Task::batch([
-                    self.request_chat_rank(),
-                    overview_refresh,
-                    Task::batch(offers),
-                ]);
+                return freeze_time!("chat_index_loaded", {
+                    freeze_time!("chat_index_apply", {
+                        self.chat_index = Arc::new(entries);
+                    });
+                    self.chat_index_loading = false;
+                    self.chat_index_loaded_at = Some(Instant::now());
+                    freeze_time!("chat_index_task_sessions", {
+                        self.sync_task_sessions_from_chat_index();
+                    });
+                    freeze_time!("chat_index_park_note", {
+                        self.refill_park_note();
+                    });
+                    // Work workspaces list the repos their chats touched (TRU-180).
+                    freeze_time!("chat_index_repo_joins", {
+                        self.sync_workspace_repos();
+                    });
+                    // PR homes read the index's facts (TRU-173).
+                    freeze_time!("chat_index_pr_homes", {
+                        self.prs.homes_built = None;
+                    });
+                    // Workspace overviews read the index (TRU-167).
+                    let overview_summary = freeze_time!("chat_index_overviews", {
+                        let visible = self
+                            .overview_key()
+                            .filter(|_| self.workspace_overview_visible());
+                        match reload_workspace_overviews(
+                            &self.workspaces,
+                            self.task_store.as_ref(),
+                            &self.overview_focus_picks,
+                            &mut self.workspace_overviews,
+                            &mut self.workspace_overview_summary_generation,
+                            visible.as_ref(),
+                        ) {
+                            Some((generation, plan)) => {
+                                let key = plan.key.clone();
+                                Task::perform(
+                                    build_workspace_overview_summary(
+                                        plan,
+                                        Arc::clone(&self.chat_index),
+                                    ),
+                                    move |result| {
+                                        Event::WorkspaceOverviewSummaryBuilt(
+                                            key.clone(),
+                                            generation,
+                                            Box::new(result),
+                                        )
+                                    },
+                                )
+                            }
+                            None => Task::none(),
+                        }
+                    });
+                    // Offers that were waiting for conversation titles.
+                    let offers = freeze_time!("chat_index_offers", {
+                        let retitled: Vec<usize> = self.v5_offer_awaiting_titles.drain().collect();
+                        let offers: Vec<Task<Event>> = retitled
+                            .into_iter()
+                            .map(|tab_id| self.request_v5_offer(tab_id))
+                            .collect();
+                        offers
+                    });
+                    let rank = freeze_time!("chat_index_rank", { self.request_chat_rank() });
+                    Task::batch([rank, overview_summary, Task::batch(offers)])
+                });
             }
             Event::ChatsQueryChanged(query) => {
                 self.chat_query = query;
@@ -30004,6 +30491,18 @@ fi
                 // A commit asked for meanwhile (a park) runs now.
                 return self.poll_work_notes();
             }
+            Event::WorkerPrsScanned(result) => {
+                self.worker_pr_scans.running = false;
+                match result {
+                    Ok(recorded) => {
+                        for (parent, prs) in recorded {
+                            self.prs.note_live_prs(&parent, &prs);
+                        }
+                    }
+                    Err(error) => eprintln!("[worker-prs] {error}"),
+                }
+                return self.poll_worker_prs();
+            }
             Event::ChatFactsBackfilled(result) => {
                 self.chat_backfill_running = false;
                 match result {
@@ -30033,7 +30532,10 @@ fi
                 let refresh =
                     self.start_workspace_overview_refresh(&dir, overview::RefreshMode::Full);
                 let documents = self.start_work_documents_scan();
-                return Task::batch([index, refresh, documents]);
+                self.prs.request_task_branch_refresh();
+                self.request_open_pr_refreshes();
+                let prs = self.poll_pr_watch();
+                return Task::batch([index, refresh, documents, prs]);
             }
             Event::WorkDocumentsRefresh => {
                 return self.start_work_documents_scan();
@@ -30063,6 +30565,36 @@ fi
                     != Some(key.as_str()))
                 .then_some(key);
             }
+            Event::WorkspaceOverviewSummaryBuilt(key, generation, result) => match *result {
+                Ok(summary) => {
+                    if apply_workspace_overview_summary(
+                        &mut self.workspace_overviews,
+                        &key,
+                        generation,
+                        summary,
+                    ) && self.workspace_overview_visible()
+                        && self.overview_key().as_ref() == Some(&key)
+                        && self
+                            .workspace_overviews
+                            .get(&key)
+                            .is_some_and(|state| state.needs_full)
+                    {
+                        return self
+                            .start_workspace_overview_refresh(&key, overview::RefreshMode::Full);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[workspace-overview] {key:?}: {error}");
+                    if let Some(state) = self
+                        .workspace_overviews
+                        .get_mut(&key)
+                        .filter(|state| state.summary_generation == generation)
+                    {
+                        state.summary_in_flight = false;
+                        state.errors.push(error);
+                    }
+                }
+            },
             Event::WorkspaceOverviewRefreshed(dir, generation, outcome) => {
                 let Some(state) = self.workspace_overviews.get_mut(&dir) else {
                     return Task::none();
@@ -39521,7 +40053,11 @@ fi
                 .active_workspace()
                 .map(|ws| overview::folder_name(&ws.dir))
                 .unwrap_or_default();
-            let roots = summary.coordinators.len();
+            let roots = self
+                .active_workspace()
+                .filter(|ws| !ws.chats.is_empty())
+                .map(|ws| ws.chats.len())
+                .unwrap_or(summary.coordinators.len());
             content = content.push(
                 text(format!(
                     "owns {roots} chat{} \u{00B7} new chats start in {home}",
@@ -48088,6 +48624,476 @@ mod tests {
     }
 
     #[test]
+    fn overview_summary_rejects_old_job_after_owner_state_recreation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::new("Work".into(), temp.path().into(), WorkspaceColor::Blue);
+        ws.chats = vec!["old-root".into()];
+        let key = OverviewKey::Owner(ws.uid);
+        let mut workspaces = vec![ws];
+        let index: Vec<_> = ["old-root", "new-root", "new-second"]
+            .into_iter()
+            .map(|id| {
+                let mut entry = chat_entry(chats::ChatBackend::Codex, false);
+                entry.id = id.into();
+                entry
+            })
+            .collect();
+        let picks = overview::FocusPicks::default();
+        let mut summary_generation = 0;
+        let mut states = HashMap::new();
+        rebuild_workspace_overview(
+            &index,
+            &workspaces,
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            &key,
+        );
+        let (old_generation, old_plan) = reload_workspace_overviews(
+            &workspaces,
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            Some(&key),
+        )
+        .unwrap();
+
+        // workspace_chats_changed rebuilds and removes an owner's state when
+        // its last chat moves out, even while that owner's old job is running.
+        workspaces[0].chats.clear();
+        rebuild_workspace_overview(
+            &index,
+            &workspaces,
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            &key,
+        );
+        assert!(!states.contains_key(&key));
+        workspaces[0].chats = vec!["new-root".into(), "new-second".into()];
+        rebuild_workspace_overview(
+            &index,
+            &workspaces,
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            &key,
+        );
+        let (new_generation, new_plan) = reload_workspace_overviews(
+            &workspaces,
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            Some(&key),
+        )
+        .unwrap();
+
+        let current = new_plan.build(&index);
+        assert_eq!(current.chat_count, 2);
+        assert!(apply_workspace_overview_summary(
+            &mut states,
+            &key,
+            new_generation,
+            current.clone()
+        ));
+        let old = old_plan.build(&index);
+        assert_eq!(old.chat_count, 1);
+        assert!(!apply_workspace_overview_summary(
+            &mut states,
+            &key,
+            old_generation,
+            old
+        ));
+        assert_eq!(states[&key].summary, current);
+        assert!(!states[&key].summary_in_flight);
+        assert!(!states[&key].summary_stale);
+    }
+
+    #[test]
+    fn overview_summary_rejects_old_focus_and_prunes_closed_owners() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = OverviewKey::Folder(temp.path().into());
+        let closed = OverviewKey::Owner(u64::MAX);
+        let mut states = HashMap::from([(closed.clone(), WorkspaceOverviewState::default())]);
+        let picks = overview::FocusPicks::default();
+        let mut summary_generation = 0;
+        let (old_generation, old_plan) = reload_workspace_overviews(
+            &[],
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            Some(&key),
+        )
+        .unwrap();
+        assert!(!states.contains_key(&closed));
+        states.get_mut(&key).unwrap().focus = overview::Focus::AllRecent;
+        // The synchronous show/focus path supersedes an in-flight reload.
+        rebuild_workspace_overview(
+            &[],
+            &[],
+            None,
+            &picks,
+            &mut states,
+            &mut summary_generation,
+            &key,
+        );
+        let current = states[&key].summary.clone();
+        assert_eq!(current.focus, overview::Focus::AllRecent);
+        assert!(!apply_workspace_overview_summary(
+            &mut states,
+            &key,
+            old_generation,
+            old_plan.build(&[])
+        ));
+        assert_eq!(states[&key].summary, current);
+        assert!(!states[&key].summary_in_flight);
+        assert!(!states[&key].summary_stale);
+    }
+
+    #[test]
+    fn task_history_links_keep_open_session_ids_and_skip_duplicates() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("tasks.json");
+        let mut task = slot_task(ExecutorTarget::Local, TaskLifecycle::Draft);
+        task.worktree = gitterm::tasks::TaskWorktree {
+            state: gitterm::tasks::TaskWorktreeState::Ready,
+            path: Some(temp.path().into()),
+        };
+        let mut store = Some(TaskStore::load(&path).unwrap());
+        store.as_mut().unwrap().insert(task.clone()).unwrap();
+        let mut ws = Workspace::new("fixture".into(), temp.path().into(), WorkspaceColor::Blue);
+        let mut tab = TabState::new(0, temp.path().into());
+        tab.chat_session_id = Some("open-chat".into());
+        tab.task_id = Some(task.task_id.clone());
+        tab.task_session_id = Some("open-session".into());
+        ws.tabs.push(tab);
+        let mut entry = chat_entry(chats::ChatBackend::Pi, false);
+        entry.id = "open-chat".into();
+        entry.cwd = temp.path().into();
+        entry.title.clear();
+        let mut other_backend = entry.clone();
+        other_backend.id = "other-chat".into();
+        other_backend.backend = chats::ChatBackend::Codex;
+        other_backend.title = "Codex title".into();
+        let entries = vec![entry.clone(), entry, other_backend];
+        let mut error = None;
+        sync_task_sessions_from_chat_index(&entries, &[ws], &mut store, &mut error);
+        assert_eq!(error, None);
+        let sessions = &store.as_ref().unwrap().get(&task.task_id).unwrap().sessions;
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].task_session_id, "open-session");
+        assert_eq!(sessions[0].label, "Pi");
+        assert_eq!(sessions[1].task_session_id, "chat-codex-other-chat");
+        assert_eq!(
+            sessions[0].conversation.as_ref().unwrap().backend,
+            HarnessConversationBackend::Pi
+        );
+        assert_eq!(sessions[1].label, "Codex title");
+        let saved = std::fs::read(&path).unwrap();
+        sync_task_sessions_from_chat_index(&entries, &[], &mut store, &mut error);
+        assert_eq!(error, None);
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        assert_eq!(
+            TaskStore::load(path).unwrap().tasks(),
+            store.unwrap().tasks()
+        );
+    }
+
+    /// Run with --nocapture to record the reload's synchronous work without
+    /// starting Iced, terminals, or using the user's config directory.
+    #[tokio::test]
+    async fn chat_index_reload_realistic_fixture() {
+        use gitterm::tasks::*;
+        let temp = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now();
+        let timestamp = "2026-11-10T20:00:00Z";
+        let mut repos = RepoRegistry::default();
+        let mut workspaces = Vec::new();
+        for n in 0..8 {
+            let dir = temp.path().join(format!("repo-{n}"));
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            let mut ws = Workspace::new(format!("Work {n}"), dir.clone(), WorkspaceColor::Blue);
+            ws.claims_new_chats = true;
+            let (id, _) = repos.attach(dir.clone(), local(&dir), RepoSeed::new(None));
+            ws.home = id;
+            ws.repos.push(id);
+            workspaces.push(ws);
+        }
+        let mut entries = Vec::new();
+        let mut tasks = Vec::new();
+        for n in 0..100 {
+            let repo = workspaces[n % 8].dir.clone();
+            let cwd = temp.path().join(format!("worker-{n}"));
+            std::fs::create_dir_all(&cwd).unwrap();
+            let mut task = TaskRecord::new_draft(
+                NewTaskRecord {
+                    task_id: format!("task-{n}"),
+                    title: format!("Worker {n}"),
+                    objective: "Realistic reload fixture".repeat(20),
+                    workspace: WorkspaceIdentity {
+                        name: "fixture".into(),
+                        location: WorkspaceLocationIdentity::Local {
+                            directory: repo.clone(),
+                        },
+                    },
+                    repository: RepositoryIdentity {
+                        common_dir: repo.join(".git"),
+                        remote_url: None,
+                    },
+                    issue: None,
+                    base: GitBase {
+                        reference: "v6".into(),
+                        commit: "fixture".into(),
+                    },
+                    branch: format!("task/TRU-268-{n}"),
+                    executor: ExecutorTarget::Local,
+                    harness: None,
+                    stopping_boundary: StoppingBoundary::ImplementUntilTestsPass,
+                },
+                timestamp,
+            );
+            task.worktree.path = Some(cwd.clone());
+            task.worktree.state = TaskWorktreeState::Ready;
+            for c in 0..40 {
+                let id = format!("chat-{n}-{c}");
+                if c == 0 {
+                    workspaces[n % 8].chats.push(id.clone());
+                }
+                entries.push(chats::ChatIndexEntry {
+                    id: id.clone(),
+                    backend: chats::ChatBackend::Codex,
+                    path: cwd.join(format!("{id}.jsonl")),
+                    cwd: cwd.clone(),
+                    repo_root: Some(repo.clone()),
+                    is_worktree: true,
+                    branch: Some(task.branch.clone()),
+                    title: format!("Investigate worker {n}, conversation {c}"),
+                    latest: Some("Continuing implementation and verification".into()),
+                    mtime: now,
+                    size: 50_000,
+                    dead_cwd: false,
+                    root_id: (c > 0).then(|| format!("chat-{n}-0")),
+                    facts: Some(chat_facts::ChatFacts {
+                        issue_keys: vec!["TRU-268".into(), format!("TRU-{}", 300 + n)],
+                        repos_touched: vec![chat_facts::RepoTouch {
+                            dir: repo.clone(),
+                            edits: 8,
+                        }],
+                        checkouts: vec![chat_facts::CheckoutTouch {
+                            repo: repo.clone(),
+                            dir: cwd.clone(),
+                            branch: Some(task.branch.clone()),
+                            edits: 4,
+                            last: timestamp.into(),
+                        }],
+                        documents: (0..8).map(|d| repo.join(format!("doc-{d}.md"))).collect(),
+                        ..Default::default()
+                    }),
+                });
+                // Existing history plus one newly indexed conversation per task.
+                if c < 39 {
+                    task.sessions.push(TaskSessionRecord {
+                        task_session_id: format!("chat-codex-{id}"),
+                        label: entries.last().unwrap().title.clone(),
+                        harness: Some(HarnessSelection {
+                            kind: HarnessKind::TerminalPreset {
+                                preset_name: "Codex".into(),
+                            },
+                            model: None,
+                        }),
+                        conversation: Some(HarnessConversationRef {
+                            backend: HarnessConversationBackend::Codex,
+                            session_id: id,
+                        }),
+                        objective_delivery: ObjectiveDeliveryState::Unknown,
+                        launch_identity: None,
+                        created_at: timestamp.into(),
+                        updated_at: timestamp.into(),
+                    });
+                }
+            }
+            tasks.push(task);
+        }
+        let path = temp.path().join("tasks.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&TaskStoreDocument {
+                tasks,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut store = Some(TaskStore::load(&path).unwrap());
+        let picks = overview::FocusPicks::default();
+        let mut summary_generation = 0;
+        let mut overviews = HashMap::new();
+        for ws in &workspaces {
+            overviews.insert(
+                OverviewKey::Owner(ws.uid),
+                WorkspaceOverviewState::default(),
+            );
+            overviews.insert(
+                OverviewKey::Folder(ws.dir.clone()),
+                WorkspaceOverviewState::default(),
+            );
+        }
+        let mut index = Arc::new(entries.clone());
+        assert_eq!(index.len(), 4000);
+        let total = Instant::now();
+        macro_rules! timed {
+            ($label:expr, $body:block) => {{
+                let start = Instant::now();
+                let result = $body;
+                eprintln!(
+                    "TRU-268 {}: {:.3} ms",
+                    $label,
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
+                result
+            }};
+        }
+        timed!("apply", {
+            index = Arc::new(entries);
+        });
+        let mut error = None;
+        timed!("task_sessions", {
+            sync_task_sessions_from_chat_index(&index, &workspaces, &mut store, &mut error);
+        });
+        assert_eq!(error, None);
+        timed!("park_note", {
+            let roots = &workspaces[0].chats;
+            let other_roots = workspaces
+                .iter()
+                .skip(1)
+                .flat_map(|ws| ws.chats.clone())
+                .collect::<Vec<_>>();
+            let note = park_note_prefill(&park_note_chats(&index, roots, &[], &other_roots));
+            assert!(!note.is_empty());
+        });
+        timed!("repo_joins", {
+            assert!(workspace_repo_joins(&index, &workspaces, &repos, store.as_ref()).is_empty());
+        });
+        let mut homes_built = Some(Instant::now());
+        timed!("pr_homes", {
+            assert!(homes_built.take().is_some());
+        });
+        let visible = OverviewKey::Owner(workspaces[0].uid);
+        let (generation, plan) = timed!("overviews", {
+            reload_workspace_overviews(
+                &workspaces,
+                store.as_ref(),
+                &picks,
+                &mut overviews,
+                &mut summary_generation,
+                Some(&visible),
+            )
+            .unwrap()
+        });
+        eprintln!(
+            "TRU-268 total: {:.3} ms",
+            total.elapsed().as_secs_f64() * 1000.0
+        );
+        assert!(store
+            .as_ref()
+            .unwrap()
+            .tasks()
+            .iter()
+            .all(|task| task.sessions.len() == 40));
+        // No summary was computed on the reload's thread, including the visible one.
+        for (key, state) in &overviews {
+            assert!(
+                state.summary_stale,
+                "overview rebuilt synchronously: {key:?}"
+            );
+            assert_eq!(state.summary, overview::WorkSummary::default());
+        }
+        let summary = build_workspace_overview_summary(plan, Arc::clone(&index))
+            .await
+            .unwrap();
+        assert!(apply_workspace_overview_summary(
+            &mut overviews,
+            &visible,
+            generation,
+            summary
+        ));
+        assert!(!overviews[&visible].summary_stale);
+        assert_eq!(overviews[&visible].summary.chat_count, 520);
+        // A later reload invalidates even a completion that found no new claims.
+        reload_workspace_overviews(
+            &workspaces,
+            store.as_ref(),
+            &picks,
+            &mut overviews,
+            &mut summary_generation,
+            None,
+        );
+        assert!(!apply_workspace_overview_summary(
+            &mut overviews,
+            &visible,
+            generation,
+            overview::WorkSummary::default()
+        ));
+        assert_eq!(overviews[&visible].summary.chat_count, 520);
+        // Showing a deferred overview produces the same result as the old eager path.
+        let hidden = OverviewKey::Owner(workspaces[1].uid);
+        let expected = overview::WorkSummary::build_owned(
+            &index,
+            &workspaces[1].chats,
+            &store
+                .as_ref()
+                .unwrap()
+                .tasks()
+                .iter()
+                .map(overview::TaskInfo::from)
+                .collect::<Vec<_>>(),
+            std::time::SystemTime::now(),
+        );
+        rebuild_workspace_overview(
+            &index,
+            &workspaces,
+            store.as_ref(),
+            &picks,
+            &mut overviews,
+            &mut summary_generation,
+            &hidden,
+        );
+        assert!(!overviews[&hidden].summary_stale);
+        assert_eq!(overviews[&hidden].summary, expected);
+        // Repo joins still use the same first-touch candidates and manual removals.
+        let joined = temp.path().join("joined-repo");
+        std::fs::create_dir(&joined).unwrap();
+        Arc::make_mut(&mut index)[0]
+            .facts
+            .as_mut()
+            .unwrap()
+            .repos_touched
+            .push(chat_facts::RepoTouch {
+                dir: joined.clone(),
+                edits: 1,
+            });
+        assert_eq!(
+            workspace_repo_joins(&index, &workspaces, &repos, store.as_ref()),
+            vec![(
+                workspaces[0].uid,
+                vec![std::fs::canonicalize(&joined).unwrap()]
+            )]
+        );
+        workspaces[0].repos_removed.push(joined);
+        assert!(workspace_repo_joins(&index, &workspaces, &repos, store.as_ref()).is_empty());
+        assert_eq!(
+            TaskStore::load(path).unwrap().tasks(),
+            store.as_ref().unwrap().tasks()
+        );
+    }
+
+    #[test]
     fn plain_vertical_wheel_moves_horizontal_and_preserves_other_deltas() {
         assert_eq!(
             plain_vertical_wheel_offset(iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }),
@@ -50405,6 +51411,121 @@ mod tests {
     }
 
     #[test]
+    fn find_shortcut_routes_chat_and_other_tabs() {
+        let mac = cfg!(target_os = "macos");
+        let (key, modifiers) = hostkey_chord(&hostkey("f", mac, !mac, false, false)).unwrap();
+        assert_eq!(forwarded_key(&key, modifiers), Some(ForwardedKey::Find));
+        assert!(matches!(
+            find_shortcut(&key, modifiers, true),
+            Some(Event::AgentFindOpen)
+        ));
+        assert!(matches!(
+            find_shortcut(&key, modifiers, false),
+            Some(Event::ToggleSearch)
+        ));
+        for modifiers in [Modifiers::empty(), Modifiers::COMMAND | Modifiers::SHIFT] {
+            assert!(find_shortcut(&key, modifiers, true).is_none());
+        }
+        assert!(find_shortcut(&ch("g"), Modifiers::COMMAND, true).is_none());
+    }
+
+    #[test]
+    fn chat_find_requires_visible_chat_without_native_focus() {
+        for terminal in [false, true] {
+            for input in [false, true] {
+                for surface in [
+                    VisibleSurface::None,
+                    VisibleSurface::Viewer,
+                    VisibleSurface::Page,
+                    VisibleSurface::AgentChat(3),
+                ] {
+                    assert_eq!(
+                        chat_find_allowed(surface, terminal, input),
+                        surface == VisibleSurface::AgentChat(3) && !terminal && !input,
+                        "surface={surface:?}, terminal={terminal}, input={input}",
+                    );
+                }
+            }
+        }
+        // Settings and file viewers can cover a still-selected agent tab.
+        for (viewer, overlay) in [
+            (ViewerWebview::None, true),
+            (ViewerWebview::PlansViewer, false),
+        ] {
+            assert!(!chat_find_allowed(
+                visible_webview_surface(viewer, ActiveTabSurface::AgentChat(3), overlay),
+                false,
+                false,
+            ));
+        }
+    }
+
+    #[test]
+    fn font_shortcuts_resize_chat_or_terminal_and_preserve_the_other() {
+        let mut terminal = 14.0;
+        let mut chat = 15.0;
+        let chat_tab = TabKind::Agent(AgentSession::new(new_claude_chat_config(
+            &config::ChatDefaults::default(),
+        )));
+        for (key, shift) in [("=", false), ("+", true), ("-", false), ("_", true)] {
+            let (key, modifiers) = hostkey_chord(&hostkey(key, true, false, shift, false)).unwrap();
+            assert_eq!(forwarded_key(&key, modifiers), Some(ForwardedKey::FontSize));
+        }
+        let event = font_shortcut(
+            &ch("="),
+            Modifiers::COMMAND,
+            matches!(chat_tab, TabKind::Agent(_)),
+        )
+        .unwrap();
+        assert!(matches!(event, Event::IncreaseChatFont));
+        assert!(matches!(
+            font_shortcut(&ch("+"), Modifiers::COMMAND | Modifiers::SHIFT, true),
+            Some(Event::IncreaseUiFont)
+        ));
+        assert!(matches!(
+            font_shortcut(&ch("_"), Modifiers::COMMAND | Modifiers::SHIFT, true),
+            Some(Event::DecreaseUiFont)
+        ));
+        assert!(resize_tab_font(
+            matches!(event, Event::IncreaseChatFont),
+            FONT_SIZE_STEP,
+            &mut terminal,
+            &mut chat
+        ));
+        assert_eq!((terminal, chat), (14.0, 16.0));
+        let event = font_shortcut(&ch("="), Modifiers::COMMAND, false).unwrap();
+        assert!(matches!(event, Event::IncreaseTerminalFont));
+        assert!(resize_tab_font(
+            matches!(event, Event::IncreaseChatFont),
+            FONT_SIZE_STEP,
+            &mut terminal,
+            &mut chat
+        ));
+        assert_eq!((terminal, chat), (15.0, 16.0));
+        assert!(resize_tab_font(
+            true,
+            -FONT_SIZE_STEP,
+            &mut terminal,
+            &mut chat
+        ));
+        assert_eq!((terminal, chat), (15.0, 15.0));
+        chat = 22.0;
+        assert!(!resize_tab_font(
+            true,
+            FONT_SIZE_STEP,
+            &mut terminal,
+            &mut chat
+        ));
+        chat = 11.0;
+        assert!(!resize_tab_font(
+            true,
+            -FONT_SIZE_STEP,
+            &mut terminal,
+            &mut chat
+        ));
+    }
+
+    #[test]
     fn global_shortcut_knows_the_app_wide_chords() {
         let space = Key::Named(key::Named::Space);
         let escape = Key::Named(key::Named::Escape);
@@ -51910,6 +53031,33 @@ mod tests {
     }
 
     // === AppTheme::toggle ===
+
+    #[test]
+    fn closed_chat_results_log_once_until_the_count_changes() {
+        let mut previous = HashMap::new();
+        let waiting = || vec!["closed-chat".to_string(); 3];
+        assert_eq!(
+            waiting_delegation_log_lines(&mut previous, waiting()),
+            vec!["[delegation] 3 finished results wait for chat closed-chat until it is open"]
+        );
+        assert!(waiting_delegation_log_lines(&mut previous, waiting()).is_empty());
+        let mut more = waiting();
+        more.push("closed-chat".into());
+        more.push("other-chat".into());
+        let lines = waiting_delegation_log_lines(&mut previous, more);
+        assert_eq!(lines.len(), 2);
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("4 finished results wait for chat closed-chat")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("1 finished results wait for chat other-chat")));
+        assert!(waiting_delegation_log_lines(&mut previous, Vec::new()).is_empty());
+        assert_eq!(
+            waiting_delegation_log_lines(&mut previous, waiting()).len(),
+            1
+        );
+    }
 
     #[test]
     fn theme_toggle_dark_to_light() {
