@@ -283,6 +283,57 @@ mod tests {
     }
 
     #[test]
+    fn chat_font_defaults_clamps_and_round_trips_through_settings() {
+        assert_eq!(Config::default().chat_font_size, 15.0);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SETTINGS_FILE), r#"{"ui_font_size":13}"#).unwrap();
+        assert_eq!(load_settings_from(dir.path()).config.chat_font_size, 15.0);
+        for (size, expected) in [
+            (15.0, 15.0),
+            (11.0, 11.0),
+            (22.0, 22.0),
+            (1.0, 11.0),
+            (99.0, 22.0),
+        ] {
+            let config = Config {
+                chat_font_size: size,
+                ..Config::default()
+            };
+            save_settings_to(dir.path(), &config).unwrap();
+            let loaded = load_settings_from(dir.path());
+            assert_eq!(loaded.refused, None);
+            assert_eq!(loaded.config.chat_font_size, expected);
+            save_settings_to(dir.path(), &loaded.config).unwrap();
+            let raw: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join(SETTINGS_FILE)).unwrap())
+                    .unwrap();
+            assert_eq!(raw["chat_font_size"], expected);
+        }
+    }
+
+    #[test]
+    fn chat_width_defaults_and_round_trips_through_settings() {
+        assert_eq!(Config::default().chat_width, ChatWidth::Medium);
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.chat_width, ChatWidth::Medium);
+        let dir = tempfile::tempdir().unwrap();
+        for chat_width in ChatWidth::ALL {
+            let config = Config {
+                chat_width,
+                ..Config::default()
+            };
+            save_settings_to(dir.path(), &config).unwrap();
+            let loaded = load_settings_from(dir.path());
+            assert_eq!(loaded.refused, None);
+            assert_eq!(loaded.config.chat_width, chat_width);
+            let raw: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join(SETTINGS_FILE)).unwrap())
+                    .unwrap();
+            assert_eq!(raw["chat_width"], chat_width.as_str());
+        }
+    }
+
+    #[test]
     fn settings_round_trip_through_the_shared_file() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config {
@@ -1273,6 +1324,19 @@ fn default_ui_font() -> f32 {
     13.0
 }
 
+pub const MIN_CHAT_FONT_SIZE: f32 = 11.0;
+pub const MAX_CHAT_FONT_SIZE: f32 = 22.0;
+
+fn default_chat_font() -> f32 {
+    15.0
+}
+
+fn deserialize_chat_font<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<f32, D::Error> {
+    Ok(f32::deserialize(deserializer)?.clamp(MIN_CHAT_FONT_SIZE, MAX_CHAT_FONT_SIZE))
+}
+
 fn default_sidebar_width() -> f32 {
     360.0
 }
@@ -1318,6 +1382,40 @@ fn default_max_concurrent_local_tasks() -> usize {
     4
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatWidth {
+    Narrow,
+    #[default]
+    Medium,
+    Wide,
+    Full,
+}
+
+impl ChatWidth {
+    pub const ALL: [Self; 4] = [Self::Narrow, Self::Medium, Self::Wide, Self::Full];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Narrow => "narrow",
+            Self::Medium => "medium",
+            Self::Wide => "wide",
+            Self::Full => "full",
+        }
+    }
+}
+
+impl std::fmt::Display for ChatWidth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Narrow => f.write_str("Narrow"),
+            Self::Medium => f.write_str("Medium"),
+            Self::Wide => f.write_str("Wide"),
+            Self::Full => f.write_str("Full"),
+        }
+    }
+}
+
 // Persistent configuration: the shared `settings.json` (TRU-181), see
 // `SETTINGS_FILE`. Every field is a setting the user expects to keep.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1329,6 +1427,13 @@ pub struct Config {
     pub terminal_font_size: f32,
     #[serde(default = "default_ui_font")]
     pub ui_font_size: f32,
+    #[serde(
+        default = "default_chat_font",
+        deserialize_with = "deserialize_chat_font"
+    )]
+    pub chat_font_size: f32,
+    #[serde(default)]
+    pub chat_width: ChatWidth,
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
     #[serde(default = "default_scrollback_lines")]
@@ -1741,6 +1846,8 @@ impl Default for Config {
             editor: default_editor(),
             terminal_font_size: 14.0,
             ui_font_size: 13.0,
+            chat_font_size: default_chat_font(),
+            chat_width: ChatWidth::default(),
             sidebar_width: 360.0,
             scrollback_lines: 30_000,
             font_size: None,
