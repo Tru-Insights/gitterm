@@ -20,10 +20,12 @@ pub fn run() {
             },
             move |window, cx| {
                 if terminal {
-                    let backend = gitterm_terminal::Backend::new(Default::default())
-                        .expect("start terminal prototype PTY ($SHELL)");
                     let view = cx.new(|cx| {
-                        gitterm_terminal::TerminalView::new(backend, Default::default(), cx)
+                        gitterm_terminal::TerminalView::new_deferred(
+                            Default::default(),
+                            Default::default(),
+                            cx,
+                        )
                     });
                     let focus = view.read(cx).focus_handle().clone();
                     window.focus(&focus, cx);

@@ -32,6 +32,7 @@ struct Shared {
     notifier: OnceLock<EventLoopSender>,
     dirty: AtomicBool,
     effects_dirty: AtomicBool,
+    output_ready: AtomicBool,
     pending: Mutex<PendingEvents>,
 }
 
@@ -47,6 +48,9 @@ impl EventProxy {
     }
     pub fn clear_dirty(&self) {
         self.0.dirty.store(false, Ordering::Release);
+    }
+    pub fn output_ready(&self) -> bool {
+        self.0.output_ready.load(Ordering::Acquire)
     }
     pub fn mark_dirty(&self) {
         self.0.dirty.store(true, Ordering::Release);
@@ -88,6 +92,7 @@ impl EventListener for EventProxy {
                 self.queue_effect(|pending| pending.clipboard_store = Some(text))
             }
             Event::Exit | Event::ChildExit(_) => self.queue_effect(|pending| pending.exited = true),
+            Event::Wakeup => self.0.output_ready.store(true, Ordering::Release),
             // Config keeps Alacritty's copy-only OSC52 policy. No clipboard reads.
             Event::ClipboardLoad(..) => {}
             _ => {}

@@ -169,6 +169,101 @@ fn ime_preedit_utf16_commit_selection_and_unicode_snapshots(cx: &mut TestAppCont
 }
 
 #[::gpui::test]
+fn configured_menlo_cell_width_matches_measured_monospace_advance(cx: &mut TestAppContext) {
+    use gpui_kit::{Font, FontFeatures, FontStyle, FontWeight, TextRun, black};
+
+    let backend = Backend::new(BackendSettings::default()).unwrap();
+    let handle = cx.add_window(|_, cx| TerminalView::new(backend, TerminalConfig::default(), cx));
+    handle
+        .update(cx, |view, window, _| {
+            assert_eq!(view.config.font_family, "Menlo");
+            assert_eq!(view.config.font_size, px(14.0));
+            view.renderer.measure_cell(window);
+            let run = TextRun {
+                len: 1,
+                font: Font {
+                    family: "Menlo".into(),
+                    features: FontFeatures::default(),
+                    fallbacks: None,
+                    weight: FontWeight::NORMAL,
+                    style: FontStyle::Normal,
+                },
+                color: black(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let shaped = window
+                .text_system()
+                .shape_line("m".into(), px(14.0), &[run], None);
+            let difference: f32 = (view.renderer.cell_width - shaped.width).into();
+            assert!(difference.abs() <= 0.5, "advance difference: {difference}");
+            let measured_height = shaped.ascent + shaped.descent;
+            let height_difference: f32 = (view.renderer.cell_height - measured_height).into();
+            assert!(
+                height_difference.abs() <= 0.5,
+                "line height difference: {height_difference}"
+            );
+        })
+        .unwrap();
+}
+
+#[::gpui::test]
+fn deferred_shell_starts_with_first_laid_out_grid(cx: &mut TestAppContext) {
+    use gpui_kit::{AvailableSpace, IntoElement, ParentElement, Styled, div, size};
+
+    cx.background_executor.allow_parking();
+    cx.update(gpui_kit::init);
+    let backend_settings = BackendSettings {
+        program: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            "set -- $(stty size); printf '\\033]2;INITIAL:%s:%s\\007' \"$2\" \"$1\"; exec sleep 3"
+                .into(),
+        ],
+        ..Default::default()
+    };
+    let first_layout = Arc::new(parking_lot::Mutex::new(None));
+    let initial_prompt = Arc::new(parking_lot::Mutex::new(None));
+    let (entity, cx) = cx.add_window_view(|_, cx| {
+        let first_layout = first_layout.clone();
+        let initial_prompt = initial_prompt.clone();
+        TerminalView::new_deferred(backend_settings, TerminalConfig::default(), cx)
+            .with_resize_callback(move |cols, rows| {
+                let mut first_layout = first_layout.lock();
+                if first_layout.is_none() {
+                    *first_layout = Some((cols, rows));
+                }
+            })
+            .with_title_callback(move |_, _, title| {
+                if title.starts_with("INITIAL:") {
+                    *initial_prompt.lock() = Some(title.to_string());
+                }
+            })
+    });
+
+    let view = entity.clone();
+    cx.draw(
+        point(px(0.), px(0.)),
+        size(
+            AvailableSpace::Definite(px(800.)),
+            AvailableSpace::Definite(px(480.)),
+        ),
+        move |_, _| div().size_full().child(view).into_any_element(),
+    );
+
+    wait(|| initial_prompt.lock().is_some());
+    entity.read_with(cx, |view, _| {
+        let (cols, rows) = first_layout.lock().expect("first view layout");
+        assert_eq!(
+            initial_prompt.lock().as_deref(),
+            Some(format!("INITIAL:{cols}:{rows}").as_str())
+        );
+        assert!(!view.backend.is_deferred());
+    });
+}
+
+#[::gpui::test]
 fn real_pty_resize_reaches_child_and_grid(cx: &mut TestAppContext) {
     cx.background_executor.allow_parking();
     let backend = python(

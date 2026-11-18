@@ -39,7 +39,7 @@ impl Default for TerminalConfig {
         Self {
             cols: 80,
             rows: 24,
-            font_family: "monospace".into(),
+            font_family: "Menlo".into(),
             font_size: px(14.0),
             scrollback: 100_000,
             line_height_multiplier: 1.0,
@@ -111,8 +111,20 @@ fn should_defer_text_input_to_ime(event: &KeyDownEvent) -> bool {
 }
 
 impl TerminalView {
+    pub fn new_deferred(
+        settings: crate::BackendSettings,
+        config: TerminalConfig,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::initialize(Backend::new_deferred(settings), config, cx)
+    }
+
     pub fn new(mut backend: Backend, config: TerminalConfig, cx: &mut Context<Self>) -> Self {
         backend.resize_cells(config.cols, config.rows);
+        Self::initialize(backend, config, cx)
+    }
+
+    fn initialize(mut backend: Backend, config: TerminalConfig, cx: &mut Context<Self>) -> Self {
         backend.set_history_limit(config.scrollback);
         cx.bind_keys([
             KeyBinding::new("tab", SendTab, Some(CONTEXT)),
@@ -768,7 +780,22 @@ impl Render for TerminalView {
                         {
                             callback(cols, rows);
                         }
-                        entity.update(cx, |view, _| view.backend.resize_cells(cols, rows));
+                        entity.update(cx, |view, _| {
+                            if view.backend.is_deferred() {
+                                if let Err(error) = view.backend.initialize_deferred(
+                                    cols,
+                                    rows,
+                                    cell_width_f32.round() as u16,
+                                    cell_height_f32.round() as u16,
+                                ) {
+                                    view.backend.record_error(format!(
+                                        "initial terminal PTY startup: {error}"
+                                    ));
+                                }
+                            } else {
+                                view.backend.resize_cells(cols, rows);
+                            }
+                        });
 
                         let origin = Point {
                             x: bounds.origin.x + padding.left,

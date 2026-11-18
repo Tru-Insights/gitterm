@@ -120,6 +120,19 @@ impl Default for TerminalSize {
 }
 
 impl TerminalSize {
+    fn for_grid(cols: usize, rows: usize, cell_width: u16, cell_height: u16) -> Self {
+        let num_cols = cols.clamp(2, u16::MAX as usize) as u16;
+        let num_lines = rows.clamp(1, u16::MAX as usize) as u16;
+        Self {
+            cell_width: cell_width.max(1),
+            cell_height: cell_height.max(1),
+            num_cols,
+            num_lines,
+            layout_width: f32::from(num_cols) * f32::from(cell_width.max(1)),
+            layout_height: f32::from(num_lines) * f32::from(cell_height.max(1)),
+        }
+    }
+
     fn update(&mut self, layout_size: Option<Size>, font_measure: Option<Size>) {
         if let Some(size) = layout_size {
             self.layout_height = size.height;
@@ -184,7 +197,10 @@ pub struct Backend {
     pub(crate) term: Arc<FairMutex<Term<EventProxy>>>,
     size: TerminalSize,
     applied_size: TerminalSize,
-    notifier: Notifier,
+    notifier: Option<Notifier>,
+    pending_settings: Option<BackendSettings>,
+    startup_output_pending: bool,
+    deferred_resize: Option<(usize, usize)>,
     events: EventProxy,
     pending_selection: Option<(Point, SelectionType, bool)>,
     pending_endpoint: Option<Point>,
@@ -198,7 +214,18 @@ pub struct Backend {
 
 impl Backend {
     pub fn new(settings: BackendSettings) -> Result<Self> {
-        let size = TerminalSize::default();
+        Self::new_sized(settings, 80, 50, 1, 1)
+    }
+
+    /// Spawn a shell with the geometry measured from its first view layout.
+    fn new_sized(
+        settings: BackendSettings,
+        cols: usize,
+        rows: usize,
+        cell_width: u16,
+        cell_height: u16,
+    ) -> Result<Self> {
+        let size = TerminalSize::for_grid(cols, rows, cell_width, cell_height);
         let pty_config = tty::Options {
             shell: Some(tty::Shell::new(
                 settings.program.clone(),
@@ -211,10 +238,99 @@ impl Backend {
             escape_args: true,
         };
         let pty = tty::new(&pty_config, size.into(), 278)?;
-        Self::with_pty(settings, pty)
+        Self::with_pty_sized(settings, pty, size)
     }
 
+    /// Construct the terminal state without starting a shell. The view starts
+    /// the PTY once it has measured its first real layout.
+    pub fn new_deferred(settings: BackendSettings) -> Self {
+        let size = TerminalSize::default();
+        let events = EventProxy::default();
+        let term = Term::new(term::Config::default(), &size, events.clone());
+        let mut initial_content = RenderableContent::default();
+        initial_content.sync_from(&term, size);
+        Self {
+            term: Arc::new(FairMutex::new(term)),
+            size,
+            applied_size: size,
+            notifier: None,
+            pending_settings: Some(settings),
+            startup_output_pending: false,
+            deferred_resize: None,
+            events,
+            pending_selection: None,
+            pending_endpoint: None,
+            pending_scroll: 0,
+            pending_history: None,
+            pending_clear: false,
+            pending_bottom: std::sync::atomic::AtomicBool::new(false),
+            last_content: initial_content,
+            url_regex: RegexSearch::new(URL_REGEX).expect("invalid URL regexp"),
+        }
+    }
+
+    pub(crate) fn initialize_deferred(
+        &mut self,
+        cols: usize,
+        rows: usize,
+        cell_width: u16,
+        cell_height: u16,
+    ) -> Result<bool> {
+        let Some(settings) = self.pending_settings.take() else {
+            return Ok(false);
+        };
+        let size = TerminalSize::for_grid(cols, rows, cell_width, cell_height);
+        let pty_config = tty::Options {
+            shell: Some(tty::Shell::new(
+                settings.program.clone(),
+                settings.args.clone(),
+            )),
+            working_directory: settings.working_directory.clone(),
+            env: settings.env.clone(),
+            drain_on_exit: true,
+            #[cfg(windows)]
+            escape_args: true,
+        };
+        let pty = tty::new(&pty_config, size.into(), 278)?;
+        let config = term::Config {
+            scrolling_history: settings.scrollback_lines,
+            ..Default::default()
+        };
+        {
+            let mut term = self.term.lock_unfair();
+            *term = Term::new(config, &size, self.events.clone());
+        }
+        self.size = size;
+        self.applied_size = size;
+        self.startup_output_pending = true;
+        self.deferred_resize = None;
+        self.last_content = RenderableContent::default();
+        self.last_content.sync_from(&self.term.lock_unfair(), size);
+        let event_loop = EventLoop::new(self.term.clone(), self.events.clone(), pty, true, false)?;
+        let channel = event_loop.channel();
+        self.notifier = Some(Notifier(channel.clone()));
+        self.events.set_notifier(channel);
+        let _ = event_loop.spawn();
+        Ok(true)
+    }
+
+    pub(crate) fn is_deferred(&self) -> bool {
+        self.pending_settings.is_some()
+    }
+
+    pub(crate) fn record_error(&self, error: String) {
+        self.events.record_error(error);
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_pty<T>(settings: BackendSettings, pty: T) -> Result<Self>
+    where
+        T: tty::EventedPty + OnResize + Send + 'static,
+    {
+        Self::with_pty_sized(settings, pty, TerminalSize::default())
+    }
+
+    fn with_pty_sized<T>(settings: BackendSettings, pty: T, size: TerminalSize) -> Result<Self>
     where
         T: tty::EventedPty + OnResize + Send + 'static,
     {
@@ -222,21 +338,24 @@ impl Backend {
             scrolling_history: settings.scrollback_lines,
             ..Default::default()
         };
-        let size = TerminalSize::default();
         let events = EventProxy::default();
         let term = Term::new(config, &size, events.clone());
         let mut initial_content = RenderableContent::default();
         initial_content.sync_from(&term, size);
         let term = Arc::new(FairMutex::new(term));
         let event_loop = EventLoop::new(term.clone(), events.clone(), pty, true, false)?;
-        let notifier = Notifier(event_loop.channel());
-        events.set_notifier(event_loop.channel());
+        let channel = event_loop.channel();
+        let notifier = Notifier(channel.clone());
+        events.set_notifier(channel);
         let _ = event_loop.spawn();
         Ok(Self {
             term,
             size,
             applied_size: size,
-            notifier,
+            notifier: Some(notifier),
+            pending_settings: None,
+            startup_output_pending: false,
+            deferred_resize: None,
             events,
             last_content: initial_content,
             pending_selection: None,
@@ -297,6 +416,10 @@ impl Backend {
         self.scroll(term, delta);
     }
     pub fn resize_cells(&mut self, cols: usize, rows: usize) {
+        if self.startup_output_pending && !self.events.output_ready() {
+            self.deferred_resize = Some((cols, rows));
+            return;
+        }
         self.size.num_cols = cols.clamp(2, u16::MAX as usize) as u16;
         self.size.num_lines = rows.clamp(1, u16::MAX as usize) as u16;
         if !self.size.same_terminal_geometry(&self.applied_size) {
@@ -617,11 +740,23 @@ impl Backend {
     }
 
     fn apply_resize(&mut self, terminal: &mut Term<EventProxy>) {
+        if self.startup_output_pending {
+            if !self.events.output_ready() {
+                return;
+            }
+            self.startup_output_pending = false;
+            if let Some((cols, rows)) = self.deferred_resize.take() {
+                self.size.num_cols = cols.clamp(2, u16::MAX as usize) as u16;
+                self.size.num_lines = rows.clamp(1, u16::MAX as usize) as u16;
+            }
+        }
         if self.size.same_terminal_geometry(&self.applied_size) {
             return;
         }
 
-        self.notifier.on_resize(self.size.into());
+        if let Some(notifier) = &mut self.notifier {
+            notifier.on_resize(self.size.into());
+        }
         if self.size.num_cols != self.applied_size.num_cols
             || self.size.num_lines != self.applied_size.num_lines
         {
@@ -638,7 +773,10 @@ impl Backend {
         if input.is_empty() {
             return true;
         }
-        match self.notifier.0.send(Msg::Input(input)) {
+        let Some(notifier) = &self.notifier else {
+            return false;
+        };
+        match notifier.0.send(Msg::Input(input)) {
             Ok(()) => true,
             Err(error) => {
                 self.events
@@ -987,7 +1125,9 @@ mod tests {
 
 impl Drop for Backend {
     fn drop(&mut self) {
-        let _ = self.notifier.0.send(Msg::Shutdown);
+        if let Some(notifier) = &self.notifier {
+            let _ = notifier.0.send(Msg::Shutdown);
+        }
     }
 }
 

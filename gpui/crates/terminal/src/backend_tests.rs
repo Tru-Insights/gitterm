@@ -95,3 +95,36 @@ fn deferred_selection_and_resize_survive_parser_lock_contention() {
     let guard = term.lock_unfair();
     assert_eq!((guard.columns(), guard.screen_lines()), (100, 30));
 }
+
+#[test]
+fn first_layout_grid_matches_initial_pty_geometry_without_resize() {
+    let cols = 103;
+    let rows = 31;
+    let mut backend = Backend::new_sized(BackendSettings::default(), cols, rows, 9, 19).unwrap();
+    let (initial_cols, initial_rows) = backend.dimensions();
+    assert_eq!((initial_cols, initial_rows), (cols, rows));
+
+    backend.resize_cells(cols, rows);
+    assert!(
+        !backend.needs_sync(),
+        "matching first layout must not queue resize"
+    );
+}
+
+#[test]
+fn startup_layout_resize_waits_until_first_pty_output() {
+    let mut backend = Backend::new_deferred(BackendSettings {
+        program: "/bin/cat".into(),
+        ..Default::default()
+    });
+    assert!(backend.initialize_deferred(103, 31, 9, 19).unwrap());
+    assert_eq!(backend.dimensions(), (103, 31));
+
+    backend.resize_cells(120, 35);
+    assert_eq!(backend.dimensions(), (103, 31));
+    assert!(!backend.needs_sync());
+
+    backend.events.send_event(Event::Wakeup);
+    assert!(backend.sync());
+    assert_eq!(backend.dimensions(), (120, 35));
+}

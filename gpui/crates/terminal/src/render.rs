@@ -103,7 +103,7 @@ impl TerminalRenderer {
         };
         let shaped = window
             .text_system()
-            .shape_line("M".into(), self.font_size, &[text_run], None);
+            .shape_line("m".into(), self.font_size, &[text_run], None);
         self.set_cell_metrics(shaped.width, shaped.ascent + shaped.descent);
     }
 
@@ -331,7 +331,7 @@ impl TerminalRenderer {
                     continue;
                 }
 
-                let x = origin.x + self.cell_width * (col_idx as f32);
+                let x = cell_position(origin.x, self.cell_width, col_idx);
                 let y = origin.y + self.cell_height * (line_idx as f32);
 
                 let point = AlacPoint::new(line, Column(col_idx));
@@ -557,6 +557,10 @@ impl TerminalRenderer {
     }
 }
 
+fn cell_position(origin: Pixels, cell_width: Pixels, col: usize) -> Pixels {
+    origin + cell_width * col as f32
+}
+
 fn selection_contains(selection: &Option<SelectionRange>, point: AlacPoint) -> bool {
     selection
         .as_ref()
@@ -641,6 +645,17 @@ mod tests {
         renderer.set_cell_metrics(px(8.), px(16.));
         assert_eq!(renderer.cell_width, px(8.));
         assert_eq!(renderer.cell_height, px(16.));
+    }
+
+    #[test]
+    fn consecutive_rendered_cells_use_exact_measured_advance() {
+        let width = px(8.625);
+        let positions: Vec<_> = (0..4)
+            .map(|col| cell_position(px(3.0), width, col))
+            .collect();
+        assert_eq!(positions[1] - positions[0], width);
+        assert_eq!(positions[2] - positions[1], width);
+        assert_eq!(positions[3] - positions[2], width);
     }
 
     #[test]
