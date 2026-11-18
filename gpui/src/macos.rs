@@ -2,7 +2,8 @@ use gpui::*;
 use gpui_component::{Root, dock::DockSkin};
 
 pub fn run() {
-    gpui_kit::application().run(|cx| {
+    let terminal = std::env::args().any(|arg| arg == "--terminal");
+    gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         cx.open_window(
             WindowOptions {
@@ -17,7 +18,19 @@ pub fn run() {
                 }),
                 ..Default::default()
             },
-            |window, cx| {
+            move |window, cx| {
+                if terminal {
+                    let view = cx.new(|cx| {
+                        gitterm_terminal::TerminalView::new_deferred(
+                            Default::default(),
+                            Default::default(),
+                            cx,
+                        )
+                    });
+                    let focus = view.read(cx).focus_handle().clone();
+                    window.focus(&focus, cx);
+                    return cx.new(|cx| Root::new(view, window, cx));
+                }
                 let (dock, _) = DockSkin::dock_area("gitterm-gpui", None, window, cx);
                 cx.new(|cx| Root::new(dock, window, cx))
             },
