@@ -1,9 +1,10 @@
 // Adapted from gpui_xterm 0.3.0; see README.md and licenses/gpui_xterm-MIT.
-use crate::backend::{Backend, Command, MouseButton as ReportButton};
+use crate::backend::{Backend, Command, LinkAction, MouseButton as ReportButton};
 use crate::colors::ColorPalette;
 use crate::input::keystroke_to_bytes;
 use crate::mouse::pixel_to_cell;
 use crate::render::TerminalRenderer;
+use crate::{Action, SessionState};
 use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::TermMode;
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
@@ -59,6 +60,8 @@ pub type TitleCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>, &st
 
 pub type ClipboardStoreCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>, &str)>;
 
+pub type UrlOpener = Box<dyn Fn(&str)>;
+
 pub type ExitCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>)>;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -92,6 +95,10 @@ pub struct TerminalView {
     clipboard_store_callback: Option<ClipboardStoreCallback>,
 
     exit_callback: Option<ExitCallback>,
+    url_opener: Option<UrlOpener>,
+    link_position: Option<Point<Pixels>>,
+    link_modifier: bool,
+    link_click: bool,
 
     layout_metrics: Arc<parking_lot::Mutex<LayoutMetrics>>,
 
@@ -168,6 +175,10 @@ impl TerminalView {
             title_callback: None,
             clipboard_store_callback: None,
             exit_callback: None,
+            url_opener: None,
+            link_position: None,
+            link_modifier: false,
+            link_click: false,
             layout_metrics: Arc::new(parking_lot::Mutex::new(LayoutMetrics::default())),
             dragging_selection: false,
             pending_copy: false,
@@ -229,6 +240,46 @@ impl TerminalView {
     ) -> Self {
         self.exit_callback = Some(Box::new(callback));
         self
+    }
+
+    /// The embedding app owns URL policy and opening. The terminal never launches URLs.
+    pub fn with_url_opener(mut self, opener: impl Fn(&str) + 'static) -> Self {
+        self.url_opener = Some(Box::new(opener));
+        self
+    }
+
+    pub fn status_message(&self) -> Option<String> {
+        self.backend.status_message()
+    }
+
+    fn update_link_hover(&mut self) {
+        let point = self
+            .link_modifier
+            .then_some(self.link_position)
+            .flatten()
+            .and_then(|position| self.link_cell(position));
+        self.backend.update_link(point);
+    }
+
+    fn link_cell(&self, position: Point<Pixels>) -> Option<alacritty_terminal::index::Point> {
+        let m = *self.layout_metrics.lock();
+        if position.x >= m.origin.x + m.cell_width * m.cols as f32
+            || position.y >= m.origin.y + m.cell_height * m.rows as f32
+        {
+            return None;
+        }
+        self.hit_test_cell(position)
+    }
+
+    fn on_modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.link_modifier = event.modifiers.platform;
+        self.update_link_hover();
+        cx.notify();
     }
 
     fn on_action_send_tab(&mut self, _: &SendTab, _window: &mut Window, _cx: &mut Context<Self>) {
@@ -309,6 +360,19 @@ impl TerminalView {
         let Some(point) = self.hit_test_cell(event.position) else {
             return;
         };
+        if event.button == MouseButton::Left && event.modifiers.platform {
+            self.link_click = true;
+            self.dragging_selection = false;
+            if let Some(point) = self.link_cell(event.position)
+                && let Action::OpenUrl(url) = self
+                    .backend
+                    .handle(Command::ProcessLink(LinkAction::Open, point))
+                && let Some(opener) = &self.url_opener
+            {
+                opener(&url);
+            }
+            return;
+        }
         if self.reporting_mouse() {
             self.report_mouse(event.button, event.modifiers, point, true);
             self.dragging_selection = false;
@@ -333,6 +397,9 @@ impl TerminalView {
     }
 
     pub(crate) fn mouse_up(&mut self, event: &MouseUpEvent) {
+        if event.button == MouseButton::Left && std::mem::take(&mut self.link_click) {
+            return;
+        }
         if let Some(point) = self.hit_test_cell(event.position) {
             if self.reporting_mouse() {
                 self.report_mouse(event.button, event.modifiers, point, false);
@@ -352,6 +419,13 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.link_position = Some(event.position);
+        self.link_modifier = event.modifiers.platform;
+        self.update_link_hover();
+        if event.modifiers.platform {
+            cx.notify();
+            return;
+        }
         if let Some(point) = self.hit_test_cell(event.position) {
             let mode = self.backend.mode();
             if mode.intersects(TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG)
@@ -563,7 +637,7 @@ impl TerminalView {
     }
 
     fn write_input_bytes(&self, bytes: &[u8]) -> bool {
-        self.backend.input(bytes.to_vec())
+        self.backend.input_bytes(bytes)
     }
 
     fn build_context_menu(
@@ -670,6 +744,9 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.backend.state() != SessionState::Running {
+            return;
+        }
         self.ime_text = new_text.to_string();
         self.ime_marked_range = if new_text.is_empty() {
             None
@@ -719,6 +796,17 @@ impl Render for TerminalView {
         if self.backend.sync() && self.pending_copy {
             self.copy_selection();
         }
+        self.update_link_hover();
+        let link_hovered = self
+            .backend
+            .renderable_content()
+            .hovered_hyperlink
+            .is_some();
+        let status = self.status_message();
+        if self.backend.state() != SessionState::Running {
+            self.ime_text.clear();
+            self.ime_marked_range = None;
+        }
         let snapshot = Arc::new(self.backend.renderable_content().clone());
         let renderer = self.renderer.clone();
         let resize_callback = self.resize_callback.clone();
@@ -731,6 +819,12 @@ impl Render for TerminalView {
 
         div()
             .size_full()
+            .relative()
+            .cursor(if link_hovered {
+                CursorStyle::PointingHand
+            } else {
+                CursorStyle::IBeam
+            })
             .bg(self.config.colors.background())
             .track_focus(&self.focus_handle)
             .key_context(CONTEXT)
@@ -744,6 +838,12 @@ impl Render for TerminalView {
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
+            .on_mouse_exit(cx.listener(|view, _: &MouseExitEvent, _, cx| {
+                view.link_position = None;
+                view.update_link_hover();
+                cx.notify();
+            }))
             .on_scroll(cx.listener(Self::on_scroll))
             .context_menu({
                 let view = cx.entity().downgrade();
@@ -822,6 +922,17 @@ impl Render for TerminalView {
                 )
                 .size_full(),
             )
+            .children(status.map(|message| {
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .px_2()
+                    .py_1()
+                    .bg(self.config.colors.background())
+                    .text_color(self.config.colors.foreground())
+                    .child(message)
+            }))
     }
 }
 

@@ -252,7 +252,19 @@ fn deferred_shell_starts_with_first_laid_out_grid(cx: &mut TestAppContext) {
         move |_, _| div().size_full().child(view).into_any_element(),
     );
 
-    wait(|| initial_prompt.lock().is_some());
+    wait(|| {
+        // Title callbacks run on render; an OS child may respond after the first frame.
+        let view = entity.clone();
+        cx.draw(
+            point(px(0.), px(0.)),
+            size(
+                AvailableSpace::Definite(px(800.)),
+                AvailableSpace::Definite(px(480.)),
+            ),
+            move |_, _| div().size_full().child(view).into_any_element(),
+        );
+        initial_prompt.lock().is_some()
+    });
     entity.read_with(cx, |view, _| {
         let (cols, rows) = first_layout.lock().expect("first view layout");
         assert_eq!(
@@ -564,6 +576,258 @@ fn drag_shift_copy_and_native_copy_survive_parser_contention(cx: &mut TestAppCon
                     .get_text()
                     .unwrap(),
                 "bcdefg"
+            );
+        })
+        .unwrap();
+}
+
+#[::gpui::test]
+fn dropping_view_joins_reader_and_reaps_child(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
+    let backend = python("import os, signal, time\nsignal.signal(signal.SIGHUP, signal.SIG_IGN)\nos.write(1,b'\x1b]2;' + str(os.getpid()).encode() + b'\x07')\ntime.sleep(60)".into());
+    let weak = Arc::downgrade(&backend.term);
+    let entity = cx.new(|cx| TerminalView::new(backend, TerminalConfig::default(), cx));
+    let mut pid = None;
+    wait(|| {
+        pid = entity
+            .read_with(cx, |view, _| view.backend.take_events().title)
+            .and_then(|s| s.parse::<i32>().ok())
+            .or(pid);
+        pid.is_some()
+    });
+    drop(entity);
+    cx.update(|_| {}); // Flush GPUI's deferred entity release.
+    cx.run_until_parked();
+    assert!(
+        weak.upgrade().is_none(),
+        "reader must release the terminal when view closes"
+    );
+    assert_eq!(unsafe { libc::kill(pid.unwrap(), 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid.unwrap(), &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}
+
+#[::gpui::test]
+fn exited_and_failed_views_paint_persistent_status_and_ignore_input(cx: &mut TestAppContext) {
+    use gpui_kit::{AvailableSpace, IntoElement, ParentElement, Styled, div, size};
+    cx.background_executor.allow_parking();
+    cx.update(gpui_kit::init);
+    for failure in [false, true] {
+        let backend = if failure {
+            Backend::new_deferred(BackendSettings {
+                program: "/no-such-terminal-test-shell".into(),
+                ..Default::default()
+            })
+        } else {
+            let backend = python("import sys\nsys.exit(17)".into());
+            wait(|| backend.state() != crate::SessionState::Running);
+            backend
+        };
+        let (entity, cx) =
+            cx.add_window_view(|_, cx| TerminalView::new(backend, TerminalConfig::default(), cx));
+        let view = entity.clone();
+        cx.draw(
+            point(px(0.), px(0.)),
+            size(
+                AvailableSpace::Definite(px(500.)),
+                AvailableSpace::Definite(px(300.)),
+            ),
+            move |_, _| div().size_full().child(view).into_any_element(),
+        );
+        wait(|| {
+            entity.read_with(cx, |view, _| {
+                view.backend.state() != crate::SessionState::Running
+            })
+        });
+        entity.update(cx, |view, _| {
+            if failure {
+                assert!(view.status_message().unwrap().contains("Terminal error:"));
+            } else {
+                assert_eq!(
+                    view.status_message().as_deref(),
+                    Some("Shell exited (status 17)")
+                );
+            }
+            view.backend.take_events();
+            assert!(view.status_message().is_some());
+            assert!(!view.write_input_bytes(b"x"));
+            assert!(!view.backend.paste("ignored"));
+        });
+    }
+}
+
+#[::gpui::test]
+fn legacy_mouse_press_release_and_wheel_use_non_sgr_bytes(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
+    let backend = python(query_script(
+        b"\x1b[?1049h\x1b[?1000h",
+        b"\x1b[M\x20\x22\x22\x1b[M\x23\x22\x22\x1b[M\x60\x22\x22",
+    ));
+    let entity = cx.new(|cx| TerminalView::new(backend, TerminalConfig::default(), cx));
+    wait(|| {
+        entity.update(cx, |view, _| {
+            view.backend.sync() && view.backend.mode().contains(TermMode::MOUSE_REPORT_CLICK)
+        })
+    });
+    entity.update(cx, |view, _| {
+        *view.layout_metrics.lock() = LayoutMetrics {
+            origin: point(px(0.), px(0.)),
+            cell_width: px(10.),
+            cell_height: px(20.),
+            cols: 80,
+            rows: 24,
+        };
+        let position = point(px(15.), px(25.));
+        // Consumed Cmd-click must suppress its release even if Cmd is released first.
+        view.mouse_down(&MouseDownEvent {
+            position,
+            modifiers: gpui_kit::Modifiers {
+                platform: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        view.mouse_up(&MouseUpEvent {
+            position,
+            ..Default::default()
+        });
+        view.mouse_down(&MouseDownEvent {
+            position,
+            click_count: 1,
+            ..Default::default()
+        });
+        // A regular press still needs a release if Cmd is pressed in between.
+        view.mouse_up(&MouseUpEvent {
+            position,
+            modifiers: gpui_kit::Modifiers {
+                platform: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        view.scroll(&ScrollEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0., 1.)),
+            ..Default::default()
+        });
+        assert!(view.backend.term.lock_unfair().selection.is_none());
+    });
+    let mut title = None;
+    wait(|| {
+        title = entity
+            .read_with(cx, |view, _| view.backend.take_events().title)
+            .filter(|title| title == "OK" || title.starts_with("FAIL:"))
+            .or(title.take());
+        title.is_some()
+    });
+    assert_eq!(title.as_deref(), Some("OK"));
+}
+
+#[::gpui::test]
+fn cmd_hover_and_click_resolve_current_url_and_call_only_app_opener(cx: &mut TestAppContext) {
+    use alacritty_terminal::vte::ansi::Processor;
+    use gpui_kit::{Modifiers, ModifiersChangedEvent, MouseMoveEvent};
+    use std::{cell::RefCell, rc::Rc};
+    cx.background_executor.allow_parking();
+    let opened = Rc::new(RefCell::new(Vec::new()));
+    let callback = opened.clone();
+    let backend = Backend::new(BackendSettings {
+        program: "/bin/cat".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    let handle = cx.add_window(|_, cx| {
+        TerminalView::new(backend, TerminalConfig::default(), cx)
+            .with_url_opener(move |url| callback.borrow_mut().push(url.to_owned()))
+    });
+    handle
+        .update(cx, |view, window, cx| {
+            let mut parser: Processor = Processor::new();
+            parser.advance(
+                &mut *view.backend.term.lock_unfair(),
+                b"https://example.com/path other\r\nhttps://example.org/second\x1b[?1000h",
+            );
+            assert!(view.backend.sync());
+            *view.layout_metrics.lock() = LayoutMetrics {
+                origin: point(px(0.), px(0.)),
+                cell_width: px(10.),
+                cell_height: px(20.),
+                cols: 80,
+                rows: 24,
+            };
+            let position = point(px(35.), px(10.));
+            view.on_mouse_move(
+                &MouseMoveEvent {
+                    position,
+                    ..Default::default()
+                },
+                window,
+                cx,
+            );
+            assert!(
+                view.backend
+                    .renderable_content()
+                    .hovered_hyperlink
+                    .is_none()
+            );
+            view.on_modifiers_changed(
+                &ModifiersChangedEvent {
+                    modifiers: Modifiers {
+                        platform: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                window,
+                cx,
+            );
+            assert!(
+                view.backend
+                    .renderable_content()
+                    .hovered_hyperlink
+                    .is_some()
+            );
+            let click = |position| MouseDownEvent {
+                position,
+                click_count: 1,
+                modifiers: Modifiers {
+                    platform: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            view.mouse_down(&click(position));
+            // Clicking another URL without a prior hover must never use the old URL.
+            view.mouse_down(&click(point(px(35.), px(30.))));
+            view.mouse_down(&click(point(px(600.), px(30.))));
+            assert_eq!(
+                &*opened.borrow(),
+                &["https://example.com/path", "https://example.org/second"]
+            );
+            assert!(view.backend.term.lock_unfair().selection.is_none());
+            // Lock contention clears hover and refuses an old cached destination.
+            let term = view.backend.term.clone();
+            let guard = term.lock_unfair();
+            view.mouse_down(&click(position));
+            assert_eq!(opened.borrow().len(), 2);
+            drop(guard);
+            view.on_modifiers_changed(&ModifiersChangedEvent::default(), window, cx);
+            assert!(
+                view.backend
+                    .renderable_content()
+                    .hovered_hyperlink
+                    .is_none()
             );
         })
         .unwrap();

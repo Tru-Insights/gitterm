@@ -10,16 +10,17 @@ This is a macOS prototype in GitTerm's separate `gpui/` workspace.
 From the repository root, using rustup through the existing wrapper:
 
 ```sh
-export CARGO_TARGET_DIR=/private/tmp/gt-target-tru278
+export CARGO_TARGET_DIR=/private/tmp/gt-target-tru282
 scripts/cargo.sh run --manifest-path gpui/Cargo.toml --locked -j 4 -- --terminal
 scripts/cargo.sh build --manifest-path gpui/Cargo.toml --locked -j 4
-scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --locked -j 4 -- -D warnings
+scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --workspace --locked --all-targets -j 4 -- -D warnings
 scripts/cargo.sh fmt --manifest-path gpui/Cargo.toml --all -- --check
-scripts/cargo.sh test --manifest-path gpui/Cargo.toml --locked -j 4 -- --nocapture --test-threads=1
+scripts/cargo.sh test --manifest-path gpui/Cargo.toml --workspace --locked -j 4
 ```
 
-Use `nice -n 10` before `scripts/cargo.sh` where permitted. It was denied in
-this sandbox, so verification omitted it. The terminal flag runs `$SHELL`
+Use `nice -n 10` before `scripts/cargo.sh` where permitted. In this sandbox `nice`
+reported `setpriority: Operation not permitted`, but still ran Cargo; its exit
+codes below are the completed commands' results. The terminal flag runs `$SHELL`
 (`/bin/zsh` when unset) in a real Alacritty PTY. Without the flag, the existing
 stage-0 dock opens. Neither mode reads or writes GitTerm settings; this binary
 has no Iced runtime or running-GitTerm interaction. No visible app was launched
@@ -58,10 +59,10 @@ its package checksum remains pinned in `gpui/Cargo.lock`.
 
 | Destination | Input and adaptation |
 | --- | --- |
-| `src/backend.rs` | Fork `src/backend.rs` from the commit above, including its snapshot tests, mouse encoders, selection, geometry, regex/history/search helpers and Alacritty event-loop construction. Replace Iced `Size` with `LayoutSize`, Iced modifiers with GPUI modifiers (Control correctly supplies mouse modifier 16), remove Tokio event channel, retain viewport snapshots, add deferred interaction/resize/config application, explicit busy results, inclusive extraction, ordered asynchronous input and app-owned URL result. |
+| `src/backend.rs` | Fork `src/backend.rs` from the commit above, including its snapshot tests, mouse encoders, selection, geometry, regex/history/search helpers and Alacritty PTY construction (TRU-282 moves scheduling into the bounded `session` worker). Replace Iced `Size` with `LayoutSize`, Iced modifiers with GPUI modifiers (Control correctly supplies mouse modifier 16), remove Tokio event channel, retain viewport snapshots, add deferred interaction/resize/config application, explicit busy results, inclusive extraction, ordered asynchronous input and app-owned URL result. |
 | `src/settings.rs` | Fork `src/settings.rs`: **only** `BackendSettings` and its `Default` implementation. Use `$SHELL` with zsh fallback; add the small geometry value type. No font/theme settings copied. |
 | `src/backend.rs::paste` | Adapt fork `src/view.rs`'s `BindingAction::Paste` arm: CRLF/LF normalization and mode-2004 envelope. Clipboard acquisition lives in GPUI; additionally strip ESC to prevent pasted content from ending the envelope. |
-| `src/events.rs` | New replacement for the fork proxy: send terminal replies directly to Alacritty's event-loop input channel; coalesce UI-only effects. No copied Tokio bridge or Iced actions module. |
+| `src/events.rs` | New replacement for the fork proxy: send terminal replies directly to the bounded per-session input queue; coalesce UI-only effects. No copied Tokio bridge or Iced actions module. |
 | `src/view.rs` | Published xterm `src/view.rs`, retaining EntityInputHandler/UTF16 preedit, focus/key actions, menus, callbacks, drag/semantic/line selection, canvas/font measurement. Replace reader, queue, foreground parser and writer with Backend; use a 16 ms notification task; connect native Cmd-C/V and mode-aware mouse; defer copy during parser contention. |
 | `src/render.rs` | Published xterm `src/render.rs`, including renderer tests except its old TerminalState ingest test. Paint immutable viewport cells/colors/cursor/selection instead of locking live Term; preserve geometric glyphs/font fallback/preedit and append combining marks. |
 | `src/colors.rs`, `src/glyphs.rs`, `src/input.rs` | Published files and their tests, with attribution headers/formatting. No new emulator or key-encoding scheme. |
@@ -75,13 +76,28 @@ In particular its uncommitted URL delimiter work is **not** in this crate.
 
 ## Ownership and limits
 
-Alacritty's own event loop owns reading, parsing and partial/asynchronous PTY
-writes on its worker. Its read buffer is bounded at 1 MiB. The grid retains at
+The crate's `session` worker owns the Alacritty PTY and parser. Reading/parsing
+and partial writes each have a 64 KiB budget per turn. The read buffer is 64 KiB;
+a busy foreground lock retains these bytes for retry, while cancellation stays
+responsive. Interrupted polling retries; registration/read/write/resize-interest
+errors become persistent session errors rather than panics. Resize requests
+coalesce in one slot. Synchronized-output timeouts remain supported. The grid retains at
 most the configured history (100,000 by default) plus the viewport; the stored
 render snapshot contains only viewport cells. A failed foreground `try_lock`
 keeps the last snapshot and requests a retry. Selection endpoints, scroll,
 clear, history configuration, resize and scroll-to-bottom requests are retained
 until a successful sync. Paint never holds the live terminal lock.
+
+Input admission is nonblocking and all-or-nothing. Each session admits at most
+1 MiB of unsent user input and reserves another 64 KiB for protocol replies;
+message counts are also capped at 4,096 (4,352 including replies). One in-flight
+message can retain its consumed prefix until completion, so allocation remains
+bounded by two maximum messages plus queue overhead. Oversized or full-queue
+paste returns `false`, sends no partial envelope, and displays a retry message.
+The byte limit is checked before copying/normalizing foreground paste or IME
+input. Accepted input retains ordering, ESC stripping, newline normalization and
+bracketed-paste safety. A saturated protocol reserve terminates with a visible
+error instead of silently dropping replies or allocating indefinitely.
 
 `PtyWrite` bypasses the coalesced UI mailbox, including when GPUI is not pumped.
 Latest title/clipboard-store, bell and exit state coalesce; they do not queue
@@ -96,3 +112,18 @@ the term is busy, distinct from an empty result. Search/export still perform
 full-history work on the caller; stage 3 must move service exports/search jobs
 off foreground and add an efficient tail API. Search positions can expire as
 history is evicted. Do not treat this prototype as complete GitTerm integration.
+
+`Backend::cancel` is idempotent and joins the reader. View drop calls the same
+path. On Unix, cleanup kills an unreaped owned child before Alacritty's PTY Drop
+waits, so a HUP-ignoring shell cannot leak a thread or zombie. Normal child exit
+retains its numeric exit code; signal exits report that the code is unavailable
+(the PTY API exposes only `Option<i32>`). Exit and I/O-error state persist after
+callbacks run, paint a banner, and reject subsequent input. The dead child's PTY
+tail is drained with a 1 MiB ceiling so descendants retaining the slave cannot
+keep a completed reader alive indefinitely.
+
+`TerminalView::with_url_opener` installs app policy. Holding Cmd over a regex
+match shows a pointer; Cmd-click takes precedence over mouse reporting and
+selection and calls that callback. Releasing Cmd or leaving the view clears the
+hover. A busy parser clears stale link state; click never opens an old hover
+location. The terminal crate itself never launches a URL or process opener.

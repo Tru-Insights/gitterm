@@ -26,6 +26,21 @@ pub fn run() {
                             Default::default(),
                             cx,
                         )
+                        .with_url_opener(|url| {
+                            let url = url.to_owned();
+                            std::thread::spawn(move || {
+                                match std::process::Command::new("/usr/bin/open")
+                                    .arg("--")
+                                    .arg(&url)
+                                    .status()
+                                {
+                                    Ok(status) if status.success() => {}
+                                    result => eprintln!(
+                                        "[gitterm-terminal] URL opener failed: {result:?}"
+                                    ),
+                                }
+                            });
+                        })
                     });
                     let focus = view.read(cx).focus_handle().clone();
                     window.focus(&focus, cx);
