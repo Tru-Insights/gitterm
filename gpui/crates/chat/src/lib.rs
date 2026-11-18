@@ -7,4 +7,4 @@ extern crate gpui_kit as gpui;
 #[cfg(target_os = "macos")]
 mod view;
 #[cfg(target_os = "macos")]
-pub use view::{ChatView, run};
+pub use view::{ChatView, init, run};
