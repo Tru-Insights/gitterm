@@ -1098,6 +1098,8 @@ pub struct TaskStore {
     // An accepted prompt must not be resent just because its receipt could not
     // be written. Any successful store commit also persists these receipts.
     delivery_ack_pending: bool,
+    #[cfg(test)]
+    write_count: std::cell::Cell<usize>,
 }
 
 impl TaskStore {
@@ -1114,6 +1116,8 @@ impl TaskStore {
                     path,
                     document: TaskStoreDocument::default(),
                     delivery_ack_pending: false,
+                    #[cfg(test)]
+                    write_count: std::cell::Cell::new(0),
                 });
             }
             Err(error) => {
@@ -1128,6 +1132,8 @@ impl TaskStore {
             path,
             document,
             delivery_ack_pending: false,
+            #[cfg(test)]
+            write_count: std::cell::Cell::new(0),
         })
     }
 
@@ -1160,31 +1166,41 @@ impl TaskStore {
     }
 
     pub fn replace(&mut self, task: TaskRecord) -> Result<(), TaskStoreError> {
-        let Some(index) = self
-            .document
-            .tasks
-            .iter()
-            .position(|existing| existing.task_id == task.task_id)
-        else {
-            return Err(TaskStoreError::new(
-                "replace",
-                &self.path,
-                format!("task {} does not exist", task.task_id),
-            ));
-        };
-        let previous = &self.document.tasks[index];
-        if !previous.lifecycle.can_transition_to(task.lifecycle) {
-            return Err(TaskStoreError::new(
-                "replace",
-                &self.path,
-                format!(
-                    "task {} cannot transition from {:?} to {:?}",
-                    task.task_id, previous.lifecycle, task.lifecycle
-                ),
-            ));
+        self.replace_many(vec![task])
+    }
+
+    /// Validate and persist related replacements in one atomic store write.
+    /// On failure neither the in-memory document nor the file is replaced.
+    pub fn replace_many(&mut self, tasks: Vec<TaskRecord>) -> Result<(), TaskStoreError> {
+        if tasks.is_empty() {
+            return Ok(());
         }
         let mut candidate = self.document.clone();
-        candidate.tasks[index] = task;
+        for task in tasks {
+            let Some(index) = candidate
+                .tasks
+                .iter()
+                .position(|existing| existing.task_id == task.task_id)
+            else {
+                return Err(TaskStoreError::new(
+                    "replace",
+                    &self.path,
+                    format!("task {} does not exist", task.task_id),
+                ));
+            };
+            let previous = &candidate.tasks[index];
+            if !previous.lifecycle.can_transition_to(task.lifecycle) {
+                return Err(TaskStoreError::new(
+                    "replace",
+                    &self.path,
+                    format!(
+                        "task {} cannot transition from {:?} to {:?}",
+                        task.task_id, previous.lifecycle, task.lifecycle
+                    ),
+                ));
+            }
+            candidate.tasks[index] = task;
+        }
         self.commit_candidate(candidate)
     }
 
@@ -2409,6 +2425,8 @@ impl TaskStore {
     where
         F: FnOnce(&Path, &Path) -> io::Result<()>,
     {
+        #[cfg(test)]
+        self.write_count.set(self.write_count.get() + 1);
         let mut encoded = serde_json::to_vec_pretty(document)
             .map_err(|error| TaskStoreError::new("serialize", &self.path, error.to_string()))?;
         encoded.push(b'\n');
@@ -2894,6 +2912,73 @@ fn validate_task(task: &TaskRecord) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_replacements_write_once_and_match_individual_replacements() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut batch = TaskStore::load(temp.path().join("batch.json")).unwrap();
+        let mut individual = TaskStore::load(temp.path().join("individual.json")).unwrap();
+        for id in ["a", "b", "c"] {
+            batch.insert(sample_task(id)).unwrap();
+            individual.insert(sample_task(id)).unwrap();
+        }
+        let changed = batch
+            .tasks()
+            .iter()
+            .cloned()
+            .map(|mut task| {
+                task.title.push_str(" updated");
+                task
+            })
+            .collect::<Vec<_>>();
+        let before = batch.write_count.get();
+        batch.replace_many(changed.clone()).unwrap();
+        assert_eq!(batch.write_count.get() - before, 1);
+        for task in changed {
+            individual.replace(task).unwrap();
+        }
+        assert_eq!(batch.document, individual.document);
+        assert_eq!(
+            TaskStore::load(batch.path()).unwrap().document,
+            batch.document
+        );
+        let before = batch.write_count.get();
+        batch.replace_many(Vec::new()).unwrap();
+        assert_eq!(batch.write_count.get(), before);
+    }
+
+    #[test]
+    fn batch_replacements_roll_back_memory_and_disk_on_any_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join("tasks.json")).unwrap();
+        store.insert(sample_task("a")).unwrap();
+        store.insert(sample_task("b")).unwrap();
+        let original = store.document.clone();
+        let bytes = fs::read(store.path()).unwrap();
+        let mut changed = store.get("a").unwrap().clone();
+        changed.title.push_str(" changed");
+        let mut invalid = store.get("b").unwrap().clone();
+        invalid.title.clear();
+        assert!(store.replace_many(vec![changed.clone(), invalid]).is_err());
+        assert!(store
+            .replace_many(vec![changed.clone(), sample_task("missing")])
+            .is_err());
+        let mut invalid_transition = store.get("b").unwrap().clone();
+        invalid_transition.lifecycle = TaskLifecycle::Completed;
+        assert!(!TaskLifecycle::Draft.can_transition_to(TaskLifecycle::Completed));
+        assert!(store
+            .replace_many(vec![changed.clone(), invalid_transition])
+            .is_err());
+        assert_eq!(store.document, original);
+        assert_eq!(fs::read(store.path()).unwrap(), bytes);
+        // A write failure must also leave the candidate unapplied.
+        let blocked = temp.path().join("not-a-file");
+        fs::create_dir(&blocked).unwrap();
+        store.path = blocked;
+        assert!(store.replace_many(vec![changed]).is_err());
+        assert_eq!(store.document, original);
+        assert_eq!(fs::read(temp.path().join("tasks.json")).unwrap(), bytes);
+    }
 
     #[test]
     fn activity_snapshot_cannot_precede_session_start() {
