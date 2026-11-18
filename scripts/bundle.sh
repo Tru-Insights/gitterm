@@ -13,7 +13,7 @@ BUILD_DIR="$TARGET_DIR/release"
 APP_DIR="$TARGET_DIR/$APP_NAME.app"
 
 echo "Building release binary..."
-"$SCRIPT_DIR/cargo.sh" build -j 4 --release --locked -p gitterm-v6 --features "stt excalidraw" --manifest-path "$PROJECT_DIR/Cargo.toml"
+"$SCRIPT_DIR/cargo.sh" build --release --locked -p gitterm-v6 --features "stt excalidraw" --manifest-path "$PROJECT_DIR/Cargo.toml"
 
 echo "Creating app bundle..."
 rm -rf "$APP_DIR"

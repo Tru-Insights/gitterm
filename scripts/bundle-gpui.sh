@@ -11,7 +11,7 @@ if [ "$(uname -s)" != Darwin ]; then
 fi
 TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_DIR/gpui/target}"
 APP_DIR="$TARGET_DIR/GitTerm GPUI.app"
-"$SCRIPT_DIR/cargo.sh" build --manifest-path "$PROJECT_DIR/gpui/Cargo.toml" --release -j 4 --locked
+"$SCRIPT_DIR/cargo.sh" build --manifest-path "$PROJECT_DIR/gpui/Cargo.toml" --release --locked
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$TARGET_DIR/release/gitterm-gpui" "$APP_DIR/Contents/MacOS/gitterm-gpui"
 cp "$PROJECT_DIR/assets/icon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"

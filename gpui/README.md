@@ -18,8 +18,8 @@ per workspace. No shared crate is introduced in stage 0.
 
 ## Toolchain and build
 
-Use the installed **rustup stable toolchain, Rust 1.99 or newer**. The packages'
-`rust-version` declarations enforce the minimum. Do not use Homebrew Cargo:
+Use the installed **rustup stable toolchain, Rust 1.99 or newer**. This package's
+`rust-version` enforces the minimum (the root Iced package declares none). Do not use Homebrew Cargo:
 even `rustup run stable cargo` can find Homebrew's `rustc` on PATH.
 `scripts/cargo.sh` obtains the installed compiler path from rustup and prepends
 that toolchain's binaries before invoking Cargo. It never installs or updates

@@ -1,8 +1,8 @@
 # Building GitTerm
 
-Use the **rustup stable toolchain, Rust 1.99 or newer**. `rust-toolchain.toml`
-selects stable for rustup proxies, and each package declares its minimum Rust
-version. If Homebrew's Cargo comes first on PATH, invoke `scripts/cargo.sh`
+The Iced app builds with any current stable Rust. The GPUI app (`gpui/`) needs
+**rustup stable, Rust 1.99 or newer**, declared in its `rust-version`.
+`rust-toolchain.toml` selects stable for rustup proxies. If Homebrew's Cargo comes first on PATH, invoke `scripts/cargo.sh`
 instead of plain `cargo`; it calls rustup by absolute path and does not install
 or update a toolchain. Bundle scripts and macOS CI use this selection too.
 
