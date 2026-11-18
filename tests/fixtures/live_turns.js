@@ -31,6 +31,31 @@
   window.ipc = { postMessage: () => {} };
   window.__setTabId(1, 'default', null, false);
   try {
+    // A wide fixture exercises all caps even on a small physical screen.
+    const originalWidth = document.body.style.width;
+    document.body.style.width = '1600px';
+    const column = () => {
+      const style = getComputedStyle(messages);
+      return messages.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+    };
+    const footer = document.getElementById('footer');
+    const rem = parseFloat(getComputedStyle(document.documentElement).fontSize);
+    check('chat width defaults to Medium', Math.abs(column() - 60 * rem) < 1);
+    for (const [preset, size] of [['narrow', 46], ['medium', 60], ['wide', 72]]) {
+      window.__setChatWidth(preset);
+      check(preset + ' changes the column immediately', Math.abs(column() - size * rem) < 1);
+      const panel = footer.getBoundingClientRect();
+      const timeline = messages.getBoundingClientRect();
+      check(preset + ' input panel matches the column', Math.abs(panel.width - column() - 28) < 1 && Math.abs(panel.left + panel.width / 2 - timeline.left - timeline.width / 2) < 1);
+    }
+    window.__setChatWidth('full');
+    check('Full removes the column limit', Math.abs(column() - messages.clientWidth + 28) < 1 && column() > 72 * rem);
+    check('Full input panel fills the pane', Math.abs(footer.getBoundingClientRect().width - messages.clientWidth) < 1);
+    document.body.style.width = '400px';
+    window.__setChatWidth('narrow');
+    check('narrow panes retain the 14px edge', getComputedStyle(messages).paddingLeft === '14px' && getComputedStyle(messages).paddingRight === '14px');
+    document.body.style.width = originalWidth;
+    window.__setChatWidth('medium');
     reset();
     send(H('thinking_delta', ''));
     check('redacted thinking stays activity-only', !document.querySelector('details.thinking'));

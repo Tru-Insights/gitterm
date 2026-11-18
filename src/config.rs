@@ -283,6 +283,28 @@ mod tests {
     }
 
     #[test]
+    fn chat_width_defaults_and_round_trips_through_settings() {
+        assert_eq!(Config::default().chat_width, ChatWidth::Medium);
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.chat_width, ChatWidth::Medium);
+        let dir = tempfile::tempdir().unwrap();
+        for chat_width in ChatWidth::ALL {
+            let config = Config {
+                chat_width,
+                ..Config::default()
+            };
+            save_settings_to(dir.path(), &config).unwrap();
+            let loaded = load_settings_from(dir.path());
+            assert_eq!(loaded.refused, None);
+            assert_eq!(loaded.config.chat_width, chat_width);
+            let raw: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join(SETTINGS_FILE)).unwrap())
+                    .unwrap();
+            assert_eq!(raw["chat_width"], chat_width.as_str());
+        }
+    }
+
+    #[test]
     fn settings_round_trip_through_the_shared_file() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config {
@@ -1247,6 +1269,40 @@ fn default_max_concurrent_local_tasks() -> usize {
     4
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatWidth {
+    Narrow,
+    #[default]
+    Medium,
+    Wide,
+    Full,
+}
+
+impl ChatWidth {
+    pub const ALL: [Self; 4] = [Self::Narrow, Self::Medium, Self::Wide, Self::Full];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Narrow => "narrow",
+            Self::Medium => "medium",
+            Self::Wide => "wide",
+            Self::Full => "full",
+        }
+    }
+}
+
+impl std::fmt::Display for ChatWidth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Narrow => f.write_str("Narrow"),
+            Self::Medium => f.write_str("Medium"),
+            Self::Wide => f.write_str("Wide"),
+            Self::Full => f.write_str("Full"),
+        }
+    }
+}
+
 // Persistent configuration: the shared `settings.json` (TRU-181), see
 // `SETTINGS_FILE`. Every field is a setting the user expects to keep.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1258,6 +1314,8 @@ pub struct Config {
     pub terminal_font_size: f32,
     #[serde(default = "default_ui_font")]
     pub ui_font_size: f32,
+    #[serde(default)]
+    pub chat_width: ChatWidth,
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
     #[serde(default = "default_scrollback_lines")]
@@ -1667,6 +1725,7 @@ impl Default for Config {
             editor: default_editor(),
             terminal_font_size: 14.0,
             ui_font_size: 13.0,
+            chat_width: ChatWidth::default(),
             sidebar_width: 360.0,
             scrollback_lines: 30_000,
             font_size: None,

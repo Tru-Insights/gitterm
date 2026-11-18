@@ -1504,6 +1504,7 @@ struct MenuIds {
     increase_ui_font: muda::MenuId,
     decrease_ui_font: muda::MenuId,
     toggle_theme: muda::MenuId,
+    chat_width: Vec<(muda::MenuId, config::ChatWidth)>,
     toggle_terminal_log_mirroring: muda::MenuId,
     clear_terminal: muda::MenuId,
     open_plans_viewer: muda::MenuId,
@@ -1588,6 +1589,15 @@ fn setup_menu_bar() {
         .append_items(&[&increase_ui_font, &decrease_ui_font])
         .unwrap();
 
+    let chat_width_menu = Submenu::new("Chat width", true);
+    let chat_width_items: Vec<_> = config::ChatWidth::ALL
+        .into_iter()
+        .map(|width| (MenuItem::new(width.to_string(), true, None), width))
+        .collect();
+    for (item, _) in &chat_width_items {
+        chat_width_menu.append(item).unwrap();
+    }
+
     let toggle_theme = MenuItem::new(
         "Toggle Light/Dark Theme",
         true,
@@ -1617,6 +1627,7 @@ fn setup_menu_bar() {
         .append_items(&[
             &terminal_font_menu,
             &ui_font_menu,
+            &chat_width_menu,
             &PredefinedMenuItem::separator(),
             &toggle_theme,
             &toggle_terminal_log_mirroring,
@@ -1651,6 +1662,10 @@ fn setup_menu_bar() {
         increase_ui_font: increase_ui_font.id().clone(),
         decrease_ui_font: decrease_ui_font.id().clone(),
         toggle_theme: toggle_theme.id().clone(),
+        chat_width: chat_width_items
+            .into_iter()
+            .map(|(item, width)| (item.id().clone(), width))
+            .collect(),
         toggle_terminal_log_mirroring: toggle_terminal_log_mirroring.id().clone(),
         clear_terminal: clear_terminal.id().clone(),
         open_plans_viewer: open_plans_viewer.id().clone(),
@@ -6970,6 +6985,7 @@ pub enum Event {
     FileBrowserSnapshotReady(usize),
     // Theme
     ToggleTheme,
+    SetChatWidth(config::ChatWidth),
     ToggleTerminalLogMirroring,
     // Font size - Terminal
     IncreaseTerminalFont,
@@ -7286,6 +7302,7 @@ pub enum Event {
     /// "Index older chats" in the Chats panel (TRU-166).
     ChatFactsBackfill,
     ChatFactsBackfilled(Result<chat_facts::BackfillReport, String>),
+    WorkerPrsScanned(Result<gitterm::worker_prs::RecordedPrs, String>),
     /// A ~/Work git job ended (TRU-201).
     WorkNotesDone(gitterm::work_notes::JobResult),
     /// Workspace overview (TRU-167): rebuild from the index and reread git.
@@ -7604,8 +7621,10 @@ struct App {
     delegation_runs: HashMap<String, iced::task::Handle>,
     /// Latest Codex activity line per running delegation (not persisted).
     delegation_activity: HashMap<String, String>,
+    worker_pr_scans: gitterm::worker_prs::Scans,
     /// Send-to-Claude messages held per chat tab until its turn ends.
     delegation_held: HashMap<usize, Vec<gitterm::delegations::HeldSend>>,
+    delegation_waiting_counts: HashMap<String, usize>,
     /// New-chat model/effort defaults and the last selection (config
     /// `chat`, TRU-143).
     chat_config: config::ChatDefaults,
@@ -7662,6 +7681,7 @@ struct App {
     theme: AppTheme,
     terminal_font_size: f32,
     ui_font_size: f32,
+    chat_width: config::ChatWidth,
     sidebar_width: f32,
     scrollback_lines: usize,
     sidebar_collapsed: bool,
@@ -10300,6 +10320,7 @@ impl App {
             editor: self.editor.clone(),
             terminal_font_size: self.terminal_font_size,
             ui_font_size: self.ui_font_size,
+            chat_width: self.chat_width,
             sidebar_width: self.sidebar_width,
             scrollback_lines: self.scrollback_lines,
             font_size: None,
@@ -15664,6 +15685,34 @@ impl App {
         chat_facts::store_links(store.delegations(), store.tasks(), &uid_to_chat)
     }
 
+    fn poll_worker_prs(&mut self) -> Task<Event> {
+        let Some(store) = self.task_store.as_ref() else {
+            return Task::none();
+        };
+        let uid_to_chat = self.chat_uid_to_chat();
+        let scans = self.worker_pr_scans.take_due(
+            store.delegations(),
+            store.tasks(),
+            &uid_to_chat,
+            chrono::Utc::now(),
+        );
+        if scans.is_empty() {
+            return Task::none();
+        }
+        let config_dir = config::global_config_dir();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let home = dirs::home_dir().ok_or("cannot locate home for worker PR scans")?;
+                    Ok(gitterm::worker_prs::run(scans, &config_dir, &home))
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("worker PR scan task failed: {error}")))
+            },
+            Event::WorkerPrsScanned,
+        )
+    }
+
     /// Write a chat tab's facts when they are due (TRU-166): debounced while
     /// a turn runs, at once when `force` (the turn ended). The write runs
     /// on a blocking thread; one per tab at a time. A requested catch-up
@@ -19548,16 +19597,17 @@ impl App {
             })
             .unwrap_or_default();
         let mut tabs: HashSet<usize> = self.delegation_held.keys().copied().collect();
+        let mut waiting = Vec::new();
         for parent in parents {
             match self.delegation_chat_tab_id(&parent) {
                 Some(tab_id) => {
                     tabs.insert(tab_id);
                 }
-                None => eprintln!(
-                    "[delegation] results for {} not sent: requesting chat tab is gone",
-                    parent.session_uid
-                ),
+                None => waiting.push(parent.session_uid),
             }
+        }
+        for line in waiting_delegation_log_lines(&mut self.delegation_waiting_counts, waiting) {
+            eprintln!("{line}");
         }
         Task::batch(
             tabs.into_iter()
@@ -19910,6 +19960,26 @@ fn worker_delivery_allows_close(
         .and_then(|result| result.handoff.as_ref())
         .is_some();
     handoff_stored && (d.is_delivered() || held || !auto_tell || !parent_present)
+}
+
+fn waiting_delegation_log_lines(
+    previous: &mut HashMap<String, usize>,
+    waiting: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut counts = HashMap::new();
+    for chat in waiting {
+        *counts.entry(chat).or_insert(0) += 1;
+    }
+    let mut lines = Vec::new();
+    for (chat, count) in &counts {
+        if previous.get(chat) != Some(count) {
+            lines.push(format!(
+                "[delegation] {count} finished results wait for chat {chat} until it is open"
+            ));
+        }
+    }
+    *previous = counts;
+    lines
 }
 
 fn load_task_store_for_startup(
@@ -20547,7 +20617,9 @@ impl App {
             model_policy: config.policy.clone(),
             delegation_runs: HashMap::new(),
             delegation_activity: HashMap::new(),
+            worker_pr_scans: gitterm::worker_prs::Scans::default(),
             delegation_held: HashMap::new(),
+            delegation_waiting_counts: HashMap::new(),
             chat_config: config.chat.clone(),
             task_store_error,
             task_ui_error: None,
@@ -20580,6 +20652,7 @@ impl App {
             theme,
             terminal_font_size: terminal_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
             ui_font_size: ui_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
+            chat_width: config.chat_width,
             sidebar_width: config.sidebar_width.clamp(150.0, 600.0),
             scrollback_lines: config.scrollback_lines,
             sidebar_collapsed: false,
@@ -23572,7 +23645,18 @@ fi
 
     fn update(&mut self, event: Event) -> Task<Event> {
         let overlay_was_open = self.webview_overlay_open();
+        // Reports/time limits scan immediately; the tick also catches every
+        // other terminal worker outcome and performs startup catch-up once.
+        let check_worker_prs = matches!(
+            &event,
+            Event::Tick | Event::TaskControlRequested(_) | Event::WorkerTimeLimitReached(..)
+        );
         let task = self.update_event(event);
+        let task = if check_worker_prs {
+            Task::batch([task, self.poll_worker_prs()])
+        } else {
+            task
+        };
         let task = match self.settle_active_workspace() {
             Some(settle) => Task::batch([task, settle]),
             None => task,
@@ -24608,6 +24692,11 @@ fi
                 if let Ok(event) = MenuEvent::receiver().try_recv() {
                     freeze_debug!("native menu event received: {:?}", event.id);
                     if let Some(ids) = MENU_IDS.get() {
+                        if let Some((_, width)) =
+                            ids.chat_width.iter().find(|(id, _)| *id == event.id)
+                        {
+                            return self.update(Event::SetChatWidth(*width));
+                        }
                         if event.id == ids.increase_terminal_font {
                             freeze_debug!("dispatching native menu: increase_terminal_font");
                             return self.update(Event::IncreaseTerminalFont);
@@ -26388,6 +26477,10 @@ fi
                             "light"
                         }
                     ),
+                );
+                webview::evaluate_script(
+                    WebviewSurface::Agent(tab_id),
+                    &format!("window.__setChatWidth({:?})", self.chat_width.as_str()),
                 );
                 let composer = self.chat_composer_state(tab_id);
                 set_agent_webview_tab_id(
@@ -29621,6 +29714,16 @@ fi
                     eprintln!("Cannot open file preview: local content server is not running");
                 }
             }
+            Event::SetChatWidth(width) => {
+                self.chat_width = width;
+                for tab_id in &self.agent_pages {
+                    webview::evaluate_script(
+                        WebviewSurface::Agent(*tab_id),
+                        &format!("window.__setChatWidth({:?})", width.as_str()),
+                    );
+                }
+                self.save_config();
+            }
             Event::ToggleTheme => {
                 self.theme = self.theme.toggle();
                 for tab_id in &self.agent_pages {
@@ -30182,6 +30285,18 @@ fi
                 self.work_notes.finish(result, Instant::now());
                 // A commit asked for meanwhile (a park) runs now.
                 return self.poll_work_notes();
+            }
+            Event::WorkerPrsScanned(result) => {
+                self.worker_pr_scans.running = false;
+                match result {
+                    Ok(recorded) => {
+                        for (parent, prs) in recorded {
+                            self.prs.note_live_prs(&parent, &prs);
+                        }
+                    }
+                    Err(error) => eprintln!("[worker-prs] {error}"),
+                }
+                return self.poll_worker_prs();
             }
             Event::ChatFactsBackfilled(result) => {
                 self.chat_backfill_running = false;
@@ -52583,6 +52698,33 @@ mod tests {
     }
 
     // === AppTheme::toggle ===
+
+    #[test]
+    fn closed_chat_results_log_once_until_the_count_changes() {
+        let mut previous = HashMap::new();
+        let waiting = || vec!["closed-chat".to_string(); 3];
+        assert_eq!(
+            waiting_delegation_log_lines(&mut previous, waiting()),
+            vec!["[delegation] 3 finished results wait for chat closed-chat until it is open"]
+        );
+        assert!(waiting_delegation_log_lines(&mut previous, waiting()).is_empty());
+        let mut more = waiting();
+        more.push("closed-chat".into());
+        more.push("other-chat".into());
+        let lines = waiting_delegation_log_lines(&mut previous, more);
+        assert_eq!(lines.len(), 2);
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("4 finished results wait for chat closed-chat")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("1 finished results wait for chat other-chat")));
+        assert!(waiting_delegation_log_lines(&mut previous, Vec::new()).is_empty());
+        assert_eq!(
+            waiting_delegation_log_lines(&mut previous, waiting()).len(),
+            1
+        );
+    }
 
     #[test]
     fn theme_toggle_dark_to_light() {

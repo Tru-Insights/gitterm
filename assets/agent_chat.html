@@ -6,6 +6,7 @@
 <style>
   :root {
     color-scheme: dark;
+    --chat-width: 60rem;
     --bg: #1e1e2e;
     --bg-alt: #181825;
     --bg-block: #313244;
@@ -60,7 +61,7 @@
   /* Status line, roster and composer share one grey panel. */
   #footer { display: flex; flex-direction: column; gap: 6px; padding: 6px 8px 8px; background: var(--bg-footer); border: 1px solid var(--border); border-radius: 10px; }
   /* The input lines up with the conversation's centred column (see #messages). */
-  #footer { box-sizing: border-box; width: 100%; max-width: calc(46rem + 28px); margin-left: auto; margin-right: auto; }
+  #footer { box-sizing: border-box; width: 100%; max-width: calc(var(--chat-width) + 28px); margin-left: auto; margin-right: auto; }
   #timeline-wrap { flex: 1; position: relative; min-height: 0; }
   #messages {
     position: absolute;
@@ -68,9 +69,8 @@
     overflow-y: auto;
     background: var(--bg-alt);
     border-radius: 8px;
-    /* Wide panes keep the conversation in a centred column, at most 46rem
-       of text, so lines stay readable; narrow panes keep the 14px edge. */
-    padding: 12px max(14px, calc((100% - 46rem) / 2));
+    /* Centre the chosen text width; narrow panes keep the 14px edge. */
+    padding: 12px max(14px, calc((100% - var(--chat-width)) / 2));
     line-height: 1.5;
     /* The page keeps the view still itself when "Show earlier" restores
        blocks above it (TRU-157); a second, engine-side adjustment would
@@ -784,6 +784,11 @@
   // Visuals are reconstructed from successful tool calls already persisted
   // in the conversation, including their full (untruncated) HTML results.
   const htmlRenders = new Set();
+  window.__setChatWidth = (value) => {
+    const widths = { narrow: '46rem', medium: '60rem', wide: '72rem', full: '100%' };
+    if (!Object.hasOwn(widths, value)) throw new Error('Unknown chat width: ' + value);
+    document.documentElement.style.setProperty('--chat-width', widths[value]);
+  };
   let appearance = 'dark';
   window.__setAppearance = (value) => {
     appearance = value === 'light' ? 'light' : 'dark';
