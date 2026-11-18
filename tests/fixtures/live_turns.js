@@ -306,6 +306,421 @@
     send(end);
     check('F1 turn end folds restored and detached runs without losing cards', !document.querySelector('.earlier') && !runs().length && messages.querySelectorAll('.turn-fold details.tool').length === 300 && !messages.querySelector('.tool-run .tool-run') && [...document.querySelectorAll('#messages > .assistant')].some((n) => n.textContent.includes('Finished checking.')));
 
+    // TRU-256: exercise the real find controls and native-key IPC seam.
+    reset();
+    const findBar = document.getElementById('chat-find');
+    const query = document.getElementById('find-query');
+    const count = document.getElementById('find-count');
+    const tools = document.getElementById('find-tools');
+    const findPosts = [];
+    window.ipc = { postMessage: (message) => {
+      const value = JSON.parse(message);
+      findPosts.push(value);
+      if (value.type === 'hostkey' && value.key === 'f') window.__openFind();
+    } };
+    const key = (target, value, options = {}) => {
+      const event = new KeyboardEvent('keydown', { key: value, bubbles: true, cancelable: true, ...options });
+      target.dispatchEvent(event);
+      return event;
+    };
+    const search = (text) => { query.value = text; query.dispatchEvent(new Event('input', { bubbles: true })); };
+    const highlights = () => [...(CSS.highlights.get('chat-find') || [])];
+    const current = () => [...(CSS.highlights.get('chat-find-current') || [])][0];
+    send({ type: 'user_prompt', text: 'Needle first' },
+      H('text_delta', 'An earlier paragraph.\n\n'.repeat(70) + 'A **nee**dle and `NEEDLE`.\n\n```js\nconst needle = 1;\n```'),
+      start('find-tool', 'Bash', { command: 'echo tool-only' }),
+      H('item_completed', { id: 'find-tool', output: 'Needle tool-only', is_error: false }),
+      H('thinking_delta', 'Needle thought'), H('text_delta', 'Needle final'), end);
+    await settle();
+    const originalText = messages.textContent;
+    const originalCode = messages.querySelector('pre code').textContent;
+    const originalFolds = new Map([...messages.querySelectorAll('details')].map((node) => [node, node.open]));
+    const cmdF = key(document.getElementById('prompt'), 'f', { metaKey: true });
+    check('Cmd+F forwards through hostkey and opens a labelled focused input', cmdF.defaultPrevented && findPosts.at(-1)?.key === 'f' && !findBar.hidden && document.activeElement === query && !!query.getAttribute('aria-label') && count.getAttribute('aria-live') === 'polite');
+    search('needle');
+    check('find highlights prose, thinking and code across inline markup with a live count', highlights().length === 6 && highlights().every((r) => r.toString().toLowerCase() === 'needle') && count.textContent === '1 of 6');
+    const firstFind = current().startContainer;
+    const foldedFind = document.querySelector('.turn-fold');
+    check('first match leaves later folded content closed', !foldedFind.open);
+    key(query, 'Enter');
+    const secondFind = current().startContainer;
+    const hitRect = current().getBoundingClientRect(), messageRect = messages.getBoundingClientRect();
+    check('Enter advances in conversation order', count.textContent === '2 of 6' && secondFind !== firstFind);
+    check('navigation scrolls the matching line into view', messages.scrollTop > 0 && hitRect.top >= messageRect.top && hitRect.bottom <= messageRect.bottom);
+    key(query, 'Enter', { shiftKey: true });
+    check('Shift+Enter returns to previous match', count.textContent === '1 of 6' && current().startContainer === firstFind);
+    key(query, 'Enter', { shiftKey: true });
+    check('previous wraps to the last match', count.textContent === '6 of 6' && current().startContainer.parentElement.closest('.assistant')?.textContent.trim() === 'Needle final');
+    key(query, 'Enter');
+    check('next wraps to the first match', count.textContent === '1 of 6');
+    search('Needle thought');
+    check('a match inside a folded turn and thinking card opens both', count.textContent === '1 of 1' && foldedFind.open && current().startContainer.parentElement.closest('details.thinking').open);
+    search('tool-only');
+    check('tool input and result excluded by default', count.textContent === '0 of 0' && !highlights().length && document.getElementById('find-next').disabled);
+    tools.checked = true; tools.dispatchEvent(new Event('change'));
+    check('toggle includes tool input and result and opens nested cards', count.textContent === '1 of 2' && highlights().length === 2 && card('find-tool').open && card('find-tool').closest('.tool-run').open);
+    for (const size of [11, 22]) {
+      window.__setChatFontSize(size);
+      check('find controls scale with chat text at ' + size, [query, count, findBar.querySelector('label'), document.getElementById('find-next')].every((n) => Math.abs(parseFloat(getComputedStyle(n).fontSize) - size * 12 / 14) < 0.01));
+    }
+    window.__setChatFontSize(15);
+    search('needle');
+    check('range highlights leave code copy text unchanged', messages.querySelector('pre code').textContent === originalCode);
+    const beforeEscape = findPosts.length;
+    key(query, 'Escape');
+    check('Esc restores exactly the folds find opened, preserving user-open folds', [...originalFolds].every(([node, open]) => node.open === open) && [...originalFolds.values()].some(Boolean));
+    check('Esc clears every highlight, restores exact transcript text and focuses composer', findBar.hidden && !CSS.highlights.has('chat-find') && !CSS.highlights.has('chat-find-current') && messages.textContent === originalText && document.activeElement.id === 'prompt' && findPosts.length === beforeEscape);
+
+    reset();
+    const historyForFind = [];
+    for (let i = 0; i < 1050; i++) historyForFind.push({ type: 'user_prompt', text: i === 0 ? 'Earlier [a.*] needle' : 'Historical message ' + i + (i === 300 || i === 1000 ? ' needle' : '') });
+    window.__replay(historyForFind);
+    check('history find fixture starts with unloaded earlier messages', !!document.querySelector('.earlier') && !messages.textContent.includes('Earlier [a.*] needle'));
+    const historyNodes = [...messages.children];
+    const earlierControl = messages.querySelector('.earlier');
+    const earlierText = earlierControl.textContent;
+    window.__openFind(); search('no such history text');
+    check('zero-match search leaves all detached history out of layout', messages.childElementCount === historyNodes.length && earlierControl.textContent === earlierText);
+    search('Historical message');
+    check('all matches in the selected history chunk retain their ranges after attachment', highlights().length === 199 && highlights().every((range) => range.toString() === 'Historical message'));
+    search('[a.*]');
+    check('find attaches only the current history chunk and treats query literally', messages.childElementCount === historyNodes.length + 50 && count.textContent === '1 of 1' && current().toString() === '[a.*]' && earlierControl.textContent === earlierText);
+    search('needle');
+    key(query, 'Enter');
+    check('navigating distant history replaces rather than accumulates chunks', count.textContent === '2 of 3' && messages.childElementCount === historyNodes.length + 50 && !messages.textContent.includes('Earlier [a.*] needle'));
+    key(query, 'Enter');
+    check('navigating back to live history detaches the temporary chunk', count.textContent === '3 of 3' && messages.childElementCount === historyNodes.length);
+    key(query, 'Enter');
+    key(query, 'Escape');
+    check('closing restores exact history window and earlier control', messages.childElementCount === historyNodes.length && [...messages.children].every((node, i) => node === historyNodes[i]) && earlierControl.textContent === earlierText && !earlierControl.disabled);
+    earlierControl.click();
+    check('normal history paging works after find closes', messages.childElementCount === historyNodes.length + 50 && messages.textContent.includes('Historical message 899') && !messages.textContent.includes('Earlier [a.*] needle'));
+    // Trimming resumes after find, including when the user has paged back.
+    jump.click();
+    check('following after find trims to the original live window', messages.childElementCount === historyNodes.length);
+
+    // A roster jump pages across the chunk temporarily borrowed by find.
+    window.__resetConversation();
+    const rosterHistory = [];
+    for (let i = 0; i < 1050; i++) {
+      rosterHistory.push({ type: 'user_prompt', text: 'Roster history message ' + i });
+      if (i === 250) rosterHistory.push(H('text_delta', '**rosterdeferredneedle**'), end);
+      if (i === 10) rosterHistory.push({ kind: 'delegation', delegation: {
+        delegation_id: 'history-worker', kind: 'implement', brief: 'Check history',
+        child: { model: 'test-model' }, status: { state: 'completed' },
+        created_at: '2026-11-01T10:00:00Z', updated_at: '2026-11-01T10:01:00Z',
+        result: { handoff: { summary: 'Historical report', decisions: [], next_steps: [], blockers: [] } },
+      } });
+    }
+    window.__replay(rosterHistory);
+    const rosterWindow = [...messages.children];
+    const rosterEarlierText = messages.querySelector('.earlier').textContent;
+    window.__openFind(); search('Roster history message 300');
+    document.querySelector('#roster [data-key="dlg:history-worker"]').click();
+    check('roster jump during find reveals an older worker across the borrowed chunk', !!messages.querySelector('[data-delegation-id="history-worker"]'));
+    key(query, 'Escape');
+    check('Esc after roster paging restores the exact history window', [...messages.children].length === rosterWindow.length && [...messages.children].every((node, i) => node === rosterWindow[i]) && messages.querySelector('.earlier')?.textContent === rosterEarlierText);
+    window.__openFind(); search('Roster history message 300');
+    // Exercise the shared paging handler even though the visible button is
+    // disabled during find, then borrow another chunk before the roster jump.
+    messages.querySelector('.earlier').dispatchEvent(new Event('click'));
+    search('Roster history message 200');
+    document.querySelector('#roster [data-key="dlg:history-worker"]').click();
+    jump.click();
+    key(query, 'Escape');
+    check('multiple paging paths and trimming during find restore the same window', [...messages.children].length === rosterWindow.length && [...messages.children].every((node, i) => node === rosterWindow[i]) && messages.querySelector('.earlier')?.textContent === rosterEarlierText);
+    window.__openFind(); search('rosterdeferredneedle');
+    check('deferred markdown remains searchable after roster paging restoration', count.textContent === '1 of 1' && current().startContainer.parentElement.tagName === 'STRONG');
+    key(query, 'Escape');
+    window.__openFind(); search('Roster history message ');
+    check('search after roster paging still finds every historical message', count.textContent === '1 of 1050');
+    key(query, 'Escape');
+    while (messages.querySelector('.earlier')) messages.querySelector('.earlier').click();
+    const pagedHistory = [...messages.querySelectorAll('.user-msg')].map((node) => node.textContent);
+    check('paging after roster find reaches every message in transcript order', pagedHistory.length === 1050 && pagedHistory.every((text, i) => text === 'Roster history message ' + i));
+
+    reset();
+    const replayForFind = [];
+    for (let i = 0; i < 220; i++) replayForFind.push({ type: 'user_prompt', text: 'Question ' + i }, H('text_delta', i === 0 ? '**deferredneedle**' : 'Answer ' + i), end);
+    window.__resetConversation(); window.__replay(replayForFind);
+    window.__openFind(); search('deferredneedle');
+    const deferredRoot = current().startContainer.parentElement.closest('.assistant');
+    check('find renders only the selected deferred block in its chunk', count.textContent === '1 of 1' && current().startContainer.parentElement.tagName === 'STRONG' && [...messages.querySelectorAll('.assistant')].filter((node) => node !== deferredRoot && !node.textContent).length > 0);
+    key(query, 'Escape');
+    check('closing restores deferred markdown and detached block state', !deferredRoot.isConnected && !deferredRoot.textContent);
+    window.__openFind(); search('deferredneedle');
+    check('restored deferred source is searchable on a later find', count.textContent === '1 of 1' && current().toString() === 'deferredneedle');
+    key(query, 'Escape');
+
+    reset();
+    const longOutput = 'x'.repeat(21000) + ' beyondneedle';
+    send(start('long-find'), H('item_completed', { id: 'long-find', output: longOutput, is_error: false }), end);
+    const truncatedText = messages.textContent;
+    window.__openFind(); search('beyondneedle');
+    check('long tool result stays excluded by default', count.textContent === '0 of 0');
+    // Scope is retained across opening/closing find, so set explicitly here.
+    tools.checked = true; tools.dispatchEvent(new Event('change'));
+    check('find includes full tool output beyond display truncation', count.textContent === '1 of 1' && current().toString() === 'beyondneedle' && card('long-find').open);
+    key(query, 'Escape');
+    check('closing restores truncated tool result text exactly', messages.textContent === truncatedText);
+
+    reset();
+    send({ kind: 'delegation', delegation: {
+      delegation_id: 'find-report', kind: 'implement', brief: 'Check the project',
+      child: { model: 'test-model' }, status: { state: 'completed' },
+      created_at: '2026-11-01T10:00:00Z', updated_at: '2026-11-01T10:00:00Z',
+      result: { handoff: { summary: 'Cardneedle summary', decisions: ['Cardneedle decision'], next_steps: ['Cardneedle next step'], blockers: [] } },
+    } });
+    const report = messages.querySelector('.dlg'); report.open = false;
+    window.__openFind(); search('cardneedle');
+    check('default scope searches agent reports inside closed delegation cards', count.textContent === '1 of 3' && report.open);
+    key(query, 'Escape');
+    send(start('find-subagent', 'Agent', { description: 'Check the project' }), H('subagent_event', { parent_tool_use_id: 'find-subagent', event: { type: 'text_delta', data: 'Subagentneedle response' } }));
+    card('find-subagent').open = false;
+    card('find-subagent').querySelector('.subagent').open = false;
+    window.__openFind(); search('subagentneedle');
+    check('default scope searches subagent writing inside closed tool cards', count.textContent === '1 of 1' && card('find-subagent').open && card('find-subagent').querySelector('.subagent').open);
+    key(query, 'Escape');
+
+    reset();
+    const detachedWorker = {
+      delegation_id: 'detached-find-report', kind: 'implement', brief: 'Check history',
+      child: { model: 'test-model' }, status: { state: 'running' },
+      created_at: '2026-11-01T10:00:00Z', updated_at: '2026-11-01T10:00:00Z',
+    };
+    window.__replay([
+      { kind: 'delegation', delegation: detachedWorker },
+      ...Array.from({ length: 250 }, (_, i) => ({ type: 'user_prompt', text: 'Later prompt ' + i })),
+    ]);
+    check('late worker fixture starts in detached history', !!messages.querySelector('.earlier') && !messages.querySelector('[data-delegation-id="detached-find-report"]'));
+    window.__openFind(); search('lateworkerneedle');
+    check('unfinished detached report has no matches', count.textContent === '0 of 0');
+    await settle(); await settle();
+    send({ kind: 'delegation', delegation: {
+      ...detachedWorker, status: { state: 'completed' },
+      result: { handoff: { summary: 'lateworkerneedle report', decisions: [], next_steps: [], blockers: [] } },
+    } });
+    await settle(); await settle();
+    check('completion in detached history refreshes find without retyping', count.textContent === '1 of 1' && current()?.toString() === 'lateworkerneedle');
+    key(query, 'Escape');
+
+    reset();
+    send({ kind: 'delegation', delegation: {
+      delegation_id: 'find-review', kind: 'review', brief: 'Check the project',
+      child: { model: 'test-model' }, status: { state: 'completed' },
+      created_at: '2026-11-01T10:00:00Z', updated_at: '2026-11-01T10:00:00Z',
+      result: { findings: { verdict: 'needs_changes', summary: 'Review complete', structured: true,
+        findings: [{ id: 'F1', severity: 'P2', title: 'Reviewtitleneedle', body: 'Details' }] } },
+    } });
+    window.__openFind(); search('reviewtitleneedle');
+    check('review finding title counts once despite nested search roots', count.textContent === '1 of 1' && highlights().length === 1);
+    key(query, 'Escape');
+
+    reset();
+    send({ type: 'turn_end', message: { content: [
+      { type: 'thinking', thinking: 'Pi thinkingneedle' },
+      { type: 'toolCall', name: 'Bash', arguments: { command: 'Pi toolneedle' } },
+    ] }, toolResults: ['Pi toolneedle result'] });
+    window.__openFind(); search('thinkingneedle');
+    check('Pi thinking is included in default search scope', count.textContent === '1 of 1');
+    search('toolneedle');
+    check('Pi tool calls and results are excluded by default', count.textContent === '0 of 0');
+    tools.checked = true; tools.dispatchEvent(new Event('change'));
+    check('Pi tool calls and results are included with the toggle', count.textContent === '1 of 2');
+    key(query, 'Escape');
+
+    reset();
+    send(H('text_delta', 'needle [link](https://needle.test) needle chosen needle last'));
+    await settle();
+    window.__openFind(); search('needle'); key(query, 'Enter'); key(query, 'Enter');
+    check('streaming markdown fixture selects the occurrence before chosen', count.textContent === '3 of 4' && current().startContainer.textContent.slice(current().startOffset).startsWith('needle chosen'));
+    send(H('text_delta', '\n'));
+    await settle(); await settle();
+    check('markdown conversion preserves the selected occurrence when URL offsets disappear', count.textContent === '2 of 3' && current().startContainer.textContent.slice(current().startOffset).startsWith('needle chosen'));
+    key(query, 'Escape');
+
+    reset();
+    send(H('text_delta', 'needle **needle** chosen needle last'));
+    await settle();
+    window.__openFind(); search('needle'); key(query, 'Enter');
+    check('raw streaming fixture selects the middle occurrence', count.textContent === '2 of 3' && current().startContainer.textContent.slice(current().startOffset).startsWith('needle** chosen'));
+    send(H('text_delta', ' more'));
+    await settle(); await settle();
+    check('non-newline delta preserves the selected raw markdown occurrence', count.textContent === '2 of 3' && current().startContainer.parentElement.classList.contains('tail') && current().startContainer.textContent.slice(current().startOffset).startsWith('needle** chosen'));
+    send(H('text_delta', '\n'));
+    await settle(); await settle();
+    check('newline after a raw delta preserves the selected bold occurrence', count.textContent === '2 of 3' && current().startContainer.parentElement.tagName === 'STRONG' && current().toString() === 'needle');
+    key(query, 'Escape');
+
+    reset();
+    send(H('text_delta', 'needle **needle** chosen needle last'));
+    await settle();
+    window.__openFind(); search('needle'); key(query, 'Enter');
+    const selectedReply = current().startContainer.parentElement.closest('.assistant');
+    send(H('text_delta', '\nneedle **needle** chosen needle last'));
+    await settle(); await settle();
+    check('completing a line and repeating it in the raw tail keeps occurrence two', count.textContent === '2 of 6' && current().startContainer.parentElement.tagName === 'STRONG' && current().startContainer.parentElement.closest('.assistant') === selectedReply);
+    send(H('text_delta', '\n'), end, H('text_delta', 'needle **needle** chosen needle last'));
+    await settle(); await settle();
+    check('later rendered lines and replies cannot move the selected occurrence', count.textContent === '2 of 9' && current().startContainer.parentElement.tagName === 'STRONG' && current().startContainer.parentElement.closest('.assistant') === selectedReply);
+    key(query, 'Escape');
+
+    reset();
+    send(H('text_delta', 'needle earlier'), end,
+      H('text_delta', 'needle first needle second needle third'), end,
+      H('text_delta', 'needle later'), end);
+    await settle();
+    window.__openFind(); search('needle');
+    for (let i = 0; i < 3; i++) key(query, 'Enter');
+    const rewrittenReply = current().startContainer.parentElement.closest('.assistant');
+    rewrittenReply.textContent = 'needle remaining';
+    await settle(); await settle();
+    check('removing the selected occurrence uses the nearest remaining one in the reply', count.textContent === '2 of 3' && current().startContainer.parentElement === rewrittenReply);
+    rewrittenReply.textContent = 'No matches remain in this reply';
+    await settle(); await settle();
+    check('removing all reply matches uses the nearest occurrence in another reply', count.textContent === '2 of 2' && current().startContainer.textContent.startsWith('needle later'));
+    current().startContainer.parentElement.closest('.assistant').remove();
+    await settle(); await settle();
+    check('removing the selected reply falls back to the preceding surviving match', count.textContent === '1 of 1' && current().startContainer.textContent.startsWith('needle earlier'));
+    key(query, 'Escape');
+
+    reset();
+    send(H('text_delta', 'needle [link](https://needle.test) **needle** chosen needle last'));
+    await settle();
+    window.__openFind(); search('needle'); key(query, 'Enter'); key(query, 'Enter');
+    check('inline markdown fixture selects the bold source occurrence', count.textContent === '3 of 4' && current().startContainer.textContent.slice(current().startOffset).startsWith('needle** chosen'));
+    send(H('text_delta', ' more'));
+    await settle(); await settle();
+    check('raw delta keeps the visible source ordinal even with a URL-only hit before it', count.textContent === '3 of 4' && current().startContainer.textContent.slice(current().startOffset).startsWith('needle** chosen'));
+    send(H('text_delta', '\n'));
+    await settle(); await settle();
+    check('inline markdown conversion preserves the selected bold occurrence', count.textContent === '2 of 3' && current().startContainer.parentElement.tagName === 'STRONG' && current().toString() === 'needle');
+    key(query, 'Escape');
+
+    // Run only the streaming paint, then navigate before the find frame.
+    for (const backwards of [false, true]) {
+      reset();
+      send(H('text_delta', 'needle [link](https://needle.test) needle chosen needle last'));
+      await settle();
+      window.__openFind(); search('needle'); key(query, 'Enter'); key(query, 'Enter');
+      await settle(); await settle();
+      const quietNode = messages.querySelector('.user-msg').firstChild;
+      const dataProperty = Object.getOwnPropertyDescriptor(CharacterData.prototype, 'data');
+      let quietReads = 0;
+      Object.defineProperty(quietNode, 'data', { configurable: true, get() { quietReads++; return dataProperty.get.call(this); } });
+      send(H('text_delta', '\n'));
+      frames.shift()(performance.now());
+      // Cover both undelivered records and a delivered observer callback whose
+      // refresh frame has not run yet.
+      if (backwards) await Promise.resolve();
+      key(query, 'Enter', { shiftKey: backwards });
+      check('navigation leaves unchanged blocks unscanned (' + (backwards ? 'previous' : 'next') + ')', quietReads === 0);
+      delete quietNode.data;
+      check('navigation refreshes streamed matches before the observer frame (' + (backwards ? 'previous' : 'next') + ')', count.textContent === (backwards ? '1 of 3' : '3 of 3') && current().startContainer.textContent.slice(current().startOffset).startsWith(backwards ? 'needle ' : 'needle last'));
+      key(query, 'Escape');
+      await settle();
+    }
+
+    reset();
+    send(H('text_delta', '**prefix** ' + 'needle repeated '.repeat(12)));
+    await settle();
+    window.__openFind(); search('needle');
+    for (let i = 0; i < 5; i++) key(query, 'Enter');
+    send(H('text_delta', '\n'));
+    await settle(); await settle();
+    check('identical context after a markdown prefix preserves occurrence six', count.textContent === '6 of 12');
+    key(query, 'Escape');
+
+    reset();
+    send(H('text_delta', 'needle repeated '.repeat(12)));
+    await settle();
+    window.__openFind(); search('needle');
+    for (let i = 0; i < 5; i++) key(query, 'Enter');
+    send(H('text_delta', '\n'));
+    await settle(); await settle();
+    check('identical streaming context keeps the nearest occurrence in its block', count.textContent === '6 of 12');
+    key(query, 'Escape');
+
+    reset(); tools.checked = false;
+    send(H('text_delta', 'Needle first\nNeedle second'));
+    await settle();
+    window.__openFind(); search('needle'); key(query, 'Enter');
+    const streamRoot = current().startContainer.parentElement.closest('.assistant');
+    const streamTop = messages.scrollTop;
+    send(H('text_delta', '\nNeedle third'));
+    await settle(); await settle();
+    check('streaming updates count without losing selected match or scroll', count.textContent === '2 of 3' && current().startContainer.parentElement.closest('.assistant') === streamRoot && messages.scrollTop === streamTop && current().toString() === 'Needle');
+    send(start('stream-find'), done('stream-find'), H('text_delta', 'All finished.'), end);
+    await settle();
+    check('turn folding keeps the current streaming match expanded', count.textContent === '2 of 3' && streamRoot.closest('.turn-fold')?.open);
+    key(query, 'Escape');
+
+    reset();
+    send(H('text_delta', 'Earlier line.\n'.repeat(100) + 'needle at the end'));
+    await settle();
+    window.__openFind(); search('needle');
+    const beforeGrowth = messages.scrollTop;
+    messages.dispatchEvent(new Event('scroll')); // Reaching bottom must not restart live follow.
+    send(H('text_delta', '\nNew streaming line.'.repeat(100)));
+    await settle(); await settle();
+    check('stream growth at the bottom cannot scroll the selected match away', beforeGrowth > 0 && messages.scrollTop === beforeGrowth && count.textContent === '1 of 1' && current().getBoundingClientRect().bottom <= messages.getBoundingClientRect().bottom);
+    key(query, 'Escape');
+
+    reset();
+    send(H('text_delta', '```js\nconst ' + 'x'.repeat(300) + ' = "horizontalneedle";\n```'), end);
+    window.__openFind(); search('horizontalneedle');
+    const codeScroller = current().startContainer.parentElement.closest('pre');
+    const codeHit = current().getBoundingClientRect(), codeBox = codeScroller.getBoundingClientRect();
+    check('find scrolls long code lines horizontally into view', codeScroller.scrollLeft > 0 && codeHit.left >= codeBox.left && codeHit.right <= codeBox.right);
+    key(query, 'Escape');
+
+    check('closing restores horizontal code scroll', codeScroller.scrollLeft === 0);
+
+    reset();
+    send(H('text_delta', 'Follow test line.\n'.repeat(100)));
+    await settle();
+    jump.click();
+    window.__openFind(); search('Follow test'); key(query, 'Escape');
+    await settle();
+    send(H('text_delta', 'New followed line.\n'.repeat(20)));
+    await settle();
+    check('following before find resumes following after Esc and stream growth', messages.scrollHeight - messages.clientHeight - messages.scrollTop < 2 && !jump.classList.contains('visible'));
+    messages.dispatchEvent(new Event('wheel'));
+    messages.scrollTop = 100;
+    messages.dispatchEvent(new Event('scroll'));
+    const readerTop = messages.scrollTop;
+    window.__openFind(); search('New followed'); key(query, 'Escape');
+    await settle();
+    send(H('text_delta', 'Additional line.\n'.repeat(20)));
+    await settle();
+    check('a reader not following before find keeps their original position after Esc', readerTop === 100 && messages.scrollTop === readerTop && jump.classList.contains('visible'));
+
+    // Older supported WebKit must search without the CSS Highlight API.
+    reset();
+    send(H('text_delta', 'Legacyneedle first and legacyneedle second.'), end);
+    const oldWebkitText = messages.textContent;
+    const highlightApi = window.Highlight;
+    const highlightRegistry = Object.getOwnPropertyDescriptor(CSS, 'highlights');
+    window.Highlight = undefined;
+    Object.defineProperty(CSS, 'highlights', { value: undefined, configurable: true });
+    window.__openFind(); search('legacyneedle');
+    await settle();
+    check('older WebKit paints range overlays without altering transcript text', count.textContent === '1 of 2' && document.querySelectorAll('.find-hit').length >= 2 && !!document.querySelector('.find-hit.current') && messages.textContent === oldWebkitText);
+    key(query, 'Enter');
+    check('older WebKit retains keyboard navigation', count.textContent === '2 of 2');
+    key(query, 'Escape');
+    check('older WebKit clears overlays and preserves exact transcript text', !document.querySelector('.find-hit') && findBar.hidden && messages.textContent === oldWebkitText);
+    window.Highlight = highlightApi;
+    Object.defineProperty(CSS, 'highlights', highlightRegistry);
+
+    // Leave a compact synthetic example for --screenshot.
+    reset();
+    send({ type: 'user_prompt', text: 'Where is the chat search implemented?' },
+      H('text_delta', 'The **chat search** lives in the current conversation.\n\nIt finds text in earlier messages, folded turns, and code:\n\n```js\nconst search = "plain text";\n```'),
+      start('screenshot-search'), done('screenshot-search'), H('text_delta', 'Use Enter to move to the next search match, or Shift+Enter to go back.'), end);
+    await settle();
+    window.__openFind(); search('search'); key(query, 'Enter');
+
     check('no event-render errors', ![...document.querySelectorAll('.error-block')].some((n) => n.textContent.startsWith('Chat view could not render')));
   } catch (error) {
     results.push('FAIL ' + error.stack);
@@ -313,6 +728,7 @@
   window.requestAnimationFrame = requestFrame;
   const result = document.createElement('pre');
   result.id = 'live-turn-test-result';
+  result.hidden = true;
   result.textContent = results.join('\n');
   document.body.appendChild(result);
 })();
