@@ -5214,6 +5214,28 @@ struct PendingTaskProgress {
     changes: Option<ChangedFilesSummary>,
 }
 
+#[cfg(not(test))]
+use Event::SlideScrolled as workspace_slide_scrolled;
+
+// Iced's Viewport fields are private; tests feed the same scalar into the real arm.
+#[cfg(test)]
+fn workspace_slide_scrolled(viewport: scrollable::Viewport) -> Event {
+    Event::SlideScrolled(viewport.absolute_offset().x)
+}
+
+macro_rules! status_now {
+    () => {{
+        #[cfg(test)]
+        {
+            baseline_tests::now()
+        }
+        #[cfg(not(test))]
+        {
+            Instant::now()
+        }
+    }};
+}
+
 // Tab state. Tab-kind data structures live in `src/tab/mod.rs`; the heavy `impl TabState`
 // methods (load_file, fetch_status, fetch_diff, fetch_claude_config, fetch_agent_activity, etc.)
 // stay here because they reference too many in-binary helpers, constants, and macros.
@@ -7323,7 +7345,10 @@ pub enum Event {
     // Edge peek events
     EdgePeekEnter(bool), // true=right, false=left
     EdgePeekExit,
+    #[cfg(not(test))]
     SlideScrolled(scrollable::Viewport),
+    #[cfg(test)]
+    SlideScrolled(f32),
     HorizontalStripHover(HorizontalStrip, bool),
     WheelScrolled(iced::event::Status, iced::mouse::ScrollDelta),
     // Bottom panel events (expand/collapse, height)
@@ -10462,6 +10487,8 @@ impl App {
     }
 
     fn sync_visible_terminals(&mut self) {
+        #[cfg(test)]
+        baseline_tests::observe("terminals");
         self.terminal_redraws.clear();
         let console_expanded = self.console_expanded;
         let Some(workspace) = self.active_workspace_mut() else {
@@ -10798,6 +10825,8 @@ impl App {
     }
 
     fn mark_workspaces_dirty(&mut self) {
+        #[cfg(test)]
+        baseline_tests::observe("dirty");
         self.workspaces_dirty = true;
         self.next_workspace_save_at =
             Some(Instant::now() + Duration::from_millis(WORKSPACES_SAVE_DEBOUNCE_MS));
@@ -10862,6 +10891,8 @@ impl App {
     /// Push the active workspace's markdown document directories into
     /// `ServerState` so the local viewer routes can resolve them.
     fn sync_plans_dir(&self) {
+        #[cfg(test)]
+        baseline_tests::observe("plans+docs");
         let workspace_dir = self
             .workspaces
             .get(self.active_workspace_idx)
@@ -11051,6 +11082,12 @@ impl App {
         tab_id: usize,
         fallback_root: PathBuf,
     ) -> Task<Event> {
+        #[cfg(test)]
+        if !matches!(source, WorkspaceSource::Local { .. })
+            && baseline_tests::request(format!("source:{tab_id}:{source:?}"))
+        {
+            return Task::none();
+        }
         if let WorkspaceSource::Local { root } = source {
             return Self::request_local_git_status(tab_id, root);
         }
@@ -11098,6 +11135,10 @@ impl App {
     }
 
     fn request_local_git_status(tab_id: usize, repo_path: PathBuf) -> Task<Event> {
+        #[cfg(test)]
+        if baseline_tests::request(format!("local:{tab_id}:{}", repo_path.display())) {
+            return Task::none();
+        }
         let fallback_repo_path = repo_path.clone();
         Task::perform(
             async move {
@@ -22239,6 +22280,8 @@ fi
     }
 
     fn ensure_active_remote_agent_connection(&mut self, force: bool) -> Task<Event> {
+        #[cfg(test)]
+        baseline_tests::observe("connect");
         let Some(remote_id) = self
             .active_workspace()
             .and_then(|workspace| self.remote_agent_id_for_workspace(workspace))
@@ -22432,6 +22475,8 @@ fi
     }
 
     fn refresh_worktrees_for_active_tab(&mut self) -> Task<Event> {
+        #[cfg(test)]
+        baseline_tests::observe("worktrees");
         if self.active_workspace_is_remote() {
             return Task::none();
         }
@@ -22459,6 +22504,8 @@ fi
     }
 
     fn refresh_files_for_active_tab(&mut self) -> Task<Event> {
+        #[cfg(test)]
+        baseline_tests::observe("files");
         let refresh = self
             .active_tab()
             .filter(|tab| tab.sidebar_mode == SidebarMode::Files)
@@ -22490,7 +22537,7 @@ fi
         let mut files_jump = None;
         if let Some(tab) = self.active_tab_mut() {
             tab.git_status_loading = true;
-            tab.last_poll = Instant::now();
+            tab.last_poll = status_now!();
             tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
             tab.git_unchanged_streak = 0;
             tab.last_git_status_hash = None;
@@ -24793,12 +24840,12 @@ fi
                         };
 
                         if !tab.git_status_loading
-                            && tab.last_poll.elapsed()
+                            && status_now!().saturating_duration_since(tab.last_poll)
                                 >= Duration::from_millis(effective_git_poll_interval_ms)
                         {
                             let tab_id = tab.id;
                             let repo_path = tab.repo_path.clone();
-                            tab.last_poll = Instant::now();
+                            tab.last_poll = status_now!();
                             tab.git_status_loading = true;
                             tasks.push(Self::request_source_git_status(
                                 poll_source.clone(),
@@ -27921,6 +27968,8 @@ fi
                         }
                         Some(GlobalShortcut::SelectWorkspace(num)) => {
                             if let Some(idx) = self.visible_workspace_at(num) {
+                                #[cfg(test)]
+                                baseline_tests::observe(&format!("select-command:{idx}"));
                                 return Task::done(Event::WorkspaceSelect(idx));
                             }
                         }
@@ -28294,6 +28343,8 @@ fi
                 if let Some(GlobalShortcut::SelectWorkspace(num)) = global_shortcut(&key, modifiers)
                 {
                     if let Some(idx) = self.visible_workspace_at(num) {
+                        #[cfg(test)]
+                        baseline_tests::observe(&format!("select-command:{idx}"));
                         return Task::done(Event::WorkspaceSelect(idx));
                     }
                 }
@@ -30394,9 +30445,11 @@ fi
                     std::sync::Mutex::new(None);
                 let was_sleeping = if let Ok(mut last) = LAST_FOCUS.lock() {
                     let sleeping = last
-                        .map(|t| t.elapsed() > Duration::from_secs(300))
+                        .map(|t| {
+                            status_now!().saturating_duration_since(t) > Duration::from_secs(300)
+                        })
                         .unwrap_or(false);
-                    *last = Some(std::time::Instant::now());
+                    *last = Some(status_now!());
                     sleeping
                 } else {
                     false
@@ -30408,7 +30461,7 @@ fi
                     if let Some(tab) = self.active_tab_mut() {
                         tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
                         tab.git_unchanged_streak = 0;
-                        tab.last_poll = Instant::now() - Duration::from_secs(60);
+                        tab.last_poll = status_now!() - Duration::from_secs(60);
                     }
                 }
                 self.request_open_pr_refreshes();
@@ -31312,7 +31365,7 @@ fi
                             tab.staged.len() + tab.unstaged.len() + tab.untracked.len()
                         );
 
-                        tab.last_poll = Instant::now();
+                        tab.last_poll = status_now!();
                     }
                 }
             }
@@ -31984,7 +32037,10 @@ fi
                 if !self.slide_animating {
                     let viewport_width = self.content_viewport_width();
                     if viewport_width > 0.0 {
+                        #[cfg(not(test))]
                         let offset = viewport.absolute_offset().x;
+                        #[cfg(test)]
+                        let offset = viewport;
                         self.slide_offset = offset;
                         self.last_user_scroll = Some(Instant::now());
                         if self.slide_from.is_none() {
@@ -32789,6 +32845,8 @@ fi
     /// `present_active_tab_surfaces` instead when the active tab may need its
     /// file HTML loaded or its chat created / replayed.
     fn dismiss_viewer_surface(&mut self) {
+        #[cfg(test)]
+        baseline_tests::observe("dismiss");
         webview::set_visible(WebviewSurface::Viewer, false);
         self.set_viewer_webview(ViewerWebview::None);
         self.settle_agent_surface();
@@ -32862,7 +32920,7 @@ fi
         }
         match mode {
             SidebarMode::Git => {
-                tab.last_poll = Instant::now();
+                tab.last_poll = status_now!();
                 tab.git_status_loading = true;
                 let tab_id = tab.id;
                 let repo_path = tab.repo_path.clone();
@@ -33015,6 +33073,8 @@ fi
     /// HTML on the Viewer surface, else its chat page (built and replayed only
     /// if the tab has no live page), else nothing.
     fn present_active_tab_surfaces(&mut self) -> Task<Event> {
+        #[cfg(test)]
+        baseline_tests::observe("present");
         self.prune_agent_pages();
         if let Some(html) = self.active_inline_webview_html() {
             let bounds = self.calculate_webview_bounds();
@@ -33028,6 +33088,8 @@ fi
     /// Show the surface `visible_webview_surface` selects and hide the other,
     /// keeping whatever the Viewer surface currently presents.
     fn apply_webview_surfaces(&mut self) -> Task<Event> {
+        #[cfg(test)]
+        baseline_tests::observe("surfaces");
         self.prune_agent_pages();
         match self.visible_webview_surface() {
             VisibleSurface::Viewer => {
@@ -39307,7 +39369,7 @@ fi
                     scrollable::Scrollbar::new().width(0).scroller_width(0),
                 ))
                 .id(workspace_scrollable_id())
-                .on_scroll(Event::SlideScrolled)
+                .on_scroll(workspace_slide_scrolled)
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .style(|_theme, _status| {
@@ -55439,3 +55501,7 @@ mod tests {
         assert!(error.contains("/w/api"), "{error}");
     }
 }
+
+#[cfg(test)]
+#[path = "baseline_tests.rs"]
+mod baseline_tests;
