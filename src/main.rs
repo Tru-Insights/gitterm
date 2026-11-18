@@ -4463,14 +4463,8 @@ fn is_harness_token(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && !value.contains(char::is_whitespace)
 }
 
-/// Where ACP chats keep the agents' support files (Gemini's system
-/// settings), inside this instance's config dir.
-fn acp_support_dir() -> PathBuf {
-    config::global_config_dir().join("acp")
-}
-
-/// The config a new Gemini or OpenCode chat tab starts with (TRU-153): the
-/// configured model (`chat.gemini_model` / `chat.opencode_model`; empty
+/// The config a new Antigravity or OpenCode chat tab starts with (TRU-153): the
+/// configured model (`chat.antigravity_model` / `chat.opencode_model`; empty
 /// keeps the agent's own) and the agent's default mode, which asks before
 /// edits and shell commands.
 fn new_acp_chat_config(
@@ -4479,7 +4473,8 @@ fn new_acp_chat_config(
 ) -> AgentBackendConfig {
     use gitterm::harness::acp::AcpAgent;
     let model = match agent {
-        AcpAgent::Gemini => chat_config.gemini_model.trim().to_string(),
+        AcpAgent::Antigravity => chat_config.antigravity_model.trim().to_string(),
+        AcpAgent::Gemini => String::new(),
         AcpAgent::OpenCode => chat_config.opencode_model.trim().to_string(),
     };
     AgentBackendConfig::Acp {
@@ -7176,7 +7171,7 @@ pub enum Event {
     /// Open a native Claude chat tab in the active workspace (TRU-140),
     /// the + menu's "New chat".
     NewClaudeChatTab,
-    /// Open a Gemini or OpenCode chat tab in the active (local) workspace
+    /// Open an Antigravity or OpenCode chat tab in the active (local) workspace
     /// (TRU-153).
     NewAcpChatTab(gitterm::harness::acp::AcpAgent),
     /// The + menu's "CLI" entry: show the agent presets (TRU-143).
@@ -11289,7 +11284,9 @@ impl App {
         );
         // A session that has spawned (or has a conversation to resume) is
         // bound to the directory it started in.
-        let reason = if tab.task_id.is_some() {
+        let reason = if let Some(note) = session.config.read_only_note() {
+            Some(note)
+        } else if tab.task_id.is_some() {
             Some("This chat belongs to a task and runs in the task's worktree")
         } else if session.harness.is_some() || session.session_id.is_some() {
             Some("Set when the chat started; start a new chat to change it")
@@ -11332,7 +11329,7 @@ impl App {
 
     /// The composer chips' starting state for a native chat page: the tab's
     /// configured model and effort, its checkout, and which harness drives
-    /// it (`harness`: name, and `acp` for Gemini/OpenCode, whose modes the
+    /// it (`harness`: name, and `acp` for Antigravity/OpenCode, whose modes the
     /// page takes from `ready` and whose messages wait for the turn to end).
     /// `None` for pi tabs.
     fn chat_composer_state(&self, tab_id: usize) -> Option<serde_json::Value> {
@@ -11355,6 +11352,7 @@ impl App {
             "effort": session.config.chat_effort(),
             "checkout": self.chat_checkout_state(tab_id)?,
             "harness": harness,
+            "readOnlyReason": session.config.read_only_note(),
         }))
     }
 
@@ -13436,7 +13434,8 @@ impl App {
             let provider = match gitterm::workers::provider_for_command(command) {
                 gitterm::workers::WorkerProvider::Claude => gitterm::plan_limits::Provider::Claude,
                 gitterm::workers::WorkerProvider::Codex => gitterm::plan_limits::Provider::Codex,
-                gitterm::workers::WorkerProvider::Other => return false,
+                gitterm::workers::WorkerProvider::Other
+                | gitterm::workers::WorkerProvider::Antigravity => return false,
             };
             origin.policy_blocked(
                 &self.plan_limits.evaluation_for_launch(),
@@ -22810,6 +22809,9 @@ fi
                     Some(session) => TabRuns::Chat(SessionInput {
                         harness: match session.backend() {
                             tab::AgentBackend::Claude => Harness::Claude,
+                            tab::AgentBackend::Acp(
+                                gitterm::harness::acp::AcpAgent::Antigravity,
+                            ) => Harness::Antigravity,
                             tab::AgentBackend::Acp(gitterm::harness::acp::AcpAgent::Gemini) => {
                                 Harness::Gemini
                             }
@@ -24793,6 +24795,17 @@ fi
                     }
                     _ => unreachable!(),
                 };
+                if let Some(note) = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| ws.tabs.iter())
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.agent_session())
+                    .and_then(|s| s.config.read_only_note())
+                {
+                    agent_webview_note(tab_id, note);
+                    return Task::none();
+                }
                 let mut submitted = false;
                 // Find the tab. If it's an Agent tab, ensure a subprocess
                 // manager is spawned (lazy on first prompt) and forward the
@@ -24931,7 +24944,6 @@ fi
                                 let Some(config) = session.acp_session_config(
                                     repo_path,
                                     std::mem::take(&mut acp_mcp_servers),
-                                    acp_support_dir(),
                                     guidelines,
                                 ) else {
                                     return Task::none();
@@ -25245,6 +25257,10 @@ fi
                     eprintln!("AgentSetPermissionMode: tab {tab_id} is not an agent tab");
                     return Task::none();
                 };
+                if let Some(note) = session.config.read_only_note() {
+                    agent_webview_note(tab_id, note);
+                    return Task::none();
+                }
                 // Claude's modes are known here; an ACP agent lists its own
                 // and refuses one it does not offer.
                 let permission_mode = match &mut session.config {
@@ -25322,6 +25338,10 @@ fi
                     eprintln!("AgentSetModel: tab {tab_id} is not an agent tab");
                     return Task::none();
                 };
+                if let Some(note) = session.config.read_only_note() {
+                    agent_webview_note(tab_id, note);
+                    return Task::none();
+                }
                 let is_claude = session.backend() == tab::AgentBackend::Claude;
                 let configured = match &mut session.config {
                     tab::AgentBackendConfig::Claude {
@@ -25376,6 +25396,10 @@ fi
                     eprintln!("AgentSetEffort: tab {tab_id} is not an agent tab");
                     return Task::none();
                 };
+                if let Some(note) = session.config.read_only_note() {
+                    agent_webview_note(tab_id, note);
+                    return Task::none();
+                }
                 let is_claude = session.backend() == tab::AgentBackend::Claude;
                 let configured = match &mut session.config {
                     tab::AgentBackendConfig::Claude {
@@ -26085,6 +26109,9 @@ fi
                 return Task::batch([scroll_task, self.present_active_tab_surfaces()]);
             }
             Event::NewAcpChatTab(agent) => {
+                if !gitterm::harness::acp::AcpAgent::ALL.contains(&agent) {
+                    return Task::none();
+                }
                 self.tab_picker_visible = false;
                 // ACP chats run on this Mac only in this slice (TRU-153);
                 // the picker does not offer them in a remote workspace.
@@ -26522,7 +26549,7 @@ fi
                                             // respawn starts on this model,
                                             // and new Claude chats may start
                                             // on it too (ACP chats start on
-                                            // `chat.gemini_model` /
+                                            // `chat.antigravity_model` /
                                             // `chat.opencode_model`).
                                             match &mut session.config {
                                                 tab::AgentBackendConfig::Claude {
@@ -32801,6 +32828,10 @@ fi
         else {
             return Task::none();
         };
+        if session.config.read_only_note().is_some() {
+            session.history = tab::HistoryLoad::Loaded;
+            return Task::none();
+        }
         let Some(session_id) = session.history_to_load().map(str::to_string) else {
             return Task::none();
         };
@@ -32829,12 +32860,8 @@ fi
                 document_places.as_ref(),
                 task_tools,
             );
-            let Some(config) = session.acp_session_config(
-                repo_path,
-                acp_mcp_servers,
-                acp_support_dir(),
-                guidelines,
-            ) else {
+            let Some(config) = session.acp_session_config(repo_path, acp_mcp_servers, guidelines)
+            else {
                 return Task::none();
             };
             eprintln!(
@@ -34350,7 +34377,7 @@ fi
                 theme.accent(),
                 Event::NewClaudeChatTab,
             ));
-            // Gemini and OpenCode chats run on this Mac only (TRU-153).
+            // Antigravity and OpenCode chats run on this Mac only (TRU-153).
             let local_workspace = self
                 .active_workspace()
                 .is_some_and(|ws| remote_agent_root(&ws.location).is_none());
@@ -34364,7 +34391,8 @@ fi
                         format!("New {} chat", agent.label()),
                         format!("{} · {model}", agent.label()),
                         match agent {
-                            gitterm::harness::acp::AcpAgent::Gemini => "\u{2727}", // ✧
+                            gitterm::harness::acp::AcpAgent::Antigravity
+                            | gitterm::harness::acp::AcpAgent::Gemini => "\u{2727}", // ✧
                             gitterm::harness::acp::AcpAgent::OpenCode => "\u{25c7}", // ◇
                         }
                         .to_string(),
@@ -50576,9 +50604,11 @@ mod tests {
     fn agent_chat_page_sends_while_claude_works() {
         let html = agent_chat_html();
         // Claude tabs send mid-turn; a pending request still blocks.
-        assert!(html.contains("submitBtn.disabled = !sendAllowed(busy, pending.size, steerable);"));
+        assert!(html.contains(
+            "submitBtn.disabled = !!readOnlyReason || !sendAllowed(busy, pending.size, steerable);"
+        ));
         assert!(html.contains("return pendingCount === 0 && (!isBusy || canSteer);"));
-        assert!(html.contains("steerable = permissionMode != null;"));
+        assert!(html.contains("steerable = !readOnlyReason && permissionMode != null;"));
         // Queued markers: withdraw, lifecycle, refused withdraw, exit.
         assert!(html.contains("postIpc({ type: 'withdraw', id });"));
         assert!(html.contains("case 'message_lifecycle':"));
@@ -50590,15 +50620,15 @@ mod tests {
     fn new_acp_chats_start_on_the_configured_model_and_default_mode() {
         use gitterm::harness::acp::AcpAgent;
         let chat = config::ChatDefaults::default();
-        match new_acp_chat_config(&chat, AcpAgent::Gemini) {
+        match new_acp_chat_config(&chat, AcpAgent::Antigravity) {
             AgentBackendConfig::Acp {
                 agent,
                 model,
                 mode,
                 effort,
             } => {
-                assert_eq!(agent, AcpAgent::Gemini);
-                assert_eq!(model, "gemini-4-argon");
+                assert_eq!(agent, AcpAgent::Antigravity);
+                assert_eq!(model, "gemini-4-argon-medium");
                 assert_eq!(mode.as_deref(), Some("default"));
                 assert_eq!(effort, None);
             }

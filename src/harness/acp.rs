@@ -1,6 +1,6 @@
 //! Native ACP session (TRU-153): one long-lived agent process that speaks
 //! the Agent Client Protocol, JSON-RPC 2.0 over stdio, protocol version 1
-//! (agentclientprotocol.com). Gemini CLI (`gemini --acp`) and OpenCode
+//! (agentclientprotocol.com). Antigravity (`agy acp`) and OpenCode
 //! (`opencode acp`) run on this adapter.
 //!
 //! GitTerm is the ACP *client*: it calls `initialize`, `session/new` or
@@ -46,16 +46,8 @@ const STDERR_TAIL_LINES: usize = 20;
 /// awaiting it, so the replay counts as done once no history update has
 /// arrived for this long after the response.
 const HISTORY_QUIET: Duration = Duration::from_millis(400);
-/// The macOS keychain item (generic password, by service) holding the
-/// Gemini API key.
-pub const GEMINI_KEYCHAIN_SERVICE: &str = "gemini-api-key";
-const GEMINI_API_KEY_ENV: &str = "GEMINI_API_KEY";
-/// Gemini CLI reads its system-level settings from this path when set.
-const GEMINI_SYSTEM_SETTINGS_ENV: &str = "GEMINI_CLI_SYSTEM_SETTINGS_PATH";
-/// Gemini CLI trusts the workspace folder of a process with this set to `true`.
-const GEMINI_TRUST_WORKSPACE_ENV: &str = "GEMINI_CLI_TRUST_WORKSPACE";
-/// Where Gemini CLI looks for system settings on macOS without the override.
-const GEMINI_DEFAULT_SYSTEM_SETTINGS: &str = "/Library/Application Support/GeminiCli/settings.json";
+/// Saved Gemini chats retain their identity, but never start another process.
+pub const GEMINI_REPLACED_NOTE: &str = "Gemini was replaced by Antigravity; this chat can't be continued. Saved Gemini tabs contain no transcript, so earlier messages are unavailable after restart.";
 /// OpenCode merges this JSON into its configuration (verified with 2.0.32:
 /// an agent defined here shows up in `session/new`'s mode options).
 const OPENCODE_CONFIG_CONTENT_ENV: &str = "OPENCODE_CONFIG_CONTENT";
@@ -100,15 +92,18 @@ fn truncate_output(mut s: String) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AcpAgent {
-    Gemini,
+    Antigravity,
     OpenCode,
+    /// Legacy saved state only; excluded from new-chat choices.
+    Gemini,
 }
 
 impl AcpAgent {
-    pub const ALL: [AcpAgent; 2] = [AcpAgent::Gemini, AcpAgent::OpenCode];
+    pub const ALL: [AcpAgent; 2] = [AcpAgent::Antigravity, AcpAgent::OpenCode];
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Antigravity => "Antigravity",
             Self::Gemini => "Gemini",
             Self::OpenCode => "OpenCode",
         }
@@ -116,17 +111,18 @@ impl AcpAgent {
 
     pub fn program(self) -> &'static str {
         match self {
+            Self::Antigravity => "agy",
             Self::Gemini => "gemini",
             Self::OpenCode => "opencode",
         }
     }
 
-    /// The session mode a new chat starts in: Gemini's `default` prompts
+    /// The session mode a new chat starts in: Antigravity's `default` prompts
     /// for approval; OpenCode's `build` agent asks before edits and shell
     /// under GitTerm's permission config.
     pub fn default_mode(self) -> &'static str {
         match self {
-            Self::Gemini => "default",
+            Self::Antigravity | Self::Gemini => "default",
             Self::OpenCode => "build",
         }
     }
@@ -136,12 +132,13 @@ impl AcpAgent {
         "plan"
     }
 
-    /// The MCP server name this agent sees. Gemini CLI's policy engine
+    /// The MCP server name this agent sees. Antigravity accepts these names
+    /// (verified with 1.5.11); retain the hyphens used by Gemini's policy engine, which
     /// splits `mcp_<server>_<tool>` at the first underscore after `mcp_`,
     /// so its server names use hyphens.
     pub fn mcp_server_name(self, name: &str) -> String {
         match self {
-            Self::Gemini => name.replace('_', "-"),
+            Self::Antigravity | Self::Gemini => name.replace('_', "-"),
             Self::OpenCode => name.to_string(),
         }
     }
@@ -165,123 +162,33 @@ fn opencode_config_content_with_guidelines(
     config
 }
 
-/// Gemini has no ACP system-instruction field; its first ACP prompt carries
-/// the guidelines as a clearly delimited preamble. OpenCode reads the shared
-/// file through its native `instructions` configuration.
-#[derive(Clone, Copy)]
-enum GuidelinesChannel {
-    FirstPrompt,
-    ConfigFile,
+/// Antigravity's native ACP instruction extension (1.5.11). User prompts
+/// stay untouched; OpenCode continues to read its instructions config file.
+fn session_params(config: &AcpSessionConfig, mcp_servers: Vec<Value>) -> Value {
+    let mut params = json!({"cwd": config.cwd, "mcpServers": mcp_servers});
+    if config.agent == AcpAgent::Antigravity {
+        if let Some(guidelines) = &config.guidelines {
+            params["_meta"] = json!({"antigravity": {"systemPrompt": {"append": guidelines.text}}});
+        }
+    }
+    params
 }
 
-fn guidelines_channel(agent: AcpAgent) -> Option<GuidelinesChannel> {
+fn supports_system_prompt_append(result: &Value) -> bool {
+    result["agentCapabilities"]["_meta"]["antigravity"]["systemPrompt"]["append"] == true
+}
+
+fn supports_http_mcp(agent: AcpAgent, result: &Value) -> bool {
+    // agy 1.5.11 omits mcpCapabilities, but accepts HTTP MCP servers and
+    // initializes/lists/calls their tools (covered by the headless smoke).
+    agent == AcpAgent::Antigravity || result["agentCapabilities"]["mcpCapabilities"]["http"] == true
+}
+
+fn auth_hint(agent: AcpAgent) -> &'static str {
     match agent {
-        AcpAgent::Gemini => Some(GuidelinesChannel::FirstPrompt),
-        AcpAgent::OpenCode => Some(GuidelinesChannel::ConfigFile),
-    }
-}
-
-fn first_prompt_text(
-    agent: AcpAgent,
-    guidelines: Option<&crate::guidelines::Guidelines>,
-    prompt: &str,
-) -> String {
-    prompt_text_for_channel(agent.label(), guidelines_channel(agent), guidelines, prompt)
-}
-
-fn prompt_text_for_channel(
-    label: &str,
-    channel: Option<GuidelinesChannel>,
-    guidelines: Option<&crate::guidelines::Guidelines>,
-    prompt: &str,
-) -> String {
-    let Some(guidelines) = guidelines else {
-        return prompt.to_string();
-    };
-    match channel {
-        Some(GuidelinesChannel::FirstPrompt) if !is_cli_command(prompt) => format!(
-            "<gitterm-change-guidelines>\n{}\n</gitterm-change-guidelines>\n\n{}",
-            guidelines.text.trim_end(),
-            prompt
-        ),
-        Some(GuidelinesChannel::FirstPrompt) => prompt.to_string(),
-        Some(GuidelinesChannel::ConfigFile) => prompt.to_string(),
-        None => {
-            acp_log(&format!(
-                "{label} has no instruction channel for change guidelines; skipping"
-            ));
-            prompt.to_string()
-        }
-    }
-}
-
-/// Gemini CLI dispatches slash and shell commands from the unadorned prompt.
-fn is_cli_command(prompt: &str) -> bool {
-    let prompt = prompt.trim_start();
-    prompt.starts_with('/') || prompt.starts_with('$')
-}
-
-fn should_defer_guidelines(agent: AcpAgent, prompt: &str) -> bool {
-    agent == AcpAgent::Gemini && is_cli_command(prompt)
-}
-
-/// Gemini CLI system settings for GitTerm's chats: whatever the machine's
-/// own system settings say, with the auth type pinned to the API key so
-/// neither `session/new` nor `session/load` needs `authenticate` (which
-/// would write the choice into the user's `~/.gemini/settings.json`).
-pub fn gemini_system_settings(existing: Option<Value>) -> Value {
-    let mut settings = match existing {
-        Some(Value::Object(map)) => Value::Object(map),
-        _ => json!({}),
-    };
-    if !settings["security"].is_object() {
-        settings["security"] = json!({});
-    }
-    if !settings["security"]["auth"].is_object() {
-        settings["security"]["auth"] = json!({});
-    }
-    settings["security"]["auth"]["selectedType"] = json!("gemini-api-key");
-    settings
-}
-
-/// The chat's message for a Gemini chat started without a key.
-pub fn gemini_missing_key_message(detail: &str) -> String {
-    format!(
-        "Gemini needs an API key, read from the macOS keychain item \"{GEMINI_KEYCHAIN_SERVICE}\" \
-         ({detail}). Add it in Terminal with\n\n    \
-         security add-generic-password -s {GEMINI_KEYCHAIN_SERVICE} -a \"$USER\" -w\n\n\
-         (it prompts for the key), then send the message again."
-    )
-}
-
-/// Read the Gemini API key from the keychain. Never logged.
-pub async fn gemini_api_key_from_keychain() -> Result<String, String> {
-    #[cfg(target_os = "macos")]
-    {
-        let output = Command::new("/usr/bin/security")
-            .args(["find-generic-password", "-s", GEMINI_KEYCHAIN_SERVICE, "-w"])
-            .stdin(Stdio::null())
-            .output()
-            .await
-            .map_err(|e| format!("could not run /usr/bin/security: {e}"))?;
-        if !output.status.success() {
-            return Err(match output.status.code() {
-                Some(44) => "no such keychain item".to_string(),
-                code => format!("security exited with {code:?}"),
-            });
-        }
-        let key = String::from_utf8(output.stdout)
-            .map_err(|_| "the keychain item is not UTF-8".to_string())?
-            .trim()
-            .to_string();
-        if key.is_empty() {
-            return Err("the keychain item is empty".to_string());
-        }
-        Ok(key)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Err("GitTerm reads it from the macOS keychain, which this platform lacks".to_string())
+        AcpAgent::Antigravity => ". Run `agy` in a terminal and sign in.",
+        AcpAgent::OpenCode => ". Sign in with `opencode auth login` in a terminal.",
+        AcpAgent::Gemini => GEMINI_REPLACED_NOTE,
     }
 }
 
@@ -350,9 +257,6 @@ pub struct AcpSessionConfig {
     /// Extra child environment. Values may be secrets: they never reach
     /// logs or `Debug`.
     pub env: Vec<(String, String)>,
-    /// A directory GitTerm owns where the adapter writes the agent's
-    /// support files (the Gemini system settings).
-    pub support_dir: PathBuf,
     /// When set, every stdin/stdout frame is appended to
     /// `<dir>/acp-<agent>-<pid>-{stdin,stdout}.jsonl`.
     pub wire_log_dir: Option<PathBuf>,
@@ -374,7 +278,6 @@ impl std::fmt::Debug for AcpSessionConfig {
                 "env",
                 &self.env.iter().map(|(key, _)| key).collect::<Vec<_>>(),
             )
-            .field("support_dir", &self.support_dir)
             .field("wire_log_dir", &self.wire_log_dir)
             .field("guidelines", &self.guidelines.as_ref().map(|g| &g.path))
             .finish()
@@ -383,14 +286,7 @@ impl std::fmt::Debug for AcpSessionConfig {
 
 impl AcpSessionConfig {
     pub fn args(&self) -> Vec<String> {
-        match self.agent {
-            AcpAgent::Gemini => vec!["--acp".to_string()],
-            AcpAgent::OpenCode => vec!["acp".to_string()],
-        }
-    }
-
-    fn gemini_settings_path(&self) -> PathBuf {
-        self.support_dir.join("gemini-system-settings.json")
+        vec!["acp".to_string()]
     }
 }
 
@@ -408,54 +304,15 @@ pub fn resolve_program(program: &str) -> Result<PathBuf, String> {
         })
 }
 
-/// Write the agent's support files and return the environment that points
-/// the agent at them (plus the Gemini key).
-async fn prepare_agent_env(config: &AcpSessionConfig) -> Result<Vec<(String, String)>, String> {
+/// Only OpenCode needs a process-local config overlay. Antigravity uses
+/// its own sign-in, with no credential/settings overrides from GitTerm.
+fn prepare_agent_env(config: &AcpSessionConfig) -> Vec<(String, String)> {
     match config.agent {
-        AcpAgent::Gemini => {
-            let key = gemini_api_key_from_keychain()
-                .await
-                .map_err(|detail| gemini_missing_key_message(&detail))?;
-            std::fs::create_dir_all(&config.support_dir).map_err(|e| {
-                format!(
-                    "create the Gemini support dir {}: {e}",
-                    config.support_dir.display()
-                )
-            })?;
-            let existing = match std::fs::read_to_string(GEMINI_DEFAULT_SYSTEM_SETTINGS) {
-                Ok(text) => match serde_json::from_str::<Value>(&text) {
-                    Ok(value) => Some(value),
-                    Err(e) => {
-                        return Err(format!(
-                        "{GEMINI_DEFAULT_SYSTEM_SETTINGS} is not JSON ({e}); GitTerm layers its \
-                             Gemini settings over it and will not drop it silently"
-                    ))
-                    }
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(format!("read {GEMINI_DEFAULT_SYSTEM_SETTINGS}: {e}")),
-            };
-            let settings = gemini_system_settings(existing);
-            let settings_path = config.gemini_settings_path();
-            std::fs::write(&settings_path, settings.to_string())
-                .map_err(|e| format!("write {}: {e}", settings_path.display()))?;
-            Ok(vec![
-                (GEMINI_API_KEY_ENV.to_string(), key),
-                (
-                    GEMINI_SYSTEM_SETTINGS_ENV.to_string(),
-                    settings_path.display().to_string(),
-                ),
-                // Gemini CLI attaches no MCP server and refuses its edit modes
-                // in a folder it does not trust. The chat runs where the human
-                // opened it, so the folder is trusted for this process only
-                // (the user's trustedFolders.json is not written).
-                (GEMINI_TRUST_WORKSPACE_ENV.to_string(), "true".to_string()),
-            ])
-        }
-        AcpAgent::OpenCode => Ok(vec![(
+        AcpAgent::OpenCode => vec![(
             OPENCODE_CONFIG_CONTENT_ENV.to_string(),
             opencode_config_content_with_guidelines(config.guidelines.as_ref()).to_string(),
-        )]),
+        )],
+        AcpAgent::Antigravity | AcpAgent::Gemini => Vec::new(),
     }
 }
 
@@ -499,6 +356,7 @@ const DEFAULT_EFFORT_VALUE: &str = "default";
 /// `config_option_update` / `current_mode_update` notifications.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionSettings {
+    antigravity: bool,
     config_options: Vec<Value>,
     current_model: Option<String>,
     models: Vec<Value>,
@@ -530,7 +388,18 @@ impl SessionSettings {
         settings
     }
 
+    fn for_agent(agent: AcpAgent, result: &Value) -> Self {
+        let mut settings = Self::from_result(result);
+        settings.antigravity = agent == AcpAgent::Antigravity;
+        settings
+    }
+
     fn option(&self, setting: Setting) -> Option<&Value> {
+        // agy's configOptions model is a base id; models contains the full
+        // effort-qualified ids accepted by session/set_model and the CLI.
+        if self.antigravity && setting == Setting::Model {
+            return None;
+        }
         self.config_options
             .iter()
             .find(|o| o["category"] == setting.category())
@@ -574,6 +443,9 @@ impl SessionSettings {
 
     /// Whether the agent lets the chat pick this setting.
     pub fn supports(&self, setting: Setting) -> bool {
+        if self.antigravity && setting == Setting::Model {
+            return true;
+        }
         self.option(setting).is_some()
             || match setting {
                 Setting::Model => !self.models.is_empty(),
@@ -682,6 +554,15 @@ impl SessionSettings {
         setting: Setting,
         value: Option<&str>,
     ) -> Result<(&'static str, Value), String> {
+        if self.antigravity && setting == Setting::Model {
+            let value = value
+                .filter(|v| crate::review::is_model_name(v))
+                .ok_or("Antigravity needs a well-formed model id")?;
+            return Ok((
+                "session/set_model",
+                json!({"sessionId": session_id, "modelId": value}),
+            ));
+        }
         if let Some(option) = self.option(setting) {
             let values = Self::option_values(option);
             let value = match (setting, value) {
@@ -743,6 +624,24 @@ impl SessionSettings {
 
     pub fn set_config_options(&mut self, options: Vec<Value>) {
         self.config_options = options;
+        if self.antigravity {
+            let base = self
+                .config_options
+                .iter()
+                .find(|o| o["category"] == "model")
+                .and_then(|o| o["currentValue"].as_str());
+            let effort = self.current(Setting::Effort);
+            if let (Some(base), Some(effort)) = (base, effort) {
+                let full = format!("{base}-{effort}");
+                // Only resolve names the agent actually paired; an unlisted
+                // explicit id is retained until the agent confirms another.
+                if self.models.iter().any(|m| m["modelId"] == full) {
+                    self.current_model = Some(full);
+                } else if self.models.iter().any(|m| m["modelId"] == base) {
+                    self.current_model = Some(base.to_string());
+                }
+            }
+        }
     }
 }
 
@@ -1288,14 +1187,6 @@ impl HistoryBuilder {
         self.entries.is_empty()
     }
 
-    fn contains_guidelines_preamble(&self) -> bool {
-        self.entries.iter().any(|entry| {
-            matches!(entry, TranscriptEntry::UserPrompt(text)
-                if text.contains("<gitterm-change-guidelines>")
-                    && text.contains("</gitterm-change-guidelines>"))
-        })
-    }
-
     pub fn finish(mut self) -> Vec<TranscriptEntry> {
         self.close_turn();
         self.entries
@@ -1446,7 +1337,7 @@ pub struct AcpSession {
 
 impl AcpSession {
     /// Start the agent on a dedicated thread. Spawn failures (including a
-    /// missing Gemini key) arrive on the event channel as `Error` followed
+    /// legacy saved Gemini chat) arrive on the event channel as `Error` followed
     /// by `ProcessExited`.
     pub fn spawn(config: AcpSessionConfig) -> (Self, mpsc::UnboundedReceiver<HarnessEvent>) {
         let snapshots_closed = tokio_util::sync::CancellationToken::new();
@@ -1579,7 +1470,6 @@ struct Session {
     /// The id of the prompt the running turn answers.
     turn_message: Option<String>,
     interrupted: bool,
-    prompt_started: bool,
     permissions: HashMap<String, PendingPermission>,
     next_request: u64,
     logged_methods: HashSet<String>,
@@ -1644,16 +1534,11 @@ impl Session {
 
     async fn create_session(&mut self) -> Result<(), String> {
         self.phase = Phase::Creating;
-        let cwd = self.config.cwd.display().to_string();
-        let mcp_servers = self.mcp_servers();
+        let mut params = session_params(&self.config, self.mcp_servers());
         match self.config.resume.clone() {
             Some(id) if self.load_session => {
-                self.call(
-                    "session/load",
-                    json!({"sessionId": id, "cwd": cwd, "mcpServers": mcp_servers}),
-                    Call::LoadSession,
-                )
-                .await
+                params["sessionId"] = json!(id);
+                self.call("session/load", params, Call::LoadSession).await
             }
             resume => {
                 if let Some(id) = resume {
@@ -1662,12 +1547,7 @@ impl Session {
                         self.config.agent.label()
                     ));
                 }
-                self.call(
-                    "session/new",
-                    json!({"cwd": cwd, "mcpServers": mcp_servers}),
-                    Call::NewSession,
-                )
-                .await
+                self.call("session/new", params, Call::NewSession).await
             }
         }
     }
@@ -1788,15 +1668,6 @@ impl Session {
             prompt.images.len(),
             prompt.id
         ));
-        let mut prompt = prompt;
-        if !self.prompt_started && !should_defer_guidelines(self.config.agent, &prompt.text) {
-            prompt.text = first_prompt_text(
-                self.config.agent,
-                self.config.guidelines.as_ref(),
-                &prompt.text,
-            );
-            self.prompt_started = true;
-        }
         let blocks = prompt_blocks(&prompt, self.images);
         self.in_turn = true;
         self.interrupted = false;
@@ -1857,7 +1728,6 @@ impl Session {
 
     async fn finish_history(&mut self) -> Result<(), String> {
         self.history_deadline = None;
-        self.prompt_started = self.history.contains_guidelines_preamble();
         let entries = std::mem::take(&mut self.history).finish();
         acp_log(&format!(
             "session {} replayed {} history entries",
@@ -1894,7 +1764,14 @@ impl Session {
                 }
                 let caps = &result["agentCapabilities"];
                 self.load_session = caps["loadSession"] == true;
-                self.http_mcp = caps["mcpCapabilities"]["http"] == true;
+                self.http_mcp = supports_http_mcp(self.config.agent, result);
+                if self.config.agent == AcpAgent::Antigravity
+                    && self.config.guidelines.is_some()
+                    && !supports_system_prompt_append(result)
+                {
+                    self.fail("Antigravity does not advertise systemPrompt.append; GitTerm instructions cannot be attached. Update agy and try again.".into());
+                    return Ok(());
+                }
                 self.images = caps["promptCapabilities"]["image"] == true;
                 acp_log(&format!(
                     "initialized {} {} (protocol {}, loadSession {}, http MCP {}, images {})",
@@ -1914,13 +1791,7 @@ impl Session {
                         format!(
                             "{} could not start a session: {text}{}",
                             self.config.agent.label(),
-                            match self.config.agent {
-                                AcpAgent::Gemini => format!(
-                                    ". Check the API key in the keychain item \"{GEMINI_KEYCHAIN_SERVICE}\"."
-                                ),
-                                AcpAgent::OpenCode =>
-                                    ". Sign in with `opencode auth login` in a terminal.".to_string(),
-                            }
+                            auth_hint(self.config.agent)
                         )
                     } else {
                         format!(
@@ -1939,7 +1810,7 @@ impl Session {
                     return Ok(());
                 };
                 self.session_id = Some(id.to_string());
-                self.settings = SessionSettings::from_result(result);
+                self.settings = SessionSettings::for_agent(self.config.agent, result);
                 self.begin_setup().await
             }
             Call::LoadSession => {
@@ -1954,7 +1825,7 @@ impl Session {
                     return self.create_session().await;
                 }
                 self.session_id = self.config.resume.clone();
-                self.settings = SessionSettings::from_result(result);
+                self.settings = SessionSettings::for_agent(self.config.agent, result);
                 self.phase = Phase::History;
                 self.history_deadline = Some(tokio::time::Instant::now() + HISTORY_QUIET);
                 Ok(())
@@ -1980,6 +1851,11 @@ impl Session {
                         if let Some(value) = &value {
                             self.settings.set_current(setting, value);
                         }
+                    }
+                }
+                if self.config.agent == AcpAgent::Antigravity && setting == Setting::Model {
+                    if let Some(value) = &value {
+                        self.settings.set_current(setting, value);
                     }
                 }
                 if self.phase == Phase::Setup {
@@ -2277,14 +2153,14 @@ async fn run_session(
         let _ = events.send(HarnessEvent::Error(msg));
         let _ = events.send(HarnessEvent::ProcessExited { code: None });
     };
+    if config.agent == AcpAgent::Gemini {
+        return fail(GEMINI_REPLACED_NOTE.into());
+    }
     let program = match resolve_program(config.agent.program()) {
         Ok(p) => p,
         Err(e) => return fail(e),
     };
-    let agent_env = match prepare_agent_env(&config).await {
-        Ok(env) => env,
-        Err(e) => return fail(e),
-    };
+    let agent_env = prepare_agent_env(&config);
     let args = config.args();
     let mut cmd = Command::new(&program);
     cmd.args(&args)
@@ -2294,7 +2170,7 @@ async fn run_session(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .env("PATH", super::claude::child_path());
-    // Secrets (the Gemini key, MCP tokens) travel only through the
+    // Secrets (MCP tokens) travel only through the
     // environment and stdin.
     cmd.envs(agent_env.iter().map(|(k, v)| (k, v)));
     cmd.envs(config.env.iter().map(|(k, v)| (k, v)));
@@ -2392,7 +2268,6 @@ async fn run_session(
         in_turn: false,
         turn_message: None,
         interrupted: false,
-        prompt_started: false,
         permissions: HashMap::new(),
         next_request: 0,
         logged_methods: HashSet::new(),
@@ -2938,20 +2813,6 @@ mod tests {
     }
 
     #[test]
-    fn resumed_history_records_that_guidelines_were_already_sent() {
-        let mut history = HistoryBuilder::default();
-        history.user_chunk(
-            Some("u1".into()),
-            "<gitterm-change-guidelines>\nRules\n</gitterm-change-guidelines>\n\nPlease help",
-        );
-        assert!(history.contains_guidelines_preamble());
-
-        let mut history = HistoryBuilder::default();
-        history.user_chunk(Some("u1".into()), "Please help");
-        assert!(!history.contains_guidelines_preamble());
-    }
-
-    #[test]
     fn a_model_api_error_fails_the_turn_with_the_agents_message() {
         // Gemini CLI 0.41.2 answers a failed model call with
         // `RequestError(status, message)` (gemini-KXTGCWBT.js, Session.prompt).
@@ -3002,111 +2863,204 @@ mod tests {
             url: "http://127.0.0.1:1/mcp?caller=x".into(),
             headers: vec![("Authorization".into(), "Bearer secret-token".into())],
         };
-        let gemini = server.to_acp(AcpAgent::Gemini);
-        assert_eq!(gemini["name"], "gitterm-tasks");
-        assert_eq!(gemini["type"], "http");
+        let antigravity = server.to_acp(AcpAgent::Antigravity);
+        assert_eq!(antigravity["name"], "gitterm-tasks");
+        assert_eq!(antigravity["type"], "http");
         assert_eq!(
-            gemini["headers"],
+            antigravity["headers"],
             json!([{"name": "Authorization", "value": "Bearer secret-token"}])
         );
         assert_eq!(server.to_acp(AcpAgent::OpenCode)["name"], "gitterm_tasks");
         let frame = request_frame(
             2,
             "session/new",
-            json!({"cwd": "/", "mcpServers": [gemini]}),
+            json!({"cwd": "/", "mcpServers": [antigravity]}),
         );
         assert!(!redact_frame(&frame).to_string().contains("secret-token"));
         assert!(!format!("{server:?}").contains("secret-token"));
         let config = AcpSessionConfig {
             snapshot_facts_dir: None,
-            agent: AcpAgent::Gemini,
+            agent: AcpAgent::Antigravity,
             cwd: "/".into(),
             resume: None,
             model: None,
             mode: None,
             effort: None,
             mcp_servers: vec![server],
-            env: vec![("GEMINI_API_KEY".into(), "key-value".into())],
-            support_dir: "/tmp/s".into(),
+            env: vec![("TEST_SECRET".into(), "key-value".into())],
             wire_log_dir: None,
             guidelines: None,
         };
         let debug = format!("{config:?}");
         assert!(!debug.contains("key-value") && !debug.contains("secret-token"));
-        assert_eq!(config.args(), vec!["--acp"]);
+        assert_eq!(config.args(), vec!["acp"]);
+    }
+
+    fn antigravity_config() -> AcpSessionConfig {
+        AcpSessionConfig {
+            snapshot_facts_dir: None,
+            agent: AcpAgent::Antigravity,
+            cwd: "/synthetic/repo".into(),
+            resume: None,
+            model: Some("gemini-4-argon-medium".into()),
+            mode: Some("default".into()),
+            effort: None,
+            mcp_servers: Vec::new(),
+            env: Vec::new(),
+            wire_log_dir: None,
+            guidelines: None,
+        }
     }
 
     #[test]
-    fn acp_launch_gets_guidelines_only_when_repo_switch_is_on() {
-        let config_dir = tempfile::tempdir().unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::write(
-            config_dir.path().join(crate::guidelines::GUIDELINES_FILE),
-            "Follow the repository rules.\n",
+    fn native_append_contains_instructions_only_when_enabled_and_needs_no_env() {
+        let mut config = antigravity_config();
+        assert!(session_params(&config, Vec::new()).get("_meta").is_none());
+        config.guidelines = Some(crate::guidelines::Guidelines {
+            path: "/synthetic/instructions.md".into(),
+            text: "Follow the repository rules.\n".into(),
+        });
+        assert_eq!(
+            session_params(&config, Vec::new())["_meta"],
+            json!({"antigravity":{"systemPrompt":{"append":"Follow the repository rules.\n"}}})
+        );
+        assert!(prepare_agent_env(&config).is_empty());
+        let prompt = prompt("unchanged prompt");
+        assert_eq!(
+            prompt_blocks(&prompt, true),
+            vec![json!({"type":"text","text":"unchanged prompt"})]
+        );
+        config.agent = AcpAgent::OpenCode;
+        assert!(session_params(&config, Vec::new()).get("_meta").is_none());
+        assert_eq!(
+            opencode_config_content_with_guidelines(config.guidelines.as_ref())["instructions"],
+            json!(["/synthetic/instructions.md"])
+        );
+    }
+
+    #[test]
+    fn antigravity_models_use_full_ids_and_accept_an_unlisted_id() {
+        let fixture = frames(include_str!(
+            "../../tests/fixtures/acp/antigravity_session_new.jsonl"
+        ));
+        let mut settings = SessionSettings::for_agent(AcpAgent::Antigravity, &fixture[0]["result"]);
+        assert_eq!(
+            settings.current(Setting::Model).as_deref(),
+            Some("gemini-4-argon-medium")
+        );
+        assert!(settings
+            .page_models()
+            .iter()
+            .any(|model| model["value"] == "gemini-4-argon-medium"));
+        for model in ["gemini-4-argon-high", "new-plan-model-high"] {
+            assert_eq!(
+                settings
+                    .change_request("synthetic", Setting::Model, Some(model))
+                    .unwrap(),
+                (
+                    "session/set_model",
+                    json!({"sessionId":"synthetic","modelId":model})
+                )
+            );
+        }
+        assert!(settings
+            .change_request("s", Setting::Model, Some("bad id"))
+            .is_err());
+        assert!(settings
+            .change_request("s", Setting::Mode, Some("yolo"))
+            .is_err());
+        assert!(settings
+            .change_request("s", Setting::Effort, Some("invalid"))
+            .is_err());
+        let modes: Vec<_> = settings
+            .page_modes()
+            .iter()
+            .map(|mode| mode["value"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(modes, ["default", "accept-edits", "auto", "plan"]);
+        let mut options = fixture[0]["result"]["configOptions"]
+            .as_array()
+            .unwrap()
+            .clone();
+        options
+            .iter_mut()
+            .find(|o| o["category"] == "thought_level")
+            .unwrap()["currentValue"] = json!("high");
+        settings.set_config_options(options);
+        assert_eq!(
+            settings.current(Setting::Model).as_deref(),
+            Some("gemini-4-argon-high")
+        );
+        settings.set_current(Setting::Model, "new-plan-model-high");
+        assert_eq!(
+            settings.current(Setting::Model).as_deref(),
+            Some("new-plan-model-high")
+        );
+        let opencode = SessionSettings::from_result(&fixture[0]["result"]);
+        assert!(opencode
+            .change_request("s", Setting::Model, Some("new-plan-model-high"))
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_gemini_is_refused_before_any_process_is_started() {
+        let mut config = antigravity_config();
+        config.agent = AcpAgent::Gemini;
+        let (_session, mut events) = AcpSession::spawn(config);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap(),
+            Some(HarnessEvent::Error(GEMINI_REPLACED_NOTE.into()))
+        );
+        assert!(matches!(
+            events.recv().await,
+            Some(HarnessEvent::ProcessExited { code: None })
+        ));
+    }
+
+    #[test]
+    fn recorded_antigravity_turn_maps_tools_permissions_and_reply() {
+        let mut mapper = UpdateMapper::new();
+        let (events, options) = run(
+            &mut mapper,
+            include_str!("../../tests/fixtures/acp/antigravity_turn_tools.jsonl"),
+        );
+        assert!(events.iter().any(|e| matches!(e, HarnessEvent::ItemStarted { kind: ItemKind::ToolCall { name, .. }, .. } if name == "mcp_gitterm-tasks_task_list")));
+        assert!(events.iter().any(|e| matches!(e, HarnessEvent::ItemStarted { kind: ItemKind::ToolCall { name, .. }, .. } if name == "mcp_gitterm-browser_browser_status")));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    HarnessEvent::ItemCompleted {
+                        is_error: false,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+        assert!(events.iter().any(|e| matches!(e, HarnessEvent::TextDelta(text) if text.contains("native-append-token-17f2"))));
+        assert!(permission_outcome(
+            &RuntimeDecision::Allow {
+                updated_input: None,
+                remember: None
+            },
+            &options
         )
-        .unwrap();
-        let on = crate::guidelines::for_launch(config_dir.path(), repo.path(), false);
-        assert!(on.is_some());
-        let off_settings = crate::guidelines::GuidelinesSettings {
-            enabled: true,
-            off_repos: vec![crate::guidelines::repo_key(repo.path())
-                .to_string_lossy()
-                .into_owned()],
-        };
-        crate::guidelines::save_settings(config_dir.path(), &off_settings).unwrap();
-        assert!(crate::guidelines::for_launch(config_dir.path(), repo.path(), false).is_none());
-
-        let on = on.unwrap();
-        assert_eq!(on.text, "Follow the repository rules.\n");
-        let opencode = opencode_config_content_with_guidelines(Some(&on));
-        assert_eq!(opencode["instructions"], json!([on.path]));
-        assert_eq!(first_prompt_text(AcpAgent::Gemini, Some(&on), "hello"),
-            "<gitterm-change-guidelines>\nFollow the repository rules.\n</gitterm-change-guidelines>\n\nhello");
-        assert_eq!(
-            first_prompt_text(AcpAgent::Gemini, Some(&on), "/help"),
-            "/help"
-        );
-        assert_eq!(
-            first_prompt_text(AcpAgent::Gemini, Some(&on), "  /init"),
-            "  /init"
-        );
-        assert_eq!(
-            first_prompt_text(AcpAgent::Gemini, Some(&on), "$ ls"),
-            "$ ls"
-        );
-        assert!(should_defer_guidelines(AcpAgent::Gemini, "/help"));
-        assert!(should_defer_guidelines(AcpAgent::Gemini, "$ ls"));
-        assert!(!should_defer_guidelines(AcpAgent::Gemini, "help me"));
-        assert!(!should_defer_guidelines(AcpAgent::OpenCode, "/help"));
-        assert_eq!(first_prompt_text(AcpAgent::Gemini, None, "hello"), "hello");
+        .is_ok());
     }
 
     #[test]
-    fn acp_without_guidelines_channel_skips_and_logs() {
-        let guidelines = crate::guidelines::Guidelines {
-            path: "/cfg/agent-guidelines.md".into(),
-            text: "Follow the repository rules.".into(),
-        };
-        // Model an agent added later without a mapped channel. The launch
-        // helper logs the skip and leaves its user prompt untouched.
-        let text = prompt_text_for_channel("Future ACP", None, Some(&guidelines), "hello");
-        assert_eq!(text, "hello");
-    }
-
-    #[test]
-    fn gemini_support_files_pin_api_key_auth() {
-        let settings = gemini_system_settings(Some(json!({"general": {"vimMode": true}})));
-        assert_eq!(settings["general"]["vimMode"], true);
-        assert_eq!(
-            settings["security"]["auth"]["selectedType"],
-            "gemini-api-key"
-        );
-        assert_eq!(
-            gemini_system_settings(None)["security"]["auth"]["selectedType"],
-            "gemini-api-key"
-        );
-        assert!(gemini_missing_key_message("no such keychain item")
-            .contains("security add-generic-password -s gemini-api-key"));
+    fn native_instructions_and_capabilities() {
+        let init = frames(include_str!(
+            "../../tests/fixtures/acp/antigravity_initialize.jsonl"
+        ));
+        assert!(supports_system_prompt_append(&init[0]["result"]));
+        assert!(supports_http_mcp(AcpAgent::Antigravity, &init[0]["result"]));
+        assert!(!supports_http_mcp(AcpAgent::OpenCode, &init[0]["result"]));
+        assert!(auth_hint(AcpAgent::Antigravity).contains("Run `agy` in a terminal and sign in"));
         assert_eq!(
             opencode_config_content(),
             json!({"permission": {"edit": "ask", "bash": "ask"}})

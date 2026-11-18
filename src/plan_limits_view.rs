@@ -935,7 +935,7 @@ mod tests {
     fn recipients_are_coordinator_roots_across_backends_not_resumed_children() {
         let mut root = TabState::new(1, PathBuf::from("/repo"));
         root.kind = TabKind::Agent(tab::AgentSession::new(tab::AgentBackendConfig::Acp {
-            agent: gitterm::harness::acp::AcpAgent::Gemini,
+            agent: gitterm::harness::acp::AcpAgent::Antigravity,
             model: String::new(),
             mode: None,
             effort: None,

@@ -14,8 +14,8 @@
 //!   contents to the system prompt").
 //! - Codex: `-c developer_instructions=<TOML string>` (codex-cli 0.164.0
 //!   accepts the key under `--strict-config`, which rejects unknown keys).
-//! - Gemini CLI over ACP: a delimited preamble on the first prompt (ACP
-//!   `session/new` has no system-instruction field).
+//! - Antigravity over ACP: `session/new`
+//!   `_meta.antigravity.systemPrompt.append` (agy 1.5.11).
 //! - OpenCode over ACP: its `instructions` config paths, supplied through
 //!   `OPENCODE_CONFIG_CONTENT`.
 //! - A remote Claude chat: the desktop sends the text in the remote start;
@@ -966,7 +966,7 @@ mod tests {
         assert!(!starts_a_harness("zsh"));
         for unchanged in [
             "zsh",
-            "gemini",
+            "agy",
             "claude --append-system-prompt-file /x.md",
             "codex -c developer_instructions=\"x\"",
         ] {
