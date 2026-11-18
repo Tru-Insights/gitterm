@@ -59,6 +59,8 @@
   }
   /* Status line, roster and composer share one grey panel. */
   #footer { display: flex; flex-direction: column; gap: 6px; padding: 6px 8px 8px; background: var(--bg-footer); border: 1px solid var(--border); border-radius: 10px; }
+  /* The input lines up with the conversation's centred column (see #messages). */
+  #footer { box-sizing: border-box; width: 100%; max-width: calc(46rem + 28px); margin-left: auto; margin-right: auto; }
   #timeline-wrap { flex: 1; position: relative; min-height: 0; }
   #messages {
     position: absolute;
@@ -66,7 +68,9 @@
     overflow-y: auto;
     background: var(--bg-alt);
     border-radius: 8px;
-    padding: 12px 14px;
+    /* Wide panes keep the conversation in a centred column, at most 46rem
+       of text, so lines stay readable; narrow panes keep the 14px edge. */
+    padding: 12px max(14px, calc((100% - 46rem) / 2));
     line-height: 1.5;
     /* The page keeps the view still itself when "Show earlier" restores
        blocks above it (TRU-157); a second, engine-side adjustment would
@@ -422,7 +426,8 @@
                      border: 1px solid var(--border); }
   #toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   #toolbar .tb-chips { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; flex: 1 1 auto; min-width: 0; }
-  #toolbar .tb-send { display: flex; gap: 6px; margin-left: auto; }
+  /* Send and Stop get their own row under the message box; the options follow on the next. */
+  #toolbar .tb-send { display: flex; gap: 6px; flex-basis: 100%; justify-content: flex-end; }
   #toolbar .tb-send button { padding: 5px 14px; }
   .chip svg, #mode svg, #review svg { width: 12px; height: 12px; flex: none; }
   button {
@@ -570,11 +575,12 @@
   details.dlg > summary::-webkit-details-marker { display: none; }
   details.dlg > summary::before { content: '\25B8'; color: var(--fg-muted); font-size: 10px; }
   details.dlg[open] > summary::before { content: '\25BE'; }
-  .dlg-kind { font-weight: 600; color: var(--accent); font-size: 12.5px; white-space: nowrap; }
+  /* A long head (worker model, worktree name) shortens with an ellipsis so the state and time stay inside the card. */
+  .dlg-kind { font-weight: 600; color: var(--accent); font-size: 12.5px; white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   details.dlg.completed .dlg-kind, details.dlg.done .dlg-kind { color: var(--result); }
   details.dlg.failed .dlg-kind, details.dlg.interrupted .dlg-kind { color: var(--err); }
   .dlg-what { flex: 1; min-width: 0; color: var(--fg-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .dlg-state { font-family: var(--mono); font-size: 11.5px; color: var(--fg-muted); white-space: nowrap; }
+  .dlg-state { font-family: var(--mono); font-size: 11.5px; color: var(--fg-muted); white-space: nowrap; flex: none; }
   details.dlg.running .dlg-state, details.dlg.requested .dlg-state { color: var(--accent); }
   .dlg-body { padding: 0 10px 8px 22px; }
   .dlg-line { color: var(--fg-muted); font-size: 12px; margin: 2px 0 6px; }
@@ -644,12 +650,16 @@
   </div>
   <div id="v5-offer"></div>
   <div id="request-panel"></div>
-  <div id="roster"></div>
   <div id="composer">
     <div id="attachments"></div>
     <div class="chip-menu" id="slash-menu"></div>
     <textarea id="prompt" placeholder="Message Claude... (Enter to send, Shift+Enter for newline)" rows="2"></textarea>
     <div id="toolbar">
+      <!-- First after the message box, so Tab then Enter sends. -->
+      <div class="tb-send">
+        <button id="submit" class="primary">Send</button>
+        <button id="stop" class="danger" disabled>Stop</button>
+      </div>
       <div class="tb-chips">
         <div class="review-wrap">
           <div id="review-pop"></div>
@@ -673,12 +683,10 @@
         </div>
         <span class="chip" id="guidelines-mark" title="GitTerm adds its change guidelines to this agent's system prompt (workspace settings switch them off)">guidelines</span>
       </div>
-      <div class="tb-send">
-        <button id="submit" class="primary">Send</button>
-        <button id="stop" class="danger" disabled>Stop</button>
-      </div>
     </div>
   </div>
+  <!-- Below the input, so the message box sits right under the conversation. -->
+  <div id="roster"></div>
   </div><!-- /footer -->
 <script>
 (function () {
@@ -2775,6 +2783,7 @@
     if (dismissed && !card.wasDismissed) card.root.open = false;
     card.wasDismissed = dismissed;
     card.kindEl.textContent = worker ? workerHead(card) : kindLabel(d) + ' · ' + childModel(d);
+    card.kindEl.title = card.kindEl.textContent;
     card.whatEl.textContent = worker ? workerWhat(card) : targetText(d);
     card.stateEl.textContent = (dismissed ? 'dismissed · ' : '') + stateText(card);
     const body = card.body;
