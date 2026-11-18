@@ -8,10 +8,11 @@ description = "GitTerm GPUI desktop preview"
 
 [workspace]
 resolver = "3"
-members = ["crates/shell", "crates/terminal"]
-default-members = [".", "crates/shell", "crates/terminal"]
+members = ["crates/chat", "crates/shell", "crates/terminal"]
+default-members = [".", "crates/chat", "crates/shell", "crates/terminal"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
+gitterm-gpui-chat = { path = "crates/chat" }
 gitterm-gpui-shell = { path = "crates/shell" }
 gpui-component = { version = "=0.9.1", features = ["syntect"] }
 gpui-webview = "=0.9.1"
