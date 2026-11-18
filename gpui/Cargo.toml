@@ -4,12 +4,15 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.99"
 publish = false
-description = "GitTerm GPUI stage 0 build and packaging gate"
+description = "GitTerm GPUI desktop preview"
 
 [workspace]
 resolver = "3"
+members = ["crates/shell"]
+default-members = [".", "crates/shell"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
+gitterm-gpui-shell = { path = "crates/shell" }
 gpui-component = { version = "=0.9.1", features = ["syntect"] }
 gpui-webview = "=0.9.1"
 gpui_xterm = "=0.3.0"
