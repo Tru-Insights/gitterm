@@ -947,7 +947,7 @@ fn history_metrics(
     let Some(last) = samples.next_back() else {
         return (None, None);
     };
-    let elapsed = last.observed_at - first.observed_at;
+    let elapsed = now - first.observed_at;
     if elapsed <= 0 {
         return (None, None);
     }
@@ -1342,6 +1342,18 @@ fn estimate_note(name: &str, report: &ProviderReport, now: i64) -> Option<String
     ))
 }
 
+fn add_estimate_note(
+    warning: Option<String>,
+    name: &str,
+    report: &ProviderReport,
+    now: i64,
+) -> Option<String> {
+    warning.map(|warning| match estimate_note(name, report, now) {
+        Some(note) => format!("{warning} {note}"),
+        None => warning,
+    })
+}
+
 fn provider_summary(
     name: &str,
     report: &ProviderReport,
@@ -1407,6 +1419,8 @@ pub fn evaluate_policy(file: &PlanLimitsFile, now: i64) -> PolicyEvaluation {
         Provider::Codex,
         now,
     );
+    let claude_warning = add_estimate_note(claude_warning, "Claude", &claude_report, now);
+    let codex_warning = add_estimate_note(codex_warning, "Codex", &codex_report, now);
     notices.extend(codex_notices);
     let held_state = match (
         held(&claude) || claude_report.stale_exhausted,
@@ -1485,7 +1499,19 @@ pub fn evaluate_policy(file: &PlanLimitsFile, now: i64) -> PolicyEvaluation {
         let order = first
             .map(|name| format!("use {name} first because it resets sooner"))
             .unwrap_or_else(|| "verify reset times before choosing the order".into());
-        notices.push(format!("Both plans are running hot: {c}; {x}. Want one priority task at a time, required reviews only, and {order}? Routing stays unchanged until you choose; credits or overage need your explicit choice."));
+        let estimates = [
+            estimate_note("Claude", &claude_report, now),
+            estimate_note("Codex", &codex_report, now),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let estimate_notes = if estimates.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", estimates.join(" "))
+        };
+        notices.push(format!("Both plans are running hot: {c}; {x}. Want one priority task at a time, required reviews only, and {order}? Routing stays unchanged until you choose; credits or overage need your explicit choice.{estimate_notes}"));
     } else {
         notices.extend(claude_warning.into_iter().chain(codex_warning));
     }
@@ -2530,7 +2556,16 @@ mod policy_tests {
     #[test]
     fn policy_hot_warning_once_then_once_inside_24h() {
         let mut file = fixture(35.0, 5 * 86400);
-        assert_eq!(step(&mut file, NOW).notices.len(), 1);
+        let warning = step(&mut file, NOW).notices;
+        assert_eq!(warning.len(), 1);
+        assert!(
+            warning[0].starts_with("Claude Code 35% with 5.0 days left; at this rate it runs out "),
+            "{warning:?}"
+        );
+        assert!(warning[0].ends_with(
+            ". Want me to send work to Codex until it settles? Tell the coordinator to send flexible work there until reset."
+        ));
+        assert!(!warning[0].contains("is an estimate from"));
         assert!(step(&mut file, NOW).notices.is_empty());
         file.claude.as_mut().unwrap().windows[0].used_percent = Some(85.0);
         assert_eq!(step(&mut file, NOW).notices.len(), 1);
@@ -2759,6 +2794,29 @@ mod policy_tests {
     }
 
     #[test]
+    fn sunday_estimate_counts_the_idle_hours_after_a_saturday_burst() {
+        let saturday_reading = NOW - 21 * 3600 - 48 * 60;
+        let mut file = PlanLimitsFile::default();
+        let mut claude = reading(Provider::Claude, 38.0, 4 * 86400);
+        claude.observed_at = saturday_reading;
+        claude.windows[0].resets_at = Some(saturday_reading + 4 * 86400);
+        file.absorb(claude.clone());
+        file.history[0].samples = vec![
+            UsageSample {
+                observed_at: saturday_reading - 1 * 3600 - 58 * 60,
+                used_percent: 35.0,
+            },
+            UsageSample {
+                observed_at: saturday_reading,
+                used_percent: 38.0,
+            },
+        ];
+
+        let estimate = estimated_percent(&claude, &claude.windows[0], &file.history, NOW).unwrap();
+        assert!(estimate < 50.0, "Sunday estimate was {estimate:.1}%");
+    }
+
+    #[test]
     fn pin_sets_expires_clears_and_almost_out_overrides_it() {
         let mut file = fixture(35.0, 5 * 86400);
         let pin = RoutingPin {
@@ -2958,7 +3016,41 @@ mod policy_tests {
         assert_eq!(e.notices.len(), 1);
         assert!(e.notices[0].contains("Both plans"));
         assert!(e.notices[0].contains("Codex first"));
+        assert!(!e.notices[0].contains("is an estimate from"));
         assert!(step(&mut file, NOW).notices.is_empty());
+
+        let mut estimated = fixture(90.0, 4 * 86400);
+        estimated.codex = Some(reading(Provider::Codex, 90.0, 4 * 86400));
+        for provider in [Provider::Claude, Provider::Codex] {
+            let history = estimated
+                .history
+                .iter_mut()
+                .find(|h| h.provider == provider && h.label == "7d")
+                .unwrap();
+            history.resets_at = Some(NOW + 4 * 86400);
+            history.samples = vec![
+                UsageSample {
+                    observed_at: NOW - 6 * 3600,
+                    used_percent: 60.0,
+                },
+                UsageSample {
+                    observed_at: NOW,
+                    used_percent: 90.0,
+                },
+            ];
+        }
+        let both_estimated = evaluate_policy(&estimated, NOW + 2 * 3600);
+        let both_hot = both_estimated
+            .notices
+            .iter()
+            .find(|notice| notice.contains("Both plans are running hot"))
+            .unwrap();
+        assert!(both_hot.contains("Claude weekly ≈98% is an estimate from a 90% reading as of"));
+        assert!(
+            both_hot.contains("Codex weekly ≈98% is an estimate from a 90% reading as of"),
+            "{both_hot}"
+        );
+
         let mut file = fixture(10.0, 2 * 86400);
         file.codex.as_mut().unwrap().windows[0].used_percent = Some(20.0);
         assert!(evaluate_policy(&file, NOW)
@@ -3147,23 +3239,23 @@ mod policy_tests {
 
     #[test]
     fn the_estimate_takes_the_larger_of_the_24h_rate_and_the_window_average() {
-        // The latest 24 hours ran at 20 points a day, above the window's
-        // 8.3 a day: the faster rate counts.
+        // The sample delta is diluted over the elapsed time through now,
+        // including the hour since the latest sample.
         let mut file = idle_codex(25.0);
         codex_samples(&mut file, &[(NOW - 12 * 3600, 15.0), (NOW, 25.0)]);
         let e = evaluate_policy(&file, NOW + 3600);
-        let expected = 25.0 + 20.0 / 24.0;
+        let expected = 25.0 + 10.0 / 13.0;
         assert!((codex_weekly(&e).estimated_percent.unwrap() - expected).abs() < 1e-9);
         // A slower latest day does not lower it below the window average.
         codex_samples(&mut file, &[(NOW - 12 * 3600, 24.0), (NOW, 25.0)]);
         let e = evaluate_policy(&file, NOW + 3600);
-        let expected = 25.0 + 25.0 / 3.0 / 24.0;
+        let expected = 25.0 + 25.0 / 72.0;
         assert!((codex_weekly(&e).estimated_percent.unwrap() - expected).abs() < 1e-9);
     }
 
     #[test]
     fn an_estimate_past_the_thresholds_makes_the_week_hot_but_never_holds() {
-        // 30% at 60 points a day: on track when read, hot twelve hours on.
+        // The 24h rate includes the idle 12h after the samples.
         let mut file = idle_codex(30.0);
         codex_samples(&mut file, &[(NOW - 12 * 3600, 0.0), (NOW, 30.0)]);
         assert_eq!(
@@ -3171,13 +3263,8 @@ mod policy_tests {
             Some(WeeklyState::OnTrack)
         );
         let e = step(&mut file, NOW + 12 * 3600);
-        assert!((codex_weekly(&e).estimated_percent.unwrap() - 60.0).abs() < 1e-9);
-        assert_eq!(codex_weekly(&e).state, Some(WeeklyState::Hot));
-        assert!(
-            e.notices.iter().any(|n| n.starts_with("Codex ≈60% with")),
-            "{:?}",
-            e.notices
-        );
+        assert!((codex_weekly(&e).estimated_percent.unwrap() - 45.0).abs() < 1e-9);
+        assert_eq!(codex_weekly(&e).state, Some(WeeklyState::OnTrack));
 
         // 90% at 120 points a day: two hours on, the estimate is used up,
         // but the reading itself was under the almost-out line. An estimate
@@ -3185,11 +3272,17 @@ mod policy_tests {
         // releases it): the week is hot and Codex may still start.
         let mut file = idle_codex(90.0);
         codex_samples(&mut file, &[(NOW - 6 * 3600, 60.0), (NOW, 90.0)]);
-        assert!(step(&mut file, NOW).allows_start(Provider::Codex, false, false));
         let e = step(&mut file, NOW + 2 * 3600);
         assert!(!e.report.codex.stale_exhausted);
-        assert_eq!(codex_weekly(&e).estimated_percent, Some(100.0));
+        assert_eq!(codex_weekly(&e).estimated_percent, Some(97.5));
         assert_eq!(codex_weekly(&e).state, Some(WeeklyState::Hot));
+        assert!(
+            e.notices.iter().any(|notice| {
+                notice.contains("Codex weekly ≈98% is an estimate from a 90% reading as of")
+            }),
+            "{:?}",
+            e.notices
+        );
         assert_ne!(e.report.routing.state, RoutingState::HoldCodex);
         assert!(e.allows_start(Provider::Codex, false, false));
 

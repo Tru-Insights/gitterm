@@ -1,4 +1,5 @@
 /target
+/gpui/target
 .DS_Store
 
 # Agent runtime state (personal/runtime, not repo source)

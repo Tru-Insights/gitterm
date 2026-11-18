@@ -53,3 +53,11 @@ jobs:
 
     - name: Tests (excalidraw)
       run: cargo test --features excalidraw
+
+    - name: GPUI release and bundle (macOS only)
+      run: |
+        tests/check-gpui-deps.sh
+        scripts/check-gpui-deps.sh
+        scripts/cargo.sh fmt --manifest-path gpui/Cargo.toml -- --check
+        scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --locked -- -D warnings
+        scripts/bundle-gpui.sh

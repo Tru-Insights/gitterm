@@ -32,8 +32,6 @@ pub const ROUND_MAX_KEYS: usize = 20;
 pub const FOUND_FRESH: Duration = Duration::from_secs(3600);
 /// A key no workspace knows is tried again after this long.
 pub const NOT_FOUND_RETRY: Duration = Duration::from_secs(24 * 3600);
-/// Issues the Work page lists before "n more".
-pub const ISSUES_SHOWN: usize = 5;
 
 /// Where `linear` is looked for after `PATH` (an app started from the
 /// Finder gets a short PATH), as for `gh`.
@@ -236,6 +234,51 @@ pub fn is_not_found(stderr: &str) -> bool {
         .contains("not found")
 }
 
+/// The Work page's Issues groups, in display order (TRU-243).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueGroup {
+    InProgress,
+    InDevForTesting,
+    Backlog,
+    Done,
+}
+
+impl IssueGroup {
+    pub const ALL: [Self; 4] = [
+        Self::InProgress,
+        Self::InDevForTesting,
+        Self::Backlog,
+        Self::Done,
+    ];
+
+    pub fn of_state(state: &str) -> Self {
+        match state.to_ascii_lowercase().as_str() {
+            "in progress"
+            | "waiting for deploy to dev"
+            | "in review"
+            | "ready for review"
+            | "changes requested" => Self::InProgress,
+            "in dev for testing" | "staging" | "in prod for validation" => Self::InDevForTesting,
+            "done" | "released" | "canceled" | "duplicate" => Self::Done,
+            _ => Self::Backlog,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::InProgress => "In progress",
+            Self::InDevForTesting => "In DEV for testing",
+            Self::Backlog => "Backlog",
+            Self::Done => "Done",
+        }
+    }
+
+    pub fn default_collapsed() -> Vec<Self> {
+        vec![Self::Done]
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The cache.
 
@@ -251,6 +294,9 @@ pub struct CachedIssue {
     pub workspace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// RFC 3339: first observed in any Done-group state, cleared on reopening.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_seen_done_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
     /// RFC 3339.
@@ -262,15 +308,54 @@ pub struct CachedIssue {
 
 impl CachedIssue {
     pub fn found(info: IssueInfo, workspace: &str, at: &str) -> Self {
+        let first_seen_done_at =
+            (IssueGroup::of_state(&info.state) == IssueGroup::Done).then(|| at.to_string());
         Self {
             title: Some(info.title),
             url: Some(info.url),
             workspace: Some(workspace.to_string()),
             state: Some(info.state),
+            first_seen_done_at,
             assignee: info.assignee,
             fetched_at: at.to_string(),
             not_found: false,
         }
+    }
+
+    pub fn group(&self) -> IssueGroup {
+        if self.not_found {
+            IssueGroup::Backlog
+        } else {
+            IssueGroup::of_state(self.state.as_deref().unwrap_or_default())
+        }
+    }
+
+    /// Initialize older cache entries at first sight, never at their old fetch time.
+    pub fn observe_done(&mut self, at: &str) -> bool {
+        let before = self.first_seen_done_at.clone();
+        if self.group() != IssueGroup::Done {
+            self.first_seen_done_at = None;
+        } else if self
+            .first_seen_done_at
+            .as_deref()
+            .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+            .is_none()
+        {
+            // shortcut: issues already done at upgrade are stamped at first sight,
+            // so leave about a day after upgrade, not their real completion time;
+            // use Linear's completion date if the CLI starts providing it.
+            self.first_seen_done_at = Some(at.to_string());
+        }
+        before != self.first_seen_done_at
+    }
+
+    pub fn visible_in_issues(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.group() != IssueGroup::Done
+            || self
+                .first_seen_done_at
+                .as_deref()
+                .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+                .is_none_or(|stamp| now.signed_duration_since(stamp) < chrono::Duration::hours(24))
     }
 
     pub fn not_found(at: &str) -> Self {
@@ -355,6 +440,29 @@ impl IssueTitlesFile {
         crate::merge_plan::write_atomically(path, &encoded)
     }
 
+    /// Group visible keys without changing their incoming mention-count order.
+    /// Empty groups are omitted; hidden keys stay in the overview and chat facts.
+    pub fn grouped_keys<'a>(
+        &self,
+        keys: &'a [String],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<(IssueGroup, Vec<&'a String>)> {
+        IssueGroup::ALL
+            .into_iter()
+            .filter_map(|group| {
+                let rows: Vec<_> = keys
+                    .iter()
+                    .filter(|key| {
+                        let entry = self.issues.get(*key);
+                        entry.map_or(IssueGroup::Backlog, CachedIssue::group) == group
+                            && entry.is_none_or(|entry| entry.visible_in_issues(now))
+                    })
+                    .collect();
+                (!rows.is_empty()).then_some((group, rows))
+            })
+            .collect()
+    }
+
     /// Applies one round's results stamped `at`; a failed key is left as
     /// it was.
     pub fn absorb(&mut self, outcome: &RoundOutcome, at: &str) {
@@ -364,8 +472,18 @@ impl IssueTitlesFile {
                     if let Some(prefix) = key_prefix(key) {
                         self.prefixes.insert(prefix.to_string(), workspace.clone());
                     }
-                    self.issues
-                        .insert(key.clone(), CachedIssue::found(info.clone(), workspace, at));
+                    let mut entry = CachedIssue::found(info.clone(), workspace, at);
+                    if entry.group() == IssueGroup::Done {
+                        if let Some(previous) = self
+                            .issues
+                            .get(key)
+                            .filter(|old| old.group() == IssueGroup::Done)
+                        {
+                            entry.first_seen_done_at = previous.first_seen_done_at.clone();
+                            entry.observe_done(at);
+                        }
+                    }
+                    self.issues.insert(key.clone(), entry);
                 }
                 KeyResult::NotFound => {
                     self.issues.insert(key.clone(), CachedIssue::not_found(at));
@@ -373,23 +491,6 @@ impl IssueTitlesFile {
                 KeyResult::Failed(_) => {}
             }
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The fold.
-
-/// How many of `total` issues show, and the fold button's label when some
-/// are hidden: "▸ n more" folded, "▾ show fewer" expanded.
-pub fn fold(total: usize, all: bool) -> (usize, Option<String>) {
-    let hidden = total.saturating_sub(ISSUES_SHOWN);
-    if hidden == 0 {
-        return (total, None);
-    }
-    if all {
-        (total, Some("\u{25BE} show fewer".to_string()))
-    } else {
-        (ISSUES_SHOWN, Some(format!("\u{25B8} {hidden} more")))
     }
 }
 
@@ -745,6 +846,135 @@ globex      Globex Corp Pat Example <pat@example.com>\n";
     }
 
     #[test]
+    fn issue_groups_match_all_contract_states_case_insensitively() {
+        for (group, states) in [
+            (
+                IssueGroup::InProgress,
+                vec![
+                    "In Progress",
+                    "Waiting for deploy to DEV",
+                    "In Review",
+                    "Ready for Review",
+                    "Changes requested",
+                ],
+            ),
+            (
+                IssueGroup::InDevForTesting,
+                vec!["In DEV for Testing", "Staging", "In PROD for Validation"],
+            ),
+            (
+                IssueGroup::Backlog,
+                vec![
+                    "Backlog", "Todo", "To Do", "Triage", "Ideation", "Ideating", "Parked",
+                    "Unknown", "",
+                ],
+            ),
+            (
+                IssueGroup::Done,
+                vec!["Done", "Released", "Canceled", "Duplicate"],
+            ),
+        ] {
+            for state in states {
+                assert_eq!(IssueGroup::of_state(state), group, "{state}");
+                assert_eq!(
+                    IssueGroup::of_state(&state.to_uppercase()),
+                    group,
+                    "{state}"
+                );
+                assert_eq!(
+                    IssueGroup::of_state(&state.to_lowercase()),
+                    group,
+                    "{state}"
+                );
+            }
+        }
+    }
+
+    fn observe(file: &mut IssueTitlesFile, state: &str, stamp: &str) {
+        let mut info = info();
+        info.state = state.to_string();
+        file.absorb(
+            &RoundOutcome {
+                results: vec![(
+                    "ABC-12".to_string(),
+                    KeyResult::Found {
+                        info,
+                        workspace: "globex".to_string(),
+                    },
+                )],
+            },
+            stamp,
+        );
+    }
+
+    #[test]
+    fn done_is_hidden_at_24_hours_and_reopening_clears_the_persisted_stamp() {
+        let mut file = IssueTitlesFile::default();
+        observe(&mut file, "Done", "2026-01-01T10:00:00Z");
+        let keys = vec!["ABC-12".to_string()];
+        assert_eq!(
+            file.issues["ABC-12"].first_seen_done_at.as_deref(),
+            Some("2026-01-01T10:00:00Z")
+        );
+        assert_eq!(
+            file.grouped_keys(&keys, at("2026-01-02T09:59:59Z")),
+            vec![(IssueGroup::Done, vec![&keys[0]])]
+        );
+        assert!(file
+            .grouped_keys(&keys, at("2026-01-02T10:00:00Z"))
+            .is_empty());
+        assert!(file
+            .grouped_keys(&keys, at("2026-01-02T10:00:01Z"))
+            .is_empty());
+        // Refreshes and moves between Done states must not restart the clock.
+        observe(&mut file, "Released", "2026-01-02T11:00:00Z");
+        let dir = tempfile::tempdir().unwrap();
+        let path = IssueTitlesFile::path_in(dir.path());
+        file.save(&path).unwrap();
+        let mut file = IssueTitlesFile::load(&path);
+        assert_eq!(
+            file.issues["ABC-12"].first_seen_done_at.as_deref(),
+            Some("2026-01-01T10:00:00Z")
+        );
+        assert!(file
+            .grouped_keys(&keys, at("2026-01-02T11:00:00Z"))
+            .is_empty());
+        observe(&mut file, "In Progress", "2026-01-02T12:00:00Z");
+        assert_eq!(file.issues["ABC-12"].first_seen_done_at, None);
+        assert_eq!(
+            file.grouped_keys(&keys, at("2026-01-02T12:00:00Z")),
+            vec![(IssueGroup::InProgress, vec![&keys[0]])]
+        );
+        observe(&mut file, "Done", "2026-01-03T10:00:00Z");
+        assert_eq!(
+            file.issues["ABC-12"].first_seen_done_at.as_deref(),
+            Some("2026-01-03T10:00:00Z")
+        );
+        assert_eq!(keys, ["ABC-12"]); // The source facts/keys are never pruned.
+    }
+
+    #[test]
+    fn old_done_cache_is_stamped_at_first_sight_without_extending_it_on_poll() {
+        let mut entry: CachedIssue = serde_json::from_str(
+            r#"{
+            "state":"Done", "fetched_at":"2025-12-01T10:00:00Z"
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(entry.first_seen_done_at, None);
+        assert!(entry.observe_done("2026-01-01T10:00:00Z"));
+        assert!(!entry.observe_done("2026-01-02T10:00:00Z"));
+        assert_eq!(
+            entry.first_seen_done_at.as_deref(),
+            Some("2026-01-01T10:00:00Z")
+        );
+        assert!(!entry.visible_in_issues(at("2026-01-02T10:00:00Z")));
+        entry.state = Some("Backlog".to_string());
+        assert!(entry.observe_done("2026-01-02T11:00:00Z"));
+        assert_eq!(entry.first_seen_done_at, None);
+    }
+
+    #[test]
     fn found_entries_refresh_after_an_hour() {
         let entry = CachedIssue::found(info(), "globex", "2026-01-01T10:00:00Z");
         assert!(!needs_fetch(Some(&entry), at("2026-01-01T10:59:59Z")));
@@ -821,15 +1051,6 @@ globex      Globex Corp Pat Example <pat@example.com>\n";
         assert_eq!(IssueTitlesFile::load(&path), file);
         std::fs::write(&path, "{ not json").unwrap();
         assert_eq!(IssueTitlesFile::load(&path), IssueTitlesFile::default());
-    }
-
-    #[test]
-    fn fold_shows_five_then_more_or_fewer() {
-        assert_eq!(fold(0, false), (0, None));
-        assert_eq!(fold(5, false), (5, None));
-        assert_eq!(fold(5, true), (5, None));
-        assert_eq!(fold(8, false), (5, Some("\u{25B8} 3 more".to_string())));
-        assert_eq!(fold(8, true), (8, Some("\u{25BE} show fewer".to_string())));
     }
 
     #[test]

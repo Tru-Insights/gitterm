@@ -6513,6 +6513,8 @@ impl RepoRegistry {
 
 // Workspace groups tabs by project
 struct Workspace {
+    /// Issues disclosures belong to this workspace, even when overviews share data.
+    collapsed_issue_groups: Vec<gitterm::issue_titles::IssueGroup>,
     uid: u64,
     name: String,
     abbrev: String,
@@ -6575,6 +6577,7 @@ impl Workspace {
         let abbrev = Self::derive_abbrev(&name);
         let run_command = detect_run_command(&dir);
         Self {
+            collapsed_issue_groups: gitterm::issue_titles::IssueGroup::default_collapsed(),
             uid: next_workspace_uid(),
             name,
             abbrev,
@@ -6609,6 +6612,7 @@ impl Workspace {
         let abbrev = Self::derive_abbrev(&name);
         let dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         Self {
+            collapsed_issue_groups: gitterm::issue_titles::IssueGroup::default_collapsed(),
             uid: next_workspace_uid(),
             name,
             abbrev,
@@ -6695,6 +6699,20 @@ fn task_tab_indices(workspace: &Workspace, task_id: &str) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(index, tab)| (tab.task_id.as_deref() == Some(task_id)).then_some(index))
+        .collect()
+}
+
+fn finished_task_ids_for_workspace(
+    store: &TaskStore,
+    belongs_to_workspace: impl Fn(&TaskRecord) -> bool,
+) -> Vec<String> {
+    store
+        .tasks()
+        .iter()
+        .filter(|task| belongs_to_workspace(task))
+        .filter(|task| !task.lifecycle.is_active() && task.lifecycle != TaskLifecycle::Archived)
+        .filter(|task| store.task_worktree_missing(&task.task_id))
+        .map(|task| task.task_id.clone())
         .collect()
 }
 
@@ -7055,6 +7073,8 @@ pub enum Event {
     TaskArchive(String),
     /// Archive every failed task in the active workspace in one click.
     TaskArchiveAllFailed,
+    /// Archive every settled task with a missing worktree in the active workspace.
+    TaskArchiveFinished,
     TaskSwitcherOpen,
     TaskSwitcherClose,
     TaskSwitcherQueryChanged(String),
@@ -10508,6 +10528,7 @@ impl App {
     fn workspace_config(&self, ws: &Workspace) -> WorkspaceConfig {
         let home = self.repo(ws.home);
         WorkspaceConfig {
+            collapsed_issue_groups: ws.collapsed_issue_groups.clone(),
             name: ws.name.clone(),
             abbrev: ws.abbrev.clone(),
             dir: workspace_config_dir(ws),
@@ -15401,6 +15422,7 @@ impl App {
             ws.chats = cfg.chats.clone();
             ws.guidelines_off = cfg.guidelines_off;
             ws.claude_in_chrome = cfg.claude_in_chrome;
+            ws.collapsed_issue_groups = cfg.collapsed_issue_groups.clone();
             ws.decisions_repo = cfg.decisions_repo.as_ref().map(PathBuf::from);
             if let Some(config::WorkspaceLocationConfig::RemoteAgent {
                 remote_id,
@@ -20187,6 +20209,7 @@ impl App {
         workspace.chats = ws_config.chats.clone();
         workspace.guidelines_off = ws_config.guidelines_off;
         workspace.claude_in_chrome = ws_config.claude_in_chrome;
+        workspace.collapsed_issue_groups = ws_config.collapsed_issue_groups.clone();
         workspace.decisions_repo = ws_config.decisions_repo.as_ref().map(PathBuf::from);
         // The home repo's saved env and run command (TRU-180).
         self.seed_from_saved(&mut workspace, ws_config);
@@ -22478,6 +22501,7 @@ fi
             workspace.chats = saved.chats.clone();
             workspace.guidelines_off = saved.guidelines_off;
             workspace.claude_in_chrome = saved.claude_in_chrome;
+            workspace.collapsed_issue_groups = saved.collapsed_issue_groups.clone();
             workspace.decisions_repo = saved.decisions_repo.as_ref().map(PathBuf::from);
             self.seed_from_saved(&mut workspace, saved);
             workspace
@@ -28917,6 +28941,46 @@ fi
                     }
                 }
             }
+            Event::TaskArchiveFinished => {
+                let task_ids = match (self.task_store.as_ref(), self.active_workspace()) {
+                    (Some(store), Some(workspace)) => {
+                        finished_task_ids_for_workspace(store, |task| {
+                            self.task_belongs_to_workspace(task, workspace)
+                        })
+                    }
+                    _ => Vec::new(),
+                };
+                if !task_ids.is_empty() {
+                    let timestamp = chrono::Utc::now().to_rfc3339();
+                    let focused = self.active_task_context_id().map(str::to_string);
+                    let mut focused_archived = false;
+                    let mut archive_error = None;
+                    match self.task_store.as_mut() {
+                        Some(store) => {
+                            for task_id in task_ids {
+                                match store.archive(&task_id, &timestamp) {
+                                    Ok(()) => {
+                                        if focused.as_deref() == Some(task_id.as_str()) {
+                                            focused_archived = true;
+                                        }
+                                        self.task_rows_seen.insert(task_id);
+                                    }
+                                    Err(error) => archive_error = Some(error.to_string()),
+                                }
+                            }
+                        }
+                        None => {
+                            archive_error = Some("GitTerm's task store is unavailable".to_string());
+                        }
+                    }
+                    if let Some(error) = archive_error {
+                        self.task_ui_error = Some(error);
+                    }
+                    if focused_archived {
+                        return self.update(Event::TaskContextBack);
+                    }
+                }
+            }
             Event::TaskWorktreeDeleteOpen(task_id) => {
                 let Some(task) = self
                     .task_store
@@ -32244,6 +32308,7 @@ fi
                     workspace.abbrev = cfg.abbrev.clone();
                     workspace.guidelines_off = cfg.guidelines_off;
                     workspace.claude_in_chrome = cfg.claude_in_chrome;
+                    workspace.collapsed_issue_groups = cfg.collapsed_issue_groups.clone();
                     workspace.decisions_repo = cfg.decisions_repo.as_ref().map(PathBuf::from);
                     self.seed_from_saved(&mut workspace, cfg);
                 }
@@ -40258,16 +40323,17 @@ fi
             content = content.push(also);
         }
 
-        if !summary.issue_keys.is_empty() {
+        let issue_groups = self
+            .issues
+            .cache
+            .grouped_keys(&summary.issue_keys, chrono::Utc::now());
+        let issue_count: usize = issue_groups.iter().map(|(_, keys)| keys.len()).sum();
+        if issue_count > 0 {
             content = content.push(
                 Column::new()
                     .spacing(2)
-                    .push(self.overview_section_header(
-                        "Issues",
-                        summary.issue_keys.len().to_string(),
-                        None,
-                    ))
-                    .push(self.view_work_issues(&summary.issue_keys)),
+                    .push(self.overview_section_header("Issues", issue_count.to_string(), None))
+                    .push(self.view_work_issues(issue_groups)),
             );
         }
         for error in &state.errors {
@@ -40636,6 +40702,13 @@ fi
             .iter()
             .filter(|task| task.lifecycle == TaskLifecycle::Failed)
             .count();
+        let finished_count = match (self.task_store.as_ref(), workspace) {
+            (Some(store), Some(workspace)) => finished_task_ids_for_workspace(store, |task| {
+                self.task_belongs_to_workspace(task, workspace)
+            })
+            .len(),
+            _ => 0,
+        };
 
         let header = row![
             text(workspace_name).size(10).color(text_muted).font(mono),
@@ -40778,6 +40851,35 @@ fi
                 })
                 .padding([2, 6])
                 .on_press(Event::TaskArchiveAllFailed),
+            );
+        }
+        if finished_count > 0 {
+            let danger = theme.danger();
+            filters = filters.push(
+                button(
+                    text(format!("Archive {finished_count} finished"))
+                        .size(9)
+                        .font(mono),
+                )
+                .style(move |_, status| button::Style {
+                    background: Some(
+                        if matches!(status, button::Status::Hovered) {
+                            theme.bg_overlay()
+                        } else {
+                            iced::Color::TRANSPARENT
+                        }
+                        .into(),
+                    ),
+                    text_color: danger,
+                    border: iced::Border {
+                        color: danger,
+                        width: 1.0,
+                        radius: 10.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .padding([2, 6])
+                .on_press(Event::TaskArchiveFinished),
             );
         }
         let mut content = Column::new()
@@ -48598,6 +48700,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gitterm::tasks::{GitBase, RepositoryIdentity};
     use std::path::Path;
     use std::sync::Arc;
 
@@ -48621,6 +48724,130 @@ mod tests {
                 assert_eq!(guidelines.text, gitterm::guidelines::DEFAULT_GUIDELINES);
             }
         }
+    }
+
+    #[test]
+    fn archive_finished_selects_only_settled_missing_worktrees_in_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_a = temp.path().join("workspace-a");
+        let workspace_b = temp.path().join("workspace-b");
+        let present_path = temp.path().join("present-worktree");
+        std::fs::create_dir(&present_path).unwrap();
+        let mut store = TaskStore::load(temp.path().join("tasks.json")).unwrap();
+
+        let mut add_task = |id: &str, workspace: &std::path::Path, lifecycle, worktree_path| {
+            let mut task = TaskRecord::new_draft(
+                NewTaskRecord {
+                    task_id: id.to_string(),
+                    title: id.to_string(),
+                    objective: "Test archive finished".to_string(),
+                    workspace: TaskWorkspaceIdentity {
+                        name: workspace
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                        location: WorkspaceLocationIdentity::Local {
+                            directory: workspace.to_path_buf(),
+                        },
+                    },
+                    repository: RepositoryIdentity {
+                        common_dir: workspace.join(".git"),
+                        remote_url: None,
+                    },
+                    issue: None,
+                    base: GitBase {
+                        reference: "v6".to_string(),
+                        commit: "0123456789abcdef".to_string(),
+                    },
+                    branch: format!("task/{id}"),
+                    executor: ExecutorTarget::Local,
+                    harness: None,
+                    stopping_boundary: StoppingBoundary::ImplementUntilTestsPass,
+                },
+                "2026-11-10T00:00:00Z",
+            );
+            task.lifecycle = lifecycle;
+            task.worktree = TaskWorktree {
+                state: TaskWorktreeState::Ready,
+                path: Some(worktree_path),
+            };
+            if lifecycle == TaskLifecycle::Archived {
+                task.archived_at = Some("2026-11-09T00:00:00Z".to_string());
+            }
+            store.insert(task).unwrap();
+        };
+
+        let missing_path = temp.path().join("missing-worktree");
+        add_task(
+            "active",
+            &workspace_a,
+            TaskLifecycle::Preparing,
+            missing_path.clone(),
+        );
+        add_task(
+            "settled-with-worktree",
+            &workspace_a,
+            TaskLifecycle::Completed,
+            present_path,
+        );
+        add_task(
+            "settled-without-worktree",
+            &workspace_a,
+            TaskLifecycle::Completed,
+            missing_path.clone(),
+        );
+        add_task(
+            "failed-without-worktree",
+            &workspace_a,
+            TaskLifecycle::Failed,
+            missing_path.clone(),
+        );
+        add_task(
+            "already-archived",
+            &workspace_a,
+            TaskLifecycle::Archived,
+            missing_path.clone(),
+        );
+        add_task(
+            "other-workspace",
+            &workspace_b,
+            TaskLifecycle::Completed,
+            missing_path,
+        );
+
+        let selected = finished_task_ids_for_workspace(&store, |task| {
+            matches!(
+                &task.workspace.location,
+                WorkspaceLocationIdentity::Local { directory } if directory == &workspace_a
+            )
+        });
+        assert_eq!(
+            selected,
+            ["settled-without-worktree", "failed-without-worktree"]
+        );
+
+        for task_id in &selected {
+            store.archive(task_id, "2026-11-10T01:00:00Z").unwrap();
+        }
+        for id in ["settled-without-worktree", "failed-without-worktree"] {
+            assert_eq!(store.get(id).unwrap().lifecycle, TaskLifecycle::Archived);
+        }
+        for id in ["active", "settled-with-worktree", "other-workspace"] {
+            assert_ne!(
+                store.get(id).unwrap().lifecycle,
+                TaskLifecycle::Archived,
+                "{id}"
+            );
+        }
+        assert_eq!(
+            store
+                .get("already-archived")
+                .unwrap()
+                .archived_at
+                .as_deref(),
+            Some("2026-11-09T00:00:00Z")
+        );
     }
 
     #[test]
@@ -54577,6 +54804,7 @@ mod tests {
 
     fn closed_config(name: &str, parked_at: Option<&str>) -> WorkspaceConfig {
         WorkspaceConfig {
+            collapsed_issue_groups: gitterm::issue_titles::IssueGroup::default_collapsed(),
             name: name.to_string(),
             abbrev: "AC".to_string(),
             dir: format!("/tmp/{name}"),

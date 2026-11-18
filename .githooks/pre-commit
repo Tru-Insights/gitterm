@@ -12,7 +12,7 @@
 set -e
 
 echo "Running cargo clippy (lint)..."
-if ! cargo clippy --quiet -- -D warnings; then
+if ! scripts/cargo.sh clippy --quiet -- -D warnings; then
     echo ""
     echo "ERROR: Clippy failed. Fix the errors above before committing."
     echo "Reproduce with: cargo clippy -- -D warnings"
@@ -22,7 +22,7 @@ echo "Lint passed."
 echo ""
 
 echo "Running cargo fmt --check..."
-if ! cargo fmt -- --check; then
+if ! scripts/cargo.sh fmt --all -- --check; then
     echo ""
     echo "ERROR: Formatting drift. Run 'cargo fmt' and re-stage."
     exit 1
@@ -31,7 +31,7 @@ echo "Format passed."
 echo ""
 
 echo "Running cargo test..."
-if ! cargo test --quiet; then
+if ! scripts/cargo.sh test --quiet; then
     echo ""
     echo "ERROR: Tests failed. Fix the failures above before committing."
     echo "Reproduce with: cargo test"
@@ -39,5 +39,11 @@ if ! cargo test --quiet; then
 fi
 echo "Tests passed."
 echo ""
+
+if [ "$(uname -s)" = Darwin ]; then
+    echo "Checking the separate GPUI workspace..."
+    scripts/check-gpui-deps.sh
+    scripts/cargo.sh fmt --manifest-path gpui/Cargo.toml -- --check
+fi
 
 echo "All pre-commit gates passed."
