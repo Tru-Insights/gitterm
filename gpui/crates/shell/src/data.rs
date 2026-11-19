@@ -32,6 +32,8 @@ pub struct ChangedFile {
 }
 #[derive(Clone, Debug)]
 pub struct GitStatus {
+    /// False until a first status result exists; the branch and files are placeholders.
+    pub checked: bool,
     pub repository: String,
     pub branch: String,
     pub files: Vec<ChangedFile>,
@@ -99,6 +101,7 @@ impl ShellData for SampleData {
             .expect("sample workspace exists")
             .name;
         GitStatus {
+            checked: true,
             repository,
             loading: false,
             error: None,

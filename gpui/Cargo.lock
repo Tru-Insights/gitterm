@@ -2613,6 +2613,7 @@ dependencies = [
  "dirs 6.0.0",
  "gitterm-core",
  "gitterm-gpui-chat",
+ "gitterm-gpui-review",
  "gitterm-terminal",
  "gpui-component",
  "gpui-kit",

@@ -5,7 +5,7 @@ use crate::session::Session;
 use crate::settings::BackendSettings;
 use crate::settings::LayoutSize as Size;
 use alacritty_terminal::event::{Event, EventListener, OnResize, WindowSize};
-use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::grid::{BidirectionalIterator, Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::sync::FairMutex;
@@ -632,6 +632,39 @@ impl Backend {
     ) {
         match link_action {
             LinkAction::Hover => {
+                // OSC 8 labels need not look like URLs. Resolve the current cell's
+                // destination before falling back to plain-text URL detection.
+                let viewport_start = Line(-(terminal.grid().display_offset() as i32));
+                let viewport_end = viewport_start + terminal.bottommost_line();
+                if point.column.0 >= terminal.columns()
+                    || !(viewport_start..=viewport_end).contains(&point.line)
+                {
+                    return;
+                }
+                if let Some(link) = terminal.grid()[point].hyperlink() {
+                    let mut start = point;
+                    let mut end = point;
+                    let mut before = terminal.grid().iter_from(point);
+                    while let Some(cell) = before.prev() {
+                        if cell.point.line < viewport_start
+                            || cell.hyperlink().as_ref() != Some(&link)
+                        {
+                            break;
+                        }
+                        start = cell.point;
+                    }
+                    for cell in terminal.grid().iter_from(point) {
+                        if cell.point.line > viewport_end
+                            || cell.hyperlink().as_ref() != Some(&link)
+                        {
+                            break;
+                        }
+                        end = cell.point;
+                    }
+                    self.last_content.hovered_hyperlink = Some(start..=end);
+                    self.last_content.hovered_url = Some(link.uri().to_owned());
+                    return;
+                }
                 let hovered_hyperlink =
                     self.regex_match_at(terminal, point, &mut self.url_regex.clone());
                 let hovered_url = hovered_hyperlink
