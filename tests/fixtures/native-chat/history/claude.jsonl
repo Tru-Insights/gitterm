@@ -1,0 +1,9 @@
+{"type":"user","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"Inspect fixture"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"QQ=="}}]}}
+{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"early-tool","content":"early result","is_error":false}]}}
+{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Consider"},{"type":"text","text":"Hello fixture"},{"type":"tool_use","id":"early-tool","name":"Read","input":{"file_path":"/synthetic/readme.md"}},{"type":"tool_use","id":"agent-1","name":"Agent","input":{"prompt":"Synthetic child"}}]}}
+{"type":"user","timestamp":"2026-01-01T00:00:03Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent-1","content":"child done","is_error":false}]}}
+{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"ignored sidechain"}]}}
+{"type":"user","isMeta":true,"message":{"content":"ignored metadata"}}
+{"type":"user","timestamp":"2026-01-01T00:01:00Z","message":{"role":"user","content":"Next prompt"}}
+{"type":"assistant","timestamp":"2026-01-01T00:01:01Z","message":{"role":"assistant","content":[{"type":"text","text":"Second reply"}]}}
+{"type":

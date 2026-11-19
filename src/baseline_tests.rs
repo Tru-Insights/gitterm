@@ -1206,3 +1206,6 @@ fn status_file_order_and_hash_traces() {
         assert_eq!(tab.status.git_unchanged_streak, expected_streak);
     }
 }
+
+#[path = "stage45/mod.rs"]
+mod stage45;

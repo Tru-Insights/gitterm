@@ -1,6 +1,7 @@
 #[cfg(test)]
 use git2::Status;
 use git2::{DiffOptions, Repository};
+use gitterm::chats::{ChatBackendResume, ChatEntryResume};
 use iced::advanced::graphics::core::Element;
 use iced::keyboard::{self, key, Key, Modifiers};
 use iced::widget::{
@@ -600,65 +601,22 @@ fn chat_digest_from_timeline(
     chat_summary::digest(&events)
 }
 
-/// A transcript read-back as a chat timeline, with each delegation card's
-/// anchor put back where the card was requested
-/// (`delegations::history_anchor_positions`).
+/// A transcript read-back adapted to the desktop conversation buffer.
 fn history_timeline(
     entries: Vec<gitterm::harness::transcript::TimedEntry>,
     delegations: &[(String, String)],
 ) -> Vec<tab::AgentEvent> {
-    let anchors = gitterm::delegations::history_anchor_positions(&entries, delegations);
-    let mut anchors = anchors.into_iter().peekable();
-    let mut timeline = Vec::with_capacity(entries.len() + delegations.len());
-    for (index, timed) in entries.into_iter().enumerate() {
-        while let Some((_, id)) = anchors.next_if(|(at, _)| *at == index) {
-            timeline.push(tab::AgentEvent::Other(
-                gitterm::delegations::anchor_payload(&id),
-            ));
-        }
-        let at_ms = timed
-            .at
-            .as_deref()
-            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
-            .map(|at| at.timestamp_millis());
-        let event = tab::AgentEvent::from(timed.entry);
-        let is_prompt = matches!(
-            &event,
-            tab::AgentEvent::Other(value)
-                if value.get("type").and_then(|value| value.as_str()) == Some("user_prompt")
-        );
-        let is_turn_end = matches!(
-            &event,
-            tab::AgentEvent::Harness(HarnessEvent::TurnCompleted { .. })
-        );
-        let started = tab::subagent_started(&event).map(str::to_string);
-        if is_turn_end {
-            if let Some(at_ms) = at_ms {
-                timeline.push(tab::AgentEvent::Other(gitterm::chat_page::turn_timing(
-                    None,
-                    Some(at_ms),
-                )));
+    gitterm_core::chat::history::history_timeline(entries, delegations)
+        .into_iter()
+        .map(|event| match event {
+            gitterm_core::chat::history::HistoryEvent::Harness(event) => {
+                tab::AgentEvent::Harness(event)
             }
-        }
-        timeline.push(event);
-        if is_prompt {
-            if let Some(at_ms) = at_ms {
-                timeline.push(tab::AgentEvent::Other(gitterm::chat_page::turn_timing(
-                    Some(at_ms),
-                    None,
-                )));
+            gitterm_core::chat::history::HistoryEvent::Other(value) => {
+                tab::AgentEvent::Other(value)
             }
-        }
-        if let (Some(parent), Some(at_ms)) = (started, at_ms) {
-            timeline.push(tab::AgentEvent::Other(tab::subagent_started_at(
-                &parent, at_ms,
-            )));
-        }
-    }
-    timeline.extend(
-        anchors.map(|(_, id)| tab::AgentEvent::Other(gitterm::delegations::anchor_payload(&id))),
-    );
-    timeline
+        })
+        .collect()
 }
 
 /// `App::log_terminal_failure` for the bulk recreate, which holds the

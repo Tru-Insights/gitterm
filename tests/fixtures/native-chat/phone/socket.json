@@ -1,0 +1,45 @@
+[
+  {
+    "type": "opened",
+    "chat_id": "<chat>",
+    "claude_session_id": null,
+    "head_seq": 1,
+    "gap": false,
+    "scope": "view"
+  },
+  {
+    "type": "history",
+    "events": []
+  },
+  {
+    "type": "event",
+    "seq": 2,
+    "redelivered": false,
+    "event": {
+      "kind": "harness",
+      "event": {
+        "type": "text_delta",
+        "data": "live"
+      }
+    }
+  },
+  {
+    "type": "refused",
+    "message": "this phone is paired to view only; it cannot send to Claude"
+  },
+  {
+    "type": "refused",
+    "message": "this phone is paired to view only; it cannot send to Claude"
+  },
+  {
+    "type": "refused",
+    "message": "this phone is paired to view only; it cannot send to Claude"
+  },
+  {
+    "type": "refused",
+    "message": "this phone is paired to view only; it cannot send to Claude"
+  },
+  {
+    "type": "revoked"
+  }
+]

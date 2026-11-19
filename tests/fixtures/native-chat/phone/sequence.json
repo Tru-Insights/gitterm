@@ -1,0 +1,333 @@
+{
+  "live": [
+    {
+      "event": {
+        "event": {
+          "data": {
+            "models": [],
+            "permission_mode": "default",
+            "session_id": "synthetic-session"
+          },
+          "type": "ready"
+        },
+        "kind": "harness"
+      },
+      "redelivered": false,
+      "seq": 1,
+      "type": "event"
+    },
+    {
+      "event": {
+        "event": {
+          "data": {
+            "kind": {
+              "decision_reason": null,
+              "input": {
+                "command": "true"
+              },
+              "suggestions": [],
+              "tool_name": "Bash",
+              "type": "permission"
+            },
+            "request_id": "permission-1",
+            "tool_use_id": "tool-1"
+          },
+          "type": "runtime_request"
+        },
+        "kind": "harness"
+      },
+      "redelivered": false,
+      "seq": 2,
+      "type": "event"
+    },
+    {
+      "event": {
+        "event": {
+          "data": "first",
+          "type": "text_delta"
+        },
+        "kind": "harness"
+      },
+      "redelivered": false,
+      "seq": 3,
+      "type": "event"
+    },
+    {
+      "event": {
+        "event": {
+          "data": "second",
+          "type": "text_delta"
+        },
+        "kind": "harness"
+      },
+      "redelivered": false,
+      "seq": 4,
+      "type": "event"
+    }
+  ],
+  "reconnect": [
+    {
+      "after_seq": null,
+      "gap": false,
+      "head_seq": 4,
+      "position": 4,
+      "redelivered": [
+        {
+          "event": {
+            "event": {
+              "data": {
+                "models": [],
+                "permission_mode": "default",
+                "session_id": "synthetic-session"
+              },
+              "type": "ready"
+            },
+            "kind": "harness"
+          },
+          "redelivered": true,
+          "seq": 1,
+          "type": "event"
+        },
+        {
+          "event": {
+            "event": {
+              "data": {
+                "kind": {
+                  "decision_reason": null,
+                  "input": {
+                    "command": "true"
+                  },
+                  "suggestions": [],
+                  "tool_name": "Bash",
+                  "type": "permission"
+                },
+                "request_id": "permission-1",
+                "tool_use_id": "tool-1"
+              },
+              "type": "runtime_request"
+            },
+            "kind": "harness"
+          },
+          "redelivered": true,
+          "seq": 2,
+          "type": "event"
+        }
+      ],
+      "replay": [],
+      "session": "synthetic-session"
+    },
+    {
+      "after_seq": 1,
+      "gap": true,
+      "head_seq": 4,
+      "position": 4,
+      "redelivered": [
+        {
+          "event": {
+            "event": {
+              "data": {
+                "models": [],
+                "permission_mode": "default",
+                "session_id": "synthetic-session"
+              },
+              "type": "ready"
+            },
+            "kind": "harness"
+          },
+          "redelivered": true,
+          "seq": 1,
+          "type": "event"
+        },
+        {
+          "event": {
+            "event": {
+              "data": {
+                "kind": {
+                  "decision_reason": null,
+                  "input": {
+                    "command": "true"
+                  },
+                  "suggestions": [],
+                  "tool_name": "Bash",
+                  "type": "permission"
+                },
+                "request_id": "permission-1",
+                "tool_use_id": "tool-1"
+              },
+              "type": "runtime_request"
+            },
+            "kind": "harness"
+          },
+          "redelivered": true,
+          "seq": 2,
+          "type": "event"
+        }
+      ],
+      "replay": [],
+      "session": "synthetic-session"
+    },
+    {
+      "after_seq": 3,
+      "gap": false,
+      "head_seq": 4,
+      "position": 4,
+      "redelivered": [
+        {
+          "event": {
+            "event": {
+              "data": {
+                "models": [],
+                "permission_mode": "default",
+                "session_id": "synthetic-session"
+              },
+              "type": "ready"
+            },
+            "kind": "harness"
+          },
+          "redelivered": true,
+          "seq": 1,
+          "type": "event"
+        },
+        {
+          "event": {
+            "event": {
+              "data": {
+                "kind": {
+                  "decision_reason": null,
+                  "input": {
+                    "command": "true"
+                  },
+                  "suggestions": [],
+                  "tool_name": "Bash",
+                  "type": "permission"
+                },
+                "request_id": "permission-1",
+                "tool_use_id": "tool-1"
+              },
+              "type": "runtime_request"
+            },
+            "kind": "harness"
+          },
+          "redelivered": true,
+          "seq": 2,
+          "type": "event"
+        }
+      ],
+      "replay": [
+        {
+          "event": {
+            "event": {
+              "data": "second",
+              "type": "text_delta"
+            },
+            "kind": "harness"
+          },
+          "redelivered": false,
+          "seq": 4,
+          "type": "event"
+        }
+      ],
+      "session": "synthetic-session"
+    },
+    {
+      "after_seq": 4,
+      "gap": false,
+      "head_seq": 4,
+      "position": 4,
+      "redelivered": [
+        {
+          "event": {
+            "event": {
+              "data": {
+                "models": [],
+                "permission_mode": "default",
+                "session_id": "synthetic-session"
+              },
+              "type": "ready"
+            },
+            "kind": "harness"
+          },
+          "redelivered": true,
+          "seq": 1,
+          "type": "event"
+        },
+        {
+          "event": {
+            "event": {
+              "data": {
+                "kind": {
+                  "decision_reason": null,
+                  "input": {
+                    "command": "true"
+                  },
+                  "suggestions": [],
+                  "tool_name": "Bash",
+                  "type": "permission"
+                },
+                "request_id": "permission-1",
+                "tool_use_id": "tool-1"
+              },
+              "type": "runtime_request"
+            },
+            "kind": "harness"
+          },
+          "redelivered": true,
+          "seq": 2,
+          "type": "event"
+        }
+      ],
+      "replay": [],
+      "session": "synthetic-session"
+    },
+    {
+      "after_seq": 99,
+      "gap": true,
+      "head_seq": 4,
+      "position": 4,
+      "redelivered": [
+        {
+          "event": {
+            "event": {
+              "data": {
+                "models": [],
+                "permission_mode": "default",
+                "session_id": "synthetic-session"
+              },
+              "type": "ready"
+            },
+            "kind": "harness"
+          },
+          "redelivered": true,
+          "seq": 1,
+          "type": "event"
+        },
+        {
+          "event": {
+            "event": {
+              "data": {
+                "kind": {
+                  "decision_reason": null,
+                  "input": {
+                    "command": "true"
+                  },
+                  "suggestions": [],
+                  "tool_name": "Bash",
+                  "type": "permission"
+                },
+                "request_id": "permission-1",
+                "tool_use_id": "tool-1"
+              },
+              "type": "runtime_request"
+            },
+            "kind": "harness"
+          },
+          "redelivered": true,
+          "seq": 2,
+          "type": "event"
+        }
+      ],
+      "replay": [],
+      "session": "synthetic-session"
+    }
+  ]
+}

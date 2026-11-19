@@ -254,3 +254,7 @@ impl Render for FilesView {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "review_tests.rs"]
+mod review_tests;

@@ -29,86 +29,13 @@ use std::path::{Path, PathBuf};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use gitterm_core::chat_facts::{repo_name_byte, GITHUB_PULL_PREFIX};
+pub use gitterm_core::chat_facts::{valid_repo, PrKey, PrRef};
+
 /// Directory under the GitTerm config dir that holds the plans.
 pub const PLANS_DIR_NAME: &str = "merge-plans";
-/// The only host PR URLs are collected for.
-const GITHUB_PULL_PREFIX: &str = "https://github.com/";
 /// Hold and note text kept per entry.
 const FREE_TEXT_MAX_CHARS: usize = 300;
-
-// ---------------------------------------------------------------------------
-// PR identity.
-
-/// A pull request: `owner/name` and its number. GitHub names are
-/// case-insensitive, so identity is [`PrKey::id`], lowercased; `repo` keeps
-/// the case it was given in for display.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct PrKey {
-    pub repo: String,
-    pub number: u64,
-}
-
-impl PrKey {
-    pub fn new(repo: &str, number: u64) -> Self {
-        Self {
-            repo: repo.to_string(),
-            number,
-        }
-    }
-
-    /// `owner/name#n`, lowercased: the key maps and comparisons use.
-    pub fn id(&self) -> String {
-        format!("{}#{}", self.repo.to_ascii_lowercase(), self.number)
-    }
-
-    /// `owner/name#n` as given.
-    pub fn label(&self) -> String {
-        format!("{}#{}", self.repo, self.number)
-    }
-
-    pub fn owner(&self) -> &str {
-        self.repo.split_once('/').map_or("", |(owner, _)| owner)
-    }
-
-    pub fn url(&self) -> String {
-        format!("{GITHUB_PULL_PREFIX}{}/pull/{}", self.repo, self.number)
-    }
-
-    /// Parses `owner/name#n`.
-    pub fn parse(text: &str) -> Option<Self> {
-        let (repo, number) = text.trim().rsplit_once('#')?;
-        let number: u64 = number.parse().ok().filter(|n| *n > 0)?;
-        valid_repo(repo).then(|| Self::new(repo, number))
-    }
-}
-
-/// `owner/name` with GitHub's allowed characters on both sides.
-pub fn valid_repo(repo: &str) -> bool {
-    let Some((owner, name)) = repo.split_once('/') else {
-        return false;
-    };
-    let part_ok = |part: &str| !part.is_empty() && part.bytes().all(repo_name_byte);
-    part_ok(owner) && part_ok(name) && name != "." && name != ".."
-}
-
-fn repo_name_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-}
-
-/// A PR a chat created, as recorded in its facts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PrRef {
-    /// `owner/name`.
-    pub repo: String,
-    pub number: u64,
-    pub url: String,
-}
-
-impl PrRef {
-    pub fn key(&self) -> PrKey {
-        PrKey::new(&self.repo, self.number)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Collection from `gh pr create` results.
@@ -634,26 +561,7 @@ pub fn write_plan(dir: &Path, plan: &MergePlan) -> Result<(), String> {
 
 /// Writes `bytes` to `path` through a temporary sibling and an atomic
 /// replace.
-pub fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("{} has no file name", path.display()))?;
-    let temporary = parent.join(format!(
-        ".{name}.{}.{}.tmp",
-        std::process::id(),
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::write(&temporary, bytes)
-        .and_then(|()| crate::tasks::replace_file_atomically(&temporary, path))
-        .map_err(|error| {
-            let _ = std::fs::remove_file(&temporary);
-            format!("cannot write {}: {error}", path.display())
-        })
-}
+pub use gitterm_core::atomic_file::write_atomically;
 
 // ---------------------------------------------------------------------------
 // Ordering and the next to merge.

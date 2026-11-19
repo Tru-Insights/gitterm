@@ -215,3 +215,28 @@ fn unchanged_completions_preserve_iced_backoff_and_error_clock() {
     assert_eq!(model.workspaces[0].status.last_poll, before);
     assert_eq!(model.workspaces[0].status.branch_name, "branch");
 }
+
+#[test]
+fn unpolled_workspace_is_not_checked_until_its_first_result() {
+    let now = std::time::Instant::now();
+    let mut model = WorkspaceStatus::default();
+    let id = model.add("/fixture/repo".into(), now);
+    assert!(!model.status_view(id).checked);
+    model.dispatch(
+        Intent::Completed(gitterm_core::status::GitStatusSnapshot {
+            tab_id: id.0 as usize,
+            repo_path: "/fixture/repo".into(),
+            repo_name: "repo".into(),
+            branch_name: "feature".into(),
+            is_git_repo: true,
+            staged: vec![],
+            unstaged: vec![],
+            untracked: vec![],
+            error: None,
+        }),
+        now,
+    );
+    let view = model.status_view(id);
+    assert!(view.checked);
+    assert_eq!(view.branch, "feature");
+}

@@ -1,0 +1,12 @@
+[
+  "--print",
+  "--mode",
+  "json",
+  "--model",
+  "<scenario>",
+  "--session",
+  "/synthetic/session.jsonl",
+  "--thinking",
+  "medium",
+  "Synthetic prompt"
+]

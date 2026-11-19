@@ -1,0 +1,21 @@
+{
+  "admitted": [
+    1
+  ],
+  "byte_budget": 262144,
+  "byte_truncated": true,
+  "caps": [
+    2000,
+    262144,
+    20000,
+    30000,
+    4194304,
+    2000,
+    10000,
+    200
+  ],
+  "line_budget": 2000,
+  "line_truncated": true,
+  "total_lines": 30000,
+  "total_truncated": true
+}

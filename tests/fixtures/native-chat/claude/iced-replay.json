@@ -1,0 +1,115 @@
+{
+  "payloads": [
+    {
+      "id": "prompt-1",
+      "text": "Synthetic prompt",
+      "type": "user_prompt"
+    },
+    {
+      "kind": "turn_timing",
+      "start_ms": 0
+    },
+    {
+      "event": {
+        "data": "Hello fixture",
+        "type": "text_delta"
+      },
+      "kind": "harness"
+    },
+    {
+      "event": {
+        "data": "Consider",
+        "type": "thinking_delta"
+      },
+      "kind": "harness"
+    },
+    {
+      "event": {
+        "data": {
+          "kind": {
+            "decision_reason": null,
+            "input": {
+              "command": "true"
+            },
+            "suggestions": [],
+            "tool_name": "Bash",
+            "type": "permission"
+          },
+          "request_id": "p1",
+          "tool_use_id": "tool-1"
+        },
+        "type": "runtime_request"
+      },
+      "kind": "harness"
+    },
+    {
+      "event": {
+        "data": {
+          "request_id": "p1"
+        },
+        "type": "runtime_request_resolved"
+      },
+      "kind": "harness"
+    },
+    {
+      "event": {
+        "data": "synthetic-model",
+        "type": "model_changed"
+      },
+      "kind": "harness"
+    },
+    {
+      "event": {
+        "data": "plan",
+        "type": "permission_mode_changed"
+      },
+      "kind": "harness"
+    },
+    {
+      "event": {
+        "data": {
+          "applied": "high",
+          "effort": "high"
+        },
+        "type": "effort_changed"
+      },
+      "kind": "harness"
+    },
+    {
+      "end_ms": 0,
+      "kind": "turn_timing"
+    },
+    {
+      "event": {
+        "data": {
+          "code": 0
+        },
+        "type": "process_exited"
+      },
+      "kind": "harness"
+    },
+    {
+      "kind": "turn_timing",
+      "split_ms": 0
+    },
+    {
+      "id": "queued-1",
+      "queued": true,
+      "text": "Queued synthetic prompt",
+      "type": "user_prompt"
+    },
+    {
+      "event": {
+        "data": {
+          "id": "queued-1",
+          "state": "cancelled"
+        },
+        "type": "message_lifecycle"
+      },
+      "kind": "harness"
+    }
+  ],
+  "revision": 13,
+  "shows_prompt": true,
+  "shows_queue": true
+}

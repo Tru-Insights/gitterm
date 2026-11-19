@@ -1,0 +1,68 @@
+[
+  {
+    "id": "synthetic-pi",
+    "type": "session",
+    "version": 3
+  },
+  {
+    "type": "agent_start"
+  },
+  {
+    "type": "turn_start"
+  },
+  {
+    "message": {
+      "content": [
+        {
+          "text": "Hello fixture",
+          "type": "text"
+        },
+        {
+          "thinking": "Consider",
+          "type": "thinking"
+        },
+        {
+          "arguments": {
+            "command": "true"
+          },
+          "id": "tool-1",
+          "name": "bash",
+          "type": "toolCall"
+        },
+        {
+          "data": "QQ==",
+          "mimeType": "image/png",
+          "type": "image"
+        }
+      ],
+      "role": "assistant"
+    },
+    "toolResults": [],
+    "type": "turn_end"
+  },
+  {
+    "message": "opaque child",
+    "parentToolCallId": "tool-1",
+    "type": "subagent"
+  },
+  {
+    "requestId": "p1",
+    "type": "permission"
+  },
+  {
+    "text": "Pick a shape",
+    "type": "question"
+  },
+  {
+    "message": "synthetic failure",
+    "type": "error"
+  },
+  {
+    "messages": [],
+    "type": "agent_end"
+  },
+  "{\"type\":",
+  {
+    "type": "done"
+  }
+]

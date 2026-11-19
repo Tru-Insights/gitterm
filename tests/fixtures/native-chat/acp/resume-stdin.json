@@ -1,0 +1,67 @@
+[
+  {
+    "id": 1,
+    "jsonrpc": "2.0",
+    "method": "initialize",
+    "params": {
+      "clientCapabilities": {
+        "fs": {
+          "readTextFile": false,
+          "writeTextFile": false
+        },
+        "terminal": false
+      },
+      "clientInfo": {
+        "name": "gitterm",
+        "version": "6.0.0"
+      },
+      "protocolVersion": 1
+    }
+  },
+  {
+    "id": 2,
+    "jsonrpc": "2.0",
+    "method": "session/load",
+    "params": {
+      "cwd": "<cwd>",
+      "mcpServers": [],
+      "sessionId": "synthetic-chat"
+    }
+  },
+  {
+    "id": 3,
+    "jsonrpc": "2.0",
+    "method": "session/prompt",
+    "params": {
+      "prompt": [
+        {
+          "data": "QQ==",
+          "mimeType": "image/png",
+          "type": "image"
+        },
+        {
+          "text": "Inspect fixture",
+          "type": "text"
+        }
+      ],
+      "sessionId": "synthetic-chat"
+    }
+  },
+  {
+    "id": "permission-1",
+    "jsonrpc": "2.0",
+    "result": {
+      "outcome": {
+        "optionId": "once",
+        "outcome": "selected"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "session/cancel",
+    "params": {
+      "sessionId": "synthetic-chat"
+    }
+  }
+]

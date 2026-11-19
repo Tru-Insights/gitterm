@@ -82,13 +82,7 @@ pub(crate) fn is_commit_sha(sha: &str) -> bool {
     (7..=40).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-pub(crate) fn is_model_name(model: &str) -> bool {
-    !model.is_empty()
-        && model.len() <= 64
-        && model
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '.' | '_'))
-}
+pub(crate) use gitterm_core::workers::is_model_name;
 
 /// Describes the target and lists the exact read-only git commands the
 /// reviewer runs to gather it.

@@ -3,6 +3,8 @@
 //! The host retains the workspace catalog, selection,
 //! persistence and remote transport. The optional runtime owns status jobs.
 
+pub mod chat;
+pub mod harness;
 pub mod status;
 pub mod workspace;
 
@@ -12,3 +14,27 @@ pub mod git_diff;
 pub mod git_status;
 #[cfg(feature = "runtime")]
 pub mod runtime;
+
+pub mod git_facts;
+pub mod review;
+pub mod tasks;
+#[cfg(feature = "runtime")]
+pub mod worker_process;
+
+pub mod content;
+pub mod plans;
+
+#[cfg(feature = "runtime")]
+pub mod atomic_file;
+pub mod limits;
+pub mod plan_limits;
+pub mod workers;
+
+#[cfg(feature = "runtime")]
+pub mod gh_identity;
+#[cfg(feature = "runtime")]
+pub mod task_worktree;
+
+pub mod chat_facts;
+pub mod chats;
+pub mod find;

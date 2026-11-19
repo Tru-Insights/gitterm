@@ -567,17 +567,7 @@ pub fn configure_terminal_command(command: &str, guidelines: &Guidelines) -> Str
 /// otherwise single-quoted.
 /// `value` as one POSIX shell word: as is when it is plainly safe, else
 /// single-quoted.
-pub(crate) fn shell_word(value: &str) -> String {
-    let safe = !value.is_empty()
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ':' | '='));
-    if safe {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
-}
+pub(crate) use gitterm_core::workers::shell_word;
 
 /// The directory `off_repos` compares: the canonical path, with a linked
 /// worktree's root replaced by its main repo's root (subdirectories kept).
