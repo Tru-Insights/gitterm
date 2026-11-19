@@ -1,6 +1,6 @@
-//! Copies-only preview authority. This is a guard, NOT a sandbox: path checks
-//! and rename are subject to concurrent filesystem replacement (TOCTOU). No
-//! untrusted executable writer is authorized, even after validation succeeds.
+//! GPUI persistence guard and new-service boundary, NOT a process sandbox.
+//! Path checks and rename remain subject to filesystem replacement (TOCTOU).
+//! Existing terminal and Git functionality retains its stage 1–3 authority.
 use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
@@ -117,13 +117,16 @@ pub enum Effect {
     MutateHistory,
     RestoreProcess,
 }
-/// Closed until process-tree confinement and credential behavior are established.
+/// Existing terminal/Git effects stay open; new C2 services remain closed.
 #[derive(Clone, Copy, Debug)]
 pub struct Capabilities {
     _private: (),
 }
 impl Capabilities {
     pub fn authorize(&self, effect: Effect, target: &Path) -> io::Result<()> {
+        if matches!(effect, Effect::Terminal | Effect::Git) {
+            return Ok(());
+        }
         Err(refuse(format!(
             "preview disables {effect:?}: {}",
             target.display()
@@ -163,7 +166,7 @@ impl Preview {
         self.root.join("desktop")
     }
     pub fn layout(&self) -> PathBuf {
-        self.root.join("layout")
+        self.root.clone()
     }
     pub fn history(&self) -> PathBuf {
         self.root.join("history")
@@ -197,8 +200,32 @@ impl Preview {
         Ok(actual)
     }
     /// Shell layout/catalog only. Imported history and provider state have no writer.
+    #[cfg(test)]
     fn replace_layout(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
-        if !path.starts_with(self.layout()) {
+        self.replace_layout_checked(path, bytes, || Ok(()))
+    }
+    fn replace_layout_checked(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        before_replace: impl Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
+        let allowed = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| {
+                name == "local-workspaces.json"
+                    || name
+                        .strip_prefix("layout-")
+                        .and_then(|n| n.strip_suffix(".json"))
+                        .is_some_and(|key| {
+                            (!key.is_empty() && key.bytes().all(|c| c.is_ascii_digit()))
+                                || key.strip_prefix("workspace-").is_some_and(|hash| {
+                                    hash.len() == 16 && hash.bytes().all(|c| c.is_ascii_hexdigit())
+                                })
+                        })
+            });
+        if path.parent() != Some(self.root()) || !allowed {
             return Err(refuse("not a layout destination"));
         }
         self.scoped(path)?;
@@ -228,6 +255,7 @@ impl Preview {
             file.sync_all()?;
             self.scoped(path)?;
             self.scoped(&temp)?;
+            before_replace()?;
             fs::rename(&temp, path)
         })();
         if result.is_err() && self.scoped(&temp).is_ok() {
@@ -250,7 +278,7 @@ impl Preview {
                         )));
                     }
                     #[cfg(unix)]
-                    if ancestor.starts_with(&self.root) {
+                    if ancestor != self.root && ancestor.starts_with(&self.root) {
                         use std::os::unix::fs::PermissionsExt;
                         if meta.permissions().mode() & 0o077 != 0 {
                             return Err(refuse(format!(
@@ -271,7 +299,18 @@ impl Preview {
                         use std::os::unix::fs::DirBuilderExt;
                         builder.mode(0o700);
                     }
-                    builder.create(ancestor)?;
+                    match builder.create(ancestor) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                            // Another instance may have won fresh-root creation.
+                            let meta = fs::symlink_metadata(ancestor)?;
+                            if !meta.is_dir() || resolve(ancestor)? != ancestor {
+                                return Err(refuse("preview parent changed during creation"));
+                            }
+                            self.scoped(path)?;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -279,60 +318,111 @@ impl Preview {
         self.scoped(path)?;
         Ok(())
     }
-    /// Exclusive writable owner; stale leases fail closed. No copied PID is trusted.
+    /// Each context opens its own handle. The persistent file is never unlinked:
+    /// the kernel lock, not marker contents or a copied PID, owns each save.
     pub fn claim_writer(self: &std::sync::Arc<Self>) -> io::Result<WriterLease> {
         self.create_private_dir(&self.layout())?;
         let path = self.layout().join(".writer");
         self.scoped(&path)?;
         let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
+        options.read(true).write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        options
-            .open(&path)?
-            .write_all(b"preview writer; no PID recovery\n")?;
-        Ok(WriterLease {
+        let file = match options.open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                check_lock_path(&path)?;
+                OpenOptions::new().read(true).write(true).open(&path)?
+            }
+            Err(e) => return Err(e),
+        };
+        let lease = WriterLease {
             preview: self.clone(),
             path,
-            active: std::sync::Mutex::new(true),
-        })
+            file: std::sync::Mutex::new(Some(file)),
+        };
+        lease.check_identity(lease.file.lock().unwrap().as_ref().unwrap())?;
+        Ok(lease)
     }
+}
+fn check_lock_path(path: &Path) -> io::Result<fs::Metadata> {
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_file() {
+        return Err(refuse("preview lease is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() != 1 {
+            return Err(refuse("preview lease is hard-linked"));
+        }
+    }
+    Ok(meta)
 }
 pub struct WriterLease {
     preview: std::sync::Arc<Preview>,
     path: PathBuf,
-    active: std::sync::Mutex<bool>,
+    file: std::sync::Mutex<Option<fs::File>>,
 }
 impl WriterLease {
     pub fn preview(&self) -> &std::sync::Arc<Preview> {
         &self.preview
     }
-    pub fn replace_layout(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
-        let active = self
-            .active
-            .lock()
-            .map_err(|_| refuse("preview writer lock poisoned"))?;
-        if !*active {
-            return Err(refuse("preview writer is closed"));
-        }
-        self.preview.replace_layout(path, bytes)
-    }
-    /// Stop new writes and wait for any current write before releasing ownership.
-    /// Call from the host shutdown lifecycle; macOS termination may skip Drop.
-    pub fn close(&self) -> io::Result<()> {
-        let mut active = self
-            .active
-            .lock()
-            .map_err(|_| refuse("preview writer lock poisoned"))?;
-        if !*active {
-            return Ok(());
-        }
-        *active = false;
+    fn check_identity(&self, file: &fs::File) -> io::Result<()> {
         self.preview.scoped(&self.path)?;
-        fs::remove_file(&self.path)
+        let actual = check_lock_path(&self.path)?;
+        let opened = file.metadata()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if actual.dev() != opened.dev() || actual.ino() != opened.ino() {
+                return Err(refuse("preview lease was replaced"));
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (actual, opened);
+            Err(refuse("preview lease identity requires Unix file identity"))
+        }
+    }
+    /// Blocking disk operation. UI hosts must call this from their ordered save
+    /// queue, not from update/render callbacks. A crash releases the OS lock.
+    pub fn replace_layout(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        let mut guard = self
+            .file
+            .lock()
+            .map_err(|_| refuse("preview writer lock poisoned"))?;
+        let file = guard
+            .as_ref()
+            .ok_or_else(|| refuse("preview writer is closed"))?;
+        self.check_identity(file)?;
+        file.lock()?;
+        let result = self.check_identity(file).and_then(|()| {
+            self.preview
+                .replace_layout_checked(path, bytes, || self.check_identity(file))
+        });
+        if let Err(error) = file.unlock() {
+            // Dropping also releases ownership; never reuse an uncertain lock.
+            *guard = None;
+            return Err(io::Error::new(
+                error.kind(),
+                format!("unlock preview writer: {error}"),
+            ));
+        }
+        result
+    }
+    /// Disable surviving handles after any current write. Never remove the lock
+    /// file: another instance may already be waiting on that same inode.
+    pub fn close(&self) -> io::Result<()> {
+        self.file
+            .lock()
+            .map_err(|_| refuse("preview writer lock poisoned"))?
+            .take();
+        Ok(())
     }
 }
 impl Drop for WriterLease {
@@ -467,11 +557,11 @@ mod tests {
         assert!(p
             .replace_layout(&p.history().join("imported.jsonl"), b"bad")
             .is_err());
-        p.replace_layout(&p.layout().join("missing/layout.json"), b"good")
+        p.replace_layout(&p.layout().join("layout-1.json"), b"good")
             .unwrap();
         fs::write(p.root().join(".gitterm-protected"), "sentinel").unwrap();
         assert!(p
-            .replace_layout(&p.layout().join("missing/layout.json"), b"bad")
+            .replace_layout(&p.layout().join("layout-1.json"), b"bad")
             .is_err());
     }
     #[cfg(unix)]
@@ -490,17 +580,17 @@ mod tests {
         let sentinel = source.join("sentinel");
         fs::write(&sentinel, b"unchanged").unwrap();
         p.create_private_dir(&p.layout()).unwrap();
-        let dest = p.layout().join("copied.json");
+        let dest = p.layout().join("layout-2.json");
         fs::hard_link(&sentinel, &dest).unwrap();
         p.replace_layout(&dest, b"new inode").unwrap();
         assert_eq!(fs::read(&sentinel).unwrap(), b"unchanged");
         fs::remove_file(&dest).unwrap();
         symlink(&sentinel, &dest).unwrap();
         assert!(p.replace_layout(&dest, b"bad").is_err());
-        fs::rename(p.layout(), p.root().join("old-layout")).unwrap();
+        fs::rename(p.layout(), d.path().join("old-preview")).unwrap();
         symlink(&source, p.layout()).unwrap();
         assert!(p
-            .replace_layout(&p.layout().join("sentinel"), b"bad")
+            .replace_layout(&p.layout().join("layout-1.json"), b"bad")
             .is_err());
         assert_eq!(fs::read(&sentinel).unwrap(), b"unchanged");
     }
@@ -530,24 +620,40 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
-    fn existing_public_directories_and_stale_owner_lease_are_refused() {
+    fn existing_public_root_and_stale_marker_preserve_compatibility() {
         use std::os::unix::fs::PermissionsExt;
         let (_dir, _protected, p) = fixture();
         fs::create_dir(p.root()).unwrap();
         fs::set_permissions(p.root(), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(p.layout().join(".writer"), "stale marker, not authority").unwrap();
         let p = std::sync::Arc::new(p);
-        assert!(p.claim_writer().is_err());
-        fs::set_permissions(p.root(), fs::Permissions::from_mode(0o700)).unwrap();
-        p.create_private_dir(&p.layout()).unwrap();
-        fs::write(p.layout().join(".writer"), "copied-pid-not-authority").unwrap();
-        assert!(p.claim_writer().is_err());
+        let first = p.claim_writer().unwrap();
+        let second = p.claim_writer().unwrap();
+        for writer in [&first, &second] {
+            writer
+                .replace_layout(&p.layout().join("layout-1.json"), b"saved")
+                .unwrap();
+        }
+        assert_eq!(
+            fs::metadata(p.root()).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::read(p.root().join(".writer")).unwrap(),
+            b"stale marker, not authority"
+        );
     }
+    #[cfg(unix)]
     #[test]
-    fn all_live_authorities_closed_and_second_writer_refused() {
+    fn only_legacy_effects_open_and_new_service_destinations_closed() {
         let (_d, _protected, p) = fixture();
+        for effect in [Effect::Terminal, Effect::Git] {
+            assert!(p
+                .capabilities()
+                .authorize(effect, Path::new("/workspace"))
+                .is_ok());
+        }
         for effect in [
-            Effect::Terminal,
-            Effect::Git,
             Effect::Snapshot,
             Effect::Agent,
             Effect::Worker,
@@ -561,11 +667,26 @@ mod tests {
             assert!(error.to_string().contains(target.to_str().unwrap()));
         }
         let p = std::sync::Arc::new(p);
-        let first = p.claim_writer().unwrap();
-        assert!(p.claim_writer().is_err());
-        drop(first);
-        assert!(p.claim_writer().is_ok());
+        let writer = p.claim_writer().unwrap();
+        for path in [
+            p.history().join("layout-1.json"),
+            p.provider().join("layout-1.json"),
+            p.root().join("unrelated.json"),
+            p.root().join(".writer"),
+            p.root().join("nested/layout-1.json"),
+        ] {
+            assert!(writer.replace_layout(&path, b"bad").is_err());
+        }
+        // A failed write must release the lock too.
+        let next = p.claim_writer().unwrap();
+        let guard = next.file.lock().unwrap();
+        guard.as_ref().unwrap().try_lock().unwrap();
+        guard.as_ref().unwrap().unlock().unwrap();
+        drop(guard);
+        next.replace_layout(&p.root().join("layout-1.json"), b"good")
+            .unwrap();
     }
+    #[cfg(unix)]
     #[test]
     fn fresh_sample_and_nested_override_create_only_missing_private_parents() {
         let dir = tempfile::tempdir().unwrap();
@@ -577,10 +698,10 @@ mod tests {
             let p = std::sync::Arc::new(Preview::validate(&root, protected.clone()).unwrap());
             let writer = p.claim_writer().unwrap();
             writer
-                .replace_layout(&p.layout().join("layout.json"), b"fixture")
+                .replace_layout(&p.layout().join("layout-1.json"), b"fixture")
                 .unwrap();
             writer.close().unwrap();
-            assert!(!p.layout().join(".writer").exists());
+            assert!(p.layout().join(".writer").is_file());
         }
         let sibling = dir.path().join("shared/production");
         fs::create_dir_all(&sibling).unwrap();
@@ -596,6 +717,7 @@ mod tests {
         assert_eq!(fs::metadata(parent).unwrap().permissions(), permissions);
         assert_eq!(fs::read(sibling.join("sentinel")).unwrap(), b"unchanged");
     }
+    #[cfg(unix)]
     #[test]
     fn closing_writer_denies_late_writes_and_drop_cannot_remove_next_owners_lease() {
         let (_d, _protected, p) = fixture();
@@ -604,13 +726,131 @@ mod tests {
         first.close().unwrap();
         let next = p.claim_writer().unwrap();
         assert!(first
-            .replace_layout(&p.layout().join("late.json"), b"bad")
+            .replace_layout(&p.layout().join("layout-2.json"), b"bad")
             .is_err());
         drop(first);
-        assert!(p.claim_writer().is_err());
-        next.replace_layout(&p.layout().join("current.json"), b"good")
+        assert!(p.claim_writer().is_ok());
+        next.replace_layout(&p.layout().join("layout-3.json"), b"good")
             .unwrap();
         next.close().unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn lease_subprocess() {
+        let Some(root) = std::env::var_os("GITTERM_TEST_LEASE_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let p = std::sync::Arc::new(
+            Preview::validate(
+                &root,
+                ProtectedRoots::new(&root.parent().unwrap().join("host"), []).unwrap(),
+            )
+            .unwrap(),
+        );
+        let writer = p.claim_writer().unwrap();
+        if std::env::var_os("GITTERM_TEST_HOLD_LEASE").is_some() {
+            let guard = writer.file.lock().unwrap();
+            guard.as_ref().unwrap().lock().unwrap();
+            println!("LEASE_READY");
+            std::io::stdout().flush().unwrap();
+            std::io::stdin().read_exact(&mut [0]).unwrap();
+            // Simulate abrupt process termination: no WriterLease::close or Drop.
+            std::process::exit(0);
+        }
+        for i in 0..20 {
+            writer
+                .replace_layout(
+                    &p.layout().join("layout-1.json"),
+                    &serde_json::to_vec(&serde_json::json!({"pid":std::process::id(),"i":i}))
+                        .unwrap(),
+                )
+                .unwrap();
+            let bytes = fs::read(p.layout().join("layout-1.json")).unwrap();
+            assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_ok());
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_fresh_instances_save_and_crashed_owner_releases_lease() {
+        use std::{
+            io::BufRead,
+            process::{Command, Stdio},
+        };
+        let (dir, _protected, _) = fixture();
+        let root = dir.path().join("fresh/nested/preview");
+        let launch = || {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", "preview::tests::lease_subprocess", "--nocapture"])
+                .env("GITTERM_TEST_LEASE_ROOT", &root);
+            command
+        };
+        let mut one = launch()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let two = launch().output().unwrap();
+        assert!(
+            two.status.success(),
+            "{}",
+            String::from_utf8_lossy(&two.stderr)
+        );
+        assert!(one.wait().unwrap().success());
+        let mut crashed = launch()
+            .env("GITTERM_TEST_HOLD_LEASE", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = std::io::BufReader::new(crashed.stdout.take().unwrap()).lines();
+        assert!(lines.any(|line| line.unwrap() == "LEASE_READY"));
+        let p = std::sync::Arc::new(
+            Preview::validate(
+                &root,
+                ProtectedRoots::new(&root.parent().unwrap().join("host"), []).unwrap(),
+            )
+            .unwrap(),
+        );
+        let second = p.claim_writer().unwrap(); // Startup does not wait for an active save.
+        assert!(matches!(
+            second.file.lock().unwrap().as_ref().unwrap().try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        crashed.stdin.take().unwrap().write_all(b"exit").unwrap();
+        assert!(crashed.wait().unwrap().success());
+        second
+            .replace_layout(&p.layout().join("layout-2.json"), b"saved after crash")
+            .unwrap();
+        assert!(p.root().join(".writer").is_file());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn replaced_symlinked_and_hardlinked_lease_files_fail_closed() {
+        use std::os::unix::fs::symlink;
+        let (dir, _protected, p) = fixture();
+        let p = std::sync::Arc::new(p);
+        let writer = p.claim_writer().unwrap();
+        let path = p.root().join(".writer");
+        fs::rename(&path, p.root().join("old-writer")).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        assert!(writer
+            .replace_layout(&p.root().join("layout-1.json"), b"bad")
+            .is_err());
+        writer.close().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        let source = dir.path().join("active-v6");
+        fs::create_dir(&source).unwrap();
+        let sentinel = source.join("sentinel");
+        fs::write(&sentinel, b"unchanged").unwrap();
+        fs::remove_file(&path).unwrap();
+        symlink(&sentinel, &path).unwrap();
+        assert!(p.claim_writer().is_err());
+        fs::remove_file(&path).unwrap();
+        fs::hard_link(&sentinel, &path).unwrap();
+        assert!(p.claim_writer().is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"unchanged");
     }
     #[test]
     fn git_metadata_independent_linked_subdirectories_and_protected_common() {

@@ -1,4 +1,4 @@
-//! Composition before any GPUI store is loaded. No V6 fallback, import or child.
+//! Guarded persistence composition; new C2 services have no execution authority.
 use anyhow::{Context, Result};
 use gitterm_core::preview::{Effect, Preview, ProtectedRoots, WriterLease};
 use std::{
@@ -9,18 +9,19 @@ use std::{
 
 pub struct PreviewContext {
     pub roots: Arc<Preview>,
-    writer: Arc<WriterLease>,
+    writer: Arc<Writer>,
 }
 impl PreviewContext {
-    pub(crate) fn writer(&self) -> Arc<WriterLease> {
+    pub(crate) fn writer(&self) -> Arc<Writer> {
         self.writer.clone()
     }
     pub(crate) fn release_on_quit(&self, cx: &gpui::App) {
         let writer = self.writer();
         cx.on_app_quit(move |_| {
             let writer = writer.clone();
+            let close = writer.close();
             async move {
-                if let Err(error) = writer.close() {
+                if let Err(error) = finish(close).await {
                     eprintln!(
                         "release preview writer {}: {error}",
                         writer.preview().root().display()
@@ -32,9 +33,7 @@ impl PreviewContext {
     }
     pub fn from_environment(sample: bool) -> Result<Self> {
         let roots = roots_from_environment(sample)?;
-        let writer = roots
-            .claim_writer()
-            .context("claim exclusive preview writer (stale leases require explicit recovery)")?;
+        let writer = Writer::new(roots.claim_writer().context("open guarded GPUI writer")?);
         Ok(Self {
             roots,
             writer: Arc::new(writer),
@@ -67,11 +66,9 @@ pub fn config_dir(override_dir: Option<OsString>, home: &Path) -> Result<PathBuf
         .root()
         .to_path_buf())
 }
-/// There is deliberately no enabling production branch. The private test switch
-/// lets legacy headless backend tests exercise trusted temporary repositories.
+/// Stage 1–3 terminal/Git behavior predates C2; every new-service effect stays closed.
 pub fn executable(preview: Option<&Preview>, effect: Effect, target: &Path) -> Result<()> {
-    #[cfg(test)]
-    if TRUSTED_FIXTURE.with(std::cell::Cell::get) {
+    if matches!(effect, Effect::Terminal | Effect::Git) {
         return Ok(());
     }
     let Some(preview) = preview else {
@@ -80,22 +77,116 @@ pub fn executable(preview: Option<&Preview>, effect: Effect, target: &Path) -> R
     preview.capabilities().authorize(effect, target)?;
     Ok(())
 }
-#[cfg(test)]
-thread_local! { static TRUSTED_FIXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-#[cfg(test)]
-pub(crate) fn trusted_fixture() {
-    TRUSTED_FIXTURE.with(|allowed| allowed.set(true));
+/// One FIFO disk queue per app context. Only its thread waits for the OS lease;
+/// UI callbacks enqueue snapshots and report completion errors asynchronously.
+pub(crate) struct Writer {
+    core: Arc<WriterLease>,
+    sender: std::sync::Mutex<Option<std::sync::mpsc::Sender<SaveCommand>>>,
+}
+enum SaveCommand {
+    Replace(
+        PathBuf,
+        Vec<u8>,
+        tokio::sync::oneshot::Sender<std::io::Result<()>>,
+    ),
+    Close(tokio::sync::oneshot::Sender<std::io::Result<()>>),
+}
+pub(crate) type SaveResult = tokio::sync::oneshot::Receiver<std::io::Result<()>>;
+pub(crate) async fn finish(result: Result<SaveResult>) -> Result<()> {
+    result?
+        .await
+        .context("GPUI save queue stopped before completion")??;
+    Ok(())
+}
+impl Writer {
+    pub(crate) fn new(core: WriterLease) -> Self {
+        let core = Arc::new(core);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = core.clone();
+        std::thread::spawn(move || {
+            while let Ok(command) = receiver.recv() {
+                match command {
+                    SaveCommand::Replace(path, bytes, reply) => {
+                        let result = worker.replace_layout(&path, &bytes).map_err(|error| {
+                            std::io::Error::new(
+                                error.kind(),
+                                format!("save {}: {error}", path.display()),
+                            )
+                        });
+                        if let Err(result) = reply.send(result)
+                            && let Err(error) = result
+                        {
+                            eprintln!("{error}");
+                        }
+                    }
+                    SaveCommand::Close(reply) => {
+                        let _ = reply.send(worker.close());
+                        return;
+                    }
+                }
+            }
+            let _ = worker.close();
+        });
+        Self {
+            core,
+            sender: std::sync::Mutex::new(Some(sender)),
+        }
+    }
+    pub(crate) fn preview(&self) -> &Arc<Preview> {
+        self.core.preview()
+    }
+    pub(crate) fn submit(&self, path: PathBuf, bytes: Vec<u8>) -> Result<SaveResult> {
+        self.preview().scoped(&path)?;
+        let (reply, receipt) = tokio::sync::oneshot::channel();
+        let sender = self
+            .sender
+            .lock()
+            .map_err(|_| anyhow::anyhow!("GPUI save queue poisoned"))?;
+        sender
+            .as_ref()
+            .context("GPUI writer is closed")?
+            .send(SaveCommand::Replace(path, bytes, reply))
+            .context("GPUI save queue stopped")?;
+        Ok(receipt)
+    }
+    /// Startup and headless tests only. UI saves use submit/finish.
+    pub(crate) fn replace_layout(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        self.submit(path.to_path_buf(), bytes.to_vec())?
+            .blocking_recv()??;
+        Ok(())
+    }
+    pub(crate) fn close(&self) -> Result<SaveResult> {
+        let (reply, receipt) = tokio::sync::oneshot::channel();
+        let mut sender = self
+            .sender
+            .lock()
+            .map_err(|_| anyhow::anyhow!("GPUI save queue poisoned"))?;
+        if let Some(sender) = sender.take() {
+            sender
+                .send(SaveCommand::Close(reply))
+                .context("GPUI save queue stopped")?;
+        } else {
+            let _ = reply.send(Ok(()));
+        }
+        Ok(receipt)
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{layout::LayoutStore, workspace_config::WorkspaceStore};
-    fn fixture() -> (tempfile::TempDir, Arc<WriterLease>) {
+    pub(crate) fn guarded_store(root: &Path) -> WorkspaceStore {
+        let protected =
+            ProtectedRoots::new(&root.parent().unwrap().join("fixture-home"), []).unwrap();
+        let roots = Arc::new(Preview::validate(root, protected).unwrap());
+        WorkspaceStore::guarded(Arc::new(Writer::new(roots.claim_writer().unwrap())))
+    }
+    fn fixture() -> (tempfile::TempDir, Arc<Writer>) {
         let dir = tempfile::tempdir().unwrap();
         let protected = ProtectedRoots::new(&dir.path().join("host"), []).unwrap();
         let roots = Arc::new(Preview::validate(&dir.path().join("preview"), protected).unwrap());
-        let writer = Arc::new(roots.claim_writer().unwrap());
+        let writer = Arc::new(Writer::new(roots.claim_writer().unwrap()));
         (dir, writer)
     }
     #[test]
@@ -104,8 +195,6 @@ mod tests {
         let target = writer.preview().history().join("copied-pid-123");
         let mut executed = vec![];
         for effect in [
-            Effect::Terminal,
-            Effect::Git,
             Effect::Snapshot,
             Effect::Agent,
             Effect::Worker,
@@ -125,6 +214,112 @@ mod tests {
         }
         assert!(executed.is_empty());
     }
+    #[test]
+    fn existing_catalog_and_layout_load_and_save_in_place_including_sample() {
+        for sample in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = if sample {
+                dir.path().join("config/sample")
+            } else {
+                dir.path().join("config")
+            };
+            std::fs::create_dir_all(&root).unwrap();
+            let folder = dir.path().join("workspace");
+            std::fs::create_dir(&folder).unwrap();
+            std::fs::write(
+                root.join("local-workspaces.json"),
+                serde_json::to_vec(&serde_json::json!({"version":1,"folders":[folder]})).unwrap(),
+            )
+            .unwrap();
+            let root = root.canonicalize().unwrap();
+            let path = root.join("layout-1.json");
+            let state = gpui_component::dock::DockAreaState {
+                version: Some(1),
+                center: gpui_component::dock::PanelState {
+                    panel_name: "StackPanel".into(),
+                    children: vec![],
+                    info: gpui_component::dock::PanelInfo::stack(vec![], gpui::Axis::Horizontal),
+                },
+                ..Default::default()
+            };
+            std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+            let roots = Arc::new(
+                Preview::validate(
+                    &root,
+                    ProtectedRoots::new(&dir.path().join("host"), []).unwrap(),
+                )
+                .unwrap(),
+            );
+            assert_eq!(roots.layout(), root.canonicalize().unwrap());
+            let writer = Arc::new(Writer::new(roots.claim_writer().unwrap()));
+            let mut folders = WorkspaceStore::guarded(writer.clone());
+            assert_eq!(folders.load().unwrap(), vec![folder.clone()]);
+            std::fs::remove_dir(&folder).unwrap();
+            let model = crate::load_local_workspaces(&mut folders, vec![]).unwrap();
+            assert_eq!(model.folders(), vec![folder]);
+            folders.save(&[]).unwrap();
+            assert!(folders.load().unwrap().is_empty());
+            let mut layout = LayoutStore::guarded(path.clone(), writer);
+            // An empty dock is sufficient for the file contract; use its known ids.
+            let known = std::collections::HashSet::new();
+            assert!(layout.load(&known).unwrap().is_some());
+            layout.save(&state).unwrap();
+            assert!(path.is_file());
+            assert!(!root.join("layout").exists());
+        }
+    }
+    #[test]
+    fn queue_never_waits_on_ui_orders_saves_reports_errors_and_drains_on_quit() {
+        let (_dir, writer) = fixture();
+        let blocker = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(writer.preview().root().join(".writer"))
+            .unwrap();
+        blocker.lock().unwrap();
+        let path = writer.preview().root().join("local-workspaces.json");
+        let folders = WorkspaceStore::guarded(writer.clone());
+        let mut first = folders
+            .save_async(&[writer.preview().root().join("workspace")])
+            .unwrap();
+        let layout = LayoutStore::guarded(
+            writer.preview().root().join("layout-1.json"),
+            writer.clone(),
+        );
+        let dock_save = layout.save_async(&Default::default()).unwrap();
+        let bad = writer
+            .submit(
+                writer.preview().root().join("unrelated.json"),
+                b"bad".to_vec(),
+            )
+            .unwrap();
+        let last = folders.save_async(&[]).unwrap();
+        let mut close = writer.close().unwrap();
+        assert!(matches!(
+            first.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            close.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(writer.submit(path.clone(), vec![]).is_err());
+        blocker.unlock().unwrap();
+        first.blocking_recv().unwrap().unwrap();
+        dock_save.blocking_recv().unwrap().unwrap();
+        assert!(bad.blocking_recv().unwrap().is_err());
+        last.blocking_recv().unwrap().unwrap();
+        close.blocking_recv().unwrap().unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved["folders"], serde_json::json!([]));
+        assert!(
+            writer
+                .core
+                .replace_layout(&writer.preview().root().join("layout-2.json"), b"late")
+                .is_err()
+        );
+    }
     #[cfg(unix)]
     #[test]
     fn both_store_writers_refuse_replaced_destinations_and_preserve_sources() {
@@ -140,7 +335,10 @@ mod tests {
         std::os::unix::fs::symlink(&sentinel, &path).unwrap();
         assert!(folders.load().is_err());
         assert!(folders.save(&[]).is_err());
-        let path = writer.preview().layout().join("layout-workspace.json");
+        let path = writer
+            .preview()
+            .layout()
+            .join("layout-workspace-0123456789abcdef.json");
         let layout = LayoutStore::guarded(path.clone(), writer);
         std::os::unix::fs::symlink(&sentinel, &path).unwrap();
         assert!(layout.save(&Default::default()).is_err());
@@ -148,6 +346,7 @@ mod tests {
     }
     #[gpui::test]
     fn shutdown_releases_lease_while_store_handles_are_still_alive(cx: &mut gpui::TestAppContext) {
+        cx.background_executor.allow_parking();
         let (_dir, writer) = fixture();
         let preview = PreviewContext {
             roots: writer.preview().clone(),
@@ -158,16 +357,17 @@ mod tests {
         app.quit();
         assert!(
             writer
-                .replace_layout(&preview.roots.layout().join("late.json"), b"bad")
+                .replace_layout(&preview.roots.layout().join("layout-2.json"), b"bad")
                 .is_err()
         );
         let next = preview.roots.claim_writer().unwrap();
         drop(preview);
         drop(writer);
-        assert!(next.preview().claim_writer().is_err());
+        next.replace_layout(&next.preview().layout().join("layout-3.json"), b"good")
+            .unwrap();
     }
     #[gpui::test]
-    fn startup_restore_keeps_copied_terminals_inert(cx: &mut gpui::TestAppContext) {
+    fn normal_startup_restores_existing_terminal_sessions(cx: &mut gpui::TestAppContext) {
         use gpui::AppContext;
         use std::{rc::Rc, time::Instant};
         cx.background_executor.allow_parking();
@@ -202,18 +402,17 @@ mod tests {
             let state = shell.active(cx);
             assert_eq!(state.sessions[0].id.0, 999);
             let terminal = state.panes.get("session-999").unwrap().read(cx);
-            let crate::pane::PaneContent::Error(error) = &terminal.content else {
-                panic!("restored terminal launched");
-            };
-            assert!(error.contains(folder.to_str().unwrap()));
-            assert!(error.contains("Terminal"));
+            assert!(matches!(
+                terminal.content,
+                crate::pane::PaneContent::Terminal(_)
+            ));
             assert!(
-                shell
+                !shell
                     .owner
                     .read(cx)
                     .error
                     .as_ref()
-                    .is_some_and(|error| error.contains(folder.to_str().unwrap()))
+                    .is_some_and(|e| e.contains("preview disables"))
             );
         });
     }

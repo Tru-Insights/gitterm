@@ -144,7 +144,7 @@ impl WorkspaceOwner {
             review_workers,
         }
     }
-    pub(crate) fn writer(&self) -> Option<Arc<gitterm_core::preview::WriterLease>> {
+    pub(crate) fn writer(&self) -> Option<Arc<crate::preview::Writer>> {
         self.store.as_ref().and_then(|s| s.guard.clone())
     }
     pub(crate) fn preview(&self) -> Option<Arc<gitterm_core::preview::Preview>> {
@@ -203,23 +203,6 @@ impl WorkspaceOwner {
         cx.notify();
     }
     fn run_file_job(&mut self, request: crate::files::Request) {
-        if let Some(preview) = self.preview() {
-            let safe = self
-                .model
-                .workspaces
-                .iter()
-                .find(|w| w.id == request.workspace)
-                .is_some_and(|w| {
-                    preview
-                        .protected()
-                        .check(&request.path)
-                        .is_ok_and(|p| p.starts_with(&w.folder))
-                });
-            if !safe {
-                self.error = Some(format!("preview refuses read: {}", request.path.display()));
-                return;
-            }
-        }
         if let Some(executor) = &self.executor {
             self.file_jobs
                 .execute(executor.handle(), request, self.file_sender.clone());
@@ -392,18 +375,26 @@ impl WorkspaceOwner {
         folder: PathBuf,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<crate::data::WorkspaceId> {
-        if let Some(preview) = self.preview() {
-            preview.protected().check(&folder)?;
-            gitterm_core::preview::inspect_git(&folder, preview.protected())?;
-        }
         let mut folders = self.model.folders();
         if !folders.contains(&folder) {
             folders.push(folder.clone());
         }
-        self.store
+        let save = self
+            .store
             .as_ref()
             .expect("local owner has a store")
-            .save(&folders)?;
+            .save_async(&folders)?;
+        cx.spawn(async move |owner, cx| {
+            if let Err(error) = crate::preview::finish(Ok(save)).await {
+                let _ = owner.update(cx, |owner, cx| {
+                    let error = format!("Save local folders: {error:#}");
+                    eprintln!("{error}");
+                    owner.error = Some(error);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
         let id = self.model.add(folder, Instant::now());
         self.dispatch(Intent::Activate(id), Instant::now(), cx);
         self.dispatch(Intent::Opened, Instant::now(), cx);

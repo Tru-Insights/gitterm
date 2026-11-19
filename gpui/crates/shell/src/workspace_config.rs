@@ -27,7 +27,7 @@ pub fn local_folder(path: &Path) -> Result<PathBuf> {
 pub struct WorkspaceStore {
     path: PathBuf,
     refused: bool,
-    pub(crate) guard: Option<std::sync::Arc<gitterm_core::preview::WriterLease>>,
+    pub(crate) guard: Option<std::sync::Arc<crate::preview::Writer>>,
 }
 impl WorkspaceStore {
     #[cfg(test)]
@@ -38,7 +38,7 @@ impl WorkspaceStore {
             guard: None,
         }
     }
-    pub fn guarded(guard: std::sync::Arc<gitterm_core::preview::WriterLease>) -> Self {
+    pub(crate) fn guarded(guard: std::sync::Arc<crate::preview::Writer>) -> Self {
         Self {
             path: guard.preview().layout().join("local-workspaces.json"),
             refused: false,
@@ -80,16 +80,38 @@ impl WorkspaceStore {
         self.refused = result.is_err();
         result
     }
+    fn bytes(&self, folders: &[PathBuf]) -> Result<Vec<u8>> {
+        ensure!(
+            !self.refused,
+            "refusing to overwrite invalid local folders file"
+        );
+        Ok(serde_json::to_vec_pretty(&Folders {
+            version: 1,
+            folders: folders.to_vec(),
+        })?)
+    }
+    pub(crate) fn save_async(&self, folders: &[PathBuf]) -> Result<crate::preview::SaveResult> {
+        let bytes = self.bytes(folders)?;
+        if let Some(guard) = &self.guard {
+            return guard.submit(self.path.clone(), bytes);
+        }
+        #[cfg(test)]
+        {
+            self.save(folders)?;
+            let (reply, receipt) = tokio::sync::oneshot::channel();
+            let _ = reply.send(Ok(()));
+            Ok(receipt)
+        }
+        #[cfg(not(test))]
+        anyhow::bail!("workspace writer has no preview guard")
+    }
     pub fn save(&self, folders: &[PathBuf]) -> Result<()> {
         (|| -> Result<()> {
             ensure!(
                 !self.refused,
                 "refusing to overwrite invalid local folders file"
             );
-            let bytes = serde_json::to_vec_pretty(&Folders {
-                version: 1,
-                folders: folders.to_vec(),
-            })?;
+            let bytes = self.bytes(folders)?;
             if let Some(guard) = &self.guard {
                 guard.replace_layout(&self.path, &bytes)?;
             } else {

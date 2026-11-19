@@ -18,19 +18,12 @@ fn main() {
 #[cfg(target_os = "macos")]
 fn run() -> Result<(), String> {
     let route = launch::parse(std::env::args_os().skip(1)).unwrap_or_else(|| usage());
-    // Standalone fixture routes need validated roots but no writable lease.
-    let preview = match &route {
-        launch::Launch::Shell { .. } => None,
-        _ => Some(
+    route
+        .authorize(|| {
             gitterm_gpui_shell::preview::roots_from_environment(false)
-                .map_err(|error| format!("{error:#}"))?,
-        ),
-    };
-    if let Some(preview) = &preview {
-        route
-            .authorize(preview)
-            .map_err(|error| error.to_string())?;
-    }
+                .map_err(|error| std::io::Error::other(format!("{error:#}")))
+        })
+        .map_err(|error| error.to_string())?;
     match route {
         launch::Launch::Chat(path) => {
             let records = gitterm_gpui_chat::events::load_fixture(&path)

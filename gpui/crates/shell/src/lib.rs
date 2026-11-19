@@ -592,13 +592,33 @@ fn load_workspace_layout(
                 dock.add_panel_view(panel_handle(run), DockPlacement::Bottom, None, window, cx);
             }
         });
-        if !state.store.is_refused()
-            && let Err(error) = state.store.save(&state.dock.read(cx).dump(cx))
-        {
-            state.error = Some(format!("{error:#}"));
-        }
+        save_layout(state, cx);
     }
     Ok(())
+}
+fn save_layout(state: &mut WorkspaceDock, cx: &mut Context<Shell>) {
+    if state.store.is_refused() {
+        return;
+    }
+    let save = state.store.save_async(&state.dock.read(cx).dump(cx));
+    let id = state.workspace.id;
+    cx.spawn(async move |shell, cx| {
+        if let Err(error) = crate::preview::finish(save).await {
+            let error = format!("Save layout: {error:#}");
+            eprintln!("{error}");
+            let _ = shell.update(cx, |shell, cx| {
+                if let Some(state) = shell
+                    .workspaces
+                    .iter_mut()
+                    .find(|state| state.workspace.id == id)
+                {
+                    state.error = Some(error);
+                    cx.notify();
+                }
+            });
+        }
+    })
+    .detach();
 }
 fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscription {
     let id = state.workspace.id;
@@ -652,13 +672,7 @@ fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscriptio
                 state.active_session = state.sessions.first().map(|s| s.id);
             }
         }
-        if !state.store.is_refused()
-            && let Err(e) = state.store.save(&dock.read(cx).dump(cx))
-        {
-            let error = format!("{e:#}");
-            eprintln!("{error}");
-            state.error = Some(error);
-        }
+        save_layout(state, cx);
         this.sync_git_visibility(true, cx);
         cx.notify();
     })
@@ -687,7 +701,7 @@ fn build_workspace(
     workspace: Workspace,
     data: Rc<dyn ShellData>,
     config_dir: &Path,
-    preview: Option<std::sync::Arc<gitterm_core::preview::WriterLease>>,
+    preview: Option<std::sync::Arc<crate::preview::Writer>>,
     session_ids: &mut HashSet<u64>,
     window: &mut Window,
     cx: &mut Context<Shell>,
@@ -1147,25 +1161,31 @@ impl Render for Shell {
     }
 }
 
+fn load_local_workspaces(
+    store: &mut workspace_config::WorkspaceStore,
+    folders: Vec<std::path::PathBuf>,
+) -> Result<WorkspaceStatus> {
+    let mut model = WorkspaceStatus::default();
+    // A removed saved folder still reaches the normal status/error UI.
+    for folder in store.load()? {
+        model.add(folder, Instant::now());
+    }
+    for folder in folders {
+        model.add(workspace_config::local_folder(&folder)?, Instant::now());
+    }
+    store.save(&model.folders())?;
+    Ok(model)
+}
+
 pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
     let preview = preview::PreviewContext::from_environment(sample)?;
     let config = preview.roots.layout();
     let mut store = workspace_config::WorkspaceStore::guarded(preview.writer());
-    let mut model = WorkspaceStatus::default();
-    if !sample {
-        for folder in store.load()? {
-            preview.roots.protected().check(&folder)?;
-            gitterm_core::preview::inspect_git(&folder, preview.roots.protected())?;
-            model.add(folder, Instant::now());
-        }
-        for folder in folders {
-            let folder = workspace_config::local_folder(&folder)?;
-            preview.roots.protected().check(&folder)?;
-            gitterm_core::preview::inspect_git(&folder, preview.roots.protected())?;
-            model.add(folder, Instant::now());
-        }
-        store.save(&model.folders())?;
-    }
+    let model = if sample {
+        WorkspaceStatus::default()
+    } else {
+        load_local_workspaces(&mut store, folders)?
+    };
     gpui_kit::application().run(move |cx| {
         preview.release_on_quit(cx);
         gpui_kit::init(cx);
@@ -1257,11 +1277,11 @@ mod tests {
     fn live_local_status_crosses_application_bridge_and_survives_closed_git_pane(
         cx: &mut TestAppContext,
     ) {
-        crate::preview::trusted_fixture();
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let repo = tempfile::tempdir().unwrap();
         let config = tempfile::tempdir().unwrap();
+        let config_root = config.path().canonicalize().unwrap();
         let git = |args: &[&str]| {
             let output = gitterm_core::git_status::git_command()
                 .args(args)
@@ -1282,12 +1302,12 @@ mod tests {
             let owner = cx.new(|cx| {
                 WorkspaceOwner::new(
                     WorkspaceStatus::default(),
-                    Some(workspace_config::WorkspaceStore::new(config.path())),
+                    Some(crate::preview::tests::guarded_store(config_root.as_path())),
                     cx,
                 )
             });
             let data = Rc::new(data::LocalData(owner.clone()));
-            Shell::with_owner(data, owner, config.path(), true, window, cx).unwrap()
+            Shell::with_owner(data, owner, config_root.as_path(), true, window, cx).unwrap()
         });
         draw(cx); // Empty state is renderable and has no implicit workspace.
         assert!(cx.read(|cx| shell.read(cx).active_workspace(cx)).is_none());
@@ -1354,7 +1374,7 @@ mod tests {
             );
             assert_eq!(owner.read(cx).model.workspaces[0].status.last_poll, before);
         });
-        let mut store = workspace_config::WorkspaceStore::new(config.path());
+        let mut store = crate::preview::tests::guarded_store(config_root.as_path());
         assert_eq!(store.load().unwrap(), [repo.path().canonicalize().unwrap()]);
         // Local terminals start in their workspace folder, not $HOME.
         let folder = repo.path().canonicalize().unwrap();
@@ -1456,7 +1476,6 @@ mod tests {
     fn terminal_and_chat_survive_moves_grouping_close_reopen_workspace_and_restore(
         cx: &mut TestAppContext,
     ) {
-        crate::preview::trusted_fixture();
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
@@ -1560,7 +1579,6 @@ mod tests {
 
     #[gpui::test]
     fn permanent_session_close_releases_terminal_and_removes_reopen_entry(cx: &mut TestAppContext) {
-        crate::preview::trusted_fixture();
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
@@ -1588,7 +1606,6 @@ mod tests {
 
     #[gpui::test]
     fn clicks_and_input_are_scoped_to_the_focused_terminal(cx: &mut TestAppContext) {
-        crate::preview::trusted_fixture();
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
@@ -1729,7 +1746,6 @@ mod tests {
 
     #[gpui::test]
     fn corrupt_file_starts_default_dock_and_remains_intact(cx: &mut TestAppContext) {
-        crate::preview::trusted_fixture();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("layout-1.json");
@@ -1764,7 +1780,6 @@ mod tests {
 
     #[gpui::test]
     fn saved_workspace_layout_restores_position_and_size(cx: &mut TestAppContext) {
-        crate::preview::trusted_fixture();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
         let (shell, cx) = cx.add_window_view(|w, cx| {

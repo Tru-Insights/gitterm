@@ -21,7 +21,7 @@ pub struct LayoutStore {
     pub terminals: Option<Vec<TerminalSession>>,
     pub path: PathBuf,
     refused: Option<String>,
-    guard: Option<std::sync::Arc<gitterm_core::preview::WriterLease>>,
+    guard: Option<std::sync::Arc<crate::preview::Writer>>,
 }
 impl LayoutStore {
     #[cfg(test)]
@@ -33,10 +33,7 @@ impl LayoutStore {
             guard: None,
         }
     }
-    pub fn guarded(
-        path: PathBuf,
-        guard: std::sync::Arc<gitterm_core::preview::WriterLease>,
-    ) -> Self {
+    pub(crate) fn guarded(path: PathBuf, guard: std::sync::Arc<crate::preview::Writer>) -> Self {
         Self {
             path,
             terminals: None,
@@ -119,16 +116,38 @@ impl LayoutStore {
     pub fn is_refused(&self) -> bool {
         self.refused.is_some()
     }
+    fn bytes(&self, state: &DockAreaState) -> Result<Vec<u8>> {
+        if let Some(reason) = &self.refused {
+            bail!("refusing to overwrite {}: {reason}", self.path.display());
+        }
+        let mut value = serde_json::to_value(state)?;
+        if let Some(terminals) = &self.terminals {
+            value["terminal_sessions"] = serde_json::to_value(terminals)?;
+        }
+        Ok(serde_json::to_vec_pretty(&value)?)
+    }
+    pub(crate) fn save_async(&self, state: &DockAreaState) -> Result<crate::preview::SaveResult> {
+        let bytes = self.bytes(state)?;
+        if let Some(guard) = &self.guard {
+            return guard.submit(self.path.clone(), bytes);
+        }
+        #[cfg(test)]
+        {
+            self.save(state)?;
+            let (reply, receipt) = tokio::sync::oneshot::channel();
+            let _ = reply.send(Ok(()));
+            Ok(receipt)
+        }
+        #[cfg(not(test))]
+        bail!("layout writer has no preview guard")
+    }
+    #[cfg(test)]
     pub fn save(&self, state: &DockAreaState) -> Result<()> {
         if let Some(reason) = &self.refused {
             bail!("refusing to overwrite {}: {reason}", self.path.display());
         }
         (|| -> Result<()> {
-            let mut value = serde_json::to_value(state)?;
-            if let Some(terminals) = &self.terminals {
-                value["terminal_sessions"] = serde_json::to_value(terminals)?;
-            }
-            let bytes = serde_json::to_vec_pretty(&value)?;
+            let bytes = self.bytes(state)?;
             if let Some(guard) = &self.guard {
                 guard.replace_layout(&self.path, &bytes)?;
             } else {
