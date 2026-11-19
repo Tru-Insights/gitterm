@@ -23,7 +23,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
@@ -46,8 +45,7 @@ const STDERR_TAIL_LINES: usize = 20;
 /// awaiting it, so the replay counts as done once no history update has
 /// arrived for this long after the response.
 const HISTORY_QUIET: Duration = Duration::from_millis(400);
-/// Saved Gemini chats retain their identity, but never start another process.
-pub const GEMINI_REPLACED_NOTE: &str = "Gemini was replaced by Antigravity; this chat can't be continued. Saved Gemini tabs contain no transcript, so earlier messages are unavailable after restart.";
+pub use gitterm_core::chat::types::GEMINI_REPLACED_NOTE;
 /// OpenCode merges this JSON into its configuration (verified with 2.0.32:
 /// an agent defined here shows up in `session/new`'s mode options).
 const OPENCODE_CONFIG_CONTENT_ENV: &str = "OPENCODE_CONFIG_CONTENT";
@@ -88,61 +86,7 @@ fn truncate_output(mut s: String) -> String {
 // Agents
 // ---------------------------------------------------------------------------
 
-/// Which ACP agent a chat runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AcpAgent {
-    Antigravity,
-    OpenCode,
-    /// Legacy saved state only; excluded from new-chat choices.
-    Gemini,
-}
-
-impl AcpAgent {
-    pub const ALL: [AcpAgent; 2] = [AcpAgent::Antigravity, AcpAgent::OpenCode];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Antigravity => "Antigravity",
-            Self::Gemini => "Gemini",
-            Self::OpenCode => "OpenCode",
-        }
-    }
-
-    pub fn program(self) -> &'static str {
-        match self {
-            Self::Antigravity => "agy",
-            Self::Gemini => "gemini",
-            Self::OpenCode => "opencode",
-        }
-    }
-
-    /// The session mode a new chat starts in: Antigravity's `default` prompts
-    /// for approval; OpenCode's `build` agent asks before edits and shell
-    /// under GitTerm's permission config.
-    pub fn default_mode(self) -> &'static str {
-        match self {
-            Self::Antigravity | Self::Gemini => "default",
-            Self::OpenCode => "build",
-        }
-    }
-
-    /// The read-only planning mode both agents report as `plan`.
-    pub fn plan_mode(self) -> &'static str {
-        "plan"
-    }
-
-    /// The MCP server name this agent sees. Antigravity accepts these names
-    /// (verified with 1.5.11); retain the hyphens used by Gemini's policy engine, which
-    /// splits `mcp_<server>_<tool>` at the first underscore after `mcp_`,
-    /// so its server names use hyphens.
-    pub fn mcp_server_name(self, name: &str) -> String {
-        match self {
-            Self::Antigravity | Self::Gemini => name.replace('_', "-"),
-            Self::OpenCode => name.to_string(),
-        }
-    }
-}
+pub use gitterm_core::chat::types::AcpAgent;
 
 /// The OpenCode configuration GitTerm layers over the user's own through
 /// `OPENCODE_CONFIG_CONTENT`: edits and shell commands ask first (OpenCode
