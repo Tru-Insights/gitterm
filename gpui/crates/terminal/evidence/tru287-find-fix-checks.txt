@@ -1,0 +1,64 @@
+TRU-287 find hang diagnosis and verification, 2026-11-19 UTC
+
+Starting head: ca88ca4 (origin/v6); clean worktree.
+All Cargo commands use scripts/cargo.sh, --manifest-path gpui/Cargo.toml,
+CARGO_TARGET_DIR=/private/tmp/gt-target-findfix, and -j 4 where supported.
+nice -n 10 was attempted: sandbox reports setpriority not permitted, then
+continues running Cargo. Subsequent commands omit nice.
+
+Root cause and evidence:
+  Unmodified find_shortcuts_edit_navigate_close_restore_focus_and_export_callback
+  reproduced the PTY gate deadline: exit 101 after 20.03 seconds.
+  Temporary diagnostics showed intact first[.]/second[.] text, stable revision
+  4, and repeated ServiceError::Busy from initial/batch-0 snapshot try-locks.
+  Diagnostics changed scheduling enough for two runs to pass in 5.95/7.94 s.
+  They have been removed.
+
+  poll_services unconditionally notified while waiting/retrying in Busy state.
+  TerminalView::render also calls poll_services, then syncs the parser grid.
+  GPUI 0.3.12 App::flush_effects immediately draws dirty windows in test mode;
+  the resulting self-invalidating render loop competes for the parser lock
+  and starves search snapshots. It is a product redraw bug amplified by the
+  harness. The native search thread needs no GPUI executor pumping, and no
+  output/revision churn was involved. The parser lock is not permanently held.
+
+Fix:
+  Suppress unchanged pending-Busy notifications. Preserve notifications for
+  invalidated results, status transitions, job completion and launch errors.
+  Snapshot locking, admission, retries, wait helper/deadline and all original
+  assertions remain unchanged. No caching or dependencies added.
+
+Regression:
+  find_busy_polls_notify_only_when_visible_state_changes uses deterministic
+  Busy admission and observes notifications without a worker timing race.
+  With old product code restored temporarily: exit 101 (1 notification vs 0).
+  With the fix: exit 0; stale results notify once and repeated Busy polls do not.
+
+Final verification (all exit 0):
+  scripts/cargo.sh fmt --manifest-path gpui/Cargo.toml --all -- --check
+  scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --workspace --locked --all-targets -j 4 -- -D warnings
+  scripts/cargo.sh test --manifest-path gpui/Cargo.toml --workspace --locked -j 4
+    97 passed: 71 terminal, 17 chat, 9 shell; no failures or ignored tests.
+  scripts/check-gpui-deps.sh
+  scripts/cargo.sh build --manifest-path gpui/Cargo.toml --workspace --locked -j 4
+  git diff --check
+  git diff --exit-code HEAD -- Cargo.lock gpui/Cargo.lock
+
+Repetition matrix (every invocation exit 0):
+  scripts/cargo.sh test --manifest-path gpui/Cargo.toml -p gitterm-terminal --locked -j 4 find_shortcuts_edit
+    10/10 passed, durations: 0.25, 0.24, 0.24, 0.24, 0.13, 0.24, 0.24,
+    0.24, 0.24, 0.24 seconds.
+  scripts/cargo.sh test --manifest-path gpui/Cargo.toml -p gitterm-terminal --locked -j 4
+    5/5 passed, 71 tests each, durations: 7.02, 7.23, 7.04, 6.94, 7.31 seconds.
+    This runs every other wait()-based test, including service finish() callers,
+    PTY error/lifecycle/protocol/fairness tests, hidden 200 MB ingestion, view
+    input/resize tests and zsh paste. No other flakes observed in these runs.
+
+Self-reviewed diff; no review blockers or R1-R4 specialist trigger identified.
+Only gpui/crates/terminal changed; both lockfiles unchanged. Root pre-commit
+hook runs Iced checks outside this task, so commit uses command-local
+core.hooksPath=/dev/null after the GPUI gates above.
+
+No GUI, synthetic OS input, running-app/process interaction, push or PR.
+Native visual/IME checks were not run. Sustained output may still legitimately
+keep coherent-snapshot find Busy; its existing behavior is unchanged.

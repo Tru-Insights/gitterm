@@ -282,6 +282,7 @@ impl TerminalView {
             }
         }
         if self.find_open && self.find_revision != Some(self.backend.revision()) {
+            let changed = self.find_revision.is_some() || self.find_status != "Busy";
             self.backend.clear_find();
             self.find_revision = None;
             self.find_status = "Busy".into();
@@ -293,7 +294,11 @@ impl TerminalView {
                     Err(error) => self.find_status = format!("Search failed: {error:?}"),
                 }
             }
-            cx.notify();
+            // Rendering also polls. Redrawing an unchanged Busy state competes
+            // with the snapshot's parser try-locks, and can starve the worker.
+            if changed || self.find_status != "Busy" {
+                cx.notify();
+            }
         }
     }
 
