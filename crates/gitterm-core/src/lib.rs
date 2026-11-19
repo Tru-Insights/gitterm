@@ -31,3 +31,21 @@ pub mod workers;
 pub mod gh_identity;
 #[cfg(feature = "runtime")]
 pub mod task_worktree;
+
+// Delegation services; launch authority remains with the application owner.
+#[cfg(feature = "runtime")]
+pub mod checkout_name;
+#[cfg(feature = "runtime")]
+pub mod codex_review;
+#[cfg(feature = "runtime")]
+pub mod codex_runner;
+#[cfg(feature = "runtime")]
+pub mod delegation_request;
+#[cfg(all(test, feature = "runtime"))]
+mod delegation_test_support;
+#[cfg(feature = "runtime")]
+pub mod delegations;
+#[cfg(feature = "runtime")]
+pub mod review_request;
+#[cfg(feature = "runtime")]
+pub mod runner_guidelines;

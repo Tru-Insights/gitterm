@@ -6,7 +6,7 @@ description = "Plain workspace and Git status types and workspace ordering for G
 
 [features]
 default = []
-runtime = ["dep:tokio", "dep:git2", "dep:libc"]
+runtime = ["dep:tokio", "dep:git2", "dep:libc", "dep:dirs"]
 
 # The Iced host retains its exact TOML parser pin. GPUI has an incompatible
 # transitive TOML requirement; it does not activate Codex trust yet.
@@ -19,8 +19,9 @@ chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
 schemars = "1.0"
 libc = { version = "0.2", optional = true }
-tokio = { version = "1", optional = true, features = ["rt", "sync", "process", "io-util", "time"] }
+tokio = { version = "1", optional = true, features = ["rt", "sync", "process", "io-util", "time", "macros"] }
 git2 = { version = "0.19", optional = true }
+dirs = { version = "5.0", optional = true }
 
 # Preserve the root trust parser/quoting versions.
 toml = { version = "=0.8.2", optional = true }
