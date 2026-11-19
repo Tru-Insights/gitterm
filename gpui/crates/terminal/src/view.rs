@@ -1157,3 +1157,7 @@ mod tests {
 #[cfg(test)]
 #[path = "view_tests.rs"]
 mod gate;
+
+#[cfg(test)]
+#[path = "tool_view_tests.rs"]
+mod tool_gate;
