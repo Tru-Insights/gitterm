@@ -1,0 +1,113 @@
+[
+  {
+    "data": {
+      "entries": [
+        {
+          "data": "Old synthetic prompt",
+          "type": "user_prompt"
+        },
+        {
+          "data": {
+            "data": "Old synthetic reply",
+            "type": "text_delta"
+          },
+          "type": "harness"
+        },
+        {
+          "data": {
+            "data": {
+              "cost_usd": null,
+              "status": {
+                "state": "completed"
+              },
+              "usage": null
+            },
+            "type": "turn_completed"
+          },
+          "type": "harness"
+        }
+      ]
+    },
+    "type": "history_replayed"
+  },
+  {
+    "data": {
+      "models": [],
+      "permission_mode": null,
+      "session_id": "synthetic-chat"
+    },
+    "type": "ready"
+  },
+  {
+    "data": {
+      "id": "prompt-1",
+      "state": "started"
+    },
+    "type": "message_lifecycle"
+  },
+  {
+    "data": {
+      "model": null,
+      "session_id": "synthetic-chat"
+    },
+    "type": "turn_started"
+  },
+  {
+    "data": {
+      "id": "tool-1",
+      "kind": {
+        "input": {
+          "command": "true"
+        },
+        "name": "shell",
+        "type": "tool_call"
+      }
+    },
+    "type": "item_started"
+  },
+  {
+    "data": {
+      "kind": {
+        "decision_reason": null,
+        "input": {
+          "command": "true"
+        },
+        "suggestions": [],
+        "tool_name": "shell",
+        "type": "permission"
+      },
+      "request_id": "<request>",
+      "tool_use_id": "tool-1"
+    },
+    "type": "runtime_request"
+  },
+  {
+    "data": {
+      "request_id": "<request>"
+    },
+    "type": "runtime_request_resolved"
+  },
+  {
+    "data": {
+      "cost_usd": null,
+      "status": {
+        "state": "interrupted"
+      },
+      "usage": null
+    },
+    "type": "turn_completed"
+  },
+  {
+    "data": {
+      "id": "prompt-1",
+      "state": "completed"
+    },
+    "type": "message_lifecycle"
+  },
+  {
+    "data": {
+      "code": 0
+    },
+    "type": "process_exited"
+  }
+]

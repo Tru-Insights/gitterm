@@ -1,0 +1,17 @@
+{"type":"system","subtype":"init","session_id":"synthetic-chat","model":"synthetic-model"}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello "}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"fixture"}}}
+{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"Consider"}}}
+{"type":"stream_event","event":{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"tool-1","name":"Bash","input":{}}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"true\"}"}}}
+{"type":"control_request","request_id":"permission-1","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-1","input":{"command":"true"},"permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"true"}],"behavior":"allow","destination":"session"}],"decision_reason":"synthetic check"}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":[{"type":"text","text":"ok"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"QQ=="}}],"is_error":false}]}}
+{"type":"control_request","request_id":"question-1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"question-tool","input":{"questions":[{"question":"Pick a shape","header":"Shape","multiSelect":true,"options":[{"label":"Square","description":"Four sides"},{"label":"Circle","description":"Round"}]}]}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"child text"}},"parent_tool_use_id":"agent-1"}
+{"type": "assistant", "parent_tool_use_id": "agent-1", "message": {"content": [{"type": "text", "text": "Synthetic child reply"}, {"type": "thinking", "thinking": "Child considers"}]}}
+{"type":"assistant","parent_tool_use_id":"agent-1","message":{"content":[{"type":"tool_use","id":"child-tool","name":"Read","input":{"file_path":"/synthetic/readme.md"}}]}}
+{"type":"user","parent_tool_use_id":"agent-1","message":{"content":[{"type":"tool_result","tool_use_id":"child-tool","content":"missing","is_error":true}]}}
+{"type":"control_cancel_request","request_id":"permission-1"}
+{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["synthetic failure"],"usage":{"input_tokens":3,"output_tokens":2},"total_cost_usd":0.01}
+{"type":

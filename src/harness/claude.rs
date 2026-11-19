@@ -4320,3 +4320,7 @@ for line in sys.stdin:
         );
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/native-chat/native_chat_claude.rs"]
+mod native_chat_tests;
