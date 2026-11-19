@@ -4,3 +4,5 @@ pub mod types;
 
 pub mod history;
 pub mod html_render;
+
+pub mod context;

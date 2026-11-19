@@ -64,6 +64,7 @@ fn process_exists(pid: &str) -> bool {
 
 #[gpui::test]
 fn center_startup_new_terminal_close_reaps_and_hidden_exit_updates_title(cx: &mut TestAppContext) {
+    crate::preview::trusted_fixture();
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let folder = tempfile::tempdir().unwrap();
@@ -194,6 +195,7 @@ fn center_startup_new_terminal_close_reaps_and_hidden_exit_updates_title(cx: &mu
 
 #[gpui::test]
 fn ordered_sessions_restore_fresh_shells_and_prune_stale_ids(cx: &mut TestAppContext) {
+    crate::preview::trusted_fixture();
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let folder = tempfile::tempdir().unwrap();

@@ -10,6 +10,7 @@ mod files_view;
 mod layout;
 mod owner;
 mod pane;
+pub mod preview;
 mod review_reload;
 mod theme;
 pub mod workspace_config;
@@ -79,6 +80,7 @@ pub struct Shell {
     _subscriptions: Vec<Subscription>,
 }
 impl Shell {
+    #[cfg(test)]
     pub fn new(
         data: Rc<dyn ShellData>,
         config_dir: &Path,
@@ -121,6 +123,7 @@ impl Shell {
                 workspace,
                 data.clone(),
                 config_dir,
+                owner.read(cx).writer(),
                 &mut session_ids,
                 window,
                 cx,
@@ -325,6 +328,7 @@ impl Shell {
                 workspace,
                 self.data.clone(),
                 &self.config_dir,
+                self.owner.read(cx).writer(),
                 &mut session_ids,
                 window,
                 cx,
@@ -683,14 +687,23 @@ fn build_workspace(
     workspace: Workspace,
     data: Rc<dyn ShellData>,
     config_dir: &Path,
+    preview: Option<std::sync::Arc<gitterm_core::preview::WriterLease>>,
     session_ids: &mut HashSet<u64>,
     window: &mut Window,
     cx: &mut Context<Shell>,
 ) -> Result<WorkspaceDock> {
-    let mut store = LayoutStore::new(layout::workspace_layout_path(
-        config_dir,
-        &workspace.layout_key,
-    ));
+    let path = layout::workspace_layout_path(config_dir, &workspace.layout_key);
+    let mut store = match preview {
+        Some(guard) => LayoutStore::guarded(path, guard),
+        None => {
+            #[cfg(test)]
+            {
+                LayoutStore::new(path)
+            }
+            #[cfg(not(test))]
+            anyhow::bail!("missing preview context before layout load")
+        }
+    };
     let local = data.local_owner().is_some();
     let sessions = if local {
         let restored = store.load_terminals().unwrap_or_else(|error| {
@@ -1135,21 +1148,21 @@ impl Render for Shell {
 }
 
 pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
-    let home = dirs::home_dir().expect("resolve home for isolated GPUI config");
-    let config = layout::config_dir(std::env::var_os("GITTERM_GPUI_CONFIG_DIR"), &home)?;
-    let config = if sample {
-        layout::config_dir(Some(config.join("sample").into_os_string()), &home)?
-    } else {
-        config
-    };
-    let mut store = workspace_config::WorkspaceStore::new(&config);
+    let preview = preview::PreviewContext::from_environment(sample)?;
+    let config = preview.roots.layout();
+    let mut store = workspace_config::WorkspaceStore::guarded(preview.writer());
     let mut model = WorkspaceStatus::default();
     if !sample {
         for folder in store.load()? {
+            preview.roots.protected().check(&folder)?;
+            gitterm_core::preview::inspect_git(&folder, preview.roots.protected())?;
             model.add(folder, Instant::now());
         }
         for folder in folders {
-            model.add(workspace_config::local_folder(&folder)?, Instant::now());
+            let folder = workspace_config::local_folder(&folder)?;
+            preview.roots.protected().check(&folder)?;
+            gitterm_core::preview::inspect_git(&folder, preview.roots.protected())?;
+            model.add(folder, Instant::now());
         }
         store.save(&model.folders())?;
     }
@@ -1207,7 +1220,11 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
             move |window, cx| {
                 let shell = cx.new(|cx| {
                     if sample {
-                        Shell::new(Rc::new(data::SampleData), &config, window, cx)
+                        let data: Rc<dyn ShellData> = Rc::new(data::SampleData);
+                        let model =
+                            WorkspaceStatus::sample(data.workspaces(cx).into_iter().map(|w| w.id));
+                        let owner = cx.new(|cx| WorkspaceOwner::new(model, Some(store), cx));
+                        Shell::with_owner(data, owner, &config, false, window, cx)
                             .expect("create sample shell")
                     } else {
                         let owner = cx.new(|cx| WorkspaceOwner::new(model, Some(store), cx));
@@ -1226,6 +1243,7 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
         cx.on_window_closed(|cx, _| cx.quit()).detach();
         cx.activate(true);
     });
+    drop(preview);
     Ok(())
 }
 
@@ -1239,6 +1257,7 @@ mod tests {
     fn live_local_status_crosses_application_bridge_and_survives_closed_git_pane(
         cx: &mut TestAppContext,
     ) {
+        crate::preview::trusted_fixture();
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let repo = tempfile::tempdir().unwrap();
@@ -1437,6 +1456,7 @@ mod tests {
     fn terminal_and_chat_survive_moves_grouping_close_reopen_workspace_and_restore(
         cx: &mut TestAppContext,
     ) {
+        crate::preview::trusted_fixture();
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
@@ -1540,6 +1560,7 @@ mod tests {
 
     #[gpui::test]
     fn permanent_session_close_releases_terminal_and_removes_reopen_entry(cx: &mut TestAppContext) {
+        crate::preview::trusted_fixture();
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
@@ -1567,6 +1588,7 @@ mod tests {
 
     #[gpui::test]
     fn clicks_and_input_are_scoped_to_the_focused_terminal(cx: &mut TestAppContext) {
+        crate::preview::trusted_fixture();
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
@@ -1707,6 +1729,7 @@ mod tests {
 
     #[gpui::test]
     fn corrupt_file_starts_default_dock_and_remains_intact(cx: &mut TestAppContext) {
+        crate::preview::trusted_fixture();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("layout-1.json");
@@ -1741,6 +1764,7 @@ mod tests {
 
     #[gpui::test]
     fn saved_workspace_layout_restores_position_and_size(cx: &mut TestAppContext) {
+        crate::preview::trusted_fixture();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
         let (shell, cx) = cx.add_window_view(|w, cx| {

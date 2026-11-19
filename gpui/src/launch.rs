@@ -9,6 +9,45 @@ pub enum Launch {
     Review(Vec<OsString>),
     ReviewRepo(PathBuf),
 }
+impl Launch {
+    /// All routes share the closed capability boundary before their first effect.
+    pub fn authorize(&self, preview: &gitterm_core::preview::Preview) -> std::io::Result<()> {
+        use gitterm_core::preview::Effect;
+        let source = |path: &std::path::Path| -> std::io::Result<PathBuf> {
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(path)
+            };
+            preview.protected().check(&path)
+        };
+        match self {
+            Self::Terminal => preview.capabilities().authorize(
+                Effect::Terminal,
+                std::path::Path::new("<standalone-terminal>"),
+            ),
+            Self::ReviewRepo(path) => preview.capabilities().authorize(Effect::Git, path),
+            Self::Chat(path) => {
+                source(path)?;
+                Ok(())
+            }
+            Self::Review(args) => {
+                for arg in args {
+                    let root = source(std::path::Path::new(arg))?;
+                    preview.protected().check(&root.join("review.json"))?;
+                }
+                Ok(())
+            }
+            Self::Shell { folders, .. } => {
+                for path in folders {
+                    source(path)?;
+                    gitterm_core::preview::inspect_git(path, preview.protected())?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Option<Launch> {
     let args: Vec<_> = args.into_iter().collect();
     if args.len() == 1 && args[0] == "--terminal" {
@@ -111,5 +150,41 @@ mod tests {
             route(&["--chat-live", "fixture.jsonl"]),
             Some(Launch::Chat("fixture.jsonl".into()))
         );
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    #[test]
+    fn every_route_checks_attempted_targets_without_executable_effects() {
+        let dir = std::env::temp_dir().join(format!("gpui-route-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let protected = gitterm_core::preview::ProtectedRoots::new(&dir.join("host"), []).unwrap();
+        let preview =
+            gitterm_core::preview::Preview::validate(&dir.join("preview"), protected).unwrap();
+        let forbidden = dir.join("host/.config/gitterm-v6/sentinel");
+        for args in [
+            vec!["--terminal".into()],
+            vec!["--review-repo".into(), forbidden.clone().into_os_string()],
+            vec!["--chat".into(), forbidden.clone().into_os_string()],
+            vec!["--chat-live".into(), forbidden.clone().into_os_string()],
+            vec!["--review".into(), forbidden.clone().into_os_string()],
+            vec!["--workspace".into(), forbidden.clone().into_os_string()],
+        ] {
+            let route = parse(args).unwrap();
+            let error = route.authorize(&preview).unwrap_err().to_string();
+            assert!(
+                error.contains("standalone-terminal")
+                    || error.contains(forbidden.to_str().unwrap()),
+                "{error}"
+            );
+        }
+        for args in [vec![], vec!["--sample".into()]] {
+            assert!(parse(args).unwrap().authorize(&preview).is_ok());
+        }
+        let fixture = dir.join("fixture.jsonl");
+        assert!(Launch::Chat(fixture).authorize(&preview).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

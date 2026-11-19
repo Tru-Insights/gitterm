@@ -1,44 +1,15 @@
 use crate::pane::PANEL_NAME;
 use anyhow::{Context as _, Result, bail, ensure};
 use gpui_component::dock::{DockAreaState, DockPlacement, PanelInfo, PanelState};
+#[cfg(test)]
+use std::io::Write;
 use std::{
     collections::HashSet,
-    ffi::OsString,
-    io::Write,
     path::{Path, PathBuf},
 };
 
-pub fn config_dir(override_dir: Option<OsString>, home: &Path) -> Result<PathBuf> {
-    let dir = override_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config/gitterm-gpui"));
-    ensure!(
-        dir.is_absolute(),
-        "GITTERM_GPUI_CONFIG_DIR must be absolute: {}",
-        dir.display()
-    );
-    // Resolve existing ancestors too: a not-yet-created directory may live below a symlink.
-    fn resolved(path: &Path) -> Result<PathBuf> {
-        if path.exists() {
-            return path
-                .canonicalize()
-                .with_context(|| format!("resolve {}", path.display()));
-        }
-        let parent = path.parent().context("config path has no parent")?;
-        Ok(resolved(parent)?.join(path.file_name().context("config path has no name")?))
-    }
-    let actual = resolved(&dir)?;
-    for name in ["gitterm-v3", "gitterm-v4", "gitterm-v5", "gitterm-v6"] {
-        let legacy = resolved(&home.join(".config").join(name))?;
-        ensure!(
-            !actual.starts_with(&legacy),
-            "GPUI config must be isolated from {}: {}",
-            name,
-            dir.display()
-        );
-    }
-    Ok(actual)
-}
+#[cfg(test)]
+use crate::preview::config_dir;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TerminalSession {
@@ -50,17 +21,38 @@ pub struct LayoutStore {
     pub terminals: Option<Vec<TerminalSession>>,
     pub path: PathBuf,
     refused: Option<String>,
+    guard: Option<std::sync::Arc<gitterm_core::preview::WriterLease>>,
 }
 impl LayoutStore {
+    #[cfg(test)]
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
             terminals: None,
             refused: None,
+            guard: None,
         }
+    }
+    pub fn guarded(
+        path: PathBuf,
+        guard: std::sync::Arc<gitterm_core::preview::WriterLease>,
+    ) -> Self {
+        Self {
+            path,
+            terminals: None,
+            refused: None,
+            guard: Some(guard),
+        }
+    }
+    fn check(&self) -> Result<()> {
+        if let Some(guard) = &self.guard {
+            guard.preview().scoped(&self.path)?;
+        }
+        Ok(())
     }
     pub fn load_terminals(&mut self) -> Result<Option<Vec<TerminalSession>>> {
         let result = (|| -> Result<_> {
+            self.check()?;
             let bytes = match std::fs::read(&self.path) {
                 Ok(bytes) => bytes,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -86,6 +78,7 @@ impl LayoutStore {
     }
     pub fn load(&mut self, known: &HashSet<String>) -> Result<Option<DockAreaState>> {
         let result = (|| -> Result<Option<DockAreaState>> {
+            self.check()?;
             let bytes = match std::fs::read(&self.path) {
                 Ok(bytes) => bytes,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -131,19 +124,26 @@ impl LayoutStore {
             bail!("refusing to overwrite {}: {reason}", self.path.display());
         }
         (|| -> Result<()> {
-            let dir = self
-                .path
-                .parent()
-                .context("layout has no parent directory")?;
-            std::fs::create_dir_all(dir)?;
-            let mut temp = tempfile::NamedTempFile::new_in(dir)?;
             let mut value = serde_json::to_value(state)?;
             if let Some(terminals) = &self.terminals {
                 value["terminal_sessions"] = serde_json::to_value(terminals)?;
             }
-            temp.write_all(&serde_json::to_vec_pretty(&value)?)?;
-            temp.as_file().sync_all()?;
-            temp.persist(&self.path)?;
+            let bytes = serde_json::to_vec_pretty(&value)?;
+            if let Some(guard) = &self.guard {
+                guard.replace_layout(&self.path, &bytes)?;
+            } else {
+                #[cfg(not(test))]
+                bail!("layout writer has no preview guard");
+                #[cfg(test)]
+                {
+                    let dir = self.path.parent().context("layout has no parent")?;
+                    std::fs::create_dir_all(dir)?;
+                    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+                    temp.write_all(&bytes)?;
+                    temp.as_file().sync_all()?;
+                    temp.persist(&self.path)?;
+                }
+            }
             Ok(())
         })()
         .with_context(|| format!("save dock layout {}", self.path.display()))

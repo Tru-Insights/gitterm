@@ -1,10 +1,9 @@
 //! Explicit GPUI folders only; no import from the Iced workspace store.
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::{
-    io::Write,
-    path::{Path, PathBuf},
-};
+#[cfg(test)]
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,16 +27,29 @@ pub fn local_folder(path: &Path) -> Result<PathBuf> {
 pub struct WorkspaceStore {
     path: PathBuf,
     refused: bool,
+    pub(crate) guard: Option<std::sync::Arc<gitterm_core::preview::WriterLease>>,
 }
 impl WorkspaceStore {
+    #[cfg(test)]
     pub fn new(config: &Path) -> Self {
         Self {
             path: config.join("local-workspaces.json"),
             refused: false,
+            guard: None,
+        }
+    }
+    pub fn guarded(guard: std::sync::Arc<gitterm_core::preview::WriterLease>) -> Self {
+        Self {
+            path: guard.preview().layout().join("local-workspaces.json"),
+            refused: false,
+            guard: Some(guard),
         }
     }
     pub fn load(&mut self) -> Result<Vec<PathBuf>> {
         let result = (|| {
+            if let Some(guard) = &self.guard {
+                guard.preview().scoped(&self.path)?;
+            }
             let bytes = match std::fs::read(&self.path) {
                 Ok(bytes) => bytes,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
@@ -74,15 +86,25 @@ impl WorkspaceStore {
                 !self.refused,
                 "refusing to overwrite invalid local folders file"
             );
-            let dir = self.path.parent().context("folders file has no parent")?;
-            std::fs::create_dir_all(dir)?;
-            let mut temp = tempfile::NamedTempFile::new_in(dir)?;
-            temp.write_all(&serde_json::to_vec_pretty(&Folders {
+            let bytes = serde_json::to_vec_pretty(&Folders {
                 version: 1,
                 folders: folders.to_vec(),
-            })?)?;
-            temp.as_file().sync_all()?;
-            temp.persist(&self.path)?;
+            })?;
+            if let Some(guard) = &self.guard {
+                guard.replace_layout(&self.path, &bytes)?;
+            } else {
+                #[cfg(not(test))]
+                anyhow::bail!("workspace writer has no preview guard");
+                #[cfg(test)]
+                {
+                    let dir = self.path.parent().context("folders file has no parent")?;
+                    std::fs::create_dir_all(dir)?;
+                    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+                    temp.write_all(&bytes)?;
+                    temp.as_file().sync_all()?;
+                    temp.persist(&self.path)?;
+                }
+            }
             Ok(())
         })()
         .with_context(|| format!("save local folders {}", self.path.display()))
