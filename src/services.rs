@@ -687,3 +687,55 @@ pub(crate) fn collect_file_syntax_highlight(
         file_signature,
     }
 }
+
+/// Preserve remote path tokens and source errors at the frontend/core boundary.
+pub(crate) fn source_git_status_snapshot(
+    tab_id: usize,
+    fallback_root: PathBuf,
+    result: Result<crate::source::SourceGitStatus, String>,
+) -> GitStatusSnapshot {
+    match result {
+        Ok(status) => GitStatusSnapshot {
+            tab_id,
+            repo_path: PathBuf::from(status.root.display()),
+            repo_name: status.repo_name,
+            branch_name: status.branch_name,
+            is_git_repo: status.is_git_repo,
+            staged: status
+                .staged
+                .into_iter()
+                .map(file_entry_from_source)
+                .collect(),
+            unstaged: status
+                .unstaged
+                .into_iter()
+                .map(file_entry_from_source)
+                .collect(),
+            untracked: status
+                .untracked
+                .into_iter()
+                .map(file_entry_from_source)
+                .collect(),
+            error: None,
+        },
+        Err(error) => GitStatusSnapshot {
+            tab_id,
+            repo_path: fallback_root,
+            repo_name: String::new(),
+            branch_name: String::new(),
+            is_git_repo: false,
+            staged: Vec::new(),
+            unstaged: Vec::new(),
+            untracked: Vec::new(),
+            error: Some(error),
+        },
+    }
+}
+
+fn file_entry_from_source(file: crate::source::SourceGitFile) -> FileEntry {
+    FileEntry {
+        path: file.path,
+        status: file.status,
+        is_staged: file.is_staged,
+    }
+}

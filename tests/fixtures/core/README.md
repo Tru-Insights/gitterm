@@ -107,3 +107,14 @@ Each has a `// characterized:` comment next to its assertion:
 No production behavior fixes, new dependencies, cache, core extraction or GPUI
 changes are included. Visual execution of continuations and asynchronous job
 execution are outside these traces; CLI collection itself runs against fixtures.
+
+
+## TRU-289 extraction gate
+
+The same baseline traces now read the composed `TabState.status` owner and pass
+the fake clock to the core reducer. Expected values and persisted goldens are
+unchanged. `CALLERS.md` records the current status sites alongside the original
+inventory. Core tests in `crates/gitterm-core/src/status.rs` separately exercise
+reducer commands/state, including both overlapping completion orders. Actual jobs
+still run through Iced Tasks; selection, collector/runtime extraction and GPUI
+integration remain later PRs.
