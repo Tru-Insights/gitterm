@@ -58,6 +58,9 @@ jobs:
       run: |
         tests/check-gpui-deps.sh
         scripts/check-gpui-deps.sh
-        scripts/cargo.sh fmt --manifest-path gpui/Cargo.toml -- --check
-        scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --locked -- -D warnings
+        scripts/cargo.sh fmt --manifest-path gpui/Cargo.toml --all -- --check
+        scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --workspace --locked --all-targets -- -D warnings
         scripts/bundle-gpui.sh
+
+    - name: GPUI tests (macOS only)
+      run: scripts/cargo.sh test --manifest-path gpui/Cargo.toml --workspace --locked
