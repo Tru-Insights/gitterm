@@ -2055,13 +2055,8 @@ fn main() -> iced::Result {
         .run()
 }
 
-// Git file entry
-#[derive(Debug, Clone)]
-struct FileEntry {
-    path: String,
-    status: String,
-    is_staged: bool,
-}
+use gitterm_core::status::GitFileStatus as FileEntry;
+use gitterm_core::workspace::WorkspaceId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitViewMode {
@@ -6499,7 +6494,7 @@ pub struct RemoteAgentHandshakeSnapshot {
 /// persisted. Indexes shift when workspaces open, close or reorder.
 static NEXT_WORKSPACE_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-fn next_workspace_uid() -> u64 {
+fn next_workspace_uid() -> WorkspaceId {
     NEXT_WORKSPACE_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -6639,7 +6634,7 @@ impl RepoRegistry {
 struct Workspace {
     /// Issues disclosures belong to this workspace, even when overviews share data.
     collapsed_issue_groups: Vec<gitterm::issue_titles::IssueGroup>,
-    uid: u64,
+    uid: WorkspaceId,
     name: String,
     abbrev: String,
     /// The home repo's dir (TRU-180): `RepoState::dir` of `home`.
@@ -9642,20 +9637,7 @@ fn local_clock_time(unix_secs: u64) -> String {
         .unwrap_or_else(|| unix_secs.to_string())
 }
 
-#[derive(Debug, Clone)]
-pub struct GitStatusSnapshot {
-    tab_id: usize,
-    repo_path: PathBuf,
-    repo_name: String,
-    branch_name: String,
-    is_git_repo: bool,
-    staged: Vec<FileEntry>,
-    unstaged: Vec<FileEntry>,
-    untracked: Vec<FileEntry>,
-    /// Source-level failure (e.g. remote agent unreachable); shown in the
-    /// Git sidebar instead of silently reporting a clean tree.
-    error: Option<String>,
-}
+pub use gitterm_core::status::GitStatusSnapshot;
 
 fn file_entry_from_source(file: source::SourceGitFile) -> FileEntry {
     FileEntry {
