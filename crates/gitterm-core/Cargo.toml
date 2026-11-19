@@ -9,6 +9,8 @@ default = []
 runtime = ["dep:tokio", "dep:git2"]
 
 [dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 tokio = { version = "1", optional = true, features = ["rt", "sync"] }
 git2 = { version = "0.19", optional = true }
 

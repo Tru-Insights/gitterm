@@ -21,7 +21,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{HarnessEvent, ItemKind, TurnStatus};
@@ -31,25 +30,7 @@ use super::{HarnessEvent, ItemKind, TurnStatus};
 /// (long sessions have thousands of tool results).
 pub const MAX_RESULT_CHARS: usize = 20_000;
 
-/// One timeline entry recovered from a transcript. Serializable so an
-/// agent can return a remote session's history (TRU-152).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub enum TranscriptEntry {
-    /// Something the human typed (or a compaction summary standing in for
-    /// the earlier conversation).
-    UserPrompt(String),
-    Harness(HarnessEvent),
-}
-
-/// A timeline entry and when its transcript line was written (the line's
-/// RFC 3339 `timestamp`, when it has one). The time places delegation
-/// cards, which are not in the transcript, back where they were (TRU-142).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TimedEntry {
-    pub at: Option<String>,
-    pub entry: TranscriptEntry,
-}
+pub use gitterm_core::harness::transcript::{TimedEntry, TranscriptEntry};
 
 /// Read and parse a transcript file.
 pub fn load_claude_history(path: &Path) -> std::io::Result<Vec<TimedEntry>> {

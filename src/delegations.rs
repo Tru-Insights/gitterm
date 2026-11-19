@@ -1558,15 +1558,7 @@ pub fn is_delivery_message(text: &str) -> bool {
             .is_some_and(|line| line.starts_with(DELIVERY_FOOTER_PREFIX))
 }
 
-/// How the chat view shows a GitTerm-sent prompt: its first line as the
-/// header, the delegation id when it reports exactly one, and the rest
-/// folded.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct DeliveryCard {
-    pub header: String,
-    pub delegation_id: String,
-    pub body: String,
-}
+pub use gitterm_core::chat::types::DeliveryCard;
 
 /// The card for `text`, or `None` when the user wrote it.
 pub fn delivery_card(text: &str) -> Option<DeliveryCard> {

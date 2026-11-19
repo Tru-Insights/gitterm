@@ -3,6 +3,8 @@
 //! The host retains the workspace catalog, selection,
 //! persistence and remote transport. The optional runtime owns status jobs.
 
+pub mod chat;
+pub mod harness;
 pub mod status;
 pub mod workspace;
 
