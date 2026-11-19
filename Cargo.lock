@@ -2264,11 +2264,15 @@ dependencies = [
 name = "gitterm-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "git2",
+ "libc",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

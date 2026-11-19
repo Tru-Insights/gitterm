@@ -7,6 +7,7 @@ description = "A Git status viewer with integrated terminal, built with Iced"
 
 [workspace]
 members = ["crates/gitterm-core"]
+default-members = [".", "crates/gitterm-core"]
 exclude = ["gpui"]
 resolver = "2"
 

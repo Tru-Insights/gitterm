@@ -2559,8 +2559,14 @@ dependencies = [
 name = "gitterm-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "git2",
+ "libc",
+ "schemars",
+ "serde",
+ "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -8428,6 +8434,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "windows-sys 0.61.2",
 ]

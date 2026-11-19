@@ -6,34 +6,11 @@
 //! `delegate_task` request through `resolve_worker` and launch the preset
 //! command through `with_model_flag`.
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::review::is_model_name;
 
-/// What kind of work a worker is trusted with. The coordinator (the chat
-/// tab's own Claude) is not a worker role: Tracey picks that model herself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkerRole {
-    /// Routine coding with resolved decisions and established patterns.
-    #[default]
-    Scoped,
-    /// Harder coding that needs technical judgment or new design.
-    Judgment,
-    /// Review, investigation, brainstorming.
-    Specialist,
-}
-
-impl WorkerRole {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Scoped => "scoped",
-            Self::Judgment => "judgment",
-            Self::Specialist => "specialist",
-        }
-    }
-}
+pub use gitterm_core::tasks::{ReasoningEffort, WorkerRole};
 
 /// Which CLI a preset command starts, by its executable's basename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,36 +341,6 @@ pub fn with_model_flag(command: &str, model: &str) -> Result<String, String> {
         &trimmed[..end],
         &trimmed[end..]
     ))
-}
-
-/// A worker's or Codex run's reasoning effort (TRU-212).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum ReasoningEffort {
-    Low,
-    Medium,
-    High,
-    Xhigh,
-    Max,
-}
-
-impl ReasoningEffort {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Xhigh => "xhigh",
-            Self::Max => "max",
-        }
-    }
-
-    /// Codex's `-c` value: `model_reasoning_effort` is the config key
-    /// (`~/.codex/config.toml` uses it; codex-cli 0.164.0 knows low,
-    /// medium, high and xhigh), the value a TOML string.
-    pub fn codex_config_value(self) -> String {
-        format!("model_reasoning_effort=\"{}\"", self.label())
-    }
 }
 
 /// `command` with the worker's effort and extra writable folders added
