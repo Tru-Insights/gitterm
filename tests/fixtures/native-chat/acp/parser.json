@@ -1,0 +1,88 @@
+[
+  {
+    "data": "Hello ",
+    "type": "text_delta"
+  },
+  {
+    "data": "fixture",
+    "type": "text_delta"
+  },
+  {
+    "data": "Consider",
+    "type": "thinking_delta"
+  },
+  {
+    "data": {
+      "id": "tool-1",
+      "kind": {
+        "input": {},
+        "name": "shell",
+        "type": "tool_call"
+      }
+    },
+    "type": "item_started"
+  },
+  {
+    "data": {
+      "id": "tool-1",
+      "partial_json": "{\"command\":\"true\"}"
+    },
+    "type": "item_input_delta"
+  },
+  {
+    "data": {
+      "kind": {
+        "decision_reason": null,
+        "input": {
+          "command": "true"
+        },
+        "suggestions": [
+          {
+            "kind": "allow_always",
+            "name": "Allow this rule",
+            "optionId": "always",
+            "type": "acp_option"
+          }
+        ],
+        "tool_name": "shell",
+        "type": "permission"
+      },
+      "request_id": "permission-1",
+      "tool_use_id": "tool-1"
+    },
+    "type": "runtime_request"
+  },
+  {
+    "data": {
+      "id": "tool-1",
+      "is_error": true,
+      "output": "synthetic failure\n[image]"
+    },
+    "type": "item_completed"
+  },
+  {
+    "data": "[image]",
+    "type": "text_delta"
+  },
+  {
+    "data": {
+      "id": "agent-1",
+      "kind": {
+        "input": {
+          "prompt": "Synthetic child"
+        },
+        "name": "Task",
+        "type": "tool_call"
+      }
+    },
+    "type": "item_started"
+  },
+  {
+    "data": {
+      "id": "agent-1",
+      "is_error": false,
+      "output": "child done"
+    },
+    "type": "item_completed"
+  }
+]

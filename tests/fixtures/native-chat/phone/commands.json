@@ -1,0 +1,137 @@
+[
+  {
+    "forwarded": {
+      "data": {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "images": [],
+        "text": "Synthetic hello"
+      },
+      "type": "send_user_message"
+    },
+    "input": {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "text": "Synthetic hello",
+      "type": "send"
+    },
+    "reply": null
+  },
+  {
+    "forwarded": {
+      "data": {
+        "decision": {
+          "kind": "deny",
+          "message": "Synthetic denial"
+        },
+        "request_id": "permission-1"
+      },
+      "type": "answer"
+    },
+    "input": {
+      "decision": {
+        "kind": "deny",
+        "message": "Synthetic denial"
+      },
+      "request_id": "permission-1",
+      "type": "answer"
+    },
+    "reply": null
+  },
+  {
+    "forwarded": {
+      "type": "interrupt"
+    },
+    "input": {
+      "type": "interrupt"
+    },
+    "reply": null
+  },
+  {
+    "forwarded": null,
+    "input": {
+      "type": "shutdown"
+    },
+    "reply": {
+      "message": "a phone can send a message, answer a prompt or stop the turn; \"shutdown\" is not allowed",
+      "type": "refused"
+    }
+  },
+  {
+    "forwarded": null,
+    "input": {
+      "data": "synthetic-model",
+      "type": "set_model"
+    },
+    "reply": {
+      "message": "a phone can send a message, answer a prompt or stop the turn; \"set_model\" is not allowed",
+      "type": "refused"
+    }
+  },
+  {
+    "forwarded": null,
+    "input": {
+      "id": "queued-1",
+      "type": "withdraw"
+    },
+    "reply": {
+      "message": "a phone can send a message, answer a prompt or stop the turn; \"withdraw\" is not allowed",
+      "type": "refused"
+    }
+  },
+  {
+    "forwarded": null,
+    "input": {
+      "id": "invalid",
+      "text": "hi",
+      "type": "send"
+    },
+    "reply": {
+      "id": "invalid",
+      "message": "a message id must be a UUID",
+      "type": "invalid"
+    }
+  },
+  {
+    "forwarded": null,
+    "input": {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "text": " ",
+      "type": "send"
+    },
+    "reply": {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "message": "the message is empty",
+      "type": "invalid"
+    }
+  },
+  {
+    "forwarded": null,
+    "input": {
+      "decision": {
+        "kind": "allow"
+      },
+      "request_id": "gone",
+      "type": "answer"
+    },
+    "reply": {
+      "message": "that prompt was already answered",
+      "request_id": "gone",
+      "type": "refused"
+    }
+  },
+  {
+    "forwarded": null,
+    "input": {
+      "text": "missing type"
+    },
+    "reply": {
+      "message": "a command needs a \"type\"",
+      "type": "invalid"
+    }
+  },
+  {
+    "view_interrupt": {
+      "message": "this phone is paired to view only; it cannot send to Claude",
+      "type": "refused"
+    }
+  }
+]

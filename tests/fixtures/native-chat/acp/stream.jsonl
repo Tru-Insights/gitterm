@@ -1,0 +1,13 @@
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"synthetic-chat","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello "}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"synthetic-chat","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"fixture"}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"synthetic-chat","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"Consider"}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"synthetic-chat","update":{"sessionUpdate":"tool_call","toolCallId":"tool-1","name":"shell","status":"pending","rawInput":{}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"synthetic-chat","update":{"sessionUpdate":"tool_call_update","toolCallId":"tool-1","rawInput":{"command":"true"}}}}
+{"jsonrpc":"2.0","id":"permission-1","method":"session/request_permission","params":{"sessionId":"synthetic-chat","toolCall":{"toolCallId":"tool-1","name":"shell","rawInput":{"command":"true"}},"options":[{"optionId":"once","name":"Allow once","kind":"allow_once"},{"optionId":"always","name":"Allow this rule","kind":"allow_always"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"synthetic-chat","update":{"sessionUpdate":"tool_call_update","toolCallId":"tool-1","status":"failed","content":[{"type":"content","content":{"type":"text","text":"synthetic failure"}},{"type":"content","content":{"type":"image","data":"QQ==","mimeType":"image/png"}}]}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"synthetic-chat","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"image","data":"QQ==","mimeType":"image/png"}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"synthetic-chat","update":{"sessionUpdate":"tool_call","toolCallId":"agent-1","name":"Task","rawInput":{"prompt":"Synthetic child"},"status":"completed","rawOutput":"child done"}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"synthetic-chat","update":{"sessionUpdate":"question","questions":[{"question":"Pick a shape"}]}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"synthetic-chat","update":{"sessionUpdate":"subagent","parentToolCallId":"agent-1","text":"synthetic child"}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"synthetic-chat","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"future","text":"ignored"}}}}
+{"jsonrpc":

@@ -1,0 +1,42 @@
+[
+  {
+    "data": {
+      "models": [],
+      "permission_mode": null,
+      "session_id": null
+    },
+    "type": "ready"
+  },
+  {
+    "data": {
+      "kind": {
+        "decision_reason": null,
+        "input": {
+          "command": "true"
+        },
+        "suggestions": [],
+        "tool_name": "Bash",
+        "type": "permission"
+      },
+      "request_id": "p1",
+      "tool_use_id": "tool-1"
+    },
+    "type": "runtime_request"
+  },
+  {
+    "data": {
+      "request_id": "p1"
+    },
+    "type": "runtime_request_resolved"
+  },
+  {
+    "data": "write to claude stdin: <broken pipe>",
+    "type": "error"
+  },
+  {
+    "data": {
+      "code": 0
+    },
+    "type": "process_exited"
+  }
+]
