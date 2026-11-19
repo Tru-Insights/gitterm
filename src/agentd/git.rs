@@ -5,25 +5,7 @@ use std::path::{Path, PathBuf};
 
 use git2::{Repository, Status, StatusOptions};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitFileStatus {
-    pub path: String,
-    pub status: String,
-    pub is_staged: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RepoStatus {
-    /// The repo root actually used; self-healed to `--show-toplevel` when
-    /// the requested path was inside (not at) the repository root.
-    pub root: PathBuf,
-    pub repo_name: String,
-    pub branch_name: String,
-    pub is_git_repo: bool,
-    pub staged: Vec<GitFileStatus>,
-    pub unstaged: Vec<GitFileStatus>,
-    pub untracked: Vec<GitFileStatus>,
-}
+pub use gitterm_core::status::{GitFileStatus, RepoStatus};
 
 /// Build a `git` Command with repo-discovery env scrubbed. When this
 /// process is spawned from a git hook, git exports GIT_DIR / GIT_WORK_TREE /

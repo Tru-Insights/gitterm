@@ -2261,6 +2261,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitterm-core"
+version = "0.1.0"
+
+[[package]]
 name = "gitterm-v6"
 version = "6.0.0"
 dependencies = [
@@ -2271,6 +2275,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "git2",
+ "gitterm-core",
  "hyper 0.14.32",
  "iced",
  "iced_term",
