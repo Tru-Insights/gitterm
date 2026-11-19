@@ -8,6 +8,7 @@ mod files_view;
 mod layout;
 mod owner;
 mod pane;
+mod review_reload;
 mod theme;
 pub mod workspace_config;
 pub mod workspace_status;
@@ -338,9 +339,24 @@ impl Shell {
             .workspaces
             .iter()
             .find(|w| Some(w.workspace.id) == self.active_workspace(cx))
-            .is_some_and(|w| git_visible(w, cx));
-        self.owner
-            .update(cx, |owner, cx| owner.set_git_visible(visible, enter, cx));
+            .is_some_and(|w| pane_visible(w, "git", cx));
+        let reviews: Vec<_> = self
+            .workspaces
+            .iter()
+            .map(|w| {
+                (
+                    w.workspace.id,
+                    Some(w.workspace.id) == self.active_workspace(cx)
+                        && pane_visible(w, "review", cx),
+                )
+            })
+            .collect();
+        self.owner.update(cx, |owner, cx| {
+            owner.set_git_visible(visible, enter, cx);
+            for (workspace, visible) in reviews {
+                owner.set_review_visible(workspace, visible, cx);
+            }
+        });
     }
     fn active_workspace(&self, cx: &App) -> Option<WorkspaceId> {
         self.owner.read(cx).model.active()
@@ -493,7 +509,7 @@ fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscriptio
         cx.notify();
     })
 }
-fn git_visible(state: &WorkspaceDock, cx: &App) -> bool {
+fn pane_visible(state: &WorkspaceDock, kind: &str, cx: &App) -> bool {
     use gpui_component::dock::{PanelInfo, PanelState};
     fn visible(node: &PanelState, id: &str) -> bool {
         match &node.info {
@@ -506,7 +522,7 @@ fn git_visible(state: &WorkspaceDock, cx: &App) -> bool {
         }
     }
     let layout = state.dock.read(cx).dump(cx);
-    let id = format!("workspace-{}-git", state.workspace.layout_key);
+    let id = format!("workspace-{}-{kind}", state.workspace.layout_key);
     visible(&layout.center, &id)
         || [&layout.left_dock, &layout.right_dock, &layout.bottom_dock]
             .into_iter()

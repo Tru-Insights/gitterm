@@ -155,7 +155,7 @@ fn exercise_review(cx: &mut TestAppContext, git_first: bool) {
         assert_eq!(model.files[model.selected.unwrap()].key.1, "first.txt");
         assert_eq!(owner.read(cx).reviews.len(), 1);
     });
-    // Reload even when filenames/status codes stay identical but patch contents change.
+    // Same-status content edits stay stale until a file-set change triggers a load.
     std::fs::write(root.join("first.txt"), "new patch\n").unwrap();
     cx.update(|_, cx| {
         owner.update(cx, |owner, cx| {
@@ -167,12 +167,89 @@ fn exercise_review(cx: &mut TestAppContext, git_first: bool) {
         })
     });
     wait(cx, |cx| {
+        !owner.read(cx).model.status_view(workspace).loading
+    });
+    cx.read(|cx| {
+        assert!(!review.read(cx).is_loading());
+        assert!(
+            review
+                .read(cx)
+                .model()
+                .files
+                .iter()
+                .all(|f| !f.patch.contains("+new patch"))
+        );
+    });
+    std::fs::write(root.join("added.txt"), "added\n").unwrap();
+    cx.update(|_, cx| {
+        owner.update(cx, |owner, cx| {
+            owner.dispatch(
+                Intent::Maintenance { focused: true },
+                Instant::now() + Duration::from_secs(120),
+                cx,
+            )
+        });
+    });
+    wait(cx, |cx| {
+        let model = review.read(cx).model();
+        model.files.iter().any(|f| f.key.1 == "added.txt")
+            && model
+                .files
+                .iter()
+                .any(|f| f.key.1 == "first.txt" && f.patch.contains("+new patch"))
+    });
+    // Closing Review suppresses status-triggered loads, and showing it catches up.
+    cx.update(|window, cx| {
+        let dock = shell.read(cx).active(cx).dock.clone();
+        dock.update(cx, |dock, cx| dock.remove_panel(pane.clone(), window, cx));
+    });
+    cx.run_until_parked();
+    cx.read(|cx| assert!(!pane_visible(shell.read(cx).active(cx), "review", cx)));
+    std::fs::write(root.join("hidden.txt"), "hidden\n").unwrap();
+    cx.update(|_, cx| {
+        owner.update(cx, |owner, cx| {
+            owner.dispatch(
+                Intent::Maintenance { focused: true },
+                Instant::now() + Duration::from_secs(180),
+                cx,
+            )
+        });
+    });
+    wait(cx, |cx| {
+        !owner.read(cx).model.status_view(workspace).loading
+    });
+    cx.read(|cx| {
+        assert!(
+            owner
+                .read(cx)
+                .model
+                .status_view(workspace)
+                .files
+                .iter()
+                .any(|f| f.path == "hidden.txt")
+        );
+        assert!(!review.read(cx).is_loading());
+        assert!(
+            review
+                .read(cx)
+                .model()
+                .files
+                .iter()
+                .all(|f| f.key.1 != "hidden.txt")
+        );
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.show_workspace_pane(workspace, &review_id, window, cx);
+        })
+    });
+    wait(cx, |cx| {
         review
             .read(cx)
             .model()
             .files
             .iter()
-            .any(|f| f.key.1 == "first.txt" && f.patch.contains("+new patch"))
+            .any(|f| f.key.1 == "hidden.txt")
     });
     // A saved lazy Review ID is pruned on a new shell, without refusing saves.
     cx.update(|window, cx| {

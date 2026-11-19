@@ -23,6 +23,9 @@ pub struct WorkspaceOwner {
     >,
     file_sender: tokio::sync::mpsc::UnboundedSender<crate::files::Outcome>,
     git_visible: bool,
+    review_loads:
+        std::collections::HashMap<crate::data::WorkspaceId, crate::review_reload::ReviewReload>,
+    review_workers: Arc<std::sync::Mutex<ReviewWorkers>>,
     store: Option<WorkspaceStore>,
     jobs: Arc<StatusRuntime>,
     executor: Option<Arc<tokio::runtime::Runtime>>,
@@ -62,6 +65,7 @@ impl WorkspaceOwner {
                 }
             }
         })];
+        let review_workers = Arc::new(std::sync::Mutex::new(ReviewWorkers::default()));
         let mut quit = None;
         if executor.is_some() {
             tasks.push(cx.spawn(async move |owner, cx| {
@@ -107,10 +111,19 @@ impl WorkspaceOwner {
                 }
             }));
             let shutdown = jobs.clone();
+            let workers = review_workers.clone();
             quit = Some(cx.on_app_quit(move |_, _| {
                 let shutdown = shutdown.clone();
+                let workers = {
+                    let mut workers = workers.lock().unwrap();
+                    workers.closed = true;
+                    std::mem::take(&mut workers.jobs)
+                };
                 async move {
                     shutdown.teardown().await;
+                    for worker in workers {
+                        let _ = worker.await;
+                    }
                 }
             }));
         }
@@ -127,6 +140,8 @@ impl WorkspaceOwner {
             _tasks: tasks,
             _quit: quit,
             git_visible: true,
+            review_loads: Default::default(),
+            review_workers,
         }
     }
     pub fn dispatch(&mut self, intent: Intent, now: Instant, cx: &mut Context<Self>) {
@@ -142,9 +157,10 @@ impl WorkspaceOwner {
                 self.jobs.execute(executor.handle(), owner, command);
             }
         }
-        // Status letters can stay identical while a file's patch changes.
+        // shortcut: patches with unchanged paths/groups/status letters stay stale,
+        // as in Iced; use content-based invalidation if live patch refresh is needed.
         if let Some(workspace) = completed {
-            self.reload_review(workspace, cx);
+            self.request_review(workspace, false, cx);
         }
         if refresh_files
             && self.executor.is_some()
@@ -246,6 +262,27 @@ impl WorkspaceOwner {
         workspace: crate::data::WorkspaceId,
         cx: &mut Context<Self>,
     ) {
+        self.request_review(workspace, true, cx);
+    }
+    pub(crate) fn set_review_visible(
+        &mut self,
+        workspace: crate::data::WorkspaceId,
+        visible: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let state = self.review_loads.entry(workspace).or_default();
+        let showing = visible && !state.visible;
+        state.visible = visible;
+        if showing {
+            self.request_review(workspace, false, cx);
+        }
+    }
+    fn request_review(
+        &mut self,
+        workspace: crate::data::WorkspaceId,
+        force: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(view) = self.reviews.get(&workspace).cloned() else {
             return;
         };
@@ -255,14 +292,43 @@ impl WorkspaceOwner {
         let Some(local) = self.model.workspaces.iter().find(|w| w.id == workspace) else {
             return;
         };
+        let state = self.review_loads.entry(workspace).or_default();
+        if !force && !state.visible {
+            return;
+        }
+        let mut workers = self.review_workers.lock().unwrap();
+        if workers.closed || !state.request(crate::review_reload::SnapshotKey::new(local), force) {
+            return;
+        }
         let root = local.root.clone();
         let generation = view.update(cx, |view, cx| view.begin_load(cx));
         let view = view.downgrade();
-        cx.spawn(async move |_, cx| {
-            let result =
-                gitterm_gpui_review::repo::load(executor.handle(), workspace.0 as usize, root)
-                    .await;
-            _ = view.update(cx, |view, cx| view.finish_load(generation, result, cx));
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let handle = executor.handle().clone();
+        workers.jobs.retain(|job| !job.is_finished());
+        workers.jobs.push(executor.spawn(async move {
+            let result = gitterm_gpui_review::repo::load(&handle, workspace.0 as usize, root).await;
+            let _ = sender.send(result);
+        }));
+        drop(workers);
+        cx.spawn(async move |owner, cx| {
+            let result = receiver
+                .await
+                .unwrap_or_else(|error| Err(format!("Review worker failed: {error}")));
+            let alive = view
+                .update(cx, |view, cx| view.finish_load(generation, result, cx))
+                .is_ok();
+            _ = owner.update(cx, |owner, cx| {
+                if let Some(state) = owner.review_loads.get_mut(&workspace) {
+                    state.finish();
+                }
+                if alive {
+                    owner.request_review(workspace, false, cx);
+                }
+            });
+            // Keep the executor alive until repo::load has joined its workers,
+            // even if the owner or the weak review view has gone away.
+            drop(executor);
         })
         .detach();
     }
@@ -305,3 +371,9 @@ pub struct FileOpen {
     pub changed: Option<crate::data::ChangedFile>,
 }
 impl EventEmitter<FileOpen> for WorkspaceOwner {}
+
+#[derive(Default)]
+struct ReviewWorkers {
+    closed: bool,
+    jobs: Vec<tokio::task::JoinHandle<()>>,
+}
