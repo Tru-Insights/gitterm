@@ -2263,6 +2263,10 @@ dependencies = [
 [[package]]
 name = "gitterm-core"
 version = "0.1.0"
+dependencies = [
+ "git2",
+ "tokio",
+]
 
 [[package]]
 name = "gitterm-v6"

@@ -3,3 +3,11 @@ name = "gitterm-core"
 version = "0.1.0"
 edition = "2021"
 description = "Plain workspace and Git status types and workspace ordering for GitTerm"
+
+[features]
+default = []
+runtime = ["dep:tokio", "dep:git2"]
+
+[dependencies]
+tokio = { version = "1", optional = true, features = ["rt", "sync"] }
+git2 = { version = "0.19", optional = true }

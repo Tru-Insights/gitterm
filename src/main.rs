@@ -349,6 +349,42 @@ fn task_control_stream() -> impl iced::futures::Stream<Item = Event> + Send + 's
     stream.map(Event::TaskControlRequested)
 }
 
+// Stable process-owner subscription: taking the receiver never restarts status jobs.
+#[derive(Clone)]
+struct StatusSubscriptionData {
+    runtime: std::sync::Arc<gitterm_core::runtime::StatusRuntime>,
+    receiver: std::sync::Arc<Mutex<Option<gitterm_core::runtime::StatusReceiver>>>,
+}
+
+impl StatusSubscriptionData {
+    fn new() -> Self {
+        let (runtime, receiver) = gitterm_core::runtime::StatusRuntime::new();
+        Self {
+            runtime: std::sync::Arc::new(runtime),
+            receiver: std::sync::Arc::new(Mutex::new(Some(receiver))),
+        }
+    }
+}
+
+impl Hash for StatusSubscriptionData {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::sync::Arc::as_ptr(&self.runtime).hash(state);
+    }
+}
+
+fn status_result_stream(
+    data: &StatusSubscriptionData,
+) -> iced::futures::stream::BoxStream<'static, Event> {
+    use iced::futures::StreamExt;
+    let receiver = data.receiver.lock().unwrap().take();
+    iced::futures::stream::unfold(receiver, |receiver| async move {
+        let mut receiver = receiver?;
+        let outcome = receiver.recv().await?;
+        Some((Event::StatusJobOutcome(outcome), Some(receiver)))
+    })
+    .boxed()
+}
+
 #[derive(Clone)]
 struct BrowserTelemetrySubscriptionData {
     id: u64,
@@ -6824,10 +6860,6 @@ fn status_char(status: Status, staged: bool) -> String {
     }
 }
 
-fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatusSnapshot {
-    services::collect_git_status(tab_id, repo_path)
-}
-
 fn collect_git_worktrees(tab_id: usize, repo_path: PathBuf) -> GitWorktreesSnapshot {
     services::collect_git_worktrees(tab_id, repo_path)
 }
@@ -7386,6 +7418,7 @@ pub enum Event {
     MainTerminalClicked,
     BottomTerminalClicked(usize),
     GitStatusLoaded(GitStatusSnapshot),
+    StatusJobOutcome(gitterm_core::runtime::StatusOutcome),
     GitWorktreesLoaded(GitWorktreesSnapshot),
     /// A repository's worktree list for chat-tab worktree following
     /// (TRU-146): the repo root it was listed from, and the list.
@@ -7698,6 +7731,7 @@ fn paired_browser_evidence(evidence: &[BrowserEvidence]) -> Vec<&BrowserEvidence
 }
 
 struct App {
+    status_jobs: StatusSubscriptionData,
     title: String,
     workspaces: Vec<Workspace>,
     /// The open repos the workspaces list (TRU-180).
@@ -9871,6 +9905,12 @@ fn rebuild_workspace_overview(
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        self.status_jobs.runtime.close();
+    }
+}
+
 impl App {
     /// UI font size
     fn ui_font(&self) -> f32 {
@@ -10862,6 +10902,7 @@ impl App {
     }
 
     fn request_git_status(
+        runtime: &gitterm_core::runtime::StatusRuntime,
         tab: &mut TabState,
         root: PathBuf,
         prelude: RequestPrelude,
@@ -10869,7 +10910,7 @@ impl App {
         let commands = tab
             .status
             .reduce(StatusEvent::Request { root, prelude }, status_now!());
-        Self::run_status_commands(tab.id, None, commands)
+        Self::run_status_commands(runtime, tab.id, None, commands)
     }
 
     /// Source resolution stays in the adapter; the addressed tab owns all status writes.
@@ -10899,33 +10940,46 @@ impl App {
             .status
             .reduce(StatusEvent::Request { root, prelude }, status_now!());
         match source {
-            Some(source) => Self::run_status_commands(tab_id, Some(source), commands),
+            Some(source) => {
+                Self::run_status_commands(&self.status_jobs.runtime, tab_id, Some(source), commands)
+            }
             None => Task::none(),
         }
     }
 
     fn run_status_commands(
+        runtime: &gitterm_core::runtime::StatusRuntime,
         tab_id: usize,
         source: Option<WorkspaceSource>,
         commands: Vec<StatusCommand>,
     ) -> Task<Event> {
-        Task::batch(commands.into_iter().map(|command| match command {
-            StatusCommand::CollectStatus { root } => match source.clone() {
-                Some(WorkspaceSource::Local { .. }) | None => {
-                    Self::execute_local_git_status(tab_id, root)
-                }
-                Some(source) => Self::execute_source_git_status(source, tab_id, root),
-            },
-            // The existing Tick is the sole scheduler. Core retains the deadline
-            // and rechecks it on the next tick, preserving the 5-second granularity.
-            StatusCommand::SchedulePoll { .. } => Task::none(),
-        }))
+        for command in commands {
+            match command {
+                StatusCommand::CollectStatus { root } => match source.clone() {
+                    Some(WorkspaceSource::Local { .. }) | None => {
+                        #[cfg(test)]
+                        if baseline_tests::request(format!("local:{tab_id}:{}", root.display())) {
+                            continue;
+                        }
+                        runtime.execute(
+                            &tokio::runtime::Handle::current(),
+                            tab_id,
+                            StatusCommand::CollectStatus { root },
+                        );
+                    }
+                    Some(source) => {
+                        let _ = Self::execute_source_git_status(runtime, source, tab_id, root);
+                    }
+                },
+                // The existing Tick remains the sole maintenance clock.
+                StatusCommand::SchedulePoll { .. } => {}
+            }
+        }
+        Task::none()
     }
 
-    /// Execute a remote status command through the workspace source.
-    /// Local commands use the existing collector executor directly.
-    /// Source errors surface in the snapshot and keep the last good data.
     fn execute_source_git_status(
+        runtime: &gitterm_core::runtime::StatusRuntime,
         source: WorkspaceSource,
         tab_id: usize,
         fallback_root: PathBuf,
@@ -10936,7 +10990,10 @@ impl App {
         {
             return Task::none();
         }
-        Task::perform(
+        runtime.collect_remote(
+            &tokio::runtime::Handle::current(),
+            tab_id,
+            fallback_root.clone(),
             async move {
                 services::source_git_status_snapshot(
                     tab_id,
@@ -10944,42 +11001,8 @@ impl App {
                     source.git_status().await,
                 )
             },
-            Event::GitStatusLoaded,
-        )
-    }
-
-    fn execute_local_git_status(tab_id: usize, repo_path: PathBuf) -> Task<Event> {
-        #[cfg(test)]
-        if baseline_tests::request(format!("local:{tab_id}:{}", repo_path.display())) {
-            return Task::none();
-        }
-        let fallback_repo_path = repo_path.clone();
-        Task::perform(
-            async move {
-                match tokio::task::spawn_blocking(move || collect_git_status(tab_id, repo_path))
-                    .await
-                {
-                    Ok(snapshot) => snapshot,
-                    Err(err) => {
-                        freeze_debug!("CRITICAL: spawn_blocking failed! Skipping git status for tab {} ({}): {}",
-                                     tab_id, fallback_repo_path.display(), err);
-                        // Return empty snapshot instead of blocking main thread
-                        GitStatusSnapshot {
-                            tab_id,
-                            repo_path: fallback_repo_path,
-                            repo_name: "unknown".to_string(),
-                            branch_name: "main".to_string(),
-                            is_git_repo: true,
-                            staged: Vec::new(),
-                            unstaged: Vec::new(),
-                            untracked: Vec::new(),
-                            error: Some(format!("git status task failed: {err}")),
-                        }
-                    }
-                }
-            },
-            Event::GitStatusLoaded,
-        )
+        );
+        Task::none()
     }
 
     /// A chat entry by session id, searching the local index first and
@@ -20714,6 +20737,7 @@ impl App {
             } else {
                 String::from(config::WINDOW_TITLE)
             },
+            status_jobs: StatusSubscriptionData::new(),
             workspaces: Vec::new(),
             repos: RepoRegistry::default(),
             stored_repos: Vec::new(),
@@ -21055,8 +21079,10 @@ impl App {
         // Return startup tasks (menu init + initial git status for active tab)
         let mut startup_tasks = vec![Task::done(Event::InitMenu), Self::request_syntect_warmup()];
         if !app.active_workspace_is_remote() {
+            let runtime = app.status_jobs.runtime.clone();
             if let Some(tab) = app.active_tab_mut() {
                 startup_tasks.push(Self::request_git_status(
+                    &runtime,
                     tab,
                     tab.repo_path.clone(),
                     RequestPrelude::Refresh,
@@ -22434,11 +22460,13 @@ fi
         let Ok(WorkspaceSource::Local { root }) = self.source_for_active_tab() else {
             return Task::none();
         };
+        let runtime = self.status_jobs.runtime.clone();
         let mut git_task = Task::none();
         let mut files_jump = None;
         if let Some(tab) = self.active_tab_mut() {
             tab.status.reduce(StatusEvent::Reset, status_now!());
-            git_task = Self::request_git_status(tab, root.clone(), RequestPrelude::Refresh);
+            git_task =
+                Self::request_git_status(&runtime, tab, root.clone(), RequestPrelude::Refresh);
             if let SourcePath::Local(dir) = &tab.files.dir {
                 let left_old_root = leaving
                     .as_ref()
@@ -23706,6 +23734,7 @@ fi
             // identity hash of `Subscription::run`'s function-pointer arg.
             Subscription::run(agent_ipc_stream),
             Subscription::run(task_control_stream),
+            Subscription::run_with(self.status_jobs.clone(), status_result_stream),
             iced::time::every(Duration::from_millis(5000)).map(|_| Event::Tick),
             // Poll menu events frequently
             iced::time::every(Duration::from_millis(MENU_POLL_INTERVAL_MS))
@@ -23845,6 +23874,13 @@ fi
             Some(settle) => Task::batch([task, settle]),
             None => task,
         };
+        self.status_jobs.runtime.retain_owners(
+            &self
+                .workspaces
+                .iter()
+                .flat_map(|ws| ws.tabs.iter().map(|tab| tab.id))
+                .collect(),
+        );
         // Covers every event path, including early returns and nested updates.
         if overlay_was_open != self.webview_overlay_open() {
             Task::batch([task, self.apply_webview_surfaces()])
@@ -24617,6 +24653,7 @@ fi
                                             tab.repo_path = dir.clone();
                                             tab.status.reduce(StatusEvent::Reset, status_now!());
                                             let status_task = Self::request_git_status(
+                                                &self.status_jobs.runtime,
                                                 tab,
                                                 tab.repo_path.clone(),
                                                 RequestPrelude::Refresh,
@@ -24714,6 +24751,7 @@ fi
                 tasks.push(self.poll_codex_exec());
                 let workspace_dirty = false;
 
+                let runtime = self.status_jobs.runtime.clone();
                 // Poll git status for the active tab with adaptive cadence.
                 // What gets polled is decided by the workspace source's
                 // capabilities, not by where the workspace lives.
@@ -24741,6 +24779,7 @@ fi
                             status_now!(),
                         );
                         tasks.push(Self::run_status_commands(
+                            &runtime,
                             tab.id,
                             Some(poll_source.clone()),
                             commands,
@@ -30331,7 +30370,9 @@ fi
                 self.log_server_state.shutdown.notify_one();
                 // Clean up instance-specific configuration
                 config::cleanup_instance_config();
-                // Close the window
+                // Quit must not wait on a slow or hung git: cancel and discard
+                // status jobs (as before the runtime existed) and close now.
+                self.status_jobs.runtime.close();
                 return iced::window::oldest().then(|opt_id| {
                     if let Some(id) = opt_id {
                         iced::window::close(id)
@@ -31164,6 +31205,11 @@ fi
             Event::FocusChatTab(chat) => {
                 if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&chat) {
                     return self.focus_workspace_tab(ws_idx, tab_idx);
+                }
+            }
+            Event::StatusJobOutcome(outcome) => {
+                if let gitterm_core::runtime::StatusOutcome::Completed { snapshot, .. } = outcome {
+                    return self.update_event(Event::GitStatusLoaded(snapshot));
                 }
             }
             Event::GitStatusLoaded(snapshot) => {
@@ -32821,7 +32867,12 @@ fi
                     return Task::none();
                 };
                 self.mark_log_server_dirty();
-                let status_task = Self::run_status_commands(tab_id, Some(source), commands);
+                let status_task = Self::run_status_commands(
+                    &self.status_jobs.runtime,
+                    tab_id,
+                    Some(source),
+                    commands,
+                );
                 if load_worktrees {
                     let worktrees_repo_path = active_workspace_dir.unwrap_or(repo_path);
                     return Task::batch([
@@ -55392,3 +55443,48 @@ mod tests {
 #[cfg(test)]
 #[path = "baseline_tests.rs"]
 mod baseline_tests;
+
+#[cfg(test)]
+mod status_runtime_adapter_tests {
+    use super::*;
+    use iced::futures::StreamExt;
+
+    #[tokio::test]
+    async fn one_result_stream_applies_local_jobs_to_inactive_tabs() {
+        let fixture = tempfile::tempdir().unwrap();
+        let output = gitterm_core::git_status::git_command()
+            .args(["init", "-q", "-b", "runtime-fixture"])
+            .current_dir(fixture.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let mut app = baseline_tests::app_with_tabs(fixture.path());
+        let runtime = app.status_jobs.runtime.clone();
+        let tab = &mut app.workspaces[0].tabs[0];
+        tab.repo_path = fixture.path().to_path_buf();
+        let _ = App::request_git_status(
+            &runtime,
+            tab,
+            fixture.path().to_path_buf(),
+            RequestPrelude::Refresh,
+        );
+        // The subscription is application-owned, even while another workspace
+        // is visible; a second receiver cannot steal or restart these jobs.
+        app.activate_workspace_at(1);
+        let mut results = status_result_stream(&app.status_jobs);
+        assert!(status_result_stream(&app.status_jobs)
+            .next()
+            .await
+            .is_none());
+        let event = results.next().await.unwrap();
+        assert!(matches!(event, Event::StatusJobOutcome(_)));
+        let _ = app.update_event(event);
+        let status = &app.workspaces[0].tabs[0].status;
+        assert_eq!(status.branch_name, "runtime-fixture");
+        assert!(!status.git_status_loading);
+        assert!(status.is_git_repo);
+        assert_eq!(app.active_workspace_index(), 1);
+        runtime.teardown().await;
+        assert!(results.next().await.is_none());
+    }
+}
