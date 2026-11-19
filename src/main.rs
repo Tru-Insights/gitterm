@@ -93,6 +93,9 @@ use gitterm::workspace_overview as overview;
 use gitterm::worktree_follow::{
     self, CacheLookup, WorktreeFollow, WorktreeInfo, WorktreeListCache,
 };
+#[cfg(test)]
+use gitterm_core::workspace::{next_on_bar, persisted_active_index};
+use gitterm_core::workspace::{SelectionCommand, SelectionEvent, SelectionState, WorkspaceFact};
 use plan_limits_view::PlanLimitsEvent;
 use source::{FilesState, SourceCapabilities, SourceDirListing, SourcePath, WorkspaceSource};
 use tab::{AgentBackendConfig, AgentSession, FileViewerOverlay, TabKind, TerminalTab};
@@ -2475,28 +2478,6 @@ fn running_parked_config(mut cfg: WorkspaceConfig, info: &ParkedInfo) -> Workspa
     cfg.active = false;
     cfg.parked = Some(info.clone());
     cfg
-}
-
-/// The saved `active_workspace`: the active workspace's index among the
-/// ones the file reopens, which skips the running parked (`parked`, in
-/// Vec order).
-fn persisted_active_index(active: usize, parked: &[bool]) -> usize {
-    parked
-        .iter()
-        .take(active)
-        .filter(|parked| !**parked)
-        .count()
-}
-
-/// The workspace that becomes active when the one at `from` leaves the
-/// bar, by Vec index after the change: the first one on the bar from
-/// `from` on, else the last before it. `parked` marks the ones off the
-/// bar (the leaving one, when it stays in the Vec). With nothing parked
-/// this is what park always did: the next workspace, else the last.
-fn next_on_bar(from: usize, parked: &[bool]) -> Option<usize> {
-    (from..parked.len())
-        .find(|&idx| !parked[idx])
-        .or_else(|| (0..from.min(parked.len())).rev().find(|&idx| !parked[idx]))
 }
 
 /// The open workspace a Parked list row names when it is parked running
@@ -7726,7 +7707,7 @@ struct App {
     stored_repos: Vec<config::RepoConfig>,
     /// The bottom panel's `+ ▾` repo picker is open (TRU-180).
     bottom_repo_picker_open: bool,
-    active_workspace_idx: usize,
+    selection: SelectionState,
     next_tab_id: usize,
     // Durable task registry and cross-workspace Tasks UI state.
     task_store: Option<TaskStore>,
@@ -8565,38 +8546,6 @@ struct UsageViewState {
     open: bool,
     /// The repo the view is narrowed to: its row key and display name.
     repo: Option<(gitterm::usage::RepoKey, String)>,
-}
-
-/// What can happen to the Usage view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UsageViewInput {
-    /// The rail glyph or Cmd+Shift+U.
-    Toggle,
-    /// Esc.
-    Close,
-    /// A workspace button on the rail (or Ctrl+1-9).
-    SelectWorkspace(usize),
-}
-
-/// Apply `input` to the Usage view while `active_workspace` is showing and
-/// return the workspace to show next. Opening and closing keep the
-/// selection; selecting a workspace closes the view. Closing drops the
-/// repo filter, so the view reopens app-wide.
-fn usage_view_step(
-    state: &mut UsageViewState,
-    active_workspace: usize,
-    input: UsageViewInput,
-) -> usize {
-    let (open, workspace) = match input {
-        UsageViewInput::Toggle => (!state.open, active_workspace),
-        UsageViewInput::Close => (false, active_workspace),
-        UsageViewInput::SelectWorkspace(target) => (false, target),
-    };
-    state.open = open;
-    if !open {
-        state.repo = None;
-    }
-    workspace
 }
 
 /// How many agent chat pages may be alive at once. Showing a tab without a
@@ -10409,7 +10358,7 @@ impl App {
         let position = self
             .visible_workspace_order()
             .iter()
-            .position(|&idx| idx == self.active_workspace_idx)
+            .position(|&idx| idx == self.active_workspace_index())
             .unwrap_or(0);
         let target_x = (position as f32 * ESTIMATED_WS_BTN_WIDTH).max(0.0);
         iced::advanced::widget::operate(iced::advanced::widget::operation::scrollable::scroll_to(
@@ -10473,7 +10422,7 @@ impl App {
         }
     }
 
-    fn save_workspaces(&self) {
+    fn save_workspaces(&mut self) {
         // Active workspaces from runtime state
         // A running parked workspace is saved parked (TRU-186): quitting
         // stops its processes.
@@ -10581,7 +10530,7 @@ impl App {
         }
     }
 
-    fn save_workspace_configs(&self, configs: Vec<WorkspaceConfig>) {
+    fn save_workspace_configs(&mut self, configs: Vec<WorkspaceConfig>) {
         let mut remote_session_defs = RemoteSessionsFile::load()
             .map(|file| remote_session_definitions_from_config(&file.remote_sessions))
             .unwrap_or_default();
@@ -10636,13 +10585,20 @@ impl App {
             &self.stored_repos,
             &closed,
         );
+        let selection_commands = self.selection.reduce(
+            SelectionEvent::Persist,
+            &self.selection_roster(),
+            self.usage_view.open,
+            status_now!(),
+        );
+        let active_workspace = match selection_commands.as_slice() {
+            [SelectionCommand::PersistActiveIndex(index)] => *index,
+            _ => unreachable!("persistence bridge only returns an index"),
+        };
         let ws_file = WorkspacesFile {
             workspaces: configs,
             repos,
-            active_workspace: persisted_active_index(
-                self.active_workspace_idx,
-                &self.running_parked_flags(),
-            ),
+            active_workspace,
             remote_sessions,
             remote_agents: remote_agent_defs,
             collapsed_repo_groups: {
@@ -10745,7 +10701,7 @@ impl App {
         baseline_tests::observe("plans+docs");
         let workspace_dir = self
             .workspaces
-            .get(self.active_workspace_idx)
+            .get(self.active_workspace_index())
             .map(|ws| &ws.dir);
         if let Ok(mut p) = self.log_server_state.plans_dir.write() {
             *p = workspace_dir.map(|dir| dir.join(".plans"));
@@ -12747,7 +12703,7 @@ impl App {
     /// Runs on every update: while a session tab of a task is focused, remember
     /// it (by stable tab id) so `enter_task_context` can restore it later.
     fn record_task_session_focus(&mut self) {
-        if let Some(workspace) = self.workspaces.get(self.active_workspace_idx) {
+        if let Some(workspace) = self.workspaces.get(self.active_workspace_index()) {
             if let Some(tab) = workspace.tabs.get(workspace.active_tab) {
                 if let Some(task_id) = &tab.task_id {
                     let entry = self.task_last_session_tab.get(task_id.as_str());
@@ -12907,7 +12863,7 @@ impl App {
                             "session_id": tab.task_session_id,
                             "label": tab.status.repo_name,
                             "workspace": workspace.name,
-                            "is_active": workspace_idx == self.active_workspace_idx
+                            "is_active": workspace_idx == self.active_workspace_index()
                                 && workspace.active_tab < workspace.tabs.len()
                                 && workspace.tabs[workspace.active_tab].id == tab.id,
                         })
@@ -13444,7 +13400,7 @@ impl App {
             self.workspaces[workspace_idx].tabs.push(tab);
             self.workspaces[workspace_idx].tabs.len() - 1
         };
-        self.active_workspace_idx = workspace_idx;
+        self.activate_workspace_at(workspace_idx);
         self.workspaces[workspace_idx].active_tab = target_tab;
         let tab = &mut self.workspaces[workspace_idx].tabs[target_tab];
         tab.sidebar_mode = SidebarMode::Tasks;
@@ -14087,7 +14043,7 @@ impl App {
                 matches!(workspace.location, WorkspaceLocation::Local { .. })
                     && paths_equal(&workspace.dir, &original_dir)
             }) {
-                self.active_workspace_idx = original_workspace_idx;
+                self.activate_workspace_at(original_workspace_idx);
                 if original_tab_idx < self.workspaces[original_workspace_idx].tabs.len() {
                     self.workspaces[original_workspace_idx].active_tab = original_tab_idx;
                 }
@@ -14124,7 +14080,7 @@ impl App {
     /// (the Chats panel's Go-to-Tab, which may jump workspaces).
     fn focus_workspace_tab(&mut self, ws_idx: usize, tab_idx: usize) -> Task<Event> {
         let mut tasks = Vec::new();
-        if ws_idx != self.active_workspace_idx {
+        if ws_idx != self.active_workspace_index() {
             tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
         }
         tasks.push(self.update(Event::TabSelect(tab_idx)));
@@ -14166,13 +14122,6 @@ impl App {
             .count()
     }
 
-    fn running_parked_flags(&self) -> Vec<bool> {
-        self.workspaces
-            .iter()
-            .map(|ws| ws.running_park.is_some())
-            .collect()
-    }
-
     /// This Mac's folder workspaces are shown on the bar, not only in the
     /// `Repos ▾` menu.
     fn repos_on_bar(&self) -> bool {
@@ -14186,7 +14135,7 @@ impl App {
     fn workspace_bar_layout(&self) -> workspace_bar::BarLayout {
         workspace_bar::bar_layout(
             &self.workspace_bar_chips(),
-            self.active_workspace_idx,
+            self.active_workspace_index(),
             self.repos_on_bar(),
         )
     }
@@ -14211,7 +14160,7 @@ impl App {
             .and_then(|uid| self.workspace_index_by_uid(uid));
         workspace_bar::slide_order(
             &self.workspace_bar_chips(),
-            self.active_workspace_idx,
+            self.active_workspace_index(),
             from,
             self.repos_on_bar(),
         )
@@ -14227,25 +14176,28 @@ impl App {
         position as f32 * self.content_viewport_width()
     }
 
-    /// Makes `idx` active and animates the content slide to it. A settled
-    /// slide starts from the active workspace's panel, which stays in the
-    /// slide until it settles.
+    /// Attention jumps retain their own continuation and leave Usage alone.
     fn begin_slide_to(&mut self, idx: usize) {
+        if let Some(id) = self.workspaces.get(idx).map(|ws| ws.uid) {
+            self.reduce_selection(SelectionEvent::Animate(id));
+        }
+    }
+
+    /// Animation bridge: selection has already changed; only presentation lives here.
+    fn animate_workspace_selection(&mut self, from: Option<u64>, idx: usize, at: Instant) {
         let settled = !self.slide_animating && self.last_user_scroll.is_none();
         if settled || self.slide_from.is_none() {
-            self.slide_from = self
-                .workspaces
-                .get(self.active_workspace_idx)
-                .map(|ws| ws.uid);
+            self.slide_from = from;
         }
-        let from = self.active_workspace_idx;
-        self.active_workspace_idx = idx;
         if settled {
-            self.slide_offset = self.slide_offset_of(from);
+            self.slide_offset = self.slide_offset_of(
+                from.and_then(|id| self.workspace_index_by_uid(id))
+                    .unwrap_or(0),
+            );
         }
         self.slide_start_offset = self.slide_offset;
         self.slide_target = self.slide_offset_of(idx);
-        self.slide_start_time = Some(Instant::now());
+        self.slide_start_time = Some(at);
         self.slide_animating = true;
     }
 
@@ -14277,10 +14229,6 @@ impl App {
         if order.iter().enumerate().all(|(new, &old)| new == old) {
             return;
         }
-        let new_active = order
-            .iter()
-            .position(|&old| old == self.active_workspace_idx)
-            .unwrap_or(0);
         let mut slots: Vec<Option<Workspace>> = std::mem::take(&mut self.workspaces)
             .into_iter()
             .map(Some)
@@ -14289,7 +14237,7 @@ impl App {
             .iter()
             .map(|&old| slots[old].take().expect("permutation is a bijection"))
             .collect();
-        self.active_workspace_idx = new_active;
+        self.reduce_selection(SelectionEvent::Reordered);
         self.snap_slide_to_active_workspace();
         self.mark_workspaces_dirty();
     }
@@ -14323,7 +14271,7 @@ impl App {
 
         let active_dir = self
             .workspaces
-            .get(self.active_workspace_idx)
+            .get(self.active_workspace_index())
             .map(|workspace| workspace.dir.clone());
         let active_repository_dir = active_dir
             .as_ref()
@@ -14391,7 +14339,6 @@ impl App {
                             .len()
                             .saturating_sub(tab_offset + 1),
                     );
-                self.active_workspace_idx = owner_idx;
             }
         }
 
@@ -14399,7 +14346,7 @@ impl App {
         // The folded workspaces' repos (task worktrees) are listed by no
         // one now; their terminals moved to the owner above.
         self.release_unlisted_repos();
-        self.active_workspace_idx = active_repository_dir
+        let active_index = active_repository_dir
             .as_ref()
             .and_then(|directory| {
                 self.workspaces
@@ -14407,6 +14354,7 @@ impl App {
                     .position(|workspace| paths_equal(&workspace.dir, directory))
             })
             .unwrap_or(0);
+        self.activate_workspace_at(active_index);
         if migrated > 0 {
             self.workspaces_dirty = true;
             self.next_workspace_save_at =
@@ -14417,7 +14365,7 @@ impl App {
 
     fn snap_slide_to_active_workspace(&mut self) {
         self.slide_from = None;
-        let new_target = self.slide_offset_of(self.active_workspace_idx);
+        let new_target = self.slide_offset_of(self.active_workspace_index());
         self.slide_offset = new_target;
         self.slide_target = new_target;
         self.slide_animating = false;
@@ -14726,10 +14674,6 @@ impl App {
     fn park_stopping(&mut self, idx: usize, info: ParkedInfo) -> Task<Event> {
         self.dismiss_viewer_surface();
         let uid = self.workspaces[idx].uid;
-        let active_uid = self
-            .active_workspace()
-            .map(|ws| ws.uid)
-            .filter(|&active| active != uid);
         let mut cfg = self.workspace_config(&self.workspaces[idx]);
         cfg.active = false;
         cfg.parked = Some(info);
@@ -14748,14 +14692,14 @@ impl App {
         remove_workspace_overview_presentation(&mut self.workspace_overview_presentations, uid);
         self.workspaces.remove(idx);
         self.release_unlisted_repos();
-        let kept_active = active_uid.and_then(|active| self.workspace_index_by_uid(active));
-        match kept_active.or_else(|| next_on_bar(idx, &self.running_parked_flags())) {
-            Some(active) => self.active_workspace_idx = active,
-            None => {
-                eprintln!("[workspace] no workspace is left on the bar after parking uid={uid}");
-                self.active_workspace_idx = self.workspaces.len().saturating_sub(1);
-            }
+        if self.active_workspace().is_none() && self.bar_workspace_count() == 0 {
+            eprintln!("[workspace] no workspace is left on the bar after parking uid={uid}");
         }
+        self.reduce_selection(SelectionEvent::LeftBar {
+            id: uid,
+            index: idx,
+            removed: true,
+        });
         self.after_workspace_left_bar()
     }
 
@@ -14772,15 +14716,18 @@ impl App {
             ws.name,
             ws.tabs.len()
         );
-        if self.active_workspace_idx == idx {
-            match next_on_bar(idx, &self.running_parked_flags()) {
-                Some(active) => self.active_workspace_idx = active,
-                None => eprintln!(
-                    "[workspace] no workspace is left on the bar after parking {:?}",
-                    self.workspaces[idx].name
-                ),
-            }
+        let uid = ws.uid;
+        if self.selection.active() == Some(uid) && self.bar_workspace_count() == 0 {
+            eprintln!(
+                "[workspace] no workspace is left on the bar after parking {:?}",
+                self.workspaces[idx].name
+            );
         }
+        self.reduce_selection(SelectionEvent::LeftBar {
+            id: uid,
+            index: idx,
+            removed: false,
+        });
         self.after_workspace_left_bar()
     }
 
@@ -14862,7 +14809,7 @@ impl App {
     /// label goes; a running parked one something went to (a chat, a task,
     /// an attention target) comes back to the bar (TRU-186).
     fn settle_active_workspace(&mut self) -> Option<Task<Event>> {
-        let idx = self.active_workspace_idx;
+        let idx = self.active_workspace_index();
         let ws = self.workspaces.get_mut(idx)?;
         ws.woke = None;
         ws.running_park.as_ref()?;
@@ -14881,7 +14828,7 @@ impl App {
         if let Some(idx) = running_parked_index(&self.workspaces, key) {
             self.return_running_parked(idx, None);
             self.parked_list_open = false;
-            self.active_workspace_idx = idx;
+            self.activate_workspace_at(idx);
             self.snap_slide_to_active_workspace();
             self.sync_visible_terminals();
             self.sync_plans_dir();
@@ -14914,11 +14861,23 @@ impl App {
 
     /// The resumed, now-active workspace's git, files, connection and page.
     fn after_resume(&mut self) -> Task<Event> {
-        let git_task = match self.active_tab().map(|tab| (tab.id, tab.repo_path.clone())) {
-            Some((tab_id, repo_path)) => {
-                self.request_git_status_for_active_source(tab_id, repo_path, RequestPrelude::Resume)
+        let commands = self.selection.reduce(
+            SelectionEvent::Resume,
+            &self.selection_roster(),
+            self.usage_view.open,
+            status_now!(),
+        );
+        let git_task = if commands.contains(&SelectionCommand::RefreshStatus) {
+            match self.active_tab().map(|tab| (tab.id, tab.repo_path.clone())) {
+                Some((tab_id, repo_path)) => self.request_git_status_for_active_source(
+                    tab_id,
+                    repo_path,
+                    RequestPrelude::Resume,
+                ),
+                None => Task::none(),
             }
-            None => Task::none(),
+        } else {
+            Task::none()
         };
         Task::batch([
             git_task,
@@ -15069,6 +15028,9 @@ impl App {
             }
         }
         self.workspaces.push(ws);
+        if self.selection.active().is_none() {
+            self.activate_workspace_at(0);
+        }
         self.workspaces.len() - 1
     }
 
@@ -15374,18 +15336,16 @@ impl App {
         let uid = workspace.uid;
         self.open_workspace(workspace);
         self.normalize_workspace_order();
-        self.active_workspace_idx = self
-            .workspace_index_by_uid(uid)
-            .expect("the just-opened workspace remains after ordering");
+        self.reduce_selection(SelectionEvent::Activate(uid));
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
         self.sync_plans_dir();
         self.snap_slide_to_active_workspace();
-        self.active_workspace_idx
+        self.active_workspace_index()
     }
 
     fn workspace_index_by_uid(&self, uid: u64) -> Option<usize> {
-        self.workspaces.iter().position(|ws| ws.uid == uid)
+        SelectionState::index_of(self.workspaces.iter().map(|ws| ws.uid), uid)
     }
 
     /// Slice 5, remote form: open / reopen / create the workspace that
@@ -15482,13 +15442,14 @@ impl App {
             _ => workspace.dir.to_string_lossy().into_owned(),
         };
         self.add_remote_agent_tab_to_workspace(&mut workspace, browse_root, None);
-        self.active_workspace_idx = self.open_workspace(workspace);
+        let opened = self.open_workspace(workspace);
+        self.activate_workspace_at(opened);
         self.normalize_workspace_order();
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
         self.sync_plans_dir();
         self.snap_slide_to_active_workspace();
-        self.active_workspace_idx
+        self.active_workspace_index()
     }
 
     /// The workspace a local chat resumes into (TRU-169): its owning
@@ -15584,7 +15545,7 @@ impl App {
         if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&chats::ChatRef::local(&id)) {
             return self.focus_workspace_tab(ws_idx, tab_idx);
         }
-        if ws_idx != self.active_workspace_idx {
+        if ws_idx != self.active_workspace_index() {
             tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
         }
         self.add_tab_with_command(cwd, Some(command));
@@ -15671,7 +15632,7 @@ impl App {
         if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&chats::ChatRef::local(&id)) {
             return self.focus_workspace_tab(ws_idx, tab_idx);
         }
-        if ws_idx != self.active_workspace_idx {
+        if ws_idx != self.active_workspace_index() {
             tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
         }
         let tab_id = self.next_tab_id;
@@ -15681,7 +15642,8 @@ impl App {
         tab.set_local_dir(cwd);
         tab.chat_session_id = Some(id.clone());
         let repo_path = tab.repo_path.clone();
-        let workspace = &mut self.workspaces[self.active_workspace_idx];
+        let workspace_idx = self.active_workspace_index();
+        let workspace = &mut self.workspaces[workspace_idx];
         workspace.tabs.push(tab);
         workspace.active_tab = workspace.tabs.len() - 1;
         eprintln!("[agent] opened Claude chat tab id={tab_id} resuming {id}");
@@ -15712,7 +15674,7 @@ impl App {
     ) -> Task<Event> {
         let ws_idx = self.ensure_remote_workspace_for_chat(&remote_id, &cwd, repo_root.as_deref());
         let mut tasks = Vec::new();
-        if ws_idx != self.active_workspace_idx {
+        if ws_idx != self.active_workspace_index() {
             tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
         }
         let mut tab = self.new_remote_claude_chat_tab(
@@ -15804,7 +15766,7 @@ impl App {
         let client = remote_agent_client_config(agent);
 
         let mut tasks = Vec::new();
-        if ws_idx != self.active_workspace_idx {
+        if ws_idx != self.active_workspace_index() {
             tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
         }
         tasks.push(Task::perform(
@@ -16177,7 +16139,7 @@ impl App {
         let open = if let Some(tab_idx) = hosting {
             self.update(Event::TabSelect(tab_idx))
         } else {
-            self.open_local_chat(chat, Some(self.active_workspace_idx))
+            self.open_local_chat(chat, Some(self.active_workspace_index()))
         };
         // The tab shown now may carry another sidebar mode (a new tab starts
         // on Git): put it on the overview.
@@ -16487,7 +16449,7 @@ impl App {
                 return Task::none();
             }
         };
-        let select = if idx != self.active_workspace_idx {
+        let select = if idx != self.active_workspace_index() {
             self.update(Event::WorkspaceSelect(idx))
         } else {
             Task::none()
@@ -16562,7 +16524,7 @@ impl App {
             return changed;
         }
         self.mark_log_server_dirty();
-        let show = if target != self.active_workspace_idx {
+        let show = if target != self.active_workspace_index() {
             self.update(Event::WorkspaceSelect(target))
         } else {
             self.sync_visible_terminals();
@@ -17950,7 +17912,8 @@ impl App {
         };
         self.add_remote_agent_tab_to_workspace(&mut workspace, root, None);
         workspace.active_tab = 0;
-        self.active_workspace_idx = self.open_workspace(workspace);
+        let opened = self.open_workspace(workspace);
+        self.activate_workspace_at(opened);
         self.normalize_workspace_order();
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
@@ -17978,7 +17941,7 @@ impl App {
             .unwrap_or_else(|| path.to_string_lossy().to_string());
         let mut tasks = Vec::new();
         let ws_idx = self.ensure_local_workspace_for_chat(&path, None, &name);
-        if ws_idx != self.active_workspace_idx {
+        if ws_idx != self.active_workspace_index() {
             tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
         }
         tasks.push(self.update(Event::FolderSelected(Some(path))));
@@ -18003,7 +17966,7 @@ impl App {
         let existing = self
             .active_workspace()
             .filter(|ws| holds(ws))
-            .map(|_| self.active_workspace_idx)
+            .map(|_| self.active_workspace_index())
             .or_else(|| {
                 // Deepest root first, as for chats.
                 self.workspaces
@@ -18019,7 +17982,7 @@ impl App {
         let mut tasks = Vec::new();
         match existing {
             Some(ws_idx) => {
-                if ws_idx != self.active_workspace_idx {
+                if ws_idx != self.active_workspace_index() {
                     tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
                 }
                 let ws = &self.workspaces[ws_idx];
@@ -20755,7 +20718,7 @@ impl App {
             repos: RepoRegistry::default(),
             stored_repos: Vec::new(),
             bottom_repo_picker_open: false,
-            active_workspace_idx: 0,
+            selection: SelectionState::default(),
             next_tab_id: 0,
             task_store,
             missing_task_worktrees_logged: HashSet::new(),
@@ -21052,9 +21015,11 @@ impl App {
                 }
             }
 
-            app.active_workspace_idx = ws_file
-                .active_workspace
-                .min(app.workspaces.len().saturating_sub(1));
+            app.activate_workspace_at(
+                ws_file
+                    .active_workspace
+                    .min(app.workspaces.len().saturating_sub(1)),
+            );
             let reconciled_workspaces = app.reconcile_managed_task_workspaces();
             if reconciled_workspaces > 0 {
                 eprintln!(
@@ -21083,7 +21048,7 @@ impl App {
         app.register_remote_agent_connection_defaults();
 
         // Set initial slide position for active workspace
-        let initial_offset = app.slide_offset_of(app.active_workspace_idx);
+        let initial_offset = app.slide_offset_of(app.active_workspace_index());
         app.slide_offset = initial_offset;
         app.slide_target = initial_offset;
 
@@ -22014,12 +21979,70 @@ fi
         self.sidebar_width
     }
 
+    fn selection_roster(&self) -> Vec<WorkspaceFact> {
+        self.workspaces
+            .iter()
+            .map(|ws| WorkspaceFact {
+                id: ws.uid,
+                parked: ws.running_park.is_some(),
+            })
+            .collect()
+    }
+
+    /// Index bridge for legacy UI/catalog consumers; no index is stored.
+    fn active_workspace_index(&self) -> usize {
+        self.selection
+            .active_index(self.workspaces.iter().map(|ws| ws.uid))
+            .unwrap_or(self.workspaces.len())
+    }
+
+    fn activate_workspace_at(&mut self, idx: usize) {
+        if let Some(id) = self.workspaces.get(idx).map(|ws| ws.uid) {
+            self.reduce_selection(SelectionEvent::Activate(id));
+        }
+    }
+
+    /// Interpret immediate presentation commands; each caller keeps its continuation.
+    fn reduce_selection(&mut self, event: SelectionEvent) -> bool {
+        let commands = self.selection.reduce(
+            event,
+            &self.selection_roster(),
+            self.usage_view.open,
+            status_now!(),
+        );
+        let mut changed = false;
+        for command in commands {
+            match command {
+                SelectionCommand::WorkspaceChanged { .. } => changed = true,
+                SelectionCommand::AnimateTo { from, index, at } => {
+                    self.animate_workspace_selection(from, index, at)
+                }
+                SelectionCommand::SetUsageOpen(open) => {
+                    self.usage_view.open = open;
+                    if !open {
+                        self.usage_view.repo = None;
+                    }
+                }
+                SelectionCommand::PersistActiveIndex(_) | SelectionCommand::RefreshStatus => {
+                    unreachable!("handled at the persistence/resume boundary")
+                }
+            }
+        }
+        changed
+    }
+
     fn active_workspace(&self) -> Option<&Workspace> {
-        self.workspaces.get(self.active_workspace_idx)
+        self.workspaces.get(
+            self.selection
+                .active_index(self.workspaces.iter().map(|ws| ws.uid))?,
+        )
     }
 
     fn active_workspace_mut(&mut self) -> Option<&mut Workspace> {
-        self.workspaces.get_mut(self.active_workspace_idx)
+        let idx = self
+            .selection
+            .active_index(self.workspaces.iter().map(|ws| ws.uid))?;
+        self.workspaces.get_mut(idx)
     }
 
     fn remote_session_for_workspace<'a>(
@@ -22439,7 +22462,7 @@ fi
             self.remote_session_for_workspace(workspace)
                 .is_some_and(|session| session.session_name == session_name)
         }) {
-            self.active_workspace_idx = idx;
+            self.activate_workspace_at(idx);
             self.sync_visible_terminals();
             self.mark_workspaces_dirty();
             self.sync_plans_dir();
@@ -22525,7 +22548,8 @@ fi
         }
         workspace.active_tab = 0;
 
-        self.active_workspace_idx = self.open_workspace(workspace);
+        let opened = self.open_workspace(workspace);
+        self.activate_workspace_at(opened);
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
         self.sync_plans_dir();
@@ -22599,7 +22623,7 @@ fi
     ) -> Task<Event> {
         let startup_command =
             self.remote_attach_command(&session, &tmux_session_name, &startup_command);
-        let ws_idx = self.active_workspace_idx;
+        let ws_idx = self.active_workspace_index();
         if ws_idx >= self.workspaces.len() {
             return Task::none();
         }
@@ -24964,7 +24988,7 @@ fi
                 {
                     if let Some(task_id) = tab.task_id.clone() {
                         let prompt = TaskTabClosePrompt {
-                            workspace_idx: self.active_workspace_idx,
+                            workspace_idx: self.active_workspace_index(),
                             tab_idx: idx,
                             task_id,
                         };
@@ -26192,7 +26216,7 @@ fi
                             .filter(|t| t.id != workspace.tabs[tab_idx].id)
                             .map(|t| t.id);
                         let preserve_selection =
-                            active_id.is_some() || workspace_idx != self.active_workspace_idx;
+                            active_id.is_some() || workspace_idx != self.active_workspace_index();
                         let selection = self.selected_task_id.clone();
                         let close = self.close_task_tab(TaskTabClosePrompt {
                             workspace_idx,
@@ -28072,7 +28096,9 @@ fi
                         }
                         // Cmd+Shift+W - Close current workspace
                         if (c == "w" || c == "W") && modifiers.shift() {
-                            return Task::done(Event::WorkspaceClose(self.active_workspace_idx));
+                            return Task::done(Event::WorkspaceClose(
+                                self.active_workspace_index(),
+                            ));
                         }
                         // Cmd+Shift+U - Open the Usage view
                         if global_shortcut(&key, modifiers) == Some(GlobalShortcut::UsageView) {
@@ -28659,8 +28685,8 @@ fi
                 self.remember_task_context(None);
                 let Some(workspace_idx) = self
                     .workspaces
-                    .get(self.active_workspace_idx)
-                    .map(|_| self.active_workspace_idx)
+                    .get(self.active_workspace_index())
+                    .map(|_| self.active_workspace_index())
                 else {
                     return Task::none();
                 };
@@ -28690,7 +28716,7 @@ fi
                 let Some(task_id) = self.active_task_context_id().map(str::to_string) else {
                     return Task::none();
                 };
-                let workspace_idx = self.active_workspace_idx;
+                let workspace_idx = self.active_workspace_index();
                 if self.workspaces.get(workspace_idx).is_none() {
                     return Task::none();
                 }
@@ -29545,7 +29571,7 @@ fi
             }
             Event::OpenWorktree(path) => {
                 self.dismiss_viewer_surface();
-                if self.active_workspace_idx >= self.workspaces.len() {
+                if self.active_workspace_index() >= self.workspaces.len() {
                     return Task::none();
                 }
 
@@ -29567,7 +29593,7 @@ fi
                     return self.refresh_worktrees_for_active_tab();
                 }
 
-                let ws_idx = self.active_workspace_idx;
+                let ws_idx = self.active_workspace_index();
                 let existing_idx = self.workspaces[ws_idx].tabs.iter().position(|tab| {
                     paths_equal(&tab.repo_path, &path) || paths_equal(&tab.current_dir, &path)
                 });
@@ -29834,7 +29860,7 @@ fi
                     let order = self.slide_order();
                     let position = order
                         .iter()
-                        .position(|&idx| idx == self.active_workspace_idx)
+                        .position(|&idx| idx == self.active_workspace_index())
                         .unwrap_or(0);
                     let has_left = position > 0;
                     let has_right = position + 1 < order.len();
@@ -30468,20 +30494,12 @@ fi
                 }
             }
             Event::UsageViewToggle => {
-                usage_view_step(
-                    &mut self.usage_view,
-                    self.active_workspace_idx,
-                    UsageViewInput::Toggle,
-                );
+                self.reduce_selection(SelectionEvent::UsageToggle);
                 return self.usage_view_changed();
             }
             Event::UsageViewClose => {
                 if self.usage_view.open {
-                    usage_view_step(
-                        &mut self.usage_view,
-                        self.active_workspace_idx,
-                        UsageViewInput::Close,
-                    );
+                    self.reduce_selection(SelectionEvent::UsageClose);
                     return self.usage_view_changed();
                 }
             }
@@ -31758,23 +31776,13 @@ fi
             }
             Event::WorkspaceSelect(idx) => {
                 self.editing_run_command = None;
-                if self.usage_view.open {
-                    usage_view_step(
-                        &mut self.usage_view,
-                        self.active_workspace_idx,
-                        UsageViewInput::SelectWorkspace(idx),
-                    );
-                    // Re-selecting the workspace that was showing just
-                    // closes the view; a different one switches below,
-                    // which presents its surfaces.
-                    if idx >= self.workspaces.len() || idx == self.active_workspace_idx {
-                        return self.usage_view_changed();
-                    }
+                let usage_was_open = self.usage_view.open;
+                let target = self.workspaces.get(idx).map(|ws| ws.uid);
+                let changed = self.reduce_selection(SelectionEvent::Select(target));
+                if !changed && usage_was_open {
+                    return self.usage_view_changed();
                 }
-                if idx < self.workspaces.len() && idx != self.active_workspace_idx {
-                    // Start the slide and update the active workspace
-                    // immediately (tab bar + console switch instantly).
-                    self.begin_slide_to(idx);
+                if changed {
                     let selected_task_is_in_workspace = self
                         .selected_task_id
                         .as_deref()
@@ -31839,7 +31847,7 @@ fi
                     if let Some(last_scroll) = self.last_user_scroll {
                         if last_scroll.elapsed().as_millis() >= SWIPE_DEBOUNCE_MS as u128 {
                             self.last_user_scroll = None;
-                            let target = self.slide_offset_of(self.active_workspace_idx);
+                            let target = self.slide_offset_of(self.active_workspace_index());
                             if (self.slide_offset - target).abs() > 1.0 {
                                 self.slide_start_offset = self.slide_offset;
                                 self.slide_target = target;
@@ -31916,9 +31924,13 @@ fi
                         let nearest = order
                             .get(position.min(order.len().saturating_sub(1)))
                             .copied()
-                            .unwrap_or(self.active_workspace_idx);
-                        if nearest != self.active_workspace_idx {
-                            self.active_workspace_idx = nearest;
+                            .unwrap_or(self.active_workspace_index());
+                        let changed = self
+                            .workspaces
+                            .get(nearest)
+                            .map(|ws| ws.uid)
+                            .is_some_and(|id| self.reduce_selection(SelectionEvent::Swipe(id)));
+                        if changed {
                             self.sync_visible_terminals();
                             self.mark_workspaces_dirty();
                             self.dismiss_viewer_surface();
@@ -32365,7 +32377,8 @@ fi
                     None,
                     false,
                 );
-                self.active_workspace_idx = self.open_workspace(workspace);
+                let opened = self.open_workspace(workspace);
+                self.activate_workspace_at(opened);
                 self.normalize_workspace_order();
                 self.mark_workspaces_dirty();
                 self.mark_log_server_dirty();
@@ -32578,7 +32591,7 @@ fi
                 if ws_count == 0 {
                     return Task::none();
                 }
-                let start_ws = self.active_workspace_idx;
+                let start_ws = self.active_workspace_index();
                 let start_tab = self
                     .workspaces
                     .get(start_ws)
@@ -32596,7 +32609,7 @@ fi
                     |ws, tab| self.workspaces[ws].tabs[tab].needs_attention(),
                 );
                 if let Some((ws_idx, tab_idx)) = found {
-                    if ws_idx != self.active_workspace_idx {
+                    if ws_idx != self.active_workspace_index() {
                         // Animate workspace switch
                         self.begin_slide_to(ws_idx);
                         self.sync_plans_dir();
@@ -36981,7 +36994,7 @@ fi
         let theme = &self.theme;
         let pulse_bright = self.attention_pulse_bright;
         let ws = &self.workspaces[idx];
-        let is_active = idx == self.active_workspace_idx;
+        let is_active = idx == self.active_workspace_index();
         let ws_color = ws.color.color(theme);
         let text_color = if is_active {
             ws_color
@@ -37526,7 +37539,7 @@ fi
     ) -> Element<'static, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let ws = &self.workspaces[idx];
-        let is_active = idx == self.active_workspace_idx;
+        let is_active = idx == self.active_workspace_index();
         let attention = ws.attention_count();
         let dot_color = if attention > 0 {
             theme.peach()
@@ -38038,7 +38051,7 @@ fi
             let Some(ws) = self.workspaces.get(idx) else {
                 continue;
             };
-            let is_active = idx == self.active_workspace_idx;
+            let is_active = idx == self.active_workspace_index();
             let ws_color = ws.color.color(theme);
             let inactive_color = theme.surface2();
 
@@ -38633,7 +38646,7 @@ fi
             if self.bar_workspace_count() > 1 {
                 let close_color = theme.overlay0();
                 let close_hover = theme.text_primary();
-                let ws_idx = self.active_workspace_idx;
+                let ws_idx = self.active_workspace_index();
                 let close_ws_btn = button(text("\u{00d7}").size(12).color(close_color))
                     .style(move |_theme, status| {
                         let tc = if matches!(status, button::Status::Hovered) {
@@ -39186,7 +39199,7 @@ fi
 
     fn view_workspace_slide(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let viewport_width = self.content_viewport_width();
-        let active_idx = self.active_workspace_idx;
+        let active_idx = self.active_workspace_index();
         let theme = &self.theme;
 
         // When not animating or swiping, render active workspace directly
@@ -40037,7 +40050,7 @@ fi
             refresh = refresh.on_press(Event::WorkspaceOverviewRefresh);
         }
         // Rename inline with ✎ (TRU-169).
-        let active_idx = self.active_workspace_idx;
+        let active_idx = self.active_workspace_index();
         let renaming = self.workspace_rename.as_ref().filter(|rename| {
             rename.site == RenameSite::Overview
                 && self
@@ -53868,43 +53881,39 @@ mod tests {
 
     #[test]
     fn usage_view_open_and_close_keep_the_selection() {
-        let mut state = UsageViewState::default();
-        // Workspace B (1) is showing; the glyph opens the view over it.
-        assert_eq!(usage_view_step(&mut state, 1, UsageViewInput::Toggle), 1);
-        assert!(state.open);
-        state.repo = Some((Some(PathBuf::from("/repo/alpha")), "alpha".to_string()));
-        // Esc closes it on the same workspace, app-wide again next time.
-        assert_eq!(usage_view_step(&mut state, 1, UsageViewInput::Close), 1);
-        assert_eq!(state, UsageViewState::default());
-        // The glyph again (or Cmd+Shift+U) toggles it open and shut.
-        assert_eq!(usage_view_step(&mut state, 1, UsageViewInput::Toggle), 1);
-        assert!(state.open);
-        assert_eq!(usage_view_step(&mut state, 1, UsageViewInput::Toggle), 1);
-        assert!(!state.open);
-        // Esc with the view shut changes nothing.
-        assert_eq!(usage_view_step(&mut state, 1, UsageViewInput::Close), 1);
-        assert!(!state.open);
+        let fixture = tempfile::tempdir().unwrap();
+        let mut app = baseline_tests::app_with_tabs(fixture.path());
+        app.activate_workspace_at(1);
+        for (event, open) in [
+            (SelectionEvent::UsageToggle, true),
+            (SelectionEvent::UsageClose, false),
+            (SelectionEvent::UsageToggle, true),
+            (SelectionEvent::UsageToggle, false),
+            (SelectionEvent::UsageClose, false),
+        ] {
+            app.reduce_selection(event);
+            assert_eq!(app.active_workspace_index(), 1);
+            assert_eq!(app.usage_view.open, open);
+            if open {
+                app.usage_view.repo = Some((Some(PathBuf::from("/repo/alpha")), "alpha".into()));
+            } else {
+                assert_eq!(app.usage_view, UsageViewState::default());
+            }
+        }
     }
 
     #[test]
     fn a_workspace_click_closes_the_usage_view() {
-        let mut state = UsageViewState::default();
-        usage_view_step(&mut state, 1, UsageViewInput::Toggle);
-        state.repo = Some((None, "(no cwd)".to_string()));
-        // Opened from workspace B (1); clicking A (0) on the rail selects A
-        // and closes the view.
-        assert_eq!(
-            usage_view_step(&mut state, 1, UsageViewInput::SelectWorkspace(0)),
-            0
-        );
-        assert_eq!(state, UsageViewState::default());
-        // Clicking the workspace that was showing just closes it.
-        usage_view_step(&mut state, 1, UsageViewInput::Toggle);
-        assert_eq!(
-            usage_view_step(&mut state, 1, UsageViewInput::SelectWorkspace(1)),
-            1
-        );
-        assert!(!state.open);
+        let fixture = tempfile::tempdir().unwrap();
+        let mut app = baseline_tests::app_with_tabs(fixture.path());
+        for target in [0, 1] {
+            app.activate_workspace_at(1);
+            app.reduce_selection(SelectionEvent::UsageToggle);
+            app.usage_view.repo = Some((None, "(no cwd)".into()));
+            app.reduce_selection(SelectionEvent::Select(Some(app.workspaces[target].uid)));
+            assert_eq!(app.active_workspace_index(), target);
+            assert_eq!(app.usage_view, UsageViewState::default());
+        }
     }
 
     #[test]
