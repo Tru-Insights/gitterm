@@ -1,0 +1,4 @@
+diff --git a/src/old.rs b/src/new.rs
+similarity index 100%
+rename from src/old.rs
+rename to src/new.rs

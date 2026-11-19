@@ -2541,10 +2541,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitterm-core"
+version = "0.1.0"
+
+[[package]]
 name = "gitterm-gpui"
 version = "0.0.0"
 dependencies = [
  "gitterm-gpui-chat",
+ "gitterm-gpui-review",
  "gitterm-gpui-shell",
  "gitterm-terminal",
  "gpui-component",
@@ -2562,6 +2567,18 @@ dependencies = [
  "gpui-kit",
  "gpui-pre",
  "markdown",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "gitterm-gpui-review"
+version = "0.0.0"
+dependencies = [
+ "gitterm-core",
+ "gpui-component",
+ "gpui-kit",
+ "gpui-pre",
  "serde",
  "serde_json",
 ]
