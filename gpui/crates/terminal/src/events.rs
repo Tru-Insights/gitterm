@@ -3,7 +3,7 @@ use alacritty_terminal::event::{Event, EventListener};
 use parking_lot::Mutex;
 use std::sync::{
     Arc, OnceLock,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 #[derive(Clone, Default)]
@@ -57,6 +57,7 @@ struct Shared {
     dirty: AtomicBool,
     effects_dirty: AtomicBool,
     output_ready: AtomicBool,
+    revision: AtomicU64,
     pending: Mutex<PendingEvents>,
 }
 
@@ -95,6 +96,14 @@ impl EventProxy {
     }
     pub fn output_ready(&self) -> bool {
         self.0.output_ready.load(Ordering::Acquire)
+    }
+    pub fn revision(&self) -> u64 {
+        self.0.revision.load(Ordering::Acquire)
+    }
+    /// Advance under the terminal lock whenever grid text/coordinates can change.
+    /// Keep paint notification separate, including during deferred startup.
+    pub fn invalidate(&self) {
+        self.0.revision.fetch_add(1, Ordering::AcqRel);
     }
     pub fn mark_dirty(&self) {
         self.0.dirty.store(true, Ordering::Release);

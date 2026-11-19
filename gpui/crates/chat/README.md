@@ -1,16 +1,27 @@
-# Native chat fixture viewer (TRU-281, parent TRU-274)
+# Native chat interaction surface (TRU-288, parent TRU-274)
 
-A display-only native chat pane, independent of the root Iced/Wry package.
+A fixture-driven native chat pane, independent of the root Iced/Wry package.
 No harness processes, settings, home-directory transcript discovery, or
 permission commands are started by this crate.
 
 From the repository root:
 
 ```sh
-CARGO_TARGET_DIR=/private/tmp/gt-target-tru281 scripts/cargo.sh build --manifest-path gpui/Cargo.toml --workspace --release --locked -j 4
-/private/tmp/gt-target-tru281/release/gitterm-gpui --chat gpui/crates/chat/fixtures/showcase.jsonl
-/private/tmp/gt-target-tru281/release/gitterm-gpui --chat gpui/crates/chat/fixtures/long-5000.jsonl
+CARGO_TARGET_DIR=/private/tmp/gt-target-tru288 scripts/cargo.sh build --manifest-path gpui/Cargo.toml --workspace --release --locked -j 4
+/private/tmp/gt-target-tru288/release/gitterm-gpui --chat gpui/crates/chat/fixtures/showcase.jsonl
+/private/tmp/gt-target-tru288/release/gitterm-gpui --chat gpui/crates/chat/fixtures/long-5000.jsonl
 ```
+
+For a timed stream with interactive controls and intents printed to stderr:
+
+```sh
+/private/tmp/gt-target-tru288/release/gitterm-gpui --chat-live gpui/crates/chat/fixtures/showcase.jsonl
+```
+
+`--chat` remains a read-only recorded view. `run` selects live demo behavior
+when invoked with `--chat-live`; the main entry changes only its fixture-mode
+dispatch condition. The demo emits intents and never starts a harness or
+executes a permission decision.
 
 The viewer never reads the app's configuration, so it needs no configuration
 seed. Any future integration that starts the full app must use an absolute,
@@ -47,8 +58,7 @@ Two **fixture-only** `Entry` variants supply app-owned display context:
 `display_delegation {id, title, state, body}`. These are not new harness events.
 A real `runtime_request_resolved` alone says only that a request ended; it
 never implies approval, denial, or an answer that was not recorded. Question
-answers can be shown as the existing question-text → joined-label map, without
-inventing a send/decision protocol. Permission suggestions and ACP options
+answers can be shown as the existing question-text → joined-label map, through the app adapter; this crate does not encode a harness protocol. Permission suggestions and ACP options
 remain visible JSON passthrough.
 
 `ChatModel` is deterministic and owns the timeline, scoped tool/request lookup,
@@ -56,7 +66,9 @@ stream segmentation, and stable row IDs. Nested worker events cannot append to
 the parent's assistant message. Unknown item references produce an explicit
 incomplete-history error. Reset closes lookup scopes and adds a reset marker;
 it does not reuse old row identities. The model is independent of rendered
-rows. Visited rows own their rich-text selection, folds, and diff state; parsing
+rows. At most 96 recently visited rows retain rich-text and diff entities. Fold state
+and card drafts/submissions survive rich-row eviction; rich-text selection on
+evicted rows does not. Visited rows own their rich-text selection and diff state; parsing
 completion remeasures the corresponding virtual row. No application data cache
 is introduced. Replaying starts a fresh deterministic model and retains the
 find query. Hiding a retained `ChatView` preserves its state.
@@ -81,13 +93,13 @@ not just the older migration-plan audit.
 | Selection Cmd+C and right-click Copy | Done | Component plain-copy behavior retained, including outer-whitespace trimming; explicit context-menu handler uses the same policy. |
 | Selected text Copy as Markdown / TRU-270 | Done | Right-click menu and Cmd+Shift+C use native selection Source format, preserving Markdown tables and code fences with language. Normal copy remains plain. |
 | Code block Copy / `:1090` | Done | Copies code text only; per-code-block Copied feedback for one second. |
-| Question cards / `:3317` | Display-only | Multiple questions/options, multi-select labels, Other/free-text indication, pending/answered/denied details. No answer submission controls. |
-| Permission cards / `:3254`, `:3279` | Display-only | Request IDs, original input, offered rules/options, reason and recorded pending/answered/denied/resolved state. No consent actions. |
+| Question cards / `:3317` | Done | Single/multi choice, Other/free text, header and option descriptions, validated submit and dismiss. Answered/resolved cards are read-only. |
+| Permission cards / `:3254`, `:3279` | Done | Allow / Allow always / Deny intents. Always passes the exact offered localSettings suggestion or ACP option. No invented rule or backend effect. |
 | Workers / `:1671`, `:2668` | Display-only | Nested scope labels/indentation, worker lifecycle row, scoped child text/thinking/tools and usage. No worker roster/navigation commands. |
 | Delegations / `:3048`, `:3087` | Display-only | Collapsible fixture/app delivery cards and results; no delivery or task commands. |
 | Turn status / `:784`, `:2668` | Done | Recorded input/output tokens, elapsed time, optional cost; completed/interrupted/failed and explicit errors. |
 | Review / `:2456`, `:2768` | Later | Review targets, findings, file opening, stale-head warnings, rerun/cancel/dismiss and held delivery require core/session integration. |
-| Composer and attachments / `:1843`, `:1896`, `:2028`, `:2116`, `:2221`, `:3444` | Later | Send/stop/queue/steer/withdraw, slash commands, model/effort/mode acknowledgments, attachments and dictation are outside this display-only task. Recorded queue lifecycle labels render. |
+| Composer / `:1843`, `:1896` | Done | Per-view multiline draft; Enter sends, Shift+Enter inserts newline; visible read-only reason; Stop while a turn runs. Queue/steer/withdraw, slash commands, attachments, dictation and model controls remain later. |
 | HTML results / `:784`, `:3048` | Later | Text/code stays native; interactive HTML preview belongs in a retained Viewer surface. |
 
 ## Synthetic fixtures and verification
@@ -101,8 +113,8 @@ private identity is used. The generator never reads outside its own directory.
 `long-5000.jsonl` produces exactly 5,000 rows, with unique offscreen search markers.
 
 ```sh
-CARGO_TARGET_DIR=/private/tmp/gt-target-tru281 scripts/cargo.sh test --manifest-path gpui/Cargo.toml --workspace --locked -j 4
-CARGO_TARGET_DIR=/private/tmp/gt-target-tru281 scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --workspace --locked -j 4 -- -D warnings
+CARGO_TARGET_DIR=/private/tmp/gt-target-tru288 scripts/cargo.sh test --manifest-path gpui/Cargo.toml --workspace --locked -j 4
+CARGO_TARGET_DIR=/private/tmp/gt-target-tru288 scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --workspace --locked --all-targets -j 4 -- -D warnings
 scripts/cargo.sh fmt --manifest-path gpui/Cargo.toml --all -- --check
 scripts/check-gpui-deps.sh
 ```
@@ -127,7 +139,54 @@ used. Live harness integration, physical rendering/VoiceOver, and selections
 that span rows after their endpoints are unmounted remain later integration
 coverage; native selection is tested on retained rendered content.
 
-Verified on arm64 macOS: workspace release build, Clippy (`-D warnings`),
-formatting, workspace tests (**11 passed**), and dependency boundary check all
-exited **0**. Fixture regeneration is byte-for-byte deterministic. The root
-Iced checks were not run: only the separate GPUI workspace changed.
+TRU-288 checks are run against the separate GPUI workspace with the locked
+dependency graph, including all-target Clippy and headless tests. Root Iced
+checks and physical GUI/VoiceOver testing are outside this slice.
+
+## Adapter API and local state
+
+On macOS, create `ChatView::new(records, window, cx)`, install an app callback
+with `set_intent_callback(Rc::new(|intent, app| { /* deliver intent */ }), cx)`,
+and enable interaction with `set_read_only(None, cx)`. To archive the view,
+call `set_read_only(Some(reason), cx)`: the draft survives, all mutation
+controls disable, and the reason remains visible. Without a callback, controls
+stay disabled. Worker requests remain read-only until a session adapter owns
+worker routing.
+
+`append_event(HarnessEvent, cx)` accepts normalized events one at a time;
+`append_record(&Record, cx)` additionally accepts timestamps and transcript
+entries. Text deltas, tool starts/completions and turn completion use the same
+model path as fixture loading and replay. Ingestion alone mutates transcript
+rows. Scroll-up preserves the reader anchor for both added rows and in-place
+text deltas. New content then exposes **New messages · Jump to latest**;
+jumping resumes tail-follow. Rich text uses the component's 280 ms stream fade
+and reduced-motion policy.
+
+`ChatIntent` has typed `Send`, `Stop`, `Permission`, `AnswerQuestion` and
+`DismissQuestion` variants. Permission choices are `Allow`, `AllowAlways`
+(with the exact offered suggestion), and `Deny`. Always is only offered when
+a localSettings rule or ACP option exists, matching the HTML. Question answers
+retain question text, selected labels in fixture order, and optional trimmed
+free text. The adapter can encode the existing question-text → joined-label map.
+Malformed questionnaires show an error and cannot submit; all questions need
+a selected option or nonempty free text.
+
+The only optimistic state is local: Send clears the draft after emitting;
+card submission immediately locks that card and shows **Submitted locally**
+with its answer. Stop waits for a turn-end event. Neither send nor card actions
+append an echo, decision, or resolution to the transcript. The callback must
+arrange authoritative events; no backend acknowledgment is inferred. Replacing
+the callback preserves local submissions. Replay resets transcript/card state
+but retains the composer draft and find query. A future adapter may need a
+rejection/retry API; this fixture slice deliberately provides no guessed
+acknowledgment protocol.
+
+Headless GPUI tests exercise composer Enter/Shift+Enter, empty send, retained
+drafts, read-only and stop intents, each permission decision, questionnaire
+single/multi/free text and validation, read-only/resolved/answered/worker card
+guards, follow versus jump on text deltas, and bounded rich-row retention.
+
+Verified for TRU-288 on arm64 macOS: formatting, locked workspace all-target
+Clippy (`-D warnings`), locked workspace tests (**16 chat + 7 shell + 65 terminal**),
+locked workspace build, and dependency boundary check each exited **0**. Both
+lockfiles remain unchanged. No GUI or running app was used.

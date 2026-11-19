@@ -33,6 +33,13 @@ pub struct Tool {
 }
 
 #[derive(Debug, Clone)]
+pub struct Request {
+    pub id: String,
+    pub kind: RuntimeRequestKind,
+    pub resolved: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct Row {
     pub id: u64,
     pub kind: RowKind,
@@ -41,6 +48,7 @@ pub struct Row {
     pub body: String,
     pub tool: Option<Tool>,
     pub decision: Option<DecisionState>,
+    pub request: Option<Request>,
 }
 impl Row {
     pub fn collapsible(&self) -> bool {
@@ -119,6 +127,7 @@ impl ChatModel {
             body,
             tool: None,
             decision: None,
+            request: None,
         });
         self.next_id += 1;
         index
@@ -319,12 +328,20 @@ impl ChatModel {
                     ),
                     body,
                 );
+                self.rows[index].request = Some(Request {
+                    id: request_id.clone(),
+                    kind: kind.clone(),
+                    resolved: false,
+                });
                 self.requests.insert(request_id.clone(), index);
                 changed.push(index);
             }
             HarnessEvent::RuntimeRequestResolved { request_id } => {
                 if let Some(&index) = self.requests.get(request_id) {
                     let row = &mut self.rows[index];
+                    if let Some(request) = &mut row.request {
+                        request.resolved = true;
+                    }
                     if row.decision.is_none() {
                         row.title = row
                             .title
@@ -436,6 +453,16 @@ impl ChatModel {
                 // Keep prior rows as history; new item/request IDs cannot target the old turn.
                 self.streams.clear();
                 self.items.clear();
+                for &index in self.requests.values() {
+                    let row = &mut self.rows[index];
+                    if let Some(request) = &mut row.request {
+                        request.resolved = true;
+                    }
+                    if row.decision.is_none() {
+                        row.title = row.title.replace("Pending", "Closed by reset");
+                    }
+                    changed.push(index);
+                }
                 self.requests.clear();
                 self.prompts.clear();
                 self.workers.clear();
@@ -827,7 +854,17 @@ mod tests {
         model.apply(&echo);
         model.apply(&echo);
         assert_eq!(model.rows.len(), 1);
-        model.apply(&record(HarnessEvent::ConversationReset { trigger: None }));
+        model.apply(&record(HarnessEvent::RuntimeRequest {
+            request_id: "before-reset".into(),
+            tool_use_id: "tool".into(),
+            kind: RuntimeRequestKind::Question {
+                questions: serde_json::json!([]),
+            },
+        }));
+        let request_index = model.rows.len() - 1;
+        let changed = model.apply(&record(HarnessEvent::ConversationReset { trigger: None }));
+        assert!(changed.contains(&request_index));
+        assert!(model.rows[request_index].request.as_ref().unwrap().resolved);
         model.apply(&record(HarnessEvent::ItemCompleted {
             id: "missing".into(),
             output: "result".into(),

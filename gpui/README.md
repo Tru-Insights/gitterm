@@ -1,11 +1,12 @@
-# GitTerm GPUI preview (TRU-275 / TRU-280, parent TRU-274)
+# GitTerm GPUI preview (TRU-275 / TRU-280 / TRU-283, parent TRU-274)
 
 This macOS-only app opens a 1440×900 window titled
 “GitTerm · GPUI shell · Sample data”. The default dispatch opens the stage 2
 shell in `crates/shell`: workspace/repository sidebar, session tabs, and a
-gpui-component `DockArea`. Terminal and chat panes are placeholders; Git status
-and the expandable file tree use sample data. By default it never reads GitTerm settings
-or starts terminals or services.
+gpui-component `DockArea`. Terminal panes each start one real `$SHELL` PTY in
+`$HOME`; chat panes show the bundled synthetic `showcase.jsonl`. Git status and
+the expandable file tree use
+sample data. The shell never reads GitTerm settings or real chat transcripts.
 `--terminal` opens the TRU-278 terminal route prototype instead (see below).
 The repository root is the Iced workspace. `gpui/` is a separate workspace
 with package `gitterm-gpui`, its own `Cargo.toml` and `Cargo.lock`, and is
@@ -48,7 +49,7 @@ The pinned stack is gpui-component/gpui-webview/gpui-kit 0.9.1,
 gpui_xterm 0.3.0, and gpui-pre 0.3.12. Cargo tree may print repeated `(*)`
 references; compare distinct package versions, as the dependency check does.
 
-## Stage 2 shell (TRU-280)
+## Stage 2 shell (TRU-280 / TRU-283)
 
 `gitterm-gpui-shell::data::ShellData` is the frontend-neutral port for workspace,
 session, status and file facts. `SampleData` implements it today. The later core
@@ -61,9 +62,22 @@ Every workspace retains its own dock and entity map. Session IDs and persisted
 pane IDs are independent of dock positions. The panel registry resolves layout
 IDs to these existing entities. Drag pane tabs to move, split or group them;
 drag dividers to resize. More → Show pane reopens a closed pane using the same
-entity. Session tabs also reopen/reveal their pane. Draft text, sample output
-count and expanded file directories remain in the pane when hidden or moved.
-These are in-process identities; only layout, not draft text, persists on disk.
+entity. Session tabs also reopen/reveal their pane. Terminal entities/processes
+and output history, chat entities and scroll state, and expanded file
+directories remain in the pane when hidden or moved, across
+workspace switches and in-process layout reloads. These are in-process
+identities; only layout persists on disk. Each session owns its content view;
+the dock and layout registry only refer to it. Dock close hides a pane;
+More → `Close <session title> permanently` removes the selected session for
+this launch and releases its content view. Dropping a terminal uses the existing
+backend cancel-on-drop API (including reader join and child reaping). A restart
+recreates the sample sessions.
+
+Clicks focus the terminal or chat under the pointer. Only the focused terminal
+receives typing. Chat Find (Cmd+F/G), plain/Markdown copy (Cmd+C / Cmd+Shift+C),
+and code Copy stay scoped to their chat pane, including its find input and rich
+text children. The standalone `--terminal` and `--chat <fixture>` routes remain
+available.
 
 Layouts save atomically on dock changes to `layout-<workspace-id>.json` under
 `GITTERM_GPUI_CONFIG_DIR` (absolute), defaulting to
@@ -87,11 +101,11 @@ CARGO_TARGET_DIR=/private/tmp/gt-target-tru280 scripts/cargo.sh build --manifest
 GITTERM_GPUI_CONFIG_DIR=/private/tmp/gitterm-gpui-tru280 /private/tmp/gt-target-tru280/release/gitterm-gpui
 ```
 
-Headless verification (does not open an app or send synthetic input):
+Headless verification (does not open an app or send OS input):
 
 ```sh
-CARGO_TARGET_DIR=/private/tmp/gt-target-tru280 scripts/cargo.sh test --manifest-path gpui/Cargo.toml --workspace --locked -j 4
-CARGO_TARGET_DIR=/private/tmp/gt-target-tru280 scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --workspace --locked -j 4 -- -D warnings
+CARGO_TARGET_DIR=/private/tmp/gt-target-tru283 scripts/cargo.sh test --manifest-path gpui/Cargo.toml --workspace --locked -j 4
+CARGO_TARGET_DIR=/private/tmp/gt-target-tru283 scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --workspace --locked --all-targets -j 4 -- -D warnings
 scripts/cargo.sh fmt --manifest-path gpui/Cargo.toml --all -- --check
 scripts/check-gpui-deps.sh
 ```
@@ -100,15 +114,32 @@ The test feature is enabled directly on `gpui-pre` and `gpui-component`, followi
 the mockup. Enabling `gpui-kit/test-support` instead pulls conflicting optional
 `gpui-fast-web` resolution constraints into this pinned graph. The added GPUI
 lockfile entries are the shell and headless test dependencies; the root lockfile
-stays untouched. No terminal/chat crate changes are needed for this slice.
+stays untouched. TRU-283 integrates the content views without changing the
+terminal crate. The chat crate exports its scoped key-binding initializer and
+scroll state, and focuses itself when its background is clicked.
 
-On 18 November 2026, the GPUI workspace release build, Clippy with
+For TRU-280 on 18 November 2026, the GPUI workspace release build, Clippy with
 `-D warnings`, formatting, tests (7 passed) and dependency check above all
 exited 0 on arm64 macOS. Builds used `-j 4`; `nice` was denied. Root `Cargo.lock`
 remained unchanged.
 
+TRU-283 verification on arm64 macOS, rebased onto `origin/v6` at `282d0f3`
+(including TRU-282): workspace debug build, formatting, all-target Clippy with
+`-D warnings`, workspace tests (**86 passed**: 12 chat, 9 shell, 65 terminal),
+and the dependency boundary check all exited **0**. Commands used
+`CARGO_TARGET_DIR=/private/tmp/gt-target-tru283`, `-j 4`, and the existing
+`CARGO_HOME=/private/tmp/gpui-mockup-cargo`; `nice` was denied and omitted.
+The root lockfile and terminal crate have no task diff. New headless coverage
+checks terminal/chat entity survival and history/scroll retention through dock
+moves, grouping, collapse/reopen, workspace switching and layout reload;
+permanent session close releases the terminal; two terminals and embedded chat
+route click focus and typing independently. A two-chat test exercises Find,
+plain/Markdown copy, and actual code Copy button clicks without cross-pane focus.
+Shell tests start clean zsh fixtures without host rc/session-restore scripts.
+
 Visual, VoiceOver, keyboard/IME and interactive docking feel-tests remain manual
-acceptance; headless tests prove entity lifetime and layout persistence only.
+acceptance; headless tests cover entity lifetime, layout persistence and
+per-pane input.
 No GUI was launched or driven for stage 2 verification.
 
 ## Wry finding: resolution, linking, and runtime are separate gates

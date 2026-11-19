@@ -9,7 +9,7 @@ fn setup(
 ) -> (Entity<ChatView>, &mut VisualTestContext) {
     cx.update(|cx| {
         gpui_component::init(cx);
-        bind_keys(cx);
+        init(cx);
     });
     let (root, cx) = cx.add_window_view(move |window, cx| {
         let chat = cx.new(|cx| ChatView::new(records, window, cx));
@@ -26,6 +26,116 @@ fn draw(cx: &mut VisualTestContext) {
         _ = window.draw(cx);
     });
     cx.run_until_parked();
+}
+
+struct ChatPair([Entity<ChatView>; 2]);
+impl Render for ChatPair {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .children(self.0.iter().enumerate().map(|(index, chat)| {
+                div()
+                    .id(index)
+                    .debug_selector(move || format!("chat-{index}"))
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(chat.clone())
+            }))
+    }
+}
+
+#[gpui::test]
+fn embedded_chats_keep_click_focus_find_and_copy_in_their_pane(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        init(cx);
+    });
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let pair = cx.new(|cx| ChatPair(["First", "Second"].map(|label| {
+            cx.new(|cx| ChatView::new(vec![Record {
+                at_ms: None,
+                entry: Entry::Harness(HarnessEvent::TextDelta(format!("**{label}** needle needle\n\n```rust\nlet label = \"{label}\";\n```"))),
+            }], window, cx))
+        })));
+        Root::new(pair, window, cx)
+    });
+    cx.simulate_resize(size(px(1440.), px(900.)));
+    draw(cx);
+    let chats = root.read_with(cx, |root, cx| {
+        root.view()
+            .clone()
+            .downcast::<ChatPair>()
+            .unwrap()
+            .read(cx)
+            .0
+            .clone()
+    });
+    for (index, selector) in ["chat-0", "chat-1"].into_iter().enumerate() {
+        // Click empty padding, not a child with its own focus handler.
+        let bounds = cx.debug_bounds(selector).unwrap();
+        cx.simulate_click(
+            bounds.origin + gpui::point(px(3.), px(100.)),
+            gpui::Modifiers::none(),
+        );
+        draw(cx);
+        cx.simulate_keystrokes("cmd-f");
+        draw(cx);
+        cx.simulate_input("needle");
+        draw(cx);
+        chats[index].read_with(cx, |view, _| {
+            assert!(view.find_open);
+            assert_eq!(view.find.matches.len(), 2);
+        });
+        cx.simulate_keystrokes("cmd-g");
+        draw(cx);
+        assert_eq!(
+            chats[index].read_with(cx, |view, _| view.find.current),
+            Some(1)
+        );
+        cx.simulate_keystrokes("cmd-shift-g escape");
+        draw(cx);
+        assert!(!chats[1 - index].read_with(cx, |view, _| view.find_open));
+        let text = chats[index].read_with(cx, |view, cx| {
+            view.row_views[0].as_ref().unwrap().read(cx).text.clone()
+        });
+        text.update_in(cx, |text, window, cx| {
+            text.focus_handle().focus(window, cx);
+            text.select_all(cx);
+        });
+        draw(cx);
+        cx.simulate_keystrokes("cmd-c");
+        draw(cx);
+        let plain = cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap());
+        let label = ["First", "Second"][index];
+        assert!(plain.contains(label) && !plain.contains("**"));
+        assert!(!plain.contains(["Second", "First"][index]));
+        cx.simulate_keystrokes("cmd-shift-c");
+        draw(cx);
+        let markdown = cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap());
+        assert!(markdown.contains(&format!("**{label}**")) && markdown.contains("```rust"));
+        let code = format!("let label = \"{label}\";\n");
+        let row_id = chats[index].read_with(cx, |view, _| {
+            view.row_views[0].as_ref().unwrap().entity_id()
+        });
+        let selector = Box::leak(format!("copy-code-{row_id}").into_boxed_str());
+        let button = cx.debug_bounds(selector).expect("visible code Copy button");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        draw(cx);
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+            code.trim_end()
+        );
+        cx.update(|window, cx| {
+            assert!(chats[index].focus_handle(cx).contains_focused(window, cx));
+            assert!(
+                !chats[1 - index]
+                    .focus_handle(cx)
+                    .contains_focused(window, cx)
+            );
+        });
+    }
 }
 
 #[gpui::test]
@@ -274,4 +384,127 @@ fn code_copy_feedback_and_cross_row_selection(cx: &mut TestAppContext) {
     assert!(
         cx.update(|_, cx| gpui::base::TextViewDefaults::global(cx).has_code_block_highlighter())
     );
+}
+
+#[gpui::test]
+fn composer_keys_draft_read_only_stop_and_intent_ownership(cx: &mut TestAppContext) {
+    use std::{cell::RefCell, rc::Rc};
+    let intents = Rc::new(RefCell::new(Vec::new()));
+    let (chat, cx) = setup(vec![], cx);
+    let captured = intents.clone();
+    chat.update_in(cx, |view, window, cx| {
+        view.set_intent_callback(
+            Rc::new(move |intent, _| captured.borrow_mut().push(intent)),
+            cx,
+        );
+        view.set_read_only(None, cx);
+        view.composer
+            .update(cx, |input, cx| input.focus(window, cx));
+    });
+    draw(cx);
+    cx.simulate_input("first");
+    cx.simulate_keystrokes("shift-enter");
+    cx.simulate_input("second");
+    draw(cx);
+    assert_eq!(
+        chat.read_with(cx, |view, cx| view.composer.read(cx).value().to_string()),
+        "first\nsecond"
+    );
+    assert!(intents.borrow().is_empty());
+    cx.simulate_keystrokes("enter");
+    draw(cx);
+    assert_eq!(
+        *intents.borrow(),
+        vec![ChatIntent::Send {
+            text: "first\nsecond".into()
+        }]
+    );
+    chat.read_with(cx, |view, cx| {
+        assert!(
+            view.model.rows.is_empty(),
+            "send must not echo into transcript"
+        );
+        assert!(view.composer.read(cx).value().is_empty());
+    });
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("retained draft");
+    chat.update_in(cx, |view, window, cx| {
+        view.append_event(
+            HarnessEvent::TurnStarted {
+                session_id: None,
+                model: None,
+            },
+            cx,
+        );
+        view.stop(cx);
+        view.set_read_only(Some("Archived session".into()), cx);
+        view.send(window, cx);
+        view.stop(cx);
+    });
+    draw(cx);
+    cx.simulate_input("blocked");
+    cx.simulate_keystrokes("enter");
+    draw(cx);
+    assert_eq!(intents.borrow().len(), 2);
+    assert_eq!(intents.borrow()[1], ChatIntent::Stop);
+    chat.read_with(cx, |view, cx| {
+        assert_eq!(view.composer.read(cx).value().as_str(), "retained draft");
+        assert_eq!(view.read_only_reason.as_deref(), Some("Archived session"));
+    });
+    chat.update_in(cx, |view, _, cx| {
+        view.append_event(
+            HarnessEvent::TurnCompleted {
+                status: crate::events::TurnStatus::Completed,
+                usage: serde_json::Value::Null,
+                cost_usd: None,
+            },
+            cx,
+        );
+        assert!(!view.turn_running);
+    });
+}
+
+#[gpui::test]
+fn streaming_deltas_show_jump_without_moving_reader_and_keep_rows_bounded(cx: &mut TestAppContext) {
+    let records = parse_fixture(include_str!("../../fixtures/long-5000.jsonl")).unwrap();
+    let (chat, cx) = setup(records, cx);
+    draw(cx);
+    chat.update_in(cx, |view, _, cx| {
+        view.append_event(HarnessEvent::TextDelta(" tail".into()), cx)
+    });
+    draw(cx);
+    assert!(chat.read_with(cx, |view, cx| view.scroller.read(cx).is_following_tail()));
+    chat.update_in(cx, |view, _, cx| {
+        view.scroller
+            .update(cx, |state, cx| state.scroll_to_item(20, cx))
+    });
+    draw(cx);
+    let before = chat.read_with(cx, |view, cx| {
+        view.scroller.read(cx).logical_scroll_top().item_ix
+    });
+    chat.update_in(cx, |view, _, cx| {
+        view.append_event(
+            HarnessEvent::TextDelta(" delta without a new row".into()),
+            cx,
+        )
+    });
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        assert!(view.new_messages);
+        assert!(!view.scroller.read(cx).is_following_tail());
+        assert_eq!(view.scroller.read(cx).logical_scroll_top().item_ix, before);
+    });
+    chat.update_in(cx, |view, _, cx| view.jump(cx));
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        assert!(!view.new_messages);
+        assert!(view.scroller.read(cx).is_following_tail());
+    });
+    for index in (0..5000).step_by(40) {
+        chat.update_in(cx, |view, window, cx| {
+            view.row(index, window, cx);
+        });
+        draw(cx);
+    }
+    assert!(chat.read_with(cx, |view, _| view.row_views.iter().flatten().count() <= 96));
 }

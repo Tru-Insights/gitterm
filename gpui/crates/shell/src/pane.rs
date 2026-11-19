@@ -1,12 +1,13 @@
 use crate::{
     data::{FileNode, SessionKind, ShellData, WorkspaceId},
-    theme::{Palette, TERMINAL_FONT_SIZE},
+    theme::Palette,
 };
+use gitterm_gpui_chat::{ChatView, events::parse_fixture};
+use gitterm_terminal::{Backend, BackendSettings, TerminalConfig, TerminalView};
 use gpui::*;
 use gpui_component::{
     button::{Button, ButtonVariants},
     dock::{BasePanel, Panel, PanelEvent, PanelInfo, PanelState},
-    input::{Input, InputState},
 };
 use std::{collections::HashSet, rc::Rc};
 
@@ -26,15 +27,20 @@ impl From<SessionKind> for PaneKind {
         }
     }
 }
+pub enum PaneContent {
+    Terminal(Entity<TerminalView>),
+    Chat(Entity<ChatView>),
+    Git,
+    Files,
+    Error(String),
+}
 pub struct Pane {
     pub id: String,
     pub title: String,
-    pub kind: PaneKind,
+    pub content: PaneContent,
     workspace: WorkspaceId,
     data: Rc<dyn ShellData>,
     focus: FocusHandle,
-    pub draft: Option<Entity<InputState>>,
-    pub sample_lines: usize,
     expanded: HashSet<String>,
 }
 impl Pane {
@@ -47,20 +53,57 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let draft = matches!(kind, PaneKind::Chat).then(|| {
-            cx.new(|cx| {
-                InputState::new(window, cx).placeholder("Keep a draft while moving this pane…")
-            })
-        });
+        let content =
+            match kind {
+                PaneKind::Terminal => {
+                    let settings = BackendSettings {
+                        working_directory: dirs::home_dir(),
+                        ..Default::default()
+                    };
+                    // Headless fixtures must not run host rc/session-restore scripts.
+                    #[cfg(test)]
+                    let settings = BackendSettings {
+                        program: "/bin/zsh".into(),
+                        args: vec!["-d".into(), "-f".into(), "-i".into()],
+                        ..settings
+                    };
+                    match settings.working_directory.as_ref() {
+                        None => PaneContent::Error(format!(
+                            "Start terminal {title}: cannot resolve HOME"
+                        )),
+                        Some(home) => match Backend::new(settings.clone()) {
+                            Ok(backend) => PaneContent::Terminal(cx.new(|cx| {
+                                TerminalView::new(backend, TerminalConfig::default(), cx)
+                            })),
+                            Err(error) => PaneContent::Error(format!(
+                                "Start terminal {title} ({}) in {}: {error:#}",
+                                settings.program,
+                                home.display()
+                            )),
+                        },
+                    }
+                }
+                PaneKind::Chat => PaneContent::Chat(cx.new(|cx| {
+                    ChatView::new(
+                        parse_fixture(include_str!("../../chat/fixtures/showcase.jsonl"))
+                            .expect("bundled synthetic showcase fixture is valid"),
+                        window,
+                        cx,
+                    )
+                })),
+                PaneKind::Git => PaneContent::Git,
+                PaneKind::Files => PaneContent::Files,
+            };
+        if let PaneContent::Error(error) = &content {
+            eprintln!("{error}");
+        }
         Self {
             id,
             title,
-            kind,
+            content,
             workspace,
             data,
             focus: cx.focus_handle(),
-            draft,
-            sample_lines: 0,
             expanded: HashSet::from(["src".into()]),
         }
     }
@@ -131,10 +174,11 @@ impl Pane {
 }
 impl Focusable for Pane {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.draft
-            .as_ref()
-            .map(|input| input.focus_handle(cx))
-            .unwrap_or_else(|| self.focus.clone())
+        match &self.content {
+            PaneContent::Terminal(view) => view.read(cx).focus_handle().clone(),
+            PaneContent::Chat(view) => view.focus_handle(cx),
+            _ => self.focus.clone(),
+        }
     }
 }
 impl EventEmitter<PanelEvent> for Pane {}
@@ -172,62 +216,27 @@ impl Render for Pane {
             .gap_2()
             .bg(rgb(p.base))
             .text_color(rgb(p.text));
-        match self.kind {
-            PaneKind::Terminal => body
-                .font_family("Menlo")
-                .text_size(px(TERMINAL_FONT_SIZE))
-                .child(
-                    div()
-                        .text_color(rgb(p.muted))
-                        .child("Terminal placeholder · sample output only"),
-                )
-                .child(format!(
-                    "~/{}  ⑂ {}",
-                    self.data.status(self.workspace).repository,
-                    self.data.status(self.workspace).branch
-                ))
-                .child(div().text_color(rgb(p.green)).child("$ cargo test"))
-                .child("test result: ok. 24 passed; 0 failed")
-                .child(format!(
-                    "Sample output lines appended: {}",
-                    self.sample_lines
-                ))
-                .child(
-                    Button::new("sample-output")
-                        .ghost()
-                        .label("Append sample output")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.sample_lines += 1;
-                            cx.notify();
-                        })),
-                ),
-            PaneKind::Chat => body
-                .child(
-                    div()
-                        .text_color(rgb(p.muted))
-                        .child("Native chat placeholder · sample conversation"),
-                )
-                .child(div().mt_3().child("You"))
-                .child("Add retry handling for temporary API failures.")
-                .child(div().mt_3().text_color(rgb(p.blue)).child("Codex"))
-                .child(
-                    "I’ll inspect the client, add bounded retries, and verify the failure cases.",
-                )
-                .child(
-                    div()
-                        .p_3()
-                        .rounded_md()
-                        .bg(rgb(p.mantle))
-                        .child("Read src/client.rs · complete"),
-                )
-                .child(div().flex_1())
-                .child(Input::new(self.draft.as_ref().expect("chat owns a draft")))
-                .child(
-                    div()
-                        .text_color(rgb(p.muted))
-                        .child("Sample only · drafts stay with their session"),
-                ),
-            PaneKind::Git => {
+        match &self.content {
+            PaneContent::Terminal(view) => div()
+                .id(SharedString::from(self.id.clone()))
+                .debug_selector({
+                    let id = self.id.clone();
+                    move || id
+                })
+                .size_full()
+                .min_h_0()
+                .child(view.clone()),
+            PaneContent::Chat(view) => div()
+                .id(SharedString::from(self.id.clone()))
+                .debug_selector({
+                    let id = self.id.clone();
+                    move || id
+                })
+                .size_full()
+                .min_h_0()
+                .child(view.clone()),
+            PaneContent::Error(error) => body.text_color(rgb(p.red)).child(error.clone()),
+            PaneContent::Git => {
                 let status = self.data.status(self.workspace);
                 body.child(status.repository)
                     .child(
@@ -258,7 +267,7 @@ impl Render for Pane {
                             .child(div().text_color(rgb(p.muted)).child(group))
                     }))
             }
-            PaneKind::Files => body
+            PaneContent::Files => body
                 .child(self.data.status(self.workspace).repository)
                 .children(self.files(self.data.files(self.workspace), "", 0, p, cx)),
         }
