@@ -1,0 +1,8 @@
+{
+  "fixture": {
+    "description": "Synthetic profile",
+    "env": {
+      "FIXTURE_COLOR": "blue"
+    }
+  }
+}

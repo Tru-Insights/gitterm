@@ -1,0 +1,32 @@
+[
+  {
+    "command": "select commits",
+    "error": null,
+    "focus": "a.rs",
+    "generation": 2,
+    "hide_noise": true,
+    "pending": true,
+    "source": "Commits(Some(CommitRange { first: \"newest\", last: \"newest\", pending: true }))"
+  },
+  {
+    "command": "select commits",
+    "error": null,
+    "focus": "a.rs",
+    "generation": 3,
+    "hide_noise": true,
+    "pending": false,
+    "source": "Commits(Some(CommitRange { first: \"oldest\", last: \"newest\", pending: false }))"
+  },
+  {
+    "command": "wrong token",
+    "still_open": true
+  },
+  {
+    "command": "current completion",
+    "error": "current completion"
+  },
+  {
+    "command": "completion after close",
+    "error": "current completion"
+  }
+]

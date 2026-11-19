@@ -1,0 +1,494 @@
+[
+  {
+    "all": {
+      "cost": 0.0,
+      "responses": 3,
+      "tokens": [
+        29,
+        11,
+        7,
+        0,
+        10
+      ],
+      "unpriced": 57
+    },
+    "days": 7,
+    "harness": [
+      {
+        "cost": 0.0,
+        "responses": 1,
+        "tokens": [
+          10,
+          0,
+          0,
+          0,
+          2
+        ],
+        "unpriced": 12
+      },
+      {
+        "cost": 0.0,
+        "responses": 1,
+        "tokens": [
+          15,
+          5,
+          0,
+          0,
+          3
+        ],
+        "unpriced": 23
+      },
+      {
+        "cost": 0.0,
+        "responses": 1,
+        "tokens": [
+          4,
+          6,
+          7,
+          0,
+          5
+        ],
+        "unpriced": 22
+      }
+    ],
+    "headless": 1,
+    "interactive": {
+      "cost": 0.0,
+      "responses": 2,
+      "tokens": [
+        14,
+        6,
+        7,
+        0,
+        7
+      ],
+      "unpriced": 34
+    },
+    "models": [
+      {
+        "model": "fixture-unpriced",
+        "priced": false,
+        "usage": {
+          "cost": 0.0,
+          "responses": 1,
+          "tokens": [
+            15,
+            5,
+            0,
+            0,
+            3
+          ],
+          "unpriced": 23
+        }
+      },
+      {
+        "model": "fixture-unpriced",
+        "priced": false,
+        "usage": {
+          "cost": 0.0,
+          "responses": 1,
+          "tokens": [
+            4,
+            6,
+            7,
+            0,
+            5
+          ],
+          "unpriced": 22
+        }
+      },
+      {
+        "model": "fixture-unpriced",
+        "priced": false,
+        "usage": {
+          "cost": 0.0,
+          "responses": 1,
+          "tokens": [
+            10,
+            0,
+            0,
+            0,
+            2
+          ],
+          "unpriced": 12
+        }
+      }
+    ],
+    "stats": {
+      "cached": 0,
+      "duplicates": 0,
+      "parsed": 3,
+      "resumed": 0,
+      "seen": 3
+    }
+  },
+  {
+    "all": {
+      "cost": 0.0,
+      "responses": 3,
+      "tokens": [
+        29,
+        11,
+        7,
+        0,
+        10
+      ],
+      "unpriced": 57
+    },
+    "days": 7,
+    "harness": [
+      {
+        "cost": 0.0,
+        "responses": 1,
+        "tokens": [
+          10,
+          0,
+          0,
+          0,
+          2
+        ],
+        "unpriced": 12
+      },
+      {
+        "cost": 0.0,
+        "responses": 1,
+        "tokens": [
+          15,
+          5,
+          0,
+          0,
+          3
+        ],
+        "unpriced": 23
+      },
+      {
+        "cost": 0.0,
+        "responses": 1,
+        "tokens": [
+          4,
+          6,
+          7,
+          0,
+          5
+        ],
+        "unpriced": 22
+      }
+    ],
+    "headless": 1,
+    "interactive": {
+      "cost": 0.0,
+      "responses": 2,
+      "tokens": [
+        14,
+        6,
+        7,
+        0,
+        7
+      ],
+      "unpriced": 34
+    },
+    "models": [
+      {
+        "model": "fixture-unpriced",
+        "priced": false,
+        "usage": {
+          "cost": 0.0,
+          "responses": 1,
+          "tokens": [
+            15,
+            5,
+            0,
+            0,
+            3
+          ],
+          "unpriced": 23
+        }
+      },
+      {
+        "model": "fixture-unpriced",
+        "priced": false,
+        "usage": {
+          "cost": 0.0,
+          "responses": 1,
+          "tokens": [
+            4,
+            6,
+            7,
+            0,
+            5
+          ],
+          "unpriced": 22
+        }
+      },
+      {
+        "model": "fixture-unpriced",
+        "priced": false,
+        "usage": {
+          "cost": 0.0,
+          "responses": 1,
+          "tokens": [
+            10,
+            0,
+            0,
+            0,
+            2
+          ],
+          "unpriced": 12
+        }
+      }
+    ],
+    "stats": {
+      "cached": 3,
+      "duplicates": 0,
+      "parsed": 0,
+      "resumed": 0,
+      "seen": 3
+    }
+  },
+  {
+    "all": {
+      "cost": 0.0,
+      "responses": 4,
+      "tokens": [
+        59,
+        11,
+        7,
+        0,
+        14
+      ],
+      "unpriced": 91
+    },
+    "days": 7,
+    "harness": [
+      {
+        "cost": 0.0,
+        "responses": 2,
+        "tokens": [
+          40,
+          0,
+          0,
+          0,
+          6
+        ],
+        "unpriced": 46
+      },
+      {
+        "cost": 0.0,
+        "responses": 1,
+        "tokens": [
+          15,
+          5,
+          0,
+          0,
+          3
+        ],
+        "unpriced": 23
+      },
+      {
+        "cost": 0.0,
+        "responses": 1,
+        "tokens": [
+          4,
+          6,
+          7,
+          0,
+          5
+        ],
+        "unpriced": 22
+      }
+    ],
+    "headless": 1,
+    "interactive": {
+      "cost": 0.0,
+      "responses": 3,
+      "tokens": [
+        44,
+        6,
+        7,
+        0,
+        11
+      ],
+      "unpriced": 68
+    },
+    "models": [
+      {
+        "model": "fixture-unpriced",
+        "priced": false,
+        "usage": {
+          "cost": 0.0,
+          "responses": 2,
+          "tokens": [
+            40,
+            0,
+            0,
+            0,
+            6
+          ],
+          "unpriced": 46
+        }
+      },
+      {
+        "model": "fixture-unpriced",
+        "priced": false,
+        "usage": {
+          "cost": 0.0,
+          "responses": 1,
+          "tokens": [
+            15,
+            5,
+            0,
+            0,
+            3
+          ],
+          "unpriced": 23
+        }
+      },
+      {
+        "model": "fixture-unpriced",
+        "priced": false,
+        "usage": {
+          "cost": 0.0,
+          "responses": 1,
+          "tokens": [
+            4,
+            6,
+            7,
+            0,
+            5
+          ],
+          "unpriced": 22
+        }
+      }
+    ],
+    "stats": {
+      "cached": 2,
+      "duplicates": 0,
+      "parsed": 0,
+      "resumed": 1,
+      "seen": 3
+    }
+  },
+  {
+    "all": {
+      "cost": 0.0,
+      "responses": 3,
+      "tokens": [
+        49,
+        11,
+        7,
+        0,
+        12
+      ],
+      "unpriced": 79
+    },
+    "days": 7,
+    "harness": [
+      {
+        "cost": 0.0,
+        "responses": 1,
+        "tokens": [
+          30,
+          0,
+          0,
+          0,
+          4
+        ],
+        "unpriced": 34
+      },
+      {
+        "cost": 0.0,
+        "responses": 1,
+        "tokens": [
+          15,
+          5,
+          0,
+          0,
+          3
+        ],
+        "unpriced": 23
+      },
+      {
+        "cost": 0.0,
+        "responses": 1,
+        "tokens": [
+          4,
+          6,
+          7,
+          0,
+          5
+        ],
+        "unpriced": 22
+      }
+    ],
+    "headless": 1,
+    "interactive": {
+      "cost": 0.0,
+      "responses": 2,
+      "tokens": [
+        34,
+        6,
+        7,
+        0,
+        9
+      ],
+      "unpriced": 56
+    },
+    "models": [
+      {
+        "model": "fixture-unpriced",
+        "priced": false,
+        "usage": {
+          "cost": 0.0,
+          "responses": 1,
+          "tokens": [
+            30,
+            0,
+            0,
+            0,
+            4
+          ],
+          "unpriced": 34
+        }
+      },
+      {
+        "model": "fixture-unpriced",
+        "priced": false,
+        "usage": {
+          "cost": 0.0,
+          "responses": 1,
+          "tokens": [
+            15,
+            5,
+            0,
+            0,
+            3
+          ],
+          "unpriced": 23
+        }
+      },
+      {
+        "model": "fixture-unpriced",
+        "priced": false,
+        "usage": {
+          "cost": 0.0,
+          "responses": 1,
+          "tokens": [
+            4,
+            6,
+            7,
+            0,
+            5
+          ],
+          "unpriced": 22
+        }
+      }
+    ],
+    "stats": {
+      "cached": 2,
+      "duplicates": 0,
+      "parsed": 1,
+      "resumed": 0,
+      "seen": 3
+    }
+  }
+]

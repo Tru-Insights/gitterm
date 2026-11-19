@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "tasks": [
+    {
+      "schema_version": 1,
+      "task_id": "fixture-task",
+      "title": "Synthetic task",
+      "objective": "Characterize only",
+      "created_at": "2000-01-01T00:00:00Z",
+      "updated_at": "2000-01-01T00:00:00Z",
+      "workspace": {
+        "name": "Fixture",
+        "location": {
+          "kind": "local",
+          "directory": "/fixture/work"
+        }
+      },
+      "repository": {
+        "common_dir": "/fixture/repo/.git"
+      },
+      "base": {
+        "reference": "main",
+        "commit": "0000000000000000000000000000000000000000"
+      },
+      "branch": "task/fixture",
+      "executor": {
+        "kind": "local"
+      },
+      "stopping_boundary": "implement_until_tests_pass",
+      "lifecycle": "draft",
+      "worktree": {
+        "state": "unprepared"
+      },
+      "attention": {},
+      "changes": {},
+      "verification": {
+        "state": "unknown"
+      },
+      "delivery": {}
+    }
+  ]
+}

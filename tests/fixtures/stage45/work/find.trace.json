@@ -1,0 +1,46 @@
+[
+  {
+    "backend": null,
+    "ids": [
+      "local-a",
+      "local-b"
+    ],
+    "query": "",
+    "scope": "Workspace"
+  },
+  {
+    "backend": null,
+    "ids": [
+      "local-a",
+      "local-b",
+      "outside"
+    ],
+    "query": "",
+    "scope": "Machine"
+  },
+  {
+    "backend": "codex",
+    "ids": [
+      "local-b",
+      "outside"
+    ],
+    "query": "synthetic",
+    "scope": "Everywhere"
+  },
+  {
+    "backend": null,
+    "ids": [
+      "local-a"
+    ],
+    "query": "tru-999",
+    "scope": "Workspace"
+  },
+  {
+    "command": "remote machine",
+    "local_list": false
+  },
+  {
+    "command": "same transcript id on two machines",
+    "identities_differ": true
+  }
+]

@@ -1,0 +1,2 @@
+{"type":"session","cwd":"/fixture/pi"}
+{"type":"message","id":"fixture-pi-response","timestamp":"2000-01-04T12:00:00Z","message":{"role":"assistant","model":"fixture-unpriced","usage":{"input":4,"output":5,"cacheRead":6,"cacheWrite":7}}}

@@ -1,0 +1,36 @@
+{
+  "disk_receipt_before_retry": false,
+  "failure_operation": "atomically write",
+  "pending_in_memory": true,
+  "saved_delegation": {
+    "brief": "Synthetic brief",
+    "child": {
+      "preset_name": "Codex",
+      "runner": "task_session",
+      "task_id": "fixture-task",
+      "task_session_id": "fixture-session"
+    },
+    "created_at": "2000-01-01T00:00:00Z",
+    "delegation_id": "fixture-delegation",
+    "delivered": true,
+    "delivered_at": "2000-01-01T00:06:00Z",
+    "kind": "implement",
+    "parent": {
+      "chat_session_id": "fixture-parent-chat",
+      "cwd": "/fixture/work",
+      "session_uid": "fixture-caller",
+      "workspace": "Fixture"
+    },
+    "result": {
+      "handoff": {
+        "summary": "Synthetic result",
+        "updated_at": "2000-01-01T00:05:00Z",
+        "updated_by_session_id": "fixture-session"
+      }
+    },
+    "status": {
+      "state": "completed"
+    },
+    "updated_at": "2000-01-01T00:06:00Z"
+  }
+}

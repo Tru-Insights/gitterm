@@ -1,0 +1,55 @@
+[
+  {
+    "focus_after_latest": {},
+    "format": "old",
+    "phone_after_revoke": {
+      "phones": []
+    },
+    "phone_last_seen": 0,
+    "settings_saved": true,
+    "workspaces_saved": true
+  },
+  {
+    "focus_after_latest": {},
+    "format": "current",
+    "phone_after_revoke": {
+      "phones": []
+    },
+    "phone_last_seen": 946684900,
+    "settings_saved": true,
+    "workspaces_saved": true
+  },
+  {
+    "app_save_preserves_bytes": true,
+    "format": "malformed settings",
+    "load_refused": true
+  },
+  {
+    "focus": {},
+    "format": "lossy malformed loads",
+    "guidelines": {
+      "enabled": true,
+      "off_repos": []
+    },
+    "issues": {
+      "issues": {},
+      "prefixes": {}
+    },
+    "limits": {
+      "claude": null,
+      "codex": null
+    },
+    "watch": {
+      "prs": {}
+    }
+  },
+  {
+    "bytes_unchanged": true,
+    "format": "profiles read",
+    "loaded": {
+      "fixture": {
+        "FIXTURE_COLOR": "blue"
+      }
+    }
+  }
+]

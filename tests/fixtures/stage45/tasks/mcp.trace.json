@@ -1,0 +1,38 @@
+[
+  {
+    "ack_pending": true,
+    "caller": "fixture-caller",
+    "operation": "Get(GetTaskRequest { task_id: \"fixture-task\" })",
+    "point": "received"
+  },
+  {
+    "point": "ack",
+    "value": {
+      "saved": true,
+      "task_id": "fixture-task"
+    }
+  },
+  {
+    "error": "GitTerm closed the task command without a response",
+    "point": "response dropped"
+  },
+  {
+    "error": "GitTerm's task command bridge is unavailable",
+    "point": "bridge closed"
+  },
+  {
+    "content": [
+      {
+        "text": "review_request needs the calling GitTerm tab's identity, and this call has none. Delegations report back to the tab that asked, so call it through the task MCP URL GitTerm gave that tab (it ends in ?caller=<session id>).",
+        "type": "text"
+      }
+    ],
+    "forwarded": false,
+    "is_error": true,
+    "point": "missing caller"
+  },
+  {
+    "point": "timeout configuration",
+    "seconds": 300
+  }
+]

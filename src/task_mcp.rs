@@ -2397,3 +2397,7 @@ mod tests {
         bridge.abort();
     }
 }
+
+#[cfg(test)]
+#[path = "stage45/task_mcp.rs"]
+mod stage45_tests;
