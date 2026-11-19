@@ -237,31 +237,41 @@ impl Preview {
     }
     pub(crate) fn create_private_dir(&self, path: &Path) -> io::Result<()> {
         self.scoped(path)?;
-        // Create each new component privately; never chmod imported directories.
+        // Initialization may mkdir missing ancestors of the selected root (for
+        // example .config or the sample parent). Never chmod existing parents,
+        // and revalidate the full scoped destination before each creation.
         for ancestor in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
-            if !ancestor.starts_with(&self.root) {
-                continue;
-            }
-            self.scoped(ancestor)?;
-            let mut builder = fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            match builder.create(ancestor) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && ancestor.is_dir() => {
+            match fs::symlink_metadata(ancestor) {
+                Ok(meta) => {
+                    if !meta.is_dir() || resolve(ancestor)? != ancestor {
+                        return Err(refuse(format!(
+                            "preview parent is not a plain directory: {}",
+                            ancestor.display()
+                        )));
+                    }
                     #[cfg(unix)]
-                    {
+                    if ancestor.starts_with(&self.root) {
                         use std::os::unix::fs::PermissionsExt;
-                        if fs::metadata(ancestor)?.permissions().mode() & 0o077 != 0 {
+                        if meta.permissions().mode() & 0o077 != 0 {
                             return Err(refuse(format!(
                                 "preview directory is not private: {}",
                                 ancestor.display()
                             )));
                         }
                     }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    self.scoped(path)?;
+                    if resolve(ancestor)? != ancestor {
+                        return Err(refuse("preview parent changed"));
+                    }
+                    let mut builder = fs::DirBuilder::new();
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::DirBuilderExt;
+                        builder.mode(0o700);
+                    }
+                    builder.create(ancestor)?;
                 }
                 Err(e) => return Err(e),
             }
@@ -287,26 +297,47 @@ impl Preview {
         Ok(WriterLease {
             preview: self.clone(),
             path,
+            active: std::sync::Mutex::new(true),
         })
     }
 }
 pub struct WriterLease {
     preview: std::sync::Arc<Preview>,
     path: PathBuf,
+    active: std::sync::Mutex<bool>,
 }
 impl WriterLease {
     pub fn preview(&self) -> &std::sync::Arc<Preview> {
         &self.preview
     }
     pub fn replace_layout(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| refuse("preview writer lock poisoned"))?;
+        if !*active {
+            return Err(refuse("preview writer is closed"));
+        }
         self.preview.replace_layout(path, bytes)
+    }
+    /// Stop new writes and wait for any current write before releasing ownership.
+    /// Call from the host shutdown lifecycle; macOS termination may skip Drop.
+    pub fn close(&self) -> io::Result<()> {
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| refuse("preview writer lock poisoned"))?;
+        if !*active {
+            return Ok(());
+        }
+        *active = false;
+        self.preview.scoped(&self.path)?;
+        fs::remove_file(&self.path)
     }
 }
 impl Drop for WriterLease {
     fn drop(&mut self) {
-        if self.preview.scoped(&self.path).is_ok() {
-            let _ = fs::remove_file(&self.path);
-        }
+        let _ = self.close();
     }
 }
 
@@ -534,6 +565,52 @@ mod tests {
         assert!(p.claim_writer().is_err());
         drop(first);
         assert!(p.claim_writer().is_ok());
+    }
+    #[test]
+    fn fresh_sample_and_nested_override_create_only_missing_private_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let protected = ProtectedRoots::new(&dir.path().join("host"), []).unwrap();
+        for root in [
+            dir.path().join("config/sample"),
+            dir.path().join("missing/nested/preview"),
+        ] {
+            let p = std::sync::Arc::new(Preview::validate(&root, protected.clone()).unwrap());
+            let writer = p.claim_writer().unwrap();
+            writer
+                .replace_layout(&p.layout().join("layout.json"), b"fixture")
+                .unwrap();
+            writer.close().unwrap();
+            assert!(!p.layout().join(".writer").exists());
+        }
+        let sibling = dir.path().join("shared/production");
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(sibling.join("sentinel"), b"unchanged").unwrap();
+        let parent = sibling.parent().unwrap();
+        let permissions = fs::metadata(parent).unwrap().permissions();
+        let protected = ProtectedRoots::new(&dir.path().join("host"), [sibling.clone()]).unwrap();
+        let p = std::sync::Arc::new(
+            Preview::validate(&parent.join("new/nested/preview"), protected).unwrap(),
+        );
+        let writer = p.claim_writer().unwrap();
+        writer.close().unwrap();
+        assert_eq!(fs::metadata(parent).unwrap().permissions(), permissions);
+        assert_eq!(fs::read(sibling.join("sentinel")).unwrap(), b"unchanged");
+    }
+    #[test]
+    fn closing_writer_denies_late_writes_and_drop_cannot_remove_next_owners_lease() {
+        let (_d, _protected, p) = fixture();
+        let p = std::sync::Arc::new(p);
+        let first = p.claim_writer().unwrap();
+        first.close().unwrap();
+        let next = p.claim_writer().unwrap();
+        assert!(first
+            .replace_layout(&p.layout().join("late.json"), b"bad")
+            .is_err());
+        drop(first);
+        assert!(p.claim_writer().is_err());
+        next.replace_layout(&p.layout().join("current.json"), b"good")
+            .unwrap();
+        next.close().unwrap();
     }
     #[test]
     fn git_metadata_independent_linked_subdirectories_and_protected_common() {

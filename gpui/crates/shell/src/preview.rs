@@ -15,6 +15,21 @@ impl PreviewContext {
     pub(crate) fn writer(&self) -> Arc<WriterLease> {
         self.writer.clone()
     }
+    pub(crate) fn release_on_quit(&self, cx: &gpui::App) {
+        let writer = self.writer();
+        cx.on_app_quit(move |_| {
+            let writer = writer.clone();
+            async move {
+                if let Err(error) = writer.close() {
+                    eprintln!(
+                        "release preview writer {}: {error}",
+                        writer.preview().root().display()
+                    );
+                }
+            }
+        })
+        .detach();
+    }
     pub fn from_environment(sample: bool) -> Result<Self> {
         let roots = roots_from_environment(sample)?;
         let writer = roots
@@ -130,6 +145,26 @@ mod tests {
         std::os::unix::fs::symlink(&sentinel, &path).unwrap();
         assert!(layout.save(&Default::default()).is_err());
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+    }
+    #[gpui::test]
+    fn shutdown_releases_lease_while_store_handles_are_still_alive(cx: &mut gpui::TestAppContext) {
+        let (_dir, writer) = fixture();
+        let preview = PreviewContext {
+            roots: writer.preview().clone(),
+            writer: writer.clone(),
+        };
+        let app = cx.new_app();
+        app.update(|cx| preview.release_on_quit(cx));
+        app.quit();
+        assert!(
+            writer
+                .replace_layout(&preview.roots.layout().join("late.json"), b"bad")
+                .is_err()
+        );
+        let next = preview.roots.claim_writer().unwrap();
+        drop(preview);
+        drop(writer);
+        assert!(next.preview().claim_writer().is_err());
     }
     #[gpui::test]
     fn startup_restore_keeps_copied_terminals_inert(cx: &mut gpui::TestAppContext) {

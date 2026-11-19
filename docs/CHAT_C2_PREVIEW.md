@@ -14,7 +14,10 @@ The private authority validates conventional V3–V6/provider roots and active
 dangling/looping links, and ancestors marked with `.gitterm-protected`.
 Missing tails are resolved through existing ancestors. Concrete layout/catalog
 writes are revalidated, use private temporary files and atomic replacement, and
-require an exclusive writer lease. Imported hard links are replaced, not modified
+require an exclusive writer lease. The GPUI quit lifecycle closes shared write
+  authority and releases the lease explicitly before macOS termination; late
+  writes through surviving handles fail closed. Fresh roots create only missing
+  parent directories privately, without changing existing parent permissions. Imported hard links are replaced, not modified
 in place. Stale `.writer` leases require explicit recovery; no PID is trusted or
 signalled. Imported history has no mutation or resume authority.
 

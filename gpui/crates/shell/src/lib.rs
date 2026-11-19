@@ -1167,6 +1167,7 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
         store.save(&model.folders())?;
     }
     gpui_kit::application().run(move |cx| {
+        preview.release_on_quit(cx);
         gpui_kit::init(cx);
         theme::apply(true, None, cx);
         for (index, (session_key, workspace_key)) in [
@@ -1243,7 +1244,6 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
         cx.on_window_closed(|cx, _| cx.quit()).detach();
         cx.activate(true);
     });
-    drop(preview);
     Ok(())
 }
 
