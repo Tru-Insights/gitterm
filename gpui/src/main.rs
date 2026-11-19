@@ -8,7 +8,7 @@ mod macos;
 fn main() {
     let mut args = std::env::args_os().skip(1);
     if let Some(arg) = args.next().filter(|arg| arg != "--terminal") {
-        if arg == "--chat"
+        if matches!(arg.to_str(), Some("--chat" | "--chat-live"))
             && let Some(path) = args.next().filter(|_| args.next().is_none())
         {
             match gitterm_gpui_chat::events::load_fixture(std::path::Path::new(&path)) {

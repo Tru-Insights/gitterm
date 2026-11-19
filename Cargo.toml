@@ -6,6 +6,7 @@ default-run = "gitterm-v6"
 description = "A Git status viewer with integrated terminal, built with Iced"
 
 [workspace]
+members = ["crates/gitterm-core"]
 exclude = ["gpui"]
 resolver = "2"
 
@@ -22,6 +23,7 @@ name = "gitterm-v6-agent"
 path = "src/bin/gitterm-agent/main.rs"
 
 [dependencies]
+gitterm-core = { path = "crates/gitterm-core" }
 iced = { version = "0.14", features = ["tokio", "image"] }
 iced_term = { path = "../iced_term_fork" }
 muda = "0.17"

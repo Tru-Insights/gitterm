@@ -857,3 +857,38 @@ mod tests {
         assert!(listing.error.is_some());
     }
 }
+
+#[cfg(test)]
+mod baseline_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn opaque_remote_status_error_baseline() {
+        // A deterministic backend failure before any connection or filesystem access.
+        for (root, expected) in [
+            (
+                "Q:/opaque/repo",
+                "remote git status for Q:/opaque/repo: token_ref must not be empty",
+            ),
+            (
+                "/opaque/../repo",
+                "remote git status for /opaque/../repo: token_ref must not be empty",
+            ),
+        ] {
+            let source = WorkspaceSource::RemoteAgent {
+                workspace_id: "fixture-workspace".into(),
+                root: root.into(),
+                client: RemoteAgentClientConfig {
+                    remote_id: "fixture-remote".into(),
+                    name: "Fixture".into(),
+                    endpoint: "http://fixture.invalid:1".into(),
+                    token_ref: String::new(),
+                },
+            };
+            assert_eq!(source.root(), SourcePath::Remote(root.into()));
+            assert!(source.capabilities().git_status);
+            assert!(!source.capabilities().git_worktrees);
+            assert_eq!(source.git_status().await.unwrap_err(), expected);
+        }
+    }
+}
