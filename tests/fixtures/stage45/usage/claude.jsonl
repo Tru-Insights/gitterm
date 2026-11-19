@@ -1,0 +1,2 @@
+{"type":"assistant","timestamp":"2000-01-03T12:00:00Z","cwd":"/fixture/repo","entrypoint":"sdk-ts","message":{"id":"fixture-response","model":"fixture-unpriced","usage":{"input_tokens":10,"output_tokens":1}}}
+{"type":"assistant","timestamp":"2000-01-03T12:00:00Z","cwd":"/fixture/repo","entrypoint":"sdk-ts","message":{"id":"fixture-response","model":"fixture-unpriced","usage":{"input_tokens":10,"output_tokens":2}}}

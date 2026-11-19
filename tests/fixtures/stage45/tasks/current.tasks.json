@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "tasks": [
+    {
+      "attempts": [
+        {
+          "attempt_id": "fixture-attempt",
+          "ended_at": "2000-01-01T00:03:50Z",
+          "executor": {
+            "kind": "local"
+          },
+          "harness": {
+            "kind": {
+              "kind": "terminal_preset",
+              "preset_name": "Codex"
+            }
+          },
+          "session_ref": "fixture-session",
+          "started_at": "2000-01-01T00:03:30Z",
+          "state": "stopped"
+        }
+      ],
+      "attention": {
+        "unread": false
+      },
+      "base": {
+        "commit": "0000000000000000000000000000000000000000",
+        "reference": "main"
+      },
+      "branch": "task/fixture",
+      "changes": {
+        "changed": 0,
+        "staged": 0
+      },
+      "created_at": "2000-01-01T00:00:00Z",
+      "delivery": {},
+      "executor": {
+        "kind": "local"
+      },
+      "handoff": {
+        "summary": "Synthetic handoff",
+        "updated_at": "2000-01-01T00:04:00Z",
+        "updated_by_session_id": "fixture-session"
+      },
+      "harness": {
+        "kind": {
+          "kind": "terminal_preset",
+          "preset_name": "Codex"
+        }
+      },
+      "lifecycle": "stopped",
+      "objective": "Characterize only",
+      "progress": {
+        "last_activity_at": "2000-01-01T00:03:00Z"
+      },
+      "repository": {
+        "common_dir": "/fixture/repo/.git"
+      },
+      "schema_version": 1,
+      "sessions": [
+        {
+          "conversation": {
+            "backend": "codex",
+            "session_id": "fixture-conversation"
+          },
+          "created_at": "2000-01-01T00:03:00Z",
+          "label": "Fixture",
+          "objective_delivery": "delivered",
+          "task_session_id": "fixture-session",
+          "updated_at": "2000-01-01T00:03:00Z"
+        }
+      ],
+      "stopping_boundary": "implement_until_tests_pass",
+      "task_id": "fixture-task",
+      "title": "Synthetic task",
+      "updated_at": "2000-01-01T00:04:00Z",
+      "verification": {
+        "state": "unknown"
+      },
+      "workspace": {
+        "location": {
+          "directory": "/fixture/work",
+          "kind": "local"
+        },
+        "name": "Fixture"
+      },
+      "worktree": {
+        "path": "/fixture/worktree",
+        "state": "ready"
+      }
+    }
+  ]
+}

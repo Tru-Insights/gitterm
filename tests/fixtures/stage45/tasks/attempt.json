@@ -1,0 +1,15 @@
+{
+  "attempt_id": "fixture-attempt",
+  "executor": {
+    "kind": "local"
+  },
+  "harness": {
+    "kind": {
+      "kind": "terminal_preset",
+      "preset_name": "Codex"
+    }
+  },
+  "state": "running",
+  "started_at": "2000-01-01T00:03:30Z",
+  "session_ref": "fixture-session"
+}

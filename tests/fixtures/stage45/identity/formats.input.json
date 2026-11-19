@@ -1,0 +1,223 @@
+{
+  "old": {
+    "settings": {},
+    "workspaces": {
+      "workspaces": [],
+      "active_workspace": 0
+    },
+    "remote_agents": {},
+    "remote_sessions": {},
+    "limits": {},
+    "focus": {},
+    "facts": {},
+    "watch": {},
+    "issues": {},
+    "merge_plan": {
+      "root_chat_id": "fixture-chat"
+    },
+    "guidelines": {},
+    "agent": {},
+    "phones": {
+      "phones": [
+        {
+          "id": "fixture-phone",
+          "name": "Fixture phone",
+          "scope": "view",
+          "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "created_unix_secs": 946684800
+        }
+      ]
+    }
+  },
+  "current": {
+    "settings": {
+      "theme": "light",
+      "usage": {
+        "pricing": {
+          "fixture-model": null
+        }
+      },
+      "max_concurrent_local_tasks": 2
+    },
+    "workspaces": {
+      "workspaces": [
+        {
+          "name": "Fixture",
+          "dir": "/fixture/work",
+          "active": false,
+          "parked": {
+            "note": "Synthetic note",
+            "parked_at": "2000-01-01T00:00:00Z"
+          },
+          "tabs": [
+            {
+              "dir": "/fixture/worktree",
+              "task_id": "fixture-task",
+              "task_session_id": "fixture-session",
+              "session_uid": "fixture-caller",
+              "chat_session_id": "fixture-conversation"
+            }
+          ],
+          "abbrev": "FX",
+          "color": "blue"
+        }
+      ],
+      "active_workspace": 0
+    },
+    "remote_agents": {
+      "remote_agents": [
+        {
+          "id": "fixture-remote",
+          "name": "Fixture machine",
+          "endpoint": "http://127.0.0.1:1",
+          "auth": {
+            "type": "token",
+            "token_ref": "env:FIXTURE_UNUSED_TOKEN"
+          }
+        }
+      ]
+    },
+    "remote_sessions": {},
+    "limits": {
+      "codex": {
+        "provider": "codex",
+        "observed_at": 946684800,
+        "windows": [
+          {
+            "label": "7d",
+            "used_percent": 12.5,
+            "resets_at": 947289600
+          }
+        ],
+        "local": true
+      },
+      "pending_notices": {
+        "fixture-caller": [
+          "Synthetic notice"
+        ]
+      },
+      "history": [
+        {
+          "provider": "codex",
+          "label": "7d",
+          "resets_at": 947289600,
+          "samples": [
+            {
+              "observed_at": 946684800,
+              "used_percent": 12.5
+            }
+          ]
+        }
+      ],
+      "pin": {
+        "provider": "codex",
+        "until": 947289600
+      },
+      "policy": {
+        "claude": {
+          "weekly": null,
+          "burst": {
+            "resets_at": null,
+            "busy": false,
+            "held": false
+          }
+        },
+        "codex": {
+          "weekly": {
+            "state": "on_track",
+            "since": 946684800,
+            "resets_at": 947289600,
+            "hot_warned": false,
+            "urgent_warned": false
+          },
+          "burst": {
+            "resets_at": null,
+            "busy": false,
+            "held": false
+          }
+        },
+        "routing": {
+          "state": "balanced",
+          "since": 946684800,
+          "flexible_provider": null
+        }
+      }
+    },
+    "focus": {
+      "/fixture/work": {
+        "coordinator": "fixture-chat"
+      }
+    },
+    "facts": {
+      "issue_keys": [
+        "TRU-999"
+      ],
+      "children": [
+        {
+          "session_id": "fixture-child",
+          "kind": "worker",
+          "task_id": "fixture-task",
+          "delegation_id": "fixture-delegation",
+          "title": "Synthetic child"
+        }
+      ],
+      "documents": [
+        "/fixture/docs/plan.md"
+      ]
+    },
+    "watch": {
+      "prs": {
+        "example/fixture#1": {
+          "key": {
+            "repo": "example/fixture",
+            "number": 1
+          }
+        }
+      }
+    },
+    "issues": {
+      "issues": {
+        "TRU-999": {
+          "title": "Synthetic issue",
+          "fetched_at": "2000-01-01T00:00:00Z",
+          "workspace": "fixture-space"
+        }
+      },
+      "prefixes": {
+        "TRU": "fixture-space"
+      }
+    },
+    "merge_plan": {
+      "root_chat_id": "fixture-chat",
+      "updated_at": "2000-01-01T00:00:00Z",
+      "entries": [
+        {
+          "repo": "example/fixture",
+          "number": 1
+        }
+      ]
+    },
+    "guidelines": {
+      "enabled": false,
+      "off_repos": [
+        "/fixture/repo"
+      ]
+    },
+    "agent": {
+      "agent_name": "Fixture agent",
+      "bind_addr": "127.0.0.1:1"
+    },
+    "phones": {
+      "phones": [
+        {
+          "id": "fixture-phone",
+          "name": "Fixture phone",
+          "scope": "act",
+          "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "created_unix_secs": 946684800,
+          "last_seen_unix_secs": 946684900
+        }
+      ]
+    }
+  }
+}

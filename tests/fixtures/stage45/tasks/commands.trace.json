@@ -1,0 +1,37 @@
+{
+  "brief": "Continue GitTerm task fixture-task: Synthetic task\n\nObjective:\nCharacterize only\n\nTask context:\n- Issue: none\n- State: draft\n- Worktree: not prepared\n- Branch: task/fixture\n- Base: main @ 0000000000000000000000000000000000000000\n- Stop when: Tests pass\n- Last error: none\n\nLatest durable handoff:\nNo prior handoff has been recorded.\n\nPrior harness conversations:\n- none recorded\n\nWork from the existing worktree. Inspect git status and the current diff before changing files. Use GitTerm's task_get tool for task fixture-task when it is available. Preserve valid prior work, surface conflicts or missing context explicitly, and use task_update_handoff to leave a concise durable summary before stopping when that tool is available.\n\nReport back:\nThis task is GitTerm delegation fixture-delegation: a coordinator chat handed it to you and is waiting for your report. Report through GitTerm's task_update_handoff tool for task fixture-task, from this session:\n- As you make progress, call it with status \"progress\" and a short summary of where you are.\n- When the objective is met (stop where \"Stop when\" says), call it once with status \"done\".\n- If you cannot go on without a human decision, access or missing context, call it with status \"blocked\" and say why in blockers.\n- Every report carries summary, decisions, next_steps and blockers. Keep them concise; do not paste transcripts or diffs.\n- Do not merge or push unless the objective says so.\n\nGitTerm task session: fixture-session\n",
+  "brief_relative_path": "task-briefs/fixture-session.md",
+  "commands": [
+    {
+      "mcp": "codex --config 'mcp_servers.gitterm_tasks.url=http://127.0.0.1:1/mcp?caller=fixture-caller' --config mcp_servers.gitterm_tasks.bearer_token_env_var=GITTERM_V6_TASK_MCP_TOKEN --config mcp_servers.gitterm_tasks.default_tools_approval_mode=approve --config mcp_servers.gitterm_tasks.tool_timeout_sec=300",
+      "preset": "codex",
+      "prompt": "codex \"$(cat '/fixture/task-briefs/fixture-session.md')\"",
+      "require_task_tools_accepts": true
+    },
+    {
+      "mcp": "claude --mcp-config='{\"mcpServers\":{\"gitterm_tasks\":{\"headers\":{\"Authorization\":\"Bearer ${GITTERM_V6_TASK_MCP_TOKEN}\"},\"type\":\"http\",\"url\":\"http://127.0.0.1:1/mcp?caller=fixture-caller\"}}}' --allowedTools=mcp__gitterm_tasks",
+      "preset": "claude",
+      "prompt": "claude \"$(cat '/fixture/task-briefs/fixture-session.md')\"",
+      "require_task_tools_accepts": true
+    },
+    {
+      "mcp": "pi",
+      "preset": "pi",
+      "prompt": "pi \"$(cat '/fixture/task-briefs/fixture-session.md')\"",
+      "require_task_tools_accepts": true
+    },
+    {
+      "mcp": "agy",
+      "preset": "agy",
+      "prompt": "agy --prompt-interactive \"$(cat '/fixture/task-briefs/fixture-session.md')\"",
+      "require_task_tools_accepts": false
+    },
+    {
+      "mcp": "unknown-agent",
+      "preset": "unknown-agent",
+      "prompt": "unknown-agent \"$(cat '/fixture/task-briefs/fixture-session.md')\"",
+      "require_task_tools_accepts": true
+    }
+  ],
+  "log_path": "/fixture/config/delegations/fixture-delegation.jsonl"
+}
