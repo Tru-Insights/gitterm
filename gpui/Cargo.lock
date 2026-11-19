@@ -2585,11 +2585,13 @@ dependencies = [
  "git2",
  "libc",
  "pulldown-cmark",
+ "ring",
  "schemars",
  "serde",
  "serde_json",
  "shell-words",
  "tokio",
+ "tokio-util",
  "uuid",
  "warp",
 ]
