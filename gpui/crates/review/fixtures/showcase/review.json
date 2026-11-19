@@ -1,0 +1,46 @@
+{
+  "files": [
+    {
+      "group": "staged",
+      "path": "src/hello.rs",
+      "status": "M",
+      "patch": "modified.patch"
+    },
+    {
+      "group": "staged",
+      "path": "src/new.rs",
+      "status": "R",
+      "patch": "renamed.patch"
+    },
+    {
+      "group": "unstaged",
+      "path": "src/hello.rs",
+      "status": "M",
+      "patch": "unstaged.patch"
+    },
+    {
+      "group": "unstaged",
+      "path": "image.png",
+      "status": "M",
+      "patch": "binary.patch"
+    },
+    {
+      "group": "unstaged",
+      "path": "removed.txt",
+      "status": "D",
+      "patch": "deleted.patch"
+    },
+    {
+      "group": "untracked",
+      "path": "added.rs",
+      "status": "?",
+      "patch": "added.patch"
+    },
+    {
+      "group": "untracked",
+      "path": "large.rs",
+      "status": "?",
+      "patch": "large.patch"
+    }
+  ]
+}

@@ -196,6 +196,7 @@ impl From<TerminalSize> for WindowSize {
 
 pub struct Backend {
     pub(crate) term: Arc<FairMutex<Term<EventProxy>>>,
+    pub(crate) integration: Option<tempfile::TempDir>,
     size: TerminalSize,
     applied_size: TerminalSize,
     session: Option<Session>,
@@ -224,7 +225,7 @@ impl Backend {
     }
 
     /// Spawn a shell with the geometry measured from its first view layout.
-    fn new_sized(
+    pub(crate) fn new_sized(
         settings: BackendSettings,
         cols: usize,
         rows: usize,
@@ -262,6 +263,7 @@ impl Backend {
             size,
             applied_size: size,
             session: None,
+            integration: None,
             pending_settings: Some(settings),
             startup_output_pending: false,
             deferred_resize: None,
@@ -330,6 +332,11 @@ impl Backend {
         self.pending_settings.is_some()
     }
 
+    pub(crate) fn fail_launch(&mut self, error: String) {
+        self.pending_settings = None;
+        self.record_error(error);
+    }
+
     pub(crate) fn record_error(&self, error: String) {
         self.events.record_error(error);
     }
@@ -361,6 +368,7 @@ impl Backend {
             size,
             applied_size: size,
             session: Some(session),
+            integration: None,
             pending_settings: None,
             startup_output_pending: false,
             deferred_resize: None,

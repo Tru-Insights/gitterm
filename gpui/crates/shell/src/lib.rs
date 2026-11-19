@@ -991,6 +991,27 @@ mod tests {
         });
         let mut store = workspace_config::WorkspaceStore::new(config.path());
         assert_eq!(store.load().unwrap(), [repo.path().canonicalize().unwrap()]);
+        // Local terminals start in their workspace folder, not $HOME.
+        let folder = repo.path().canonicalize().unwrap();
+        cx.read(|cx| {
+            let state = shell.read(cx).active(cx);
+            let terminals: Vec<_> = state
+                .panes
+                .values()
+                .filter(|pane| matches!(pane.read(cx).content, pane::PaneContent::Terminal(_)))
+                .collect();
+            assert!(!terminals.is_empty());
+            for terminal in terminals {
+                assert!(
+                    terminal
+                        .read(cx)
+                        .tab_title()
+                        .ends_with(&folder.display().to_string()),
+                    "{}",
+                    terminal.read(cx).tab_title()
+                );
+            }
+        });
         // A real subsequent maintenance request sees a filesystem change.
         std::fs::write(repo.path().join("later.txt"), "later").unwrap();
         cx.update(|_, cx| {
@@ -1246,9 +1267,42 @@ mod tests {
                 assert!(view.read(cx).focus_handle().is_focused(window));
                 assert!(!other.read(cx).focus_handle().is_focused(window));
             });
+            cx.simulate_keystrokes("cmd-f");
+            draw(cx);
+            cx.simulate_input("TERMINAL_FIND_ONLY");
+            cx.read(|cx| {
+                assert!(view.read(cx).is_find_open());
+                assert_eq!(view.read(cx).find_query(), "TERMINAL_FIND_ONLY");
+                assert!(!other.read(cx).is_find_open());
+            });
+            cx.simulate_keystrokes("cmd-g cmd-shift-g escape");
+            draw(cx);
+            cx.read(|cx| assert!(!view.read(cx).is_find_open()));
             cx.simulate_input(&format!("printf 'FOCUS_%s\\n' {label}"));
             cx.simulate_keystrokes("enter");
             wait_for_text(view, &format!("FOCUS_{label}"), cx);
+            cx.simulate_input(
+                "printf '\\033]7;file:///tmp/reported-pane\\007\\033]2;REPORTED_PANE\\007'\n",
+            );
+            let deadline = std::time::Instant::now();
+            loop {
+                draw(cx);
+                let pane = if selector == "session-12" {
+                    &first
+                } else {
+                    &second
+                };
+                if cx.read(|cx| pane.read(cx).tab_title()) == "REPORTED_PANE · /tmp/reported-pane"
+                {
+                    break;
+                }
+                assert!(
+                    deadline.elapsed().as_secs() < 5,
+                    "pane reports not delivered"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+
             other.read_with(cx, |view, _| {
                 assert!(
                     !view

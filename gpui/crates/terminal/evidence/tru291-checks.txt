@@ -1,0 +1,44 @@
+TRU-291 — GPUI terminal launch contract + shell wiring
+2026-11-19 UTC (local session began 2026-11-18)
+
+Environment:
+  CARGO_HOME=/private/tmp/gpui-mockup-cargo
+  CARGO_TARGET_DIR=/private/tmp/gt-target-tru291
+  scripts/cargo.sh (installed rustup stable), -j 4 for compilation/tests.
+  nice -n 10 attempted; sandbox reported setpriority not permitted but ran Cargo.
+
+Final required checks, all exit 0:
+  scripts/cargo.sh fmt --manifest-path gpui/Cargo.toml --all -- --check
+  scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --workspace --locked --all-targets -j 4 -- -D warnings
+  scripts/cargo.sh test --manifest-path gpui/Cargo.toml --workspace --locked -j 4
+  scripts/check-gpui-deps.sh
+
+Tests: 12 chat + 9 shell + 82 terminal = 103 passed; no failures/ignored tests.
+Terminal suite finished in 13.04 seconds, including the 200 MB integrity/memory gate.
+New PTY coverage: cwd; env set/remove (HOME/PATH/PWD) and SHLVL override;
+program/args; initial size; invalid cwd/program; split OSC 7 and title;
+zsh/bash startup; login/nonlogin rc forwarding and ZDOTDIR restoration;
+HOME overlay; unset ZDOTDIR; prompt-before-startup; repeated prompts without
+re-execution; startup waiting past a login-file vared editor.
+Headless coverage: app cwd/title callbacks, reported pane labels, terminal find
+Cmd+F/G/Shift+Cmd+G/Esc isolation while chat retains its own find.
+
+Investigation and review:
+  E1 consultation 98f00829-d1e5-4bed-bf5b-f4e0baa62367 identified five rc/parser
+  issues. All corrected and covered by regressions.
+  Broad follow-up cd294f8c-92ac-48b0-9c93-18b0872ceb93 hit its 5-minute limit.
+  Focused Astra follow-up c88b160e-4368-4fd2-add4-ebd9b50df138 confirmed all five
+  fixes and found no remaining blockers in launch/parser.
+
+Timing diagnostics (before final successful checks): existing find/export test
+once timed out; isolated retry and final full suite passed. Flood also timed out
+with the report observer disabled: original verifier processed 56,633,344 of
+200,000,034 bytes in 30 seconds. Production observer was restored. Test-only
+verification now compares whole pattern slices, retaining every-byte checks,
+mismatch counts, workload, deadline and memory assertions. A scalar-reference
+corruption/boundary test verifies the optimized observer's mismatch count.
+
+No GUI, synthetic OS input, or running GitTerm process interaction.
+No root Iced/chat source, root Cargo.lock, or GPUI workspace-member edits.
+Scoped GPUI gates replace the root Iced pre-commit hook for this task.
+Startup integration limits and env-launcher path constraints are in README.md.

@@ -50,6 +50,10 @@ pub trait ShellData {
     fn sessions(&self, workspace: WorkspaceId, _cx: &App) -> Vec<Session>;
     fn status(&self, workspace: WorkspaceId, cx: &App) -> GitStatus;
     fn files(&self, workspace: WorkspaceId, cx: &App) -> Vec<FileNode>;
+    /// Folder new terminals start in; `None` means the user's home folder.
+    fn terminal_cwd(&self, _workspace: WorkspaceId, _cx: &App) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 pub struct SampleData;
@@ -145,6 +149,15 @@ impl ShellData for SampleData {
 /// A view handle, never a second writable catalog or service owner.
 pub struct LocalData(pub gpui::Entity<crate::WorkspaceOwner>);
 impl ShellData for LocalData {
+    fn terminal_cwd(&self, workspace: WorkspaceId, cx: &App) -> Option<std::path::PathBuf> {
+        self.0
+            .read(cx)
+            .model
+            .workspaces
+            .iter()
+            .find(|w| w.id == workspace)
+            .map(|w| w.folder.clone())
+    }
     fn workspaces(&self, cx: &App) -> Vec<Workspace> {
         self.0
             .read(cx)

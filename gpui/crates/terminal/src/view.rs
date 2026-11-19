@@ -56,6 +56,8 @@ pub type KeyHandler = Box<dyn Fn(&KeyDownEvent) -> bool + Send + Sync>;
 
 pub type BellCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>)>;
 
+pub type CwdCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>, &std::path::Path)>;
+
 pub type TitleCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>, &str)>;
 
 pub type ClipboardStoreCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>, &str)>;
@@ -93,6 +95,7 @@ pub struct TerminalView {
     bell_callback: Option<BellCallback>,
 
     title_callback: Option<TitleCallback>,
+    cwd_callback: Option<CwdCallback>,
 
     clipboard_store_callback: Option<ClipboardStoreCallback>,
 
@@ -128,6 +131,26 @@ fn should_defer_text_input_to_ime(event: &KeyDownEvent) -> bool {
 }
 
 impl TerminalView {
+    pub fn launch(
+        launch: crate::TerminalLaunch,
+        config: TerminalConfig,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::initialize(launch.start(), config, cx)
+    }
+    pub fn is_find_open(&self) -> bool {
+        self.find_open
+    }
+    pub fn find_query(&self) -> &str {
+        &self.find_query
+    }
+    pub fn with_cwd_callback(
+        mut self,
+        callback: impl Fn(&mut Window, &mut Context<Self>, &std::path::Path) + 'static,
+    ) -> Self {
+        self.cwd_callback = Some(Box::new(callback));
+        self
+    }
     pub fn new_deferred(
         settings: crate::BackendSettings,
         config: TerminalConfig,
@@ -184,6 +207,7 @@ impl TerminalView {
             key_handler: None,
             bell_callback: None,
             title_callback: None,
+            cwd_callback: None,
             clipboard_store_callback: None,
             exit_callback: None,
             url_opener: None,
@@ -282,6 +306,7 @@ impl TerminalView {
             }
         }
         if self.find_open && self.find_revision != Some(self.backend.revision()) {
+            let changed = self.find_revision.is_some() || self.find_status != "Busy";
             self.backend.clear_find();
             self.find_revision = None;
             self.find_status = "Busy".into();
@@ -293,7 +318,11 @@ impl TerminalView {
                     Err(error) => self.find_status = format!("Search failed: {error:?}"),
                 }
             }
-            cx.notify();
+            // Rendering also polls. Redrawing an unchanged Busy state competes
+            // with the snapshot's parser try-locks, and can starve the worker.
+            if changed || self.find_status != "Busy" {
+                cx.notify();
+            }
         }
     }
 
@@ -702,6 +731,11 @@ impl TerminalView {
             && let Some(callback) = &self.bell_callback
         {
             callback(window, cx);
+        }
+        if let Some(cwd) = events.cwd
+            && let Some(callback) = &self.cwd_callback
+        {
+            callback(window, cx, &cwd);
         }
         if let Some(title) = events.title
             && let Some(callback) = &self.title_callback

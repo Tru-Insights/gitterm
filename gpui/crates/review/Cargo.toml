@@ -1,0 +1,19 @@
+[package]
+name = "gitterm-gpui-review"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+[dependencies]
+gitterm-core = { path = "../../../crates/gitterm-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui-kit = "=0.9.1"
+gpui-component = { version = "=0.9.1", features = ["syntect"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+gpui-pre = { version = "=0.3.12", features = ["test-support"] }
+gpui-component = { version = "=0.9.1", features = ["test-support"] }

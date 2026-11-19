@@ -1,0 +1,6 @@
+diff --git a/added.rs b/added.rs
+new file mode 100644
+--- /dev/null
++++ b/added.rs
+@@ -0,0 +1 @@
++pub const ADDED: bool = true;

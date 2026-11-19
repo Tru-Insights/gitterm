@@ -390,7 +390,9 @@ os.write(1,bytes.fromhex('{tail}'))
         }
         assert!(
             started.elapsed() < Duration::from_secs(30),
-            "hidden parser deadline"
+            "hidden parser deadline: {bytes}/{} bytes after {:?}",
+            TOTAL + TAIL.len(),
+            started.elapsed()
         );
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -834,6 +836,39 @@ fn cmd_hover_and_click_resolve_current_url_and_call_only_app_opener(cx: &mut Tes
 }
 
 #[::gpui::test]
+fn find_busy_polls_notify_only_when_visible_state_changes(cx: &mut TestAppContext) {
+    use std::{cell::Cell, rc::Rc, sync::atomic::Ordering};
+    cx.background_executor.allow_parking();
+    let entity = cx.new(|cx| {
+        let mut view =
+            TerminalView::new_deferred(BackendSettings::default(), TerminalConfig::default(), cx);
+        // Keep admission Busy deterministically, without a worker timing race.
+        view.backend.service_busy.store(true, Ordering::Release);
+        view.find_open = true;
+        view.find_status = "Busy".into();
+        view
+    });
+    let notifications = Rc::new(Cell::new(0));
+    let observed = notifications.clone();
+    let _subscription =
+        cx.update(|cx| cx.observe(&entity, move |_, _| observed.set(observed.get() + 1)));
+    entity.update(cx, |view, cx| view.poll_services(cx));
+    assert_eq!(notifications.get(), 0);
+
+    entity.update(cx, |view, cx| {
+        view.find_revision = Some(view.backend.revision());
+        view.find_status = "2 matches".into();
+        view.backend.events.invalidate();
+        view.poll_services(cx);
+        assert_eq!(view.find_status, "Busy");
+        assert!(view.find_revision.is_none());
+    });
+    assert_eq!(notifications.get(), 1);
+    entity.update(cx, |view, cx| view.poll_services(cx));
+    assert_eq!(notifications.get(), 1);
+}
+
+#[::gpui::test]
 fn find_shortcuts_edit_navigate_close_restore_focus_and_export_callback(cx: &mut TestAppContext) {
     use alacritty_terminal::vte::ansi::Processor;
     use gpui_kit::Modifiers;
@@ -940,4 +975,35 @@ fn find_shortcuts_edit_navigate_close_restore_focus_and_export_callback(cx: &mut
     });
     let text = received.lock().take().unwrap().unwrap();
     assert!(text.starts_with("first[.]\nsecond[.]\n"));
+}
+
+#[::gpui::test]
+fn launch_cwd_and_title_callbacks_reach_app_headlessly(cx: &mut TestAppContext) {
+    use std::{cell::RefCell, rc::Rc};
+    cx.background_executor.allow_parking();
+    let cwd = Rc::new(RefCell::new(None));
+    let title = Rc::new(RefCell::new(None));
+    let reported_cwd = cwd.clone();
+    let reported_title = title.clone();
+    let backend = python("import os\nos.write(1,b'\\x1b]7;file:///tmp/callback%20cwd\\x07\\x1b]2;CALLBACK_TITLE\\x07')".into());
+    let handle = cx.add_window(|_, cx| {
+        TerminalView::new(backend, TerminalConfig::default(), cx)
+            .with_cwd_callback(move |_, _, path| {
+                *reported_cwd.borrow_mut() = Some(path.to_path_buf())
+            })
+            .with_title_callback(move |_, _, value| {
+                *reported_title.borrow_mut() = Some(value.to_string())
+            })
+    });
+    wait(|| {
+        handle
+            .update(cx, |view, window, cx| view.process_events(window, cx))
+            .unwrap();
+        cwd.borrow().is_some() && title.borrow().is_some()
+    });
+    assert_eq!(
+        cwd.borrow().as_deref(),
+        Some(std::path::Path::new("/tmp/callback cwd"))
+    );
+    assert_eq!(title.borrow().as_deref(), Some("CALLBACK_TITLE"));
 }

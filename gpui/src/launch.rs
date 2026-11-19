@@ -6,11 +6,15 @@ pub enum Launch {
     Shell { folders: Vec<PathBuf>, sample: bool },
     Terminal,
     Chat(PathBuf),
+    Review(Vec<OsString>),
 }
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Option<Launch> {
     let args: Vec<_> = args.into_iter().collect();
     if args.len() == 1 && args[0] == "--terminal" {
         return Some(Launch::Terminal);
+    }
+    if args.first().is_some_and(|arg| arg == "--review") {
+        return Some(Launch::Review(args[1..].to_vec()));
     }
     if args.len() == 2 && matches!(args[0].to_str(), Some("--chat" | "--chat-live")) {
         return Some(Launch::Chat((&args[1]).into()));
@@ -80,6 +84,10 @@ mod tests {
             assert_eq!(route(&invalid), None);
         }
         assert_eq!(route(&["--terminal"]), Some(Launch::Terminal));
+        assert_eq!(
+            route(&["--review", "fixtures/showcase"]),
+            Some(Launch::Review(vec!["fixtures/showcase".into()]))
+        );
         assert_eq!(
             route(&["--chat-live", "fixture.jsonl"]),
             Some(Launch::Chat("fixture.jsonl".into()))

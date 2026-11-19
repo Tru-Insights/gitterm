@@ -70,22 +70,84 @@ pub struct Reader {
 impl Read for Reader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.file.read(buf)?;
-        for (i, byte) in buf[..n].iter().enumerate() {
-            let position = self.offset + i;
-            let expected = if position < TOTAL {
-                Some(PATTERN[position % PATTERN.len()])
-            } else {
-                TAIL.get(position - TOTAL).copied()
-            };
-            if expected != Some(*byte) {
-                self.counts.bad.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        self.counts
+            .bad
+            .fetch_add(mismatches(&buf[..n], self.offset), Ordering::Relaxed);
         self.offset += n;
         self.counts.bytes.store(self.offset, Ordering::Release);
         Ok(n)
     }
 }
+// Compare every byte in pattern-sized slices. The previous debug-mode loop
+// spent the flood deadline doing a modulo and match per byte.
+fn mismatches(mut bytes: &[u8], mut offset: usize) -> usize {
+    let mut bad = 0;
+    while !bytes.is_empty() {
+        let expected = if offset < TOTAL {
+            let pattern = &PATTERN[offset % PATTERN.len()..];
+            &pattern[..pattern.len().min(TOTAL - offset)]
+        } else {
+            TAIL.get(offset - TOTAL..).unwrap_or_default()
+        };
+        if expected.is_empty() {
+            return bad + bytes.len();
+        }
+        let n = bytes.len().min(expected.len());
+        if bytes[..n] != expected[..n] {
+            bad += bytes[..n]
+                .iter()
+                .zip(&expected[..n])
+                .filter(|(a, b)| a != b)
+                .count();
+        }
+        bytes = &bytes[n..];
+        offset += n;
+    }
+    bad
+}
+
+#[test]
+fn flood_observer_detects_each_bad_byte_across_pattern_and_tail_boundaries() {
+    for start in [
+        0,
+        1,
+        PATTERN.len() - 1,
+        TOTAL - 7,
+        TOTAL,
+        TOTAL + TAIL.len(),
+    ] {
+        let expected: Vec<u8> = (start..start + 131)
+            .map(|position| {
+                if position < TOTAL {
+                    PATTERN[position % PATTERN.len()]
+                } else {
+                    TAIL.get(position - TOTAL).copied().unwrap_or(0)
+                }
+            })
+            .collect();
+        for corrupt in [None, Some(0), Some(65), Some(130)] {
+            let mut bytes = expected.clone();
+            if let Some(i) = corrupt {
+                bytes[i] ^= 1;
+            }
+            let scalar_bad = bytes
+                .iter()
+                .enumerate()
+                .filter(|(i, byte)| {
+                    let position = start + i;
+                    let expected = if position < TOTAL {
+                        Some(PATTERN[position % PATTERN.len()])
+                    } else {
+                        TAIL.get(position - TOTAL).copied()
+                    };
+                    expected != Some(**byte)
+                })
+                .count();
+            assert_eq!(mismatches(&bytes, start), scalar_bad);
+        }
+    }
+}
+
 pub struct ObservedPty {
     pty: tty::Pty,
     reader: Reader,

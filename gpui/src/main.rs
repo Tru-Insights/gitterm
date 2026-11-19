@@ -18,6 +18,7 @@ fn main() {
             }
         },
         launch::Launch::Terminal => macos::run(),
+        launch::Launch::Review(args) => gitterm_gpui_review::run_fixture(args),
         launch::Launch::Shell { folders, sample } => {
             if let Err(error) = gitterm_gpui_shell::run(folders, sample) {
                 eprintln!("{error:#}");
@@ -30,7 +31,7 @@ fn main() {
 #[cfg(target_os = "macos")]
 fn usage() -> ! {
     eprintln!(
-        "Usage: gitterm-gpui [--workspace <dir> ... | --sample | --terminal | --chat <fixture.jsonl>]"
+        "Usage: gitterm-gpui [--workspace <dir> ... | --sample | --terminal | --chat <fixture.jsonl> | --chat-live <fixture.jsonl> | --review <fixture-dir>]"
     );
     std::process::exit(2);
 }
