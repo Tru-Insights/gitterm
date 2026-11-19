@@ -171,3 +171,47 @@ most ten attempts per second); a continuously changing grid can remain Busy.
 Alacritty adjusts live selections during scroll/eviction; pending selection
 coordinates from an outdated render are discarded. This favors clearing over
 highlighting replacement text at an old coordinate.
+
+## TRU-291: application launch contract
+
+`TerminalLaunch` is the application entry point; `TerminalView::launch(launch,
+config, cx)` creates a renderable terminal even when launch fails. `launch.start()`
+provides the same contract to headless/backend consumers. `BackendSettings`
+remains the low-level compatibility API. Launch options include an optional cwd
+(`None` inherits the app cwd), an environment overlay (`Some(value)` sets,
+`None` removes), program, exact argument vector, initial columns/rows, and an
+optional trusted startup command. The launch geometry reaches the PTY before
+spawn; normal view layout subsequently resizes it.
+
+Defaults follow Iced's Unix launch policy: `$SHELL`, then the user's `/etc/passwd`
+shell, then `/bin/zsh`, with `-l`; TERM/COLORTERM, LANG and the HOME-based executable
+PATH are set before applying the overlay. Parent variables otherwise remain
+inherited. No settings file or root Iced shell-integration directory is used.
+An `env -u -C` child launcher implements removals and chdir without mutating the app environment;
+arguments and paths are passed as separate arguments; environment values stay
+in the child environment, never argv. cwd and executable are validated; the
+child launcher also refuses a cwd removed during spawn. Program paths containing
+`=` are rejected because the platform env utility interprets them as assignments. Failures show the existing persistent terminal banner.
+
+Startup uses shell integration, as Iced does, with a readiness marker instead of
+executing a command before the prompt. zsh uses a private temporary ZDOTDIR that
+sources the original login files and adds a one-shot ZLE line-init hook. bash uses
+PROMPT_COMMAND to append an OSC 133 B marker to its first prompt. On readiness,
+the trusted command plus Enter is admitted once through the existing bounded
+input queue. This is deliberately command execution, separate from clipboard
+paste; paste normalization/enveloping is unchanged. Temporary integration files
+are owned by the backend and removed on drop. Startup commands currently require
+zsh or bash, with normal interactive startup processing enabled; other programs
+can launch with arbitrary arguments without a startup command. Shell rc files
+that disable/replace integration can prevent readiness; no timing-based guess at
+a prompt is made. Bash rc files can replace PROMPT_COMMAND, just as in Iced.
+
+OSC 7 `file://host/absolute/path` reports (BEL or ST terminated, including split
+PTY reads and percent-encoded paths) are coalesced independently of title reports.
+Observation is bounded to 4096 bytes per OSC; malformed, control-containing or
+oversized paths are ignored. The host is display metadata and is never resolved.
+`with_cwd_callback` and `with_title_callback` deliver the latest reports during
+foreground rendering. A hidden pane retains the latest report until shown.
+The shell displays these reports in its dock pane tab. Terminal and chat find
+shortcuts remain scoped to their focused view; the shell does not install a
+competing global find handler.

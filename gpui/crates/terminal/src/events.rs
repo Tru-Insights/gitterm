@@ -21,6 +21,7 @@ pub enum Action {
 #[derive(Default)]
 pub struct PendingEvents {
     pub title: Option<String>,
+    pub cwd: Option<std::path::PathBuf>,
     pub clipboard_store: Option<String>,
     pub bell: bool,
     pub exited: bool,
@@ -59,12 +60,44 @@ struct Shared {
     output_ready: AtomicBool,
     revision: AtomicU64,
     pending: Mutex<PendingEvents>,
+    startup: Mutex<(bool, Option<Vec<u8>>)>,
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct EventProxy(Arc<Shared>);
 
 impl EventProxy {
+    pub fn report_cwd(&self, cwd: std::path::PathBuf) {
+        self.queue_effect(|pending| pending.cwd = Some(cwd));
+        self.mark_dirty();
+    }
+    pub fn set_startup(&self, command: String) {
+        let mut startup = self.0.startup.lock();
+        let mut bytes = command
+            .replace("\r\n", "\n")
+            .replace('\n', "\r")
+            .into_bytes();
+        bytes.push(b'\r');
+        startup.1 = Some(bytes);
+        self.send_startup(&mut startup);
+    }
+    pub fn prompt_ready(&self) {
+        let mut startup = self.0.startup.lock();
+        startup.0 = true;
+        self.send_startup(&mut startup);
+    }
+    fn send_startup(&self, startup: &mut (bool, Option<Vec<u8>>)) {
+        if startup.0
+            && let Some(bytes) = startup.1.take()
+            && !self
+                .0
+                .control
+                .get()
+                .is_some_and(|control| control.input(bytes.into(), false))
+        {
+            self.record_error("startup command input admission failed".into());
+        }
+    }
     pub fn set_control(&self, control: Arc<IoControl>) {
         let _ = self.0.control.set(control);
     }
