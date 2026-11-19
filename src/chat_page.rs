@@ -9,7 +9,14 @@
 
 use serde_json::Value;
 
+pub use gitterm_core::chat::history::{
+    harness_payload, history_payloads, subagent_started, subagent_started_at, turn_timing,
+    user_prompt_payload,
+};
+
+#[cfg(test)]
 use crate::harness::transcript::{TimedEntry, TranscriptEntry};
+#[cfg(test)]
 use crate::harness::HarnessEvent;
 
 /// The sole clipboard payload accepted from the guarded agent page.
@@ -70,46 +77,6 @@ pub fn agent_chat_html() -> String {
         .replacen(BAR_HINT_SLOT, &bar_hint_script("var(--fg)", "var(--bg)"), 1)
 }
 
-/// The page's echo of a prompt the human submitted.
-pub fn user_prompt_payload(text: &str) -> Value {
-    let mut payload = serde_json::json!({"type": "user_prompt", "text": text});
-    if let Some(card) = crate::delegations::delivery_card(text) {
-        payload["delivery"] = serde_json::json!(card);
-    }
-    payload
-}
-
-/// A harness event as the page's `__appendEvent` receives it. `None` (and
-/// logged) when the event cannot be encoded.
-pub fn harness_payload(event: &HarnessEvent) -> Option<Value> {
-    match serde_json::to_value(event) {
-        Ok(event) => Some(serde_json::json!({"kind": "harness", "event": event})),
-        Err(e) => {
-            eprintln!("[agent] could not serialize harness event {event:?}: {e}");
-            None
-        }
-    }
-}
-
-/// The Agent call whose subagent `event` starts, if it is a subagent start.
-pub fn subagent_started(event: &HarnessEvent) -> Option<&str> {
-    match event {
-        HarnessEvent::SubagentEvent {
-            parent_tool_use_id,
-            event,
-        } if matches!(**event, HarnessEvent::TurnStarted { .. }) => {
-            Some(parent_tool_use_id.as_str())
-        }
-        _ => None,
-    }
-}
-
-/// The timeline marker for when Agent call `parent`'s subagent started
-/// (Unix ms). The chat page uses it when the start was not seen live.
-pub fn subagent_started_at(parent: &str, at_ms: i64) -> Value {
-    serde_json::json!({ "kind": "subagent_started_at", "id": parent, "at_ms": at_ms })
-}
-
 /// A `codex exec` run a chat started outside GitTerm's tools (TRU-212),
 /// for its roster row and card. Live only: never in the conversation
 /// buffer; a rebuilt page gets running runs back on the next poll.
@@ -117,48 +84,9 @@ pub fn codex_exec_payload(run: &crate::codex_exec::RunView) -> Value {
     serde_json::json!({ "kind": "codex_exec", "run": run })
 }
 
-/// The start and end of a chat turn, when known (TRU-209).
-pub fn turn_timing(start_ms: Option<i64>, end_ms: Option<i64>) -> Value {
-    let mut payload = serde_json::json!({ "kind": "turn_timing" });
-    if let Some(start_ms) = start_ms {
-        payload["start_ms"] = serde_json::json!(start_ms);
-    }
-    if let Some(end_ms) = end_ms {
-        payload["end_ms"] = serde_json::json!(end_ms);
-    }
-    payload
-}
-
 /// The timestamp at which a queued prompt splits an active turn fold.
 pub fn turn_split_time(split_ms: i64) -> Value {
     serde_json::json!({ "kind": "turn_timing", "split_ms": split_ms })
-}
-
-/// A transcript read-back as page payloads, each subagent start followed
-/// by when it started (from its transcript line). The desktop adds its
-/// delegation anchors on top of this; an agent has none.
-pub fn history_payloads(entries: Vec<TimedEntry>) -> Vec<Value> {
-    let mut payloads = Vec::with_capacity(entries.len());
-    for timed in entries {
-        let at_ms = timed
-            .at
-            .as_deref()
-            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
-            .map(|at| at.timestamp_millis());
-        match timed.entry {
-            TranscriptEntry::UserPrompt(text) => payloads.push(user_prompt_payload(&text)),
-            TranscriptEntry::Harness(event) => {
-                let started = subagent_started(&event).map(str::to_string);
-                if let Some(payload) = harness_payload(&event) {
-                    payloads.push(payload);
-                }
-                if let (Some(parent), Some(at_ms)) = (started, at_ms) {
-                    payloads.push(subagent_started_at(&parent, at_ms));
-                }
-            }
-        }
-    }
-    payloads
 }
 
 #[cfg(test)]
