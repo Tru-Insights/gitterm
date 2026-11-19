@@ -1,5 +1,8 @@
+#[path = "copy.rs"]
+mod copy;
 #[path = "find.rs"]
 mod find;
+use copy::CopyTarget;
 use find::TranscriptFind;
 
 use crate::{
@@ -125,6 +128,7 @@ pub struct ChatView {
     find_input: Entity<InputState>,
     find: TranscriptFind,
     find_open: bool,
+    selection_copied: Option<Task<()>>,
     focus: FocusHandle,
     replay: Option<Task<()>>,
     replay_position: usize,
@@ -187,6 +191,7 @@ impl ChatView {
             find_input,
             find: TranscriptFind::default(),
             find_open: false,
+            selection_copied: None,
             focus,
             replay: None,
             replay_position: 0,
@@ -309,43 +314,6 @@ impl ChatView {
         self.row_views[index] = Some(view.clone());
         self.update_row_find(index, cx);
         view
-    }
-    fn copy(&mut self, markdown: bool, window: &mut Window, cx: &mut Context<Self>) {
-        // Let the find input keep the platform's normal editing clipboard behavior.
-        if window.has_focused_input(cx) {
-            cx.propagate();
-            return;
-        }
-        self.copy_selection(markdown, window, cx);
-    }
-    fn copy_selection(&self, markdown: bool, window: &mut Window, cx: &mut App) {
-        for row in self.row_views.iter().flatten() {
-            row.read(cx).text.clone().update(cx, |text, cx| {
-                text.set_selection_format(
-                    if markdown {
-                        SelectionFormat::Source
-                    } else {
-                        SelectionFormat::Plain
-                    },
-                    cx,
-                )
-            });
-        }
-        let text = TextSelection::selected_text(window, cx);
-        // Match TextView's standard Cmd+C handler, including its outer whitespace policy.
-        let text = if markdown {
-            text
-        } else {
-            text.trim().to_owned()
-        };
-        if !text.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
-        }
-        for row in self.row_views.iter().flatten() {
-            row.read(cx).text.clone().update(cx, |text, cx| {
-                text.set_selection_format(SelectionFormat::Plain, cx)
-            });
-        }
     }
     fn start_replay(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.replay.take();
@@ -488,6 +456,11 @@ impl Render for ChatView {
                         "Native chat · {} rows · synthetic fixture",
                         self.model.rows.len()
                     )))
+                    .child(div().child(if self.selection_copied.is_some() {
+                        "Copied"
+                    } else {
+                        ""
+                    }))
                     .child(
                         Button::new("replay")
                             .small()
@@ -520,21 +493,8 @@ impl Render for ChatView {
                         .jump_button(false)
                         .with_content_style(StyleRefinement::default().px(px(14.)).py(px(12.))),
                     )
-                    .context_menu(move |menu, _, _| {
-                        let plain = copy_owner.clone();
-                        let markdown = copy_owner.clone();
-                        menu.item(PopupMenuItem::new("Copy").on_click(move |_, window, cx| {
-                            _ = plain.update(cx, |view, cx| view.copy_selection(false, window, cx));
-                        }))
-                        .item(
-                            PopupMenuItem::new("Copy as Markdown").on_click(
-                                move |_, window, cx| {
-                                    _ = markdown.update(cx, |view, cx| {
-                                        view.copy_selection(true, window, cx)
-                                    });
-                                },
-                            ),
-                        )
+                    .context_menu(move |menu, window, cx| {
+                        Self::selection_menu(copy_owner.clone(), menu, window, cx)
                     }),
             )
             .when(
@@ -609,7 +569,7 @@ struct RowView {
     active: Option<usize>,
     reveal_pending: bool,
     highlight_signature: Option<u64>,
-    copied: HashSet<usize>,
+    copied: HashMap<CopyTarget, Task<()>>,
     index: usize,
     scroller: Entity<MessageScrollerState>,
     _subscription: Subscription,
@@ -646,7 +606,7 @@ impl RowView {
             active: None,
             reveal_pending: false,
             highlight_signature: None,
-            copied: HashSet::new(),
+            copied: HashMap::new(),
             index,
             scroller,
             _subscription: subscription,
@@ -678,19 +638,6 @@ impl RowView {
             }
         }
     }
-    fn copy_code(&mut self, key: usize, code: String, cx: &mut Context<Self>) {
-        cx.write_to_clipboard(ClipboardItem::new_string(code));
-        self.copied.insert(key);
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(1)).await;
-            _ = this.update(cx, |view, cx| {
-                view.copied.remove(&key);
-                cx.notify();
-            });
-        })
-        .detach();
-    }
     fn toggle(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.open = !self.open;
         self.scroller.update(cx, |state, cx| {
@@ -721,8 +668,6 @@ impl Render for RowView {
             RowKind::Worker | RowKind::Delegation => 0x94e2d5,
             _ => FG,
         };
-        let owner = cx.entity().downgrade();
-        let copied = self.copied.clone();
         let content = div()
             .flex()
             .flex_col()
@@ -738,40 +683,15 @@ impl Render for RowView {
                     .iter()
                     .map(|diff| div().h(px(260.)).child(Diff::new(diff))),
             )
-            .child(
-                TextView::new(&self.text)
-                    .selectable(true)
-                    .scrollable(false)
-                    .stream_fade(true)
-                    .code_block_actions(move |block, _, _| {
-                        let mut hash = std::hash::DefaultHasher::new();
-                        block.code().hash(&mut hash);
-                        block.lang().hash(&mut hash);
-                        let key = hash.finish() as usize;
-                        let code = block.code().to_string();
-                        let owner = owner.clone();
-                        Button::new(("copy-code", key))
-                            .debug_selector({
-                                let owner = owner.clone();
-                                move || format!("copy-code-{}", owner.entity_id())
-                            })
-                            .small()
-                            .label(if copied.contains(&key) {
-                                "Copied"
-                            } else {
-                                "Copy"
-                            })
-                            .on_click(move |_, _, cx| {
-                                _ = owner
-                                    .update(cx, |view, cx| view.copy_code(key, code.clone(), cx));
-                            })
-                    }),
-            );
+            .child(self.copyable_text(cx));
         let content = content.children(self.card.clone());
         let header = div()
             .text_size(px(13.))
             .text_color(rgb(color))
-            .child(self.row.title.clone());
+            .child(self.row.title.clone())
+            .when(self.row.kind == RowKind::Assistant, |header| {
+                header.child(self.reply_copy_buttons(cx))
+            });
         div()
             .id(("row", self.row.id))
             .w_full()
