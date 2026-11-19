@@ -2560,6 +2560,8 @@ name = "gitterm-core"
 version = "0.1.0"
 dependencies = [
  "git2",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
@@ -8428,6 +8430,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "windows-sys 0.61.2",
 ]
