@@ -1,0 +1,26 @@
+{
+  "prs": {
+    "example/fixture#1": {
+      "key": {
+        "repo": "example/fixture",
+        "number": 1
+      },
+      "snapshot": {
+        "core": null,
+        "checks_sha": "",
+        "check_runs": [],
+        "statuses": [],
+        "required": [],
+        "required_rules": [],
+        "reviews": [],
+        "comments": []
+      },
+      "etags": {},
+      "reported": [],
+      "news": [],
+      "unseen_comments": 0,
+      "checked_at": null,
+      "error": null
+    }
+  }
+}

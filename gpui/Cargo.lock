@@ -2590,6 +2590,7 @@ dependencies = [
  "serde_json",
  "shell-words",
  "tokio",
+ "url",
  "uuid",
  "warp",
 ]

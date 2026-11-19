@@ -57,3 +57,8 @@ pub mod delegations;
 pub mod review_request;
 #[cfg(feature = "runtime")]
 pub mod runner_guidelines;
+
+// PR/issue/merge-plan leaf state and optional runtime services.
+pub mod issues;
+pub mod merge_plan;
+pub mod prs;
