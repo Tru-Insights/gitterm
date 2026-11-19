@@ -7,11 +7,16 @@ pub enum Launch {
     Terminal,
     Chat(PathBuf),
     Review(Vec<OsString>),
+    ReviewRepo(PathBuf),
 }
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Option<Launch> {
     let args: Vec<_> = args.into_iter().collect();
     if args.len() == 1 && args[0] == "--terminal" {
         return Some(Launch::Terminal);
+    }
+    if args.first().is_some_and(|arg| arg == "--review-repo") {
+        return (args.len() == 2 && !args[1].to_string_lossy().starts_with("--"))
+            .then(|| Launch::ReviewRepo((&args[1]).into()));
     }
     if args.first().is_some_and(|arg| arg == "--review") {
         return Some(Launch::Review(args[1..].to_vec()));
@@ -44,6 +49,20 @@ mod tests {
     use super::*;
     fn route(args: &[&str]) -> Option<Launch> {
         parse(args.iter().map(OsString::from))
+    }
+    #[test]
+    fn repo_review_requires_exactly_one_directory() {
+        assert_eq!(
+            route(&["--review-repo", "/fixture/repo"]),
+            Some(Launch::ReviewRepo("/fixture/repo".into()))
+        );
+        for args in [
+            vec!["--review-repo"],
+            vec!["--review-repo", "--sample"],
+            vec!["--review-repo", "/repo", "extra"],
+        ] {
+            assert_eq!(route(&args), None);
+        }
     }
     #[test]
     fn explicit_folders_repeat_and_sample_is_opt_in_and_exclusive() {

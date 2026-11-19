@@ -7,6 +7,8 @@ pub mod status;
 pub mod workspace;
 
 #[cfg(feature = "runtime")]
+pub mod git_diff;
+#[cfg(feature = "runtime")]
 pub mod git_status;
 #[cfg(feature = "runtime")]
 pub mod runtime;

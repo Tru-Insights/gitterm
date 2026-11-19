@@ -11,3 +11,6 @@ runtime = ["dep:tokio", "dep:git2"]
 [dependencies]
 tokio = { version = "1", optional = true, features = ["rt", "sync"] }
 git2 = { version = "0.19", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
