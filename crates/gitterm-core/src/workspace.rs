@@ -1,3 +1,5 @@
+//! Workspace selection state, pure transitions and workspace-bar ordering.
+//!
 //! Display order of the bottom workspace bar (TRU-175, TRU-192): this
 //! Mac's work first in its existing relative order, then the `Repos ▾`
 //! menu, then this Mac's folder workspaces when they are shown on the bar.
@@ -14,6 +16,190 @@
 /// Runtime identity of an open workspace; never persisted.
 /// The host allocates IDs and owns the workspace catalog.
 pub type WorkspaceId = u64;
+
+/// Borrowed facts from the host's sole workspace catalog, in its current order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceFact {
+    pub id: WorkspaceId,
+    pub parked: bool,
+}
+
+/// The sole active selection. Indices are resolved against the current roster.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelectionState {
+    active: Option<WorkspaceId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SelectionEvent {
+    /// Bar/keyboard selection also closes Usage, including same/invalid targets.
+    Select(Option<WorkspaceId>),
+    Swipe(WorkspaceId),
+    /// Attention navigation animates without closing Usage.
+    Animate(WorkspaceId),
+    /// Restore, task/chat entry or opening a workspace; no explicit-selection UI.
+    Activate(WorkspaceId),
+    UsageToggle,
+    UsageClose,
+    /// Facts are supplied after removal (stopping/close) or marking parked.
+    LeftBar {
+        id: WorkspaceId,
+        index: usize,
+        removed: bool,
+    },
+    Reordered,
+    /// The existing resume continuation requests status even if already selected.
+    Resume,
+    /// Convert only when the host is about to write its existing config format.
+    Persist,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SelectionCommand {
+    WorkspaceChanged {
+        from: Option<WorkspaceId>,
+        to: Option<WorkspaceId>,
+    },
+    AnimateTo {
+        from: Option<WorkspaceId>,
+        index: usize,
+        at: std::time::Instant,
+    },
+    SetUsageOpen(bool),
+    PersistActiveIndex(usize),
+    RefreshStatus,
+}
+
+impl SelectionState {
+    pub fn active(&self) -> Option<WorkspaceId> {
+        self.active
+    }
+
+    pub fn index_of(ids: impl IntoIterator<Item = WorkspaceId>, id: WorkspaceId) -> Option<usize> {
+        ids.into_iter().position(|candidate| candidate == id)
+    }
+
+    pub fn active_index(&self, ids: impl IntoIterator<Item = WorkspaceId>) -> Option<usize> {
+        Self::index_of(ids, self.active?)
+    }
+
+    fn persist_command(&self, roster: &[WorkspaceFact]) -> SelectionCommand {
+        let active = self
+            .active_index(roster.iter().map(|ws| ws.id))
+            .unwrap_or(0);
+        SelectionCommand::PersistActiveIndex(persisted_active_index(
+            active,
+            &roster.iter().map(|ws| ws.parked).collect::<Vec<_>>(),
+        ))
+    }
+
+    /// Pure transitions: Usage visibility and the clock belong to the frontend.
+    /// Selection alone never starts a status request; only Resume does so.
+    pub fn reduce(
+        &mut self,
+        event: SelectionEvent,
+        roster: &[WorkspaceFact],
+        usage_open: bool,
+        now: std::time::Instant,
+    ) -> Vec<SelectionCommand> {
+        let from = self.active;
+        let mut commands = Vec::new();
+        let target = match event {
+            SelectionEvent::Select(id) => {
+                if usage_open {
+                    commands.push(SelectionCommand::SetUsageOpen(false));
+                }
+                id.filter(|id| roster.iter().any(|ws| ws.id == *id))
+            }
+            SelectionEvent::Swipe(id)
+            | SelectionEvent::Activate(id)
+            | SelectionEvent::Animate(id) => roster.iter().any(|ws| ws.id == id).then_some(id),
+            SelectionEvent::UsageToggle | SelectionEvent::UsageClose => {
+                commands.push(SelectionCommand::SetUsageOpen(
+                    matches!(event, SelectionEvent::UsageToggle) && !usage_open,
+                ));
+                None
+            }
+            SelectionEvent::LeftBar { id, index, removed } => {
+                if self.active == Some(id)
+                    || self.active_index(roster.iter().map(|ws| ws.id)).is_none()
+                {
+                    let next = next_on_bar(
+                        index,
+                        &roster.iter().map(|ws| ws.parked).collect::<Vec<_>>(),
+                    );
+                    // Stopping historically falls back to the last open workspace;
+                    // keep-running with no visible successor keeps its identity.
+                    next.or_else(|| removed.then(|| roster.len().checked_sub(1)).flatten())
+                        .map(|idx| roster[idx].id)
+                } else {
+                    None
+                }
+            }
+            SelectionEvent::Reordered => {
+                if self.active_index(roster.iter().map(|ws| ws.id)).is_none() {
+                    roster.first().map(|ws| ws.id)
+                } else {
+                    None
+                }
+            }
+            SelectionEvent::Resume => {
+                commands.push(SelectionCommand::RefreshStatus);
+                None
+            }
+            SelectionEvent::Persist => {
+                commands.push(self.persist_command(roster));
+                None
+            }
+        };
+        if let Some(id) = target {
+            self.active = Some(id);
+        }
+        if roster.is_empty()
+            && matches!(
+                event,
+                SelectionEvent::LeftBar { .. } | SelectionEvent::Reordered
+            )
+        {
+            self.active = None;
+        }
+        if from != self.active {
+            commands.push(SelectionCommand::WorkspaceChanged {
+                from,
+                to: self.active,
+            });
+            if matches!(
+                event,
+                SelectionEvent::Select(_) | SelectionEvent::Animate(_)
+            ) {
+                if let Some(index) = self.active_index(roster.iter().map(|ws| ws.id)) {
+                    commands.push(SelectionCommand::AnimateTo {
+                        from,
+                        index,
+                        at: now,
+                    });
+                }
+            }
+        }
+        commands
+    }
+}
+
+/// Existing on-disk index skips running parked entries. Runtime IDs stay private.
+pub fn persisted_active_index(active: usize, parked: &[bool]) -> usize {
+    parked
+        .iter()
+        .take(active)
+        .filter(|parked| !**parked)
+        .count()
+}
+
+/// First visible workspace from `from`, otherwise the last visible predecessor.
+pub fn next_on_bar(from: usize, parked: &[bool]) -> Option<usize> {
+    (from..parked.len())
+        .find(|&idx| !parked[idx])
+        .or_else(|| (0..from.min(parked.len())).rev().find(|&idx| !parked[idx]))
+}
 
 /// The machine group key of this Mac's workspaces.
 pub const LOCAL_GROUP: &str = "local";
@@ -235,6 +421,269 @@ pub fn next_attention(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn roster(entries: &[(WorkspaceId, bool)]) -> Vec<WorkspaceFact> {
+        entries
+            .iter()
+            .map(|&(id, parked)| WorkspaceFact { id, parked })
+            .collect()
+    }
+
+    fn selected(
+        id: WorkspaceId,
+        facts: &[WorkspaceFact],
+        now: std::time::Instant,
+    ) -> SelectionState {
+        let mut state = SelectionState::default();
+        state.reduce(SelectionEvent::Activate(id), facts, false, now);
+        state
+    }
+
+    #[test]
+    fn explicit_same_invalid_and_closed_ids_close_usage_without_changing_selection() {
+        let now = std::time::Instant::now();
+        let facts = roster(&[(10, false), (20, false)]);
+        for target in [None, Some(10), Some(99)] {
+            for usage_open in [false, true] {
+                let mut state = selected(10, &facts, now);
+                let commands =
+                    state.reduce(SelectionEvent::Select(target), &facts, usage_open, now);
+                assert_eq!(state.active(), Some(10));
+                assert_eq!(
+                    commands,
+                    if usage_open {
+                        vec![SelectionCommand::SetUsageOpen(false)]
+                    } else {
+                        vec![]
+                    }
+                );
+            }
+        }
+        let mut state = selected(20, &facts, now);
+        let remaining = &facts[..1];
+        state.reduce(
+            SelectionEvent::LeftBar {
+                id: 20,
+                index: 1,
+                removed: true,
+            },
+            remaining,
+            true,
+            now,
+        );
+        assert_eq!(state.active(), Some(10));
+        assert_eq!(
+            state.reduce(SelectionEvent::Select(Some(20)), remaining, true, now),
+            [SelectionCommand::SetUsageOpen(false)]
+        );
+        for event in [
+            SelectionEvent::Swipe(20),
+            SelectionEvent::Activate(20),
+            SelectionEvent::Animate(20),
+        ] {
+            assert!(state.reduce(event, remaining, true, now).is_empty());
+            assert_eq!(state.active(), Some(10));
+        }
+    }
+
+    #[test]
+    fn explicit_animates_at_supplied_time_swipe_and_attention_preserve_usage() {
+        let now = std::time::Instant::now();
+        let facts = roster(&[(10, false), (20, false)]);
+        let changed = SelectionCommand::WorkspaceChanged {
+            from: Some(10),
+            to: Some(20),
+        };
+        let animation = SelectionCommand::AnimateTo {
+            from: Some(10),
+            index: 1,
+            at: now,
+        };
+        let mut state = selected(10, &facts, now);
+        assert_eq!(
+            state.reduce(SelectionEvent::Select(Some(20)), &facts, true, now),
+            [SelectionCommand::SetUsageOpen(false), changed, animation]
+        );
+        assert_eq!(state.active(), Some(20));
+        assert!(state
+            .reduce(SelectionEvent::Select(Some(20)), &facts, false, now)
+            .is_empty());
+
+        let mut state = selected(10, &facts, now);
+        assert_eq!(
+            state.reduce(SelectionEvent::Swipe(20), &facts, true, now),
+            [SelectionCommand::WorkspaceChanged {
+                from: Some(10),
+                to: Some(20)
+            }]
+        );
+        assert!(state
+            .reduce(SelectionEvent::Swipe(20), &facts, true, now)
+            .is_empty());
+        let mut state = selected(10, &facts, now);
+        assert_eq!(
+            state.reduce(SelectionEvent::Animate(20), &facts, true, now),
+            [
+                SelectionCommand::WorkspaceChanged {
+                    from: Some(10),
+                    to: Some(20)
+                },
+                SelectionCommand::AnimateTo {
+                    from: Some(10),
+                    index: 1,
+                    at: now
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn usage_toggle_and_close_retain_identity_even_with_no_roster() {
+        let now = std::time::Instant::now();
+        let facts = roster(&[(10, false)]);
+        let mut state = selected(10, &facts, now);
+        for (event, open, expected) in [
+            (SelectionEvent::UsageToggle, false, true),
+            (SelectionEvent::UsageToggle, true, false),
+            (SelectionEvent::UsageClose, true, false),
+            (SelectionEvent::UsageClose, false, false),
+        ] {
+            assert_eq!(
+                state.reduce(event, &[], open, now),
+                [SelectionCommand::SetUsageOpen(expected)]
+            );
+            assert_eq!(state.active(), Some(10));
+        }
+    }
+
+    #[test]
+    fn park_and_close_choose_visible_successor_or_predecessor_and_keep_other_identity() {
+        let now = std::time::Instant::now();
+        let before = roster(&[(10, false), (20, false), (30, false)]);
+        for (active, leaving, index, removed, entries, expected) in [
+            (20, 10, 0, true, vec![(20, false), (30, false)], Some(20)),
+            (20, 20, 1, true, vec![(10, false), (30, false)], Some(30)),
+            (30, 30, 2, true, vec![(10, false), (20, false)], Some(20)),
+            (10, 10, 0, true, vec![(20, true), (30, false)], Some(30)),
+            (
+                20,
+                20,
+                1,
+                false,
+                vec![(10, false), (20, true), (30, false)],
+                Some(30),
+            ),
+            (
+                30,
+                30,
+                2,
+                false,
+                vec![(10, false), (20, true), (30, true)],
+                Some(10),
+            ),
+            (
+                10,
+                20,
+                1,
+                false,
+                vec![(10, false), (20, true), (30, false)],
+                Some(10),
+            ),
+            // The guarded UI never parks the final visible workspace, but keep the old fallbacks.
+            (10, 10, 0, false, vec![(10, true)], Some(10)),
+            (10, 10, 0, true, vec![(20, true)], Some(20)),
+            (10, 10, 0, true, vec![], None),
+        ] {
+            let mut state = selected(active, &before, now);
+            let commands = state.reduce(
+                SelectionEvent::LeftBar {
+                    id: leaving,
+                    index,
+                    removed,
+                },
+                &roster(&entries),
+                true,
+                now,
+            );
+            assert_eq!(
+                state.active(),
+                expected,
+                "active={active} leaving={leaving} removed={removed}"
+            );
+            assert_eq!(
+                commands,
+                if Some(active) == expected {
+                    vec![]
+                } else {
+                    vec![SelectionCommand::WorkspaceChanged {
+                        from: Some(active),
+                        to: expected,
+                    }]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn reorder_and_persistence_resolve_current_identity_skipping_running_parked() {
+        let now = std::time::Instant::now();
+        let before = roster(&[(10, false), (20, true), (30, false)]);
+        let mut state = selected(30, &before, now);
+        assert_eq!(
+            state.reduce(SelectionEvent::Persist, &before, false, now),
+            [SelectionCommand::PersistActiveIndex(1)]
+        );
+        let after = roster(&[(30, false), (10, false), (20, true)]);
+        assert!(state
+            .reduce(SelectionEvent::Reordered, &after, true, now)
+            .is_empty());
+        assert_eq!(state.active(), Some(30));
+        assert_eq!(state.active_index(after.iter().map(|ws| ws.id)), Some(0));
+        assert_eq!(
+            state.reduce(SelectionEvent::Persist, &after, false, now),
+            [SelectionCommand::PersistActiveIndex(0)]
+        );
+        // A parked identity is still addressable; the host's settle path returns it to the bar.
+        state.reduce(SelectionEvent::Select(Some(20)), &after, false, now);
+        assert_eq!(state.active(), Some(20));
+        assert_eq!(
+            state.reduce(SelectionEvent::Persist, &after, false, now),
+            [SelectionCommand::PersistActiveIndex(2)]
+        );
+        assert_eq!(
+            state.reduce(SelectionEvent::Reordered, &[], false, now),
+            [SelectionCommand::WorkspaceChanged {
+                from: Some(20),
+                to: None
+            }]
+        );
+        assert_eq!(state.active_index([10, 30]), None);
+        assert_eq!(
+            state.reduce(SelectionEvent::Persist, &[], false, now),
+            [SelectionCommand::PersistActiveIndex(0)]
+        );
+    }
+
+    #[test]
+    fn resume_requests_status_only_at_existing_continuation_and_activate_is_silent() {
+        let now = std::time::Instant::now();
+        let facts = roster(&[(10, false), (20, true)]);
+        let mut state = selected(10, &facts, now);
+        assert_eq!(
+            state.reduce(SelectionEvent::Activate(20), &facts, true, now),
+            [SelectionCommand::WorkspaceChanged {
+                from: Some(10),
+                to: Some(20)
+            }]
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                state.reduce(SelectionEvent::Resume, &facts, true, now),
+                [SelectionCommand::RefreshStatus]
+            );
+            assert_eq!(state.active(), Some(20));
+        }
+    }
 
     fn chip(group: &str, work: bool) -> BarChip {
         BarChip {

@@ -118,3 +118,14 @@ inventory. Core tests in `crates/gitterm-core/src/status.rs` separately exercise
 reducer commands/state, including both overlapping completion orders. Actual jobs
 still run through Iced Tasks; selection, collector/runtime extraction and GPUI
 integration remain later PRs.
+
+## TRU-290 extraction gate
+
+Selection now lives in the core UID reducer. The same baseline traces and
+persisted JSON expectations remain unchanged; the headless fixture explicitly
+selects its first UID and dispatches activation instead of assigning an index.
+`CALLERS.md` maps every former selection write/read and documents the two Usage
+helper tests migrated to the real adapter. Core workspace tests separately cover
+selection commands, Usage same/invalid targets, swipe/attention differences,
+park/close successors, parked/closed identities, reorder, persistence and resume.
+There are no collector/runtime or GPUI changes in this extraction.

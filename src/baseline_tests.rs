@@ -68,7 +68,7 @@ fn headless(fixture: &Path) -> App {
         repos: RepoRegistry::default(),
         stored_repos: Vec::new(),
         bottom_repo_picker_open: false,
-        active_workspace_idx: 0,
+        selection: SelectionState::default(),
         next_tab_id: 0,
         task_store: None,
         missing_task_worktrees_logged: HashSet::new(),
@@ -314,13 +314,14 @@ fn workspace(name: &str, id: usize) -> Workspace {
     ws.tabs.push(tab);
     ws
 }
-fn app_with_tabs(fixture: &Path) -> App {
+pub(super) fn app_with_tabs(fixture: &Path) -> App {
     let mut app = headless(fixture);
     app.workspaces = vec![
         workspace("alpha", 10),
         workspace("beta", 20),
         workspace("gamma", 30),
     ];
+    app.activate_workspace_at(0);
     app
 }
 fn snapshot(id: usize, root: &str, branch: &str, dirty: bool, repo: bool) -> GitStatusSnapshot {
@@ -404,7 +405,7 @@ fn workspace_selection_traces() {
         app.selected_task_id = Some("missing-task".into());
         Trace::take();
         let _ = app.update_event(Event::WorkspaceSelect(index));
-        assert_eq!(app.active_workspace_idx, selected, "{name}");
+        assert_eq!(app.active_workspace_index(), selected, "{name}");
         assert!(!app.usage_view.open, "{name}");
         assert_eq!(app.editing_run_command, None, "{name}");
         assert_eq!(app.selected_task_id.is_none(), selected != 0, "{name}");
@@ -433,7 +434,7 @@ fn workspace_selection_traces() {
     drop(task);
     assert_eq!(Trace::take(), ["select-command:1"]);
     let _ = app.update_event(Event::WorkspaceSelect(1));
-    assert_eq!(app.active_workspace_idx, 1);
+    assert_eq!(app.active_workspace_index(), 1);
     assert_eq!(requests(), Vec::<String>::new());
 }
 
@@ -450,7 +451,7 @@ fn swipe_park_reorder_and_closed_id_traces() {
     app.viewer_webview = ViewerWebview::PlansViewer;
     let width = app.content_viewport_width();
     let _ = app.update_event(Event::SlideScrolled(width));
-    assert_eq!(app.active_workspace_idx, 1);
+    assert_eq!(app.active_workspace_index(), 1);
     // characterized: swipe leaves Usage and selected task open while explicit selection closes/clears them.
     assert!(app.usage_view.open);
     assert_eq!(app.selected_task_id.as_deref(), Some("selected-task"));
@@ -476,7 +477,7 @@ fn swipe_park_reorder_and_closed_id_traces() {
             parked_at: "2000-01-01T00:00:00Z".into(),
         },
     );
-    assert_eq!(app.active_workspace_idx, 2);
+    assert_eq!(app.active_workspace_index(), 2);
     assert_eq!(app.visible_workspace_order(), [0, 2]);
     assert_eq!(app.workspace_index_by_uid(active_uid), Some(1));
     let _ = app.update_event(Event::WorkspaceSelect(1));
@@ -489,7 +490,7 @@ fn swipe_park_reorder_and_closed_id_traces() {
     };
     app.normalize_workspace_order();
     assert_eq!(app.active_workspace().unwrap().uid, active_uid);
-    assert_eq!(app.active_workspace_idx, 0);
+    assert_eq!(app.active_workspace_index(), 0);
     let gone = app.workspaces[2].uid;
     app.workspaces.remove(2);
     assert_eq!(app.workspace_index_by_uid(gone), None);
@@ -582,7 +583,7 @@ fn status_backoff_completion_and_error_traces() {
             requests(),
             ["local:10:/fixture/alpha", "local:10:/fixture/alpha"]
         );
-        app.active_workspace_idx = 1; // completion is tab addressed, even when inactive.
+        app.activate_workspace_at(1); // completion is tab addressed, even when inactive.
         for branch in order {
             apply(
                 &mut app,
@@ -850,7 +851,7 @@ fn removed_followed_tree_and_source_failure_traces() {
         app.workspaces[0].tabs[0].status.last_git_status_hash = Some(123);
         app.workspaces[0].tabs[0].files.dir = SourcePath::Local(missing.join("sub"));
         if !active {
-            app.active_workspace_idx = 1;
+            app.activate_workspace_at(1);
         }
         Trace::take();
         apply(
@@ -1110,7 +1111,7 @@ fn stopping_park_preserves_identity_and_resume_request_prelude() {
     let _trace = Trace::start();
     for parked in [0, 1] {
         let mut app = app_with_tabs(fixture.path());
-        app.active_workspace_idx = 1;
+        app.activate_workspace_at(1);
         let selected = app.workspaces[1].uid;
         let _ = app.park_stopping(
             parked,

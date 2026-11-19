@@ -205,7 +205,7 @@ impl App {
                 }
             }
             IssueEvent::GroupToggle(group) => {
-                if let Some(ws) = self.workspaces.get_mut(self.active_workspace_idx) {
+                if let Some(ws) = self.active_workspace_mut() {
                     if let Some(index) = ws
                         .collapsed_issue_groups
                         .iter()
