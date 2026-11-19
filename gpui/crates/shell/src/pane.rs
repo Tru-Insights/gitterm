@@ -12,6 +12,7 @@ pub const PANEL_NAME: &str = "GitTermShellPane";
 #[derive(Clone)]
 pub enum PaneKind {
     Terminal,
+    CenterTerminal(std::path::PathBuf),
     Chat,
     Git,
     Files,
@@ -38,11 +39,14 @@ pub struct Pane {
     pub title: String,
     pub content: PaneContent,
     terminal_title: Option<String>,
+    center_terminal: bool,
+    exited: bool,
     terminal_cwd: Option<std::path::PathBuf>,
     workspace: WorkspaceId,
     data: Rc<dyn ShellData>,
     focus: FocusHandle,
     files: Option<Entity<crate::files_view::FilesView>>,
+    _terminal_events: Option<Subscription>,
 }
 impl Pane {
     pub fn new(
@@ -55,9 +59,12 @@ impl Pane {
         cx: &mut Context<Self>,
     ) -> Self {
         let content = match kind.clone() {
-            PaneKind::Terminal => {
+            PaneKind::Terminal | PaneKind::CenterTerminal(_) => {
                 let launch = TerminalLaunch {
-                    cwd: data.terminal_cwd(workspace, cx).or_else(dirs::home_dir),
+                    cwd: match &kind {
+                        PaneKind::CenterTerminal(cwd) => Some(cwd.clone()),
+                        _ => data.terminal_cwd(workspace, cx).or_else(dirs::home_dir),
+                    },
                     ..Default::default()
                 };
                 // Headless fixtures must not run host rc/session-restore scripts.
@@ -72,11 +79,18 @@ impl Pane {
                 } else {
                     let pane = cx.weak_entity();
                     let cwd_pane = pane.clone();
+                    let exit_pane = pane.clone();
                     PaneContent::Terminal(cx.new(|cx| {
                         TerminalView::launch(launch, TerminalConfig::default(), cx)
                             .with_title_callback(move |_, cx, title| {
                                 let _ = pane.update(cx, |pane, cx| {
                                     pane.terminal_title = Some(title.to_string());
+                                    cx.notify();
+                                });
+                            })
+                            .with_exit_callback(move |_, cx| {
+                                _ = exit_pane.update(cx, |pane, cx| {
+                                    pane.exited = true;
                                     cx.notify();
                                 });
                             })
@@ -107,11 +121,29 @@ impl Pane {
         if let PaneContent::Error(error) = &content {
             eprintln!("{error}");
         }
+        let terminal_events = if matches!(kind, PaneKind::CenterTerminal(_)) {
+            if let PaneContent::Terminal(view) = &content {
+                Some(cx.observe_in(view, window, |_, view, window, cx| {
+                    let view = view.clone();
+                    // Callbacks update this pane, so deliver after its observer releases it.
+                    window.defer(cx, move |window, cx| {
+                        view.update(cx, |view, cx| view.process_events(window, cx));
+                    });
+                }))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         Self {
+            _terminal_events: terminal_events,
             id,
             title,
             content,
             terminal_title: None,
+            center_terminal: matches!(kind, PaneKind::CenterTerminal(_)),
+            exited: false,
             terminal_cwd,
             workspace,
             data: data.clone(),
@@ -119,6 +151,11 @@ impl Pane {
             files: matches!(kind, PaneKind::Files).then(|| {
                 cx.new(|cx| crate::files_view::FilesView::new(workspace, data.clone(), cx))
             }),
+        }
+    }
+    pub(crate) fn close_terminal(&mut self, cx: &mut App) {
+        if let PaneContent::Terminal(view) = &self.content {
+            view.update(cx, |view, _| view.backend_mut().cancel());
         }
     }
     pub(crate) fn status_view(&self, cx: &App) -> crate::data::GitStatus {
@@ -131,6 +168,13 @@ impl Pane {
                 .as_deref()
                 .filter(|t| !t.is_empty())
                 .unwrap_or(&self.title);
+            if self.center_terminal {
+                return if self.exited {
+                    format!("{title} · Exited")
+                } else {
+                    title.to_string()
+                };
+            }
             match &self.terminal_cwd {
                 Some(cwd) => format!("{title} · {}", cwd.display()),
                 None => title.to_string(),

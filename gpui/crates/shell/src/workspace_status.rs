@@ -12,6 +12,9 @@ pub struct LocalWorkspace {
     pub folder: PathBuf,
     pub root: PathBuf,
     pub status: GitStatusState,
+    /// False until the first status result arrives. Only the active workspace
+    /// is polled (as in Iced), so others show placeholders until visited.
+    pub checked: bool,
 }
 #[derive(Debug)]
 pub enum Intent {
@@ -74,6 +77,7 @@ impl WorkspaceStatus {
             root: folder.clone(),
             folder,
             status: GitStatusState::new(name, false, now),
+            checked: false,
         });
         id
     }
@@ -84,13 +88,14 @@ impl WorkspaceStatus {
         self.workspaces.iter().map(|w| w.folder.clone()).collect()
     }
     pub fn status_view(&self, id: WorkspaceId) -> GitStatus {
-        let status = &self
+        let workspace = self
             .workspaces
             .iter()
             .find(|w| w.id == id)
-            .expect("owned workspace")
-            .status;
+            .expect("owned workspace");
+        let status = &workspace.status;
         GitStatus {
+            checked: workspace.checked,
             repository: status.repo_name.clone(),
             branch: status.branch_name.clone(),
             loading: status.git_status_loading,
@@ -154,6 +159,7 @@ impl WorkspaceStatus {
                     workspace.root = snapshot.repo_path.clone();
                     workspace.status.reduce(StatusEvent::Reset, now);
                 }
+                workspace.checked = true;
                 workspace
                     .status
                     .reduce(StatusEvent::Completed(snapshot), now);
