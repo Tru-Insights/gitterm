@@ -76,7 +76,7 @@ use gitterm::task_mcp::{
 };
 use gitterm::task_worktree::{
     discover_task_delivery, inspect_task_cleanup, open_task_draft_pr, pr_base_branch,
-    prepare_task_worktree, prune_worktrees, push_task_branch, remove_task_worktree,
+    prepare_resolved_task_worktree, prune_worktrees, push_task_branch, remove_task_worktree,
     resolve_task_preparation, resolve_worktree_adoption, suggested_task_branch,
     suggested_task_worktree_path, AdoptWorktreeRequest, AdoptedWorktreeResolution, CleanupContext,
     CleanupInspection, CleanupRisk, DeliveryDiscovery, PrepareTaskWorktreeRequest,
@@ -4893,7 +4893,6 @@ pub struct PendingTaskLaunch {
     issue_key: Option<String>,
     stopping_boundary: StoppingBoundary,
     resolved_worktree_path: Option<PathBuf>,
-    base_resolution_note: Option<String>,
     request: PrepareTaskWorktreeRequest,
     control_reply: Option<TaskControlReply>,
     /// `session_uid` of the tab whose MCP call created this task, recorded
@@ -13330,7 +13329,6 @@ impl App {
             issue_key,
             stopping_boundary,
             resolved_worktree_path: None,
-            base_resolution_note: None,
             request,
             control_reply: Some(reply),
             creator_session_id: caller,
@@ -28487,7 +28485,6 @@ fi
                     issue_key,
                     stopping_boundary: form.stopping_boundary,
                     resolved_worktree_path: None,
-                    base_resolution_note: None,
                     request: request.clone(),
                     control_reply: None,
                     creator_session_id: None,
@@ -28518,7 +28515,6 @@ fi
                     }
                 };
                 pending.workspace_dir = resolved.repository.top_level.clone();
-                pending.base_resolution_note = resolved.note.clone();
                 let timestamp = chrono::Utc::now().to_rfc3339();
                 let mut record = TaskRecord::new_draft(
                     NewTaskRecord {
@@ -28590,13 +28586,13 @@ fi
                         tab.sidebar_mode = SidebarMode::Tasks;
                     }
                 }
-                let request = pending.request.clone();
-                return Task::perform(prepare_task_worktree(request), move |result| {
+                return Task::perform(prepare_resolved_task_worktree(resolved), move |result| {
                     Event::TaskWorktreePrepared(pending, result.map_err(|error| error.to_string()))
                 });
             }
             Event::TaskWorktreePrepared(pending, result) => match result {
                 Ok(prepared) => {
+                    let base_resolution_note = prepared.note.clone();
                     let persisted = self.task_store.as_mut().map(|store| {
                         store.complete_worktree_preparation(
                             &pending.task_id,
@@ -28613,7 +28609,7 @@ fi
                                     &pending.task_id,
                                     worker,
                                     reply.clone(),
-                                    pending.base_resolution_note.clone(),
+                                    base_resolution_note.clone(),
                                 );
                             }
                             if let Some(reply) = &pending.control_reply {
@@ -28630,7 +28626,7 @@ fi
                                     })
                                     .and_then(|task| {
                                         self.task_control_value(&task).map(|mut value| {
-                                            if let Some(note) = &pending.base_resolution_note {
+                                            if let Some(note) = &base_resolution_note {
                                                 value["detail"] =
                                                     serde_json::Value::String(note.clone());
                                             }

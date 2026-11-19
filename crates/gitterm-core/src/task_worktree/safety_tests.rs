@@ -56,11 +56,10 @@ fn failed_checkout_rolls_back_the_created_branch_and_worktree() {
 fn rollback_preserves_changes_created_after_checkout() {
     let repository = TestRepository::new();
     let request = repository.request("changed-rollback", None, "Preserve changes", "main");
-    let proposal = resolve_task_preparation_blocking(&request)
-        .unwrap()
-        .proposal;
+    let resolved = resolve_task_preparation_blocking(&request).unwrap();
+    let proposal = resolved.proposal.clone();
 
-    let error = prepare_task_worktree_with(&request, || {
+    let error = prepare_resolved_task_worktree_with(resolved, || {
         fs::write(proposal.path.join("keep.txt"), "keep my work\n").unwrap();
         Err("injected verification failure".to_string())
     })
