@@ -6,6 +6,8 @@ rust-version = "1.99"
 publish = false
 
 [target.'cfg(target_os = "macos")'.dependencies]
+gitterm-core = { path = "../../../crates/gitterm-core", features = ["runtime"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 gitterm-terminal = { path = "../terminal" }
 gitterm-gpui-chat = { path = "../chat" }
 gpui-kit = "=0.9.1"

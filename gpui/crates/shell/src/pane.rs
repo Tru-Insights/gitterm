@@ -58,7 +58,7 @@ impl Pane {
         let content = match kind {
             PaneKind::Terminal => {
                 let launch = TerminalLaunch {
-                    cwd: dirs::home_dir(),
+                    cwd: data.terminal_cwd(workspace, cx).or_else(dirs::home_dir),
                     ..Default::default()
                 };
                 // Headless fixtures must not run host rc/session-restore scripts.
@@ -101,6 +101,9 @@ impl Pane {
             PaneKind::Git => PaneContent::Git,
             PaneKind::Files => PaneContent::Files,
         };
+        let terminal_cwd = matches!(content, PaneContent::Terminal(_))
+            .then(|| data.terminal_cwd(workspace, cx).or_else(dirs::home_dir))
+            .flatten();
         if let PaneContent::Error(error) = &content {
             eprintln!("{error}");
         }
@@ -109,12 +112,15 @@ impl Pane {
             title,
             content,
             terminal_title: None,
-            terminal_cwd: dirs::home_dir(),
+            terminal_cwd,
             workspace,
             data,
             focus: cx.focus_handle(),
             expanded: HashSet::from(["src".into()]),
         }
+    }
+    pub(crate) fn status_view(&self, cx: &App) -> crate::data::GitStatus {
+        self.data.status(self.workspace, cx)
     }
     pub(crate) fn tab_title(&self) -> String {
         if matches!(self.content, PaneContent::Terminal(_)) {
@@ -261,12 +267,22 @@ impl Render for Pane {
                 .child(view.clone()),
             PaneContent::Error(error) => body.text_color(rgb(p.red)).child(error.clone()),
             PaneContent::Git => {
-                let status = self.data.status(self.workspace);
+                let status = self.status_view(cx);
                 body.child(status.repository)
                     .child(
                         div()
                             .text_color(rgb(p.muted))
                             .child(format!("⑂ {}", status.branch)),
+                    )
+                    .children(status.loading.then(|| div().child("Loading Git status…")))
+                    .children(
+                        status
+                            .error
+                            .map(|error| div().text_color(rgb(p.red)).child(error)),
+                    )
+                    .children(
+                        (!status.loading && !status.is_git_repo)
+                            .then(|| div().child("Not a Git repository")),
                     )
                     .child(format!("Changes · {}", status.files.len()))
                     .children(status.files.into_iter().map(|file| {
@@ -292,8 +308,8 @@ impl Render for Pane {
                     }))
             }
             PaneContent::Files => body
-                .child(self.data.status(self.workspace).repository)
-                .children(self.files(self.data.files(self.workspace), "", 0, p, cx)),
+                .child(self.data.status(self.workspace, cx).repository)
+                .children(self.files(self.data.files(self.workspace, cx), "", 0, p, cx)),
         }
     }
 }

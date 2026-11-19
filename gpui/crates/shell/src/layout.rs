@@ -58,8 +58,26 @@ impl LayoutStore {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(e.into()),
             };
-            let state: DockAreaState = serde_json::from_slice(&bytes)?;
-            validate(&state, known)?;
+            let mut state: DockAreaState = serde_json::from_slice(&bytes)?;
+            validate(&state)?;
+            prune_unknown(&mut state.center, known);
+            for dock in [
+                &mut state.left_dock,
+                &mut state.right_dock,
+                &mut state.bottom_dock,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let mut panel = dock.panel().clone();
+                prune_unknown(&mut panel, known);
+                *dock = gpui_component::dock::DockState::new(
+                    panel,
+                    dock.placement(),
+                    dock.size(),
+                    dock.open(),
+                );
+            }
             Ok(Some(state))
         })()
         .with_context(|| format!("load dock layout {}", self.path.display()));
@@ -91,18 +109,13 @@ impl LayoutStore {
     }
 }
 
-fn validate(state: &DockAreaState, known: &HashSet<String>) -> Result<()> {
+fn validate(state: &DockAreaState) -> Result<()> {
     ensure!(
         state.version == Some(1),
         "unsupported dock layout version {:?}",
         state.version
     );
-    fn visit(
-        node: &PanelState,
-        known: &HashSet<String>,
-        seen: &mut HashSet<String>,
-        depth: usize,
-    ) -> Result<()> {
+    fn visit(node: &PanelState, seen: &mut HashSet<String>, depth: usize) -> Result<()> {
         ensure!(depth < 32, "dock layout nesting exceeds 32 levels");
         match &node.info {
             PanelInfo::Panel(value) => {
@@ -112,7 +125,6 @@ fn validate(state: &DockAreaState, known: &HashSet<String>) -> Result<()> {
                     node.panel_name
                 );
                 let id: String = serde_json::from_value(value.clone())?;
-                ensure!(known.contains(&id), "unknown pane ID {id}");
                 ensure!(seen.insert(id.clone()), "duplicate pane ID {id}");
             }
             PanelInfo::Stack { sizes, axis } => {
@@ -141,12 +153,12 @@ fn validate(state: &DockAreaState, known: &HashSet<String>) -> Result<()> {
             }
         }
         for child in &node.children {
-            visit(child, known, seen, depth + 1)?;
+            visit(child, seen, depth + 1)?;
         }
         Ok(())
     }
     let mut seen = HashSet::new();
-    visit(&state.center, known, &mut seen, 0)?;
+    visit(&state.center, &mut seen, 0)?;
     for (dock, placement) in [
         (&state.left_dock, DockPlacement::Left),
         (&state.right_dock, DockPlacement::Right),
@@ -159,10 +171,62 @@ fn validate(state: &DockAreaState, known: &HashSet<String>) -> Result<()> {
                     && dock.size() > gpui::px(0.),
                 "invalid dock geometry"
             );
-            visit(dock.panel(), known, &mut seen, 0)?;
+            visit(dock.panel(), &mut seen, 0)?;
         }
     }
     Ok(())
+}
+
+/// Remove panes that no longer exist while retaining the remaining dock tree.
+fn prune_unknown(node: &mut PanelState, known: &HashSet<String>) -> bool {
+    if let PanelInfo::Panel(value) = &node.info {
+        return value.as_str().is_some_and(|id| known.contains(id));
+    }
+    let old_children = std::mem::take(&mut node.children);
+    let mut kept = Vec::with_capacity(old_children.len());
+    let mut kept_indices = Vec::with_capacity(old_children.len());
+    for (index, mut child) in old_children.into_iter().enumerate() {
+        if prune_unknown(&mut child, known) {
+            kept.push(child);
+            kept_indices.push(index);
+        }
+    }
+    match &mut node.info {
+        PanelInfo::Stack { sizes, .. } => {
+            let old_sizes = std::mem::take(sizes);
+            *sizes = kept_indices
+                .iter()
+                .filter_map(|index| old_sizes.get(*index).copied())
+                .collect();
+        }
+        PanelInfo::Tabs { active_index } => {
+            *active_index = kept_indices
+                .iter()
+                .position(|index| index == active_index)
+                .unwrap_or(0);
+        }
+        PanelInfo::Panel(_) => unreachable!(),
+    }
+    node.children = kept;
+    true
+}
+
+pub fn workspace_layout_key(path: &Path) -> String {
+    format!("workspace-{:016x}", stable_path_hash(path))
+}
+
+pub fn stable_path_hash(path: &Path) -> u64 {
+    // FNV-1a is used here because DefaultHasher does not promise stable output.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in path.as_os_str().as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+pub fn workspace_layout_path(config_dir: &Path, workspace_key: &str) -> PathBuf {
+    config_dir.join(format!("layout-{workspace_key}.json"))
 }
 
 #[cfg(test)]
@@ -226,11 +290,121 @@ mod tests {
     #[test]
     fn reject_unknown_or_duplicate_identity() {
         let mut state = fixture();
-        assert!(validate(&state, &HashSet::new()).is_err());
+        assert!(validate(&state).is_ok());
         let leaf = state.bottom_dock.as_ref().unwrap().panel().children[0].clone();
         state.center.children = vec![leaf.clone(), leaf];
         state.center.info = PanelInfo::tabs(0);
-        assert!(validate(&state, &HashSet::from(["session-11".into()])).is_err());
+        assert!(validate(&state).is_err());
+    }
+    #[test]
+    fn unknown_panes_are_dropped_and_layout_remains_saveable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        let mut state = fixture();
+        let known = PanelState {
+            panel_name: PANEL_NAME.into(),
+            children: vec![],
+            info: PanelInfo::panel(serde_json::json!("session-12")),
+        };
+        let tabs = state.bottom_dock.as_mut().unwrap().panel().clone();
+        let mut tabs = tabs;
+        tabs.children.push(known);
+        tabs.info = PanelInfo::tabs(1);
+        state.bottom_dock = Some(DockState::new(
+            tabs,
+            DockPlacement::Bottom,
+            gpui::px(280.),
+            true,
+        ));
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        let mut store = LayoutStore::new(path.clone());
+        let mut loaded = store
+            .load(&HashSet::from(["session-12".into()]))
+            .unwrap()
+            .unwrap();
+        let bottom = loaded.bottom_dock.as_mut().unwrap().panel();
+        assert_eq!(bottom.children.len(), 1);
+        assert_eq!(
+            bottom.children[0].info,
+            PanelInfo::panel(serde_json::json!("session-12"))
+        );
+        store.save(&loaded).unwrap();
+        assert!(serde_json::from_slice::<DockAreaState>(&std::fs::read(path).unwrap()).is_ok());
+    }
+    #[test]
+    fn workspace_layout_keys_are_stable_and_folder_specific() {
+        let first = Path::new("/work/one");
+        let second = Path::new("/work/two");
+        assert_eq!(workspace_layout_key(first), workspace_layout_key(first));
+        assert_ne!(workspace_layout_key(first), workspace_layout_key(second));
+    }
+    #[test]
+    fn sample_and_local_layouts_and_local_folders_use_separate_files() {
+        let config = tempfile::tempdir().unwrap();
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let sample_dir = config.path().join("sample");
+        let first_key = workspace_layout_key(first_dir.path());
+        let second_key = workspace_layout_key(second_dir.path());
+        let first_path = workspace_layout_path(config.path(), &first_key);
+        let second_path = workspace_layout_path(config.path(), &second_key);
+        let sample_path = workspace_layout_path(&sample_dir, "1");
+
+        std::fs::write(config.path().join("layout-1.json"), "legacy").unwrap();
+        let first = fixture();
+        let mut second = fixture();
+        second.bottom_dock = None;
+        let known = HashSet::from(["session-11".into()]);
+        for (path, state) in [
+            (&first_path, &first),
+            (&second_path, &second),
+            (&sample_path, &first),
+        ] {
+            let store = LayoutStore::new(path.clone());
+            store.save(state).unwrap();
+        }
+
+        assert_ne!(first_path, second_path);
+        assert_ne!(first_path, sample_path);
+        assert_ne!(second_path, sample_path);
+        assert_eq!(
+            std::fs::read_to_string(config.path().join("layout-1.json")).unwrap(),
+            "legacy"
+        );
+
+        let mut first_store = LayoutStore::new(first_path);
+        let mut second_store = LayoutStore::new(second_path);
+        let mut sample_store = LayoutStore::new(sample_path);
+        assert!(
+            first_store
+                .load(&known)
+                .unwrap()
+                .unwrap()
+                .bottom_dock
+                .is_some()
+        );
+        assert!(
+            second_store
+                .load(&known)
+                .unwrap()
+                .unwrap()
+                .bottom_dock
+                .is_none()
+        );
+        assert!(
+            sample_store
+                .load(&known)
+                .unwrap()
+                .unwrap()
+                .bottom_dock
+                .is_some()
+        );
+        // Removing the first folder does not change the second folder's key.
+        assert_eq!(
+            workspace_layout_path(config.path(), &second_key),
+            workspace_layout_path(config.path(), &workspace_layout_key(second_dir.path()))
+        );
     }
     #[test]
     fn config_is_gpui_specific_and_rejects_v6_and_relative_paths() {

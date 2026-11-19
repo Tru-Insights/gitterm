@@ -2,10 +2,6 @@ use gpui::*;
 use gpui_component::Root;
 
 pub fn run() {
-    if !std::env::args().any(|arg| arg == "--terminal") {
-        gitterm_gpui_shell::run();
-        return;
-    }
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         cx.open_window(
