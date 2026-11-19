@@ -20,3 +20,8 @@ pub mod review;
 pub mod tasks;
 #[cfg(feature = "runtime")]
 pub mod worker_process;
+
+#[cfg(feature = "runtime")]
+pub mod gh_identity;
+#[cfg(feature = "runtime")]
+pub mod task_worktree;
