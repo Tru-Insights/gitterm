@@ -253,6 +253,7 @@ fn collapse_diff_and_replay_preserve_find(cx: &mut TestAppContext) {
     draw(cx);
     chat.update_in(cx, |view, window, cx| {
         view.open_find(&Find, window, cx);
+        view.toggle_find_tools(window, cx);
     });
     cx.simulate_input("saturating_add");
     draw(cx);

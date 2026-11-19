@@ -1,3 +1,7 @@
+#[path = "find.rs"]
+mod find;
+use find::TranscriptFind;
+
 use crate::{
     ChatIntent,
     cards::CardView,
@@ -6,9 +10,9 @@ use crate::{
 };
 use gpui::{
     App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, Entity, FocusHandle, Focusable,
-    HighlightStyle, InteractiveElement, IntoElement, KeyBinding, ParentElement, Render,
-    StyleRefinement, Styled, StyledText, Subscription, Task, TitlebarOptions, Window, WindowBounds,
-    WindowOptions, actions, base::TextSelection, div, prelude::FluentBuilder, px, rgb, size,
+    InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, StyleRefinement, Styled,
+    Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions,
+    base::TextSelection, div, prelude::FluentBuilder, px, rgb, size,
 };
 use gpui_component::{
     Disableable, Root, Sizable, WindowExt,
@@ -119,7 +123,7 @@ pub struct ChatView {
     row_views: Vec<Option<Entity<RowView>>>,
     scroller: Entity<MessageScrollerState>,
     find_input: Entity<InputState>,
-    find: FindState,
+    find: TranscriptFind,
     find_open: bool,
     focus: FocusHandle,
     replay: Option<Task<()>>,
@@ -136,11 +140,9 @@ impl ChatView {
             window,
             |this, input, event, window, cx| match event {
                 InputEvent::Change => {
-                    this.find
-                        .search(&this.model, input.read(cx).value().to_string());
-                    this.reveal_match(window, cx);
+                    this.change_find(input.read(cx).value().to_string(), window, cx)
                 }
-                InputEvent::PressEnter { secondary, .. } => this.navigate(*secondary, window, cx),
+                InputEvent::PressEnter { shift, .. } => this.navigate(*shift, window, cx),
                 _ => {}
             },
         )];
@@ -183,7 +185,7 @@ impl ChatView {
             model,
             scroller,
             find_input,
-            find: FindState::default(),
+            find: TranscriptFind::default(),
             find_open: false,
             focus,
             replay: None,
@@ -308,63 +310,6 @@ impl ChatView {
         self.update_row_find(index, cx);
         view
     }
-    fn update_row_find(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Some(view) = &self.row_views[index] {
-            let query = if self.find_open {
-                self.find.query.clone()
-            } else {
-                String::new()
-            };
-            let active = self
-                .find
-                .active()
-                .filter(|found| found.row == index)
-                .map(|found| found.occurrence);
-            view.update(cx, |view, cx| {
-                view.query = query;
-                view.active = active;
-                view.highlight(cx);
-                cx.notify();
-            });
-        }
-    }
-    fn reveal_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for index in 0..self.row_views.len() {
-            self.update_row_find(index, cx);
-        }
-        if let Some(found) = self.find.active().cloned() {
-            let view = self.row(found.row, window, cx);
-            view.update(cx, |view, cx| {
-                view.open = true;
-                view.reveal_pending = true;
-                view.highlight_signature = None;
-                view.highlight(cx);
-            });
-            self.scroller.update(cx, |state, cx| {
-                state.remeasure_items(found.row..found.row + 1, cx);
-                state.scroll_to_item(found.row, cx);
-            });
-        }
-        cx.notify();
-    }
-    fn navigate(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.find.step(backwards);
-        self.reveal_match(window, cx);
-    }
-    fn open_find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
-        self.find_open = true;
-        self.find_input
-            .update(cx, |state, cx| state.focus(window, cx));
-        self.reveal_match(window, cx);
-    }
-    fn close_find(&mut self, _: &CloseFind, window: &mut Window, cx: &mut Context<Self>) {
-        self.find_open = false;
-        self.focus.focus(window, cx);
-        for index in 0..self.row_views.len() {
-            self.update_row_find(index, cx);
-        }
-        cx.notify();
-    }
     fn copy(&mut self, markdown: bool, window: &mut Window, cx: &mut Context<Self>) {
         // Let the find input keep the platform's normal editing clipboard behavior.
         if window.has_focused_input(cx) {
@@ -413,7 +358,7 @@ impl ChatView {
         self.new_messages = false;
         self.replay_position = 0;
         self.scroller.update(cx, |state, cx| state.reset(0, cx));
-        self.find.search(&self.model, self.find.query.clone());
+        self.reset_find(cx);
         let records = self.records.clone();
         self.replay = Some(cx.spawn(async move |this, cx| {
             for record in records.iter() {
@@ -475,7 +420,7 @@ impl ChatView {
                 view.update(cx, |view, cx| view.set_row(row, cx));
             }
         }
-        if !self.find.query.is_empty() {
+        if self.find_open && !self.find.query.is_empty() {
             self.find.refresh(&self.model, &changed);
             for index in 0..self.row_views.len() {
                 self.update_row_find(index, cx);
@@ -554,34 +499,7 @@ impl Render for ChatView {
                             .on_click(cx.listener(Self::start_replay)),
                     ),
             )
-            .when(self.find_open, |view| {
-                view.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .p(px(6.))
-                        .bg(rgb(0x2a2b3d))
-                        .rounded(px(8.))
-                        .child(div().flex_1().child(Input::new(&self.find_input)))
-                        .child(format!(
-                            "{} of {}",
-                            self.find.current.map_or(0, |index| index + 1),
-                            self.find.matches.len()
-                        ))
-                        .child(Button::new("previous").small().label("Previous").on_click(
-                            cx.listener(|this, _, window, cx| this.navigate(true, window, cx)),
-                        ))
-                        .child(Button::new("next").small().label("Next").on_click(
-                            cx.listener(|this, _, window, cx| this.navigate(false, window, cx)),
-                        ))
-                        .child(Button::new("close-find").small().label("Close").on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.close_find(&CloseFind, window, cx)
-                            }),
-                        )),
-                )
-            })
+            .when(self.find_open, |view| view.child(self.find_bar(cx)))
             .child(
                 div()
                     .flex_1()
@@ -760,42 +678,6 @@ impl RowView {
             }
         }
     }
-    fn highlight(&mut self, cx: &mut Context<Self>) {
-        let query = self.query.clone();
-        let title_count = find_ranges(&self.row.title, &query).len();
-        let active = self.active.and_then(|index| index.checked_sub(title_count));
-        let reveal = self.reveal_pending;
-        let rendered = self.text.read(cx).rendered_text();
-        let mut signature = std::hash::DefaultHasher::new();
-        (rendered.as_str(), &query, active).hash(&mut signature);
-        let signature = signature.finish();
-        // Native highlight updates notify observers; avoid a render/notify cycle.
-        if self.highlight_signature == Some(signature) {
-            return;
-        }
-        self.highlight_signature = Some(signature);
-        let revealed = self.text.update(cx, |text, cx| {
-            let rendered = text.rendered_text();
-            let ranges = find_ranges(rendered.as_str(), &query);
-            let available = active.is_none() || active.is_some_and(|index| index < ranges.len());
-            let mut highlights: Vec<_> = ranges
-                .iter()
-                .cloned()
-                .map(|range| RangeHighlight::new(range, rgb(0x665c32)))
-                .collect();
-            if let Some(range) = active.and_then(|index| ranges.get(index)) {
-                highlights.push(RangeHighlight::new(range.clone(), rgb(0x9a6a28)));
-                if reveal {
-                    _ = text.reveal_range(range.clone(), cx);
-                }
-            }
-            // All ranges were computed against this very revision, never source byte offsets.
-            text.set_range_highlights(highlights, cx)
-                .expect("current rendered ranges");
-            available
-        });
-        self.reveal_pending = reveal && !revealed;
-    }
     fn copy_code(&mut self, key: usize, code: String, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(code));
         self.copied.insert(key);
@@ -886,20 +768,10 @@ impl Render for RowView {
                     }),
             );
         let content = content.children(self.card.clone());
-        let header_highlights =
-            find_ranges(&self.row.title, &self.query)
-                .into_iter()
-                .map(|range| {
-                    (
-                        range,
-                        HighlightStyle {
-                            background_color: Some(rgb(0x665c32).into()),
-                            ..Default::default()
-                        },
-                    )
-                });
-        let title = StyledText::new(self.row.title.clone()).with_highlights(header_highlights);
-        let header = div().text_size(px(13.)).text_color(rgb(color)).child(title);
+        let header = div()
+            .text_size(px(13.))
+            .text_color(rgb(color))
+            .child(self.row.title.clone());
         div()
             .id(("row", self.row.id))
             .w_full()
@@ -937,10 +809,6 @@ impl Render for RowView {
                     .child(
                         Button::new("fold")
                             .small()
-                            .when(
-                                !find_ranges(&self.row.title, &self.query).is_empty(),
-                                |button| button.bg(rgb(0x665c32)),
-                            )
                             .label(format!(
                                 "{} {}",
                                 if self.open { "▾" } else { "▸" },
