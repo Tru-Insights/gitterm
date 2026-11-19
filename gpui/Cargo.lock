@@ -2601,6 +2601,8 @@ dependencies = [
  "gpui-pre",
  "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

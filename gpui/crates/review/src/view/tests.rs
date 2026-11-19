@@ -230,3 +230,37 @@ fn snapshot_replacement_clears_changed_viewed_mark_and_updates_rendered_diff(
         assert_eq!(v.diff.as_ref().unwrap().read(cx).files()[0].additions(), 1);
     });
 }
+
+#[gpui::test]
+fn repo_backed_view_renders_real_files_and_hunks(cx: &mut TestAppContext) {
+    let dir = crate::repo::tests::fixture();
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let (snapshot, patches) = executor
+        .block_on(crate::repo::load(executor.handle(), 9, dir.path().into()))
+        .unwrap();
+    let model = ReviewModel::new(&snapshot, &patches).unwrap();
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        init(cx);
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(model, window, cx));
+    draw(cx);
+    for (index, status, additions, deletions) in [
+        (0, DiffFileStatus::Modified, 1, 1),
+        (1, DiffFileStatus::Renamed, 0, 0),
+        (2, DiffFileStatus::Modified, 1, 1),
+        (3, DiffFileStatus::Added, 1, 0),
+    ] {
+        view.update_in(cx, |v, window, cx| v.select(index, window, cx));
+        draw(cx);
+        view.read_with(cx, |v, cx| {
+            assert!(v.diff_error.is_none(), "{:?}", v.diff_error);
+            let file = &v.diff.as_ref().unwrap().read(cx).files()[0];
+            assert_eq!(file.path().as_str(), v.model.files[index].key.1);
+            assert_eq!(file.status(), status);
+            assert_eq!((file.additions(), file.deletions()), (additions, deletions));
+        });
+    }
+}

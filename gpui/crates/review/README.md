@@ -1,4 +1,4 @@
-# Native fixture review (TRU-274 stage 4a)
+# Native review (TRU-274)
 
 `gitterm-gpui --review gpui/crates/review/fixtures/showcase` opens a standalone
 native review window. This is a display-only fixture demo: no git calls, runtime
@@ -25,7 +25,27 @@ ends); these shortcuts also work with the diff body focused. **Option+V** or
 for this fixture session. `ReviewModel::replace` (also exposed on `ReviewView`) preserves marks, expansion and
 selection across reorder, clearing viewed/expanded state for any entry whose
 exact patch changes. Removing an entry drops its state. There is no persistence
-or patch hashing, and no runtime adapter is introduced at this stage.
+or patch hashing; repo-backed replacement uses the complete collected patch too.
+
+## Local repository source
+
+`gitterm-gpui --review-repo /absolute/path/to/repo` opens a standalone repo-backed
+review. A host-owned Tokio executor runs status and per-file diff jobs through
+`gitterm-core` with `spawn_blocking`; there is no new polling clock. Untracked
+directory status entries expand into individual files. Staged and unstaged
+patches stay separate. Collection errors are displayed with the operation/path.
+This route reads the repo once; the shell file-click hook is a later change.
+Status retains the Iced collector's characterized unusual-filename limitations.
+
+The legacy Iced line-preview collector moved verbatim into `git_diff` and is
+re-exported by `agentd::git`. The full-patch API additionally retains rename and
+binary headers, whitespace, and content past the initial large-file display
+limits. `DiffRuntime::collect_diff` accepts an owner and `DiffRequest` and returns
+a correlation `JobId`; its receiver emits one completed/cancelled outcome.
+It shares status jobs' cancellation, removed-owner discard, and explicit teardown.
+
+Both lockfiles only gain edges to already-resolved packages: core's test-only
+`tempfile`, and review's `tokio` plus test-only `tempfile`. No package versions change.
 
 ## Synthetic fixture format
 
@@ -51,15 +71,13 @@ large patch with `python3 gpui/crates/review/fixtures/generate_large.py`.
 From the repository root (no app launch or OS input):
 
 ```sh
-CARGO_TARGET_DIR=/private/tmp/gt-target-review4a scripts/cargo.sh fmt --manifest-path gpui/Cargo.toml --all -- --check
-CARGO_TARGET_DIR=/private/tmp/gt-target-review4a scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --workspace --locked --all-targets -j 4 -- -D warnings
-CARGO_TARGET_DIR=/private/tmp/gt-target-review4a scripts/cargo.sh test --manifest-path gpui/Cargo.toml --workspace --locked -j 4
-CARGO_TARGET_DIR=/private/tmp/gt-target-review4a scripts/check-gpui-deps.sh
+CARGO_TARGET_DIR=/private/tmp/gt-target-diff scripts/cargo.sh fmt --manifest-path gpui/Cargo.toml --all -- --check
+CARGO_TARGET_DIR=/private/tmp/gt-target-diff scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --workspace --locked --all-targets -j 4 -- -D warnings
+CARGO_TARGET_DIR=/private/tmp/gt-target-diff scripts/cargo.sh test --manifest-path gpui/Cargo.toml --workspace --locked -j 4
+CARGO_TARGET_DIR=/private/tmp/gt-target-diff scripts/check-gpui-deps.sh
 ```
 
-Use `nice -n 10` before the script when permitted. The root Iced lockfile is
-unchanged; only the GPUI lockfile includes this crate and the dependency-free
-shared core.
+Use `nice -n 10` before the script when permitted. The root and GPUI dependency graphs remain separate.
 
 Model tests cover grouping/status, same-path versions, viewed invalidation,
 reorder/removal, navigation boundaries, source errors and edge cases. GPUI tests
@@ -73,7 +91,7 @@ the same retained DiffState as the review view.
 Interactive visual, accessibility and trackpad feel checks remain manual; no
 GUI screenshots or live process manipulation are part of this verification.
 
-Verified on arm64 macOS on 18 November 2026: workspace formatting, all-target
+The earlier fixture-only stage was verified on arm64 macOS on 18 November 2026: workspace formatting, all-target
 Clippy (`-D warnings`), workspace tests (97 passed, including 11 review tests)
 and the unchanged dependency boundary script exited 0. The 20k probe measured
 180 ms parsing, 222 ms through first layout (38 rows), and an 85 ms tail jump.

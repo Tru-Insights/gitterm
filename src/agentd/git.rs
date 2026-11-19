@@ -1,162 +1,16 @@
 //! Git status collection shared by the desktop's local backend and the
 //! remote agent, so both sources report identical status semantics.
 
+#[cfg(test)]
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
-
-use git2::{Repository, Status, StatusOptions};
 
 pub use gitterm_core::status::{GitFileStatus, RepoStatus};
 
 pub use gitterm_core::git_status::{collect_repo_status, git_command, status_char};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiffLineKind {
-    Context,
-    Addition,
-    Deletion,
-    Header,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileDiffLine {
-    pub content: String,
-    pub kind: DiffLineKind,
-    /// 1-based; `None` when the line doesn't exist on that side.
-    pub old_line: Option<u32>,
-    pub new_line: Option<u32>,
-}
-
-/// Collect the diff for one repo-relative file, staged (HEAD→index) or
-/// unstaged (index→worktree). Untracked files render as an added-lines
-/// preview capped at `max_untracked_preview_lines`.
-pub fn collect_file_diff(
-    repo_root: &Path,
-    file_path: &str,
-    is_staged: bool,
-    max_untracked_preview_lines: usize,
-) -> Vec<FileDiffLine> {
-    let mut lines = Vec::new();
-    // A chat tab keeps the folder it started in, which can be below the
-    // repo root (TRU-237); `file_path` is relative to the repo root.
-    let Ok(repo) = Repository::open(repo_root).or_else(|_| Repository::discover(repo_root)) else {
-        return lines;
-    };
-    let repo_root = repo.workdir().unwrap_or(repo_root).to_path_buf();
-
-    // Use no_refresh + pathspec so status doesn't rewrite .git/index.lock
-    // (would contend with concurrent git commands) and only inspects this file.
-    let mut untracked_opts = StatusOptions::new();
-    untracked_opts
-        .no_refresh(true)
-        .include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .pathspec(file_path);
-    let is_untracked = repo
-        .statuses(Some(&mut untracked_opts))
-        .ok()
-        .map(|statuses| {
-            statuses
-                .iter()
-                .any(|e| e.path() == Some(file_path) && e.status().contains(Status::WT_NEW))
-        })
-        .unwrap_or(false);
-
-    if is_untracked {
-        let full_path = repo_root.join(file_path);
-        if let Ok(content) = std::fs::read_to_string(&full_path) {
-            let total_lines = content.lines().count();
-            lines.push(FileDiffLine {
-                content: format!("@@ -0,0 +1,{} @@ (new file)", total_lines),
-                kind: DiffLineKind::Header,
-                old_line: None,
-                new_line: None,
-            });
-            for (i, line) in content
-                .lines()
-                .take(max_untracked_preview_lines)
-                .enumerate()
-            {
-                lines.push(FileDiffLine {
-                    content: line.to_string(),
-                    kind: DiffLineKind::Addition,
-                    old_line: None,
-                    new_line: Some((i + 1) as u32),
-                });
-            }
-            if total_lines > max_untracked_preview_lines {
-                lines.push(FileDiffLine {
-                    content: format!(
-                        "... truncated to first {} lines ({} total)",
-                        max_untracked_preview_lines, total_lines
-                    ),
-                    kind: DiffLineKind::Header,
-                    old_line: None,
-                    new_line: None,
-                });
-            }
-        }
-        return lines;
-    }
-
-    let mut diff_opts = git2::DiffOptions::new();
-    diff_opts.pathspec(file_path);
-    let diff = if is_staged {
-        let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
-        repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut diff_opts))
-    } else {
-        repo.diff_index_to_workdir(None, Some(&mut diff_opts))
-    };
-
-    if let Ok(diff) = diff {
-        let _ = diff.print(git2::DiffFormat::Patch, |_delta, hunk, line| {
-            let content = String::from_utf8_lossy(line.content())
-                .trim_end()
-                .to_string();
-            match line.origin() {
-                'H' => {
-                    if let Some(h) = hunk {
-                        lines.push(FileDiffLine {
-                            content: format!(
-                                "@@ -{},{} +{},{} @@",
-                                h.old_start(),
-                                h.old_lines(),
-                                h.new_start(),
-                                h.new_lines()
-                            ),
-                            kind: DiffLineKind::Header,
-                            old_line: None,
-                            new_line: None,
-                        });
-                    }
-                }
-                '+' => lines.push(FileDiffLine {
-                    content,
-                    kind: DiffLineKind::Addition,
-                    old_line: None,
-                    new_line: line.new_lineno(),
-                }),
-                '-' => lines.push(FileDiffLine {
-                    content,
-                    kind: DiffLineKind::Deletion,
-                    old_line: line.old_lineno(),
-                    new_line: None,
-                }),
-                ' ' => lines.push(FileDiffLine {
-                    content,
-                    kind: DiffLineKind::Context,
-                    old_line: line.old_lineno(),
-                    new_line: line.new_lineno(),
-                }),
-                _ => {}
-            }
-            true
-        });
-    }
-
-    lines
-}
+pub use gitterm_core::git_diff::{collect_file_diff, DiffLineKind, FileDiffLine};
 
 #[cfg(test)]
 mod tests {

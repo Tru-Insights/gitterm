@@ -22,8 +22,7 @@ pub type FileKey = (Group, String);
 pub type Patches = BTreeMap<FileKey, Arc<str>>;
 
 /// Match the Iced review's initial per-file text limits; explicit expansion is unrestricted.
-pub const LARGE_LINES: usize = 2_000;
-pub const LARGE_BYTES: usize = 256 * 1024;
+pub use gitterm_core::git_diff::{LARGE_BYTES, LARGE_LINES};
 
 #[derive(Debug)]
 pub struct ReviewFile {

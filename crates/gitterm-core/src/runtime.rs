@@ -1,4 +1,4 @@
-//! Process-owned status jobs. No domain state, clock, timeout or freshness policy.
+//! Process-owned Git jobs. No domain state, clock, timeout or freshness policy.
 
 use crate::status::{GitStatusSnapshot, StatusCommand};
 use std::collections::{HashMap, HashSet};
@@ -13,15 +13,9 @@ use tokio::task::{AbortHandle, JoinHandle};
 pub struct JobId(u64);
 
 #[derive(Debug, Clone)]
-pub enum StatusOutcome {
-    Completed {
-        job: JobId,
-        snapshot: GitStatusSnapshot,
-    },
-    Cancelled {
-        job: JobId,
-        owner: usize,
-    },
+pub enum JobOutcome<T> {
+    Completed { job: JobId, snapshot: T },
+    Cancelled { job: JobId, owner: usize },
 }
 
 struct Job {
@@ -31,32 +25,47 @@ struct Job {
     monitor: JoinHandle<()>,
 }
 
-struct Jobs {
+struct Jobs<T> {
     next: u64,
     owners: HashSet<usize>,
     jobs: HashMap<JobId, Job>,
-    output: Option<mpsc::UnboundedSender<StatusOutcome>>,
+    output: Option<mpsc::UnboundedSender<(usize, JobOutcome<T>)>>,
 }
 
 /// Retain this at application scope, independently of panes and subscriptions.
 /// Handles are supplied by the host, which must keep its executor alive through teardown.
 /// Owner IDs must be unique for the process lifetime, as with host tab IDs.
-pub struct StatusRuntime {
-    inner: Arc<Mutex<Jobs>>,
+pub struct JobRuntime<T> {
+    inner: Arc<Mutex<Jobs<T>>>,
     teardown: tokio::sync::Mutex<()>,
 }
 
 /// The sole result receiver; removed owners' queued snapshots are discarded here too.
-pub struct StatusReceiver {
-    input: mpsc::UnboundedReceiver<StatusOutcome>,
-    inner: Arc<Mutex<Jobs>>,
+pub struct JobReceiver<T> {
+    input: mpsc::UnboundedReceiver<(usize, JobOutcome<T>)>,
+    completion_owner: fn(usize, &T) -> usize,
+    inner: Arc<Mutex<Jobs<T>>>,
 }
 
-impl StatusReceiver {
-    pub async fn recv(&mut self) -> Option<StatusOutcome> {
-        while let Some(outcome) = self.input.recv().await {
-            if let StatusOutcome::Completed { snapshot, .. } = &outcome {
-                if !self.inner.lock().unwrap().owners.contains(&snapshot.tab_id) {
+pub type StatusOutcome = JobOutcome<GitStatusSnapshot>;
+pub type StatusRuntime = JobRuntime<GitStatusSnapshot>;
+pub type StatusReceiver = JobReceiver<GitStatusSnapshot>;
+pub type DiffOutcome = JobOutcome<DiffSnapshot>;
+pub type DiffRuntime = JobRuntime<DiffSnapshot>;
+pub type DiffReceiver = JobReceiver<DiffSnapshot>;
+
+#[derive(Debug, Clone)]
+pub struct DiffSnapshot {
+    pub request: crate::git_diff::DiffRequest,
+    pub patches: Result<Vec<crate::git_diff::FilePatch>, String>,
+}
+
+impl<T> JobReceiver<T> {
+    pub async fn recv(&mut self) -> Option<JobOutcome<T>> {
+        while let Some((owner, outcome)) = self.input.recv().await {
+            if let JobOutcome::Completed { snapshot, .. } = &outcome {
+                let owner = (self.completion_owner)(owner, snapshot);
+                if !self.inner.lock().unwrap().owners.contains(&owner) {
                     continue;
                 }
             }
@@ -66,8 +75,8 @@ impl StatusReceiver {
     }
 }
 
-impl StatusRuntime {
-    pub fn new() -> (Self, StatusReceiver) {
+impl<T: Send + 'static> JobRuntime<T> {
+    fn new_with_owner(completion_owner: fn(usize, &T) -> usize) -> (Self, JobReceiver<T>) {
         let (output, input) = mpsc::unbounded_channel();
         let inner = Arc::new(Mutex::new(Jobs {
             next: 0,
@@ -80,41 +89,22 @@ impl StatusRuntime {
                 inner: inner.clone(),
                 teardown: tokio::sync::Mutex::new(()),
             },
-            StatusReceiver { input, inner },
+            JobReceiver {
+                input,
+                inner,
+                completion_owner,
+            },
         )
     }
 
-    /// SchedulePoll remains the host's existing maintenance input, never a new timer.
-    pub fn execute(&self, handle: &Handle, owner: usize, command: StatusCommand) -> Option<JobId> {
-        let StatusCommand::CollectStatus { root } = command else {
-            return None;
-        };
-        self.submit(handle, owner, root, true, |handle, owner, root| {
-            handle.spawn_blocking(move || collect_snapshot(owner, root))
-        })
-    }
-
-    /// The adapter retains remote transport, credentials and DTO conversion. Both
-    /// local and remote jobs use the same correlation, cancellation and result path.
-    pub fn collect_remote(
-        &self,
-        handle: &Handle,
-        owner: usize,
-        root: PathBuf,
-        collect: impl Future<Output = GitStatusSnapshot> + Send + 'static,
-    ) -> Option<JobId> {
-        self.submit(handle, owner, root, false, |handle, _, _| {
-            handle.spawn(collect)
-        })
-    }
-
-    fn submit(
+    fn submit_job(
         &self,
         handle: &Handle,
         owner: usize,
         root: PathBuf,
         blocking: bool,
-        start: impl FnOnce(&Handle, usize, PathBuf) -> JoinHandle<GitStatusSnapshot>,
+        start: impl FnOnce(&Handle, usize, PathBuf) -> JoinHandle<T>,
+        failed: impl FnOnce(tokio::task::JoinError) -> T + Send + 'static,
     ) -> Option<JobId> {
         let mut jobs = self.inner.lock().unwrap();
         jobs.output.as_ref()?;
@@ -126,23 +116,13 @@ impl StatusRuntime {
         let abort = (!blocking).then(|| worker.abort_handle());
         let inner = self.inner.clone();
         let monitor = handle.spawn(async move {
-            let snapshot = worker.await.unwrap_or_else(|err| GitStatusSnapshot {
-                tab_id: owner,
-                repo_path: root,
-                repo_name: "unknown".into(),
-                branch_name: "main".into(),
-                is_git_repo: true,
-                staged: Vec::new(),
-                unstaged: Vec::new(),
-                untracked: Vec::new(),
-                error: Some(format!("git status task failed: {err}")),
-            });
+            let snapshot = worker.await.unwrap_or_else(failed);
             let mut jobs = inner.lock().unwrap();
             if let Some(job) = jobs.jobs.get_mut(&id) {
                 if job.pending {
                     job.pending = false;
                     if let Some(output) = &jobs.output {
-                        let _ = output.send(StatusOutcome::Completed { job: id, snapshot });
+                        let _ = output.send((owner, JobOutcome::Completed { job: id, snapshot }));
                     }
                 }
             }
@@ -202,13 +182,7 @@ impl StatusRuntime {
     /// Stop accepting jobs, cancel pending outcomes and close the result channel.
     /// Nonblocking fallback for host drop; use teardown to account for running Git.
     pub fn close(&self) {
-        let mut jobs = self.inner.lock().unwrap();
-        let ids: Vec<_> = jobs.jobs.keys().copied().collect();
-        for id in ids {
-            cancel(&mut jobs, id);
-        }
-        jobs.owners.clear();
-        jobs.output.take();
+        close(&mut self.inner.lock().unwrap());
     }
 
     /// Explicit shutdown waits for started blocking Git instead of claiming that
@@ -231,13 +205,13 @@ impl StatusRuntime {
     }
 }
 
-impl Drop for StatusRuntime {
+impl<T> Drop for JobRuntime<T> {
     fn drop(&mut self) {
-        self.close();
+        close(&mut self.inner.lock().unwrap());
     }
 }
 
-fn cancel(jobs: &mut Jobs, id: JobId) -> bool {
+fn cancel<T>(jobs: &mut Jobs<T>, id: JobId) -> bool {
     let Some(job) = jobs.jobs.get_mut(&id) else {
         return false;
     };
@@ -249,12 +223,111 @@ fn cancel(jobs: &mut Jobs, id: JobId) -> bool {
         abort.abort();
     }
     if let Some(output) = &jobs.output {
-        let _ = output.send(StatusOutcome::Cancelled {
-            job: id,
-            owner: job.owner,
-        });
+        let _ = output.send((
+            job.owner,
+            JobOutcome::Cancelled {
+                job: id,
+                owner: job.owner,
+            },
+        ));
     }
     true
+}
+
+fn close<T>(jobs: &mut Jobs<T>) {
+    let ids: Vec<_> = jobs.jobs.keys().copied().collect();
+    for id in ids {
+        cancel(jobs, id);
+    }
+    jobs.owners.clear();
+    jobs.output.take();
+}
+
+impl StatusRuntime {
+    pub fn new() -> (Self, StatusReceiver) {
+        // Keep the status adapter's existing snapshot-addressed discard rule.
+        Self::new_with_owner(|_, snapshot| snapshot.tab_id)
+    }
+
+    /// SchedulePoll remains the host's existing maintenance input, never a new timer.
+    pub fn execute(&self, handle: &Handle, owner: usize, command: StatusCommand) -> Option<JobId> {
+        let StatusCommand::CollectStatus { root } = command else {
+            return None;
+        };
+        self.submit(handle, owner, root, true, |handle, owner, root| {
+            handle.spawn_blocking(move || collect_snapshot(owner, root))
+        })
+    }
+
+    /// The adapter retains remote transport, credentials and DTO conversion. Both
+    /// local and remote jobs use the same correlation, cancellation and result path.
+    pub fn collect_remote(
+        &self,
+        handle: &Handle,
+        owner: usize,
+        root: PathBuf,
+        collect: impl Future<Output = GitStatusSnapshot> + Send + 'static,
+    ) -> Option<JobId> {
+        self.submit(handle, owner, root, false, |handle, _, _| {
+            handle.spawn(collect)
+        })
+    }
+
+    fn submit(
+        &self,
+        handle: &Handle,
+        owner: usize,
+        root: PathBuf,
+        blocking: bool,
+        start: impl FnOnce(&Handle, usize, PathBuf) -> JoinHandle<GitStatusSnapshot>,
+    ) -> Option<JobId> {
+        let failed_root = root.clone();
+        self.submit_job(handle, owner, root, blocking, start, move |err| {
+            GitStatusSnapshot {
+                tab_id: owner,
+                repo_path: failed_root,
+                repo_name: "unknown".into(),
+                branch_name: "main".into(),
+                is_git_repo: true,
+                staged: Vec::new(),
+                unstaged: Vec::new(),
+                untracked: Vec::new(),
+                error: Some(format!("git status task failed: {err}")),
+            }
+        })
+    }
+}
+
+impl DiffRuntime {
+    pub fn new() -> (Self, DiffReceiver) {
+        Self::new_with_owner(|owner, _| owner)
+    }
+
+    /// Full per-file patches run on the same blocking/cancellation lifecycle as status.
+    pub fn collect_diff(
+        &self,
+        handle: &Handle,
+        owner: usize,
+        request: crate::git_diff::DiffRequest,
+    ) -> Option<JobId> {
+        let failed_request = request.clone();
+        self.submit_job(
+            handle,
+            owner,
+            request.root.clone(),
+            true,
+            move |handle, _, _| {
+                handle.spawn_blocking(move || DiffSnapshot {
+                    patches: crate::git_diff::collect_patches(&request),
+                    request,
+                })
+            },
+            move |err| DiffSnapshot {
+                request: failed_request,
+                patches: Err(format!("git diff task failed: {err}")),
+            },
+        )
+    }
 }
 
 pub fn collect_snapshot(tab_id: usize, root: PathBuf) -> GitStatusSnapshot {
@@ -505,6 +578,117 @@ mod tests {
             assert_eq!(snapshot.is_git_repo, expected.is_git_repo);
             drop(runtime);
             assert!(results.recv().await.is_none());
+        });
+    }
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+    use crate::git_diff::{DiffRequest, LARGE_LINES};
+
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let output = crate::git_status::git_command()
+            .current_dir(root)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    }
+
+    #[test]
+    fn real_diff_jobs_cover_groups_binary_rename_large_and_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-qb", "main"]);
+        for (path, content) in [
+            ("both.txt", "before\n"),
+            ("old.txt", "rename me\n"),
+            ("binary.bin", "before\0binary"),
+        ] {
+            std::fs::write(root.join(path), content).unwrap();
+        }
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::write(root.join("both.txt"), "staged  \n").unwrap();
+        git(root, &["add", "both.txt"]);
+        std::fs::write(root.join("both.txt"), "unstaged\n").unwrap();
+        git(root, &["mv", "old.txt", "renamed.txt"]);
+        std::fs::write(root.join("binary.bin"), "after\0binary").unwrap();
+        std::fs::create_dir(root.join("new-dir")).unwrap();
+        std::fs::write(root.join("new-dir/new.txt"), "new file\n").unwrap();
+        std::fs::write(root.join("new.bin"), b"\0new binary").unwrap();
+        std::fs::write(root.join("large.txt"), "line\n".repeat(LARGE_LINES + 10)).unwrap();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let (runtime, mut results) = DiffRuntime::new();
+            for (path, staged, expected) in [
+                ("both.txt", true, "+staged  \n"), ("both.txt", false, "+unstaged\n"),
+                ("new-dir/", false, "+new file\n"), ("renamed.txt", true, "rename from old.txt"),
+                ("binary.bin", false, "Binary files "), ("new.bin", false, "Binary files "),
+                ("large.txt", false, "+line\n"),
+            ] {
+                let request = DiffRequest { root: root.into(), file_path: path.into(), staged };
+                let id = runtime.collect_diff(executor.handle(), 7, request.clone()).unwrap();
+                let Some(DiffOutcome::Completed { job, snapshot }) = results.recv().await else { panic!("completion expected") };
+                assert_eq!(job, id);
+                assert_eq!(snapshot.request, request);
+                let patches = snapshot.patches.unwrap();
+                assert_eq!(patches.len(), 1);
+                let patch = &patches[0];
+                assert!(patch.patch.contains(expected), "{path}: {patch:?}");
+                assert_eq!(patch.binary, path.ends_with(".bin"));
+                assert_eq!(patch.large, path == "large.txt");
+                if path == "renamed.txt" { assert_eq!(patch.old_path.as_deref(), Some("old.txt")); }
+                assert!(!runtime.cancel(id));
+            }
+            let id = runtime.collect_diff(executor.handle(), 7, DiffRequest { root: root.into(), file_path: "missing.txt".into(), staged: false }).unwrap();
+            assert!(matches!(results.recv().await, Some(DiffOutcome::Completed { job, snapshot }) if job == id && snapshot.patches.as_ref().unwrap_err().contains("missing.txt")));
+            runtime.teardown().await;
+            assert!(results.recv().await.is_none());
+        });
+    }
+
+    #[test]
+    fn diff_owner_removal_discards_running_and_queued_output_once() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            for queued in [false, true] {
+                let (runtime, mut results) = DiffRuntime::new();
+                let (started, wait_started) = std::sync::mpsc::channel();
+                let (release, wait_release) = std::sync::mpsc::channel();
+                let id = runtime.submit_job(executor.handle(), 7, PathBuf::new(), true,
+                    |handle, _, _| handle.spawn_blocking(move || {
+                        started.send(()).unwrap();
+                        wait_release.recv().unwrap();
+                        DiffSnapshot { request: DiffRequest { root: PathBuf::new(), file_path: "late".into(), staged: false }, patches: Ok(vec![]) }
+                    }), |_| panic!("worker failed")).unwrap();
+                wait_started.recv().unwrap();
+                if queued {
+                    release.send(()).unwrap();
+                    while runtime.inner.lock().unwrap().jobs.values().any(|j| j.pending) {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                runtime.remove_owner(7);
+                assert!(!runtime.cancel(id));
+                if !queued {
+                    assert!(matches!(results.recv().await, Some(DiffOutcome::Cancelled { job, owner: 7 }) if job == id));
+                    release.send(()).unwrap();
+                }
+                runtime.teardown().await;
+                assert!(results.recv().await.is_none());
+            }
         });
     }
 }

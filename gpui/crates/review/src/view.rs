@@ -13,7 +13,11 @@ use gpui_component::{
     button::Button,
     diff::{Diff, DiffFile, DiffMode, DiffState},
 };
-use std::{ffi::OsString, path::Path};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 actions!(native_review, [NextFile, PreviousFile, ToggleViewed]);
 
@@ -25,7 +29,7 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-/// CLI parsing stays in this crate so the host only dispatches the fixture demo.
+/// Fixture argument validation stays here; the host dispatches review routes.
 pub fn run_fixture(args: Vec<OsString>) {
     let [path] = args.as_slice() else {
         eprintln!("Usage: gitterm-gpui --review <fixture-dir>");
@@ -38,10 +42,41 @@ pub fn run_fixture(args: Vec<OsString>) {
             std::process::exit(1);
         }
     };
+    run(model, None);
+}
+
+pub fn run_repo(path: PathBuf) {
+    run(ReviewModel::default(), Some(path));
+}
+
+fn run(model: ReviewModel, repo: Option<PathBuf>) {
+    let executor = repo.as_ref().map(|_| {
+        Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .build()
+                .expect("create review executor"),
+        )
+    });
+    let title = if repo.is_some() {
+        "GitTerm · Repository review"
+    } else {
+        "GitTerm · Native review fixtures"
+    };
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
         init(cx);
+        // Retain the one host executor through application shutdown, even after
+        // the one-shot review load finishes. Job runtimes also close on drop.
+        let process_executor = executor.clone();
+        cx.on_app_quit(move |_| {
+            let executor = process_executor.clone();
+            async move {
+                drop(executor);
+            }
+        })
+        .detach();
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -50,17 +85,37 @@ pub fn run_fixture(args: Vec<OsString>) {
                     cx,
                 ))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("GitTerm · Native review fixtures".into()),
+                    title: Some(title.into()),
                     ..Default::default()
                 }),
                 ..Default::default()
             },
             move |window, cx| {
                 let view = cx.new(|cx| ReviewView::new(model, window, cx));
+                if let (Some(path), Some(executor)) = (repo, executor) {
+                    view.update(cx, |view, _| view.loading = true);
+                    let review = view.downgrade();
+                    cx.spawn(async move |cx| {
+                        let result = crate::repo::load(executor.handle(), 0, path).await;
+                        _ = review.update(cx, |view, cx| {
+                            view.loading = false;
+                            match result {
+                                Ok((snapshot, patches)) => {
+                                    if let Err(error) = view.replace(&snapshot, &patches, cx) {
+                                        view.model.error = Some(error);
+                                    }
+                                }
+                                Err(error) => view.model.error = Some(error),
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
                 cx.new(|cx| Root::new(view, window, cx))
             },
         )
-        .expect("open native review fixture viewer");
+        .expect("open native review viewer");
         cx.on_window_closed(|cx, _| cx.quit()).detach();
         cx.activate(true);
     });
@@ -71,6 +126,7 @@ pub struct ReviewView {
     diff: Option<Entity<DiffState>>,
     diff_error: Option<String>,
     focus: FocusHandle,
+    loading: bool,
 }
 impl ReviewView {
     pub fn new(model: ReviewModel, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -81,6 +137,7 @@ impl ReviewView {
             diff: None,
             diff_error: None,
             focus,
+            loading: false,
         };
         view.prepare(cx);
         view
@@ -244,7 +301,11 @@ impl Render for ReviewView {
                 );
             }
         } else {
-            body = body.child(div().p_4().child("No changed files"));
+            body = body.child(div().p_4().child(if self.loading {
+                "Loading repository…"
+            } else {
+                "No changed files"
+            }));
         }
         div()
             .size_full()
@@ -258,9 +319,11 @@ impl Render for ReviewView {
             .on_action(cx.listener(Self::next))
             .on_action(cx.listener(Self::previous))
             .on_action(cx.listener(Self::toggle_viewed))
-            .child(div().p_2().child(
-                "Fixture review · Option+↓ / Option+↑ next / previous file · Option+V viewed",
-            ))
+            .child(
+                div()
+                    .p_2()
+                    .child("Review · Option+↓ / Option+↑ next / previous file · Option+V viewed"),
+            )
             .child(div().flex_1().min_h_0().flex().child(sidebar).child(body))
     }
 }
