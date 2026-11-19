@@ -9,6 +9,38 @@ pub enum Launch {
     Review(Vec<OsString>),
     ReviewRepo(PathBuf),
 }
+impl Launch {
+    /// Compose C2 roots lazily: legacy terminal/repo review and shell admission
+    /// must not depend on provider overrides or preview metadata validation.
+    pub fn authorize(
+        &self,
+        compose: impl FnOnce() -> std::io::Result<std::sync::Arc<gitterm_core::preview::Preview>>,
+    ) -> std::io::Result<()> {
+        if matches!(
+            self,
+            Self::Terminal | Self::ReviewRepo(_) | Self::Review(_) | Self::Shell { .. }
+        ) {
+            return Ok(());
+        }
+        let preview = compose()?;
+        let source = |path: &std::path::Path| -> std::io::Result<PathBuf> {
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(path)
+            };
+            preview.protected().check(&path)
+        };
+        match self {
+            Self::Chat(path) => {
+                source(path)?;
+            }
+            _ => unreachable!("legacy routes returned above"),
+        }
+        Ok(())
+    }
+}
+
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Option<Launch> {
     let args: Vec<_> = args.into_iter().collect();
     if args.len() == 1 && args[0] == "--terminal" {
@@ -111,5 +143,66 @@ mod tests {
             route(&["--chat-live", "fixture.jsonl"]),
             Some(Launch::Chat("fixture.jsonl".into()))
         );
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    #[test]
+    fn legacy_terminal_review_and_shell_routes_are_not_blocked() {
+        let dir = std::env::temp_dir().join(format!("gpui-route-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let protected = gitterm_core::preview::ProtectedRoots::new(&dir.join("host"), []).unwrap();
+        let preview = std::sync::Arc::new(
+            gitterm_core::preview::Preview::validate(&dir.join("preview"), protected).unwrap(),
+        );
+        let forbidden = dir.join("host/.config/gitterm-v6/sentinel");
+        for args in [
+            vec!["--chat".into(), forbidden.clone().into_os_string()],
+            vec!["--chat-live".into(), forbidden.clone().into_os_string()],
+        ] {
+            let route = parse(args).unwrap();
+            let error = route
+                .authorize(|| Ok(preview.clone()))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("standalone-terminal")
+                    || error.contains(forbidden.to_str().unwrap()),
+                "{error}"
+            );
+        }
+        for args in [
+            vec![],
+            vec!["--sample".into()],
+            vec!["--terminal".into()],
+            vec![
+                "--review".into(),
+                dir.join("fixture-review").into_os_string(),
+            ],
+            vec![
+                "--review-repo".into(),
+                dir.join("missing-repo").into_os_string(),
+            ],
+            vec![
+                "--workspace".into(),
+                dir.join("missing-workspace").into_os_string(),
+            ],
+        ] {
+            assert!(
+                parse(args)
+                    .unwrap()
+                    .authorize(|| panic!("legacy route composed preview roots"))
+                    .is_ok()
+            );
+        }
+        let fixture = dir.join("fixture.jsonl");
+        assert!(
+            Launch::Chat(fixture)
+                .authorize(|| Ok(preview.clone()))
+                .is_ok()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

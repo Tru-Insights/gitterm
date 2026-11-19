@@ -5,6 +5,7 @@
 
 pub mod chat;
 pub mod harness;
+pub mod preview;
 pub mod status;
 pub mod workspace;
 
@@ -38,6 +39,8 @@ pub mod task_worktree;
 pub mod chat_facts;
 pub mod chats;
 pub mod find;
+
+pub mod work;
 
 // Delegation services; launch authority remains with the application owner.
 #[cfg(feature = "runtime")]
