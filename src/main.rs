@@ -1,6 +1,7 @@
 #[cfg(test)]
 use git2::Status;
 use git2::{DiffOptions, Repository};
+use gitterm::chats::{ChatBackendResume, ChatEntryResume};
 use iced::advanced::graphics::core::Element;
 use iced::keyboard::{self, key, Key, Modifiers};
 use iced::widget::{

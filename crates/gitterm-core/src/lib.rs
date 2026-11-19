@@ -21,6 +21,9 @@ pub mod tasks;
 #[cfg(feature = "runtime")]
 pub mod worker_process;
 
+pub mod content;
+pub mod plans;
+
 #[cfg(feature = "runtime")]
 pub mod atomic_file;
 pub mod limits;
@@ -31,6 +34,10 @@ pub mod workers;
 pub mod gh_identity;
 #[cfg(feature = "runtime")]
 pub mod task_worktree;
+
+pub mod chat_facts;
+pub mod chats;
+pub mod find;
 
 // Delegation services; launch authority remains with the application owner.
 #[cfg(feature = "runtime")]
