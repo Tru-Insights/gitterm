@@ -3,7 +3,7 @@ use crate::{
     theme::Palette,
 };
 use gitterm_gpui_chat::{ChatView, events::parse_fixture};
-use gitterm_terminal::{Backend, BackendSettings, TerminalConfig, TerminalView};
+use gitterm_terminal::{TerminalConfig, TerminalLaunch, TerminalView};
 use gpui::*;
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -38,6 +38,8 @@ pub struct Pane {
     pub id: String,
     pub title: String,
     pub content: PaneContent,
+    terminal_title: Option<String>,
+    terminal_cwd: Option<std::path::PathBuf>,
     workspace: WorkspaceId,
     data: Rc<dyn ShellData>,
     focus: FocusHandle,
@@ -53,47 +55,52 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let content =
-            match kind {
-                PaneKind::Terminal => {
-                    let settings = BackendSettings {
-                        working_directory: dirs::home_dir(),
-                        ..Default::default()
-                    };
-                    // Headless fixtures must not run host rc/session-restore scripts.
-                    #[cfg(test)]
-                    let settings = BackendSettings {
-                        program: "/bin/zsh".into(),
-                        args: vec!["-d".into(), "-f".into(), "-i".into()],
-                        ..settings
-                    };
-                    match settings.working_directory.as_ref() {
-                        None => PaneContent::Error(format!(
-                            "Start terminal {title}: cannot resolve HOME"
-                        )),
-                        Some(home) => match Backend::new(settings.clone()) {
-                            Ok(backend) => PaneContent::Terminal(cx.new(|cx| {
-                                TerminalView::new(backend, TerminalConfig::default(), cx)
-                            })),
-                            Err(error) => PaneContent::Error(format!(
-                                "Start terminal {title} ({}) in {}: {error:#}",
-                                settings.program,
-                                home.display()
-                            )),
-                        },
-                    }
+        let content = match kind {
+            PaneKind::Terminal => {
+                let launch = TerminalLaunch {
+                    cwd: dirs::home_dir(),
+                    ..Default::default()
+                };
+                // Headless fixtures must not run host rc/session-restore scripts.
+                #[cfg(test)]
+                let launch = TerminalLaunch {
+                    program: "/bin/zsh".into(),
+                    args: vec!["-d".into(), "-f".into(), "-i".into()],
+                    ..launch
+                };
+                if launch.cwd.is_none() {
+                    PaneContent::Error(format!("Start terminal {title}: cannot resolve HOME"))
+                } else {
+                    let pane = cx.weak_entity();
+                    let cwd_pane = pane.clone();
+                    PaneContent::Terminal(cx.new(|cx| {
+                        TerminalView::launch(launch, TerminalConfig::default(), cx)
+                            .with_title_callback(move |_, cx, title| {
+                                let _ = pane.update(cx, |pane, cx| {
+                                    pane.terminal_title = Some(title.to_string());
+                                    cx.notify();
+                                });
+                            })
+                            .with_cwd_callback(move |_, cx, cwd| {
+                                let _ = cwd_pane.update(cx, |pane, cx| {
+                                    pane.terminal_cwd = Some(cwd.to_path_buf());
+                                    cx.notify();
+                                });
+                            })
+                    }))
                 }
-                PaneKind::Chat => PaneContent::Chat(cx.new(|cx| {
-                    ChatView::new(
-                        parse_fixture(include_str!("../../chat/fixtures/showcase.jsonl"))
-                            .expect("bundled synthetic showcase fixture is valid"),
-                        window,
-                        cx,
-                    )
-                })),
-                PaneKind::Git => PaneContent::Git,
-                PaneKind::Files => PaneContent::Files,
-            };
+            }
+            PaneKind::Chat => PaneContent::Chat(cx.new(|cx| {
+                ChatView::new(
+                    parse_fixture(include_str!("../../chat/fixtures/showcase.jsonl"))
+                        .expect("bundled synthetic showcase fixture is valid"),
+                    window,
+                    cx,
+                )
+            })),
+            PaneKind::Git => PaneContent::Git,
+            PaneKind::Files => PaneContent::Files,
+        };
         if let PaneContent::Error(error) = &content {
             eprintln!("{error}");
         }
@@ -101,10 +108,27 @@ impl Pane {
             id,
             title,
             content,
+            terminal_title: None,
+            terminal_cwd: dirs::home_dir(),
             workspace,
             data,
             focus: cx.focus_handle(),
             expanded: HashSet::from(["src".into()]),
+        }
+    }
+    pub(crate) fn tab_title(&self) -> String {
+        if matches!(self.content, PaneContent::Terminal(_)) {
+            let title = self
+                .terminal_title
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .unwrap_or(&self.title);
+            match &self.terminal_cwd {
+                Some(cwd) => format!("{title} · {}", cwd.display()),
+                None => title.to_string(),
+            }
+        } else {
+            self.title.clone()
         }
     }
     fn files(
@@ -196,7 +220,7 @@ impl BasePanel for Pane {
 }
 impl Panel for Pane {
     fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        self.title.clone()
+        self.tab_title()
     }
     fn inner_padding(&self, _: &App) -> bool {
         false

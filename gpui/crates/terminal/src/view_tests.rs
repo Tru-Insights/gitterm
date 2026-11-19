@@ -390,7 +390,9 @@ os.write(1,bytes.fromhex('{tail}'))
         }
         assert!(
             started.elapsed() < Duration::from_secs(30),
-            "hidden parser deadline"
+            "hidden parser deadline: {bytes}/{} bytes after {:?}",
+            TOTAL + TAIL.len(),
+            started.elapsed()
         );
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -940,4 +942,35 @@ fn find_shortcuts_edit_navigate_close_restore_focus_and_export_callback(cx: &mut
     });
     let text = received.lock().take().unwrap().unwrap();
     assert!(text.starts_with("first[.]\nsecond[.]\n"));
+}
+
+#[::gpui::test]
+fn launch_cwd_and_title_callbacks_reach_app_headlessly(cx: &mut TestAppContext) {
+    use std::{cell::RefCell, rc::Rc};
+    cx.background_executor.allow_parking();
+    let cwd = Rc::new(RefCell::new(None));
+    let title = Rc::new(RefCell::new(None));
+    let reported_cwd = cwd.clone();
+    let reported_title = title.clone();
+    let backend = python("import os\nos.write(1,b'\\x1b]7;file:///tmp/callback%20cwd\\x07\\x1b]2;CALLBACK_TITLE\\x07')".into());
+    let handle = cx.add_window(|_, cx| {
+        TerminalView::new(backend, TerminalConfig::default(), cx)
+            .with_cwd_callback(move |_, _, path| {
+                *reported_cwd.borrow_mut() = Some(path.to_path_buf())
+            })
+            .with_title_callback(move |_, _, value| {
+                *reported_title.borrow_mut() = Some(value.to_string())
+            })
+    });
+    wait(|| {
+        handle
+            .update(cx, |view, window, cx| view.process_events(window, cx))
+            .unwrap();
+        cwd.borrow().is_some() && title.borrow().is_some()
+    });
+    assert_eq!(
+        cwd.borrow().as_deref(),
+        Some(std::path::Path::new("/tmp/callback cwd"))
+    );
+    assert_eq!(title.borrow().as_deref(), Some("CALLBACK_TITLE"));
 }

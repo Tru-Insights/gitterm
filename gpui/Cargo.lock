@@ -2594,6 +2594,7 @@ dependencies = [
  "mach2",
  "parking_lot",
  "polling",
+ "tempfile",
 ]
 
 [[package]]

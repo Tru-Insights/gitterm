@@ -164,6 +164,7 @@ fn drive<T: EventedPty + OnResize>(
 ) -> io::Result<()> {
     let mut polled = Events::new();
     let mut parser: Processor = Processor::new();
+    let mut reports = crate::reports::Reports::default();
     let mut buffer = vec![0; IO_BUDGET];
     let mut buffered = 0;
     let mut child_exit = None;
@@ -210,6 +211,7 @@ fn drive<T: EventedPty + OnResize>(
         if buffered > 0 {
             if let Some(mut terminal) = term.try_lock_unfair() {
                 parser.advance(&mut *terminal, &buffer[..buffered]);
+                reports.advance(&buffer[..buffered], events);
                 events.invalidate();
                 if parser.sync_bytes_count() < buffered {
                     events.send_event(Event::Wakeup);
