@@ -63,6 +63,56 @@ PRs 3–5 must account for every listed site. The owner remains the existing App
 | `src/main.rs:32451` | `update_event / WorkspaceCreated` | `self.normalize_workspace_order();` |
 | `src/main.rs:32680` | `update_event / AttentionJumpNext` | `self.begin_slide_to(ws_idx);` |
 
+## TRU-289 current status caller map
+
+This section supersedes the historical status locations below on this branch.
+Selection and source/root ownership remain unchanged for PRs 4–5. The historical
+base inventory is retained so every former write/request can be traced.
+
+`GitStatusState::reduce(StatusEvent, Instant) -> Vec<StatusCommand>` mutates the
+sole per-tab state. Its inputs include request/reset/input/wake/visibility,
+completion/discard, and existing UI metadata/error writes. Commands collect a
+resolved root or expose the remaining poll delay. Iced retains source identity,
+capability/root guards and job execution. No job generation/freshness guard is added.
+
+| Former owner / caller | Current site | Transition / retained boundary |
+| --- | --- | --- |
+| TabState fields / constructor | `src/main.rs:5244`; `src/main.rs:5338` | One composed status owner; no writable legacy status fields. |
+| Core state / reducer API | `crates/gitterm-core/src/status.rs:51`; `crates/gitterm-core/src/status.rs:131` | Single mutable owner; explicit clock; pure transition to commands. |
+| adopt_git_root | `src/main.rs:5395` | Root guards remain here; accepted adoption dispatches Reset. |
+| hash / next interval | `crates/gitterm-core/src/status.rs:226`; `crates/gitterm-core/src/status.rs:242` | Hash and cadence now pure core rules; same field/list ordering and thresholds. |
+| request_git_status / active-source wrapper | `src/main.rs:10908`; `src/main.rs:10920` | Dispatch Request with explicit prelude; resolve source and actual local request root in adapter. |
+| command interpreter / executors | `src/main.rs:10951`; `src/main.rs:10972`; `src/main.rs:10995` | CollectStatus becomes existing Iced Task. SchedulePoll uses existing Tick checks; no second timer. |
+| after_resume | `src/main.rs:14916` | Request(Resume): no loading or clock prelude. |
+| resume_chat_as_tab / resume_chat_as_chat_tab / remote chat | `src/main.rs:15524`; `src/main.rs:15616`; `src/main.rs:15706` | Request(TabOpened): loading only, via active-source wrapper. |
+| startup | `src/main.rs:21090` | Local Request(Refresh): loading and clock, no cadence/hash reset. |
+| launch_session_tab | `src/main.rs:21292` | Request(TabOpened) via active-source wrapper. |
+| refresh_panels_for_context | `src/main.rs:22410` | Reset then local Request(Refresh); Files jump stays in adapter. |
+| Terminal input / CWD | `src/main.rs:24473`; `src/main.rs:24594` | Input; CWD changes Reset then local Request(Refresh). |
+| Tick | `src/main.rs:24710` | Current Git-or-diff visibility and resolved root enter reducer; capability/active-tab gates remain in adapter. |
+| RemoteSessionLaunched / FileSelect errors | `src/main.rs:27409`; `src/main.rs:27672` | SetError preserves prior loading and clock behavior. |
+| EditFile / FolderSelected | `src/main.rs:27424`; `src/main.rs:27637` | Request(TabOpened) via active-source wrapper. |
+| OpenWorktree | `src/main.rs:29546` | Request(Refresh) via active-source wrapper. |
+| RemoteAgentHandshakeLoaded | `src/main.rs:29623` | Request(Resume): preserve connection path without a prelude. |
+| WindowFocused | `src/main.rs:30348` | Wake after existing strict >300s guard; backdate by 60s, keep hash. |
+| GitStatusLoaded | `src/main.rs:31151` | Address tab, preserve domain/root guards; Completed or DiscardCompletion enters reducer. Late results for absent tabs ignored. |
+| WorkspaceCreated | `src/main.rs:32328` | Request(TabOpened) via active-source wrapper. |
+| set_sidebar_mode | `src/main.rs:32742` | Git entry Request(Refresh); source absence ClearLoading. Re-entry remains a no-op. |
+| services DTO conversion | `src/services.rs:25`; `src/services.rs:692` | Local collector DTOs and remote opaque-root/error conversion stay outside core. |
+
+The dead `TabState::fetch_status` alternate writer was removed, without adding
+any callers. `status_char` remains test-only for its existing tests. Label writes
+in task/chat/remote-tab setup now use `SetLabel`; initial remote browser state
+uses `InitializeRemote`. Read sites consume `tab.status` directly.
+
+`src/baseline_tests.rs` retains all pre-extraction expected values and goldens;
+only composed field paths and the renamed raw source-executor reference change.
+Core reducer unit tests also cover both overlapping completion orders, success /
+error orders, dirty/clean/non-repo backoff, identity-excluding order-sensitive
+hashes, each request prelude, visibility/loading guards, input, wake, reset and
+discard. The collector, source transport and selection inventory below remain
+historical references, not extracted implementations.
+
 ## Status requests, completions, polling writes and reset sites
 
 | Base site | Enclosing function / event arm | Code |

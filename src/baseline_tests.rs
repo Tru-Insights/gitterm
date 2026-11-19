@@ -310,7 +310,7 @@ fn workspace(name: &str, id: usize) -> Workspace {
     let root = PathBuf::from(format!("/fixture/{name}"));
     let mut ws = Workspace::new(name.into(), root.clone(), WorkspaceColor::Blue);
     let mut tab = TabState::new(id, root);
-    tab.last_poll = now();
+    tab.status.last_poll = now();
     ws.tabs.push(tab);
     ws
 }
@@ -410,7 +410,7 @@ fn workspace_selection_traces() {
         assert_eq!(app.selected_task_id.is_none(), selected != 0, "{name}");
         assert_eq!(Trace::take(), expected, "{name}");
         assert!(
-            !app.active_tab().unwrap().git_status_loading,
+            !app.active_tab().unwrap().status.git_status_loading,
             "selection has no immediate status: {name}"
         );
         if selected != 0 {
@@ -534,17 +534,17 @@ fn status_backoff_completion_and_error_traces() {
             let tab = app.active_tab().unwrap();
             assert_eq!(
                 (
-                    tab.git_unchanged_streak,
-                    tab.git_poll_interval_ms,
-                    tab.last_poll,
-                    tab.git_status_loading
+                    tab.status.git_unchanged_streak,
+                    tab.status.git_poll_interval_ms,
+                    tab.status.last_poll,
+                    tab.status.git_status_loading
                 ),
                 (streak as u32, interval, now(), false),
                 "{label}:{streak}"
             );
         }
-        let before = app.active_tab().unwrap().last_poll;
-        let hash = app.active_tab().unwrap().last_git_status_hash;
+        let before = app.active_tab().unwrap().status.last_poll;
+        let hash = app.active_tab().unwrap().status.last_git_status_hash;
         Trace::advance(999);
         let mut failed = snapshot(10, "/fixture/alpha", "bad", false, false);
         failed.error = Some("remote status failed: synthetic disconnect".into());
@@ -552,10 +552,10 @@ fn status_backoff_completion_and_error_traces() {
         let tab = app.active_tab().unwrap();
         assert_eq!(
             (
-                tab.last_poll,
-                tab.last_git_status_hash,
-                tab.branch_name.as_str(),
-                tab.git_status_error.as_deref()
+                tab.status.last_poll,
+                tab.status.last_git_status_hash,
+                tab.status.branch_name.as_str(),
+                tab.status.git_status_error.as_deref()
             ),
             (
                 before,
@@ -565,11 +565,14 @@ fn status_backoff_completion_and_error_traces() {
             )
         );
         // characterized: repo name is excluded from the hash, so changing it keeps the unchanged streak.
-        let streak = tab.git_unchanged_streak;
+        let streak = tab.status.git_unchanged_streak;
         let mut renamed = snapshot(10, "/fixture/alpha", "branch", dirty, repo);
         renamed.repo_name = "renamed".into();
         apply(&mut app, renamed);
-        assert_eq!(app.active_tab().unwrap().git_unchanged_streak, streak + 1);
+        assert_eq!(
+            app.active_tab().unwrap().status.git_unchanged_streak,
+            streak + 1
+        );
     }
     for order in [["old", "new"], ["new", "old"]] {
         let mut app = app_with_tabs(fixture.path());
@@ -587,10 +590,10 @@ fn status_backoff_completion_and_error_traces() {
             );
             let tab = &app.workspaces[0].tabs[0];
             // characterized: any completion clears loading; there is no latest-request-wins guard.
-            assert!(!tab.git_status_loading);
-            assert_eq!(tab.branch_name, branch);
+            assert!(!tab.status.git_status_loading);
+            assert_eq!(tab.status.branch_name, branch);
         }
-        assert_eq!(app.workspaces[0].tabs[0].branch_name, order[1]);
+        assert_eq!(app.workspaces[0].tabs[0].status.branch_name, order[1]);
         app.workspaces[0].tabs.clear();
         apply(
             &mut app,
@@ -619,7 +622,7 @@ fn status_poll_visibility_and_reset_traces() {
         let tab = app.active_tab_mut().unwrap();
         tab.sidebar_mode = mode;
         tab.selected_file = selected.then(|| "diff.txt".into());
-        tab.git_status_loading = loading;
+        tab.status.git_status_loading = loading;
         Trace::advance(elapsed);
         Trace::take();
         let _ = app.update_event(Event::Tick);
@@ -633,17 +636,17 @@ fn status_poll_visibility_and_reset_traces() {
             "{mode:?} selected={selected} elapsed={elapsed}"
         );
         assert_eq!(
-            app.active_tab().unwrap().git_status_loading,
+            app.active_tab().unwrap().status.git_status_loading,
             loading || expected
         );
-        assert!(!app.workspaces[1].tabs[0].git_status_loading);
+        assert!(!app.workspaces[1].tabs[0].status.git_status_loading);
     }
     let mut app = app_with_tabs(fixture.path());
     let tab = app.active_tab_mut().unwrap();
-    tab.git_poll_interval_ms = 30000;
-    tab.git_unchanged_streak = 9;
-    tab.last_git_status_hash = Some(123);
-    let before = tab.last_poll;
+    tab.status.git_poll_interval_ms = 30000;
+    tab.status.git_unchanged_streak = 9;
+    tab.status.last_git_status_hash = Some(123);
+    let before = tab.status.last_poll;
     let _ = app.update_event(Event::Terminal(
         10,
         iced_term::Event::BackendCall(10, iced_term::backend::Command::Write(b"x".to_vec())),
@@ -651,10 +654,10 @@ fn status_poll_visibility_and_reset_traces() {
     let tab = app.active_tab().unwrap();
     assert_eq!(
         (
-            tab.git_poll_interval_ms,
-            tab.git_unchanged_streak,
-            tab.last_git_status_hash,
-            tab.last_poll
+            tab.status.git_poll_interval_ms,
+            tab.status.git_unchanged_streak,
+            tab.status.last_git_status_hash,
+            tab.status.last_poll
         ),
         (5000, 0, Some(123), before)
     );
@@ -662,11 +665,11 @@ fn status_poll_visibility_and_reset_traces() {
     let tab = app.active_tab().unwrap();
     assert_eq!(
         (
-            tab.git_poll_interval_ms,
-            tab.git_unchanged_streak,
-            tab.last_git_status_hash,
-            tab.last_poll,
-            tab.git_status_loading
+            tab.status.git_poll_interval_ms,
+            tab.status.git_unchanged_streak,
+            tab.status.last_git_status_hash,
+            tab.status.last_poll,
+            tab.status.git_status_loading
         ),
         (5000, 0, None, now(), true)
     );
@@ -829,7 +832,7 @@ fn source_root_precedence_and_adoption_traces() {
             "{guard}"
         );
         assert_eq!(tab.current_dir, launch, "{guard}");
-        assert_eq!(tab.branch_name, "discovered", "{guard}");
+        assert_eq!(tab.status.branch_name, "discovered", "{guard}");
     }
 }
 
@@ -844,7 +847,7 @@ fn removed_followed_tree_and_source_failure_traces() {
         let mut app = app_with_tabs(fixture.path());
         let missing = fixture.path().join("gone");
         follow(&mut app.workspaces[0].tabs[0], &missing);
-        app.workspaces[0].tabs[0].last_git_status_hash = Some(123);
+        app.workspaces[0].tabs[0].status.last_git_status_hash = Some(123);
         app.workspaces[0].tabs[0].files.dir = SourcePath::Local(missing.join("sub"));
         if !active {
             app.active_workspace_idx = 1;
@@ -855,13 +858,13 @@ fn removed_followed_tree_and_source_failure_traces() {
             snapshot(10, missing.to_str().unwrap(), "discard-this", false, false),
         );
         let tab = &app.workspaces[0].tabs[0];
-        assert_eq!(tab.branch_name, "main");
-        assert_eq!(tab.last_git_status_hash, None);
+        assert_eq!(tab.status.branch_name, "main");
+        assert_eq!(tab.status.last_git_status_hash, None);
         assert_eq!(
             tab.worktree_follow.note.as_deref(),
             Some("worktree gone is gone; back to the workspace root")
         );
-        assert_eq!(tab.git_status_loading, active);
+        assert_eq!(tab.status.git_status_loading, active);
         assert_eq!(
             requests(),
             if active {
@@ -905,7 +908,7 @@ fn removed_followed_tree_and_source_failure_traces() {
         Trace::take();
         let _ = app.update_event(Event::Tick);
         assert!(requests().is_empty(), "{kind}");
-        assert!(!app.active_tab().unwrap().git_status_loading);
+        assert!(!app.active_tab().unwrap().status.git_status_loading);
     }
     let mut app = app_with_tabs(fixture.path());
     app.workspaces[0].location = WorkspaceLocation::RemoteAgent {
@@ -918,19 +921,19 @@ fn removed_followed_tree_and_source_failure_traces() {
     assert!(source.capabilities().git_status);
     assert!(matches!(&source,WorkspaceSource::RemoteAgent {root,..} if root=="Q:/opaque/repo"));
     Trace::take();
-    let _ = App::request_source_git_status(source, 10, "/fixture/fallback".into());
+    let _ = App::execute_source_git_status(source, 10, "/fixture/fallback".into());
     assert_eq!(requests().len(), 1);
     apply(&mut app, snapshot(10, "/fixture/alpha", "good", true, true));
-    let before = app.active_tab().unwrap().last_poll;
+    let before = app.active_tab().unwrap().status.last_poll;
     let mut error = snapshot(10, "/fixture/fallback", "", false, false);
     error.error = Some("synthetic remote transport failure".into());
     apply(&mut app, error);
     let tab = app.active_tab().unwrap();
     assert_eq!(
         (
-            tab.branch_name.as_str(),
-            tab.last_poll,
-            tab.git_status_error.as_deref()
+            tab.status.branch_name.as_str(),
+            tab.status.last_poll,
+            tab.status.git_status_error.as_deref()
         ),
         ("good", before, Some("synthetic remote transport failure"))
     );
@@ -1041,9 +1044,9 @@ fn input_wake_and_enter_git_reset_traces() {
     let mut app = app_with_tabs(fixture.path());
     for (interval, streak, expected) in [(30000, 9, 0), (5000, 2, 2)] {
         let tab = app.active_tab_mut().unwrap();
-        tab.git_poll_interval_ms = interval;
-        tab.git_unchanged_streak = streak;
-        tab.last_git_status_hash = Some(123);
+        tab.status.git_poll_interval_ms = interval;
+        tab.status.git_unchanged_streak = streak;
+        tab.status.last_git_status_hash = Some(123);
         let _ = app.update_event(Event::Terminal(
             10,
             iced_term::Event::BackendCall(10, iced_term::backend::Command::Write(b"x".to_vec())),
@@ -1051,19 +1054,19 @@ fn input_wake_and_enter_git_reset_traces() {
         let tab = app.active_tab().unwrap();
         assert_eq!(
             (
-                tab.git_poll_interval_ms,
-                tab.git_unchanged_streak,
-                tab.last_git_status_hash
+                tab.status.git_poll_interval_ms,
+                tab.status.git_unchanged_streak,
+                tab.status.last_git_status_hash
             ),
             (5000, expected, Some(123))
         );
     }
     let _ = app.update_event(Event::WindowFocused);
     Trace::advance(300000);
-    app.active_tab_mut().unwrap().git_poll_interval_ms = 30000;
+    app.active_tab_mut().unwrap().status.git_poll_interval_ms = 30000;
     let _ = app.update_event(Event::WindowFocused);
     assert_eq!(
-        app.active_tab().unwrap().git_poll_interval_ms,
+        app.active_tab().unwrap().status.git_poll_interval_ms,
         30000,
         "exactly 300s is not sleep"
     );
@@ -1072,10 +1075,10 @@ fn input_wake_and_enter_git_reset_traces() {
     let tab = app.active_tab().unwrap();
     assert_eq!(
         (
-            tab.git_poll_interval_ms,
-            tab.git_unchanged_streak,
-            tab.last_poll,
-            tab.last_git_status_hash
+            tab.status.git_poll_interval_ms,
+            tab.status.git_unchanged_streak,
+            tab.status.last_poll,
+            tab.status.last_git_status_hash
         ),
         (5000, 0, now() - Duration::from_secs(60), Some(123))
     );
@@ -1085,9 +1088,9 @@ fn input_wake_and_enter_git_reset_traces() {
     let tab = app.active_tab().unwrap();
     assert_eq!(
         (
-            tab.last_poll,
-            tab.git_status_loading,
-            tab.last_git_status_hash
+            tab.status.last_poll,
+            tab.status.git_status_loading,
+            tab.status.last_git_status_hash
         ),
         (now(), true, Some(123))
     );
@@ -1128,7 +1131,7 @@ fn stopping_park_preserves_identity_and_resume_request_prelude() {
             requests().is_empty(),
             "parking doesn't immediately poll status"
         );
-        let before = app.active_tab().unwrap().last_poll;
+        let before = app.active_tab().unwrap().status.last_poll;
         let _ = app.after_resume();
         assert_eq!(
             requests(),
@@ -1141,8 +1144,8 @@ fn stopping_park_preserves_identity_and_resume_request_prelude() {
         // characterized: resume issues a request without setting loading or advancing the poll clock.
         assert_eq!(
             (
-                app.active_tab().unwrap().git_status_loading,
-                app.active_tab().unwrap().last_poll
+                app.active_tab().unwrap().status.git_status_loading,
+                app.active_tab().unwrap().status.last_poll
             ),
             (false, before)
         );
@@ -1177,20 +1180,22 @@ fn status_file_order_and_hash_traces() {
             ["z.txt", "a.txt"]
         };
         assert_eq!(
-            tab.staged
+            tab.status
+                .staged
                 .iter()
                 .map(|f| f.path.as_str())
                 .collect::<Vec<_>>(),
             expected
         );
         assert_eq!(
-            tab.unstaged
+            tab.status
+                .unstaged
                 .iter()
                 .map(|f| (f.path.as_str(), f.status.as_str(), f.is_staged))
                 .collect::<Vec<_>>(),
             [("z.txt", "D", false)]
         );
-        assert_eq!(tab.untracked[0].path, "new.txt");
-        assert_eq!(tab.git_unchanged_streak, expected_streak);
+        assert_eq!(tab.status.untracked[0].path, "new.txt");
+        assert_eq!(tab.status.git_unchanged_streak, expected_streak);
     }
 }

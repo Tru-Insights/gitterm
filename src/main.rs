@@ -1,4 +1,6 @@
-use git2::{DiffOptions, Repository, Status, StatusOptions};
+#[cfg(test)]
+use git2::Status;
+use git2::{DiffOptions, Repository};
 use iced::advanced::graphics::core::Element;
 use iced::keyboard::{self, key, Key, Modifiers};
 use iced::widget::{
@@ -2055,7 +2057,9 @@ fn main() -> iced::Result {
         .run()
 }
 
-use gitterm_core::status::GitFileStatus as FileEntry;
+use gitterm_core::status::{
+    GitFileStatus as FileEntry, GitStatusState, RequestPrelude, StatusCommand, StatusEvent,
+};
 use gitterm_core::workspace::WorkspaceId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3965,7 +3969,7 @@ impl AttentionItem {
             .terminal_title()
             .map(strip_title_status_glyphs)
             .filter(|title| !title.is_empty())
-            .unwrap_or(tab.repo_name.as_str())
+            .unwrap_or(tab.status.repo_name.as_str())
             .to_string();
         Some(Self {
             target: AttentionTarget::Tab(tab.id),
@@ -5232,12 +5236,12 @@ macro_rules! status_now {
 }
 
 // Tab state. Tab-kind data structures live in `src/tab/mod.rs`; the heavy `impl TabState`
-// methods (load_file, fetch_status, fetch_diff, fetch_claude_config, fetch_agent_activity, etc.)
+// methods (load_file, fetch_diff, fetch_claude_config, fetch_agent_activity, etc.)
 // stay here because they reference too many in-binary helpers, constants, and macros.
 struct TabState {
     id: usize,
     repo_path: PathBuf,
-    repo_name: String,
+    status: GitStatusState,
     kind: TabKind,
     /// Modal file viewer overlay sitting on top of the tab's primary content
     /// (the terminal, or the chat surface of an agent tab). Closing it (Back /
@@ -5246,16 +5250,6 @@ struct TabState {
     /// Debounce: most-recent `ViewFile` request this tab received, to suppress double-clicks.
     last_view_request_path: Option<PathBuf>,
     last_view_request_at: Option<Instant>,
-    staged: Vec<FileEntry>,
-    unstaged: Vec<FileEntry>,
-    untracked: Vec<FileEntry>,
-    branch_name: String,
-    last_poll: Instant,
-    git_poll_interval_ms: u64,
-    git_unchanged_streak: u32,
-    last_git_status_hash: Option<u64>,
-    git_status_loading: bool,
-    git_status_error: Option<String>,
     git_view_mode: GitViewMode,
     worktrees: Vec<GitWorktreeEntry>,
     branches: Vec<GitBranchEntry>,
@@ -5327,7 +5321,6 @@ struct TabState {
     // for its debounced write to the chat's facts file (TRU-166). Claude
     // chat tabs in local workspaces only.
     chat_facts: chat_facts::LiveFacts,
-    is_git_repo: bool,
 }
 
 impl TabState {
@@ -5342,21 +5335,11 @@ impl TabState {
         Self {
             id,
             repo_path,
-            repo_name,
+            status: GitStatusState::new(repo_name, is_git_repo, status_now!()),
             kind: TabKind::Terminal(TerminalTab::new()),
             file_viewer: None,
             last_view_request_path: None,
             last_view_request_at: None,
-            staged: Vec::new(),
-            unstaged: Vec::new(),
-            untracked: Vec::new(),
-            branch_name: String::from("main"),
-            last_poll: Instant::now() - Duration::from_millis(GIT_POLL_FAST_INTERVAL_MS),
-            git_poll_interval_ms: GIT_POLL_FAST_INTERVAL_MS,
-            git_unchanged_streak: 0,
-            last_git_status_hash: None,
-            git_status_loading: false,
-            git_status_error: None,
             git_view_mode: GitViewMode::Changes,
             worktrees: Vec::new(),
             branches: Vec::new(),
@@ -5396,7 +5379,6 @@ impl TabState {
             claude_config: ClaudeConfig::default(),
             worktree_follow: WorktreeFollow::default(),
             chat_facts: chat_facts::LiveFacts::default(),
-            is_git_repo,
         }
     }
 
@@ -5420,9 +5402,7 @@ impl TabState {
             return;
         }
         self.repo_path = root.to_path_buf();
-        self.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
-        self.git_unchanged_streak = 0;
-        self.last_git_status_hash = None;
+        self.status.reduce(StatusEvent::Reset, status_now!());
     }
 
     // ---- Tab-kind accessors -------------------------------------------------
@@ -5842,77 +5822,16 @@ impl TabState {
     }
 
     fn total_changes(&self) -> usize {
-        self.staged.len() + self.unstaged.len() + self.untracked.len()
+        self.status.staged.len() + self.status.unstaged.len() + self.status.untracked.len()
     }
 
     fn all_files(&self) -> Vec<&FileEntry> {
-        self.staged
+        self.status
+            .staged
             .iter()
-            .chain(self.unstaged.iter())
-            .chain(self.untracked.iter())
+            .chain(self.status.unstaged.iter())
+            .chain(self.status.untracked.iter())
             .collect()
-    }
-
-    #[allow(dead_code)]
-    fn fetch_status(&mut self) {
-        if let Ok(repo) = Repository::open(&self.repo_path) {
-            // Get branch name
-            if let Ok(head) = repo.head() {
-                if let Some(name) = head.shorthand() {
-                    self.branch_name = name.to_string();
-                }
-            }
-
-            // Get file statuses
-            let mut opts = StatusOptions::new();
-            opts.no_refresh(true)
-                .include_untracked(true)
-                .recurse_untracked_dirs(true)
-                .include_ignored(false);
-
-            self.staged.clear();
-            self.unstaged.clear();
-            self.untracked.clear();
-
-            if let Ok(statuses) = repo.statuses(Some(&mut opts)) {
-                for entry in statuses.iter() {
-                    let path = entry.path().unwrap_or("").to_string();
-                    let status = entry.status();
-
-                    if status.contains(Status::INDEX_NEW)
-                        || status.contains(Status::INDEX_MODIFIED)
-                        || status.contains(Status::INDEX_DELETED)
-                        || status.contains(Status::INDEX_RENAMED)
-                    {
-                        self.staged.push(FileEntry {
-                            path: path.clone(),
-                            status: status_char(status, true),
-                            is_staged: true,
-                        });
-                    }
-
-                    if status.contains(Status::WT_MODIFIED)
-                        || status.contains(Status::WT_DELETED)
-                        || status.contains(Status::WT_RENAMED)
-                    {
-                        self.unstaged.push(FileEntry {
-                            path: path.clone(),
-                            status: status_char(status, false),
-                            is_staged: false,
-                        });
-                    }
-
-                    if status.contains(Status::WT_NEW) {
-                        self.untracked.push(FileEntry {
-                            path,
-                            status: "?".to_string(),
-                            is_staged: false,
-                        });
-                    }
-                }
-            }
-        }
-        self.last_poll = Instant::now();
     }
 
     fn fetch_claude_config(&mut self) {
@@ -6097,7 +6016,7 @@ impl TabState {
         };
 
         // Check if it's untracked
-        let is_untracked = self.untracked.iter().any(|f| f.path == file_path);
+        let is_untracked = self.status.untracked.iter().any(|f| f.path == file_path);
 
         if is_untracked {
             // Read file content for untracked files
@@ -6899,6 +6818,7 @@ fn compute_word_diff(old_text: &str, new_text: &str) -> Vec<InlineChange> {
         .collect()
 }
 
+#[cfg(test)]
 fn status_char(status: Status, staged: bool) -> String {
     if staged {
         if status.contains(Status::INDEX_NEW) {
@@ -6920,45 +6840,6 @@ fn status_char(status: Status, staged: bool) -> String {
         "R".to_string()
     } else {
         "?".to_string()
-    }
-}
-
-fn hash_file_entry_list(entries: &[FileEntry], hasher: &mut DefaultHasher) {
-    for entry in entries {
-        entry.path.hash(hasher);
-        entry.status.hash(hasher);
-        entry.is_staged.hash(hasher);
-    }
-}
-
-fn git_tab_state_hash(tab: &TabState) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    tab.is_git_repo.hash(&mut hasher);
-    tab.branch_name.hash(&mut hasher);
-    hash_file_entry_list(&tab.staged, &mut hasher);
-    hash_file_entry_list(&tab.unstaged, &mut hasher);
-    hash_file_entry_list(&tab.untracked, &mut hasher);
-    hasher.finish()
-}
-
-fn next_git_poll_interval_ms(is_git_repo: bool, has_changes: bool, unchanged_streak: u32) -> u64 {
-    if !is_git_repo {
-        return GIT_POLL_NON_REPO_INTERVAL_MS;
-    }
-
-    if has_changes {
-        return match unchanged_streak {
-            0..=2 => GIT_POLL_FAST_INTERVAL_MS,
-            3..=8 => GIT_POLL_MEDIUM_INTERVAL_MS,
-            _ => GIT_POLL_SLOW_INTERVAL_MS,
-        };
-    }
-
-    match unchanged_streak {
-        0..=1 => GIT_POLL_FAST_INTERVAL_MS,
-        2..=4 => GIT_POLL_MEDIUM_INTERVAL_MS,
-        5..=8 => GIT_POLL_SLOW_INTERVAL_MS,
-        _ => GIT_POLL_IDLE_INTERVAL_MS,
     }
 }
 
@@ -8887,11 +8768,6 @@ const WORKSPACES_SAVE_DEBOUNCE_MS: u64 = 1500;
 const LOG_SERVER_SYNC_INTERVAL_MS: u64 = 15000;
 const LOG_SERVER_STARTUP_RETRY_MS: u64 = 500;
 const MENU_POLL_INTERVAL_MS: u64 = 200;
-const GIT_POLL_FAST_INTERVAL_MS: u64 = 5000;
-const GIT_POLL_MEDIUM_INTERVAL_MS: u64 = 10000;
-const GIT_POLL_SLOW_INTERVAL_MS: u64 = 15000;
-const GIT_POLL_IDLE_INTERVAL_MS: u64 = 30000;
-const GIT_POLL_NON_REPO_INTERVAL_MS: u64 = 20000;
 const GIT_WORKTREES_POLL_INTERVAL_MS: u64 = 15000;
 // Workspace overview polling (TRU-167, design decision 16): the panel on
 // screen rereads every owned checkout on the slow tier; hidden, a stat of
@@ -9638,14 +9514,6 @@ fn local_clock_time(unix_secs: u64) -> String {
 }
 
 pub use gitterm_core::status::GitStatusSnapshot;
-
-fn file_entry_from_source(file: source::SourceGitFile) -> FileEntry {
-    FileEntry {
-        path: file.path,
-        status: file.status,
-        is_staged: file.is_staged,
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct GitWorktreesSnapshot {
@@ -10989,11 +10857,11 @@ impl App {
                 true.hash(&mut snapshot_hasher);
                 let content = term.get_all_text();
                 terminal_bytes += content.len();
-                tab.repo_name.hash(&mut snapshot_hasher);
+                tab.status.repo_name.hash(&mut snapshot_hasher);
                 content.hash(&mut snapshot_hasher);
                 let snapshot = log_server::TerminalSnapshot {
                     tab_id: tab.id,
-                    tab_name: tab.repo_name.clone(),
+                    tab_name: tab.status.repo_name.clone(),
                     content,
                 };
                 terminal_snapshots.insert(tab.id, snapshot);
@@ -11037,29 +10905,71 @@ impl App {
         )
     }
 
-    fn request_git_status(tab_id: usize, repo_path: PathBuf) -> Task<Event> {
-        Self::request_local_git_status(tab_id, repo_path)
+    fn request_git_status(
+        tab: &mut TabState,
+        root: PathBuf,
+        prelude: RequestPrelude,
+    ) -> Task<Event> {
+        let commands = tab
+            .status
+            .reduce(StatusEvent::Request { root, prelude }, status_now!());
+        Self::run_status_commands(tab.id, None, commands)
     }
 
-    /// Refresh git status for the active tab through its workspace source.
-    /// No-op when the source doesn't support git status (legacy remotes).
+    /// Source resolution stays in the adapter; the addressed tab owns all status writes.
     fn request_git_status_for_active_source(
-        &self,
+        &mut self,
         tab_id: usize,
-        repo_path: PathBuf,
+        root: PathBuf,
+        prelude: RequestPrelude,
     ) -> Task<Event> {
-        match self.source_for_active_tab() {
-            Ok(source) if source.capabilities().git_status => {
-                Self::request_source_git_status(source, tab_id, repo_path)
-            }
-            _ => Task::none(),
+        let source = self
+            .source_for_active_tab()
+            .ok()
+            .filter(|s| s.capabilities().git_status);
+        let root = match &source {
+            Some(WorkspaceSource::Local { root }) => root.clone(),
+            _ => root,
+        };
+        let Some(tab) = self
+            .workspaces
+            .iter_mut()
+            .flat_map(|ws| &mut ws.tabs)
+            .find(|t| t.id == tab_id)
+        else {
+            return Task::none();
+        };
+        let commands = tab
+            .status
+            .reduce(StatusEvent::Request { root, prelude }, status_now!());
+        match source {
+            Some(source) => Self::run_status_commands(tab_id, Some(source), commands),
+            None => Task::none(),
         }
     }
 
-    /// Git status through a workspace source. Local delegates to the
-    /// existing collector path; remote asks the agent. Errors surface in
-    /// the snapshot rather than pretending the tree is clean.
-    fn request_source_git_status(
+    fn run_status_commands(
+        tab_id: usize,
+        source: Option<WorkspaceSource>,
+        commands: Vec<StatusCommand>,
+    ) -> Task<Event> {
+        Task::batch(commands.into_iter().map(|command| match command {
+            StatusCommand::CollectStatus { root } => match source.clone() {
+                Some(WorkspaceSource::Local { .. }) | None => {
+                    Self::execute_local_git_status(tab_id, root)
+                }
+                Some(source) => Self::execute_source_git_status(source, tab_id, root),
+            },
+            // The existing Tick is the sole scheduler. Core retains the deadline
+            // and rechecks it on the next tick, preserving the 5-second granularity.
+            StatusCommand::SchedulePoll { .. } => Task::none(),
+        }))
+    }
+
+    /// Execute a remote status command through the workspace source.
+    /// Local commands use the existing collector executor directly.
+    /// Source errors surface in the snapshot and keep the last good data.
+    fn execute_source_git_status(
         source: WorkspaceSource,
         tab_id: usize,
         fallback_root: PathBuf,
@@ -11070,53 +10980,19 @@ impl App {
         {
             return Task::none();
         }
-        if let WorkspaceSource::Local { root } = source {
-            return Self::request_local_git_status(tab_id, root);
-        }
         Task::perform(
             async move {
-                match source.git_status().await {
-                    Ok(status) => GitStatusSnapshot {
-                        tab_id,
-                        repo_path: PathBuf::from(status.root.display()),
-                        repo_name: status.repo_name,
-                        branch_name: status.branch_name,
-                        is_git_repo: status.is_git_repo,
-                        staged: status
-                            .staged
-                            .into_iter()
-                            .map(file_entry_from_source)
-                            .collect(),
-                        unstaged: status
-                            .unstaged
-                            .into_iter()
-                            .map(file_entry_from_source)
-                            .collect(),
-                        untracked: status
-                            .untracked
-                            .into_iter()
-                            .map(file_entry_from_source)
-                            .collect(),
-                        error: None,
-                    },
-                    Err(err) => GitStatusSnapshot {
-                        tab_id,
-                        repo_path: fallback_root,
-                        repo_name: String::new(),
-                        branch_name: String::new(),
-                        is_git_repo: false,
-                        staged: Vec::new(),
-                        unstaged: Vec::new(),
-                        untracked: Vec::new(),
-                        error: Some(err),
-                    },
-                }
+                services::source_git_status_snapshot(
+                    tab_id,
+                    fallback_root,
+                    source.git_status().await,
+                )
             },
             Event::GitStatusLoaded,
         )
     }
 
-    fn request_local_git_status(tab_id: usize, repo_path: PathBuf) -> Task<Event> {
+    fn execute_local_git_status(tab_id: usize, repo_path: PathBuf) -> Task<Event> {
         #[cfg(test)]
         if baseline_tests::request(format!("local:{tab_id}:{}", repo_path.display())) {
             return Task::none();
@@ -11275,8 +11151,8 @@ impl App {
         let sources = chat_rank::snippet_sources(&entries);
         let tab = self.active_tab();
         let branch = tab
-            .filter(|t| t.is_git_repo && !t.branch_name.is_empty())
-            .map(|t| t.branch_name.clone());
+            .filter(|t| t.status.is_git_repo && !t.status.branch_name.is_empty())
+            .map(|t| t.status.branch_name.clone());
         let recent_prompt = tab.and_then(|t| match &t.kind {
             TabKind::Agent(session) => {
                 chat_rank::last_prompt(&session.conversation).map(str::to_string)
@@ -13029,7 +12905,7 @@ impl App {
                     .map(move |tab| {
                         serde_json::json!({
                             "session_id": tab.task_session_id,
-                            "label": tab.repo_name,
+                            "label": tab.status.repo_name,
                             "workspace": workspace.name,
                             "is_active": workspace_idx == self.active_workspace_idx
                                 && workspace.active_tab < workspace.tabs.len()
@@ -13381,7 +13257,10 @@ impl App {
             // resume command so an app restart reopens it instead of
             // launching a fresh harness.
             tab.set_startup_command(Some(command));
-            tab.repo_name = format!("{backend_label} · {}", task.title);
+            tab.status.reduce(
+                StatusEvent::SetLabel(format!("{backend_label} · {}", task.title)),
+                status_now!(),
+            );
             self.mark_workspaces_dirty();
             return self.focus_workspace_tab(workspace_idx, tab_idx);
         }
@@ -13421,7 +13300,10 @@ impl App {
         // Persist the resume command so an app restart reopens this
         // conversation instead of launching a fresh harness.
         tab.set_startup_command(Some(command));
-        tab.repo_name = format!("{backend_label} · {}", task.title);
+        tab.status.reduce(
+            StatusEvent::SetLabel(format!("{backend_label} · {}", task.title)),
+            status_now!(),
+        );
         tab.sidebar_mode = SidebarMode::Tasks;
         self.workspaces[workspace_idx].tabs.push(tab);
         let tab_idx = self.workspaces[workspace_idx].tabs.len() - 1;
@@ -14154,7 +14036,10 @@ impl App {
             // re-submitted (create_tab stored the injected command).
             tab.set_startup_command(pre_injection_command.clone());
         }
-        tab.repo_name = format!("{child_label} · {}", task.title);
+        tab.status.reduce(
+            StatusEvent::SetLabel(format!("{child_label} · {}", task.title)),
+            status_now!(),
+        );
         tab.sidebar_mode = SidebarMode::Tasks;
         let conversation = chat_session_id.map(|chat_session_id| HarnessConversationRef {
             backend: conversation_backend.unwrap_or(HarnessConversationBackend::Claude),
@@ -15031,7 +14916,7 @@ impl App {
     fn after_resume(&mut self) -> Task<Event> {
         let git_task = match self.active_tab().map(|tab| (tab.id, tab.repo_path.clone())) {
             Some((tab_id, repo_path)) => {
-                self.request_git_status_for_active_source(tab_id, repo_path)
+                self.request_git_status_for_active_source(tab_id, repo_path, RequestPrelude::Resume)
             }
             None => Task::none(),
         };
@@ -15705,14 +15590,17 @@ impl App {
         self.add_tab_with_command(cwd, Some(command));
         if let Some(tab) = self.active_tab_mut() {
             tab.chat_session_id = Some(id);
-            tab.git_status_loading = true;
         }
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
         if let Some((tab_id, repo_path)) =
             self.active_tab().map(|tab| (tab.id, tab.repo_path.clone()))
         {
-            tasks.push(self.request_git_status_for_active_source(tab_id, repo_path));
+            tasks.push(self.request_git_status_for_active_source(
+                tab_id,
+                repo_path,
+                RequestPrelude::TabOpened,
+            ));
         }
         tasks.push(self.scroll_to_active_tab());
         Task::batch(tasks)
@@ -15792,7 +15680,6 @@ impl App {
         tab.kind = TabKind::Agent(resumed_claude_chat_session(&self.chat_config, &id));
         tab.set_local_dir(cwd);
         tab.chat_session_id = Some(id.clone());
-        tab.git_status_loading = true;
         let repo_path = tab.repo_path.clone();
         let workspace = &mut self.workspaces[self.active_workspace_idx];
         workspace.tabs.push(tab);
@@ -15800,7 +15687,11 @@ impl App {
         eprintln!("[agent] opened Claude chat tab id={tab_id} resuming {id}");
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
-        tasks.push(self.request_git_status_for_active_source(tab_id, repo_path));
+        tasks.push(self.request_git_status_for_active_source(
+            tab_id,
+            repo_path,
+            RequestPrelude::TabOpened,
+        ));
         tasks.push(self.scroll_to_active_tab());
         // Builds the chat page: history read-back, replay, composer focus.
         tasks.push(self.present_active_tab_surfaces());
@@ -15830,7 +15721,6 @@ impl App {
         );
         let tab_id = tab.id;
         tab.chat_session_id = Some(id.clone());
-        tab.git_status_loading = true;
         let repo_path = tab.repo_path.clone();
         let workspace = &mut self.workspaces[ws_idx];
         workspace.tabs.push(tab);
@@ -15838,7 +15728,11 @@ impl App {
         eprintln!("[agent] opened Claude chat tab id={tab_id} resuming {id} on {remote_id}");
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
-        tasks.push(self.request_git_status_for_active_source(tab_id, repo_path));
+        tasks.push(self.request_git_status_for_active_source(
+            tab_id,
+            repo_path,
+            RequestPrelude::TabOpened,
+        ));
         tasks.push(self.scroll_to_active_tab());
         tasks.push(self.present_active_tab_surfaces());
         // "Open Chat" on a conversation running there: attach now (TRU-152).
@@ -21196,17 +21090,12 @@ impl App {
         // Return startup tasks (menu init + initial git status for active tab)
         let mut startup_tasks = vec![Task::done(Event::InitMenu), Self::request_syntect_warmup()];
         if !app.active_workspace_is_remote() {
-            let refresh_target = {
-                if let Some(tab) = app.active_tab_mut() {
-                    tab.git_status_loading = true;
-                    tab.last_poll = Instant::now();
-                    Some((tab.id, tab.repo_path.clone()))
-                } else {
-                    None
-                }
-            };
-            if let Some((tab_id, repo_path)) = refresh_target {
-                startup_tasks.push(Self::request_git_status(tab_id, repo_path));
+            if let Some(tab) = app.active_tab_mut() {
+                startup_tasks.push(Self::request_git_status(
+                    tab,
+                    tab.repo_path.clone(),
+                    RequestPrelude::Refresh,
+                ));
             }
         }
         startup_tasks.push(app.ensure_active_remote_agent_connection(false));
@@ -21266,7 +21155,8 @@ impl App {
         if let Some(session) = self.remote_session_for_workspace(workspace) {
             let title =
                 remote_tab_title_for_startup_command(session, startup_command_for_title.as_deref());
-            tab.repo_name = title.clone();
+            tab.status
+                .reduce(StatusEvent::SetLabel(title.clone()), status_now!());
             tab.set_terminal_title(Some(title));
         }
         workspace.tabs.push(tab);
@@ -21314,10 +21204,13 @@ impl App {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         let mut tab = TabState::new(id, PathBuf::from(&root));
-        tab.repo_name = workspace_name.to_string();
-        tab.branch_name = "remote".to_string();
+        tab.status.reduce(
+            StatusEvent::SetLabel(workspace_name.to_string()),
+            status_now!(),
+        );
+        tab.status
+            .reduce(StatusEvent::InitializeRemote, status_now!());
         tab.sidebar_mode = SidebarMode::Files;
-        tab.is_git_repo = false;
         // Browser state is remote-native; the agent validates the persisted
         // dir on the first listing and any error is shown in the sidebar.
         tab.files = FilesState::at(SourcePath::Remote(
@@ -21425,7 +21318,6 @@ impl App {
                 self.mark_log_server_dirty();
                 let refresh_target = {
                     if let Some(tab) = self.active_tab_mut() {
-                        tab.git_status_loading = true;
                         tab.chat_session_id = chat_session_id;
                         Some((tab.id, tab.repo_path.clone()))
                     } else {
@@ -21435,7 +21327,11 @@ impl App {
                 if let Some((tab_id, repo_path)) = refresh_target {
                     return Task::batch([
                         self.scroll_to_active_tab(),
-                        self.request_git_status_for_active_source(tab_id, repo_path),
+                        self.request_git_status_for_active_source(
+                            tab_id,
+                            repo_path,
+                            RequestPrelude::TabOpened,
+                        ),
                     ]);
                 }
                 return self.scroll_to_active_tab();
@@ -22518,12 +22414,8 @@ fi
         let mut git_task = Task::none();
         let mut files_jump = None;
         if let Some(tab) = self.active_tab_mut() {
-            tab.git_status_loading = true;
-            tab.last_poll = status_now!();
-            tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
-            tab.git_unchanged_streak = 0;
-            tab.last_git_status_hash = None;
-            git_task = Self::request_local_git_status(tab.id, root.clone());
+            tab.status.reduce(StatusEvent::Reset, status_now!());
+            git_task = Self::request_git_status(tab, root.clone(), RequestPrelude::Refresh);
             if let SourcePath::Local(dir) = &tab.files.dir {
                 let left_old_root = leaving
                     .as_ref()
@@ -22718,7 +22610,8 @@ fi
                 .is_some_and(|cmd| cmd == startup_command)
         }) {
             if let Some(tab) = self.workspaces[ws_idx].tabs.get_mut(idx) {
-                tab.repo_name = title.clone();
+                tab.status
+                    .reduce(StatusEvent::SetLabel(title.clone()), status_now!());
                 tab.set_terminal_title(Some(title));
             }
             self.workspaces[ws_idx].active_tab = idx;
@@ -22734,7 +22627,8 @@ fi
         };
         let mut tab =
             self.create_tab_for_workspace(local_cwd, Some(startup_command), Some(&workspace_name));
-        tab.repo_name = title.clone();
+        tab.status
+            .reduce(StatusEvent::SetLabel(title.clone()), status_now!());
         tab.set_terminal_title(Some(title));
         self.workspaces[ws_idx].tabs.push(tab);
         self.workspaces[ws_idx].active_tab = self.workspaces[ws_idx].tabs.len() - 1;
@@ -23220,8 +23114,8 @@ fi
             for tab in &workspace.tabs {
                 tab.id.hash(&mut hasher);
                 tab.chat_session_id.hash(&mut hasher);
-                tab.repo_name.hash(&mut hasher);
-                tab.branch_name.hash(&mut hasher);
+                tab.status.repo_name.hash(&mut hasher);
+                tab.status.branch_name.hash(&mut hasher);
                 tab.is_running().hash(&mut hasher);
                 tab.attention
                     .map(|attention| attention.reason.label())
@@ -23394,17 +23288,17 @@ fi
                 // CLI terminal tabs often carry no repo name of their own;
                 // fall back to the conversation's indexed repo, then to
                 // the directory's name.
-                let repo = if tab.repo_name.is_empty() {
+                let repo = if tab.status.repo_name.is_empty() {
                     entry.map(|entry| entry.group_name()).unwrap_or_else(|| {
                         cwd.file_name()
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_default()
                     })
                 } else {
-                    tab.repo_name.clone()
+                    tab.status.repo_name.clone()
                 };
-                let branch = (tab.is_git_repo && !tab.branch_name.is_empty())
-                    .then_some(tab.branch_name.as_str())
+                let branch = (tab.status.is_git_repo && !tab.status.branch_name.is_empty())
+                    .then_some(tab.status.branch_name.as_str())
                     .or_else(|| entry.and_then(|entry| entry.branch.as_deref()));
                 snapshot.chats.push(chat_overview::tab_snapshot(
                     TabInput {
@@ -23515,7 +23409,7 @@ fi
             .and_then(|id| self.chat_index.iter().find(|entry| entry.id == id))
             .map(|entry| entry.title.as_str())
             .or(terminal_title)
-            .unwrap_or(tab.repo_name.as_str())
+            .unwrap_or(tab.status.repo_name.as_str())
     }
 
     /// Feed the needs-you notifier what can need the human right now and
@@ -23682,7 +23576,10 @@ fi
             _ => String::new(),
         };
         if let Some(tab) = ws.active_tab() {
-            format!("{} - {} - {}{machine}", self.title, ws.name, tab.repo_name)
+            format!(
+                "{} - {} - {}{machine}",
+                self.title, ws.name, tab.status.repo_name
+            )
         } else {
             format!("{} - {}{machine}", self.title, ws.name)
         }
@@ -23698,7 +23595,7 @@ fi
     fn browser_owner_label(&self, tab: &TabState) -> String {
         self.chat_tab_title(tab, None)
             .or_else(|| tab.terminal_title())
-            .unwrap_or(tab.repo_name.as_str())
+            .unwrap_or(tab.status.repo_name.as_str())
             .to_string()
     }
 
@@ -24573,10 +24470,7 @@ fi
                         }
                         tab.clear_attention(AttentionReason::HumanInputRequired);
                         // Reset git poll to fast when user is actively typing
-                        if tab.git_poll_interval_ms > GIT_POLL_FAST_INTERVAL_MS {
-                            tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
-                            tab.git_unchanged_streak = 0;
-                        }
+                        tab.status.reduce(StatusEvent::Input, status_now!());
                         // A keystroke into an Interrupted task's session is the
                         // user resuming it. Deliberately input, not output —
                         // relaunch banners and TUI redraws are output, and they
@@ -24697,14 +24591,11 @@ fi
                                             // Trigger a git status refresh — the worker will
                                             // discover the correct repo root off the main thread.
                                             tab.repo_path = dir.clone();
-                                            tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
-                                            tab.git_unchanged_streak = 0;
-                                            tab.last_git_status_hash = None;
-                                            tab.last_poll = Instant::now();
-                                            tab.git_status_loading = true;
+                                            tab.status.reduce(StatusEvent::Reset, status_now!());
                                             let status_task = Self::request_git_status(
-                                                tab.id,
+                                                tab,
                                                 tab.repo_path.clone(),
+                                                RequestPrelude::Refresh,
                                             );
                                             pending_task = Some(
                                                 if let Some(tree_task) = pending_task.take() {
@@ -24813,28 +24704,23 @@ fi
                         // NOTE: repo root self-heal moved to GitStatusLoaded handler
                         // to avoid blocking main thread with Repository::discover().
 
-                        let git_focus_active =
+                        let focused =
                             tab.sidebar_mode == SidebarMode::Git || tab.selected_file.is_some();
-                        let effective_git_poll_interval_ms = if git_focus_active {
-                            tab.git_poll_interval_ms
-                        } else {
-                            tab.git_poll_interval_ms.max(GIT_POLL_SLOW_INTERVAL_MS)
-                        };
-
-                        if !tab.git_status_loading
-                            && status_now!().saturating_duration_since(tab.last_poll)
-                                >= Duration::from_millis(effective_git_poll_interval_ms)
-                        {
-                            let tab_id = tab.id;
-                            let repo_path = tab.repo_path.clone();
-                            tab.last_poll = status_now!();
-                            tab.git_status_loading = true;
-                            tasks.push(Self::request_source_git_status(
-                                poll_source.clone(),
-                                tab_id,
-                                repo_path,
-                            ));
-                        }
+                        let commands = tab.status.reduce(
+                            StatusEvent::VisibilityChanged {
+                                focused,
+                                root: match &poll_source {
+                                    WorkspaceSource::Local { root } => root.clone(),
+                                    _ => tab.repo_path.clone(),
+                                },
+                            },
+                            status_now!(),
+                        );
+                        tasks.push(Self::run_status_commands(
+                            tab.id,
+                            Some(poll_source.clone()),
+                            commands,
+                        ));
 
                         if poll_caps.git_worktrees
                             && tab.sidebar_mode == SidebarMode::Git
@@ -27502,7 +27388,8 @@ fi
                         if let Some(machine) = &machine {
                             label = format!("{label} @ {machine}");
                         }
-                        tab.repo_name = label.clone();
+                        tab.status
+                            .reduce(StatusEvent::SetLabel(label.clone()), status_now!());
                         tab.set_terminal_title(Some(label));
                         // Registry rule: a chat resumed on its remote
                         // machine owns this attach tab.
@@ -27518,7 +27405,8 @@ fi
                     self.remote_sessions_error = Some(message.clone());
                     if let Some(tab) = self.active_tab_mut() {
                         tab.files.error = Some(message.clone());
-                        tab.git_status_error = Some(message);
+                        tab.status
+                            .reduce(StatusEvent::SetError(message), status_now!());
                     }
                 }
             },
@@ -27554,7 +27442,6 @@ fi
                     self.mark_log_server_dirty();
                     let refresh_target = {
                         if let Some(tab) = self.active_tab_mut() {
-                            tab.git_status_loading = true;
                             Some((tab.id, tab.repo_path.clone()))
                         } else {
                             None
@@ -27563,7 +27450,11 @@ fi
                     if let Some((tab_id, repo_path)) = refresh_target {
                         return Task::batch([
                             self.scroll_to_active_tab(),
-                            self.request_git_status_for_active_source(tab_id, repo_path),
+                            self.request_git_status_for_active_source(
+                                tab_id,
+                                repo_path,
+                                RequestPrelude::TabOpened,
+                            ),
                         ]);
                     }
                     return self.scroll_to_active_tab();
@@ -27750,7 +27641,6 @@ fi
                 self.mark_log_server_dirty();
                 let refresh_target = {
                     if let Some(tab) = self.active_tab_mut() {
-                        tab.git_status_loading = true;
                         Some((tab.id, tab.repo_path.clone()))
                     } else {
                         None
@@ -27759,7 +27649,11 @@ fi
                 if let Some((tab_id, repo_path)) = refresh_target {
                     return Task::batch([
                         self.scroll_to_active_tab(),
-                        self.request_git_status_for_active_source(tab_id, repo_path),
+                        self.request_git_status_for_active_source(
+                            tab_id,
+                            repo_path,
+                            RequestPrelude::TabOpened,
+                        ),
                     ]);
                 }
                 return self.scroll_to_active_tab();
@@ -27773,8 +27667,12 @@ fi
                     .unwrap_or(false);
                 if !git_diff_supported {
                     if let Some(tab) = self.active_tab_mut() {
-                        tab.git_status_error =
-                            Some("Diffs aren't available for this source yet".to_string());
+                        tab.status.reduce(
+                            StatusEvent::SetError(
+                                "Diffs aren't available for this source yet".to_string(),
+                            ),
+                            status_now!(),
+                        );
                     }
                     return Task::none();
                 }
@@ -28414,7 +28312,7 @@ fi
                         Some("Open a repository session before creating a task".to_string());
                     return Task::none();
                 };
-                if !tab.is_git_repo {
+                if !tab.status.is_git_repo {
                     self.task_ui_error = Some(format!(
                         "{} is not a Git repository",
                         tab.repo_path.display()
@@ -29689,15 +29587,17 @@ fi
                 let mut tasks = vec![self.scroll_to_active_tab()];
                 let refresh_target = {
                     if let Some(tab) = self.active_tab_mut() {
-                        tab.git_status_loading = true;
-                        tab.last_poll = Instant::now();
                         Some((tab.id, tab.repo_path.clone()))
                     } else {
                         None
                     }
                 };
                 if let Some((tab_id, repo_path)) = refresh_target {
-                    tasks.push(self.request_git_status_for_active_source(tab_id, repo_path));
+                    tasks.push(self.request_git_status_for_active_source(
+                        tab_id,
+                        repo_path,
+                        RequestPrelude::Refresh,
+                    ));
                 }
 
                 tasks.push(self.present_active_tab_surfaces());
@@ -29747,7 +29647,11 @@ fi
                                 .active_tab()
                                 .map(|tab| (tab.id, tab.repo_path.clone()))
                                 .map(|(tab_id, repo_path)| {
-                                    self.request_git_status_for_active_source(tab_id, repo_path)
+                                    self.request_git_status_for_active_source(
+                                        tab_id,
+                                        repo_path,
+                                        RequestPrelude::Resume,
+                                    )
                                 })
                                 .unwrap_or_else(Task::none);
                             pending_refresh =
@@ -30441,9 +30345,7 @@ fi
                     freeze_debug!("WAKE RECOVERY: Window focused after sleep, refreshing state");
                     // Reset git polling for active tab so it refreshes quickly
                     if let Some(tab) = self.active_tab_mut() {
-                        tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
-                        tab.git_unchanged_streak = 0;
-                        tab.last_poll = status_now!() - Duration::from_secs(60);
+                        tab.status.reduce(StatusEvent::Wake, status_now!());
                     }
                 }
                 self.request_open_pr_refreshes();
@@ -31273,7 +31175,6 @@ fi
                     .flat_map(|ws| ws.tabs.iter_mut())
                     .find(|t| t.id == snapshot.tab_id)
                 {
-                    tab.git_status_loading = false;
                     // A followed agent worktree that was removed (merged,
                     // cleaned up) drops the tab back to its root with a note
                     // (TRU-146). When the panels were following it, this
@@ -31281,16 +31182,21 @@ fi
                     // the root is read instead.
                     let was_following = tab.worktree_follow.panel_root().is_some();
                     if tab.worktree_follow.check_removed(Path::is_dir) && was_following {
-                        tab.git_status_error = None;
+                        tab.status.reduce(
+                            StatusEvent::DiscardCompletion {
+                                clear_hash: !is_active_tab,
+                            },
+                            status_now!(),
+                        );
                         if is_active_tab {
                             return self.refresh_panels_for_context(context_root_before);
                         }
                         // Polled again (from the root) once it is active.
-                        tab.last_git_status_hash = None;
                         return Task::none();
                     }
-                    tab.git_status_error = snapshot.error.clone();
                     if snapshot.error.is_some() {
+                        tab.status
+                            .reduce(StatusEvent::Completed(snapshot), status_now!());
                         // Keep the last good status visible alongside the error;
                         // retry on the normal poll cadence.
                         return Task::none();
@@ -31311,43 +31217,17 @@ fi
                             tab.adopt_git_root(&snapshot.repo_path);
                         }
 
-                        // Apply the git status from the worker (which already ran
-                        // Repository::discover off the main thread)
-                        tab.repo_name = snapshot.repo_name;
-                        tab.branch_name = snapshot.branch_name;
-                        tab.is_git_repo = snapshot.is_git_repo;
-                        tab.staged = snapshot.staged;
-                        tab.unstaged = snapshot.unstaged;
-                        tab.untracked = snapshot.untracked;
-
-                        let effective_hash = git_tab_state_hash(tab);
-                        let unchanged = tab.last_git_status_hash == Some(effective_hash);
-                        if unchanged {
-                            tab.git_unchanged_streak = tab.git_unchanged_streak.saturating_add(1);
-                        } else {
-                            tab.git_unchanged_streak = 0;
-                        }
-
-                        let has_changes = !tab.staged.is_empty()
-                            || !tab.unstaged.is_empty()
-                            || !tab.untracked.is_empty();
-                        tab.git_poll_interval_ms = next_git_poll_interval_ms(
-                            tab.is_git_repo,
-                            has_changes,
-                            tab.git_unchanged_streak,
-                        );
-                        tab.last_git_status_hash = Some(effective_hash);
-
+                        let previous_hash = tab.status.last_git_status_hash;
+                        tab.status
+                            .reduce(StatusEvent::Completed(snapshot), status_now!());
                         perf_log!(
                             "git_poll tab={} interval={}ms unchanged={} streak={} changes={}",
                             tab.id,
-                            tab.git_poll_interval_ms,
-                            unchanged,
-                            tab.git_unchanged_streak,
-                            tab.staged.len() + tab.unstaged.len() + tab.untracked.len()
+                            tab.status.git_poll_interval_ms,
+                            previous_hash == tab.status.last_git_status_hash,
+                            tab.status.git_unchanged_streak,
+                            tab.total_changes()
                         );
-
-                        tab.last_poll = status_now!();
                     }
                 }
             }
@@ -32496,14 +32376,17 @@ fi
                 self.snap_slide_to_active_workspace();
                 let refresh_target = {
                     if let Some(tab) = self.active_tab_mut() {
-                        tab.git_status_loading = true;
                         Some((tab.id, tab.repo_path.clone()))
                     } else {
                         None
                     }
                 };
                 if let Some((tab_id, repo_path)) = refresh_target {
-                    return self.request_git_status_for_active_source(tab_id, repo_path);
+                    return self.request_git_status_for_active_source(
+                        tab_id,
+                        repo_path,
+                        RequestPrelude::TabOpened,
+                    );
                 }
             }
             Event::WorkspaceCreated(None) => {}
@@ -32902,8 +32785,16 @@ fi
         }
         match mode {
             SidebarMode::Git => {
-                tab.last_poll = status_now!();
-                tab.git_status_loading = true;
+                let commands = tab.status.reduce(
+                    StatusEvent::Request {
+                        root: match &active_source {
+                            Some(WorkspaceSource::Local { root }) => root.clone(),
+                            _ => tab.repo_path.clone(),
+                        },
+                        prelude: RequestPrelude::Refresh,
+                    },
+                    status_now!(),
+                );
                 let tab_id = tab.id;
                 let repo_path = tab.repo_path.clone();
                 let load_worktrees =
@@ -32913,12 +32804,11 @@ fi
                     tab.last_worktrees_poll = Instant::now();
                 }
                 let Some(source) = active_source else {
-                    tab.git_status_loading = false;
+                    tab.status.reduce(StatusEvent::ClearLoading, status_now!());
                     return Task::none();
                 };
                 self.mark_log_server_dirty();
-                let status_task =
-                    Self::request_source_git_status(source, tab_id, repo_path.clone());
+                let status_task = Self::run_status_commands(tab_id, Some(source), commands);
                 if load_worktrees {
                     let worktrees_repo_path = active_workspace_dir.unwrap_or(repo_path);
                     return Task::batch([
@@ -38476,9 +38366,10 @@ fi
             });
             let display_title = task_session_label.unwrap_or_else(|| {
                 if workspace_is_remote {
-                    tab.repo_name.as_str()
+                    tab.status.repo_name.as_str()
                 } else {
-                    tab.terminal_title().unwrap_or(tab.repo_name.as_str())
+                    tab.terminal_title()
+                        .unwrap_or(tab.status.repo_name.as_str())
                 }
             });
             let (icon_str, icon_color) = self.session_tab_icon(tab, is_active, display_title);
@@ -38692,7 +38583,7 @@ fi
             .or_else(|| {
                 self.active_workspace()
                     .and_then(Workspace::active_tab)
-                    .map(|tab| tab.branch_name.as_str())
+                    .map(|tab| tab.status.branch_name.as_str())
             })
             .unwrap_or_default();
         let branch_copy = text(format!("⎇ {branch}"))
@@ -38787,7 +38678,7 @@ fi
             } else {
                 format!(
                     "\u{2387} {} \u{b7} workspace root \u{b7} follow worktree {label}",
-                    tab.branch_name
+                    tab.status.branch_name
                 )
             };
             let chip_color = if follow.follow {
@@ -41580,7 +41471,7 @@ fi
                 sessions = sessions.push(
                     button(
                         row![
-                            text(tab.repo_name.as_str())
+                            text(tab.status.repo_name.as_str())
                                 .size(12)
                                 .color(text_primary)
                                 .font(mono)
@@ -43398,9 +43289,9 @@ fi
             // Second line: where the tab lives and what it is about, since a
             // click jumps straight there with no preview in between.
             let mut place = workspace.name.clone();
-            if tab.is_git_repo && !tab.branch_name.is_empty() {
+            if tab.status.is_git_repo && !tab.status.branch_name.is_empty() {
                 place.push_str(" · ");
-                place.push_str(&tab.branch_name);
+                place.push_str(&tab.status.branch_name);
             }
             let about: Option<String> = match &tab.kind {
                 TabKind::Agent(session) => {
@@ -46815,13 +46706,15 @@ fi
     fn view_git_list<'a>(&'a self, tab: &'a TabState) -> Element<'a, Event, Theme, iced::Renderer> {
         // Only show the loading banner for the initial fetch. Subsequent polls refresh in place
         // to avoid visible flashing in the Git list.
-        let show_loading = tab.git_status_loading && tab.last_git_status_hash.is_none();
+        let show_loading =
+            tab.status.git_status_loading && tab.status.last_git_status_hash.is_none();
 
         // Debug large git status results
-        let total_files = tab.staged.len() + tab.unstaged.len() + tab.untracked.len();
+        let total_files =
+            tab.status.staged.len() + tab.status.unstaged.len() + tab.status.untracked.len();
         if total_files > 1000 {
             freeze_debug!("Large git status with {} files ({} staged, {} unstaged, {} untracked) in view_git_list",
-                total_files, tab.staged.len(), tab.unstaged.len(), tab.untracked.len());
+                total_files, tab.status.staged.len(), tab.status.unstaged.len(), tab.status.untracked.len());
         }
 
         // Toggle and the selection panel stay pinned above the scrollable so
@@ -46949,7 +46842,7 @@ fi
         let font = self.ui_font();
         let font_small = self.ui_font_small();
 
-        if let Some(error) = &tab.git_status_error {
+        if let Some(error) = &tab.status.git_status_error {
             let error_bg = iced::Color {
                 a: 0.12,
                 ..theme.danger()
@@ -46970,13 +46863,13 @@ fi
         }
 
         // Branch display - styled rounded container with diamond icon
-        if tab.is_git_repo {
+        if tab.status.is_git_repo {
             let branch_bg = theme.bg_base();
             let mauve = theme.mauve();
             let branch_container = container(
                 row![
                     text("\u{25c6}").size(font).color(mauve),
-                    text(&tab.branch_name)
+                    text(&tab.status.branch_name)
                         .size(font)
                         .color(mauve)
                         .font(iced::Font::with_name("Menlo")),
@@ -47004,55 +46897,58 @@ fi
             );
         }
 
-        if !tab.staged.is_empty() {
+        if !tab.status.staged.is_empty() {
             content = content.push(
                 row![
                     text("S T A G E D").size(10).color(theme.text_muted()),
-                    text(format!("{}", tab.staged.len()))
+                    text(format!("{}", tab.status.staged.len()))
                         .size(10)
                         .color(theme.success()),
                 ]
                 .spacing(6),
             );
-            for file in &tab.staged {
+            for file in &tab.status.staged {
                 content = content.push(self.view_file_item(file, tab));
             }
         }
 
-        if !tab.unstaged.is_empty() {
+        if !tab.status.unstaged.is_empty() {
             content = content.push(
                 row![
                     text("U N S T A G E D").size(10).color(theme.text_muted()),
-                    text(format!("{}", tab.unstaged.len()))
+                    text(format!("{}", tab.status.unstaged.len()))
                         .size(10)
                         .color(theme.warning()),
                 ]
                 .spacing(6),
             );
-            for file in &tab.unstaged {
+            for file in &tab.status.unstaged {
                 content = content.push(self.view_file_item(file, tab));
             }
         }
 
-        if !tab.untracked.is_empty() {
+        if !tab.status.untracked.is_empty() {
             content = content.push(
                 row![
                     text("U N T R A C K E D").size(10).color(theme.text_muted()),
-                    text(format!("{}", tab.untracked.len()))
+                    text(format!("{}", tab.status.untracked.len()))
                         .size(10)
                         .color(theme.text_secondary()),
                 ]
                 .spacing(6),
             );
-            for file in &tab.untracked {
+            for file in &tab.status.untracked {
                 content = content.push(self.view_file_item(file, tab));
             }
         }
 
-        if tab.staged.is_empty() && tab.unstaged.is_empty() && tab.untracked.is_empty() {
+        if tab.status.staged.is_empty()
+            && tab.status.unstaged.is_empty()
+            && tab.status.untracked.is_empty()
+        {
             let msg = if show_loading {
                 ""
-            } else if tab.is_git_repo {
+            } else if tab.status.is_git_repo {
                 "No changes"
             } else {
                 "Not a git repository"
@@ -47117,7 +47013,7 @@ fi
                 content = content.push(self.view_worktree_item(worktree, is_selected));
             }
         } else if !tab.worktrees_loading && tab.worktrees_error.is_none() && source_matches {
-            let msg = if tab.is_git_repo {
+            let msg = if tab.status.is_git_repo {
                 "No linked worktrees"
             } else {
                 "Not a git repository"
