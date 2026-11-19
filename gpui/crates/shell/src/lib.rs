@@ -910,14 +910,22 @@ impl Render for Shell {
             })
             .children(self.workspaces.iter().enumerate().map(|(index, state)| {
                 let workspace = &state.workspace;
-                let count = self.data.status(workspace.id, cx).files.len();
+                let status = self.data.status(workspace.id, cx);
+                let count = status.files.len();
+                // Not polled yet: don't show the placeholder "0 main".
+                let (count_label, branch_label) = if status.checked {
+                    (count.to_string(), status.branch.clone())
+                } else {
+                    (String::new(), "Not checked yet".to_string())
+                };
                 Button::new(("workspace", index))
                     .ghost()
                     .selected(Some(workspace.id) == self.active_workspace(cx))
-                    .accessibility_label(format!(
-                        "{}, {}, {} changes",
-                        workspace.name, workspace.status, count
-                    ))
+                    .accessibility_label(if status.checked {
+                        format!("{}, {}, {} changes", workspace.name, status.branch, count)
+                    } else {
+                        format!("{}, not checked yet", workspace.name)
+                    })
                     .h(px(62.))
                     .w_full()
                     .flex()
@@ -935,13 +943,13 @@ impl Render for Shell {
                             .flex()
                             .gap_2()
                             .child(workspace.name.clone())
-                            .child(div().text_color(rgb(p.blue)).child(count.to_string())),
+                            .child(div().text_color(rgb(p.blue)).child(count_label)),
                     )
                     .child(
                         div()
                             .text_size(px(11.))
                             .text_color(rgb(p.muted))
-                            .child(self.data.status(workspace.id, cx).branch),
+                            .child(branch_label),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.select_workspace(index, window, cx)
