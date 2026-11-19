@@ -144,6 +144,14 @@ impl WorkspaceOwner {
             review_workers,
         }
     }
+    pub(crate) fn writer(&self) -> Option<Arc<crate::preview::Writer>> {
+        self.store.as_ref().and_then(|s| s.guard.clone())
+    }
+    pub(crate) fn preview(&self) -> Option<Arc<gitterm_core::preview::Preview>> {
+        self.store
+            .as_ref()
+            .and_then(|s| s.guard.as_ref().map(|g| g.preview().clone()))
+    }
     pub fn dispatch(&mut self, intent: Intent, now: Instant, cx: &mut Context<Self>) {
         let completed = match &intent {
             Intent::Completed(snapshot) => Some(crate::data::WorkspaceId(snapshot.tab_id as u64)),
@@ -154,7 +162,22 @@ impl WorkspaceOwner {
             if let Command::Status { owner, command } = command
                 && let Some(executor) = &self.executor
             {
-                self.jobs.execute(executor.handle(), owner, command);
+                let target = self
+                    .model
+                    .workspaces
+                    .iter()
+                    .find(|w| w.id.0 as usize == owner)
+                    .map(|w| w.folder.as_path())
+                    .unwrap_or(std::path::Path::new("<status>"));
+                if let Err(error) = crate::preview::executable(
+                    self.preview().as_deref(),
+                    gitterm_core::preview::Effect::Git,
+                    target,
+                ) {
+                    self.error = Some(error.to_string());
+                } else {
+                    self.jobs.execute(executor.handle(), owner, command);
+                }
             }
         }
         // shortcut: patches with unchanged paths/groups/status letters stay stale,
@@ -283,6 +306,21 @@ impl WorkspaceOwner {
         force: bool,
         cx: &mut Context<Self>,
     ) {
+        let target = self
+            .model
+            .workspaces
+            .iter()
+            .find(|w| w.id == workspace)
+            .map(|w| w.root.as_path())
+            .unwrap_or(std::path::Path::new("<review>"));
+        if let Err(error) = crate::preview::executable(
+            self.preview().as_deref(),
+            gitterm_core::preview::Effect::Git,
+            target,
+        ) {
+            self.error = Some(error.to_string());
+            return;
+        }
         let Some(view) = self.reviews.get(&workspace).cloned() else {
             return;
         };
@@ -341,14 +379,29 @@ impl WorkspaceOwner {
         if !folders.contains(&folder) {
             folders.push(folder.clone());
         }
-        self.store
+        let save = self
+            .store
             .as_ref()
             .expect("local owner has a store")
-            .save(&folders)?;
+            .save_async(&folders)?;
+        self.watch_save(save, cx);
         let id = self.model.add(folder, Instant::now());
         self.dispatch(Intent::Activate(id), Instant::now(), cx);
         self.dispatch(Intent::Opened, Instant::now(), cx);
         Ok(id)
+    }
+    pub(crate) fn watch_save(&self, save: crate::preview::SaveResult, cx: &mut Context<Self>) {
+        cx.spawn(async move |owner, cx| {
+            if let Err(error) = crate::preview::finish(Ok(save)).await {
+                let _ = owner.update(cx, |owner, cx| {
+                    let error = format!("Save local folders: {error:#}");
+                    eprintln!("{error}");
+                    owner.error = Some(error);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
     pub fn set_git_visible(&mut self, visible: bool, enter: bool, cx: &mut Context<Self>) {
         if enter && visible && !self.git_visible {
