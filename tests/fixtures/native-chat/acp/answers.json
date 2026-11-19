@@ -1,0 +1,21 @@
+[
+  {
+    "Ok": {
+      "outcome": {
+        "optionId": "once",
+        "outcome": "selected"
+      }
+    }
+  },
+  {
+    "Ok": {
+      "outcome": {
+        "optionId": "deny",
+        "outcome": "selected"
+      }
+    }
+  },
+  {
+    "Err": "ACP agents ask no structured questions; nothing to answer"
+  }
+]

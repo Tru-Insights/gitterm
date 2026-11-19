@@ -1,0 +1,54 @@
+{
+  "cancelled": {
+    "data": {
+      "id": "third",
+      "state": "cancelled"
+    },
+    "type": "message_lifecycle"
+  },
+  "empty": true,
+  "first": [
+    {
+      "id": "first",
+      "images": [],
+      "text": "Synthetic first"
+    },
+    []
+  ],
+  "next": {
+    "id": "second",
+    "images": [],
+    "text": "Synthetic second"
+  },
+  "refused": {
+    "data": {
+      "id": "first",
+      "reason": "it was already sent"
+    },
+    "type": "message_withdraw_refused"
+  },
+  "second": [
+    null,
+    [
+      {
+        "data": {
+          "id": "second",
+          "state": "queued"
+        },
+        "type": "message_lifecycle"
+      }
+    ]
+  ],
+  "third": [
+    null,
+    [
+      {
+        "data": {
+          "id": "third",
+          "state": "queued"
+        },
+        "type": "message_lifecycle"
+      }
+    ]
+  ]
+}

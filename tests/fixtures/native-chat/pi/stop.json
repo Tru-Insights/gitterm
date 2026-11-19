@@ -1,0 +1,9 @@
+[
+  {
+    "id": "synthetic-pi",
+    "type": "ready"
+  },
+  {
+    "type": "stopped"
+  }
+]

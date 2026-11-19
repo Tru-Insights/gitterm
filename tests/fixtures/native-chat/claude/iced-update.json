@@ -1,0 +1,1599 @@
+[
+  {
+    "config": {
+      "backend": "pi",
+      "model": "synthetic-model",
+      "session_path": "/synthetic/session.jsonl",
+      "thinking": true
+    },
+    "history": "NotLoaded",
+    "payloads": [
+      {
+        "id": "prompt-1",
+        "text": "Synthetic submit",
+        "type": "user_prompt"
+      },
+      {
+        "kind": "turn_timing",
+        "start_ms": 0
+      }
+    ],
+    "pending": [],
+    "revision": 1,
+    "state": "Streaming",
+    "step": "submit-pi"
+  },
+  {
+    "config": {
+      "backend": "pi",
+      "model": "synthetic-model",
+      "session_path": "/synthetic/session.jsonl",
+      "thinking": true
+    },
+    "history": "NotLoaded",
+    "payloads": [
+      {
+        "id": "prompt-1",
+        "text": "Synthetic submit",
+        "type": "user_prompt"
+      },
+      {
+        "kind": "turn_timing",
+        "start_ms": 0
+      }
+    ],
+    "pending": [],
+    "revision": 1,
+    "state": "Stopped",
+    "step": "stop-pi"
+  },
+  {
+    "config": {
+      "backend": "claude",
+      "model": "default"
+    },
+    "history": "Loading",
+    "payloads": [
+      {
+        "id": "prompt-1",
+        "text": "Synthetic submit",
+        "type": "user_prompt"
+      },
+      {
+        "kind": "turn_timing",
+        "start_ms": 0
+      },
+      {
+        "event": {
+          "data": {
+            "model": "synthetic-model",
+            "session_id": "synthetic-chat"
+          },
+          "type": "turn_started"
+        },
+        "kind": "harness"
+      },
+      {
+        "kind": "turn_timing",
+        "start_ms": 0
+      },
+      {
+        "event": {
+          "data": {
+            "kind": {
+              "decision_reason": null,
+              "input": {
+                "command": "true"
+              },
+              "suggestions": [],
+              "tool_name": "Bash",
+              "type": "permission"
+            },
+            "request_id": "p1",
+            "tool_use_id": "tool-1"
+          },
+          "type": "runtime_request"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "kind": {
+              "questions": [
+                {
+                  "question": "Pick a shape"
+                }
+              ],
+              "type": "question"
+            },
+            "request_id": "p2",
+            "tool_use_id": "tool-2"
+          },
+          "type": "runtime_request"
+        },
+        "kind": "harness"
+      }
+    ],
+    "pending": [
+      "p1",
+      "p2"
+    ],
+    "revision": 4,
+    "state": "Streaming",
+    "step": "pending-requests"
+  },
+  {
+    "config": {
+      "backend": "claude",
+      "model": "default"
+    },
+    "history": "Loading",
+    "payloads": [
+      {
+        "id": "prompt-1",
+        "text": "Synthetic submit",
+        "type": "user_prompt"
+      },
+      {
+        "kind": "turn_timing",
+        "start_ms": 0
+      },
+      {
+        "event": {
+          "data": {
+            "model": "synthetic-model",
+            "session_id": "synthetic-chat"
+          },
+          "type": "turn_started"
+        },
+        "kind": "harness"
+      },
+      {
+        "kind": "turn_timing",
+        "start_ms": 0
+      },
+      {
+        "event": {
+          "data": {
+            "kind": {
+              "decision_reason": null,
+              "input": {
+                "command": "true"
+              },
+              "suggestions": [],
+              "tool_name": "Bash",
+              "type": "permission"
+            },
+            "request_id": "p1",
+            "tool_use_id": "tool-1"
+          },
+          "type": "runtime_request"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "kind": {
+              "questions": [
+                {
+                  "question": "Pick a shape"
+                }
+              ],
+              "type": "question"
+            },
+            "request_id": "p2",
+            "tool_use_id": "tool-2"
+          },
+          "type": "runtime_request"
+        },
+        "kind": "harness"
+      }
+    ],
+    "pending": [
+      "p1",
+      "p2"
+    ],
+    "revision": 4,
+    "state": "Streaming",
+    "step": "answer-without-process"
+  },
+  {
+    "config": {
+      "backend": "claude",
+      "model": "default"
+    },
+    "history": "Loading",
+    "payloads": [
+      {
+        "id": "prompt-1",
+        "text": "Synthetic submit",
+        "type": "user_prompt"
+      },
+      {
+        "kind": "turn_timing",
+        "start_ms": 0
+      },
+      {
+        "event": {
+          "data": {
+            "model": "synthetic-model",
+            "session_id": "synthetic-chat"
+          },
+          "type": "turn_started"
+        },
+        "kind": "harness"
+      },
+      {
+        "kind": "turn_timing",
+        "start_ms": 0
+      },
+      {
+        "event": {
+          "data": {
+            "kind": {
+              "decision_reason": null,
+              "input": {
+                "command": "true"
+              },
+              "suggestions": [],
+              "tool_name": "Bash",
+              "type": "permission"
+            },
+            "request_id": "p1",
+            "tool_use_id": "tool-1"
+          },
+          "type": "runtime_request"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "kind": {
+              "questions": [
+                {
+                  "question": "Pick a shape"
+                }
+              ],
+              "type": "question"
+            },
+            "request_id": "p2",
+            "tool_use_id": "tool-2"
+          },
+          "type": "runtime_request"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "request_id": "p1"
+          },
+          "type": "runtime_request_resolved"
+        },
+        "kind": "harness"
+      }
+    ],
+    "pending": [
+      "p2"
+    ],
+    "revision": 5,
+    "state": "Streaming",
+    "step": "one-request-resolved"
+  },
+  {
+    "config": {
+      "backend": "claude",
+      "model": "default"
+    },
+    "history": "Loaded",
+    "payloads": [
+      {
+        "text": "Inspect fixture\n[image]",
+        "type": "user_prompt"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "early-tool",
+            "is_error": false,
+            "output": "early result"
+          },
+          "type": "item_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": "Consider",
+          "type": "thinking_delta"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": "Hello fixture",
+          "type": "text_delta"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "early-tool",
+            "kind": {
+              "input": {
+                "file_path": "/synthetic/readme.md"
+              },
+              "name": "Read",
+              "type": "tool_call"
+            }
+          },
+          "type": "item_started"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "early-tool",
+            "is_error": false,
+            "output": "early result"
+          },
+          "type": "item_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "agent-1",
+            "kind": {
+              "input": {
+                "prompt": "Synthetic child"
+              },
+              "name": "Agent",
+              "type": "tool_call"
+            }
+          },
+          "type": "item_started"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "event": {
+              "data": {
+                "model": null,
+                "session_id": null
+              },
+              "type": "turn_started"
+            },
+            "parent_tool_use_id": "agent-1"
+          },
+          "type": "subagent_event"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "agent-1",
+            "is_error": false,
+            "output": "child done"
+          },
+          "type": "item_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "event": {
+              "data": {
+                "cost_usd": null,
+                "status": {
+                  "state": "completed"
+                },
+                "usage": null
+              },
+              "type": "turn_completed"
+            },
+            "parent_tool_use_id": "agent-1"
+          },
+          "type": "subagent_event"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "cost_usd": null,
+            "status": {
+              "state": "completed"
+            },
+            "usage": null
+          },
+          "type": "turn_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "text": "Next prompt",
+        "type": "user_prompt"
+      },
+      {
+        "event": {
+          "data": "Second reply",
+          "type": "text_delta"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "cost_usd": null,
+            "status": {
+              "state": "completed"
+            },
+            "usage": null
+          },
+          "type": "turn_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "id": "prompt-1",
+        "text": "Synthetic submit",
+        "type": "user_prompt"
+      },
+      {
+        "kind": "turn_timing",
+        "start_ms": 0
+      },
+      {
+        "event": {
+          "data": {
+            "model": "synthetic-model",
+            "session_id": "synthetic-chat"
+          },
+          "type": "turn_started"
+        },
+        "kind": "harness"
+      },
+      {
+        "kind": "turn_timing",
+        "start_ms": 0
+      },
+      {
+        "event": {
+          "data": {
+            "kind": {
+              "decision_reason": null,
+              "input": {
+                "command": "true"
+              },
+              "suggestions": [],
+              "tool_name": "Bash",
+              "type": "permission"
+            },
+            "request_id": "p1",
+            "tool_use_id": "tool-1"
+          },
+          "type": "runtime_request"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "kind": {
+              "questions": [
+                {
+                  "question": "Pick a shape"
+                }
+              ],
+              "type": "question"
+            },
+            "request_id": "p2",
+            "tool_use_id": "tool-2"
+          },
+          "type": "runtime_request"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "request_id": "p1"
+          },
+          "type": "runtime_request_resolved"
+        },
+        "kind": "harness"
+      }
+    ],
+    "pending": [
+      "p2"
+    ],
+    "revision": 5,
+    "state": "Streaming",
+    "step": "history-before-live"
+  },
+  {
+    "config": {
+      "backend": "claude",
+      "model": "default"
+    },
+    "history": "Loaded",
+    "payloads": [
+      {
+        "text": "Inspect fixture\n[image]",
+        "type": "user_prompt"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "early-tool",
+            "is_error": false,
+            "output": "early result"
+          },
+          "type": "item_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": "Consider",
+          "type": "thinking_delta"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": "Hello fixture",
+          "type": "text_delta"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "early-tool",
+            "kind": {
+              "input": {
+                "file_path": "/synthetic/readme.md"
+              },
+              "name": "Read",
+              "type": "tool_call"
+            }
+          },
+          "type": "item_started"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "early-tool",
+            "is_error": false,
+            "output": "early result"
+          },
+          "type": "item_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "agent-1",
+            "kind": {
+              "input": {
+                "prompt": "Synthetic child"
+              },
+              "name": "Agent",
+              "type": "tool_call"
+            }
+          },
+          "type": "item_started"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "event": {
+              "data": {
+                "model": null,
+                "session_id": null
+              },
+              "type": "turn_started"
+            },
+            "parent_tool_use_id": "agent-1"
+          },
+          "type": "subagent_event"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "agent-1",
+            "is_error": false,
+            "output": "child done"
+          },
+          "type": "item_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "event": {
+              "data": {
+                "cost_usd": null,
+                "status": {
+                  "state": "completed"
+                },
+                "usage": null
+              },
+              "type": "turn_completed"
+            },
+            "parent_tool_use_id": "agent-1"
+          },
+          "type": "subagent_event"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "cost_usd": null,
+            "status": {
+              "state": "completed"
+            },
+            "usage": null
+          },
+          "type": "turn_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "text": "Next prompt",
+        "type": "user_prompt"
+      },
+      {
+        "event": {
+          "data": "Second reply",
+          "type": "text_delta"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "cost_usd": null,
+            "status": {
+              "state": "completed"
+            },
+            "usage": null
+          },
+          "type": "turn_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "id": "prompt-1",
+        "text": "Synthetic submit",
+        "type": "user_prompt"
+      },
+      {
+        "kind": "turn_timing",
+        "start_ms": 0
+      },
+      {
+        "event": {
+          "data": {
+            "model": "synthetic-model",
+            "session_id": "synthetic-chat"
+          },
+          "type": "turn_started"
+        },
+        "kind": "harness"
+      },
+      {
+        "kind": "turn_timing",
+        "start_ms": 0
+      },
+      {
+        "event": {
+          "data": {
+            "kind": {
+              "decision_reason": null,
+              "input": {
+                "command": "true"
+              },
+              "suggestions": [],
+              "tool_name": "Bash",
+              "type": "permission"
+            },
+            "request_id": "p1",
+            "tool_use_id": "tool-1"
+          },
+          "type": "runtime_request"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "kind": {
+              "questions": [
+                {
+                  "question": "Pick a shape"
+                }
+              ],
+              "type": "question"
+            },
+            "request_id": "p2",
+            "tool_use_id": "tool-2"
+          },
+          "type": "runtime_request"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "request_id": "p1"
+          },
+          "type": "runtime_request_resolved"
+        },
+        "kind": "harness"
+      }
+    ],
+    "pending": [
+      "p2"
+    ],
+    "revision": 5,
+    "state": "Streaming",
+    "step": "repeated-acp-replay"
+  },
+  {
+    "config": {
+      "backend": "claude",
+      "effort": "high",
+      "model": "synthetic-model",
+      "permission_mode": "plan"
+    },
+    "history": "Loaded",
+    "payloads": [
+      {
+        "text": "Inspect fixture\n[image]",
+        "type": "user_prompt"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "early-tool",
+            "is_error": false,
+            "output": "early result"
+          },
+          "type": "item_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": "Consider",
+          "type": "thinking_delta"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": "Hello fixture",
+          "type": "text_delta"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "early-tool",
+            "kind": {
+              "input": {
+                "file_path": "/synthetic/readme.md"
+              },
+              "name": "Read",
+              "type": "tool_call"
+            }
+          },
+          "type": "item_started"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "early-tool",
+            "is_error": false,
+            "output": "early result"
+          },
+          "type": "item_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "agent-1",
+            "kind": {
+              "input": {
+                "prompt": "Synthetic child"
+              },
+              "name": "Agent",
+              "type": "tool_call"
+            }
+          },
+          "type": "item_started"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "event": {
+              "data": {
+                "model": null,
+                "session_id": null
+              },
+              "type": "turn_started"
+            },
+            "parent_tool_use_id": "agent-1"
+          },
+          "type": "subagent_event"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "agent-1",
+            "is_error": false,
+            "output": "child done"
+          },
+          "type": "item_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "event": {
+              "data": {
+                "cost_usd": null,
+                "status": {
+                  "state": "completed"
+                },
+                "usage": null
+              },
+              "type": "turn_completed"
+            },
+            "parent_tool_use_id": "agent-1"
+          },
+          "type": "subagent_event"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "cost_usd": null,
+            "status": {
+              "state": "completed"
+            },
+            "usage": null
+          },
+          "type": "turn_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "text": "Next prompt",
+        "type": "user_prompt"
+      },
+      {
+        "event": {
+          "data": "Second reply",
+          "type": "text_delta"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "cost_usd": null,
+            "status": {
+              "state": "completed"
+            },
+            "usage": null
+          },
+          "type": "turn_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "id": "prompt-1",
+        "text": "Synthetic submit",
+        "type": "user_prompt"
+      },
+      {
+        "kind": "turn_timing",
+        "start_ms": 0
+      },
+      {
+        "event": {
+          "data": {
+            "model": "synthetic-model",
+            "session_id": "synthetic-chat"
+          },
+          "type": "turn_started"
+        },
+        "kind": "harness"
+      },
+      {
+        "kind": "turn_timing",
+        "start_ms": 0
+      },
+      {
+        "event": {
+          "data": {
+            "kind": {
+              "decision_reason": null,
+              "input": {
+                "command": "true"
+              },
+              "suggestions": [],
+              "tool_name": "Bash",
+              "type": "permission"
+            },
+            "request_id": "p1",
+            "tool_use_id": "tool-1"
+          },
+          "type": "runtime_request"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "kind": {
+              "questions": [
+                {
+                  "question": "Pick a shape"
+                }
+              ],
+              "type": "question"
+            },
+            "request_id": "p2",
+            "tool_use_id": "tool-2"
+          },
+          "type": "runtime_request"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "request_id": "p1"
+          },
+          "type": "runtime_request_resolved"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": "synthetic-model",
+          "type": "model_changed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": "plan",
+          "type": "permission_mode_changed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "applied": "high",
+            "effort": "high"
+          },
+          "type": "effort_changed"
+        },
+        "kind": "harness"
+      }
+    ],
+    "pending": [
+      "p2"
+    ],
+    "revision": 8,
+    "state": "Streaming",
+    "step": "confirmed-pickers"
+  },
+  {
+    "config": {
+      "backend": "claude",
+      "effort": "high",
+      "model": "synthetic-model",
+      "permission_mode": "plan"
+    },
+    "history": "Loaded",
+    "payloads": [
+      {
+        "text": "Inspect fixture\n[image]",
+        "type": "user_prompt"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "early-tool",
+            "is_error": false,
+            "output": "early result"
+          },
+          "type": "item_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": "Consider",
+          "type": "thinking_delta"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": "Hello fixture",
+          "type": "text_delta"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "early-tool",
+            "kind": {
+              "input": {
+                "file_path": "/synthetic/readme.md"
+              },
+              "name": "Read",
+              "type": "tool_call"
+            }
+          },
+          "type": "item_started"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "early-tool",
+            "is_error": false,
+            "output": "early result"
+          },
+          "type": "item_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "agent-1",
+            "kind": {
+              "input": {
+                "prompt": "Synthetic child"
+              },
+              "name": "Agent",
+              "type": "tool_call"
+            }
+          },
+          "type": "item_started"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "event": {
+              "data": {
+                "model": null,
+                "session_id": null
+              },
+              "type": "turn_started"
+            },
+            "parent_tool_use_id": "agent-1"
+          },
+          "type": "subagent_event"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "agent-1",
+            "is_error": false,
+            "output": "child done"
+          },
+          "type": "item_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "event": {
+              "data": {
+                "cost_usd": null,
+                "status": {
+                  "state": "completed"
+                },
+                "usage": null
+              },
+              "type": "turn_completed"
+            },
+            "parent_tool_use_id": "agent-1"
+          },
+          "type": "subagent_event"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "cost_usd": null,
+            "status": {
+              "state": "completed"
+            },
+            "usage": null
+          },
+          "type": "turn_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "text": "Next prompt",
+        "type": "user_prompt"
+      },
+      {
+        "event": {
+          "data": "Second reply",
+          "type": "text_delta"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "cost_usd": null,
+            "status": {
+              "state": "completed"
+            },
+            "usage": null
+          },
+          "type": "turn_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "id": "prompt-1",
+        "text": "Synthetic submit",
+        "type": "user_prompt"
+      },
+      {
+        "kind": "turn_timing",
+        "start_ms": 0
+      },
+      {
+        "event": {
+          "data": {
+            "model": "synthetic-model",
+            "session_id": "synthetic-chat"
+          },
+          "type": "turn_started"
+        },
+        "kind": "harness"
+      },
+      {
+        "kind": "turn_timing",
+        "start_ms": 0
+      },
+      {
+        "event": {
+          "data": {
+            "kind": {
+              "decision_reason": null,
+              "input": {
+                "command": "true"
+              },
+              "suggestions": [],
+              "tool_name": "Bash",
+              "type": "permission"
+            },
+            "request_id": "p1",
+            "tool_use_id": "tool-1"
+          },
+          "type": "runtime_request"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "kind": {
+              "questions": [
+                {
+                  "question": "Pick a shape"
+                }
+              ],
+              "type": "question"
+            },
+            "request_id": "p2",
+            "tool_use_id": "tool-2"
+          },
+          "type": "runtime_request"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "request_id": "p1"
+          },
+          "type": "runtime_request_resolved"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": "synthetic-model",
+          "type": "model_changed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": "plan",
+          "type": "permission_mode_changed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "applied": "high",
+            "effort": "high"
+          },
+          "type": "effort_changed"
+        },
+        "kind": "harness"
+      },
+      {
+        "end_ms": 0,
+        "kind": "turn_timing"
+      },
+      {
+        "event": {
+          "data": {
+            "code": 7
+          },
+          "type": "process_exited"
+        },
+        "kind": "harness"
+      }
+    ],
+    "pending": [],
+    "revision": 9,
+    "state": "Errored(\"The chat's agent exited mid-turn (code Some(7))\")",
+    "step": "process-exit-with-pending"
+  },
+  {
+    "config": {
+      "backend": "claude",
+      "effort": "high",
+      "model": "synthetic-model",
+      "permission_mode": "plan"
+    },
+    "history": "Loaded",
+    "payloads": [
+      {
+        "text": "Inspect fixture\n[image]",
+        "type": "user_prompt"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "early-tool",
+            "is_error": false,
+            "output": "early result"
+          },
+          "type": "item_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": "Consider",
+          "type": "thinking_delta"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": "Hello fixture",
+          "type": "text_delta"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "early-tool",
+            "kind": {
+              "input": {
+                "file_path": "/synthetic/readme.md"
+              },
+              "name": "Read",
+              "type": "tool_call"
+            }
+          },
+          "type": "item_started"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "early-tool",
+            "is_error": false,
+            "output": "early result"
+          },
+          "type": "item_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "agent-1",
+            "kind": {
+              "input": {
+                "prompt": "Synthetic child"
+              },
+              "name": "Agent",
+              "type": "tool_call"
+            }
+          },
+          "type": "item_started"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "event": {
+              "data": {
+                "model": null,
+                "session_id": null
+              },
+              "type": "turn_started"
+            },
+            "parent_tool_use_id": "agent-1"
+          },
+          "type": "subagent_event"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "id": "agent-1",
+            "is_error": false,
+            "output": "child done"
+          },
+          "type": "item_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "event": {
+              "data": {
+                "cost_usd": null,
+                "status": {
+                  "state": "completed"
+                },
+                "usage": null
+              },
+              "type": "turn_completed"
+            },
+            "parent_tool_use_id": "agent-1"
+          },
+          "type": "subagent_event"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "cost_usd": null,
+            "status": {
+              "state": "completed"
+            },
+            "usage": null
+          },
+          "type": "turn_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "text": "Next prompt",
+        "type": "user_prompt"
+      },
+      {
+        "event": {
+          "data": "Second reply",
+          "type": "text_delta"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "cost_usd": null,
+            "status": {
+              "state": "completed"
+            },
+            "usage": null
+          },
+          "type": "turn_completed"
+        },
+        "kind": "harness"
+      },
+      {
+        "id": "prompt-1",
+        "text": "Synthetic submit",
+        "type": "user_prompt"
+      },
+      {
+        "kind": "turn_timing",
+        "start_ms": 0
+      },
+      {
+        "event": {
+          "data": {
+            "model": "synthetic-model",
+            "session_id": "synthetic-chat"
+          },
+          "type": "turn_started"
+        },
+        "kind": "harness"
+      },
+      {
+        "kind": "turn_timing",
+        "start_ms": 0
+      },
+      {
+        "event": {
+          "data": {
+            "kind": {
+              "decision_reason": null,
+              "input": {
+                "command": "true"
+              },
+              "suggestions": [],
+              "tool_name": "Bash",
+              "type": "permission"
+            },
+            "request_id": "p1",
+            "tool_use_id": "tool-1"
+          },
+          "type": "runtime_request"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "kind": {
+              "questions": [
+                {
+                  "question": "Pick a shape"
+                }
+              ],
+              "type": "question"
+            },
+            "request_id": "p2",
+            "tool_use_id": "tool-2"
+          },
+          "type": "runtime_request"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "request_id": "p1"
+          },
+          "type": "runtime_request_resolved"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": "synthetic-model",
+          "type": "model_changed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": "plan",
+          "type": "permission_mode_changed"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "applied": "high",
+            "effort": "high"
+          },
+          "type": "effort_changed"
+        },
+        "kind": "harness"
+      },
+      {
+        "end_ms": 0,
+        "kind": "turn_timing"
+      },
+      {
+        "event": {
+          "data": {
+            "code": 7
+          },
+          "type": "process_exited"
+        },
+        "kind": "harness"
+      },
+      {
+        "event": {
+          "data": {
+            "request_id": "p2"
+          },
+          "type": "runtime_request_resolved"
+        },
+        "kind": "harness"
+      }
+    ],
+    "pending": [],
+    "revision": 10,
+    "state": "Errored(\"The chat's agent exited mid-turn (code Some(7))\")",
+    "step": "last-request-resolved"
+  },
+  {
+    "step": "close-last-tab",
+    "tabs_remaining": 1
+  },
+  {
+    "remaining_id": 11,
+    "step": "close-with-sibling",
+    "tabs_remaining": 1
+  }
+]

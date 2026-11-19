@@ -2156,6 +2156,12 @@ async fn run_session(
     if config.agent == AcpAgent::Gemini {
         return fail(GEMINI_REPLACED_NOTE.into());
     }
+    #[cfg(test)]
+    let resolve_program = |name: &str| {
+        native_chat_tests::program()
+            .map(Ok)
+            .unwrap_or_else(|| self::resolve_program(name))
+    };
     let program = match resolve_program(config.agent.program()) {
         Ok(p) => p,
         Err(e) => return fail(e),
@@ -3137,3 +3143,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/native-chat/native_chat_acp.rs"]
+mod native_chat_tests;

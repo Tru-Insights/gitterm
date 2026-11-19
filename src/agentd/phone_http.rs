@@ -1385,6 +1385,7 @@ mod tests {
         fx.events
             .send(HarnessEvent::TextDelta("before".into()))
             .unwrap();
+        assert_eq!(fx._desktop.live.recv().await.unwrap().seq, 1);
         let mut client = warp::test::ws()
             .path("/api/ws")
             .handshake(routes(fx.state.clone()))
@@ -1399,7 +1400,11 @@ mod tests {
         let opened = recv_json(&mut client).await;
         assert_eq!(opened["type"], "opened");
         assert_eq!(opened["scope"], "view");
-        assert_eq!(recv_json(&mut client).await["type"], "history");
+        let history = recv_json(&mut client).await;
+        assert_eq!(history["type"], "history");
+        let mut canonical_opened = opened.clone();
+        canonical_opened["chat_id"] = json!("<chat>");
+        let mut wire = vec![canonical_opened, history];
 
         let head = fx.chats.list()[0].attached_clients;
         assert_eq!(head, 2, "the phone attaches like a desktop client");
@@ -1410,6 +1415,7 @@ mod tests {
         assert_eq!(live["type"], "event");
         assert_eq!(live["event"]["kind"], "harness");
         assert_eq!(live["event"]["event"]["data"], "live");
+        wire.push(live.clone());
         let first_seq = live["seq"].as_u64().unwrap();
         assert!(first_seq >= 1);
 
@@ -1423,13 +1429,18 @@ mod tests {
             "not even json".to_string(),
         ] {
             client.send_text(message).await;
-            assert_eq!(recv_json(&mut client).await["type"], "refused");
+            let refused = recv_json(&mut client).await;
+            assert_eq!(refused["type"], "refused");
+            wire.push(refused);
         }
         assert!(fx.commands.try_recv().is_err());
 
         // Revoking closes the socket.
         assert_eq!(fx.phones.revoke(&phone_id), Ok(true));
-        assert_eq!(recv_json(&mut client).await["type"], "revoked");
+        let revoked = recv_json(&mut client).await;
+        assert_eq!(revoked["type"], "revoked");
+        wire.push(revoked);
+        super::native_chat_tests::socket_golden(json!(wire));
         let closed = tokio::time::timeout(Duration::from_secs(5), client.recv())
             .await
             .unwrap();
@@ -1682,3 +1693,7 @@ mod tests {
         assert!(!valid_session_id("a/b"));
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/native-chat/native_chat_phone.rs"]
+mod native_chat_tests;
