@@ -233,12 +233,16 @@ impl Render for FilesView {
                         } else {
                             p.text
                         }))
-                        .child(if entry.is_folder() {
-                            if entry.is_expanded() { "⌄" } else { "›" }
-                        } else {
-                            "·"
-                        })
-                        .child(entry.item().label.clone())
+                        // One text child: ListItem stacks multiple children vertically.
+                        .child(format!(
+                            "{} {}",
+                            if entry.is_folder() {
+                                if entry.is_expanded() { "⌄" } else { "›" }
+                            } else {
+                                "·"
+                            },
+                            entry.item().label
+                        ))
                         .on_click(move |_, _, cx| {
                             let _ = view.update(cx, |this, cx| this.activate(&id, cx));
                         })
