@@ -31,6 +31,8 @@ warp = { version = "0.3", optional = true }
 toml = { version = "=0.8.2", optional = true }
 shell-words = "=1.1.1"
 
+ring = "0.17"
+
 [dev-dependencies]
 toml = "=0.8.2"
 tempfile = "3"
