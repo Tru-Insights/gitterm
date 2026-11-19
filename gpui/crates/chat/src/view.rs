@@ -44,7 +44,7 @@ pub fn run(records: Vec<Record>) {
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
-        bind_keys(cx);
+        init(cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -69,7 +69,8 @@ pub fn run(records: Vec<Record>) {
     });
 }
 
-fn bind_keys(cx: &mut App) {
+/// Register chat shortcuts, scoped to the focused NativeChat subtree.
+pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-f", Find, Some("NativeChat")),
         KeyBinding::new("cmd-g", NextMatch, Some("NativeChat")),
@@ -129,6 +130,11 @@ impl ChatView {
             _subscriptions: subscriptions,
         }
     }
+    /// Retained scroll state for embedding hosts (independent of dock layout).
+    pub fn scroller(&self) -> &Entity<MessageScrollerState> {
+        &self.scroller
+    }
+
     fn row(&mut self, index: usize, cx: &mut Context<Self>) -> Entity<RowView> {
         if let Some(view) = &self.row_views[index] {
             return view.clone();
@@ -297,6 +303,12 @@ impl Render for ChatView {
         let owner = cx.entity().downgrade();
         let copy_owner = owner.clone();
         div().id("native-chat").key_context("NativeChat").track_focus(&self.focus)
+            .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, window, cx| {
+                // A child input/selection may already have claimed focus during bubbling.
+                if !this.focus.contains_focused(window, cx) {
+                    this.focus.focus(window, cx);
+                }
+            }))
             .on_action(cx.listener(Self::open_find)).on_action(cx.listener(Self::close_find))
             .on_action(cx.listener(|this, _: &NextMatch, window, cx| this.navigate(false, window, cx)))
             .on_action(cx.listener(|this, _: &PreviousMatch, window, cx| this.navigate(true, window, cx)))
@@ -511,6 +523,10 @@ impl Render for RowView {
                         let code = block.code().to_string();
                         let owner = owner.clone();
                         Button::new(("copy-code", key))
+                            .debug_selector({
+                                let owner = owner.clone();
+                                move || format!("copy-code-{}", owner.entity_id())
+                            })
                             .small()
                             .label(if copied.contains(&key) {
                                 "Copied"
