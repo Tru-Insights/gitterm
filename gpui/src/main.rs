@@ -8,6 +8,10 @@ mod macos;
 fn main() {
     let mut args = std::env::args_os().skip(1);
     if let Some(arg) = args.next().filter(|arg| arg != "--terminal") {
+        if arg == "--review" {
+            gitterm_gpui_review::run_fixture(args.collect());
+            return;
+        }
         if arg == "--chat"
             && let Some(path) = args.next().filter(|_| args.next().is_none())
         {
@@ -22,7 +26,9 @@ fn main() {
                 }
             }
         }
-        eprintln!("Usage: gitterm-gpui [--terminal | --chat <fixture.jsonl>]");
+        eprintln!(
+            "Usage: gitterm-gpui [--terminal | --chat <fixture.jsonl> | --review <fixture-dir>]"
+        );
         std::process::exit(2);
     }
     macos::run();
