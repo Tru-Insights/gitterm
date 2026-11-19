@@ -137,6 +137,99 @@ impl Pane {
             self.title.clone()
         }
     }
+    fn local_files(
+        &self,
+        owner: Entity<crate::WorkspaceOwner>,
+        p: Palette,
+        cx: &Context<Self>,
+    ) -> Vec<AnyElement> {
+        use crate::files::Row;
+        let workspace = self.workspace;
+        let rows = owner
+            .read(cx)
+            .files
+            .get(&workspace)
+            .map(|tree| tree.rows())
+            .unwrap_or_default();
+        rows.into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let owner = owner.clone();
+                match row {
+                    Row::Entry {
+                        entry,
+                        expanded,
+                        depth,
+                    } => {
+                        let label = format!(
+                            "{} {}",
+                            if entry.is_dir {
+                                if expanded { "⌄" } else { "›" }
+                            } else {
+                                "·"
+                            },
+                            entry.name
+                        );
+                        let accessibility = if entry.is_dir {
+                            format!(
+                                "{} directory, {}",
+                                entry.name,
+                                if expanded { "expanded" } else { "collapsed" }
+                            )
+                        } else {
+                            format!("Open {}", entry.name)
+                        };
+                        Button::new(SharedString::from(format!("local-file-{index}")))
+                            .ghost()
+                            .label(label)
+                            .w_full()
+                            .justify_start()
+                            .pl(px(8. + depth as f32 * 16.))
+                            .accessibility_label(accessibility)
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                owner.update(cx, |owner, cx| {
+                                    if entry.is_dir {
+                                        owner.toggle_directory(workspace, entry.path.clone(), cx);
+                                    } else {
+                                        owner.open_file(workspace, entry.path.clone(), cx);
+                                    }
+                                });
+                            }))
+                            .into_any_element()
+                    }
+                    Row::More { path, depth } => {
+                        Button::new(SharedString::from(format!("more-files-{index}")))
+                            .ghost()
+                            .label("Show more…")
+                            .w_full()
+                            .justify_start()
+                            .pl(px(8. + depth as f32 * 16.))
+                            .accessibility_label("Show more directory entries")
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                owner.update(cx, |owner, cx| {
+                                    owner.more_files(workspace, path.clone(), cx)
+                                });
+                            }))
+                            .into_any_element()
+                    }
+                    Row::Loading { depth } => div()
+                        .pl(px(8. + depth as f32 * 16.))
+                        .child("Loading files…")
+                        .into_any_element(),
+                    Row::Error { message, depth } => div()
+                        .pl(px(8. + depth as f32 * 16.))
+                        .text_color(rgb(p.red))
+                        .child(message)
+                        .into_any_element(),
+                    Row::Empty { depth } => div()
+                        .pl(px(8. + depth as f32 * 16.))
+                        .text_color(rgb(p.muted))
+                        .child("Empty directory")
+                        .into_any_element(),
+                }
+            })
+            .collect()
+    }
     fn files(
         &self,
         nodes: Vec<FileNode>,
@@ -307,9 +400,19 @@ impl Render for Pane {
                             .child(div().text_color(rgb(p.muted)).child(group))
                     }))
             }
-            PaneContent::Files => body
-                .child(self.data.status(self.workspace, cx).repository)
-                .children(self.files(self.data.files(self.workspace, cx), "", 0, p, cx)),
+            PaneContent::Files => {
+                if let Some(owner) = self.data.local_owner() {
+                    let folder = self
+                        .data
+                        .terminal_cwd(self.workspace, cx)
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default();
+                    body.child(folder).children(self.local_files(owner, p, cx))
+                } else {
+                    body.child(self.data.status(self.workspace, cx).repository)
+                        .children(self.files(self.data.files(self.workspace, cx), "", 0, p, cx))
+                }
+            }
         }
     }
 }

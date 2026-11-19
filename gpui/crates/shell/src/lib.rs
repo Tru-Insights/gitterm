@@ -3,13 +3,14 @@ extern crate gpui_kit as gpui;
 
 pub mod data;
 mod dialogs;
+pub mod files;
 mod layout;
 mod owner;
 mod pane;
 mod theme;
 pub mod workspace_config;
 pub mod workspace_status;
-pub use owner::WorkspaceOwner;
+pub use owner::{FileOpen, WorkspaceOwner};
 use std::{cell::RefCell, time::Instant};
 use workspace_status::{Intent, WorkspaceStatus};
 
