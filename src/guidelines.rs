@@ -229,12 +229,7 @@ pub fn repo_provides_guidelines(cwd: &Path, instruction_file: InstructionFile) -
     }
 }
 
-/// The guidelines a launch carries.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Guidelines {
-    pub path: PathBuf,
-    pub text: String,
-}
+pub use gitterm_core::runner_guidelines::Guidelines;
 
 /// The guidelines for an agent starting now in `cwd`, or `None` when the
 /// settings switch them off, the repo supplies kit rules, or the file cannot
@@ -502,18 +497,7 @@ pub fn pi_args(guidelines: &Guidelines) -> Vec<String> {
     ]
 }
 
-/// The `-c` value for Codex. Codex parses the value as TOML; a JSON string
-/// literal is a valid TOML basic string (serde_json escapes `"`, `\` and
-/// control characters with escapes TOML shares, and never emits `\/`).
-pub fn codex_config_value(guidelines: &Guidelines) -> String {
-    let literal =
-        serde_json::to_string(&guidelines.text).expect("serializing a string to JSON cannot fail");
-    format!("developer_instructions={literal}")
-}
-
-pub fn codex_args(guidelines: &Guidelines) -> Vec<String> {
-    vec!["-c".to_string(), codex_config_value(guidelines)]
-}
+pub use gitterm_core::runner_guidelines::{codex_args, codex_config_value};
 
 /// `(executable, its basename, the rest)` of a startup command.
 fn split_command(command: &str) -> (&str, &str, &str) {
