@@ -5,11 +5,13 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Child, Output, Stdio};
+use std::time::{Duration, Instant};
 
-/// Internal request marker for the product default: prefer `develop`, then
-/// `main`, and fall back to the current branch only when neither exists.
+/// Internal request marker for the product default: fetch origin, then prefer
+/// origin/develop, origin/main, origin/HEAD's branch, and local refs without origin.
 pub const DEFAULT_TASK_BASE: &str = "__gitterm_default_task_base__";
+const DEFAULT_BASE_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRepository {
@@ -40,13 +42,16 @@ pub struct PreparedTaskWorktree {
     pub base: GitBase,
     pub branch: String,
     pub path: PathBuf,
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedTaskPreparation {
     pub repository: ResolvedRepository,
+    pub worktree_root: PathBuf,
     pub base: GitBase,
     pub proposal: TaskWorktreeProposal,
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,6 +386,17 @@ pub async fn prepare_task_worktree(
         })?
 }
 
+pub async fn prepare_resolved_task_worktree(
+    resolved: ResolvedTaskPreparation,
+) -> Result<PreparedTaskWorktree, TaskWorktreeError> {
+    let error_path = resolved.repository.top_level.clone();
+    tokio::task::spawn_blocking(move || prepare_resolved_task_worktree_blocking(resolved))
+        .await
+        .map_err(|error| {
+            TaskWorktreeError::new("join preparation worker", error_path, error.to_string())
+        })?
+}
+
 pub async fn resolve_task_preparation(
     request: PrepareTaskWorktreeRequest,
 ) -> Result<ResolvedTaskPreparation, TaskWorktreeError> {
@@ -396,20 +412,10 @@ pub fn resolve_task_preparation_blocking(
     request: &PrepareTaskWorktreeRequest,
 ) -> Result<ResolvedTaskPreparation, TaskWorktreeError> {
     let repository = resolve_repository(&request.repository_path)?;
-    let base = if request.base_reference == DEFAULT_TASK_BASE {
-        let preferred = ["develop", "main"]
-            .into_iter()
-            .find_map(|reference| resolve_base(&repository, reference).ok());
-        if let Some(base) = preferred {
-            base
-        } else {
-            resolve_base(
-                &repository,
-                repository.current_branch.as_deref().unwrap_or("HEAD"),
-            )?
-        }
+    let (base, note) = if request.base_reference == DEFAULT_TASK_BASE {
+        resolve_default_base(&repository)?
     } else {
-        resolve_base(&repository, &request.base_reference)?
+        (resolve_base(&repository, &request.base_reference)?, None)
     };
     let proposal = propose_task_worktree(
         &repository,
@@ -421,9 +427,234 @@ pub fn resolve_task_preparation_blocking(
     reject_collisions(&repository, &proposal)?;
     Ok(ResolvedTaskPreparation {
         repository,
+        worktree_root: request.worktree_root.clone(),
         base,
         proposal,
+        note,
     })
+}
+
+fn resolve_default_base(
+    repository: &ResolvedRepository,
+) -> Result<(GitBase, Option<String>), TaskWorktreeError> {
+    if repository.identity.remote_url.is_some() {
+        let fetch_result = fetch_origin(repository);
+        let base = match &fetch_result {
+            Ok(fetched_branches) => ["develop", "main"]
+                .into_iter()
+                .filter(|branch| fetched_branches.contains(*branch))
+                .find_map(|branch| resolve_base(repository, &format!("origin/{branch}")).ok())
+                .or_else(|| {
+                    resolve_origin_head_base(repository).filter(|base| {
+                        fetched_branches
+                            .contains(base.reference.strip_prefix("origin/").unwrap_or_default())
+                    })
+                }),
+            Err(_) => ["origin/develop", "origin/main"]
+                .into_iter()
+                .find_map(|reference| resolve_base(repository, reference).ok())
+                .or_else(|| resolve_origin_head_base(repository)),
+        };
+        let base = base.ok_or_else(|| {
+            TaskWorktreeError::new(
+                "resolve default base",
+                &repository.top_level,
+                "origin has no usable develop, main, or origin/HEAD branch",
+            )
+        })?;
+        let note = fetch_result.err().map(|error| {
+            format!(
+                "fetch failed: {error}; started from {} as of its last fetch",
+                base.reference
+            )
+        });
+        Ok((base, note))
+    } else {
+        let base = ["develop", "main"]
+            .into_iter()
+            .find_map(|reference| resolve_base(repository, reference).ok())
+            .or_else(|| {
+                repository
+                    .current_branch
+                    .as_deref()
+                    .and_then(|branch| resolve_base(repository, branch).ok())
+            })
+            .or_else(|| resolve_base(repository, "HEAD").ok())
+            .ok_or_else(|| {
+                TaskWorktreeError::new(
+                    "resolve default base",
+                    &repository.top_level,
+                    "no usable local develop, main, current branch, or HEAD",
+                )
+            })?;
+        let note = Some(format!(
+            "no origin remote; started from {} using local refs",
+            base.reference
+        ));
+        Ok((base, note))
+    }
+}
+
+fn resolve_origin_head_base(repository: &ResolvedRepository) -> Option<GitBase> {
+    let output = git_command()
+        .args([
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])
+        .current_dir(&repository.top_level)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let reference = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    resolve_base(repository, &reference).ok()
+}
+
+fn fetch_origin(
+    repository: &ResolvedRepository,
+) -> Result<std::collections::HashSet<String>, String> {
+    fetch_origin_with_timeout(repository, DEFAULT_BASE_FETCH_TIMEOUT)
+}
+
+fn fetch_origin_with_timeout(
+    repository: &ResolvedRepository,
+    timeout: Duration,
+) -> Result<std::collections::HashSet<String>, String> {
+    let mut command = git_command();
+    command
+        .args(["fetch", "origin"])
+        .current_dir(&repository.top_level)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never");
+    let configured_ssh = git_command()
+        .args(["config", "--get", "core.sshCommand"])
+        .current_dir(&repository.top_level)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    command.env(
+        "GIT_SSH_COMMAND",
+        noninteractive_ssh_command(std::env::var("GIT_SSH_COMMAND").ok(), configured_ssh),
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let mut stderr = child.stderr.take().expect("piped fetch stderr");
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = io::Read::read_to_end(&mut stderr, &mut bytes);
+        (result, bytes)
+    });
+    let started = Instant::now();
+    loop {
+        match child.try_wait().map_err(|error| error.to_string())? {
+            Some(status) if status.success() => {
+                let (read_result, _stderr) = stderr_reader.join().unwrap_or_else(|_| {
+                    (
+                        Err(io::Error::other("fetch stderr reader panicked")),
+                        Vec::new(),
+                    )
+                });
+                read_result.map_err(|error| error.to_string())?;
+                return read_fetched_branches(repository).map_err(|error| error.to_string());
+            }
+            Some(status) => {
+                let (read_result, stderr) = stderr_reader.join().unwrap_or_else(|_| {
+                    (
+                        Err(io::Error::other("fetch stderr reader panicked")),
+                        Vec::new(),
+                    )
+                });
+                read_result.map_err(|error| error.to_string())?;
+                let detail = String::from_utf8_lossy(&stderr).trim().to_string();
+                return Err(if detail.is_empty() {
+                    format!("git fetch exited with {status}")
+                } else {
+                    detail
+                });
+            }
+            None if started.elapsed() >= timeout => {
+                kill_fetch(&mut child)?;
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                return Err(format!(
+                    "git fetch timed out after {} seconds",
+                    timeout.as_secs()
+                ));
+            }
+            None => std::thread::sleep(Duration::from_millis(25)),
+        }
+    }
+}
+
+fn noninteractive_ssh_command(existing: Option<String>, configured: Option<String>) -> String {
+    format!(
+        "{} -o BatchMode=yes",
+        existing
+            .or(configured)
+            .filter(|command| !command.trim().is_empty())
+            .unwrap_or_else(|| "ssh".to_string())
+    )
+}
+
+fn read_fetched_branches(
+    repository: &ResolvedRepository,
+) -> io::Result<std::collections::HashSet<String>> {
+    let path = git_command()
+        .args(["rev-parse", "--git-path", "FETCH_HEAD"])
+        .current_dir(&repository.top_level)
+        .output()?;
+    if !path.status.success() {
+        return Ok(Default::default());
+    }
+    let path = repository
+        .top_level
+        .join(String::from_utf8_lossy(&path.stdout).trim());
+    let contents = fs::read_to_string(path)?;
+    Ok(contents
+        .lines()
+        .filter_map(|line| line.split('\t').nth(2))
+        .filter_map(|description| description.strip_prefix("branch '"))
+        .filter_map(|branch| branch.split("' of ").next())
+        .map(|branch| {
+            branch
+                .strip_prefix("refs/heads/")
+                .unwrap_or(branch)
+                .to_owned()
+        })
+        .collect())
+}
+
+#[cfg(unix)]
+fn kill_fetch(child: &mut Child) -> Result<(), String> {
+    // SAFETY: child.id() is the process group id assigned by CommandExt::process_group(0).
+    let result = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error.to_string())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn kill_fetch(child: &mut Child) -> Result<(), String> {
+    // shortcut: kills only the Git process on Windows, upgrade when Windows job objects are added.
+    child.kill().map_err(|error| error.to_string())
 }
 
 pub fn resolve_worktree_adoption_blocking(
@@ -576,28 +807,36 @@ fn worktree_admin_lock(common_dir: &Path) -> std::sync::Arc<std::sync::Mutex<()>
 pub fn prepare_task_worktree_blocking(
     request: &PrepareTaskWorktreeRequest,
 ) -> Result<PreparedTaskWorktree, TaskWorktreeError> {
-    prepare_task_worktree_with(request, || Ok(()))
+    let resolved = resolve_task_preparation_blocking(request)?;
+    prepare_resolved_task_worktree_blocking(resolved)
 }
 
-fn prepare_task_worktree_with<F>(
-    request: &PrepareTaskWorktreeRequest,
+pub fn prepare_resolved_task_worktree_blocking(
+    resolved: ResolvedTaskPreparation,
+) -> Result<PreparedTaskWorktree, TaskWorktreeError> {
+    prepare_resolved_task_worktree_with(resolved, || Ok(()))
+}
+
+fn prepare_resolved_task_worktree_with<F>(
+    resolved: ResolvedTaskPreparation,
     after_add: F,
 ) -> Result<PreparedTaskWorktree, TaskWorktreeError>
 where
     F: FnOnce() -> Result<(), String>,
 {
-    let resolved = resolve_task_preparation_blocking(request)?;
     let repository = resolved.repository;
+    let worktree_root = resolved.worktree_root;
     let base = resolved.base;
+    let note = resolved.note;
     let proposal = resolved.proposal;
     let admin = worktree_admin_lock(&repository.identity.common_dir);
     let _admin = admin
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if request.worktree_root.starts_with(&repository.top_level) {
+    if worktree_root.starts_with(&repository.top_level) {
         return Err(TaskWorktreeError::new(
             "validate worktree root",
-            &request.worktree_root,
+            worktree_root,
             "configured worktree root must not be inside the source checkout",
         ));
     }
@@ -612,7 +851,7 @@ where
     fs::create_dir_all(parent).map_err(|error| {
         TaskWorktreeError::new("create worktree parent", parent, error.to_string())
     })?;
-    ensure_safe_worktree_path(&repository, &request.worktree_root, &proposal.path)?;
+    ensure_safe_worktree_path(&repository, &worktree_root, &proposal.path)?;
 
     let output = git_command()
         .args(["worktree", "add", "-b"])
@@ -666,6 +905,7 @@ where
         base,
         branch: proposal.branch,
         path,
+        note,
     })
 }
 
@@ -1613,6 +1853,18 @@ mod tests {
             git_ok(&self.path, &["commit", "-m", message]);
             git_stdout(&self.path, &["rev-parse", "HEAD"])
         }
+
+        fn add_bare_origin(&self) -> PathBuf {
+            let bare = self._temp.path().join("origin.git");
+            fs::create_dir_all(&bare).unwrap();
+            git_ok(&bare, &["init", "--bare"]);
+            git_ok(
+                &self.path,
+                &["remote", "add", "origin", bare.to_str().unwrap()],
+            );
+            git_ok(&self.path, &["push", "origin", "main"]);
+            bare
+        }
     }
 
     fn git_output(path: &Path, arguments: &[&str]) -> Output {
@@ -1625,6 +1877,31 @@ mod tests {
 
     fn git_ok(path: &Path, arguments: &[&str]) {
         let output = git_output(path, arguments);
+        assert!(
+            output.status.success(),
+            "git {arguments:?} failed in {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_input(path: &Path, arguments: &[&str], input: &str) {
+        let mut child = git_command()
+            .args(arguments)
+            .current_dir(path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),
             "git {arguments:?} failed in {}: {}",
@@ -1731,6 +2008,395 @@ mod tests {
 
         assert_eq!(resolved.base.reference, "main");
         assert_eq!(resolved.base.commit, repository.initial_commit);
+    }
+
+    #[test]
+    fn default_base_fetches_newest_origin_develop_without_setting_upstream() {
+        let repository = TestRepository::new();
+        repository.add_bare_origin();
+        git_ok(
+            &repository.path,
+            &["branch", "develop", &repository.initial_commit],
+        );
+        git_ok(&repository.path, &["push", "origin", "develop"]);
+        git_ok(&repository.path, &["fetch", "origin"]);
+        git_ok(&repository.path, &["checkout", "develop"]);
+        let remote_head = repository.commit_file("remote.txt", "remote\n", "Remote develop update");
+        git_ok(&repository.path, &["push", "origin", "develop"]);
+        git_ok(
+            &repository.path,
+            &["reset", "--hard", &repository.initial_commit],
+        );
+        git_ok(&repository.path, &["checkout", "main"]);
+        let request = repository.request("fetched-develop", None, "Fetched", DEFAULT_TASK_BASE);
+
+        let prepared = prepare_task_worktree_blocking(&request).unwrap();
+
+        assert_eq!(prepared.base.reference, "origin/develop");
+        assert_eq!(prepared.base.commit, remote_head);
+        assert!(!git_output(
+            &prepared.path,
+            &["rev-parse", "--abbrev-ref", "@{upstream}"]
+        )
+        .status
+        .success());
+    }
+
+    #[test]
+    fn default_base_uses_origin_main_when_remote_develop_is_missing() {
+        let repository = TestRepository::new();
+        repository.add_bare_origin();
+        let request = repository.request("origin-main", None, "Origin main", DEFAULT_TASK_BASE);
+
+        let resolved = resolve_task_preparation_blocking(&request).unwrap();
+
+        assert_eq!(resolved.base.reference, "origin/main");
+        assert!(resolved.note.is_none());
+    }
+
+    #[test]
+    fn default_base_uses_origin_head_branch_after_develop_and_main() {
+        let repository = TestRepository::new();
+        let bare = repository.add_bare_origin();
+        git_ok(
+            &repository.path,
+            &[
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "symbolic-ref",
+                "HEAD",
+                "refs/heads/trunk",
+            ],
+        );
+        git_ok(&repository.path, &["push", "origin", "--delete", "main"]);
+        git_ok(
+            &repository.path,
+            &["branch", "trunk", &repository.initial_commit],
+        );
+        git_ok(&repository.path, &["push", "origin", "trunk"]);
+        git_ok(
+            &repository.path,
+            &[
+                "update-ref",
+                "refs/remotes/origin/HEAD",
+                &repository.initial_commit,
+            ],
+        );
+        git_ok(
+            &repository.path,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk",
+            ],
+        );
+        let request = repository.request("origin-head", None, "Origin head", DEFAULT_TASK_BASE);
+
+        let resolved = resolve_task_preparation_blocking(&request).unwrap();
+
+        assert_eq!(resolved.base.reference, "origin/trunk");
+    }
+
+    #[test]
+    fn successful_fetch_ignores_deleted_cached_remote_branches() {
+        let repository = TestRepository::new();
+        let bare = repository.add_bare_origin();
+        git_ok(
+            &repository.path,
+            &["branch", "develop", &repository.initial_commit],
+        );
+        git_ok(&repository.path, &["push", "origin", "develop"]);
+        git_ok(&repository.path, &["fetch", "origin"]);
+        git_ok(
+            &repository.path,
+            &[
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "update-ref",
+                "-d",
+                "refs/heads/develop",
+            ],
+        );
+        let request =
+            repository.request("deleted-develop", None, "Deleted branch", DEFAULT_TASK_BASE);
+
+        let resolved = resolve_task_preparation_blocking(&request).unwrap();
+
+        assert_eq!(resolved.base.reference, "origin/main");
+        assert!(git_output(
+            &repository.path,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/remotes/origin/develop"
+            ]
+        )
+        .status
+        .success());
+    }
+
+    #[test]
+    fn prepared_worktree_uses_the_base_resolved_by_the_single_fetch() {
+        let repository = TestRepository::new();
+        let bare = repository.add_bare_origin();
+        git_ok(
+            &repository.path,
+            &["branch", "develop", &repository.initial_commit],
+        );
+        git_ok(&repository.path, &["push", "origin", "develop"]);
+        git_ok(&repository.path, &["fetch", "origin"]);
+        git_ok(
+            &repository.path,
+            &["remote", "set-url", "origin", "/missing/local/origin.git"],
+        );
+        let request = repository.request("single-fetch", None, "Single fetch", DEFAULT_TASK_BASE);
+        let resolved = resolve_task_preparation_blocking(&request).unwrap();
+        let resolved_commit = resolved.base.commit.clone();
+        let resolved_note = resolved.note.clone();
+        assert!(resolved_note.is_some());
+
+        let remote_checkout = repository._temp.path().join("remote-checkout");
+        git_ok(
+            repository._temp.path(),
+            &[
+                "clone",
+                bare.to_str().unwrap(),
+                remote_checkout.to_str().unwrap(),
+            ],
+        );
+        git_ok(
+            &remote_checkout,
+            &["checkout", "-b", "develop", "origin/develop"],
+        );
+        git_ok(&remote_checkout, &["config", "user.name", "Test"]);
+        git_ok(
+            &remote_checkout,
+            &["config", "user.email", "test@example.invalid"],
+        );
+        fs::write(remote_checkout.join("later.txt"), "later\n").unwrap();
+        git_ok(&remote_checkout, &["add", "later.txt"]);
+        git_ok(&remote_checkout, &["commit", "-m", "Later remote update"]);
+        git_ok(&remote_checkout, &["push", "origin", "develop"]);
+        git_ok(
+            &repository.path,
+            &["remote", "set-url", "origin", bare.to_str().unwrap()],
+        );
+
+        let prepared = prepare_resolved_task_worktree_blocking(resolved).unwrap();
+
+        assert_eq!(prepared.base.commit, resolved_commit);
+        assert_eq!(prepared.note, resolved_note);
+        assert_eq!(
+            git_stdout(&prepared.path, &["rev-parse", "HEAD"]),
+            resolved_commit
+        );
+    }
+
+    #[test]
+    fn noninteractive_ssh_appends_batch_mode_and_preserves_user_commands() {
+        assert_eq!(
+            noninteractive_ssh_command(
+                Some("ssh -i key".to_string()),
+                Some("ssh -F cfg".to_string())
+            ),
+            "ssh -i key -o BatchMode=yes"
+        );
+        assert_eq!(
+            noninteractive_ssh_command(None, Some("custom-ssh --flag".to_string())),
+            "custom-ssh --flag -o BatchMode=yes"
+        );
+        assert_eq!(
+            noninteractive_ssh_command(None, None),
+            "ssh -o BatchMode=yes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_is_noninteractive_and_keeps_the_configured_ssh_helper() {
+        let repository = TestRepository::new();
+        let record = repository._temp.path().join("ssh-record");
+        let helper = repository._temp.path().join("fake-ssh.sh");
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$GIT_TERMINAL_PROMPT\" \"$GCM_INTERACTIVE\" \"$*\" > '{}'\nexit 1\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        git_ok(
+            &repository.path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "ssh://example.invalid/project.git",
+            ],
+        );
+        git_ok(
+            &repository.path,
+            &[
+                "config",
+                "core.sshCommand",
+                &format!("sh {} preserved-marker", helper.display()),
+            ],
+        );
+        let resolved = resolve_repository(&repository.path).unwrap();
+        let started = Instant::now();
+        let output = fetch_origin_with_timeout(&resolved, Duration::from_secs(10));
+
+        assert!(output.is_err());
+        let record_text = fs::read_to_string(&record).ok();
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "fetch took {:?}; result={output:?}; ssh helper output={record_text:?}",
+            started.elapsed()
+        );
+        let record_text = record_text.unwrap();
+        assert!(record_text.starts_with("0|never|preserved-marker "));
+        assert!(record_text.contains("-o BatchMode=yes"));
+        assert_eq!(
+            git_stdout(&repository.path, &["config", "--get", "core.sshCommand"])
+                .contains("preserved-marker"),
+            true
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_timeout_kills_the_ssh_descendant_process_group() {
+        let repository = TestRepository::new();
+        let marker = repository._temp.path().join("survived-timeout");
+        let helper = repository._temp.path().join("slow-ssh.sh");
+        fs::write(
+            &helper,
+            format!("#!/bin/sh\nsleep 1\ntouch '{}'\n", marker.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        git_ok(
+            &repository.path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "ssh://example.invalid/project.git",
+            ],
+        );
+        git_ok(
+            &repository.path,
+            &[
+                "config",
+                "core.sshCommand",
+                &format!("sh {}", helper.display()),
+            ],
+        );
+        let resolved = resolve_repository(&repository.path).unwrap();
+
+        let error = fetch_origin_with_timeout(&resolved, Duration::from_millis(150)).unwrap_err();
+        std::thread::sleep(Duration::from_millis(1200));
+
+        assert!(error.contains("timed out"));
+        assert!(
+            !marker.exists(),
+            "the SSH transport descendant survived timeout"
+        );
+    }
+
+    #[test]
+    fn fetch_drains_large_stderr_without_timing_out() {
+        let repository = TestRepository::new();
+        repository.add_bare_origin();
+        let refs = (0..1800)
+            .map(|index| {
+                format!(
+                    "create refs/heads/noisy-{index:04} {}\n",
+                    repository.initial_commit
+                )
+            })
+            .collect::<String>();
+        git_input(&repository.path, &["update-ref", "--stdin"], &refs);
+        git_ok(
+            &repository.path,
+            &["push", "origin", "refs/heads/noisy-*:refs/heads/noisy-*"],
+        );
+        let resolved = resolve_repository(&repository.path).unwrap();
+
+        let fetched = fetch_origin_with_timeout(&resolved, Duration::from_secs(5)).unwrap();
+
+        assert_eq!(fetched.len(), 1801);
+    }
+
+    #[test]
+    fn failed_fetch_uses_last_fetched_remote_ref_and_reports_it() {
+        let repository = TestRepository::new();
+        repository.add_bare_origin();
+        git_ok(&repository.path, &["fetch", "origin"]);
+        git_ok(
+            &repository.path,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "/definitely/missing/origin.git",
+            ],
+        );
+        let request = repository.request("fetch-failure", None, "Failure", DEFAULT_TASK_BASE);
+
+        let resolved = resolve_task_preparation_blocking(&request).unwrap();
+
+        assert_eq!(resolved.base.reference, "origin/main");
+        assert!(resolved.note.as_deref().unwrap().contains("fetch failed:"));
+        assert!(resolved
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("as of its last fetch"));
+    }
+
+    #[test]
+    fn no_origin_uses_local_order_and_reports_it() {
+        let repository = TestRepository::new();
+        git_ok(
+            &repository.path,
+            &["branch", "develop", &repository.initial_commit],
+        );
+        let request = repository.request("no-origin", None, "Local", DEFAULT_TASK_BASE);
+
+        let resolved = resolve_task_preparation_blocking(&request).unwrap();
+
+        assert_eq!(resolved.base.reference, "develop");
+        assert!(resolved
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("no origin remote"));
+    }
+
+    #[test]
+    fn explicit_base_is_not_fetched_or_rewritten() {
+        let repository = TestRepository::new();
+        repository.add_bare_origin();
+        git_ok(
+            &repository.path,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "/definitely/missing/origin.git",
+            ],
+        );
+        let request = repository.request("explicit", None, "Explicit", "main");
+
+        let resolved = resolve_task_preparation_blocking(&request).unwrap();
+
+        assert_eq!(resolved.base.reference, "main");
+        assert!(resolved.note.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1840,7 +2506,8 @@ mod tests {
         )
         .unwrap();
 
-        let error = prepare_task_worktree_with(&request, || {
+        let resolved = resolve_task_preparation_blocking(&request).unwrap();
+        let error = prepare_resolved_task_worktree_with(resolved, || {
             Err("injected verification failure".to_string())
         })
         .unwrap_err();

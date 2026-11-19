@@ -76,7 +76,7 @@ use gitterm::task_mcp::{
 };
 use gitterm::task_worktree::{
     discover_task_delivery, inspect_task_cleanup, open_task_draft_pr, pr_base_branch,
-    prepare_task_worktree, prune_worktrees, push_task_branch, remove_task_worktree,
+    prepare_resolved_task_worktree, prune_worktrees, push_task_branch, remove_task_worktree,
     resolve_task_preparation, resolve_worktree_adoption, suggested_task_branch,
     suggested_task_worktree_path, AdoptWorktreeRequest, AdoptedWorktreeResolution, CleanupContext,
     CleanupInspection, CleanupRisk, DeliveryDiscovery, PrepareTaskWorktreeRequest,
@@ -19021,6 +19021,7 @@ impl App {
                         options,
                     },
                     reply,
+                    None,
                 )
             }
             Err(error) => {
@@ -19096,6 +19097,7 @@ impl App {
         task_id: &str,
         worker: PendingWorker,
         reply: TaskControlReply,
+        base_resolution_note: Option<String>,
     ) -> Task<Event> {
         let Some(task) = self
             .task_store
@@ -19195,6 +19197,7 @@ impl App {
             "role": worker.choice.role.label(),
             "queued": queued,
             "queue_position": queue_position,
+            "base_note": base_resolution_note,
             "detail": if queued {
                 "The worker is queued until plan limits and concurrency permit it. Do not wait or poll: its report appears as a card in the requesting chat tab, and delegation_get reads it."
             } else {
@@ -28583,13 +28586,13 @@ fi
                         tab.sidebar_mode = SidebarMode::Tasks;
                     }
                 }
-                let request = pending.request.clone();
-                return Task::perform(prepare_task_worktree(request), move |result| {
+                return Task::perform(prepare_resolved_task_worktree(resolved), move |result| {
                     Event::TaskWorktreePrepared(pending, result.map_err(|error| error.to_string()))
                 });
             }
             Event::TaskWorktreePrepared(pending, result) => match result {
                 Ok(prepared) => {
+                    let base_resolution_note = prepared.note.clone();
                     let persisted = self.task_store.as_mut().map(|store| {
                         store.complete_worktree_preparation(
                             &pending.task_id,
@@ -28606,6 +28609,7 @@ fi
                                     &pending.task_id,
                                     worker,
                                     reply.clone(),
+                                    base_resolution_note.clone(),
                                 );
                             }
                             if let Some(reply) = &pending.control_reply {
@@ -28620,7 +28624,15 @@ fi
                                             pending.task_id
                                         )
                                     })
-                                    .and_then(|task| self.task_control_value(&task));
+                                    .and_then(|task| {
+                                        self.task_control_value(&task).map(|mut value| {
+                                            if let Some(note) = &base_resolution_note {
+                                                value["detail"] =
+                                                    serde_json::Value::String(note.clone());
+                                            }
+                                            value
+                                        })
+                                    });
                                 reply.send(result);
                                 return Task::none();
                             }

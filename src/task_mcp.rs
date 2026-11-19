@@ -67,8 +67,10 @@ pub struct CreateTaskRequest {
     pub workspace_name: Option<String>,
     /// Optional Linear issue key such as TRU-106.
     pub issue_key: Option<String>,
-    /// Branch, tag, or commit to use as the exact task base. Defaults to
-    /// `develop` when it exists, then `main`, then the current branch.
+    /// Branch, tag, or commit to use as the exact task base. By default,
+    /// GitTerm fetches `origin` and uses `origin/develop`, then `origin/main`,
+    /// then the branch `origin/HEAD` points to. Fetch or no-origin fallbacks
+    /// are reported in the result.
     pub base_reference: Option<String>,
     /// Where the worker should stop. Defaults to implement_until_tests_pass.
     pub stopping_boundary: Option<TaskStoppingBoundary>,
@@ -173,8 +175,10 @@ pub struct DelegateTaskRequest {
     pub user_model_choice: bool,
     /// Optional Linear issue key such as TRU-150.
     pub issue_key: Option<String>,
-    /// Branch, tag or commit the task worktree starts from. Defaults to
-    /// `develop` when it exists, then `main`, then the current branch.
+    /// Branch, tag or commit the task worktree starts from. By default,
+    /// GitTerm fetches `origin` and uses `origin/develop`, then `origin/main`,
+    /// then the branch `origin/HEAD` points to. Fetch or no-origin fallbacks
+    /// are reported in the result.
     pub base_reference: Option<String>,
     /// Where the worker should stop. Defaults to implement_until_tests_pass.
     pub stopping_boundary: Option<TaskStoppingBoundary>,
