@@ -6,6 +6,7 @@ mod glyphs;
 mod input;
 mod mouse;
 pub mod render;
+mod services;
 mod session;
 mod settings;
 #[cfg(test)]
@@ -15,5 +16,6 @@ mod view;
 pub use backend::{Backend, Command, LinkAction, MouseButton, RenderableContent, SearchMatch};
 pub use colors::ColorPalette;
 pub use events::{Action, PendingEvents, SessionState};
+pub use services::{JobState, SearchResults, ServiceError, ServiceJob};
 pub use settings::{BackendSettings, LayoutSize};
 pub use view::{TerminalConfig, TerminalView};

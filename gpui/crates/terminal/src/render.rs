@@ -302,7 +302,13 @@ impl TerminalRenderer {
                 ));
             }
 
+            let find_range = snapshot
+                .find_match
+                .as_ref()
+                .map(|found| SelectionRange::new(found.start, found.end, false));
             for (start_col, end_col) in selection_segments_for_row(&selection_range, line, num_cols)
+                .into_iter()
+                .chain(selection_segments_for_row(&find_range, line, num_cols))
             {
                 let x = origin.x + self.cell_width * (start_col as f32);
                 let y = origin.y + self.cell_height * (line_idx as f32);

@@ -1,0 +1,52 @@
+TRU-287 final verification, 2026-11-19 UTC
+
+Environment:
+  CARGO_HOME=/private/tmp/gpui-mockup-cargo
+  CARGO_TARGET_DIR=/private/tmp/gt-target-tru287
+  Commands prefixed with nice -n 10; sandbox reported setpriority not permitted,
+  then ran Cargo successfully. No toolchain installation or registry patch.
+
+Final command exit codes:
+  0 scripts/cargo.sh fmt --manifest-path gpui/Cargo.toml --all -- --check
+  0 scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --workspace --locked --all-targets -j 4 -- -D warnings
+  0 scripts/cargo.sh test --manifest-path gpui/Cargo.toml --workspace --locked -j 4
+    88 passed: 70 terminal, 11 chat, 7 shell; no failures/ignored tests.
+    Terminal suite includes all 65 pre-existing tests and five new regressions.
+  0 scripts/check-gpui-deps.sh
+  0 scripts/cargo.sh build --manifest-path gpui/Cargo.toml --workspace --locked -j 4
+  0 git diff --check
+  0 git diff --exit-code HEAD -- Cargo.lock gpui/Cargo.lock
+
+New regression coverage:
+  background_literal_search_100k_and_contention
+    Literal metacharacters, retained 100k history, match navigation/scroll,
+    parser lock contention returns Busy rather than zero matches.
+  background_export_includes_first_cell_wrap_and_unicode
+    Plain text, first cell, Unicode and bounded job admission.
+  tail_reads_only_last_n_lines_without_rendering
+    Zero/one/two-line tails, Unicode, no viewport sync, busy parser.
+    Busy assertion is exercised in the search/contention test.
+  eviction_invalidates_matches_and_rotates_or_clears_selection
+    Live selection rotation then eviction, expired pending coordinates,
+    no stale match highlight and no panic.
+  find_shortcuts_edit_navigate_close_restore_focus_and_export_callback
+    Headless key handlers/IME input, Cmd+F/G/Shift+G/Esc, reopen, highlight,
+    restored focus and plain-text callback on the foreground.
+
+Initial verification found and resolved:
+  - Headless fixture used a deferred backend, which replaced seeded text at
+    layout; fixture now uses an owned /bin/cat PTY.
+  - Revision invalidation initially dirtied deferred startup; epoch updates
+    now preserve the existing paint-notification invariant.
+
+Self-reviewed final diff. No R1-R4 specialist review trigger identified.
+Only gpui/crates/terminal changed. No GUI/OS input, installed/running app
+interaction, root Iced checks, push or PR. Root hook invokes Iced checks, so
+commit uses command-local core.hooksPath=/dev/null after the GPUI gates above.
+
+Integration limits:
+  Shell may need to route its global Cmd+F to open_find and focus the terminal.
+  Changing output clears results; sustained mutation can remain Busy. Full
+  search/export uses one temporary grid, with capture in 32-row lock slices.
+  Tail work scales with requested N. Manual native IME/accessibility/visual
+  checks remain in stage 3; no visible-app verification is claimed.

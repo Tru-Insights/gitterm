@@ -10,7 +10,7 @@ This is a macOS prototype in GitTerm's separate `gpui/` workspace.
 From the repository root, using rustup through the existing wrapper:
 
 ```sh
-export CARGO_TARGET_DIR=/private/tmp/gt-target-tru282
+export CARGO_TARGET_DIR=/private/tmp/gt-target-tru287
 scripts/cargo.sh run --manifest-path gpui/Cargo.toml --locked -j 4 -- --terminal
 scripts/cargo.sh build --manifest-path gpui/Cargo.toml --locked -j 4
 scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --workspace --locked --all-targets -j 4 -- -D warnings
@@ -108,10 +108,9 @@ an integrating app, not written to the OS automatically.
 
 `backend()` / `backend_mut()` expose history/search/scroll operations on the
 view. `get_all_text`, `search_all`, and `selectable_content` return `None` when
-the term is busy, distinct from an empty result. Search/export still perform
-full-history work on the caller; stage 3 must move service exports/search jobs
-off foreground and add an efficient tail API. Search positions can expire as
-history is evicted. Do not treat this prototype as complete GitTerm integration.
+the term is busy, distinct from an empty result. The original synchronous methods
+remain compatibility helpers for tests and non-UI callers. UI/service consumers should use the TRU-287 APIs below.
+Do not treat this prototype as complete GitTerm integration.
 
 `Backend::cancel` is idempotent and joins the reader. View drop calls the same
 path. On Unix, cleanup kills an unreaped owned child before Alacritty's PTY Drop
@@ -127,3 +126,48 @@ match shows a pointer; Cmd-click takes precedence over mouse reporting and
 selection and calls that callback. Releasing Cmd or leaving the view clears the
 hover. A busy parser clears stale link state; click never opens an old hover
 location. The terminal crate itself never launches a URL or process opener.
+
+## TRU-287: find and service jobs
+
+The terminal's focused key handler opens literal find with Cmd+F. Type through
+the existing IME input handler, use Backspace to edit, Cmd+G / Shift+Cmd+G (or
+Enter / Shift+Enter) to navigate, and Esc to close and restore terminal focus.
+The selected match is highlighted independently of the copy selection and
+scrolled into view. The bar reports `Busy` during search/contention, then the
+match count. The shell may need to route its global Cmd+F action to
+`TerminalView::open_find` and focus the terminal if it intercepts that shortcut;
+no shell integration was changed here.
+
+- `Backend::search_job(String)` returns `ServiceJob<SearchResults>`; `poll()`
+  returns `Pending` or `Ready(Result<_, ServiceError>)`. Search is literal via
+  the existing Alacritty regex engine. `set_find_results` validates the revision
+  before highlighting; `next_find(previous)` navigates without waiting on a lock.
+- `Backend::export_job()` has the same protocol, producing plain text. Apps can
+  poll it directly, or install `TerminalView::with_export_callback` and call
+  `request_export()`. Accepted view requests deliver success or failure on the
+  GPUI foreground notification task, even without a paint. Admission errors
+  return directly. A missing callback returns `NoExportCallback`. The crate
+  does no file IO, dialog, or save-location policy.
+- `Backend::tail_snapshot(n)` returns the last N physical grid rows, including
+  blank viewport rows. It includes combining/wide text and joins wrapped rows
+  using Alacritty's extraction semantics. Zero returns an empty string; N above
+  retention returns all retained text. It needs no render/snapshot sync, and
+  its work/allocation scales with N (callers should request small log tails).
+
+Each terminal admits one background search/export job at a time. A worker
+copies at most 32 rows under each nonblocking parser lock, releases it, then
+performs regex/extraction against a detached grid. Full-history allocation and
+regex scans never run on the foreground. Tail uses the same sliced capture over only the
+requested rows, with text conversion outside the lock. Contention or mutation
+during capture returns `Busy`, never an empty success or a mixed-version grid.
+A full-history job needs one temporary grid proportional to retained history;
+no history cache, output queue, or extra parser is introduced. Dropping a job
+receiver discards its result; an already running finite worker finishes without
+holding up view/session cancellation.
+
+Any parsed output, resize, clear or history-limit change invalidates find
+positions. The bar conservatively clears and retries after output quiets (at
+most ten attempts per second); a continuously changing grid can remain Busy.
+Alacritty adjusts live selections during scroll/eviction; pending selection
+coordinates from an outdated render are discarded. This favors clearing over
+highlighting replacement text at an old coordinate.
