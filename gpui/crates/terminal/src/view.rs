@@ -725,7 +725,8 @@ impl TerminalView {
         self.backend.extend_selection(point);
     }
 
-    fn process_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Deliver pending UI effects even when an embedding tab is hidden.
+    pub fn process_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let events = self.backend.take_events();
         if events.bell
             && let Some(callback) = &self.bell_callback

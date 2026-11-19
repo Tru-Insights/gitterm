@@ -40,7 +40,14 @@ pub fn config_dir(override_dir: Option<OsString>, home: &Path) -> Result<PathBuf
     Ok(actual)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TerminalSession {
+    pub id: u64,
+    pub cwd: PathBuf,
+}
+
 pub struct LayoutStore {
+    pub terminals: Option<Vec<TerminalSession>>,
     pub path: PathBuf,
     refused: Option<String>,
 }
@@ -48,8 +55,34 @@ impl LayoutStore {
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
+            terminals: None,
             refused: None,
         }
+    }
+    pub fn load_terminals(&mut self) -> Result<Option<Vec<TerminalSession>>> {
+        let result = (|| -> Result<_> {
+            let bytes = match std::fs::read(&self.path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
+            let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let Some(value) = value.get("terminal_sessions") else {
+                return Ok(None);
+            };
+            let mut sessions: Vec<TerminalSession> = serde_json::from_value(value.clone())?;
+            let mut seen = HashSet::new();
+            sessions.retain(|session| seen.insert(session.id));
+            ensure!(
+                sessions.iter().all(|s| s.cwd.is_absolute()),
+                "terminal cwd must be absolute"
+            );
+            Ok(Some(sessions))
+        })();
+        if let Err(error) = &result {
+            self.refused = Some(format!("{error:#}"));
+        }
+        result
     }
     pub fn load(&mut self, known: &HashSet<String>) -> Result<Option<DockAreaState>> {
         let result = (|| -> Result<Option<DockAreaState>> {
@@ -58,9 +91,13 @@ impl LayoutStore {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(e.into()),
             };
+            if let Some(reason) = &self.refused {
+                bail!("{reason}");
+            }
             let mut state: DockAreaState = serde_json::from_slice(&bytes)?;
-            validate(&state)?;
-            prune_unknown(&mut state.center, known);
+            validate(&state, self.terminals.is_some())?;
+            let mut seen = HashSet::new();
+            prune_unknown(&mut state.center, known, &mut seen);
             for dock in [
                 &mut state.left_dock,
                 &mut state.right_dock,
@@ -70,7 +107,7 @@ impl LayoutStore {
             .flatten()
             {
                 let mut panel = dock.panel().clone();
-                prune_unknown(&mut panel, known);
+                prune_unknown(&mut panel, known, &mut seen);
                 *dock = gpui_component::dock::DockState::new(
                     panel,
                     dock.placement(),
@@ -100,7 +137,11 @@ impl LayoutStore {
                 .context("layout has no parent directory")?;
             std::fs::create_dir_all(dir)?;
             let mut temp = tempfile::NamedTempFile::new_in(dir)?;
-            temp.write_all(&serde_json::to_vec_pretty(state)?)?;
+            let mut value = serde_json::to_value(state)?;
+            if let Some(terminals) = &self.terminals {
+                value["terminal_sessions"] = serde_json::to_value(terminals)?;
+            }
+            temp.write_all(&serde_json::to_vec_pretty(&value)?)?;
             temp.as_file().sync_all()?;
             temp.persist(&self.path)?;
             Ok(())
@@ -109,13 +150,18 @@ impl LayoutStore {
     }
 }
 
-fn validate(state: &DockAreaState) -> Result<()> {
+fn validate(state: &DockAreaState, recover_duplicates: bool) -> Result<()> {
     ensure!(
         state.version == Some(1),
         "unsupported dock layout version {:?}",
         state.version
     );
-    fn visit(node: &PanelState, seen: &mut HashSet<String>, depth: usize) -> Result<()> {
+    fn visit(
+        node: &PanelState,
+        seen: &mut HashSet<String>,
+        depth: usize,
+        recover_duplicates: bool,
+    ) -> Result<()> {
         ensure!(depth < 32, "dock layout nesting exceeds 32 levels");
         match &node.info {
             PanelInfo::Panel(value) => {
@@ -125,7 +171,10 @@ fn validate(state: &DockAreaState) -> Result<()> {
                     node.panel_name
                 );
                 let id: String = serde_json::from_value(value.clone())?;
-                ensure!(seen.insert(id.clone()), "duplicate pane ID {id}");
+                ensure!(
+                    seen.insert(id.clone()) || recover_duplicates,
+                    "duplicate pane ID {id}"
+                );
             }
             PanelInfo::Stack { sizes, axis } => {
                 ensure!(
@@ -153,12 +202,12 @@ fn validate(state: &DockAreaState) -> Result<()> {
             }
         }
         for child in &node.children {
-            visit(child, seen, depth + 1)?;
+            visit(child, seen, depth + 1, recover_duplicates)?;
         }
         Ok(())
     }
     let mut seen = HashSet::new();
-    visit(&state.center, &mut seen, 0)?;
+    visit(&state.center, &mut seen, 0, recover_duplicates)?;
     for (dock, placement) in [
         (&state.left_dock, DockPlacement::Left),
         (&state.right_dock, DockPlacement::Right),
@@ -171,22 +220,28 @@ fn validate(state: &DockAreaState) -> Result<()> {
                     && dock.size() > gpui::px(0.),
                 "invalid dock geometry"
             );
-            visit(dock.panel(), &mut seen, 0)?;
+            visit(dock.panel(), &mut seen, 0, recover_duplicates)?;
         }
     }
     Ok(())
 }
 
 /// Remove panes that no longer exist while retaining the remaining dock tree.
-fn prune_unknown(node: &mut PanelState, known: &HashSet<String>) -> bool {
+fn prune_unknown(
+    node: &mut PanelState,
+    known: &HashSet<String>,
+    seen: &mut HashSet<String>,
+) -> bool {
     if let PanelInfo::Panel(value) = &node.info {
-        return value.as_str().is_some_and(|id| known.contains(id));
+        return value
+            .as_str()
+            .is_some_and(|id| known.contains(id) && seen.insert(id.to_string()));
     }
     let old_children = std::mem::take(&mut node.children);
     let mut kept = Vec::with_capacity(old_children.len());
     let mut kept_indices = Vec::with_capacity(old_children.len());
     for (index, mut child) in old_children.into_iter().enumerate() {
-        if prune_unknown(&mut child, known) {
+        if prune_unknown(&mut child, known, seen) {
             kept.push(child);
             kept_indices.push(index);
         }
@@ -209,6 +264,28 @@ fn prune_unknown(node: &mut PanelState, known: &HashSet<String>) -> bool {
     }
     node.children = kept;
     true
+}
+
+pub fn pane_order(state: &DockAreaState) -> Vec<String> {
+    fn visit(node: &PanelState, ids: &mut Vec<String>) {
+        if let PanelInfo::Panel(value) = &node.info
+            && let Some(id) = value.as_str()
+        {
+            ids.push(id.to_string());
+        }
+        for child in &node.children {
+            visit(child, ids);
+        }
+    }
+    let mut ids = vec![];
+    visit(&state.center, &mut ids);
+    for dock in [&state.left_dock, &state.right_dock, &state.bottom_dock]
+        .into_iter()
+        .flatten()
+    {
+        visit(dock.panel(), &mut ids);
+    }
+    ids
 }
 
 pub fn workspace_layout_key(path: &Path) -> String {
@@ -290,11 +367,11 @@ mod tests {
     #[test]
     fn reject_unknown_or_duplicate_identity() {
         let mut state = fixture();
-        assert!(validate(&state).is_ok());
+        assert!(validate(&state, false).is_ok());
         let leaf = state.bottom_dock.as_ref().unwrap().panel().children[0].clone();
         state.center.children = vec![leaf.clone(), leaf];
         state.center.info = PanelInfo::tabs(0);
-        assert!(validate(&state).is_err());
+        assert!(validate(&state, false).is_err());
     }
     #[test]
     fn unknown_panes_are_dropped_and_layout_remains_saveable() {
