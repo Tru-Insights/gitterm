@@ -948,26 +948,7 @@ pub(crate) fn resolve_repo_root(cwd: &Path) -> Option<(PathBuf, bool)> {
 
 /// All .jsonl files up to `depth` directory levels below `root`
 /// (claude/pi: slug/file = 1; codex: YYYY/MM/DD/file = 3).
-pub(crate) fn jsonl_files_under(root: &Path, depth: usize) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut dirs = vec![(root.to_path_buf(), 0usize)];
-    while let Some((dir, level)) = dirs.pop() {
-        let Ok(read) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for item in read.flatten() {
-            let path = item.path();
-            if path.is_dir() {
-                if level < depth {
-                    dirs.push((path, level + 1));
-                }
-            } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                out.push(path);
-            }
-        }
-    }
-    out
-}
+pub(crate) use gitterm_core::plan_limits::jsonl_files_under;
 
 fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
