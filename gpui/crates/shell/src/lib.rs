@@ -4,11 +4,18 @@ extern crate gpui_kit as gpui;
 pub mod data;
 mod dialogs;
 mod layout;
+mod owner;
 mod pane;
 mod theme;
+pub mod workspace_config;
+pub mod workspace_status;
+pub use owner::WorkspaceOwner;
+use std::{cell::RefCell, time::Instant};
+use workspace_status::{Intent, WorkspaceStatus};
 
 use anyhow::{Result, ensure};
 use data::{Session, SessionId, ShellData, Workspace, WorkspaceId};
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Action, Anchor, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable,
     FontWeight, InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render,
@@ -59,7 +66,10 @@ struct WorkspaceDock {
 pub struct Shell {
     data: Rc<dyn ShellData>,
     workspaces: Vec<WorkspaceDock>,
-    active_workspace: WorkspaceId,
+    owner: Entity<WorkspaceOwner>,
+    registry: Rc<RefCell<HashMap<String, gpui::WeakEntity<Pane>>>>,
+    config_dir: std::path::PathBuf,
+    local: bool,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -70,10 +80,25 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<Self> {
+        let model = WorkspaceStatus::sample(data.workspaces(cx).into_iter().map(|w| w.id));
+        let owner = cx.new(|cx| WorkspaceOwner::new(model, None, cx));
+        Self::with_owner(data, owner, config_dir, false, window, cx)
+    }
+    fn with_owner(
+        data: Rc<dyn ShellData>,
+        owner: Entity<WorkspaceOwner>,
+        config_dir: &Path,
+        local: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Self> {
         gitterm_gpui_chat::init(cx);
-        let catalog = data.workspaces();
-        ensure!(!catalog.is_empty(), "shell data has no workspaces");
-        let active_workspace = catalog[0].id;
+        let catalog = data.workspaces(cx);
+        if let Some(first) = catalog.first() {
+            owner.update(cx, |owner, cx| {
+                owner.dispatch(Intent::Activate(first.id), Instant::now(), cx)
+            });
+        }
         let mut workspace_ids = HashSet::new();
         let mut session_ids = HashSet::new();
         let mut workspaces = vec![];
@@ -83,61 +108,14 @@ impl Shell {
                 "duplicate workspace ID {:?}",
                 workspace.id
             );
-            let sessions = data.sessions(workspace.id);
-            let mut panes = HashMap::new();
-            for session in &sessions {
-                ensure!(
-                    session_ids.insert(session.id.0),
-                    "duplicate session ID {:?}",
-                    session.id
-                );
-                let id = session_pane_id(session.id);
-                let pane = cx.new(|cx| {
-                    Pane::new(
-                        id.clone(),
-                        session.title.clone(),
-                        session.kind.into(),
-                        workspace.id,
-                        data.clone(),
-                        window,
-                        cx,
-                    )
-                });
-                panes.insert(id, pane);
-            }
-            for (name, title, kind) in [
-                ("git", "Git status", PaneKind::Git),
-                ("files", "Files", PaneKind::Files),
-            ] {
-                let id = format!("workspace-{}-{name}", workspace.id.0);
-                panes.insert(
-                    id.clone(),
-                    cx.new(|cx| {
-                        Pane::new(
-                            id,
-                            title.into(),
-                            kind,
-                            workspace.id,
-                            data.clone(),
-                            window,
-                            cx,
-                        )
-                    }),
-                );
-            }
-            let (dock, skin) =
-                DockSkin::dock_area(format!("workspace-{}", workspace.id.0), Some(1), window, cx);
-            skin.set_panel_style(PanelStyle::TabBar, cx);
-            skin.set_close_button_visible(true, cx);
-            workspaces.push(WorkspaceDock {
-                active_session: sessions.first().map(|s| s.id),
-                store: LayoutStore::new(config_dir.join(format!("layout-{}.json", workspace.id.0))),
+            workspaces.push(build_workspace(
                 workspace,
-                sessions,
-                panes,
-                dock,
-                error: None,
-            });
+                data.clone(),
+                config_dir,
+                &mut session_ids,
+                window,
+                cx,
+            )?);
         }
         // Restoration resolves stable persisted IDs to the SAME entities. It never
         // constructs panes, even when a layout is loaded again within this process.
@@ -145,6 +123,8 @@ impl Shell {
             .iter()
             .flat_map(|w| w.panes.iter().map(|(id, p)| (id.clone(), p.downgrade())))
             .collect();
+        let registry = Rc::new(RefCell::new(handles));
+        let handles = registry.clone();
         register_panel(cx, PANEL_NAME, move |context, _, _| {
             let gpui_component::dock::PanelInfo::Panel(value) = context.info() else {
                 unreachable!("registry only builds leaves")
@@ -152,6 +132,7 @@ impl Shell {
             let id = value.as_str().expect("layout IDs validated before load");
             panel_handle(
                 handles
+                    .borrow()
                     .get(id)
                     .expect("layout IDs validated before load")
                     .upgrade()
@@ -160,84 +141,174 @@ impl Shell {
         });
         let mut subscriptions = vec![];
         for state in &mut workspaces {
-            let known = state.panes.keys().cloned().collect();
-            let loaded = match state.store.load(&known) {
-                Ok(loaded) => loaded,
-                Err(e) => {
-                    let error = format!("{e:#}");
-                    eprintln!("{error}");
-                    state.error = Some(format!(
-                        "{error} · Using the default layout. Saves disabled until this file is repaired."
-                    ));
-                    None
+            load_workspace_layout(state, window, cx)?;
+            subscriptions.push(subscribe_dock(state, cx));
+        }
+        subscriptions.push(cx.observe(&owner, |this, _, cx| {
+            for workspace in &this.workspaces {
+                for pane in workspace.panes.values() {
+                    pane.update(cx, |_, cx| cx.notify());
                 }
-            };
-            if let Some(layout) = loaded {
-                state
-                    .dock
-                    .update(cx, |dock, cx| dock.load(layout, window, cx))?;
-            } else {
-                default_layout(state, window, cx);
             }
-            let id = state.workspace.id;
-            subscriptions.push(
-                cx.subscribe(&state.dock, move |this, dock, _: &DockEvent, cx| {
-                    let state = this
-                        .workspaces
-                        .iter_mut()
-                        .find(|w| w.workspace.id == id)
-                        .expect("workspace still owned");
-                    if state.store.is_refused() {
-                        return;
-                    }
-                    if let Err(e) = state.store.save(&dock.read(cx).dump(cx)) {
-                        let error = format!("{e:#}");
-                        if state.error.as_ref() != Some(&error) {
-                            eprintln!("{error}");
-                        }
-                        state.error = Some(error);
-                        cx.notify();
-                    }
-                }),
-            );
+            cx.notify();
+        }));
+        if local {
+            owner.update(cx, |owner, cx| {
+                owner.dispatch(Intent::Opened, Instant::now(), cx)
+            });
         }
         Ok(Self {
             data,
             workspaces,
-            active_workspace,
+            owner,
+            registry,
+            config_dir: config_dir.to_path_buf(),
+            local,
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
         })
     }
-    fn active(&self) -> &WorkspaceDock {
+    fn add_folder_button(&self, cx: &Context<Self>) -> Button {
+        Button::new("add-folder")
+            .ghost()
+            .label("Add folder…")
+            .on_click(cx.listener(|this, _, window, cx| this.pick_folder(window, cx)))
+    }
+    fn pick_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let response = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Add workspace folder".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = match response.await {
+                Ok(Ok(Some(paths))) => {
+                    cx.background_executor()
+                        .spawn(async move {
+                            paths
+                                .first()
+                                .map(|path| workspace_config::local_folder(path))
+                                .transpose()
+                        })
+                        .await
+                }
+                Ok(Ok(None)) => Ok(None),
+                Ok(Err(error)) => Err(error),
+                Err(error) => Err(error.into()),
+            };
+            _ = this.update_in(cx, |this, window, cx| {
+                let result = result.and_then(|folder| {
+                    if let Some(folder) = folder {
+                        this.add_folder(folder, window, cx)?;
+                    }
+                    Ok(())
+                });
+                if let Err(error) = result {
+                    let error = format!("Add folder: {error:#}");
+                    eprintln!("{error}");
+                    this.owner.update(cx, |owner, cx| {
+                        owner.error = Some(error);
+                        cx.notify();
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+    fn add_folder(
+        &mut self,
+        folder: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let id = self
+            .owner
+            .update(cx, |owner, cx| owner.add_folder(folder, cx))?;
+        if !self.workspaces.iter().any(|w| w.workspace.id == id) {
+            let workspace = self
+                .data
+                .workspaces(cx)
+                .into_iter()
+                .find(|w| w.id == id)
+                .expect("added workspace");
+            let mut session_ids = self
+                .workspaces
+                .iter()
+                .flat_map(|w| w.sessions.iter().map(|s| s.id.0))
+                .collect();
+            let mut state = build_workspace(
+                workspace,
+                self.data.clone(),
+                &self.config_dir,
+                &mut session_ids,
+                window,
+                cx,
+            )?;
+            self.registry.borrow_mut().extend(
+                state
+                    .panes
+                    .iter()
+                    .map(|(id, p)| (id.clone(), p.downgrade())),
+            );
+            load_workspace_layout(&mut state, window, cx)?;
+            self._subscriptions.push(subscribe_dock(&state, cx));
+            self.workspaces.push(state);
+        }
+        self.sync_git_visibility(false, cx);
+        self.focus.focus(window, cx);
+        cx.notify();
+        Ok(())
+    }
+    fn sync_git_visibility(&self, enter: bool, cx: &mut Context<Self>) {
+        let visible = self
+            .workspaces
+            .iter()
+            .find(|w| Some(w.workspace.id) == self.active_workspace(cx))
+            .is_some_and(|w| git_visible(w, cx));
+        self.owner
+            .update(cx, |owner, cx| owner.set_git_visible(visible, enter, cx));
+    }
+    fn active_workspace(&self, cx: &App) -> Option<WorkspaceId> {
+        self.owner.read(cx).model.active()
+    }
+    fn active(&self, cx: &App) -> &WorkspaceDock {
         self.workspaces
             .iter()
-            .find(|w| w.workspace.id == self.active_workspace)
+            .find(|w| Some(w.workspace.id) == self.active_workspace(cx))
             .expect("active workspace exists")
     }
     fn select_workspace(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(state) = self.workspaces.get(index) {
-            self.active_workspace = state.workspace.id;
+        if self.workspaces.get(index).is_some() {
+            self.owner.update(cx, |owner, cx| {
+                owner.dispatch(Intent::SelectIndex(index), Instant::now(), cx)
+            });
+            self.sync_git_visibility(false, cx);
             self.focus.focus(window, cx);
             cx.notify();
         }
     }
     fn select_session(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(session) = self.active().sessions.get(index) {
+        if self.workspaces.is_empty() {
+            return;
+        }
+        if let Some(session) = self.active(cx).sessions.get(index) {
             let id = session.id;
+            let active = self.active_workspace(cx);
             self.workspaces
                 .iter_mut()
-                .find(|w| w.workspace.id == self.active_workspace)
+                .find(|w| Some(w.workspace.id) == active)
                 .expect("active workspace exists")
                 .active_session = Some(id);
             self.show_pane(&session_pane_id(id), window, cx);
         }
     }
     fn close_session(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<Self>) {
+        let active = self.active_workspace(cx);
         let state = self
             .workspaces
             .iter_mut()
-            .find(|state| state.workspace.id == self.active_workspace)
+            .find(|state| Some(state.workspace.id) == active)
             .expect("active workspace exists");
         if let Some(pane) = state.panes.remove(&session_pane_id(id)) {
             state.sessions.retain(|session| session.id != id);
@@ -252,11 +323,12 @@ impl Shell {
         }
     }
     fn show_pane(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let state = self.active();
+        let state = self.active(cx);
         let Some(pane) = state.panes.get(id).cloned() else {
             return;
         };
         let panel_id = PanelId::from(pane.entity_id());
+        let restoring = state.dock.read(cx).panel(panel_id).is_none();
         state.dock.update(cx, |dock, cx| {
             if dock.panel(panel_id).is_none() {
                 dock.add_panel_view(
@@ -282,10 +354,145 @@ impl Shell {
             }
             dock.select_panel(panel_id, window, cx);
         });
+        // Restoring a closed view retains the owner's jobs and last-poll clock.
+        // Selecting an existing Git tab still dispatches the Git-entry intent.
+        if restoring {
+            self.sync_git_visibility(false, cx);
+        }
         pane.focus_handle(cx).focus(window, cx);
         cx.notify();
     }
 }
+fn load_workspace_layout(
+    state: &mut WorkspaceDock,
+    window: &mut Window,
+    cx: &mut Context<Shell>,
+) -> Result<()> {
+    let known = state.panes.keys().cloned().collect();
+    let loaded = match state.store.load(&known) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            let error = format!("{e:#}");
+            eprintln!("{error}");
+            state.error = Some(format!(
+                "{error} · Using the default layout. Saves disabled until this file is repaired."
+            ));
+            None
+        }
+    };
+    if let Some(layout) = loaded {
+        state
+            .dock
+            .update(cx, |dock, cx| dock.load(layout, window, cx))?;
+    } else {
+        default_layout(state, window, cx);
+    }
+    Ok(())
+}
+fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscription {
+    let id = state.workspace.id;
+    cx.subscribe(&state.dock, move |this, dock, _: &DockEvent, cx| {
+        let state = this
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace.id == id)
+            .expect("owned workspace");
+        if !state.store.is_refused()
+            && let Err(e) = state.store.save(&dock.read(cx).dump(cx))
+        {
+            let error = format!("{e:#}");
+            eprintln!("{error}");
+            state.error = Some(error);
+        }
+        this.sync_git_visibility(true, cx);
+        cx.notify();
+    })
+}
+fn git_visible(state: &WorkspaceDock, cx: &App) -> bool {
+    use gpui_component::dock::{PanelInfo, PanelState};
+    fn visible(node: &PanelState, id: &str) -> bool {
+        match &node.info {
+            PanelInfo::Panel(value) => value.as_str() == Some(id),
+            PanelInfo::Tabs { active_index } => node
+                .children
+                .get(*active_index)
+                .is_some_and(|n| visible(n, id)),
+            PanelInfo::Stack { .. } => node.children.iter().any(|n| visible(n, id)),
+        }
+    }
+    let layout = state.dock.read(cx).dump(cx);
+    let id = format!("workspace-{}-git", state.workspace.id.0);
+    visible(&layout.center, &id)
+        || [&layout.left_dock, &layout.right_dock, &layout.bottom_dock]
+            .into_iter()
+            .flatten()
+            .any(|d| d.open() && visible(d.panel(), &id))
+}
+fn build_workspace(
+    workspace: Workspace,
+    data: Rc<dyn ShellData>,
+    config_dir: &Path,
+    session_ids: &mut HashSet<u64>,
+    window: &mut Window,
+    cx: &mut Context<Shell>,
+) -> Result<WorkspaceDock> {
+    let sessions = data.sessions(workspace.id, cx);
+    let mut panes = HashMap::new();
+    for session in &sessions {
+        ensure!(
+            session_ids.insert(session.id.0),
+            "duplicate session ID {:?}",
+            session.id
+        );
+        let id = session_pane_id(session.id);
+        let pane = cx.new(|cx| {
+            Pane::new(
+                id.clone(),
+                session.title.clone(),
+                session.kind.into(),
+                workspace.id,
+                data.clone(),
+                window,
+                cx,
+            )
+        });
+        panes.insert(id, pane);
+    }
+    for (name, title, kind) in [
+        ("git", "Git status", PaneKind::Git),
+        ("files", "Files", PaneKind::Files),
+    ] {
+        let id = format!("workspace-{}-{name}", workspace.id.0);
+        panes.insert(
+            id.clone(),
+            cx.new(|cx| {
+                Pane::new(
+                    id,
+                    title.into(),
+                    kind,
+                    workspace.id,
+                    data.clone(),
+                    window,
+                    cx,
+                )
+            }),
+        );
+    }
+    let (dock, skin) =
+        DockSkin::dock_area(format!("workspace-{}", workspace.id.0), Some(1), window, cx);
+    skin.set_panel_style(PanelStyle::TabBar, cx);
+    skin.set_close_button_visible(true, cx);
+    Ok(WorkspaceDock {
+        active_session: sessions.first().map(|s| s.id),
+        store: LayoutStore::new(config_dir.join(format!("layout-{}.json", workspace.id.0))),
+        workspace,
+        sessions,
+        panes,
+        dock,
+        error: None,
+    })
+}
+
 fn session_pane_id(id: SessionId) -> String {
     format!("session-{}", id.0)
 }
@@ -329,8 +536,30 @@ impl Focusable for Shell {
 impl Render for Shell {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::current(cx);
-        let state = self.active();
-        let repository = self.data.status(self.active_workspace).repository;
+        if self.workspaces.is_empty() {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .p_4()
+                .gap_3()
+                .child("No local workspaces yet")
+                .child("Add a local folder to see live Git status.")
+                .child(self.add_folder_button(cx))
+                .children(
+                    self.owner
+                        .read(cx)
+                        .error
+                        .clone()
+                        .map(|error| div().text_color(rgb(p.red)).child(error)),
+                )
+                .into_any_element();
+        }
+        let state = self.active(cx);
+        let repository = self
+            .data
+            .status(self.active_workspace(cx).expect("active workspace"), cx)
+            .repository;
         let active_session = state
             .active_session
             .and_then(|id| state.sessions.iter().position(|s| s.id == id))
@@ -353,12 +582,15 @@ impl Render for Shell {
                     .child("GitTerm"),
             )
             .child(div().text_color(rgb(p.muted)).mb_4().child("Workspaces"))
+            .when(self.local, |sidebar| {
+                sidebar.child(self.add_folder_button(cx))
+            })
             .children(self.workspaces.iter().enumerate().map(|(index, state)| {
                 let workspace = &state.workspace;
-                let count = self.data.status(workspace.id).files.len();
+                let count = self.data.status(workspace.id, cx).files.len();
                 Button::new(("workspace", index))
                     .ghost()
-                    .selected(workspace.id == self.active_workspace)
+                    .selected(Some(workspace.id) == self.active_workspace(cx))
                     .accessibility_label(format!(
                         "{}, {}, {} changes",
                         workspace.name, workspace.status, count
@@ -370,7 +602,7 @@ impl Render for Shell {
                     .items_start()
                     .p_2()
                     .rounded_md()
-                    .bg(rgb(if workspace.id == self.active_workspace {
+                    .bg(rgb(if Some(workspace.id) == self.active_workspace(cx) {
                         p.surface
                     } else {
                         p.mantle
@@ -386,7 +618,7 @@ impl Render for Shell {
                         div()
                             .text_size(px(11.))
                             .text_color(rgb(p.muted))
-                            .child(workspace.status.clone()),
+                            .child(self.data.status(workspace.id, cx).branch),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.select_workspace(index, window, cx)
@@ -421,17 +653,22 @@ impl Render for Shell {
                     .map(|repo| div().p_2().child(format!("⌄  {repo}"))),
             )
             .child(
-                div()
-                    .pl_4()
-                    .text_color(rgb(p.muted))
-                    .child(self.data.status(self.active_workspace).branch),
+                div().pl_4().text_color(rgb(p.muted)).child(
+                    self.data
+                        .status(self.active_workspace(cx).expect("active workspace"), cx)
+                        .branch,
+                ),
             )
             .child(div().flex_1())
             .child(
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(p.muted))
-                    .child("Local · GPUI sample data"),
+                    .child(if self.local {
+                        "Local · Live Git status"
+                    } else {
+                        "Local · GPUI sample data"
+                    }),
             );
         let tabs = TabBar::new("sessions")
             .underline()
@@ -518,6 +755,9 @@ impl Render for Shell {
                 .child(div().flex_1().min_w_0().child(tabs))
                 .child(more),
         );
+        if let Some(error) = &self.owner.read(cx).error {
+            content = content.child(div().p_2().text_color(rgb(p.red)).child(error.clone()));
+        }
         if let Some(error) = &state.error {
             content = content.child(div().p_2().text_color(rgb(p.red)).child(error.clone()));
         }
@@ -541,13 +781,29 @@ impl Render for Shell {
             .bg(rgb(p.base))
             .child(sidebar)
             .child(content.child(div().flex_1().min_h_0().child(state.dock.clone())))
+            .into_any_element()
     }
 }
 
-pub fn run() {
+pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
     let home = dirs::home_dir().expect("resolve home for isolated GPUI config");
-    let config = layout::config_dir(std::env::var_os("GITTERM_GPUI_CONFIG_DIR"), &home)
-        .expect("resolve isolated GPUI config directory");
+    let config = layout::config_dir(std::env::var_os("GITTERM_GPUI_CONFIG_DIR"), &home)?;
+    let config = if sample {
+        layout::config_dir(Some(config.join("sample").into_os_string()), &home)?
+    } else {
+        config
+    };
+    let mut store = workspace_config::WorkspaceStore::new(&config);
+    let mut model = WorkspaceStatus::default();
+    if !sample {
+        for folder in store.load()? {
+            model.add(folder, Instant::now());
+        }
+        for folder in folders {
+            model.add(workspace_config::local_folder(&folder)?, Instant::now());
+        }
+        store.save(&model.folders())?;
+    }
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         theme::apply(true, None, cx);
@@ -587,15 +843,31 @@ pub fn run() {
                     cx,
                 ))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("GitTerm · GPUI shell · Sample data".into()),
+                    title: Some(
+                        if sample {
+                            "GitTerm · GPUI shell · Sample data"
+                        } else {
+                            "GitTerm · GPUI · Local workspaces"
+                        }
+                        .into(),
+                    ),
                     ..Default::default()
                 }),
                 ..Default::default()
             },
             move |window, cx| {
                 let shell = cx.new(|cx| {
-                    Shell::new(Rc::new(data::SampleData), &config, window, cx)
-                        .expect("create sample shell")
+                    if sample {
+                        Shell::new(Rc::new(data::SampleData), &config, window, cx)
+                            .expect("create sample shell")
+                    } else {
+                        let owner = cx.new(|cx| WorkspaceOwner::new(model, Some(store), cx));
+                        let data = Rc::new(data::LocalData(owner.clone()));
+                        let shell = Shell::with_owner(data, owner, &config, true, window, cx)
+                            .expect("create local shell");
+                        shell.sync_git_visibility(false, cx);
+                        shell
+                    }
                 });
                 shell.focus_handle(cx).focus(window, cx);
                 cx.new(|cx| Root::new(shell, window, cx))
@@ -605,6 +877,7 @@ pub fn run() {
         cx.on_window_closed(|cx, _| cx.quit()).detach();
         cx.activate(true);
     });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -612,6 +885,144 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
     use gpui_component::dock::{InsertTarget, PaneRef};
+
+    #[gpui::test]
+    fn live_local_status_crosses_application_bridge_and_survives_closed_git_pane(
+        cx: &mut TestAppContext,
+    ) {
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let repo = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = gitterm_core::git_status::git_command()
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "live-fixture"]);
+        std::fs::write(repo.path().join("staged.txt"), "staged").unwrap();
+        std::fs::write(repo.path().join("untracked.txt"), "untracked").unwrap();
+        git(&["add", "staged.txt"]);
+        let (shell, cx) = cx.add_window_view(|window, cx| {
+            let owner = cx.new(|cx| {
+                WorkspaceOwner::new(
+                    WorkspaceStatus::default(),
+                    Some(workspace_config::WorkspaceStore::new(config.path())),
+                    cx,
+                )
+            });
+            let data = Rc::new(data::LocalData(owner.clone()));
+            Shell::with_owner(data, owner, config.path(), true, window, cx).unwrap()
+        });
+        draw(cx); // Empty state is renderable and has no implicit workspace.
+        assert!(cx.read(|cx| shell.read(cx).active_workspace(cx)).is_none());
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell
+                    .add_folder(
+                        workspace_config::local_folder(repo.path()).unwrap(),
+                        window,
+                        cx,
+                    )
+                    .unwrap();
+                shell.select_workspace(0, window, cx);
+                shell.owner.update(cx, |owner, cx| {
+                    owner.dispatch(Intent::Maintenance { focused: true }, Instant::now(), cx)
+                });
+            })
+        });
+        let (owner, dock, pane) = cx.read(|cx| {
+            let shell = shell.read(cx);
+            let state = shell.active(cx);
+            (
+                shell.owner.clone(),
+                state.dock.clone(),
+                state.panes["workspace-1-git"].clone(),
+            )
+        });
+        cx.update(|window, cx| {
+            dock.update(cx, |dock, cx| dock.remove_panel(pane.clone(), window, cx))
+        });
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            if cx.read(|cx| owner.read(cx).model.workspaces[0].status.branch_name == "live-fixture")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "runtime outcome never reached the application owner"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let before = cx.read(|cx| owner.read(cx).model.workspaces[0].status.last_poll);
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.show_pane("workspace-1-git", window, cx)
+            })
+        });
+        draw(cx);
+        cx.read(|cx| {
+            let status = pane.read(cx).status_view(cx);
+            assert_eq!(status.branch, "live-fixture");
+            assert!(!status.loading);
+            assert!(status.error.is_none());
+            assert!(
+                status
+                    .files
+                    .iter()
+                    .any(|f| f.path == "staged.txt" && f.staged)
+            );
+            assert!(
+                status
+                    .files
+                    .iter()
+                    .any(|f| f.path == "untracked.txt" && f.status == "??")
+            );
+            assert_eq!(owner.read(cx).model.workspaces[0].status.last_poll, before);
+        });
+        let mut store = workspace_config::WorkspaceStore::new(config.path());
+        assert_eq!(store.load().unwrap(), [repo.path().canonicalize().unwrap()]);
+        // A real subsequent maintenance request sees a filesystem change.
+        std::fs::write(repo.path().join("later.txt"), "later").unwrap();
+        cx.update(|_, cx| {
+            owner.update(cx, |owner, cx| {
+                owner.dispatch(
+                    Intent::Maintenance { focused: true },
+                    Instant::now() + std::time::Duration::from_secs(15),
+                    cx,
+                );
+            })
+        });
+        loop {
+            cx.run_until_parked();
+            if cx.read(|cx| {
+                pane.read(cx)
+                    .status_view(cx)
+                    .files
+                    .iter()
+                    .any(|f| f.path == "later.txt")
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "maintenance did not refresh the live pane"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        eprintln!(
+            "live status arrived via GPUI owner: staged.txt, untracked.txt, later.txt (isolated config)"
+        );
+    }
 
     fn terminal(pane: &Entity<Pane>, cx: &App) -> Entity<gitterm_terminal::TerminalView> {
         let pane::PaneContent::Terminal(view) = &pane.read(cx).content else {
@@ -666,7 +1077,7 @@ mod tests {
             Shell::new(Rc::new(data::SampleData), dir.path(), window, cx).unwrap()
         });
         let (dock, held, git) = cx.read(|cx| {
-            let state = shell.read(cx).active();
+            let state = shell.read(cx).active(cx);
             (
                 state.dock.clone(),
                 vec![
@@ -737,7 +1148,7 @@ mod tests {
             shell.update(cx, |s, cx| {
                 s.select_workspace(1, window, cx);
                 s.select_session(1, window, cx);
-                assert_eq!(s.active().active_session, Some(SessionId(22)));
+                assert_eq!(s.active(cx).active_session, Some(SessionId(22)));
                 s.select_workspace(0, window, cx);
             });
             assert_eq!(
@@ -769,12 +1180,12 @@ mod tests {
             Shell::new(Rc::new(data::SampleData), dir.path(), w, cx).unwrap()
         });
         let weak =
-            cx.read(|cx| terminal(&shell.read(cx).active().panes["session-12"], cx).downgrade());
+            cx.read(|cx| terminal(&shell.read(cx).active(cx).panes["session-12"], cx).downgrade());
         cx.update(|window, cx| {
             shell.update(cx, |s, cx| {
                 s.close_session(SessionId(12), window, cx);
-                assert!(!s.active().panes.contains_key("session-12"));
-                assert!(s.active().sessions.iter().all(|s| s.id != SessionId(12)));
+                assert!(!s.active(cx).panes.contains_key("session-12"));
+                assert!(s.active(cx).sessions.iter().all(|s| s.id != SessionId(12)));
                 s.show_pane("session-12", window, cx);
             })
         });
@@ -800,7 +1211,7 @@ mod tests {
             (
                 shell.workspaces[0].panes["session-12"].clone(),
                 shell.workspaces[1].panes["session-22"].clone(),
-                shell.active().dock.clone(),
+                shell.active(cx).dock.clone(),
             )
         });
         cx.update(|window, cx| {
@@ -848,7 +1259,7 @@ mod tests {
                 )
             });
         }
-        let chat_pane = cx.read(|cx| shell.read(cx).active().panes["session-11"].clone());
+        let chat_pane = cx.read(|cx| shell.read(cx).active(cx).panes["session-11"].clone());
         cx.update(|window, cx| {
             dock.update(cx, |dock, cx| {
                 dock.set_dock(
@@ -904,7 +1315,7 @@ mod tests {
             Shell::new(Rc::new(data::SampleData), dir.path(), w, cx).unwrap()
         });
         cx.update(|window, cx| {
-            let state = shell.read(cx).active();
+            let state = shell.read(cx).active(cx);
             assert!(
                 state
                     .error
@@ -936,7 +1347,7 @@ mod tests {
             Shell::new(Rc::new(data::SampleData), dir.path(), w, cx).unwrap()
         });
         cx.update(|window, cx| {
-            let state = shell.read(cx).active();
+            let state = shell.read(cx).active(cx);
             let dock = state.dock.clone();
             dock.update(cx, |dock, cx| {
                 dock.set_dock_size(DockPlacement::Bottom, px(321.), window, cx);
@@ -947,7 +1358,7 @@ mod tests {
         cx.update(|window, cx| {
             let restored =
                 cx.new(|cx| Shell::new(Rc::new(data::SampleData), dir.path(), window, cx).unwrap());
-            let dock = &restored.read(cx).active().dock;
+            let dock = &restored.read(cx).active(cx).dock;
             assert_eq!(
                 dock.read(cx).dock_size(DockPlacement::Bottom),
                 Some(px(321.))

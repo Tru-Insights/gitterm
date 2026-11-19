@@ -1,25 +1,95 @@
 # GitTerm GPUI preview (TRU-275 / TRU-280 / TRU-283, parent TRU-274)
 
-This macOS-only app opens a 1440×900 window titled
-“GitTerm · GPUI shell · Sample data”. The default dispatch opens the stage 2
-shell in `crates/shell`: workspace/repository sidebar, session tabs, and a
-gpui-component `DockArea`. Terminal panes each start one real `$SHELL` PTY in
-`$HOME`; chat panes show the bundled synthetic `showcase.jsonl`. Git status and
-the expandable file tree use
-sample data. The shell never reads GitTerm settings or real chat transcripts.
-`--terminal` opens the TRU-278 terminal route prototype instead (see below).
-The repository root is the Iced workspace. `gpui/` is a separate workspace
-with package `gitterm-gpui`, its own `Cargo.toml` and `Cargo.lock`, and is
-explicitly excluded from the root workspace. Root Cargo commands (including
-`--workspace` and `fmt --all`) never descend into GPUI. GPUI dependencies are
-target-gated to macOS; the Windows workflow remains unchanged.
+This macOS-only app opens a 1440×900 shell with explicit local workspaces and
+live Git status. Start with `gitterm-gpui --workspace <dir>` (repeatable), or
+choose **Add folder…** in the sidebar. With no saved/seeded folders it shows an
+empty state with Add folder. Names come from folder names; branches and the Git
+pane's staged, unstaged and untracked lists, loading and errors come from the
+shared core. Only the selected workspace is polled.
 
-The root lockfile is identical to `origin/v6`: Iced's dependency graph is
-unchanged. Separate lockfiles avoid the incompatible published Wry manifests
-described below without vendoring or patching either dependency. A future
-shared core crate will be consumed by both apps through path dependencies.
-Its dependencies must stay minimal because Cargo resolves them twice, once
-per workspace. No shared crate is introduced in stage 0.
+`--sample` explicitly opens the original demo catalog, synthetic chat and Git
+status; it cannot be combined with `--workspace` and never loads/saves the local
+folder list. Demo layouts live in the config directory's `sample/` subdirectory.
+`--terminal` and `--chat <fixture.jsonl>` retain their standalone routes.
+Terminal panes still launch `$SHELL` in `$HOME`: workspace cwd awaits TRU-291's
+`TerminalLaunch`. The Files tree, task/browser actions and sample-mode chat are
+still synthetic. Local mode creates a shell session, with no restored chat or
+saved sessions and no remote connections.
+
+GPUI uses only `GITTERM_GPUI_CONFIG_DIR` (absolute; default
+`~/.config/gitterm-gpui`). It never imports or writes V6 workspaces/settings.
+Explicit folders are canonicalized, deduplicated and saved by atomic tempfile
+rename to **`local-workspaces.json`**:
+
+```json
+{"version": 1, "folders": ["/absolute/local/repo", "/absolute/another/folder"]}
+```
+
+CLI folders append to that list; Add folder saves before changing the catalog.
+Missing saved folders remain visible as non-repositories, matching the core
+collector's existing failure semantics. Invalid JSON, versions, duplicate or
+relative paths fail startup with a path-specific error; the file is preserved.
+Picker/save errors appear in stderr and an on-screen banner. No active selection,
+status snapshots, runtime IDs or sessions are stored in this file.
+
+The repository root is the Iced workspace; `gpui/` is separately locked and
+excluded from root workspace commands. Both frontends depend on
+`crates/gitterm-core`; GPUI enables its `runtime` feature. The GPUI lock delta
+adds **eight packages**: `gitterm-core`, `git2` 0.19, `libgit2-sys`, `libssh2-sys`,
+`libz-sys`, `openssl-probe` 0.1, `openssl-sys` and `vcpkg`. The OpenSSL probe
+references are disambiguated from the existing 0.2 version. Existing package
+versions are unchanged; Tokio was already present and gains the shell's direct
+executor dependency. Root `Cargo.lock`, the Iced app and dependency-check script
+are unchanged. The separate Wry graphs remain mandatory (see below).
+
+## Stage 1 local adapter (TRU-274)
+
+`gitterm_gpui_shell::workspace_status::WorkspaceStatus::dispatch(Intent, Instant)`
+resolves selection indices and workspace/root identities into `Command::Selection`
+and addressed `Command::Status` values. It owns one core `SelectionState` and
+one core `GitStatusState` per local workspace/root. `status_view` projects core
+state into the same read-only facts used by the Git pane. Bar clicks and Ctrl+n
+share `SelectIndex`; Git entry, maintenance, wake, context refresh and completions
+all go through the core reducers. Selection alone does not force collection.
+
+One application-level `WorkspaceOwner` retains that model, one multi-thread Tokio
+runtime, one `StatusRuntime` and its sole result bridge. Completions update the
+owner on the GPUI context and notify the shell/panes, including hidden panes.
+Dock close/move/reopen does not own, cancel or recreate jobs. A single five-second
+maintenance clock drives only the active root, respects loading, adaptive core
+backoff and the hidden-Git 15-second minimum, and detects >300-second wake gaps.
+`SchedulePoll` never creates another timer. Application quit closes/drains the
+shared runner; local blocking Git retains the core's accounted teardown behavior.
+
+Adapter tests replay the local cases pinned by Iced's
+`workspace_selection_traces`, `status_poll_visibility_and_reset_traces`,
+`input_wake_and_enter_git_reset_traces` and completion/backoff fixtures in
+`src/baseline_tests.rs`. They assert exact core commands, addressed roots and all
+core fields after replay. The headless shell test
+`live_local_status_crosses_application_bridge_and_survives_closed_git_pane`
+creates a temporary repository and separate config, adds/selects it, runs the
+real runner/bridge, renders and checks the Git pane's staged/untracked facts,
+then collects a later filesystem change through maintenance. It uses GPUI's test
+platform, no native application window or OS input.
+
+Stage 1 PR 6 verification on arm64 macOS (18 November 2026): GPUI formatting,
+all-target Clippy and the dependency boundary check exited 0. The unfiltered
+workspace tests exited 101 solely for the known terminal test
+`find_shortcuts_edit_navigate_close_restore_focus_and_export_callback` (PTY gate
+deadline); it is unchanged. Excluding that one test, **102 tests passed**, exit 0.
+Root `test --workspace` (**1,406 passed**, 14 ignored), Clippy with `-D warnings`
+and formatting exited 0. Checks used `scripts/cargo.sh`,
+`CARGO_TARGET_DIR=/private/tmp/gt-target-s1pr6`, `CARGO_HOME=/private/tmp/gpui-mockup-cargo`
+and `-j 4`; `nice` was denied. The real-status evidence is the headless pipeline
+above. No GUI, native picker interaction, screen control, VoiceOver or visual
+comparison was performed.
+
+For an isolated manual launch (never use the V6 config directory):
+
+```sh
+CARGO_HOME=/private/tmp/gpui-mockup-cargo CARGO_TARGET_DIR=/private/tmp/gt-target-s1pr6 scripts/cargo.sh build --manifest-path gpui/Cargo.toml --workspace --locked -j 4
+GITTERM_GPUI_CONFIG_DIR=/private/tmp/gitterm-gpui-local-preview /private/tmp/gt-target-s1pr6/debug/gitterm-gpui --workspace /absolute/temp/repo
+```
 
 ## Toolchain and build
 
@@ -51,9 +121,10 @@ references; compare distinct package versions, as the dependency check does.
 
 ## Stage 2 shell (TRU-280 / TRU-283)
 
-`gitterm-gpui-shell::data::ShellData` is the frontend-neutral port for workspace,
-session, status and file facts. `SampleData` implements it today. The later core
-adapter belongs behind this port; GPUI does not depend on the root Iced package.
+`gitterm-gpui-shell::data::ShellData` is the read-only port for workspace,
+session, status and file facts. `LocalData` reads the application owner on the
+GPUI context; `SampleData` implements demo mode. GPUI does not depend on the
+root Iced package.
 The stage 1 design is in the planning repository's
 `docs/gpui-stage1-core-design.md` sections 1–2: dock entities do not own service
 jobs or recreate sessions.
@@ -71,7 +142,7 @@ the dock and layout registry only refer to it. Dock close hides a pane;
 More → `Close <session title> permanently` removes the selected session for
 this launch and releases its content view. Dropping a terminal uses the existing
 backend cancel-on-drop API (including reader join and child reaping). A restart
-recreates the sample sessions.
+recreates preview sessions; full saved-session restore is deferred.
 
 Clicks focus the terminal or chat under the pointer. Only the focused terminal
 receives typing. Chat Find (Cmd+F/G), plain/Markdown copy (Cmd+C / Cmd+Shift+C),
