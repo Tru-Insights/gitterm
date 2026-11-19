@@ -816,3 +816,7 @@ mod tests {
         assert!(started.unwrap() < completed_after.unwrap());
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/native-chat/native_chat_history.rs"]
+mod native_chat_tests;

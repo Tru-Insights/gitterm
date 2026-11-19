@@ -879,6 +879,10 @@ async fn run_turn(
     mut stop_rx: oneshot::Receiver<()>,
 ) -> Result<(), String> {
     let mut cmd = build_command(config, prompt, guidelines_file)?;
+    #[cfg(test)]
+    {
+        cmd = native_chat_tests::override_command(cmd);
+    }
     cmd.current_dir(repo_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1441,3 +1445,7 @@ mod tests {
         assert_eq!(got[6], &HarnessEvent::TextDelta("more".into()));
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/native-chat/native_chat_agent.rs"]
+mod native_chat_tests;

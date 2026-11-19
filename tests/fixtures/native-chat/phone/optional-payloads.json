@@ -1,0 +1,45 @@
+[
+  {
+    "event": {
+      "event": {
+        "data": {
+          "id": "prompt-1",
+          "image_count": 2,
+          "text": "Synthetic relay"
+        },
+        "type": "user_message_echo"
+      },
+      "kind": "harness"
+    },
+    "redelivered": false,
+    "seq": 1,
+    "type": "event"
+  },
+  {
+    "event": {
+      "event": {
+        "data": {
+          "cost_usd": 0.01,
+          "rate_limit": {
+            "info": {
+              "resetsAt": 0,
+              "status": "allowed"
+            },
+            "observed_at": 0
+          },
+          "status": {
+            "state": "completed"
+          },
+          "usage": {
+            "output_tokens": 2
+          }
+        },
+        "type": "turn_completed"
+      },
+      "kind": "harness"
+    },
+    "redelivered": false,
+    "seq": 2,
+    "type": "event"
+  }
+]

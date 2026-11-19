@@ -1,0 +1,199 @@
+[
+  {
+    "at": "2026-01-01T00:00:00Z",
+    "entry": {
+      "data": "Inspect fixture\n[image]",
+      "type": "user_prompt"
+    }
+  },
+  {
+    "at": "2026-01-01T00:00:01Z",
+    "entry": {
+      "data": {
+        "data": {
+          "id": "early-tool",
+          "is_error": false,
+          "output": "early result"
+        },
+        "type": "item_completed"
+      },
+      "type": "harness"
+    }
+  },
+  {
+    "at": "2026-01-01T00:00:02Z",
+    "entry": {
+      "data": {
+        "data": "Consider",
+        "type": "thinking_delta"
+      },
+      "type": "harness"
+    }
+  },
+  {
+    "at": "2026-01-01T00:00:02Z",
+    "entry": {
+      "data": {
+        "data": "Hello fixture",
+        "type": "text_delta"
+      },
+      "type": "harness"
+    }
+  },
+  {
+    "at": "2026-01-01T00:00:02Z",
+    "entry": {
+      "data": {
+        "data": {
+          "id": "early-tool",
+          "kind": {
+            "input": {
+              "file_path": "/synthetic/readme.md"
+            },
+            "name": "Read",
+            "type": "tool_call"
+          }
+        },
+        "type": "item_started"
+      },
+      "type": "harness"
+    }
+  },
+  {
+    "at": "2026-01-01T00:00:02Z",
+    "entry": {
+      "data": {
+        "data": {
+          "id": "early-tool",
+          "is_error": false,
+          "output": "early result"
+        },
+        "type": "item_completed"
+      },
+      "type": "harness"
+    }
+  },
+  {
+    "at": "2026-01-01T00:00:02Z",
+    "entry": {
+      "data": {
+        "data": {
+          "id": "agent-1",
+          "kind": {
+            "input": {
+              "prompt": "Synthetic child"
+            },
+            "name": "Agent",
+            "type": "tool_call"
+          }
+        },
+        "type": "item_started"
+      },
+      "type": "harness"
+    }
+  },
+  {
+    "at": "2026-01-01T00:00:02Z",
+    "entry": {
+      "data": {
+        "data": {
+          "event": {
+            "data": {
+              "model": null,
+              "session_id": null
+            },
+            "type": "turn_started"
+          },
+          "parent_tool_use_id": "agent-1"
+        },
+        "type": "subagent_event"
+      },
+      "type": "harness"
+    }
+  },
+  {
+    "at": "2026-01-01T00:00:03Z",
+    "entry": {
+      "data": {
+        "data": {
+          "id": "agent-1",
+          "is_error": false,
+          "output": "child done"
+        },
+        "type": "item_completed"
+      },
+      "type": "harness"
+    }
+  },
+  {
+    "at": "2026-01-01T00:00:03Z",
+    "entry": {
+      "data": {
+        "data": {
+          "event": {
+            "data": {
+              "cost_usd": null,
+              "status": {
+                "state": "completed"
+              },
+              "usage": null
+            },
+            "type": "turn_completed"
+          },
+          "parent_tool_use_id": "agent-1"
+        },
+        "type": "subagent_event"
+      },
+      "type": "harness"
+    }
+  },
+  {
+    "at": null,
+    "entry": {
+      "data": {
+        "data": {
+          "cost_usd": null,
+          "status": {
+            "state": "completed"
+          },
+          "usage": null
+        },
+        "type": "turn_completed"
+      },
+      "type": "harness"
+    }
+  },
+  {
+    "at": "2026-01-01T00:01:00Z",
+    "entry": {
+      "data": "Next prompt",
+      "type": "user_prompt"
+    }
+  },
+  {
+    "at": "2026-01-01T00:01:01Z",
+    "entry": {
+      "data": {
+        "data": "Second reply",
+        "type": "text_delta"
+      },
+      "type": "harness"
+    }
+  },
+  {
+    "at": null,
+    "entry": {
+      "data": {
+        "data": {
+          "cost_usd": null,
+          "status": {
+            "state": "completed"
+          },
+          "usage": null
+        },
+        "type": "turn_completed"
+      },
+      "type": "harness"
+    }
+  }
+]

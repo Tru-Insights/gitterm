@@ -1,0 +1,109 @@
+[
+  {
+    "backend": "claude",
+    "history": [
+      {
+        "history": "NotLoaded",
+        "load": "synthetic-session"
+      },
+      {
+        "history": "Loading",
+        "load": null
+      },
+      {
+        "history": "Loaded",
+        "load": null
+      }
+    ],
+    "mode": "default",
+    "queue": [
+      {
+        "state": "Idle",
+        "with_process": false,
+        "without_process": false
+      },
+      {
+        "state": "Streaming",
+        "with_process": true,
+        "without_process": false
+      },
+      {
+        "state": "Stopped",
+        "with_process": false,
+        "without_process": false
+      }
+    ]
+  },
+  {
+    "backend": {
+      "acp": "opencode"
+    },
+    "history": [
+      {
+        "history": "NotLoaded",
+        "load": "synthetic-session"
+      },
+      {
+        "history": "Loading",
+        "load": null
+      },
+      {
+        "history": "Loaded",
+        "load": null
+      }
+    ],
+    "mode": "build",
+    "queue": [
+      {
+        "state": "Idle",
+        "with_process": false,
+        "without_process": false
+      },
+      {
+        "state": "Streaming",
+        "with_process": true,
+        "without_process": false
+      },
+      {
+        "state": "Stopped",
+        "with_process": false,
+        "without_process": false
+      }
+    ]
+  },
+  {
+    "backend": "pi",
+    "history": [
+      {
+        "history": "NotLoaded",
+        "load": null
+      },
+      {
+        "history": "Loading",
+        "load": null
+      },
+      {
+        "history": "Loaded",
+        "load": null
+      }
+    ],
+    "mode": null,
+    "queue": [
+      {
+        "state": "Idle",
+        "with_process": false,
+        "without_process": false
+      },
+      {
+        "state": "Streaming",
+        "with_process": false,
+        "without_process": false
+      },
+      {
+        "state": "Stopped",
+        "with_process": false,
+        "without_process": false
+      }
+    ]
+  }
+]

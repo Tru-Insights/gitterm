@@ -1,0 +1,83 @@
+[
+  {
+    "data": {
+      "models": [],
+      "permission_mode": "default",
+      "session_id": "sid"
+    },
+    "type": "ready"
+  },
+  {
+    "data": {
+      "model": "synthetic-model",
+      "session_id": "synthetic-chat"
+    },
+    "type": "turn_started"
+  },
+  {
+    "data": {
+      "kind": {
+        "decision_reason": null,
+        "input": {
+          "command": "true"
+        },
+        "suggestions": [],
+        "tool_name": "Bash",
+        "type": "permission"
+      },
+      "request_id": "permission-1",
+      "tool_use_id": "tool-1"
+    },
+    "type": "runtime_request"
+  },
+  {
+    "data": {
+      "request_id": "permission-1"
+    },
+    "type": "runtime_request_resolved"
+  },
+  {
+    "data": {
+      "kind": {
+        "questions": [
+          {
+            "multiSelect": false,
+            "options": [
+              {
+                "description": "Four sides",
+                "label": "Square"
+              }
+            ],
+            "question": "Pick a shape"
+          }
+        ],
+        "type": "question"
+      },
+      "request_id": "question-1",
+      "tool_use_id": "question-tool"
+    },
+    "type": "runtime_request"
+  },
+  {
+    "data": {
+      "request_id": "question-1"
+    },
+    "type": "runtime_request_resolved"
+  },
+  {
+    "data": {
+      "cost_usd": null,
+      "status": {
+        "state": "interrupted"
+      },
+      "usage": {}
+    },
+    "type": "turn_completed"
+  },
+  {
+    "data": {
+      "code": null
+    },
+    "type": "process_exited"
+  }
+]

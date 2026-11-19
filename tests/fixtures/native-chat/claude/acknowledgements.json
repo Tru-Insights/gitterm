@@ -1,0 +1,44 @@
+[
+  {
+    "data": {
+      "models": [],
+      "permission_mode": "default",
+      "session_id": "synthetic-chat"
+    },
+    "type": "ready"
+  },
+  {
+    "data": "synthetic-model",
+    "type": "model_changed"
+  },
+  {
+    "data": "plan",
+    "type": "permission_mode_changed"
+  },
+  {
+    "data": {
+      "applied": "high",
+      "effort": "high"
+    },
+    "type": "effort_changed"
+  },
+  {
+    "data": {
+      "id": "queued-1",
+      "reason": "Claude had already picked it up"
+    },
+    "type": "message_withdraw_refused"
+  },
+  {
+    "data": "Claude rejected model \"unsupported\": synthetic rejection",
+    "type": "error"
+  },
+  {
+    "data": "Claude rejected permission mode \"unsupported\": synthetic rejection",
+    "type": "error"
+  },
+  {
+    "data": "Claude did not change the effort to high: synthetic rejection",
+    "type": "error"
+  }
+]

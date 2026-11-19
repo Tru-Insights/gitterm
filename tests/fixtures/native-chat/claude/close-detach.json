@@ -1,0 +1,28 @@
+[
+  {
+    "channel_closed": true,
+    "commands": [
+      {
+        "type": "shutdown"
+      }
+    ],
+    "explicit_close": false,
+    "local": true
+  },
+  {
+    "channel_closed": true,
+    "commands": [],
+    "explicit_close": false,
+    "local": false
+  },
+  {
+    "channel_closed": true,
+    "commands": [
+      {
+        "type": "shutdown"
+      }
+    ],
+    "explicit_close": true,
+    "local": false
+  }
+]

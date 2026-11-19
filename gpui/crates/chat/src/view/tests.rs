@@ -253,6 +253,7 @@ fn collapse_diff_and_replay_preserve_find(cx: &mut TestAppContext) {
     draw(cx);
     chat.update_in(cx, |view, window, cx| {
         view.open_find(&Find, window, cx);
+        view.toggle_find_tools(window, cx);
     });
     cx.simulate_input("saturating_add");
     draw(cx);
@@ -376,11 +377,11 @@ fn code_copy_feedback_and_cross_row_selection(cx: &mut TestAppContext) {
         cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
         "let n = 1;\n"
     );
-    assert!(rows[0].read_with(cx, |row, _| row.copied.contains(&17)));
+    assert!(rows[0].read_with(cx, |row, _| row.copied.contains_key(&CopyTarget::Code(17))));
     cx.run_until_parked();
-    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.executor().advance_clock(Duration::from_millis(1200));
     draw(cx);
-    assert!(!rows[0].read_with(cx, |row, _| row.copied.contains(&17)));
+    assert!(!rows[0].read_with(cx, |row, _| row.copied.contains_key(&CopyTarget::Code(17))));
     assert!(
         cx.update(|_, cx| gpui::base::TextViewDefaults::global(cx).has_code_block_highlighter())
     );

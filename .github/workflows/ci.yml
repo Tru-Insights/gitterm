@@ -3,10 +3,9 @@ name: CI
 on:
   push:
     branches: [ master, main, v3, v4, v5, v6 ]
-  pull_request:
-    # tracey/** covers stacked PRs whose base is another feature branch
-    # (the v3 lane workflow); workflow_dispatch is the manual backstop.
-    branches: [ master, main, v3, v4, v5, v6, 'tracey/**' ]
+  # No pull_request trigger: PRs merge on the full local gate (macOS), and
+  # CI runs once on the target branch after merge as the backstop.
+  # workflow_dispatch runs it on demand for any branch.
   workflow_dispatch:
 
 env:
