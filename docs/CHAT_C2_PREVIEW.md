@@ -30,7 +30,9 @@ replaced, so imported hard links are replaced without modifying their source.
 Existing root/parent permissions are preserved, including old `0755` config
 roots. Missing parents are created privately, with concurrent creation checked.
 
-Each app context has an ordered background save queue. An OS-exclusive lease
+Each app context has an ordered background save queue. Startup catalog saves
+also enqueue without waiting for a writer lock; delayed failures reach the owner
+error UI. An OS-exclusive lease
 on the regular `.writer` file surrounds each save; UI callbacks never wait for
 that lock. A second instance starts and serializes its saves through the same
 lock. This preserves atomic last-writer-wins behavior, not merging between stale
@@ -39,9 +41,13 @@ unlinked: its contents and copied PIDs convey no authority. Process exit/crash
 releases the kernel lock automatically, so an old regular marker needs no manual
 recovery. Symlinked/hard-linked/replaced lock files fail closed. Unix device/inode
 identity is checked after acquisition and before replacement; unsupported
-platform identity fails closed. Quit rejects new submissions, drains queued
-saves and closes shared writer authority even if store handles survive. Save
-failures are surfaced in the shell; late writes fail closed.
+platform identity fails closed. Quit rejects new submissions and synchronously
+drains the independent disk queue before returning its quit-hook future. In
+pinned GPUI 0.3.12, the 200 ms future timeout starts only after those synchronous
+callbacks, so it cannot discard pending saves. Final termination may wait for a
+live competing writer; normal UI callbacks never wait for it. The lease closes
+even if store handles survive. Save failures are logged on the disk thread and
+surfaced in the shell; late writes fail closed.
 
 This is a filesystem guard, **not a sandbox**. Concurrent filesystem replacement
 can race checks and rename. No process-tree confinement has been demonstrated.

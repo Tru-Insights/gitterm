@@ -105,6 +105,7 @@ impl WorkspaceStore {
         #[cfg(not(test))]
         anyhow::bail!("workspace writer has no preview guard")
     }
+    #[cfg(test)]
     pub fn save(&self, folders: &[PathBuf]) -> Result<()> {
         (|| -> Result<()> {
             ensure!(

@@ -1164,7 +1164,7 @@ impl Render for Shell {
 fn load_local_workspaces(
     store: &mut workspace_config::WorkspaceStore,
     folders: Vec<std::path::PathBuf>,
-) -> Result<WorkspaceStatus> {
+) -> Result<(WorkspaceStatus, preview::SaveResult)> {
     let mut model = WorkspaceStatus::default();
     // A removed saved folder still reaches the normal status/error UI.
     for folder in store.load()? {
@@ -1173,18 +1173,19 @@ fn load_local_workspaces(
     for folder in folders {
         model.add(workspace_config::local_folder(&folder)?, Instant::now());
     }
-    store.save(&model.folders())?;
-    Ok(model)
+    let save = store.save_async(&model.folders())?;
+    Ok((model, save))
 }
 
 pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
     let preview = preview::PreviewContext::from_environment(sample)?;
     let config = preview.roots.layout();
     let mut store = workspace_config::WorkspaceStore::guarded(preview.writer());
-    let model = if sample {
-        WorkspaceStatus::default()
+    let (model, startup_save) = if sample {
+        (WorkspaceStatus::default(), None)
     } else {
-        load_local_workspaces(&mut store, folders)?
+        let (model, save) = load_local_workspaces(&mut store, folders)?;
+        (model, Some(save))
     };
     gpui_kit::application().run(move |cx| {
         preview.release_on_quit(cx);
@@ -1249,6 +1250,9 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
                             .expect("create sample shell")
                     } else {
                         let owner = cx.new(|cx| WorkspaceOwner::new(model, Some(store), cx));
+                        if let Some(save) = startup_save {
+                            owner.update(cx, |owner, cx| owner.watch_save(save, cx));
+                        }
                         let data = Rc::new(data::LocalData(owner.clone()));
                         let shell = Shell::with_owner(data, owner, &config, true, window, cx)
                             .expect("create local shell");

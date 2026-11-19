@@ -18,16 +18,24 @@ impl PreviewContext {
     pub(crate) fn release_on_quit(&self, cx: &gpui::App) {
         let writer = self.writer();
         cx.on_app_quit(move |_| {
-            let writer = writer.clone();
-            let close = writer.close();
-            async move {
-                if let Err(error) = finish(close).await {
-                    eprintln!(
-                        "release preview writer {}: {error}",
-                        writer.preview().root().display()
-                    );
-                }
+            // GPUI 0.3.12 starts its 200ms future timeout AFTER invoking these
+            // callbacks. Drain synchronously here, before returning the future:
+            // the independent disk thread needs no App borrow or UI polling.
+            // Only final termination waits; ordinary saves/startup never do.
+            let result = (|| -> Result<()> {
+                writer
+                    .close()?
+                    .blocking_recv()
+                    .context("GPUI quit save queue stopped")??;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                eprintln!(
+                    "release preview writer {}: {error:#}",
+                    writer.preview().root().display()
+                );
             }
+            std::future::ready(())
         })
         .detach();
     }
@@ -113,11 +121,11 @@ impl Writer {
                                 format!("save {}: {error}", path.display()),
                             )
                         });
-                        if let Err(result) = reply.send(result)
-                            && let Err(error) = result
-                        {
+                        // Quit may drain while UI completion tasks cannot run.
+                        if let Err(error) = &result {
                             eprintln!("{error}");
                         }
+                        let _ = reply.send(result);
                     }
                     SaveCommand::Close(reply) => {
                         let _ = reply.send(worker.close());
@@ -149,7 +157,8 @@ impl Writer {
             .context("GPUI save queue stopped")?;
         Ok(receipt)
     }
-    /// Startup and headless tests only. UI saves use submit/finish.
+    /// Headless tests only. Production saves use submit/finish.
+    #[cfg(test)]
     pub(crate) fn replace_layout(&self, path: &Path, bytes: &[u8]) -> Result<()> {
         self.submit(path.to_path_buf(), bytes.to_vec())?
             .blocking_recv()??;
@@ -255,8 +264,9 @@ pub(crate) mod tests {
             let mut folders = WorkspaceStore::guarded(writer.clone());
             assert_eq!(folders.load().unwrap(), vec![folder.clone()]);
             std::fs::remove_dir(&folder).unwrap();
-            let model = crate::load_local_workspaces(&mut folders, vec![]).unwrap();
+            let (model, save) = crate::load_local_workspaces(&mut folders, vec![]).unwrap();
             assert_eq!(model.folders(), vec![folder]);
+            save.blocking_recv().unwrap().unwrap();
             folders.save(&[]).unwrap();
             assert!(folders.load().unwrap().is_empty());
             let mut layout = LayoutStore::guarded(path.clone(), writer);
@@ -267,6 +277,40 @@ pub(crate) mod tests {
             assert!(path.is_file());
             assert!(!root.join("layout").exists());
         }
+    }
+    #[test]
+    fn startup_catalog_save_does_not_block_app_composition_on_another_writer() {
+        let (dir, writer) = fixture();
+        let folder = dir.path().join("workspace");
+        std::fs::create_dir(&folder).unwrap();
+        let blocker = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(writer.preview().root().join(".writer"))
+            .unwrap();
+        blocker.lock().unwrap();
+        let mut folders = WorkspaceStore::guarded(writer.clone());
+        let (send, receive) = std::sync::mpsc::channel();
+        let composed = std::thread::spawn(move || {
+            send.send(crate::load_local_workspaces(&mut folders, vec![folder]))
+                .unwrap();
+        });
+        let (model, mut saved) = receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("startup blocked on writer lease")
+            .unwrap();
+        assert_eq!(model.folders().len(), 1);
+        assert!(matches!(
+            saved.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        blocker.unlock().unwrap();
+        saved.blocking_recv().unwrap().unwrap();
+        composed.join().unwrap();
+        assert_eq!(
+            WorkspaceStore::guarded(writer).load().unwrap(),
+            model.folders()
+        );
     }
     #[test]
     fn queue_never_waits_on_ui_orders_saves_reports_errors_and_drains_on_quit() {
@@ -343,6 +387,102 @@ pub(crate) mod tests {
         std::os::unix::fs::symlink(&sentinel, &path).unwrap();
         assert!(layout.save(&Default::default()).is_err());
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+    }
+    #[gpui::test]
+    fn startup_catalog_delayed_failure_reaches_owner(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        cx.background_executor.allow_parking();
+        let (_dir, writer) = fixture();
+        let blocker = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(writer.preview().root().join(".writer"))
+            .unwrap();
+        blocker.lock().unwrap();
+        let mut folders = WorkspaceStore::guarded(writer.clone());
+        let (model, save) = crate::load_local_workspaces(&mut folders, vec![]).unwrap();
+        let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, Some(folders), cx));
+        owner.update(cx, |owner, cx| owner.watch_save(save, cx));
+        std::fs::write(
+            writer.preview().root().join(".gitterm-protected"),
+            b"fixture",
+        )
+        .unwrap();
+        blocker.unlock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            cx.run_until_parked();
+            if owner.read_with(cx, |owner, _| owner.error.is_some()) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "startup save error not delivered"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        owner.read_with(cx, |owner, _| {
+            let error = owner.error.as_ref().unwrap();
+            assert!(error.contains("local-workspaces.json"), "{error}");
+            assert!(error.contains("protected sentinel"), "{error}");
+        });
+        assert!(
+            !writer
+                .preview()
+                .root()
+                .join("local-workspaces.json")
+                .exists()
+        );
+    }
+    #[gpui::test]
+    fn quit_drains_beyond_gpui_timeout_before_later_observers(cx: &mut gpui::TestAppContext) {
+        cx.background_executor.allow_parking();
+        let (_dir, writer) = fixture();
+        let blocker = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(writer.preview().root().join(".writer"))
+            .unwrap();
+        blocker.lock().unwrap();
+        let path = writer.preview().root().join("layout-1.json");
+        let saved = writer
+            .submit(path.clone(), b"must persist before quit".to_vec())
+            .unwrap();
+        let (begin, started) = std::sync::mpsc::channel();
+        let released = std::thread::spawn(move || {
+            started.recv().unwrap();
+            std::thread::sleep(gpui::SHUTDOWN_TIMEOUT + std::time::Duration::from_millis(100));
+            blocker.unlock().unwrap();
+        });
+        let preview = PreviewContext {
+            roots: writer.preview().clone(),
+            writer: writer.clone(),
+        };
+        let app = cx.new_app();
+        let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let checked = observed.clone();
+        let surviving = writer.clone();
+        app.update(|cx| {
+            cx.on_app_quit(move |_| {
+                begin.send(()).unwrap();
+                std::future::ready(())
+            })
+            .detach();
+            preview.release_on_quit(cx);
+            cx.on_app_quit(move |_| {
+                assert_eq!(std::fs::read(&path).unwrap(), b"must persist before quit");
+                assert!(surviving.core.replace_layout(&path, b"late").is_err());
+                checked.set(true);
+                std::future::ready(())
+            })
+            .detach();
+        });
+        let start = std::time::Instant::now();
+        app.update(|app| app.shutdown());
+        assert!(start.elapsed() > gpui::SHUTDOWN_TIMEOUT);
+        assert!(observed.get());
+        saved.blocking_recv().unwrap().unwrap();
+        released.join().unwrap();
     }
     #[gpui::test]
     fn shutdown_releases_lease_while_store_handles_are_still_alive(cx: &mut gpui::TestAppContext) {

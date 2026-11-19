@@ -384,6 +384,13 @@ impl WorkspaceOwner {
             .as_ref()
             .expect("local owner has a store")
             .save_async(&folders)?;
+        self.watch_save(save, cx);
+        let id = self.model.add(folder, Instant::now());
+        self.dispatch(Intent::Activate(id), Instant::now(), cx);
+        self.dispatch(Intent::Opened, Instant::now(), cx);
+        Ok(id)
+    }
+    pub(crate) fn watch_save(&self, save: crate::preview::SaveResult, cx: &mut Context<Self>) {
         cx.spawn(async move |owner, cx| {
             if let Err(error) = crate::preview::finish(Ok(save)).await {
                 let _ = owner.update(cx, |owner, cx| {
@@ -395,10 +402,6 @@ impl WorkspaceOwner {
             }
         })
         .detach();
-        let id = self.model.add(folder, Instant::now());
-        self.dispatch(Intent::Activate(id), Instant::now(), cx);
-        self.dispatch(Intent::Opened, Instant::now(), cx);
-        Ok(id)
     }
     pub fn set_git_visible(&mut self, visible: bool, enter: bool, cx: &mut Context<Self>) {
         if enter && visible && !self.git_visible {
