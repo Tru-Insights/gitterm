@@ -264,3 +264,34 @@ fn repo_backed_view_renders_real_files_and_hunks(cx: &mut TestAppContext) {
         });
     }
 }
+
+#[gpui::test]
+fn asynchronous_reload_keeps_marks_selection_and_rejects_stale_results(cx: &mut TestAppContext) {
+    let (view, cx) = setup(cx);
+    let (snapshot, patches) = fixture::load(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/showcase"
+    )))
+    .unwrap();
+    view.update_in(cx, |v, window, cx| {
+        v.toggle_viewed(&ToggleViewed, window, cx);
+        let old = v.begin_load(cx);
+        let current = v.begin_load(cx);
+        v.select_file((Group::Unstaged, "src/hello.rs".into()), cx);
+        v.finish_load(old, Err("stale error".into()), cx);
+        assert!(v.is_loading());
+        assert!(v.model.error.is_none());
+        v.finish_load(current, Ok((snapshot, patches)), cx);
+        assert!(!v.is_loading());
+        assert!(v.model.files[0].viewed);
+        assert_eq!(
+            v.model.files[v.model.selected.unwrap()].key,
+            (Group::Unstaged, "src/hello.rs".into())
+        );
+        let current = v.begin_load(cx);
+        v.finish_load(current, Err("load failed for fixture".into()), cx);
+        assert_eq!(v.model.error.as_deref(), Some("load failed for fixture"));
+        assert!(!v.is_loading());
+    });
+    draw(cx);
+}

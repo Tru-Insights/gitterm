@@ -17,6 +17,10 @@ pub struct WorkspaceOwner {
     pub error: Option<String>,
     pub files: std::collections::HashMap<crate::data::WorkspaceId, crate::files::FileTree>,
     file_jobs: crate::files::FileJobs,
+    pub(crate) reviews: std::collections::HashMap<
+        crate::data::WorkspaceId,
+        Entity<gitterm_gpui_review::ReviewView>,
+    >,
     file_sender: tokio::sync::mpsc::UnboundedSender<crate::files::Outcome>,
     git_visible: bool,
     store: Option<WorkspaceStore>,
@@ -113,6 +117,7 @@ impl WorkspaceOwner {
         Self {
             model,
             files: Default::default(),
+            reviews: Default::default(),
             file_jobs: Default::default(),
             file_sender,
             error: None,
@@ -125,6 +130,10 @@ impl WorkspaceOwner {
         }
     }
     pub fn dispatch(&mut self, intent: Intent, now: Instant, cx: &mut Context<Self>) {
+        let completed = match &intent {
+            Intent::Completed(snapshot) => Some(crate::data::WorkspaceId(snapshot.tab_id as u64)),
+            _ => None,
+        };
         let refresh_files = matches!(intent, Intent::SelectIndex(_) | Intent::Activate(_));
         for command in self.model.dispatch(intent, now) {
             if let Command::Status { owner, command } = command
@@ -132,6 +141,10 @@ impl WorkspaceOwner {
             {
                 self.jobs.execute(executor.handle(), owner, command);
             }
+        }
+        // Status letters can stay identical while a file's patch changes.
+        if let Some(workspace) = completed {
+            self.reload_review(workspace, cx);
         }
         if refresh_files
             && self.executor.is_some()
@@ -201,8 +214,6 @@ impl WorkspaceOwner {
             .files
             .into_iter()
             .find(|file| local.root.join(&file.path) == path);
-        // The shell does not host a live review yet. Preserve the status match
-        // on the intent so a future review host can route it without re-querying.
         let intent = FileOpen {
             workspace,
             path,
@@ -215,6 +226,45 @@ impl WorkspaceOwner {
             intent.changed.is_some()
         );
         cx.emit(intent);
+    }
+    pub fn open_changed_file(
+        &mut self,
+        workspace: crate::data::WorkspaceId,
+        changed: crate::data::ChangedFile,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(local) = self.model.workspaces.iter().find(|w| w.id == workspace) {
+            cx.emit(FileOpen {
+                workspace,
+                path: local.root.join(&changed.path),
+                changed: Some(changed),
+            });
+        }
+    }
+    pub(crate) fn reload_review(
+        &mut self,
+        workspace: crate::data::WorkspaceId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.reviews.get(&workspace).cloned() else {
+            return;
+        };
+        let Some(executor) = self.executor.clone() else {
+            return;
+        };
+        let Some(local) = self.model.workspaces.iter().find(|w| w.id == workspace) else {
+            return;
+        };
+        let root = local.root.clone();
+        let generation = view.update(cx, |view, cx| view.begin_load(cx));
+        let view = view.downgrade();
+        cx.spawn(async move |_, cx| {
+            let result =
+                gitterm_gpui_review::repo::load(executor.handle(), workspace.0 as usize, root)
+                    .await;
+            _ = view.update(cx, |view, cx| view.finish_load(generation, result, cx));
+        })
+        .detach();
     }
     pub fn add_folder(
         &mut self,
@@ -247,7 +297,7 @@ impl Drop for WorkspaceOwner {
     }
 }
 
-/// File activation fallback until the shell hosts live review/editor surfaces.
+/// File activation shared by Files and Git status; unchanged files retain the log fallback.
 #[derive(Clone, Debug)]
 pub struct FileOpen {
     pub workspace: crate::data::WorkspaceId,

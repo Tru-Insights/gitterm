@@ -9,6 +9,7 @@ publish = false
 gitterm-core = { path = "../../../crates/gitterm-core", features = ["runtime"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 gitterm-terminal = { path = "../terminal" }
+gitterm-gpui-review = { path = "../review" }
 gitterm-gpui-chat = { path = "../chat" }
 gpui-kit = "=0.9.1"
 gpui-component = "=0.9.1"
