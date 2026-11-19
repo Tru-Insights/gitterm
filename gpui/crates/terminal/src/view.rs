@@ -4,7 +4,7 @@ use crate::colors::ColorPalette;
 use crate::input::keystroke_to_bytes;
 use crate::mouse::pixel_to_cell;
 use crate::render::TerminalRenderer;
-use crate::{Action, SessionState};
+use crate::{Action, JobState, SearchResults, ServiceError, ServiceJob, SessionState};
 use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::TermMode;
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
@@ -62,6 +62,8 @@ pub type ClipboardStoreCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalV
 
 pub type UrlOpener = Box<dyn Fn(&str)>;
 
+pub type ExportCallback = Box<dyn Fn(Result<String, ServiceError>, &mut Context<TerminalView>)>;
+
 pub type ExitCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>)>;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -105,6 +107,14 @@ pub struct TerminalView {
     dragging_selection: bool,
     pending_copy: bool,
 
+    find_open: bool,
+    find_query: String,
+    find_job: Option<(String, ServiceJob<SearchResults>)>,
+    find_revision: Option<u64>,
+    find_status: String,
+    find_retry: std::time::Instant,
+    export_job: Option<ServiceJob<String>>,
+    export_callback: Option<ExportCallback>,
     ime_text: String,
     ime_marked_range: Option<std::ops::Range<usize>>,
 }
@@ -153,6 +163,7 @@ impl TerminalView {
                     .await;
                 if this
                     .update(cx, |view: &mut Self, cx| {
+                        view.poll_services(cx);
                         if view.backend.needs_sync() {
                             cx.notify();
                         }
@@ -182,8 +193,107 @@ impl TerminalView {
             layout_metrics: Arc::new(parking_lot::Mutex::new(LayoutMetrics::default())),
             dragging_selection: false,
             pending_copy: false,
+            find_open: false,
+            find_query: String::new(),
+            find_job: None,
+            find_revision: None,
+            find_status: String::new(),
+            find_retry: std::time::Instant::now(),
+            export_job: None,
+            export_callback: None,
             ime_text: String::new(),
             ime_marked_range: None,
+        }
+    }
+
+    /// Export completion is delivered on the GPUI foreground, including Busy/errors.
+    pub fn with_export_callback(
+        mut self,
+        callback: impl Fn(Result<String, ServiceError>, &mut Context<Self>) + 'static,
+    ) -> Self {
+        self.export_callback = Some(Box::new(callback));
+        self
+    }
+
+    pub fn request_export(&mut self) -> Result<(), ServiceError> {
+        if self.export_callback.is_none() {
+            return Err(ServiceError::NoExportCallback);
+        }
+        if self.export_job.is_some() {
+            return Err(ServiceError::Busy);
+        }
+        self.export_job = Some(self.backend.export_job()?);
+        Ok(())
+    }
+
+    pub fn open_find(&mut self, cx: &mut Context<Self>) {
+        self.find_open = true;
+        self.find_revision = None;
+        self.backend.clear_find();
+        self.ime_text.clear();
+        self.ime_marked_range = None;
+        self.find_retry = std::time::Instant::now();
+        cx.notify();
+    }
+
+    pub fn set_find_query(&mut self, query: String, cx: &mut Context<Self>) {
+        self.find_query = query;
+        self.find_revision = None;
+        self.backend.clear_find();
+        self.find_status = "Busy".into();
+        self.find_retry = std::time::Instant::now();
+        self.poll_services(cx);
+        cx.notify();
+    }
+
+    fn poll_services(&mut self, cx: &mut Context<Self>) {
+        if let Some(job) = &self.export_job
+            && let JobState::Ready(result) = job.poll()
+        {
+            self.export_job = None;
+            if let Some(callback) = &self.export_callback {
+                callback(result, cx);
+            }
+        }
+        if let Some((query, job)) = &self.find_job
+            && let JobState::Ready(result) = job.poll()
+        {
+            let current = self.find_open && *query == self.find_query;
+            self.find_job = None;
+            if current {
+                match result {
+                    Ok(results) if results.revision == self.backend.revision() => {
+                        self.find_revision = Some(results.revision);
+                        self.find_status = format!("{} matches", results.matches.len());
+                        if !self.backend.set_find_results(results) {
+                            self.find_revision = None;
+                            self.find_status = "Busy".into();
+                        }
+                    }
+                    Ok(_) | Err(ServiceError::Busy) => {
+                        self.find_status = "Busy".into();
+                    }
+                    Err(error) => {
+                        self.find_status = format!("Search failed: {error:?}");
+                        self.find_revision = Some(self.backend.revision());
+                    }
+                }
+                cx.notify();
+            }
+        }
+        if self.find_open && self.find_revision != Some(self.backend.revision()) {
+            self.backend.clear_find();
+            self.find_revision = None;
+            self.find_status = "Busy".into();
+            if self.find_job.is_none() && std::time::Instant::now() >= self.find_retry {
+                self.find_retry = std::time::Instant::now() + Duration::from_millis(100);
+                match self.backend.search_job(self.find_query.clone()) {
+                    Ok(job) => self.find_job = Some((self.find_query.clone(), job)),
+                    Err(ServiceError::Busy) => {}
+                    Err(error) => self.find_status = format!("Search failed: {error:?}"),
+                }
+            }
+            cx.notify();
         }
     }
 
@@ -283,7 +393,7 @@ impl TerminalView {
     }
 
     fn on_action_send_tab(&mut self, _: &SendTab, _window: &mut Window, _cx: &mut Context<Self>) {
-        if self.write_input_bytes(b"\t") {
+        if !self.find_open && self.write_input_bytes(b"\t") {
             _cx.notify();
         }
     }
@@ -294,12 +404,55 @@ impl TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        if self.write_input_bytes(b"\x1b[Z") {
+        if !self.find_open && self.write_input_bytes(b"\x1b[Z") {
             _cx.notify();
         }
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+        let key = event.keystroke.key.to_lowercase();
+        if event.keystroke.modifiers.platform && key == "f" {
+            self.open_find(_cx);
+            _cx.stop_propagation();
+            return;
+        }
+        if event.keystroke.modifiers.platform && key == "g" {
+            self.backend.next_find(event.keystroke.modifiers.shift);
+            _cx.notify();
+            _cx.stop_propagation();
+            return;
+        }
+        if self.find_open {
+            match key.as_str() {
+                "escape" => {
+                    self.find_open = false;
+                    self.backend.clear_find();
+                    self.ime_text.clear();
+                    self.ime_marked_range = None;
+                    _window.focus(&self.focus_handle, _cx);
+                }
+                "backspace" => {
+                    let mut query = self.find_query.clone();
+                    query.pop();
+                    self.set_find_query(query, _cx);
+                }
+                "enter" => {
+                    self.backend.next_find(event.keystroke.modifiers.shift);
+                }
+                "v" if event.keystroke.modifiers.platform => {
+                    if let Ok(mut clipboard) = crate::clipboard::Clipboard::new()
+                        && let Ok(text) = clipboard.get_text()
+                    {
+                        self.set_find_query(format!("{}{}", self.find_query, text), _cx);
+                    }
+                }
+                // Printable keys arrive through EntityInputHandler, preserving IME.
+                _ => return,
+            }
+            _cx.stop_propagation();
+            _cx.notify();
+            return;
+        }
         if let Some(ref handler) = self.key_handler
             && handler(event)
         {
@@ -730,6 +883,10 @@ impl EntityInputHandler for TerminalView {
     ) {
         self.ime_marked_range = None;
         self.ime_text.clear();
+        if self.find_open {
+            self.set_find_query(format!("{}{}", self.find_query, text), cx);
+            return;
+        }
         if !text.is_empty() {
             let _ = self.write_input_bytes(text.as_bytes());
         }
@@ -744,7 +901,7 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.backend.state() != SessionState::Running {
+        if !self.find_open && self.backend.state() != SessionState::Running {
             return;
         }
         self.ime_text = new_text.to_string();
@@ -792,6 +949,7 @@ impl EntityInputHandler for TerminalView {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.process_events(window, cx);
+        self.poll_services(cx);
 
         if self.backend.sync() && self.pending_copy {
             self.copy_selection();
@@ -803,7 +961,7 @@ impl Render for TerminalView {
             .hovered_hyperlink
             .is_some();
         let status = self.status_message();
-        if self.backend.state() != SessionState::Running {
+        if !self.find_open && self.backend.state() != SessionState::Running {
             self.ime_text.clear();
             self.ime_marked_range = None;
         }
@@ -922,6 +1080,20 @@ impl Render for TerminalView {
                 )
                 .size_full(),
             )
+            .children(self.find_open.then(|| {
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .px_2()
+                    .py_1()
+                    .bg(self.config.colors.background())
+                    .text_color(self.config.colors.foreground())
+                    .child(format!(
+                        "Find: {}{}▏  {}  (Esc closes)",
+                        self.find_query, self.ime_text, self.find_status
+                    ))
+            }))
             .children(status.map(|message| {
                 div()
                     .absolute()

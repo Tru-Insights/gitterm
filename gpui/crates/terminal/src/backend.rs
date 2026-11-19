@@ -24,7 +24,7 @@ use std::sync::Arc;
 const URL_REGEX: &str = r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#;
 
 /// Escape special regex characters for literal string matching
-fn escape_regex(pattern: &str) -> String {
+pub(crate) fn escape_regex(pattern: &str) -> String {
     let mut escaped = String::with_capacity(pattern.len() * 2);
     for c in pattern.chars() {
         match c {
@@ -202,9 +202,14 @@ pub struct Backend {
     pending_settings: Option<BackendSettings>,
     startup_output_pending: bool,
     deferred_resize: Option<(usize, usize)>,
-    events: EventProxy,
+    pub(crate) events: EventProxy,
+    pub(crate) service_busy: Arc<std::sync::atomic::AtomicBool>,
+    find_results: Option<crate::SearchResults>,
+    find_index: usize,
     pending_selection: Option<(Point, SelectionType, bool)>,
     pending_endpoint: Option<Point>,
+    pending_selection_revision: u64,
+    snapshot_revision: u64,
     pending_scroll: i32,
     pending_history: Option<usize>,
     pending_clear: bool,
@@ -261,8 +266,13 @@ impl Backend {
             startup_output_pending: false,
             deferred_resize: None,
             events,
+            service_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            find_results: None,
+            find_index: 0,
             pending_selection: None,
             pending_endpoint: None,
+            pending_selection_revision: 0,
+            snapshot_revision: 0,
             pending_scroll: 0,
             pending_history: None,
             pending_clear: false,
@@ -304,6 +314,7 @@ impl Backend {
         {
             let mut term = self.term.lock_unfair();
             *term = Term::new(config, &size, self.events.clone());
+            self.events.invalidate();
         }
         self.size = size;
         self.applied_size = size;
@@ -354,9 +365,14 @@ impl Backend {
             startup_output_pending: false,
             deferred_resize: None,
             events,
+            service_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            find_results: None,
+            find_index: 0,
             last_content: initial_content,
             pending_selection: None,
             pending_endpoint: None,
+            pending_selection_revision: 0,
+            snapshot_revision: 0,
             pending_scroll: 0,
             pending_history: None,
             pending_clear: false,
@@ -366,11 +382,15 @@ impl Backend {
     }
 
     pub fn select(&mut self, point: Point, kind: SelectionType, extend: bool) {
+        self.pending_selection_revision = self.snapshot_revision;
         self.pending_selection = Some((point, kind, extend));
         self.pending_endpoint = None;
         self.events.mark_dirty();
     }
     pub fn extend_selection(&mut self, point: Point) {
+        if self.pending_selection.is_none() {
+            self.pending_selection_revision = self.snapshot_revision;
+        }
         self.pending_endpoint = Some(point);
         self.events.mark_dirty();
     }
@@ -379,6 +399,9 @@ impl Backend {
         self.events.mark_dirty();
     }
     fn apply_pending(&mut self, term: &mut Term<EventProxy>) {
+        if self.pending_history.is_some() || self.pending_clear {
+            self.events.invalidate();
+        }
         if let Some(lines) = self.pending_history.take() {
             term.set_options(term::Config {
                 scrolling_history: lines,
@@ -390,6 +413,10 @@ impl Backend {
             let mut parser: Processor = Processor::new();
             parser.advance(term, b"\x1b[3J\x1b[H\x1b[2J");
             term.selection = None;
+        }
+        if self.pending_selection_revision != self.revision() {
+            self.pending_selection = None;
+            self.pending_endpoint = None;
         }
         if let Some((point, kind, extend)) = self.pending_selection.take() {
             if extend && let Some(selection) = term.selection.as_mut() {
@@ -793,6 +820,11 @@ impl Backend {
         if self.size.num_cols != self.applied_size.num_cols
             || self.size.num_lines != self.applied_size.num_lines
         {
+            let previous = self.revision();
+            self.events.invalidate();
+            if self.pending_selection_revision == previous {
+                self.pending_selection_revision = self.revision();
+            }
             terminal.resize(TermSize::new(
                 self.size.num_cols as usize,
                 self.size.num_lines as usize,
@@ -882,6 +914,13 @@ impl Backend {
         // the content will be slightly stale until the next frame.
         let Some(mut term) = term_arc.try_lock_unfair() else {
             self.events.mark_dirty();
+            if self
+                .find_results
+                .as_ref()
+                .is_some_and(|r| r.revision != self.revision())
+            {
+                self.clear_find();
+            }
             return false;
         };
         self.apply_resize(&mut term);
@@ -891,7 +930,69 @@ impl Backend {
     }
 
     fn internal_sync(&mut self, terminal: &Term<EventProxy>) {
+        self.snapshot_revision = self.revision();
         self.last_content.sync_from(terminal, self.size);
+        self.last_content.find_match = self
+            .find_results
+            .as_ref()
+            .filter(|r| r.revision == self.events.revision())
+            .and_then(|r| r.matches.get(self.find_index))
+            .cloned();
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.events.revision()
+    }
+
+    pub fn clear_find(&mut self) {
+        self.find_results = None;
+        self.last_content.find_match = None;
+    }
+
+    pub fn set_find_results(&mut self, results: crate::SearchResults) -> bool {
+        if results.revision != self.revision() {
+            self.clear_find();
+            return false;
+        }
+        self.find_results = Some(results);
+        self.find_index = 0;
+        self.navigate_find(false, false)
+    }
+
+    pub fn next_find(&mut self, previous: bool) -> bool {
+        self.navigate_find(previous, true)
+    }
+
+    fn navigate_find(&mut self, previous: bool, advance: bool) -> bool {
+        let term_arc = self.term.clone();
+        let Some(mut term) = term_arc.try_lock_unfair() else {
+            return false;
+        };
+        let Some(results) = self.find_results.as_ref() else {
+            return false;
+        };
+        if results.revision != self.revision() {
+            self.clear_find();
+            return false;
+        }
+        let len = results.matches.len();
+        if len == 0 {
+            self.last_content.find_match = None;
+            return true;
+        }
+        if advance {
+            self.find_index = if previous {
+                (self.find_index + len - 1) % len
+            } else {
+                (self.find_index + 1) % len
+            };
+        }
+        let found = &results.matches[self.find_index];
+        let offset = (-found.start.line.0).max(0) as usize;
+        let delta = offset as i32 - term.grid().display_offset() as i32;
+        term.scroll_display(Scroll::Delta(delta));
+        self.internal_sync(&term);
+        true
     }
 
     pub fn renderable_content(&self) -> &RenderableContent {
@@ -1014,6 +1115,7 @@ pub struct RenderableContent {
     pub display_offset: usize,
     pub hovered_hyperlink: Option<RangeInclusive<Point>>,
     pub selectable_range: Option<SelectionRange>,
+    pub find_match: Option<SearchMatch>,
     pub cursor_point: Point,
     pub cursor: Cell,
     pub terminal_mode: TermMode,
@@ -1054,6 +1156,7 @@ impl Default for RenderableContent {
             display_offset: 0,
             hovered_hyperlink: None,
             selectable_range: None,
+            find_match: None,
             cursor_point: Point::default(),
             cursor: Cell::default(),
             terminal_mode: TermMode::empty(),
