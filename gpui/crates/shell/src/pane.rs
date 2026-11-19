@@ -1,15 +1,12 @@
 use crate::{
-    data::{FileNode, SessionKind, ShellData, WorkspaceId},
+    data::{SessionKind, ShellData, WorkspaceId},
     theme::Palette,
 };
 use gitterm_gpui_chat::{ChatView, events::parse_fixture};
 use gitterm_terminal::{TerminalConfig, TerminalLaunch, TerminalView};
 use gpui::*;
-use gpui_component::{
-    button::{Button, ButtonVariants},
-    dock::{BasePanel, Panel, PanelEvent, PanelInfo, PanelState},
-};
-use std::{collections::HashSet, rc::Rc};
+use gpui_component::dock::{BasePanel, Panel, PanelEvent, PanelInfo, PanelState};
+use std::rc::Rc;
 
 pub const PANEL_NAME: &str = "GitTermShellPane";
 #[derive(Clone, Copy)]
@@ -43,7 +40,7 @@ pub struct Pane {
     workspace: WorkspaceId,
     data: Rc<dyn ShellData>,
     focus: FocusHandle,
-    expanded: HashSet<String>,
+    files: Option<Entity<crate::files_view::FilesView>>,
 }
 impl Pane {
     pub fn new(
@@ -114,9 +111,11 @@ impl Pane {
             terminal_title: None,
             terminal_cwd,
             workspace,
-            data,
+            data: data.clone(),
             focus: cx.focus_handle(),
-            expanded: HashSet::from(["src".into()]),
+            files: matches!(kind, PaneKind::Files).then(|| {
+                cx.new(|cx| crate::files_view::FilesView::new(workspace, data.clone(), cx))
+            }),
         }
     }
     pub(crate) fn status_view(&self, cx: &App) -> crate::data::GitStatus {
@@ -136,163 +135,6 @@ impl Pane {
         } else {
             self.title.clone()
         }
-    }
-    fn local_files(
-        &self,
-        owner: Entity<crate::WorkspaceOwner>,
-        p: Palette,
-        cx: &Context<Self>,
-    ) -> Vec<AnyElement> {
-        use crate::files::Row;
-        let workspace = self.workspace;
-        let rows = owner
-            .read(cx)
-            .files
-            .get(&workspace)
-            .map(|tree| tree.rows())
-            .unwrap_or_default();
-        rows.into_iter()
-            .enumerate()
-            .map(|(index, row)| {
-                let owner = owner.clone();
-                match row {
-                    Row::Entry {
-                        entry,
-                        expanded,
-                        depth,
-                    } => {
-                        let label = format!(
-                            "{} {}",
-                            if entry.is_dir {
-                                if expanded { "⌄" } else { "›" }
-                            } else {
-                                "·"
-                            },
-                            entry.name
-                        );
-                        let accessibility = if entry.is_dir {
-                            format!(
-                                "{} directory, {}",
-                                entry.name,
-                                if expanded { "expanded" } else { "collapsed" }
-                            )
-                        } else {
-                            format!("Open {}", entry.name)
-                        };
-                        Button::new(SharedString::from(format!("local-file-{index}")))
-                            .ghost()
-                            .label(label)
-                            .w_full()
-                            .justify_start()
-                            .pl(px(8. + depth as f32 * 16.))
-                            .accessibility_label(accessibility)
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                owner.update(cx, |owner, cx| {
-                                    if entry.is_dir {
-                                        owner.toggle_directory(workspace, entry.path.clone(), cx);
-                                    } else {
-                                        owner.open_file(workspace, entry.path.clone(), cx);
-                                    }
-                                });
-                            }))
-                            .into_any_element()
-                    }
-                    Row::More { path, depth } => {
-                        Button::new(SharedString::from(format!("more-files-{index}")))
-                            .ghost()
-                            .label("Show more…")
-                            .w_full()
-                            .justify_start()
-                            .pl(px(8. + depth as f32 * 16.))
-                            .accessibility_label("Show more directory entries")
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                owner.update(cx, |owner, cx| {
-                                    owner.more_files(workspace, path.clone(), cx)
-                                });
-                            }))
-                            .into_any_element()
-                    }
-                    Row::Loading { depth } => div()
-                        .pl(px(8. + depth as f32 * 16.))
-                        .child("Loading files…")
-                        .into_any_element(),
-                    Row::Error { message, depth } => div()
-                        .pl(px(8. + depth as f32 * 16.))
-                        .text_color(rgb(p.red))
-                        .child(message)
-                        .into_any_element(),
-                    Row::Empty { depth } => div()
-                        .pl(px(8. + depth as f32 * 16.))
-                        .text_color(rgb(p.muted))
-                        .child("Empty directory")
-                        .into_any_element(),
-                }
-            })
-            .collect()
-    }
-    fn files(
-        &self,
-        nodes: Vec<FileNode>,
-        parent: &str,
-        depth: usize,
-        p: Palette,
-        cx: &Context<Self>,
-    ) -> Vec<AnyElement> {
-        let mut rows = vec![];
-        for node in nodes {
-            let path = if parent.is_empty() {
-                node.name.clone()
-            } else {
-                format!("{parent}/{}", node.name)
-            };
-            let directory = !node.children.is_empty();
-            let expanded = self.expanded.contains(&path);
-            let label = format!(
-                "{} {}",
-                if directory {
-                    if expanded { "⌄" } else { "›" }
-                } else {
-                    "·"
-                },
-                node.name
-            );
-            if directory {
-                let key = path.clone();
-                rows.push(
-                    Button::new(SharedString::from(path.clone()))
-                        .ghost()
-                        .label(label)
-                        .w_full()
-                        .accessibility_label(format!(
-                            "{} directory, {}",
-                            node.name,
-                            if expanded { "expanded" } else { "collapsed" }
-                        ))
-                        .pl(px(8. + depth as f32 * 16.))
-                        .justify_start()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if !this.expanded.remove(&key) {
-                                this.expanded.insert(key.clone());
-                            }
-                            cx.notify();
-                        }))
-                        .into_any_element(),
-                );
-            } else {
-                rows.push(
-                    div()
-                        .pl(px(16. + depth as f32 * 16.))
-                        .py_1()
-                        .text_color(rgb(p.muted))
-                        .child(label)
-                        .into_any_element(),
-                );
-            }
-            if directory && expanded {
-                rows.extend(self.files(node.children, &path, depth + 1, p, cx));
-            }
-        }
-        rows
     }
 }
 impl Focusable for Pane {
@@ -401,17 +243,14 @@ impl Render for Pane {
                     }))
             }
             PaneContent::Files => {
-                if let Some(owner) = self.data.local_owner() {
-                    let folder = self
-                        .data
-                        .terminal_cwd(self.workspace, cx)
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_default();
-                    body.child(folder).children(self.local_files(owner, p, cx))
-                } else {
-                    body.child(self.data.status(self.workspace, cx).repository)
-                        .children(self.files(self.data.files(self.workspace, cx), "", 0, p, cx))
-                }
+                let folder = self
+                    .data
+                    .terminal_cwd(self.workspace, cx)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| self.data.status(self.workspace, cx).repository);
+                body.overflow_hidden()
+                    .child(folder)
+                    .child(div().flex_1().min_h_0().children(self.files.clone()))
             }
         }
     }

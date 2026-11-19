@@ -4,6 +4,7 @@ extern crate gpui_kit as gpui;
 pub mod data;
 mod dialogs;
 pub mod files;
+mod files_view;
 mod layout;
 mod owner;
 mod pane;
