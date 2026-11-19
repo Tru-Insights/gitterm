@@ -6,7 +6,7 @@ description = "Plain workspace and Git status types and workspace ordering for G
 
 [features]
 default = []
-runtime = ["dep:ring", "dep:tokio-util", "dep:tokio", "dep:git2", "dep:libc", "dep:warp", "dep:dirs"]
+runtime = ["dep:tokio-util", "dep:tokio", "dep:git2", "dep:libc", "dep:warp", "dep:dirs"]
 
 excalidraw = []
 
@@ -15,7 +15,6 @@ excalidraw = []
 codex-trust = ["runtime", "dep:toml"]
 
 [dependencies]
-ring = { version = "0.17", optional = true }
 tokio-util = { version = "0.7", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -33,6 +32,8 @@ warp = { version = "0.3", optional = true }
 # Preserve the root trust parser/quoting versions.
 toml = { version = "=0.8.2", optional = true }
 shell-words = "=1.1.1"
+
+ring = "0.17"
 
 [dev-dependencies]
 toml = "=0.8.2"

@@ -74,7 +74,19 @@ impl Pane {
                     args: vec!["-d".into(), "-f".into(), "-i".into()],
                     ..launch
                 };
-                if launch.cwd.is_none() {
+                let preview = data
+                    .local_owner()
+                    .and_then(|owner| owner.read(cx).preview());
+                if let Err(error) = crate::preview::executable(
+                    preview.as_deref(),
+                    gitterm_core::preview::Effect::Terminal,
+                    launch
+                        .cwd
+                        .as_deref()
+                        .unwrap_or(std::path::Path::new("<terminal>")),
+                ) {
+                    PaneContent::Error(error.to_string())
+                } else if launch.cwd.is_none() {
                     PaneContent::Error(format!("Start terminal {title}: cannot resolve HOME"))
                 } else {
                     let pane = cx.weak_entity();

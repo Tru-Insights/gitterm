@@ -3,6 +3,7 @@ extern crate gpui_kit as gpui;
 
 #[cfg(test)]
 mod center_tests;
+pub mod content;
 pub mod data;
 mod dialogs;
 pub mod files;
@@ -10,6 +11,7 @@ mod files_view;
 mod layout;
 mod owner;
 mod pane;
+pub mod preview;
 mod review_reload;
 mod theme;
 pub mod workspace_config;
@@ -79,6 +81,7 @@ pub struct Shell {
     _subscriptions: Vec<Subscription>,
 }
 impl Shell {
+    #[cfg(test)]
     pub fn new(
         data: Rc<dyn ShellData>,
         config_dir: &Path,
@@ -121,6 +124,7 @@ impl Shell {
                 workspace,
                 data.clone(),
                 config_dir,
+                owner.read(cx).writer(),
                 &mut session_ids,
                 window,
                 cx,
@@ -325,6 +329,7 @@ impl Shell {
                 workspace,
                 self.data.clone(),
                 &self.config_dir,
+                self.owner.read(cx).writer(),
                 &mut session_ids,
                 window,
                 cx,
@@ -588,13 +593,33 @@ fn load_workspace_layout(
                 dock.add_panel_view(panel_handle(run), DockPlacement::Bottom, None, window, cx);
             }
         });
-        if !state.store.is_refused()
-            && let Err(error) = state.store.save(&state.dock.read(cx).dump(cx))
-        {
-            state.error = Some(format!("{error:#}"));
-        }
+        save_layout(state, cx);
     }
     Ok(())
+}
+fn save_layout(state: &mut WorkspaceDock, cx: &mut Context<Shell>) {
+    if state.store.is_refused() {
+        return;
+    }
+    let save = state.store.save_async(&state.dock.read(cx).dump(cx));
+    let id = state.workspace.id;
+    cx.spawn(async move |shell, cx| {
+        if let Err(error) = crate::preview::finish(save).await {
+            let error = format!("Save layout: {error:#}");
+            eprintln!("{error}");
+            let _ = shell.update(cx, |shell, cx| {
+                if let Some(state) = shell
+                    .workspaces
+                    .iter_mut()
+                    .find(|state| state.workspace.id == id)
+                {
+                    state.error = Some(error);
+                    cx.notify();
+                }
+            });
+        }
+    })
+    .detach();
 }
 fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscription {
     let id = state.workspace.id;
@@ -648,13 +673,7 @@ fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscriptio
                 state.active_session = state.sessions.first().map(|s| s.id);
             }
         }
-        if !state.store.is_refused()
-            && let Err(e) = state.store.save(&dock.read(cx).dump(cx))
-        {
-            let error = format!("{e:#}");
-            eprintln!("{error}");
-            state.error = Some(error);
-        }
+        save_layout(state, cx);
         this.sync_git_visibility(true, cx);
         cx.notify();
     })
@@ -683,14 +702,23 @@ fn build_workspace(
     workspace: Workspace,
     data: Rc<dyn ShellData>,
     config_dir: &Path,
+    preview: Option<std::sync::Arc<crate::preview::Writer>>,
     session_ids: &mut HashSet<u64>,
     window: &mut Window,
     cx: &mut Context<Shell>,
 ) -> Result<WorkspaceDock> {
-    let mut store = LayoutStore::new(layout::workspace_layout_path(
-        config_dir,
-        &workspace.layout_key,
-    ));
+    let path = layout::workspace_layout_path(config_dir, &workspace.layout_key);
+    let mut store = match preview {
+        Some(guard) => LayoutStore::guarded(path, guard),
+        None => {
+            #[cfg(test)]
+            {
+                LayoutStore::new(path)
+            }
+            #[cfg(not(test))]
+            anyhow::bail!("missing preview context before layout load")
+        }
+    };
     let local = data.local_owner().is_some();
     let sessions = if local {
         let restored = store.load_terminals().unwrap_or_else(|error| {
@@ -1134,26 +1162,34 @@ impl Render for Shell {
     }
 }
 
-pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
-    let home = dirs::home_dir().expect("resolve home for isolated GPUI config");
-    let config = layout::config_dir(std::env::var_os("GITTERM_GPUI_CONFIG_DIR"), &home)?;
-    let config = if sample {
-        layout::config_dir(Some(config.join("sample").into_os_string()), &home)?
-    } else {
-        config
-    };
-    let mut store = workspace_config::WorkspaceStore::new(&config);
+fn load_local_workspaces(
+    store: &mut workspace_config::WorkspaceStore,
+    folders: Vec<std::path::PathBuf>,
+) -> Result<(WorkspaceStatus, preview::SaveResult)> {
     let mut model = WorkspaceStatus::default();
-    if !sample {
-        for folder in store.load()? {
-            model.add(folder, Instant::now());
-        }
-        for folder in folders {
-            model.add(workspace_config::local_folder(&folder)?, Instant::now());
-        }
-        store.save(&model.folders())?;
+    // A removed saved folder still reaches the normal status/error UI.
+    for folder in store.load()? {
+        model.add(folder, Instant::now());
     }
+    for folder in folders {
+        model.add(workspace_config::local_folder(&folder)?, Instant::now());
+    }
+    let save = store.save_async(&model.folders())?;
+    Ok((model, save))
+}
+
+pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
+    let preview = preview::PreviewContext::from_environment(sample)?;
+    let config = preview.roots.layout();
+    let mut store = workspace_config::WorkspaceStore::guarded(preview.writer());
+    let (model, startup_save) = if sample {
+        (WorkspaceStatus::default(), None)
+    } else {
+        let (model, save) = load_local_workspaces(&mut store, folders)?;
+        (model, Some(save))
+    };
     gpui_kit::application().run(move |cx| {
+        preview.release_on_quit(cx);
         gpui_kit::init(cx);
         theme::apply(true, None, cx);
         for (index, (session_key, workspace_key)) in [
@@ -1207,10 +1243,17 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
             move |window, cx| {
                 let shell = cx.new(|cx| {
                     if sample {
-                        Shell::new(Rc::new(data::SampleData), &config, window, cx)
+                        let data: Rc<dyn ShellData> = Rc::new(data::SampleData);
+                        let model =
+                            WorkspaceStatus::sample(data.workspaces(cx).into_iter().map(|w| w.id));
+                        let owner = cx.new(|cx| WorkspaceOwner::new(model, Some(store), cx));
+                        Shell::with_owner(data, owner, &config, false, window, cx)
                             .expect("create sample shell")
                     } else {
                         let owner = cx.new(|cx| WorkspaceOwner::new(model, Some(store), cx));
+                        if let Some(save) = startup_save {
+                            owner.update(cx, |owner, cx| owner.watch_save(save, cx));
+                        }
                         let data = Rc::new(data::LocalData(owner.clone()));
                         let shell = Shell::with_owner(data, owner, &config, true, window, cx)
                             .expect("create local shell");
@@ -1243,6 +1286,7 @@ mod tests {
         cx.update(gpui_component::init);
         let repo = tempfile::tempdir().unwrap();
         let config = tempfile::tempdir().unwrap();
+        let config_root = config.path().canonicalize().unwrap();
         let git = |args: &[&str]| {
             let output = gitterm_core::git_status::git_command()
                 .args(args)
@@ -1263,12 +1307,12 @@ mod tests {
             let owner = cx.new(|cx| {
                 WorkspaceOwner::new(
                     WorkspaceStatus::default(),
-                    Some(workspace_config::WorkspaceStore::new(config.path())),
+                    Some(crate::preview::tests::guarded_store(config_root.as_path())),
                     cx,
                 )
             });
             let data = Rc::new(data::LocalData(owner.clone()));
-            Shell::with_owner(data, owner, config.path(), true, window, cx).unwrap()
+            Shell::with_owner(data, owner, config_root.as_path(), true, window, cx).unwrap()
         });
         draw(cx); // Empty state is renderable and has no implicit workspace.
         assert!(cx.read(|cx| shell.read(cx).active_workspace(cx)).is_none());
@@ -1335,7 +1379,7 @@ mod tests {
             );
             assert_eq!(owner.read(cx).model.workspaces[0].status.last_poll, before);
         });
-        let mut store = workspace_config::WorkspaceStore::new(config.path());
+        let mut store = crate::preview::tests::guarded_store(config_root.as_path());
         assert_eq!(store.load().unwrap(), [repo.path().canonicalize().unwrap()]);
         // Local terminals start in their workspace folder, not $HOME.
         let folder = repo.path().canonicalize().unwrap();

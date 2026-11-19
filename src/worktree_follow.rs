@@ -29,13 +29,7 @@ pub struct ActiveWorktree {
     pub branch: Option<String>,
 }
 
-/// One entry of `git worktree list --porcelain`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorktreeInfo {
-    pub path: PathBuf,
-    /// Short branch name; `None` for a detached HEAD.
-    pub branch: Option<String>,
-}
+pub use gitterm_core::work::summary::WorktreeInfo;
 
 /// Parses `git worktree list --porcelain`. Bare entries have no working
 /// tree and are skipped.

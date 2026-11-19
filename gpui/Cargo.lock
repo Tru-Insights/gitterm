@@ -2643,6 +2643,7 @@ name = "gitterm-gpui-shell"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "block2 0.6.2",
  "dirs 6.0.0",
  "gitterm-core",
  "gitterm-gpui-chat",
@@ -2651,6 +2652,11 @@ dependencies = [
  "gpui-component",
  "gpui-kit",
  "gpui-pre",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "objc2-web-kit",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "tempfile",
