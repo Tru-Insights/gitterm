@@ -1,0 +1,19 @@
+{
+  "documents": {
+    "failure": {
+      "error": "synthetic document failure",
+      "old_result_retained": true
+    },
+    "loaded": {
+      "active_has_result": false,
+      "background_owner_loaded": true,
+      "in_flight": false
+    },
+    "remote_request_refused": true,
+    "removed_owner_ignored": true
+  },
+  "find": {
+    "late_preview_cached": true,
+    "selection_still_current": true
+  }
+}

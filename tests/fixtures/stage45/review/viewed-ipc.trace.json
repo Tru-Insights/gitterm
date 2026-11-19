@@ -1,0 +1,7 @@
+{
+  "corrupt_store_preserved": true,
+  "loading_does_not_write": true,
+  "marked_paths": {
+    "a.rs": "fixture-content-id"
+  }
+}

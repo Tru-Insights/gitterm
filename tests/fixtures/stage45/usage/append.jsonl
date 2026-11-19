@@ -1,0 +1,1 @@
+{"type":"assistant","timestamp":"2000-01-05T12:00:00Z","cwd":"/fixture/repo","message":{"id":"fixture-new-response","model":"fixture-unpriced","usage":{"input_tokens":30,"output_tokens":4}}}

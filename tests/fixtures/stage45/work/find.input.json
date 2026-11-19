@@ -1,0 +1,5 @@
+[
+  {"id":"local-a","backend":"claude","cwd":"/fixture/alpha","title":"Synthetic one","facts":{"issue_keys":["TRU-999"]}},
+  {"id":"local-b","backend":"codex","cwd":"/fixture/elsewhere","repo_root":"/fixture/alpha/repo","title":"Synthetic two"},
+  {"id":"outside","backend":"codex","cwd":"/fixture/beta","title":"Synthetic three"}
+]

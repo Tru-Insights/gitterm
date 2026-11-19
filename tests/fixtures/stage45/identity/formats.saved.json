@@ -1,0 +1,459 @@
+{
+  "current": {
+    "agent": {
+      "agent_name": "Fixture agent",
+      "bind_addr": "127.0.0.1:1"
+    },
+    "facts": {
+      "checkouts": [],
+      "children": [
+        {
+          "delegation_id": "fixture-delegation",
+          "kind": "worker",
+          "session_id": "fixture-child",
+          "task_id": "fixture-task",
+          "title": "Synthetic child"
+        }
+      ],
+      "documents": [
+        "/fixture/docs/plan.md"
+      ],
+      "issue_keys": [
+        "TRU-999"
+      ],
+      "repos_touched": []
+    },
+    "focus": {
+      "/fixture/work": {
+        "coordinator": "fixture-chat"
+      }
+    },
+    "guidelines": {
+      "enabled": false,
+      "off_repos": [
+        "/fixture/repo"
+      ]
+    },
+    "issues": {
+      "issues": {
+        "TRU-999": {
+          "fetched_at": "2000-01-01T00:00:00Z",
+          "title": "Synthetic issue",
+          "workspace": "fixture-space"
+        }
+      },
+      "prefixes": {
+        "TRU": "fixture-space"
+      }
+    },
+    "limits": {
+      "claude": null,
+      "codex": {
+        "provider": "codex",
+        "observed_at": 946684800,
+        "windows": [
+          {
+            "label": "7d",
+            "used_percent": 12.5,
+            "resets_at": 947289600
+          }
+        ],
+        "local": true,
+        "alerts": [],
+        "plan_type": null,
+        "credits": null
+      },
+      "pending_notices": {
+        "fixture-caller": [
+          "Synthetic notice"
+        ]
+      },
+      "history": [
+        {
+          "provider": "codex",
+          "label": "7d",
+          "resets_at": 947289600,
+          "samples": [
+            {
+              "observed_at": 946684800,
+              "used_percent": 12.5
+            }
+          ]
+        }
+      ],
+      "pin": {
+        "provider": "codex",
+        "until": 947289600
+      },
+      "policy": {
+        "claude": {
+          "weekly": null,
+          "burst": {
+            "resets_at": null,
+            "busy": false,
+            "held": false
+          }
+        },
+        "codex": {
+          "weekly": {
+            "state": "on_track",
+            "since": 946684800,
+            "resets_at": 947289600,
+            "hot_warned": false,
+            "urgent_warned": false
+          },
+          "burst": {
+            "resets_at": null,
+            "busy": false,
+            "held": false
+          }
+        },
+        "routing": {
+          "state": "balanced",
+          "since": 946684800,
+          "flexible_provider": null
+        }
+      }
+    },
+    "merge_plan": {
+      "entries": [
+        {
+          "number": 1,
+          "repo": "example/fixture"
+        }
+      ],
+      "root_chat_id": "fixture-chat",
+      "updated_at": "2000-01-01T00:00:00Z"
+    },
+    "phones": {
+      "phones": [
+        {
+          "created_unix_secs": 946684800,
+          "id": "fixture-phone",
+          "last_seen_unix_secs": 946684900,
+          "name": "Fixture phone",
+          "scope": "act",
+          "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ]
+    },
+    "remote_agents": {
+      "remote_agents": [
+        {
+          "auth": {
+            "token_ref": "env:FIXTURE_UNUSED_TOKEN",
+            "type": "token"
+          },
+          "endpoint": "http://127.0.0.1:1",
+          "id": "fixture-remote",
+          "name": "Fixture machine"
+        }
+      ]
+    },
+    "remote_sessions": {
+      "remote_sessions": []
+    },
+    "settings": {
+      "agent_presets": [
+        {
+          "color": "pink",
+          "command": "pi",
+          "icon": "π",
+          "name": "Pi",
+          "resume_command": "pi --resume"
+        },
+        {
+          "color": "peach",
+          "command": "claude",
+          "icon": "❯",
+          "name": "Claude Code",
+          "resume_command": "claude --resume"
+        },
+        {
+          "color": "green",
+          "command": "codex",
+          "icon": "≡",
+          "name": "Codex",
+          "resume_command": "codex resume"
+        },
+        {
+          "color": "blue",
+          "command": "agy",
+          "icon": "✧",
+          "name": "Antigravity",
+          "resume_command": "agy --continue"
+        }
+      ],
+      "chat": {
+        "antigravity_model": "gemini-4-argon-medium",
+        "default_model": "opus",
+        "opencode_model": "",
+        "remember_last": true
+      },
+      "chat_font_size": 15.0,
+      "chat_width": "medium",
+      "console_expanded": true,
+      "console_height": 200.0,
+      "delegations": {
+        "auto_tell": true
+      },
+      "editor": "vscode",
+      "font_size": null,
+      "max_concurrent_local_tasks": 2,
+      "notifications": {
+        "needs_you": true
+      },
+      "policy": {
+        "antigravity": {
+          "coordinator": "gemini-4-argon-high",
+          "judgment": "gemini-4-argon-high",
+          "scoped": "gemini-4-hydrogen-high",
+          "specialist": "gemini-4-argon-high"
+        },
+        "claude": {
+          "coordinator": "opus",
+          "judgment": "opus",
+          "scoped": "sonnet",
+          "specialist": "fable"
+        },
+        "codex": {
+          "coordinator": "gpt-6.1-sol",
+          "judgment": "gpt-6.1-sol",
+          "scoped": "gpt-6-luna",
+          "specialist": "gpt-6-astra"
+        }
+      },
+      "pr_watch": {
+        "auto_tell": true
+      },
+      "quick_commands": [],
+      "review": {
+        "default_reviewer": "claude-subagent",
+        "max_concurrent_reviews": 2,
+        "subagent_model": "opus"
+      },
+      "scrollback_lines": 100000,
+      "show_hidden": false,
+      "sidebar_width": 360.0,
+      "stt_enabled": true,
+      "stt_model_path": null,
+      "terminal_font_size": 14.0,
+      "terminal_log_mirroring_enabled": false,
+      "theme": "light",
+      "ui_font_size": 13.0,
+      "usage": {
+        "pricing": {
+          "fixture-model": null
+        }
+      },
+      "work_notes": {
+        "auto_commit": true
+      }
+    },
+    "watch": {
+      "prs": {
+        "example/fixture#1": {
+          "checked_at": null,
+          "error": null,
+          "etags": {},
+          "key": {
+            "number": 1,
+            "repo": "example/fixture"
+          },
+          "news": [],
+          "reported": [],
+          "snapshot": {
+            "check_runs": [],
+            "checks_sha": "",
+            "comments": [],
+            "core": null,
+            "required": [],
+            "required_rules": [],
+            "reviews": [],
+            "statuses": []
+          },
+          "unseen_comments": 0
+        }
+      }
+    },
+    "workspaces": {
+      "active_workspace": 0,
+      "remote_sessions": [],
+      "workspaces": [
+        {
+          "abbrev": "FX",
+          "active": false,
+          "bottom_terminals": [],
+          "collapsed_issue_groups": [
+            "done"
+          ],
+          "color": "blue",
+          "dir": "/fixture/work",
+          "name": "Fixture",
+          "parked": {
+            "note": "Synthetic note",
+            "parked_at": "2000-01-01T00:00:00Z"
+          },
+          "run_command": null,
+          "tabs": [
+            {
+              "chat_session_id": "fixture-conversation",
+              "dir": "/fixture/worktree",
+              "session_uid": "fixture-caller",
+              "task_id": "fixture-task",
+              "task_session_id": "fixture-session"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "old": {
+    "agent": {},
+    "facts": {
+      "checkouts": [],
+      "children": [],
+      "issue_keys": [],
+      "repos_touched": []
+    },
+    "focus": {},
+    "guidelines": {
+      "enabled": true,
+      "off_repos": []
+    },
+    "issues": {
+      "issues": {},
+      "prefixes": {}
+    },
+    "limits": {
+      "claude": null,
+      "codex": null
+    },
+    "merge_plan": {
+      "entries": [],
+      "root_chat_id": "fixture-chat",
+      "updated_at": ""
+    },
+    "phones": {
+      "phones": [
+        {
+          "created_unix_secs": 946684800,
+          "id": "fixture-phone",
+          "last_seen_unix_secs": 0,
+          "name": "Fixture phone",
+          "scope": "view",
+          "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ]
+    },
+    "remote_agents": {
+      "remote_agents": []
+    },
+    "remote_sessions": {
+      "remote_sessions": []
+    },
+    "settings": {
+      "agent_presets": [
+        {
+          "color": "pink",
+          "command": "pi",
+          "icon": "π",
+          "name": "Pi",
+          "resume_command": "pi --resume"
+        },
+        {
+          "color": "peach",
+          "command": "claude",
+          "icon": "❯",
+          "name": "Claude Code",
+          "resume_command": "claude --resume"
+        },
+        {
+          "color": "green",
+          "command": "codex",
+          "icon": "≡",
+          "name": "Codex",
+          "resume_command": "codex resume"
+        },
+        {
+          "color": "blue",
+          "command": "agy",
+          "icon": "✧",
+          "name": "Antigravity",
+          "resume_command": "agy --continue"
+        }
+      ],
+      "chat": {
+        "antigravity_model": "gemini-4-argon-medium",
+        "default_model": "opus",
+        "opencode_model": "",
+        "remember_last": true
+      },
+      "chat_font_size": 15.0,
+      "chat_width": "medium",
+      "console_expanded": true,
+      "console_height": 200.0,
+      "delegations": {
+        "auto_tell": true
+      },
+      "editor": "vscode",
+      "font_size": null,
+      "max_concurrent_local_tasks": 4,
+      "notifications": {
+        "needs_you": true
+      },
+      "policy": {
+        "antigravity": {
+          "coordinator": "gemini-4-argon-high",
+          "judgment": "gemini-4-argon-high",
+          "scoped": "gemini-4-hydrogen-high",
+          "specialist": "gemini-4-argon-high"
+        },
+        "claude": {
+          "coordinator": "opus",
+          "judgment": "opus",
+          "scoped": "sonnet",
+          "specialist": "fable"
+        },
+        "codex": {
+          "coordinator": "gpt-6.1-sol",
+          "judgment": "gpt-6.1-sol",
+          "scoped": "gpt-6-luna",
+          "specialist": "gpt-6-astra"
+        }
+      },
+      "pr_watch": {
+        "auto_tell": true
+      },
+      "quick_commands": [],
+      "review": {
+        "default_reviewer": "claude-subagent",
+        "max_concurrent_reviews": 2,
+        "subagent_model": "opus"
+      },
+      "scrollback_lines": 100000,
+      "show_hidden": false,
+      "sidebar_width": 360.0,
+      "stt_enabled": true,
+      "stt_model_path": null,
+      "terminal_font_size": 14.0,
+      "terminal_log_mirroring_enabled": false,
+      "theme": "dark",
+      "ui_font_size": 13.0,
+      "usage": {
+        "pricing": {}
+      },
+      "work_notes": {
+        "auto_commit": true
+      }
+    },
+    "watch": {
+      "prs": {}
+    },
+    "workspaces": {
+      "active_workspace": 0,
+      "remote_sessions": [],
+      "workspaces": []
+    }
+  }
+}

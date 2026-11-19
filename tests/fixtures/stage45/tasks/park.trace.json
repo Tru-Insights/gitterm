@@ -1,0 +1,49 @@
+[
+  {
+    "active": "beta",
+    "command": "park KeepRunning",
+    "effects": [
+      "dismiss",
+      "terminals",
+      "dirty",
+      "plans+docs",
+      "connect",
+      "present",
+      "surfaces"
+    ],
+    "live_workspace_count": 3,
+    "saved_active": false,
+    "saved_note": "synthetic park",
+    "saved_session": true,
+    "session_alive": true
+  },
+  {
+    "active": "beta",
+    "command": "wake",
+    "effects": [
+      "dirty"
+    ],
+    "parked": false,
+    "same_session": true,
+    "same_uid": true,
+    "woke": "needs you"
+  },
+  {
+    "active": "beta",
+    "command": "park Stop",
+    "effects": [
+      "dismiss",
+      "terminals",
+      "dirty",
+      "plans+docs",
+      "connect",
+      "present",
+      "surfaces"
+    ],
+    "live_workspace_count": 2,
+    "saved_active": false,
+    "saved_note": "synthetic park",
+    "saved_session": true,
+    "session_alive": false
+  }
+]

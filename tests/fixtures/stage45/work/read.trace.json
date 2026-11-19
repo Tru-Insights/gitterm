@@ -1,0 +1,47 @@
+{
+  "documents": [
+    {
+      "copies": 1,
+      "differ": false,
+      "rel": ".plans/plan.md",
+      "source": "repo",
+      "title": "Synthetic plan"
+    },
+    {
+      "copies": 1,
+      "differ": false,
+      "rel": "docs/DESIGN.md",
+      "source": "repo",
+      "title": "Synthetic design"
+    },
+    {
+      "copies": 1,
+      "differ": false,
+      "rel": "docs/note.md",
+      "source": "work docs",
+      "title": "Synthetic note"
+    },
+    {
+      "copies": 1,
+      "differ": false,
+      "rel": "docs/ordinary.md",
+      "source": "repo",
+      "title": "Written document"
+    }
+  ],
+  "summary": {
+    "chat_count": 2,
+    "focused": [
+      "fixture-root"
+    ],
+    "has_facts": true,
+    "issue_keys": [],
+    "repos": [
+      {
+        "dir": "/fixture/repo",
+        "edits": 2
+      }
+    ]
+  },
+  "truncated": false
+}

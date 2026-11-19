@@ -1,0 +1,493 @@
+{
+  "base": {
+    "commits": [
+      "merge",
+      "side",
+      "feature"
+    ],
+    "commits_error": null,
+    "commits_truncated": false,
+    "files": [
+      {
+        "additions": 1,
+        "content_id": "482f2597181fff29061d06ae9b801758a2e13785",
+        "content_id_kind": "blob",
+        "deletions": 0,
+        "kind": "Code",
+        "note": null,
+        "old_path": null,
+        "omitted": false,
+        "patch_sample": [
+          {
+            "new": 1,
+            "old": null,
+            "op": "Add",
+            "text": "fn committed() {}"
+          }
+        ],
+        "path": "committed.rs",
+        "shown_lines": 1,
+        "status": "added",
+        "truncated": false
+      },
+      {
+        "additions": 1,
+        "content_id": "2dc44c61cc923720692acb662969c8a7a4c67238",
+        "content_id_kind": "blob",
+        "deletions": 0,
+        "kind": "Code",
+        "note": null,
+        "old_path": null,
+        "omitted": false,
+        "patch_sample": [
+          {
+            "new": 1,
+            "old": null,
+            "op": "Add",
+            "text": "fn side() {}"
+          }
+        ],
+        "path": "side.rs",
+        "shown_lines": 1,
+        "status": "added",
+        "truncated": false
+      }
+    ],
+    "live_paths": [
+      "a.rs",
+      "binary.dat",
+      "committed.rs",
+      "gone.txt",
+      "large.md",
+      "renamed.rs",
+      "side.rs",
+      "untracked.txt"
+    ],
+    "merge_base": true,
+    "unlisted": 0
+  },
+  "commits_empty": {
+    "commits": [
+      "merge",
+      "side",
+      "feature"
+    ],
+    "commits_error": null,
+    "commits_truncated": false,
+    "files": [],
+    "live_paths": [
+      "a.rs",
+      "binary.dat",
+      "committed.rs",
+      "gone.txt",
+      "large.md",
+      "renamed.rs",
+      "side.rs",
+      "untracked.txt"
+    ],
+    "merge_base": false,
+    "unlisted": 0
+  },
+  "errors": [
+    "no base branch found for <repo>: no task base, tracked branch, or develop/main/master/trunk",
+    "no base branch found for <repo>",
+    "selected commits are not an ordered range on this branch"
+  ],
+  "root_endpoint": {
+    "from_empty_tree": true,
+    "to_root": true
+  },
+  "selections": [
+    {
+      "from_is_root": true,
+      "load": {
+        "commits": [
+          "merge",
+          "side",
+          "feature"
+        ],
+        "commits_error": null,
+        "commits_truncated": false,
+        "files": [
+          {
+            "additions": 1,
+            "content_id": "482f2597181fff29061d06ae9b801758a2e13785",
+            "content_id_kind": "blob",
+            "deletions": 0,
+            "kind": "Code",
+            "note": null,
+            "old_path": null,
+            "omitted": false,
+            "patch_sample": [
+              {
+                "new": 1,
+                "old": null,
+                "op": "Add",
+                "text": "fn committed() {}"
+              }
+            ],
+            "path": "committed.rs",
+            "shown_lines": 1,
+            "status": "added",
+            "truncated": false
+          },
+          {
+            "additions": 1,
+            "content_id": "2dc44c61cc923720692acb662969c8a7a4c67238",
+            "content_id_kind": "blob",
+            "deletions": 0,
+            "kind": "Code",
+            "note": null,
+            "old_path": null,
+            "omitted": false,
+            "patch_sample": [
+              {
+                "new": 1,
+                "old": null,
+                "op": "Add",
+                "text": "fn side() {}"
+              }
+            ],
+            "path": "side.rs",
+            "shown_lines": 1,
+            "status": "added",
+            "truncated": false
+          }
+        ],
+        "live_paths": [
+          "a.rs",
+          "binary.dat",
+          "committed.rs",
+          "gone.txt",
+          "large.md",
+          "renamed.rs",
+          "side.rs",
+          "untracked.txt"
+        ],
+        "merge_base": false,
+        "unlisted": 0
+      },
+      "pending": true,
+      "to_is_merge": true
+    },
+    {
+      "from_is_root": true,
+      "load": {
+        "commits": [
+          "merge",
+          "side",
+          "feature"
+        ],
+        "commits_error": null,
+        "commits_truncated": false,
+        "files": [
+          {
+            "additions": 1,
+            "content_id": "482f2597181fff29061d06ae9b801758a2e13785",
+            "content_id_kind": "blob",
+            "deletions": 0,
+            "kind": "Code",
+            "note": null,
+            "old_path": null,
+            "omitted": false,
+            "patch_sample": [
+              {
+                "new": 1,
+                "old": null,
+                "op": "Add",
+                "text": "fn committed() {}"
+              }
+            ],
+            "path": "committed.rs",
+            "shown_lines": 1,
+            "status": "added",
+            "truncated": false
+          },
+          {
+            "additions": 1,
+            "content_id": "2dc44c61cc923720692acb662969c8a7a4c67238",
+            "content_id_kind": "blob",
+            "deletions": 0,
+            "kind": "Code",
+            "note": null,
+            "old_path": null,
+            "omitted": false,
+            "patch_sample": [
+              {
+                "new": 1,
+                "old": null,
+                "op": "Add",
+                "text": "fn side() {}"
+              }
+            ],
+            "path": "side.rs",
+            "shown_lines": 1,
+            "status": "added",
+            "truncated": false
+          }
+        ],
+        "live_paths": [
+          "a.rs",
+          "binary.dat",
+          "committed.rs",
+          "gone.txt",
+          "large.md",
+          "renamed.rs",
+          "side.rs",
+          "untracked.txt"
+        ],
+        "merge_base": false,
+        "unlisted": 0
+      },
+      "pending": false,
+      "to_is_merge": true
+    }
+  ],
+  "turns": [
+    {
+      "load": {
+        "commits": [
+          "merge",
+          "side",
+          "feature"
+        ],
+        "commits_error": null,
+        "commits_truncated": false,
+        "files": [],
+        "live_paths": null,
+        "merge_base": false,
+        "unlisted": 0
+      },
+      "selected": null
+    },
+    {
+      "load": {
+        "commits": [
+          "merge",
+          "side",
+          "feature"
+        ],
+        "commits_error": null,
+        "commits_truncated": false,
+        "files": [
+          {
+            "additions": 1,
+            "content_id": "80f452ff78576398922778b4e93af19cebc33f99",
+            "content_id_kind": "blob",
+            "deletions": 0,
+            "kind": "Code",
+            "note": null,
+            "old_path": null,
+            "omitted": false,
+            "patch_sample": [
+              {
+                "new": 1,
+                "old": null,
+                "op": "Add",
+                "text": "fn turn() {}"
+              }
+            ],
+            "path": "turn.rs",
+            "shown_lines": 1,
+            "status": "added",
+            "truncated": false
+          }
+        ],
+        "live_paths": null,
+        "merge_base": false,
+        "unlisted": 0
+      },
+      "selected": 1
+    },
+    {
+      "error": "turn has no end snapshot (running or incomplete)",
+      "selected": 2
+    },
+    {
+      "error": "turn has no start snapshot (checkout discovered late or skipped)",
+      "selected": 3
+    },
+    {
+      "error": "selected turn is no longer available",
+      "selected": 99
+    }
+  ],
+  "uncommitted": {
+    "commits": [
+      "merge",
+      "side",
+      "feature"
+    ],
+    "commits_error": null,
+    "commits_truncated": false,
+    "files": [
+      {
+        "additions": 1,
+        "content_id": "bab3b9e235a0c8807cc9cf787200bf649ae348d6",
+        "content_id_kind": "blob",
+        "deletions": 1,
+        "kind": "Code",
+        "note": null,
+        "old_path": null,
+        "omitted": false,
+        "patch_sample": [
+          {
+            "new": null,
+            "old": 1,
+            "op": "Del",
+            "text": "fn old() {}"
+          },
+          {
+            "new": 1,
+            "old": null,
+            "op": "Add",
+            "text": "fn changed() {}"
+          }
+        ],
+        "path": "a.rs",
+        "shown_lines": 2,
+        "status": "modified",
+        "truncated": false
+      },
+      {
+        "additions": 0,
+        "content_id": "2bc2613ca04255cb03e29a1d705cc1028c84b989",
+        "content_id_kind": "blob",
+        "deletions": 0,
+        "kind": "Code",
+        "note": null,
+        "old_path": null,
+        "omitted": false,
+        "patch_sample": [],
+        "path": "binary.dat",
+        "shown_lines": 0,
+        "status": "binary",
+        "truncated": false
+      },
+      {
+        "additions": 0,
+        "content_id": "deleted:286c5f5776916d7d7d5849988ca9d83e722cf9c2",
+        "content_id_kind": "deleted",
+        "deletions": 1,
+        "kind": "Docs",
+        "note": null,
+        "old_path": null,
+        "omitted": false,
+        "patch_sample": [
+          {
+            "new": null,
+            "old": 1,
+            "op": "Del",
+            "text": "gone"
+          }
+        ],
+        "path": "gone.txt",
+        "shown_lines": 1,
+        "status": "deleted",
+        "truncated": false
+      },
+      {
+        "additions": 2000,
+        "content_id": "9bba87db6dc1fb8f76050e360676dc21b756b125",
+        "content_id_kind": "blob",
+        "deletions": 0,
+        "kind": "Docs",
+        "note": null,
+        "old_path": null,
+        "omitted": false,
+        "patch_sample": [
+          {
+            "new": 1,
+            "old": null,
+            "op": "Add",
+            "text": "line 0"
+          },
+          {
+            "new": 2,
+            "old": null,
+            "op": "Add",
+            "text": "line 1"
+          },
+          {
+            "new": 3,
+            "old": null,
+            "op": "Add",
+            "text": "line 2"
+          },
+          {
+            "new": 4,
+            "old": null,
+            "op": "Add",
+            "text": "line 3"
+          }
+        ],
+        "path": "large.md",
+        "shown_lines": 2000,
+        "status": "untracked",
+        "truncated": true
+      },
+      {
+        "additions": 0,
+        "content_id": "32073f3072204cb7f937a51e872bc21b51d49f1b",
+        "content_id_kind": "blob",
+        "deletions": 0,
+        "kind": "Code",
+        "note": null,
+        "old_path": "old.rs",
+        "omitted": false,
+        "patch_sample": [],
+        "path": "renamed.rs",
+        "shown_lines": 0,
+        "status": "renamed",
+        "truncated": false
+      },
+      {
+        "additions": 1,
+        "content_id": "3e757656cf36eca53338e520d134963a44f793f8",
+        "content_id_kind": "blob",
+        "deletions": 0,
+        "kind": "Docs",
+        "note": null,
+        "old_path": null,
+        "omitted": false,
+        "patch_sample": [
+          {
+            "new": 1,
+            "old": null,
+            "op": "Add",
+            "text": "new"
+          }
+        ],
+        "path": "untracked.txt",
+        "shown_lines": 1,
+        "status": "untracked",
+        "truncated": false
+      }
+    ],
+    "live_paths": [
+      "a.rs",
+      "binary.dat",
+      "committed.rs",
+      "gone.txt",
+      "large.md",
+      "renamed.rs",
+      "side.rs",
+      "untracked.txt"
+    ],
+    "merge_base": false,
+    "unlisted": 0
+  },
+  "viewed": {
+    "after": "ChangedSinceViewed",
+    "before": "Viewed",
+    "malformed_load_refused": true,
+    "no_identity_refused": true
+  },
+  "viewed_shape": {
+    "checkouts": {
+      "<checkout>": {
+        "large.md": "9bba87db6dc1fb8f76050e360676dc21b756b125"
+      }
+    }
+  }
+}
