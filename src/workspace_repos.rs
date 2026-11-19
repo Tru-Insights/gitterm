@@ -17,11 +17,7 @@ use std::path::{Path, PathBuf};
 /// The deepest ancestor of `path` (itself included) holding a `.git`
 /// entry: a directory for a main checkout, a file for a linked worktree
 /// or a submodule.
-pub fn checkout_root(path: &Path) -> Option<PathBuf> {
-    path.ancestors()
-        .find(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok())
-        .map(Path::to_path_buf)
-}
+pub use gitterm_core::workers::checkout_root;
 
 /// The git common dir of the checkout at `root`, canonical, from
 /// `git rev-parse --git-common-dir` (which prints it relative to `root`
