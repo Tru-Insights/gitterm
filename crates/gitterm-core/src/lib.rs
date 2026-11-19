@@ -40,6 +40,8 @@ pub mod chat_facts;
 pub mod chats;
 pub mod find;
 
+pub mod work;
+
 // Delegation services; launch authority remains with the application owner.
 #[cfg(feature = "runtime")]
 pub mod checkout_name;
