@@ -8,6 +8,7 @@ pub struct SessionId(pub u64);
 #[derive(Clone, Debug)]
 pub struct Workspace {
     pub id: WorkspaceId,
+    pub layout_key: String,
     pub name: String,
     pub status: String,
     pub repositories: Vec<String>,
@@ -62,6 +63,7 @@ impl ShellData for SampleData {
         .into_iter()
         .map(|(id, name, status, repos)| Workspace {
             id: WorkspaceId(id),
+            layout_key: id.to_string(),
             name: name.into(),
             status: status.into(),
             repositories: repos.into_iter().map(String::from).collect(),
@@ -151,6 +153,7 @@ impl ShellData for LocalData {
             .iter()
             .map(|w| Workspace {
                 id: w.id,
+                layout_key: crate::layout::workspace_layout_key(&w.folder),
                 name: w
                     .folder
                     .file_name()
@@ -162,9 +165,16 @@ impl ShellData for LocalData {
             })
             .collect()
     }
-    fn sessions(&self, workspace: WorkspaceId, _: &App) -> Vec<Session> {
+    fn sessions(&self, workspace: WorkspaceId, cx: &App) -> Vec<Session> {
+        let model = &self.0.read(cx).model;
+        let folder = &model
+            .workspaces
+            .iter()
+            .find(|candidate| candidate.id == workspace)
+            .expect("owned workspace")
+            .folder;
         vec![Session {
-            id: SessionId(workspace.0 * 10 + 2),
+            id: SessionId(crate::layout::stable_path_hash(folder)),
             title: "Shell".into(),
             kind: SessionKind::Terminal,
         }]

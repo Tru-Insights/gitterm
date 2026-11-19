@@ -150,10 +150,14 @@ and code Copy stay scoped to their chat pane, including its find input and rich
 text children. The standalone `--terminal` and `--chat <fixture>` routes remain
 available.
 
-Layouts save atomically on dock changes to `layout-<workspace-id>.json` under
-`GITTERM_GPUI_CONFIG_DIR` (absolute), defaulting to
-`~/.config/gitterm-gpui`. Real V3–V6 config directories, their descendants and
-symlink aliases are rejected. Unknown IDs, duplicate IDs, malformed geometry,
+Layouts save atomically on dock changes under `GITTERM_GPUI_CONFIG_DIR`
+(absolute), defaulting to `~/.config/gitterm-gpui`. Local workspace filenames
+use a stable hash of each canonical folder path, so adding or removing folders
+does not move another workspace's layout. Sample layouts stay in the
+`sample/` subdirectory. Older top-level `layout-N.json` files are ignored and
+left untouched. Real V3–V6 config directories, their descendants and symlink
+aliases are rejected. Panes that no longer exist are dropped while the
+remaining layout stays saveable. Duplicate IDs, malformed geometry,
 unsupported versions and corrupt JSON are reported with the full file path in
 stderr and an on-screen banner. That workspace starts with the default layout
 and refuses saves for the launch; repair or move the file before restarting.

@@ -421,7 +421,7 @@ fn git_visible(state: &WorkspaceDock, cx: &App) -> bool {
         }
     }
     let layout = state.dock.read(cx).dump(cx);
-    let id = format!("workspace-{}-git", state.workspace.id.0);
+    let id = format!("workspace-{}-git", state.workspace.layout_key);
     visible(&layout.center, &id)
         || [&layout.left_dock, &layout.right_dock, &layout.bottom_dock]
             .into_iter()
@@ -462,7 +462,7 @@ fn build_workspace(
         ("git", "Git status", PaneKind::Git),
         ("files", "Files", PaneKind::Files),
     ] {
-        let id = format!("workspace-{}-{name}", workspace.id.0);
+        let id = format!("workspace-{}-{name}", workspace.layout_key);
         panes.insert(
             id.clone(),
             cx.new(|cx| {
@@ -484,7 +484,10 @@ fn build_workspace(
     skin.set_close_button_visible(true, cx);
     Ok(WorkspaceDock {
         active_session: sessions.first().map(|s| s.id),
-        store: LayoutStore::new(config_dir.join(format!("layout-{}.json", workspace.id.0))),
+        store: LayoutStore::new(layout::workspace_layout_path(
+            config_dir,
+            &workspace.layout_key,
+        )),
         workspace,
         sessions,
         panes,
@@ -509,8 +512,8 @@ fn default_layout(state: &WorkspaceDock, window: &mut Window, cx: &mut App) {
             center = center.panel_view(pane, cx);
         }
     }
-    let git = state.panes[&format!("workspace-{}-git", state.workspace.id.0)].clone();
-    let files = state.panes[&format!("workspace-{}-files", state.workspace.id.0)].clone();
+    let git = state.panes[&format!("workspace-{}-git", state.workspace.layout_key)].clone();
+    let files = state.panes[&format!("workspace-{}-files", state.workspace.layout_key)].clone();
     state.dock.update(cx, |dock, cx| {
         dock.set_center(DockLayout::h_split().child(center, None), window, cx);
         dock.set_dock(
@@ -938,13 +941,14 @@ mod tests {
                 });
             })
         });
-        let (owner, dock, pane) = cx.read(|cx| {
+        let (owner, dock, pane, git_id) = cx.read(|cx| {
             let shell = shell.read(cx);
             let state = shell.active(cx);
             (
                 shell.owner.clone(),
                 state.dock.clone(),
-                state.panes["workspace-1-git"].clone(),
+                state.panes[&format!("workspace-{}-git", state.workspace.layout_key)].clone(),
+                format!("workspace-{}-git", state.workspace.layout_key),
             )
         });
         cx.update(|window, cx| {
@@ -964,11 +968,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let before = cx.read(|cx| owner.read(cx).model.workspaces[0].status.last_poll);
-        cx.update(|window, cx| {
-            shell.update(cx, |shell, cx| {
-                shell.show_pane("workspace-1-git", window, cx)
-            })
-        });
+        cx.update(|window, cx| shell.update(cx, |shell, cx| shell.show_pane(&git_id, window, cx)));
         draw(cx);
         cx.read(|cx| {
             let status = pane.read(cx).status_view(cx);
