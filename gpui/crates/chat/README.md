@@ -68,8 +68,10 @@ incomplete-history error. Reset closes lookup scopes and adds a reset marker;
 it does not reuse old row identities. The model is independent of rendered
 rows. At most 96 recently visited rows retain rich-text and diff entities. Fold state
 and card drafts/submissions survive rich-row eviction; rich-text selection on
-evicted rows does not. Visited rows own their rich-text selection and diff state; parsing
-completion remeasures the corresponding virtual row. No application data cache
+evicted rows does not. Cross-row drag selection works across mounted rows through
+gpui-component 0.9.1; it cannot span arbitrary unmounted/evicted history. Use
+whole-reply Copy markdown for full-fidelity content after scrolling. Visited
+rows own their rich-text selection and diff state; parsing completion remeasures the corresponding virtual row. No application data cache
 is introduced. Replaying starts a fresh deterministic model and retains the
 find query. Hiding a retained `ChatView` preserves its state.
 
@@ -91,8 +93,9 @@ not just the older migration-plan audit.
 | Earlier history, reconnect, reset / `:945`, `:3501`, `:3731` | Display-only | All fixture history is in the model; history replay, reset markers, disconnect/reconnect errors and gap notice render. Live transport, fetching older history and repairing gaps are later. |
 | Find in current chat / TRU-256 | Done | Cmd+F input, Enter/Cmd+G next, Cmd+Shift+G previous, Escape close; full model search including folded/unmounted rows; highlights and reveal; query retained during replay. Case-insensitive Unicode ranges remain valid byte boundaries. |
 | Selection Cmd+C and right-click Copy | Done | Component plain-copy behavior retained, including outer-whitespace trimming; explicit context-menu handler uses the same policy. |
-| Selected text Copy as Markdown / TRU-270 | Done | Right-click menu and Cmd+Shift+C use native selection Source format, preserving Markdown tables and code fences with language. Normal copy remains plain. |
-| Code block Copy / `:1090` | Done | Copies code text only; per-code-block Copied feedback for one second. |
+| Selected text Copy as Markdown / TRU-270 | Done | Right-click menu and Cmd+Shift+C use native selection Source format, preserving Markdown tables and code fences with language. Normal copy remains plain. Menu payloads are captured on opening, like HTML `:4427`, before popup focus changes; selection copy shows Copied for 1.2 seconds. |
+| Whole-reply copy / TRU-274, `d7fe92b:1796`, `:1880` | Done | Assistant reply buttons copy complete model source as Markdown or plain text, independent of selection and prior row eviction; 1.2-second Copied feedback. |
+| Code block Copy / `:1090` | Done | Copies code text only; per-code-block Copied feedback for 1.2 seconds (HTML `:1841`). |
 | Question cards / `:3317` | Done | Single/multi choice, Other/free text, header and option descriptions, validated submit and dismiss. Answered/resolved cards are read-only. |
 | Permission cards / `:3254`, `:3279` | Done | Allow / Allow always / Deny intents. Always passes the exact offered localSettings suggestion or ACP option. No invented rule or backend effect. |
 | Workers / `:1671`, `:2668` | Display-only | Nested scope labels/indentation, worker lifecycle row, scoped child text/thinking/tools and usage. No worker roster/navigation commands. |
