@@ -15,6 +15,9 @@ use std::{
 pub struct WorkspaceOwner {
     pub model: WorkspaceStatus,
     pub error: Option<String>,
+    pub files: std::collections::HashMap<crate::data::WorkspaceId, crate::files::FileTree>,
+    file_jobs: crate::files::FileJobs,
+    file_sender: tokio::sync::mpsc::UnboundedSender<crate::files::Outcome>,
     git_visible: bool,
     store: Option<WorkspaceStore>,
     jobs: Arc<StatusRuntime>,
@@ -38,7 +41,23 @@ impl WorkspaceOwner {
                     .expect("create GPUI status executor"),
             )
         });
-        let mut tasks = vec![];
+        let (file_sender, mut file_receiver) =
+            tokio::sync::mpsc::unbounded_channel::<crate::files::Outcome>();
+        let mut tasks = vec![cx.spawn(async move |owner, cx| {
+            while let Some(outcome) = file_receiver.recv().await {
+                if owner
+                    .update(cx, |owner, cx| {
+                        if let Some(tree) = owner.files.get_mut(&outcome.request.workspace) {
+                            tree.complete(outcome);
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })];
         let mut quit = None;
         if executor.is_some() {
             tasks.push(cx.spawn(async move |owner, cx| {
@@ -93,6 +112,9 @@ impl WorkspaceOwner {
         }
         Self {
             model,
+            files: Default::default(),
+            file_jobs: Default::default(),
+            file_sender,
             error: None,
             store,
             jobs,
@@ -103,6 +125,7 @@ impl WorkspaceOwner {
         }
     }
     pub fn dispatch(&mut self, intent: Intent, now: Instant, cx: &mut Context<Self>) {
+        let refresh_files = matches!(intent, Intent::SelectIndex(_) | Intent::Activate(_));
         for command in self.model.dispatch(intent, now) {
             if let Command::Status { owner, command } = command
                 && let Some(executor) = &self.executor
@@ -110,7 +133,88 @@ impl WorkspaceOwner {
                 self.jobs.execute(executor.handle(), owner, command);
             }
         }
+        if refresh_files
+            && self.executor.is_some()
+            && let Some(workspace) = self
+                .model
+                .workspaces
+                .iter()
+                .find(|w| Some(w.id) == self.model.active())
+        {
+            let request = self
+                .files
+                .entry(workspace.id)
+                .or_default()
+                .refresh(workspace.id, workspace.folder.clone());
+            self.run_file_job(request);
+        }
         cx.notify();
+    }
+    fn run_file_job(&mut self, request: crate::files::Request) {
+        if let Some(executor) = &self.executor {
+            self.file_jobs
+                .execute(executor.handle(), request, self.file_sender.clone());
+        }
+    }
+    pub fn toggle_directory(
+        &mut self,
+        workspace: crate::data::WorkspaceId,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(request) = self
+            .files
+            .get_mut(&workspace)
+            .and_then(|tree| tree.toggle(workspace, path))
+        {
+            self.run_file_job(request);
+        }
+        cx.notify();
+    }
+    pub fn more_files(
+        &mut self,
+        workspace: crate::data::WorkspaceId,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(request) = self
+            .files
+            .get_mut(&workspace)
+            .and_then(|tree| tree.more(workspace, path))
+        {
+            self.run_file_job(request);
+        }
+        cx.notify();
+    }
+    pub fn open_file(
+        &mut self,
+        workspace: crate::data::WorkspaceId,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(local) = self.model.workspaces.iter().find(|w| w.id == workspace) else {
+            return;
+        };
+        let changed = self
+            .model
+            .status_view(workspace)
+            .files
+            .into_iter()
+            .find(|file| local.root.join(&file.path) == path);
+        // The shell does not host a live review yet. Preserve the status match
+        // on the intent so a future review host can route it without re-querying.
+        let intent = FileOpen {
+            workspace,
+            path,
+            changed,
+        };
+        eprintln!(
+            "FileOpen workspace={} path={} changed={}",
+            workspace.0,
+            intent.path.display(),
+            intent.changed.is_some()
+        );
+        cx.emit(intent);
     }
     pub fn add_folder(
         &mut self,
@@ -142,3 +246,12 @@ impl Drop for WorkspaceOwner {
         self.jobs.close();
     }
 }
+
+/// File activation fallback until the shell hosts live review/editor surfaces.
+#[derive(Clone, Debug)]
+pub struct FileOpen {
+    pub workspace: crate::data::WorkspaceId,
+    pub path: PathBuf,
+    pub changed: Option<crate::data::ChangedFile>,
+}
+impl EventEmitter<FileOpen> for WorkspaceOwner {}

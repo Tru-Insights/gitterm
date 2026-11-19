@@ -46,6 +46,9 @@ pub struct FileNode {
 }
 
 pub trait ShellData {
+    fn local_owner(&self) -> Option<gpui::Entity<crate::WorkspaceOwner>> {
+        None
+    }
     fn workspaces(&self, cx: &App) -> Vec<Workspace>;
     fn sessions(&self, workspace: WorkspaceId, _cx: &App) -> Vec<Session>;
     fn status(&self, workspace: WorkspaceId, cx: &App) -> GitStatus;
@@ -149,6 +152,9 @@ impl ShellData for SampleData {
 /// A view handle, never a second writable catalog or service owner.
 pub struct LocalData(pub gpui::Entity<crate::WorkspaceOwner>);
 impl ShellData for LocalData {
+    fn local_owner(&self) -> Option<gpui::Entity<crate::WorkspaceOwner>> {
+        Some(self.0.clone())
+    }
     fn terminal_cwd(&self, workspace: WorkspaceId, cx: &App) -> Option<std::path::PathBuf> {
         self.0
             .read(cx)
@@ -195,7 +201,7 @@ impl ShellData for LocalData {
     fn status(&self, workspace: WorkspaceId, cx: &App) -> GitStatus {
         self.0.read(cx).model.status_view(workspace)
     }
-    fn files(&self, workspace: WorkspaceId, cx: &App) -> Vec<FileNode> {
-        SampleData.files(workspace, cx)
+    fn files(&self, _: WorkspaceId, _: &App) -> Vec<FileNode> {
+        vec![]
     }
 }

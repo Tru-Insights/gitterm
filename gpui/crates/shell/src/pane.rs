@@ -1,15 +1,12 @@
 use crate::{
-    data::{FileNode, SessionKind, ShellData, WorkspaceId},
+    data::{SessionKind, ShellData, WorkspaceId},
     theme::Palette,
 };
 use gitterm_gpui_chat::{ChatView, events::parse_fixture};
 use gitterm_terminal::{TerminalConfig, TerminalLaunch, TerminalView};
 use gpui::*;
-use gpui_component::{
-    button::{Button, ButtonVariants},
-    dock::{BasePanel, Panel, PanelEvent, PanelInfo, PanelState},
-};
-use std::{collections::HashSet, rc::Rc};
+use gpui_component::dock::{BasePanel, Panel, PanelEvent, PanelInfo, PanelState};
+use std::rc::Rc;
 
 pub const PANEL_NAME: &str = "GitTermShellPane";
 #[derive(Clone, Copy)]
@@ -43,7 +40,7 @@ pub struct Pane {
     workspace: WorkspaceId,
     data: Rc<dyn ShellData>,
     focus: FocusHandle,
-    expanded: HashSet<String>,
+    files: Option<Entity<crate::files_view::FilesView>>,
 }
 impl Pane {
     pub fn new(
@@ -114,9 +111,11 @@ impl Pane {
             terminal_title: None,
             terminal_cwd,
             workspace,
-            data,
+            data: data.clone(),
             focus: cx.focus_handle(),
-            expanded: HashSet::from(["src".into()]),
+            files: matches!(kind, PaneKind::Files).then(|| {
+                cx.new(|cx| crate::files_view::FilesView::new(workspace, data.clone(), cx))
+            }),
         }
     }
     pub(crate) fn status_view(&self, cx: &App) -> crate::data::GitStatus {
@@ -136,70 +135,6 @@ impl Pane {
         } else {
             self.title.clone()
         }
-    }
-    fn files(
-        &self,
-        nodes: Vec<FileNode>,
-        parent: &str,
-        depth: usize,
-        p: Palette,
-        cx: &Context<Self>,
-    ) -> Vec<AnyElement> {
-        let mut rows = vec![];
-        for node in nodes {
-            let path = if parent.is_empty() {
-                node.name.clone()
-            } else {
-                format!("{parent}/{}", node.name)
-            };
-            let directory = !node.children.is_empty();
-            let expanded = self.expanded.contains(&path);
-            let label = format!(
-                "{} {}",
-                if directory {
-                    if expanded { "⌄" } else { "›" }
-                } else {
-                    "·"
-                },
-                node.name
-            );
-            if directory {
-                let key = path.clone();
-                rows.push(
-                    Button::new(SharedString::from(path.clone()))
-                        .ghost()
-                        .label(label)
-                        .w_full()
-                        .accessibility_label(format!(
-                            "{} directory, {}",
-                            node.name,
-                            if expanded { "expanded" } else { "collapsed" }
-                        ))
-                        .pl(px(8. + depth as f32 * 16.))
-                        .justify_start()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if !this.expanded.remove(&key) {
-                                this.expanded.insert(key.clone());
-                            }
-                            cx.notify();
-                        }))
-                        .into_any_element(),
-                );
-            } else {
-                rows.push(
-                    div()
-                        .pl(px(16. + depth as f32 * 16.))
-                        .py_1()
-                        .text_color(rgb(p.muted))
-                        .child(label)
-                        .into_any_element(),
-                );
-            }
-            if directory && expanded {
-                rows.extend(self.files(node.children, &path, depth + 1, p, cx));
-            }
-        }
-        rows
     }
 }
 impl Focusable for Pane {
@@ -307,9 +242,16 @@ impl Render for Pane {
                             .child(div().text_color(rgb(p.muted)).child(group))
                     }))
             }
-            PaneContent::Files => body
-                .child(self.data.status(self.workspace, cx).repository)
-                .children(self.files(self.data.files(self.workspace, cx), "", 0, p, cx)),
+            PaneContent::Files => {
+                let folder = self
+                    .data
+                    .terminal_cwd(self.workspace, cx)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| self.data.status(self.workspace, cx).repository);
+                body.overflow_hidden()
+                    .child(folder)
+                    .child(div().flex_1().min_h_0().children(self.files.clone()))
+            }
         }
     }
 }
