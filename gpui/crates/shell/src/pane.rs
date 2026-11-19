@@ -9,12 +9,14 @@ use gpui_component::dock::{BasePanel, Panel, PanelEvent, PanelInfo, PanelState};
 use std::rc::Rc;
 
 pub const PANEL_NAME: &str = "GitTermShellPane";
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum PaneKind {
     Terminal,
+    CenterTerminal(std::path::PathBuf),
     Chat,
     Git,
     Files,
+    Review(Entity<gitterm_gpui_review::ReviewView>),
 }
 impl From<SessionKind> for PaneKind {
     fn from(kind: SessionKind) -> Self {
@@ -29,6 +31,7 @@ pub enum PaneContent {
     Chat(Entity<ChatView>),
     Git,
     Files,
+    Review(Entity<gitterm_gpui_review::ReviewView>),
     Error(String),
 }
 pub struct Pane {
@@ -36,11 +39,14 @@ pub struct Pane {
     pub title: String,
     pub content: PaneContent,
     terminal_title: Option<String>,
+    center_terminal: bool,
+    exited: bool,
     terminal_cwd: Option<std::path::PathBuf>,
     workspace: WorkspaceId,
     data: Rc<dyn ShellData>,
     focus: FocusHandle,
     files: Option<Entity<crate::files_view::FilesView>>,
+    _terminal_events: Option<Subscription>,
 }
 impl Pane {
     pub fn new(
@@ -52,10 +58,13 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let content = match kind {
-            PaneKind::Terminal => {
+        let content = match kind.clone() {
+            PaneKind::Terminal | PaneKind::CenterTerminal(_) => {
                 let launch = TerminalLaunch {
-                    cwd: data.terminal_cwd(workspace, cx).or_else(dirs::home_dir),
+                    cwd: match &kind {
+                        PaneKind::CenterTerminal(cwd) => Some(cwd.clone()),
+                        _ => data.terminal_cwd(workspace, cx).or_else(dirs::home_dir),
+                    },
                     ..Default::default()
                 };
                 // Headless fixtures must not run host rc/session-restore scripts.
@@ -70,11 +79,18 @@ impl Pane {
                 } else {
                     let pane = cx.weak_entity();
                     let cwd_pane = pane.clone();
+                    let exit_pane = pane.clone();
                     PaneContent::Terminal(cx.new(|cx| {
                         TerminalView::launch(launch, TerminalConfig::default(), cx)
                             .with_title_callback(move |_, cx, title| {
                                 let _ = pane.update(cx, |pane, cx| {
                                     pane.terminal_title = Some(title.to_string());
+                                    cx.notify();
+                                });
+                            })
+                            .with_exit_callback(move |_, cx| {
+                                _ = exit_pane.update(cx, |pane, cx| {
+                                    pane.exited = true;
                                     cx.notify();
                                 });
                             })
@@ -97,6 +113,7 @@ impl Pane {
             })),
             PaneKind::Git => PaneContent::Git,
             PaneKind::Files => PaneContent::Files,
+            PaneKind::Review(view) => PaneContent::Review(view),
         };
         let terminal_cwd = matches!(content, PaneContent::Terminal(_))
             .then(|| data.terminal_cwd(workspace, cx).or_else(dirs::home_dir))
@@ -104,11 +121,29 @@ impl Pane {
         if let PaneContent::Error(error) = &content {
             eprintln!("{error}");
         }
+        let terminal_events = if matches!(kind, PaneKind::CenterTerminal(_)) {
+            if let PaneContent::Terminal(view) = &content {
+                Some(cx.observe_in(view, window, |_, view, window, cx| {
+                    let view = view.clone();
+                    // Callbacks update this pane, so deliver after its observer releases it.
+                    window.defer(cx, move |window, cx| {
+                        view.update(cx, |view, cx| view.process_events(window, cx));
+                    });
+                }))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         Self {
+            _terminal_events: terminal_events,
             id,
             title,
             content,
             terminal_title: None,
+            center_terminal: matches!(kind, PaneKind::CenterTerminal(_)),
+            exited: false,
             terminal_cwd,
             workspace,
             data: data.clone(),
@@ -116,6 +151,11 @@ impl Pane {
             files: matches!(kind, PaneKind::Files).then(|| {
                 cx.new(|cx| crate::files_view::FilesView::new(workspace, data.clone(), cx))
             }),
+        }
+    }
+    pub(crate) fn close_terminal(&mut self, cx: &mut App) {
+        if let PaneContent::Terminal(view) = &self.content {
+            view.update(cx, |view, _| view.backend_mut().cancel());
         }
     }
     pub(crate) fn status_view(&self, cx: &App) -> crate::data::GitStatus {
@@ -128,6 +168,13 @@ impl Pane {
                 .as_deref()
                 .filter(|t| !t.is_empty())
                 .unwrap_or(&self.title);
+            if self.center_terminal {
+                return if self.exited {
+                    format!("{title} · Exited")
+                } else {
+                    title.to_string()
+                };
+            }
             match &self.terminal_cwd {
                 Some(cwd) => format!("{title} · {}", cwd.display()),
                 None => title.to_string(),
@@ -142,6 +189,7 @@ impl Focusable for Pane {
         match &self.content {
             PaneContent::Terminal(view) => view.read(cx).focus_handle().clone(),
             PaneContent::Chat(view) => view.focus_handle(cx),
+            PaneContent::Review(view) => view.focus_handle(cx),
             _ => self.focus.clone(),
         }
     }
@@ -200,6 +248,11 @@ impl Render for Pane {
                 .size_full()
                 .min_h_0()
                 .child(view.clone()),
+            PaneContent::Review(view) => div()
+                .id("review-pane")
+                .size_full()
+                .min_h_0()
+                .child(view.clone()),
             PaneContent::Error(error) => body.text_color(rgb(p.red)).child(error.clone()),
             PaneContent::Git => {
                 let status = self.status_view(cx);
@@ -228,7 +281,22 @@ impl Render for Pane {
                         } else {
                             "unstaged"
                         };
+                        let data = self.data.clone();
+                        let workspace = self.workspace;
+                        let selected = file.clone();
                         div()
+                            .id(SharedString::from(format!(
+                                "git-file-{group}-{}",
+                                file.path
+                            )))
+                            .cursor_pointer()
+                            .on_click(move |_, _, cx| {
+                                if let Some(owner) = data.local_owner() {
+                                    owner.update(cx, |owner, cx| {
+                                        owner.open_changed_file(workspace, selected.clone(), cx)
+                                    });
+                                }
+                            })
                             .flex()
                             .gap_2()
                             .py_1()

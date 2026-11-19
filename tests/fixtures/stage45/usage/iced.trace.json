@@ -1,0 +1,12 @@
+{
+  "failure": {
+    "error": "synthetic scan failure",
+    "old_report_retained": true,
+    "scanning": false
+  },
+  "stale_completion": {
+    "report": "Days7",
+    "rescanning": true,
+    "selected": "Days90"
+  }
+}

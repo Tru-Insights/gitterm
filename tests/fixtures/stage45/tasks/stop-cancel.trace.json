@@ -1,0 +1,17 @@
+{
+  "cancel": {
+    "prompt_gone": true,
+    "publishing": false,
+    "store_unchanged": true
+  },
+  "stop": {
+    "effects": [
+      "dirty",
+      "terminals"
+    ],
+    "lifecycle": "stopped",
+    "remaining_task_tabs": 0,
+    "selected": "fixture-task",
+    "worktree_kept": true
+  }
+}

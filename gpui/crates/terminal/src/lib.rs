@@ -25,3 +25,6 @@ pub use view::{TerminalConfig, TerminalView};
 
 #[cfg(test)]
 mod launch_tests;
+
+#[cfg(test)]
+mod tool_tests;

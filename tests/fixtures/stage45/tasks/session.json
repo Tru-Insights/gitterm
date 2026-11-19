@@ -1,0 +1,11 @@
+{
+  "task_session_id": "fixture-session",
+  "label": "Fixture",
+  "conversation": {
+    "backend": "codex",
+    "session_id": "fixture-conversation"
+  },
+  "objective_delivery": "delivered",
+  "created_at": "2000-01-01T00:03:00Z",
+  "updated_at": "2000-01-01T00:03:00Z"
+}

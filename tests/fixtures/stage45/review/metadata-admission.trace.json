@@ -1,0 +1,136 @@
+{
+  "files": [
+    {
+      "additions": 2001,
+      "identity_kind": "blob",
+      "omitted": false,
+      "path": "budget-00.rs",
+      "shown": 2000,
+      "status": "modified",
+      "truncated": true,
+      "zero_commit_identity": false
+    },
+    {
+      "additions": 2001,
+      "identity_kind": "blob",
+      "omitted": false,
+      "path": "budget-01.rs",
+      "shown": 2000,
+      "status": "modified",
+      "truncated": true,
+      "zero_commit_identity": false
+    },
+    {
+      "additions": 2001,
+      "identity_kind": "blob",
+      "omitted": false,
+      "path": "budget-02.rs",
+      "shown": 2000,
+      "status": "modified",
+      "truncated": true,
+      "zero_commit_identity": false
+    },
+    {
+      "additions": 2001,
+      "identity_kind": "blob",
+      "omitted": false,
+      "path": "budget-03.rs",
+      "shown": 2000,
+      "status": "modified",
+      "truncated": true,
+      "zero_commit_identity": false
+    },
+    {
+      "additions": 2001,
+      "identity_kind": "blob",
+      "omitted": false,
+      "path": "budget-04.rs",
+      "shown": 2000,
+      "status": "modified",
+      "truncated": true,
+      "zero_commit_identity": false
+    },
+    {
+      "additions": 2001,
+      "identity_kind": "blob",
+      "omitted": false,
+      "path": "budget-05.rs",
+      "shown": 2000,
+      "status": "modified",
+      "truncated": true,
+      "zero_commit_identity": false
+    },
+    {
+      "additions": 2001,
+      "identity_kind": "blob",
+      "omitted": false,
+      "path": "budget-06.rs",
+      "shown": 2000,
+      "status": "modified",
+      "truncated": true,
+      "zero_commit_identity": false
+    },
+    {
+      "additions": 2001,
+      "identity_kind": "blob",
+      "omitted": false,
+      "path": "budget-07.rs",
+      "shown": 2000,
+      "status": "modified",
+      "truncated": true,
+      "zero_commit_identity": false
+    },
+    {
+      "additions": 2001,
+      "identity_kind": "blob",
+      "omitted": false,
+      "path": "budget-08.rs",
+      "shown": 2000,
+      "status": "modified",
+      "truncated": true,
+      "zero_commit_identity": false
+    },
+    {
+      "additions": 2001,
+      "identity_kind": "blob",
+      "omitted": false,
+      "path": "budget-09.rs",
+      "shown": 2000,
+      "status": "modified",
+      "truncated": true,
+      "zero_commit_identity": false
+    },
+    {
+      "additions": 2001,
+      "identity_kind": "blob",
+      "omitted": true,
+      "path": "budget-10.rs",
+      "shown": 0,
+      "status": "modified",
+      "truncated": false,
+      "zero_commit_identity": false
+    },
+    {
+      "additions": 0,
+      "identity_kind": "blob",
+      "omitted": false,
+      "path": "mode.sh",
+      "shown": 0,
+      "status": "modified",
+      "truncated": false,
+      "zero_commit_identity": false
+    },
+    {
+      "additions": 1,
+      "identity_kind": "commit",
+      "omitted": true,
+      "path": "module",
+      "shown": 0,
+      "status": "modified",
+      "truncated": false,
+      "zero_commit_identity": false
+    }
+  ],
+  "total_files": 13,
+  "unstaged_submodule_identity": "commit:0000000000000000000000000000000000000000"
+}

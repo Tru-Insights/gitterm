@@ -1,0 +1,4 @@
+{
+  "initial": {"a.rs":"fn old() {}\n","old.rs":"fn rename() {}\n","gone.txt":"gone\n","binary.dat":"\u0000before"},
+  "dirty": {"a.rs":"fn changed() {}\n","binary.dat":"\u0000after","untracked.txt":"new\n"}
+}

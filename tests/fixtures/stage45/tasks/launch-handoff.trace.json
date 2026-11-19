@@ -1,0 +1,66 @@
+[
+  {
+    "command": "launch missing",
+    "error": "Task absent is not available"
+  },
+  {
+    "command": "launch invalid preset",
+    "error": "The selected agent preset is unavailable"
+  },
+  {
+    "command": "launch unprepared",
+    "error": "Task Synthetic task has no prepared worktree to resume"
+  },
+  {
+    "command": "launch missing worktree",
+    "error": "Task Synthetic task worktree is not ready at <fixture>/missing"
+  },
+  {
+    "command": "launch remote",
+    "error": "Remote task sessions require the later remote-executor slice"
+  },
+  {
+    "command": "queue launch",
+    "harness": {
+      "kind": {
+        "kind": "terminal_preset",
+        "preset_name": "Codex"
+      }
+    },
+    "lifecycle": "queued",
+    "origin": "Agent",
+    "override": false,
+    "position": 1,
+    "queue_len": 1
+  },
+  {
+    "command": "queue launch",
+    "harness": {
+      "kind": {
+        "kind": "terminal_preset",
+        "preset_name": "Codex"
+      }
+    },
+    "lifecycle": "queued",
+    "origin": "User",
+    "override": true,
+    "position": 1,
+    "queue_len": 1
+  },
+  {
+    "ack": "progress",
+    "command": "handoff",
+    "delegation_id": null,
+    "saved_decisions": [
+      "pin"
+    ],
+    "saved_summary": "Synthetic progress",
+    "writer": null
+  },
+  {
+    "ack": false,
+    "command": "handoff failed store",
+    "error_has_operation_and_path": true,
+    "memory_unchanged": true
+  }
+]

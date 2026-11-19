@@ -1,0 +1,9 @@
+{
+  "home/docs/note.md": "# Synthetic note\n",
+  "home/docs/.hidden/secret.md": "# Hidden fixture\n",
+  "repo/.plans/plan.md": "# Synthetic plan\n",
+  "repo/docs/DESIGN.md": "# Synthetic design\n",
+  "repo/docs/ordinary.md": "# Written document\n",
+  "repo/docs/unreferenced.md": "# Not listed\n",
+  "scratch/private.md": "# Scratch fixture\n"
+}

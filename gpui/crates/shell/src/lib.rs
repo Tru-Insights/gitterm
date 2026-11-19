@@ -1,6 +1,8 @@
 #![cfg(target_os = "macos")]
 extern crate gpui_kit as gpui;
 
+#[cfg(test)]
+mod center_tests;
 pub mod data;
 mod dialogs;
 pub mod files;
@@ -8,6 +10,7 @@ mod files_view;
 mod layout;
 mod owner;
 mod pane;
+mod review_reload;
 mod theme;
 pub mod workspace_config;
 pub mod workspace_status;
@@ -53,7 +56,7 @@ struct SelectSession {
 struct SelectWorkspace {
     index: usize,
 }
-actions!(gitterm_shell, [ShowShortcuts]);
+actions!(gitterm_shell, [ShowShortcuts, NewTerminal]);
 
 struct WorkspaceDock {
     workspace: Workspace,
@@ -95,6 +98,10 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Result<Self> {
         gitterm_gpui_chat::init(cx);
+        gitterm_gpui_review::init(cx);
+        if local {
+            cx.bind_keys([KeyBinding::new("cmd-t", NewTerminal, Some("GitTermShell"))]);
+        }
         let catalog = data.workspaces(cx);
         if let Some(first) = catalog.first() {
             owner.update(cx, |owner, cx| {
@@ -145,6 +152,11 @@ impl Shell {
         for state in &mut workspaces {
             load_workspace_layout(state, window, cx)?;
             subscriptions.push(subscribe_dock(state, cx));
+            if local {
+                for pane in state.panes.values() {
+                    subscriptions.push(cx.observe(pane, |_, _, cx| cx.notify()));
+                }
+            }
         }
         subscriptions.push(cx.observe(&owner, |this, _, cx| {
             for workspace in &this.workspaces {
@@ -154,6 +166,13 @@ impl Shell {
             }
             cx.notify();
         }));
+        subscriptions.push(cx.subscribe_in(
+            &owner,
+            window,
+            |this, _, event: &FileOpen, window, cx| {
+                this.open_review(event, window, cx);
+            },
+        ));
         if local {
             owner.update(cx, |owner, cx| {
                 owner.dispatch(Intent::Opened, Instant::now(), cx)
@@ -169,6 +188,69 @@ impl Shell {
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
         })
+    }
+    fn open_review(&mut self, event: &FileOpen, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(file) = &event.changed else { return };
+        if !self.local {
+            return;
+        }
+        let Some(state) = self
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace.id == event.workspace)
+        else {
+            return;
+        };
+        let id = format!("workspace-{}-review", state.workspace.layout_key);
+        let mut created = false;
+        let pane = state
+            .panes
+            .entry(id.clone())
+            .or_insert_with(|| {
+                created = true;
+                let review = cx
+                    .new(|cx| gitterm_gpui_review::ReviewView::new(Default::default(), window, cx));
+                self.owner.update(cx, |owner, _| {
+                    owner.reviews.insert(event.workspace, review.clone());
+                });
+                let pane = cx.new(|cx| {
+                    Pane::new(
+                        id.clone(),
+                        "Review".into(),
+                        PaneKind::Review(review),
+                        event.workspace,
+                        self.data.clone(),
+                        window,
+                        cx,
+                    )
+                });
+                self.registry
+                    .borrow_mut()
+                    .insert(id.clone(), pane.downgrade());
+                pane
+            })
+            .clone();
+        let pane::PaneContent::Review(review) = &pane.read(cx).content else {
+            unreachable!()
+        };
+        let review = review.clone();
+        use gitterm_gpui_review::model::Group;
+        let group = if file.staged {
+            Group::Staged
+        } else if file.status == "??" {
+            Group::Untracked
+        } else {
+            Group::Unstaged
+        };
+        review.update(cx, |review, cx| {
+            review.select_file((group, file.path.clone()), cx)
+        });
+        if created || review.read(cx).model().error.is_some() {
+            self.owner
+                .update(cx, |owner, cx| owner.reload_review(event.workspace, cx));
+        }
+        // Use the event's workspace even if selection changed before delivery.
+        self.show_workspace_pane(event.workspace, &id, window, cx);
     }
     fn add_folder_button(&self, cx: &Context<Self>) -> Button {
         Button::new("add-folder")
@@ -255,6 +337,10 @@ impl Shell {
             );
             load_workspace_layout(&mut state, window, cx)?;
             self._subscriptions.push(subscribe_dock(&state, cx));
+            for pane in state.panes.values() {
+                self._subscriptions
+                    .push(cx.observe(pane, |_, _, cx| cx.notify()));
+            }
             self.workspaces.push(state);
         }
         self.sync_git_visibility(false, cx);
@@ -267,9 +353,24 @@ impl Shell {
             .workspaces
             .iter()
             .find(|w| Some(w.workspace.id) == self.active_workspace(cx))
-            .is_some_and(|w| git_visible(w, cx));
-        self.owner
-            .update(cx, |owner, cx| owner.set_git_visible(visible, enter, cx));
+            .is_some_and(|w| pane_visible(w, "git", cx));
+        let reviews: Vec<_> = self
+            .workspaces
+            .iter()
+            .map(|w| {
+                (
+                    w.workspace.id,
+                    Some(w.workspace.id) == self.active_workspace(cx)
+                        && pane_visible(w, "review", cx),
+                )
+            })
+            .collect();
+        self.owner.update(cx, |owner, cx| {
+            owner.set_git_visible(visible, enter, cx);
+            for (workspace, visible) in reviews {
+                owner.set_review_visible(workspace, visible, cx);
+            }
+        });
     }
     fn active_workspace(&self, cx: &App) -> Option<WorkspaceId> {
         self.owner.read(cx).model.active()
@@ -305,6 +406,66 @@ impl Shell {
             self.show_pane(&session_pane_id(id), window, cx);
         }
     }
+    fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.local || self.workspaces.is_empty() {
+            return;
+        }
+        let used: HashSet<_> = self
+            .workspaces
+            .iter()
+            .flat_map(|w| w.sessions.iter().map(|s| s.id.0))
+            .collect();
+        let active = self.active_workspace(cx);
+        let state = self
+            .workspaces
+            .iter_mut()
+            .find(|w| Some(w.workspace.id) == active)
+            .unwrap();
+        let cwd = self
+            .data
+            .terminal_cwd(state.workspace.id, cx)
+            .expect("local workspace folder");
+        let mut id = layout::stable_path_hash(&cwd);
+        while used.contains(&id) {
+            id = id.wrapping_add(1);
+        }
+        let title = cwd
+            .file_name()
+            .unwrap_or(cwd.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        let pane_id = session_pane_id(SessionId(id));
+        let pane = cx.new(|cx| {
+            Pane::new(
+                pane_id.clone(),
+                title.clone(),
+                PaneKind::CenterTerminal(cwd.clone()),
+                state.workspace.id,
+                self.data.clone(),
+                window,
+                cx,
+            )
+        });
+        self._subscriptions
+            .push(cx.observe(&pane, |_, _, cx| cx.notify()));
+        self.registry
+            .borrow_mut()
+            .insert(pane_id.clone(), pane.downgrade());
+        state.panes.insert(pane_id.clone(), pane);
+        state.sessions.push(Session {
+            id: SessionId(id),
+            title,
+            kind: data::SessionKind::Terminal,
+        });
+        state
+            .store
+            .terminals
+            .as_mut()
+            .expect("local sessions")
+            .push(layout::TerminalSession { id, cwd });
+        state.active_session = Some(SessionId(id));
+        self.show_pane(&pane_id, window, cx);
+    }
     fn close_session(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<Self>) {
         let active = self.active_workspace(cx);
         let state = self
@@ -313,6 +474,11 @@ impl Shell {
             .find(|state| Some(state.workspace.id) == active)
             .expect("active workspace exists");
         if let Some(pane) = state.panes.remove(&session_pane_id(id)) {
+            pane.update(cx, |pane, cx| pane.close_terminal(cx));
+            self.registry.borrow_mut().remove(&session_pane_id(id));
+            if let Some(terminals) = &mut state.store.terminals {
+                terminals.retain(|terminal| terminal.id != id.0);
+            }
             state.sessions.retain(|session| session.id != id);
             state
                 .dock
@@ -325,7 +491,19 @@ impl Shell {
         }
     }
     fn show_pane(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let state = self.active(cx);
+        let workspace = self.active(cx).workspace.id;
+        self.show_workspace_pane(workspace, id, window, cx);
+    }
+    fn show_workspace_pane(
+        &mut self,
+        workspace: WorkspaceId,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.workspaces.iter().find(|w| w.workspace.id == workspace) else {
+            return;
+        };
         let Some(pane) = state.panes.get(id).cloned() else {
             return;
         };
@@ -389,6 +567,33 @@ fn load_workspace_layout(
     } else {
         default_layout(state, window, cx);
     }
+    if state.store.terminals.is_some() {
+        for session in &state.sessions {
+            let pane = state.panes[&session_pane_id(session.id)].clone();
+            state.dock.update(cx, |dock, cx| {
+                if dock.panel(PanelId::from(pane.entity_id())).is_none() {
+                    dock.add_panel_view(
+                        panel_handle(pane),
+                        DockPlacement::Center,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+            });
+        }
+        let run = state.panes[&format!("workspace-{}-run", state.workspace.layout_key)].clone();
+        state.dock.update(cx, |dock, cx| {
+            if dock.panel(PanelId::from(run.entity_id())).is_none() {
+                dock.add_panel_view(panel_handle(run), DockPlacement::Bottom, None, window, cx);
+            }
+        });
+        if !state.store.is_refused()
+            && let Err(error) = state.store.save(&state.dock.read(cx).dump(cx))
+        {
+            state.error = Some(format!("{error:#}"));
+        }
+    }
     Ok(())
 }
 fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscription {
@@ -399,6 +604,50 @@ fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscriptio
             .iter_mut()
             .find(|w| w.workspace.id == id)
             .expect("owned workspace");
+        if let Some(terminals) = &mut state.store.terminals {
+            let removed: HashSet<_> = state
+                .sessions
+                .iter()
+                .filter(|session| {
+                    let pane = &state.panes[&session_pane_id(session.id)];
+                    dock.read(cx)
+                        .panel(PanelId::from(pane.entity_id()))
+                        .is_none()
+                })
+                .map(|session| session.id.0)
+                .collect();
+            for id in &removed {
+                let id = session_pane_id(SessionId(*id));
+                if let Some(pane) = state.panes.remove(&id) {
+                    pane.update(cx, |pane, cx| pane.close_terminal(cx));
+                }
+                this.registry.borrow_mut().remove(&id);
+            }
+            terminals.retain(|session| !removed.contains(&session.id));
+            let layout = dock.read(cx).dump(cx);
+            let order = layout::pane_order(&layout);
+            terminals.sort_by_key(|session| {
+                order
+                    .iter()
+                    .position(|id| *id == session_pane_id(SessionId(session.id)))
+                    .unwrap_or(usize::MAX)
+            });
+            state.sessions.sort_by_key(|session| {
+                terminals
+                    .iter()
+                    .position(|t| t.id == session.id.0)
+                    .unwrap_or(usize::MAX)
+            });
+            state
+                .sessions
+                .retain(|session| !removed.contains(&session.id.0));
+            if state
+                .active_session
+                .is_some_and(|id| removed.contains(&id.0))
+            {
+                state.active_session = state.sessions.first().map(|s| s.id);
+            }
+        }
         if !state.store.is_refused()
             && let Err(e) = state.store.save(&dock.read(cx).dump(cx))
         {
@@ -410,7 +659,7 @@ fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscriptio
         cx.notify();
     })
 }
-fn git_visible(state: &WorkspaceDock, cx: &App) -> bool {
+fn pane_visible(state: &WorkspaceDock, kind: &str, cx: &App) -> bool {
     use gpui_component::dock::{PanelInfo, PanelState};
     fn visible(node: &PanelState, id: &str) -> bool {
         match &node.info {
@@ -423,7 +672,7 @@ fn git_visible(state: &WorkspaceDock, cx: &App) -> bool {
         }
     }
     let layout = state.dock.read(cx).dump(cx);
-    let id = format!("workspace-{}-git", state.workspace.layout_key);
+    let id = format!("workspace-{}-{kind}", state.workspace.layout_key);
     visible(&layout.center, &id)
         || [&layout.left_dock, &layout.right_dock, &layout.bottom_dock]
             .into_iter()
@@ -438,7 +687,46 @@ fn build_workspace(
     window: &mut Window,
     cx: &mut Context<Shell>,
 ) -> Result<WorkspaceDock> {
-    let sessions = data.sessions(workspace.id, cx);
+    let mut store = LayoutStore::new(layout::workspace_layout_path(
+        config_dir,
+        &workspace.layout_key,
+    ));
+    let local = data.local_owner().is_some();
+    let sessions = if local {
+        let restored = store.load_terminals().unwrap_or_else(|error| {
+            eprintln!("load terminal sessions {}: {error:#}", store.path.display());
+            None
+        });
+        let cwd = data
+            .terminal_cwd(workspace.id, cx)
+            .expect("local workspace folder");
+        let mut terminals = restored.unwrap_or_else(|| {
+            vec![layout::TerminalSession {
+                // The old single dock terminal used the bare folder hash.
+                id: layout::stable_path_hash(&cwd).wrapping_add(1),
+                cwd,
+            }]
+        });
+        // An identity already owned elsewhere cannot construct a second pane.
+        terminals.retain(|session| !session_ids.contains(&session.id));
+        let sessions = terminals
+            .iter()
+            .map(|terminal| Session {
+                id: SessionId(terminal.id),
+                title: terminal
+                    .cwd
+                    .file_name()
+                    .unwrap_or(terminal.cwd.as_os_str())
+                    .to_string_lossy()
+                    .into_owned(),
+                kind: data::SessionKind::Terminal,
+            })
+            .collect();
+        store.terminals = Some(terminals);
+        sessions
+    } else {
+        data.sessions(workspace.id, cx)
+    };
     let mut panes = HashMap::new();
     for session in &sessions {
         ensure!(
@@ -451,7 +739,18 @@ fn build_workspace(
             Pane::new(
                 id.clone(),
                 session.title.clone(),
-                session.kind.into(),
+                if let Some(terminals) = &store.terminals {
+                    PaneKind::CenterTerminal(
+                        terminals
+                            .iter()
+                            .find(|t| t.id == session.id.0)
+                            .unwrap()
+                            .cwd
+                            .clone(),
+                    )
+                } else {
+                    session.kind.into()
+                },
                 workspace.id,
                 data.clone(),
                 window,
@@ -459,6 +758,23 @@ fn build_workspace(
             )
         });
         panes.insert(id, pane);
+    }
+    if local {
+        let id = format!("workspace-{}-run", workspace.layout_key);
+        panes.insert(
+            id.clone(),
+            cx.new(|cx| {
+                Pane::new(
+                    id,
+                    "Run terminal".into(),
+                    PaneKind::Terminal,
+                    workspace.id,
+                    data.clone(),
+                    window,
+                    cx,
+                )
+            }),
+        );
     }
     for (name, title, kind) in [
         ("git", "Git status", PaneKind::Git),
@@ -486,10 +802,7 @@ fn build_workspace(
     skin.set_close_button_visible(true, cx);
     Ok(WorkspaceDock {
         active_session: sessions.first().map(|s| s.id),
-        store: LayoutStore::new(layout::workspace_layout_path(
-            config_dir,
-            &workspace.layout_key,
-        )),
+        store,
         workspace,
         sessions,
         panes,
@@ -507,12 +820,17 @@ fn default_layout(state: &WorkspaceDock, window: &mut Window, cx: &mut App) {
     let mut has_terminal = false;
     for session in &state.sessions {
         let pane = panel_handle(state.panes[&session_pane_id(session.id)].clone());
-        if session.kind == data::SessionKind::Terminal {
+        if session.kind == data::SessionKind::Terminal && state.store.terminals.is_none() {
             bottom = bottom.panel_view(pane, cx);
             has_terminal = true;
         } else {
             center = center.panel_view(pane, cx);
         }
+    }
+    if state.store.terminals.is_some() {
+        let run = state.panes[&format!("workspace-{}-run", state.workspace.layout_key)].clone();
+        bottom = bottom.panel_view(panel_handle(run), cx);
+        has_terminal = true;
     }
     let git = state.panes[&format!("workspace-{}-git", state.workspace.layout_key)].clone();
     let files = state.panes[&format!("workspace-{}-files", state.workspace.layout_key)].clone();
@@ -592,14 +910,22 @@ impl Render for Shell {
             })
             .children(self.workspaces.iter().enumerate().map(|(index, state)| {
                 let workspace = &state.workspace;
-                let count = self.data.status(workspace.id, cx).files.len();
+                let status = self.data.status(workspace.id, cx);
+                let count = status.files.len();
+                // Not polled yet: don't show the placeholder "0 main".
+                let (count_label, branch_label) = if status.checked {
+                    (count.to_string(), status.branch.clone())
+                } else {
+                    (String::new(), "Not checked yet".to_string())
+                };
                 Button::new(("workspace", index))
                     .ghost()
                     .selected(Some(workspace.id) == self.active_workspace(cx))
-                    .accessibility_label(format!(
-                        "{}, {}, {} changes",
-                        workspace.name, workspace.status, count
-                    ))
+                    .accessibility_label(if status.checked {
+                        format!("{}, {}, {} changes", workspace.name, status.branch, count)
+                    } else {
+                        format!("{}, not checked yet", workspace.name)
+                    })
                     .h(px(62.))
                     .w_full()
                     .flex()
@@ -617,13 +943,13 @@ impl Render for Shell {
                             .flex()
                             .gap_2()
                             .child(workspace.name.clone())
-                            .child(div().text_color(rgb(p.blue)).child(count.to_string())),
+                            .child(div().text_color(rgb(p.blue)).child(count_label)),
                     )
                     .child(
                         div()
                             .text_size(px(11.))
                             .text_color(rgb(p.muted))
-                            .child(self.data.status(workspace.id, cx).branch),
+                            .child(branch_label),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.select_workspace(index, window, cx)
@@ -679,7 +1005,13 @@ impl Render for Shell {
             .underline()
             .selected_index(active_session)
             .h(px(38.))
-            .children(state.sessions.iter().map(|s| Tab::from(s.title.clone())))
+            .children(state.sessions.iter().map(|s| {
+                Tab::from(if self.local {
+                    state.panes[&session_pane_id(s.id)].read(cx).tab_title()
+                } else {
+                    s.title.clone()
+                })
+            }))
             .on_click(cx.listener(|this, index: &usize, window, cx| {
                 this.select_session(*index, window, cx)
             }));
@@ -758,6 +1090,17 @@ impl Render for Shell {
                 .h(px(38.))
                 .bg(rgb(p.mantle))
                 .child(div().flex_1().min_w_0().child(tabs))
+                .when(self.local, |bar| {
+                    bar.child(
+                        Button::new("new-terminal")
+                            .ghost()
+                            .label("+")
+                            .tooltip("New terminal · ⌘T")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.new_terminal(window, cx)),
+                            ),
+                    )
+                })
                 .child(more),
         );
         if let Some(error) = &self.owner.read(cx).error {
@@ -778,6 +1121,7 @@ impl Render for Shell {
                     this.select_workspace(a.index, w, cx)
                 }),
             )
+            .on_action(cx.listener(|this, _: &NewTerminal, w, cx| this.new_terminal(w, cx)))
             .on_action(cx.listener(|_, _: &ShowShortcuts, w, cx| dialogs::shortcuts(w, cx)))
             .flex()
             .font_family(".SystemUIFont")
@@ -1008,7 +1352,7 @@ mod tests {
                     terminal
                         .read(cx)
                         .tab_title()
-                        .ends_with(&folder.display().to_string()),
+                        .contains(folder.file_name().unwrap().to_str().unwrap()),
                     "{}",
                     terminal.read(cx).tab_title()
                 );
