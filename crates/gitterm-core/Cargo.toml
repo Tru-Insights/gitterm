@@ -6,7 +6,9 @@ description = "Plain workspace and Git status types and workspace ordering for G
 
 [features]
 default = []
-runtime = ["dep:tokio", "dep:git2", "dep:libc"]
+runtime = ["dep:tokio", "dep:git2", "dep:libc", "dep:warp"]
+
+excalidraw = []
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -18,5 +20,9 @@ libc = { version = "0.2", optional = true }
 tokio = { version = "1", optional = true, features = ["rt", "sync", "process", "io-util", "time"] }
 git2 = { version = "0.19", optional = true }
 
+pulldown-cmark = "0.12"
+warp = { version = "0.3", optional = true }
+
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

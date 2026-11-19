@@ -2267,12 +2267,14 @@ dependencies = [
  "chrono",
  "git2",
  "libc",
+ "pulldown-cmark",
  "schemars",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "uuid",
+ "warp",
 ]
 
 [[package]]

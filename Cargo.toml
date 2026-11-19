@@ -84,7 +84,7 @@ objc2 = "0.5"
 [features]
 default = ["stt"]
 stt = ["whisper-rs", "cpal"]
-excalidraw = []
+excalidraw = ["gitterm-core/excalidraw"]
 
 [package.metadata.bundle]
 name = "GitTerm V6"
