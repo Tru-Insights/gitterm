@@ -7419,7 +7419,6 @@ pub enum Event {
     BottomTerminalClicked(usize),
     GitStatusLoaded(GitStatusSnapshot),
     StatusJobOutcome(gitterm_core::runtime::StatusOutcome),
-    StatusRuntimeStopped,
     GitWorktreesLoaded(GitWorktreesSnapshot),
     /// A repository's worktree list for chat-tab worktree following
     /// (TRU-146): the repo root it was listed from, and the list.
@@ -30371,12 +30370,9 @@ fi
                 self.log_server_state.shutdown.notify_one();
                 // Clean up instance-specific configuration
                 config::cleanup_instance_config();
-                let runtime = self.status_jobs.runtime.clone();
-                return Task::perform(async move { runtime.teardown().await }, |_| {
-                    Event::StatusRuntimeStopped
-                });
-            }
-            Event::StatusRuntimeStopped => {
+                // Quit must not wait on a slow or hung git: cancel and discard
+                // status jobs (as before the runtime existed) and close now.
+                self.status_jobs.runtime.close();
                 return iced::window::oldest().then(|opt_id| {
                     if let Some(id) = opt_id {
                         iced::window::close(id)
