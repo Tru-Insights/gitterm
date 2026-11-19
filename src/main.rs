@@ -4935,6 +4935,7 @@ pub struct PendingTaskLaunch {
     issue_key: Option<String>,
     stopping_boundary: StoppingBoundary,
     resolved_worktree_path: Option<PathBuf>,
+    base_resolution_note: Option<String>,
     request: PrepareTaskWorktreeRequest,
     control_reply: Option<TaskControlReply>,
     /// `session_uid` of the tab whose MCP call created this task, recorded
@@ -13371,6 +13372,7 @@ impl App {
             issue_key,
             stopping_boundary,
             resolved_worktree_path: None,
+            base_resolution_note: None,
             request,
             control_reply: Some(reply),
             creator_session_id: caller,
@@ -19063,6 +19065,7 @@ impl App {
                         options,
                     },
                     reply,
+                    None,
                 )
             }
             Err(error) => {
@@ -19138,6 +19141,7 @@ impl App {
         task_id: &str,
         worker: PendingWorker,
         reply: TaskControlReply,
+        base_resolution_note: Option<String>,
     ) -> Task<Event> {
         let Some(task) = self
             .task_store
@@ -19237,6 +19241,7 @@ impl App {
             "role": worker.choice.role.label(),
             "queued": queued,
             "queue_position": queue_position,
+            "base_note": base_resolution_note,
             "detail": if queued {
                 "The worker is queued until plan limits and concurrency permit it. Do not wait or poll: its report appears as a card in the requesting chat tab, and delegation_get reads it."
             } else {
@@ -28524,6 +28529,7 @@ fi
                     issue_key,
                     stopping_boundary: form.stopping_boundary,
                     resolved_worktree_path: None,
+                    base_resolution_note: None,
                     request: request.clone(),
                     control_reply: None,
                     creator_session_id: None,
@@ -28554,6 +28560,7 @@ fi
                     }
                 };
                 pending.workspace_dir = resolved.repository.top_level.clone();
+                pending.base_resolution_note = resolved.note.clone();
                 let timestamp = chrono::Utc::now().to_rfc3339();
                 let mut record = TaskRecord::new_draft(
                     NewTaskRecord {
@@ -28648,6 +28655,7 @@ fi
                                     &pending.task_id,
                                     worker,
                                     reply.clone(),
+                                    pending.base_resolution_note.clone(),
                                 );
                             }
                             if let Some(reply) = &pending.control_reply {
@@ -28662,7 +28670,15 @@ fi
                                             pending.task_id
                                         )
                                     })
-                                    .and_then(|task| self.task_control_value(&task));
+                                    .and_then(|task| {
+                                        self.task_control_value(&task).map(|mut value| {
+                                            if let Some(note) = &pending.base_resolution_note {
+                                                value["detail"] =
+                                                    serde_json::Value::String(note.clone());
+                                            }
+                                            value
+                                        })
+                                    });
                                 reply.send(result);
                                 return Task::none();
                             }
