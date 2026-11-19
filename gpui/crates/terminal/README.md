@@ -121,11 +121,13 @@ callbacks run, paint a banner, and reject subsequent input. The dead child's PTY
 tail is drained with a 1 MiB ceiling so descendants retaining the slave cannot
 keep a completed reader alive indefinitely.
 
-`TerminalView::with_url_opener` installs app policy. Holding Cmd over a regex
-match shows a pointer; Cmd-click takes precedence over mouse reporting and
-selection and calls that callback. Releasing Cmd or leaving the view clears the
+`TerminalView::with_url_opener` installs app policy. Holding Cmd over an OSC 8
+label or regex URL match shows a pointer; Cmd-click takes precedence over mouse
+reporting and selection and calls that callback. Releasing Cmd or leaving the view clears the
 hover. A busy parser clears stale link state; click never opens an old hover
-location. The terminal crate itself never launches a URL or process opener.
+location. OSC 8 destinations take precedence over label text; highlights include
+wrapped and wide cells within the visible viewport. The terminal crate itself
+never launches a URL or process opener.
 
 ## TRU-287: find and service jobs
 
@@ -215,3 +217,22 @@ foreground rendering. A hidden pane retains the latest report until shown.
 The shell displays these reports in its dock pane tab. Terminal and chat find
 shortcuts remain scoped to their focused view; the shell does not install a
 competing global find handler.
+
+## TRU-274: real-tool PTY gate
+
+`tool_tests.rs` and `tool_view_tests.rs` exercise the production `TerminalLaunch`
+backend with isolated homes and temporary files/repos. They poll rendered grids
+and modes for vim edit/write/quit, bracketed paste, SGR mouse, alternate screen
+restoration, less and git log/diff paging, top/htop resize/quit, sustained output
+resize, Unicode and SGR colors, OSC 8 links, title/cwd callbacks, and shell exit.
+Close tests assert one callback, joined reader ownership and a reaped child PID.
+Missing executables print a runtime `SKIP` reason; a sandbox denying top process
+inspection is also reported explicitly. New probes use deadlines and state
+polling, with no fixed readiness delays or OS input automation.
+
+OSC 8 activation previously ignored cell hyperlink metadata and only recognized
+URL-shaped text. It now resolves the explicit target before the regex fallback,
+including wide/wrapped labels, and keeps opening policy in the app callback.
+The headless gate does not certify native IME, font rasterization, accessibility,
+Retina behavior or interactive feel. Verification and per-behavior test names
+are recorded in [evidence/tru274-checks.txt](evidence/tru274-checks.txt).

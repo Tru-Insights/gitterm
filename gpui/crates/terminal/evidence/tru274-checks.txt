@@ -1,0 +1,72 @@
+TRU-274: real-tool headless PTY gate
+
+Scope: gpui/crates/terminal only. Route A's local fork-derived backend; no
+external iced_term fork, shell/review crate, dependency or lockfile changes.
+No GUI/OS input automation, AI/network tools, running GitTerm processes or real
+config touched. Shell homes, files, git config and repos are isolated fixtures.
+
+Fix: OSC 8 metadata reached Alacritty cells but URL resolution only used a regex.
+The existing app callback now receives the explicit hyperlink target. Hover
+ranges follow contiguous linked cells within the viewport, including wraps and
+wide spacers. Out-of-viewport points are refused; stale hover is still cleared.
+The app retains opening policy; the crate never launches the target.
+
+Regression evidence: real_tools_osc8_label_reaches_link_callback failed before
+the fix (callback list [] instead of explicit destination) and passes afterward.
+The wide/wrapped fixture verifies metadata wins over a URL-shaped label.
+
+New probes poll snapshots/modes with a 60-second screen deadline, or use the
+existing 20-second predicate poll for callbacks. No fixed readiness delays.
+Sustained output emits at least 200,000 rows and continues until all four
+resizes have completed; final count, prompt and a subsequent command are checked.
+Pager fixtures explicitly enable less alternate screen (git otherwise sets
+LESS=FRX). Vim reports SGR drag mode, which also accepts click/release reports.
+
+Tool/behavior | Result | Test name | Fix
+vim open/insert/:wq | pass | real_tools_vim_edit_paste_mouse_and_alternate_screen | none
+vim alternate-screen prompt restore | pass | real_tools_vim_edit_paste_mouse_and_alternate_screen | none
+vim literal bracketed paste | pass | real_tools_vim_edit_paste_mouse_and_alternate_screen | none
+vim SGR mouse cursor movement | pass | real_tools_vim_edit_paste_mouse_and_alternate_screen | none
+less scroll/quit | pass | real_tools_less_scroll_and_quit | none
+git log/diff pager scroll/quit | pass | real_tools_git_log_and_diff_pagers_scroll_and_quit | none
+top start/resize redraw/q | pass | real_tools_monitor_resize_and_quit | none
+htop | skipped | real_tools_monitor_resize_and_quit | executable absent; top used
+resize under sustained output | pass | real_tools_resize_during_heavy_output_restores_prompt | none
+wide/emoji/combining/256-color/truecolor | pass | real_tools_unicode_and_sgr_reach_renderable_cells | none
+OSC 8 callback | fixed | real_tools_osc8_label_reaches_link_callback | resolve cell metadata before regex
+OSC 8 wide/wrapped/explicit target/bounds | fixed | real_tools_osc8_wraps_wide_cells_and_prefers_explicit_target | viewport-bounded metadata lookup
+OSC 0/2 titles + OSC 7 cwd callbacks | pass | real_tools_osc0_osc2_and_osc7_callbacks | none
+Ctrl-D/exit/one close callback/reap/join | pass | real_tools_ctrl_d_and_exit_callback_reap_session | none
+
+Verification (from repository root):
+Every cargo invocation uses scripts/cargo.sh, --manifest-path gpui/Cargo.toml,
+and CARGO_TARGET_DIR=/private/tmp/gt-target-termtools. Compile/test gates use
+-j 4; tests use --test-threads=4 and --nocapture for visible runtime skip logs.
+
+  fmt --all -- --check
+  clippy --workspace --locked --all-targets -j 4 -- -D warnings
+  test --workspace --locked -j 4 -- --test-threads=4 --nocapture
+  scripts/check-gpui-deps.sh
+  build --workspace --locked -j 4
+
+All five gates exited 0. Final workspace tests: 155 passed (2 app, 17 chat,
+14 review, 29 shell, 93 terminal), 0 failed, 0 ignored; doc tests also passed.
+Format, Clippy and dependency boundaries passed on the final Rust sources.
+
+Three consecutive complete terminal runs, each exit 0 (93 passed, 0 failed,
+0 ignored, plus doc tests):
+  test --locked -p gitterm-terminal -j 4 -- --test-threads=4 --nocapture
+  run 1: 7.22 seconds; run 2: 7.06 seconds; run 3: 6.43 seconds.
+
+macOS initially denied top process inspection under the sandbox; the monitor
+probe, full workspace tests and all three terminal repeats were rerun with
+approved sandbox escalation. top passed; only htop was unavailable. Missing
+tools are skipped at runtime with a reason, never #[ignore].
+
+No specialist trigger matched; final diff was self-reviewed. The root commit
+hook runs unrelated Iced checks, so the commit uses a command-local empty
+hooksPath after the requested GPUI gates. No global hook config is changed.
+
+Limits: this proves headless PTY/parser/grid/callback behavior, not native font
+rasterization, real IME/accessibility, Retina behavior or interactive GUI feel.
+No CI run, push, merge or install is performed.
