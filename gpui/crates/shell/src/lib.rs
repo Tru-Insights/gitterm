@@ -3,6 +3,7 @@ extern crate gpui_kit as gpui;
 
 #[cfg(test)]
 mod center_tests;
+pub mod content;
 pub mod data;
 mod dialogs;
 pub mod files;
