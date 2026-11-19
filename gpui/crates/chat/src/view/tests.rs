@@ -9,7 +9,7 @@ fn setup(
 ) -> (Entity<ChatView>, &mut VisualTestContext) {
     cx.update(|cx| {
         gpui_component::init(cx);
-        bind_keys(cx);
+        init(cx);
     });
     let (root, cx) = cx.add_window_view(move |window, cx| {
         let chat = cx.new(|cx| ChatView::new(records, window, cx));
@@ -26,6 +26,116 @@ fn draw(cx: &mut VisualTestContext) {
         _ = window.draw(cx);
     });
     cx.run_until_parked();
+}
+
+struct ChatPair([Entity<ChatView>; 2]);
+impl Render for ChatPair {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .children(self.0.iter().enumerate().map(|(index, chat)| {
+                div()
+                    .id(index)
+                    .debug_selector(move || format!("chat-{index}"))
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(chat.clone())
+            }))
+    }
+}
+
+#[gpui::test]
+fn embedded_chats_keep_click_focus_find_and_copy_in_their_pane(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        init(cx);
+    });
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let pair = cx.new(|cx| ChatPair(["First", "Second"].map(|label| {
+            cx.new(|cx| ChatView::new(vec![Record {
+                at_ms: None,
+                entry: Entry::Harness(HarnessEvent::TextDelta(format!("**{label}** needle needle\n\n```rust\nlet label = \"{label}\";\n```"))),
+            }], window, cx))
+        })));
+        Root::new(pair, window, cx)
+    });
+    cx.simulate_resize(size(px(1440.), px(900.)));
+    draw(cx);
+    let chats = root.read_with(cx, |root, cx| {
+        root.view()
+            .clone()
+            .downcast::<ChatPair>()
+            .unwrap()
+            .read(cx)
+            .0
+            .clone()
+    });
+    for (index, selector) in ["chat-0", "chat-1"].into_iter().enumerate() {
+        // Click empty padding, not a child with its own focus handler.
+        let bounds = cx.debug_bounds(selector).unwrap();
+        cx.simulate_click(
+            bounds.origin + gpui::point(px(3.), px(100.)),
+            gpui::Modifiers::none(),
+        );
+        draw(cx);
+        cx.simulate_keystrokes("cmd-f");
+        draw(cx);
+        cx.simulate_input("needle");
+        draw(cx);
+        chats[index].read_with(cx, |view, _| {
+            assert!(view.find_open);
+            assert_eq!(view.find.matches.len(), 2);
+        });
+        cx.simulate_keystrokes("cmd-g");
+        draw(cx);
+        assert_eq!(
+            chats[index].read_with(cx, |view, _| view.find.current),
+            Some(1)
+        );
+        cx.simulate_keystrokes("cmd-shift-g escape");
+        draw(cx);
+        assert!(!chats[1 - index].read_with(cx, |view, _| view.find_open));
+        let text = chats[index].read_with(cx, |view, cx| {
+            view.row_views[0].as_ref().unwrap().read(cx).text.clone()
+        });
+        text.update_in(cx, |text, window, cx| {
+            text.focus_handle().focus(window, cx);
+            text.select_all(cx);
+        });
+        draw(cx);
+        cx.simulate_keystrokes("cmd-c");
+        draw(cx);
+        let plain = cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap());
+        let label = ["First", "Second"][index];
+        assert!(plain.contains(label) && !plain.contains("**"));
+        assert!(!plain.contains(["Second", "First"][index]));
+        cx.simulate_keystrokes("cmd-shift-c");
+        draw(cx);
+        let markdown = cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap());
+        assert!(markdown.contains(&format!("**{label}**")) && markdown.contains("```rust"));
+        let code = format!("let label = \"{label}\";\n");
+        let row_id = chats[index].read_with(cx, |view, _| {
+            view.row_views[0].as_ref().unwrap().entity_id()
+        });
+        let selector = Box::leak(format!("copy-code-{row_id}").into_boxed_str());
+        let button = cx.debug_bounds(selector).expect("visible code Copy button");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        draw(cx);
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+            code.trim_end()
+        );
+        cx.update(|window, cx| {
+            assert!(chats[index].focus_handle(cx).contains_focused(window, cx));
+            assert!(
+                !chats[1 - index]
+                    .focus_handle(cx)
+                    .contains_focused(window, cx)
+            );
+        });
+    }
 }
 
 #[gpui::test]

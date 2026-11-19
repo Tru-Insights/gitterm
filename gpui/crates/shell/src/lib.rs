@@ -51,7 +51,7 @@ struct WorkspaceDock {
     sessions: Vec<Session>,
     active_session: Option<SessionId>,
     dock: Entity<DockArea>,
-    // Sole lifetime owner: a dock can drop every reference without losing a draft.
+    // Lifetime owner: dock removal hides a pane; session close releases it.
     panes: HashMap<String, Entity<Pane>>,
     store: LayoutStore,
     error: Option<String>,
@@ -70,6 +70,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<Self> {
+        gitterm_gpui_chat::init(cx);
         let catalog = data.workspaces();
         ensure!(!catalog.is_empty(), "shell data has no workspaces");
         let active_workspace = catalog[0].id;
@@ -230,6 +231,24 @@ impl Shell {
                 .expect("active workspace exists")
                 .active_session = Some(id);
             self.show_pane(&session_pane_id(id), window, cx);
+        }
+    }
+    fn close_session(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self
+            .workspaces
+            .iter_mut()
+            .find(|state| state.workspace.id == self.active_workspace)
+            .expect("active workspace exists");
+        if let Some(pane) = state.panes.remove(&session_pane_id(id)) {
+            state.sessions.retain(|session| session.id != id);
+            state
+                .dock
+                .update(cx, |dock, cx| dock.remove_panel(pane, window, cx));
+            if state.active_session == Some(id) {
+                state.active_session = state.sessions.first().map(|session| session.id);
+            }
+            self.focus.focus(window, cx);
+            cx.notify();
         }
     }
     fn show_pane(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -423,6 +442,13 @@ impl Render for Shell {
                 this.select_session(*index, window, cx)
             }));
         let weak = cx.weak_entity();
+        let close_session = state.active_session;
+        let close_label = state
+            .sessions
+            .iter()
+            .find(|session| Some(session.id) == close_session)
+            .map(|session| format!("Close {} permanently", session.title))
+            .unwrap_or_else(|| "Close session permanently".into());
         let mut panes: Vec<_> = state
             .panes
             .iter()
@@ -437,6 +463,7 @@ impl Render for Shell {
                 let repository = repository.clone();
                 let weak = weak.clone();
                 let panes = panes.clone();
+                let close_owner = weak.clone();
                 menu.item(
                     PopupMenuItem::new("New task…")
                         .on_click(move |_, w, cx| dialogs::new_task(repository.clone(), w, cx)),
@@ -456,6 +483,16 @@ impl Render for Shell {
                             },
                         ))
                     })
+                })
+                .item({
+                    let weak = close_owner.clone();
+                    PopupMenuItem::new(close_label.clone())
+                        .disabled(close_session.is_none())
+                        .on_click(move |_, window, cx| {
+                            if let Some(id) = close_session {
+                                _ = weak.update(cx, |this, cx| this.close_session(id, window, cx));
+                            }
+                        })
                 })
                 .item(
                     PopupMenuItem::new("Toggle Mocha / Latte").on_click(|_, w, cx| {
@@ -576,11 +613,53 @@ mod tests {
     use gpui::TestAppContext;
     use gpui_component::dock::{InsertTarget, PaneRef};
 
-    // TestAppContext uses GPUI's headless test platform. No native window or input.
+    fn terminal(pane: &Entity<Pane>, cx: &App) -> Entity<gitterm_terminal::TerminalView> {
+        let pane::PaneContent::Terminal(view) = &pane.read(cx).content else {
+            panic!("expected real terminal");
+        };
+        view.clone()
+    }
+    fn chat(pane: &Entity<Pane>, cx: &App) -> Entity<gitterm_gpui_chat::ChatView> {
+        let pane::PaneContent::Chat(view) = &pane.read(cx).content else {
+            panic!("expected native chat");
+        };
+        view.clone()
+    }
+    fn wait_for_text(
+        view: &Entity<gitterm_terminal::TerminalView>,
+        needle: &str,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if view.read_with(cx, |view, _| {
+                view.backend()
+                    .get_all_text()
+                    .is_some_and(|text| text.contains(needle))
+            }) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal never produced {needle}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    fn draw(cx: &mut gpui::VisualTestContext) {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    // Test platform only: owned PTYs, no native window, clipboard or OS input.
     #[gpui::test]
-    fn pane_entity_and_draft_survive_moves_grouping_close_reopen_and_restore(
+    fn terminal_and_chat_survive_moves_grouping_close_reopen_workspace_and_restore(
         cx: &mut TestAppContext,
     ) {
+        cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
         let (shell, cx) = cx.add_window_view(|window, cx| {
@@ -590,85 +669,228 @@ mod tests {
             let state = shell.read(cx).active();
             (
                 state.dock.clone(),
-                state.panes["session-11"].clone(),
+                vec![
+                    state.panes["session-11"].clone(),
+                    state.panes["session-12"].clone(),
+                ],
                 state.panes["workspace-1-git"].clone(),
             )
         });
-        let id = PanelId::from(held.entity_id());
-        let draft = cx.read(|cx| held.read(cx).draft.clone().unwrap());
+        let terminal = cx.read(|cx| terminal(&held[1], cx));
+        terminal.update_in(cx, |view, _, _| {
+            view.backend_mut().handle(gitterm_terminal::Command::Write(
+                b"printf 'SURVIVAL_%s\\n' history\r".to_vec(),
+            ));
+        });
+        wait_for_text(&terminal, "SURVIVAL_history", cx);
+        let chat = cx.read(|cx| chat(&held[0], cx));
+        let scroller = cx.read(|cx| chat.read(cx).scroller().clone());
+        cx.update(|_, cx| scroller.update(cx, |state, cx| state.scroll_to_item(2, cx)));
+        let scroll = cx.read(|cx| scroller.read(cx).logical_scroll_top());
+        assert_eq!(scroll.item_ix, 2);
         cx.update(|window, cx| {
-            draft.update(cx, |s, cx| s.set_value("keep this draft", window, cx));
-            held.update(cx, |p, _| p.sample_lines = 7);
-            let node = dock
-                .read(cx)
-                .layout(DockPlacement::Right)
-                .unwrap()
-                .find_panel_node(PanelId::from(git.entity_id()))
-                .unwrap();
-            dock.update(cx, |dock, cx| {
-                dock.move_panel(
-                    id,
-                    InsertTarget::Tabs {
-                        node,
-                        ix: None,
-                        activate: true,
-                    },
-                    window,
-                    cx,
-                )
-            });
-            assert!(
-                dock.read(cx)
+            for pane in &held {
+                let id = PanelId::from(pane.entity_id());
+                let node = dock
+                    .read(cx)
                     .layout(DockPlacement::Right)
                     .unwrap()
-                    .contains_panel(id)
-            );
-            assert_eq!(
-                dock.read(cx).panel(id).unwrap().view().entity_id(),
-                held.entity_id()
-            );
-            // Collapse and reopen an entire dock, then close its pane and reopen it.
-            dock.update(cx, |dock, cx| {
-                dock.toggle_dock(DockPlacement::Right, window, cx);
-                dock.toggle_dock(DockPlacement::Right, window, cx);
-                dock.remove_panel(held.clone(), window, cx);
-            });
-            assert!(dock.read(cx).panel(id).is_none());
-            shell.update(cx, |s, cx| s.show_pane("session-11", window, cx));
-            assert_eq!(
-                dock.read(cx).panel(id).unwrap().view().entity_id(),
-                held.entity_id()
-            );
-            let saved = dock.read(cx).dump(cx);
-            dock.update(cx, |dock, cx| dock.load(saved, window, cx).unwrap());
-            assert_eq!(
-                dock.read(cx).panel(id).unwrap().view().entity_id(),
-                held.entity_id()
-            );
-            assert_eq!(held.read(cx).sample_lines, 7);
-            assert_eq!(
-                held.read(cx).draft.as_ref().unwrap().entity_id(),
-                draft.entity_id()
-            );
-            assert_eq!(draft.read(cx).value().as_str(), "keep this draft");
+                    .find_panel_node(PanelId::from(git.entity_id()))
+                    .unwrap();
+                dock.update(cx, |dock, cx| {
+                    dock.move_panel(
+                        id,
+                        InsertTarget::Tabs {
+                            node,
+                            ix: None,
+                            activate: true,
+                        },
+                        window,
+                        cx,
+                    )
+                });
+                assert!(
+                    dock.read(cx)
+                        .layout(DockPlacement::Right)
+                        .unwrap()
+                        .contains_panel(id)
+                );
+                assert_eq!(
+                    dock.read(cx).panel(id).unwrap().view().entity_id(),
+                    pane.entity_id()
+                );
+                dock.update(cx, |dock, cx| {
+                    dock.toggle_dock(DockPlacement::Right, window, cx);
+                    dock.toggle_dock(DockPlacement::Right, window, cx);
+                    dock.remove_panel(pane.clone(), window, cx);
+                });
+                assert!(dock.read(cx).panel(id).is_none());
+                let pane_id = pane.read(cx).id.clone();
+                shell.update(cx, |s, cx| s.show_pane(&pane_id, window, cx));
+                let saved = dock.read(cx).dump(cx);
+                dock.update(cx, |dock, cx| dock.load(saved, window, cx).unwrap());
+                assert_eq!(
+                    dock.read(cx).panel(id).unwrap().view().entity_id(),
+                    pane.entity_id()
+                );
+            }
             shell.update(cx, |s, cx| {
                 s.select_workspace(1, window, cx);
                 s.select_session(1, window, cx);
                 assert_eq!(s.active().active_session, Some(SessionId(22)));
                 s.select_workspace(0, window, cx);
-                assert_eq!(s.active().active_session, Some(SessionId(11)));
             });
+            assert_eq!(
+                self::terminal(&held[1], cx).entity_id(),
+                terminal.entity_id()
+            );
+            assert_eq!(self::chat(&held[0], cx).entity_id(), chat.entity_id());
+            assert_eq!(scroller.read(cx).logical_scroll_top(), scroll);
+            for pane in &held {
+                let tree = dock.read(cx).layout(DockPlacement::Center).unwrap();
+                let id = PanelId::from(pane.entity_id());
+                assert!(matches!(
+                    tree.find_node(tree.find_panel_node(id).unwrap())
+                        .unwrap()
+                        .kind(),
+                    PaneRef::Tabs { .. }
+                ));
+            }
+        });
+        wait_for_text(&terminal, "SURVIVAL_history", cx);
+    }
+
+    #[gpui::test]
+    fn permanent_session_close_releases_terminal_and_removes_reopen_entry(cx: &mut TestAppContext) {
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        let (shell, cx) = cx.add_window_view(|w, cx| {
+            Shell::new(Rc::new(data::SampleData), dir.path(), w, cx).unwrap()
+        });
+        let weak =
+            cx.read(|cx| terminal(&shell.read(cx).active().panes["session-12"], cx).downgrade());
+        cx.update(|window, cx| {
+            shell.update(cx, |s, cx| {
+                s.close_session(SessionId(12), window, cx);
+                assert!(!s.active().panes.contains_key("session-12"));
+                assert!(s.active().sessions.iter().all(|s| s.id != SessionId(12)));
+                s.show_pane("session-12", window, cx);
+            })
         });
         cx.run_until_parked();
-        cx.read(|cx| {
-            assert_eq!(draft.read(cx).value().as_str(), "keep this draft");
-            let tree = dock.read(cx).layout(DockPlacement::Center).unwrap();
-            assert!(matches!(
-                tree.find_node(tree.find_panel_node(id).unwrap())
-                    .unwrap()
-                    .kind(),
-                PaneRef::Tabs { .. }
-            ));
+        cx.read(|_| {
+            assert!(
+                weak.upgrade().is_none(),
+                "permanent close retained a terminal"
+            )
+        });
+    }
+
+    #[gpui::test]
+    fn clicks_and_input_are_scoped_to_the_focused_terminal(cx: &mut TestAppContext) {
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        let (shell, cx) = cx.add_window_view(|w, cx| {
+            Shell::new(Rc::new(data::SampleData), dir.path(), w, cx).unwrap()
+        });
+        let (first, second, dock) = cx.read(|cx| {
+            let shell = shell.read(cx);
+            (
+                shell.workspaces[0].panes["session-12"].clone(),
+                shell.workspaces[1].panes["session-22"].clone(),
+                shell.active().dock.clone(),
+            )
+        });
+        cx.update(|window, cx| {
+            dock.update(cx, |dock, cx| {
+                dock.remove_panel(first.clone(), window, cx);
+                dock.set_center(
+                    DockLayout::h_split()
+                        .child(
+                            DockLayout::tabs().panel_view(panel_handle(first.clone()), cx),
+                            None,
+                        )
+                        .child(
+                            DockLayout::tabs().panel_view(panel_handle(second.clone()), cx),
+                            None,
+                        ),
+                    window,
+                    cx,
+                );
+            })
+        });
+        cx.simulate_resize(size(px(1440.), px(900.)));
+        draw(cx);
+        let first_view = cx.read(|cx| terminal(&first, cx));
+        let second_view = cx.read(|cx| terminal(&second, cx));
+        for (selector, view, other, label) in [
+            ("session-12", &first_view, &second_view, "FIRST"),
+            ("session-22", &second_view, &first_view, "SECOND"),
+        ] {
+            let bounds = cx.debug_bounds(selector).expect("visible terminal pane");
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.update(|window, cx| {
+                assert!(view.read(cx).focus_handle().is_focused(window));
+                assert!(!other.read(cx).focus_handle().is_focused(window));
+            });
+            cx.simulate_input(&format!("printf 'FOCUS_%s\\n' {label}"));
+            cx.simulate_keystrokes("enter");
+            wait_for_text(view, &format!("FOCUS_{label}"), cx);
+            other.read_with(cx, |view, _| {
+                assert!(
+                    !view
+                        .backend()
+                        .get_all_text()
+                        .unwrap()
+                        .contains(&format!("FOCUS_{label}"))
+                )
+            });
+        }
+        let chat_pane = cx.read(|cx| shell.read(cx).active().panes["session-11"].clone());
+        cx.update(|window, cx| {
+            dock.update(cx, |dock, cx| {
+                dock.set_dock(
+                    DockPlacement::Right,
+                    DockLayout::tabs().panel_view(panel_handle(chat_pane.clone()), cx),
+                    window,
+                    cx,
+                );
+            });
+        });
+        draw(cx);
+        let bounds = cx.debug_bounds("session-11").expect("visible chat pane");
+        cx.simulate_click(
+            bounds.origin + gpui::point(px(12.), px(100.)),
+            gpui::Modifiers::none(),
+        );
+        let chat = cx.read(|cx| chat(&chat_pane, cx));
+        cx.update(|window, cx| {
+            assert!(
+                chat.focus_handle(cx).contains_focused(window, cx),
+                "click must focus docked chat"
+            )
+        });
+        draw(cx);
+        cx.simulate_keystrokes("cmd-f");
+        draw(cx);
+        cx.simulate_input("CHAT_ONLY_QUERY");
+        cx.update(|window, cx| {
+            let focus = chat.focus_handle(cx);
+            assert!(focus.contains_focused(window, cx));
+            assert!(!focus.is_focused(window), "Find must focus its child input");
+            for terminal in [&first_view, &second_view] {
+                assert!(!terminal.read(cx).focus_handle().is_focused(window));
+                assert!(
+                    !terminal
+                        .read(cx)
+                        .backend()
+                        .get_all_text()
+                        .unwrap()
+                        .contains("CHAT_ONLY_QUERY")
+                );
+            }
         });
     }
 
