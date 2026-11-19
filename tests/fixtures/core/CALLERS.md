@@ -63,6 +63,99 @@ PRs 3–5 must account for every listed site. The owner remains the existing App
 | `src/main.rs:32451` | `update_event / WorkspaceCreated` | `self.normalize_workspace_order();` |
 | `src/main.rs:32680` | `update_event / AttentionJumpNext` | `self.begin_slide_to(ws_idx);` |
 
+## TRU-290 selection caller map
+
+This section supersedes the historical selection locations above. Base line
+numbers remain pinned; current sites are named by enclosing function so later
+extractions can still trace every caller.
+
+`SelectionState::reduce(SelectionEvent, &[WorkspaceFact], usage_open, Instant)
+-> Vec<SelectionCommand>` owns the sole `Option<WorkspaceId>` (the existing
+runtime `u64` UID). `WorkspaceFact` is a temporary projection of the host roster,
+not a second catalog. The active field is private; there is no stored active
+index. Core owns UID lookup, index resolution, park/close successor choice and
+the saved-index conversion that skips running parked entries.
+
+| Historical caller(s) | Current route / retained boundary |
+| --- | --- |
+| `persisted_active_index`; `save_workspace_configs` | Core helper retains exact conversion; the real writer dispatches `Persist` and consumes `PersistActiveIndex`. The config serializer and running-park-to-stopped format stay in Iced. |
+| `usage_view_step`; `UsageViewToggle`; `UsageViewClose` | `UsageToggle` / `UsageClose` return `SetUsageOpen`; adapter clears the repo filter on close and keeps surface handling. No selection change. The duplicate legacy helper is removed. |
+| `WorkspaceSelect`; both keyboard mappers; `NewWorkOpenExisting` | Existing index events resolve a UID at the edge, then dispatch `Select`. Same/invalid/closed targets keep identity and still close Usage. Changed identity returns `WorkspaceChanged` and `AnimateTo`; the existing task-ownership, terminals, dirty, plans **and docs**, worktrees/files/connection/overview/surface continuation remains ordered as before. No immediate status request. |
+| `SlideScrolled` | The existing slide order and scroll projection produce a UID for `Swipe`. Only `WorkspaceChanged` runs its existing continuation: keep Usage/task selection, dismiss viewer, sync plans/docs and refresh other panels. No animation or status request. |
+| `begin_slide_to`; `AttentionJumpNext` | Attention dispatches `Animate`, which leaves Usage alone. `animate_workspace_selection` consumes the previous UID, target index and supplied clock; it never writes selection. `slide_from` remains presentation state only. |
+| `visible_workspace_at`; `slide_order`; `workspace_bar_layout` | Existing core bar ordering remains shared. The active index is resolved from core identity for layout/keyboard/slide bridges; `slide_from` resolves through the same core UID lookup. |
+| `normalize_workspace_order` | Reorder catalog, dispatch `Reordered`; preserve identity without index arithmetic, then keep the snap/dirty continuation. |
+| `reconcile_managed_task_workspaces` | Existing canonical task-directory reconciliation computes the owning workspace, then activates its UID. Remove the unobserved intermediate index write while the roster was detached; the final selection is unchanged. |
+| `park_workspace`; `park_stopping`; `park_keep_running`; `close_workspace` | Keep validation, last-visible guard, config/process/repo lifecycle and close-as-stop-then-done in Iced. After marking parked or removing, dispatch `LeftBar { id, index, removed }`; core retains another active UID or chooses next visible / last predecessor, including old no-visible fallbacks. Keep diagnostics and the existing settle/snap/plans/docs continuation. |
+| `wake_running_parked`; `settle_active_workspace` | UID/index resolution reads core; returning a parked workspace to the bar does not take focus. Existing active visit/wake labels remain host domain state. |
+| `resume_parked_workspace`; `after_resume` | Existing running/stopped restore paths activate the UID. `Resume` at `after_resume` emits `RefreshStatus`, interpreted with the unchanged `RequestPrelude::Resume` (no loading/clock prelude). |
+| `enter_task_context`; `try_launch_task_child` | `activate_workspace_at` resolves the chosen/restored UID and dispatches `Activate`; task/session selection and persistence continuation stay at their original seams. |
+| `push_and_activate_workspace`; `ensure_remote_workspace_for_chat`; `create_remote_workspace_at`; `open_remote_workspace`; `WorkspaceCreated` | Open/restore the host workspace, then `Activate` its UID. Existing normalization, status/tab setup, sync and persistence work remain caller-owned. |
+| `new`; `open_workspace` | Default empty core state; first catalog entry is explicitly activated (formerly implicit index 0). Restore converts the saved index to a UID before reconciliation/normalization. |
+| `workspace_index_by_uid`; `add_repo_to_workspace`; `remove_repo_from_workspace`; `sync_workspace_repos`; `make_workspace_from_chat`; `add_chat_to_workspace`; `confirm_folder_picker`; `WorkspaceRepoHide`; `WorkspaceRepoJoinedUndo`; `WorkspaceRepoJoinedDismiss` | All UID lookups use `SelectionState::index_of`, including invalid/closed IDs. Existing repo/chat/folder domain operations are unchanged. |
+| All former `active_workspace_idx` reads, including active workspace/tab accessors, status/source context, task/chat paths and rendering | `active_workspace_index` or `active_workspace` / `active_workspace_mut` resolves core identity against the current catalog. `src/work_issues.rs::update_issues(GroupToggle)` uses the active accessor too. No Rust references to the legacy field remain outside the excluded GPUI workspace. |
+
+The TRU-284 trace expectations and JSON goldens are unchanged. Beyond mechanical
+field/accessor paths, `src/baseline_tests.rs` explicitly activates the first
+fixture UID, uses reducer activation for three inactive-tab/park setups, and
+exposes its fixture constructor to the existing Usage tests. Two `main.rs` Usage
+helper tests now exercise the real adapter and retain the same identity,
+open/close and repo-filter expectations. Core selection tests cover same/invalid/
+closed IDs with Usage open, explicit vs swipe vs attention commands, parked
+selection, active/inactive stop/keep-running/close, fallback boundaries, reorder,
+persisted-index translation, empty roster and resume-only status requests.
+
+## TRU-289 current status caller map
+
+This section supersedes the historical status locations below on this branch.
+Status locations below are the TRU-289 snapshot; selection now follows the
+TRU-290 map above, and source/root ownership remains for PR 5. The historical
+base inventory is retained so every former write/request can be traced.
+
+`GitStatusState::reduce(StatusEvent, Instant) -> Vec<StatusCommand>` mutates the
+sole per-tab state. Its inputs include request/reset/input/wake/visibility,
+completion/discard, and existing UI metadata/error writes. Commands collect a
+resolved root or expose the remaining poll delay. Iced retains source identity,
+capability/root guards and job execution. No job generation/freshness guard is added.
+
+| Former owner / caller | Current site | Transition / retained boundary |
+| --- | --- | --- |
+| TabState fields / constructor | `src/main.rs:5244`; `src/main.rs:5338` | One composed status owner; no writable legacy status fields. |
+| Core state / reducer API | `crates/gitterm-core/src/status.rs:51`; `crates/gitterm-core/src/status.rs:131` | Single mutable owner; explicit clock; pure transition to commands. |
+| adopt_git_root | `src/main.rs:5395` | Root guards remain here; accepted adoption dispatches Reset. |
+| hash / next interval | `crates/gitterm-core/src/status.rs:226`; `crates/gitterm-core/src/status.rs:242` | Hash and cadence now pure core rules; same field/list ordering and thresholds. |
+| request_git_status / active-source wrapper | `src/main.rs:10908`; `src/main.rs:10920` | Dispatch Request with explicit prelude; resolve source and actual local request root in adapter. |
+| command interpreter / executors | `src/main.rs:10951`; `src/main.rs:10972`; `src/main.rs:10995` | CollectStatus becomes existing Iced Task. SchedulePoll uses existing Tick checks; no second timer. |
+| after_resume | `src/main.rs:14916` | Request(Resume): no loading or clock prelude. |
+| resume_chat_as_tab / resume_chat_as_chat_tab / remote chat | `src/main.rs:15524`; `src/main.rs:15616`; `src/main.rs:15706` | Request(TabOpened): loading only, via active-source wrapper. |
+| startup | `src/main.rs:21090` | Local Request(Refresh): loading and clock, no cadence/hash reset. |
+| launch_session_tab | `src/main.rs:21292` | Request(TabOpened) via active-source wrapper. |
+| refresh_panels_for_context | `src/main.rs:22410` | Reset then local Request(Refresh); Files jump stays in adapter. |
+| Terminal input / CWD | `src/main.rs:24473`; `src/main.rs:24594` | Input; CWD changes Reset then local Request(Refresh). |
+| Tick | `src/main.rs:24710` | Current Git-or-diff visibility and resolved root enter reducer; capability/active-tab gates remain in adapter. |
+| RemoteSessionLaunched / FileSelect errors | `src/main.rs:27409`; `src/main.rs:27672` | SetError preserves prior loading and clock behavior. |
+| EditFile / FolderSelected | `src/main.rs:27424`; `src/main.rs:27637` | Request(TabOpened) via active-source wrapper. |
+| OpenWorktree | `src/main.rs:29546` | Request(Refresh) via active-source wrapper. |
+| RemoteAgentHandshakeLoaded | `src/main.rs:29623` | Request(Resume): preserve connection path without a prelude. |
+| WindowFocused | `src/main.rs:30348` | Wake after existing strict >300s guard; backdate by 60s, keep hash. |
+| GitStatusLoaded | `src/main.rs:31151` | Address tab, preserve domain/root guards; Completed or DiscardCompletion enters reducer. Late results for absent tabs ignored. |
+| WorkspaceCreated | `src/main.rs:32328` | Request(TabOpened) via active-source wrapper. |
+| set_sidebar_mode | `src/main.rs:32742` | Git entry Request(Refresh); source absence ClearLoading. Re-entry remains a no-op. |
+| services DTO conversion | `src/services.rs:25`; `src/services.rs:692` | Local collector DTOs and remote opaque-root/error conversion stay outside core. |
+
+The dead `TabState::fetch_status` alternate writer was removed, without adding
+any callers. `status_char` remains test-only for its existing tests. Label writes
+in task/chat/remote-tab setup now use `SetLabel`; initial remote browser state
+uses `InitializeRemote`. Read sites consume `tab.status` directly.
+
+`src/baseline_tests.rs` retains all pre-extraction expected values and goldens;
+only composed field paths and the renamed raw source-executor reference change.
+Core reducer unit tests also cover both overlapping completion orders, success /
+error orders, dirty/clean/non-repo backoff, identity-excluding order-sensitive
+hashes, each request prelude, visibility/loading guards, input, wake, reset and
+discard. The collector, source transport and selection inventory below remain
+historical references, not extracted implementations.
+
 ## Status requests, completions, polling writes and reset sites
 
 | Base site | Enclosing function / event arm | Code |

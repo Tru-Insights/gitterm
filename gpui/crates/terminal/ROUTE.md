@@ -1,8 +1,8 @@
 # TRU-278 — terminal route decision
 
 **Recommend Route A: committed iced_term backend + GPUI snapshot renderer.**
-The implemented prototype passes the required real-PTY gates. Budget **7–12
-worker-days remaining for stage 3 after TRU-282**, compared with Route B's **18–27** from
+The implemented prototype passes the required real-PTY gates. Budget **6–10
+worker-days remaining for stage 3 after TRU-287**, compared with Route B's **18–27** from
 TRU-276. Both routes reuse Alacritty 0.25.1; no emulator rewrite is needed.
 
 This recommendation is based on the code and automated tests in this crate,
@@ -25,10 +25,10 @@ was not patched here. Route A tests assert the required working behavior.
 | 100k history / search / export | PASS: exactly 100,000 retained lines after 100,100; literal `[.]` query and scroll-to-match; first retained cell included. Busy returns `None`, not an empty success. Snapshot remains viewport-sized. | FAIL widget: ignores 100k config and retains 10k; standalone emulator has working primitives, but private view state lacks service/search/export hooks. |
 | Selection / resize | PASS: drag/semantic/line paths retained, Shift extends anchor, copy waits through parser contention. Headless paint resizes snapshot; real PTY child observes 103×31 via ioctl. | Existing local selection/resize foundation reusable; Shift currently resets anchor. PTY resize needs app-owned callback wiring. |
 | IME / Unicode | PASS at automated scope: original UTF16 EntityInputHandler/preedit path retained, commit reaches child once, CJK/wide spacer/combining cells survive serial UTF8; geometric box/block glyph tests and headless preedit paint pass. | Existing view/render path is the source used by A; manual IME/font/Retina/feel verification still needed for either route. |
-| URLs / app services | Committed fork regex/search APIs retained and URL opening returned to app policy; Cmd-hover pointer and Cmd-click app callback in TRU-282. Add background service jobs and cheap tail snapshots. | Add widget hooks plus GitTerm link detection/opener and all history/service hooks. |
+| URLs / app services | Committed fork regex/search APIs retained and URL opening returned to app policy; Cmd-hover pointer and Cmd-click app callback in TRU-282. Background service jobs, literal find and cheap tail snapshots completed in TRU-287. | Add widget hooks plus GitTerm link detection/opener and all history/service hooks. |
 | Ownership / licences | MIT copying permitted with notices; one local crate owns fork-derived backend and xterm-derived presentation. No dependency on Iced. Future fixes need explicit synchronization with upstream/fork. | Maintain a widget patch/upstream changes, including its internal PTY scheduling architecture. Same permissive source licences. |
 | Effort spent in TRU-278 | One local judgment-role implementation session: backend extraction, snapshot renderer/view integration, real-PTY/headless regressions, provenance and checks. Elapsed time is recorded under verification; it is not a worker-day productivity measure. | Estimate only; no implementation work spent on B in this task. TRU-276 supplied the comparison evidence. |
-| Remaining stage-3 allowance | **7–12 worker-days** after TRU-282; breakdown below. | **18–27 worker-days** for the full patched-widget route, as sized in TRU-276. |
+| Remaining stage-3 allowance | **6–10 worker-days** after TRU-287; breakdown below. | **18–27 worker-days** for the full patched-widget route, as sized in TRU-276. |
 
 A avoids replacing the widget's reader/queue/parser ownership while preserving
 its GPUI presentation and IME implementation. Copying the backend was necessary
@@ -98,11 +98,11 @@ times or calendar promises. They exclude other GPUI migration stages.
 | Remaining work | Worker-days |
 | --- | ---: |
 | Close/reap/cancellation and error UX, bounded input, protocol/legacy-mouse fixtures, duplex multi-session fairness — completed in TRU-282 | 0 |
-| Asynchronous search/export service jobs, efficient watchdog/log tail snapshots and eviction handling (link interaction/app policy completed in TRU-282) | 1–2 |
+| Asynchronous search/export, literal find bar, watchdog/log tail snapshots and eviction handling — completed in TRU-287 | 0 |
 | Main/bottom/run integration: cwd/env/startup, ownership/session lifecycle, hidden sessions and service consumers | 3–4 |
 | Real shell/Claude/Codex/mouse-TUI checks, Unicode/IME/font/Retina/accessibility and resize under load | 2–4 |
 | Contingency for GPUI scheduling, copied-code maintenance and integration discoveries | 1–2 |
-| **Remaining total** | **7–12** |
+| **Remaining total** | **6–10** |
 
 Do not count the prototype as complete stage 3. It establishes the route and
 removes the main scheduling/reply/paste uncertainty; it does not wire the
@@ -169,3 +169,27 @@ terminal tests), dependency boundaries and locked workspace build. Commands and
 limits are in [evidence/tru282-checks.txt](evidence/tru282-checks.txt). The existing
 deferred-layout test now pumps a headless frame while waiting for a title
 callback, rather than relying on the child replying during the first frame.
+
+## TRU-287 verification
+
+Stage 3b adds literal find (Cmd+F, next/previous, Esc), background search/export
+and tail snapshots. A worker copies a coherent grid in 32-row try-lock slices,
+then runs the existing Alacritty regex/text APIs off the foreground. One job
+per terminal bounds admission. Capture contention/mutation reports `Busy`;
+find clears and retries after output quiets. Export returns plain text to app
+policy, with an optional foreground view callback. Tail copies only the last N
+physical rows and needs no render. Revision checks discard expired matches and
+pending selection coordinates; Alacritty rotates live selections on eviction.
+
+All required checks and the locked GPUI build exited **0**: format, workspace
+Clippy (`--all-targets`, `-D warnings`), workspace tests (**88 passed**, including
+all 65 previous terminal tests plus five new regressions), and dependency
+boundaries. Commands, regressions and resolved verification failures are in
+[evidence/tru287-checks.txt](evidence/tru287-checks.txt).
+
+Only this crate changed; both lockfiles remain unchanged. No GUI, OS input,
+running app interaction or push was used. Native IME/visual/accessibility checks
+and shell integration remain in the table above. If the shell consumes Cmd+F,
+it must route that action to `open_find` and focus the terminal. Sustained output
+can keep find Busy; full-history jobs allocate one temporary grid. See README
+for callback and polling contracts. No history cache or file IO policy was added.

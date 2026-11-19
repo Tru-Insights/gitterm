@@ -832,3 +832,112 @@ fn cmd_hover_and_click_resolve_current_url_and_call_only_app_opener(cx: &mut Tes
         })
         .unwrap();
 }
+
+#[::gpui::test]
+fn find_shortcuts_edit_navigate_close_restore_focus_and_export_callback(cx: &mut TestAppContext) {
+    use alacritty_terminal::vte::ansi::Processor;
+    use gpui_kit::Modifiers;
+    cx.background_executor.allow_parking();
+    let backend = Backend::new(BackendSettings {
+        program: "/bin/cat".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    {
+        let mut term = backend.term.lock_unfair();
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut *term, b"first[.]\r\nsecond[.]\r\n");
+        backend.events.invalidate();
+    }
+    let received = Arc::new(parking_lot::Mutex::new(None));
+    let received_callback = received.clone();
+    let handle = cx.add_window(|_, cx| {
+        TerminalView::new(backend, TerminalConfig::default(), cx).with_export_callback(
+            move |result, _| {
+                *received_callback.lock() = Some(result);
+            },
+        )
+    });
+    let key = |key: &str, platform, shift| KeyDownEvent {
+        keystroke: Keystroke {
+            key: key.into(),
+            modifiers: Modifiers {
+                platform,
+                shift,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        is_held: false,
+        prefer_character_input: false,
+    };
+    handle
+        .update(cx, |view, window, cx| {
+            assert!(view.backend.sync());
+            view.on_key_down(&key("f", true, false), window, cx);
+            assert!(view.find_open);
+            view.replace_text_in_range(None, "[.]", window, cx);
+            assert_eq!(view.find_query, "[.]");
+            assert_eq!(view.find_status, "Busy");
+        })
+        .unwrap();
+    wait(|| {
+        handle
+            .update(cx, |view, _, cx| {
+                view.poll_services(cx);
+                view.find_status == "2 matches"
+            })
+            .unwrap()
+    });
+    handle
+        .update(cx, |view, window, cx| {
+            let first = view.backend.last_content.find_match.as_ref().unwrap().start;
+            view.on_key_down(&key("g", true, false), window, cx);
+            assert_ne!(
+                view.backend.last_content.find_match.as_ref().unwrap().start,
+                first
+            );
+            view.on_key_down(&key("g", true, true), window, cx);
+            assert_eq!(
+                view.backend.last_content.find_match.as_ref().unwrap().start,
+                first
+            );
+            view.on_key_down(&key("escape", false, false), window, cx);
+            assert!(!view.find_open);
+            assert!(view.backend.last_content.find_match.is_none());
+            assert!(view.focus_handle.is_focused(window));
+        })
+        .unwrap();
+    // Reopening the retained query must rebuild highlights after Esc cleared them.
+    handle
+        .update(cx, |view, window, cx| {
+            view.on_key_down(&key("f", true, false), window, cx)
+        })
+        .unwrap();
+    wait(|| {
+        handle
+            .update(cx, |view, _, cx| {
+                view.poll_services(cx);
+                view.backend.last_content.find_match.is_some()
+            })
+            .unwrap()
+    });
+    handle
+        .update(cx, |view, window, cx| {
+            view.on_key_down(&key("escape", false, false), window, cx)
+        })
+        .unwrap();
+    wait(|| {
+        handle
+            .update(cx, |view, _, _| view.request_export().is_ok())
+            .unwrap()
+    });
+    wait(|| {
+        handle
+            .update(cx, |view, _, cx| view.poll_services(cx))
+            .unwrap();
+        received.lock().is_some()
+    });
+    let text = received.lock().take().unwrap().unwrap();
+    assert!(text.starts_with("first[.]\nsecond[.]\n"));
+}

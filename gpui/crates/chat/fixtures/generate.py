@@ -27,7 +27,7 @@ def done(identifier, text="Done", error=False):
 
 
 def permission(identifier):
-    return event("runtime_request", {"request_id": identifier, "tool_use_id": "shell", "kind": {"type": "permission", "tool_name": "Bash", "input": {"command": "echo synthetic"}, "suggestions": [{"optionId": "allow_once", "name": "Allow once"}, {"optionId": "deny", "name": "Deny"}], "decision_reason": "Command execution requires approval"}})
+    return event("runtime_request", {"request_id": identifier, "tool_use_id": "shell", "kind": {"type": "permission", "tool_name": "Bash", "input": {"command": "echo synthetic"}, "suggestions": [{"optionId": "allow_once", "name": "Allow once"}, {"optionId": "deny", "name": "Deny"}, {"type": "addRules", "destination": "localSettings", "rules": [{"toolName": "Bash", "ruleContent": "echo synthetic"}]}], "decision_reason": "Command execution requires approval"}})
 
 
 def question(identifier):

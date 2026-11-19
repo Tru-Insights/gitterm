@@ -12,7 +12,7 @@ fn main() {
             gitterm_gpui_review::run_fixture(args.collect());
             return;
         }
-        if arg == "--chat"
+        if matches!(arg.to_str(), Some("--chat" | "--chat-live"))
             && let Some(path) = args.next().filter(|_| args.next().is_none())
         {
             match gitterm_gpui_chat::events::load_fixture(std::path::Path::new(&path)) {
@@ -27,7 +27,7 @@ fn main() {
             }
         }
         eprintln!(
-            "Usage: gitterm-gpui [--terminal | --chat <fixture.jsonl> | --review <fixture-dir>]"
+            "Usage: gitterm-gpui [--terminal | --chat <fixture.jsonl> | --chat-live <fixture.jsonl> | --review <fixture-dir>]"
         );
         std::process::exit(2);
     }

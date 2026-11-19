@@ -210,6 +210,7 @@ fn drive<T: EventedPty + OnResize>(
         if buffered > 0 {
             if let Some(mut terminal) = term.try_lock_unfair() {
                 parser.advance(&mut *terminal, &buffer[..buffered]);
+                events.invalidate();
                 if parser.sync_bytes_count() < buffered {
                     events.send_event(Event::Wakeup);
                 }
@@ -223,6 +224,7 @@ fn drive<T: EventedPty + OnResize>(
                 .is_some_and(|t| t <= std::time::Instant::now())
             {
                 parser.stop_sync(&mut *terminal);
+                events.invalidate();
                 events.send_event(Event::Wakeup);
             }
         }
