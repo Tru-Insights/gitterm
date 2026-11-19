@@ -17,11 +17,13 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use gitterm::harness::acp::{AcpAgent, AcpMcpServer, AcpSessionConfig, ACP_WIRE_LOG_ENV};
+#[cfg(test)]
+use gitterm::harness::acp::AcpAgent;
+use gitterm::harness::acp::{AcpMcpServer, AcpSessionConfig, ACP_WIRE_LOG_ENV};
 use gitterm::harness::claude::{ClaudeMcpServer, ClaudeSessionConfig};
 use gitterm::harness::transcript::TranscriptEntry;
 use gitterm::harness::{HarnessEvent, HarnessSession, UserPrompt};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
@@ -46,109 +48,9 @@ pub(crate) const CLAUDE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xh
 /// Set to a directory to log every Claude stdin/stdout frame there.
 const CLAUDE_WIRE_LOG_ENV: &str = "GITTERM_V6_CLAUDE_WIRE_LOG_DIR";
 
-/// Which agent backend this tab is driving.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum AgentBackend {
-    Pi,
-    Claude,
-    /// An Agent Client Protocol agent (Antigravity, OpenCode; TRU-153).
-    Acp(AcpAgent),
-}
-
-impl AgentBackend {
-    /// A native harness chat (one long-lived process per tab driven through
-    /// `HarnessSession`): Claude or an ACP agent. Pi runs per turn.
-    pub(crate) fn is_native(self) -> bool {
-        matches!(self, Self::Claude | Self::Acp(_))
-    }
-}
-
-/// Per-backend configuration. Tagged by the `backend` discriminator so this
-/// round-trips cleanly through `workspaces.json` next to the existing fields.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "backend", rename_all = "lowercase")]
-pub(crate) enum AgentBackendConfig {
-    Pi {
-        model: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        session_path: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        thinking: Option<bool>,
-    },
-    Claude {
-        model: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        permission_mode: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        effort: Option<String>,
-    },
-    /// An ACP agent's chat (TRU-153). `model` empty keeps the agent's own
-    /// choice; `mode` is the agent's session mode (Antigravity `default`,
-    /// `accept-edits`, `auto`, `plan`; OpenCode `build`, `plan`).
-    Acp {
-        agent: AcpAgent,
-        #[serde(default)]
-        model: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        mode: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        effort: Option<String>,
-    },
-}
-
-impl AgentBackendConfig {
-    pub(crate) fn backend(&self) -> AgentBackend {
-        match self {
-            Self::Pi { .. } => AgentBackend::Pi,
-            Self::Claude { .. } => AgentBackend::Claude,
-            Self::Acp { agent, .. } => AgentBackend::Acp(*agent),
-        }
-    }
-
-    pub(crate) fn read_only_note(&self) -> Option<&'static str> {
-        matches!(
-            self,
-            Self::Acp {
-                agent: AcpAgent::Gemini,
-                ..
-            }
-        )
-        .then_some(gitterm::harness::acp::GEMINI_REPLACED_NOTE)
-    }
-
-    /// The chat's model as configured (Claude and ACP tabs).
-    pub(crate) fn chat_model(&self) -> Option<&str> {
-        match self {
-            Self::Claude { model, .. } | Self::Acp { model, .. } => Some(model),
-            Self::Pi { .. } => None,
-        }
-    }
-
-    /// The chat's effort as configured (Claude and ACP tabs).
-    pub(crate) fn chat_effort(&self) -> Option<&str> {
-        match self {
-            Self::Claude { effort, .. } | Self::Acp { effort, .. } => effort.as_deref(),
-            Self::Pi { .. } => None,
-        }
-    }
-}
-
-/// High-level lifecycle of the agent subprocess as observed by the UI.
-///
-/// State transitions (Step 3 will own these):
-/// - `Idle` → `Streaming` on first `SystemInit` after a prompt is submitted
-/// - `Streaming` → `Idle` on `Result` event (turn complete)
-/// - any → `Stopped` on user stop request
-/// - any → `Errored` on subprocess crash or fatal parse failure
-#[derive(Debug, Clone, Default)]
-pub(crate) enum AgentSessionState {
-    #[default]
-    Idle,
-    Streaming,
-    Stopped,
-    Errored(String),
-}
+pub(crate) use gitterm_core::chat::types::{
+    AgentBackend, AgentBackendConfig, AgentSessionState, HistoryLoad,
+};
 
 /// Parsed stream-json events from the agent subprocess. The variant taxonomy is
 /// the union of pi and Claude Code event shapes; the parser (Step 3) decides
@@ -295,15 +197,6 @@ fn unix_ms(now: std::time::SystemTime) -> Option<i64> {
     now.duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_millis() as i64)
-}
-
-/// Whether a resumed session's earlier timeline has been read back from
-/// its transcript (Claude backend; TRU-140).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HistoryLoad {
-    NotLoaded,
-    Loading,
-    Loaded,
 }
 
 /// Live agent-tab session state. The conversation buffer here is the source of

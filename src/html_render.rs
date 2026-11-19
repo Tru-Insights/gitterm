@@ -3,40 +3,16 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub const MAX_HTML_BYTES: usize = 512 * 1024;
-pub const MIN_HEIGHT: u32 = 100;
-pub const MAX_HEIGHT: u32 = 4000;
+pub use gitterm_core::chat::html_render::{
+    is_render_output, validate_html, HtmlRenderRequest, HtmlRenderResult, MAX_HEIGHT,
+    MAX_HTML_BYTES, MIN_HEIGHT,
+};
+
 pub const DEFAULT_WIDTH: u32 = 760;
 // Wry 0.48's Windows navigation callback omits subframe navigation. Keep
 // rendering inert until that platform has an equivalent native boundary.
 pub const NATIVE_HTML_SUPPORTED: bool = cfg!(target_os = "macos");
 pub const RENDER_JS: &str = include_str!("../assets/html_render.js");
-
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct HtmlRenderRequest {
-    /// Complete self-contained HTML document, at most 512 KiB in UTF-8.
-    #[schemars(length(min = 1, max = 524288))]
-    pub html: String,
-    /// Fitted frame height in CSS pixels, 100–4000. Use html_preview's contentHeight.
-    #[schemars(range(min = 100, max = 4000))]
-    pub height: u32,
-}
-
-/// Additive tool-result payload: persisted by each harness with its conversation.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HtmlRenderResult {
-    pub html_render: HtmlRenderRequest,
-}
-
-/// Ordinary tool output stays capped. A validated visual reply must retain
-/// its complete document for replay, including adapters without raw tool input.
-pub fn is_render_output(output: &str) -> bool {
-    output.len() <= MAX_HTML_BYTES * 6 + 128
-        && serde_json::from_str::<HtmlRenderResult>(output)
-            .is_ok_and(|result| result.html_render.validate().is_ok())
-}
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -57,23 +33,6 @@ pub struct HtmlPreviewRequest {
     pub width: Option<u32>,
     /// Theme to check: dark (default) or light.
     pub theme: Option<HtmlTheme>,
-}
-
-pub fn validate_html(html: &str) -> Result<(), String> {
-    if html.trim().is_empty() || html.len() > MAX_HTML_BYTES {
-        return Err("HTML must be nonempty and at most 512 KiB in UTF-8".into());
-    }
-    Ok(())
-}
-
-impl HtmlRenderRequest {
-    pub fn validate(&self) -> Result<(), String> {
-        validate_html(&self.html)?;
-        if !(MIN_HEIGHT..=MAX_HEIGHT).contains(&self.height) {
-            return Err("HTML height must be 100–4000 CSS pixels".into());
-        }
-        Ok(())
-    }
 }
 
 impl HtmlPreviewRequest {

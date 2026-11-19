@@ -12,9 +12,17 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
+use gitterm_core::chat::history::DELIVERY_FOOTER_PREFIX;
+pub(crate) use gitterm_core::chat::history::DELIVERY_SOURCE_LINE;
+pub use gitterm_core::chat::history::{
+    anchor_payload, delivery_card, history_anchor_positions, is_delivery_message,
+};
+
 use crate::agentd::git::git_command;
 use crate::codex_runner::{describe_target, CodexRun, CodexRunKind};
+#[cfg(test)]
 use crate::harness::transcript::{TimedEntry, TranscriptEntry};
+#[cfg(test)]
 use crate::harness::{HarnessEvent, ItemKind};
 use crate::review::{is_commit_sha, is_model_name, is_safe_ref};
 use crate::task_mcp::DelegateTaskRequest;
@@ -33,8 +41,6 @@ use crate::workers::{ReasoningEffort, WorkerChoice};
 pub const DELEGATIONS_DIR: &str = "delegations";
 /// Upper bound of the message "Send to Claude" submits.
 pub const MAX_SEND_BYTES: usize = 8 * 1024;
-pub(crate) const DELIVERY_SOURCE_LINE: &str = "GitTerm delivery (not typed by the user):";
-const DELIVERY_FOOTER_PREFIX: &str = "Full record: delegation_get ";
 const MAX_DELIVERY_CONTENT_BYTES: usize = MAX_SEND_BYTES - DELIVERY_SOURCE_LINE.len() - 1;
 const MAX_BRIEF_CHARS: usize = 20_000;
 const MAX_FOCUS_CHARS: usize = 2_000;
@@ -1540,62 +1546,7 @@ pub fn from_gitterm(text: &str) -> String {
     format!("{DELIVERY_SOURCE_LINE}\n{text}")
 }
 
-/// Whether text is a prompt GitTerm sent rather than the user: it starts
-/// with the source line, or (results delivered before the source line
-/// existed) it ends with the full-record footer.
-///
-/// shortcut: judged from the text alone, so a user who pastes a message
-/// starting with the source line (or ending with a copied footer) sees it
-/// as a card and it is left out of the chat summary; it is still sent in
-/// full. A transcript replay has nothing but the text, so a recorded origin
-/// would only help the live view; record one if this ever misleads.
-pub fn is_delivery_message(text: &str) -> bool {
-    let text = text.trim();
-    text.lines().next() == Some(DELIVERY_SOURCE_LINE)
-        || text
-            .lines()
-            .last()
-            .is_some_and(|line| line.starts_with(DELIVERY_FOOTER_PREFIX))
-}
-
-/// How the chat view shows a GitTerm-sent prompt: its first line as the
-/// header, the delegation id when it reports exactly one, and the rest
-/// folded.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct DeliveryCard {
-    pub header: String,
-    pub delegation_id: String,
-    pub body: String,
-}
-
-/// The card for `text`, or `None` when the user wrote it.
-pub fn delivery_card(text: &str) -> Option<DeliveryCard> {
-    if !is_delivery_message(text) {
-        return None;
-    }
-    let text = text.trim();
-    let content = text
-        .strip_prefix(DELIVERY_SOURCE_LINE)
-        .map(|rest| rest.trim_start_matches('\n'))
-        .unwrap_or(text);
-    let header = content.lines().next().unwrap_or("GitTerm delivery");
-    let mut ids = content
-        .lines()
-        .filter_map(|line| line.strip_prefix(DELIVERY_FOOTER_PREFIX));
-    let delegation_id = match (ids.next(), ids.next()) {
-        (Some(id), None) => id.to_string(),
-        _ => String::new(),
-    };
-    Some(DeliveryCard {
-        header: header.to_string(),
-        delegation_id,
-        body: content
-            .strip_prefix(header)
-            .unwrap_or(content)
-            .trim_start()
-            .to_string(),
-    })
-}
+pub use gitterm_core::chat::types::DeliveryCard;
 
 fn with_delivery_source(message: String, id: &str) -> String {
     let footer = format!("{DELIVERY_FOOTER_PREFIX}{id}");
@@ -1930,88 +1881,6 @@ fn show_place(payload: &mut Value, delegation: &Delegation) {
             }
         }
     }
-}
-
-/// The timeline marker recorded in the parent tab's conversation where the
-/// request was made, so a rebuilt page puts the card back there.
-pub fn anchor_payload(delegation_id: &str) -> Value {
-    json!({ "kind": "delegation_anchor", "delegation_id": delegation_id })
-}
-
-/// The task tools whose result returns a new delegation's id.
-const REQUEST_TOOLS: [&str; 3] = ["review_request", "consult_request", "delegate_task"];
-
-/// Where a chat's delegation cards go in a timeline read back from its
-/// transcript, as (index to insert the anchor at, delegation id), by
-/// index. The anchors recorded live are only in memory, so without this
-/// every card lands at the end after a restart. A delegation Claude asked
-/// for goes right after the tool result that returned its id; one asked
-/// for from the page (Review…, Re-run) goes before the first entry written
-/// after its `created_at`. One placed by neither is left out, and its card
-/// goes at the end. `delegations` are (id, created_at), oldest first.
-pub fn history_anchor_positions(
-    entries: &[TimedEntry],
-    delegations: &[(String, String)],
-) -> Vec<(usize, String)> {
-    let mut request_calls: HashSet<&str> = HashSet::new();
-    let mut request_results: Vec<(usize, &str)> = Vec::new();
-    for (index, timed) in entries.iter().enumerate() {
-        match &timed.entry {
-            TranscriptEntry::Harness(HarnessEvent::ItemStarted {
-                id,
-                kind: ItemKind::ToolCall { name, .. },
-            }) if is_request_tool(name) => {
-                request_calls.insert(id);
-            }
-            TranscriptEntry::Harness(HarnessEvent::ItemCompleted {
-                id,
-                output,
-                is_error: false,
-            }) if request_calls.contains(id.as_str()) => request_results.push((index, output)),
-            _ => {}
-        }
-    }
-    let mut positions: Vec<(usize, String)> = delegations
-        .iter()
-        .filter_map(|(id, created_at)| {
-            let after_result = request_results
-                .iter()
-                .find(|(_, output)| output.contains(id.as_str()))
-                .map(|(index, _)| index + 1);
-            let by_time = || {
-                let created = parse_time(created_at)?;
-                Some(
-                    entries
-                        .iter()
-                        .position(|timed| {
-                            timed
-                                .at
-                                .as_deref()
-                                .and_then(parse_time)
-                                .is_some_and(|at| at > created)
-                        })
-                        .unwrap_or(entries.len()),
-                )
-            };
-            after_result
-                .or_else(by_time)
-                .map(|index| (index, id.clone()))
-        })
-        .collect();
-    // Stable: delegations at one index keep their oldest-first order.
-    positions.sort_by_key(|(index, _)| *index);
-    positions
-}
-
-/// A Claude tool name for one of `REQUEST_TOOLS` on GitTerm's task server
-/// (MCP tools reach Claude as `mcp__<server>__<tool>`).
-fn is_request_tool(name: &str) -> bool {
-    name.strip_prefix("mcp__gitterm_tasks__")
-        .is_some_and(|tool| REQUEST_TOOLS.contains(&tool))
-}
-
-fn parse_time(text: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
-    chrono::DateTime::parse_from_rfc3339(text).ok()
 }
 
 /// A ready local task with its worktree at `worktree`, for the tests of
