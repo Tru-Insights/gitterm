@@ -31,6 +31,7 @@ fn exercise_review(cx: &mut TestAppContext, git_first: bool) {
     cx.update(gpui_component::init);
     let repo = tempfile::tempdir().unwrap();
     let config = tempfile::tempdir().unwrap();
+    let config_root = config.path().canonicalize().unwrap();
     let git = |args: &[&str]| {
         let output = gitterm_core::git_status::git_command()
             .args(args)
@@ -66,14 +67,14 @@ fn exercise_review(cx: &mut TestAppContext, git_first: bool) {
         let owner = cx.new(|cx| {
             WorkspaceOwner::new(
                 model,
-                Some(workspace_config::WorkspaceStore::new(config.path())),
+                Some(crate::preview::tests::guarded_store(config_root.as_path())),
                 cx,
             )
         });
         Shell::with_owner(
             Rc::new(data::LocalData(owner.clone())),
             owner,
-            config.path(),
+            config_root.as_path(),
             true,
             window,
             cx,
@@ -260,7 +261,7 @@ fn exercise_review(cx: &mut TestAppContext, git_first: bool) {
         let owner = cx.new(|cx| {
             WorkspaceOwner::new(
                 model,
-                Some(workspace_config::WorkspaceStore::new(config.path())),
+                Some(crate::preview::tests::guarded_store(config_root.as_path())),
                 cx,
             )
         });
@@ -268,7 +269,7 @@ fn exercise_review(cx: &mut TestAppContext, git_first: bool) {
             Shell::with_owner(
                 Rc::new(data::LocalData(owner.clone())),
                 owner,
-                config.path(),
+                config_root.as_path(),
                 true,
                 window,
                 cx,
