@@ -90,6 +90,14 @@ pub enum RestoreFocus {
     PriorOrActivePane,
 }
 
+#[derive(PartialEq, Eq)]
+enum LoadPhase {
+    Preparing,
+    Navigating,
+    Ready,
+    Failed,
+}
+
 /// Owns exactly one ephemeral native surface. The host never restores itself in
 /// an async callback: all callbacks come back through these generation checks.
 pub struct RetainedViewer<H: SurfaceHost> {
@@ -102,8 +110,7 @@ pub struct RetainedViewer<H: SurfaceHost> {
     covers: BTreeMap<CoverId, Cover>,
     geometry: Option<Geometry>,
     selected: bool,
-    ready: bool,
-    preparing: bool,
+    phase: LoadPhase,
     state: State,
     pending: Option<(SnapshotTicket, Instant)>,
     snapshot: Option<Snapshot>,
@@ -125,8 +132,7 @@ impl<H: SurfaceHost> RetainedViewer<H> {
             covers: BTreeMap::new(),
             geometry: None,
             selected: false,
-            ready: false,
-            preparing: false,
+            phase: LoadPhase::Failed,
             state: State::Empty,
             pending: None,
             snapshot: None,
@@ -157,8 +163,7 @@ impl<H: SurfaceHost> RetainedViewer<H> {
             origin,
         };
         self.load = Some(ticket.clone());
-        self.ready = false;
-        self.preparing = true;
+        self.phase = LoadPhase::Preparing;
         self.error = None;
         self.state = State::Loading;
         ticket
@@ -169,13 +174,32 @@ impl<H: SurfaceHost> RetainedViewer<H> {
         ticket: &LoadTicket,
         document: Result<Document, String>,
     ) -> bool {
-        if self.load.as_ref() != Some(ticket) || !self.preparing {
+        if self.load.as_ref() != Some(ticket) || self.phase != LoadPhase::Preparing {
             return false;
         }
-        self.preparing = false;
-        match document.and_then(|document| self.host.load(&document)) {
-            Ok(()) => self.ready = true,
-            Err(error) => self.error = Some(error),
+        match document.and_then(|document| self.host.load(ticket.clone(), &document)) {
+            Ok(()) => self.phase = LoadPhase::Navigating,
+            Err(error) => {
+                self.phase = LoadPhase::Failed;
+                self.error = Some(error);
+            }
+        }
+        self.reconcile();
+        true
+    }
+
+    /// Injection starts asynchronous WebKit navigation. Never show/capture the
+    /// previous DOM as the new generation while waiting for its didFinish event.
+    pub fn complete_navigation(&mut self, ticket: &LoadTicket, result: Result<(), String>) -> bool {
+        if self.load.as_ref() != Some(ticket) || self.phase != LoadPhase::Navigating {
+            return false;
+        }
+        match result {
+            Ok(()) => self.phase = LoadPhase::Ready,
+            Err(error) => {
+                self.phase = LoadPhase::Failed;
+                self.error = Some(error);
+            }
         }
         self.reconcile();
         true
@@ -194,8 +218,7 @@ impl<H: SurfaceHost> RetainedViewer<H> {
     pub fn clear(&mut self) {
         self.invalidate();
         self.load = None;
-        self.ready = false;
-        self.preparing = false;
+        self.phase = LoadPhase::Failed;
         self.selected = false;
         self.error = None;
         self.host.clear();
@@ -300,7 +323,7 @@ impl<H: SurfaceHost> RetainedViewer<H> {
     }
 
     pub fn dimmed(&self) -> bool {
-        !self.replacing() && self.covers.values().any(|cover| *cover == Cover::Modal)
+        self.covers.values().any(|cover| *cover == Cover::Modal)
     }
 
     /// Purely painted backdrop: no mouse listeners, focus handle, or accessibility
@@ -342,8 +365,8 @@ impl<H: SurfaceHost> RetainedViewer<H> {
             self.state = State::Empty;
             return;
         }
-        if !self.ready {
-            self.state = if self.preparing {
+        if self.phase != LoadPhase::Ready {
+            self.state = if matches!(self.phase, LoadPhase::Preparing | LoadPhase::Navigating) {
                 State::Loading
             } else {
                 State::Hidden

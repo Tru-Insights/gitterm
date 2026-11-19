@@ -40,7 +40,7 @@ struct FixtureHost {
 }
 
 impl SurfaceHost for FixtureHost {
-    fn load(&mut self, document: &Document) -> Result<(), String> {
+    fn load(&mut self, _: LoadTicket, document: &Document) -> Result<(), String> {
         self.events.push("load");
         self.html = document.html().into();
         Ok(())
@@ -101,6 +101,8 @@ fn viewer() -> RetainedViewer<FixtureHost> {
     viewer.select(true, Some(geometry(2.)));
     let load = viewer.begin_content(origin("viewer.html"));
     assert!(viewer.complete_content(&load, Ok(document())));
+    assert_eq!(viewer.state(), State::Loading);
+    assert!(viewer.complete_navigation(&load, Ok(())));
     assert_eq!(viewer.state(), State::Visible);
     viewer
 }
@@ -251,6 +253,7 @@ fn stale_render_and_duplicate_results_do_not_replace_selected_content() {
     assert!(!viewer.complete_content(&old, Ok(document())));
     assert!(viewer.complete_content(&new, Ok(document())));
     assert!(!viewer.complete_content(&new, Err("duplicate".into())));
+    assert!(viewer.complete_navigation(&new, Ok(())));
     assert_eq!(viewer.state(), State::Covered);
     viewer.close_cover(cover, Some(geometry(2.)));
     assert_eq!(viewer.state(), State::Visible);
@@ -271,7 +274,7 @@ fn replacement_and_dock_motion_remove_snapshot_and_restore_only_on_final_close()
         viewer.complete_snapshot(&ticket, snapshot((200, 160)), now);
         let replacement = viewer.open_cover(kind, now);
         assert!(viewer.snapshot_image().is_none());
-        assert!(!viewer.dimmed());
+        assert!(viewer.dimmed());
         viewer.close_cover(modal, Some(geometry(2.)));
         assert!(!viewer.host_mut().visible);
         viewer.close_cover(replacement, None);
@@ -279,6 +282,65 @@ fn replacement_and_dock_motion_remove_snapshot_and_restore_only_on_final_close()
         viewer.select(true, Some(geometry(1.)));
         assert_eq!(viewer.state(), State::Visible);
     }
+}
+
+#[test]
+fn native_navigation_is_required_and_stale_or_failed_navigations_cannot_show_or_capture() {
+    let mut viewer = viewer();
+    let now = Instant::now();
+    let old = viewer.begin_content(origin("old.html"));
+    assert!(viewer.complete_content(&old, Ok(document())));
+    assert_eq!(viewer.state(), State::Loading);
+    let requests = viewer.host_mut().requests.len();
+    let cover = viewer.open_cover(Cover::Menu, now);
+    assert_eq!(viewer.host_mut().requests.len(), requests);
+    viewer.close_cover(cover, Some(geometry(2.)));
+    assert!(!viewer.host_mut().visible);
+
+    let current = viewer.begin_content(origin("new.html"));
+    assert!(viewer.complete_content(&current, Ok(document())));
+    assert!(!viewer.complete_navigation(&old, Ok(())));
+    assert!(!viewer.complete_navigation(&old, Err("old cancellation".into())));
+    assert_eq!(viewer.state(), State::Loading);
+    let cover = viewer.open_cover(Cover::Modal, now);
+    assert!(viewer.complete_navigation(&current, Ok(())));
+    assert!(!viewer.complete_navigation(&current, Ok(())));
+    assert_eq!(viewer.state(), State::Covered);
+    assert!(!viewer.host_mut().visible);
+    viewer.close_cover(cover, Some(geometry(2.)));
+    assert_eq!(viewer.state(), State::Visible);
+
+    let failed = viewer.begin_content(origin("failed.html"));
+    assert!(viewer.complete_content(&failed, Ok(document())));
+    assert!(viewer.complete_navigation(&failed, Err("fixture native navigation failed".into())));
+    assert_eq!(viewer.state(), State::Hidden);
+    assert_eq!(viewer.error(), Some("fixture native navigation failed"));
+    assert!(!viewer.host_mut().visible);
+    let closed = viewer.begin_content(origin("closed.html"));
+    assert!(viewer.complete_content(&closed, Ok(document())));
+    viewer.clear();
+    assert!(!viewer.complete_navigation(&closed, Ok(())));
+    assert_eq!(viewer.state(), State::Empty);
+}
+
+#[test]
+fn modal_over_replacement_dims_once_without_restoring_retained_backdrop() {
+    let mut viewer = viewer();
+    let now = Instant::now();
+    let replacement = viewer.open_cover(Cover::Replacement, now);
+    assert!(!viewer.dimmed());
+    let modal = viewer.open_cover(Cover::Modal, now);
+    let picker = viewer.open_cover(Cover::Modal, now);
+    assert!(viewer.dimmed());
+    assert!(viewer.snapshot_image().is_none());
+    assert!(!viewer.host_mut().visible);
+    viewer.close_cover(picker, None);
+    assert!(viewer.dimmed());
+    viewer.close_cover(modal, None);
+    assert!(!viewer.dimmed());
+    assert!(!viewer.host_mut().visible);
+    viewer.close_cover(replacement, Some(geometry(2.)));
+    assert_eq!(viewer.state(), State::Visible);
 }
 
 #[test]

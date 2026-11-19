@@ -2,7 +2,8 @@
 //!
 //! PR9 must own one coordinator per window, prepare documents off the UI thread,
 //! route every cover (including popup menus and dock motion) through it before
-//! drawing controls, drain native snapshot results and tick snapshot deadlines.
+//! drawing controls, drain native navigation results into `complete_navigation`,
+//! drain snapshots into `complete_snapshot`, and tick snapshot deadlines.
 //! Render `backdrop()` in the pane, one `dim_layer()` above native content, then
 //! controls. Recompute window-relative geometry before final cover close. Honor
 //! `RestoreFocus` using the saved valid native focus target or active pane.

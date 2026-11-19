@@ -17,20 +17,22 @@ use objc2_foundation::{
     NSDictionary, NSError, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
 use objc2_web_kit::{
-    WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate, WKSnapshotConfiguration,
-    WKWebView, WKWebViewConfiguration, WKWebsiteDataStore,
+    WKNavigation, WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate,
+    WKSnapshotConfiguration, WKWebView, WKWebViewConfiguration, WKWebsiteDataStore,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use super::{
     Document,
-    overlay::{Geometry, Snapshot, SnapshotTicket},
+    overlay::{Geometry, LoadTicket, Snapshot, SnapshotTicket},
 };
 
 /// UI-thread interface. `hide` MUST synchronously hide/detach the native view;
 /// snapshot initiation and completion must never control native visibility.
 pub trait SurfaceHost {
-    fn load(&mut self, document: &Document) -> Result<(), String>;
+    /// Start injection; report native navigation completion separately. Returning
+    /// Ok does not permit display or capture of the still-loading document.
+    fn load(&mut self, ticket: LoadTicket, document: &Document) -> Result<(), String>;
     fn show(&mut self, geometry: Geometry) -> Result<(), String>;
     fn hide(&mut self);
     fn clear(&mut self);
@@ -38,11 +40,31 @@ pub trait SurfaceHost {
 }
 
 pub type SnapshotResult = (SnapshotTicket, Result<Snapshot, String>);
+pub type NavigationResult = (LoadTicket, Result<(), String>);
+
+#[derive(Default)]
+struct NavigationState {
+    injection: Cell<bool>,
+    pending: RefCell<Option<(Retained<WKNavigation>, LoadTicket)>>,
+    results: RefCell<VecDeque<NavigationResult>>,
+}
+
+impl NavigationState {
+    fn finish(&self, navigation: Option<&WKNavigation>, result: Result<(), String>) {
+        let mut pending = self.pending.borrow_mut();
+        if let Some((expected, _)) = pending.as_ref()
+            && navigation.is_some_and(|navigation| std::ptr::eq(&**expected, navigation))
+        {
+            let (_, ticket) = pending.take().expect("matched pending navigation");
+            self.results.borrow_mut().push_back((ticket, result));
+        }
+    }
+}
 
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
-    #[ivars = Cell<bool>]
+    #[ivars = NavigationState]
     struct LocalNavigation;
 
     unsafe impl NSObjectProtocol for LocalNavigation {}
@@ -58,12 +80,52 @@ define_class!(
             // content may fetch renderer assets but cannot navigate into Page,
             // local files, custom schemes, or launch an external application.
             let url = unsafe { action.request().URL() }.and_then(|url| url.absoluteString());
-            let allow = allow_injected_document(self.ivars(), url.as_ref().map(|url| url.to_string()).as_deref());
+            let allow = allow_injected_document(
+                &self.ivars().injection,
+                url.as_ref().map(|url| url.to_string()).as_deref(),
+            );
             decision.call((if allow {
                 WKNavigationActionPolicy::Allow
             } else {
                 WKNavigationActionPolicy::Cancel
             },));
+        }
+
+        #[unsafe(method(webView:didFinishNavigation:))]
+        unsafe fn finished(&self, _view: &WKWebView, navigation: Option<&WKNavigation>) {
+            self.ivars().finish(navigation, Ok(()));
+        }
+
+        #[unsafe(method(webView:didFailNavigation:withError:))]
+        unsafe fn failed(
+            &self,
+            _view: &WKWebView,
+            navigation: Option<&WKNavigation>,
+            error: &NSError,
+        ) {
+            self.ivars().finish(
+                navigation,
+                Err(format!(
+                    "Retained content navigation failed: {}",
+                    error.localizedDescription()
+                )),
+            );
+        }
+
+        #[unsafe(method(webView:didFailProvisionalNavigation:withError:))]
+        unsafe fn provisional_failed(
+            &self,
+            _view: &WKWebView,
+            navigation: Option<&WKNavigation>,
+            error: &NSError,
+        ) {
+            self.ivars().finish(
+                navigation,
+                Err(format!(
+                    "Retained content navigation failed: {}",
+                    error.localizedDescription()
+                )),
+            );
         }
     }
 );
@@ -78,7 +140,7 @@ pub(super) fn allow_injected_document(pending: &Cell<bool>, url: Option<&str>) -
 pub struct LocalWebKitHost {
     view: Retained<WKWebView>,
     parent: Retained<NSView>,
-    _navigation: Retained<LocalNavigation>,
+    navigation: Retained<LocalNavigation>,
     results: Rc<RefCell<VecDeque<SnapshotResult>>>,
 }
 
@@ -95,7 +157,7 @@ impl LocalWebKitHost {
         let parent = unsafe { Retained::retain(handle.ns_view.as_ptr().cast::<NSView>()) }
             .ok_or("Missing native parent view")?;
         let navigation: Retained<LocalNavigation> = unsafe {
-            let allocated = LocalNavigation::alloc(mtm).set_ivars(Cell::new(false));
+            let allocated = LocalNavigation::alloc(mtm).set_ivars(NavigationState::default());
             msg_send![super(allocated), init]
         };
         // SAFETY: configuration and all native view operations stay on the main
@@ -116,7 +178,7 @@ impl LocalWebKitHost {
         Ok(Self {
             view,
             parent,
-            _navigation: navigation,
+            navigation,
             results: Rc::default(),
         })
     }
@@ -124,20 +186,31 @@ impl LocalWebKitHost {
     pub fn drain_snapshots(&mut self) -> Vec<SnapshotResult> {
         self.results.borrow_mut().drain(..).collect()
     }
+
+    pub fn drain_navigation(&mut self) -> Vec<NavigationResult> {
+        self.navigation
+            .ivars()
+            .results
+            .borrow_mut()
+            .drain(..)
+            .collect()
+    }
 }
 
 impl SurfaceHost for LocalWebKitHost {
-    fn load(&mut self, document: &Document) -> Result<(), String> {
+    fn load(&mut self, ticket: LoadTicket, document: &Document) -> Result<(), String> {
         self.hide();
+        self.navigation.ivars().pending.borrow_mut().take();
         // SAFETY: main-thread WebKit instance, owned string, no filesystem base
         // URL or read-access grant. Store stays ephemeral across replacements.
-        unsafe {
+        let navigation = unsafe {
             self.view.stopLoading();
-            self._navigation.ivars().set(true);
+            self.navigation.ivars().injection.set(true);
             self.view
                 .loadHTMLString_baseURL(&NSString::from_str(document.html()), None)
         }
         .ok_or("WebKit refused retained HTML")?;
+        *self.navigation.ivars().pending.borrow_mut() = Some((navigation, ticket));
         Ok(())
     }
 
@@ -177,9 +250,10 @@ impl SurfaceHost for LocalWebKitHost {
 
     fn clear(&mut self) {
         self.hide();
+        self.navigation.ivars().pending.borrow_mut().take();
         unsafe {
             self.view.stopLoading();
-            self._navigation.ivars().set(true);
+            self.navigation.ivars().injection.set(true);
             self.view
                 .loadHTMLString_baseURL(&NSString::from_str(""), None);
         }
