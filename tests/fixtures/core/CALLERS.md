@@ -485,3 +485,35 @@ client/server entry points, repository discovery and root/current-dir writes.
 Source error/capability guards and the dead `fetch_status` path are included.
 The App selection arm's non-status continuations remain the Iced adapter's
 responsibility; a migration must retain both plans and docs synchronization.
+
+## TRU-274 PR 5 shared runtime caller map
+
+The historical inventories above remain pinned. The composed status/selection
+reducers and every TRU-284 expected value and golden are unchanged.
+
+| Caller / owner | Current route / retained boundary |
+| --- | --- |
+| `App::request_git_status`; `request_git_status_for_active_source`; startup, resume, tab-open, context/CWD, connection, Git-entry and Tick callers listed above | Preserve the same reducer event/prelude and source/root guards. `run_status_commands` now submits to the application's `StatusRuntime` using Iced's current Tokio handle; it returns no pane-owned status Task. |
+| Local `StatusCommand::CollectStatus` | Core `StatusRuntime::execute` starts `git_status::collect_repo_status` through `Handle::spawn_blocking`. `SchedulePoll` still uses only the existing 5 s Tick. No new clock, timeout, cache or latest-request rejection. |
+| Remote executor | `execute_source_git_status` submits the existing `WorkspaceSource::git_status` future and `services::source_git_status_snapshot` conversion to `StatusRuntime::collect_remote`. Transport, credentials, capabilities, opaque roots and error DTOs stay in their original owners. |
+| `src/agentd/git.rs`; agent server and local source consumers | Compatibility facade re-exports core `git_status::{collect_repo_status, git_command, status_char}`. CLI parsing, discovery and git2 fallback move verbatim. File diff collection and all facade tests stay here. |
+| `services::collect_git_status`; worktree status summaries | Use core `runtime::collect_snapshot` for the same DTO conversion, preserving the existing wrapper's diagnostics. The unused main collector wrapper is removed. |
+| `App::subscription`; completion | One stable `StatusSubscriptionData` holds the sole `StatusReceiver`. `status_result_stream` forwards `StatusJobOutcome`; completed snapshots enter the unchanged `GitStatusLoaded` adapter/reducer path. Overlapping requests still apply in arrival order. Cancellation outcomes do not overwrite status. |
+| Tab/workspace close or stop | After each outer `App::update`, retain owners from the current host tab roster. Removed owners' pending jobs get one cancellation outcome; running/queued late snapshots are discarded. Hidden/inactive/keep-running tabs remain live. Runtime retains only job/owner resources, never a domain-state copy. |
+| Window close / application drop | `WindowCloseRequested` awaits `StatusRuntime::teardown` before `StatusRuntimeStopped` closes the window. Teardown closes submissions, cancels pending jobs and waits for already-started local Git. `App::drop` supplies nonblocking `close` as a fallback; aborting an async join does not claim to kill a Git child. |
+
+Core's optional `runtime` feature enables only the already-locked `tokio` and
+`git2` dependencies. The root Cargo.lock delta adds those two dependency edges
+to `gitterm-core`; it adds no packages or version/checksum changes. The separate
+GPUI workspace and lockfile are untouched.
+
+Existing test edits are mechanical adapter plumbing only: the headless App
+initializer receives its new runtime/receiver field, the direct remote-executor
+call receives that runtime argument, and the facade's PathBuf import becomes
+test-only. No assertions, expected values, goldens or collector tests change.
+New core runtime tests cover cancellation, late blocking output, queued output
+after owner removal, both overlapping completion orders (including errors),
+local command dispatch, drop and explicit teardown. A headless Iced adapter test
+also runs a real local job through the sole result stream into an inactive tab.
+Owner IDs are process-local
+host tab IDs and must not be reused for a different owner.

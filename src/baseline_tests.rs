@@ -63,6 +63,7 @@ impl Drop for Trace {
 fn headless(fixture: &Path) -> App {
     let config = Config::default();
     App {
+        status_jobs: StatusSubscriptionData::new(),
         title: "Synthetic baseline".into(),
         workspaces: Vec::new(),
         repos: RepoRegistry::default(),
@@ -922,7 +923,12 @@ fn removed_followed_tree_and_source_failure_traces() {
     assert!(source.capabilities().git_status);
     assert!(matches!(&source,WorkspaceSource::RemoteAgent {root,..} if root=="Q:/opaque/repo"));
     Trace::take();
-    let _ = App::execute_source_git_status(source, 10, "/fixture/fallback".into());
+    let _ = App::execute_source_git_status(
+        &app.status_jobs.runtime,
+        source,
+        10,
+        "/fixture/fallback".into(),
+    );
     assert_eq!(requests().len(), 1);
     apply(&mut app, snapshot(10, "/fixture/alpha", "good", true, true));
     let before = app.active_tab().unwrap().status.last_poll;

@@ -25,18 +25,7 @@ const MAX_UNTRACKED_DIFF_PREVIEW_LINES: usize = 3000;
 pub(crate) fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatusSnapshot {
     let started = Instant::now();
 
-    let status = gitterm::agentd::git::collect_repo_status(&repo_path);
-    let snapshot = GitStatusSnapshot {
-        tab_id,
-        repo_name: status.repo_name,
-        repo_path: status.root,
-        branch_name: status.branch_name,
-        is_git_repo: status.is_git_repo,
-        staged: status.staged.into_iter().map(file_entry).collect(),
-        unstaged: status.unstaged.into_iter().map(file_entry).collect(),
-        untracked: status.untracked.into_iter().map(file_entry).collect(),
-        error: None,
-    };
+    let snapshot = gitterm_core::runtime::collect_snapshot(tab_id, repo_path.clone());
 
     let elapsed = started.elapsed();
     perf_log!(
@@ -58,14 +47,6 @@ pub(crate) fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatus
     }
 
     snapshot
-}
-
-fn file_entry(status: gitterm::agentd::git::GitFileStatus) -> FileEntry {
-    FileEntry {
-        path: status.path,
-        status: status.status,
-        is_staged: status.is_staged,
-    }
 }
 
 pub(crate) fn collect_git_worktrees(tab_id: usize, repo_path: PathBuf) -> GitWorktreesSnapshot {
