@@ -834,6 +834,39 @@ fn cmd_hover_and_click_resolve_current_url_and_call_only_app_opener(cx: &mut Tes
 }
 
 #[::gpui::test]
+fn find_busy_polls_notify_only_when_visible_state_changes(cx: &mut TestAppContext) {
+    use std::{cell::Cell, rc::Rc, sync::atomic::Ordering};
+    cx.background_executor.allow_parking();
+    let entity = cx.new(|cx| {
+        let mut view =
+            TerminalView::new_deferred(BackendSettings::default(), TerminalConfig::default(), cx);
+        // Keep admission Busy deterministically, without a worker timing race.
+        view.backend.service_busy.store(true, Ordering::Release);
+        view.find_open = true;
+        view.find_status = "Busy".into();
+        view
+    });
+    let notifications = Rc::new(Cell::new(0));
+    let observed = notifications.clone();
+    let _subscription =
+        cx.update(|cx| cx.observe(&entity, move |_, _| observed.set(observed.get() + 1)));
+    entity.update(cx, |view, cx| view.poll_services(cx));
+    assert_eq!(notifications.get(), 0);
+
+    entity.update(cx, |view, cx| {
+        view.find_revision = Some(view.backend.revision());
+        view.find_status = "2 matches".into();
+        view.backend.events.invalidate();
+        view.poll_services(cx);
+        assert_eq!(view.find_status, "Busy");
+        assert!(view.find_revision.is_none());
+    });
+    assert_eq!(notifications.get(), 1);
+    entity.update(cx, |view, cx| view.poll_services(cx));
+    assert_eq!(notifications.get(), 1);
+}
+
+#[::gpui::test]
 fn find_shortcuts_edit_navigate_close_restore_focus_and_export_callback(cx: &mut TestAppContext) {
     use alacritty_terminal::vte::ansi::Processor;
     use gpui_kit::Modifiers;
