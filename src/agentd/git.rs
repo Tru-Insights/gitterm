@@ -580,3 +580,148 @@ mod tests {
         assert_eq!(healed, expected);
     }
 }
+
+#[cfg(test)]
+mod baseline_tests {
+    use super::*;
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = git_command()
+            .current_dir(root)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fn odd_names() -> Vec<&'static str> {
+        if cfg!(windows) {
+            vec!["space name.txt"]
+        } else {
+            vec![
+                "double\"quote.txt",
+                "line\nbreak.txt",
+                "space name.txt",
+                "tab\tfile.txt",
+            ]
+        }
+    }
+
+    #[test]
+    fn cli_parser_and_missing_git_fallback_baseline() {
+        const CHILD: &str = "GITTERM_V6_GIT_BASELINE_ROOT";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let nested = root.join("nested/deep");
+            let status = collect_repo_status(&nested);
+            assert!(status.is_git_repo);
+            // characterized: git2 fallback discovers the repo but retains the requested nested root/name.
+            assert_eq!(status.root, nested);
+            assert_eq!(status.repo_name, "deep");
+            let detached = std::env::var_os("GITTERM_V6_GIT_BASELINE_DETACHED").is_some();
+            assert_eq!(
+                status.branch_name,
+                if detached { "HEAD" } else { "fixture-branch" }
+            );
+            let paths: Vec<_> = status.untracked.iter().map(|f| f.path.as_str()).collect();
+            assert_eq!(paths, odd_names());
+            // Renames are disabled in the fallback: separate add/delete entries.
+            assert_eq!(
+                status
+                    .staged
+                    .iter()
+                    .map(|f| (f.path.as_str(), f.status.as_str()))
+                    .collect::<Vec<_>>(),
+                [("old.txt", "D"), ("renamed file.txt", "A")]
+            );
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-qb", "fixture-branch"]);
+        git(&root, &["config", "core.quotePath", "true"]);
+        std::fs::write(root.join("old.txt"), "fixture\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join("nested/deep")).unwrap();
+        git(&root, &["mv", "old.txt", "renamed file.txt"]);
+        for path in odd_names() {
+            std::fs::write(root.join(path), "fixture\n").unwrap();
+        }
+        for detached in [false, true] {
+            if detached {
+                git(&root, &["checkout", "--detach", "-q"]);
+            }
+            let status = collect_repo_status(&root.join("nested/deep"));
+            assert!(status.is_git_repo);
+            assert_eq!(
+                std::fs::canonicalize(&status.root).unwrap(),
+                std::fs::canonicalize(&root).unwrap()
+            );
+            assert_eq!(status.repo_name, "repo");
+            // characterized: detached CLI HEAD keeps the initial "main" label, unlike fallback "HEAD".
+            assert_eq!(
+                status.branch_name,
+                if detached { "main" } else { "fixture-branch" }
+            );
+            // characterized: line parser leaves C-quoted filenames escaped and truncates a spaced rename at the last space.
+            assert_eq!(
+                status
+                    .untracked
+                    .iter()
+                    .map(|f| f.path.as_str())
+                    .collect::<Vec<_>>(),
+                if cfg!(windows) {
+                    vec!["space name.txt"]
+                } else {
+                    vec![
+                        "\"double\\\"quote.txt\"",
+                        "\"line\\nbreak.txt\"",
+                        "space name.txt",
+                        "\"tab\\tfile.txt\"",
+                    ]
+                }
+            );
+            assert_eq!(
+                status
+                    .staged
+                    .iter()
+                    .map(|f| (f.path.as_str(), f.status.as_str()))
+                    .collect::<Vec<_>>(),
+                [("file.txt", "R")]
+            );
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "agentd::git::baseline_tests::cli_parser_and_missing_git_fallback_baseline",
+                    "--nocapture",
+                ])
+                .env(CHILD, &root)
+                .env("PATH", fixture.path().join("missing-git-bin"));
+            if detached {
+                child.env("GITTERM_V6_GIT_BASELINE_DETACHED", "1");
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let nonrepo = collect_repo_status(fixture.path());
+        assert!(!nonrepo.is_git_repo);
+        assert_eq!(nonrepo.branch_name, "main");
+    }
+}

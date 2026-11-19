@@ -1,0 +1,173 @@
+{
+  "active_workspace": 0,
+  "collapsed_repo_groups": [
+    "local"
+  ],
+  "remote_sessions": [],
+  "repos": [
+    {
+      "bottom_terminals": [
+        {
+          "dir": "/fixture/shared/repo-console"
+        }
+      ],
+      "dir": "/fixture/shared",
+      "env": {
+        "FIXTURE_BASE": "base",
+        "FIXTURE_MODE": "repo"
+      },
+      "run_command": "fixture-run"
+    },
+    {
+      "bottom_terminals": [
+        {
+          "dir": "/fixture/extra/console"
+        }
+      ],
+      "dir": "/fixture/extra",
+      "env": {
+        "FIXTURE_EXTRA": "extra"
+      }
+    }
+  ],
+  "workspaces": [
+    {
+      "abbrev": "FA",
+      "active": true,
+      "bottom_terminals": [
+        {
+          "dir": "/fixture/shared/console"
+        }
+      ],
+      "chats": [
+        "fixture-chat-a"
+      ],
+      "collapsed_issue_groups": [
+        "done"
+      ],
+      "color": "blue",
+      "decisions_repo": "/fixture/extra",
+      "dir": "/fixture/shared",
+      "env": {
+        "FIXTURE_MODE": "alpha"
+      },
+      "env_overrides": {
+        "FIXTURE_MODE": "alpha"
+      },
+      "guidelines_off": true,
+      "home": "/fixture/shared",
+      "name": "Fixture Alpha",
+      "repos": [
+        "/fixture/shared",
+        "/fixture/extra"
+      ],
+      "repos_added": [
+        "/fixture/extra"
+      ],
+      "repos_removed": [
+        "/fixture/removed"
+      ],
+      "run_command": null,
+      "tabs": [
+        {
+          "chat_session_id": "fixture-chat-a",
+          "dir": "/fixture/shared/sub",
+          "session_uid": "fixture-session-a",
+          "startup_command": "fixture-shell",
+          "task_id": "fixture-task-a",
+          "task_session_id": "fixture-task-session-a"
+        }
+      ]
+    },
+    {
+      "abbrev": "FB",
+      "active": false,
+      "active_tab": 0,
+      "bottom_terminals": [],
+      "chats": [
+        "fixture-chat-b"
+      ],
+      "collapsed_issue_groups": [],
+      "color": "green",
+      "dir": "/fixture/shared",
+      "env": {
+        "FIXTURE_MODE": "beta"
+      },
+      "env_overrides": {
+        "FIXTURE_MODE": "beta"
+      },
+      "home": "/fixture/shared",
+      "name": "Fixture Beta",
+      "parked": {
+        "note": "Synthetic running park",
+        "parked_at": "2000-01-03T00:00:00Z"
+      },
+      "repos": [
+        "/fixture/shared",
+        "/fixture/extra"
+      ],
+      "run_command": null,
+      "tabs": [
+        {
+          "agent_config": {
+            "agent": "gemini",
+            "backend": "acp",
+            "model": "retired-fixture-model"
+          },
+          "chat_session_id": "fixture-chat-b",
+          "dir": "/fixture/shared",
+          "session_uid": "fixture-session-b",
+          "tab_kind": "agent"
+        }
+      ]
+    },
+    {
+      "abbrev": "FP",
+      "active": false,
+      "bottom_terminals": [],
+      "collapsed_issue_groups": [
+        "done"
+      ],
+      "color": "red",
+      "dir": "/fixture/parked",
+      "name": "Fixture Parked",
+      "parked": {
+        "note": "Synthetic parked fixture",
+        "parked_at": "2000-01-01T00:00:00Z"
+      },
+      "run_command": null,
+      "tabs": [
+        {
+          "dir": "/fixture/parked"
+        }
+      ]
+    },
+    {
+      "abbrev": "FD",
+      "active": false,
+      "bottom_terminals": [],
+      "collapsed_issue_groups": [
+        "done"
+      ],
+      "color": "yellow",
+      "dir": "/fixture/done",
+      "done_at": "2000-01-02T00:00:00Z",
+      "name": "Fixture Done",
+      "run_command": null,
+      "tabs": []
+    },
+    {
+      "abbrev": "FC",
+      "active": false,
+      "bottom_terminals": [],
+      "collapsed_issue_groups": [
+        "done"
+      ],
+      "color": "lavender",
+      "dir": "/fixture/closed",
+      "name": "Fixture Legacy Closed",
+      "run_command": null,
+      "tabs": []
+    }
+  ]
+}
