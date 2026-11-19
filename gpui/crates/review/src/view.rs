@@ -1,6 +1,6 @@
 use crate::{
     fixture,
-    model::{Group, Patches, ReviewModel},
+    model::{FileKey, Group, Patches, ReviewModel},
 };
 use gitterm_core::status::GitStatusSnapshot;
 use gpui::{
@@ -9,9 +9,10 @@ use gpui::{
     TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, px, rgb, size,
 };
 use gpui_component::{
-    Root, Selectable, Sizable,
+    Root, Sizable,
     button::Button,
     diff::{Diff, DiffFile, DiffMode, DiffState},
+    list::ListItem,
 };
 use std::{
     ffi::OsString,
@@ -127,6 +128,8 @@ pub struct ReviewView {
     diff_error: Option<String>,
     focus: FocusHandle,
     loading: bool,
+    generation: u64,
+    pending_selection: Option<FileKey>,
 }
 impl ReviewView {
     pub fn new(model: ReviewModel, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -138,9 +141,62 @@ impl ReviewView {
             diff_error: None,
             focus,
             loading: false,
+            generation: 0,
+            pending_selection: None,
         };
         view.prepare(cx);
         view
+    }
+    pub fn model(&self) -> &ReviewModel {
+        &self.model
+    }
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
+    pub fn select_file(&mut self, key: FileKey, cx: &mut Context<Self>) {
+        self.pending_selection = Some(key);
+        self.apply_selection(cx);
+        cx.notify();
+    }
+    fn apply_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(key) = &self.pending_selection
+            && let Some(index) = self.model.files.iter().position(|file| &file.key == key)
+        {
+            self.model.selected = Some(index);
+            self.prepare(cx);
+            if !self.loading {
+                self.pending_selection = None;
+            }
+        }
+    }
+    pub fn begin_load(&mut self, cx: &mut Context<Self>) -> u64 {
+        self.generation += 1;
+        self.loading = true;
+        self.model.error = None;
+        cx.notify();
+        self.generation
+    }
+    pub fn finish_load(
+        &mut self,
+        generation: u64,
+        result: Result<(GitStatusSnapshot, Patches), String>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.generation {
+            return;
+        }
+        self.loading = false;
+        match result {
+            Ok((snapshot, patches)) => {
+                if let Err(error) = self.replace(&snapshot, &patches, cx) {
+                    self.model.error = Some(error);
+                }
+                self.apply_selection(cx);
+                self.pending_selection = None;
+            }
+            Err(error) => self.model.error = Some(error),
+        }
+        cx.notify();
     }
     /// Apply a newer status/patch set while retaining marks for unchanged entries.
     pub fn replace(
@@ -172,6 +228,7 @@ impl ReviewView {
         }
     }
     fn select(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_selection = None;
         if index < self.model.files.len() && self.model.selected != Some(index) {
             self.model.selected = Some(index);
             self.prepare(cx);
@@ -186,6 +243,7 @@ impl ReviewView {
         self.navigate(true, window, cx);
     }
     fn navigate(&mut self, previous: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_selection = None;
         let before = self.model.selected;
         self.model.navigate(previous);
         if before != self.model.selected {
@@ -235,16 +293,17 @@ impl Render for ReviewView {
                 .enumerate()
                 .filter(|(_, f)| f.key.0 == group)
             {
+                let label = format!(
+                    "{} {} {}",
+                    if file.viewed { "✓" } else { "○" },
+                    file.status,
+                    file.title()
+                );
                 sidebar = sidebar.child(
-                    Button::new(("review-file", index))
+                    ListItem::new(("review-file", index))
                         .w_full()
-                        .small()
-                        .label(format!(
-                            "{} {} {}",
-                            if file.viewed { "✓" } else { "○" },
-                            file.status,
-                            file.title()
-                        ))
+                        .accessibility_label(label.clone())
+                        .child(label)
                         .selected(self.model.selected == Some(index))
                         .on_click(
                             cx.listener(move |this, _, window, cx| this.select(index, window, cx)),
@@ -253,6 +312,9 @@ impl Render for ReviewView {
             }
         }
         let mut body = div().flex_1().min_w_0().h_full().flex().flex_col();
+        if self.loading {
+            body = body.child(div().p_3().child("Loading repository…"));
+        }
         if let Some(error) = &self.model.error {
             body = body.child(div().p_3().text_color(rgb(0xf38ba8)).child(error.clone()));
         }
@@ -300,12 +362,8 @@ impl Render for ReviewView {
                         .child(Diff::new(diff).line_number(true).syntax_highlight(true)),
                 );
             }
-        } else {
-            body = body.child(div().p_4().child(if self.loading {
-                "Loading repository…"
-            } else {
-                "No changed files"
-            }));
+        } else if !self.loading {
+            body = body.child(div().p_4().child("No changed files"));
         }
         div()
             .size_full()

@@ -9,12 +9,13 @@ use gpui_component::dock::{BasePanel, Panel, PanelEvent, PanelInfo, PanelState};
 use std::rc::Rc;
 
 pub const PANEL_NAME: &str = "GitTermShellPane";
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum PaneKind {
     Terminal,
     Chat,
     Git,
     Files,
+    Review(Entity<gitterm_gpui_review::ReviewView>),
 }
 impl From<SessionKind> for PaneKind {
     fn from(kind: SessionKind) -> Self {
@@ -29,6 +30,7 @@ pub enum PaneContent {
     Chat(Entity<ChatView>),
     Git,
     Files,
+    Review(Entity<gitterm_gpui_review::ReviewView>),
     Error(String),
 }
 pub struct Pane {
@@ -52,7 +54,7 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let content = match kind {
+        let content = match kind.clone() {
             PaneKind::Terminal => {
                 let launch = TerminalLaunch {
                     cwd: data.terminal_cwd(workspace, cx).or_else(dirs::home_dir),
@@ -97,6 +99,7 @@ impl Pane {
             })),
             PaneKind::Git => PaneContent::Git,
             PaneKind::Files => PaneContent::Files,
+            PaneKind::Review(view) => PaneContent::Review(view),
         };
         let terminal_cwd = matches!(content, PaneContent::Terminal(_))
             .then(|| data.terminal_cwd(workspace, cx).or_else(dirs::home_dir))
@@ -142,6 +145,7 @@ impl Focusable for Pane {
         match &self.content {
             PaneContent::Terminal(view) => view.read(cx).focus_handle().clone(),
             PaneContent::Chat(view) => view.focus_handle(cx),
+            PaneContent::Review(view) => view.focus_handle(cx),
             _ => self.focus.clone(),
         }
     }
@@ -200,6 +204,11 @@ impl Render for Pane {
                 .size_full()
                 .min_h_0()
                 .child(view.clone()),
+            PaneContent::Review(view) => div()
+                .id("review-pane")
+                .size_full()
+                .min_h_0()
+                .child(view.clone()),
             PaneContent::Error(error) => body.text_color(rgb(p.red)).child(error.clone()),
             PaneContent::Git => {
                 let status = self.status_view(cx);
@@ -228,7 +237,22 @@ impl Render for Pane {
                         } else {
                             "unstaged"
                         };
+                        let data = self.data.clone();
+                        let workspace = self.workspace;
+                        let selected = file.clone();
                         div()
+                            .id(SharedString::from(format!(
+                                "git-file-{group}-{}",
+                                file.path
+                            )))
+                            .cursor_pointer()
+                            .on_click(move |_, _, cx| {
+                                if let Some(owner) = data.local_owner() {
+                                    owner.update(cx, |owner, cx| {
+                                        owner.open_changed_file(workspace, selected.clone(), cx)
+                                    });
+                                }
+                            })
                             .flex()
                             .gap_2()
                             .py_1()

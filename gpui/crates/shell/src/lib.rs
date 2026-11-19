@@ -8,6 +8,7 @@ mod files_view;
 mod layout;
 mod owner;
 mod pane;
+mod review_reload;
 mod theme;
 pub mod workspace_config;
 pub mod workspace_status;
@@ -95,6 +96,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Result<Self> {
         gitterm_gpui_chat::init(cx);
+        gitterm_gpui_review::init(cx);
         let catalog = data.workspaces(cx);
         if let Some(first) = catalog.first() {
             owner.update(cx, |owner, cx| {
@@ -154,6 +156,13 @@ impl Shell {
             }
             cx.notify();
         }));
+        subscriptions.push(cx.subscribe_in(
+            &owner,
+            window,
+            |this, _, event: &FileOpen, window, cx| {
+                this.open_review(event, window, cx);
+            },
+        ));
         if local {
             owner.update(cx, |owner, cx| {
                 owner.dispatch(Intent::Opened, Instant::now(), cx)
@@ -169,6 +178,69 @@ impl Shell {
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
         })
+    }
+    fn open_review(&mut self, event: &FileOpen, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(file) = &event.changed else { return };
+        if !self.local {
+            return;
+        }
+        let Some(state) = self
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace.id == event.workspace)
+        else {
+            return;
+        };
+        let id = format!("workspace-{}-review", state.workspace.layout_key);
+        let mut created = false;
+        let pane = state
+            .panes
+            .entry(id.clone())
+            .or_insert_with(|| {
+                created = true;
+                let review = cx
+                    .new(|cx| gitterm_gpui_review::ReviewView::new(Default::default(), window, cx));
+                self.owner.update(cx, |owner, _| {
+                    owner.reviews.insert(event.workspace, review.clone());
+                });
+                let pane = cx.new(|cx| {
+                    Pane::new(
+                        id.clone(),
+                        "Review".into(),
+                        PaneKind::Review(review),
+                        event.workspace,
+                        self.data.clone(),
+                        window,
+                        cx,
+                    )
+                });
+                self.registry
+                    .borrow_mut()
+                    .insert(id.clone(), pane.downgrade());
+                pane
+            })
+            .clone();
+        let pane::PaneContent::Review(review) = &pane.read(cx).content else {
+            unreachable!()
+        };
+        let review = review.clone();
+        use gitterm_gpui_review::model::Group;
+        let group = if file.staged {
+            Group::Staged
+        } else if file.status == "??" {
+            Group::Untracked
+        } else {
+            Group::Unstaged
+        };
+        review.update(cx, |review, cx| {
+            review.select_file((group, file.path.clone()), cx)
+        });
+        if created || review.read(cx).model().error.is_some() {
+            self.owner
+                .update(cx, |owner, cx| owner.reload_review(event.workspace, cx));
+        }
+        // Use the event's workspace even if selection changed before delivery.
+        self.show_workspace_pane(event.workspace, &id, window, cx);
     }
     fn add_folder_button(&self, cx: &Context<Self>) -> Button {
         Button::new("add-folder")
@@ -267,9 +339,24 @@ impl Shell {
             .workspaces
             .iter()
             .find(|w| Some(w.workspace.id) == self.active_workspace(cx))
-            .is_some_and(|w| git_visible(w, cx));
-        self.owner
-            .update(cx, |owner, cx| owner.set_git_visible(visible, enter, cx));
+            .is_some_and(|w| pane_visible(w, "git", cx));
+        let reviews: Vec<_> = self
+            .workspaces
+            .iter()
+            .map(|w| {
+                (
+                    w.workspace.id,
+                    Some(w.workspace.id) == self.active_workspace(cx)
+                        && pane_visible(w, "review", cx),
+                )
+            })
+            .collect();
+        self.owner.update(cx, |owner, cx| {
+            owner.set_git_visible(visible, enter, cx);
+            for (workspace, visible) in reviews {
+                owner.set_review_visible(workspace, visible, cx);
+            }
+        });
     }
     fn active_workspace(&self, cx: &App) -> Option<WorkspaceId> {
         self.owner.read(cx).model.active()
@@ -325,7 +412,19 @@ impl Shell {
         }
     }
     fn show_pane(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let state = self.active(cx);
+        let workspace = self.active(cx).workspace.id;
+        self.show_workspace_pane(workspace, id, window, cx);
+    }
+    fn show_workspace_pane(
+        &mut self,
+        workspace: WorkspaceId,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.workspaces.iter().find(|w| w.workspace.id == workspace) else {
+            return;
+        };
         let Some(pane) = state.panes.get(id).cloned() else {
             return;
         };
@@ -410,7 +509,7 @@ fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscriptio
         cx.notify();
     })
 }
-fn git_visible(state: &WorkspaceDock, cx: &App) -> bool {
+fn pane_visible(state: &WorkspaceDock, kind: &str, cx: &App) -> bool {
     use gpui_component::dock::{PanelInfo, PanelState};
     fn visible(node: &PanelState, id: &str) -> bool {
         match &node.info {
@@ -423,7 +522,7 @@ fn git_visible(state: &WorkspaceDock, cx: &App) -> bool {
         }
     }
     let layout = state.dock.read(cx).dump(cx);
-    let id = format!("workspace-{}-git", state.workspace.layout_key);
+    let id = format!("workspace-{}-{kind}", state.workspace.layout_key);
     visible(&layout.center, &id)
         || [&layout.left_dock, &layout.right_dock, &layout.bottom_dock]
             .into_iter()
