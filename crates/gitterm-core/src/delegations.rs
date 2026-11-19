@@ -2045,11 +2045,17 @@ mod tests {
                 r#"{"brief":"Keep artifacts.","child":{"runner":"codex_consult"},"created_at":"2026-10-08T10:00:00Z","delegation_id":"consult-fixture","kind":"consult","log_path":"/fixture/delegations/consult-fixture.jsonl","parent":{"chat_session_id":"claude-1","cwd":"/repo","session_uid":"tab-uid","workspace":"GitTerm"},"status":{"state":"requested"},"updated_at":"2026-10-08T10:00:00Z"}"#,
             ),
         ] {
+            // PathBuf::join preserves the root spelling and appends native separators.
+            let expected = if cfg!(windows) {
+                expected.replace("/fixture/delegations/", r"/fixture\\delegations\\")
+            } else {
+                expected.to_string()
+            };
             let encoded =
                 serde_json::to_string(&delegation_record(&record, Path::new("/fixture")).unwrap())
                     .unwrap();
             assert_eq!(encoded, expected);
-            let restored: Delegation = serde_json::from_str(expected).unwrap();
+            let restored: Delegation = serde_json::from_str(&expected).unwrap();
             assert_eq!(restored, record);
         }
     }
