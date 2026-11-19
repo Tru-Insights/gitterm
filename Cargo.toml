@@ -24,7 +24,7 @@ name = "gitterm-v6-agent"
 path = "src/bin/gitterm-agent/main.rs"
 
 [dependencies]
-gitterm-core = { path = "crates/gitterm-core", features = ["runtime"] }
+gitterm-core = { path = "crates/gitterm-core", features = ["runtime", "codex-trust"] }
 iced = { version = "0.14", features = ["tokio", "image"] }
 iced_term = { path = "../iced_term_fork" }
 muda = "0.17"
@@ -84,7 +84,7 @@ objc2 = "0.5"
 [features]
 default = ["stt"]
 stt = ["whisper-rs", "cpal"]
-excalidraw = []
+excalidraw = ["gitterm-core/excalidraw"]
 
 [package.metadata.bundle]
 name = "GitTerm V6"

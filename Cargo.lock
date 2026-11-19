@@ -2267,12 +2267,16 @@ dependencies = [
  "chrono",
  "git2",
  "libc",
+ "pulldown-cmark",
  "schemars",
  "serde",
  "serde_json",
+ "shell-words",
  "tempfile",
  "tokio",
+ "toml 0.8.2",
  "uuid",
+ "warp",
 ]
 
 [[package]]

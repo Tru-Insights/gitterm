@@ -1,16 +1,11 @@
-#[cfg(feature = "excalidraw")]
-use crate::excalidraw;
-use crate::markdown;
 use crate::{
-    add_word_diffs_to_lines, build_syntax_highlight_lines, format_bytes, read_text_preview,
-    DiffLine, DiffLineType, DiffSnapshot, FileEntry, FileLoadSnapshot, FileSyntaxSnapshot,
-    FileVersionSignature, GitBranchEntry, GitStatusSnapshot, GitWorktreeEntry,
-    GitWorktreesSnapshot, RemoteHostConfig, RemoteSessionEntry, RemoteSessionsSnapshot, TabState,
-    LARGE_TEXT_PREVIEW_BYTES, LARGE_TEXT_PREVIEW_LINES, MAX_FULL_TEXT_LOAD_BYTES,
-    MAX_INLINE_WEBVIEW_BYTES,
+    add_word_diffs_to_lines, build_syntax_highlight_lines, DiffLine, DiffLineType, DiffSnapshot,
+    FileEntry, FileLoadSnapshot, FileSyntaxSnapshot, FileVersionSignature, GitBranchEntry,
+    GitStatusSnapshot, GitWorktreeEntry, GitWorktreesSnapshot, RemoteHostConfig,
+    RemoteSessionEntry, RemoteSessionsSnapshot, TabState,
 };
 use std::path::PathBuf;
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::Instant;
 
 macro_rules! perf_log {
     ($($arg:tt)*) => {{
@@ -359,266 +354,45 @@ pub(crate) fn collect_file_load(
     path: PathBuf,
     is_dark_theme: bool,
 ) -> FileLoadSnapshot {
-    let started = Instant::now();
-    let mut snapshot = FileLoadSnapshot {
+    file_load_snapshot(gitterm_core::content::collect_file_load(
         tab_id,
-        path: path.clone(),
-        file_content: String::new(),
-        image_path: None,
-        webview_content: None,
-        file_preview_notice: None,
-        syntax_highlight_lines: None,
-        syntax_highlight_notice: None,
-        file_signature: None,
-    };
-
-    let file_metadata = std::fs::metadata(&path).ok();
-    let file_size = file_metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-    snapshot.file_signature = file_metadata.as_ref().and_then(|metadata| {
-        let modified_unix_nanos = metadata
-            .modified()
-            .ok()?
-            .duration_since(UNIX_EPOCH)
-            .ok()?
-            .as_nanos();
-        Some(FileVersionSignature {
-            modified_unix_nanos,
-            file_len: metadata.len(),
-        })
-    });
-
-    #[cfg(feature = "excalidraw")]
-    if excalidraw::is_excalidraw_file(&path) {
-        if file_size > MAX_INLINE_WEBVIEW_BYTES {
-            snapshot.file_preview_notice = Some(format!(
-                "Inline preview skipped for large Excalidraw file ({}). Click \"View in Browser\".",
-                format_bytes(file_size)
-            ));
-            perf_log!(
-                "file_load tab={} path={} kind=excalidraw_skip size={}B text={}B webview={}B notice={} took={}ms",
-                tab_id,
-                path.display(),
-                file_size,
-                snapshot.file_content.len(),
-                snapshot.webview_content.as_ref().map(|s| s.len()).unwrap_or(0),
-                snapshot.file_preview_notice.is_some(),
-                started.elapsed().as_millis()
-            );
-            return snapshot;
-        }
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if excalidraw::validate_excalidraw(&content) {
-                snapshot.webview_content =
-                    Some(excalidraw::render_excalidraw_html(&content, is_dark_theme));
-            }
-        }
-        perf_log!(
-            "file_load tab={} path={} kind=excalidraw_inline size={}B text={}B webview={}B notice={} took={}ms",
-            tab_id,
-            path.display(),
-            file_size,
-            snapshot.file_content.len(),
-            snapshot.webview_content.as_ref().map(|s| s.len()).unwrap_or(0),
-            snapshot.file_preview_notice.is_some(),
-            started.elapsed().as_millis()
-        );
-        return snapshot;
-    }
-
-    if TabState::is_markdown_file(&path) {
-        if file_size > MAX_INLINE_WEBVIEW_BYTES {
-            snapshot.file_preview_notice = Some(format!(
-                "Inline preview skipped for large Markdown file ({}). Click \"View in Browser\".",
-                format_bytes(file_size)
-            ));
-            perf_log!(
-                "file_load tab={} path={} kind=markdown_skip size={}B text={}B webview={}B notice={} took={}ms",
-                tab_id,
-                path.display(),
-                file_size,
-                snapshot.file_content.len(),
-                snapshot.webview_content.as_ref().map(|s| s.len()).unwrap_or(0),
-                snapshot.file_preview_notice.is_some(),
-                started.elapsed().as_millis()
-            );
-            return snapshot;
-        }
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            snapshot.webview_content =
-                Some(markdown::render_markdown_to_html(&content, is_dark_theme));
-        }
-    } else if TabState::is_html_file(&path) {
-        if file_size > MAX_INLINE_WEBVIEW_BYTES {
-            snapshot.file_preview_notice = Some(format!(
-                "Inline preview skipped for large HTML file ({}). Click \"View in Browser\".",
-                format_bytes(file_size)
-            ));
-            perf_log!(
-                "file_load tab={} path={} kind=html_skip size={}B text={}B webview={}B notice={} took={}ms",
-                tab_id,
-                path.display(),
-                file_size,
-                snapshot.file_content.len(),
-                snapshot.webview_content.as_ref().map(|s| s.len()).unwrap_or(0),
-                snapshot.file_preview_notice.is_some(),
-                started.elapsed().as_millis()
-            );
-            return snapshot;
-        }
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            snapshot.webview_content = Some(content);
-        }
-    } else if TabState::is_image_file(&path) {
-        snapshot.image_path = Some(path.clone());
-    } else if file_size > MAX_FULL_TEXT_LOAD_BYTES {
-        if let Ok(preview) =
-            read_text_preview(&path, LARGE_TEXT_PREVIEW_BYTES, LARGE_TEXT_PREVIEW_LINES)
-        {
-            snapshot.file_content = preview;
-        } else if let Ok(content) = std::fs::read_to_string(&path) {
-            snapshot.file_content = content;
-        }
-        snapshot.file_preview_notice = Some(format!(
-            "Large file ({}): showing first {} lines (~{} KB).",
-            format_bytes(file_size),
-            LARGE_TEXT_PREVIEW_LINES,
-            LARGE_TEXT_PREVIEW_BYTES / 1024
-        ));
-    } else if let Ok(content) = std::fs::read_to_string(&path) {
-        snapshot.file_content = content;
-    }
-
-    let kind = if snapshot.image_path.is_some() {
-        "image"
-    } else if snapshot.webview_content.is_some() {
-        "inline_webview"
-    } else if snapshot.file_preview_notice.is_some() {
-        "text_preview"
-    } else {
-        "text"
-    };
-    perf_log!(
-        "file_load tab={} path={} kind={} size={}B text={}B webview={}B preview_notice={} syntax_notice={} took={}ms",
-        tab_id,
-        path.display(),
-        kind,
-        file_size,
-        snapshot.file_content.len(),
-        snapshot
-            .webview_content
-            .as_ref()
-            .map(|s| s.len())
-            .unwrap_or(0),
-        snapshot.file_preview_notice.is_some(),
-        false,
-        started.elapsed().as_millis()
-    );
-
-    snapshot
+        path,
+        is_dark_theme,
+    ))
 }
 
-/// Shape a FileLoadSnapshot from bytes fetched via a WorkspaceSource so
-/// remote files render through the exact same viewer pipeline as local
-/// ones. `path` is the remote path as a display/extension token — nothing
-/// here touches the local filesystem.
+/// Remote shaping delegates without consulting the local filesystem.
 pub(crate) fn shape_source_file_load(
     tab_id: usize,
     path: PathBuf,
     content: Result<crate::source::SourceFileContent, String>,
     is_dark_theme: bool,
 ) -> FileLoadSnapshot {
-    let mut snapshot = FileLoadSnapshot {
+    file_load_snapshot(gitterm_core::content::shape_source_file_load(
         tab_id,
-        path: path.clone(),
-        file_content: String::new(),
-        image_path: None,
-        webview_content: None,
-        file_preview_notice: None,
+        path,
+        content,
+        is_dark_theme,
+    ))
+}
+
+fn file_load_snapshot(snapshot: gitterm_core::content::FileLoadSnapshot) -> FileLoadSnapshot {
+    FileLoadSnapshot {
+        tab_id: snapshot.tab_id,
+        path: snapshot.path,
+        file_content: snapshot.file_content,
+        image_path: snapshot.image_path,
+        webview_content: snapshot.webview_content,
+        file_preview_notice: snapshot.file_preview_notice,
         syntax_highlight_lines: None,
         syntax_highlight_notice: None,
-        file_signature: None,
-    };
-
-    let content = match content {
-        Ok(content) => content,
-        Err(err) => {
-            snapshot.file_preview_notice = Some(format!("Could not load remote file: {err}"));
-            return snapshot;
-        }
-    };
-    let total_size = content.total_size;
-
-    #[cfg(feature = "excalidraw")]
-    if excalidraw::is_excalidraw_file(&path) {
-        if total_size > MAX_INLINE_WEBVIEW_BYTES {
-            snapshot.file_preview_notice = Some(format!(
-                "Inline preview skipped for large Excalidraw file ({}).",
-                format_bytes(total_size)
-            ));
-            return snapshot;
-        }
-        if let Ok(text) = String::from_utf8(content.data) {
-            if excalidraw::validate_excalidraw(&text) {
-                snapshot.webview_content =
-                    Some(excalidraw::render_excalidraw_html(&text, is_dark_theme));
-            }
-        }
-        return snapshot;
+        file_signature: snapshot
+            .file_signature
+            .map(|signature| FileVersionSignature {
+                modified_unix_nanos: signature.modified_unix_nanos,
+                file_len: signature.file_len,
+            }),
     }
-
-    if TabState::is_markdown_file(&path) {
-        if total_size > MAX_INLINE_WEBVIEW_BYTES {
-            snapshot.file_preview_notice = Some(format!(
-                "Inline preview skipped for large Markdown file ({}).",
-                format_bytes(total_size)
-            ));
-            return snapshot;
-        }
-        let text = String::from_utf8_lossy(&content.data);
-        snapshot.webview_content = Some(markdown::render_markdown_to_html(&text, is_dark_theme));
-    } else if TabState::is_html_file(&path) {
-        if total_size > MAX_INLINE_WEBVIEW_BYTES {
-            snapshot.file_preview_notice = Some(format!(
-                "Inline preview skipped for large HTML file ({}).",
-                format_bytes(total_size)
-            ));
-            return snapshot;
-        }
-        snapshot.webview_content = Some(String::from_utf8_lossy(&content.data).to_string());
-    } else if TabState::is_image_file(&path) {
-        snapshot.file_preview_notice =
-            Some("Image preview isn't supported for remote files yet.".to_string());
-    } else if std::str::from_utf8(&content.data).is_err() {
-        snapshot.file_preview_notice = Some(format!(
-            "Binary file ({}) — no preview.",
-            format_bytes(total_size)
-        ));
-    } else if total_size > MAX_FULL_TEXT_LOAD_BYTES {
-        let cut = content.data.len().min(LARGE_TEXT_PREVIEW_BYTES);
-        let text = String::from_utf8_lossy(&content.data[..cut]);
-        snapshot.file_content = text
-            .lines()
-            .take(LARGE_TEXT_PREVIEW_LINES)
-            .collect::<Vec<_>>()
-            .join("\n");
-        snapshot.file_preview_notice = Some(format!(
-            "Large file ({}): showing first {} lines (~{} KB).",
-            format_bytes(total_size),
-            LARGE_TEXT_PREVIEW_LINES,
-            LARGE_TEXT_PREVIEW_BYTES / 1024
-        ));
-    } else {
-        snapshot.file_content = String::from_utf8_lossy(&content.data).to_string();
-        if content.truncated {
-            snapshot.file_preview_notice = Some(format!(
-                "Preview truncated: showing {} of {}.",
-                format_bytes(snapshot.file_content.len() as u64),
-                format_bytes(total_size)
-            ));
-        }
-    }
-
-    snapshot
 }
 
 pub(crate) fn collect_file_syntax_highlight(

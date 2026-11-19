@@ -1,7 +1,7 @@
 //! Plan limits in the Usage view and on the rail (TRU-211): the Claude Code
 //! and Codex windows `/usage` shows. The reading, the rules and the words
-//! live in `gitterm::plan_limits`; this holds the state, the background
-//! work and the widgets.
+//! live in `gitterm::plan_limits`; shared state and jobs live in core limits.
+//! This adapter selects local sources and recipients, submits notices and renders widgets.
 //!
 //! Claude readings arrive on `TurnCompleted.rate_limit` from any chat tab,
 //! local only, and are taken in `update()` (a cheap in-memory merge).
@@ -13,10 +13,8 @@
 use super::*;
 
 use gitterm::harness::RateLimitReading;
-use gitterm::plan_limits::{self, Level, PlanLimits, PlanLimitsFile, Provider};
+use gitterm::plan_limits::{self, Level, PlanLimitsFile, Provider};
 
-/// How often the newest Codex rollout is read again.
-const CODEX_READ_EVERY: Duration = Duration::from_secs(60);
 /// The rail badge's text size.
 const BADGE_FONT: f32 = 9.0;
 /// The badge row's height when there is a badge.
@@ -61,106 +59,7 @@ fn daily_usage(samples: &[plan_limits::UsageSample], now: i64) -> [Option<f64>; 
     })
 }
 
-#[derive(Debug, Clone)]
-pub enum PlanLimitsEvent {
-    /// A Codex read finished: the newest account-wide reading, if any.
-    CodexRead(Option<Box<PlanLimits>>),
-    PinChanged(Option<plan_limits::RoutingPin>),
-    Saved(Result<(), String>),
-}
-
-#[derive(Debug, Default)]
-pub struct PlanLimitsState {
-    /// The last reading of each provider (`plan-limits.json`).
-    file: PlanLimitsFile,
-    codex_in_flight: bool,
-    codex_read_at: Option<Instant>,
-    /// A change not yet written.
-    dirty: bool,
-    save_in_flight: bool,
-}
-
-impl PlanLimitsState {
-    pub(super) fn evaluation_for_launch(&self) -> plan_limits::PolicyEvaluation {
-        plan_limits::evaluate_policy(&self.file, now_unix())
-    }
-
-    fn evaluate(&mut self, chats: &[String], now: i64) {
-        if self.file.prune_history(now) {
-            self.dirty = true;
-        }
-        let evaluation = plan_limits::evaluate_policy(&self.file, now);
-        if self.file.pin != evaluation.pin {
-            self.file.pin = evaluation.pin.clone();
-            self.dirty = true;
-        }
-        if self.file.policy.as_ref() != Some(&evaluation.policy) {
-            self.file.policy = Some(evaluation.policy);
-            self.dirty = true;
-        }
-        self.queue_notices(chats, &evaluation.notices);
-    }
-
-    fn queue_notices(&mut self, chats: &[String], lines: &[String]) {
-        let before = self.file.pending_notices.len();
-        self.file
-            .pending_notices
-            .retain(|chat, _| chats.contains(chat));
-        self.dirty |= before != self.file.pending_notices.len();
-        if lines.is_empty() {
-            return;
-        }
-        for chat in chats {
-            let pending = self.file.pending_notices.entry(chat.clone()).or_default();
-            if lines.iter().any(|line| line.starts_with("Routing:")) {
-                let before = pending.len();
-                pending.retain(|line| !line.starts_with("Routing:"));
-                self.dirty |= before != pending.len();
-            }
-            for line in lines {
-                if !pending.contains(line) {
-                    pending.push(line.clone());
-                    self.dirty = true;
-                }
-            }
-        }
-    }
-
-    fn notice(&self, chat: &str, busy: bool) -> Option<String> {
-        if busy {
-            return None;
-        }
-        self.file.pending_notices.get(chat).map(|lines| {
-            gitterm::delegations::from_gitterm(&format!("GitTerm plan limits: {}\nRelay this heads-up to the user and follow `plan_limits` routing for new work. An explicit user model choice wins; never restart running workers to change routing.", lines.join("\n")))
-        })
-    }
-
-    fn finish_notice(&mut self, chat: &str, accepted: bool) {
-        if accepted {
-            self.dirty |= self.file.pending_notices.remove(chat).is_some();
-        } else {
-            eprintln!("[plan-limits] coordinator {chat} did not accept the notice; retaining it for retry");
-        }
-    }
-
-    /// The persisted readings from the config dir (a small read).
-    pub fn load(config_dir: &Path) -> Self {
-        Self {
-            file: PlanLimitsFile::load(&PlanLimitsFile::path_in(config_dir)),
-            ..Self::default()
-        }
-    }
-
-    fn finish_save(&mut self, result: Result<(), String>, path: &Path) -> bool {
-        self.save_in_flight = false;
-        if let Err(error) = result {
-            eprintln!("[plan-limits] not saved to {}: {error}", path.display());
-            self.dirty = true;
-            return false;
-        }
-        true
-    }
-}
+pub use gitterm_core::limits::{PlanLimitsEvent, PlanLimitsState};
 
 fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
@@ -226,14 +125,14 @@ impl App {
     }
 
     pub(super) fn plan_limits_routing(&self) -> plan_limits::RoutingReport {
-        plan_limits::evaluate_policy(&self.plan_limits.file, now_unix())
+        plan_limits::evaluate_policy(self.plan_limits.file(), now_unix())
             .report
             .routing
     }
 
     pub(super) fn plan_limits_snapshot(&self) -> Result<serde_json::Value, String> {
         serde_json::to_value(
-            plan_limits::evaluate_policy(&self.plan_limits.file, now_unix()).report,
+            plan_limits::evaluate_policy(self.plan_limits.file(), now_unix()).report,
         )
         .map_err(|error| format!("cannot encode plan_limits result: {error}"))
     }
@@ -310,6 +209,7 @@ impl App {
             let Some(prompt) = self.plan_limits.notice(&uid, busy) else {
                 continue;
             };
+            let prompt = gitterm::delegations::from_gitterm(&prompt);
             tasks.push(self.update(Event::AgentSubmitPrompt(id, prompt.into())));
             let accepted = self
                 .workspaces
@@ -325,10 +225,7 @@ impl App {
 
     /// A Claude chat's turn reported its plan limits: the latest wins.
     pub(super) fn observe_claude_rate_limit(&mut self, reading: &RateLimitReading) {
-        let mut limits = plan_limits::claude_limits(&reading.info, reading.observed_at);
-        limits.local = Some(true);
-        if self.plan_limits.file.absorb(limits) {
-            self.plan_limits.dirty = true;
+        if self.plan_limits.observe_claude_rate_limit(reading) {
             self.evaluate_plan_limits();
         }
     }
@@ -337,10 +234,7 @@ impl App {
     /// changed.
     pub(super) fn poll_plan_limits(&mut self) -> Task<Event> {
         self.evaluate_plan_limits();
-        let due = self
-            .plan_limits
-            .codex_read_at
-            .is_none_or(|at| at.elapsed() >= CODEX_READ_EVERY);
+        let due = self.plan_limits.codex_read_due(Instant::now());
         let read = if due {
             self.read_codex_limits()
         } else {
@@ -356,62 +250,31 @@ impl App {
 
     /// Read the newest Codex rollout's limits now, unless a read runs.
     pub(super) fn read_codex_limits(&mut self) -> Task<Event> {
-        if self.plan_limits.codex_in_flight {
+        if self.plan_limits.codex_read_in_flight() {
             return Task::none();
         }
-        let Some(sources) = gitterm::usage::UsageSources::local() else {
-            eprintln!("[plan-limits] cannot find the home directory; Codex limits not read");
-            self.plan_limits.codex_read_at = Some(Instant::now());
+        let sessions = gitterm::usage::UsageSources::local().map(|sources| sources.codex_sessions);
+        let Some(job) = self.plan_limits.begin_codex_read(sessions, Instant::now()) else {
             return Task::none();
         };
-        self.plan_limits.codex_in_flight = true;
-        self.plan_limits.codex_read_at = Some(Instant::now());
-        Task::perform(
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    plan_limits::latest_codex_limits(&sources.codex_sessions)
-                })
-                .await
-            },
-            |result| match result {
-                Ok(limits) => Event::PlanLimits(PlanLimitsEvent::CodexRead(limits.map(Box::new))),
-                Err(error) => {
-                    eprintln!("[plan-limits] Codex read task failed: {error}");
-                    Event::PlanLimits(PlanLimitsEvent::CodexRead(None))
-                }
-            },
-        )
+        Task::perform(job.run(), Event::PlanLimits)
     }
 
     /// Writes the readings off the UI thread, one write at a time.
     fn save_plan_limits(&mut self) -> Task<Event> {
-        if !self.plan_limits.dirty || self.plan_limits.save_in_flight {
-            return Task::none();
-        }
-        self.plan_limits.dirty = false;
-        self.plan_limits.save_in_flight = true;
-        let file = self.plan_limits.file.clone();
         let path = PlanLimitsFile::path_in(&config::global_config_dir());
-        Task::perform(
-            async move {
-                tokio::task::spawn_blocking(move || file.save(&path))
-                    .await
-                    .unwrap_or_else(|error| Err(format!("plan limits save task failed: {error}")))
-            },
-            |result| Event::PlanLimits(PlanLimitsEvent::Saved(result)),
-        )
+        let Some(job) = self.plan_limits.begin_save(path) else {
+            return Task::none();
+        };
+        Task::perform(job.run(), Event::PlanLimits)
     }
 
     pub(super) fn update_plan_limits(&mut self, event: PlanLimitsEvent) -> Task<Event> {
         match event {
             PlanLimitsEvent::CodexRead(limits) => {
-                self.plan_limits.codex_in_flight = false;
-                if let Some(limits) = limits {
-                    if self.plan_limits.file.absorb(*limits) {
-                        self.plan_limits.dirty = true;
-                        self.evaluate_plan_limits();
-                        return self.save_plan_limits();
-                    }
+                if self.plan_limits.finish_codex_read(limits) {
+                    self.evaluate_plan_limits();
+                    return self.save_plan_limits();
                 }
             }
             PlanLimitsEvent::Saved(result) => {
@@ -422,11 +285,9 @@ impl App {
                 return self.save_plan_limits();
             }
             PlanLimitsEvent::PinChanged(pin) => {
-                if self.plan_limits.file.pin == pin {
+                if !self.plan_limits.set_pin(pin.clone()) {
                     return Task::none();
                 }
-                self.plan_limits.file.pin = pin.clone();
-                self.plan_limits.dirty = true;
                 self.evaluate_plan_limits();
                 let chats = self
                     .plan_limit_chats()
@@ -462,8 +323,8 @@ impl App {
     /// tree when a reading arrives.
     pub(super) fn view_plan_limits_badge(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let badge = plan_limits::badge(
-            self.plan_limits.file.readings(),
-            &self.plan_limits.file.history,
+            self.plan_limits.file().readings(),
+            &self.plan_limits.file().history,
             now_unix(),
         );
         let (label, color, height) = match &badge {
@@ -491,10 +352,10 @@ impl App {
     pub(super) fn plan_limits_tooltip(&self) -> String {
         let now = now_unix();
         let mut lines = vec!["Usage  ⌘⇧U".to_string()];
-        for reading in self.plan_limits.file.readings() {
+        for reading in self.plan_limits.file().readings() {
             lines.extend(plan_limits::tooltip_lines(
                 reading,
-                &self.plan_limits.file.history,
+                &self.plan_limits.file().history,
                 now,
                 &chrono::Local,
             ));
@@ -548,7 +409,7 @@ impl App {
         let muted = theme.text_muted();
         let secondary = theme.text_secondary();
         let no_wrap = iced::widget::text::Wrapping::None;
-        let reading = self.plan_limits.file.get(provider);
+        let reading = self.plan_limits.file().get(provider);
         let mut header = Row::new()
             .spacing(8)
             .align_y(iced::Alignment::Center)
@@ -562,7 +423,7 @@ impl App {
             Provider::Claude => "From GitTerm Claude chats; updates when a turn ends.",
             Provider::Codex => "From the newest Codex rollout; read every minute.",
         };
-        let report = plan_limits::evaluate_policy(&self.plan_limits.file, now);
+        let report = plan_limits::evaluate_policy(self.plan_limits.file(), now);
         let provider_report = match provider {
             Provider::Claude => &report.report.claude,
             Provider::Codex => &report.report.codex,
@@ -594,7 +455,7 @@ impl App {
         }
         if self
             .plan_limits
-            .file
+            .file()
             .pin
             .as_ref()
             .is_some_and(|pin| pin.provider == provider)
@@ -648,7 +509,7 @@ impl App {
         let track = theme.surface0();
         for window in &reading.windows {
             let figure =
-                plan_limits::window_figure(reading, window, &self.plan_limits.file.history, now);
+                plan_limits::window_figure(reading, window, &self.plan_limits.file().history, now);
             let percent = figure.map(|(p, _)| p);
             let (figure, fill_color) = match figure {
                 Some((p, mark)) => (
@@ -719,7 +580,7 @@ impl App {
                 .spacing(10)
                 .align_y(iced::Alignment::Center),
             );
-            let history = self.plan_limits.file.history.iter().find(|history| {
+            let history = self.plan_limits.file().history.iter().find(|history| {
                 history.provider == provider
                     && history.label == window.label
                     && history.resets_at == window.resets_at
@@ -786,7 +647,7 @@ impl App {
         });
         if self
             .plan_limits
-            .file
+            .file()
             .pin
             .as_ref()
             .is_some_and(|pin| pin.provider == provider && pin.until > now)
@@ -832,106 +693,6 @@ mod tests {
     }
 
     #[test]
-    fn notices_are_deduplicated_per_chat_grouped_and_held_until_idle() {
-        let mut state = PlanLimitsState::default();
-        let chats = vec!["first".into(), "second".into()];
-        let lines = vec!["hot".into(), "routing changed".into()];
-        state.queue_notices(&chats, &lines);
-        state.queue_notices(&chats, &lines);
-        assert!(state.notice("first", true).is_none());
-        let second = state.notice("second", false).unwrap();
-        assert_eq!(second.matches("hot").count(), 1);
-        assert!(second.contains("routing changed"));
-        state.finish_notice("second", false);
-        assert!(state.notice("second", false).is_some());
-        state.finish_notice("second", true);
-        assert!(state.notice("second", false).is_none());
-        assert!(state.notice("first", false).is_some());
-        state.finish_notice("first", true);
-        assert!(state.notice("first", false).is_none());
-        state.queue_notices(&chats, &["Routing: hold_claude".into()]);
-        state.queue_notices(&chats, &["Routing: balanced".into()]);
-        let prompt = state.notice("first", false).unwrap();
-        assert!(!prompt.contains("hold_claude"));
-        assert!(prompt.contains("Routing: balanced"));
-    }
-
-    #[test]
-    fn setting_and_clearing_a_pin_queue_a_routing_nudge() {
-        let mut state = PlanLimitsState::default();
-        let chats = vec!["coordinator".into()];
-        let pin = plan_limits::RoutingPin {
-            provider: Provider::Codex,
-            until: now_unix() + 3600,
-        };
-        state.queue_notices(
-            &chats,
-            &[plan_limits::pin_change_notice(
-                Some(&pin),
-                now_unix(),
-                &plan_limits::evaluate_policy(&state.file, now_unix())
-                    .report
-                    .routing,
-            )],
-        );
-        assert!(state
-            .notice("coordinator", false)
-            .unwrap()
-            .contains("pin to Codex set"));
-        state.queue_notices(
-            &chats,
-            &[plan_limits::pin_change_notice(
-                None,
-                now_unix(),
-                &plan_limits::evaluate_policy(&state.file, now_unix())
-                    .report
-                    .routing,
-            )],
-        );
-        let notice = state.notice("coordinator", false).unwrap();
-        assert!(notice.contains("pin cleared."));
-        assert!(!notice.contains("pin to Codex set"));
-    }
-
-    fn claude_reading(used: f64, now: i64) -> PlanLimits {
-        let mut reading = plan_limits::claude_limits(
-            &serde_json::json!({
-                "unifiedWindows": {"seven_day": {"utilization": used / 100.0, "resetsAt": now + 5 * 86400}}
-            }),
-            now,
-        );
-        reading.local = Some(true);
-        reading
-    }
-
-    #[test]
-    fn pending_hot_and_hold_notices_survive_restart_and_acknowledgement() {
-        for used in [35.0, 95.0] {
-            let now = now_unix();
-            let dir = tempfile::tempdir().unwrap();
-            let path = PlanLimitsFile::path_in(dir.path());
-            let mut state = PlanLimitsState::default();
-            let chats = vec!["coordinator".into(), "other".into()];
-            state.file.absorb(claude_reading(used, now));
-            state.evaluate(&chats, now);
-            assert!(state.notice("coordinator", true).is_none());
-            let expected = state.notice("coordinator", false).unwrap();
-            state.file.save(&path).unwrap();
-            let mut resumed = PlanLimitsState::load(dir.path());
-            resumed.evaluate(&chats, now);
-            assert_eq!(resumed.notice("coordinator", false), Some(expected.clone()));
-            resumed.finish_notice("coordinator", false);
-            assert_eq!(resumed.notice("coordinator", false), Some(expected.clone()));
-            resumed.finish_notice("coordinator", true);
-            resumed.file.save(&path).unwrap();
-            let mut acknowledged = PlanLimitsState::load(dir.path());
-            acknowledged.evaluate(&chats, now);
-            assert!(acknowledged.notice("coordinator", false).is_none());
-            assert_eq!(acknowledged.notice("other", false), Some(expected));
-        }
-    }
-
-    #[test]
     fn recipients_are_coordinator_roots_across_backends_not_resumed_children() {
         let mut root = TabState::new(1, PathBuf::from("/repo"));
         root.kind = TabKind::Agent(tab::AgentSession::new(tab::AgentBackendConfig::Acp {
@@ -958,49 +719,6 @@ mod tests {
     }
 
     #[test]
-    fn pin_under_hold_keeps_the_effective_checkpoint_and_handoff_notice() {
-        let now = now_unix();
-        let chats = vec!["coordinator".into()];
-        let mut state = PlanLimitsState::default();
-        state.file.absorb(claude_reading(95.0, now));
-        state.evaluate(&chats, now);
-        state.file.pin = Some(plan_limits::RoutingPin {
-            provider: Provider::Claude,
-            until: now + 3600,
-        });
-        state.evaluate(&chats, now);
-        state.queue_notices(
-            &chats,
-            &[plan_limits::pin_change_notice(
-                state.file.pin.as_ref(),
-                now,
-                &plan_limits::evaluate_policy(&state.file, now)
-                    .report
-                    .routing,
-            )],
-        );
-        let prompt = state.notice("coordinator", false).unwrap();
-        assert!(prompt.contains("start nothing new on Claude"));
-        assert!(prompt.contains("writes checkpoint and handoff"));
-        state.finish_notice("coordinator", true);
-        state.file.pin = None;
-        state.evaluate(&chats, now);
-        state.queue_notices(
-            &chats,
-            &[plan_limits::pin_change_notice(
-                None,
-                now,
-                &plan_limits::evaluate_policy(&state.file, now)
-                    .report
-                    .routing,
-            )],
-        );
-        let cleared = state.notice("coordinator", false).unwrap();
-        assert!(cleared.contains("pin cleared."));
-        assert!(cleared.contains("writes checkpoint and handoff"));
-    }
-
-    #[test]
     fn busy_count_is_shared_by_provider_and_tracks_same_batch_worker_launches() {
         let mut ws = Workspace::new("work".into(), PathBuf::from("/repo"), WorkspaceColor::Blue);
         let mut codex = TabState::new(1, PathBuf::from("/repo"));
@@ -1020,44 +738,6 @@ mod tests {
             running_plan_limit_workers(std::slice::from_ref(&ws), Provider::Codex, None),
             0
         );
-    }
-
-    #[test]
-    fn notice_changes_during_an_in_flight_save_remain_dirty() {
-        let chats = vec!["coordinator".into()];
-        let mut state = PlanLimitsState::default();
-        state.queue_notices(&chats, &["Routing: hold_codex".into()]);
-        let snapshot = state.file.clone();
-        state.dirty = false;
-        state.save_in_flight = true;
-        state.finish_notice("coordinator", true);
-        let dir = tempfile::tempdir().unwrap();
-        let path = PlanLimitsFile::path_in(dir.path());
-        snapshot.save(&path).unwrap();
-        assert!(state.finish_save(Ok(()), &path));
-        assert!(state.dirty);
-        state.file.save(&path).unwrap();
-        assert!(PlanLimitsState::load(dir.path())
-            .notice("coordinator", false)
-            .is_none());
-        state.queue_notices(&chats, &["Routing: balanced".into()]);
-        state.dirty = false;
-        state.queue_notices(&[], &[]);
-        assert!(state.dirty);
-        assert!(state.file.pending_notices.is_empty());
-    }
-
-    #[test]
-    fn failed_save_restores_dirty_state_for_a_later_tick() {
-        let mut state = PlanLimitsState {
-            dirty: false,
-            save_in_flight: true,
-            ..PlanLimitsState::default()
-        };
-
-        assert!(!state.finish_save(Err("disk full".into()), Path::new("plan-limits.json")));
-        assert!(state.dirty);
-        assert!(!state.save_in_flight);
     }
 
     #[test]
