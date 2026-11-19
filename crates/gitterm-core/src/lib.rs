@@ -31,3 +31,7 @@ pub mod workers;
 pub mod gh_identity;
 #[cfg(feature = "runtime")]
 pub mod task_worktree;
+
+pub mod chat_facts;
+pub mod chats;
+pub mod find;
