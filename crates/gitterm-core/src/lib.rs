@@ -45,6 +45,7 @@ pub mod chats;
 pub mod find;
 
 pub mod work;
+pub mod work_notes;
 
 // Delegation services; launch authority remains with the application owner.
 #[cfg(feature = "runtime")]
