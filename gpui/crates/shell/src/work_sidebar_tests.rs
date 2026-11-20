@@ -525,3 +525,388 @@ fn refresh_and_more_in_find_emit_from_fixture_rows() {
         .unwrap();
     assert_eq!(sidebar.activate(action), Some(WorkSidebarOutcome::OpenFind));
 }
+
+struct IcedFixture {
+    root: tempfile::TempDir,
+    config: PathBuf,
+    workspace: gitterm_core::workspace_config::WorkspaceConfig,
+    repo: PathBuf,
+}
+impl IcedFixture {
+    fn new() -> Self {
+        use gitterm_core::tasks::*;
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let config = base.join("iced");
+        let home = base.join("work");
+        let repo = base.join("api");
+        for dir in [&config, &home.join("docs"), &repo] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let git = |args: &[&str]| {
+            let output = gitterm_core::git_status::git_command()
+                .current_dir(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ]);
+        std::fs::write(repo.join("changed.txt"), "changed").unwrap();
+        for (dir, name, text) in [
+            (&home, "docs/note.md", "# Work note\n"),
+            (&repo, ".plans/plan.md", "# Repo plan\n"),
+            (&repo, "docs/DECISIONS.md", "# Decisions\n"),
+            (&repo, "docs/random.md", "# Not listed\n"),
+        ] {
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let file = serde_json::json!({"active_workspace":0,"workspaces":[
+            {"name":"Work fixture","abbrev":"WF","dir":home,"color":"blue","location":{"kind":"local","root":repo},"tabs":[{"dir":home,"chat_session_id":"root-chat","session_uid":"parent"}],"chats":["root-chat"],"repos":[home,repo]},
+            {"name":"Other","abbrev":"O","dir":base.join("other"),"color":"blue","tabs":[]}
+        ],"repos":[{"dir":repo,"run_command":"cargo run"}]});
+        std::fs::write(
+            config.join("workspaces.json"),
+            serde_json::to_vec(&file).unwrap(),
+        )
+        .unwrap();
+        let facts_dir = gitterm_core::chat_facts::facts_dir(&config);
+        std::fs::create_dir(&facts_dir).unwrap();
+        let facts = ChatFacts {
+            checkouts: vec![gitterm_core::chat_facts::CheckoutTouch {
+                repo: repo.clone(),
+                dir: repo.clone(),
+                branch: Some("main".into()),
+                edits: 3,
+                last: "2026-01-01T00:00:00Z".into(),
+            }],
+            repos_touched: vec![RepoTouch {
+                dir: repo.clone(),
+                edits: 3,
+            }],
+            ..Default::default()
+        };
+        std::fs::write(
+            gitterm_core::chat_facts::facts_path(&facts_dir, ChatBackend::Claude, "root-chat")
+                .unwrap(),
+            serde_json::to_vec(&facts).unwrap(),
+        )
+        .unwrap();
+        let mut task = crate::tasks::fixture_task("task-1", "Fixture task", "task/fixture");
+        task.workspace.location = WorkspaceLocationIdentity::Local {
+            directory: repo.clone(),
+        };
+        task.repository.common_dir = repo.join(".git");
+        task.lifecycle = TaskLifecycle::Interrupted;
+        task.attention.reason = Some(TaskAttentionReason::Interrupted);
+        task.attention.unread = true;
+        task.attention.since = Some("2026-01-01T00:00:00Z".into());
+        let mut other = task.clone();
+        other.task_id = "other-task".into();
+        other.workspace.location = WorkspaceLocationIdentity::Local {
+            directory: base.join("other"),
+        };
+        let worker = Delegation {
+            delegation_id: "worker-1".into(),
+            kind: DelegationKind::Implement,
+            parent: DelegationParent {
+                session_uid: "parent".into(),
+                chat_session_id: Some("root-chat".into()),
+                workspace: "Work fixture".into(),
+                cwd: home,
+            },
+            child: DelegationChild::TaskSession {
+                task_id: task.task_id.clone(),
+                task_session_id: None,
+                conversation: None,
+                preset_name: None,
+                model: None,
+                role: None,
+            },
+            brief: "Implement fixture".into(),
+            target: None,
+            previous: None,
+            superseded_by: None,
+            status: DelegationStatus::Running,
+            result: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            delivered_at: None,
+            delivered: false,
+            dismissed_at: None,
+            options: Default::default(),
+            time_limit_reached_at: None,
+            time_limit_deadline_unix_ms: None,
+        };
+        let document = TaskStoreDocument {
+            tasks: vec![task, other],
+            delegations: vec![worker],
+            ..Default::default()
+        };
+        std::fs::write(
+            config.join("tasks.json"),
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+        let catalog = crate::workspace_config::IcedCatalog::read(&config).unwrap();
+        Self {
+            root,
+            config,
+            workspace: catalog.workspaces[0].clone(),
+            repo,
+        }
+    }
+    fn load(&self) -> crate::data::IcedWorkData {
+        crate::data::IcedWorkData::read(&self.config, 1, &self.workspace, Focus::Latest).unwrap()
+    }
+}
+
+fn tree_snapshot(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<PathBuf, (Option<Vec<u8>>, SystemTime)> {
+    let mut snapshot = std::collections::BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let meta = std::fs::metadata(&path).unwrap();
+        let bytes = if meta.is_dir() {
+            pending.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+            None
+        } else {
+            Some(std::fs::read(&path).unwrap())
+        };
+        snapshot.insert(path, (bytes, meta.modified().unwrap()));
+    }
+    snapshot
+}
+
+#[test]
+fn iced_work_fixture_has_real_rows_in_order_and_never_changes_source_bytes_or_mtimes() {
+    let fixture = IcedFixture::new();
+    let before = tree_snapshot(fixture.root.path());
+    let data = fixture.load();
+    assert_eq!(data.tasks.len(), 1);
+    assert_eq!(data.workers.len(), 1);
+    assert_eq!(
+        data.facts.repos.iter().map(|r| &r.dir).collect::<Vec<_>>(),
+        [
+            PathBuf::from(fixture.workspace.home_dir()),
+            fixture.repo.clone()
+        ]
+        .iter()
+        .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        data.facts.repos[1].run_command.as_deref(),
+        Some("cargo run")
+    );
+    let state = Rc::new(RefCell::new(State::default()));
+    data.apply(&mut state.borrow_mut());
+    let mut sidebar = WorkSidebar::new(data.facts, state);
+    sidebar.tasks = data.tasks;
+    sidebar.workers = data.workers;
+    assert_eq!(
+        sidebar
+            .rows()
+            .iter()
+            .filter(|r| r.heading)
+            .map(|r| r.label.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Work fixture",
+            "Repos",
+            "Tasks",
+            "Workers",
+            "Chats",
+            "Documents",
+            "Needs you"
+        ]
+    );
+    assert!(!sidebar.rows().iter().any(|r| r.label == "Work note"));
+    sidebar.open.insert(Fold::Documents);
+    sidebar.open.insert(Fold::Repo(fixture.repo.clone()));
+    let rows = sidebar.rows();
+    for label in [
+        "api",
+        "Fixture task",
+        "Implement fixture",
+        "Work note",
+        "Repo plan",
+        "Decisions",
+        "main",
+    ] {
+        assert!(rows.iter().any(|r| r.label == label), "missing {label}");
+    }
+    assert!(!rows.iter().any(|r| r.label == "Not listed"));
+    assert!(
+        rows.iter()
+            .find(|r| r.label == "main")
+            .unwrap()
+            .badges
+            .iter()
+            .any(|badge| badge.contains("dirty"))
+    );
+    assert_eq!(
+        rows.iter().find(|r| r.label == "Work note").unwrap().action,
+        Some(Action::Emit(WorkSidebarOutcome::OpenDocument {
+            workspace: 1,
+            path: PathBuf::from(&fixture.workspace.dir).join("docs/note.md")
+        }))
+    );
+    // A second load also must not acquire a lease, migrate a task, or write
+    // status refresh metadata in the repositories or source config directory.
+    fixture.load();
+    assert_eq!(tree_snapshot(fixture.root.path()), before);
+}
+
+#[test]
+fn missing_and_malformed_task_stores_are_read_only_and_errors_are_visible() {
+    let fixture = IcedFixture::new();
+    std::fs::remove_file(fixture.config.join("tasks.json")).unwrap();
+    let before = tree_snapshot(fixture.root.path());
+    assert!(fixture.load().tasks.is_empty());
+    assert_eq!(tree_snapshot(fixture.root.path()), before);
+    std::fs::write(fixture.config.join("tasks.json"), b"{bad").unwrap();
+    let before = tree_snapshot(fixture.root.path());
+    let result =
+        crate::data::IcedWorkData::read(&fixture.config, 1, &fixture.workspace, Focus::Latest);
+    assert!(result.err().unwrap().to_string().contains("task store"));
+    assert_eq!(tree_snapshot(fixture.root.path()), before);
+}
+
+#[gpui::test]
+fn write_outcomes_report_unavailable_and_still_emit_typed_events(cx: &mut gpui::TestAppContext) {
+    let sidebar = cx.new(|_| fixture(false));
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let received = events.clone();
+    cx.update(|cx| {
+        cx.subscribe(&sidebar, move |_, outcome: &WorkSidebarOutcome, _| {
+            received.borrow_mut().push(outcome.clone());
+        })
+        .detach();
+    });
+    let actions = [
+        WorkSidebarOutcome::AddRepo,
+        WorkSidebarOutcome::RemoveRepo {
+            workspace: 7,
+            repo: "/repos/tools".into(),
+        },
+        WorkSidebarOutcome::UndoAutoRepo {
+            workspace: 7,
+            repos: vec!["/repos/tools".into()],
+        },
+        WorkSidebarOutcome::EditRunCommand {
+            repo: "/repos/tools".into(),
+            command: Some("cargo run".into()),
+        },
+        WorkSidebarOutcome::DismissAutoRepos { workspace: 7 },
+        WorkSidebarOutcome::RunRepoCommand {
+            repo: "/repos/tools".into(),
+        },
+        WorkSidebarOutcome::OpenEditor {
+            dir: "/repos/tools".into(),
+        },
+        WorkSidebarOutcome::MakeWorkspace {
+            chat: "root".into(),
+        },
+    ];
+    for outcome in &actions {
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.emit(outcome.clone(), cx);
+            assert_eq!(sidebar.error, outcome.preview_error());
+            assert!(
+                sidebar
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("not available in preview")
+            );
+        });
+    }
+    assert_eq!(events.borrow().as_slice(), actions.as_slice());
+    assert!(
+        WorkSidebarOutcome::Refresh { workspace: 7 }
+            .preview_error()
+            .is_none()
+    );
+}
+
+#[gpui::test]
+fn owner_catalog_supplies_mounted_sidebar_read_authority_without_a_gui(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.background_executor.allow_parking();
+    let fixture = IcedFixture::new();
+    let before = tree_snapshot(fixture.root.path());
+    let catalog = crate::workspace_config::IcedCatalog::read(&fixture.config).unwrap();
+    let model = crate::workspace_status::WorkspaceStatus::from_iced(&catalog);
+    let mut store =
+        crate::workspace_config::WorkspaceStore::new(&fixture.root.path().join("preview"));
+    store.iced = Some(catalog);
+    let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, Some(store), cx));
+    let mut facts = fixture.load().facts;
+    facts.repos.clear();
+    let sidebar = cx.new(|_| WorkSidebar::new(facts, Default::default()));
+    sidebar.update(cx, |sidebar, cx| sidebar.load(false, cx));
+    cx.run_until_parked();
+    sidebar.read_with(cx, |sidebar, _| {
+        assert!(!sidebar.loading);
+        assert!(sidebar.error.is_none(), "{:?}", sidebar.error);
+        assert_eq!(sidebar.workspace.repos.len(), 2);
+        assert_eq!(sidebar.tasks.len(), 1);
+    });
+    let files = Rc::new(RefCell::new(Vec::new()));
+    let received = files.clone();
+    cx.update(|cx| {
+        cx.subscribe(&owner, move |_, event: &crate::FileOpen, _| {
+            received.borrow_mut().push(event.path.clone())
+        })
+        .detach();
+    });
+    let path = PathBuf::from(&fixture.workspace.dir).join("docs/note.md");
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.emit(
+            WorkSidebarOutcome::OpenDocument {
+                workspace: 1,
+                path: path.clone(),
+            },
+            cx,
+        )
+    });
+    assert_eq!(files.borrow().as_slice(), &[path]);
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.emit(
+            WorkSidebarOutcome::RunRepoCommand {
+                repo: fixture.repo.clone(),
+            },
+            cx,
+        )
+    });
+    owner.read_with(cx, |owner, _| {
+        assert_eq!(
+            owner.error.as_deref(),
+            Some("Run command · not available in preview")
+        )
+    });
+    assert_eq!(tree_snapshot(fixture.root.path()), before);
+}

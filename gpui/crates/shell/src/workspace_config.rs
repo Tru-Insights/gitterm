@@ -189,6 +189,8 @@ mod tests {
 /// claims an Iced lease, including when the source is absent or half-written.
 #[derive(Default)]
 pub(crate) struct IcedCatalog {
+    pub source: PathBuf,
+    pub repos: Vec<gitterm_core::workspace_config::RepoConfig>,
     pub workspaces: Vec<gitterm_core::workspace_config::WorkspaceConfig>,
     pub active: usize,
     pub repos_on_bar: bool,
@@ -198,9 +200,11 @@ impl IcedCatalog {
         let path = config.join("workspaces.json");
         let bytes = std::fs::read(&path)
             .with_context(|| format!("read Iced workspaces {}", path.display()))?;
-        let file: gitterm_core::workspace_config::WorkspacesFile =
+        let mut file: gitterm_core::workspace_config::WorkspacesFile =
             serde_json::from_slice(&bytes)
                 .with_context(|| format!("parse Iced workspaces {}", path.display()))?;
+        // Normalize legacy repo records in memory, just as Iced does on restore.
+        file.normalize_repos();
         let mut open: Vec<_> = file
             .workspaces
             .into_iter()
@@ -225,6 +229,8 @@ impl IcedCatalog {
         });
         let active = open.iter().position(|(i, _)| *i == selected).unwrap_or(0);
         Ok(Self {
+            source: config.to_owned(),
+            repos: file.repos,
             workspaces: open.into_iter().map(|(_, w)| w).collect(),
             active,
             repos_on_bar: !file.collapsed_repo_groups.iter().any(|g| g == "local"),
