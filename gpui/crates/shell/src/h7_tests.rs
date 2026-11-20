@@ -45,6 +45,8 @@ pub(super) fn fixture(
     let work = root.path().join("work");
     std::fs::create_dir(&source).unwrap();
     std::fs::create_dir(&work).unwrap();
+    let second = root.path().join("second");
+    std::fs::create_dir(&second).unwrap();
     std::fs::write(work.join("file.txt"), "retained file").unwrap();
     std::fs::write(
         source.join("settings.json"),
@@ -53,7 +55,8 @@ pub(super) fn fixture(
     .unwrap();
     std::fs::write(source.join("workspaces.json"), serde_json::json!({
         "active_workspace":0,"repos":[{"dir":work,"run_command":"printf x >> h7-run.txt"}],
-        "workspaces":[{"name":"H7","abbrev":"H7","color":"blue","dir":work,"repos":[work],"tabs":[]}]
+        "workspaces":[{"name":"H7","abbrev":"H7","color":"blue","dir":work,"repos":[work],"tabs":[]},
+        {"name":"second","abbrev":"S","color":"green","dir":second,"repos":[second],"tabs":[]}]
     }).to_string()).unwrap();
     let mut store = preview::tests::guarded_store(&root.path().join("preview"));
     let model = workspace_config::load_iced_workspaces_from(&mut store, &source);
@@ -324,4 +327,147 @@ fn usage_limits_filters_and_pin_are_read_only(cx: &mut TestAppContext) {
         );
     });
     assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[gpui::test]
+fn saved_run_inventory_and_workspace_switches_never_start_a_terminal(cx: &mut TestAppContext) {
+    let (root, shell, cx) = fixture(cx);
+    let cwd = root.path().join("work");
+    let id = SessionId(42);
+    let (owner, config) = cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            // Model a saved run tab without ever creating a real PTY in the fixture.
+            let workspace = shell.active(cx).workspace.id;
+            let pane_id = session_pane_id(id);
+            let pane = cx.new(|cx| {
+                Pane::new(
+                    pane_id.clone(),
+                    "printf x >> h7-run.txt".into(),
+                    PaneKind::StoppedTerminal(cwd.clone(), true),
+                    workspace,
+                    shell.data.clone(),
+                    window,
+                    cx,
+                )
+            });
+            let state = shell
+                .workspaces
+                .iter_mut()
+                .find(|w| w.workspace.id == workspace)
+                .unwrap();
+            state.sessions.push(Session {
+                id,
+                title: "printf x >> h7-run.txt".into(),
+                kind: data::SessionKind::Terminal,
+            });
+            state
+                .store
+                .terminals
+                .as_mut()
+                .unwrap()
+                .push(layout::TerminalSession {
+                    id: id.0,
+                    cwd: cwd.clone(),
+                });
+            state.panes.insert(pane_id, pane.clone());
+            state.dock.update(cx, |dock, cx| {
+                dock.add_panel_view(panel_handle(pane), DockPlacement::Bottom, None, window, cx)
+            });
+            state.store.save(&state.dock.read(cx).dump(cx)).unwrap();
+            (shell.owner.clone(), shell.config_dir.clone())
+        })
+    });
+    let restored = cx.update(|window, cx| {
+        cx.new(|cx| {
+            Shell::with_owner(
+                Rc::new(data::LocalData(owner.clone())),
+                owner,
+                &config,
+                true,
+                window,
+                cx,
+            )
+            .unwrap()
+        })
+    });
+    for workspace in [WorkspaceId(1), WorkspaceId(2), WorkspaceId(1)] {
+        cx.update(|window, cx| {
+            restored.update(cx, |shell, cx| {
+                shell.select_workspace_id(workspace, window, cx);
+                shell.refresh_bottom_panel(window, cx);
+                if workspace == WorkspaceId(1) {
+                    shell.bottom_outcome(
+                        bottom_panel::Outcome::SelectTab { id: id.0 as usize },
+                        window,
+                        cx,
+                    );
+                }
+                assert!(shell.run_tabs.is_empty());
+                // There is no terminal backend to spawn a child or receive PTY writes.
+                assert!(
+                    shell
+                        .workspaces
+                        .iter()
+                        .flat_map(|w| w.panes.values())
+                        .all(|p| !matches!(p.read(cx).content, pane::PaneContent::Terminal(_)))
+                );
+                assert!(
+                    matches!(&shell.workspaces[0].panes[&session_pane_id(id)].read(cx).content,
+                pane::PaneContent::IcedSession(text) if text.contains("idle"))
+                );
+            })
+        });
+        draw(cx);
+    }
+    assert!(!cwd.join("h7-run.txt").exists());
+}
+
+#[gpui::test]
+fn work_run_outcome_is_an_unavailable_notice_and_cannot_launch(cx: &mut TestAppContext) {
+    let (root, shell, cx) = fixture(cx);
+    let sidebar = cx.read(|cx| shell.read(cx).work_sidebars[&WorkspaceId(1)].clone());
+    sidebar.update(cx, |_, cx| {
+        cx.emit(work_sidebar::WorkSidebarOutcome::RunRepoCommand {
+            repo: root.path().join("work"),
+        })
+    });
+    draw(cx);
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        assert!(shell.run_tabs.is_empty());
+        assert!(shell.bottom.read(cx).input.tabs.is_empty());
+        assert_eq!(
+            shell.owner.read(cx).error.as_deref(),
+            Some("Run command · unavailable in preview")
+        );
+    });
+    let notice = cx.debug_bounds("preview-notice").unwrap();
+    let strip = cx.debug_bounds("pstrip-session-strip").unwrap();
+    assert!(notice.origin.y > strip.bottom());
+    assert!(!root.path().join("work/h7-run.txt").exists());
+}
+
+#[gpui::test]
+fn title_tracks_workspace_and_sidebar_and_tabs_use_iced_label_alignment(cx: &mut TestAppContext) {
+    let (_root, shell, cx) = fixture(cx);
+    for (selector, mode) in [("Files", "Files"), ("Find", "Find"), ("Work", "Work")] {
+        let bounds = cx.debug_bounds(selector).unwrap();
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        draw(cx);
+        assert_eq!(
+            cx.window_title(),
+            Some(format!("GitTerm V6 Development - H7 - {mode}"))
+        );
+    }
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.select_workspace_id(WorkspaceId(2), window, cx);
+        })
+    });
+    draw(cx);
+    assert_eq!(
+        cx.window_title().as_deref(),
+        Some("GitTerm V6 Development - second - Work")
+    );
+    assert!(cx.debug_bounds("Work").unwrap().origin.x < cx.debug_bounds("Files").unwrap().origin.x);
 }
