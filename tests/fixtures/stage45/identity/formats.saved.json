@@ -63,11 +63,6 @@
         "plan_type": null,
         "credits": null
       },
-      "pending_notices": {
-        "fixture-caller": [
-          "Synthetic notice"
-        ]
-      },
       "history": [
         {
           "provider": "codex",
@@ -113,6 +108,10 @@
           "since": 946684800,
           "flexible_provider": null
         }
+      },
+      "usage_badge": {
+        "level": "on_track",
+        "candidate": null
       }
     },
     "merge_plan": {
@@ -327,7 +326,11 @@
     },
     "limits": {
       "claude": null,
-      "codex": null
+      "codex": null,
+      "usage_badge": {
+        "level": "on_track",
+        "candidate": null
+      }
     },
     "merge_plan": {
       "entries": [],

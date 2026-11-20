@@ -839,7 +839,7 @@ pub struct PolicyEvaluation {
     pub policy: PolicyState,
     pub pin: Option<RoutingPin>,
     pub report: PolicyReport,
-    /// Already deduplicated per provider/window; the app fans out per chat.
+    /// Transition details for Usage; never deliver these as chat prompts.
     pub notices: Vec<String>,
 }
 
@@ -1587,6 +1587,68 @@ pub fn evaluate_policy(file: &PlanLimitsFile, now: i64) -> PolicyEvaluation {
     }
 }
 
+/// Presentation state only: never used to decide routing or launch permission.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageBadgeLevel {
+    #[default]
+    OnTrack,
+    Hot,
+    Urgent,
+}
+
+/// Require a candidate to remain unchanged for a minute, even when the UI
+/// evaluates several times per second. Persist the candidate across restarts.
+pub const USAGE_BADGE_DWELL_SECS: i64 = 60;
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UsageBadgeState {
+    pub level: UsageBadgeLevel,
+    candidate: Option<(UsageBadgeLevel, i64)>,
+}
+
+impl UsageBadgeState {
+    pub fn observe(&mut self, policy: &PolicyState, report: &PolicyReport, now: i64) -> bool {
+        let mut next = UsageBadgeLevel::OnTrack;
+        for (provider, report) in [
+            (&policy.claude, &report.claude),
+            (&policy.codex, &report.codex),
+        ] {
+            let Some(weekly) = &provider.weekly else {
+                continue;
+            };
+            let days = report
+                .windows
+                .iter()
+                .find(|w| w.label == "7d")
+                .and_then(|w| w.days_left);
+            match weekly.state {
+                WeeklyState::AlmostOut => next = UsageBadgeLevel::Urgent,
+                WeeklyState::Hot if days.is_some_and(|days| days <= URGENT_RUNOUT_DAYS) => {
+                    next = UsageBadgeLevel::Urgent;
+                }
+                WeeklyState::Hot if next == UsageBadgeLevel::OnTrack => next = UsageBadgeLevel::Hot,
+                _ => {}
+            }
+        }
+        let previous = self.clone();
+        if next == self.level {
+            self.candidate = None;
+        } else {
+            match self.candidate {
+                Some((candidate, since)) if candidate == next && now >= since => {
+                    if now - since >= USAGE_BADGE_DWELL_SECS {
+                        self.level = next;
+                        self.candidate = None;
+                    }
+                }
+                _ => self.candidate = Some((next, now)),
+            }
+        }
+        *self != previous
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The persisted last readings
 // ---------------------------------------------------------------------------
@@ -1603,9 +1665,10 @@ pub struct PlanLimitsFile {
     pub history: Vec<WindowHistory>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin: Option<RoutingPin>,
-    /// Notices and their policy suppression flags are saved together so a
-    /// busy coordinator can receive them after a restart.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default)]
+    pub usage_badge: UsageBadgeState,
+    /// Legacy input only. Load drops all queued chat prompts after upgrade.
+    #[serde(default, skip_serializing)]
     pub pending_notices: HashMap<String, Vec<String>>,
 }
 
@@ -1618,13 +1681,17 @@ impl PlanLimitsFile {
     /// (left alone until the next save replaces it).
     pub fn load(path: &Path) -> Self {
         match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-                eprintln!(
-                    "[plan-limits] {} is not a plan-limits file ({error}); starting empty",
-                    path.display()
-                );
-                Self::default()
-            }),
+            Ok(bytes) => {
+                let mut file: Self = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+                    eprintln!(
+                        "[plan-limits] {} is not a plan-limits file ({error}); starting empty",
+                        path.display()
+                    );
+                    Self::default()
+                });
+                file.pending_notices.clear();
+                file
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(error) => {
                 eprintln!(
@@ -2269,6 +2336,79 @@ mod policy_tests {
         file.absorb(reading(Provider::Claude, used, left));
         file.absorb(reading(Provider::Codex, 10.0, 2 * 86400));
         file
+    }
+
+    #[test]
+    fn usage_badge_holds_through_flapping_escalates_and_recovers() {
+        let mut file = fixture(35.0, 5 * 86400);
+        let mut hot = evaluate_policy(&file, NOW);
+        assert_eq!(
+            hot.policy.claude.weekly.as_ref().unwrap().state,
+            WeeklyState::Hot
+        );
+        let mut badge = UsageBadgeState::default();
+        badge.observe(&hot.policy, &hot.report, NOW);
+        // Repeated evaluations in a single tick cannot satisfy the dwell.
+        for _ in 0..10 {
+            badge.observe(&hot.policy, &hot.report, NOW);
+        }
+        assert_eq!(badge.level, UsageBadgeLevel::OnTrack);
+        badge.observe(&hot.policy, &hot.report, NOW + 60);
+        assert_eq!(badge.level, UsageBadgeLevel::Hot);
+
+        let mut recovered = hot.policy.clone();
+        recovered.claude.weekly.as_mut().unwrap().state = WeeklyState::OnTrack;
+        badge.observe(&recovered, &hot.report, NOW + 70);
+        badge.observe(&hot.policy, &hot.report, NOW + 100);
+        assert_eq!(badge.level, UsageBadgeLevel::Hot);
+        assert!(badge.candidate.is_none());
+
+        hot.report
+            .claude
+            .windows
+            .iter_mut()
+            .find(|w| w.label == "7d")
+            .unwrap()
+            .days_left = Some(URGENT_RUNOUT_DAYS);
+        badge.observe(&hot.policy, &hot.report, NOW + 110);
+        badge.observe(&hot.policy, &hot.report, NOW + 170);
+        assert_eq!(badge.level, UsageBadgeLevel::Urgent);
+        badge.observe(&recovered, &hot.report, NOW + 180);
+        assert_eq!(badge.level, UsageBadgeLevel::Urgent);
+        badge.observe(&recovered, &hot.report, NOW + 240);
+        assert_eq!(badge.level, UsageBadgeLevel::OnTrack);
+
+        // A held weekly plan must not lose its urgent badge when its last
+        // usable run-out estimate disappears.
+        file.claude.as_mut().unwrap().windows[0].used_percent = Some(95.0);
+        let held = evaluate_policy(&file, NOW);
+        badge.observe(&held.policy, &held.report, NOW + 250);
+        badge.observe(&held.policy, &held.report, NOW + 310);
+        assert_eq!(badge.level, UsageBadgeLevel::Urgent);
+    }
+
+    #[test]
+    fn usage_badge_considers_either_provider_and_persists_candidates() {
+        let mut file = fixture(10.0, 2 * 86400);
+        file.codex = Some(reading(Provider::Codex, 35.0, 5 * 86400));
+        let hot = evaluate_policy(&file, NOW);
+        file.policy = Some(hot.policy.clone());
+        file.usage_badge.observe(&hot.policy, &hot.report, NOW);
+        let dir = tempfile::tempdir().unwrap();
+        let path = PlanLimitsFile::path_in(dir.path());
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        let mut loaded = PlanLimitsFile::load(&path);
+        assert_eq!(loaded, file);
+        loaded
+            .usage_badge
+            .observe(loaded.policy.as_ref().unwrap(), &hot.report, NOW + 60);
+        assert_eq!(loaded.usage_badge.level, UsageBadgeLevel::Hot);
+        // The settled state survives a restart too.
+        std::fs::write(&path, serde_json::to_vec(&loaded).unwrap()).unwrap();
+        assert_eq!(
+            PlanLimitsFile::load(&path).usage_badge.level,
+            UsageBadgeLevel::Hot
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Plan limits in the Usage view and on the rail (TRU-211): the Claude Code
 //! and Codex windows `/usage` shows. The reading, the rules and the words
 //! live in `gitterm::plan_limits`; shared state and jobs live in core limits.
-//! This adapter selects local sources and recipients, submits notices and renders widgets.
+//! This adapter selects local sources and renders Usage status; it never prompts chats.
 //!
 //! Claude readings arrive on `TurnCompleted.rate_limit` from any chat tab,
 //! local only, and are taken in `update()` (a cheap in-memory merge).
@@ -59,6 +59,56 @@ fn daily_usage(samples: &[plan_limits::UsageSample], now: i64) -> [Option<f64>; 
     })
 }
 
+fn weekly_status(report: &plan_limits::ProviderReport, now: i64) -> String {
+    let weekly = report.windows.iter().find(|window| window.label == "7d");
+    let Some(weekly) = weekly else {
+        return "Weekly usage unknown; days left unknown; run-out unknown; pace unknown; no reading".into();
+    };
+    let used = weekly
+        .estimated_percent
+        .or(weekly.used_percent)
+        .map(|used| format!("{used:.0}% used"))
+        .unwrap_or_else(|| "usage unknown".into());
+    let left = weekly
+        .resets_in
+        .filter(|left| *left > 0)
+        .map(|left| format!("{:.1} days until reset", left as f64 / 86400.0))
+        .unwrap_or_else(|| {
+            if weekly.resets_at.is_some_and(|at| at <= now) {
+                "window reset; no reading since".into()
+            } else {
+                "reset unknown".into()
+            }
+        });
+    let runout = weekly
+        .days_left
+        .and_then(|days| {
+            chrono::DateTime::from_timestamp(now.saturating_add((days * 86400.0) as i64), 0)
+        })
+        .map(|at| format!("run-out {} UTC", at.format("%Y-%m-%d %H:%M")))
+        .unwrap_or_else(|| "run-out unknown".into());
+    let pace = weekly
+        .pace
+        .map(|pace| format!("pace {pace:.0} (100 uses the full weekly allowance)"))
+        .unwrap_or_else(|| "pace unknown".into());
+    let status = match weekly.state {
+        Some(plan_limits::WeeklyState::Hot) => "running hot",
+        Some(plan_limits::WeeklyState::AlmostOut) => "almost out",
+        Some(plan_limits::WeeklyState::OnTrack) => "on track",
+        None => "unknown",
+    };
+    let reading = if weekly.estimated {
+        "estimated reading"
+    } else if report.observed_at.is_none() {
+        "no reading"
+    } else if report.stale {
+        "stale reading"
+    } else {
+        "observed reading"
+    };
+    format!("Weekly {status}: {used} · {left} · {runout} · {pace} · {reading}")
+}
+
 pub use gitterm_core::limits::{PlanLimitsEvent, PlanLimitsState};
 
 fn now_unix() -> i64 {
@@ -70,20 +120,6 @@ pub(super) fn local_limit_source(workspaces: &[Workspace], tab_id: usize) -> boo
         matches!(ws.location, WorkspaceLocation::Local { .. })
             && ws.tabs.iter().any(|tab| tab.id == tab_id)
     })
-}
-
-fn is_plan_limit_coordinator(tab: &TabState, children: &HashSet<String>) -> bool {
-    let Some(session) = tab.agent_session() else {
-        return false;
-    };
-    ![
-        tab.chat_session_id.as_ref(),
-        session.session_id.as_ref(),
-        tab.task_session_id.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .any(|id| children.contains(id))
 }
 
 fn running_plan_limit_workers(
@@ -141,90 +177,8 @@ impl App {
         .map_err(|error| format!("cannot encode plan_limits result: {error}"))
     }
 
-    fn plan_limit_chats(&self) -> Vec<(usize, String, bool)> {
-        if self.task_mcp.is_none() {
-            return Vec::new();
-        }
-        let mut children: HashSet<String> = self
-            .chat_child_links()
-            .into_iter()
-            .filter(|link| link.parent != link.child.session_id)
-            .map(|link| link.child.session_id)
-            .chain(
-                self.chat_index
-                    .iter()
-                    .filter(|entry| entry.root_id.is_some())
-                    .map(|entry| entry.id.clone()),
-            )
-            .collect();
-        if let Some(store) = self.task_authority.store() {
-            for delegation in store.delegations() {
-                if let gitterm::tasks::DelegationChild::TaskSession {
-                    task_session_id: Some(id),
-                    ..
-                } = &delegation.child
-                {
-                    children.insert(id.clone());
-                }
-            }
-            for task in store.tasks().iter().filter(|task| {
-                task.created_by.as_ref().is_some_and(|creator| {
-                    creator.kind == gitterm::tasks::TaskCreatorKind::Coordinator
-                })
-            }) {
-                children.extend(
-                    task.sessions
-                        .iter()
-                        .map(|session| session.task_session_id.clone()),
-                );
-            }
-        }
-        self.workspaces
-            .iter()
-            .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
-            .flat_map(|ws| &ws.tabs)
-            .filter_map(|tab| {
-                let session = tab.agent_session()?;
-                is_plan_limit_coordinator(tab, &children).then(|| {
-                    (
-                        tab.id,
-                        tab.session_uid.clone(),
-                        !matches!(session.state, tab::AgentSessionState::Idle),
-                    )
-                })
-            })
-            .collect()
-    }
-
     fn evaluate_plan_limits(&mut self) {
-        let chats = self
-            .plan_limit_chats()
-            .into_iter()
-            .map(|(_, uid, _)| uid)
-            .collect::<Vec<_>>();
-        self.plan_limits.evaluate(&chats, now_unix());
-    }
-
-    /// As with PR news, busy chats wait until the turn ends. Submit through
-    /// the normal path synchronously so a rejected send remains pending.
-    pub(super) fn tell_plan_limit_coordinators(&mut self) -> Task<Event> {
-        let mut tasks = Vec::new();
-        for (id, uid, busy) in self.plan_limit_chats() {
-            let Some(prompt) = self.plan_limits.notice(&uid, busy) else {
-                continue;
-            };
-            let prompt = gitterm::delegations::from_gitterm(&prompt);
-            tasks.push(self.update(Event::AgentSubmitPrompt(id, prompt.into())));
-            let accepted = self
-                .workspaces
-                .iter()
-                .flat_map(|ws| &ws.tabs)
-                .find(|tab| tab.id == id)
-                .and_then(|tab| tab.agent_session())
-                .is_some_and(|session| matches!(session.state, tab::AgentSessionState::Streaming));
-            self.plan_limits.finish_notice(&uid, accepted);
-        }
-        Task::batch(tasks)
+        self.plan_limits.evaluate(&[], now_unix());
     }
 
     /// A Claude chat's turn reported its plan limits: the latest wins.
@@ -246,7 +200,6 @@ impl App {
         };
         Task::batch([
             read,
-            self.tell_plan_limit_coordinators(),
             self.save_plan_limits(),
             self.start_queued_delegations(),
         ])
@@ -293,21 +246,7 @@ impl App {
                     return Task::none();
                 }
                 self.evaluate_plan_limits();
-                let chats = self
-                    .plan_limit_chats()
-                    .into_iter()
-                    .map(|(_, uid, _)| uid)
-                    .collect::<Vec<_>>();
-                let routing = self.plan_limits_routing();
-                self.plan_limits.queue_notices(
-                    &chats,
-                    &[plan_limits::pin_change_notice(
-                        pin.as_ref(),
-                        now_unix(),
-                        &routing,
-                    )],
-                );
-                return Task::batch([self.tell_plan_limit_coordinators(), self.save_plan_limits()]);
+                return self.save_plan_limits();
             }
         }
         Task::none()
@@ -326,18 +265,10 @@ impl App {
     /// no height while there is nothing to show, so the rail keeps its
     /// tree when a reading arrives.
     pub(super) fn view_plan_limits_badge(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        let badge = plan_limits::badge(
-            self.plan_limits.file().readings(),
-            &self.plan_limits.file().history,
-            now_unix(),
-        );
-        let (label, color, height) = match &badge {
-            Some(badge) => (
-                badge.text.clone(),
-                self.plan_level_color(badge.level, self.theme.subtext0()),
-                BADGE_HEIGHT,
-            ),
-            None => (String::new(), self.theme.subtext0(), 0.0),
+        let (label, color, height) = match self.plan_limits.file().usage_badge.level {
+            plan_limits::UsageBadgeLevel::Hot => ("hot", self.theme.warning(), BADGE_HEIGHT),
+            plan_limits::UsageBadgeLevel::Urgent => ("urgent", self.theme.danger(), BADGE_HEIGHT),
+            plan_limits::UsageBadgeLevel::OnTrack => ("", self.theme.subtext0(), 0.0),
         };
         container(
             text(label)
@@ -356,6 +287,11 @@ impl App {
     pub(super) fn plan_limits_tooltip(&self) -> String {
         let now = now_unix();
         let mut lines = vec!["Usage  ⌘⇧U".to_string()];
+        match self.plan_limits.file().usage_badge.level {
+            plan_limits::UsageBadgeLevel::Hot => lines.push("Plan usage is running hot".into()),
+            plan_limits::UsageBadgeLevel::Urgent => lines.push("Plan usage is urgent".into()),
+            plan_limits::UsageBadgeLevel::OnTrack => {}
+        }
         for reading in self.plan_limits.file().readings() {
             lines.extend(plan_limits::tooltip_lines(
                 reading,
@@ -397,6 +333,11 @@ impl App {
         Column::new()
             .spacing(8)
             .push(text("Plan limits").size(font).color(theme.text_primary()))
+            .push(
+                text(self.plan_limits_routing().reason)
+                    .size(font_small)
+                    .color(theme.text_secondary()),
+            )
             .push(blocks)
             .into()
     }
@@ -478,6 +419,11 @@ impl App {
             return Column::new()
                 .spacing(8)
                 .push(header)
+                .push(
+                    text(weekly_status(provider_report, now))
+                        .size(font_small)
+                        .color(secondary),
+                )
                 .push(text(empty).size(font_small).color(secondary))
                 .push(pin_controls)
                 .push(text(source).size(font_tiny).color(muted))
@@ -494,7 +440,11 @@ impl App {
             .size(font_tiny)
             .color(if stale { theme.warning() } else { muted }),
         );
-        let mut col = Column::new().spacing(8).push(header);
+        let mut col = Column::new().spacing(8).push(header).push(
+            text(weekly_status(provider_report, now))
+                .size(font_small)
+                .color(secondary),
+        );
         let danger = theme.danger();
         for alert in reading.active_alerts(now) {
             col = col.push(
@@ -683,6 +633,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn weekly_status_shows_projection_estimate_and_unknown_reset() {
+        let now = 1_800_000_000;
+        let mut file = PlanLimitsFile::default();
+        let mut reading = plan_limits::claude_limits(
+            &serde_json::json!({
+                "unifiedWindows": {"seven_day": {"utilization": 0.35, "resetsAt": now + 5 * 86400}}
+            }),
+            now,
+        );
+        reading.local = Some(true);
+        file.absorb(reading);
+        let report = plan_limits::evaluate_policy(&file, now);
+        let status = weekly_status(&report.report.claude, now);
+        for fact in [
+            "running hot",
+            "35% used",
+            "5.0 days until reset",
+            "run-out 20",
+            "UTC",
+            "pace",
+            "observed reading",
+        ] {
+            assert!(status.contains(fact), "missing {fact}: {status}");
+        }
+        let mut tiny = plan_limits::evaluate_policy(&file, now);
+        tiny.report
+            .claude
+            .windows
+            .iter_mut()
+            .find(|w| w.label == "7d")
+            .unwrap()
+            .days_left = Some(f64::MAX);
+        assert!(weekly_status(&tiny.report.claude, now).contains("run-out unknown"));
+        let later = now + plan_limits::STALE_AFTER_SECS + 1;
+        let estimated = plan_limits::evaluate_policy(&file, later);
+        assert!(weekly_status(&estimated.report.claude, later).contains("estimated reading"));
+        let reset_at = now + 5 * 86400;
+        let reset = plan_limits::evaluate_policy(&file, reset_at);
+        let status = weekly_status(&reset.report.claude, reset_at);
+        assert!(status.contains("usage unknown"));
+        assert!(status.contains("window reset; no reading since"));
+        assert!(status.contains("run-out unknown"));
+    }
+
+    #[test]
     fn only_an_existing_local_tab_can_supply_local_allowances() {
         let mut ws = Workspace::new("work".into(), PathBuf::from("/repo"), WorkspaceColor::Blue);
         ws.tabs.push(TabState::new(1, PathBuf::from("/repo")));
@@ -694,32 +689,6 @@ mod tests {
             root: "/repo".into(),
         };
         assert!(!local_limit_source(&[ws], 1));
-    }
-
-    #[test]
-    fn recipients_are_coordinator_roots_across_backends_not_resumed_children() {
-        let mut root = TabState::new(1, PathBuf::from("/repo"));
-        root.kind = TabKind::Agent(tab::AgentSession::new(tab::AgentBackendConfig::Acp {
-            agent: gitterm::harness::acp::AcpAgent::Antigravity,
-            model: String::new(),
-            mode: None,
-            effort: None,
-        }));
-        root.chat_session_id = Some("root".into());
-        let mut child = TabState::new(2, PathBuf::from("/repo"));
-        child.kind = TabKind::Agent(tab::AgentSession::new(tab::AgentBackendConfig::Claude {
-            model: "default".into(),
-            permission_mode: None,
-            effort: None,
-        }));
-        child.chat_session_id = Some("worker-conversation".into());
-        let children = HashSet::from(["worker-conversation".into()]);
-        assert!(is_plan_limit_coordinator(&root, &children));
-        assert!(!is_plan_limit_coordinator(&child, &children));
-        assert!(!is_plan_limit_coordinator(
-            &TabState::new(3, PathBuf::from("/repo")),
-            &children
-        ));
     }
 
     #[test]

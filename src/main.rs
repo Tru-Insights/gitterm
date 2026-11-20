@@ -28145,7 +28145,6 @@ fi
                     };
                     return Task::batch([
                         self.flush_held_delegation(tab_id),
-                        self.tell_plan_limit_coordinators(),
                         self.refresh_delegation_head(tab_id),
                         follow_task,
                         index,
@@ -38864,7 +38863,7 @@ fi
                 .width(Length::Fixed(SPINE_WIDTH - 1.0))
                 .center_x(Length::Fixed(SPINE_WIDTH - 1.0))
                 .center_y(Length::Fixed(16.0)),
-            // Plan limits (TRU-211): the highest % across providers.
+            // Plan usage (TRU-295): persisted hot/urgent status.
             self.view_plan_limits_badge(),
         ])
         .style(move |_theme, status| button::Style {
