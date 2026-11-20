@@ -224,6 +224,73 @@ fn definitive_rejection_retries_but_uncertainty_and_resolution_never_do() {
     );
 }
 #[test]
+fn uncertain_answer_stays_blocked_across_task_rebindings() {
+    for outcome in [
+        Some(DeliveryOutcome::Uncertain("partial write".into())),
+        None,
+        Some(DeliveryOutcome::Written),
+        Some(DeliveryOutcome::Rejected("zero bytes written".into())),
+    ] {
+        let mut adapter = ChatAdapter::default();
+        let stamp = adapter.begin_runtime(target());
+        request(&mut adapter, &stamp);
+        let prepared = adapter
+            .admit(permission(), facts())
+            .unwrap_or_else(|r| panic!("{r:?}"));
+        let mut receipt = accepted(&mut adapter, prepared);
+        if let Some(outcome) = outcome {
+            receipt = adapter.delivery(receipt.id, &target(), outcome).unwrap();
+        }
+        let mut rebound_facts = facts();
+        rebound_facts.authority.target.task_id = Some("synthetic-task".into());
+        rebound_facts.authority.target.task_session_id = Some("synthetic-task-session".into());
+        assert!(
+            adapter
+                .state()
+                .accepts_stream(&stamp, &rebound_facts.authority.target)
+        );
+        let result = adapter.admit(permission(), rebound_facts);
+        if receipt.state.retryable() {
+            assert!(result.is_ok(), "known non-delivery must permit retry");
+        } else {
+            assert_eq!(result.err(), Some(receipt));
+        }
+    }
+}
+
+#[test]
+fn receiver_echo_does_not_record_the_local_submission_twice() {
+    let mut adapter = ChatAdapter::default();
+    let stamp = adapter.begin_runtime(target());
+    let prepared = adapter
+        .admit(prompt(), facts())
+        .unwrap_or_else(|r| panic!("{r:?}"));
+    accepted(&mut adapter, prepared);
+    let conversation_len = adapter.state().conversation.len();
+    let revision = adapter.state().revision;
+    for _ in 0..2 {
+        let update = adapter
+            .receive(
+                &stamp,
+                &target(),
+                AgentEvent::Harness(HarnessEvent::UserMessageEcho {
+                    id: Some("synthetic-message".into()),
+                    text: "synthetic draft".into(),
+                    image_count: 1,
+                    delivery: None,
+                }),
+                Some(2000),
+                |_, _| {},
+            )
+            .unwrap();
+        assert_eq!(adapter.state().conversation.len(), conversation_len);
+        assert_eq!(adapter.state().revision, revision);
+        assert!(update.presentation.is_none());
+    }
+    assert_eq!(revision, 1);
+}
+
+#[test]
 fn deferred_commands_revalidate_full_binding_and_pending_request() {
     for intent in [prompt(), permission(), ChatIntent::Stop] {
         let mut adapter = ChatAdapter::default();

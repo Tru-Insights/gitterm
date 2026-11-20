@@ -563,6 +563,102 @@ fn rejected_send_retains_images_and_draft_and_receipts_preserve_new_edits(cx: &m
 }
 
 #[gpui::test]
+fn completed_before_written_reconciles_submitted_draft_and_preserves_new_edits(
+    cx: &mut TestAppContext,
+) {
+    use crate::adapter::{Admission, ChatAdapter, DeliveryOutcome};
+    use gitterm_core::{
+        chat::{state::AgentEvent, types::*},
+        session,
+    };
+    let (chat, cx) = setup(vec![], cx);
+    for edit in 0..3 {
+        let mut adapter = ChatAdapter::default();
+        let target = session::Target {
+            tab_id: 1,
+            session_uid: "synthetic".into(),
+            task_id: None,
+            task_session_id: None,
+        };
+        let stamp = adapter.begin_runtime(target.clone());
+        let images = vec![ImageAttachment {
+            media_type: "image/png".into(),
+            data: "QQ==".into(),
+        }];
+        let prepared = adapter
+            .admit(
+                ChatIntent::Send {
+                    text: "submitted draft".into(),
+                    images: images.clone(),
+                },
+                Admission {
+                    authority: session::State {
+                        target: target.clone(),
+                        control: session::TurnControl::Harness,
+                        task_live: false,
+                        last_tab: false,
+                    },
+                    backend: AgentBackend::Claude,
+                    process_running: true,
+                    just_spawned: false,
+                    message_id: "synthetic-message".into(),
+                },
+            )
+            .unwrap_or_else(|r| panic!("{r:?}"));
+        let (receipt, _) = adapter.execute(prepared, &target, 1000, |_| Ok(()));
+        let attempt_id = receipt.id;
+        chat.update_in(cx, |view, window, cx| {
+            view.set_intent_callback(Rc::new(move |_, _| receipt.clone()), cx);
+            view.set_read_only(None, cx);
+            view.composer.update(cx, |input, cx| {
+                input.set_value("submitted draft", window, cx)
+            });
+            view.set_images(images.clone(), cx).unwrap();
+            view.send(window, cx);
+            if edit == 1 {
+                view.composer
+                    .update(cx, |input, cx| input.set_value("newer draft", window, cx));
+            } else if edit == 2 {
+                view.set_images(vec![], cx).unwrap();
+            }
+            let update = adapter
+                .receive(
+                    &stamp,
+                    &target,
+                    AgentEvent::Harness(HarnessEvent::MessageLifecycle {
+                        id: "synthetic-message".into(),
+                        state: MessageState::Completed,
+                    }),
+                    None,
+                    |_, _| {},
+                )
+                .unwrap();
+            view.present(&stamp, adapter.state(), update, window, cx);
+            assert_eq!(
+                view.submission.as_ref().unwrap().state,
+                ReceiptState::Resolved
+            );
+            assert!(!view.submission_blocked());
+            assert_eq!(
+                view.composer.read(cx).value().as_str(),
+                match edit {
+                    0 => "",
+                    1 => "newer draft",
+                    _ => "submitted draft",
+                }
+            );
+            assert_eq!(view.images, if edit == 1 { images } else { vec![] });
+            assert!(view.submitted_draft.is_none());
+        });
+        assert!(
+            adapter
+                .delivery(attempt_id, &target, DeliveryOutcome::Written)
+                .is_none()
+        );
+    }
+}
+
+#[gpui::test]
 fn replay_without_revision_change_retains_uncertain_card_by_request(cx: &mut TestAppContext) {
     use crate::adapter::ChatAdapter;
     use gitterm_core::{
@@ -609,7 +705,7 @@ fn replay_without_revision_change_retains_uncertain_card_by_request(cx: &mut Tes
             cx,
         );
         view.set_read_only(None, cx);
-        view.present(&stamp, adapter.state(), update, cx);
+        view.present(&stamp, adapter.state(), update, window, cx);
         view.row(0, window, cx);
     });
     let original = chat.read_with(cx, |view, _| view.cards[&0].clone());
@@ -633,8 +729,8 @@ fn replay_without_revision_change_retains_uncertain_card_by_request(cx: &mut Tes
         .unwrap()
         .unwrap();
     assert_eq!(adapter.state().revision, revision);
-    chat.update_in(cx, |view, _, cx| {
-        view.present(&stamp, adapter.state(), update, cx);
+    chat.update_in(cx, |view, window, cx| {
+        view.present(&stamp, adapter.state(), update, window, cx);
         assert_eq!(view.model.rows.len(), 2);
         assert_eq!(view.cards[&1], original);
         assert!(!view.cards.contains_key(&0));

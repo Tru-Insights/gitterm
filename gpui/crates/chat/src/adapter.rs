@@ -162,7 +162,7 @@ impl ChatAdapter {
                 || message_id.is_some() && a.message_id == message_id)
                 && self
                     .state
-                    .accepts_runtime(&a.runtime, &facts.authority.target)
+                    .accepts_stream(&a.runtime, &facts.authority.target)
                 && !a.receipt.state.retryable()
         }) {
             return Err(attempt.receipt.clone());
@@ -347,6 +347,13 @@ impl ChatAdapter {
             )
         {
             return None;
+        }
+        // A receiver can relay our channel-accepted prompt back under the same ID.
+        // Use the sole conversation's prompt lookup before any duplicate effects.
+        if let AgentEvent::Harness(HarnessEvent::UserMessageEcho { id: Some(id), .. }) = &event
+            && self.state.shows_prompt(id)
+        {
+            return Some(Update::default());
         }
         let Effect::Event(effects) = self.state.reduce(Intent::Event(event.clone())) else {
             unreachable!()

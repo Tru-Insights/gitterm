@@ -170,7 +170,7 @@ or stale history completions do nothing.
 
 On macOS, install an `IntentCallback` returning a correlated `Receipt`. Deliver
 adapter updates with `ChatView::present(receiver_stamp, adapter.state(), update,
-cx)` and later receipts with `update_receipt`. Keep raw `append_record` /
+window, cx)` and later receipts with `update_receipt`. Keep raw `append_record` /
 `append_event` for fixture playback. History replacement reconciles retained
 cards by request ID, scope and kind, rather than positional row ID. A new
 runtime discards old card controls; stale projection stamps are refused.
@@ -184,7 +184,7 @@ runtime discards old card controls; stale projection stamps are refused.
 | Uncertain | Delivery may have occurred. Keep the draft/answer and block retry; never auto-resend. |
 | Resolved | Runtime closed the request. It does **not** mean approved. Late rejection cannot reopen it. |
 
-The composer retains text and image bytes until a write receipt, and clears
+The composer retains text and image bytes until a write or terminal receipt, and clears
 only the unchanged submitted draft, preserving newer edits. Images can enter
 through `set_images`; image preparation/strip/paste remains C13. Receipt IDs
 prevent late outcomes from modifying a newer attempt. Card answers remain

@@ -280,7 +280,7 @@ impl ChatView {
         cx.notify();
     }
     /// Apply only the matching attempt. Keep rejected/uncertain drafts intact;
-    /// a write receipt clears only the exact draft, preserving newer edits.
+    /// a write or terminal receipt clears only the exact draft, preserving newer edits.
     pub fn update_receipt(
         &mut self,
         receipt: Receipt,
@@ -331,6 +331,7 @@ impl ChatView {
         source: &gitterm_core::chat::state::RuntimeStamp,
         state: &gitterm_core::chat::state::State,
         update: Update,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !state.accepts_stream(source, &source.target) {
@@ -390,7 +391,7 @@ impl ChatView {
             None => {}
         }
         for receipt in update.receipts {
-            self.sync_receipt(&receipt, cx);
+            self.update_receipt(receipt, window, cx);
         }
         self.turn_running = matches!(
             state.state,
