@@ -1,0 +1,56 @@
+[
+  {
+    "state": "Streaming",
+    "pending": []
+  },
+  {
+    "state": "Streaming",
+    "pending": [
+      "permission-1"
+    ]
+  },
+  {
+    "state": "Idle",
+    "pending": []
+  },
+  {
+    "state": "Idle",
+    "pending": []
+  },
+  {
+    "state": "Streaming",
+    "pending": []
+  },
+  {
+    "state": "Streaming",
+    "pending": [
+      "permission-1"
+    ]
+  },
+  {
+    "state": "Idle",
+    "pending": []
+  },
+  {
+    "state": "Idle",
+    "pending": []
+  },
+  {
+    "state": "Streaming",
+    "pending": []
+  },
+  {
+    "state": "Streaming",
+    "pending": [
+      "permission-1"
+    ]
+  },
+  {
+    "state": "Errored(\"Synthetic failure\")",
+    "pending": []
+  },
+  {
+    "state": "Errored(\"Synthetic failure\")",
+    "pending": []
+  }
+]

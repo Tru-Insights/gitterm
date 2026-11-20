@@ -1,0 +1,81 @@
+{
+  "editor": "vscode",
+  "terminal_font_size": 14.0,
+  "ui_font_size": 13.0,
+  "chat_font_size": 22.0,
+  "chat_width": "medium",
+  "sidebar_width": 360.0,
+  "scrollback_lines": 100000,
+  "font_size": 19.0,
+  "theme": "dark",
+  "show_hidden": false,
+  "console_height": 200.0,
+  "console_expanded": true,
+  "terminal_log_mirroring_enabled": false,
+  "stt_enabled": true,
+  "stt_model_path": null,
+  "agent_presets": [
+    {
+      "name": "Antigravity",
+      "command": "agy",
+      "resume_command": "agy --continue",
+      "icon": "✧",
+      "color": "blue"
+    },
+    {
+      "name": "Custom",
+      "command": "gemini --custom",
+      "resume_command": null,
+      "icon": "",
+      "color": "lavender"
+    }
+  ],
+  "quick_commands": [],
+  "max_concurrent_local_tasks": 4,
+  "review": {
+    "default_reviewer": "claude-subagent",
+    "subagent_model": "opus",
+    "max_concurrent_reviews": 2
+  },
+  "chat": {
+    "default_model": "opus",
+    "remember_last": true,
+    "antigravity_model": "gemini-4-argon-medium",
+    "opencode_model": ""
+  },
+  "policy": {
+    "claude": {
+      "coordinator": "opus",
+      "scoped": "sonnet",
+      "judgment": "opus",
+      "specialist": "fable"
+    },
+    "codex": {
+      "coordinator": "gpt-6.1-sol",
+      "scoped": "gpt-6-luna",
+      "judgment": "gpt-6.1-sol",
+      "specialist": "gpt-6-astra"
+    },
+    "antigravity": {
+      "coordinator": "gemini-4-argon-high",
+      "scoped": "gemini-4-hydrogen-high",
+      "judgment": "gemini-4-argon-high",
+      "specialist": "gemini-4-argon-high"
+    }
+  },
+  "usage": {
+    "pricing": {}
+  },
+  "notifications": {
+    "needs_you": true
+  },
+  "pr_watch": {
+    "auto_tell": true
+  },
+  "delegations": {
+    "auto_tell": true
+  },
+  "work_notes": {
+    "auto_commit": true
+  }
+}

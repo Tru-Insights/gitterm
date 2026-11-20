@@ -1,0 +1,13 @@
+[
+  "null",
+  "{\"chat_width\":\"extra-wide\"}",
+  "{\"chat_font_size\":null}",
+  "{\"scrollback_lines\":-1}",
+  "{\"agent_presets\":[{\"command\":\"synthetic\"}]}",
+  "{\"agent_presets\":null}",
+  "{\"chat\":{\"remember_last\":\"yes\"}}",
+  "{\"task_worktree_root\":null}",
+  "{\"editor\":\"first\",\"editor\":\"second\"}",
+  "{\"font_size\":null,\"font_size\":12}",
+  "{\"review\":{\"codex_model\":null,\"codex_model\":\"synthetic\"}}"
+]
