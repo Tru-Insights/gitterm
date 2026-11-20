@@ -1,6 +1,6 @@
 //! Standalone port of Iced's `task_switcher_entries` / `view_task_switcher`.
 //!
-//! Hookup (deliberately not installed in Shell): the host's
+//! Hookup (installed in Shell): the host's
 //! `app_menus::TaskSwitcherOpen` handler creates/opens this entity and subscribes
 //! to `Outcome`. Close/Next/Previous/ActivateFirst and Escape are handled here.
 //! Mount last in a full-size relative overlay; restore host focus on an outcome.
@@ -56,7 +56,7 @@ impl TaskRow {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Inputs {
     pub tasks: Vec<TaskRow>,
     pub general_session_count: usize,
@@ -269,6 +269,13 @@ fn fuzzy_score(candidate: &str, query: &str) -> Option<i32> {
         .then_some(20)
 }
 
+pub(crate) enum Command {
+    Close,
+    Next,
+    Previous,
+    Activate,
+}
+
 pub struct TaskSwitcher {
     model: Model,
     input: Entity<InputState>,
@@ -307,6 +314,29 @@ impl TaskSwitcher {
             input,
             focus: cx.focus_handle(),
             _subscription: subscription,
+        }
+    }
+
+    pub(crate) fn command(&mut self, command: Command, cx: &mut Context<Self>) {
+        let outcome = match command {
+            Command::Close => self.model.close(),
+            Command::Activate => self.model.activate_first(),
+            Command::Next => {
+                self.model.next();
+                None
+            }
+            Command::Previous => {
+                self.model.previous();
+                None
+            }
+        };
+        self.emit(outcome, cx);
+    }
+
+    pub fn set_inputs(&mut self, inputs: Inputs, cx: &mut Context<Self>) {
+        if self.model.inputs != inputs {
+            self.model.inputs = inputs;
+            cx.notify();
         }
     }
 
@@ -593,6 +623,77 @@ impl Render for TaskSwitcher {
             }
         }
         overlay.into_any_element()
+    }
+}
+
+/// Iced's task_state_copy without queue/delivery probes or elapsed live facts.
+/// Durable delivery is used only for sessions the host actually has open.
+pub(crate) fn state_copy(task: &TaskRecord, open: &[&str], streaming: bool) -> String {
+    use gitterm_core::tasks::{ObjectiveDeliveryState, TaskAttentionReason};
+    let failed = || {
+        let line = task
+            .last_error
+            .as_deref()
+            .unwrap_or("agent stopped")
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim();
+        let detail = if line.chars().count() > 40 {
+            format!("{}…", line.chars().take(40).collect::<String>().trim_end())
+        } else {
+            line.to_string()
+        };
+        format!("Failed · {detail}")
+    };
+    if let Some(reason) = task.attention.reason {
+        return match reason {
+            TaskAttentionReason::RequiresInput => "Needs you — input required".into(),
+            TaskAttentionReason::ExecutionFailed => failed(),
+            TaskAttentionReason::Interrupted => "Interrupted · resume".into(),
+            TaskAttentionReason::CompletedUnread | TaskAttentionReason::ReadyForReview => {
+                "Done · review".into()
+            }
+            TaskAttentionReason::RemoteUnavailable => "Needs you — remote unavailable".into(),
+        };
+    }
+    if streaming {
+        return "Working".into();
+    }
+    match task.lifecycle {
+        TaskLifecycle::Preparing => "Preparing…".into(),
+        TaskLifecycle::Ready => {
+            let sessions: Vec<_> = task
+                .sessions
+                .iter()
+                .filter(|s| open.contains(&s.task_session_id.as_str()))
+                .collect();
+            if sessions.is_empty() {
+                "Ready · not started"
+            } else if sessions
+                .iter()
+                .any(|s| s.objective_delivery == ObjectiveDeliveryState::NotDelivered)
+            {
+                "Session open · no brief"
+            } else if sessions
+                .iter()
+                .all(|s| s.objective_delivery == ObjectiveDeliveryState::Delivered)
+            {
+                "Session open · briefed"
+            } else {
+                "Session open · delivery unknown"
+            }
+            .into()
+        }
+        TaskLifecycle::Queued => "Queued".into(),
+        TaskLifecycle::Running => "Working".into(),
+        TaskLifecycle::WaitingForInput => "Needs you — input required".into(),
+        TaskLifecycle::Completed => "Done · review".into(),
+        TaskLifecycle::Failed => failed(),
+        TaskLifecycle::Stopped => "Stopped".into(),
+        TaskLifecycle::Interrupted => "Interrupted · resume".into(),
+        TaskLifecycle::Draft => "Draft".into(),
+        TaskLifecycle::Archived => "Archived".into(),
     }
 }
 

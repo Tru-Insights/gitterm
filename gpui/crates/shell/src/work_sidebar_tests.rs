@@ -1172,3 +1172,13 @@ fn folder_work_includes_historical_chats_and_missing_index_preserves_fallback() 
     }
     assert_eq!(tree_snapshot(fixture.root.path()), before);
 }
+
+// Install the production read-only projection before a headless host's first draw.
+pub(crate) fn h8_install(sidebar: &mut WorkSidebar, data: crate::data::IcedWorkData) {
+    data.apply(&mut sidebar.state.borrow_mut());
+    sidebar.workspace = data.facts;
+    sidebar.tasks = data.tasks;
+    sidebar.workers = data.workers;
+    sidebar.repo_recency = data.repo_recency;
+    sidebar.loaded_at = Some(Instant::now());
+}
