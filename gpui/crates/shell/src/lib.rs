@@ -4533,13 +4533,7 @@ fn roster_entries(
                 id: format!("dlg:{}", worker.delegation_id),
                 name,
                 model,
-                checkout: worker
-                    .options
-                    .checkout
-                    .as_ref()
-                    .or_else(|| task.and_then(|t| t.worktree.path.as_ref()))
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default(),
+                checkout: roster_checkout(worker, task),
                 activity: task
                     .and_then(|t| t.handoff.as_ref())
                     .or_else(|| worker.result.as_ref().and_then(|r| r.handoff.as_ref()))
@@ -4562,11 +4556,71 @@ fn roster_entries(
         .collect()
 }
 
+fn roster_checkout(
+    worker: &gitterm_core::tasks::Delegation,
+    task: Option<&gitterm_core::tasks::TaskRecord>,
+) -> String {
+    worker
+        .options
+        .checkout
+        .as_ref()
+        .or_else(|| task.and_then(|task| task.worktree.path.as_ref()))
+        .or(Some(&worker.parent.cwd))
+        .map(|path| path.display().to_string())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::TestAppContext;
     use gpui_component::dock::{InsertTarget, PaneRef};
+
+    #[test]
+    fn roster_entries_project_delegation_and_task_checkouts() {
+        let delegation: gitterm_core::tasks::Delegation = serde_json::from_value(serde_json::json!({
+            "delegation_id": "checkout-option",
+            "kind": "implement",
+            "parent": {"session_uid":"parent", "workspace":"repo", "cwd":"/repo/session-checkout"},
+            "child": {"runner":"codex_consult", "model":"gpt-6"},
+            "brief":"fixture",
+            "status": {"state":"running"},
+            "created_at":"2026-01-01T00:00:00Z",
+            "updated_at":"2026-01-01T00:00:00Z",
+            "options": {"checkout":"/repo/delegation-checkout"}
+        }))
+        .unwrap();
+        assert_eq!(roster_checkout(&delegation, None), "/repo/delegation-checkout");
+
+        let task: gitterm_core::tasks::TaskRecord = serde_json::from_value(serde_json::json!({
+            "schema_version":1,
+            "task_id":"task-1", "title":"fixture", "objective":"fixture",
+            "created_at":"2026-01-01T00:00:00Z", "updated_at":"2026-01-01T00:00:00Z",
+            "workspace":{"name":"repo","location":{"kind":"local","directory":"/repo"}},
+            "repository":{"common_dir":"/repo/.git","remote_url":null},
+            "base":{"reference":"main","commit":"abc"}, "branch":"worker",
+            "worktree":{"state":"ready","path":"/repo/task-worktree"},
+            "executor":{"kind":"local"}, "stopping_boundary":"implement_until_tests_pass",
+            "lifecycle":"running", "attention":{}, "changes":{}, "verification":{"state":"unknown"}, "delivery":{}
+        }))
+        .unwrap();
+        let mut task_delegation = delegation.clone();
+        task_delegation.delegation_id = "task-worktree".into();
+        task_delegation.child = gitterm_core::tasks::DelegationChild::TaskSession {
+            task_id: "task-1".into(),
+            task_session_id: None,
+            conversation: None,
+            preset_name: Some("Codex".into()),
+            model: Some("gpt-6".into()),
+            role: None,
+        };
+        task_delegation.options.checkout = None;
+        let rows = roster_entries(&[task], &[delegation, task_delegation], |_| {
+            gitterm_core::delegations::WorkerTab::Closed
+        });
+        assert_eq!(rows[0].checkout, "/repo/delegation-checkout");
+        assert_eq!(rows[1].checkout, "/repo/task-worktree");
+    }
 
     #[test]
     fn window_title_matches_iced_workspace_and_sidebar_format() {

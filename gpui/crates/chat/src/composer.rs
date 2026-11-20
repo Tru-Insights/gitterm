@@ -572,8 +572,14 @@ mod ui {
                             }))
                             .px(px(8.)).py(px(4.)).h_auto().bg(rgb(palette.block))
                             .text_color(rgb(palette.muted)).border_1().border_color(rgb(palette.strong)).rounded(px(6.));
-                        if id == "mode" {
-                            chip = chip.icon(gpui_component::Icon::default().data(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V6a4 4 0 0 1 8 0v4"/></svg>"#).size(px(12.)));
+                        let icon = match id {
+                            "model" => Some(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0.8l1.7 4.6 4.7 1.6-4.7 1.7L8 13.4 6.3 8.7 1.6 7l4.7-1.6z"/></svg>"#.as_slice()),
+                            "effort" => Some(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2.5 11.5a5.5 5.5 0 1 1 11 0"/><path d="M8 11.5l2.6-3.4"/></svg>"#.as_slice()),
+                            "mode" => Some(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="7" width="10" height="7.5" rx="1.5"/><path d="M5.2 7V5a2.8 2.8 0 0 1 5.6 0v2"/></svg>"#.as_slice()),
+                            _ => None,
+                        };
+                        if let Some(icon) = icon {
+                            chip = chip.icon(gpui_component::Icon::default().data(icon).size(px(12.)));
                         }
                         if id == "checkout" && let Some(path) = &self.checkout_path { chip = chip.tooltip(path.clone()); }
                         chip
