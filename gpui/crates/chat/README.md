@@ -219,7 +219,9 @@ shows the core's “Not withdrawn” reason without removing the prompt.
 The adapter retains each Queue/Withdraw core correlation until the transport
 outcome, including pre-send rejection and channel failure. Known-unsent and
 uncertain prompts come from the core projection; exit never auto-resends them.
-An uncertain submission blocks retry. Both Enter and the Send/Queue button
+An uncertain submission blocks retry. An explicit retry of a known-unsent
+queued delivery gets a fresh runtime message ID, while retaining the old unsent
+entry and the caller identity for duplicate/uncertain-retry protection. Both Enter and the Send/Queue button
 recheck pending requests and IME marked text; the adapter also checks pending
 requests at admission and immediately before channel handoff. Draft/image
 retention and matching receipt IDs preserve newer edits.

@@ -113,6 +113,8 @@ impl Prepared {
 struct Attempt {
     runtime: RuntimeStamp,
     request_id: Option<String>,
+    /// Caller identity for retry/dedup; queued retries get a fresh wire ID.
+    admission_id: Option<String>,
     message_id: Option<String>,
     withdraw_id: Option<String>,
     correlation: Option<CommandCorrelation>,
@@ -168,11 +170,11 @@ impl ChatAdapter {
             ChatIntent::Withdraw { message_id } => Some(message_id.clone()),
             _ => None,
         };
-        let message_id =
+        let admission_id =
             matches!(&intent, ChatIntent::Send { .. }).then(|| facts.message_id.clone());
         if let Some(attempt) = self.attempts.values().find(|a| {
             (request_id.is_some() && a.request_id == request_id
-                || message_id.is_some() && a.message_id == message_id)
+                || admission_id.is_some() && a.admission_id == admission_id)
                 && self
                     .state
                     .accepts_stream(&a.runtime, &facts.authority.target)
@@ -180,6 +182,7 @@ impl ChatAdapter {
         }) {
             return Err(attempt.receipt.clone());
         }
+        let mut message_id = admission_id.clone();
         let effect = match intent {
             ChatIntent::Send { text, images } => {
                 if !self.state.pending_requests.is_empty() {
@@ -203,9 +206,36 @@ impl ChatAdapter {
                 // streaming. An explicit retry after definitive non-delivery
                 // must keep that Submit's identity instead of becoming a Queue.
                 let retry_submit = self.attempts.values().any(|attempt| {
-                    attempt.message_id.as_ref() == Some(&facts.message_id)
+                    attempt.admission_id.as_ref() == Some(&facts.message_id)
                         && attempt.receipt.state.retryable()
                 }) && !self.state.queued_prompts.contains_key(&facts.message_id);
+                let retry_queue = self.attempts.values().any(|attempt| {
+                    attempt.admission_id.as_ref() == Some(&facts.message_id)
+                        && attempt.receipt.state.retryable()
+                        && attempt.message_id.as_ref().is_some_and(|id| {
+                            self.state
+                                .queued_prompts
+                                .get(id)
+                                .is_some_and(|queued| queued.status == PromptStatus::Unsent)
+                        })
+                });
+                let delivery_id = if retry_queue {
+                    // The core intentionally retains Unsent IDs and refuses
+                    // their reuse. Explicit retries are new deliveries; retain
+                    // the old entry and let Queue track the new one normally.
+                    loop {
+                        let next = NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+                        let id = format!("{}-retry-{next}", facts.message_id);
+                        if !self.state.queued_prompts.contains_key(&id)
+                            && !self.state.shows_prompt(&id)
+                        {
+                            break id;
+                        }
+                    }
+                } else {
+                    facts.message_id
+                };
+                message_id = Some(delivery_id.clone());
                 if !retry_submit
                     && !facts.just_spawned
                     && self.state.submit_queues(backend, facts.process_running)
@@ -216,7 +246,7 @@ impl ChatAdapter {
                         config: facts.config,
                         process_running: facts.process_running,
                         prompt,
-                        message_id: facts.message_id,
+                        message_id: delivery_id,
                     })
                 } else {
                     self.state.reduce(Intent::Submit {
@@ -224,7 +254,7 @@ impl ChatAdapter {
                         backend,
                         process_running: facts.process_running,
                         just_spawned: facts.just_spawned,
-                        message_id: facts.message_id,
+                        message_id: delivery_id,
                     })
                 }
             }
@@ -289,6 +319,7 @@ impl ChatAdapter {
             Attempt {
                 runtime: runtime.clone(),
                 request_id,
+                admission_id,
                 message_id,
                 withdraw_id,
                 correlation,

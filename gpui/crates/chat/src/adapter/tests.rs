@@ -896,3 +896,99 @@ fn provider_withdraw_refusal_settles_visible_control_receipt_after_write() {
     composer.project(adapter.state(), update.event.as_ref());
     assert!(composer.notice.unwrap().contains("already picked up"));
 }
+
+#[test]
+fn explicit_same_caller_retry_of_unsent_queue_uses_fresh_tracked_delivery_id() {
+    for failure in ["validation", "channel", "delivery"] {
+        let mut adapter = ChatAdapter::default();
+        let source = adapter.begin_runtime(target());
+        streaming(&mut adapter, &source);
+        let prepared = adapter.admit(prompt(), facts()).unwrap();
+        let receipt = if failure == "validation" {
+            request(&mut adapter, &source);
+            let receipt = adapter
+                .execute(prepared, &target(), 1, |_| panic!("blocked send"))
+                .0;
+            adapter
+                .receive(
+                    &source,
+                    &target(),
+                    AgentEvent::Harness(HarnessEvent::RuntimeRequestResolved {
+                        request_id: "synthetic-request".into(),
+                    }),
+                    None,
+                    |_, _| {},
+                )
+                .unwrap();
+            receipt
+        } else if failure == "channel" {
+            adapter
+                .execute(prepared, &target(), 1, |_| Err("closed".into()))
+                .0
+        } else {
+            let receipt = accepted(&mut adapter, prepared);
+            adapter
+                .delivery(
+                    receipt.id,
+                    &target(),
+                    DeliveryOutcome::Rejected("not written".into()),
+                )
+                .unwrap()
+        };
+        assert!(receipt.state.retryable());
+        assert_eq!(
+            adapter.state().queued_prompts["synthetic-message"].status,
+            PromptStatus::Unsent
+        );
+        let retry = adapter.admit(prompt(), facts()).unwrap();
+        let mut delivery_id = String::new();
+        let (receipt, _) = adapter.execute(retry, &target(), 2, |command| {
+            let HarnessCommand::SendUserMessage(prompt) = command else {
+                panic!()
+            };
+            delivery_id = prompt.id.unwrap();
+            assert_ne!(delivery_id, "synthetic-message");
+            assert_eq!(prompt.text, "synthetic draft");
+            Ok(())
+        });
+        assert_eq!(adapter.state().queued_prompts.len(), 2);
+        assert_eq!(
+            adapter.state().queued_prompts[&delivery_id].status,
+            PromptStatus::Pending
+        );
+        assert!(
+            adapter.admit(prompt(), facts()).is_err(),
+            "caller identity still deduplicates"
+        );
+        let update = adapter
+            .receive(
+                &source,
+                &target(),
+                AgentEvent::Harness(HarnessEvent::MessageLifecycle {
+                    id: delivery_id.clone(),
+                    state: MessageState::Queued,
+                }),
+                None,
+                |_, _| {},
+            )
+            .unwrap();
+        assert!(update.event.is_some());
+        assert_eq!(
+            adapter.state().queued_prompts[&delivery_id].status,
+            PromptStatus::Queued
+        );
+        adapter
+            .delivery(
+                receipt.id,
+                &target(),
+                DeliveryOutcome::Uncertain("partial write".into()),
+            )
+            .unwrap();
+        let rejected = adapter.admit(prompt(), facts()).err().unwrap();
+        assert!(
+            matches!(rejected.state, ReceiptState::Uncertain(_)),
+            "uncertainty must never retry"
+        );
+        assert_eq!(adapter.state().queued_prompts.len(), 2);
+    }
+}
