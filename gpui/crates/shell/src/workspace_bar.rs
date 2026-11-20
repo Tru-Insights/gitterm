@@ -12,9 +12,156 @@ use std::rc::Rc;
 
 use gitterm_core::{park::WakeReason, settings::WorkspaceColor, workspace};
 use gpui::{App, Div, SharedString, Stateful, Window, div, prelude::*, px, rgb};
-use gpui_component::tooltip::Tooltip;
+use gpui_component::{
+    button::{Button, ButtonVariants},
+    popover::Popover,
+    tooltip::Tooltip,
+};
 
 use crate::data::WorkspaceId;
+
+/// A fresh, read-only projection of Iced's saved PR and parked facts. The
+/// catalog retains only open workspaces, so closed entries come from its source.
+#[derive(Default)]
+pub(crate) struct SavedFacts {
+    pub ready: usize,
+    pub news_count: usize,
+    pub parked: usize,
+    pub news: std::collections::HashMap<WorkspaceId, News>,
+    pub machines: Vec<News>,
+}
+impl SavedFacts {
+    pub fn read(
+        catalog: &crate::workspace_config::IcedCatalog,
+        roots: &std::collections::HashMap<WorkspaceId, Vec<String>>,
+        colors: Colors,
+    ) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        use gitterm_core::{chat_facts, chats::ChatBackend, merge_plan, prs};
+        use std::collections::{HashMap, HashSet};
+        let path = catalog.source.join("workspaces.json");
+        let file: gitterm_core::workspace_config::WorkspacesFile = serde_json::from_slice(
+            &std::fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+        )
+        .with_context(|| format!("parse {}", path.display()))?;
+        let watch = prs::WatchFile::load(&prs::WatchFile::path_in(&catalog.source));
+        let plans = merge_plan::load_plans(&merge_plan::plans_dir(&catalog.source));
+        let briefs: HashMap<_, _> = watch
+            .prs
+            .iter()
+            .filter_map(|(id, pr)| Some((id.clone(), pr.brief()?)))
+            .collect();
+        let mut result = Self {
+            parked: file.workspaces.iter().filter(|w| w.is_parked()).count(),
+            ..Default::default()
+        };
+        result.machines = file
+            .remote_agents
+            .iter()
+            .map(|machine| News {
+                label: format!("{} · not connected in preview", machine.name),
+                color: colors.muted,
+            })
+            .collect();
+        let homes = catalog
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (Some(WorkspaceId(i as u64 + 1)), w))
+            .chain(
+                file.workspaces
+                    .iter()
+                    .filter(|w| w.is_parked())
+                    .map(|w| (None, w)),
+            );
+        for (id, saved) in homes {
+            if saved.is_legacy_remote()
+                || matches!(
+                    saved.location,
+                    Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. })
+                )
+            {
+                continue;
+            }
+            let mut home_roots = saved.chats.clone();
+            if let Some(extra) = id.and_then(|id| roots.get(&id)) {
+                home_roots.extend(extra.iter().cloned());
+            }
+            home_roots.extend(saved.tabs.iter().filter_map(|t| t.chat_session_id.clone()));
+            let mut seen_roots = HashSet::new();
+            let mut seen_prs = HashSet::new();
+            let mut newest = None;
+            for root in home_roots
+                .into_iter()
+                .filter(|root| seen_roots.insert(root.clone()))
+            {
+                if let Some(plan) = plans.get(&root) {
+                    result.ready += usize::from(
+                        merge_plan::next_to_merge(&merge_plan::order_plan(plan, &briefs)).is_some(),
+                    );
+                }
+                let mut keys: Vec<_> = plans
+                    .get(&root)
+                    .into_iter()
+                    .flat_map(|plan| plan.entries.iter().map(|entry| entry.key()))
+                    .collect();
+                let mut pending = vec![root];
+                let mut seen_chats = HashSet::new();
+                while let Some(chat) = pending.pop() {
+                    if !seen_chats.insert(chat.clone()) {
+                        continue;
+                    }
+                    for backend in ChatBackend::ALL {
+                        let path = chat_facts::facts_path(
+                            &chat_facts::facts_dir(&catalog.source),
+                            backend,
+                            &chat,
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                        if let Some(facts) =
+                            chat_facts::load_facts(&path).map_err(anyhow::Error::msg)?
+                        {
+                            pending
+                                .extend(facts.children.into_iter().map(|child| child.session_id));
+                            keys.extend(facts.prs.iter().map(|pr| pr.key()));
+                        }
+                    }
+                }
+                for key in keys.into_iter().filter(|key| seen_prs.insert(key.id())) {
+                    if let Some(pr) = watch.prs.get(&key.id()) {
+                        for news in pr.open_news() {
+                            result.news_count += 1;
+                            if newest
+                                .as_ref()
+                                .is_none_or(|(_, old): &(_, &prs::NewsItem)| news.at > old.at)
+                            {
+                                newest = Some((pr.key.number, news));
+                            }
+                        }
+                    }
+                }
+            }
+            if let (Some(id), Some((number, news))) = (id, newest) {
+                result.news.insert(
+                    id,
+                    News {
+                        label: format!("#{number} {}", news.text),
+                        color: match news.kind {
+                            prs::NewsKind::ChecksFailed
+                            | prs::NewsKind::Conflicting
+                            | prs::NewsKind::Closed => colors.red,
+                            prs::NewsKind::RequiredChecksPassed | prs::NewsKind::Merged => {
+                                colors.green
+                            }
+                            prs::NewsKind::NewActivity => colors.blue,
+                        },
+                    },
+                );
+            }
+        }
+        Ok(result)
+    }
+}
 
 pub type Handler<T> = Rc<dyn Fn(T, &mut Window, &mut App)>;
 
@@ -285,6 +432,7 @@ pub(crate) fn control<T: Clone + 'static>(
 pub fn render(input: &Input, colors: Colors, emit: Handler<Outcome>) -> gpui::Stateful<gpui::Div> {
     let mut chips = div()
         .id("pstrip-workspace-scroll")
+        .debug_selector(|| "pstrip-workspace-scroll".into())
         .flex()
         .items_center()
         .flex_1()
@@ -399,32 +547,17 @@ pub fn render(input: &Input, colors: Colors, emit: Handler<Outcome>) -> gpui::St
                 chips = chips.child(chip);
             }
             Item::Repos => {
-                let mut repos = control(
-                    "pstrip-repos",
-                    if input.repos_open {
-                        "Repos ▴"
-                    } else {
-                        "Repos ▾"
-                    },
-                    std::iter::once("Repos and machines".to_string())
-                        .chain(input.machine_news.iter().map(|news| news.label.clone()))
-                        .chain(input.hidden_news().then(|| "news inside".to_string()))
-                        .collect::<Vec<_>>()
-                        .join(" · "),
-                    colors.muted,
-                    colors,
-                    Outcome::OpenReposMenu,
-                    emit.clone(),
-                )
-                .flex()
-                .items_center()
-                .gap(px(5.))
-                .px(px(12.))
-                .flex_none()
-                .debug_selector(|| "pstrip-repos".into())
-                .when(input.repos_open, |s| {
-                    s.bg(rgb(colors.surface0)).text_color(rgb(colors.text))
-                });
+                let mut repos = Button::new("pstrip-repos")
+                    .ghost()
+                    .label("Repos ▾")
+                    .tooltip("Repos and machines")
+                    .font_family(crate::theme::LABEL_FONT)
+                    .text_size(px(11.))
+                    .text_color(rgb(colors.muted))
+                    .h(px(27.))
+                    .px(px(12.))
+                    .flex_none()
+                    .debug_selector(|| "pstrip-repos".into());
                 if input.hidden_news() {
                     repos = repos.child(
                         dot(colors.peach, 6., 6.).debug_selector(|| "pstrip-repos-news".into()),
@@ -433,7 +566,68 @@ pub fn render(input: &Input, colors: Colors, emit: Handler<Outcome>) -> gpui::St
                 for news in &input.machine_news {
                     repos = repos.child(dot(news.color, 5., 5.));
                 }
-                chips = chips.child(repos);
+                let menu_input = input.clone();
+                let menu_emit = emit.clone();
+                chips = chips.child(
+                    Popover::new("pstrip-repos-menu")
+                        .anchor(gpui::Anchor::BottomLeft)
+                        .trigger(repos)
+                        .content(move |_, _, cx| {
+                            let mut menu = div()
+                                .id("pstrip-repos-list")
+                                .debug_selector(|| "pstrip-repos-list".into())
+                                .flex()
+                                .flex_col()
+                                .w(px(260.))
+                                .max_h(px(360.))
+                                .overflow_y_scroll()
+                                .font_family(crate::theme::LABEL_FONT)
+                                .text_size(px(11.));
+                            for section in menu_input.layout().sections {
+                                menu = menu.child(
+                                    div()
+                                        .px(px(8.))
+                                        .py(px(4.))
+                                        .text_color(rgb(colors.muted))
+                                        .child(if section.key == workspace::LOCAL_GROUP {
+                                            "This Mac".to_string()
+                                        } else {
+                                            section.key
+                                        }),
+                                );
+                                for index in section.workspaces {
+                                    let workspace = &menu_input.workspaces[index];
+                                    let id = workspace.id;
+                                    let weak = cx.entity().downgrade();
+                                    let emit = menu_emit.clone();
+                                    menu = menu.child(
+                                        control(
+                                            format!("pstrip-repo-{}", id.0),
+                                            workspace.name.clone(),
+                                            workspace.hint(),
+                                            colors.text,
+                                            colors,
+                                            Outcome::SelectWorkspace(id),
+                                            Rc::new(move |outcome, window, cx| {
+                                                let _ = weak.update(cx, |state, cx| {
+                                                    state.dismiss(window, cx)
+                                                });
+                                                emit(outcome, window, cx);
+                                            }),
+                                        )
+                                        .debug_selector(move || format!("pstrip-repo-{}", id.0)),
+                                    );
+                                }
+                            }
+                            menu.child(
+                                div()
+                                    .px(px(8.))
+                                    .py(px(6.))
+                                    .text_color(rgb(colors.muted))
+                                    .child("Manage repos · not available in preview"),
+                            )
+                        }),
+                );
             }
             Item::NewWork => {
                 chips = chips.child(
@@ -538,25 +732,7 @@ pub fn render(input: &Input, colors: Colors, emit: Handler<Outcome>) -> gpui::St
             .cursor_pointer()
             .on_click(move |_, window, cx| emit(Outcome::Browser(action), window, cx));
     }
-    right = right
-        .child(browser_button)
-        .child(
-            control(
-                "pstrip-more",
-                "⋯",
-                "Help and browser actions",
-                if input.more_open {
-                    colors.text
-                } else {
-                    colors.muted
-                },
-                colors,
-                Outcome::OpenMoreMenu,
-                emit,
-            )
-            .debug_selector(|| "pstrip-more".into()),
-        )
-        .pr(px(4.));
+    right = right.child(browser_button).pr(px(4.));
     div()
         .id("pstrip-workspace-bar")
         .debug_selector(|| "pstrip-workspace-bar".into())
@@ -585,7 +761,7 @@ fn right_side_labels(input: &Input) -> Vec<String> {
     if input.parked_count > 0 {
         labels.push(format!("⏸{}", input.parked_count));
     }
-    labels.extend([">_".to_string(), "Browser".to_string(), "⋯".to_string()]);
+    labels.extend([">_".to_string(), "Browser".to_string()]);
     labels
 }
 
@@ -736,14 +912,11 @@ pub(crate) mod tests {
         let mut i = input();
         i.ready_count = 2;
         i.parked_count = 16;
-        assert_eq!(
-            right_side_labels(&i),
-            ["↑2", "⏸16", ">_", "Browser", "⋯"]
-        );
+        assert_eq!(right_side_labels(&i), ["↑2", "⏸16", ">_", "Browser"]);
         i.ready_count = 0;
         i.parked_count = 0;
         i.ready_news_count = 0;
-        assert_eq!(right_side_labels(&i), [">_", "Browser", "⋯"]);
+        assert_eq!(right_side_labels(&i), [">_", "Browser"]);
     }
     pub(crate) fn draw(cx: &mut VisualTestContext) {
         cx.run_until_parked();
@@ -771,6 +944,56 @@ pub(crate) mod tests {
                 Colors::new(true),
                 Rc::new(move |outcome, _, _| events.borrow_mut().push(outcome)),
             )
+        }
+    }
+    #[gpui::test]
+    fn overflowing_chips_scroll_without_shrinking_and_right_controls_stay_pinned(
+        cx: &mut TestAppContext,
+    ) {
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let mut input = input();
+        input.workspaces = (1..=30)
+            .map(|id| workspace(id, "A long workspace name", "local", true, false))
+            .collect();
+        input.ready_count = 2;
+        input.parked_count = 16;
+        let (_, cx) = cx.add_window_view(|_, _| View {
+            input,
+            events: Rc::new(RefCell::new(vec![])),
+        });
+        cx.simulate_resize(gpui::size(px(1400.), px(800.)));
+        draw(cx);
+        let chip_width = cx.debug_bounds("pstrip-workspace-1").unwrap().size.width;
+        let ready_width = cx.debug_bounds("pstrip-ready").unwrap().size.width;
+        for width in [320., 640., 1400.] {
+            cx.simulate_resize(gpui::size(px(width), px(800.)));
+            draw(cx);
+            let bar = cx.debug_bounds("pstrip-workspace-bar").unwrap();
+            let scroll = cx.debug_bounds("pstrip-workspace-scroll").unwrap();
+            let ready = cx.debug_bounds("pstrip-ready").unwrap();
+            let terminal = cx.debug_bounds("pstrip-terminal").unwrap();
+            let browser = cx.debug_bounds("pstrip-browser").unwrap();
+            assert_eq!(
+                cx.debug_bounds("pstrip-workspace-1").unwrap().size.width,
+                chip_width
+            );
+            assert_eq!(ready.size.width, ready_width);
+            assert!(scroll.right() <= ready.left());
+            assert!(ready.left() >= bar.left() && browser.right() <= bar.right());
+            let terminal_before = terminal;
+            cx.simulate_event(gpui::ScrollEvent {
+                position: scroll.center(),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-10000.))),
+                modifiers: Default::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+                source: gpui::ScrollSource::Pointer,
+            });
+            draw(cx);
+            let plus = cx.debug_bounds("pstrip-new-work").unwrap();
+            assert!(plus.left() >= scroll.left() && plus.right() <= scroll.right());
+            assert_eq!(cx.debug_bounds("pstrip-terminal").unwrap(), terminal_before);
+            assert!(cx.debug_bounds("pstrip-more").is_none());
         }
     }
     #[gpui::test]
@@ -818,13 +1041,11 @@ pub(crate) mod tests {
         for selector in [
             "pstrip-workspace-1",
             "pstrip-settings",
-            "pstrip-repos",
             "pstrip-new-work",
             "pstrip-ready",
             "pstrip-parked",
             "pstrip-terminal",
             "pstrip-browser",
-            "pstrip-more",
         ] {
             click(cx, selector);
         }
@@ -833,14 +1054,20 @@ pub(crate) mod tests {
             vec![
                 Outcome::SelectWorkspace(WorkspaceId(1)),
                 Outcome::OpenSettings(WorkspaceId(2)),
-                Outcome::OpenReposMenu,
                 Outcome::NewWork,
                 Outcome::OpenReady,
                 Outcome::OpenParked,
                 Outcome::ToggleTerminal,
-                Outcome::Browser(BrowserAction::Open),
-                Outcome::OpenMoreMenu
+                Outcome::Browser(BrowserAction::Open)
             ]
+        );
+        assert!(cx.debug_bounds("pstrip-more").is_none());
+        click(cx, "pstrip-repos");
+        assert!(cx.debug_bounds("pstrip-repos-list").is_some());
+        click(cx, "pstrip-repo-1");
+        assert_eq!(
+            events.borrow().last(),
+            Some(&Outcome::SelectWorkspace(WorkspaceId(1)))
         );
         events.borrow_mut().clear();
         view.update(cx, |v, cx| {
@@ -878,6 +1105,14 @@ pub(crate) mod tests {
         );
         click(cx, "pstrip-browser");
         assert_eq!(*events.borrow(), [Outcome::Browser(BrowserAction::Focus)]);
+        assert!(cx.debug_bounds("pstrip-more").is_none());
+        click(cx, "pstrip-repos");
+        assert!(cx.debug_bounds("pstrip-repos-list").is_some());
+        click(cx, "pstrip-repo-1");
+        assert_eq!(
+            events.borrow().last(),
+            Some(&Outcome::SelectWorkspace(WorkspaceId(1)))
+        );
         events.borrow_mut().clear();
         view.update(cx, |v, cx| {
             v.input.browser.action = None;

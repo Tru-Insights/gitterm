@@ -178,7 +178,11 @@ fn git_mount_actions_file_cover_return_and_unavailable_worktrees(cx: &mut TestAp
     let (root, shell, cx) = fixture(cx);
     let source = root.path().join("iced");
     let before = std::fs::read(source.join("workspaces.json")).unwrap();
-    click(cx, "open-git-sidebar");
+    // Exercise the retained Git host path; navigation belongs under Work.
+    shell.update(cx, |shell, cx| {
+        shell.update_regions(|r| r.sidebar_mode = SidebarMode::Git, cx)
+    });
+    draw(cx);
     assert!(cx.debug_bounds("git-changes").is_some());
     let git = cx.read(|cx| {
         let shell = shell.read(cx);
@@ -242,11 +246,21 @@ fn work_mode_has_no_git_header_and_git_requires_entry(cx: &mut TestAppContext) {
             SidebarMode::Work
         )
     });
-    // Navigation stays on the mode strip, with no separate Git heading.
-    let git_entry = cx.debug_bounds("open-git-sidebar").unwrap();
-    let work_entry = cx.debug_bounds("Work").unwrap();
-    assert_eq!(git_entry.top(), work_entry.top());
-    click(cx, "open-git-sidebar");
+    assert!(cx.debug_bounds("open-git-sidebar").is_none());
+    let work = cx.debug_bounds("Work").unwrap();
+    let files = cx.debug_bounds("Files").unwrap();
+    let find = cx.debug_bounds("Find").unwrap();
+    let collapse = cx.debug_bounds("collapse-sidebar").unwrap();
+    assert!(work.right() <= files.left() && files.right() <= find.left());
+    assert!(find.right() <= collapse.left());
+    assert_eq!(work.top(), collapse.top());
+    click(cx, "collapse-sidebar");
+    cx.read(|cx| assert!(shell.read(cx).active(cx).store.regions.sidebar_collapsed));
+    click(cx, "collapse-sidebar");
+    shell.update(cx, |shell, cx| {
+        shell.update_regions(|r| r.sidebar_mode = SidebarMode::Git, cx)
+    });
+    draw(cx);
     assert!(cx.debug_bounds("git-back-work").is_some());
     click(cx, "git-back-work");
     assert!(cx.debug_bounds("git-back-work").is_none());
