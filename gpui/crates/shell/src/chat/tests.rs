@@ -26,6 +26,93 @@ fn script(dir: &Path, name: &str, contents: &str) -> PathBuf {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     path
 }
+fn independent_clone(cwd: &Path) {
+    std::fs::create_dir_all(cwd.join(".git/objects/info")).unwrap();
+    std::fs::create_dir_all(cwd.join(".git/refs/heads")).unwrap();
+    std::fs::write(cwd.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(
+        cwd.join(".git/config"),
+        "[core]\nrepositoryformatversion = 0\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn fake_help_missing_restricted_refuses_and_success_does_not_grant_authority() {
+    let (dir, preview) = fixture();
+    let help = "  --restricted  restricted\n  --strict-mcp-config  strict\n  --safe-mode  safe\n  --permission-mode <mode> (choices: \"default\", \"acceptEdits\")\n";
+    for (help, supported) in [
+        (help.to_owned(), true),
+        (help.replace("--restricted", "--unknown"), false),
+    ] {
+        let path = script(
+            dir.path(),
+            "fake-help",
+            &format!(
+                "#!/bin/sh\n[ \"$1\" = --help ] || exit 9\nprintf '%s' {}\n",
+                super::provider::quote(&help)
+            ),
+        );
+        let provider = Provider::new(preview.clone(), &path).unwrap();
+        let output = std::process::Command::new(path)
+            .arg("--help")
+            .env_clear()
+            .envs(provider.spec.environment())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            super::fence::check_help(std::str::from_utf8(&output.stdout).unwrap()).is_ok(),
+            supported
+        );
+        // Even supported CLI evidence cannot bypass the unresolved R2 gates.
+        assert!(provider.authorize().is_err());
+    }
+}
+
+#[test]
+fn workspace_requires_independent_clone_without_shared_metadata_or_preview_overlap() {
+    let (dir, preview) = fixture();
+    let provider = Provider::new(preview.clone(), Path::new("/fake/claude")).unwrap();
+    let cwd = dir.path().join("clone");
+    std::fs::create_dir(&cwd).unwrap();
+    assert!(provider.validate_workspace(&cwd).is_err());
+    independent_clone(&cwd);
+    provider.validate_workspace(&cwd).unwrap();
+    std::fs::create_dir(cwd.join("src")).unwrap();
+    assert!(provider.validate_workspace(&cwd.join("src")).is_err());
+    for redirect in [
+        "commondir",
+        "worktrees",
+        "objects/info/alternates",
+        "objects/info/http-alternates",
+    ] {
+        let path = cwd.join(".git").join(redirect);
+        std::fs::write(&path, ".\n").unwrap();
+        assert!(provider.validate_workspace(&cwd).is_err(), "{redirect}");
+        std::fs::remove_file(path).unwrap();
+    }
+    let linked = dir.path().join("linked");
+    std::fs::create_dir(&linked).unwrap();
+    std::fs::write(
+        linked.join(".git"),
+        format!("gitdir: {}\n", cwd.join(".git").display()),
+    )
+    .unwrap();
+    assert!(provider.validate_workspace(&linked).is_err());
+    std::fs::remove_file(linked.join(".git")).unwrap();
+    symlink(cwd.join(".git"), linked.join(".git")).unwrap();
+    assert!(provider.validate_workspace(&linked).is_err());
+    std::fs::rename(cwd.join(".git/config"), cwd.join("config-backup")).unwrap();
+    symlink(cwd.join("config-backup"), cwd.join(".git/config")).unwrap();
+    assert!(provider.validate_workspace(&cwd).is_err());
+    independent_clone(&preview.root().join("clone"));
+    assert!(
+        provider
+            .validate_workspace(&preview.root().join("clone"))
+            .is_err()
+    );
+}
 #[test]
 fn provider_roots_refuse_protected_overlap_relative_alias_and_replacement() {
     let (dir, preview) = fixture();
@@ -339,7 +426,7 @@ assert not sys.stdin.read()
     let fake = script(dir.path(), "fake-claude", &program);
     let provider = Arc::new(Provider::new(preview.clone(), &fake).unwrap());
     let cwd = dir.path().join("checkout");
-    std::fs::create_dir(&cwd).unwrap();
+    independent_clone(&cwd);
     let (runtime, mut events) = provider
         .clone()
         .fake_start(cwd.clone())
@@ -540,7 +627,7 @@ Path('reaped-marker').write_text('finished')
         .build()
         .unwrap();
     let cwd = dir.path().join("checkout");
-    std::fs::create_dir(&cwd).unwrap();
+    independent_clone(&cwd);
     let (runtime, mut events) = executor
         .block_on(provider.fake_start(cwd.clone()))
         .unwrap()

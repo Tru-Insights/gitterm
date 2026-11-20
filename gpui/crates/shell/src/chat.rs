@@ -1,5 +1,6 @@
 //! Native preview composition. The shared workspace owner retains these entities;
 //! docking/hiding never installs another runtime receiver.
+mod fence;
 mod provider;
 #[cfg(test)]
 mod tests;
