@@ -28,6 +28,13 @@ pub enum UsageIntent {
     PinChanged(Option<RoutingPin>),
 }
 
+pub(crate) fn follow_up_window(
+    requested: UsageWindow,
+    current: UsageWindow,
+) -> Option<UsageWindow> {
+    (requested != current).then_some(current)
+}
+
 /// Compatibility entry points for hosts that only have the scan state yet.
 #[derive(Clone, Debug, PartialEq)]
 pub enum UsageState {

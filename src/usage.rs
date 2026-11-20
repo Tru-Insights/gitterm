@@ -2,7 +2,7 @@
 
 pub use gitterm_core::usage::*;
 
-use chrono::{Local, NaiveDate, TimeZone};
+use chrono::{NaiveDate, TimeZone};
 use std::path::{Path, PathBuf};
 
 /// Where the three harnesses keep their transcripts.
@@ -46,14 +46,7 @@ pub fn scan_usage(
     pricing: &Pricing,
     cache: &mut UsageCache,
 ) -> UsageReport {
-    scan_usage_in(
-        sources,
-        window,
-        Local::now().date_naive(),
-        &Local,
-        pricing,
-        cache,
-    )
+    gitterm_core::usage::scan_usage_local(&sources.core_sources(), window, pricing, cache)
 }
 
 /// Explicit-calendar scan through the shared service.

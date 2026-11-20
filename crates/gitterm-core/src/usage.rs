@@ -67,6 +67,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(feature = "runtime")]
+use chrono::Local;
 use chrono::NaiveDate;
 #[cfg(feature = "runtime")]
 use chrono::{DateTime, Utc};
@@ -78,6 +80,25 @@ use crate::chats::ChatBackend;
 mod scan;
 #[cfg(feature = "runtime")]
 pub use scan::{scan_usage_in, UsageCache};
+
+/// Scan local harness transcripts for a window ending today in local time.
+/// This performs blocking file I/O and should run on a background thread.
+#[cfg(feature = "runtime")]
+pub fn scan_usage_local(
+    sources: &UsageSources,
+    window: UsageWindow,
+    pricing: &Pricing,
+    cache: &mut UsageCache,
+) -> UsageReport {
+    scan_usage_in(
+        sources,
+        window,
+        Local::now().date_naive(),
+        &Local,
+        pricing,
+        cache,
+    )
+}
 
 /// The panel's time window, ending today (local time).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

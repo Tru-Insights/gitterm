@@ -105,6 +105,8 @@ pub struct Shell {
     usage_return_focus: Option<FocusHandle>,
     usage_page: Entity<usage::UsagePage>,
     usage_input: usage::UsageInput,
+    usage_cache: gitterm_core::usage::UsageCache,
+    usage_scan_task: Option<gpui::Task<()>>,
     run_sidebar_subscriptions: HashMap<WorkspaceId, Subscription>,
     workspaces: Vec<WorkspaceDock>,
     owner: Entity<WorkspaceOwner>,
@@ -336,6 +338,8 @@ impl Shell {
             usage_return_focus: None,
             usage_page,
             usage_input,
+            usage_cache: gitterm_core::usage::UsageCache::default(),
+            usage_scan_task: None,
             run_sidebar_subscriptions: HashMap::new(),
             workspaces,
             owner,
@@ -2738,10 +2742,52 @@ impl Shell {
         window.dispatch_action(action, cx);
     }
     fn request_usage_scan(&mut self, cx: &mut Context<Self>) {
-        // TODO(TRU-274): core exposes scan_usage_in with chrono arguments, but
-        // this shell has no chrono dependency or public local-time scan accessor.
-        self.usage_input.error = Some("Usage scanning is not available in preview".into());
+        if self.usage_input.scanning {
+            return;
+        }
+        let Some(home) = dirs::home_dir() else {
+            self.usage_input.error = Some("Could not resolve home directory for usage scan".into());
+            self.sync_usage(cx);
+            return;
+        };
+        let sources = gitterm_core::usage::UsageSources::under(&home);
+        let window = self.usage_input.window;
+        let usage_config = serde_json::from_value::<gitterm_core::usage::UsageConfig>(
+            workspace_config::load_iced_settings().usage,
+        )
+        .unwrap_or_default();
+        let pricing = gitterm_core::usage::Pricing::with_overrides(&usage_config);
+        let mut cache = std::mem::take(&mut self.usage_cache);
+        self.usage_input.scanning = true;
+        self.usage_input.error = None;
         self.sync_usage(cx);
+        self.usage_scan_task = Some(cx.spawn(async move |shell, cx| {
+            let (report, cache) = cx
+                .background_executor()
+                .spawn(async move {
+                    let report = gitterm_core::usage::scan_usage_local(
+                        &sources,
+                        window,
+                        &pricing,
+                        &mut cache,
+                    );
+                    (report, cache)
+                })
+                .await;
+            let _ = shell.update(cx, |shell, cx| {
+                shell.usage_scan_task = None;
+                shell.usage_cache = cache;
+                shell.usage_input.scanning = false;
+                if let Some(next) = usage::follow_up_window(window, shell.usage_input.window) {
+                    shell.usage_input.window = next;
+                    shell.request_usage_scan(cx);
+                } else {
+                    shell.usage_input.report = Some(Box::new(report));
+                    shell.usage_input.error = None;
+                }
+                shell.sync_usage(cx);
+            });
+        }));
     }
     fn sync_usage(&self, cx: &mut Context<Self>) {
         self.usage_page.update(cx, |page, cx| {
