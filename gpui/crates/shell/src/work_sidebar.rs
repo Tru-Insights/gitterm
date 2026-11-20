@@ -129,10 +129,10 @@ impl WorkSidebarOutcome {
             Self::UndoAutoRepo { .. } => "Undo auto-added repos",
             Self::EditRunCommand { .. } => "Save run command",
             Self::DismissAutoRepos { .. } => "Dismiss auto-added repos",
-            Self::RunRepoCommand { .. } => "Run command",
             Self::OpenEditor { .. } => "Open in editor",
             Self::MakeWorkspace { .. } => "Make workspace",
-            Self::OpenTask { .. } => "Task overview",
+            // RunRepoCommand and OpenTask are carried out by the shell (as in
+            // Iced), so a "not available" banner here would contradict them.
             _ => return None,
         };
         Some(format!("{action} · not available in preview"))

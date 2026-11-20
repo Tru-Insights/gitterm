@@ -1096,12 +1096,8 @@ fn owner_catalog_supplies_mounted_sidebar_read_authority_without_a_gui(
             cx,
         )
     });
-    owner.read_with(cx, |owner, _| {
-        assert_eq!(
-            owner.error.as_deref(),
-            Some("Run command · not available in preview")
-        )
-    });
+    // The shell runs it, as Iced does; the sidebar must not claim otherwise.
+    owner.read_with(cx, |owner, _| assert_eq!(owner.error, None));
     assert_eq!(tree_snapshot(fixture.root.path()), before);
 }
 
