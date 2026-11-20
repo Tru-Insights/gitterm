@@ -79,31 +79,7 @@ pub struct CleanupContext {
     pub pull_request_url: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CleanupRisk {
-    ActiveProcess,
-    WorktreeMissing,
-    WorktreeNotRegistered,
-    UncommittedChanges,
-    UnpushedCommits { count: u64 },
-    ExistingPullRequest { url: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CleanupInspection {
-    pub path_exists: bool,
-    pub registered: bool,
-    pub dirty: bool,
-    pub unpushed_commits: u64,
-    pub upstream: Option<String>,
-    pub risks: Vec<CleanupRisk>,
-}
-
-impl CleanupInspection {
-    pub fn safe_to_remove(&self) -> bool {
-        self.risks.is_empty()
-    }
-}
+pub use crate::tasks::{CleanupInspection, CleanupRisk};
 
 /// A pull request found for a task branch during delivery discovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1407,7 +1383,8 @@ fn rev_count(
     })
 }
 
-fn validate_branch(repository_path: &Path, branch: &str) -> Result<(), TaskWorktreeError> {
+/// Validate the existing task branch convention and Git ref rules. Runs Git.
+pub fn validate_branch(repository_path: &Path, branch: &str) -> Result<(), TaskWorktreeError> {
     if !branch.starts_with("task/") || branch["task/".len()..].contains('/') {
         return Err(TaskWorktreeError::new(
             "validate branch",

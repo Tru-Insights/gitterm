@@ -1,0 +1,13 @@
+[
+  {"state":"draft","allowed":true},
+  {"state":"preparing","allowed":false},
+  {"state":"ready","allowed":true},
+  {"state":"queued","allowed":false},
+  {"state":"running","allowed":false},
+  {"state":"waiting_for_input","allowed":false},
+  {"state":"completed","allowed":true},
+  {"state":"failed","allowed":true},
+  {"state":"stopped","allowed":true},
+  {"state":"interrupted","allowed":true},
+  {"state":"archived","allowed":true}
+]

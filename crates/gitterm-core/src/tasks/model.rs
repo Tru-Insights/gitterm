@@ -497,7 +497,6 @@ impl AttemptState {
         )
     }
 
-    #[cfg(feature = "runtime")]
     pub(super) fn lifecycle(self) -> TaskLifecycle {
         match self {
             Self::Preparing => TaskLifecycle::Preparing,
@@ -1101,4 +1100,53 @@ impl ReasoningEffort {
 pub struct LaunchIdentity {
     pub pid: u32,
     pub birth: String,
+}
+
+/// What a `task_update_handoff` says about the work (TRU-142 S6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffStatus {
+    /// Still working; the delegating chat's card shows the summary line.
+    #[default]
+    Progress,
+    /// The objective is met: the delegation completes with this handoff.
+    Done,
+    /// Cannot go on without a human: blockers say why.
+    Blocked,
+}
+
+impl HandoffStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Progress => "progress",
+            Self::Done => "done",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CleanupRisk {
+    ActiveProcess,
+    WorktreeMissing,
+    WorktreeNotRegistered,
+    UncommittedChanges,
+    UnpushedCommits { count: u64 },
+    ExistingPullRequest { url: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupInspection {
+    pub path_exists: bool,
+    pub registered: bool,
+    pub dirty: bool,
+    pub unpushed_commits: u64,
+    pub upstream: Option<String>,
+    pub risks: Vec<CleanupRisk>,
+}
+
+impl CleanupInspection {
+    pub fn safe_to_remove(&self) -> bool {
+        self.risks.is_empty()
+    }
 }

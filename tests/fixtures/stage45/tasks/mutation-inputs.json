@@ -1,0 +1,9 @@
+[
+  {"title":" ","objective":"work","error":"title is required"},
+  {"title":"work","objective":"\n ","error":"objective is required"},
+  {"title":" work ","objective":" objective ","issue_key":" tru-274 ","base_reference":" ","title_out":"work","objective_out":"objective","issue_out":"TRU-274"},
+  {"title":"work","objective":"objective","issue_key":"A-1","error":"Linear issue must look like TRU-106"},
+  {"title":"work","objective":"objective","issue_key":"AB-12345678","error":"Linear issue must look like TRU-106"},
+  {"title":"work","objective":"objective","issue_key":"A2-0","base_reference":" custom/ref ","title_out":"work","objective_out":"objective","issue_out":"A2-0","base_out":"custom/ref"},
+  {"title":"work","objective":"objective","issue_key":" ","title_out":"work","objective_out":"objective","issue_out":null}
+]
