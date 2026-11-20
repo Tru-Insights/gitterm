@@ -5,8 +5,7 @@ use std::sync::OnceLock;
 
 pub const APP_NAME: &str = "GitTerm V6";
 pub const WINDOW_TITLE: &str = "GitTerm V6 Development";
-pub const CONFIG_DIR_NAME: &str = "gitterm-v6";
-pub const CONFIG_DIR_ENV: &str = "GITTERM_V6_CONFIG_DIR";
+pub use gitterm_core::config_paths::{default_config_dir, resolve_dir_override, CONFIG_DIR_ENV};
 pub const INSTANCE_ID_ENV: &str = "GITTERM_V6_INSTANCE_ID";
 
 /// The V5 runtime's config dir and its override variable. V6 only reads
@@ -41,35 +40,12 @@ fn resolve_config_dir_override(raw: Option<std::ffi::OsString>) -> Option<PathBu
     resolve_dir_override(CONFIG_DIR_ENV, raw)
 }
 
-/// Validate a config-dir override read from `env_name`: absolute and
-/// non-empty, otherwise ignored with a log line.
-pub fn resolve_dir_override(env_name: &str, raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    let raw = raw?;
-    if raw.is_empty() {
-        eprintln!("{env_name} is set but empty; ignoring override");
-        return None;
-    }
-    let path = PathBuf::from(raw);
-    if path.is_relative() {
-        eprintln!(
-            "{env_name} is relative ({}); ignoring override",
-            path.display()
-        );
-        return None;
-    }
-    Some(path)
-}
-
 /// Get the shared (non-instance-specific) config directory
 pub fn global_config_dir() -> PathBuf {
     if let Some(dir) = config_dir_override() {
         return dir.clone();
     }
     default_config_dir(&dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
-}
-
-fn default_config_dir(home: &Path) -> PathBuf {
-    home.join(".config").join(CONFIG_DIR_NAME)
 }
 
 /// Get the base config directory for this instance

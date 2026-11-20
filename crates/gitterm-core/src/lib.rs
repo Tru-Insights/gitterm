@@ -82,3 +82,6 @@ pub mod settings;
 pub mod usage;
 
 pub mod remote;
+
+pub mod config_paths;
+pub mod workspace_config;

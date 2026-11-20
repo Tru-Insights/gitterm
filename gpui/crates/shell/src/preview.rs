@@ -51,15 +51,11 @@ impl PreviewContext {
 /// Read-only routes compose the same validated roots without creating any files.
 pub fn roots_from_environment(sample: bool) -> Result<Arc<Preview>> {
     let home = dirs::home_dir().context("resolve home for preview protection")?;
-    let overrides = [
-        "GITTERM_V6_CONFIG_DIR",
-        "GITTERM_V5_CONFIG_DIR",
-        "CLAUDE_CONFIG_DIR",
-        "CODEX_HOME",
-    ]
-    .into_iter()
-    .filter_map(std::env::var_os)
-    .map(PathBuf::from);
+    let others = ["GITTERM_V5_CONFIG_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from);
+    let overrides = protected_overrides(std::env::var_os("GITTERM_V6_CONFIG_DIR"), others);
     let protected = ProtectedRoots::new(&home, overrides)?;
     let root = config_dir(std::env::var_os("GITTERM_GPUI_CONFIG_DIR"), &home)?;
     let root = if sample { root.join("sample") } else { root };
@@ -70,6 +66,19 @@ pub fn roots_from_environment(sample: bool) -> Result<Arc<Preview>> {
         root.display()
     );
     Ok(roots)
+}
+fn protected_overrides(
+    v6: Option<OsString>,
+    others: impl IntoIterator<Item = PathBuf>,
+) -> Vec<PathBuf> {
+    let mut roots: Vec<_> = others.into_iter().collect();
+    // Ignore exactly the overrides Iced ignores. The default V6 root stays
+    // protected by ProtectedRoots even when no valid override was supplied.
+    roots.extend(gitterm_core::config_paths::resolve_dir_override(
+        "GITTERM_V6_CONFIG_DIR",
+        v6,
+    ));
+    roots
 }
 pub fn config_dir(override_dir: Option<OsString>, home: &Path) -> Result<PathBuf> {
     let root = override_dir
@@ -564,5 +573,29 @@ pub(crate) mod tests {
                     .is_some_and(|e| e.contains("preview disables"))
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod iced_override_tests {
+    use super::*;
+    #[test]
+    fn invalid_v6_overrides_fall_back_while_default_and_valid_override_stay_protected() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("fixture-home");
+        for raw in [None, Some(OsString::new()), Some("relative".into())] {
+            let source = gitterm_core::config_paths::iced_config_dir(raw.clone(), &home);
+            let protected = ProtectedRoots::new(&home, protected_overrides(raw, [])).unwrap();
+            let preview = Preview::validate(&dir.path().join("preview"), protected).unwrap();
+            assert_eq!(source, home.join(".config/gitterm-v6"));
+            assert!(preview.scoped(&source.join("workspaces.json")).is_err());
+        }
+        let source = dir.path().join("isolated-iced");
+        let raw = Some(source.as_os_str().to_owned());
+        let protected = ProtectedRoots::new(&home, protected_overrides(raw, [])).unwrap();
+        assert!(Preview::validate(&source, protected.clone()).is_err());
+        let preview = Preview::validate(&dir.path().join("preview"), protected).unwrap();
+        assert!(preview.scoped(&source.join("workspaces.json")).is_err());
+        assert!(!source.exists());
     }
 }
