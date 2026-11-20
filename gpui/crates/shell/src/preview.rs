@@ -64,15 +64,24 @@ pub fn roots_from_environment(sample: bool) -> Result<Arc<Preview>> {
     let root = config_dir(std::env::var_os("GITTERM_GPUI_CONFIG_DIR"), &home)?;
     let root = if sample { root.join("sample") } else { root };
     let roots = Arc::new(Preview::validate(&root, protected)?);
+    anyhow::ensure!(
+        roots.root() == root,
+        "preview root is aliased: {}",
+        root.display()
+    );
     Ok(roots)
 }
 pub fn config_dir(override_dir: Option<OsString>, home: &Path) -> Result<PathBuf> {
     let root = override_dir
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".config/gitterm-gpui"));
-    Ok(Preview::validate(&root, ProtectedRoots::new(home, [])?)?
-        .root()
-        .to_path_buf())
+    let validated = Preview::validate(&root, ProtectedRoots::new(home, [])?)?;
+    anyhow::ensure!(
+        validated.root() == root,
+        "preview root is aliased: {}",
+        root.display()
+    );
+    Ok(root)
 }
 /// Stage 1–3 terminal/Git behavior predates C2; every new-service effect stays closed.
 pub fn executable(preview: Option<&Preview>, effect: Effect, target: &Path) -> Result<()> {

@@ -263,7 +263,8 @@ impl Preview {
         }
         result
     }
-    pub(crate) fn create_private_dir(&self, path: &Path) -> io::Result<()> {
+    /// Create validated scoped directories without granting file-write or execution authority.
+    pub fn create_private_dir(&self, path: &Path) -> io::Result<()> {
         self.scoped(path)?;
         // Initialization may mkdir missing ancestors of the selected root (for
         // example .config or the sample parent). Never chmod existing parents,
