@@ -1,5 +1,4 @@
 //! UI intent seam. The app adapter decides how to deliver these to a session.
-#[cfg(target_os = "macos")]
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -7,6 +6,7 @@ use serde_json::Value;
 pub enum ChatIntent {
     Send {
         text: String,
+        images: Vec<gitterm_core::chat::types::ImageAttachment>,
     },
     Stop,
     Permission {
@@ -40,10 +40,10 @@ pub struct QuestionAnswer {
     pub free_text: Option<String>,
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct Question {
     pub question: String,
+    #[cfg(target_os = "macos")]
     #[serde(default)]
     pub header: String,
     #[serde(default, rename = "multiSelect")]
@@ -51,10 +51,21 @@ pub(crate) struct Question {
     #[serde(default)]
     pub options: Vec<QuestionOption>,
 }
-#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct QuestionOption {
     pub label: String,
+    #[cfg(target_os = "macos")]
     #[serde(default)]
     pub description: String,
+}
+
+impl ChatIntent {
+    pub(crate) fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::Permission { request_id, .. }
+            | Self::AnswerQuestion { request_id, .. }
+            | Self::DismissQuestion { request_id } => Some(request_id),
+            _ => None,
+        }
+    }
 }

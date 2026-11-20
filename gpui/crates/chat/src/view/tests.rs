@@ -395,7 +395,12 @@ fn composer_keys_draft_read_only_stop_and_intent_ownership(cx: &mut TestAppConte
     let captured = intents.clone();
     chat.update_in(cx, |view, window, cx| {
         view.set_intent_callback(
-            Rc::new(move |intent, _| captured.borrow_mut().push(intent)),
+            Rc::new(move |intent, _| {
+                captured.borrow_mut().push(intent);
+                let mut r = Receipt::rejected("synthetic");
+                r.state = ReceiptState::Written;
+                r
+            }),
             cx,
         );
         view.set_read_only(None, cx);
@@ -417,7 +422,8 @@ fn composer_keys_draft_read_only_stop_and_intent_ownership(cx: &mut TestAppConte
     assert_eq!(
         *intents.borrow(),
         vec![ChatIntent::Send {
-            text: "first\nsecond".into()
+            text: "first\nsecond".into(),
+            images: vec![]
         }]
     );
     chat.read_with(cx, |view, cx| {
@@ -458,6 +464,7 @@ fn composer_keys_draft_read_only_stop_and_intent_ownership(cx: &mut TestAppConte
                 status: crate::events::TurnStatus::Completed,
                 usage: serde_json::Value::Null,
                 cost_usd: None,
+                rate_limit: None,
             },
             cx,
         );
@@ -508,4 +515,141 @@ fn streaming_deltas_show_jump_without_moving_reader_and_keep_rows_bounded(cx: &m
         draw(cx);
     }
     assert!(chat.read_with(cx, |view, _| view.row_views.iter().flatten().count() <= 96));
+}
+
+#[gpui::test]
+fn rejected_send_retains_images_and_draft_and_receipts_preserve_new_edits(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    chat.update_in(cx, |view, window, cx| {
+        view.set_intent_callback(Rc::new(|_, _| Receipt::rejected("closed channel")), cx);
+        view.set_read_only(None, cx);
+        view.composer.update(cx, |input, cx| {
+            input.set_value("original draft", window, cx)
+        });
+        let images = vec![gitterm_core::chat::types::ImageAttachment {
+            media_type: "image/png".into(),
+            data: "QQ==".into(),
+        }];
+        view.set_images(images.clone(), cx).unwrap();
+        view.send(window, cx);
+        assert_eq!(view.composer.read(cx).value().as_str(), "original draft");
+        assert_eq!(view.images, images);
+        assert!(!view.submission_blocked());
+        view.set_intent_callback(
+            Rc::new(|_, _| {
+                let mut r = Receipt::rejected("synthetic");
+                r.state = ReceiptState::ChannelAccepted;
+                r
+            }),
+            cx,
+        );
+        view.send(window, cx);
+        let mut receipt = view.submission.clone().unwrap();
+        assert!(view.submission_blocked());
+        view.composer
+            .update(cx, |input, cx| input.set_value("newer draft", window, cx));
+        receipt.state = ReceiptState::Rejected("zero bytes written".into());
+        view.update_receipt(receipt, window, cx);
+        assert_eq!(view.composer.read(cx).value().as_str(), "newer draft");
+        assert_eq!(view.images, images);
+        view.send(window, cx);
+        let mut receipt = view.submission.clone().unwrap();
+        receipt.state = ReceiptState::Uncertain("partial write".into());
+        view.update_receipt(receipt, window, cx);
+        assert!(view.submission_blocked());
+        assert_eq!(view.composer.read(cx).value().as_str(), "newer draft");
+        assert_eq!(view.images, images);
+    });
+}
+
+#[gpui::test]
+fn replay_without_revision_change_retains_uncertain_card_by_request(cx: &mut TestAppContext) {
+    use crate::adapter::ChatAdapter;
+    use gitterm_core::{
+        chat::{
+            state::AgentEvent,
+            types::{AgentBackend, AgentBackendConfig},
+        },
+        session,
+    };
+    let (chat, cx) = setup(vec![], cx);
+    let mut adapter = ChatAdapter::default();
+    let target = session::Target {
+        tab_id: 1,
+        session_uid: "synthetic".into(),
+        task_id: None,
+        task_session_id: None,
+    };
+    adapter.bind_session(Some("synthetic-history".into()));
+    let stamp = adapter.begin_runtime(target.clone());
+    let (ticket, _) = adapter
+        .begin_history(
+            target.clone(),
+            AgentBackendConfig::Claude {
+                model: String::new(),
+                permission_mode: None,
+                effort: None,
+            },
+        )
+        .unwrap();
+    let update = adapter.receive(&stamp, &target, AgentEvent::Harness(HarnessEvent::RuntimeRequest {
+        request_id: "synthetic-request".into(), tool_use_id: "tool".into(),
+        kind: crate::events::RuntimeRequestKind::Question { questions: serde_json::json!([{ "question":"Which?", "options":[{"label":"A"}] }]) },
+    }), None, |_, _| {}).unwrap();
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+    let captured = calls.clone();
+    chat.update_in(cx, |view, window, cx| {
+        view.set_intent_callback(
+            Rc::new(move |_, _| {
+                captured.set(captured.get() + 1);
+                let mut receipt = Receipt::rejected("synthetic");
+                receipt.state = ReceiptState::Uncertain("partial write".into());
+                receipt
+            }),
+            cx,
+        );
+        view.set_read_only(None, cx);
+        view.present(&stamp, adapter.state(), update, cx);
+        view.row(0, window, cx);
+    });
+    let original = chat.read_with(cx, |view, _| view.cards[&0].clone());
+    original.update(cx, |card, cx| {
+        card.emit(
+            ChatIntent::DismissQuestion {
+                request_id: "synthetic-request".into(),
+            },
+            cx,
+        )
+    });
+    assert_eq!(calls.get(), 1);
+    let revision = adapter.state().revision;
+    let update = adapter
+        .complete_history(
+            &ticket,
+            &target,
+            AgentBackend::Claude,
+            Ok(vec![AgentEvent::user_prompt("earlier history")]),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(adapter.state().revision, revision);
+    chat.update_in(cx, |view, _, cx| {
+        view.present(&stamp, adapter.state(), update, cx);
+        assert_eq!(view.model.rows.len(), 2);
+        assert_eq!(view.cards[&1], original);
+        assert!(!view.cards.contains_key(&0));
+        view.cards[&1].update(cx, |card, cx| {
+            card.emit(
+                ChatIntent::DismissQuestion {
+                    request_id: "synthetic-request".into(),
+                },
+                cx,
+            )
+        });
+        assert_eq!(
+            calls.get(),
+            1,
+            "uncertain card must remain locked after prepend"
+        );
+    });
 }

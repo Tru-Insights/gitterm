@@ -108,6 +108,7 @@ pub struct ChatModel {
     workers: HashMap<String, usize>,
     turn_start: HashMap<String, u64>,
     next_id: u64,
+    recorded_time: Option<u64>,
 }
 impl ChatModel {
     pub fn from_records(records: &[Record]) -> Self {
@@ -116,6 +117,69 @@ impl ChatModel {
             model.apply(record);
         }
         model
+    }
+    /// Rows are a disposable projection of core State::conversation.
+    pub fn from_conversation(events: &[gitterm_core::chat::state::AgentEvent]) -> Self {
+        let mut model = Self::default();
+        for event in events {
+            model.apply_agent(event);
+        }
+        model
+    }
+    pub fn apply_agent(&mut self, event: &gitterm_core::chat::state::AgentEvent) -> Vec<usize> {
+        use gitterm_core::chat::state::AgentEvent;
+        let entry = match event {
+            AgentEvent::Harness(event) => Entry::Harness(event.clone()),
+            AgentEvent::Other(value) if value["kind"] == "turn_timing" => {
+                if let Some(start) = value["start_ms"].as_u64() {
+                    self.turn_start.insert(String::new(), start);
+                }
+                self.recorded_time = value["end_ms"].as_u64();
+                return vec![];
+            }
+            AgentEvent::Other(value) if value["kind"] == "subagent_started_at" => {
+                if let (Some(id), Some(at)) = (value["id"].as_str(), value["at_ms"].as_u64()) {
+                    self.turn_start.insert(id.into(), at);
+                }
+                return vec![];
+            }
+            AgentEvent::Other(value) if value["type"] == "user_prompt" => {
+                let Some(text) = value["text"].as_str() else {
+                    return self.apply(&Record {
+                        at_ms: None,
+                        entry: Entry::Harness(HarnessEvent::Error(
+                            "Invalid user prompt event: missing text".into(),
+                        )),
+                    });
+                };
+                let delivery = match value.get("delivery").filter(|v| !v.is_null()) {
+                    Some(value) => match serde_json::from_value(value.clone()) {
+                        Ok(delivery) => Some(delivery),
+                        Err(error) => {
+                            return self.apply(&Record {
+                                at_ms: None,
+                                entry: Entry::Harness(HarnessEvent::Error(format!(
+                                    "Invalid prompt delivery card: {error}"
+                                ))),
+                            });
+                        }
+                    },
+                    None => None,
+                };
+                Entry::Harness(HarnessEvent::UserMessageEcho {
+                    id: value["id"].as_str().map(str::to_owned),
+                    text: text.into(),
+                    image_count: value["images"].as_array().map_or_else(
+                        || value["image_count"].as_u64().unwrap_or(0) as usize,
+                        Vec::len,
+                    ),
+                    delivery,
+                })
+            }
+            _ => return vec![],
+        };
+        let at_ms = self.recorded_time.take();
+        self.apply(&Record { at_ms, entry })
     }
     fn push(&mut self, kind: RowKind, scope: &str, title: String, body: String) -> usize {
         let index = self.rows.len();
@@ -356,6 +420,7 @@ impl ChatModel {
                 status,
                 usage,
                 cost_usd,
+                ..
             } => {
                 self.streams.remove(scope);
                 let duration = self
@@ -430,7 +495,13 @@ impl ChatModel {
                     ));
                 }
                 if let Some(delivery) = delivery {
-                    body.push_str(&format!("\n\n{}", code(&pretty(delivery), "json")));
+                    body.push_str(&format!(
+                        "\n\n{}",
+                        code(
+                            &pretty(&serde_json::to_value(delivery).expect("delivery DTO")),
+                            "json"
+                        )
+                    ));
                 }
                 let index = self.push(kind, scope, "You".into(), body);
                 if let Some(id) = id {
@@ -446,7 +517,15 @@ impl ChatModel {
             }
             HarnessEvent::HistoryReplayed { entries } => {
                 for entry in entries {
-                    self.entry(entry, at, scope, changed);
+                    let entry = match entry {
+                        gitterm_core::harness::transcript::TranscriptEntry::UserPrompt(text) => {
+                            Entry::UserPrompt(text.clone())
+                        }
+                        gitterm_core::harness::transcript::TranscriptEntry::Harness(event) => {
+                            Entry::Harness(event.clone())
+                        }
+                    };
+                    self.entry(&entry, at, scope, changed);
                 }
             }
             HarnessEvent::ConversationReset { trigger } => {
@@ -517,7 +596,7 @@ impl ChatModel {
                     },
                 ));
             }
-            HarnessEvent::Ready(_)
+            HarnessEvent::Ready { .. }
             | HarnessEvent::PermissionModeChanged(_)
             | HarnessEvent::ModelChanged(_)
             | HarnessEvent::EffortChanged { .. } => {}
