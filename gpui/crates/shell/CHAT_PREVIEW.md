@@ -159,7 +159,10 @@ parent before cleanup. F3 is fixed by checking all scoped app/provider/Git and
 child roots and treating dangling marker entries as protected. F4 is fixed by
 preserving the visible root, resolved target and resolved-parent namespace for
 every protected path, matching core `ProtectedRoots`. Each has a synthetic
-regression; no real probe was executed. Re-review is required for these changes.
+regression; no real probe was executed. R2 re-review
+`9f3fe814-9fae-4fa2-92fc-7a9f8bab6ac2` verified the clean task checkout at
+`a6e32ac`, confirmed F1–F4 resolved and reported no new concrete defects. Its
+verdict is correct for this safe partial delivery; activation remains blocked.
 
 The local shell's More menu opens **New Claude chat** and **Claude preview
 history**. The workspace owner retains each chat entity across dock changes.
