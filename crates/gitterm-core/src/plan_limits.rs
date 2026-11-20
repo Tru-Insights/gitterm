@@ -1672,6 +1672,190 @@ pub struct PlanLimitsFile {
     pub pending_notices: HashMap<String, Vec<String>>,
 }
 
+/// Read-only Usage presentation of a provider's persisted observations.
+/// No policy transitions or persistence run while taking this snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageProviderSnapshot {
+    pub provider: Provider,
+    pub freshness: Option<String>,
+    pub weekly_status: String,
+    pub windows: Vec<UsageWindowSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageWindowSnapshot {
+    pub label: String,
+    pub percent: Option<f64>,
+    pub figure: String,
+    pub reset: String,
+    /// Oldest to newest local calendar day, only for matching window history.
+    pub daily: Option<[Option<f64>; 7]>,
+    pub weekdays: [String; 7],
+}
+
+fn usage_daily(samples: &[UsageSample], now: i64) -> [Option<f64>; 7] {
+    let Some(today) = chrono::DateTime::from_timestamp(now, 0)
+        .map(|at| at.with_timezone(&chrono::Local).date_naive())
+    else {
+        return [None; 7];
+    };
+    let mut last_by_day: [Option<(i64, f64)>; 7] = [None; 7];
+    let mut prior = None;
+    for sample in samples {
+        if sample.observed_at > now {
+            continue;
+        }
+        let Some(date) = chrono::DateTime::from_timestamp(sample.observed_at, 0)
+            .map(|at| at.with_timezone(&chrono::Local).date_naive())
+        else {
+            continue;
+        };
+        let age = (today - date).num_days();
+        if age >= 7 {
+            if prior.is_none_or(|(at, _)| sample.observed_at > at) {
+                prior = Some((sample.observed_at, sample.used_percent));
+            }
+        } else if age >= 0 {
+            let day = 6 - age as usize;
+            if last_by_day[day].is_none_or(|(at, _)| sample.observed_at > at) {
+                last_by_day[day] = Some((sample.observed_at, sample.used_percent));
+            }
+        }
+    }
+
+    let mut previous = prior.map(|(_, value)| value);
+    std::array::from_fn(|day| {
+        let (_, value) = last_by_day[day]?;
+        let used = (value - previous.unwrap_or(0.0)).max(0.0);
+        previous = Some(value);
+        Some(used)
+    })
+}
+
+fn usage_weekly_status(report: &ProviderReport, now: i64) -> String {
+    let weekly = report.windows.iter().find(|window| window.label == "7d");
+    let Some(weekly) = weekly else {
+        return "Weekly usage unknown; days left unknown; run-out unknown; pace unknown; no reading".into();
+    };
+    let used = weekly
+        .estimated_percent
+        .or(weekly.used_percent)
+        .map(|used| format!("{used:.0}% used"))
+        .unwrap_or_else(|| "usage unknown".into());
+    let left = weekly
+        .resets_in
+        .filter(|left| *left > 0)
+        .map(|left| format!("{:.1} days until reset", left as f64 / 86400.0))
+        .unwrap_or_else(|| {
+            if weekly.resets_at.is_some_and(|at| at <= now) {
+                "window reset; no reading since".into()
+            } else {
+                "reset unknown".into()
+            }
+        });
+    let runout = weekly
+        .days_left
+        .and_then(|days| {
+            chrono::DateTime::from_timestamp(now.saturating_add((days * 86400.0) as i64), 0)
+        })
+        .map(|at| format!("run-out {} UTC", at.format("%Y-%m-%d %H:%M")))
+        .unwrap_or_else(|| "run-out unknown".into());
+    let pace = weekly
+        .pace
+        .map(|pace| format!("pace {pace:.0} (100 uses the full weekly allowance)"))
+        .unwrap_or_else(|| "pace unknown".into());
+    let status = match weekly.state {
+        Some(WeeklyState::Hot) => "running hot",
+        Some(WeeklyState::AlmostOut) => "almost out",
+        Some(WeeklyState::OnTrack) => "on track",
+        None => "unknown",
+    };
+    let reading = if weekly.estimated {
+        "estimated reading"
+    } else if report.observed_at.is_none() {
+        "no reading"
+    } else if report.stale {
+        "stale reading"
+    } else {
+        "observed reading"
+    };
+    format!("Weekly {status}: {used} · {left} · {runout} · {pace} · {reading}")
+}
+
+impl PlanLimitsFile {
+    /// Iced's Usage labels in local time, accessible without a frontend's own
+    /// clock/calendar dependency. The caller pins `now` for a consistent render.
+    /// This accessor never changes policy, observations or persistence.
+    pub fn usage_snapshot(&self, now: i64) -> [UsageProviderSnapshot; 2] {
+        let evaluation = evaluate_policy(self, now);
+        let today = chrono::Local
+            .timestamp_opt(now, 0)
+            .single()
+            .map(|at| at.date_naive());
+        [Provider::Claude, Provider::Codex].map(|provider| {
+            let report = match provider {
+                Provider::Claude => &evaluation.report.claude,
+                Provider::Codex => &evaluation.report.codex,
+            };
+            let reading = self.get(provider);
+            let mut windows = Vec::new();
+            if let Some(reading) = reading {
+                for window in &reading.windows {
+                    let figure = window_figure(reading, window, &self.history, now);
+                    let history = self.history.iter().find(|history| {
+                        history.provider == provider
+                            && history.label == window.label
+                            && history.resets_at == window.resets_at
+                    });
+                    let reset = window
+                        .resets_at
+                        .map(|at| {
+                            let reset = format_reset(at, now, &chrono::Local);
+                            if window.has_reset(now) {
+                                format!("{reset}; no reading since")
+                            } else {
+                                reset
+                            }
+                        })
+                        .unwrap_or_default();
+                    windows.push(UsageWindowSnapshot {
+                        label: window.label.clone(),
+                        percent: figure.map(|(p, _)| p),
+                        figure: match figure {
+                            Some((p, mark)) => format!("{mark}{}%", p.round()),
+                            None if window.has_reset(now) => "–".into(),
+                            None => "unknown".into(),
+                        },
+                        reset,
+                        daily: history.map(|history| usage_daily(&history.samples, now)),
+                        weekdays: std::array::from_fn(|day| {
+                            today
+                                .and_then(|date| {
+                                    date.checked_sub_days(chrono::Days::new((6 - day) as u64))
+                                })
+                                .map(|date| date.format("%a").to_string())
+                                .unwrap_or_else(|| "Day".into())
+                        }),
+                    });
+                }
+            }
+            UsageProviderSnapshot {
+                provider,
+                freshness: reading.map(|reading| {
+                    let text = freshness(reading, now, &chrono::Local);
+                    if reading.is_stale(now) {
+                        format!("{text}; may be higher now")
+                    } else {
+                        text
+                    }
+                }),
+                weekly_status: usage_weekly_status(report, now),
+                windows,
+            }
+        })
+    }
+}
+
 impl PlanLimitsFile {
     pub fn path_in(config_dir: &Path) -> PathBuf {
         config_dir.join(LIMITS_FILE)
