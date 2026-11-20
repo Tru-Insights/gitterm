@@ -13,6 +13,8 @@ pub mod files;
 mod files_view;
 pub mod find_sidebar;
 #[cfg(test)]
+mod h2_tests;
+#[cfg(test)]
 mod hookup_tests;
 mod layout;
 mod owner;
@@ -45,20 +47,18 @@ use anyhow::{Result, ensure};
 use data::{Session, SessionId, ShellData, Workspace, WorkspaceId};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Action, Anchor, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable,
+    Action, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, Styled as _,
     Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, px, rgb,
     size,
 };
 use gpui_component::{
-    Disableable, Root, Selectable,
+    Root, Selectable,
     button::{Button, ButtonVariants},
     dock::{
         DockArea, DockEvent, DockLayout, DockPlacement, DockSkin, PanelId, PanelStyle,
         panel_handle, register_panel,
     },
-    menu::{DropdownMenu, PopupMenuItem},
-    tab::{Tab, TabBar},
 };
 use layout::{LayoutStore, SidebarMode};
 use pane::{PANEL_NAME, Pane, PaneKind};
@@ -111,6 +111,8 @@ pub struct Shell {
     picker_subscription: Option<Subscription>,
     park_sheet: Option<Entity<park_sheet::ParkSheet>>,
     park_subscription: Option<Subscription>,
+    new_work_sheet: Option<Entity<workspace_sheet::WorkspaceSheet>>,
+    new_work_subscription: Option<Subscription>,
     work_state: Rc<RefCell<gitterm_core::work::state::State>>,
     work_sidebars: HashMap<WorkspaceId, Entity<work_sidebar::WorkSidebar>>,
     work_subscriptions: HashMap<WorkspaceId, Subscription>,
@@ -278,6 +280,8 @@ impl Shell {
             picker_subscription: None,
             park_sheet: None,
             park_subscription: None,
+            new_work_sheet: None,
+            new_work_subscription: None,
             work_state: Default::default(),
             work_sidebars: HashMap::new(),
             work_subscriptions: HashMap::new(),
@@ -285,6 +289,7 @@ impl Shell {
             dock_fixture: false,
         };
         shell.restore_parked(saved_parked, cx);
+        shell.load_active_iced_history(window, cx);
         Ok(shell)
     }
     fn open_content(&mut self, event: &FileOpen, window: &mut Window, cx: &mut Context<Self>) {
@@ -455,6 +460,7 @@ impl Shell {
             content.picker = true;
             content.sync_covers(window, cx);
         });
+        let sheet = self.new_work_sheet.clone();
         let response = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: false,
             directories: true,
@@ -478,10 +484,23 @@ impl Shell {
                 Err(error) => Err(error.into()),
             };
             _ = this.update_in(cx, |this, window, cx| {
-                this.content.update(cx, |content, cx| {
-                    content.picker = false;
-                    content.sync_covers(window, cx);
-                });
+                this.cover_sheet(this.new_work_sheet.is_some(), window, cx);
+                if let Some(sheet) = sheet {
+                    if this.new_work_sheet.as_ref() != Some(&sheet) {
+                        return;
+                    }
+                    let (folder, error) = match result {
+                        Ok(folder) => (folder, None),
+                        Err(error) => (None, Some(format!("Pick folder: {error:#}"))),
+                    };
+                    sheet.update(cx, |sheet, cx| {
+                        sheet.folder_picker_finished(folder, window, cx);
+                        if let Some(error) = error {
+                            sheet.show_error(error, cx);
+                        }
+                    });
+                    return;
+                }
                 let result = result.and_then(|folder| {
                     if let Some(folder) = folder {
                         this.add_folder(folder, window, cx)?;
@@ -599,21 +618,39 @@ impl Shell {
             .get(index)
             .map(|&i| self.workspaces[i].workspace.id)
         {
-            if Some(id) != self.active_workspace(cx) {
-                self.session_picker = None;
-                self.picker_subscription = None;
-                self.park_sheet = None;
-                self.park_subscription = None;
-                self.cover_sheet(false, window, cx);
-            }
-            self.owner.update(cx, |owner, cx| {
-                owner.dispatch(Intent::Activate(id), Instant::now(), cx)
-            });
-            self.sync_git_visibility(false, cx);
-            self.sync_content_selection(cx);
-            self.focus.focus(window, cx);
-            cx.notify();
+            self.select_workspace_id(id, window, cx);
         }
+    }
+    fn select_workspace_id(
+        &mut self,
+        id: WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .workspaces
+            .iter()
+            .any(|w| w.workspace.id == id && w.on_bar())
+        {
+            return;
+        }
+        if Some(id) != self.active_workspace(cx) || self.new_work_sheet.is_some() {
+            self.session_picker = None;
+            self.picker_subscription = None;
+            self.park_sheet = None;
+            self.park_subscription = None;
+            self.new_work_sheet = None;
+            self.new_work_subscription = None;
+            self.cover_sheet(false, window, cx);
+        }
+        self.owner.update(cx, |owner, cx| {
+            owner.dispatch(Intent::Activate(id), Instant::now(), cx)
+        });
+        self.load_active_iced_history(window, cx);
+        self.sync_git_visibility(false, cx);
+        self.sync_content_selection(cx);
+        self.focus.focus(window, cx);
+        cx.notify();
     }
     fn select_session(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.workspaces.is_empty() {
@@ -628,6 +665,7 @@ impl Shell {
                 .expect("active workspace exists")
                 .active_session = Some(id);
             self.show_pane(&session_pane_id(id), window, cx);
+            self.load_active_iced_history(window, cx);
         }
     }
     fn new_claude_chat(
@@ -930,6 +968,7 @@ fn observe_content_dock(dock: &Entity<DockArea>, cx: &mut Context<Shell>) -> Sub
 fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscription {
     let id = state.workspace.id;
     cx.subscribe(&state.dock, move |this, dock, _: &DockEvent, cx| {
+        let imported = this.owner.read(cx).iced_workspace(id).is_some();
         let state = this
             .workspaces
             .iter_mut()
@@ -945,10 +984,12 @@ fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscriptio
                     .unwrap_or(usize::MAX)
             });
             state.sessions.sort_by_key(|session| {
-                terminals
-                    .iter()
-                    .position(|t| t.id == session.id.0)
-                    .unwrap_or(usize::MAX)
+                let position = terminals.iter().position(|t| t.id == session.id.0);
+                if imported {
+                    (position.is_some(), position.unwrap_or(0))
+                } else {
+                    (false, position.unwrap_or(usize::MAX))
+                }
             });
         }
         let removed: Vec<_> = state
@@ -1206,46 +1247,6 @@ fn default_layout(state: &WorkspaceDock, window: &mut Window, cx: &mut App) {
     });
 }
 impl Shell {
-    fn spine(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let p = Palette::current(cx);
-        div()
-            .id("spine")
-            .debug_selector(|| "spine".into())
-            .w(px(layout::SPINE_WIDTH + 1.))
-            .h_full()
-            .flex_shrink_0()
-            .border_r_1()
-            .border_color(rgb(p.surface))
-            .bg(rgb(p.mantle))
-            .flex()
-            .flex_col()
-            .children(
-                self.visible_workspace_indices(cx)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, i)| {
-                        let state = &self.workspaces[i];
-                        Button::new(("spine-workspace", index))
-                            .ghost()
-                            .label(
-                                state
-                                    .workspace
-                                    .name
-                                    .chars()
-                                    .take(2)
-                                    .collect::<String>()
-                                    .to_uppercase(),
-                            )
-                            .tooltip(state.workspace.name.clone())
-                            .w(px(36.))
-                            .h(px(36.))
-                            .selected(Some(state.workspace.id) == self.active_workspace(cx))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.select_workspace(index, window, cx)
-                            }))
-                    }),
-            )
-    }
     fn visible_workspace_indices(&self, cx: &App) -> Vec<usize> {
         if let Some(catalog) = self.owner.read(cx).iced_catalog() {
             let visible = catalog.visible_order(self.active_workspace(cx));
@@ -1261,139 +1262,166 @@ impl Shell {
             .map(|(i, _)| i)
             .collect()
     }
-    fn workspace_bar_items(&self, cx: &App) -> Vec<(usize, WorkspaceId, String)> {
-        self.visible_workspace_indices(cx)
-            .into_iter()
-            .enumerate()
-            .map(|(index, i)| {
-                let state = &self.workspaces[i];
-                let active = Some(state.workspace.id) == self.active_workspace(cx);
-                let label = if active {
-                    state.workspace.name.clone()
-                } else {
-                    state
-                        .workspace
-                        .name
-                        .chars()
-                        .take(2)
-                        .collect::<String>()
-                        .to_uppercase()
+    fn chrome_workspaces(&self, cx: &App) -> Vec<workspace_bar::Workspace> {
+        self.workspaces
+            .iter()
+            .map(|state| {
+                let saved = self.owner.read(cx).iced_workspace(state.workspace.id);
+                let group = match saved.and_then(|w| w.location.as_ref()) {
+                    Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent {
+                        remote_id,
+                        ..
+                    }) => format!("agent:{remote_id}"),
+                    _ => saved
+                        .filter(|w| w.is_legacy_remote())
+                        .map(|w| format!("ssh:{}", w.remote_session.as_ref().unwrap().session_name))
+                        .unwrap_or_else(|| "local".into()),
                 };
-                (index, state.workspace.id, label)
+                workspace_bar::Workspace {
+                    id: state.workspace.id,
+                    name: state.workspace.name.clone(),
+                    color: saved
+                        .map(|w| w.color)
+                        .unwrap_or(gitterm_core::settings::WorkspaceColor::Lavender),
+                    placement: gitterm_core::workspace::BarChip {
+                        group,
+                        work: saved
+                            .is_some_and(|w| gitterm_core::work::catalog::is_work(&w.chats, false)),
+                        parked: !state.on_bar(),
+                    },
+                    attention: None,
+                    woke: None,
+                    pr_news: None,
+                }
             })
             .collect()
     }
-    fn workspace_bar(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let p = Palette::current(cx);
-        let layout = self
-            .owner
+    fn repos_on_bar(&self, cx: &App) -> bool {
+        self.owner
             .read(cx)
             .iced_catalog()
-            .map(|catalog| catalog.bar_layout(self.active_workspace(cx)));
-        let menu_items: Vec<_> = layout
-            .as_ref()
-            .into_iter()
-            .flat_map(|layout| &layout.sections)
-            .flat_map(|section| &section.workspaces)
-            .filter_map(|&i| self.workspaces.get(i))
-            .filter(|w| w.on_bar())
-            .map(|w| (w.workspace.id, w.workspace.name.clone()))
-            .collect();
-        let owner = cx.entity().downgrade();
-        let mut chips: Vec<_> = self
-            .workspace_bar_items(cx)
-            .into_iter()
-            .map(|(index, id, label)| {
-                div()
-                    .id(("workspace-chip", index))
-                    .debug_selector(move || format!("workspace-chip-{index}"))
-                    .h_full()
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .bg(rgb(if Some(id) == self.active_workspace(cx) {
-                        p.surface
-                    } else {
-                        p.mantle
-                    }))
-                    .child(
-                        Button::new(("workspace", index))
-                            .ghost()
-                            .selected(Some(id) == self.active_workspace(cx))
-                            .label(label)
-                            .h(px(27.))
-                            .accessibility_label(
-                                self.workspaces
-                                    .iter()
-                                    .find(|w| w.workspace.id == id)
-                                    .expect("bar workspace")
-                                    .workspace
-                                    .name
-                                    .clone(),
-                            )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.select_workspace(index, window, cx)
-                            })),
-                    )
-            })
-            .collect();
-        let split = layout
-            .as_ref()
-            .map(|layout| layout.work.len())
-            .unwrap_or(chips.len());
-        let after = chips.split_off(split.min(chips.len()));
-        div()
-            .id("workspace-bar")
-            .debug_selector(|| "workspace-bar".into())
-            .h(px(layout::WORKSPACE_BAR_HEIGHT))
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .bg(rgb(p.mantle))
-            .border_t_1()
-            .border_color(rgb(p.surface))
-            .children(chips)
-            .when(layout.is_some(), |bar| {
-                bar.child(
-                    Button::new("iced-workspaces-menu")
-                        .ghost()
-                        .label("Repos ▾")
-                        .dropdown_menu(move |menu, _, _| {
-                            menu_items.iter().fold(menu, |menu, (id, name)| {
-                                let owner = owner.clone();
-                                let id = *id;
-                                menu.item(PopupMenuItem::new(name.clone()).on_click(
-                                    move |_, window, cx| {
-                                        _ = owner.update(cx, |shell, cx| {
-                                            shell.owner.update(cx, |owner, cx| {
-                                                owner.dispatch(
-                                                    Intent::Activate(id),
-                                                    Instant::now(),
-                                                    cx,
-                                                )
-                                            });
-                                            shell.sync_git_visibility(false, cx);
-                                            shell.sync_content_selection(cx);
-                                            shell.focus.focus(window, cx);
-                                            cx.notify();
-                                        });
-                                    },
-                                ))
-                            })
-                        }),
-                )
-            })
-            .children(after)
-            .child(
-                Button::new("new-workspace")
-                    .ghost()
-                    .label("+")
-                    .tooltip("Workspaces are read from Iced GitTerm")
-                    .disabled(self.owner.read(cx).iced_catalog().is_some())
-                    .h(px(27.))
-                    .on_click(cx.listener(|this, _, window, cx| this.pick_folder(window, cx))),
-            )
+            .is_none_or(|c| c.repos_on_bar)
+    }
+    fn bar_input(&self, cx: &App) -> workspace_bar::Input {
+        let active = self
+            .workspaces
+            .iter()
+            .find(|w| Some(w.workspace.id) == self.active_workspace(cx));
+        let colors = workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark());
+        workspace_bar::Input {
+            workspaces: self.chrome_workspaces(cx),
+            active: self.active_workspace(cx),
+            repos_on_bar: self.repos_on_bar(cx),
+            repos_open: false,
+            machine_news: vec![],
+            pulse_bright: false,
+            ready_count: 0,
+            ready_news_count: 0,
+            parked_count: self.workspaces.iter().filter(|w| !w.on_bar()).count(),
+            terminal_expanded: active.is_some_and(|w| w.store.regions.bottom_visible),
+            terminal_running: false,
+            browser: workspace_bar::Browser {
+                color: colors.muted,
+                driving: false,
+                hint: "Browser".into(),
+                action: Some(workspace_bar::BrowserAction::Open),
+            },
+            more_open: false,
+        }
+    }
+    fn spine_input(&self, cx: &App) -> spine::Input {
+        spine::Input {
+            workspaces: self.chrome_workspaces(cx),
+            active: self.active_workspace(cx),
+            repos_on_bar: self.repos_on_bar(cx),
+            attention: vec![],
+            frontmost: self
+                .workspaces
+                .iter()
+                .find(|w| Some(w.workspace.id) == self.active_workspace(cx))
+                .and_then(|w| {
+                    w.active_session
+                        .map(|s| (w.workspace.id, spine::Target::Tab(s.0)))
+                }),
+            running: vec![],
+            pulse_bright: false,
+            usage_open: false,
+            usage_hint: "Usage".into(),
+            usage_badge: None,
+        }
+    }
+    fn strip_input(&self, cx: &App) -> session_strip::Input {
+        let state = self
+            .workspaces
+            .iter()
+            .find(|w| Some(w.workspace.id) == self.active_workspace(cx));
+        let saved = state.and_then(|w| self.owner.read(cx).iced_workspace(w.workspace.id));
+        session_strip::Input {
+            workspace: state.map(|w| w.workspace.id),
+            workspace_name: state.map(|w| w.workspace.name.clone()).unwrap_or_default(),
+            workspace_color: saved
+                .map(|w| w.color)
+                .unwrap_or(gitterm_core::settings::WorkspaceColor::Lavender),
+            visible_workspace_count: self.visible_workspace_indices(cx).len(),
+            sessions: state
+                .into_iter()
+                .flat_map(|w| &w.sessions)
+                .map(|s| session_strip::Session {
+                    id: s.id,
+                    kind: s.kind,
+                    display_title: state.unwrap().panes[&session_pane_id(s.id)]
+                        .read(cx)
+                        .tab_title(),
+                    chat_title: (s.kind == data::SessionKind::Chat).then(|| s.title.clone()),
+                    task_session_label: None,
+                    attention: None,
+                    running: false,
+                    pending_requests: 0,
+                })
+                .collect(),
+            active: state.and_then(|w| w.active_session),
+            remote: state.is_some_and(|w| self.data.terminal_cwd(w.workspace.id, cx).is_none()),
+            task: None,
+            branch: state
+                .map(|w| self.data.status(w.workspace.id, cx).branch)
+                .unwrap_or_default(),
+            pulse_bright: false,
+            mic: None,
+            worktree_follow: None,
+        }
+    }
+    fn spine(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let weak = cx.weak_entity();
+        spine::render(
+            &self.spine_input(cx),
+            workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark()),
+            Rc::new(move |outcome, window, cx| {
+                _ = weak.update(cx, |shell, cx| shell.spine_outcome(outcome, window, cx));
+            }),
+        )
+        .w(px(layout::SPINE_WIDTH + 1.))
+    }
+    fn workspace_bar(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let weak = cx.weak_entity();
+        workspace_bar::render(
+            &self.bar_input(cx),
+            workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark()),
+            Rc::new(move |outcome, window, cx| {
+                _ = weak.update(cx, |shell, cx| shell.bar_outcome(outcome, window, cx));
+            }),
+        )
+        .h(px(layout::WORKSPACE_BAR_HEIGHT))
+    }
+    fn session_strip(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let weak = cx.weak_entity();
+        session_strip::render(
+            &self.strip_input(cx),
+            workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark()),
+            Rc::new(move |outcome, window, cx| {
+                _ = weak.update(cx, |shell, cx| shell.strip_outcome(outcome, window, cx));
+            }),
+        )
+        .h(px(layout::SESSION_HEIGHT + 1.))
     }
     fn update_regions(
         &mut self,
@@ -1701,6 +1729,7 @@ impl Render for Shell {
         let p = Palette::current(cx);
         if !self.workspaces.iter().any(|state| state.on_bar()) {
             return div()
+                .relative()
                 .size_full()
                 .flex()
                 .bg(rgb(p.base))
@@ -1713,13 +1742,7 @@ impl Render for Shell {
                         .h_full()
                         .flex()
                         .flex_col()
-                        .child(
-                            div()
-                                .h(px(layout::SESSION_HEIGHT + 1.))
-                                .flex_shrink_0()
-                                .border_b_1()
-                                .border_color(rgb(p.surface)),
-                        )
+                        .child(self.session_strip(cx))
                         .child(
                             div()
                                 .flex_1()
@@ -1737,150 +1760,18 @@ impl Render for Shell {
                         )
                         .child(self.workspace_bar(cx)),
                 )
+                .children(self.new_work_sheet.clone())
                 .into_any_element();
         }
         let state = self.active(cx);
-        let active_session = state
-            .active_session
-            .and_then(|id| state.sessions.iter().position(|s| s.id == id))
-            .unwrap_or(0);
         let sidebar = self.sidebar(cx);
-        let tabs = TabBar::new("sessions")
-            .underline()
-            .selected_index(active_session)
-            .h(px(layout::SESSION_HEIGHT))
-            .children(state.sessions.iter().map(|s| {
-                Tab::from(if self.local {
-                    state.panes[&session_pane_id(s.id)].read(cx).tab_title()
-                } else {
-                    s.title.clone()
-                })
-            }))
-            .on_click(cx.listener(|this, index: &usize, window, cx| {
-                this.select_session(*index, window, cx)
-            }));
-        let weak = cx.weak_entity();
-        let close_session = state.active_session;
-        let close_target = close_session
-            .and_then(|id| state.panes.get(&session_pane_id(id)))
-            .and_then(|pane| pane.read(cx).session.clone());
-        let state_session_count = state.sessions.len();
-        let close_label = state
-            .sessions
-            .iter()
-            .find(|session| Some(session.id) == close_session)
-            .map(|session| format!("Close {} permanently", session.title))
-            .unwrap_or_else(|| "Close session permanently".into());
-        let history_owner = weak.clone();
-        let history = self
-            .owner
-            .read(cx)
-            .chat_history(self.data.terminal_cwd(state.workspace.id, cx).as_deref());
-        let local = self.local;
-        let more = Button::new("more")
-            .ghost()
-            .label("⋯")
-            .tooltip("More")
-            .debug_selector(|| "more".into())
-            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
-                let history_owner = history_owner.clone();
-                let history = history.clone();
-                let weak = weak.clone();
-                let close_owner = weak.clone();
-                menu.item({
-                    let owner = weak.clone();
-                    PopupMenuItem::new("New terminal")
-                        .disabled(!local)
-                        .on_click(move |_, window, cx| {
-                            _ = owner.update(cx, |shell, cx| shell.new_terminal(window, cx));
-                        })
-                })
-                .item({
-                    let owner = weak.clone();
-                    PopupMenuItem::new("Open bottom terminal")
-                        .disabled(!local)
-                        .on_click(move |_, window, cx| {
-                            _ = owner
-                                .update(cx, |shell, cx| shell.open_bottom_terminal(window, cx));
-                        })
-                })
-                .submenu("Claude preview history", window, cx, move |menu, _, _| {
-                    history.iter().fold(menu, |menu, saved| {
-                        let owner = history_owner.clone();
-                        let saved = saved.clone();
-                        menu.item(
-                            PopupMenuItem::new(format!(
-                                "Claude · {}",
-                                saved.session_id.as_deref().unwrap_or(&saved.uid)
-                            ))
-                            .on_click(move |_, window, cx| {
-                                _ = owner.update(cx, |shell, cx| {
-                                    shell.new_claude_chat(Some(saved.clone()), window, cx)
-                                });
-                            }),
-                        )
-                    })
-                })
-                .item(
-                    PopupMenuItem::new("Keyboard shortcuts     ⌥/")
-                        .on_click(|_, w, cx| dialogs::shortcuts(w, cx)),
-                )
-                .item({
-                    let weak = close_owner.clone();
-                    let close_target = close_target.clone();
-                    PopupMenuItem::new(close_label.clone())
-                        .disabled(close_target.is_none() || state_session_count <= 1)
-                        .on_click(move |_, window, cx| {
-                            if let Some(target) = close_target.clone() {
-                                _ = weak
-                                    .update(cx, |this, cx| this.close_target(&target, window, cx));
-                            }
-                        })
-                })
-                .item(
-                    PopupMenuItem::new("Toggle Mocha / Latte").on_click(|_, w, cx| {
-                        theme::apply(
-                            !gpui_component::Theme::global(cx).mode.is_dark(),
-                            Some(w),
-                            cx,
-                        );
-                    }),
-                )
-            });
-        let mut content = div().flex_1().min_w_0().h_full().flex().flex_col().child(
-            div()
-                .flex()
-                .items_center()
-                .h(px(layout::SESSION_HEIGHT))
-                .bg(rgb(p.mantle))
-                .child(div().flex_1().min_w_0().child(tabs))
-                .child(
-                    Button::new("new-session")
-                        .ghost()
-                        .label("+ Session")
-                        .debug_selector(|| "new-session".into())
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.open_session_picker(window, cx)),
-                        ),
-                )
-                .child(more)
-                .child(
-                    Button::new("close-workspace")
-                        .ghost()
-                        .label("×")
-                        .tooltip("Close workspace (⌘⇧W)")
-                        .debug_selector(|| "close-workspace".into())
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.open_park_sheet(window, cx)),
-                        ),
-                )
-                .border_b_1()
-                .border_color(rgb(p.surface))
-                .h(px(layout::SESSION_HEIGHT + 1.))
-                .flex_shrink_0()
-                .id("session-strip")
-                .debug_selector(|| "session-strip".into()),
-        );
+        let mut content = div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .child(self.session_strip(cx));
         if let Some(error) = &self.owner.read(cx).error {
             content = content.child(div().p_2().text_color(rgb(p.red)).child(error.clone()));
         }
@@ -1966,6 +1857,7 @@ impl Render for Shell {
             )
             .children(self.session_picker.clone())
             .children(self.park_sheet.clone())
+            .children(self.new_work_sheet.clone())
             .into_any_element()
     }
 }
