@@ -27,6 +27,7 @@ pub mod settings;
 pub mod tasks;
 mod theme;
 pub mod usage;
+pub mod work_sidebar;
 pub mod workspace_config;
 pub mod workspace_sheet;
 pub mod workspace_status;
