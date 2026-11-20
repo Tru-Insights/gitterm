@@ -114,7 +114,7 @@ fn header_and_shortcut_open_same_sheet_with_bottom_terminal_and_chat_facts(
     cx.background_executor.allow_parking();
     cx.update(|cx| {
         gpui_component::init(cx);
-        bind_workspace_keys(cx);
+        install_app_menus(cx);
     });
     let fixture = Fixture::new();
     let (shell, cx) = cx.add_window_view(|window, cx| fixture.shell(window, cx));

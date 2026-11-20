@@ -21,6 +21,8 @@ mod h4_tests;
 #[cfg(test)]
 mod h5_tests;
 #[cfg(test)]
+mod h6_tests;
+#[cfg(test)]
 mod hookup_tests;
 mod layout;
 mod owner;
@@ -53,10 +55,9 @@ use anyhow::{Result, ensure};
 use data::{Session, SessionId, ShellData, Workspace, WorkspaceId};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Action, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, Styled as _,
-    Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, px, rgb,
-    size,
+    App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, Styled as _, Subscription, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, actions, div, px, rgb, size,
 };
 use gpui_component::{
     Root, Selectable,
@@ -75,25 +76,9 @@ use std::{
 };
 use theme::Palette;
 
-#[derive(Clone, PartialEq, Action)]
-#[action(no_json)]
-struct SelectSession {
-    index: usize,
-}
-#[derive(Clone, PartialEq, Action)]
-#[action(no_json)]
-struct SelectWorkspace {
-    index: usize,
-}
 actions!(
     gitterm_shell,
-    [
-        ShowShortcuts,
-        NewTerminal,
-        NewClaudeChat,
-        CloseWorkspace,
-        ToggleBottomPanel
-    ]
+    [NewTerminal, NewClaudeChat, ToggleBottomPanel]
 );
 
 struct WorkspaceDock {
@@ -117,6 +102,8 @@ pub struct Shell {
     registry: Rc<RefCell<HashMap<String, gpui::WeakEntity<Pane>>>>,
     config_dir: std::path::PathBuf,
     local: bool,
+    selected_files: HashMap<WorkspaceId, FileOpen>,
+    chat_find: HashSet<gpui::EntityId>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
     resize: Option<(bool, f32, f32)>,
@@ -185,7 +172,6 @@ impl Shell {
                 client_height,
             ))
         });
-        gitterm_gpui_chat::init(cx);
         gitterm_gpui_review::init(cx);
         let content = cx.new(|cx| content::window::ContentWindow::new(window, cx));
         let catalog = data.workspaces(cx);
@@ -307,6 +293,7 @@ impl Shell {
             &owner,
             window,
             |this, _, event: &FileOpen, window, cx| {
+                this.selected_files.insert(event.workspace, event.clone());
                 this.open_file_viewer(event, window, cx);
             },
         ));
@@ -331,6 +318,8 @@ impl Shell {
             registry,
             config_dir: config_dir.to_path_buf(),
             local,
+            selected_files: HashMap::new(),
+            chat_find: HashSet::new(),
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
             resize: None,
@@ -352,6 +341,9 @@ impl Shell {
         };
         shell.restore_parked(saved_parked, cx);
         shell.load_active_iced_history(window, cx);
+        if let Some(fonts) = shell.workspaces.iter().find_map(|w| w.store.regions.fonts) {
+            theme::set_font_sizes(fonts, cx);
+        }
         Ok(shell)
     }
     fn sync_content_selection(&self, cx: &mut Context<Self>) {
@@ -1675,6 +1667,21 @@ impl Shell {
                 }),
                 |pane| pane.font_family(".SystemUIFont"),
             )
+            .when(
+                pane.is_some_and(|p| matches!(p.read(cx).content, pane::PaneContent::Terminal(_))),
+                |host| {
+                    host.capture_any_mouse_down(|event, _, cx| {
+                        if event.button == gpui::MouseButton::Right {
+                            cx.stop_propagation();
+                        }
+                    })
+                    .capture_any_mouse_up(|event, _, cx| {
+                        if event.button == gpui::MouseButton::Right {
+                            cx.stop_propagation();
+                        }
+                    })
+                },
+            )
             .children(pane.cloned())
     }
     fn refresh_bottom_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1720,8 +1727,22 @@ impl Shell {
             .and_then(|id| state.panes.get(id))
             .cloned()
             .map(|pane| {
-                Rc::new(move |_: &mut Window, _: &mut App| pane.clone().into_any_element())
-                    as bottom_panel::ContentSlot
+                Rc::new(move |_: &mut Window, _: &mut App| {
+                    div()
+                        .size_full()
+                        .capture_any_mouse_down(|event, _, cx| {
+                            if event.button == gpui::MouseButton::Right {
+                                cx.stop_propagation();
+                            }
+                        })
+                        .capture_any_mouse_up(|event, _, cx| {
+                            if event.button == gpui::MouseButton::Right {
+                                cx.stop_propagation();
+                            }
+                        })
+                        .child(pane.clone())
+                        .into_any_element()
+                }) as bottom_panel::ContentSlot
             });
         self.bottom.update(cx, |panel, cx| {
             panel.set_input(input, cx);
@@ -1964,6 +1985,424 @@ fn bottom_pane_ids(state: &WorkspaceDock, cx: &App) -> Vec<String> {
         .collect()
 }
 
+impl Shell {
+    fn has_dialog(window: &mut Window, cx: &mut App) -> bool {
+        use gpui_component::WindowExt;
+        window.root::<Root>().flatten().is_some() && window.has_active_dialog(cx)
+    }
+    fn focused_terminal(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> Option<Entity<gitterm_terminal::TerminalView>> {
+        self.workspaces
+            .iter()
+            .flat_map(|state| state.panes.values())
+            .find_map(|pane| {
+                let pane::PaneContent::Terminal(view) = &pane.read(cx).content else {
+                    return None;
+                };
+                view.read(cx)
+                    .focus_handle()
+                    .is_focused(window)
+                    .then(|| view.clone())
+            })
+    }
+    fn focused_chat(&self, window: &Window, cx: &App) -> Option<gpui::EntityId> {
+        self.workspaces
+            .iter()
+            .flat_map(|state| state.panes.values())
+            .find_map(|pane| {
+                (matches!(
+                    pane.read(cx).content,
+                    pane::PaneContent::Chat(_) | pane::PaneContent::PreviewChat(_)
+                ) && pane.focus_handle(cx).contains_focused(window, cx))
+                .then(|| pane.entity_id())
+            })
+    }
+    fn active_chat_pane(&self, cx: &App) -> Option<Entity<Pane>> {
+        let state = self
+            .workspaces
+            .iter()
+            .find(|s| Some(s.workspace.id) == self.active_workspace(cx))?;
+        let pane = state.panes.get(&session_pane_id(state.active_session?))?;
+        matches!(
+            pane.read(cx).content,
+            pane::PaneContent::Chat(_) | pane::PaneContent::PreviewChat(_)
+        )
+        .then(|| pane.clone())
+    }
+    fn active_agent_tab(&self, cx: &App) -> bool {
+        let strip = self.strip_input(cx);
+        strip
+            .sessions
+            .iter()
+            .any(|s| Some(s.id) == strip.active && s.kind == data::SessionKind::Chat)
+    }
+    fn menu_context(&self, window: &mut Window, cx: &mut App) -> String {
+        use gpui_component::WindowExt;
+        let mut context = String::from("GitTermShell");
+        let chat_pane = self.focused_chat(window, cx);
+        let chat = chat_pane.is_some();
+        let modal = self.session_picker.is_some()
+            || self.park_sheet.is_some()
+            || self.new_work_sheet.is_some()
+            || Self::has_dialog(window, cx);
+        if !modal {
+            context.push_str(" IcedMain");
+        }
+        if Self::has_dialog(window, cx) {
+            context.push_str(" IcedHelp");
+        }
+        if self.active_agent_tab(cx) {
+            context.push_str(" IcedAgentTab");
+        }
+        let editable = window.root::<Root>().flatten().is_some() && window.has_focused_input(cx);
+        if chat && editable {
+            context.push_str(" IcedEditable");
+        }
+        if chat && !modal {
+            context.push_str(" IcedChat");
+            if chat_pane.is_some_and(|pane| self.chat_find.contains(&pane)) {
+                context.push_str(" IcedChatFind");
+            }
+        }
+        if !modal
+            && (chat
+                || (!editable
+                    && self.focused_terminal(window, cx).is_none()
+                    && self.active_chat_pane(cx).is_some()
+                    && self.content.read(cx).selected.is_none()
+                    && self
+                        .find_state
+                        .borrow()
+                        .selected(&self.find_owner(cx))
+                        .is_none()))
+        {
+            context.push_str(" IcedChatFindAllowed");
+        }
+        if self
+            .focused_terminal(window, cx)
+            .is_some_and(|v| v.read(cx).is_find_open())
+        {
+            context.push_str(" IcedTerminalSearch");
+        }
+        if !modal
+            && !chat
+            && self.focused_terminal(window, cx).is_none()
+            && self
+                .active_workspace(cx)
+                .and_then(|id| self.selected_files.get(&id))
+                .is_some_and(|file| file.changed.is_some())
+            && (self.content.read(cx).selected.is_some()
+                || self.workspaces.iter().any(|s| {
+                    Some(s.workspace.id) == self.active_workspace(cx)
+                        && s.panes.iter().any(|(id, p)| {
+                            matches!(p.read(cx).content, pane::PaneContent::Review(_))
+                                && pane_id_visible(s, id, cx)
+                        })
+                }))
+        {
+            context.push_str(" IcedDiff");
+        }
+        context
+    }
+    fn menu_root(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+        use app_menus::*;
+        div()
+            .track_focus(&self.focus)
+            .key_context(self.menu_context(window, cx).as_str())
+            .capture_key_down(cx.listener(Self::guard_app_shortcut))
+            .on_action(cx.listener(|_, _: &Minimize, w, _| w.minimize_window()))
+            .on_action(cx.listener(|_, _: &Maximize, w, _| w.zoom_window()))
+            .on_action(cx.listener(|_, _: &Fullscreen, w, _| w.toggle_fullscreen()))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                this.update_regions(|r| r.sidebar_collapsed = !r.sidebar_collapsed, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &ConsoleToggle, w, cx| this.open_bottom_terminal(w, cx)),
+            )
+            .on_action(
+                cx.listener(|this, a: &WorkspaceSelect, w, cx| {
+                    this.select_workspace(a.index, w, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, a: &TabSelect, w, cx| this.select_session(a.index, w, cx)),
+            )
+            .on_action(cx.listener(|this, _: &WorkspaceClose, w, cx| this.open_park_sheet(w, cx)))
+            .on_action(cx.listener(|this, _: &OpenFolder, w, cx| this.open_new_work_sheet(w, cx)))
+            .on_action(cx.listener(|this, _: &ToggleHelp, w, cx| {
+                use gpui_component::WindowExt;
+                if Self::has_dialog(w, cx) {
+                    w.close_dialog(cx);
+                } else {
+                    dialogs::shortcuts(w, cx);
+                }
+                this.content
+                    .update(cx, |content, cx| content.sync_covers(w, cx));
+            }))
+            .on_action(
+                cx.listener(|this, _: &IncreaseUiFont, _, cx| this.resize_font(true, 1., cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &DecreaseUiFont, _, cx| this.resize_font(true, -1., cx)),
+            )
+            // Iced redirects these menu actions to chat on an agent tab.
+            // P8c exposes no chat-font setter yet, so disable that route as well.
+            .when(!self.active_agent_tab(cx), |root| {
+                root.on_action(cx.listener(|this, _: &IncreaseTerminalFont, _, cx| {
+                    this.resize_font(false, 1., cx)
+                }))
+                .on_action(cx.listener(
+                    |this, _: &DecreaseTerminalFont, _, cx| this.resize_font(false, -1., cx),
+                ))
+            })
+            .on_action(cx.listener(|_, _: &ToggleTheme, w, cx| {
+                theme::apply(
+                    !gpui_component::Theme::global(cx).mode.is_dark(),
+                    Some(w),
+                    cx,
+                );
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ClearTerminal, w, cx| {
+                if let Some(view) = this.focused_terminal(w, cx) {
+                    view.update(cx, |v, _| {
+                        v.backend_mut()
+                            .handle(gitterm_terminal::Command::Write(b"clear\n".to_vec()));
+                    });
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSearch, w, cx| {
+                if let Some(view) = this.focused_terminal(w, cx) {
+                    if view.read(cx).is_find_open() {
+                        w.defer(cx, |w, cx| {
+                            w.dispatch_keystroke(gpui::Keystroke::parse("escape").unwrap(), cx);
+                        });
+                    } else {
+                        view.update(cx, |v, cx| v.open_find(cx));
+                    }
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SearchNext, w, cx| {
+                if let Some(view) = this.focused_terminal(w, cx) {
+                    view.update(cx, |v, cx| {
+                        v.backend_mut().next_find(false);
+                        cx.notify();
+                    });
+                }
+            }))
+            .on_action(cx.listener(Self::escape))
+            .on_action(cx.listener(|this, a: &FileSelectByIndex, w, cx| {
+                this.select_file(&a.selection, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &EditFile, w, cx| {
+                if let Some(mut file) = this
+                    .active_workspace(cx)
+                    .and_then(|id| this.selected_files.get(&id))
+                    .cloned()
+                {
+                    file.changed = None;
+                    file.from_files = true;
+                    this.open_file_viewer(&file, w, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &AgentFindOpen, w, cx| {
+                let focused = this.focused_chat(w, cx);
+                let pane = focused
+                    .and_then(|id| {
+                        this.workspaces
+                            .iter()
+                            .flat_map(|s| s.panes.values())
+                            .find(|p| p.entity_id() == id)
+                            .cloned()
+                    })
+                    .or_else(|| this.active_chat_pane(cx));
+                if let Some(pane) = pane {
+                    this.chat_find.insert(pane.entity_id());
+                    pane.focus_handle(cx).focus(w, cx);
+                    Self::chat_action("native_chat::Find", w, cx);
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|_, _: &Copy, w, cx| {
+                use gpui_component::WindowExt;
+                if w.has_focused_input(cx) {
+                    w.dispatch_action(Box::new(gpui_component::input::Copy), cx);
+                } else {
+                    Self::chat_action("native_chat::CopyPlain", w, cx);
+                }
+            }))
+            .on_action(cx.listener(|_, _: &CopyMarkdown, w, cx| {
+                Self::chat_action("native_chat::CopyMarkdown", w, cx)
+            }))
+            .on_action(cx.listener(|_, _: &FindNext, w, cx| {
+                Self::chat_action("native_chat::NextMatch", w, cx)
+            }))
+            .on_action(cx.listener(|_, _: &FindPrevious, w, cx| {
+                Self::chat_action("native_chat::PreviousMatch", w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CloseFind, w, cx| {
+                if let Some(pane) = this.focused_chat(w, cx) {
+                    this.chat_find.remove(&pane);
+                }
+                Self::chat_action("native_chat::CloseFind", w, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|_, _: &Cut, w, cx| {
+                w.dispatch_action(Box::new(gpui_component::input::Cut), cx)
+            }))
+            .on_action(cx.listener(|_, _: &Paste, w, cx| {
+                w.dispatch_action(Box::new(gpui_component::input::Paste), cx)
+            }))
+            .on_action(cx.listener(|_, _: &SelectAll, w, cx| {
+                w.dispatch_action(Box::new(gpui_component::input::SelectAll), cx)
+            }))
+            .on_action(cx.listener(|_, _: &Undo, w, cx| {
+                w.dispatch_action(Box::new(gpui_component::input::Undo), cx)
+            }))
+            .on_action(cx.listener(|_, _: &Redo, w, cx| {
+                w.dispatch_action(Box::new(gpui_component::input::Redo), cx)
+            }))
+            .on_action(cx.listener(|this, _: &NewTerminal, w, cx| this.new_terminal(w, cx)))
+            .on_action(
+                cx.listener(|this, _: &ToggleBottomPanel, w, cx| this.open_bottom_terminal(w, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &NewClaudeChat, w, cx| this.new_claude_chat(None, w, cx)),
+            )
+    }
+    fn chat_action(name: &str, window: &mut Window, cx: &mut App) {
+        // The chat action types are private. Use GPUI's registered action contract
+        // rather than duplicating the chat's find/copy/input implementation.
+        let action = cx
+            .build_action(name, None)
+            .expect("native chat action is registered");
+        window.dispatch_action(action, cx);
+    }
+    fn resize_font(&mut self, ui: bool, delta: f32, cx: &mut Context<Self>) {
+        let mut fonts = theme::font_sizes(cx);
+        let value = if ui {
+            &mut fonts.ui
+        } else {
+            &mut fonts.terminal
+        };
+        *value = (*value + delta).clamp(10., 24.);
+        theme::set_font_sizes(fonts, cx);
+        for state in &mut self.workspaces {
+            state.store.regions.fonts = Some(fonts);
+            save_layout(state, cx);
+            for pane in state.panes.values() {
+                if let pane::PaneContent::Terminal(view) = &pane.read(cx).content {
+                    theme::sync_terminal_typography(&view.clone(), cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+    fn escape(&mut self, _: &app_menus::Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_picker.is_some()
+            || self.park_sheet.is_some()
+            || self.new_work_sheet.is_some()
+            || Self::has_dialog(window, cx)
+            || self
+                .focused_terminal(window, cx)
+                .is_some_and(|v| v.read(cx).is_find_open())
+        {
+            // The existing sheet/search raw-key handler consumes Escape once.
+            cx.propagate();
+        } else if self
+            .focused_chat(window, cx)
+            .is_some_and(|pane| self.chat_find.remove(&pane))
+        {
+            Self::chat_action("native_chat::CloseFind", window, cx);
+            cx.notify();
+        } else if let Some(workspace) = self.active_workspace(cx).filter(|id| {
+            self.selected_files.contains_key(id) || self.content.read(cx).selected.is_some()
+        }) {
+            self.selected_files.remove(&workspace);
+            self.close_file_viewer(workspace, window, cx);
+            if let Some(session) = self
+                .workspaces
+                .iter()
+                .find(|s| s.workspace.id == workspace)
+                .and_then(|s| s.active_session)
+            {
+                self.show_workspace_pane(workspace, &session_pane_id(session), window, cx);
+            }
+            cx.notify();
+        } else {
+            self.focus.focus(window, cx);
+        }
+    }
+    fn guard_app_shortcut(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.key == "escape"
+            && (self.session_picker.is_some()
+                || self.park_sheet.is_some()
+                || self.new_work_sheet.is_some()
+                || Self::has_dialog(window, cx)
+                || self
+                    .focused_terminal(window, cx)
+                    .is_some_and(|v| v.read(cx).is_find_open()))
+        {
+            return;
+        }
+        let stroke = &event.keystroke;
+        let reserved = cx.key_bindings().borrow().bindings().any(|binding| {
+            binding.action().name().starts_with("gitterm_iced::")
+                && binding.keystrokes().first().is_some_and(|key| {
+                    key.key() == stroke.key && *key.modifiers() == stroke.modifiers
+                })
+                && (stroke.modifiers.platform
+                    || stroke.modifiers.control
+                    || stroke.modifiers.alt
+                    || stroke.key == "escape")
+        });
+        if reserved {
+            // Unimplemented actions stay unavailable for native menu validation,
+            // but their reserved chords must never fall through to a PTY.
+            cx.stop_propagation();
+        }
+    }
+    fn select_file(
+        &mut self,
+        selection: &app_menus::FileSelection,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use app_menus::FileSelection;
+        let Some(workspace) = self.active_workspace(cx) else {
+            return;
+        };
+        let files = self.data.status(workspace, cx).files;
+        let current = self.selected_files.get(&workspace).and_then(|selected| {
+            files.iter().position(|file| {
+                selected
+                    .changed
+                    .as_ref()
+                    .is_some_and(|s| s.path == file.path && s.staged == file.staged)
+            })
+        });
+        let index = match selection {
+            FileSelection::Next => current.and_then(|i| i.checked_add(1)),
+            FileSelection::Previous => current.and_then(|i| i.checked_sub(1)),
+            FileSelection::First => Some(0),
+            FileSelection::Last => files.len().checked_sub(1),
+        };
+        if let Some(file) = index.and_then(|i| files.get(i)).cloned() {
+            self.owner
+                .update(cx, |owner, cx| owner.open_changed_file(workspace, file, cx));
+        }
+    }
+}
+
 impl Focusable for Shell {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -1990,7 +2429,8 @@ impl Render for Shell {
         self.refresh_bottom_panel(window, cx);
         let p = Palette::current(cx);
         if !self.workspaces.iter().any(|state| state.on_bar()) {
-            return div()
+            return self
+                .menu_root(window, cx)
                 .relative()
                 .size_full()
                 .flex()
@@ -2042,32 +2482,9 @@ impl Render for Shell {
         if let Some(error) = &state.error {
             content = content.child(div().p_2().text_color(rgb(p.red)).child(error.clone()));
         }
-        div()
+        self.menu_root(window, cx)
             .relative()
             .size_full()
-            .track_focus(&self.focus)
-            .key_context("GitTermShell")
-            .on_action(
-                cx.listener(|this, a: &SelectSession, w, cx| this.select_session(a.index, w, cx)),
-            )
-            .on_action(
-                cx.listener(|this, a: &SelectWorkspace, w, cx| {
-                    this.select_workspace(a.index, w, cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &CloseWorkspace, w, cx| this.open_park_sheet(w, cx)))
-            .on_action(cx.listener(|this, _: &NewTerminal, w, cx| this.new_terminal(w, cx)))
-            .on_action(
-                cx.listener(|this, _: &ToggleBottomPanel, w, cx| this.open_bottom_terminal(w, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &NewClaudeChat, w, cx| this.new_claude_chat(None, w, cx)),
-            )
-            .on_action(cx.listener(|this, _: &ShowShortcuts, w, cx| {
-                dialogs::shortcuts(w, cx);
-                this.content
-                    .update(cx, |content, cx| content.sync_covers(w, cx));
-            }))
             .flex()
             .font_family(gpui_component::Theme::global(cx).font_family.clone())
             .text_size(gpui_component::Theme::global(cx).font_size)
@@ -2146,17 +2563,21 @@ fn load_local_workspaces(
     Ok((model, save))
 }
 
-fn bind_workspace_keys(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new(
-        "cmd-j",
-        ToggleBottomPanel,
-        Some("GitTermShell"),
-    )]);
-    cx.bind_keys([KeyBinding::new(
-        "cmd-shift-w",
-        CloseWorkspace,
-        Some("GitTermShell"),
-    )]);
+/// Bind before menus: native accelerators are derived from the installed keymap.
+fn install_app_menus(cx: &mut App) {
+    cx.bind_keys(app_menus::key_bindings());
+    cx.set_menus(app_menus::menus());
+    cx.on_action(|_: &app_menus::Hide, cx| cx.hide());
+    cx.on_action(|_: &app_menus::HideOthers, cx| cx.hide_other_apps());
+    cx.on_action(|_: &app_menus::ShowAll, cx| cx.unhide_other_apps());
+    cx.on_action(|_: &app_menus::Quit, cx| cx.quit());
+    cx.on_action(|_: &app_menus::About, _| {
+        #[cfg(not(test))]
+        {
+            let mtm = objc2::MainThreadMarker::new().expect("GPUI runs on the main thread");
+            objc2_app_kit::NSApplication::sharedApplication(mtm).orderFrontStandardAboutPanel(None);
+        }
+    });
 }
 
 pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
@@ -2178,35 +2599,7 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
         preview.release_on_quit(cx);
         gpui_kit::init(cx);
         theme::apply_settings(&settings, None, cx);
-        for (index, (session_key, workspace_key)) in [
-            ("cmd-1", "ctrl-1"),
-            ("cmd-2", "ctrl-2"),
-            ("cmd-3", "ctrl-3"),
-            ("cmd-4", "ctrl-4"),
-            ("cmd-5", "ctrl-5"),
-            ("cmd-6", "ctrl-6"),
-            ("cmd-7", "ctrl-7"),
-            ("cmd-8", "ctrl-8"),
-            ("cmd-9", "ctrl-9"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            cx.bind_keys([
-                KeyBinding::new(session_key, SelectSession { index }, Some("GitTermShell")),
-                KeyBinding::new(
-                    workspace_key,
-                    SelectWorkspace { index },
-                    Some("GitTermShell"),
-                ),
-            ]);
-        }
-        bind_workspace_keys(cx);
-        cx.bind_keys([KeyBinding::new(
-            "alt-/",
-            ShowShortcuts,
-            Some("GitTermShell"),
-        )]);
+        install_app_menus(cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -2614,12 +3007,19 @@ mod tests {
     #[gpui::test]
     fn clicks_and_input_are_scoped_to_the_focused_terminal(cx: &mut TestAppContext) {
         cx.background_executor.allow_parking();
-        cx.update(gpui_component::init);
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            install_app_menus(cx);
+        });
         let dir = tempfile::tempdir().unwrap();
         let (shell, cx) = cx.add_window_view(|w, cx| {
             Shell::new(Rc::new(data::SampleData), dir.path(), w, cx).unwrap()
         });
-        shell.update(cx, |shell, _| shell.dock_fixture = true);
+        shell.update(cx, |shell, cx| {
+            shell.dock_fixture = true;
+            shell.workspaces[0].active_session = Some(SessionId(12));
+            cx.notify();
+        });
         let (first, second, dock) = cx.read(|cx| {
             let shell = shell.read(cx);
             (
@@ -2723,6 +3123,10 @@ mod tests {
             bounds.origin + gpui::point(px(12.), px(100.)),
             gpui::Modifiers::none(),
         );
+        shell.update(cx, |shell, cx| {
+            shell.workspaces[0].active_session = Some(SessionId(11));
+            cx.notify();
+        });
         let chat = cx.read(|cx| chat(&chat_pane, cx));
         cx.update(|window, cx| {
             assert!(
