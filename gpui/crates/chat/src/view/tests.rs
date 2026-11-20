@@ -1,5 +1,5 @@
 use super::*;
-use crate::events::{Entry, HarnessEvent, parse_fixture};
+use crate::events::{Entry, HarnessEvent, ItemKind, TurnStatus, parse_fixture};
 use gpui::{TestAppContext, VisualTestContext};
 use std::time::Instant;
 
@@ -1923,4 +1923,165 @@ fn finished_work_uses_iced_fold_and_keeps_final_answer_visible(cx: &mut TestAppC
         assert!(view.row_views[1].as_ref().unwrap().read(cx).work_open);
         assert!(!view.row_views[2].as_ref().unwrap().read(cx).hidden_by_work);
     });
+}
+
+#[gpui::test]
+fn history_fold_keeps_short_reply_before_later_tools_and_has_no_empty_tail(
+    cx: &mut TestAppContext,
+) {
+    let mut records = vec![
+        Record {
+            at_ms: None,
+            entry: Entry::UserPrompt("Check".into()),
+        },
+        Record {
+            at_ms: None,
+            entry: Entry::TurnTiming {
+                start_ms: Some(1000),
+                end_ms: None,
+                split_ms: None,
+            },
+        },
+    ];
+    for index in 0..80 {
+        records.push(Record {
+            at_ms: None,
+            entry: Entry::Harness(HarnessEvent::ItemStarted {
+                id: index.to_string(),
+                kind: ItemKind::ToolCall {
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command":"check"}),
+                },
+            }),
+        });
+        records.push(Record {
+            at_ms: None,
+            entry: Entry::Harness(HarnessEvent::ItemCompleted {
+                id: index.to_string(),
+                output: "ok".into(),
+                is_error: false,
+            }),
+        });
+        if index == 78 {
+            records.push(Record {
+                at_ms: None,
+                entry: Entry::Harness(HarnessEvent::TextDelta("The fix is merged.".into())),
+            });
+        }
+    }
+    records.extend([
+        Record {
+            at_ms: None,
+            entry: Entry::TurnTiming {
+                start_ms: None,
+                end_ms: Some(81_000),
+                split_ms: None,
+            },
+        },
+        Record {
+            at_ms: None,
+            entry: Entry::Harness(HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                usage: serde_json::Value::Null,
+                cost_usd: None,
+                rate_limit: None,
+            }),
+        },
+    ]);
+    // Exercise the persisted envelope too, rather than only live projection.
+    let records = parse_fixture(
+        &records
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    let (chat, cx) = setup(records, cx);
+    cx.simulate_resize(size(px(1200.), px(900.)));
+    draw(cx);
+    let (reply_id, fold_id) = chat.update_in(cx, |view, window, cx| {
+        let reply = view
+            .model
+            .rows
+            .iter()
+            .position(|row| row.kind == RowKind::Assistant)
+            .unwrap();
+        let reply_view = view.row(reply, window, cx);
+        assert!(!reply_view.read(cx).hidden_by_work);
+        assert!(reply_view.read(cx).work_summary.is_none());
+        let fold = turns::work_folds(&view.model);
+        assert_eq!(fold.len(), 2);
+        assert!(fold.iter().all(|f| f.label == "Worked for 1m 20s"));
+        assert!(fold.iter().all(|f| !f.range.contains(&reply)));
+        assert!(view.scroller.read(cx).is_following_tail());
+        (
+            view.model.rows[reply].id,
+            view.model.rows[fold[0].range.start].id,
+        )
+    });
+    draw(cx);
+    assert_eq!((reply_id, fold_id), (80, 1));
+    let reply = cx
+        .debug_bounds("transcript-row-80")
+        .expect("reply drawn at tail");
+    let fold = cx.debug_bounds("work-fold-1").expect("fold drawn at tail");
+    assert!(reply.origin.y >= fold.origin.y);
+    assert!(
+        reply.origin.y - fold.origin.y < px(100.),
+        "hidden tools must occupy no space"
+    );
+}
+
+#[gpui::test]
+fn read_only_history_chips_use_saved_config_and_recorded_labels(cx: &mut TestAppContext) {
+    let records = vec![Record {
+        at_ms: None,
+        entry: Entry::Harness(HarnessEvent::Ready {
+            session_id: None,
+            permission_mode: Some("auto".into()),
+            models: vec![
+                serde_json::json!({"value":"opus", "displayName":"Opus 5.5", "supportsEffort":true}),
+                serde_json::json!({"value":"sonnet", "displayName":"Sonnet", "supportsEffort":true}),
+            ],
+            modes: vec![],
+            commands: vec![],
+        }),
+    }];
+    let (chat, cx) = setup(records, cx);
+    chat.update_in(cx, |view, _, cx| {
+        view.set_history_config(
+            &gitterm_core::chat::types::AgentBackendConfig::Claude {
+                model: "opus".into(),
+                permission_mode: Some("default".into()),
+                effort: None,
+            },
+            cx,
+        );
+        view.set_read_only(Some("History".into()), cx);
+        assert_eq!(view.composer_state.model, "Opus 5.5");
+        assert_eq!(view.composer_state.effort, "Auto · 200k");
+        assert_eq!(view.composer_state.mode, "Auto mode");
+        assert!(!view.settings_enabled());
+        view.append_event(HarnessEvent::ModelChanged("sonnet".into()), cx);
+        view.set_history_config(
+            &gitterm_core::chat::types::AgentBackendConfig::Claude {
+                model: "opus".into(),
+                permission_mode: Some("default".into()),
+                effort: Some("low".into()),
+            },
+            cx,
+        );
+        assert_eq!(
+            view.composer_state.model, "Sonnet",
+            "transcript acknowledgement wins"
+        );
+        assert_eq!(view.composer_state.mode, "Auto mode");
+        assert_eq!(view.composer_state.effort, "Auto · 200k");
+    });
+    draw(cx);
+    let bounds = cx.debug_bounds("composer-model").unwrap();
+    cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+    draw(cx);
+    chat.read_with(cx, |view, _| assert!(view.composer_state.picker.is_none()));
 }
