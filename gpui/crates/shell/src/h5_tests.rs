@@ -229,3 +229,26 @@ fn git_mount_actions_file_cover_return_and_unavailable_worktrees(cx: &mut TestAp
         before
     );
 }
+
+#[gpui::test]
+fn work_mode_has_no_git_header_and_git_requires_entry(cx: &mut TestAppContext) {
+    let (_root, shell, cx) = fixture(cx);
+    assert!(cx.debug_bounds("work-sidebar").is_some());
+    assert!(cx.debug_bounds("git-back-work").is_none());
+    assert!(cx.debug_bounds("git-changes").is_none());
+    cx.read(|cx| {
+        assert_eq!(
+            shell.read(cx).active(cx).store.regions.sidebar_mode,
+            SidebarMode::Work
+        )
+    });
+    // Navigation stays on the mode strip, with no separate Git heading.
+    let git_entry = cx.debug_bounds("open-git-sidebar").unwrap();
+    let work_entry = cx.debug_bounds("Work").unwrap();
+    assert_eq!(git_entry.top(), work_entry.top());
+    click(cx, "open-git-sidebar");
+    assert!(cx.debug_bounds("git-back-work").is_some());
+    click(cx, "git-back-work");
+    assert!(cx.debug_bounds("git-back-work").is_none());
+    assert!(cx.debug_bounds("work-sidebar").is_some());
+}

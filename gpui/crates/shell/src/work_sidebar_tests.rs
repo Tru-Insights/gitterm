@@ -678,7 +678,8 @@ impl IcedFixture {
         }
     }
     fn load(&self) -> crate::data::IcedWorkData {
-        crate::data::IcedWorkData::read(&self.config, 1, &self.workspace, Focus::Latest).unwrap()
+        crate::data::IcedWorkData::read(&self.config, 1, &self.workspace, Focus::Latest, |_| {})
+            .unwrap()
     }
 }
 
@@ -735,10 +736,10 @@ fn iced_work_fixture_has_real_rows_in_order_and_never_changes_source_bytes_or_mt
         [
             "Work fixture",
             "Repos",
-            "Tasks",
-            "Workers",
             "Chats",
             "Documents",
+            "Tasks",
+            "Workers",
             "Needs you"
         ]
     );
@@ -788,8 +789,13 @@ fn missing_and_malformed_task_stores_are_read_only_and_errors_are_visible() {
     assert_eq!(tree_snapshot(fixture.root.path()), before);
     std::fs::write(fixture.config.join("tasks.json"), b"{bad").unwrap();
     let before = tree_snapshot(fixture.root.path());
-    let result =
-        crate::data::IcedWorkData::read(&fixture.config, 1, &fixture.workspace, Focus::Latest);
+    let result = crate::data::IcedWorkData::read(
+        &fixture.config,
+        1,
+        &fixture.workspace,
+        Focus::Latest,
+        |_| {},
+    );
     assert!(result.err().unwrap().to_string().contains("task store"));
     assert_eq!(tree_snapshot(fixture.root.path()), before);
 }
@@ -867,7 +873,19 @@ fn owner_catalog_supplies_mounted_sidebar_read_authority_without_a_gui(
     let mut facts = fixture.load().facts;
     facts.repos.clear();
     let sidebar = cx.new(|_| WorkSidebar::new(facts, Default::default()));
-    sidebar.update(cx, |sidebar, cx| sidebar.load(false, cx));
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.load(false, cx);
+        assert!(sidebar.loading);
+        assert_eq!(
+            sidebar.workspace.repos.len(),
+            2,
+            "saved repos must precede all background I/O"
+        );
+        assert_eq!(
+            sidebar.workspace.repos[1].run_command.as_deref(),
+            Some("cargo run")
+        );
+    });
     cx.run_until_parked();
     sidebar.read_with(cx, |sidebar, _| {
         assert!(!sidebar.loading);
@@ -1181,4 +1199,177 @@ pub(crate) fn h8_install(sidebar: &mut WorkSidebar, data: crate::data::IcedWorkD
     sidebar.workers = data.workers;
     sidebar.repo_recency = data.repo_recency;
     sidebar.loaded_at = Some(Instant::now());
+}
+
+#[test]
+fn realistic_catalog_partial_index_publishes_repos_chats_docs_before_branch_checks() {
+    use gitterm_core::{chat_facts::CheckoutTouch, tasks::*};
+    let fixture = IcedFixture::new();
+    let home = fixture.root.path().join("harness-home");
+    let cwd = PathBuf::from(&fixture.workspace.dir);
+    indexed_transcript(
+        &home,
+        "root-chat",
+        &cwd,
+        "Root title",
+        "Latest request",
+        "2026-11-20T12:00:00Z",
+    );
+    indexed_transcript(
+        &home,
+        "unrelated",
+        &fixture.root.path().join("other"),
+        "Unrelated title",
+        "Elsewhere",
+        "2026-11-20T13:00:00Z",
+    );
+    let path = fixture.config.join("workspaces.json");
+    let mut file: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let selected = &mut file["workspaces"][0];
+    selected["home"] = serde_json::json!(cwd);
+    selected["active"] = serde_json::json!(true);
+    selected["active_tab"] = serde_json::json!(2);
+    selected["repos_added"] = serde_json::json!([fixture.repo]);
+    selected["repos_removed"] = serde_json::json!([]);
+    selected["chats"] = serde_json::json!([
+        "root-chat",
+        "owned-2",
+        "owned-3",
+        "owned-4",
+        "owned-5",
+        "owned-6",
+        "owned-7"
+    ]);
+    selected["tabs"] = serde_json::json!([
+        {"dir":cwd,"repo_dir":fixture.repo,"tab_kind":"agent","agent_config":{"backend":"claude","model":"default"},"chat_session_id":"owned-2","session_uid":"tab-2"},
+        {"dir":cwd,"repo_dir":fixture.repo,"tab_kind":"agent","agent_config":{"backend":"claude","model":"default"},"chat_session_id":"owned-3","session_uid":"tab-3"},
+        {"dir":cwd,"repo_dir":fixture.repo,"tab_kind":"agent","agent_config":{"backend":"claude","model":"default"},"chat_session_id":"root-chat","session_uid":"parent"}
+    ]);
+    // The selected named work is neither index 0 nor identified by its folder:
+    // a second work shares that folder, and closed entries are also persisted.
+    let work = selected.clone();
+    let mut shared = work.clone();
+    shared["name"] = serde_json::json!("Same folder, different work");
+    shared["chats"] = serde_json::json!([]);
+    let mut closed = shared.clone();
+    closed["active"] = serde_json::json!(false);
+    file["workspaces"] = serde_json::json!([shared.clone(), closed, shared.clone(), shared, work]);
+    file["active_workspace"] = serde_json::json!(3);
+    std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+    std::fs::write(fixture.config.join("settings.json"), br#"{"theme":"dark","pr_watch":{"auto_tell":true},"chat":{"default_model":"default"},"console_expanded":false}"#).unwrap();
+    let facts_dir = gitterm_core::chat_facts::facts_dir(&fixture.config);
+    let facts_path =
+        gitterm_core::chat_facts::facts_path(&facts_dir, ChatBackend::Claude, "root-chat").unwrap();
+    let mut facts = gitterm_core::chat_facts::load_facts(&facts_path)
+        .unwrap()
+        .unwrap();
+    facts.checkouts.extend((0..178).map(|index| CheckoutTouch {
+        repo: fixture.repo.clone(),
+        dir: fixture.root.path().join(format!("gone-checkout-{index}")),
+        branch: Some(format!("task/test-42-fixture-{index}")),
+        edits: 1,
+        last: "2026-11-20T12:00:00Z".into(),
+    }));
+    facts.prs.push(gitterm_core::chat_facts::PrRef {
+        repo: "example/project".into(),
+        number: 42,
+        url: "https://github.com/example/project/pull/42".into(),
+    });
+    facts.issue_keys = vec!["TEST-42".into()];
+    std::fs::write(facts_path, serde_json::to_vec(&facts).unwrap()).unwrap();
+    std::fs::write(fixture.config.join("issue-titles.json"), br#"{"issues":{"TEST-42":{"title":"Synthetic issue","state":"In Progress","fetched_at":"2026-11-20T12:00:00Z"}}}"#).unwrap();
+    let mut watch = gitterm_core::prs::WatchFile::default();
+    let mut pr = gitterm_core::prs::WatchedPr::new(gitterm_core::merge_plan::PrKey::new(
+        "example/project",
+        42,
+    ));
+    pr.snapshot.core = Some(gitterm_core::prs::PullCore {
+        title: "Synthetic pull request".into(),
+        state: Some(gitterm_core::merge_plan::PrState::Draft),
+        mergeable: Some(false),
+        ..Default::default()
+    });
+    watch.prs.insert(pr.key.id(), pr);
+    std::fs::write(
+        gitterm_core::prs::WatchFile::path_in(&fixture.config),
+        serde_json::to_vec(&watch).unwrap(),
+    )
+    .unwrap();
+    // Preserve the full persisted task/delegation wire shape, not a rows-only mock.
+    let store = TaskStore::load(fixture.config.join("tasks.json")).unwrap();
+    assert_eq!(store.tasks().len(), 2);
+    let catalog = crate::workspace_config::IcedCatalog::read(&fixture.config).unwrap();
+    assert_eq!(catalog.active, 3);
+    let saved = &catalog.workspaces[3];
+    assert_ne!(
+        crate::workspace_config::iced_layout_key(saved),
+        crate::workspace_config::iced_layout_key(&catalog.workspaces[0])
+    );
+    let before = tree_snapshot(fixture.root.path());
+    let mut publications = 0;
+    let result = crate::data::IcedWorkData::read_with_progress(
+        &fixture.config,
+        Some(&home),
+        4,
+        saved,
+        Focus::Latest,
+        true,
+        |data| {
+            publications += 1;
+            let state = Rc::new(RefCell::new(State::default()));
+            data.apply(&mut state.borrow_mut());
+            assert!(
+                state.borrow().pane(4).unwrap().branches.is_empty(),
+                "overview must precede branch probes"
+            );
+            let mut sidebar = WorkSidebar::new(data.facts.clone(), state);
+            sidebar.pull_requests = data.pull_requests.clone();
+            sidebar.issues = data.issues.clone();
+            let rows = sidebar.rows();
+            let headings: Vec<_> = rows
+                .iter()
+                .filter(|row| row.heading)
+                .map(|row| row.label.as_str())
+                .collect();
+            assert_eq!(
+                headings,
+                [
+                    "Work fixture",
+                    "Pull requests",
+                    "Repos",
+                    "Chats",
+                    "Documents",
+                    "Issues",
+                    "In progress"
+                ]
+            );
+            assert_eq!(
+                rows.iter().find(|row| row.label == "Chats").unwrap().badges,
+                ["7"]
+            );
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.label == "Pull requests")
+                    .unwrap()
+                    .badges,
+                ["1 open"]
+            );
+            assert!(
+                rows.iter()
+                    .any(|row| row.label.contains("Synthetic pull request")
+                        && row.badges.contains(&"draft".into()))
+            );
+            assert!(rows.iter().any(|row| row.label.contains("Synthetic issue")));
+            assert!(rows.iter().any(|row| row.label == "✦ Root title"));
+            assert!(rows.iter().any(|row| row.label.starts_with("owns 7 chats")));
+            assert!(!rows.iter().any(|row| row.label.contains("Unrelated title")));
+        },
+    )
+    .unwrap();
+    assert_eq!(publications, 1);
+    let mut state = State::default();
+    result.apply(&mut state);
+    assert!(!state.pane(4).unwrap().branches.is_empty());
+    assert_eq!(tree_snapshot(fixture.root.path()), before);
 }
