@@ -471,3 +471,91 @@ impl Shell {
             .update(cx, |owner, cx| owner.save_parked(workspaces, cx));
     }
 }
+
+impl Shell {
+    pub(crate) fn workspace_sheet(&self, cx: &App) -> Option<crate::park_sheet::WorkspaceSheet> {
+        let workspace = self.active_workspace(cx)?;
+        let state = self
+            .workspaces
+            .iter()
+            .find(|s| s.workspace.id == workspace)?;
+        let chats = state
+            .sessions
+            .iter()
+            .filter(|s| s.kind == crate::data::SessionKind::Chat)
+            .count();
+        let terminals = state
+            .sessions
+            .iter()
+            .filter(|s| s.kind == crate::data::SessionKind::Terminal)
+            .count();
+        let working_chat = state
+            .panes
+            .values()
+            .any(|pane| match &pane.read(cx).content {
+                crate::pane::PaneContent::PreviewChat(view) => view.read(cx).is_working(),
+                _ => false,
+            });
+        crate::park_sheet::WorkspaceSheet::open(
+            &self.park_projection(cx),
+            state.runtime_uid,
+            crate::park_sheet::WorkspaceFacts {
+                owns_chats: chats > 0,
+                terminals,
+                chats,
+                working_chat,
+                others_have_chats: self
+                    .workspaces
+                    .iter()
+                    .filter(|s| s.workspace.id != workspace)
+                    .any(|s| {
+                        s.sessions
+                            .iter()
+                            .any(|s| s.kind == crate::data::SessionKind::Chat)
+                    }),
+                ..Default::default()
+            },
+        )
+    }
+    pub(crate) fn open_park_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui::AppContext as _;
+        if self.park_sheet.is_some() {
+            return;
+        }
+        let Some(model) = self.workspace_sheet(cx) else {
+            return;
+        };
+        let target = model.target.clone();
+        let previous_focus = if self.session_picker.is_some() {
+            self.focus.clone()
+        } else {
+            window.focused(cx).unwrap_or_else(|| self.focus.clone())
+        };
+        self.session_picker = None;
+        self.picker_subscription = None;
+        self.cover_sheet(true, window, cx);
+        let sheet = cx.new(|cx| crate::park_sheet::ParkSheet::workspace(model, window, cx));
+        self.park_subscription = Some(cx.subscribe_in(
+            &sheet,
+            window,
+            move |shell, _, outcome: &crate::park_sheet::Outcome, window, cx| {
+                shell.park_sheet = None;
+                shell.park_subscription = None;
+                shell.cover_sheet(false, window, cx);
+                let stamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .to_string();
+                if let Some(intent) = outcome.intent(Some(&target), stamp) {
+                    shell.park_intent(Some(&target), intent, window, cx);
+                } else {
+                    previous_focus.focus(window, cx);
+                }
+                cx.notify();
+            },
+        ));
+        self.park_sheet = Some(sheet);
+        cx.notify();
+    }
+}
