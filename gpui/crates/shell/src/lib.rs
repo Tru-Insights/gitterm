@@ -18,6 +18,7 @@ pub mod preview;
 mod review_reload;
 mod sessions;
 mod theme;
+pub mod usage;
 pub mod workspace_config;
 pub mod workspace_status;
 pub use owner::{FileOpen, WorkspaceOwner};
