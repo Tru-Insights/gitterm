@@ -1,5 +1,58 @@
 //! Read-only view facts. Live data reads the application owner on the GPUI thread.
 use gpui::App;
+
+/// Read-only roster facts from the resolved Iced catalog, never the preview's
+/// own config directory. Keep tasks outside the chat's home workspace too:
+/// workers can run in another repository or worktree.
+#[derive(Default)]
+pub(crate) struct RosterFacts {
+    pub tasks: Vec<gitterm_core::tasks::TaskRecord>,
+    pub workers: Vec<gitterm_core::tasks::Delegation>,
+    pub tabs: Vec<gitterm_core::workspace_config::WorkspaceTabConfig>,
+}
+impl RosterFacts {
+    pub(crate) fn worker_tab(
+        &self,
+        task_id: &str,
+        session: Option<&str>,
+    ) -> gitterm_core::delegations::WorkerTab {
+        use gitterm_core::{delegations::WorkerTab, tasks::TaskLifecycle};
+        if !self.tabs.iter().any(|tab| {
+            tab.task_id.as_deref() == Some(task_id)
+                && session.is_none_or(|id| tab.task_session_id.as_deref() == Some(id))
+        }) {
+            WorkerTab::Closed
+        } else if self
+            .tasks
+            .iter()
+            .any(|task| task.task_id == task_id && task.lifecycle == TaskLifecycle::WaitingForInput)
+        {
+            WorkerTab::AwaitingInput
+        } else {
+            WorkerTab::Idle
+        }
+    }
+
+    pub(crate) fn read_from(source: &std::path::Path) -> anyhow::Result<Self> {
+        use gitterm_core::tasks::TaskStore;
+        let store = TaskStore::load(TaskStore::path_for_config_root(source))?;
+        let catalog = crate::workspace_config::IcedCatalog::read(source)?;
+        Ok(Self {
+            tasks: store.tasks().to_vec(),
+            workers: store.delegations().iter().rev().cloned().collect(),
+            tabs: catalog
+                .workspaces
+                .into_iter()
+                .filter(|w| {
+                    !w.is_legacy_remote()
+                        && !matches!(w.location,
+                    Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. }))
+                })
+                .flat_map(|w| w.tabs)
+                .collect(),
+        })
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WorkspaceId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
