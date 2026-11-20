@@ -4,6 +4,13 @@ use gitterm_core::chat::{
     types::{AgentSessionState, HarnessEvent, ItemKind},
 };
 
+fn fallback_claude_model_name(model: &str) -> &str {
+    match model {
+        "opus" => "Opus 5.5",
+        other => other,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct QueuedRow {
     pub id: String,
@@ -229,7 +236,7 @@ impl ComposerState {
                         .into()
                 } else {
                     info.and_then(|info| info["displayName"].as_str())
-                        .unwrap_or(value)
+                        .unwrap_or_else(|| fallback_claude_model_name(value))
                         .into()
                 }
             },
