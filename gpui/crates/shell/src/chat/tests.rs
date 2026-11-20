@@ -1042,3 +1042,47 @@ fn finds_claude_in_home_local_bin_when_finder_path_lacks_it() {
             .unwrap_or(true)
     );
 }
+
+#[gpui::test]
+fn shell_hookup_reports_chat_identity_and_actual_working_state(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let (dir, preview) = fixture();
+    let saved = SavedChat {
+        uid: "hosted-uid".into(),
+        cwd: dir.path().to_owned(),
+        provider: preview.provider(),
+        session_id: Some("provider-id".into()),
+        records: vec![],
+    };
+    let (pane, cx) = cx
+        .add_window_view(|window, cx| ChatPane::history(RuntimeShutdown::new(), saved, window, cx));
+    pane.update(cx, |pane, _| {
+        assert!(pane.matches_chat("hosted-uid"));
+        assert!(pane.matches_chat("provider-id"));
+        assert!(!pane.matches_chat("another-chat"));
+        assert!(!pane.is_working());
+        let source = pane.controller.source.clone();
+        pane.controller
+            .apply_runtime_outcome(
+                &source,
+                RuntimeEvent::Harness(HarnessEvent::TurnStarted {
+                    session_id: None,
+                    model: None,
+                }),
+            )
+            .unwrap();
+        assert!(pane.is_working());
+        pane.controller
+            .apply_runtime_outcome(
+                &source,
+                RuntimeEvent::Harness(HarnessEvent::TurnCompleted {
+                    status: gitterm_core::chat::types::TurnStatus::Completed,
+                    usage: serde_json::json!({}),
+                    cost_usd: None,
+                    rate_limit: None,
+                }),
+            )
+            .unwrap();
+        assert!(!pane.is_working());
+    });
+}

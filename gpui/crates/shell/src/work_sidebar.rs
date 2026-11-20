@@ -748,6 +748,7 @@ impl Render for WorkSidebar {
         let p = crate::theme::Palette::current(cx);
         let mut body = div()
             .id("work-sidebar")
+            .debug_selector(|| "work-sidebar".into())
             .size_full()
             .min_h_0()
             .overflow_y_scroll()

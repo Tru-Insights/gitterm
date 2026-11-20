@@ -11,6 +11,8 @@ pub mod data;
 mod dialogs;
 pub mod files;
 mod files_view;
+#[cfg(test)]
+mod hookup_tests;
 mod layout;
 mod owner;
 mod pane;
@@ -76,7 +78,10 @@ struct SelectSession {
 struct SelectWorkspace {
     index: usize,
 }
-actions!(gitterm_shell, [ShowShortcuts, NewTerminal, NewClaudeChat]);
+actions!(
+    gitterm_shell,
+    [ShowShortcuts, NewTerminal, NewClaudeChat, CloseWorkspace]
+);
 
 struct WorkspaceDock {
     runtime_uid: u64,
@@ -101,6 +106,13 @@ pub struct Shell {
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
     resize: Option<(bool, f32, f32)>,
+    session_picker: Option<Entity<session_picker::SessionPicker>>,
+    picker_subscription: Option<Subscription>,
+    park_sheet: Option<Entity<park_sheet::ParkSheet>>,
+    park_subscription: Option<Subscription>,
+    work_state: Rc<RefCell<gitterm_core::work::state::State>>,
+    work_sidebars: HashMap<WorkspaceId, Entity<work_sidebar::WorkSidebar>>,
+    work_subscriptions: HashMap<WorkspaceId, Subscription>,
     #[cfg(test)]
     dock_fixture: bool,
 }
@@ -250,6 +262,13 @@ impl Shell {
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
             resize: None,
+            session_picker: None,
+            picker_subscription: None,
+            park_sheet: None,
+            park_subscription: None,
+            work_state: Default::default(),
+            work_sidebars: HashMap::new(),
+            work_subscriptions: HashMap::new(),
             #[cfg(test)]
             dock_fixture: false,
         };
@@ -570,6 +589,13 @@ impl Shell {
             .nth(index)
             .map(|state| state.workspace.id)
         {
+            if Some(id) != self.active_workspace(cx) {
+                self.session_picker = None;
+                self.picker_subscription = None;
+                self.park_sheet = None;
+                self.park_subscription = None;
+                self.cover_sheet(false, window, cx);
+            }
             self.owner.update(cx, |owner, cx| {
                 owner.dispatch(Intent::Activate(id), Instant::now(), cx)
             });
@@ -1340,6 +1366,14 @@ impl Shell {
                 );
             }
         }
+        if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Work {
+            sidebar = sidebar.child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .children(self.work_sidebars.get(&state.workspace.id).cloned()),
+            );
+        }
         sidebar
     }
     fn start_resize(
@@ -1545,6 +1579,7 @@ impl Render for Shell {
         self.sync_content_selection(cx);
         self.content
             .update(cx, |content, cx| content.sync_covers(window, cx));
+        self.ensure_work_sidebars(window, cx);
         let p = Palette::current(cx);
         if !self.workspaces.iter().any(|state| state.on_bar()) {
             return div()
@@ -1611,22 +1646,13 @@ impl Render for Shell {
         let close_target = close_session
             .and_then(|id| state.panes.get(&session_pane_id(id)))
             .and_then(|pane| pane.read(cx).session.clone());
-        let workspace_target = state.park_target(cx);
         let state_session_count = state.sessions.len();
-        let can_park = self.local
-            && self
-                .workspaces
-                .iter()
-                .filter(|state| state.on_bar())
-                .count()
-                > 1;
         let close_label = state
             .sessions
             .iter()
             .find(|session| Some(session.id) == close_session)
             .map(|session| format!("Close {} permanently", session.title))
             .unwrap_or_else(|| "Close session permanently".into());
-        let chat_owner = weak.clone();
         let history_owner = weak.clone();
         let history = self
             .owner
@@ -1637,25 +1663,13 @@ impl Render for Shell {
             .ghost()
             .label("⋯")
             .tooltip("More")
+            .debug_selector(|| "more".into())
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
-                let chat_owner = chat_owner.clone();
                 let history_owner = history_owner.clone();
                 let history = history.clone();
                 let weak = weak.clone();
                 let close_owner = weak.clone();
-                let park_owner = weak.clone();
-                let stop_target = workspace_target.clone();
-                let keep_target = workspace_target.clone();
-                let close_workspace_target = workspace_target.clone();
-                menu.item(
-                    PopupMenuItem::new("New Claude chat")
-                        .disabled(!local)
-                        .on_click(move |_, window, cx| {
-                            _ = chat_owner
-                                .update(cx, |shell, cx| shell.new_claude_chat(None, window, cx));
-                        }),
-                )
-                .item({
+                menu.item({
                     let owner = weak.clone();
                     PopupMenuItem::new("New terminal")
                         .disabled(!local)
@@ -1693,51 +1707,6 @@ impl Render for Shell {
                     PopupMenuItem::new("Keyboard shortcuts     ⌥/")
                         .on_click(|_, w, cx| dialogs::shortcuts(w, cx)),
                 )
-                .separator()
-                .item(
-                    PopupMenuItem::new("Park workspace · stop terminals")
-                        .disabled(!can_park)
-                        .on_click(move |_, window, cx| {
-                            _ = park_owner.update(cx, |shell, cx| {
-                                shell.park_workspace(
-                                    &stop_target,
-                                    gitterm_core::park::Mode::Stop,
-                                    window,
-                                    cx,
-                                )
-                            });
-                        }),
-                )
-                .item({
-                    let weak = close_owner.clone();
-                    PopupMenuItem::new("Park workspace · keep running")
-                        .disabled(!can_park)
-                        .on_click(move |_, window, cx| {
-                            _ = weak.update(cx, |shell, cx| {
-                                shell.park_workspace(
-                                    &keep_target,
-                                    gitterm_core::park::Mode::KeepRunning,
-                                    window,
-                                    cx,
-                                )
-                            });
-                        })
-                })
-                .item({
-                    let weak = close_owner.clone();
-                    PopupMenuItem::new("Close workspace")
-                        .disabled(!can_park)
-                        .on_click(move |_, window, cx| {
-                            _ = weak.update(cx, |shell, cx| {
-                                shell.park_intent(
-                                    Some(&close_workspace_target),
-                                    gitterm_core::park::Intent::Close(close_workspace_target.uid),
-                                    window,
-                                    cx,
-                                )
-                            });
-                        })
-                })
                 .item({
                     let weak = close_owner.clone();
                     let close_target = close_target.clone();
@@ -1767,7 +1736,26 @@ impl Render for Shell {
                 .h(px(layout::SESSION_HEIGHT))
                 .bg(rgb(p.mantle))
                 .child(div().flex_1().min_w_0().child(tabs))
+                .child(
+                    Button::new("new-session")
+                        .ghost()
+                        .label("+ Session")
+                        .debug_selector(|| "new-session".into())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_session_picker(window, cx)),
+                        ),
+                )
                 .child(more)
+                .child(
+                    Button::new("close-workspace")
+                        .ghost()
+                        .label("×")
+                        .tooltip("Close workspace (⌘⇧W)")
+                        .debug_selector(|| "close-workspace".into())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_park_sheet(window, cx)),
+                        ),
+                )
                 .border_b_1()
                 .border_color(rgb(p.surface))
                 .h(px(layout::SESSION_HEIGHT + 1.))
@@ -1782,6 +1770,7 @@ impl Render for Shell {
             content = content.child(div().p_2().text_color(rgb(p.red)).child(error.clone()));
         }
         div()
+            .relative()
             .size_full()
             .track_focus(&self.focus)
             .key_context("GitTermShell")
@@ -1793,6 +1782,7 @@ impl Render for Shell {
                     this.select_workspace(a.index, w, cx)
                 }),
             )
+            .on_action(cx.listener(|this, _: &CloseWorkspace, w, cx| this.open_park_sheet(w, cx)))
             .on_action(cx.listener(|this, _: &NewTerminal, w, cx| this.new_terminal(w, cx)))
             .on_action(
                 cx.listener(|this, _: &NewClaudeChat, w, cx| this.new_claude_chat(None, w, cx)),
@@ -1856,6 +1846,8 @@ impl Render for Shell {
                     .children(self.bottom_panel(cx))
                     .child(self.workspace_bar(cx)),
             )
+            .children(self.session_picker.clone())
+            .children(self.park_sheet.clone())
             .into_any_element()
     }
 }
@@ -1874,6 +1866,14 @@ fn load_local_workspaces(
     }
     let save = store.save_async(&model.folders())?;
     Ok((model, save))
+}
+
+fn bind_workspace_keys(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new(
+        "cmd-shift-w",
+        CloseWorkspace,
+        Some("GitTermShell"),
+    )]);
 }
 
 pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
@@ -1913,6 +1913,7 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
                 ),
             ]);
         }
+        bind_workspace_keys(cx);
         cx.bind_keys([KeyBinding::new(
             "alt-/",
             ShowShortcuts,
