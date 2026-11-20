@@ -4,6 +4,8 @@ extern crate gpui_kit as gpui;
 #[cfg(test)]
 mod center_tests;
 pub mod content;
+#[cfg(test)]
+mod content_shell_tests;
 pub mod data;
 mod dialogs;
 pub mod files;
@@ -72,6 +74,7 @@ struct WorkspaceDock {
 }
 pub struct Shell {
     data: Rc<dyn ShellData>,
+    content: Entity<content::window::ContentWindow>,
     workspaces: Vec<WorkspaceDock>,
     owner: Entity<WorkspaceOwner>,
     registry: Rc<RefCell<HashMap<String, gpui::WeakEntity<Pane>>>>,
@@ -105,6 +108,7 @@ impl Shell {
         if local {
             cx.bind_keys([KeyBinding::new("cmd-t", NewTerminal, Some("GitTermShell"))]);
         }
+        let content = cx.new(|cx| content::window::ContentWindow::new(window, cx));
         let catalog = data.workspaces(cx);
         if let Some(first) = catalog.first() {
             owner.update(cx, |owner, cx| {
@@ -152,10 +156,20 @@ impl Shell {
                     .expect("shell owns pane until window closes"),
             )
         });
-        let mut subscriptions = vec![];
+        let mut subscriptions = vec![cx.observe(&content, |this, _, cx| {
+            for state in &this.workspaces {
+                for pane in state.panes.values() {
+                    if matches!(pane.read(cx).content, pane::PaneContent::Content(_)) {
+                        pane.update(cx, |_, cx| cx.notify());
+                    }
+                }
+            }
+            cx.notify();
+        })];
         for state in &mut workspaces {
             load_workspace_layout(state, window, cx)?;
             subscriptions.push(subscribe_dock(state, cx));
+            subscriptions.push(observe_content_dock(&state.dock, cx));
             if local {
                 for pane in state.panes.values() {
                     subscriptions.push(cx.observe(pane, |_, _, cx| cx.notify()));
@@ -174,7 +188,11 @@ impl Shell {
             &owner,
             window,
             |this, _, event: &FileOpen, window, cx| {
-                this.open_review(event, window, cx);
+                if event.from_files && content::window::supported(&event.path) {
+                    this.open_content(event, window, cx);
+                } else {
+                    this.open_review(event, window, cx);
+                }
             },
         ));
         if local {
@@ -184,6 +202,7 @@ impl Shell {
         }
         Ok(Self {
             data,
+            content,
             workspaces,
             owner,
             registry,
@@ -192,6 +211,106 @@ impl Shell {
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
         })
+    }
+    fn open_content(&mut self, event: &FileOpen, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.local {
+            return;
+        }
+        let Some(root) = self.data.terminal_cwd(event.workspace, cx) else {
+            return;
+        };
+        let Ok(relative) = event.path.strip_prefix(&root) else {
+            self.owner.update(cx, |owner, cx| {
+                owner.error = Some(format!(
+                    "Cannot preview {}: outside workspace root",
+                    event.path.display()
+                ));
+                cx.notify();
+            });
+            return;
+        };
+        let Some(state) = self
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace.id == event.workspace)
+        else {
+            return;
+        };
+        let id = content_pane_id(event.workspace, &event.path);
+        if !state.panes.contains_key(&id) {
+            let dark = gpui_component::Theme::global(cx).mode.is_dark();
+            let pane = cx.new(|cx| {
+                Pane::new(
+                    id.clone(),
+                    event
+                        .path
+                        .file_name()
+                        .unwrap_or(event.path.as_os_str())
+                        .to_string_lossy()
+                        .into_owned(),
+                    PaneKind::Content(self.content.clone()),
+                    event.workspace,
+                    self.data.clone(),
+                    window,
+                    cx,
+                )
+            });
+            self.content.update(cx, |content, cx| {
+                content.open(
+                    id.clone(),
+                    content::window::ContentRequest {
+                        root: root.clone(),
+                        relative: relative.to_owned(),
+                        workspace: event.workspace.0,
+                        pane: pane.entity_id().as_u64(),
+                        dark,
+                    },
+                    window,
+                    cx,
+                )
+            });
+            self.registry
+                .borrow_mut()
+                .insert(id.clone(), pane.downgrade());
+            state.panes.insert(id.clone(), pane);
+        }
+        self.content
+            .update(cx, |content, _| content.select(Some(id.clone())));
+        self.show_workspace_pane(event.workspace, &id, window, cx);
+    }
+    fn sync_content_selection(&self, cx: &mut Context<Self>) {
+        let mut visible: Vec<String> = self
+            .workspaces
+            .iter()
+            .filter(|w| Some(w.workspace.id) == self.active_workspace(cx))
+            .flat_map(|state| {
+                state
+                    .panes
+                    .iter()
+                    .filter(|(id, pane)| {
+                        matches!(pane.read(cx).content, pane::PaneContent::Content(_))
+                            && content_pane_visible(state, id, cx)
+                    })
+                    .map(|(id, _)| id.clone())
+            })
+            .collect();
+        visible.sort();
+        let current = self.content.read(cx).selected.clone();
+        let selected = current
+            .filter(|id| visible.contains(id))
+            .or_else(|| visible.into_iter().next());
+        let focus = selected
+            .as_ref()
+            .and_then(|id| {
+                self.workspaces
+                    .iter()
+                    .find_map(|state| state.panes.get(id).map(|pane| pane.focus_handle(cx)))
+            })
+            .unwrap_or_else(|| self.focus.clone());
+        self.content.update(cx, |content, _| {
+            content.set_focus_target(self.focus.clone(), focus);
+            content.select(selected);
+        });
     }
     fn open_review(&mut self, event: &FileOpen, window: &mut Window, cx: &mut Context<Self>) {
         let Some(file) = &event.changed else { return };
@@ -263,6 +382,10 @@ impl Shell {
             .on_click(cx.listener(|this, _, window, cx| this.pick_folder(window, cx)))
     }
     fn pick_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.content.update(cx, |content, cx| {
+            content.picker = true;
+            content.sync_covers(window, cx);
+        });
         let response = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: false,
             directories: true,
@@ -286,6 +409,10 @@ impl Shell {
                 Err(error) => Err(error.into()),
             };
             _ = this.update_in(cx, |this, window, cx| {
+                this.content.update(cx, |content, cx| {
+                    content.picker = false;
+                    content.sync_covers(window, cx);
+                });
                 let result = result.and_then(|folder| {
                     if let Some(folder) = folder {
                         this.add_folder(folder, window, cx)?;
@@ -342,6 +469,8 @@ impl Shell {
             );
             load_workspace_layout(&mut state, window, cx)?;
             self._subscriptions.push(subscribe_dock(&state, cx));
+            self._subscriptions
+                .push(observe_content_dock(&state.dock, cx));
             for pane in state.panes.values() {
                 self._subscriptions
                     .push(cx.observe(pane, |_, _, cx| cx.notify()));
@@ -392,6 +521,7 @@ impl Shell {
                 owner.dispatch(Intent::SelectIndex(index), Instant::now(), cx)
             });
             self.sync_git_visibility(false, cx);
+            self.sync_content_selection(cx);
             self.focus.focus(window, cx);
             cx.notify();
         }
@@ -544,6 +674,7 @@ impl Shell {
         if restoring {
             self.sync_git_visibility(false, cx);
         }
+        self.sync_content_selection(cx);
         pane.focus_handle(cx).focus(window, cx);
         cx.notify();
     }
@@ -621,6 +752,13 @@ fn save_layout(state: &mut WorkspaceDock, cx: &mut Context<Shell>) {
     })
     .detach();
 }
+fn observe_content_dock(dock: &Entity<DockArea>, cx: &mut Context<Shell>) -> Subscription {
+    // Zoom changes notify the dock without emitting a persisted layout change.
+    cx.observe(dock, |shell, _, cx| {
+        shell.sync_content_selection(cx);
+        cx.notify();
+    })
+}
 fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscription {
     let id = state.workspace.id;
     cx.subscribe(&state.dock, move |this, dock, _: &DockEvent, cx| {
@@ -673,12 +811,59 @@ fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscriptio
                 state.active_session = state.sessions.first().map(|s| s.id);
             }
         }
+        let removed: Vec<_> = state
+            .panes
+            .iter()
+            .filter(|(_, pane)| {
+                matches!(pane.read(cx).content, pane::PaneContent::Content(_))
+                    && dock
+                        .read(cx)
+                        .panel(PanelId::from(pane.entity_id()))
+                        .is_none()
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in removed {
+            state.panes.remove(&id);
+            this.registry.borrow_mut().remove(&id);
+            this.content.update(cx, |content, _| content.close(&id));
+        }
         save_layout(state, cx);
+        this.sync_content_selection(cx);
         this.sync_git_visibility(true, cx);
         cx.notify();
     })
 }
+fn content_pane_id(workspace: WorkspaceId, path: &Path) -> String {
+    format!("workspace-{}-content-{:?}", workspace.0, path)
+}
+fn content_pane_visible(state: &WorkspaceDock, id: &str, cx: &App) -> bool {
+    let dock = state.dock.read(cx);
+    if let Some(zoomed) = dock.zoomed_group() {
+        let panel = PanelId::from(state.panes[id].entity_id());
+        return [
+            DockPlacement::Center,
+            DockPlacement::Left,
+            DockPlacement::Right,
+            DockPlacement::Bottom,
+        ]
+        .into_iter()
+        .filter_map(|placement| dock.layout(placement)?.find_node(zoomed))
+        .any(|node| {
+            matches!(node.kind(), gpui_component::dock::PaneRef::Tabs { panels, active_ix }
+                if panels.get(active_ix) == Some(&panel))
+        });
+    }
+    pane_id_visible(state, id, cx)
+}
 fn pane_visible(state: &WorkspaceDock, kind: &str, cx: &App) -> bool {
+    pane_id_visible(
+        state,
+        &format!("workspace-{}-{kind}", state.workspace.layout_key),
+        cx,
+    )
+}
+fn pane_id_visible(state: &WorkspaceDock, id: &str, cx: &App) -> bool {
     use gpui_component::dock::{PanelInfo, PanelState};
     fn visible(node: &PanelState, id: &str) -> bool {
         match &node.info {
@@ -691,12 +876,11 @@ fn pane_visible(state: &WorkspaceDock, kind: &str, cx: &App) -> bool {
         }
     }
     let layout = state.dock.read(cx).dump(cx);
-    let id = format!("workspace-{}-{kind}", state.workspace.layout_key);
-    visible(&layout.center, &id)
+    visible(&layout.center, id)
         || [&layout.left_dock, &layout.right_dock, &layout.bottom_dock]
             .into_iter()
             .flatten()
-            .any(|d| d.open() && visible(d.panel(), &id))
+            .any(|d| d.open() && visible(d.panel(), id))
 }
 fn build_workspace(
     workspace: Workspace,
@@ -885,7 +1069,10 @@ impl Focusable for Shell {
     }
 }
 impl Render for Shell {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_content_selection(cx);
+        self.content
+            .update(cx, |content, cx| content.sync_covers(window, cx));
         let p = Palette::current(cx);
         if self.workspaces.is_empty() {
             return div()
@@ -998,8 +1185,11 @@ impl Render for Shell {
                             .tooltip("New task")
                             .on_click({
                                 let repository = repository.clone();
+                                let content = self.content.clone();
                                 move |_, window, cx| {
-                                    dialogs::new_task(repository.clone(), window, cx)
+                                    dialogs::new_task(repository.clone(), window, cx);
+                                    content
+                                        .update(cx, |content, cx| content.sync_covers(window, cx));
                                 }
                             }),
                     ),
@@ -1150,7 +1340,11 @@ impl Render for Shell {
                 }),
             )
             .on_action(cx.listener(|this, _: &NewTerminal, w, cx| this.new_terminal(w, cx)))
-            .on_action(cx.listener(|_, _: &ShowShortcuts, w, cx| dialogs::shortcuts(w, cx)))
+            .on_action(cx.listener(|this, _: &ShowShortcuts, w, cx| {
+                dialogs::shortcuts(w, cx);
+                this.content
+                    .update(cx, |content, cx| content.sync_covers(w, cx));
+            }))
             .flex()
             .font_family(".SystemUIFont")
             .text_size(px(UI_FONT_SIZE))
