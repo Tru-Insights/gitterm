@@ -26,9 +26,9 @@ use wry::WebViewBuilder;
 
 #[derive(Debug)]
 enum AppEvent {
-    ClaudeLine(String),
-    ClaudeDone,
-    ClaudeError(String),
+    Line(String),
+    Done,
+    Error(String),
 }
 
 const HTML: &str = include_str!("claude_webview_test.html");
@@ -90,7 +90,7 @@ fn main() -> wry::Result<()> {
             } => {
                 *control_flow = ControlFlow::Exit;
             }
-            Event::UserEvent(AppEvent::ClaudeLine(line)) => {
+            Event::UserEvent(AppEvent::Line(line)) => {
                 // Embed the raw JSON line directly — the JS side will JSON.parse.
                 // We have to base64-or-JSON-encode to pass safely; simplest is
                 // to pass it as a JSON string argument that JS then parses.
@@ -102,10 +102,10 @@ fn main() -> wry::Result<()> {
                     eprintln!("[eval] error: {}", e);
                 }
             }
-            Event::UserEvent(AppEvent::ClaudeDone) => {
+            Event::UserEvent(AppEvent::Done) => {
                 let _ = webview.evaluate_script("window.__claudeDone()");
             }
-            Event::UserEvent(AppEvent::ClaudeError(msg)) => {
+            Event::UserEvent(AppEvent::Error(msg)) => {
                 let script = format!("window.__claudeError({})", serde_json::Value::String(msg));
                 let _ = webview.evaluate_script(&script);
             }
@@ -132,8 +132,8 @@ async fn tokio_main(
             Ok(_) => {}
             Err(e) => {
                 eprintln!("[tokio] error: {}", e);
-                let _ = proxy.send_event(AppEvent::ClaudeError(e.to_string()));
-                let _ = proxy.send_event(AppEvent::ClaudeDone);
+                let _ = proxy.send_event(AppEvent::Error(e.to_string()));
+                let _ = proxy.send_event(AppEvent::Done);
             }
         }
     }
@@ -199,12 +199,12 @@ async fn run_claude(
                 }
             }
         }
-        if proxy.send_event(AppEvent::ClaudeLine(line)).is_err() {
+        if proxy.send_event(AppEvent::Line(line)).is_err() {
             // Main thread is gone, bail out.
             break;
         }
     }
     let _ = child.wait().await?;
-    let _ = proxy.send_event(AppEvent::ClaudeDone);
+    let _ = proxy.send_event(AppEvent::Done);
     Ok(captured_session)
 }

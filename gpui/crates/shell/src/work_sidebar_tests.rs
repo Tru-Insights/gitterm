@@ -910,3 +910,265 @@ fn owner_catalog_supplies_mounted_sidebar_read_authority_without_a_gui(
     });
     assert_eq!(tree_snapshot(fixture.root.path()), before);
 }
+
+fn indexed_transcript(
+    home: &std::path::Path,
+    id: &str,
+    cwd: &std::path::Path,
+    title: &str,
+    latest: &str,
+    timestamp: &str,
+) {
+    let path = home
+        .join(".claude/projects/fixture")
+        .join(format!("{id}.jsonl"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let lines = [
+        serde_json::json!({"type":"user", "cwd":cwd, "gitBranch":"main",
+            "timestamp":"2026-11-19T00:00:00Z", "message":{"content":"Opening request"}}),
+        serde_json::json!({"type":"ai-title", "aiTitle": title}),
+        serde_json::json!({"type":"user", "cwd":cwd, "timestamp":timestamp,
+            "message":{"content": latest}}),
+        // Reopening a chat changes the file, but must not change activity time.
+        serde_json::json!({"type":"file-history-snapshot", "timestamp":"2030-01-01T00:00:00Z"}),
+    ];
+    std::fs::write(
+        &path,
+        lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000))
+        .unwrap();
+}
+
+#[test]
+fn indexed_work_uses_iced_titles_latest_and_child_activity_in_iced_order_read_only() {
+    use gitterm_core::tasks::*;
+    let fixture = IcedFixture::new();
+    let home = fixture.root.path().join("harness-home");
+    let cwd = PathBuf::from(&fixture.workspace.dir);
+    indexed_transcript(
+        &home,
+        "root-chat",
+        &cwd,
+        "Real root title",
+        "Latest root request",
+        "2026-11-20T12:00:00Z",
+    );
+    indexed_transcript(
+        &home,
+        "second",
+        &cwd,
+        "Second title",
+        "Latest second request",
+        "2026-11-20T13:00:00Z",
+    );
+    indexed_transcript(
+        &home,
+        "worker",
+        &fixture.repo,
+        "Worker title",
+        "Latest worker request",
+        "2026-11-20T14:00:00Z",
+    );
+    indexed_transcript(
+        &home,
+        "dead",
+        &home.join("missing-cwd"),
+        "Dead title",
+        "Gone",
+        "2026-11-20T15:00:00Z",
+    );
+    let mut file: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.config.join("workspaces.json")).unwrap())
+            .unwrap();
+    file["workspaces"][0]["chats"] = serde_json::json!(["second", "root-chat"]);
+    std::fs::write(
+        fixture.config.join("workspaces.json"),
+        serde_json::to_vec(&file).unwrap(),
+    )
+    .unwrap();
+    let task_path = fixture.config.join("tasks.json");
+    let mut store: TaskStoreDocument =
+        serde_json::from_slice(&std::fs::read(&task_path).unwrap()).unwrap();
+    if let DelegationChild::TaskSession { conversation, .. } = &mut store.delegations[0].child {
+        *conversation = Some(HarnessConversationRef {
+            backend: HarnessConversationBackend::Claude,
+            session_id: "worker".into(),
+        });
+    } else {
+        panic!("fixture task child");
+    }
+    std::fs::write(task_path, serde_json::to_vec(&store).unwrap()).unwrap();
+    let before = tree_snapshot(fixture.root.path());
+    let data = crate::data::IcedWorkData::read_with_home(
+        &fixture.config,
+        Some(&home),
+        1,
+        &fixture.workspace,
+        Focus::Latest,
+    )
+    .unwrap();
+    let state = Rc::new(RefCell::new(State::default()));
+    data.apply(&mut state.borrow_mut());
+    let summary = state.borrow().pane(1).unwrap().summary.clone();
+    let noon = SystemTime::UNIX_EPOCH + Duration::from_secs(1_795_176_000);
+    assert_eq!(
+        summary
+            .coordinators
+            .iter()
+            .map(|c| (c.id.as_str(), c.title.as_str()))
+            .collect::<Vec<_>>(),
+        [("root-chat", "Real root title"), ("second", "Second title")]
+    );
+    let root = &summary.coordinators[0];
+    assert_eq!(root.latest.as_deref(), Some("Latest root request"));
+    assert_eq!(root.mtime, noon);
+    assert_eq!(root.active, noon + Duration::from_secs(7200));
+    assert_eq!(
+        root.children
+            .iter()
+            .map(|c| c.title.as_str())
+            .collect::<Vec<_>>(),
+        ["Worker title"]
+    );
+    let mut sidebar = WorkSidebar::new(data.facts, state);
+    sidebar.repo_recency = data.repo_recency;
+    sidebar.open.insert(Fold::Chat("root-chat".into()));
+    let rows = sidebar.rows();
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.label.starts_with("✦ "))
+            .map(|r| r.label.as_str())
+            .collect::<Vec<_>>(),
+        ["✦ Real root title", "✦ Second title"]
+    );
+    assert!(
+        rows.iter()
+            .find(|r| r.label == "✦ Real root title")
+            .unwrap()
+            .details
+            .iter()
+            .any(|line| line == "↳ Latest root request")
+    );
+    assert_eq!(
+        sidebar.repo_recency(),
+        &[
+            (fixture.repo.clone(), noon + Duration::from_secs(7200)),
+            (cwd, noon + Duration::from_secs(3600))
+        ]
+    );
+    // Without transcripts, task links must not change the previous fallback rows.
+    let fallback = crate::data::IcedWorkData::read_with_home(
+        &fixture.config,
+        Some(&home.join("absent-index")),
+        1,
+        &fixture.workspace,
+        Focus::Latest,
+    )
+    .unwrap();
+    let mut state = State::default();
+    fallback.apply(&mut state);
+    assert!(
+        state
+            .pane(1)
+            .unwrap()
+            .summary
+            .coordinators
+            .iter()
+            .all(|c| c.fan_out.is_none())
+    );
+    assert_eq!(tree_snapshot(fixture.root.path()), before);
+}
+
+#[test]
+fn folder_work_includes_historical_chats_and_missing_index_preserves_fallback() {
+    let fixture = IcedFixture::new();
+    let home = fixture.root.path().join("harness-home");
+    let missing = fixture.root.path().join("absent-home");
+    let before = tree_snapshot(fixture.root.path());
+    let fallback = crate::data::IcedWorkData::read_with_home(
+        &fixture.config,
+        Some(&missing),
+        1,
+        &fixture.workspace,
+        Focus::Latest,
+    )
+    .unwrap();
+    let state = Rc::new(RefCell::new(State::default()));
+    fallback.apply(&mut state.borrow_mut());
+    assert_eq!(
+        state.borrow().pane(1).unwrap().summary.coordinators[0].title,
+        "root-chat"
+    );
+    assert!(fallback.repo_recency.is_empty());
+    assert_eq!(tree_snapshot(fixture.root.path()), before);
+    let mut file: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.config.join("workspaces.json")).unwrap())
+            .unwrap();
+    file["workspaces"][0]["chats"] = serde_json::json!([]);
+    std::fs::write(
+        fixture.config.join("workspaces.json"),
+        serde_json::to_vec(&file).unwrap(),
+    )
+    .unwrap();
+    let cwd = std::path::Path::new(&fixture.workspace.dir);
+    indexed_transcript(
+        &home,
+        "historical",
+        cwd,
+        "Historical folder chat",
+        "Old request",
+        "2026-11-20T11:00:00Z",
+    );
+    indexed_transcript(
+        &home,
+        "root-chat",
+        cwd,
+        "Open chat title",
+        "New request",
+        "2026-11-20T12:00:00Z",
+    );
+    indexed_transcript(
+        &home,
+        "elsewhere",
+        &fixture.repo,
+        "Other workspace",
+        "Other",
+        "2026-11-20T13:00:00Z",
+    );
+    let before = tree_snapshot(fixture.root.path());
+    for _ in 0..2 {
+        let data = crate::data::IcedWorkData::read_with_home(
+            &fixture.config,
+            Some(&home),
+            1,
+            &fixture.workspace,
+            Focus::Latest,
+        )
+        .unwrap();
+        let state = Rc::new(RefCell::new(State::default()));
+        data.apply(&mut state.borrow_mut());
+        let mut sidebar = WorkSidebar::new(data.facts, state);
+        // Fixed timestamp fixtures remain visible after the recent window expires.
+        sidebar.open.insert(Fold::Older);
+        assert_eq!(
+            sidebar
+                .rows()
+                .iter()
+                .filter(|r| r.label.starts_with("✦ "))
+                .map(|r| r.label.as_str())
+                .collect::<Vec<_>>(),
+            ["✦ Open chat title", "✦ Historical folder chat"]
+        );
+    }
+    assert_eq!(tree_snapshot(fixture.root.path()), before);
+}

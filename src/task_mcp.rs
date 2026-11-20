@@ -1258,6 +1258,8 @@ mod tests {
         ServiceExt,
     };
 
+    type BridgedInvocations = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
     #[test]
     fn connection_uses_v6_task_range_and_memory_only_token_environment() {
         let (commands, _requests) = command_channel();
@@ -1384,13 +1386,15 @@ mod tests {
                 envelope.operation,
                 TaskControlOperation::PlanLimits
             ));
-            let mut file = crate::plan_limits::PlanLimitsFile::default();
-            file.claude = Some(crate::plan_limits::claude_limits(
-                &serde_json::json!({
-                    "unifiedWindows":{"seven_day":{"utilization":0.85,"resetsAt":1_800_432_000}}
-                }),
-                1_800_000_000,
-            ));
+            let mut file = crate::plan_limits::PlanLimitsFile {
+                claude: Some(crate::plan_limits::claude_limits(
+                    &serde_json::json!({
+                        "unifiedWindows":{"seven_day":{"utilization":0.85,"resetsAt":1_800_432_000}}
+                    }),
+                    1_800_000_000,
+                )),
+                ..crate::plan_limits::PlanLimitsFile::default()
+            };
             file.claude.as_mut().unwrap().local = Some(true);
             let report = crate::plan_limits::evaluate_policy(&file, 1_800_000_000).report;
             envelope
@@ -1818,7 +1822,7 @@ mod tests {
     fn spawn_delegation_bridge(
         mut requests: TaskControlReceiver,
         store_dir: PathBuf,
-        bridged: Arc<Mutex<Vec<(String, Option<String>)>>>,
+        bridged: BridgedInvocations,
     ) -> tokio::task::JoinHandle<()> {
         use crate::delegations::{self, CallerTab};
         use crate::tasks::{Delegation, TaskStore};
@@ -2067,7 +2071,7 @@ mod tests {
         mut requests: TaskControlReceiver,
         store_dir: PathBuf,
         worker_caller: &'static str,
-        bridged: Arc<Mutex<Vec<(String, Option<String>)>>>,
+        bridged: BridgedInvocations,
     ) -> tokio::task::JoinHandle<()> {
         use crate::delegations::{self, CallerTab};
         use crate::tasks::{Delegation, TaskHandoff, TaskSessionRecord, TaskStore};

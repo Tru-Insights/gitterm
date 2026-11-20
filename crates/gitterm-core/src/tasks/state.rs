@@ -14,6 +14,57 @@ pub struct TaskAuthority {
     pending_workers: HashMap<crate::task_commands::WorkerPreparationId, mutation::PendingWorker>,
 }
 
+impl From<Option<TaskStore>> for TaskAuthority {
+    fn from(store: Option<TaskStore>) -> Self {
+        Self {
+            store,
+            ..Self::default()
+        }
+    }
+}
+
+impl TaskAuthority {
+    /// Transitional Iced/delegation seam. No second writable store is loaded.
+    pub fn store(&self) -> &Option<TaskStore> {
+        &self.store
+    }
+
+    pub fn store_mut(&mut self) -> &mut Option<TaskStore> {
+        &mut self.store
+    }
+
+    pub fn reduce(&self, command: TaskReadCommand) -> TaskReadEffect {
+        let projection = match command.query {
+            TaskRead::List { include_archived } => self
+                .store
+                .as_ref()
+                .ok_or_else(|| "GitTerm's task store is unavailable".to_string())
+                .map(|store| {
+                    TaskProjection::List(
+                        store
+                            .tasks()
+                            .iter()
+                            .filter(|task| include_archived || task.archived_at.is_none())
+                            .cloned()
+                            .collect(),
+                    )
+                }),
+            TaskRead::Get { task_id } => self
+                .store
+                .as_ref()
+                .and_then(|store| store.get(&task_id))
+                .cloned()
+                .map(Box::new)
+                .map(TaskProjection::Get)
+                .ok_or_else(|| format!("Task {task_id} is not available")),
+        };
+        TaskReadEffect {
+            reply: command.reply,
+            projection,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,56 +153,5 @@ mod tests {
         };
         assert!(task.archived_at.is_some());
         assert_eq!(std::fs::read(path).unwrap(), before);
-    }
-}
-
-impl From<Option<TaskStore>> for TaskAuthority {
-    fn from(store: Option<TaskStore>) -> Self {
-        Self {
-            store,
-            ..Self::default()
-        }
-    }
-}
-
-impl TaskAuthority {
-    /// Transitional Iced/delegation seam. No second writable store is loaded.
-    pub fn store(&self) -> &Option<TaskStore> {
-        &self.store
-    }
-
-    pub fn store_mut(&mut self) -> &mut Option<TaskStore> {
-        &mut self.store
-    }
-
-    pub fn reduce(&self, command: TaskReadCommand) -> TaskReadEffect {
-        let projection = match command.query {
-            TaskRead::List { include_archived } => self
-                .store
-                .as_ref()
-                .ok_or_else(|| "GitTerm's task store is unavailable".to_string())
-                .map(|store| {
-                    TaskProjection::List(
-                        store
-                            .tasks()
-                            .iter()
-                            .filter(|task| include_archived || task.archived_at.is_none())
-                            .cloned()
-                            .collect(),
-                    )
-                }),
-            TaskRead::Get { task_id } => self
-                .store
-                .as_ref()
-                .and_then(|store| store.get(&task_id))
-                .cloned()
-                .map(Box::new)
-                .map(TaskProjection::Get)
-                .ok_or_else(|| format!("Task {task_id} is not available")),
-        };
-        TaskReadEffect {
-            reply: command.reply,
-            projection,
-        }
     }
 }

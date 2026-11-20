@@ -682,7 +682,7 @@ mod tests {
         // gets a repo entry from the workspace's own fields.
         for ws in &file.workspaces {
             assert_eq!(ws.home.as_deref(), Some(ws.dir.as_str()));
-            assert_eq!(ws.repos, [ws.dir.clone()]);
+            assert_eq!(ws.repos, std::slice::from_ref(&ws.dir));
             assert!(ws.env_overrides.is_empty());
         }
         assert_eq!(file.repos.len(), 2);
@@ -1848,6 +1848,8 @@ pub struct RemoteSessionConfig {
     pub claude_command: Option<String>,
 }
 
+// Used by app code; focused facade tests do not reference this re-export.
+#[allow(unused_imports)]
 pub use gitterm_core::remote::config::{
     RemoteAgentAuthConfig, RemoteAgentConfig, WorkspaceLocationConfig,
 };

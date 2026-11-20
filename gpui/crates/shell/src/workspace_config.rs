@@ -286,6 +286,21 @@ fn iced_config_dir() -> PathBuf {
     )
 }
 
+/// Iced builds its index from harness transcripts, independently of its config
+/// override. Only the facts directory comes from the resolved Iced catalog.
+/// Both core operations are read-only; catch-up/backfill writers are never run.
+pub(crate) fn read_iced_chat_index(
+    config: &Path,
+    home: &Path,
+) -> Vec<gitterm_core::chats::ChatIndexEntry> {
+    let mut entries = gitterm_core::find::build_local_index(home);
+    gitterm_core::chat_facts::attach_facts(
+        &mut entries,
+        &gitterm_core::chat_facts::facts_dir(config),
+    );
+    entries
+}
+
 // Keep host-owned usage data opaque while parsing the shared settings schema.
 pub(crate) type IcedSettings = gitterm_core::settings::Settings<
     gitterm_core::settings::WorkspaceColor,

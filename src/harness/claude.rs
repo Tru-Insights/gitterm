@@ -1795,9 +1795,11 @@ for line in sys.stdin:
 }
 
 #[cfg(test)]
+#[allow(clippy::duplicate_mod)] // Shared characterization sources are loaded by multiple focused test modules.
 #[path = "../../tests/native-chat/native_chat_claude.rs"]
 mod native_chat_tests;
 
 #[cfg(all(test, unix))]
+#[allow(clippy::duplicate_mod)] // Reuses the process fixture from native chat characterization tests.
 #[path = "../../tests/claude-process/characterization.rs"]
 mod process_characterization;

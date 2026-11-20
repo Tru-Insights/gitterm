@@ -978,7 +978,7 @@ mod tests {
 
     #[test]
     fn legacy_conversation_without_turn_times_still_has_replay_events() {
-        let old_conversation = vec![
+        let old_conversation = [
             AgentEvent::user_prompt("legacy"),
             AgentEvent::Harness(HarnessEvent::TurnCompleted {
                 status: gitterm::harness::TurnStatus::Completed,

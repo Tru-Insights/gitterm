@@ -2258,20 +2258,22 @@ mod tests {
                 .unwrap_err()
                 .contains("requires the model")
         );
-        let mut file = crate::plan_limits::PlanLimitsFile::default();
-        file.codex = Some(crate::plan_limits::PlanLimits {
-            provider: crate::plan_limits::Provider::Codex,
-            observed_at: 1_800_000_000,
-            local: Some(true),
-            windows: vec![crate::plan_limits::LimitWindow {
-                label: "7d".into(),
-                used_percent: Some(95.0),
-                resets_at: Some(1_800_086_400),
-            }],
-            alerts: vec![],
-            plan_type: None,
-            credits: None,
-        });
+        let file = crate::plan_limits::PlanLimitsFile {
+            codex: Some(crate::plan_limits::PlanLimits {
+                provider: crate::plan_limits::Provider::Codex,
+                observed_at: 1_800_000_000,
+                local: Some(true),
+                windows: vec![crate::plan_limits::LimitWindow {
+                    label: "7d".into(),
+                    used_percent: Some(95.0),
+                    resets_at: Some(1_800_086_400),
+                }],
+                alerts: vec![],
+                plan_type: None,
+                credits: None,
+            }),
+            ..crate::plan_limits::PlanLimitsFile::default()
+        };
         let policy = crate::plan_limits::evaluate_policy(&file, 1_800_000_000);
         let configured = Delegation::new_requested(configured, "2026-11-05T12:00:00Z");
         let agent_choice = Delegation::new_requested(agent_choice, "2026-11-05T12:00:00Z");

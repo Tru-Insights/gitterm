@@ -386,6 +386,7 @@ pub(crate) struct IcedWorkData {
     pub facts: crate::work_sidebar::WorkspaceFacts,
     pub tasks: Vec<gitterm_core::tasks::TaskRecord>,
     pub workers: Vec<gitterm_core::tasks::Delegation>,
+    pub repo_recency: Vec<(std::path::PathBuf, std::time::SystemTime)>,
     inputs: gitterm_core::work::state::Inputs,
     summary: gitterm_core::work::summary::WorkSummary,
     branches: Vec<gitterm_core::work::summary::BranchStatus>,
@@ -395,6 +396,20 @@ pub(crate) struct IcedWorkData {
 impl IcedWorkData {
     pub fn read(
         config: &std::path::Path,
+        id: u64,
+        saved: &gitterm_core::workspace_config::WorkspaceConfig,
+        focus: gitterm_core::work::summary::Focus,
+    ) -> anyhow::Result<Self> {
+        // Tests must supply an explicit fixture home, never discover real transcripts.
+        #[cfg(test)]
+        let home: Option<std::path::PathBuf> = None;
+        #[cfg(not(test))]
+        let home = dirs::home_dir();
+        Self::read_with_home(config, home.as_deref(), id, saved, focus)
+    }
+    pub(crate) fn read_with_home(
+        config: &std::path::Path,
+        home: Option<&std::path::Path>,
         id: u64,
         saved: &gitterm_core::workspace_config::WorkspaceConfig,
         focus: gitterm_core::work::summary::Focus,
@@ -484,67 +499,87 @@ impl IcedWorkData {
             .cloned()
             .collect();
         let mut errors = vec![];
-        let mut entries = vec![];
-        // Only Iced-owned facts are read. Transcript homes are outside this read
-        // authority; titles/history/live tab state require a future index feed.
-        let mut pending: Vec<_> = saved
-            .chats
-            .iter()
-            .cloned()
-            .chain(facts.open_chats.iter().cloned())
-            .map(|id| (id.clone(), id))
-            .collect();
-        let mut seen = std::collections::HashSet::new();
-        while let Some((chat, title)) = pending.pop() {
-            if !seen.insert(chat.clone()) {
-                continue;
+        let mut entries = if local {
+            home.map(|home| crate::workspace_config::read_iced_chat_index(config, home))
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+        // The host can later use this snapshot for recent-repo shortcuts. Keep
+        // the index's order and message times, excluding dead directories as Iced does.
+        let mut repo_recency = vec![];
+        for entry in entries.iter().filter(|entry| !entry.dead_cwd) {
+            let repo = entry.group_root();
+            if !repo_recency.iter().any(|(seen, _)| seen == repo) {
+                repo_recency.push((repo.to_owned(), entry.mtime));
             }
-            let path = match gitterm_core::chat_facts::facts_path(
-                &gitterm_core::chat_facts::facts_dir(config),
-                chats::ChatBackend::Claude,
-                &chat,
-            ) {
-                Ok(path) => path,
-                Err(error) => {
-                    errors.push(error);
+        }
+        let links = if entries.is_empty() {
+            vec![]
+        } else {
+            iced_chat_links(&catalog, &store)
+        };
+        // Preserve the existing facts-only rows when no transcript index is available.
+        if entries.is_empty() {
+            let mut pending: Vec<_> = saved
+                .chats
+                .iter()
+                .cloned()
+                .chain(facts.open_chats.iter().cloned())
+                .map(|id| (id.clone(), id))
+                .collect();
+            let mut seen = std::collections::HashSet::new();
+            while let Some((chat, title)) = pending.pop() {
+                if !seen.insert(chat.clone()) {
                     continue;
                 }
-            };
-            let chat_facts = match gitterm_core::chat_facts::load_facts(&path) {
-                Ok(facts) => facts,
-                Err(error) => {
-                    errors.push(error);
-                    None
+                let path = match gitterm_core::chat_facts::facts_path(
+                    &gitterm_core::chat_facts::facts_dir(config),
+                    chats::ChatBackend::Claude,
+                    &chat,
+                ) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        errors.push(error);
+                        continue;
+                    }
+                };
+                let chat_facts = match gitterm_core::chat_facts::load_facts(&path) {
+                    Ok(facts) => facts,
+                    Err(error) => {
+                        errors.push(error);
+                        None
+                    }
+                };
+                if let Some(facts) = &chat_facts {
+                    pending.extend(facts.children.iter().map(|c| {
+                        (
+                            c.session_id.clone(),
+                            c.title.clone().unwrap_or_else(|| c.session_id.clone()),
+                        )
+                    }));
                 }
-            };
-            if let Some(facts) = &chat_facts {
-                pending.extend(facts.children.iter().map(|c| {
-                    (
-                        c.session_id.clone(),
-                        c.title.clone().unwrap_or_else(|| c.session_id.clone()),
-                    )
-                }));
+                entries.push(chats::ChatIndexEntry {
+                    id: chat,
+                    backend: chats::ChatBackend::Claude,
+                    path: path.clone(),
+                    cwd: saved.dir.clone().into(),
+                    repo_root: None,
+                    is_worktree: false,
+                    branch: None,
+                    title,
+                    latest: None,
+                    mtime: std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .unwrap_or(SystemTime::UNIX_EPOCH),
+                    size: 0,
+                    dead_cwd: !Path::new(&saved.dir).exists(),
+                    root_id: None,
+                    facts: chat_facts,
+                });
             }
-            entries.push(chats::ChatIndexEntry {
-                id: chat,
-                backend: chats::ChatBackend::Claude,
-                path: path.clone(),
-                cwd: saved.dir.clone().into(),
-                repo_root: None,
-                is_worktree: false,
-                branch: None,
-                title,
-                latest: None,
-                mtime: std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .unwrap_or(SystemTime::UNIX_EPOCH),
-                size: 0,
-                dead_cwd: !Path::new(&saved.dir).exists(),
-                root_id: None,
-                facts: chat_facts,
-            });
         }
-        gitterm_core::chat_facts::resolve_tree(&mut entries, &[]);
+        gitterm_core::chat_facts::resolve_tree(&mut entries, &links);
         let infos: Vec<_> = store.tasks().iter().map(TaskInfo::from).collect();
         let source = if saved.chats.is_empty() {
             Source::Folder(saved.dir.clone().into())
@@ -666,6 +701,7 @@ impl IcedWorkData {
             facts,
             tasks,
             workers,
+            repo_recency,
             inputs,
             summary,
             branches,
@@ -720,6 +756,142 @@ impl IcedWorkData {
             }
         }
     }
+}
+
+// Read-only counterpart of Iced chat_facts::store_links; no facts are written.
+fn iced_chat_links(
+    catalog: &crate::workspace_config::IcedCatalog,
+    store: &gitterm_core::tasks::TaskStore,
+) -> Vec<gitterm_core::chat_facts::ChildLink> {
+    use gitterm_core::{
+        chat_facts::{ChatChild, ChildKind, ChildLink},
+        tasks::*,
+    };
+    use std::collections::HashMap;
+    let delegations = store.delegations();
+    let tasks = store.tasks();
+    let mut uid_to_chat: HashMap<String, String> = catalog
+        .workspaces
+        .iter()
+        .flat_map(|w| &w.tabs)
+        .filter_map(|t| Some((t.session_uid.clone()?, t.chat_session_id.clone()?)))
+        .collect();
+    for delegation in delegations {
+        if let Some(chat) = &delegation.parent.chat_session_id {
+            uid_to_chat
+                .entry(delegation.parent.session_uid.clone())
+                .or_insert_with(|| chat.clone());
+        }
+    }
+    let task_conversations = |task_id: &str| -> Vec<String> {
+        tasks
+            .iter()
+            .find(|task| task.task_id == task_id)
+            .map(|task| {
+                task.sessions
+                    .iter()
+                    .filter_map(|session| session.conversation.as_ref())
+                    .map(|conversation| conversation.session_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut links = Vec::new();
+    for delegation in delegations {
+        let parent = delegation
+            .parent
+            .chat_session_id
+            .clone()
+            .or_else(|| uid_to_chat.get(&delegation.parent.session_uid).cloned());
+        let Some(parent) = parent else {
+            continue;
+        };
+        let kind = match delegation.kind {
+            DelegationKind::Review => ChildKind::Review,
+            DelegationKind::Implement => ChildKind::Worker,
+            DelegationKind::Consult => ChildKind::Consult,
+        };
+        let title = delegation
+            .brief
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|line| {
+                let mut title: String = line.chars().take(90).collect();
+                if line.chars().count() > 90 {
+                    title.push('…');
+                }
+                title
+            });
+        let child = |session_id: String, kind: ChildKind, task_id: Option<String>| ChatChild {
+            session_id,
+            kind,
+            delegation_id: Some(delegation.delegation_id.clone()),
+            task_id,
+            title: title.clone(),
+        };
+        let children: Vec<ChatChild> = match &delegation.child {
+            DelegationChild::CodexReview { thread_id, .. }
+            | DelegationChild::CodexConsult { thread_id, .. } => thread_id
+                .iter()
+                .map(|thread| child(thread.clone(), kind, None))
+                .collect(),
+            DelegationChild::TaskSession {
+                task_id,
+                conversation,
+                ..
+            } => match conversation {
+                Some(conversation) => vec![child(
+                    conversation.session_id.clone(),
+                    kind,
+                    Some(task_id.clone()),
+                )],
+                None => task_conversations(task_id)
+                    .into_iter()
+                    .map(|session| child(session, kind, Some(task_id.clone())))
+                    .collect(),
+            },
+            DelegationChild::ClaudeSubagent { parent_tool_use_id } => parent_tool_use_id
+                .iter()
+                .map(|id| child(id.clone(), ChildKind::Subagent, None))
+                .collect(),
+        };
+        links.extend(children.into_iter().map(|child| ChildLink {
+            parent: parent.clone(),
+            child,
+        }));
+    }
+    for task in tasks {
+        let Some(creator) = &task.created_by else {
+            continue;
+        };
+        if creator.kind != TaskCreatorKind::Coordinator {
+            continue;
+        }
+        let Some(parent) = creator
+            .session_id
+            .as_ref()
+            .and_then(|uid| uid_to_chat.get(uid))
+        else {
+            continue;
+        };
+        for session in &task.sessions {
+            let Some(conversation) = &session.conversation else {
+                continue;
+            };
+            links.push(ChildLink {
+                parent: parent.clone(),
+                child: ChatChild {
+                    session_id: conversation.session_id.clone(),
+                    kind: ChildKind::Worker,
+                    delegation_id: None,
+                    task_id: Some(task.task_id.clone()),
+                    title: None,
+                },
+            });
+        }
+    }
+    links
 }
 
 struct WorkGit(tokio::runtime::Runtime);

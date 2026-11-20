@@ -7,6 +7,20 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    type RoundTripVariants = (
+        Vec<TaskLifecycle>,
+        Vec<AttemptState>,
+        Vec<ExecutorTarget>,
+        Vec<HarnessKind>,
+        Vec<StoppingBoundary>,
+        Vec<TaskWorktreeState>,
+        Vec<TaskAttentionReason>,
+        Vec<VerificationState>,
+        Vec<IssueProvider>,
+        Vec<WorkspaceLocationIdentity>,
+        Vec<HarnessConversationBackend>,
+    );
+
     #[test]
     fn activity_snapshot_cannot_precede_session_start() {
         let temp = tempfile::tempdir().unwrap();
@@ -1029,7 +1043,7 @@ mod tests {
     #[test]
     fn marking_a_worktree_missing_keeps_its_path() {
         let temp = tempfile::tempdir().unwrap();
-        let mut store = TaskStore::load(&temp.path().join(TASKS_FILE_NAME)).unwrap();
+        let mut store = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
         let mut task = sample_task("task-1");
         task.worktree = TaskWorktree {
             state: TaskWorktreeState::Ready,
@@ -1510,19 +1524,7 @@ mod tests {
             conversation_backends.clone(),
         ))
         .unwrap();
-        let decoded: (
-            Vec<TaskLifecycle>,
-            Vec<AttemptState>,
-            Vec<ExecutorTarget>,
-            Vec<HarnessKind>,
-            Vec<StoppingBoundary>,
-            Vec<TaskWorktreeState>,
-            Vec<TaskAttentionReason>,
-            Vec<VerificationState>,
-            Vec<IssueProvider>,
-            Vec<WorkspaceLocationIdentity>,
-            Vec<HarnessConversationBackend>,
-        ) = serde_json::from_slice(&encoded).unwrap();
+        let decoded: RoundTripVariants = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded.0, lifecycle);
         assert_eq!(decoded.1, attempts);
         assert_eq!(decoded.2, executors);

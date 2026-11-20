@@ -6,10 +6,11 @@ pub use gitterm_core::chat::history::{
 };
 
 #[cfg(test)]
-use super::{HarnessEvent, ItemKind};
+use super::HarnessEvent;
 #[cfg(test)]
 use serde_json::{json, Value};
 
 #[cfg(test)]
+#[allow(clippy::duplicate_mod)] // Shared characterization sources are loaded by multiple focused test modules.
 #[path = "../../tests/native-chat/native_chat_history.rs"]
 mod native_chat_tests;

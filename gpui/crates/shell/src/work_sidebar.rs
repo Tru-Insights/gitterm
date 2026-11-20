@@ -208,6 +208,7 @@ pub struct WorkSidebar {
     edit_subscription: Option<Subscription>,
     tasks: Vec<gitterm_core::tasks::TaskRecord>,
     workers: Vec<gitterm_core::tasks::Delegation>,
+    repo_recency: Vec<(PathBuf, std::time::SystemTime)>,
     source: Option<IcedWorkSource>,
     loading: bool,
     loaded_at: Option<std::time::Instant>,
@@ -226,12 +227,19 @@ impl WorkSidebar {
             edit_subscription: None,
             tasks: vec![],
             workers: vec![],
+            repo_recency: vec![],
             source: None,
             loading: false,
             loaded_at: None,
             focus: Default::default(),
             error: None,
         }
+    }
+
+    /// Distinct live repo roots in Iced's newest-chat order, with exact activity
+    /// times. Available after the background Work load; shortcut wiring is host-owned.
+    pub fn repo_recency(&self) -> &[(PathBuf, std::time::SystemTime)] {
+        &self.repo_recency
     }
 
     fn load(&mut self, force: bool, cx: &mut Context<Self>) {
@@ -280,6 +288,7 @@ impl WorkSidebar {
                         this.workspace = data.facts;
                         this.tasks = data.tasks;
                         this.workers = data.workers;
+                        this.repo_recency = data.repo_recency;
                         this.error = None;
                     }
                     Err(error) => this.error = Some(format!("Load Iced Work: {error:#}")),

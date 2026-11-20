@@ -55,6 +55,7 @@ fn local_list_dir(
 }
 
 #[cfg(test)]
+#[allow(clippy::result_large_err)] // The test interceptor uses tonic's direct `Status` error contract.
 mod tests {
     use super::*;
     use gitterm::agentd::server::{is_authorized_metadata, GitTermAgentService};
