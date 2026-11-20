@@ -11,6 +11,7 @@ pub mod data;
 mod dialogs;
 pub mod files;
 mod files_view;
+pub mod find_sidebar;
 #[cfg(test)]
 mod h2_tests;
 #[cfg(test)]
