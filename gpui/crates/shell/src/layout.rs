@@ -16,7 +16,6 @@ pub const WINDOW_HEIGHT: f32 = 800.;
 pub const SPINE_WIDTH: f32 = 36.;
 pub const SESSION_HEIGHT: f32 = 36.;
 pub const WORKSPACE_BAR_HEIGHT: f32 = 28.;
-pub const BOTTOM_DIVIDER: f32 = 3.;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SidebarMode {
@@ -24,6 +23,7 @@ pub enum SidebarMode {
     Work,
     Files,
     Find,
+    Git,
 }
 
 /// Stored alongside the retained pane inventory in the existing layout file.
@@ -35,6 +35,7 @@ pub struct RegionLayout {
     pub sidebar_mode: SidebarMode,
     pub bottom_height: f32,
     pub bottom_visible: bool,
+    pub bottom_opened: bool,
 }
 impl Default for RegionLayout {
     fn default() -> Self {
@@ -44,6 +45,7 @@ impl Default for RegionLayout {
             sidebar_mode: SidebarMode::Work,
             bottom_height: 200.,
             bottom_visible: true,
+            bottom_opened: false,
         }
     }
 }
@@ -59,7 +61,7 @@ impl RegionLayout {
         }
     }
     pub fn has_bottom(&self, explicit_terminal: bool) -> bool {
-        explicit_terminal && self.bottom_visible
+        (self.bottom_opened || explicit_terminal) && self.bottom_visible
     }
     fn validate(&mut self) -> Result<()> {
         ensure!(
@@ -461,6 +463,7 @@ mod tests {
             sidebar_mode: SidebarMode::Files,
             bottom_height: 321.,
             bottom_visible: false,
+            bottom_opened: true,
         };
         store.save(&fixture()).unwrap();
         let mut restored = LayoutStore::new(path);

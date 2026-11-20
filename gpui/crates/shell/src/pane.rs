@@ -212,6 +212,9 @@ impl Pane {
             }),
         }
     }
+    pub(crate) fn terminal_alive(&self) -> bool {
+        matches!(self.content, PaneContent::Terminal(_)) && !self.exited
+    }
     pub(crate) fn close_terminal(&mut self, cx: &mut App) {
         if let PaneContent::Terminal(view) = &self.content {
             view.update(cx, |view, _| view.backend_mut().cancel());
@@ -386,7 +389,6 @@ impl Render for Pane {
 
 impl crate::Shell {
     /// Mount the retained Git subview when the Work repo route is selected.
-    #[allow(dead_code)] // Coordinator mounts this from the Work repo route in lib.rs.
     pub(crate) fn git_sidebar(&self, sidebar: Stateful<Div>, cx: &Context<Self>) -> Stateful<Div> {
         let state = self.active(cx);
         sidebar.child(
