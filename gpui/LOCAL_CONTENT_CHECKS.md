@@ -56,7 +56,9 @@ has not launched this binary. Omit `nice` if the environment denies setpriority.
    picker covers content throughout and cancellation restores the selected pane.
 6. Resize the window and dock dividers; drag/group/split content tabs. Check
    native bounds include neither dock headers nor other panes. Move between
-   displays/scales (including Retina). Repeat menu/dialog checks during motion.
+   displays/scales (including Retina). Zoom each split content pane in turn,
+   then zoom a non-content pane; verify its content is selected or all native
+   surfaces are hidden respectively. Repeat menu/dialog checks during motion.
 7. Switch tabs/workspaces or close the tab while a snapshot/navigation is pending.
    Verify no late callback restores old content. Snapshot failure, wrong scale,
    timeout and nested stale completion have deterministic headless tests; there

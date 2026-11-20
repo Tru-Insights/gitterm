@@ -169,6 +169,7 @@ impl Shell {
         for state in &mut workspaces {
             load_workspace_layout(state, window, cx)?;
             subscriptions.push(subscribe_dock(state, cx));
+            subscriptions.push(observe_content_dock(&state.dock, cx));
             if local {
                 for pane in state.panes.values() {
                     subscriptions.push(cx.observe(pane, |_, _, cx| cx.notify()));
@@ -288,7 +289,7 @@ impl Shell {
                     .iter()
                     .filter(|(id, pane)| {
                         matches!(pane.read(cx).content, pane::PaneContent::Content(_))
-                            && pane_id_visible(state, id, cx)
+                            && content_pane_visible(state, id, cx)
                     })
                     .map(|(id, _)| id.clone())
             })
@@ -468,6 +469,8 @@ impl Shell {
             );
             load_workspace_layout(&mut state, window, cx)?;
             self._subscriptions.push(subscribe_dock(&state, cx));
+            self._subscriptions
+                .push(observe_content_dock(&state.dock, cx));
             for pane in state.panes.values() {
                 self._subscriptions
                     .push(cx.observe(pane, |_, _, cx| cx.notify()));
@@ -749,6 +752,13 @@ fn save_layout(state: &mut WorkspaceDock, cx: &mut Context<Shell>) {
     })
     .detach();
 }
+fn observe_content_dock(dock: &Entity<DockArea>, cx: &mut Context<Shell>) -> Subscription {
+    // Zoom changes notify the dock without emitting a persisted layout change.
+    cx.observe(dock, |shell, _, cx| {
+        shell.sync_content_selection(cx);
+        cx.notify();
+    })
+}
 fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscription {
     let id = state.workspace.id;
     cx.subscribe(&state.dock, move |this, dock, _: &DockEvent, cx| {
@@ -826,6 +836,25 @@ fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscriptio
 }
 fn content_pane_id(workspace: WorkspaceId, path: &Path) -> String {
     format!("workspace-{}-content-{:?}", workspace.0, path)
+}
+fn content_pane_visible(state: &WorkspaceDock, id: &str, cx: &App) -> bool {
+    let dock = state.dock.read(cx);
+    if let Some(zoomed) = dock.zoomed_group() {
+        let panel = PanelId::from(state.panes[id].entity_id());
+        return [
+            DockPlacement::Center,
+            DockPlacement::Left,
+            DockPlacement::Right,
+            DockPlacement::Bottom,
+        ]
+        .into_iter()
+        .filter_map(|placement| dock.layout(placement)?.find_node(zoomed))
+        .any(|node| {
+            matches!(node.kind(), gpui_component::dock::PaneRef::Tabs { panels, active_ix }
+                if panels.get(active_ix) == Some(&panel))
+        });
+    }
+    pane_id_visible(state, id, cx)
 }
 fn pane_visible(state: &WorkspaceDock, kind: &str, cx: &App) -> bool {
     pane_id_visible(
