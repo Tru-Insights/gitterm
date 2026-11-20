@@ -379,3 +379,448 @@ pub(crate) fn iced_active_tab(saved: &gitterm_core::workspace_config::WorkspaceC
         })
         .unwrap_or(0)
 }
+
+/// A read-only Work load. No store mutation, migration, lease, or index backfill
+/// is performed. The caller runs this blocking work away from the GPUI thread.
+pub(crate) struct IcedWorkData {
+    pub facts: crate::work_sidebar::WorkspaceFacts,
+    pub tasks: Vec<gitterm_core::tasks::TaskRecord>,
+    pub workers: Vec<gitterm_core::tasks::Delegation>,
+    inputs: gitterm_core::work::state::Inputs,
+    summary: gitterm_core::work::summary::WorkSummary,
+    branches: Vec<gitterm_core::work::summary::BranchStatus>,
+    documents: gitterm_core::work::documents::ScanResult,
+    errors: Vec<String>,
+}
+impl IcedWorkData {
+    pub fn read(
+        config: &std::path::Path,
+        id: u64,
+        saved: &gitterm_core::workspace_config::WorkspaceConfig,
+        focus: gitterm_core::work::summary::Focus,
+    ) -> anyhow::Result<Self> {
+        use gitterm_core::{
+            chats,
+            tasks::*,
+            work::{documents, state::*, summary::*},
+        };
+        use std::{
+            collections::HashMap,
+            path::{Path, PathBuf},
+            time::SystemTime,
+        };
+        let catalog = crate::workspace_config::IcedCatalog::read(config)?;
+        let key = crate::workspace_config::iced_layout_key(saved);
+        let saved = catalog
+            .workspaces
+            .iter()
+            .find(|w| crate::workspace_config::iced_layout_key(w) == key)
+            .ok_or_else(|| anyhow::anyhow!("Iced workspace {} is no longer open", saved.name))?;
+        let local = !saved.is_legacy_remote()
+            && !matches!(
+                saved.location,
+                Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. })
+            );
+        let mut facts = crate::work_sidebar::WorkspaceFacts {
+            id,
+            name: saved.name.clone(),
+            dir: saved.dir.clone().into(),
+            home: saved.home_dir().into(),
+            local,
+            repos: vec![],
+            removed: saved.repos_removed.iter().map(PathBuf::from).collect(),
+            auto_added: vec![],
+            open_chats: saved
+                .tabs
+                .iter()
+                .filter_map(|t| t.chat_session_id.clone())
+                .collect(),
+            owned_chats: saved.chats.clone(),
+            chat_owners: catalog
+                .workspaces
+                .iter()
+                .flat_map(|w| w.chats.iter().map(|chat| (chat.clone(), w.name.clone())))
+                .collect(),
+            running_by_repo: HashMap::new(),
+            selected_checkout: None,
+        };
+        let store = TaskStore::load(TaskStore::path_for_config_root(config))?;
+        let equal = |a: &Path, b: &Path| {
+            a.canonicalize().unwrap_or_else(|_| a.to_owned())
+                == b.canonicalize().unwrap_or_else(|_| b.to_owned())
+        };
+        let workspace_root = match &saved.location {
+            Some(gitterm_core::remote::config::WorkspaceLocationConfig::Local { root }) => {
+                Path::new(root)
+            }
+            _ => Path::new(&saved.dir),
+        };
+        let mut tasks: Vec<_> = store.tasks().iter().filter(|t| t.lifecycle != TaskLifecycle::Archived && match (&t.workspace.location, &saved.location) {
+            (WorkspaceLocationIdentity::Local { directory }, _) if local => equal(directory, Path::new(&saved.dir)) || equal(directory, workspace_root),
+            (WorkspaceLocationIdentity::RemoteAgent { remote_id: a, root: ar }, Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { remote_id: b, root: br, .. })) => a == b && ar == br,
+            _ => false,
+        }).cloned().collect();
+        tasks.sort_by(|a, b| {
+            crate::tasks::sort_bucket(a)
+                .cmp(&crate::tasks::sort_bucket(b))
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+        });
+        let workers = store
+            .delegations()
+            .iter()
+            .rev()
+            .filter(|d| {
+                d.dismissed_at.is_none()
+                    && (saved
+                        .tabs
+                        .iter()
+                        .any(|t| t.session_uid.as_deref() == Some(&d.parent.session_uid))
+                        || d.parent
+                            .chat_session_id
+                            .as_ref()
+                            .is_some_and(|id| saved.chats.contains(id))
+                        || (local && equal(&d.parent.cwd, Path::new(&saved.dir))))
+            })
+            .cloned()
+            .collect();
+        let mut errors = vec![];
+        let mut entries = vec![];
+        // Only Iced-owned facts are read. Transcript homes are outside this read
+        // authority; titles/history/live tab state require a future index feed.
+        let mut pending: Vec<_> = saved
+            .chats
+            .iter()
+            .cloned()
+            .chain(facts.open_chats.iter().cloned())
+            .map(|id| (id.clone(), id))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        while let Some((chat, title)) = pending.pop() {
+            if !seen.insert(chat.clone()) {
+                continue;
+            }
+            let path = match gitterm_core::chat_facts::facts_path(
+                &gitterm_core::chat_facts::facts_dir(config),
+                chats::ChatBackend::Claude,
+                &chat,
+            ) {
+                Ok(path) => path,
+                Err(error) => {
+                    errors.push(error);
+                    continue;
+                }
+            };
+            let chat_facts = match gitterm_core::chat_facts::load_facts(&path) {
+                Ok(facts) => facts,
+                Err(error) => {
+                    errors.push(error);
+                    None
+                }
+            };
+            if let Some(facts) = &chat_facts {
+                pending.extend(facts.children.iter().map(|c| {
+                    (
+                        c.session_id.clone(),
+                        c.title.clone().unwrap_or_else(|| c.session_id.clone()),
+                    )
+                }));
+            }
+            entries.push(chats::ChatIndexEntry {
+                id: chat,
+                backend: chats::ChatBackend::Claude,
+                path: path.clone(),
+                cwd: saved.dir.clone().into(),
+                repo_root: None,
+                is_worktree: false,
+                branch: None,
+                title,
+                latest: None,
+                mtime: std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH),
+                size: 0,
+                dead_cwd: !Path::new(&saved.dir).exists(),
+                root_id: None,
+                facts: chat_facts,
+            });
+        }
+        gitterm_core::chat_facts::resolve_tree(&mut entries, &[]);
+        let infos: Vec<_> = store.tasks().iter().map(TaskInfo::from).collect();
+        let source = if saved.chats.is_empty() {
+            Source::Folder(saved.dir.clone().into())
+        } else {
+            Source::Owned(saved.chats.clone())
+        };
+        let summary = SummaryPlan {
+            source: source.clone(),
+            tasks: infos.clone(),
+            focus: focus.clone(),
+            now: SystemTime::now(),
+        }
+        .build(&entries);
+        let task_worktrees = store
+            .tasks()
+            .iter()
+            .filter_map(|t| t.worktree.path.clone())
+            .collect();
+        let mut git = WorkGit(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?,
+        );
+        let mut branches = vec![];
+        if local {
+            for dir in &saved.repos {
+                let path = PathBuf::from(dir);
+                let run_command = catalog
+                    .repos
+                    .iter()
+                    .find(|r| r.dir == *dir && r.key().is_local())
+                    .and_then(|r| r.run_command.clone());
+                facts.repos.push(crate::work_sidebar::RepoFacts {
+                    dir: path.clone(),
+                    local,
+                    run_command,
+                });
+                let common =
+                    gitterm_core::work::documents::GitDiscovery::git_common_dir(&mut git, &path)
+                        .ok();
+                let running = store
+                    .tasks()
+                    .iter()
+                    .filter(|t| {
+                        t.lifecycle == TaskLifecycle::Running
+                            && common
+                                .as_ref()
+                                .is_some_and(|common| equal(&t.repository.common_dir, common))
+                    })
+                    .count();
+                if running > 0 {
+                    facts.running_by_repo.insert(path, running);
+                }
+            }
+            // Iced only lists checkouts owned by the focused work: facts edits,
+            // its child task worktrees, and issue-key matches. A shared repo's
+            // unrelated branches must never be presented as this work's edits.
+            let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_owned());
+            let key_repos: Vec<_> = summary.key_repos.iter().map(|p| canonical(p)).collect();
+            let mut candidates = summary.candidates.clone();
+            for candidate in &mut candidates {
+                candidate.checkout = canonical(&candidate.checkout);
+                candidate.repo = candidate.repo.as_deref().map(canonical);
+            }
+            let mut probes = key_repos.clone();
+            probes.extend(candidates.iter().filter_map(|c| c.repo.clone()));
+            probes.extend(
+                candidates
+                    .iter()
+                    .filter(|c| c.repo.is_none())
+                    .map(|c| c.checkout.clone()),
+            );
+            let mut lists = HashMap::new();
+            let mut seen = std::collections::HashSet::new();
+            for probe in probes {
+                if !seen.insert(probe.clone()) || !probe.is_dir() {
+                    continue;
+                }
+                match gitterm_core::work::documents::GitDiscovery::list_worktrees(&mut git, &probe)
+                {
+                    Ok(list) if !list.is_empty() => {
+                        lists.insert(list[0].path.clone(), list);
+                    }
+                    Ok(_) => {}
+                    Err(error) => errors.push(error),
+                }
+            }
+            for mut owned in resolve_owned(&candidates, &summary.issue_keys, &key_repos, &lists) {
+                owned.gone = !owned.checkout.is_dir();
+                branches.push(git.branch(owned));
+            }
+        } else {
+            errors.push("The overview reads this Mac's chats and checkouts; this workspace is on another machine.".into());
+        }
+        let written = entries
+            .iter()
+            .filter_map(|e| e.facts.as_ref())
+            .flat_map(|f| f.documents.iter().cloned())
+            .collect();
+        let request = documents::ScanRequest {
+            docs_dir: Path::new(&saved.dir).join("docs"),
+            written,
+            repos: facts.repos.iter().map(|r| r.dir.clone()).collect(),
+            task_worktrees,
+        };
+        let documents = if local {
+            documents::scan(&request, &mut git)
+        } else {
+            Default::default()
+        };
+        let inputs = Inputs {
+            workspace: id,
+            source,
+            tasks: infos,
+            focus,
+            documents: local.then_some(request),
+        };
+        Ok(Self {
+            facts,
+            tasks,
+            workers,
+            inputs,
+            summary,
+            branches,
+            documents,
+            errors,
+        })
+    }
+    pub fn apply(&self, state: &mut gitterm_core::work::state::State) {
+        use gitterm_core::work::state::*;
+        use std::time::{Instant, SystemTime};
+        state.reduce(Intent::SetInputs(self.inputs.clone()));
+        let effects = state.reduce(Intent::Open {
+            workspace: self.facts.id,
+            now: Instant::now(),
+            wall_time: SystemTime::now(),
+        });
+        for effect in effects {
+            match effect {
+                Effect::BuildSummary { stamp, .. } => {
+                    for refresh in state.reduce(Intent::SummaryFinished {
+                        stamp,
+                        result: Box::new(Ok(self.summary.clone())),
+                        now: Instant::now(),
+                        visible: true,
+                    }) {
+                        if let Effect::Refresh { stamp, .. } = refresh {
+                            state.reduce(Intent::RefreshFinished {
+                                stamp,
+                                result: RefreshOutcome {
+                                    mode: RefreshMode::Full,
+                                    branches: self.branches.clone(),
+                                    errors: self.errors.clone(),
+                                    git_runs: 0,
+                                    skipped_unchanged: 0,
+                                    took: Default::default(),
+                                },
+                                now: Instant::now(),
+                                visible: true,
+                            });
+                        }
+                    }
+                }
+                Effect::ScanDocuments { stamp, .. } => {
+                    state.reduce(Intent::DocumentsFinished {
+                        stamp,
+                        result: Ok(self.documents.clone()),
+                        now: Instant::now(),
+                    });
+                }
+                // Index backfill would write Iced data and is never executed.
+                _ => {}
+            }
+        }
+    }
+}
+
+struct WorkGit(tokio::runtime::Runtime);
+impl gitterm_core::work::documents::GitDiscovery for WorkGit {
+    fn list_worktrees(
+        &mut self,
+        repo: &std::path::Path,
+    ) -> Result<Vec<gitterm_core::work::summary::WorktreeInfo>, String> {
+        let text = self.text(repo, &["worktree", "list", "--porcelain", "-z"])?;
+        let mut rows = vec![];
+        for field in text.split('\0') {
+            if let Some(path) = field.strip_prefix("worktree ") {
+                rows.push(gitterm_core::work::summary::WorktreeInfo {
+                    path: path.into(),
+                    branch: None,
+                });
+            } else if let Some(branch) = field.strip_prefix("branch refs/heads/")
+                && let Some(row) = rows.last_mut()
+            {
+                row.branch = Some(branch.into());
+            }
+        }
+        Ok(rows)
+    }
+    fn git_common_dir(&mut self, root: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        let path = self.text(
+            root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        Ok(path.trim().into())
+    }
+}
+impl WorkGit {
+    fn text(&self, root: &std::path::Path, args: &[&str]) -> Result<String, String> {
+        let mut read_args = vec!["--no-optional-locks"];
+        read_args.extend_from_slice(args);
+        self.0.block_on(gitterm_core::git_facts::git_text(
+            root,
+            &read_args,
+            gitterm_core::git_facts::GIT_TIMEOUT,
+        ))
+    }
+    fn branch(
+        &self,
+        owned: gitterm_core::work::summary::OwnedBranch,
+    ) -> gitterm_core::work::summary::BranchStatus {
+        use gitterm_core::{git_facts::*, work::summary::*};
+        let mut errors = vec![];
+        let status = if owned.gone {
+            None
+        } else {
+            let mut counts = StatusCounts::default();
+            match self.0.block_on(run_git_lines(
+                &owned.checkout,
+                &[
+                    "--no-optional-locks",
+                    "status",
+                    "--porcelain=v2",
+                    "--branch",
+                ],
+                GIT_TIMEOUT,
+                |line| counts.observe(line, STATUS_COUNT_CAP),
+            )) {
+                Ok(()) => Some(counts),
+                Err(error) => {
+                    errors.push(error);
+                    None
+                }
+            }
+        };
+        let mut candidates = base_candidates(
+            owned.task.as_ref().map(|t| t.base.as_str()),
+            status
+                .as_ref()
+                .and_then(|s| s.head.as_deref())
+                .or(owned.branch.as_deref()),
+            status.as_ref().and_then(|s| s.upstream.as_deref()),
+        );
+        let (base, vs_base) = if owned.gone {
+            (None, None)
+        } else {
+            match self
+                .0
+                .block_on(measure_bases(&owned.checkout, &mut candidates, &mut 0))
+            {
+                Ok(measured) => choose_nearest(&candidates, &measured)
+                    .map_or((None, None), |(base, counts)| (Some(base), Some(counts))),
+                Err(error) => {
+                    errors.push(error);
+                    (None, None)
+                }
+            }
+        };
+        BranchStatus {
+            owned,
+            base,
+            status,
+            vs_base,
+            error: (!errors.is_empty()).then(|| errors.join("; ")),
+            stamp: GitdirStamp::default(),
+            checked_at: std::time::SystemTime::now(),
+        }
+    }
+}

@@ -9,7 +9,7 @@ use copy::CopyTarget;
 use find::TranscriptFind;
 
 use crate::{
-    ChatIntent,
+    ChatAppearance, ChatIntent,
     adapter::{Presentation, Receipt, ReceiptState, Update},
     cards::CardView,
     events::{Entry, HarnessEvent, Record},
@@ -42,12 +42,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-
-const BASE: u32 = 0x1e1e2e;
-const MANTLE: u32 = 0x181825;
-const FG: u32 = 0xbac2de;
-const MUTED: u32 = 0x7f849c;
-const BORDER: u32 = 0x45475a;
 
 actions!(
     native_chat,
@@ -125,6 +119,7 @@ pub fn init(cx: &mut App) {
 /// Owns the document model and retained selection/fold state independently of list layout.
 /// Rich-text state is initialized only for visited rows; it is not the event source of truth.
 pub struct ChatView {
+    appearance: ChatAppearance,
     records: Arc<Vec<Record>>,
     preview: bool,
     composer: Entity<TextareaState>,
@@ -227,6 +222,7 @@ impl ChatView {
         let mut composer_state = crate::composer::ComposerState::default();
         composer_state.project(&fixture_composer, None);
         Self {
+            appearance: ChatAppearance::default(),
             records: Arc::new(records),
             preview: false,
             composer,
@@ -265,6 +261,30 @@ impl ChatView {
             _subscriptions: subscriptions,
         }
     }
+    /// Apply host settings to retained rows without discarding folds, drafts or selection.
+    pub fn set_appearance(&mut self, appearance: ChatAppearance, cx: &mut Context<Self>) {
+        let appearance = appearance.normalized();
+        if self.appearance == appearance {
+            return;
+        }
+        self.appearance = appearance;
+        for row in self.row_views.iter().flatten() {
+            row.update(cx, |row, cx| {
+                row.appearance = appearance;
+                cx.notify();
+            });
+        }
+        self.scroller.update(cx, |state, cx| {
+            state.remeasure_items(0..self.model.rows.len(), cx);
+        });
+        if let Some(saved) = &self.find.saved_scroller {
+            saved.update(cx, |state, cx| {
+                state.remeasure_items(0..self.model.rows.len(), cx);
+            });
+        }
+        cx.notify();
+    }
+
     /// Supply the chat's worker/task roster without giving the view runtime ownership.
     // TODO: shell::chat::ChatPane should project its task/delegation registry here
     // once the shared workspace owner exposes those workers to this pane.
@@ -686,6 +706,7 @@ impl ChatView {
             if let Some(open) = open {
                 view.open = open;
             }
+            view.appearance = self.appearance;
             view.turn_collapsed = turn_collapsed;
             view.hidden_by_turn =
                 turn_collapsed && turn.as_ref().is_some_and(|turn| turn.contains(index));
@@ -746,7 +767,7 @@ impl ChatView {
             .gap(px(6.))
             .p(px(10.))
             .border_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(self.appearance.palette().border))
             .rounded(px(6.))
             .when(position > 0, |panel| {
                 panel.child("Earlier worker requests · read-only")
@@ -913,6 +934,7 @@ impl Focusable for ChatView {
 }
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.appearance.palette();
         let send_blocked = self.send_blocked(window, cx);
         let owner = cx.entity().downgrade();
         let copy_owner = owner.clone();
@@ -983,16 +1005,16 @@ impl Render for ChatView {
             .flex_col()
             .gap(px(8.))
             .p(px(10.))
-            .bg(rgb(BASE))
-            .text_color(rgb(FG))
+            .bg(rgb(palette.base))
+            .text_color(rgb(palette.fg))
             .font_family(".SystemUIFont")
-            .text_size(px(15.))
+            .text_size(px(self.appearance.font_size))
             .when(self.find_open, |view| view.child(self.find_bar(cx)))
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
-                    .bg(rgb(MANTLE))
+                    .bg(rgb(palette.alt))
                     .rounded(px(8.))
                     .child(
                         MessageScroller::new(
@@ -1035,11 +1057,11 @@ impl Render for ChatView {
                     .px(px(8.))
                     .pt(px(6.))
                     .pb(px(8.))
-                    .bg(rgb(0x2a2b3d))
+                    .bg(rgb(palette.footer))
                     .border_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(palette.border))
                     .rounded(px(10.))
-                    .child(self.composer_state.render_activity())
+                    .child(self.composer_state.render_activity(self.appearance))
                     .child(self.pending_panel(window, cx))
                     .children(
                         self.submission
@@ -1056,8 +1078,8 @@ impl Render for ChatView {
                                 div()
                                     .id(("chat-command-error", index))
                                     .debug_selector(|| "chat-command-error".into())
-                                    .text_size(px(15. * 12. / 14.))
-                                    .text_color(rgb(0xf38ba8))
+                                    .text_size(px(self.appearance.size(12.)))
+                                    .text_color(rgb(palette.err))
                                     .child(receipt.state.label())
                             }),
                     )
@@ -1071,6 +1093,7 @@ impl Render for ChatView {
                         }),
                         send_blocked,
                         &self.slash_scroll,
+                        self.appearance,
                         window,
                         cx,
                     ))
@@ -1078,6 +1101,7 @@ impl Render for ChatView {
                         &self.roster,
                         &self.roster_hidden,
                         crate::composer::now_ms(),
+                        self.appearance,
                         cx,
                     )),
             )
@@ -1085,6 +1109,9 @@ impl Render for ChatView {
 }
 
 struct RowView {
+    appearance: ChatAppearance,
+    sent_images: Vec<Result<attachments::Thumbnail, String>>,
+    preparing_sent_images: Option<Task<()>>,
     row: Row,
     text: Entity<TextViewState>,
     diffs: Vec<Entity<DiffState>>,
@@ -1126,6 +1153,9 @@ impl RowView {
         });
         let open = !row.collapsible();
         let mut view = Self {
+            appearance: ChatAppearance::default(),
+            sent_images: vec![],
+            preparing_sent_images: None,
             row,
             text,
             diffs: vec![],
@@ -1147,15 +1177,20 @@ impl RowView {
             turn_toggle: Rc::new(|_, _| {}),
         };
         view.make_diffs(cx);
+        view.prepare_sent_images(cx);
         view
     }
     fn set_row(&mut self, row: Row, cx: &mut Context<Self>) {
         let edits_changed = self.row.edits() != row.edits();
+        let images_changed = self.row.images != row.images;
         self.text
             .update(cx, |text, cx| text.set_text(&row.body, cx));
         self.row = row;
         if edits_changed {
             self.make_diffs(cx);
+        }
+        if images_changed {
+            self.prepare_sent_images(cx);
         }
         cx.notify();
     }
@@ -1187,10 +1222,13 @@ impl Render for RowView {
             return div().h(px(0.)).mb(px(0.)).into_any_element();
         }
         self.highlight(cx);
+        let palette = self.appearance.palette();
         let color = match self.row.kind {
-            RowKind::User => 0xa6e3a1,
-            RowKind::Thinking | RowKind::Status => MUTED,
-            RowKind::Tool if self.row.tool.as_ref().is_some_and(|tool| tool.is_error) => 0xf38ba8,
+            RowKind::User => palette.user,
+            RowKind::Thinking | RowKind::Status => palette.muted,
+            RowKind::Tool if self.row.tool.as_ref().is_some_and(|tool| tool.is_error) => {
+                palette.err
+            }
             RowKind::Tool
                 if self
                     .row
@@ -1198,13 +1236,13 @@ impl Render for RowView {
                     .as_ref()
                     .is_some_and(|tool| tool.output.is_some()) =>
             {
-                0x94e2d5
+                palette.result
             }
-            RowKind::Tool => 0xfab387,
-            RowKind::Error => 0xf38ba8,
-            RowKind::Permission | RowKind::Question => 0xf9e2af,
-            RowKind::Worker | RowKind::Delegation => 0x94e2d5,
-            _ => FG,
+            RowKind::Tool => palette.tool,
+            RowKind::Error => palette.err,
+            RowKind::Permission | RowKind::Question => palette.warn,
+            RowKind::Worker | RowKind::Delegation => palette.result,
+            _ => palette.fg,
         };
         let content = div()
             .flex()
@@ -1214,16 +1252,17 @@ impl Render for RowView {
             .children(
                 self.diff_error
                     .clone()
-                    .map(|error| div().text_color(rgb(0xf38ba8)).child(error)),
+                    .map(|error| div().text_color(rgb(palette.err)).child(error)),
             )
             .children(
                 self.diffs
                     .iter()
                     .map(|diff| div().h(px(260.)).child(Diff::new(diff))),
             )
+            .children((!self.row.images.is_empty()).then(|| self.render_sent_images()))
             .child(self.copyable_text(cx));
         let header = div()
-            .text_size(px(13.))
+            .text_size(px(self.appearance.size(13.)))
             .text_color(rgb(color))
             .child(self.row.title.clone())
             .when(self.row.kind == RowKind::Assistant, |header| {
@@ -1245,20 +1284,29 @@ impl Render for RowView {
             });
         div()
             .id(("row", self.row.id))
+            .text_size(px(self.appearance.font_size))
+            .text_color(rgb(match self.row.kind {
+                RowKind::Thinking | RowKind::Status => palette.muted,
+                RowKind::Error => palette.err,
+                _ => palette.fg,
+            }))
+            .font_family(".SystemUIFont")
             .w_full()
             .max_w(px(960.))
             .mx_auto()
             .mb(px(10.))
             .when(!self.row.scope.is_empty(), |view| {
-                view.ml(px(18.)).border_l_2().border_color(rgb(BORDER))
+                view.ml(px(18.))
+                    .border_l_2()
+                    .border_color(rgb(palette.border))
             })
             .when(self.row.kind == RowKind::User, |view| {
                 view.max_w(px(816.))
                     .ml_auto()
                     .mr_0()
-                    .bg(rgb(0x313244))
+                    .bg(rgb(palette.block))
                     .border_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(palette.border))
                     .rounded(px(10.))
             })
             .when(
@@ -1267,7 +1315,7 @@ impl Render for RowView {
                     RowKind::Tool | RowKind::Permission | RowKind::Question | RowKind::Delegation
                 ),
                 |view| {
-                    view.bg(rgb(BASE))
+                    view.bg(rgb(palette.base))
                         .border_1()
                         .border_l_3()
                         .border_color(rgb(color))

@@ -231,6 +231,7 @@ impl ChatPane {
         };
         let view = cx.new(|cx| {
             let mut view = ChatView::new(vec![], window, cx);
+            view.set_appearance(crate::theme::chat_appearance(cx), cx);
             view.set_preview(cx);
             view.set_read_only(Some("Preview activation unavailable".into()), cx);
             view
@@ -296,6 +297,7 @@ impl ChatPane {
         let controller = Controller::new();
         let view = cx.new(|cx| {
             let mut view = ChatView::new(saved.records.clone(), window, cx);
+            view.set_appearance(crate::theme::chat_appearance(cx), cx);
             view.set_preview(cx);
             view.set_read_only(
                 Some("Preview history · read only · resume not in preview yet".into()),
@@ -355,6 +357,19 @@ impl ChatPane {
                     at_ms: None,
                     entry: Entry::Harness(event.clone()),
                 }),
+                AgentEvent::Other(value)
+                    if value["type"] == "user_prompt" && value.get("images").is_some() =>
+                {
+                    Some(Record {
+                        at_ms: None,
+                        entry: match serde_json::from_value(value.clone()) {
+                            Ok(prompt) => Entry::SubmittedPrompt(prompt),
+                            Err(_) => Entry::Harness(HarnessEvent::Error(
+                                "Invalid saved image prompt".into(),
+                            )),
+                        },
+                    })
+                }
                 AgentEvent::Other(value) if value["type"] == "user_prompt" => {
                     value["text"].as_str().map(|text| Record {
                         at_ms: None,
@@ -529,6 +544,9 @@ impl Drop for RuntimeShutdown {
 
 impl Render for ChatPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.view.update(cx, |view, cx| {
+            view.set_appearance(crate::theme::chat_appearance(cx), cx);
+        });
         for update in std::mem::take(&mut self.pending) {
             self.view.update(cx, |view, cx| {
                 view.present(
@@ -573,4 +591,44 @@ fn find_claude(path: Option<std::ffi::OsString>, home: Option<PathBuf>) -> Resul
         .ok_or_else(|| {
             anyhow::anyhow!("Claude executable not found in PATH or the usual install folders")
         })
+}
+
+#[cfg(test)]
+mod appearance_tests {
+
+    #[gpui::test]
+    fn loaded_chat_font_is_independent_and_theme_refresh_retains_it(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(|cx| {
+            let settings = crate::settings::FixtureSettings {
+                theme: "light".into(),
+                chat_font_size: 19.,
+                ui_font_size: 12.,
+                terminal_font_size: 17.,
+                ..Default::default()
+            };
+            crate::theme::apply_settings(&settings, None, cx);
+            assert_eq!(
+                crate::theme::chat_appearance(cx),
+                gitterm_gpui_chat::ChatAppearance {
+                    light: true,
+                    font_size: 19.
+                }
+            );
+            crate::theme::apply(true, None, cx);
+            assert_eq!(
+                crate::theme::chat_appearance(cx),
+                gitterm_gpui_chat::ChatAppearance {
+                    light: false,
+                    font_size: 19.
+                }
+            );
+            let updated = crate::settings::FixtureSettings {
+                chat_font_size: 22.,
+                ..settings
+            };
+            crate::theme::apply_settings(&updated, None, cx);
+            assert_eq!(crate::theme::chat_appearance(cx).font_size, 22.);
+        });
+    }
 }

@@ -52,6 +52,7 @@ pub struct Row {
     pub scope: String,
     pub title: String,
     pub body: String,
+    pub images: Vec<gitterm_core::chat::types::ImageAttachment>,
     pub tool: Option<Tool>,
     pub decision: Option<DecisionState>,
     pub request: Option<Request>,
@@ -189,17 +190,47 @@ impl ChatModel {
                 Entry::Harness(HarnessEvent::UserMessageEcho {
                     id: value["id"].as_str().map(str::to_owned),
                     text: text.into(),
-                    image_count: value["images"].as_array().map_or_else(
-                        || value["image_count"].as_u64().unwrap_or(0) as usize,
-                        Vec::len,
-                    ),
+                    image_count: value["image_count"].as_u64().unwrap_or(0) as usize,
                     delivery,
                 })
             }
             _ => return vec![],
         };
+        let images = match event {
+            AgentEvent::Other(value) if value["type"] == "user_prompt" => {
+                let parsed = value
+                    .get("images")
+                    .map(|images| {
+                        serde_json::from_value::<Vec<gitterm_core::chat::types::ImageAttachment>>(
+                            images.clone(),
+                        )
+                        .map_err(|_| "Invalid sent image payload".to_string())
+                        .and_then(|images| {
+                            gitterm_core::chat::types::validate_images(&images)?;
+                            Ok(images)
+                        })
+                    })
+                    .transpose();
+                match parsed {
+                    Ok(images) => Some(images.unwrap_or_default()),
+                    Err(error) => {
+                        return self.apply(&Record {
+                            at_ms: None,
+                            entry: Entry::Harness(HarnessEvent::Error(error)),
+                        });
+                    }
+                }
+            }
+            _ => None,
+        };
         let at_ms = self.recorded_time.take();
-        self.apply(&Record { at_ms, entry })
+        let changed = self.apply(&Record { at_ms, entry });
+        if let Some(images) = images
+            && let Some(&index) = changed.first()
+        {
+            self.rows[index].images = images;
+        }
+        changed
     }
     fn push(&mut self, kind: RowKind, scope: &str, title: String, body: String) -> usize {
         let index = self.rows.len();
@@ -209,6 +240,7 @@ impl ChatModel {
             scope: scope.into(),
             title,
             body,
+            images: vec![],
             tool: None,
             decision: None,
             request: None,
@@ -229,6 +261,12 @@ impl ChatModel {
             Entry::UserPrompt(text) => {
                 self.streams.remove(scope);
                 changed.push(self.push(RowKind::User, scope, "You".into(), literal(text)));
+            }
+            Entry::SubmittedPrompt(prompt) => {
+                self.recorded_time = at;
+                changed.extend(self.apply_agent(
+                    &gitterm_core::chat::state::AgentEvent::submitted_prompt(prompt, false),
+                ));
             }
             Entry::Harness(event) => self.event(event, at, scope, changed),
             Entry::DisplayDecision {
@@ -897,6 +935,57 @@ mod tests {
             entry: Entry::Harness(event),
         }
     }
+    #[test]
+    fn sent_images_survive_projection_lifecycle_and_saved_record_replay() {
+        use gitterm_core::chat::{
+            state::AgentEvent,
+            types::{ImageAttachment, UserPrompt},
+        };
+        let prompt = UserPrompt {
+            text: "with image".into(),
+            images: vec![ImageAttachment {
+                media_type: "image/png".into(),
+                data: "aGVsbG8=".into(),
+            }],
+            id: Some("sent".into()),
+        };
+        let event = AgentEvent::submitted_prompt(&prompt, false);
+        let mut model = ChatModel::from_conversation(std::slice::from_ref(&event));
+        assert_eq!(model.rows[0].images, prompt.images);
+        assert!(!model.rows[0].body.contains("not relayed"));
+        model.apply_agent(&AgentEvent::Harness(HarnessEvent::MessageLifecycle {
+            id: "sent".into(),
+            state: MessageState::Started,
+        }));
+        assert_eq!(model.rows[0].images, prompt.images);
+        model.apply_agent(&event);
+        assert_eq!(model.rows.len(), 1, "duplicate echoes stay deduplicated");
+        let saved = Record {
+            at_ms: None,
+            entry: Entry::SubmittedPrompt(prompt.clone()),
+        };
+        let json = serde_json::to_string(&saved).unwrap();
+        let restored = ChatModel::from_records(&parse_fixture(&json).unwrap());
+        assert_eq!(restored.rows[0].images, prompt.images);
+        let remote = ChatModel::from_conversation(&[AgentEvent::Other(json!({
+            "type": "user_prompt", "text": "remote", "image_count": 2
+        }))]);
+        assert!(remote.rows[0].images.is_empty());
+        assert!(remote.rows[0].body.contains("not relayed"));
+    }
+
+    #[test]
+    fn invalid_sent_images_show_an_error_without_exposing_payload() {
+        let model = ChatModel::from_conversation(&[gitterm_core::chat::state::AgentEvent::Other(
+            json!({
+                "type": "user_prompt", "text": "bad image", "images": [{ "media_type": "text/html", "data": "private-payload" }]
+            }),
+        )]);
+        assert_eq!(model.rows[0].kind, RowKind::Error);
+        assert!(!model.rows[0].body.contains("private-payload"));
+        assert!(model.rows[0].images.is_empty());
+    }
+
     #[test]
     fn fixtures_build_stable_rows_and_do_not_merge_workers_into_parent() {
         let records = parse_fixture(include_str!("../fixtures/showcase.jsonl")).unwrap();
