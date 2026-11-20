@@ -1,0 +1,436 @@
+use super::*;
+use crate::delegation_request::ConsultDelegationRequest;
+use crate::plan_limits::{evaluate_policy, LimitWindow, PlanLimits, PlanLimitsFile, Provider};
+use crate::tasks::{
+    DelegationResult, DelegationStatus, TaskHandoff, WorkspaceIdentity, WorkspaceLocationIdentity,
+};
+
+fn caller() -> Caller {
+    let tab = CallerTab {
+        session_uid: "caller".into(),
+        chat_session_id: Some("chat".into()),
+        workspace: "fixture".into(),
+        cwd: "/fixture/repo".into(),
+        remote: false,
+        home: "/fixture/repo".into(),
+        repos: vec![],
+    };
+    Caller {
+        authority: WorkerCaller {
+            target: crate::session::Target {
+                tab_id: 1,
+                session_uid: tab.session_uid.clone(),
+                task_id: None,
+                task_session_id: None,
+            },
+            chat_session_id: tab.chat_session_id.clone(),
+            workspace: WorkspaceIdentity {
+                name: tab.workspace.clone(),
+                location: WorkspaceLocationIdentity::Local {
+                    directory: tab.home.clone(),
+                },
+            },
+            repository: None,
+            repository_workdir: None,
+            checkout: tab.cwd.clone(),
+            home: tab.home.clone(),
+            repos: vec![],
+            remote: false,
+        },
+        tab,
+    }
+}
+fn request(previous: Option<String>) -> Box<NewDelegation> {
+    Box::new(
+        delegations::consult_delegation(
+            &ConsultDelegationRequest {
+                brief: "Inspect parser".into(),
+                ..Default::default()
+            },
+            &caller().tab,
+            None,
+            previous,
+        )
+        .unwrap(),
+    )
+}
+fn record(id: &str) -> Delegation {
+    let mut d = Delegation::new_requested(*request(None), "t0");
+    d.delegation_id = id.into();
+    d
+}
+fn stored(state: &mut State, id: &str) {
+    state.reduce(Intent::Stored {
+        id: id.into(),
+        caller: caller(),
+    });
+}
+fn admit(
+    state: &mut State,
+    records: &[Delegation],
+    cap: usize,
+    limits: &PlanLimitsFile,
+    workers: usize,
+) -> Vec<Effect> {
+    state.reduce(Intent::Admit {
+        delegations: records,
+        running: &HashSet::new(),
+        callers: &HashMap::from([("caller".into(), caller())]),
+        max_concurrent: cap,
+        policy: &evaluate_policy(limits, 1_800_000_000),
+        running_workers: workers,
+    })
+}
+fn starts(effects: &[Effect]) -> Vec<&str> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Start(id) => Some(id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+fn hold() -> PlanLimitsFile {
+    let mut file = PlanLimitsFile::default();
+    file.absorb(PlanLimits {
+        provider: Provider::Codex,
+        observed_at: 1_800_000_000,
+        local: Some(true),
+        windows: vec![LimitWindow {
+            label: "7d".into(),
+            used_percent: Some(99.0),
+            resets_at: Some(1_800_086_400),
+        }],
+        alerts: vec![],
+        plan_type: None,
+        credits: None,
+    });
+    file
+}
+
+#[test]
+fn admission_reserves_before_launch_and_preserves_cap_policy_and_override() {
+    let mut state = State::default();
+    let mut records = vec![record("a"), record("b")];
+    for d in &records {
+        stored(&mut state, &d.delegation_id);
+    }
+    assert!(admit(&mut state, &records, 2, &hold(), 0).is_empty());
+    records[1].options.user_model_choice = true;
+    assert_eq!(
+        starts(&admit(&mut state, &records, 0, &hold(), 0)),
+        vec!["b"]
+    );
+    assert!(state.busy());
+    assert!(admit(&mut state, &records, 1, &PlanLimitsFile::default(), 0).is_empty());
+    // No host handle has been installed: reservation still owns the slot.
+    assert_eq!(
+        starts(&admit(
+            &mut state,
+            &records,
+            2,
+            &PlanLimitsFile::default(),
+            0
+        )),
+        vec!["a"]
+    );
+    assert!(admit(&mut state, &records, 2, &PlanLimitsFile::default(), 0).is_empty());
+}
+
+#[test]
+fn host_handles_and_reservations_are_counted_as_a_union() {
+    let mut state = State::default();
+    let records = vec![record("a"), record("b")];
+    for d in &records {
+        stored(&mut state, &d.delegation_id);
+    }
+    assert_eq!(
+        starts(&admit(
+            &mut state,
+            &records[..1],
+            1,
+            &PlanLimitsFile::default(),
+            0
+        )),
+        vec!["a"]
+    );
+    let effects = state.reduce(Intent::Admit {
+        delegations: &records,
+        running: &HashSet::from(["a".into()]),
+        callers: &HashMap::from([("caller".into(), caller())]),
+        max_concurrent: 2,
+        policy: &evaluate_policy(&PlanLimitsFile::default(), 1_800_000_000),
+        running_workers: 0,
+    });
+    assert_eq!(starts(&effects), vec!["b"]);
+}
+
+#[test]
+fn checked_request_rejects_stale_incarnations_roots_and_duplicate_callbacks() {
+    for change in 0..7 {
+        let mut state = State::default();
+        let Effect::Check {
+            request: ticket,
+            new,
+            ..
+        } = state
+            .reduce(Intent::Request {
+                new: request(None),
+                caller: caller(),
+            })
+            .pop()
+            .unwrap()
+        else {
+            panic!()
+        };
+        let mut live = caller();
+        match change {
+            0 => live.authority.target.tab_id += 1,
+            1 => live.tab.chat_session_id = Some("other".into()),
+            2 => live.authority.checkout = "/other".into(),
+            3 => live.tab.repos.push("/extra".into()),
+            4 => live.authority.workspace.name = "moved".into(),
+            5 => live.tab.remote = true,
+            _ => live.authority.home = "/other".into(),
+        }
+        assert!(matches!(
+            state
+                .reduce(Intent::Checked {
+                    request: ticket,
+                    new: new.clone(),
+                    caller: Some(&live),
+                    result: Ok(())
+                })
+                .as_slice(),
+            [Effect::Rejected(_)]
+        ));
+        assert!(state
+            .reduce(Intent::Checked {
+                request: ticket,
+                new,
+                caller: Some(&caller()),
+                result: Ok(())
+            })
+            .is_empty());
+    }
+}
+
+#[test]
+fn queued_admission_revalidates_the_original_caller() {
+    let mut state = State::default();
+    stored(&mut state, "a");
+    let mut live = caller();
+    live.authority.target.tab_id += 1;
+    let effects = state.reduce(Intent::Admit {
+        delegations: &[record("a")],
+        running: &HashSet::new(),
+        callers: &HashMap::from([("caller".into(), live)]),
+        max_concurrent: 1,
+        policy: &evaluate_policy(&PlanLimitsFile::default(), 1_800_000_000),
+        running_workers: 0,
+    });
+    assert!(matches!(effects.as_slice(), [Effect::StartRejected { .. }]));
+    // Even a failed terminal save cannot make this stale request runnable.
+    assert!(admit(&mut state, &[record("a")], 1, &PlanLimitsFile::default(), 0).is_empty());
+}
+
+#[test]
+fn finish_cancel_and_rerun_are_idempotent_when_store_writes_fail() {
+    for cancel in [false, true] {
+        let mut state = State::default();
+        let d = record("a");
+        stored(&mut state, "a");
+        assert_eq!(
+            starts(&admit(
+                &mut state,
+                std::slice::from_ref(&d),
+                1,
+                &PlanLimitsFile::default(),
+                0
+            )),
+            vec!["a"]
+        );
+        if cancel {
+            assert!(state
+                .reduce(Intent::Dismiss { delegation: &d })
+                .iter()
+                .any(|e| matches!(e, Effect::Abort(_))));
+            assert!(!state
+                .reduce(Intent::Dismiss { delegation: &d })
+                .iter()
+                .any(|e| matches!(e, Effect::Abort(_))));
+            assert!(state.reduce(Intent::Finished { delegation: &d }).is_empty());
+        } else {
+            assert!(matches!(
+                state.reduce(Intent::Finished { delegation: &d }).as_slice(),
+                [Effect::RecordCompletion(_)]
+            ));
+            assert!(state.reduce(Intent::Finished { delegation: &d }).is_empty());
+        }
+        assert!(!state.busy());
+        assert!(state
+            .reduce(Intent::Progress {
+                delegation: &d,
+                event: CodexRunEvent::Activity {
+                    description: "late".into()
+                }
+            })
+            .is_empty());
+        // Durable status is deliberately still Requested, modelling a failed
+        // started/terminal/cancellation save or run-construction failure.
+        assert!(admit(&mut state, &[d], 1, &PlanLimitsFile::default(), 0).is_empty());
+        let Effect::Check {
+            request: ticket,
+            new,
+            ..
+        } = state
+            .reduce(Intent::Request {
+                new: request(Some("a".into())),
+                caller: caller(),
+            })
+            .pop()
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(matches!(
+            state
+                .reduce(Intent::Request {
+                    new: new.clone(),
+                    caller: caller()
+                })
+                .as_slice(),
+            [Effect::Rejected(_)]
+        ));
+        assert!(matches!(
+            state
+                .reduce(Intent::Checked {
+                    request: ticket,
+                    new,
+                    caller: Some(&caller()),
+                    result: Ok(())
+                })
+                .as_slice(),
+            [Effect::Insert { .. }]
+        ));
+        stored(&mut state, "rerun");
+        assert_eq!(
+            starts(&admit(
+                &mut state,
+                &[record("rerun")],
+                1,
+                &PlanLimitsFile::default(),
+                0
+            )),
+            vec!["rerun"]
+        );
+    }
+}
+
+fn completed() -> Delegation {
+    let mut d = record("done");
+    d.status = DelegationStatus::Completed;
+    d.result = Some(DelegationResult {
+        handoff: Some(TaskHandoff {
+            summary: "Parser inspected".into(),
+            decisions: vec![],
+            next_steps: vec![],
+            blockers: vec![],
+            updated_by_session_id: None,
+            updated_at: "t1".into(),
+        }),
+        findings: None,
+        reviewed: None,
+    });
+    d
+}
+fn flush(state: &mut State, d: &Delegation, busy: bool) -> Vec<Effect> {
+    state.reduce(Intent::Flush {
+        tab_id: 1,
+        recipient_exists: true,
+        delegations: &[d],
+        streaming: busy,
+        automatic: true,
+    })
+}
+#[test]
+fn delivery_is_held_until_turn_end_and_receipts_suppress_repeat_flushes() {
+    let mut state = State::default();
+    let mut d = completed();
+    assert!(!flush(&mut state, &d, true)
+        .iter()
+        .any(|e| matches!(e, Effect::Deliver { .. })));
+    assert_eq!(state.held(1).unwrap().len(), 1);
+    assert!(!flush(&mut state, &d, true)
+        .iter()
+        .any(|e| matches!(e, Effect::Deliver { .. })));
+    let effects = flush(&mut state, &d, false);
+    assert_eq!(
+        effects
+            .iter()
+            .filter(
+                |e| matches!(e, Effect::Deliver { batch, .. } if batch.delegation_ids == ["done"])
+            )
+            .count(),
+        1
+    );
+    // Host synchronously marks acceptance before another flush. The store
+    // retains in-memory receipts even when their disk save fails.
+    d.delivered = true;
+    assert!(!flush(&mut state, &d, false)
+        .iter()
+        .any(|e| matches!(e, Effect::Deliver { .. })));
+    d.delivered = false;
+    assert!(flush(&mut state, &d, false)
+        .iter()
+        .any(|e| matches!(e, Effect::Deliver { .. }))); // rejected submission retries
+}
+
+#[test]
+fn manual_send_deduplicates_and_does_not_follow_a_rebound_parent() {
+    let mut state = State::default();
+    let d = completed();
+    for _ in 0..2 {
+        state.reduce(Intent::ManualSend {
+            tab_id: 1,
+            delegation: &d,
+            finding_ids: &[],
+            streaming: true,
+        });
+    }
+    assert_eq!(state.held(1).unwrap().len(), 1);
+    let effects = state.reduce(Intent::Flush {
+        tab_id: 1,
+        recipient_exists: true,
+        delegations: &[],
+        streaming: false,
+        automatic: false,
+    });
+    assert!(!effects.iter().any(|e| matches!(e, Effect::Deliver { .. })));
+    assert!(state.held(1).unwrap().is_empty());
+}
+
+#[test]
+fn burst_policy_accounts_for_existing_workers_and_same_batch_admissions() {
+    let mut policy = evaluate_policy(&PlanLimitsFile::default(), 1_800_000_000);
+    policy.policy.codex.burst.busy = true;
+    let records = vec![record("a"), record("b")];
+    for workers in [0, 1] {
+        let mut state = State::default();
+        for d in &records {
+            stored(&mut state, &d.delegation_id);
+        }
+        let effects = state.reduce(Intent::Admit {
+            delegations: &records,
+            running: &HashSet::new(),
+            callers: &HashMap::from([("caller".into(), caller())]),
+            max_concurrent: 2,
+            policy: &policy,
+            running_workers: workers,
+        });
+        assert_eq!(
+            starts(&effects),
+            if workers == 0 { vec!["a"] } else { vec![] }
+        );
+    }
+}
