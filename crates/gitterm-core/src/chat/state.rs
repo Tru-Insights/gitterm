@@ -153,6 +153,15 @@ pub struct RuntimeStamp {
     generation: u64,
 }
 
+/// Transient UI authority for one exact occurrence of a runtime request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestIdentity {
+    pub runtime: RuntimeStamp,
+    pub owner: Vec<String>,
+    pub request_id: String,
+    instance: u64,
+}
+
 /// A source-bound read. Claude file/remote reads survive process installation;
 /// ACP replay is additionally bound to the receiver which supplied it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,6 +272,7 @@ pub struct State {
     pub session_id: Option<String>,
     pub state: AgentSessionState,
     pub pending_requests: Vec<String>,
+    request_instances: BTreeMap<(Vec<String>, String), u64>,
     pub history: HistoryLoad,
     /// Record counter, including merged fragments. History replacement/reset
     /// uses explicit effects; retain Iced's existing revision semantics.
@@ -284,6 +294,7 @@ impl Default for State {
             session_id: None,
             state: AgentSessionState::Idle,
             pending_requests: Vec::new(),
+            request_instances: BTreeMap::new(),
             history: HistoryLoad::NotLoaded,
             revision: 0,
             acknowledged: AcknowledgedSettings::default(),
@@ -453,6 +464,64 @@ impl State {
             .any(|ev| ev.prompt_id() == Some(id))
     }
 
+    pub fn has_pending_requests(&self) -> bool {
+        !self.request_instances.is_empty() || !self.pending_requests.is_empty()
+    }
+
+    pub fn request_identity(
+        &self,
+        runtime: &RuntimeStamp,
+        owner: &[String],
+        request_id: &str,
+    ) -> Option<RequestIdentity> {
+        if !self.accepts_runtime(runtime, &runtime.target) {
+            return None;
+        }
+        let instance = *self
+            .request_instances
+            .get(&(owner.to_vec(), request_id.to_owned()))?;
+        Some(RequestIdentity {
+            runtime: runtime.clone(),
+            owner: owner.to_vec(),
+            request_id: request_id.into(),
+            instance,
+        })
+    }
+    pub fn accepts_request(&self, identity: &RequestIdentity, current: &session::Target) -> bool {
+        self.accepts_stream(&identity.runtime, current)
+            && self
+                .request_instances
+                .get(&(identity.owner.clone(), identity.request_id.clone()))
+                == Some(&identity.instance)
+    }
+    fn track_request_identity(&mut self, event: &HarnessEvent, owner: &mut Vec<String>) {
+        match event {
+            HarnessEvent::RuntimeRequest { request_id, .. } => {
+                self.request_instances
+                    .insert((owner.clone(), request_id.clone()), generation());
+            }
+            HarnessEvent::RuntimeRequestResolved { request_id } => {
+                self.request_instances
+                    .remove(&(owner.clone(), request_id.clone()));
+            }
+            HarnessEvent::SubagentEvent {
+                parent_tool_use_id,
+                event,
+            } => {
+                owner.push(parent_tool_use_id.clone());
+                self.track_request_identity(event, owner);
+                owner.pop();
+            }
+            HarnessEvent::ConversationReset { .. }
+            | HarnessEvent::TurnCompleted { .. }
+            | HarnessEvent::ProcessExited { .. } => {
+                self.request_instances
+                    .retain(|(path, _), _| !path.starts_with(owner));
+            }
+            _ => {}
+        }
+    }
+
     pub fn runtime_stamp(&self, target: session::Target) -> RuntimeStamp {
         RuntimeStamp {
             target,
@@ -469,6 +538,7 @@ impl State {
         self.acknowledged = AcknowledgedSettings::default();
         self.finish_queue();
         self.pending_requests.clear();
+        self.request_instances.clear();
     }
 
     /// Task attachment/resume changes attribution without replacing the chat's
@@ -983,6 +1053,7 @@ impl State {
                 Effect::Rejected(error)
             }
             Intent::ResetHistory => {
+                self.request_instances.clear();
                 self.conversation.clear();
                 self.pending_requests.clear();
                 self.state = AgentSessionState::Idle;
@@ -1042,6 +1113,9 @@ impl State {
     }
 
     fn apply_event(&mut self, event: &AgentEvent) -> EventEffects {
+        if let AgentEvent::Harness(event) = event {
+            self.track_request_identity(event, &mut vec![]);
+        }
         let mut effects = EventEffects::default();
         match event {
             // Keep C6 presentation/lifecycle semantics, but a dead process

@@ -8,6 +8,23 @@ use gitterm_gpui_chat::{PermissionDecision, QuestionAnswer, adapter::ReceiptStat
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 
+fn bound(controller: &Controller, intent: ChatIntent) -> ChatIntent {
+    let id = match &intent {
+        ChatIntent::Permission { request_id, .. }
+        | ChatIntent::AnswerQuestion { request_id, .. }
+        | ChatIntent::DismissQuestion { request_id } => request_id,
+        _ => return intent,
+    };
+    let identity = controller
+        .adapter
+        .state()
+        .request_identity(&controller.source, &[], id)
+        .expect("synthetic pending request");
+    ChatIntent::Answer {
+        identity,
+        answer: Box::new(intent),
+    }
+}
 pub(super) fn fixture() -> (tempfile::TempDir, Arc<Preview>) {
     let dir = tempfile::tempdir_in("/private/tmp").unwrap();
     let root = dir.path().join("preview");
@@ -262,10 +279,13 @@ fn uncorrelated_ports_refuse_send_stop_permission_question_and_stale_stamps() {
     let (sender, mut commands) = tokio::sync::mpsc::unbounded_channel();
     controller.runtime = Some(Session::from_port(sender, true).into());
     controller.ready = true;
-    let (receipt, _) = controller.dispatch(ChatIntent::Send {
-        text: "Hello preview".into(),
-        images: vec![],
-    });
+    let (receipt, _) = controller.dispatch(bound(
+        &controller,
+        ChatIntent::Send {
+            text: "Hello preview".into(),
+            images: vec![],
+        },
+    ));
     assert_eq!(
         receipt.state,
         ReceiptState::Rejected("correlated writes require Session::spawn_runtime".into())
@@ -279,7 +299,7 @@ fn uncorrelated_ports_refuse_send_stop_permission_question_and_stale_stamps() {
             model: None,
         },
     );
-    let (receipt, _) = controller.dispatch(ChatIntent::Stop);
+    let (receipt, _) = controller.dispatch(bound(&controller, ChatIntent::Stop));
     assert_eq!(
         receipt.state,
         ReceiptState::Rejected("correlated writes require Session::spawn_runtime".into())
@@ -297,10 +317,15 @@ fn uncorrelated_ports_refuse_send_stop_permission_question_and_stale_stamps() {
             },
         ),
     );
-    let (receipt, _) = controller.dispatch(ChatIntent::Permission {
-        request_id: "permission".into(),
-        decision: PermissionDecision::Deny,
-    });
+    let (receipt, _) = controller.dispatch(bound(
+        &controller,
+        ChatIntent::Permission {
+            request_id: "permission".into(),
+            decision: PermissionDecision::Deny {
+                reason: String::new(),
+            },
+        },
+    ));
     assert_eq!(
         receipt.state,
         ReceiptState::Rejected("correlated writes require Session::spawn_runtime".into())
@@ -315,14 +340,17 @@ fn uncorrelated_ports_refuse_send_stop_permission_question_and_stale_stamps() {
             },
         ),
     );
-    let (receipt, _) = controller.dispatch(ChatIntent::AnswerQuestion {
-        request_id: "question".into(),
-        answers: vec![QuestionAnswer {
-            question: "Shape?".into(),
-            selected: vec!["Square".into()],
-            free_text: None,
-        }],
-    });
+    let (receipt, _) = controller.dispatch(bound(
+        &controller,
+        ChatIntent::AnswerQuestion {
+            request_id: "question".into(),
+            answers: vec![QuestionAnswer {
+                question: "Shape?".into(),
+                selected: vec!["Square".into()],
+                free_text: None,
+            }],
+        },
+    ));
     assert_eq!(
         receipt.state,
         ReceiptState::Rejected("correlated writes require Session::spawn_runtime".into())
@@ -496,7 +524,9 @@ assert not sys.stdin.read()
                     ..
                 } => Some(ChatIntent::Permission {
                     request_id: request_id.clone(),
-                    decision: PermissionDecision::Deny,
+                    decision: PermissionDecision::Deny {
+                        reason: String::new(),
+                    },
                 }),
                 HarnessEvent::RuntimeRequest {
                     request_id,
@@ -559,7 +589,7 @@ assert not sys.stdin.read()
         }
         if let Some(intent) = intent {
             assert_eq!(
-                controller.dispatch(intent).0.state,
+                controller.dispatch(bound(&controller, intent)).0.state,
                 ReceiptState::ChannelAccepted
             );
         }
@@ -956,10 +986,12 @@ async fn fake_process_rejected_and_partial_write_outcomes_reach_adapter() {
             );
             ChatIntent::Permission {
                 request_id: "already-gone".into(),
-                decision: PermissionDecision::Deny,
+                decision: PermissionDecision::Deny {
+                    reason: String::new(),
+                },
             }
         };
-        let receipt = controller.dispatch(intent).0;
+        let receipt = controller.dispatch(bound(&controller, intent)).0;
         assert_eq!(receipt.state, ReceiptState::ChannelAccepted);
         let delivered = loop {
             let next = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
@@ -1003,7 +1035,10 @@ fn preview_rejects_all_forged_mode_intents_without_dispatch_or_pending_setting()
         "bypassPermissions",
         "forged",
     ] {
-        let (receipt, update) = controller.dispatch(ChatIntent::ChangeMode { mode: mode.into() });
+        let (receipt, update) = controller.dispatch(bound(
+            &controller,
+            ChatIntent::ChangeMode { mode: mode.into() },
+        ));
         assert!(
             matches!(receipt.state, ReceiptState::Rejected(ref reason) if reason.contains("FreshPreview remains in default mode"))
         );
@@ -1040,5 +1075,36 @@ fn finds_claude_in_home_local_bin_when_finder_path_lacks_it() {
         find_claude(finder_path, Some(PathBuf::from("relative-home")))
             .map(|found| found.is_absolute())
             .unwrap_or(true)
+    );
+}
+
+#[test]
+fn preview_refuses_forged_bound_remember_before_any_writer() {
+    let mut controller = Controller::new();
+    event(
+        &mut controller,
+        request(
+            "remember",
+            RuntimeRequestKind::Permission {
+                tool_name: "Read".into(),
+                input: serde_json::json!({}),
+                suggestions: vec![serde_json::json!({"destination":"localSettings"})],
+                decision_reason: None,
+            },
+        ),
+    );
+    let intent = bound(
+        &controller,
+        ChatIntent::Permission {
+            request_id: "remember".into(),
+            decision: PermissionDecision::AllowAlways {
+                suggestion: serde_json::json!({"destination":"localSettings"}),
+            },
+        },
+    );
+    let (receipt, _) = controller.dispatch(intent);
+    assert_eq!(
+        receipt.state,
+        ReceiptState::Rejected("Allow and remember · not saved in preview".into())
     );
 }

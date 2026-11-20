@@ -5,8 +5,8 @@ use gitterm_core::chat::types::DeliveryOutcome as CoreOutcome;
 use gitterm_core::{
     chat::{
         state::{
-            AgentEvent, Effect, EventEffects, HistoryTicket, Intent, PromptStatus, RuntimeStamp,
-            State,
+            AgentEvent, Effect, EventEffects, HistoryTicket, Intent, PromptStatus, RequestIdentity,
+            RuntimeStamp, State,
         },
         types::*,
     },
@@ -112,7 +112,7 @@ impl Prepared {
 }
 struct Attempt {
     runtime: RuntimeStamp,
-    request_id: Option<String>,
+    request: Option<RequestIdentity>,
     /// Caller identity for retry/dedup; queued retries get a fresh wire ID.
     admission_id: Option<String>,
     message_id: Option<String>,
@@ -165,7 +165,30 @@ impl ChatAdapter {
             ));
         }
         let runtime = self.state.runtime_stamp(facts.authority.target.clone());
-        let request_id = intent.request_id().map(str::to_owned);
+        let (request, intent) = match intent {
+            ChatIntent::Answer { identity, answer } => {
+                if !identity.owner.is_empty() {
+                    return Err(Receipt::rejected("Worker request routing is unavailable"));
+                }
+                if answer.request_id() != Some(identity.request_id.as_str())
+                    || matches!(*answer, ChatIntent::Answer { .. })
+                    || !self
+                        .state
+                        .accepts_request(&identity, &facts.authority.target)
+                {
+                    return Err(Receipt::rejected(
+                        "Request identity is no longer pending on this runtime",
+                    ));
+                }
+                (Some(identity), *answer)
+            }
+            intent if intent.request_id().is_some() => {
+                return Err(Receipt::rejected(
+                    "Answer requires the displayed request identity",
+                ));
+            }
+            intent => (None, intent),
+        };
         let withdraw_id = match &intent {
             ChatIntent::Withdraw { message_id } => Some(message_id.clone()),
             _ => None,
@@ -173,7 +196,7 @@ impl ChatAdapter {
         let admission_id =
             matches!(&intent, ChatIntent::Send { .. }).then(|| facts.message_id.clone());
         if let Some(attempt) = self.attempts.values().find(|a| {
-            (request_id.is_some() && a.request_id == request_id
+            (request.is_some() && a.request == request
                 || admission_id.is_some() && a.admission_id == admission_id)
                 && self
                     .state
@@ -185,7 +208,7 @@ impl ChatAdapter {
         let mut message_id = admission_id.clone();
         let effect = match intent {
             ChatIntent::Send { text, images } => {
-                if !self.state.pending_requests.is_empty() {
+                if self.state.has_pending_requests() {
                     return Err(Receipt::rejected(
                         "Answer the pending request before sending",
                     ));
@@ -318,7 +341,7 @@ impl ChatAdapter {
             id,
             Attempt {
                 runtime: runtime.clone(),
-                request_id,
+                request,
                 admission_id,
                 message_id,
                 withdraw_id,
@@ -355,13 +378,13 @@ impl ChatAdapter {
         let valid = self.attempts.get(&id).is_some_and(|a| {
             a.receipt.state == ReceiptState::Prepared
                 && a.runtime == runtime
-                && a.request_id
+                && a.request
                     .as_ref()
-                    .is_none_or(|id| self.current_request(id).is_some())
+                    .is_none_or(|request| self.state.accepts_request(request, current))
         }) && !self.exited
             && self.state.accepts_runtime(&runtime, current)
             && match &command {
-                HarnessCommand::SendUserMessage(_) => self.state.pending_requests.is_empty(),
+                HarnessCommand::SendUserMessage(_) => !self.state.has_pending_requests(),
                 HarnessCommand::WithdrawQueuedMessage(id) => {
                     self.state.queued_prompts.get(id).is_some_and(|p| {
                         matches!(p.status, PromptStatus::Pending | PromptStatus::Queued)
@@ -502,22 +525,48 @@ impl ChatAdapter {
         {
             return Some(Update::default());
         }
+        fn resolved(
+            event: &HarnessEvent,
+            owner: &mut Vec<String>,
+            out: &mut Vec<(Vec<String>, String)>,
+        ) {
+            match event {
+                HarnessEvent::RuntimeRequestResolved { request_id } => {
+                    out.push((owner.clone(), request_id.clone()))
+                }
+                HarnessEvent::SubagentEvent {
+                    parent_tool_use_id,
+                    event,
+                } => {
+                    owner.push(parent_tool_use_id.clone());
+                    resolved(event, owner, out);
+                    owner.pop();
+                }
+                _ => {}
+            }
+        }
+        let mut resolved_keys = vec![];
+        if let AgentEvent::Harness(event) = &event {
+            resolved(event, &mut vec![], &mut resolved_keys);
+        }
+        let resolved_requests: Vec<_> = resolved_keys
+            .iter()
+            .filter_map(|(owner, id)| self.state.request_identity(source, owner, id))
+            .collect();
         let Effect::Event(effects) = self.state.reduce(Intent::Event(event.clone())) else {
             unreachable!()
         };
         observer(&event, &effects);
         let mut receipts = Vec::new();
+        for attempt in self.attempts.values_mut().filter(|a| {
+            a.request
+                .as_ref()
+                .is_some_and(|r| resolved_requests.contains(r))
+        }) {
+            attempt.receipt.state = ReceiptState::Resolved;
+            receipts.push(attempt.receipt.clone());
+        }
         match &event {
-            AgentEvent::Harness(HarnessEvent::RuntimeRequestResolved { request_id }) => {
-                for attempt in self
-                    .attempts
-                    .values_mut()
-                    .filter(|a| a.request_id.as_ref() == Some(request_id))
-                {
-                    attempt.receipt.state = ReceiptState::Resolved;
-                    receipts.push(attempt.receipt.clone());
-                }
-            }
             AgentEvent::Harness(HarnessEvent::MessageLifecycle {
                 id,
                 state: MessageState::Completed | MessageState::Cancelled,
@@ -706,26 +755,42 @@ fn decision(intent: &ChatIntent, kind: &RuntimeRequestKind) -> Result<RuntimeDec
         }),
         (
             ChatIntent::Permission {
-                decision: PermissionDecision::Deny,
+                decision: PermissionDecision::Deny { reason },
                 ..
             },
             RuntimeRequestKind::Permission { .. },
-        )
-        | (ChatIntent::DismissQuestion { .. }, RuntimeRequestKind::Question { .. }) => {
+        ) => Ok(RuntimeDecision::Deny {
+            message: if reason.trim().is_empty() {
+                "The user denied this tool call.".into()
+            } else {
+                reason.trim().into()
+            },
+        }),
+        (ChatIntent::DismissQuestion { .. }, RuntimeRequestKind::Question { .. }) => {
             Ok(RuntimeDecision::Deny {
-                message: "Declined by the user".into(),
+                message: "The user declined to answer.".into(),
             })
         }
         (
             ChatIntent::Permission {
-                decision: PermissionDecision::AllowAlways { .. },
+                decision: PermissionDecision::AllowAlways { suggestion },
                 ..
             },
-            _,
-        ) => Err(
-            "Remembering requires a verified preview-owned settings destination; unavailable in C7"
-                .into(),
-        ),
+            RuntimeRequestKind::Permission { suggestions, .. },
+        ) => {
+            let offered = suggestions
+                .iter()
+                .find(|s| s["destination"] == "localSettings")
+                .into_iter()
+                .chain(suggestions.iter().filter(|s| s["type"] == "acp_option"));
+            if !offered.into_iter().any(|s| s == suggestion) {
+                return Err("Remember option is not offered by this request".into());
+            }
+            Ok(RuntimeDecision::Allow {
+                updated_input: None,
+                remember: Some(suggestion.clone()),
+            })
+        }
         (
             ChatIntent::AnswerQuestion { answers, .. },
             RuntimeRequestKind::Question { questions },

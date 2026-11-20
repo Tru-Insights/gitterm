@@ -17,6 +17,11 @@ pub enum ChatIntent {
     ChangeMode {
         mode: String,
     },
+    /// Bind an answer to the exact request the UI displayed.
+    Answer {
+        identity: gitterm_core::chat::state::RequestIdentity,
+        answer: Box<ChatIntent>,
+    },
     Permission {
         request_id: String,
         decision: PermissionDecision,
@@ -37,7 +42,9 @@ pub enum PermissionDecision {
     AllowAlways {
         suggestion: Value,
     },
-    Deny,
+    Deny {
+        reason: String,
+    },
 }
 
 /// Kept structured so the adapter can encode the question-text → joined-label map.
@@ -70,6 +77,7 @@ pub(crate) struct QuestionOption {
 impl ChatIntent {
     pub(crate) fn request_id(&self) -> Option<&str> {
         match self {
+            Self::Answer { answer, .. } => answer.request_id(),
             Self::Permission { request_id, .. }
             | Self::AnswerQuestion { request_id, .. }
             | Self::DismissQuestion { request_id } => Some(request_id),

@@ -975,3 +975,144 @@ fn slash_keyboard_completion_runs_no_arg_commands_and_fills_argument_commands(
     draw(cx);
     assert!(matches!(&intents.borrow()[1], ChatIntent::Send { text, .. } if text == "/cl"));
 }
+
+#[gpui::test]
+fn pending_panel_is_independent_of_transcript_and_advances_on_resolution(cx: &mut TestAppContext) {
+    use crate::adapter::ChatAdapter;
+    use gitterm_core::{chat::state::AgentEvent, session};
+    use std::cell::RefCell;
+    let (chat, cx) = setup(vec![], cx);
+    let mut adapter = ChatAdapter::default();
+    let target = session::Target {
+        tab_id: 1,
+        session_uid: "synthetic-panel".into(),
+        task_id: None,
+        task_session_id: None,
+    };
+    let stamp = adapter.begin_runtime(target.clone());
+    let intents = Rc::new(RefCell::new(vec![]));
+    let captured = intents.clone();
+    chat.update_in(cx, |view, _, cx| {
+        view.set_intent_callback(
+            Rc::new(move |intent, _| {
+                captured.borrow_mut().push(intent);
+                let mut r = Receipt::rejected("fixture");
+                r.state = ReceiptState::ChannelAccepted;
+                r
+            }),
+            cx,
+        );
+        view.set_read_only(None, cx);
+    });
+    for id in ["first", "second"] {
+        let update = adapter
+            .receive(
+                &stamp,
+                &target,
+                AgentEvent::Harness(HarnessEvent::RuntimeRequest {
+                    request_id: id.into(),
+                    tool_use_id: id.into(),
+                    kind: crate::events::RuntimeRequestKind::Permission {
+                        tool_name: "Read".into(),
+                        input: serde_json::json!({}),
+                        suggestions: vec![],
+                        decision_reason: None,
+                    },
+                }),
+                None,
+                |_, _| {},
+            )
+            .unwrap();
+        chat.update_in(cx, |view, window, cx| {
+            view.present(&stamp, adapter.state(), update, window, cx)
+        });
+    }
+    chat.update_in(cx, |view, window, cx| {
+        view.row_views.fill(None);
+        view.cards.clear();
+        view.pending_panel(window, cx);
+        assert!(view.row_views.iter().all(Option::is_none));
+        assert_eq!(view.cards.len(), 1);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("pending-request-panel").is_some());
+    chat.update_in(cx, |view, _, cx| {
+        assert_eq!(view.cards.len(), 1);
+        view.cards[&0].update(cx, |card, cx| {
+            card.emit(
+                ChatIntent::Permission {
+                    request_id: "first".into(),
+                    decision: crate::PermissionDecision::Allow,
+                },
+                cx,
+            )
+        });
+        assert_eq!(view.model.pending_rows(), vec![0, 1]);
+    });
+    assert!(
+        matches!(&intents.borrow()[0], ChatIntent::Answer { identity, .. } if identity.request_id == "first" && identity.owner.is_empty())
+    );
+    let update = adapter
+        .receive(
+            &stamp,
+            &target,
+            AgentEvent::Harness(HarnessEvent::RuntimeRequestResolved {
+                request_id: "first".into(),
+            }),
+            None,
+            |_, _| {},
+        )
+        .unwrap();
+    chat.update_in(cx, |view, window, cx| {
+        view.present(&stamp, adapter.state(), update, window, cx);
+        assert_eq!(view.model.pending_rows(), vec![1]);
+        assert!(view.cards.contains_key(&1));
+    });
+}
+
+#[gpui::test]
+fn deny_enter_uses_focused_reason_and_preserves_composer_draft(cx: &mut TestAppContext) {
+    use std::cell::RefCell;
+    let (chat, cx) = setup(vec![], cx);
+    let intents = Rc::new(RefCell::new(vec![]));
+    let captured = intents.clone();
+    chat.update_in(cx, |view, window, cx| {
+        view.set_intent_callback(
+            Rc::new(move |intent, _| {
+                captured.borrow_mut().push(intent);
+                Receipt::rejected("fixture")
+            }),
+            cx,
+        );
+        view.set_read_only(None, cx);
+        view.composer.update(cx, |input, cx| {
+            input.set_value("retained draft", window, cx)
+        });
+        view.append_event(
+            HarnessEvent::RuntimeRequest {
+                request_id: "deny".into(),
+                tool_use_id: "deny".into(),
+                kind: crate::events::RuntimeRequestKind::Permission {
+                    tool_name: "Read".into(),
+                    input: serde_json::json!({}),
+                    suggestions: vec![],
+                    decision_reason: None,
+                },
+            },
+            cx,
+        );
+    });
+    draw(cx);
+    let reason = cx.debug_bounds("deny-reason").unwrap();
+    cx.simulate_click(reason.center(), gpui::Modifiers::none());
+    cx.simulate_input("  typed reason  ");
+    cx.simulate_keystrokes("enter");
+    draw(cx);
+    assert_eq!(intents.borrow().len(), 1);
+    assert!(
+        matches!(&intents.borrow()[0], ChatIntent::Permission { decision:crate::PermissionDecision::Deny { reason }, .. } if reason == "  typed reason  ")
+    );
+    chat.read_with(cx, |view, cx| {
+        assert_eq!(view.composer.read(cx).value().as_str(), "retained draft")
+    });
+}

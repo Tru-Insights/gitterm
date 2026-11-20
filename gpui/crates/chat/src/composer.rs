@@ -57,7 +57,7 @@ pub struct ComposerState {
 }
 impl ComposerState {
     pub fn project(&mut self, state: &State, effects: Option<&EventEffects>) {
-        self.pending_request = !state.pending_requests.is_empty();
+        self.pending_request = state.has_pending_requests();
         self.streaming = matches!(state.state, AgentSessionState::Streaming);
         self.status = if self.pending_request {
             "Needs you · answer the pending request before sending".into()
