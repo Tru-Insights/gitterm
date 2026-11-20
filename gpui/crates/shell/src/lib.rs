@@ -1642,24 +1642,43 @@ impl Shell {
                     })),
             );
         }
-        sidebar = sidebar.child(modes).child(
-            Button::new("collapse-sidebar")
-                .ghost()
-                .label(if regions.sidebar_collapsed {
-                    "›"
-                } else {
-                    "‹"
-                })
-                .tooltip(if regions.sidebar_collapsed {
-                    "Expand sidebar"
-                } else {
-                    "Collapse sidebar"
-                })
-                .h(px(28.))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.update_regions(|r| r.sidebar_collapsed = !r.sidebar_collapsed, cx)
-                })),
-        );
+        modes = modes
+            .child(div().flex_1())
+            .child(
+                Button::new("open-git-sidebar")
+                    .ghost()
+                    .label("⎇")
+                    .tooltip("Open Git status")
+                    .debug_selector(|| "open-git-sidebar".into())
+                    .on_click(cx.listener(|shell, _, _, cx| {
+                        shell.update_regions(
+                            |r| {
+                                r.sidebar_mode = SidebarMode::Git;
+                                r.sidebar_collapsed = false;
+                            },
+                            cx,
+                        );
+                    })),
+            )
+            .child(
+                Button::new("collapse-sidebar")
+                    .ghost()
+                    .label(if regions.sidebar_collapsed {
+                        "›"
+                    } else {
+                        "‹"
+                    })
+                    .tooltip(if regions.sidebar_collapsed {
+                        "Expand sidebar"
+                    } else {
+                        "Collapse sidebar"
+                    })
+                    .h(px(28.))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.update_regions(|r| r.sidebar_collapsed = !r.sidebar_collapsed, cx)
+                    })),
+            );
+        sidebar = sidebar.child(modes);
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Files {
             sidebar = self.files_sidebar(sidebar, cx);
         }
@@ -1667,15 +1686,6 @@ impl Shell {
             sidebar = self.git_sidebar(sidebar, cx);
         }
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Work {
-            sidebar = sidebar.child(
-                Button::new("open-git-sidebar")
-                    .ghost()
-                    .label("Git")
-                    .debug_selector(|| "open-git-sidebar".into())
-                    .on_click(cx.listener(|shell, _, _, cx| {
-                        shell.update_regions(|r| r.sidebar_mode = SidebarMode::Git, cx);
-                    })),
-            );
             sidebar = sidebar.child(
                 div()
                     .flex_1()

@@ -382,11 +382,15 @@ pub(crate) fn iced_active_tab(saved: &gitterm_core::workspace_config::WorkspaceC
 
 /// A read-only Work load. No store mutation, migration, lease, or index backfill
 /// is performed. The caller runs this blocking work away from the GPUI thread.
+#[derive(Clone)]
 pub(crate) struct IcedWorkData {
     pub facts: crate::work_sidebar::WorkspaceFacts,
     pub tasks: Vec<gitterm_core::tasks::TaskRecord>,
     pub workers: Vec<gitterm_core::tasks::Delegation>,
     pub repo_recency: Vec<(std::path::PathBuf, std::time::SystemTime)>,
+    pub pull_requests: Vec<(String, Vec<gitterm_core::prs::WatchedPr>)>,
+    pub issues: gitterm_core::issues::IssueTitlesFile,
+    pub collapsed_issue_groups: Vec<gitterm_core::issues::IssueGroup>,
     inputs: gitterm_core::work::state::Inputs,
     summary: gitterm_core::work::summary::WorkSummary,
     branches: Vec<gitterm_core::work::summary::BranchStatus>,
@@ -399,20 +403,37 @@ impl IcedWorkData {
         id: u64,
         saved: &gitterm_core::workspace_config::WorkspaceConfig,
         focus: gitterm_core::work::summary::Focus,
+        mut publish: impl FnMut(&Self),
     ) -> anyhow::Result<Self> {
-        // Tests must supply an explicit fixture home, never discover real transcripts.
         #[cfg(test)]
         let home: Option<std::path::PathBuf> = None;
         #[cfg(not(test))]
         let home = dirs::home_dir();
-        Self::read_with_home(config, home.as_deref(), id, saved, focus)
+        // Saved facts can populate Work independently of a slow full harness
+        // index. This is a fresh read, never a second persisted index/cache.
+        if home.is_some() {
+            Self::read_with_progress(config, None, id, saved, focus.clone(), false, &mut publish)?;
+        }
+        Self::read_with_progress(config, home.as_deref(), id, saved, focus, true, publish)
     }
+    #[cfg(test)]
     pub(crate) fn read_with_home(
         config: &std::path::Path,
         home: Option<&std::path::Path>,
         id: u64,
         saved: &gitterm_core::workspace_config::WorkspaceConfig,
         focus: gitterm_core::work::summary::Focus,
+    ) -> anyhow::Result<Self> {
+        Self::read_with_progress(config, home, id, saved, focus, true, |_| {})
+    }
+    pub(crate) fn read_with_progress(
+        config: &std::path::Path,
+        home: Option<&std::path::Path>,
+        id: u64,
+        saved: &gitterm_core::workspace_config::WorkspaceConfig,
+        focus: gitterm_core::work::summary::Focus,
+        measure_branches: bool,
+        mut publish: impl FnMut(&Self),
     ) -> anyhow::Result<Self> {
         use gitterm_core::{
             chats,
@@ -424,6 +445,12 @@ impl IcedWorkData {
             path::{Path, PathBuf},
             time::SystemTime,
         };
+        let started = std::time::Instant::now();
+        eprintln!(
+            "[work-sidebar] reading {} (workspace {id}, transcripts: {})",
+            config.display(),
+            home.is_some()
+        );
         let catalog = crate::workspace_config::IcedCatalog::read(config)?;
         let key = crate::workspace_config::iced_layout_key(saved);
         let saved = catalog
@@ -514,13 +541,14 @@ impl IcedWorkData {
                 repo_recency.push((repo.to_owned(), entry.mtime));
             }
         }
-        let links = if entries.is_empty() {
+        let indexed = !entries.is_empty();
+        let links = if !indexed {
             vec![]
         } else {
             iced_chat_links(&catalog, &store)
         };
-        // Preserve the existing facts-only rows when no transcript index is available.
-        if entries.is_empty() {
+        // A partial index must not erase owned chats whose transcript is absent.
+        {
             let mut pending: Vec<_> = saved
                 .chats
                 .iter()
@@ -551,13 +579,16 @@ impl IcedWorkData {
                         None
                     }
                 };
-                if let Some(facts) = &chat_facts {
+                if !indexed && let Some(facts) = &chat_facts {
                     pending.extend(facts.children.iter().map(|c| {
                         (
                             c.session_id.clone(),
                             c.title.clone().unwrap_or_else(|| c.session_id.clone()),
                         )
                     }));
+                }
+                if entries.iter().any(|entry| entry.id == chat) {
+                    continue;
                 }
                 entries.push(chats::ChatIndexEntry {
                     id: chat,
@@ -603,7 +634,7 @@ impl IcedWorkData {
                 .enable_all()
                 .build()?,
         );
-        let mut branches = vec![];
+        let branches = vec![];
         if local {
             for dir in &saved.repos {
                 let path = PathBuf::from(dir);
@@ -634,12 +665,112 @@ impl IcedWorkData {
                     facts.running_by_repo.insert(path, running);
                 }
             }
+        } else {
+            errors.push("The overview reads this Mac's chats and checkouts; this workspace is on another machine.".into());
+        }
+        let work_entries = match &source {
+            Source::Owned(roots) => chats_under(&entries, roots),
+            Source::Folder(dir) => work_chats(&entries, dir),
+        };
+        let written = work_entries
+            .iter()
+            .filter_map(|e| e.facts.as_ref())
+            .flat_map(|f| f.documents.iter().cloned())
+            .collect();
+        let request = documents::ScanRequest {
+            docs_dir: Path::new(&saved.dir).join("docs"),
+            written,
+            repos: facts.repos.iter().map(|r| r.dir.clone()).collect(),
+            task_worktrees,
+        };
+        let documents = if local {
+            documents::scan(&request, &mut git)
+        } else {
+            Default::default()
+        };
+        let inputs = Inputs {
+            workspace: id,
+            source,
+            tasks: infos,
+            focus,
+            documents: local.then_some(request),
+        };
+        let watch =
+            gitterm_core::prs::WatchFile::load(&gitterm_core::prs::WatchFile::path_in(config));
+        let plans =
+            gitterm_core::merge_plan::load_plans(&gitterm_core::merge_plan::plans_dir(config));
+        let pull_requests = summary
+            .coordinators
+            .iter()
+            .filter(|root| summary.focused.contains(&root.id))
+            .filter_map(|root| {
+                let mut keys: Vec<_> = plans
+                    .get(&root.id)
+                    .into_iter()
+                    .flat_map(|plan| &plan.entries)
+                    .map(|entry| entry.key())
+                    .collect();
+                let roots = vec![root.id.clone()];
+                for entry in chats_under(&entries, &roots) {
+                    for pr in entry.facts.iter().flat_map(|facts| &facts.prs) {
+                        if !keys.iter().any(|key| key.id() == pr.key().id()) {
+                            keys.push(pr.key());
+                        }
+                    }
+                }
+                let prs: Vec<_> = keys
+                    .into_iter()
+                    .map(|key| {
+                        watch
+                            .prs
+                            .get(&key.id())
+                            .cloned()
+                            .unwrap_or_else(|| gitterm_core::prs::WatchedPr::new(key))
+                    })
+                    .collect();
+                (!prs.is_empty()).then(|| (root.title.clone(), prs))
+            })
+            .collect();
+        let issues = gitterm_core::issues::IssueTitlesFile::load(
+            &gitterm_core::issues::IssueTitlesFile::path_in(config),
+        );
+        let mut data = Self {
+            facts,
+            tasks,
+            workers,
+            repo_recency,
+            pull_requests,
+            issues,
+            collapsed_issue_groups: saved.collapsed_issue_groups.clone(),
+            inputs,
+            summary,
+            branches,
+            documents,
+            errors,
+        };
+        // Real work can own hundreds of checkouts. Publish its overview before
+        // probing status/base candidates for every branch, as Iced does.
+        eprintln!(
+            "[work-sidebar] overview {} (workspace {id}): {} repos, {} chats, {} documents in {:?}",
+            config.display(),
+            data.facts.repos.len(),
+            data.summary.coordinators.len(),
+            data.documents.documents.len(),
+            started.elapsed()
+        );
+        publish(&data);
+        if local && measure_branches {
             // Iced only lists checkouts owned by the focused work: facts edits,
             // its child task worktrees, and issue-key matches. A shared repo's
             // unrelated branches must never be presented as this work's edits.
             let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_owned());
-            let key_repos: Vec<_> = summary.key_repos.iter().map(|p| canonical(p)).collect();
-            let mut candidates = summary.candidates.clone();
+            let key_repos: Vec<_> = data
+                .summary
+                .key_repos
+                .iter()
+                .map(|p| canonical(p))
+                .collect();
+            let mut candidates = data.summary.candidates.clone();
             for candidate in &mut candidates {
                 candidate.checkout = canonical(&candidate.checkout);
                 candidate.repo = candidate.repo.as_deref().map(canonical);
@@ -664,51 +795,25 @@ impl IcedWorkData {
                         lists.insert(list[0].path.clone(), list);
                     }
                     Ok(_) => {}
-                    Err(error) => errors.push(error),
+                    Err(error) => data.errors.push(error),
                 }
             }
-            for mut owned in resolve_owned(&candidates, &summary.issue_keys, &key_repos, &lists) {
+            for mut owned in
+                resolve_owned(&candidates, &data.summary.issue_keys, &key_repos, &lists)
+            {
                 owned.gone = !owned.checkout.is_dir();
-                branches.push(git.branch(owned));
+                data.branches.push(git.branch(owned));
             }
-        } else {
-            errors.push("The overview reads this Mac's chats and checkouts; this workspace is on another machine.".into());
         }
-        let written = entries
-            .iter()
-            .filter_map(|e| e.facts.as_ref())
-            .flat_map(|f| f.documents.iter().cloned())
-            .collect();
-        let request = documents::ScanRequest {
-            docs_dir: Path::new(&saved.dir).join("docs"),
-            written,
-            repos: facts.repos.iter().map(|r| r.dir.clone()).collect(),
-            task_worktrees,
-        };
-        let documents = if local {
-            documents::scan(&request, &mut git)
-        } else {
-            Default::default()
-        };
-        let inputs = Inputs {
-            workspace: id,
-            source,
-            tasks: infos,
-            focus,
-            documents: local.then_some(request),
-        };
-        Ok(Self {
-            facts,
-            tasks,
-            workers,
-            repo_recency,
-            inputs,
-            summary,
-            branches,
-            documents,
-            errors,
-        })
+        eprintln!(
+            "[work-sidebar] finished {} (workspace {id}): {} branches in {:?}",
+            config.display(),
+            data.branches.len(),
+            started.elapsed()
+        );
+        Ok(data)
     }
+
     pub fn apply(&self, state: &mut gitterm_core::work::state::State) {
         use gitterm_core::work::state::*;
         use std::time::{Instant, SystemTime};
@@ -928,11 +1033,19 @@ impl WorkGit {
     fn text(&self, root: &std::path::Path, args: &[&str]) -> Result<String, String> {
         let mut read_args = vec!["--no-optional-locks"];
         read_args.extend_from_slice(args);
-        self.0.block_on(gitterm_core::git_facts::git_text(
+        let result = self.0.block_on(gitterm_core::git_facts::git_text(
             root,
             &read_args,
             gitterm_core::git_facts::GIT_TIMEOUT,
-        ))
+        ));
+        if let Err(error) = &result {
+            eprintln!(
+                "[work-sidebar] git {} in {}: {error}",
+                args.join(" "),
+                root.display()
+            );
+        }
+        result
     }
     fn branch(
         &self,

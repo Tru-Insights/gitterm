@@ -30,6 +30,7 @@ use gpui_component::{
 pub(crate) struct IcedWorkSource {
     pub config: PathBuf,
     pub workspaces: Vec<gitterm_core::workspace_config::WorkspaceConfig>,
+    pub repos: Vec<gitterm_core::workspace_config::RepoConfig>,
     pub owner: gpui::WeakEntity<crate::WorkspaceOwner>,
 }
 impl gpui::Global for IcedWorkSource {}
@@ -115,6 +116,9 @@ pub enum WorkSidebarOutcome {
     OpenTask {
         task: String,
     },
+    OpenUrl {
+        url: String,
+    },
 }
 
 impl WorkSidebarOutcome {
@@ -147,6 +151,7 @@ enum Fold {
     AllDocuments,
     Document(String),
     Copies(String),
+    Issues(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,6 +215,9 @@ pub struct WorkSidebar {
     workers: Vec<gitterm_core::tasks::Delegation>,
     repo_recency: Vec<(PathBuf, std::time::SystemTime)>,
     source: Option<IcedWorkSource>,
+    pull_requests: Vec<(String, Vec<gitterm_core::prs::WatchedPr>)>,
+    issues: gitterm_core::issues::IssueTitlesFile,
+    collapsed_issue_groups: Vec<gitterm_core::issues::IssueGroup>,
     loading: bool,
     loaded_at: Option<std::time::Instant>,
     focus: Focus,
@@ -229,6 +237,9 @@ impl WorkSidebar {
             workers: vec![],
             repo_recency: vec![],
             source: None,
+            pull_requests: vec![],
+            issues: Default::default(),
+            collapsed_issue_groups: vec![],
             loading: false,
             loaded_at: None,
             focus: Default::default(),
@@ -268,6 +279,15 @@ impl WorkSidebar {
             .and_then(|id| source.workspaces.get(id as usize))
             .cloned()
         else {
+            let message = format!(
+                "Load Iced Work {}: workspace {} is missing from the imported catalog",
+                source.config.display(),
+                self.workspace.id
+            );
+            if self.error.as_ref() != Some(&message) {
+                eprintln!("{message}");
+                self.error = Some(message);
+            }
             return;
         };
         if self.loading
@@ -282,28 +302,81 @@ impl WorkSidebar {
         let id = self.workspace.id;
         let focus = self.focus.clone();
         let requested_focus = focus.clone();
+        // The catalog is already loaded. Never display an invented Repos 0
+        // while the much larger transcript/Git load is pending.
+        self.workspace.local = !saved.is_legacy_remote()
+            && !matches!(
+                saved.location,
+                Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. })
+            );
+        self.workspace.home = saved.home_dir().into();
+        self.workspace.dir = saved.dir.clone().into();
+        self.workspace.owned_chats = saved.chats.clone();
+        self.workspace.open_chats = saved
+            .tabs
+            .iter()
+            .filter_map(|t| t.chat_session_id.clone())
+            .collect();
+        self.workspace.repos = saved
+            .repos
+            .iter()
+            .filter(|_| self.workspace.local)
+            .map(|dir| RepoFacts {
+                dir: dir.into(),
+                local: self.workspace.local,
+                run_command: source
+                    .repos
+                    .iter()
+                    .find(|r| r.dir == *dir && !matches!(r.location, Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. })))
+                    .and_then(|r| r.run_command.clone()),
+            })
+            .collect();
+        let config = source.config.clone();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let job = cx.background_executor().spawn(async move {
-            crate::data::IcedWorkData::read(&source.config, id, &saved, focus)
+            let result =
+                crate::data::IcedWorkData::read(&source.config, id, &saved, focus, |data| {
+                    _ = sender.send(Ok(data.clone()));
+                });
+            _ = sender.send(result);
         });
         cx.spawn(async move |view, cx| {
-            let result = job.await;
+            while let Some(result) = receiver.recv().await {
+                let updated = view.update(cx, |this, cx| {
+                    if this.focus != requested_focus {
+                        return false;
+                    }
+                    this.loaded_at = Some(std::time::Instant::now());
+                    match result {
+                        Ok(data) => {
+                            data.apply(&mut this.state.borrow_mut());
+                            this.workspace = data.facts;
+                            this.tasks = data.tasks;
+                            this.workers = data.workers;
+                            this.repo_recency = data.repo_recency;
+                            this.pull_requests = data.pull_requests;
+                            this.issues = data.issues;
+                            this.collapsed_issue_groups = data.collapsed_issue_groups;
+                            this.error = None;
+                        }
+                        Err(error) => {
+                            let message = format!("Load Iced Work {}: {error:#}", config.display());
+                            eprintln!("{message}");
+                            this.error = Some(message);
+                        }
+                    }
+                    cx.notify();
+                    true
+                });
+                if !matches!(updated, Ok(true)) {
+                    break;
+                }
+            }
+            job.await;
             _ = view.update(cx, |this, cx| {
                 this.loading = false;
                 if this.focus != requested_focus {
                     this.load(true, cx);
-                    return;
-                }
-                this.loaded_at = Some(std::time::Instant::now());
-                match result {
-                    Ok(data) => {
-                        data.apply(&mut this.state.borrow_mut());
-                        this.workspace = data.facts;
-                        this.tasks = data.tasks;
-                        this.workers = data.workers;
-                        this.repo_recency = data.repo_recency;
-                        this.error = None;
-                    }
-                    Err(error) => this.error = Some(format!("Load Iced Work: {error:#}")),
                 }
                 cx.notify();
             });
@@ -336,6 +409,11 @@ impl WorkSidebar {
                     // The shell's focus outcome also invalidates its reducer.
                     // Complete a new read after that notification has returned.
                     self.loaded_at = None;
+                }
+                WorkSidebarOutcome::OpenUrl { url }
+                    if url.starts_with("https://") || url.starts_with("http://") =>
+                {
+                    cx.open_url(url)
                 }
                 WorkSidebarOutcome::OpenDocument { workspace, path } => {
                     if let Some(source) = &self.source {
@@ -372,12 +450,15 @@ impl WorkSidebar {
                 workspace: self.workspace.id,
             }),
         );
+        if self.loading {
+            title.badges.push("reading…".into());
+        }
         let mut rows = vec![title];
         if let Some(error) = &self.error {
             rows.push(Row::text(error));
         }
+        self.pull_request_rows(&mut rows);
         self.repo_rows(pane, &mut rows);
-        self.task_rows(&mut rows);
         let Some(pane) = pane else {
             rows.push(Row::text("Loading…"));
             return rows;
@@ -488,11 +569,109 @@ impl WorkSidebar {
                 }
             }
         }
+        self.issue_rows(&summary.issue_keys, &mut rows);
         for error in &pane.errors {
             rows.push(Row::text(summary::shorten(error, 200)));
         }
+        self.task_rows(&mut rows);
         self.attention_rows(&mut rows);
         rows
+    }
+
+    fn pull_request_rows(&self, rows: &mut Vec<Row>) {
+        if self.pull_requests.is_empty() {
+            return;
+        }
+        let mut heading = Row::text("Pull requests");
+        heading.heading = true;
+        let count = self
+            .pull_requests
+            .iter()
+            .flat_map(|(_, prs)| prs)
+            .filter(|pr| !pr.done())
+            .count();
+        heading.badges.push(format!("{count} open"));
+        rows.push(heading);
+        for (title, prs) in &self.pull_requests {
+            if self.pull_requests.len() > 1 {
+                rows.push(Row::text(title));
+            }
+            for pr in prs.iter().filter(|pr| !pr.done()) {
+                let mut row = Row::text(format!(
+                    "{} · {}",
+                    pr.key.label(),
+                    pr.snapshot
+                        .core
+                        .as_ref()
+                        .map(|c| c.title.as_str())
+                        .unwrap_or("not read")
+                ));
+                row.action = Some(Action::Emit(WorkSidebarOutcome::OpenUrl {
+                    url: pr.key.url(),
+                }));
+                if let Some(core) = &pr.snapshot.core {
+                    row.badges
+                        .extend(core.state.map(|state| state.label().to_string()));
+                    if pr.snapshot.conflicting() == Some(true) {
+                        row.badges.push("conflicts".into());
+                    }
+                    row.badges.push(pr.snapshot.checks().label().into());
+                    row.badges
+                        .push(pr.snapshot.review_decision().label().into());
+                } else {
+                    row.badges.push("not read".into());
+                }
+                if let Some(error) = &pr.error {
+                    row.details.push(error.clone());
+                }
+                rows.push(row);
+            }
+            let done = prs.iter().filter(|pr| pr.done()).count();
+            if done > 0 {
+                rows.push(Row::text(format!("{title} · {done} merged/closed")));
+            }
+        }
+    }
+
+    fn issue_rows(&self, keys: &[String], rows: &mut Vec<Row>) {
+        let groups = self
+            .issues
+            .grouped_keys(keys, std::time::SystemTime::now().into());
+        let count: usize = groups.iter().map(|(_, keys)| keys.len()).sum();
+        if count == 0 {
+            return;
+        }
+        let mut heading = Row::text("Issues");
+        heading.heading = true;
+        heading.badges.push(count.to_string());
+        rows.push(heading);
+        for (group, keys) in groups {
+            let fold = Fold::Issues(group.label().into());
+            let expanded =
+                self.open.contains(&fold) == self.collapsed_issue_groups.contains(&group);
+            let mut row = Row::text(group.label());
+            row.heading = true;
+            row.badges.push(keys.len().to_string());
+            row.expanded = expanded;
+            row.fold = Some(fold.clone());
+            row.action = Some(Action::Toggle(fold));
+            rows.push(row);
+            if expanded {
+                for key in keys {
+                    let issue = self.issues.issues.get(key);
+                    let mut row = Row::text(match issue.and_then(|issue| issue.title.as_deref()) {
+                        Some(title) => format!("{key}  {}", summary::shorten(title, 60)),
+                        None => key.clone(),
+                    });
+                    row.badges
+                        .extend(issue.and_then(|issue| issue.state.clone()));
+                    if let Some(url) = issue.and_then(|issue| issue.url.clone()) {
+                        row.action = Some(Action::Emit(WorkSidebarOutcome::OpenUrl { url }));
+                    }
+                    rows.push(row);
+                }
+            }
+        }
     }
 
     fn task_rows(&self, rows: &mut Vec<Row>) {
