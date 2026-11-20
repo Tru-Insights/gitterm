@@ -13,6 +13,7 @@ pub const PANEL_NAME: &str = "GitTermShellPane";
 pub enum PaneKind {
     Terminal,
     CenterTerminal(std::path::PathBuf),
+    StoppedTerminal(std::path::PathBuf, bool),
     Chat,
     Git,
     Files,
@@ -37,12 +38,14 @@ pub enum PaneContent {
     Error(String),
 }
 pub struct Pane {
+    pub(crate) session: Option<gitterm_core::session::Target>,
     pub id: String,
     pub title: String,
     pub content: PaneContent,
     terminal_title: Option<String>,
     center_terminal: bool,
     exited: bool,
+    pub(crate) exit_pending: bool,
     terminal_cwd: Option<std::path::PathBuf>,
     workspace: WorkspaceId,
     data: Rc<dyn ShellData>,
@@ -51,6 +54,9 @@ pub struct Pane {
     _terminal_events: Option<Subscription>,
 }
 impl Pane {
+    pub(crate) fn workspace_dir(&self, cx: &App) -> Option<std::path::PathBuf> {
+        self.data.terminal_cwd(self.workspace, cx)
+    }
     pub fn new(
         id: String,
         title: String,
@@ -60,7 +66,10 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let session = matches!(kind, PaneKind::Terminal | PaneKind::CenterTerminal(_))
+            .then(crate::sessions::fresh_target);
         let content = match kind.clone() {
+            PaneKind::StoppedTerminal(..) => PaneContent::Error("Terminal stopped".into()),
             PaneKind::Terminal | PaneKind::CenterTerminal(_) => {
                 let launch = TerminalLaunch {
                     cwd: match &kind {
@@ -94,22 +103,35 @@ impl Pane {
                     let pane = cx.weak_entity();
                     let cwd_pane = pane.clone();
                     let exit_pane = pane.clone();
+                    let title_target = session.clone();
+                    let exit_target = session.clone();
+                    let cwd_target = session.clone();
                     PaneContent::Terminal(cx.new(|cx| {
                         TerminalView::launch(launch, TerminalConfig::default(), cx)
                             .with_title_callback(move |_, cx, title| {
                                 let _ = pane.update(cx, |pane, cx| {
+                                    if pane.session != title_target {
+                                        return;
+                                    }
                                     pane.terminal_title = Some(title.to_string());
                                     cx.notify();
                                 });
                             })
                             .with_exit_callback(move |_, cx| {
                                 _ = exit_pane.update(cx, |pane, cx| {
+                                    if pane.session != exit_target {
+                                        return;
+                                    }
                                     pane.exited = true;
+                                    pane.exit_pending = true;
                                     cx.notify();
                                 });
                             })
                             .with_cwd_callback(move |_, cx, cwd| {
                                 let _ = cwd_pane.update(cx, |pane, cx| {
+                                    if pane.session != cwd_target {
+                                        return;
+                                    }
                                     pane.terminal_cwd = Some(cwd.to_path_buf());
                                     cx.notify();
                                 });
@@ -130,13 +152,15 @@ impl Pane {
             PaneKind::Content(view) => PaneContent::Content(view),
             PaneKind::Review(view) => PaneContent::Review(view),
         };
-        let terminal_cwd = matches!(content, PaneContent::Terminal(_))
-            .then(|| data.terminal_cwd(workspace, cx).or_else(dirs::home_dir))
-            .flatten();
+        let terminal_cwd = match &kind {
+            PaneKind::CenterTerminal(cwd) | PaneKind::StoppedTerminal(cwd, _) => Some(cwd.clone()),
+            PaneKind::Terminal => data.terminal_cwd(workspace, cx).or_else(dirs::home_dir),
+            _ => None,
+        };
         if let PaneContent::Error(error) = &content {
             eprintln!("{error}");
         }
-        let terminal_events = if matches!(kind, PaneKind::CenterTerminal(_)) {
+        let terminal_events = if matches!(kind, PaneKind::CenterTerminal(_) | PaneKind::Terminal) {
             if let PaneContent::Terminal(view) = &content {
                 Some(cx.observe_in(view, window, |_, view, window, cx| {
                     let view = view.clone();
@@ -152,13 +176,18 @@ impl Pane {
             None
         };
         Self {
+            session,
             _terminal_events: terminal_events,
             id,
             title,
             content,
             terminal_title: None,
-            center_terminal: matches!(kind, PaneKind::CenterTerminal(_)),
+            center_terminal: matches!(
+                kind,
+                PaneKind::CenterTerminal(_) | PaneKind::StoppedTerminal(_, true)
+            ),
             exited: false,
+            exit_pending: false,
             terminal_cwd,
             workspace,
             data: data.clone(),
@@ -172,6 +201,38 @@ impl Pane {
         if let PaneContent::Terminal(view) = &self.content {
             view.update(cx, |view, _| view.backend_mut().cancel());
         }
+    }
+    /// Whole-session teardown, distinct from core's terminal StopTurn no-op.
+    pub(crate) fn stop_target(&mut self, target: &gitterm_core::session::Target, cx: &mut App) {
+        if self.session.as_ref() != Some(target) {
+            return;
+        }
+        self.close_terminal(cx);
+        self.session = None;
+        self.content = PaneContent::Error("Terminal stopped".into());
+        self._terminal_events = None;
+        self.exited = true;
+    }
+    pub(crate) fn resume_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cwd) = self.terminal_cwd.clone() else {
+            return;
+        };
+        if self.session.is_some() {
+            return;
+        }
+        *self = Self::new(
+            self.id.clone(),
+            self.title.clone(),
+            if self.center_terminal {
+                PaneKind::CenterTerminal(cwd)
+            } else {
+                PaneKind::Terminal
+            },
+            self.workspace,
+            self.data.clone(),
+            window,
+            cx,
+        );
     }
     pub(crate) fn status_view(&self, cx: &App) -> crate::data::GitStatus {
         self.data.status(self.workspace, cx)
@@ -210,7 +271,13 @@ impl Focusable for Pane {
     }
 }
 impl EventEmitter<PanelEvent> for Pane {}
+impl EventEmitter<crate::sessions::Removed> for Pane {}
 impl BasePanel for Pane {
+    fn on_removed(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(target) = &self.session {
+            cx.emit(crate::sessions::Removed(target.clone()));
+        }
+    }
     fn panel_name(&self) -> &'static str {
         PANEL_NAME
     }

@@ -13,6 +13,8 @@ use std::{
 /// Process/window owner. Dock panels hold read handles only. The executor and
 /// outcome bridge survive every dock close, move, hide and reconstruction.
 pub struct WorkspaceOwner {
+    /// Startup park metadata blocks PTY construction until explicit resume.
+    pub(crate) stopped_workspaces: std::collections::HashSet<crate::data::WorkspaceId>,
     pub model: WorkspaceStatus,
     pub error: Option<String>,
     pub files: std::collections::HashMap<crate::data::WorkspaceId, crate::files::FileTree>,
@@ -128,6 +130,7 @@ impl WorkspaceOwner {
             }));
         }
         Self {
+            stopped_workspaces: Default::default(),
             model,
             files: Default::default(),
             reviews: Default::default(),
@@ -146,6 +149,27 @@ impl WorkspaceOwner {
     }
     pub(crate) fn writer(&self) -> Option<Arc<crate::preview::Writer>> {
         self.store.as_ref().and_then(|s| s.guard.clone())
+    }
+    pub(crate) fn saved_parked(&self) -> Vec<crate::park::SavedPark> {
+        self.store
+            .as_ref()
+            .map(|store| store.parked.clone())
+            .unwrap_or_default()
+    }
+    pub(crate) fn save_parked(
+        &mut self,
+        records: Vec<crate::park::SavedPark>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = &mut self.store else { return };
+        store.parked = records;
+        match store.save_async(&self.model.folders()) {
+            Ok(save) => self.watch_save(save, cx),
+            Err(error) => {
+                self.error = Some(format!("Save parked workspaces: {error:#}"));
+                cx.notify();
+            }
+        }
     }
     pub(crate) fn preview(&self) -> Option<Arc<gitterm_core::preview::Preview>> {
         self.store
