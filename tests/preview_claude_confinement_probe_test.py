@@ -68,20 +68,33 @@ if MODE == 'replace-settings-dir' and not Path('.claude').is_symlink():
     (external / 'settings.json').write_text('external-keep')
     Path('.claude').rename('preserved-settings')
     Path('.claude').symlink_to(external, target_is_directory=True)
+if MODE == 'replace-settings-inode' and not Path('preserved-settings').exists():
+    Path('.claude').rename('preserved-settings')
+    (Path(__file__).parent.parent / 'existing-empty').rename('.claude')
 if MODE == 'exit': sys.exit(7)
 if MODE == 'malformed':
     print('not json')
     sys.exit(0)
 tools = ['Read', 'Write', 'Edit'] + (['Bash'] if MODE == 'shell' else [])
 events = [{{'type':'system','subtype':'init','tools':tools}}]
+denials = []
 match = re.search(r'absolute file_path (".*?") with content', args[-1])
 if match:
     target = Path(json.loads(match[1]))
+    inputs = {{'file_path':str(target), 'content':'preview-confinement-probe\\n'}}
+    if MODE == 'input-error': inputs.pop('content')
     if MODE != 'refuse':
-        events.append({{'type':'assistant','message':{{'content':[{{'type':'tool_use','name':'Write','input':{{'file_path':str(target)}}}}]}}}})
+        events.append({{'type':'assistant','message':{{'content':[{{'type':'tool_use','id':'write-probe','name':'Write','input':inputs}}]}}}})
+    if not target.name.endswith('-allowed.txt') and MODE not in ('input-error', 'unrelated-error'):
+        denials.append({{'tool_name':'Write','tool_use_id':'write-probe','tool_input':dict(inputs)}})
+        if MODE == 'wrong-denial-id': denials[-1]['tool_use_id'] = 'different-tool'
+        if MODE == 'wrong-denial-input': denials[-1]['tool_input']['file_path'] = '/different-file'
+    if MODE in ('input-error', 'unrelated-error'):
+        events.append({{'type':'user','message':{{'content':[{{'type':'tool_result','tool_use_id':'write-probe','is_error':True,'content':'InputValidationError: missing required content'}}]}}}})
     if (target.name.endswith('-allowed.txt') and MODE != 'no-positive') or MODE == 'escape':
         target.write_text('preview-confinement-probe\\n')
-events.append({{'type':'result','subtype':'success','is_error':False}})
+events.append({{'type':'result','subtype':'success','is_error':False,'permission_denials':denials}})
+if MODE == 'omit-denials': events[-1].pop('permission_denials')
 if MODE == 'no-init': events.pop(0)
 if MODE == 'auth-error': events[-1] = {{'type':'result','subtype':'error_during_execution','is_error':True}}
 for event in events: print(json.dumps(event))
@@ -150,6 +163,24 @@ for event in events: print(json.dumps(event))
         self.assertEqual((self.root / "external-settings/settings.json").read_text(), "external-keep")
         self.assertEqual((self.clone / "preserved-settings/settings.json").read_text(), "{}\n")
 
+    def test_cleanup_never_removes_a_replacement_directory_inode(self):
+        self.fake("replace-settings-inode")
+        existing = self.root / "existing-empty"
+        existing.mkdir()
+        inode = existing.stat().st_ino
+        output = self.run_probe()
+        self.assertNotEqual(output.returncode, 0)
+        self.assertTrue((self.clone / ".claude").is_dir())
+        self.assertEqual((self.clone / ".claude").stat().st_ino, inode)
+
+    def test_schema_errors_and_uncorrelated_denials_are_inconclusive(self):
+        for mode in ("input-error", "unrelated-error", "wrong-denial-id", "wrong-denial-input", "omit-denials"):
+            with self.subTest(mode=mode):
+                self.fake(mode)
+                output = self.run_probe()
+                self.assertNotEqual(output.returncode, 0, output.stdout)
+                self.assertIn("FAIL absolute synthetic protected root", output.stdout)
+
     def test_refusal_auth_errors_missing_tools_shell_and_missing_positive_fail(self):
         for mode in ("refuse", "exit", "malformed", "auth-error", "no-init", "shell", "no-positive"):
             with self.subTest(mode=mode):
@@ -190,6 +221,39 @@ for event in events: print(json.dumps(event))
         with self.assertRaises(ValueError):
             probe.check_help(HELP.replace('"acceptEdits"', '"acceptEditsPlus"'))
         self.assertFalse(probe.attempted([{"name": "Bash", "input": {"file_path": "/path"}}], Path("/path")))
+
+    def test_dangling_protected_marker_refuses_before_cli(self):
+        (self.root / ".gitterm-protected").symlink_to(self.root / "absent")
+        output = self.run_probe()
+        self.assertNotEqual(output.returncode, 0)
+        self.assertIn("protected sentinel ancestor", output.stderr)
+        self.assertFalse((self.clone / "fake-argv.json").exists())
+
+    def test_all_scoped_root_markers_refuse_before_cli(self):
+        for parent in (self.provider, self.clone / ".git", self.clone / ".git/objects", self.preview / "child/home",
+                       self.preview / "desktop", self.preview / "history", self.preview / "artifacts/snapshots",
+                       self.provider / "projects"):
+            with self.subTest(parent=parent):
+                parent.mkdir(parents=True, exist_ok=True)
+                marker = parent / ".gitterm-protected"
+                marker.write_text("protected")
+                output = self.run_probe()
+                self.assertNotEqual(output.returncode, 0, output.stdout + output.stderr)
+                self.assertIn("protected sentinel ancestor", output.stderr)
+                self.assertFalse((self.clone / "fake-argv.json").exists())
+                marker.unlink()
+
+    def test_protected_override_preserves_resolved_parent_namespace(self):
+        alias = self.root / "alias"
+        alias.symlink_to(self.preview, target_is_directory=True)
+        external = self.root / "external"
+        external.mkdir()
+        (self.preview / "production-link").symlink_to(external, target_is_directory=True)
+        self.env["CLAUDE_CONFIG_DIR"] = str(alias / "production-link")
+        output = self.run_probe()
+        self.assertNotEqual(output.returncode, 0, output.stdout)
+        self.assertIn("protected root overlap", output.stderr)
+        self.assertFalse((self.clone / "fake-argv.json").exists())
 
 
 if __name__ == "__main__":

@@ -83,20 +83,6 @@ impl Provider {
                 && git.common == dotgit,
             "Claude preview requires the root of an independent clone with local .git metadata"
         );
-        // Even an in-tree commondir or object alternate can share another
-        // checkout's state. Do not invoke Git to discover these redirects.
-        for redirect in [
-            "commondir",
-            "worktrees",
-            "objects/info/alternates",
-            "objects/info/http-alternates",
-        ] {
-            match std::fs::symlink_metadata(dotgit.join(redirect)) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-                Ok(_) => anyhow::bail!("independent clone cannot contain .git/{redirect}"),
-            }
-        }
         for (path, directory) in [
             ("config", false),
             ("HEAD", false),
@@ -120,6 +106,20 @@ impl Provider {
             Ok(meta) => ensure!(meta.is_dir(), "aliased Git objects/info"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
+        }
+        // Validate parent directories before inspecting redirects so discovery
+        // never follows an objects/info symlink into another checkout.
+        for redirect in [
+            "commondir",
+            "worktrees",
+            "objects/info/alternates",
+            "objects/info/http-alternates",
+        ] {
+            match std::fs::symlink_metadata(dotgit.join(redirect)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+                Ok(_) => anyhow::bail!("independent clone cannot contain .git/{redirect}"),
+            }
         }
         self.preview.scoped(&self.preview.provider())?;
         Ok(())

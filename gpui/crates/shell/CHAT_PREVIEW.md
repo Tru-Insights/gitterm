@@ -71,8 +71,12 @@ Exact probe argv per case, with one mode (the sole probe-only exception):
 
 `--permission-prompts none` is documented by installed help and denies protected
 config/Git requests that would need a person. Output must have CLI init/tool
-inventory, a successful result and an attempted file-tool call for the requested
-path; a model refusal, auth failure or missing evidence is FAIL/inconclusive.
+inventory, a successful result and a valid Write call carrying the exact path
+and marker content. Forbidden cases additionally require the same tool-use ID,
+name and input in the result's authoritative
+[`permission_denials`](https://code.claude.com/docs/en/agent-sdk/typescript#sdkpermissiondenial).
+A schema/IO error, unrelated denial, model refusal, auth failure or missing
+evidence is FAIL/inconclusive.
 The shell case checks the CLI tool inventory and invocation records, never the
 model's explanation. Every invocation independently checks all forbidden paths
 on disk, including after CLI/parse errors. Cases print separate PASS/FAIL:
@@ -132,7 +136,7 @@ C8-confine verification uses `scripts/cargo.sh`,
 - `scripts/check-gpui-deps.sh`: exit 0.
 - Root `fmt --all -- --check`: exit 0. No core changes, so conditional core
   runtime tests are not required for this diff.
-- `python3 -B tests/preview_claude_confinement_probe_test.py`: exit 0, nine
+- `python3 -B tests/preview_claude_confinement_probe_test.py`: exit 0, 14
   tests, including simulated escapes, refusal/auth/parse failures, exact argv
   and environment, missing `--restricted`, shared metadata and cleanup aliases.
 - `sh -n scripts/preview-claude-confinement-probe.sh` and `git diff --check`:
@@ -145,6 +149,17 @@ inspection access exited 0. Neither failure was weakened or skipped. Only
 mechanical follow-ons are the two existing fake-launch fixtures gaining local
 Git metadata to satisfy the stricter clone validator. The task-specific checks
 replace the unrelated Iced pre-commit hook; repository hook config is unchanged.
+
+R2 code review `ec75a6b1-cb1f-4b8f-aed8-85fd4de0604d` confirmed the task's
+checkout/commit `0659319` and closed C2 posture, and reported four P2 findings.
+F1 is fixed by validating the complete Write input and requiring correlated
+authoritative denial evidence; schema/IO failures can no longer count as
+confinement. F2 is fixed by tracking directory device/inode and checking its
+parent before cleanup. F3 is fixed by checking all scoped app/provider/Git and
+child roots and treating dangling marker entries as protected. F4 is fixed by
+preserving the visible root, resolved target and resolved-parent namespace for
+every protected path, matching core `ProtectedRoots`. Each has a synthetic
+regression; no real probe was executed. Re-review is required for these changes.
 
 The local shell's More menu opens **New Claude chat** and **Claude preview
 history**. The workspace owner retains each chat entity across dock changes.
