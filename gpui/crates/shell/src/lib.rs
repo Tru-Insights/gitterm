@@ -20,6 +20,7 @@ pub mod preview;
 mod region_tests;
 pub mod remote;
 mod review_reload;
+pub mod session_picker;
 mod sessions;
 pub mod settings;
 pub mod tasks;
