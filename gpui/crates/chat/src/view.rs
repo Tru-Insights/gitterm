@@ -619,9 +619,22 @@ impl ChatView {
     }
     fn pending_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let pending = self.model.pending_rows();
-        let Some(&index) = pending.first() else {
+        if pending.is_empty() {
             return div().into_any_element();
-        };
+        }
+        // Worker delivery is gated; it must not strand a parent's answerable request.
+        let position = pending
+            .iter()
+            .position(|&index| {
+                self.model.rows[index]
+                    .request
+                    .as_ref()
+                    .unwrap()
+                    .owner
+                    .is_empty()
+            })
+            .unwrap_or(0);
+        let index = pending[position];
         let row = self.model.rows[index].clone();
         let card = self
             .cards
@@ -653,8 +666,11 @@ impl ChatView {
             .border_1()
             .border_color(rgb(BORDER))
             .rounded(px(6.))
+            .when(position > 0, |panel| {
+                panel.child("Earlier worker requests · read-only")
+            })
             .when(pending.len() > 1, |panel| {
-                panel.child(format!("1 of {}", pending.len()))
+                panel.child(format!("{} of {}", position + 1, pending.len()))
             })
             .child(card)
             .into_any_element()

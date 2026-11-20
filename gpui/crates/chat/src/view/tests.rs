@@ -1116,3 +1116,81 @@ fn deny_enter_uses_focused_reason_and_preserves_composer_draft(cx: &mut TestAppC
         assert_eq!(view.composer.read(cx).value().as_str(), "retained draft")
     });
 }
+
+#[gpui::test]
+fn worker_first_panel_keeps_same_id_parent_answer_reachable(cx: &mut TestAppContext) {
+    use crate::adapter::ChatAdapter;
+    use gitterm_core::{chat::state::AgentEvent, session};
+    use std::cell::RefCell;
+    let (chat, cx) = setup(vec![], cx);
+    let mut adapter = ChatAdapter::default();
+    let target = session::Target {
+        tab_id: 1,
+        session_uid: "worker-first".into(),
+        task_id: None,
+        task_session_id: None,
+    };
+    let stamp = adapter.begin_runtime(target.clone());
+    let intents = Rc::new(RefCell::new(vec![]));
+    let captured = intents.clone();
+    chat.update_in(cx, |view, _, cx| {
+        view.set_intent_callback(
+            Rc::new(move |intent, _| {
+                captured.borrow_mut().push(intent);
+                Receipt::rejected("fixture")
+            }),
+            cx,
+        );
+        view.set_read_only(None, cx);
+    });
+    let request = || HarnessEvent::RuntimeRequest {
+        request_id: "same".into(),
+        tool_use_id: "same".into(),
+        kind: crate::events::RuntimeRequestKind::Permission {
+            tool_name: "Read".into(),
+            input: serde_json::json!({}),
+            suggestions: vec![],
+            decision_reason: None,
+        },
+    };
+    for event in [
+        HarnessEvent::SubagentEvent {
+            parent_tool_use_id: "worker".into(),
+            event: Box::new(request()),
+        },
+        request(),
+    ] {
+        let update = adapter
+            .receive(&stamp, &target, AgentEvent::Harness(event), None, |_, _| {})
+            .unwrap();
+        chat.update_in(cx, |view, window, cx| {
+            view.present(&stamp, adapter.state(), update, window, cx)
+        });
+    }
+    chat.update_in(cx, |view, _, cx| {
+        assert_eq!(view.model.pending_rows(), vec![0, 1]);
+        view.cards[&0].update(cx, |card, cx| {
+            card.emit(
+                ChatIntent::Permission {
+                    request_id: "same".into(),
+                    decision: crate::PermissionDecision::Allow,
+                },
+                cx,
+            )
+        });
+        assert!(intents.borrow().is_empty(), "worker remains gated");
+        view.cards[&1].update(cx, |card, cx| {
+            card.emit(
+                ChatIntent::Permission {
+                    request_id: "same".into(),
+                    decision: crate::PermissionDecision::Allow,
+                },
+                cx,
+            )
+        });
+    });
+    assert_eq!(intents.borrow().len(), 1);
+    assert!(
+        matches!(&intents.borrow()[0], ChatIntent::Answer { identity, .. } if identity.request_id == "same" && identity.owner.is_empty())
+    );
+}
