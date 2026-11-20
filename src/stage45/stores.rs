@@ -79,10 +79,15 @@ fn stores_load_action_save_and_refusals() {
             read_json(&RemoteAgentsFile::file_path()),
             shape::<RemoteAgentsFile>(&case["remote_agents"])
         );
-        let limits: gitterm::plan_limits::PlanLimitsFile =
+        let mut limits: gitterm::plan_limits::PlanLimitsFile =
             serde_json::from_value(case["limits"].clone()).unwrap();
         let path = gitterm::plan_limits::PlanLimitsFile::path_in(&dir);
-        limits.save(&path).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&case["limits"]).unwrap()).unwrap();
+        limits.pending_notices.clear();
+        let loaded = gitterm::plan_limits::PlanLimitsFile::load(&path);
+        assert_eq!(loaded, limits);
+        loaded.save(&path).unwrap();
+        assert!(read_json(&path).get("pending_notices").is_none());
         assert_eq!(gitterm::plan_limits::PlanLimitsFile::load(&path), limits);
         let focus: gitterm::workspace_overview::FocusPicks =
             serde_json::from_value(case["focus"].clone()).unwrap();

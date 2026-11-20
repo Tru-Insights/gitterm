@@ -1,15 +1,20 @@
 //! Native preview composition. The shared workspace owner retains these entities;
 //! docking/hiding never installs another runtime receiver.
+mod auth;
 mod fence;
+mod lease;
+mod managed;
 mod provider;
 #[cfg(test)]
 mod tests;
-use anyhow::Result;
-#[cfg(test)]
-use gitterm_core::chat::types::HarnessEvent;
+use anyhow::{Context as _, Result};
+use gitterm_core::chat::{
+    runtime::{DeliveryOutcome, RuntimeEvent},
+    types::HarnessEvent,
+};
 use gitterm_core::{
     chat::{
-        runtime::Session,
+        runtime::{CommandCorrelation, Session},
         state::{AgentEvent, RuntimeStamp},
         types::AgentBackend,
     },
@@ -17,7 +22,7 @@ use gitterm_core::{
 };
 use gitterm_gpui_chat::{
     ChatIntent, ChatView,
-    adapter::{Admission, ChatAdapter, Receipt, Update},
+    adapter::{Admission, AttemptId, ChatAdapter, Receipt, Update},
     events::{Entry, Record},
 };
 use gpui::{
@@ -26,7 +31,7 @@ use gpui::{
 };
 use gpui_component::{Disableable, button::Button};
 use provider::Provider;
-use std::{path::PathBuf, rc::Rc, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, rc::Rc, sync::Arc};
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,9 +56,10 @@ struct Controller {
     adapter: ChatAdapter,
     target: session::Target,
     source: RuntimeStamp,
-    runtime: Option<Session>,
+    runtime: Option<OwnedRuntime>,
     ready: bool,
     message: u64,
+    correlations: HashMap<CommandCorrelation, AttemptId>,
 }
 impl Controller {
     fn new() -> Self {
@@ -67,6 +73,7 @@ impl Controller {
             runtime: None,
             ready: false,
             message: 0,
+            correlations: HashMap::new(),
         }
     }
     fn dispatch(&mut self, intent: ChatIntent) -> (Receipt, Update) {
@@ -105,23 +112,57 @@ impl Controller {
             Ok(prepared) => prepared,
             Err(receipt) => return (receipt, Update::default()),
         };
+        let correlation = CommandCorrelation(self.message);
+        self.correlations.insert(correlation, prepared.id());
         let runtime = self.runtime.as_ref();
-        self.adapter
+        let result = self
+            .adapter
             .execute(prepared, &self.target, now_ms(), |command| {
                 runtime
                     .ok_or_else(|| "No preview runtime".to_string())?
-                    .send(command)
-            })
+                    .send_correlated(command, correlation)
+            });
+        if !matches!(
+            result.0.state,
+            gitterm_gpui_chat::adapter::ReceiptState::ChannelAccepted
+        ) {
+            self.correlations.remove(&correlation);
+        }
+        result
     }
-    /// C8a hook: channel handoff is not a correlated runner write outcome.
-    /// Add the actual core outcome contract here when it lands; never infer one
-    /// from errors, Ready, ProcessExited, or RuntimeRequestResolved.
-    #[cfg(test)]
     fn apply_runtime_outcome(
         &mut self,
         source: &RuntimeStamp,
-        event: HarnessEvent,
+        event: RuntimeEvent,
     ) -> Option<Update> {
+        if !self.adapter.state().accepts_stream(source, &self.target) {
+            return None;
+        }
+        let event = match event {
+            RuntimeEvent::Harness(event) => event,
+            RuntimeEvent::CommandOutcome {
+                correlation,
+                outcome,
+            } => {
+                let id = self.correlations.remove(&correlation)?;
+                let outcome = match outcome {
+                    DeliveryOutcome::Written => {
+                        gitterm_gpui_chat::adapter::DeliveryOutcome::Written
+                    }
+                    DeliveryOutcome::Rejected(error) => {
+                        gitterm_gpui_chat::adapter::DeliveryOutcome::Rejected(error)
+                    }
+                    DeliveryOutcome::Uncertain(error) => {
+                        gitterm_gpui_chat::adapter::DeliveryOutcome::Uncertain(error)
+                    }
+                };
+                let receipt = self.adapter.delivery(id, &self.target, outcome)?;
+                return Some(Update {
+                    receipts: vec![receipt],
+                    ..Update::default()
+                });
+            }
+        };
         let ready = matches!(event, HarnessEvent::Ready { .. });
         let exited = matches!(event, HarnessEvent::ProcessExited { .. });
         let update = self.adapter.receive(
@@ -180,26 +221,31 @@ impl ChatPane {
         });
         let callback = Self::intent_callback(cx.weak_entity());
         view.update(cx, |view, cx| view.set_intent_callback(callback, cx));
-        let status = (|| -> Result<String> {
+        let launch = (|| -> Result<_> {
             let program = claude_program()?;
-            let provider = Provider::new(preview, &program)?;
-            provider.validate_workspace(&saved.cwd)?;
+            let provider = Arc::new(Provider::new(preview, &program)?);
             provider.prepare()?;
             let command = provider.sign_in_command();
-            let gate = match provider.authorize() {
-                Err(error) => error,
-                Ok(()) => anyhow::bail!("Claude launch confinement has not been implemented"),
-            };
-            Ok(format!("Claude preview unavailable: {gate:#}\nSign in to Claude for the preview (after isolation review):\n{command}"))
-        })().unwrap_or_else(|error| format!("Claude preview unavailable: {error:#}"));
-        Self {
+            let (runtime, events) = provider.start(saved.cwd.clone()).with_context(|| {
+                format!(
+                    "Sign in once with a personal Pro/Max account in the isolated root:\n{command}"
+                )
+            })?;
+            Ok((runtime, events))
+        })();
+        let mut pane = Self {
             controller,
             saved,
             view,
-            status,
+            status: String::new(),
             pending: vec![],
             shutdown,
+        };
+        match launch {
+            Ok((runtime, events)) => pane.install_runtime(runtime, events, window, cx),
+            Err(error) => pane.status = format!("Claude preview unavailable: {error:#}"),
         }
+        pane
     }
     fn intent_callback(weak: gpui::WeakEntity<Self>) -> gitterm_gpui_chat::IntentCallback {
         Rc::new(move |intent, cx| {
@@ -283,11 +329,10 @@ impl ChatPane {
         cx.emit(self.saved.clone());
         cx.notify();
     }
-    #[cfg(test)]
-    fn install_fake(
+    fn install_runtime(
         &mut self,
-        runtime: Session,
-        mut events: tokio::sync::mpsc::UnboundedReceiver<HarnessEvent>,
+        runtime: OwnedRuntime,
+        mut events: tokio::sync::mpsc::UnboundedReceiver<RuntimeEvent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -297,10 +342,31 @@ impl ChatPane {
             while let Some(event) = events.recv().await {
                 if pane
                     .update_in(cx, |pane, _, cx| {
+                        if !pane
+                            .controller
+                            .adapter
+                            .state()
+                            .accepts_stream(&source, &pane.controller.target)
+                        {
+                            return;
+                        }
+                        if let RuntimeEvent::Harness(HarnessEvent::Error(error)) = &event {
+                            pane.status = format!("Claude preview unavailable: {error}");
+                        }
+                        let exited = matches!(
+                            &event,
+                            RuntimeEvent::Harness(HarnessEvent::ProcessExited { .. })
+                        );
                         if let Some(update) = pane.controller.apply_runtime_outcome(&source, event)
                         {
                             pane.pending.push(update);
                             pane.changed(cx);
+                        }
+                        if exited {
+                            pane.shutdown_runtime();
+                            pane.view.update(cx, |view, cx| {
+                                view.set_read_only(Some("Claude preview stopped".into()), cx)
+                            });
                         }
                     })
                     .is_err()
@@ -310,7 +376,7 @@ impl ChatPane {
             }
         })
         .detach();
-        self.status = "Synthetic Claude runtime · delivery unconfirmed".into();
+        self.status = "Fresh isolated Claude preview · personal Pro/Max gate".into();
         self.view
             .update(cx, |view, cx| view.set_read_only(None, cx));
     }
@@ -326,6 +392,33 @@ impl gpui::Focusable for ChatPane {
     }
 }
 
+/// The lease travels with the runtime into the completion queue. It is released
+/// only after completed() has joined the session thread, including cleanup.
+struct OwnedRuntime {
+    session: Session,
+    _lease: Option<Arc<lease::ProviderLease>>,
+}
+impl std::ops::Deref for OwnedRuntime {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        &self.session
+    }
+}
+impl std::ops::DerefMut for OwnedRuntime {
+    fn deref_mut(&mut self) -> &mut Session {
+        &mut self.session
+    }
+}
+#[cfg(test)]
+impl From<Session> for OwnedRuntime {
+    fn from(session: Session) -> Self {
+        Self {
+            session,
+            _lease: None,
+        }
+    }
+}
+
 /// The application retains completion ownership after a pane is closed. Quit
 /// drains synchronously before GPUI starts its 200 ms future timeout, as the
 /// existing preview disk queue does. Ordinary close callbacks only enqueue.
@@ -333,7 +426,7 @@ pub(crate) struct RuntimeShutdown {
     sender: std::sync::mpsc::Sender<ShutdownCommand>,
 }
 enum ShutdownCommand {
-    Session(Session),
+    Session(OwnedRuntime),
     Drain(std::sync::mpsc::SyncSender<std::result::Result<(), String>>),
 }
 impl RuntimeShutdown {
@@ -368,9 +461,10 @@ impl RuntimeShutdown {
             .expect("create preview chat shutdown thread");
         Arc::new(Self { sender })
     }
-    fn enqueue(&self, session: Session) -> std::result::Result<(), Session> {
+    fn enqueue(&self, session: OwnedRuntime) -> std::result::Result<(), OwnedRuntime> {
         // A closed channel means the child has already exited. Completion still
         // owns snapshot cleanup and the thread join, so always queue the handle.
+        session.close_turn_snapshots();
         let _ = session.send(gitterm_core::chat::types::HarnessCommand::Shutdown);
         self.sender
             .send(ShutdownCommand::Session(session))
@@ -419,7 +513,7 @@ impl Render for ChatPane {
             .child(div().p_2().child(self.status.clone()))
             .child(
                 Button::new("preview-status")
-                    .label("Isolation review required before sign-in or chat")
+                    .label("Fresh local chat · resume, workers and remote unavailable")
                     .disabled(true),
             )
             .child(div().flex_1().min_h_0().child(self.view.clone()))

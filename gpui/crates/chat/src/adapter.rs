@@ -36,12 +36,10 @@ impl ReceiptState {
     pub fn label(&self) -> String {
         match self {
             Self::Prepared => "Preparing command".into(),
-            Self::ChannelAccepted => {
-                "Accepted by command channel · harness delivery unconfirmed".into()
-            }
-            Self::Written => "Written to harness · awaiting authoritative outcome".into(),
-            Self::Rejected(error) => format!("Not delivered · {error} · retry available"),
-            Self::Uncertain(error) => format!("Delivery uncertain · {error} · retry blocked"),
+            Self::ChannelAccepted => "Sending to harness".into(),
+            Self::Written => "Written to harness · awaiting provider response".into(),
+            Self::Rejected(error) => format!("Rejected · {error} · retry available"),
+            Self::Uncertain(error) => format!("Uncertain · {error} · retry blocked"),
             Self::Resolved => "Resolved · decision not recorded".into(),
         }
     }

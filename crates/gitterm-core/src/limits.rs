@@ -1,5 +1,5 @@
-//! Shared plan-limit observations, notices and serialized read/save transitions.
-//! Hosts own launch authority, provider counts, recipients and delivery acceptance.
+//! Shared plan-limit observations, Usage badge and serialized read/save transitions.
+//! Hosts own launch authority and provider counts; limits never prompt chats.
 //! Jobs require explicit paths; enabling runtime does not authorize service startup.
 use crate::chat::types::RateLimitReading;
 use crate::plan_limits::{self, PlanLimits, PlanLimitsFile};
@@ -47,6 +47,10 @@ impl PlanLimitsState {
             self.file.pin = evaluation.pin.clone();
             self.dirty = true;
         }
+        self.dirty |= self
+            .file
+            .usage_badge
+            .observe(&evaluation.policy, &evaluation.report, now);
         if self.file.policy.as_ref() != Some(&evaluation.policy) {
             self.file.policy = Some(evaluation.policy);
             self.dirty = true;
@@ -54,52 +58,26 @@ impl PlanLimitsState {
         self.queue_notices(chats, &evaluation.notices);
     }
 
-    pub fn queue_notices(&mut self, chats: &[String], lines: &[String]) {
-        let before = self.file.pending_notices.len();
-        self.file
-            .pending_notices
-            .retain(|chat, _| chats.contains(chat));
-        self.dirty |= before != self.file.pending_notices.len();
-        if lines.is_empty() {
-            return;
-        }
-        for chat in chats {
-            let pending = self.file.pending_notices.entry(chat.clone()).or_default();
-            if lines.iter().any(|line| line.starts_with("Routing:")) {
-                let before = pending.len();
-                pending.retain(|line| !line.starts_with("Routing:"));
-                self.dirty |= before != pending.len();
-            }
-            for line in lines {
-                if !pending.contains(line) {
-                    pending.push(line.clone());
-                    self.dirty = true;
-                }
-            }
-        }
+    /// Legacy host API: plan-limit messages must never enter a chat queue.
+    pub fn queue_notices(&mut self, _chats: &[String], _lines: &[String]) {
+        self.dirty |= !self.file.pending_notices.is_empty();
+        self.file.pending_notices.clear();
     }
 
-    pub fn notice(&self, chat: &str, busy: bool) -> Option<String> {
-        if busy {
-            return None;
-        }
-        self.file.pending_notices.get(chat).map(|lines| {
-            format!("GitTerm plan limits: {}\nRelay this heads-up to the user and follow `plan_limits` routing for new work. An explicit user model choice wins; never restart running workers to change routing.", lines.join("\n"))
-        })
+    pub fn notice(&self, _chat: &str, _busy: bool) -> Option<String> {
+        None
     }
 
-    pub fn finish_notice(&mut self, chat: &str, accepted: bool) {
-        if accepted {
-            self.dirty |= self.file.pending_notices.remove(chat).is_some();
-        } else {
-            eprintln!("[plan-limits] coordinator {chat} did not accept the notice; retaining it for retry");
-        }
+    pub fn finish_notice(&mut self, _chat: &str, _accepted: bool) {
+        self.queue_notices(&[], &[]);
     }
 
     /// The persisted readings from the config dir (a small read).
     pub fn load(config_dir: &Path) -> Self {
         Self {
             file: PlanLimitsFile::load(&PlanLimitsFile::path_in(config_dir)),
+            // Rewrite legacy files without their pending chat prompts.
+            dirty: true,
             ..Self::default()
         }
     }
@@ -232,65 +210,27 @@ mod tests {
         chrono::Utc::now().timestamp()
     }
     #[test]
-    fn notices_are_deduplicated_per_chat_grouped_and_held_until_idle() {
+    fn no_notice_kind_can_be_queued_or_delivered_to_any_chat() {
         let mut state = PlanLimitsState::default();
         let chats = vec!["first".into(), "second".into()];
-        let lines = vec!["hot".into(), "routing changed".into()];
+        let lines = vec![
+            "running hot".into(),
+            "urgent".into(),
+            "Both plans are running hot".into(),
+            "Routing: hold_claude".into(),
+            "weekly window reset; usage is unknown".into(),
+            "pin cleared".into(),
+        ];
         state.queue_notices(&chats, &lines);
         state.queue_notices(&chats, &lines);
-        assert!(state.notice("first", true).is_none());
-        let second = state.notice("second", false).unwrap();
-        assert_eq!(second.matches("hot").count(), 1);
-        assert!(second.contains("routing changed"));
-        state.finish_notice("second", false);
-        assert!(state.notice("second", false).is_some());
-        state.finish_notice("second", true);
-        assert!(state.notice("second", false).is_none());
-        assert!(state.notice("first", false).is_some());
-        state.finish_notice("first", true);
-        assert!(state.notice("first", false).is_none());
-        state.queue_notices(&chats, &["Routing: hold_claude".into()]);
-        state.queue_notices(&chats, &["Routing: balanced".into()]);
-        let prompt = state.notice("first", false).unwrap();
-        assert!(!prompt.contains("hold_claude"));
-        assert!(prompt.contains("Routing: balanced"));
-    }
-
-    #[test]
-    fn setting_and_clearing_a_pin_queue_a_routing_nudge() {
-        let mut state = PlanLimitsState::default();
-        let chats = vec!["coordinator".into()];
-        let pin = plan_limits::RoutingPin {
-            provider: Provider::Codex,
-            until: now_unix() + 3600,
-        };
-        state.queue_notices(
-            &chats,
-            &[plan_limits::pin_change_notice(
-                Some(&pin),
-                now_unix(),
-                &plan_limits::evaluate_policy(&state.file, now_unix())
-                    .report
-                    .routing,
-            )],
-        );
-        assert!(state
-            .notice("coordinator", false)
-            .unwrap()
-            .contains("pin to Codex set"));
-        state.queue_notices(
-            &chats,
-            &[plan_limits::pin_change_notice(
-                None,
-                now_unix(),
-                &plan_limits::evaluate_policy(&state.file, now_unix())
-                    .report
-                    .routing,
-            )],
-        );
-        let notice = state.notice("coordinator", false).unwrap();
-        assert!(notice.contains("pin cleared."));
-        assert!(!notice.contains("pin to Codex set"));
+        for chat in chats {
+            for busy in [false, true] {
+                assert!(state.notice(&chat, busy).is_none());
+            }
+            state.finish_notice(&chat, false);
+            state.finish_notice(&chat, true);
+        }
+        assert!(state.file.pending_notices.is_empty());
     }
 
     fn claude_reading(used: f64, now: i64) -> PlanLimits {
@@ -304,101 +244,104 @@ mod tests {
         reading
     }
 
-    #[cfg(feature = "runtime")]
     #[test]
-    fn pending_hot_and_hold_notices_survive_restart_and_acknowledgement() {
+    fn legacy_pending_notices_are_dropped_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = PlanLimitsFile::path_in(dir.path());
+        std::fs::write(
+            &path,
+            br#"{"pin":{"provider":"codex","until":1800003600},"pending_notices":{"first":["hot"],"second":["Routing: hold_codex"]}}"#,
+        )
+        .unwrap();
+        let loaded = PlanLimitsFile::load(&path);
+        assert!(loaded.pending_notices.is_empty());
+        assert_eq!(
+            loaded.pin.as_ref().map(|pin| pin.provider),
+            Some(Provider::Codex)
+        );
+        let mut resumed = PlanLimitsState::load(dir.path());
+        assert!(resumed.file.pending_notices.is_empty());
+        resumed.evaluate(&["first".into(), "second".into()], now_unix());
+        assert!(resumed.notice("first", false).is_none());
+        assert!(resumed.notice("second", false).is_none());
+        assert!(!serde_json::to_string(resumed.file())
+            .unwrap()
+            .contains("pending_notices"));
+    }
+
+    #[test]
+    fn hot_hold_pin_and_reset_evaluations_never_queue_chat_notices() {
+        let now = now_unix();
+        let chats = vec!["first".into(), "second".into()];
         for used in [35.0, 95.0] {
-            let now = now_unix();
-            let dir = tempfile::tempdir().unwrap();
-            let path = PlanLimitsFile::path_in(dir.path());
             let mut state = PlanLimitsState::default();
-            let chats = vec!["coordinator".into(), "other".into()];
-            state.file.absorb(claude_reading(used, now));
+            state.absorb(claude_reading(used, now));
+            let mut codex = claude_reading(used, now);
+            codex.provider = Provider::Codex;
+            state.absorb(codex);
+            assert!(!plan_limits::evaluate_policy(state.file(), now)
+                .notices
+                .is_empty());
             state.evaluate(&chats, now);
-            assert!(state.notice("coordinator", true).is_none());
-            let expected = state.notice("coordinator", false).unwrap();
-            state.file.save(&path).unwrap();
-            let mut resumed = PlanLimitsState::load(dir.path());
-            resumed.evaluate(&chats, now);
-            assert_eq!(resumed.notice("coordinator", false), Some(expected.clone()));
-            resumed.finish_notice("coordinator", false);
-            assert_eq!(resumed.notice("coordinator", false), Some(expected.clone()));
-            resumed.finish_notice("coordinator", true);
-            resumed.file.save(&path).unwrap();
-            let mut acknowledged = PlanLimitsState::load(dir.path());
-            acknowledged.evaluate(&chats, now);
-            assert!(acknowledged.notice("coordinator", false).is_none());
-            assert_eq!(acknowledged.notice("other", false), Some(expected));
+            state.set_pin(Some(plan_limits::RoutingPin {
+                provider: Provider::Claude,
+                until: now + 3600,
+            }));
+            state.evaluate(&chats, now);
+            if used >= 95.0 {
+                assert_eq!(
+                    state.evaluation_for_launch().report.routing.state,
+                    plan_limits::RoutingState::Conserve
+                );
+            }
+            state.set_pin(None);
+            state.evaluate(&chats, now);
+            let mut reset = claude_reading(used, now + 60);
+            reset.windows[0].used_percent = None;
+            state.absorb(reset);
+            state.evaluate(&chats, now + 60);
+            assert!(state.file.pending_notices.is_empty());
+            for chat in &chats {
+                assert!(state.notice(chat, false).is_none());
+            }
         }
     }
 
     #[test]
-    fn pin_under_hold_keeps_the_effective_checkpoint_and_handoff_notice() {
+    fn drifting_hot_estimates_keep_one_badge_and_never_prompt_chats() {
         let now = now_unix();
-        let chats = vec!["coordinator".into()];
         let mut state = PlanLimitsState::default();
-        state.file.absorb(claude_reading(95.0, now));
-        state.evaluate(&chats, now);
-        state.file.pin = Some(plan_limits::RoutingPin {
-            provider: Provider::Claude,
-            until: now + 3600,
-        });
-        state.evaluate(&chats, now);
-        state.queue_notices(
-            &chats,
-            &[plan_limits::pin_change_notice(
-                state.file.pin.as_ref(),
-                now,
-                &plan_limits::evaluate_policy(&state.file, now)
+        let chats = vec!["first".into(), "second".into()];
+        let mut runouts = Vec::new();
+        for minute in 0..120 {
+            let at = now + minute * 60;
+            state.absorb(claude_reading(35.0 + minute as f64 * 0.01, at));
+            state.evaluate(&chats, at);
+            let report = plan_limits::evaluate_policy(state.file(), at);
+            runouts.push(
+                report
                     .report
-                    .routing,
-            )],
-        );
-        let prompt = state.notice("coordinator", false).unwrap();
-        assert!(prompt.contains("start nothing new on Claude"));
-        assert!(prompt.contains("writes checkpoint and handoff"));
-        state.finish_notice("coordinator", true);
-        state.file.pin = None;
-        state.evaluate(&chats, now);
-        state.queue_notices(
-            &chats,
-            &[plan_limits::pin_change_notice(
-                None,
-                now,
-                &plan_limits::evaluate_policy(&state.file, now)
-                    .report
-                    .routing,
-            )],
-        );
-        let cleared = state.notice("coordinator", false).unwrap();
-        assert!(cleared.contains("pin cleared."));
-        assert!(cleared.contains("writes checkpoint and handoff"));
-    }
-
-    #[cfg(feature = "runtime")]
-    #[test]
-    fn notice_changes_during_an_in_flight_save_remain_dirty() {
-        let chats = vec!["coordinator".into()];
-        let mut state = PlanLimitsState::default();
-        state.queue_notices(&chats, &["Routing: hold_codex".into()]);
-        let snapshot = state.file.clone();
-        state.dirty = false;
-        state.save_in_flight = true;
-        state.finish_notice("coordinator", true);
-        let dir = tempfile::tempdir().unwrap();
-        let path = PlanLimitsFile::path_in(dir.path());
-        snapshot.save(&path).unwrap();
-        assert!(state.finish_save(Ok(()), &path));
-        assert!(state.dirty);
-        state.file.save(&path).unwrap();
-        assert!(PlanLimitsState::load(dir.path())
-            .notice("coordinator", false)
-            .is_none());
-        state.queue_notices(&chats, &["Routing: balanced".into()]);
-        state.dirty = false;
-        state.queue_notices(&[], &[]);
-        assert!(state.dirty);
-        assert!(state.file.pending_notices.is_empty());
+                    .claude
+                    .windows
+                    .iter()
+                    .find(|w| w.label == "7d")
+                    .unwrap()
+                    .days_left,
+            );
+            assert_eq!(
+                state.file.usage_badge.level,
+                if minute == 0 {
+                    plan_limits::UsageBadgeLevel::OnTrack
+                } else {
+                    plan_limits::UsageBadgeLevel::Hot
+                }
+            );
+            assert!(state.file.pending_notices.is_empty());
+            for chat in &chats {
+                assert!(state.notice(chat, false).is_none());
+            }
+        }
+        assert_ne!(runouts.first(), runouts.last());
     }
 
     #[test]
@@ -450,21 +393,21 @@ mod tests {
             .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = PlanLimitsFile::path_in(dir.path());
-        let chats = vec!["coordinator".into()];
         let mut state = PlanLimitsState::default();
         assert!(state.begin_save(path.clone()).is_none());
-        state.queue_notices(&chats, &["Routing: hold_codex".into()]);
+        state.set_pin(Some(plan_limits::RoutingPin {
+            provider: Provider::Codex,
+            until: now_unix() + 3600,
+        }));
         let first = state.begin_save(path.clone()).unwrap();
         assert!(state.begin_save(path.clone()).is_none());
-        state.finish_notice("coordinator", true);
+        state.set_pin(None);
         let PlanLimitsEvent::Saved(result) = runtime.block_on(first.run()) else {
             panic!("expected save completion")
         };
         assert!(result.is_ok());
         assert!(state.finish_save(result, &path));
-        assert!(PlanLimitsState::load(dir.path())
-            .notice("coordinator", false)
-            .is_some());
+        assert!(PlanLimitsState::load(dir.path()).file.pin.is_some());
         // The completion handler drains changes made after the first snapshot.
         let second = state.begin_save(path.clone()).unwrap();
         let PlanLimitsEvent::Saved(result) = runtime.block_on(second.run()) else {
@@ -473,11 +416,12 @@ mod tests {
         assert!(result.is_ok());
         assert!(state.finish_save(result, &path));
         assert!(state.begin_save(path.clone()).is_none());
-        assert!(PlanLimitsState::load(dir.path())
-            .notice("coordinator", false)
-            .is_none());
+        assert!(PlanLimitsState::load(dir.path()).file.pin.is_none());
 
-        state.queue_notices(&chats, &["Routing: balanced".into()]);
+        state.set_pin(Some(plan_limits::RoutingPin {
+            provider: Provider::Claude,
+            until: now_unix() + 3600,
+        }));
         let blocker = dir.path().join("a-file");
         std::fs::write(&blocker, b"not a directory").unwrap();
         let failed = state.begin_save(blocker.join("limits.json")).unwrap();

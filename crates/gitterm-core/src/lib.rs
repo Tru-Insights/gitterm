@@ -47,7 +47,7 @@ pub mod find;
 pub mod work;
 pub mod work_notes;
 
-// Delegation services; launch authority remains with the application owner.
+// Delegation services and runtime lifecycle authority; hosts execute effects.
 #[cfg(feature = "runtime")]
 pub mod checkout_name;
 #[cfg(feature = "runtime")]
@@ -56,6 +56,8 @@ pub mod codex_review;
 pub mod codex_runner;
 #[cfg(feature = "runtime")]
 pub mod delegation_request;
+#[cfg(feature = "runtime")]
+pub mod delegation_state;
 #[cfg(all(test, feature = "runtime"))]
 mod delegation_test_support;
 #[cfg(feature = "runtime")]

@@ -8,7 +8,7 @@ use gitterm_gpui_chat::{PermissionDecision, QuestionAnswer, adapter::ReceiptStat
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 
-fn fixture() -> (tempfile::TempDir, Arc<Preview>) {
+pub(super) fn fixture() -> (tempfile::TempDir, Arc<Preview>) {
     let dir = tempfile::tempdir_in("/private/tmp").unwrap();
     let root = dir.path().join("preview");
     let preview = Arc::new(
@@ -20,13 +20,13 @@ fn fixture() -> (tempfile::TempDir, Arc<Preview>) {
     );
     (dir, preview)
 }
-fn script(dir: &Path, name: &str, contents: &str) -> PathBuf {
+pub(super) fn script(dir: &Path, name: &str, contents: &str) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, contents).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     path
 }
-fn independent_clone(cwd: &Path) {
+pub(super) fn independent_clone(cwd: &Path) {
     std::fs::create_dir_all(cwd.join(".git/objects/info")).unwrap();
     std::fs::create_dir_all(cwd.join(".git/refs/heads")).unwrap();
     std::fs::write(cwd.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
@@ -53,7 +53,7 @@ fn fake_help_missing_restricted_refuses_and_success_does_not_grant_authority() {
                 super::provider::quote(&help)
             ),
         );
-        let provider = Provider::new(preview.clone(), &path).unwrap();
+        let provider = Provider::fixture(preview.clone(), &path).unwrap();
         let output = std::process::Command::new(path)
             .arg("--help")
             .env_clear()
@@ -73,7 +73,7 @@ fn fake_help_missing_restricted_refuses_and_success_does_not_grant_authority() {
 #[test]
 fn workspace_requires_independent_clone_without_shared_metadata_or_preview_overlap() {
     let (dir, preview) = fixture();
-    let provider = Provider::new(preview.clone(), Path::new("/fake/claude")).unwrap();
+    let provider = Provider::fixture(preview.clone(), Path::new("/fake/claude")).unwrap();
     let cwd = dir.path().join("clone");
     std::fs::create_dir(&cwd).unwrap();
     assert!(provider.validate_workspace(&cwd).is_err());
@@ -129,7 +129,7 @@ fn provider_roots_refuse_protected_overlap_relative_alias_and_replacement() {
     std::fs::create_dir(preview.root()).unwrap();
     symlink(preview.root(), &alias).unwrap();
     assert!(crate::preview::config_dir(Some(alias.into_os_string()), &home).is_err());
-    let provider = Provider::new(preview.clone(), Path::new("/fake/claude")).unwrap();
+    let provider = Provider::fixture(preview.clone(), Path::new("/fake/claude")).unwrap();
     provider.prepare().unwrap();
     assert_eq!(
         provider.spec.environment()[std::ffi::OsStr::new("CLAUDE_CONFIG_DIR")],
@@ -138,7 +138,7 @@ fn provider_roots_refuse_protected_overlap_relative_alias_and_replacement() {
     std::fs::rename(preview.provider(), preview.root().join("old-provider")).unwrap();
     symlink(dir.path().join("production"), preview.provider()).unwrap();
     assert!(provider.prepare().is_err());
-    assert!(Provider::new(preview, Path::new("/fake/claude")).is_err());
+    assert!(Provider::fixture(preview, Path::new("/fake/claude")).is_err());
 }
 #[tokio::test]
 async fn probe_both_states_and_environment_are_rooted_and_success_does_not_open_c2() {
@@ -156,7 +156,7 @@ async fn probe_both_states_and_environment_are_rooted_and_success_does_not_open_
                 dir.path().join("environment").display()
             ),
         );
-        let provider = Provider::new(preview.clone(), &fake).unwrap();
+        let provider = Provider::fixture(preview.clone(), &fake).unwrap();
         assert_eq!(provider.fake_probe().await.unwrap(), expected);
         assert!(provider.authorize().is_err());
         let env = std::fs::read_to_string(dir.path().join("environment")).unwrap();
@@ -216,7 +216,7 @@ async fn malformed_mismatched_oversized_and_hung_probe_fail_closed() {
         "exec /bin/sleep 5",
     ] {
         let fake = script(dir.path(), "fake-status", &format!("#!/bin/sh\n{body}\n"));
-        let provider = Provider::new(preview.clone(), &fake).unwrap();
+        let provider = Provider::fixture(preview.clone(), &fake).unwrap();
         assert_eq!(
             provider.fake_probe().await.unwrap(),
             ProbeStatus::Unavailable
@@ -225,7 +225,11 @@ async fn malformed_mismatched_oversized_and_hung_probe_fail_closed() {
 }
 fn event(controller: &mut Controller, event: HarnessEvent) {
     let source = controller.source.clone();
-    assert!(controller.apply_runtime_outcome(&source, event).is_some());
+    assert!(
+        controller
+            .apply_runtime_outcome(&source, RuntimeEvent::Harness(event))
+            .is_some()
+    );
 }
 fn request(id: &str, kind: RuntimeRequestKind) -> HarnessEvent {
     HarnessEvent::RuntimeRequest {
@@ -235,21 +239,21 @@ fn request(id: &str, kind: RuntimeRequestKind) -> HarnessEvent {
     }
 }
 #[test]
-fn adapter_channel_acceptance_stop_permission_question_and_stale_stamps() {
+fn uncorrelated_ports_refuse_send_stop_permission_question_and_stale_stamps() {
     let mut controller = Controller::new();
     let (sender, mut commands) = tokio::sync::mpsc::unbounded_channel();
-    controller.runtime = Some(Session::from_port(sender, true));
+    controller.runtime = Some(Session::from_port(sender, true).into());
     controller.ready = true;
     let (receipt, _) = controller.dispatch(ChatIntent::Send {
         text: "Hello preview".into(),
         images: vec![],
     });
-    assert_eq!(receipt.state, ReceiptState::ChannelAccepted);
-    assert!(receipt.state.label().contains("delivery unconfirmed"));
-    assert!(matches!(
-        commands.try_recv().unwrap(),
-        HarnessCommand::SendUserMessage(_)
-    ));
+    assert_eq!(
+        receipt.state,
+        ReceiptState::Rejected("correlated writes require Session::spawn_runtime".into())
+    );
+    assert!(receipt.state.label().contains("Rejected"));
+    assert!(commands.try_recv().is_err());
     event(
         &mut controller,
         HarnessEvent::TurnStarted {
@@ -258,11 +262,11 @@ fn adapter_channel_acceptance_stop_permission_question_and_stale_stamps() {
         },
     );
     let (receipt, _) = controller.dispatch(ChatIntent::Stop);
-    assert_eq!(receipt.state, ReceiptState::ChannelAccepted);
-    assert!(matches!(
-        commands.try_recv().unwrap(),
-        HarnessCommand::Interrupt
-    ));
+    assert_eq!(
+        receipt.state,
+        ReceiptState::Rejected("correlated writes require Session::spawn_runtime".into())
+    );
+    assert!(commands.try_recv().is_err());
     event(
         &mut controller,
         request(
@@ -279,10 +283,11 @@ fn adapter_channel_acceptance_stop_permission_question_and_stale_stamps() {
         request_id: "permission".into(),
         decision: PermissionDecision::Deny,
     });
-    assert_eq!(receipt.state, ReceiptState::ChannelAccepted);
-    assert!(
-        matches!(commands.try_recv().unwrap(), HarnessCommand::Answer { request_id, .. } if request_id == "permission")
+    assert_eq!(
+        receipt.state,
+        ReceiptState::Rejected("correlated writes require Session::spawn_runtime".into())
     );
+    assert!(commands.try_recv().is_err());
     event(
         &mut controller,
         request(
@@ -300,15 +305,19 @@ fn adapter_channel_acceptance_stop_permission_question_and_stale_stamps() {
             free_text: None,
         }],
     });
-    assert_eq!(receipt.state, ReceiptState::ChannelAccepted);
-    assert!(
-        matches!(commands.try_recv().unwrap(), HarnessCommand::Answer { request_id, .. } if request_id == "question")
+    assert_eq!(
+        receipt.state,
+        ReceiptState::Rejected("correlated writes require Session::spawn_runtime".into())
     );
+    assert!(commands.try_recv().is_err());
     let stale = controller.source.clone();
     controller.source = controller.adapter.begin_runtime(controller.target.clone());
     assert!(
         controller
-            .apply_runtime_outcome(&stale, HarnessEvent::TextDelta("stale".into()))
+            .apply_runtime_outcome(
+                &stale,
+                RuntimeEvent::Harness(HarnessEvent::TextDelta("stale".into()))
+            )
             .is_none()
     );
 }
@@ -332,16 +341,21 @@ fn pane_owns_one_receiver_projects_adapter_and_saves_only_accepted_events(
     let (sender, mut commands) = tokio::sync::mpsc::unbounded_channel();
     let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
     pane.update_in(cx, |pane, window, cx| {
-        pane.install_fake(Session::from_port(sender, true), receiver, window, cx);
+        pane.install_runtime(
+            Session::from_port(sender, true).into(),
+            receiver,
+            window,
+            cx,
+        );
     });
     events
-        .send(HarnessEvent::Ready {
+        .send(RuntimeEvent::Harness(HarnessEvent::Ready {
             session_id: None,
             permission_mode: None,
             models: vec![],
             modes: vec![],
             commands: vec![],
-        })
+        }))
         .unwrap();
     cx.run_until_parked();
     let callback = ChatPane::intent_callback(pane.downgrade());
@@ -353,12 +367,16 @@ fn pane_owns_one_receiver_projects_adapter_and_saves_only_accepted_events(
             },
             cx,
         );
-        assert_eq!(receipt.state, ReceiptState::ChannelAccepted);
+        assert_eq!(
+            receipt.state,
+            ReceiptState::Rejected("correlated writes require Session::spawn_runtime".into())
+        );
     });
     pane.update(cx, |pane, _| {
         assert!(pane.controller.ready);
         assert!(
-            pane.saved
+            !pane
+                .saved
                 .records
                 .iter()
                 .any(|r| matches!(&r.entry, Entry::UserPrompt(text) if text == "Pane prompt"))
@@ -370,15 +388,15 @@ fn pane_owns_one_receiver_projects_adapter_and_saves_only_accepted_events(
             .begin_runtime(pane.controller.target.clone());
         assert!(
             pane.controller
-                .apply_runtime_outcome(&stale, HarnessEvent::TextDelta("stale".into()))
+                .apply_runtime_outcome(
+                    &stale,
+                    RuntimeEvent::Harness(HarnessEvent::TextDelta("stale".into()))
+                )
                 .is_none()
         );
         assert!(pane.saved.session_id.is_none());
     });
-    assert!(matches!(
-        commands.try_recv().unwrap(),
-        HarnessCommand::SendUserMessage(_)
-    ));
+    assert!(commands.try_recv().is_err());
     pane.update(cx, |pane, cx| pane.close(cx));
     assert!(matches!(
         commands.try_recv().unwrap(),
@@ -398,6 +416,12 @@ async fn fake_runtime_probe_fresh_launch_send_answers_stop_and_shutdown() {
         r##"#!{}
 import json, sys, os
 from pathlib import Path
+if sys.argv[1:] == ['--help']:
+    print('  --restricted\n  --strict-mcp-config\n  --safe-mode\n  --permission-mode <mode> (choices: "manual")')
+    sys.exit(0)
+if sys.argv[1:] == ['auth', 'status', '--json']:
+    print(json.dumps({{'fixture_signed_in':True,'fixture_method':'fixture_personal','fixture_plan':'fixture_pro','fixture_root':os.environ['CLAUDE_CONFIG_DIR'],'fixture_policy':None}}))
+    sys.exit(0)
 if sys.argv[1:] == ['auth', 'status']:
     print(json.dumps({{'authMethod':'claude.ai', 'configDirectory':os.environ['CLAUDE_CONFIG_DIR']}}))
     sys.exit(0)
@@ -424,7 +448,7 @@ assert not sys.stdin.read()
         String::from_utf8(python.stdout).unwrap().trim()
     );
     let fake = script(dir.path(), "fake-claude", &program);
-    let provider = Arc::new(Provider::new(preview.clone(), &fake).unwrap());
+    let provider = Arc::new(Provider::fixture(preview.clone(), &fake).unwrap());
     let cwd = dir.path().join("checkout");
     independent_clone(&cwd);
     let (runtime, mut events) = provider
@@ -435,53 +459,86 @@ assert not sys.stdin.read()
         .unwrap();
     let mut controller = Controller::new();
     controller.runtime = Some(runtime);
+    let mut written = 0;
+    let mut raw_written = 0;
     loop {
         let next = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
             .await
             .unwrap()
             .unwrap();
         let intent = match &next {
-            HarnessEvent::Ready { .. } => Some(ChatIntent::Send {
-                text: "Synthetic test".into(),
-                images: vec![],
-            }),
-            HarnessEvent::RuntimeRequest {
-                request_id,
-                kind: RuntimeRequestKind::Permission { .. },
-                ..
-            } => Some(ChatIntent::Permission {
-                request_id: request_id.clone(),
-                decision: PermissionDecision::Deny,
-            }),
-            HarnessEvent::RuntimeRequest {
-                request_id,
-                kind: RuntimeRequestKind::Question { .. },
-                ..
-            } => Some(ChatIntent::AnswerQuestion {
-                request_id: request_id.clone(),
-                answers: vec![QuestionAnswer {
-                    question: "Shape?".into(),
-                    selected: vec!["Square".into()],
-                    free_text: None,
-                }],
-            }),
-            HarnessEvent::RuntimeRequestResolved { request_id } if request_id == "question" => {
-                Some(ChatIntent::Stop)
-            }
-            HarnessEvent::TurnCompleted { .. } => {
-                controller
-                    .runtime
-                    .as_ref()
-                    .unwrap()
-                    .send(HarnessCommand::Shutdown)
-                    .unwrap();
-                None
-            }
-            HarnessEvent::Error(error) => panic!("fake runtime: {error}"),
-            _ => None,
+            RuntimeEvent::Harness(next) => match next {
+                HarnessEvent::Ready { .. } => Some(ChatIntent::Send {
+                    text: "Synthetic test".into(),
+                    images: vec![],
+                }),
+                HarnessEvent::RuntimeRequest {
+                    request_id,
+                    kind: RuntimeRequestKind::Permission { .. },
+                    ..
+                } => Some(ChatIntent::Permission {
+                    request_id: request_id.clone(),
+                    decision: PermissionDecision::Deny,
+                }),
+                HarnessEvent::RuntimeRequest {
+                    request_id,
+                    kind: RuntimeRequestKind::Question { .. },
+                    ..
+                } => Some(ChatIntent::AnswerQuestion {
+                    request_id: request_id.clone(),
+                    answers: vec![QuestionAnswer {
+                        question: "Shape?".into(),
+                        selected: vec!["Square".into()],
+                        free_text: None,
+                    }],
+                }),
+                HarnessEvent::RuntimeRequestResolved { request_id } if request_id == "question" => {
+                    Some(ChatIntent::Stop)
+                }
+                HarnessEvent::TurnCompleted { .. } => {
+                    controller
+                        .runtime
+                        .as_ref()
+                        .unwrap()
+                        .send(HarnessCommand::Shutdown)
+                        .unwrap();
+                    None
+                }
+                HarnessEvent::Error(error) => panic!("fake runtime: {error}"),
+                _ => None,
+            },
+            RuntimeEvent::CommandOutcome { .. } => None,
         };
-        let exited = matches!(next, HarnessEvent::ProcessExited { .. });
-        event(&mut controller, next);
+        let exited = matches!(
+            next,
+            RuntimeEvent::Harness(HarnessEvent::ProcessExited { .. })
+        );
+        let is_outcome = matches!(&next, RuntimeEvent::CommandOutcome { .. });
+        if matches!(
+            &next,
+            RuntimeEvent::CommandOutcome {
+                outcome: DeliveryOutcome::Written,
+                ..
+            }
+        ) {
+            raw_written += 1;
+        }
+        let source = controller.source.clone();
+        if let Some(update) = controller.apply_runtime_outcome(&source, next) {
+            for receipt in update.receipts {
+                if receipt.state == ReceiptState::Written {
+                    written += 1;
+                }
+                if is_outcome {
+                    assert_eq!(receipt.state, ReceiptState::Written);
+                } else {
+                    assert!(matches!(
+                        receipt.state,
+                        ReceiptState::Resolved | ReceiptState::Uncertain(_)
+                    ));
+                }
+            }
+        }
         if let Some(intent) = intent {
             assert_eq!(
                 controller.dispatch(intent).0.state,
@@ -499,6 +556,14 @@ assert not sys.stdin.read()
         .completed()
         .await
         .unwrap();
+    assert_eq!(
+        raw_written, 4,
+        "send, deny, question and interrupt must all receive actual write outcomes"
+    );
+    assert_eq!(
+        written, 2,
+        "send and stop are Written; already resolved answers retain Resolved"
+    );
     assert_eq!(controller.runtime.as_ref().unwrap().local_pid(), None);
     assert_eq!(
         controller.adapter.state().session_id.as_deref(),
@@ -517,7 +582,7 @@ assert not sys.stdin.read()
         "fake-unsigned",
         "#!/bin/sh\nprintf '{\"authMethod\":\"none\",\"configDirectory\":\"%s\"}' \"$CLAUDE_CONFIG_DIR\"\nexit 1\n",
     );
-    let unsigned = Arc::new(Provider::new(preview, &fake).unwrap());
+    let unsigned = Arc::new(Provider::fixture(preview, &fake).unwrap());
     assert!(unsigned.fake_start(cwd).await.unwrap().is_none());
 }
 
@@ -572,7 +637,7 @@ fn sign_in_command_quotes_provider_and_executable_paths_without_shell_expansion(
         "fake claude ' $(false)",
         &format!("#!/bin/sh\n/usr/bin/env > '{}'\n", marker.display()),
     );
-    let provider = Provider::new(preview.clone(), &fake).unwrap();
+    let provider = Provider::fixture(preview.clone(), &fake).unwrap();
     provider.prepare().unwrap();
     let command = provider.sign_in_command();
     let output = std::process::Command::new("/bin/sh")
@@ -609,6 +674,12 @@ fn quit_drains_a_closed_slow_child_before_gpui_timeout_and_later_observers(
             r##"#!{}
 import json, sys, os, time
 from pathlib import Path
+if sys.argv[1:] == ['--help']:
+    print('  --restricted\n  --strict-mcp-config\n  --safe-mode\n  --permission-mode <mode> (choices: "manual")')
+    sys.exit(0)
+if sys.argv[1:] == ['auth', 'status', '--json']:
+    print(json.dumps({{'fixture_signed_in':True,'fixture_method':'fixture_personal','fixture_plan':'fixture_pro','fixture_root':os.environ['CLAUDE_CONFIG_DIR'],'fixture_policy':None}}))
+    sys.exit(0)
 if sys.argv[1:] == ['auth', 'status']:
     print(json.dumps({{'authMethod':'claude.ai','configDirectory':os.environ['CLAUDE_CONFIG_DIR']}}))
     sys.exit(0)
@@ -621,7 +692,7 @@ Path('reaped-marker').write_text('finished')
             String::from_utf8(python.stdout).unwrap().trim()
         ),
     );
-    let provider = Arc::new(Provider::new(preview, &fake).unwrap());
+    let provider = Arc::new(Provider::fixture(preview.clone(), &fake).unwrap());
     let executor = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -629,17 +700,21 @@ Path('reaped-marker').write_text('finished')
     let cwd = dir.path().join("checkout");
     independent_clone(&cwd);
     let (runtime, mut events) = executor
-        .block_on(provider.fake_start(cwd.clone()))
+        .block_on(provider.clone().fake_start(cwd.clone()))
         .unwrap()
         .unwrap();
     executor.block_on(async {
         loop {
-            if matches!(events.recv().await.unwrap(), HarnessEvent::Ready { .. }) {
+            if matches!(
+                events.recv().await.unwrap(),
+                RuntimeEvent::Harness(HarnessEvent::Ready { .. })
+            ) {
                 break;
             }
         }
     });
     let pid = runtime.local_pid().unwrap();
+    assert!(super::lease::ProviderLease::claim(&preview).is_err());
     // Explicit pane close gives up the view, but the application still owns the
     // completion via its queue. This is exactly the prior detached-close gap.
     let mut app = cx.new_app();
@@ -652,6 +727,10 @@ Path('reaped-marker').write_text('finished')
     });
     let shutdown = owner.read_with(&app, |owner, _| owner.chat_shutdown.clone());
     assert!(shutdown.enqueue(runtime).is_ok());
+    assert!(
+        super::lease::ProviderLease::claim(&preview).is_err(),
+        "lease must survive pane close"
+    );
     let marker = cwd.join("reaped-marker");
     app.update(|app| {
         app.on_app_quit(move |_| {
@@ -670,6 +749,9 @@ Path('reaped-marker').write_text('finished')
     });
     let start = std::time::Instant::now();
     app.update(|app| app.shutdown());
+    let lease =
+        super::lease::ProviderLease::claim(&preview).expect("lease released after quit drain");
+    drop(lease);
     assert!(start.elapsed() > gpui::SHUTDOWN_TIMEOUT);
 }
 
@@ -706,4 +788,181 @@ fn preview_pane_focus_forwards_to_the_native_chat(cx: &mut gpui::TestAppContext)
         pane.focus_handle(cx).focus(window, cx);
         assert!(expected.is_focused(window));
     });
+}
+
+#[test]
+fn correlated_receipts_are_stamped_and_preserve_all_delivery_states() {
+    use gitterm_gpui_chat::adapter::DeliveryOutcome as AdapterOutcome;
+    for (outcome, expected) in [
+        (DeliveryOutcome::Written, ReceiptState::Written),
+        (
+            DeliveryOutcome::Rejected("closed".into()),
+            ReceiptState::Rejected("closed".into()),
+        ),
+        (
+            DeliveryOutcome::Uncertain("partial write".into()),
+            ReceiptState::Uncertain("partial write".into()),
+        ),
+    ] {
+        let mut controller = Controller::new();
+        let prepared = controller
+            .adapter
+            .admit(
+                ChatIntent::Send {
+                    text: "Synthetic".into(),
+                    images: vec![],
+                },
+                Admission {
+                    authority: session::State {
+                        target: controller.target.clone(),
+                        control: session::TurnControl::Harness,
+                        task_live: false,
+                        last_tab: false,
+                    },
+                    backend: AgentBackend::Claude,
+                    process_running: true,
+                    just_spawned: false,
+                    message_id: "synthetic".into(),
+                },
+            )
+            .unwrap();
+        let id = prepared.id();
+        let correlation = CommandCorrelation(42);
+        controller.correlations.insert(correlation, id);
+        controller
+            .adapter
+            .execute(prepared, &controller.target, now_ms(), |_| Ok(()));
+        let source = controller.source.clone();
+        let update = controller
+            .apply_runtime_outcome(
+                &source,
+                RuntimeEvent::CommandOutcome {
+                    correlation,
+                    outcome,
+                },
+            )
+            .unwrap();
+        assert_eq!(update.receipts[0].id, id);
+        assert_eq!(update.receipts[0].state, expected);
+        assert_eq!(controller.adapter.receipt(id).unwrap().state, expected);
+        assert!(
+            controller
+                .adapter
+                .delivery(id, &controller.target, AdapterOutcome::Written)
+                .is_none()
+        );
+        assert!(
+            controller
+                .apply_runtime_outcome(
+                    &source,
+                    RuntimeEvent::CommandOutcome {
+                        correlation,
+                        outcome: DeliveryOutcome::Written
+                    }
+                )
+                .is_none()
+        );
+        let stale = source;
+        controller.source = controller.adapter.begin_runtime(controller.target.clone());
+        assert!(
+            controller
+                .apply_runtime_outcome(
+                    &stale,
+                    RuntimeEvent::CommandOutcome {
+                        correlation,
+                        outcome: DeliveryOutcome::Written
+                    }
+                )
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn fake_process_rejected_and_partial_write_outcomes_reach_adapter() {
+    for partial in [false, true] {
+        let (dir, preview) = fixture();
+        let python = std::process::Command::new("python3")
+            .args(["-I", "-S", "-c", "import sys; print(sys.executable)"])
+            .output()
+            .unwrap();
+        assert!(python.status.success());
+        let body = include_str!("../../../../../tests/claude-process/preview_outcomes.py")
+            .replacen(
+                "#!/usr/bin/env python3",
+                &format!("#!{}", String::from_utf8(python.stdout).unwrap().trim()),
+                1,
+            );
+        let program = script(dir.path(), "fake-outcomes", &body);
+        let provider = Arc::new(Provider::fixture(preview, &program).unwrap());
+        let cwd = dir.path().join("clone");
+        independent_clone(&cwd);
+        if partial {
+            std::fs::write(cwd.join("partial-mode"), b"").unwrap();
+        }
+        let (runtime, mut events) = provider.fake_start(cwd).await.unwrap().unwrap();
+        let mut controller = Controller::new();
+        controller.runtime = Some(runtime);
+        while !controller.ready {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let RuntimeEvent::Harness(HarnessEvent::Error(error)) = &event {
+                panic!("{error}");
+            }
+            let source = controller.source.clone();
+            controller.apply_runtime_outcome(&source, event);
+        }
+        let intent = if partial {
+            ChatIntent::Send {
+                text: "x".repeat(4 * 1024 * 1024),
+                images: vec![],
+            }
+        } else {
+            // The pane saw a request which the runner no longer owns.
+            event(
+                &mut controller,
+                request(
+                    "already-gone",
+                    RuntimeRequestKind::Permission {
+                        tool_name: "Write".into(),
+                        input: serde_json::json!({}),
+                        suggestions: vec![],
+                        decision_reason: None,
+                    },
+                ),
+            );
+            ChatIntent::Permission {
+                request_id: "already-gone".into(),
+                decision: PermissionDecision::Deny,
+            }
+        };
+        let receipt = controller.dispatch(intent).0;
+        assert_eq!(receipt.state, ReceiptState::ChannelAccepted);
+        let delivered = loop {
+            let next = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let source = controller.source.clone();
+            if let Some(update) = controller.apply_runtime_outcome(&source, next)
+                && let Some(receipt) = update
+                    .receipts
+                    .into_iter()
+                    .find(|next| next.id == receipt.id)
+            {
+                break receipt;
+            }
+        };
+        if partial {
+            assert!(matches!(delivered.state, ReceiptState::Uncertain(_)));
+        } else {
+            assert!(matches!(delivered.state, ReceiptState::Rejected(_)));
+        }
+        assert_eq!(controller.adapter.receipt(receipt.id), Some(&delivered));
+        let runtime = controller.runtime.as_mut().unwrap();
+        let _ = runtime.send(HarnessCommand::Shutdown);
+        runtime.completed().await.unwrap();
+    }
 }
