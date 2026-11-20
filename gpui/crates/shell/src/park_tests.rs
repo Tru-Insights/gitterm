@@ -33,6 +33,7 @@ impl Fixture {
         }
     }
     fn shell(&self, window: &mut Window, cx: &mut Context<Shell>) -> Shell {
+        let fresh = !self.config.exists();
         let mut model = WorkspaceStatus::default();
         for folder in &self.folders {
             model.add(folder.clone(), Instant::now());
@@ -41,7 +42,16 @@ impl Fixture {
         store.load().unwrap();
         let owner = cx.new(|cx| WorkspaceOwner::new(model, Some(store), cx));
         let data: Rc<dyn ShellData> = Rc::new(LocalData(owner.clone()));
-        Shell::with_owner(data, owner, &self.config, true, window, cx).unwrap()
+        let mut shell = Shell::with_owner(data, owner, &self.config, true, window, cx).unwrap();
+        if fresh {
+            // Park scenarios explicitly open their terminals; startup creates none.
+            for index in 0..self.folders.len() {
+                shell.select_workspace(index, window, cx);
+                shell.new_terminal(window, cx);
+            }
+            shell.select_workspace(0, window, cx);
+        }
+        shell
     }
 }
 
