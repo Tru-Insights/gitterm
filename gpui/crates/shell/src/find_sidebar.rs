@@ -24,7 +24,7 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
 };
 
-use crate::theme::Palette;
+use crate::theme::{self, Palette};
 
 #[cfg(test)]
 #[path = "find_sidebar_tests.rs"]
@@ -138,8 +138,9 @@ struct Control {
 struct ChatRow {
     id: ChatRef,
     title: String,
-    workspace: String,
     age: String,
+    branch: Option<String>,
+    meta: Vec<String>,
     backend: ChatBackend,
     details: Vec<String>,
     selected: bool,
@@ -214,9 +215,6 @@ fn chat_row(
         }
     }
     let mut meta = vec![];
-    if let Some(branch) = &entry.branch {
-        meta.push(branch.clone());
-    }
     if open.is_none() && entry.possibly_running() {
         meta.push("◐ possibly running".into());
     }
@@ -229,14 +227,12 @@ fn chat_row(
     if entry.dead_cwd {
         meta.push("⚠ dir gone".into());
     }
-    if !meta.is_empty() {
-        details.push(meta.join(" · "));
-    }
     ChatRow {
         id: id.clone(),
         title: entry.title.clone(),
-        workspace: entry.group_name(),
         age: chats::format_age(entry.mtime),
+        branch: entry.branch.clone(),
+        meta,
         backend: entry.backend,
         details,
         selected: state.selected(owner).is_some_and(|s| s.chat == id),
@@ -481,11 +477,37 @@ impl FindSidebar {
     ) -> impl IntoElement {
         let p = Palette::current(cx);
         let selector = id.clone();
+        let backend = matches!(control.outcome, FindOutcome::SetBackend(_));
+        let mut content = div()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .text_size(px(theme::font_sizes(cx).ui - 2.));
+        if let FindOutcome::SetBackend(Some(backend)) = &control.outcome {
+            content = content.child(
+                div()
+                    .text_size(px(7.))
+                    .text_color(backend_color(*backend, cx))
+                    .child("●"),
+            );
+        }
         Button::new(id)
             .debug_selector(move || selector.clone())
-            .label(control.label)
             .ghost()
             .xsmall()
+            .h_auto()
+            .line_height(gpui::relative(theme::LABEL_LINE_HEIGHT))
+            .px(px(if backend { 9. } else { 8. }))
+            .py(px(if backend { 2. } else { 3. }))
+            .when(backend, |b| {
+                b.rounded_full().border_1().border_color(rgb(if active {
+                    p.border
+                } else {
+                    p.surface
+                }))
+            })
+            .accessibility_label(control.label.clone())
+            .child(content.child(control.label))
             .when(active, |b| b.bg(rgb(p.surface)))
             .on_click(cx.listener(move |_, _, _, cx| {
                 cx.stop_propagation();
@@ -494,16 +516,60 @@ impl FindSidebar {
     }
 }
 
+// Iced's open-tab title/detail limits are character counts, not byte offsets.
+fn open_lines(session: &OpenSession) -> (String, String) {
+    let truncate = |text: &str, limit: usize| {
+        if text.chars().count() > limit {
+            format!("{}…", text.chars().take(limit - 1).collect::<String>())
+        } else {
+            text.to_string()
+        }
+    };
+    let detail = if session.detail.is_empty() {
+        session.workspace.clone()
+    } else {
+        format!("{} · {}", session.workspace, session.detail)
+    };
+    (truncate(&session.title, 48), truncate(&detail, 72))
+}
+
+// A Button label is a centred, single-line control with a fixed height. Use
+// full-width content and intrinsic height for headers and multi-line rows.
+fn header(id: String, parts: Vec<String>, cx: &gpui::App) -> Button {
+    let p = Palette::current(cx);
+    Button::new(id)
+        .accessibility_label(parts.join(" "))
+        .ghost()
+        .h_auto()
+        .line_height(gpui::relative(theme::LABEL_LINE_HEIGHT))
+        .w_full()
+        .px(px(6.))
+        .py(px(6.))
+        .child(
+            div()
+                .w_full()
+                .text_left()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .text_size(px(10.))
+                .text_color(rgb(p.subtext0))
+                .children(parts.into_iter().map(|part| div().child(part))),
+        )
+}
+
 impl Render for FindSidebar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::current(cx);
+        let font_small = theme::font_sizes(cx).ui - 1.;
+        let secondary = font_small - 1.;
         let state = self.state.borrow();
-        let mut scope = div().flex().gap_1();
+        let mut scope = div().flex().gap(px(2.));
         for (i, control) in scopes(&state, &self.facts).into_iter().enumerate() {
             let active = control.outcome == FindOutcome::SetScope(state.filter().scope);
             scope = scope.child(self.control(format!("find-scope-{i}"), control, active, cx));
         }
-        let mut backend = div().flex().gap_1();
+        let mut backend = div().flex().gap(px(6.));
         for (i, control) in backends().into_iter().enumerate() {
             let active = control.outcome == FindOutcome::SetBackend(state.filter().backend);
             backend = backend.child(self.control(format!("find-backend-{i}"), control, active, cx));
@@ -512,51 +578,92 @@ impl Render for FindSidebar {
             .id("find-results")
             .flex_1()
             .min_h_0()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
             .overflow_y_scroll()
-            .px_2();
+            .px(px(6.))
+            .py(px(4.));
         if !self.facts.open_sessions.is_empty() {
             list = list.child(
-                Button::new("find-open")
-                    .label(format!(
-                        "{} OPEN {}",
+                header(
+                    "find-open".into(),
+                    vec![
                         if self.folds.open_collapsed {
                             "▸"
                         } else {
                             "▾"
-                        },
-                        self.facts.open_sessions.len()
-                    ))
-                    .ghost()
-                    .xsmall()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.folds.open_collapsed = !this.folds.open_collapsed;
-                        cx.notify();
-                    })),
+                        }
+                        .into(),
+                        "OPEN".into(),
+                        self.facts.open_sessions.len().to_string(),
+                    ],
+                    cx,
+                )
+                .debug_selector(|| "find-open".into())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.folds.open_collapsed = !this.folds.open_collapsed;
+                    cx.notify();
+                })),
             );
             if !self.folds.open_collapsed {
                 for (i, session) in self.facts.open_sessions.iter().enumerate() {
-                    let control = Control {
-                        label: format!(
-                            "{} {}\n{}{}",
-                            session.marker,
-                            session.title,
-                            session.workspace,
-                            if session.detail.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" · {}", session.detail)
-                            }
-                        ),
-                        outcome: FindOutcome::Open {
-                            id: session.id.clone(),
-                        },
-                    };
-                    list = list.child(self.control(
-                        format!("find-open-{i}"),
-                        control,
-                        session.selected,
-                        cx,
-                    ));
+                    let (title, detail) = open_lines(session);
+                    let id = session.id.clone();
+                    list = list.child(
+                        Button::new(format!("find-open-{i}"))
+                            .accessibility_label(format!("{title}, {detail}"))
+                            .debug_selector(move || format!("find-open-{i}"))
+                            .ghost()
+                            .h_auto()
+                            .line_height(gpui::relative(theme::LABEL_LINE_HEIGHT))
+                            .w_full()
+                            .px(px(8.))
+                            .py(px(4.))
+                            .when(session.selected, |b| b.bg(rgb(p.surface)))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .whitespace_normal()
+                                    .text_left()
+                                    .flex()
+                                    .items_start()
+                                    .gap(px(6.))
+                                    .text_size(px(font_small))
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .child(session.marker.trim_end().to_string()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(1.))
+                                            .child(
+                                                div()
+                                                    .debug_selector(move || {
+                                                        format!("find-open-title-{i}")
+                                                    })
+                                                    .child(title),
+                                            )
+                                            .child(
+                                                div()
+                                                    .debug_selector(move || {
+                                                        format!("find-open-detail-{i}")
+                                                    })
+                                                    .text_size(px(secondary))
+                                                    .text_color(rgb(p.muted))
+                                                    .child(detail),
+                                            ),
+                                    ),
+                            )
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(FindOutcome::Open { id: id.clone() });
+                            })),
+                    );
                 }
             }
         }
@@ -574,95 +681,169 @@ impl Render for FindSidebar {
                     let status = self
                         .facts
                         .machine(&id)
-                        .map(|m| m.status.as_str())
+                        .map(|m| m.status.clone())
                         .unwrap_or_default();
-                    let label = if state.filter().scope == ChatScope::Everywhere {
-                        format!(
-                            "{} {label} {count} {status}",
-                            if expanded { "▾" } else { "▸" }
-                        )
+                    let mut parts = vec![label];
+                    if state.filter().scope == ChatScope::Everywhere {
+                        parts.insert(0, if expanded { "▾" } else { "▸" }.into());
+                        parts.push(count.to_string());
+                        if !status.is_empty() {
+                            parts.push(status);
+                        }
+                        list = list.child(
+                            header(format!("find-machine-{i}"), parts, cx)
+                                .debug_selector(move || format!("find-machine-{i}"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if !this.folds.machines.remove(&id) {
+                                        this.folds.machines.insert(id.clone());
+                                    }
+                                    cx.notify();
+                                })),
+                        );
                     } else {
-                        format!("{label} {status}")
-                    };
-                    list = list.child(
-                        Button::new(format!("find-machine-{i}"))
-                            .label(label)
-                            .ghost()
-                            .xsmall()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if !this.folds.machines.remove(&id) {
-                                    this.folds.machines.insert(id.clone());
-                                }
-                                cx.notify();
-                            })),
-                    );
+                        if !status.is_empty() {
+                            parts.push(status);
+                        }
+                        list = list.child(
+                            div()
+                                .debug_selector(move || format!("find-machine-{i}"))
+                                .flex_shrink_0()
+                                .flex()
+                                .gap(px(8.))
+                                .px(px(2.))
+                                .py(px(6.))
+                                .text_size(px(10.))
+                                .text_color(rgb(p.subtext0))
+                                .children(parts.into_iter().map(|part| div().child(part))),
+                        );
+                    }
                 }
                 Row::Group { label, count } => {
                     list = list.child(
                         div()
-                            .py_1()
+                            .debug_selector(move || format!("find-group-{i}"))
+                            .flex_shrink_0()
+                            .flex()
+                            .gap(px(6.))
+                            .px(px(2.))
+                            .py(px(6.))
                             .text_size(px(10.))
                             .text_color(rgb(p.muted))
-                            .child(format!("{label} {count}")),
-                    )
+                            .child(label)
+                            .child(count.to_string()),
+                    );
                 }
                 Row::Note(note) => {
-                    list = list.child(div().py_1().text_color(rgb(p.muted)).child(note))
+                    list = list.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(secondary))
+                            .text_color(rgb(p.muted))
+                            .child(note),
+                    );
                 }
                 Row::Chat(row) => {
                     let id = row.id.clone();
-                    let mut content = div()
-                        .id(format!("find-chat-{i}"))
-                        .debug_selector(move || format!("find-chat-{i}"))
-                        .rounded_md()
-                        .p_2()
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(p.surface)))
-                        .when(row.selected, |s| s.bg(rgb(p.surface)))
-                        .when(row.child, |s| s.ml(px(18.)))
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(FindOutcome::Select { id: id.clone() })
-                        }))
-                        .child(
-                            div()
-                                .flex()
-                                .gap_1()
+                    let accessible_title = row.title.clone();
+                    let mut meta = div()
+                        .debug_selector(move || format!("find-meta-{i}"))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .text_size(px(secondary))
+                        .text_color(rgb(p.muted))
+                        .child(row.age);
+                    if let Some(branch) = row.branch {
+                        meta = meta.child(div().text_color(rgb(p.subtext0)).child(branch));
+                    }
+                    if let Some(control) = row.open {
+                        meta = meta.child(
+                            Button::new(format!("find-focus-{i}"))
+                                .accessibility_label(control.label.clone())
+                                .debug_selector(move || format!("find-focus-{i}"))
+                                .ghost()
+                                .h_auto()
+                                .line_height(gpui::relative(theme::LABEL_LINE_HEIGHT))
+                                .p_0()
                                 .child(
                                     div()
-                                        .text_color(backend_color(row.backend, cx))
-                                        .child(format!("● {}", row.backend.label())),
+                                        .text_size(px(secondary))
+                                        .text_color(rgb(p.green))
+                                        .child(control.label),
                                 )
-                                .child(row.title),
-                        )
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.emit(control.outcome.clone());
+                                })),
+                        );
+                    }
+                    for text in row.meta {
+                        meta = meta.child(div().child(text));
+                    }
+                    let mut lines = div()
+                        .w_full()
+                        .whitespace_normal()
+                        .text_left()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
                         .child(
                             div()
-                                .text_size(px(11.))
-                                .text_color(rgb(p.muted))
-                                .child(format!("{} · {}", row.workspace, row.age)),
+                                .debug_selector(move || format!("find-title-{i}"))
+                                .flex()
+                                .gap(px(6.))
+                                .text_size(px(font_small))
+                                .child(
+                                    div()
+                                        .text_size(px(8.))
+                                        .text_color(backend_color(row.backend, cx))
+                                        .child("●"),
+                                )
+                                .child(div().flex_1().min_w_0().child(row.title)),
                         );
-                    for detail in row.details {
-                        content = content.child(
+                    for (line, detail) in row.details.into_iter().enumerate() {
+                        lines = lines.child(
                             div()
-                                .text_size(px(11.))
-                                .text_color(rgb(p.muted))
+                                .debug_selector(move || format!("find-detail-{i}-{line}"))
+                                .text_size(px(secondary))
+                                .text_color(rgb(p.subtext0))
                                 .child(detail),
                         );
                     }
-                    if let Some(control) = row.open {
-                        content = content.child(div().child(self.control(
-                            format!("find-focus-{i}"),
-                            control,
-                            false,
-                            cx,
-                        )));
-                    }
+                    let content = Button::new(format!("find-chat-{i}"))
+                        .accessibility_label(accessible_title)
+                        .debug_selector(move || format!("find-chat-{i}"))
+                        .ghost()
+                        .h_auto()
+                        .line_height(gpui::relative(theme::LABEL_LINE_HEIGHT))
+                        .flex_1()
+                        .min_w_0()
+                        .px(px(8.))
+                        .py(px(6.))
+                        .when(row.child, |s| s.ml(px(18.)))
+                        .when(row.selected, |s| {
+                            s.bg(rgb(p.surface)).border_1().border_color(rgb(p.border))
+                        })
+                        .child(lines.child(meta))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(FindOutcome::Select { id: id.clone() })
+                        }));
+                    let mut line = div()
+                        .w_full()
+                        .flex_shrink_0()
+                        .flex()
+                        .items_start()
+                        .child(content);
                     if let Some(expanded) = row.fold {
                         let id = row.id;
-                        content = content.child(
+                        line = line.child(
                             Button::new(format!("find-fold-{i}"))
                                 .label(if expanded { "▾" } else { "▸" })
                                 .ghost()
-                                .xsmall()
+                                .h_auto()
+                                .px(px(8.))
+                                .py(px(6.))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     if !this.folds.roots.remove(&id) {
@@ -672,7 +853,7 @@ impl Render for FindSidebar {
                                 })),
                         );
                     }
-                    list = list.child(content);
+                    list = list.child(line);
                 }
             }
         }
@@ -686,10 +867,18 @@ impl Render for FindSidebar {
             .min_h_0()
             .bg(rgb(p.base))
             .text_color(rgb(p.text))
-            .text_size(px(12.))
-            .child(div().px_2().py_1().child(Input::new(&self.query).small()))
+            .text_left()
+            .font_family(theme::LABEL_FONT)
+            .line_height(gpui::relative(theme::LABEL_LINE_HEIGHT))
+            .text_size(px(font_small))
+            .child(
+                div()
+                    .px_2()
+                    .py(px(6.))
+                    .child(Input::new(&self.query).small().text_size(px(font_small))),
+            )
             .child(div().px_2().child(scope))
-            .child(div().px_2().child(backend))
+            .child(div().px_2().py(px(2.)).child(backend))
             .child(list)
     }
 }
