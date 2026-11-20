@@ -17,6 +17,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[test]
+fn files_tree_rows_start_at_list_padding_plus_their_indent() {
+    let depths = [0, 1, 2, 4];
+    let origins: Vec<_> = depths
+        .into_iter()
+        .map(super::files_row_x_origin)
+        .collect();
+
+    assert_eq!(origins, [8.0, 24.0, 40.0, 72.0]);
+}
+
 fn setup<'a>(
     cx: &'a mut TestAppContext,
     root: &Path,

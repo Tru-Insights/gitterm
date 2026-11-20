@@ -8,11 +8,19 @@ use crate::{
 use gpui::base::actions::Confirm;
 use gpui::*;
 use gpui_component::{
+    ActiveTheme,
     button::{Button, ButtonVariants},
     list::ListItem,
     tree::{TreeEvent, TreeItem, TreeState, tree},
 };
 use std::{collections::HashMap, path::PathBuf, rc::Rc};
+
+const FILES_LIST_LEFT_PADDING: f32 = 8.0;
+const FILES_TREE_INDENT: f32 = 16.0;
+
+fn files_row_x_origin(depth: usize) -> f32 {
+    FILES_LIST_LEFT_PADDING + depth as f32 * FILES_TREE_INDENT
+}
 
 #[derive(Clone)]
 enum EntryAction {
@@ -246,6 +254,7 @@ impl Render for FilesView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.weak_entity();
         let p = Palette::current(cx);
+        let font: f32 = cx.theme().font_size.into();
         let badges: HashMap<SharedString, (String, bool)> = self
             .owner
             .as_ref()
@@ -277,7 +286,7 @@ impl Render for FilesView {
                 for (ix, root) in roots.iter().enumerate() {
                     let root = root.clone();
                     let label = format!(
-                        "📁 {}/",
+                        "{}/",
                         root.file_name()
                             .unwrap_or(root.as_os_str())
                             .to_string_lossy()
@@ -285,7 +294,21 @@ impl Render for FilesView {
                     body = body.child(
                         Button::new(("files-root", ix))
                             .ghost()
-                            .label(label)
+                            .w_full()
+                            .justify_start()
+                            .px(px(8.))
+                            .py(px(4.))
+                            .text_size(px(font))
+                            .text_color(rgb(p.blue))
+                            .accessibility_label(format!("📁 {label}"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .child(div().w(px(24.)).child("📁"))
+                                    .child(label),
+                            )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.browse_root(root.clone(), cx)
                             })),
@@ -297,6 +320,11 @@ impl Render for FilesView {
                 Button::new("files-all-folders")
                     .ghost()
                     .label("← All folders")
+                    .w_full()
+                    .justify_start()
+                    .px(px(8.))
+                    .py(px(4.))
+                    .text_size(px(font))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.browsing_root = None;
                         cx.notify();
@@ -306,7 +334,9 @@ impl Render for FilesView {
         if let Some(root) = &self.browsing_root {
             body = body.child(
                 div()
-                    .px_2()
+                    .px(px(FILES_LIST_LEFT_PADDING))
+                    .py(px(4.))
+                    .text_size(px(font))
                     .text_color(rgb(p.blue))
                     .child(root.display().to_string()),
             );
@@ -320,7 +350,8 @@ impl Render for FilesView {
                     .h(px(28.))
                     .w_full()
                     .justify_start()
-                    .pl(px(8. + entry.depth() as f32 * 16.))
+                    .pl(px(files_row_x_origin(entry.depth())))
+                    .text_size(px(font))
                     .text_color(rgb(if id.starts_with("error:") {
                         p.red
                     } else if entry.is_disabled() {
@@ -328,23 +359,41 @@ impl Render for FilesView {
                     } else {
                         p.text
                     }))
-                    // One text child: ListItem stacks multiple children vertically.
-                    .child(format!(
-                        "{} {}{}{}",
-                        if entry.is_folder() {
-                            if entry.is_expanded() { "⌄" } else { "›" }
-                        } else {
-                            "·"
-                        },
-                        entry.item().label,
-                        if entry.is_folder() { "/" } else { "" },
-                        badge
-                            .map(|(status, staged)| format!(
-                                "  {status}{}",
-                                if *staged { " ●" } else { "" }
-                            ))
-                            .unwrap_or_default()
-                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .w(px(24.))
+                                    .text_color(rgb(if entry.is_folder() { p.blue } else { p.text }))
+                                    .child(if entry.is_folder() { "📁" } else { "  " }),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(if id.starts_with("error:") {
+                                        p.red
+                                    } else if entry.is_disabled() {
+                                        p.muted
+                                    } else if entry.is_folder() {
+                                        p.blue
+                                    } else {
+                                        p.text
+                                    }))
+                                    .child(format!(
+                                        "{}{}{}",
+                                        entry.item().label,
+                                        if entry.is_folder() { "/" } else { "" },
+                                        badge
+                                            .map(|(status, staged)| format!(
+                                                "  {status}{}",
+                                                if *staged { " ●" } else { "" }
+                                            ))
+                                            .unwrap_or_default()
+                                    )),
+                            ),
+                    )
                     .on_click(move |_, _, cx| {
                         let _ = view.update(cx, |this, cx| this.activate(&id, cx));
                     })
