@@ -9,12 +9,30 @@ use std::{
 pub(crate) struct Provider {
     pub preview: Arc<Preview>,
     pub spec: ProbeSpec,
+    real_home: PathBuf,
 }
 impl Provider {
     pub fn new(preview: Arc<Preview>, executable: &Path) -> Result<Self> {
+        let home = dirs::home_dir().context("resolve GitTerm process home for Claude keychain")?;
+        Self::new_with_home(preview, executable, home)
+    }
+    fn new_with_home(preview: Arc<Preview>, executable: &Path, real_home: PathBuf) -> Result<Self> {
         let spec = ProbeSpec::claude_status(&preview, executable)?;
         preview.scoped(&preview.provider())?;
-        Ok(Self { preview, spec })
+        Ok(Self {
+            preview,
+            spec,
+            real_home,
+        })
+    }
+    #[cfg(test)]
+    pub(super) fn fixture(preview: Arc<Preview>, executable: &Path) -> Result<Self> {
+        let home = preview
+            .root()
+            .parent()
+            .expect("temporary fixture parent")
+            .join("host");
+        Self::new_with_home(preview, executable, home)
     }
     pub fn sign_in_command(&self) -> String {
         // The command uses the exact same complete environment as the probe.
@@ -55,6 +73,41 @@ impl Provider {
             .chain(std::iter::once(self.spec.cwd().to_path_buf()))
         {
             self.preview.create_private_dir(&path)?;
+        }
+        self.prepare_keychain()?;
+        Ok(())
+    }
+    fn prepare_keychain(&self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            let home = PathBuf::from(&self.spec.environment()[std::ffi::OsStr::new("HOME")]);
+            let library = home.join("Library");
+            self.preview.create_private_dir(&library)?;
+            let link = library.join("Keychains");
+            let target = self.real_home.join("Library/Keychains");
+            // This one leaf is intentionally outside preview scope. Never scope,
+            // create directories in, chmod, or otherwise write through its target.
+            match std::fs::symlink_metadata(&link) {
+                Ok(meta) => ensure!(
+                    meta.is_symlink()
+                        && std::fs::read_link(&link).with_context(|| format!(
+                            "read Claude keychain link {}",
+                            link.display()
+                        ))? == target,
+                    "Claude keychain path already exists with a different type or target: {}",
+                    link.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::os::unix::fs::symlink(&target, &link).with_context(|| {
+                        format!("create Claude keychain link {}", link.display())
+                    })?;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("inspect Claude keychain path {}", link.display())
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -373,6 +426,132 @@ impl gitterm_core::harness::claude::SnapshotRecorder for NoSnapshots {
 }
 
 #[cfg(test)]
+mod keychain_tests {
+    use super::super::tests::fixture;
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepare_links_only_keychains_and_is_idempotent_without_touching_target() {
+        let (dir, preview) = fixture();
+        let real_home = dir.path().join("injected-host");
+        let target = real_home.join("Library/Keychains");
+        let provider =
+            Provider::new_with_home(preview.clone(), Path::new("/fake/claude"), real_home).unwrap();
+        provider.prepare().unwrap();
+        let home = preview.root().join("child/home");
+        let link = home.join("Library/Keychains");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert!(
+            !target.exists(),
+            "prepare must not create or inspect target contents"
+        );
+        assert_eq!(
+            std::fs::metadata(home.join("Library"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let before = std::fs::symlink_metadata(&link).unwrap();
+        provider.prepare().unwrap();
+        let after = std::fs::symlink_metadata(&link).unwrap();
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        assert_eq!(
+            provider.spec.environment()[std::ffi::OsStr::new("HOME")],
+            home
+        );
+        assert!(!home.join(".claude").exists());
+        assert!(!home.join(".config").exists());
+        assert!(
+            provider
+                .sign_in_command()
+                .contains(&format!("HOME={}", home.display()))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepare_refuses_and_preserves_file_directory_and_wrong_link() {
+        for kind in ["file", "directory", "wrong-link", "dangling-link"] {
+            let (dir, preview) = fixture();
+            let provider = Provider::fixture(preview.clone(), Path::new("/fake/claude")).unwrap();
+            let library = preview.root().join("child/home/Library");
+            preview.create_private_dir(&library).unwrap();
+            let path = library.join("Keychains");
+            let wrong = dir.path().join("wrong");
+            match kind {
+                "file" => std::fs::write(&path, "keep").unwrap(),
+                "directory" => {
+                    std::fs::create_dir(&path).unwrap();
+                    std::fs::write(path.join("keep"), "keep").unwrap();
+                }
+                "wrong-link" => {
+                    std::fs::create_dir(&wrong).unwrap();
+                    std::fs::write(wrong.join("keep"), "keep").unwrap();
+                    symlink(&wrong, &path).unwrap();
+                }
+                _ => symlink(&wrong, &path).unwrap(),
+            }
+            let before = std::fs::symlink_metadata(&path).unwrap();
+            let error = format!("{:#}", provider.prepare().unwrap_err());
+            assert!(error.contains(path.to_str().unwrap()), "{error}");
+            let after = std::fs::symlink_metadata(&path).unwrap();
+            assert_eq!(
+                (before.dev(), before.ino(), before.mode()),
+                (after.dev(), after.ino(), after.mode())
+            );
+            match kind {
+                "file" => assert_eq!(std::fs::read_to_string(path).unwrap(), "keep"),
+                "directory" => {
+                    assert_eq!(std::fs::read_to_string(path.join("keep")).unwrap(), "keep")
+                }
+                _ => {
+                    assert_eq!(std::fs::read_link(path).unwrap(), wrong);
+                    if kind == "wrong-link" {
+                        assert_eq!(std::fs::read_to_string(wrong.join("keep")).unwrap(), "keep");
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepare_refuses_aliased_or_non_private_library_without_writing_outside() {
+        for alias in [true, false] {
+            let (dir, preview) = fixture();
+            let provider = Provider::fixture(preview.clone(), Path::new("/fake/claude")).unwrap();
+            let home = preview.root().join("child/home");
+            preview.create_private_dir(&home).unwrap();
+            let outside = dir.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            let library = home.join("Library");
+            if alias {
+                symlink(&outside, &library).unwrap();
+            } else {
+                std::fs::create_dir(&library).unwrap();
+                std::fs::set_permissions(&library, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            assert!(provider.prepare().is_err());
+            assert!(!library.join("Keychains").exists());
+            assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn prepare_does_not_create_library_off_macos() {
+        let (_dir, preview) = fixture();
+        let provider = Provider::fixture(preview.clone(), Path::new("/fake/claude")).unwrap();
+        provider.prepare().unwrap();
+        assert!(!preview.root().join("child/home/Library").exists());
+    }
+}
+
+#[cfg(test)]
 mod gate_tests {
     use super::super::{
         auth::{AUTH_STATUS_SCHEMA, FIXTURE_SCHEMA},
@@ -401,7 +580,7 @@ mod gate_tests {
         );
         let cwd = dir.path().join("clone");
         super::super::tests::independent_clone(&cwd);
-        let provider = Arc::new(Provider::new(preview.clone(), &fake).unwrap());
+        let provider = Arc::new(Provider::fixture(preview.clone(), &fake).unwrap());
         let (runtime, _events) = provider
             .start_with_policy(cwd, FIXTURE_SCHEMA, dir.path().join("no-policy"))
             .unwrap();
@@ -451,7 +630,7 @@ mod gate_tests {
                     quote(&status)
                 ),
             );
-            let provider = Provider::new(preview.clone(), &fake).unwrap();
+            let provider = Provider::fixture(preview.clone(), &fake).unwrap();
             provider.prepare().unwrap();
             assert_eq!(
                 provider

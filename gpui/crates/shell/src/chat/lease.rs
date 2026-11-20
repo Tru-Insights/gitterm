@@ -61,7 +61,7 @@ mod tests {
     fn persistent_stale_marker_has_no_authority_and_aliases_refuse() {
         let (_dir, preview) = super::super::tests::fixture();
         let provider =
-            super::super::provider::Provider::new(preview.clone(), Path::new("/fake/claude"))
+            super::super::provider::Provider::fixture(preview.clone(), Path::new("/fake/claude"))
                 .unwrap();
         provider.prepare().unwrap();
         let path = preview.provider().join(".writer");
@@ -87,7 +87,7 @@ mod process_tests {
     #[test]
     fn independent_process_observes_the_same_kernel_lease() {
         let (_dir, preview) = super::super::tests::fixture();
-        super::super::provider::Provider::new(preview.clone(), Path::new("/fake/claude"))
+        super::super::provider::Provider::fixture(preview.clone(), Path::new("/fake/claude"))
             .unwrap()
             .prepare()
             .unwrap();

@@ -53,7 +53,7 @@ fn fake_help_missing_restricted_refuses_and_success_does_not_grant_authority() {
                 super::provider::quote(&help)
             ),
         );
-        let provider = Provider::new(preview.clone(), &path).unwrap();
+        let provider = Provider::fixture(preview.clone(), &path).unwrap();
         let output = std::process::Command::new(path)
             .arg("--help")
             .env_clear()
@@ -73,7 +73,7 @@ fn fake_help_missing_restricted_refuses_and_success_does_not_grant_authority() {
 #[test]
 fn workspace_requires_independent_clone_without_shared_metadata_or_preview_overlap() {
     let (dir, preview) = fixture();
-    let provider = Provider::new(preview.clone(), Path::new("/fake/claude")).unwrap();
+    let provider = Provider::fixture(preview.clone(), Path::new("/fake/claude")).unwrap();
     let cwd = dir.path().join("clone");
     std::fs::create_dir(&cwd).unwrap();
     assert!(provider.validate_workspace(&cwd).is_err());
@@ -129,7 +129,7 @@ fn provider_roots_refuse_protected_overlap_relative_alias_and_replacement() {
     std::fs::create_dir(preview.root()).unwrap();
     symlink(preview.root(), &alias).unwrap();
     assert!(crate::preview::config_dir(Some(alias.into_os_string()), &home).is_err());
-    let provider = Provider::new(preview.clone(), Path::new("/fake/claude")).unwrap();
+    let provider = Provider::fixture(preview.clone(), Path::new("/fake/claude")).unwrap();
     provider.prepare().unwrap();
     assert_eq!(
         provider.spec.environment()[std::ffi::OsStr::new("CLAUDE_CONFIG_DIR")],
@@ -138,7 +138,7 @@ fn provider_roots_refuse_protected_overlap_relative_alias_and_replacement() {
     std::fs::rename(preview.provider(), preview.root().join("old-provider")).unwrap();
     symlink(dir.path().join("production"), preview.provider()).unwrap();
     assert!(provider.prepare().is_err());
-    assert!(Provider::new(preview, Path::new("/fake/claude")).is_err());
+    assert!(Provider::fixture(preview, Path::new("/fake/claude")).is_err());
 }
 #[tokio::test]
 async fn probe_both_states_and_environment_are_rooted_and_success_does_not_open_c2() {
@@ -156,7 +156,7 @@ async fn probe_both_states_and_environment_are_rooted_and_success_does_not_open_
                 dir.path().join("environment").display()
             ),
         );
-        let provider = Provider::new(preview.clone(), &fake).unwrap();
+        let provider = Provider::fixture(preview.clone(), &fake).unwrap();
         assert_eq!(provider.fake_probe().await.unwrap(), expected);
         assert!(provider.authorize().is_err());
         let env = std::fs::read_to_string(dir.path().join("environment")).unwrap();
@@ -216,7 +216,7 @@ async fn malformed_mismatched_oversized_and_hung_probe_fail_closed() {
         "exec /bin/sleep 5",
     ] {
         let fake = script(dir.path(), "fake-status", &format!("#!/bin/sh\n{body}\n"));
-        let provider = Provider::new(preview.clone(), &fake).unwrap();
+        let provider = Provider::fixture(preview.clone(), &fake).unwrap();
         assert_eq!(
             provider.fake_probe().await.unwrap(),
             ProbeStatus::Unavailable
@@ -448,7 +448,7 @@ assert not sys.stdin.read()
         String::from_utf8(python.stdout).unwrap().trim()
     );
     let fake = script(dir.path(), "fake-claude", &program);
-    let provider = Arc::new(Provider::new(preview.clone(), &fake).unwrap());
+    let provider = Arc::new(Provider::fixture(preview.clone(), &fake).unwrap());
     let cwd = dir.path().join("checkout");
     independent_clone(&cwd);
     let (runtime, mut events) = provider
@@ -582,7 +582,7 @@ assert not sys.stdin.read()
         "fake-unsigned",
         "#!/bin/sh\nprintf '{\"authMethod\":\"none\",\"configDirectory\":\"%s\"}' \"$CLAUDE_CONFIG_DIR\"\nexit 1\n",
     );
-    let unsigned = Arc::new(Provider::new(preview, &fake).unwrap());
+    let unsigned = Arc::new(Provider::fixture(preview, &fake).unwrap());
     assert!(unsigned.fake_start(cwd).await.unwrap().is_none());
 }
 
@@ -637,7 +637,7 @@ fn sign_in_command_quotes_provider_and_executable_paths_without_shell_expansion(
         "fake claude ' $(false)",
         &format!("#!/bin/sh\n/usr/bin/env > '{}'\n", marker.display()),
     );
-    let provider = Provider::new(preview.clone(), &fake).unwrap();
+    let provider = Provider::fixture(preview.clone(), &fake).unwrap();
     provider.prepare().unwrap();
     let command = provider.sign_in_command();
     let output = std::process::Command::new("/bin/sh")
@@ -692,7 +692,7 @@ Path('reaped-marker').write_text('finished')
             String::from_utf8(python.stdout).unwrap().trim()
         ),
     );
-    let provider = Arc::new(Provider::new(preview.clone(), &fake).unwrap());
+    let provider = Arc::new(Provider::fixture(preview.clone(), &fake).unwrap());
     let executor = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -894,7 +894,7 @@ async fn fake_process_rejected_and_partial_write_outcomes_reach_adapter() {
                 1,
             );
         let program = script(dir.path(), "fake-outcomes", &body);
-        let provider = Arc::new(Provider::new(preview, &program).unwrap());
+        let provider = Arc::new(Provider::fixture(preview, &program).unwrap());
         let cwd = dir.path().join("clone");
         independent_clone(&cwd);
         if partial {

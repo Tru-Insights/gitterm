@@ -111,8 +111,12 @@ and death during a partial write.
 These commands are for the coordinator **after review**, never run by the
 worker. Close all preview chats and probe processes first. Use the default
 non-sample preview root below; launch the GPUI shell with this same explicit
-`GITTERM_GPUI_CONFIG_DIR` later. No credentials are copied, linked or exported.
+`GITTERM_GPUI_CONFIG_DIR` later. On macOS only, the child home's
+`Library/Keychains` links to the process user's `~/Library/Keychains` so Security
+can find the login keychain. All other child-home paths stay substitute, and
+`CLAUDE_CONFIG_DIR` still selects the preview's separate credential entry.
 Use a personal Pro/Max account; never select a Team/Enterprise organization.
+Never click "Reset To Defaults" in a macOS "Keychain Not Found" dialog.
 
 ```sh
 P="$HOME/.config/gitterm-gpui"
@@ -121,6 +125,26 @@ C="$HOME/gitterm-chat-c8-disposable-clone"  # independent, exclusively owned clo
 REPO="$PWD"                  # this checkout, before changing directory
 # If C does not exist, create it once: git clone --no-local "$REPO" "$C"
 umask 077
+if [ "$(uname -s)" = Darwin ]; then
+  # Run in the parent environment, before HOME is substituted. Never overwrite.
+  python3 - "$P/child/home" <<'PY' || exit 1
+from pathlib import Path
+import sys
+library = Path(sys.argv[1]) / "Library"
+if not library.is_absolute() or library.resolve() != library:
+    raise SystemExit(f"Refusing aliased directory or ancestor: {library}")
+library.mkdir(mode=0o700, parents=True, exist_ok=True)
+if library.is_symlink() or not library.is_dir() or library.stat().st_mode & 0o077:
+    raise SystemExit(f"Refusing aliased or non-private directory: {library}")
+link = library / "Keychains"
+target = Path.home() / "Library/Keychains"
+try:
+    link.symlink_to(target, target_is_directory=True)
+except FileExistsError:
+    if not link.is_symlink() or link.readlink() != target:
+        raise SystemExit(f"Refusing existing keychain path: {link}")
+PY
+fi
 mkdir -p "$P/providers/claude" "$P/child/neutral" "$P/child/home" "$P/child/config" "$P/child/tmp"
 cd "$P/child/neutral"
 # (a) One-time isolated sign-in. Then /login; exit the CLI after signing in.
