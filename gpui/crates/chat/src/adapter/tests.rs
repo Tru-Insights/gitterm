@@ -18,7 +18,11 @@ fn facts() -> Admission {
             task_live: false,
             last_tab: false,
         },
-        backend: AgentBackend::Claude,
+        config: gitterm_core::chat::types::AgentBackendConfig::Claude {
+            model: String::new(),
+            permission_mode: Some("default".into()),
+            effort: None,
+        },
         process_running: true,
         just_spawned: false,
         message_id: "synthetic-message".into(),
@@ -295,7 +299,9 @@ fn deferred_commands_revalidate_full_binding_and_pending_request() {
     for intent in [prompt(), permission(), ChatIntent::Stop] {
         let mut adapter = ChatAdapter::default();
         let stamp = adapter.begin_runtime(target());
-        request(&mut adapter, &stamp);
+        if intent.request_id().is_some() {
+            request(&mut adapter, &stamp);
+        }
         let prepared = adapter
             .admit(intent, facts())
             .unwrap_or_else(|r| panic!("{r:?}"));
@@ -623,7 +629,366 @@ fn native_adapter_refuses_pi_instead_of_ignoring_image_limitations() {
     let mut adapter = ChatAdapter::default();
     adapter.begin_runtime(target());
     let mut admission = facts();
-    admission.backend = AgentBackend::Pi;
+    admission.config = AgentBackendConfig::Pi {
+        model: String::new(),
+        session_path: None,
+        thinking: None,
+    };
     assert!(adapter.admit(prompt(), admission).is_err());
     assert!(adapter.state().conversation.is_empty());
+}
+
+fn streaming(adapter: &mut ChatAdapter, source: &RuntimeStamp) {
+    adapter
+        .receive(
+            source,
+            &target(),
+            AgentEvent::Harness(HarnessEvent::TurnStarted {
+                session_id: None,
+                model: None,
+            }),
+            None,
+            |_, _| {},
+        )
+        .unwrap();
+}
+fn lifecycle(adapter: &mut ChatAdapter, source: &RuntimeStamp, state: MessageState) -> Update {
+    adapter
+        .receive(
+            source,
+            &target(),
+            AgentEvent::Harness(HarnessEvent::MessageLifecycle {
+                id: "synthetic-message".into(),
+                state,
+            }),
+            None,
+            |_, _| {},
+        )
+        .unwrap()
+}
+fn withdraw() -> ChatIntent {
+    ChatIntent::Withdraw {
+        message_id: "synthetic-message".into(),
+    }
+}
+
+#[test]
+fn send_gate_checks_admission_and_execution_and_settles_queued_correlation() {
+    for queue in [false, true] {
+        let mut adapter = ChatAdapter::default();
+        let source = adapter.begin_runtime(target());
+        if queue {
+            streaming(&mut adapter, &source);
+        }
+        let prepared = adapter.admit(prompt(), facts()).unwrap();
+        request(&mut adapter, &source);
+        assert!(adapter.admit(prompt(), facts()).is_err());
+        let (receipt, _) =
+            adapter.execute(prepared, &target(), 1, |_| panic!("pending request sent"));
+        assert!(matches!(receipt.state, ReceiptState::Rejected(_)));
+        assert!(!adapter.state().shows_prompt("synthetic-message"));
+        if queue {
+            assert_eq!(
+                adapter.state().queued_prompts["synthetic-message"].status,
+                PromptStatus::Unsent
+            );
+        }
+    }
+}
+
+#[test]
+fn streaming_uses_queue_and_rejected_channel_settles_withdraw_for_explicit_retry() {
+    let mut adapter = ChatAdapter::default();
+    let source = adapter.begin_runtime(target());
+    streaming(&mut adapter, &source);
+    let prepared = adapter.admit(prompt(), facts()).unwrap();
+    let id = prepared.id();
+    assert_eq!(
+        adapter.state().queued_prompts["synthetic-message"].status,
+        PromptStatus::Pending
+    );
+    accepted(&mut adapter, prepared);
+    adapter
+        .delivery(id, &target(), DeliveryOutcome::Written)
+        .unwrap();
+    lifecycle(&mut adapter, &source, MessageState::Queued);
+    let prepared = adapter.admit(withdraw(), facts()).unwrap();
+    assert!(adapter.state().queued_prompts["synthetic-message"].withdraw_pending);
+    adapter.execute(prepared, &target(), 1, |_| Err("channel closed".into()));
+    assert!(!adapter.state().queued_prompts["synthetic-message"].withdraw_pending);
+    assert!(adapter.admit(withdraw(), facts()).is_ok());
+}
+
+#[test]
+fn withdrawal_start_race_is_refused_before_send_and_visible_after_send() {
+    for start_before_execute in [false, true] {
+        let mut adapter = ChatAdapter::default();
+        let source = adapter.begin_runtime(target());
+        streaming(&mut adapter, &source);
+        let prepared = adapter.admit(prompt(), facts()).unwrap();
+        accepted(&mut adapter, prepared);
+        lifecycle(&mut adapter, &source, MessageState::Queued);
+        let prepared = adapter.admit(withdraw(), facts()).unwrap();
+        if start_before_execute {
+            let update = lifecycle(&mut adapter, &source, MessageState::Started);
+            assert!(update.event.unwrap().notices[0].contains("already started"));
+            let receipt = adapter
+                .execute(prepared, &target(), 1, |_| {
+                    panic!("started withdrawal sent")
+                })
+                .0;
+            assert!(matches!(receipt.state, ReceiptState::Rejected(_)));
+        } else {
+            accepted(&mut adapter, prepared);
+            let update = lifecycle(&mut adapter, &source, MessageState::Started);
+            let mut composer = crate::composer::ComposerState::default();
+            composer.project(adapter.state(), update.event.as_ref());
+            assert!(composer.notice.unwrap().contains("already started"));
+            assert!(!composer.queue[0].withdrawable());
+            assert!(adapter.admit(withdraw(), facts()).is_err());
+        }
+    }
+}
+
+#[test]
+fn exit_projects_core_unsent_versus_uncertain_without_resend() {
+    for written in [false, true] {
+        let mut adapter = ChatAdapter::default();
+        let source = adapter.begin_runtime(target());
+        streaming(&mut adapter, &source);
+        let prepared = adapter.admit(prompt(), facts()).unwrap();
+        let receipt = accepted(&mut adapter, prepared);
+        if written {
+            adapter
+                .delivery(receipt.id, &target(), DeliveryOutcome::Written)
+                .unwrap();
+        }
+        let update = adapter
+            .receive(
+                &source,
+                &target(),
+                AgentEvent::Harness(HarnessEvent::ProcessExited { code: Some(1) }),
+                None,
+                |_, _| {},
+            )
+            .unwrap();
+        let mut composer = crate::composer::ComposerState::default();
+        composer.project(adapter.state(), update.event.as_ref());
+        assert_eq!(
+            composer.queue[0].status,
+            if written {
+                PromptStatus::Uncertain
+            } else {
+                PromptStatus::Unsent
+            }
+        );
+        assert!(
+            composer.queue[0]
+                .label()
+                .contains(if written { "Uncertain" } else { "Unsent" })
+        );
+        assert_eq!(composer.queue[0].text, "synthetic draft");
+        assert!(!composer.queue[0].withdrawable());
+    }
+}
+
+#[test]
+fn forged_mode_intent_has_no_adapter_command_path() {
+    let mut adapter = ChatAdapter::default();
+    adapter.begin_runtime(target());
+    for mode in [
+        "default",
+        "auto",
+        "dontAsk",
+        "bypassPermissions",
+        "plan",
+        "made-up",
+    ] {
+        let receipt = adapter
+            .admit(ChatIntent::ChangeMode { mode: mode.into() }, facts())
+            .err()
+            .unwrap();
+        assert!(
+            matches!(receipt.state, ReceiptState::Rejected(ref reason) if reason.contains("Mode changes are disabled"))
+        );
+        assert!(adapter.state().pending_change().is_none());
+    }
+}
+
+#[test]
+fn task_rebind_rejects_deferred_queue_but_settles_its_original_correlation() {
+    let mut adapter = ChatAdapter::default();
+    let source = adapter.begin_runtime(target());
+    streaming(&mut adapter, &source);
+    let prepared = adapter.admit(prompt(), facts()).unwrap();
+    let mut current = target();
+    current.task_id = Some("new-task".into());
+    let receipt = adapter
+        .execute(prepared, &current, 1, |_| panic!("stale binding sent"))
+        .0;
+    assert!(matches!(receipt.state, ReceiptState::Rejected(_)));
+    assert_eq!(
+        adapter.state().queued_prompts["synthetic-message"].status,
+        PromptStatus::Unsent
+    );
+}
+
+#[test]
+fn process_exit_between_admission_and_execute_prevents_idle_submit() {
+    let mut adapter = ChatAdapter::default();
+    let source = adapter.begin_runtime(target());
+    let prepared = adapter.admit(prompt(), facts()).unwrap();
+    adapter
+        .receive(
+            &source,
+            &target(),
+            AgentEvent::Harness(HarnessEvent::ProcessExited { code: Some(1) }),
+            None,
+            |_, _| {},
+        )
+        .unwrap();
+    assert!(matches!(
+        adapter
+            .execute(prepared, &target(), 1, |_| panic!("exited runtime sent"))
+            .0
+            .state,
+        ReceiptState::Rejected(_)
+    ));
+    assert!(adapter.admit(prompt(), facts()).is_err());
+}
+
+#[test]
+fn provider_withdraw_refusal_settles_visible_control_receipt_after_write() {
+    let mut adapter = ChatAdapter::default();
+    let source = adapter.begin_runtime(target());
+    streaming(&mut adapter, &source);
+    let prepared = adapter.admit(prompt(), facts()).unwrap();
+    accepted(&mut adapter, prepared);
+    lifecycle(&mut adapter, &source, MessageState::Queued);
+    let prepared = adapter.admit(withdraw(), facts()).unwrap();
+    let receipt = accepted(&mut adapter, prepared);
+    let written = adapter
+        .delivery(receipt.id, &target(), DeliveryOutcome::Written)
+        .unwrap();
+    let update = adapter
+        .receive(
+            &source,
+            &target(),
+            AgentEvent::Harness(HarnessEvent::MessageWithdrawRefused {
+                id: "synthetic-message".into(),
+                reason: "already picked up".into(),
+            }),
+            None,
+            |_, _| {},
+        )
+        .unwrap();
+    let refused = update
+        .receipts
+        .iter()
+        .find(|receipt| receipt.id == written.id)
+        .unwrap();
+    assert!(written.accepts_update(refused));
+    assert!(
+        matches!(&refused.state, ReceiptState::Rejected(reason) if reason.contains("already picked up"))
+    );
+    assert!(!adapter.state().queued_prompts["synthetic-message"].withdraw_pending);
+    let mut composer = crate::composer::ComposerState::default();
+    composer.project(adapter.state(), update.event.as_ref());
+    assert!(composer.notice.unwrap().contains("already picked up"));
+}
+
+#[test]
+fn explicit_same_caller_retry_of_unsent_queue_uses_fresh_tracked_delivery_id() {
+    for failure in ["validation", "channel", "delivery"] {
+        let mut adapter = ChatAdapter::default();
+        let source = adapter.begin_runtime(target());
+        streaming(&mut adapter, &source);
+        let prepared = adapter.admit(prompt(), facts()).unwrap();
+        let receipt = if failure == "validation" {
+            request(&mut adapter, &source);
+            let receipt = adapter
+                .execute(prepared, &target(), 1, |_| panic!("blocked send"))
+                .0;
+            adapter
+                .receive(
+                    &source,
+                    &target(),
+                    AgentEvent::Harness(HarnessEvent::RuntimeRequestResolved {
+                        request_id: "synthetic-request".into(),
+                    }),
+                    None,
+                    |_, _| {},
+                )
+                .unwrap();
+            receipt
+        } else if failure == "channel" {
+            adapter
+                .execute(prepared, &target(), 1, |_| Err("closed".into()))
+                .0
+        } else {
+            let receipt = accepted(&mut adapter, prepared);
+            adapter
+                .delivery(
+                    receipt.id,
+                    &target(),
+                    DeliveryOutcome::Rejected("not written".into()),
+                )
+                .unwrap()
+        };
+        assert!(receipt.state.retryable());
+        assert_eq!(
+            adapter.state().queued_prompts["synthetic-message"].status,
+            PromptStatus::Unsent
+        );
+        let retry = adapter.admit(prompt(), facts()).unwrap();
+        let mut delivery_id = String::new();
+        let (receipt, _) = adapter.execute(retry, &target(), 2, |command| {
+            let HarnessCommand::SendUserMessage(prompt) = command else {
+                panic!()
+            };
+            delivery_id = prompt.id.unwrap();
+            assert_ne!(delivery_id, "synthetic-message");
+            assert_eq!(prompt.text, "synthetic draft");
+            Ok(())
+        });
+        assert_eq!(adapter.state().queued_prompts.len(), 2);
+        assert_eq!(
+            adapter.state().queued_prompts[&delivery_id].status,
+            PromptStatus::Pending
+        );
+        assert!(
+            adapter.admit(prompt(), facts()).is_err(),
+            "caller identity still deduplicates"
+        );
+        let update = adapter
+            .receive(
+                &source,
+                &target(),
+                AgentEvent::Harness(HarnessEvent::MessageLifecycle {
+                    id: delivery_id.clone(),
+                    state: MessageState::Queued,
+                }),
+                None,
+                |_, _| {},
+            )
+            .unwrap();
+        assert!(update.event.is_some());
+        assert_eq!(
+            adapter.state().queued_prompts[&delivery_id].status,
+            PromptStatus::Queued
+        );
+        adapter
+            .delivery(
+                receipt.id,
+                &target(),
+                DeliveryOutcome::Uncertain("partial write".into()),
+            )
+            .unwrap();
+        let rejected = adapter.admit(prompt(), facts()).err().unwrap();
+        assert!(
+            matches!(rejected.state, ReceiptState::Uncertain(_)),
+            "uncertainty must never retry"
+        );
+        assert_eq!(adapter.state().queued_prompts.len(), 2);
+    }
 }
