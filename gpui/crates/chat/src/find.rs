@@ -12,7 +12,7 @@ pub(super) struct TranscriptFind {
     // list untouched while a temporary list handles find jumps, then restore it.
     // shortcut: empty find opens at the saved top row, not its intra-row offset;
     // use a snapshot API when MessageScroller offers one. Escape restores exactly.
-    saved_scroller: Option<Entity<MessageScrollerState>>,
+    pub(super) saved_scroller: Option<Entity<MessageScrollerState>>,
     scroll_subscription: Option<Subscription>,
     opened: HashSet<u64>,
     opened_turns: HashSet<u64>,
@@ -272,7 +272,8 @@ impl ChatView {
             .items_center()
             .gap(px(6.))
             .p(px(6.))
-            .bg(rgb(0x2a2b3d))
+            .bg(rgb(self.appearance.palette().footer))
+            .text_size(px(self.appearance.size(12.)))
             .rounded(px(8.))
             .child(div().flex_1().child(Input::new(&self.find_input)))
             .child(format!(

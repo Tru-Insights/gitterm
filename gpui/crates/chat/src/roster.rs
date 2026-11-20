@@ -23,13 +23,13 @@ impl WorkerState {
         }
     }
     #[cfg(target_os = "macos")]
-    fn color(self) -> u32 {
+    fn color(self, palette: crate::ChatPalette) -> u32 {
         match self {
-            Self::Queued => 0x7f849c,
-            Self::Running => 0x89b4fa,
-            Self::Waiting => 0xf9e2af,
-            Self::Done => 0x94e2d5,
-            Self::Failed => 0xf38ba8,
+            Self::Queued => palette.muted,
+            Self::Running => palette.accent,
+            Self::Waiting => palette.warn,
+            Self::Done => palette.result,
+            Self::Failed => palette.err,
         }
     }
 }
@@ -105,12 +105,14 @@ pub(crate) fn render(
     input: &[RosterEntry],
     hidden: &std::collections::HashSet<String>,
     now_ms: u64,
+    appearance: crate::ChatAppearance,
     cx: &mut gpui::Context<crate::ChatView>,
 ) -> impl gpui::IntoElement {
     use gpui::{
         InteractiveElement, ParentElement, StatefulInteractiveElement, Styled, div, px, rgb,
     };
     use gpui_component::button::Button;
+    let palette = appearance.palette();
     let rows: Vec<_> = rows(input, now_ms)
         .into_iter()
         .filter(|row| !hidden.contains(&row.id))
@@ -123,15 +125,15 @@ pub(crate) fn render(
         .flex_col()
         .gap(px(2.))
         .font_family("Menlo")
-        .text_size(px(15. * 12. / 14.))
-        .text_color(rgb(0x7f849c))
+        .text_size(px(appearance.size(12.)))
+        .text_color(rgb(palette.muted))
         .children((!rows.is_empty()).then(|| {
             div()
                 .flex()
                 .flex_col()
                 .gap(px(2.))
                 .border_t_1()
-                .border_color(rgb(0x45475a))
+                .border_color(rgb(palette.border))
                 .pt(px(4.))
                 .px(px(6.))
                 .pb(px(6.))
@@ -155,7 +157,7 @@ pub(crate) fn render(
                         .py(px(1.))
                         .cursor_pointer()
                         .rounded(px(4.))
-                        .hover(|style| style.bg(rgb(0x45475a)))
+                        .hover(|style| style.bg(rgb(palette.border)))
                         .on_click(cx.listener(move |view, _, _, cx| {
                             view.roster_outcome(RosterOutcome::Open { id: id.clone() }, cx)
                         }))
@@ -164,13 +166,13 @@ pub(crate) fn render(
                                 .size(px(7.))
                                 .flex_shrink_0()
                                 .rounded_full()
-                                .bg(rgb(row.state.color()))
+                                .bg(rgb(row.state.color(palette)))
                                 .opacity(opacity),
                         )
                         .child(
                             div()
                                 .flex_shrink_0()
-                                .text_color(rgb(0xbac2de))
+                                .text_color(rgb(palette.fg))
                                 .child(row.name),
                         )
                         .child(div().flex_1().min_w_0().truncate().child(row.what))
