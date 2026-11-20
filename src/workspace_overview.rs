@@ -235,57 +235,8 @@ async fn list_worktrees_async(dir: &Path) -> Result<Vec<WorktreeInfo>, String> {
         .collect())
 }
 
-/// What one refresh does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefreshMode {
-    /// Rediscover owned branches (worktree lists, refs), read every one.
-    Full,
-    /// Keep the previous rows; read only those whose gitdir stamp moved.
-    Gated,
-}
-
-#[derive(Debug, Clone)]
-pub struct RefreshPlan {
-    pub mode: RefreshMode,
-    pub candidates: Vec<BranchCandidate>,
-    pub issue_keys: Vec<String>,
-    pub key_repos: Vec<PathBuf>,
-    pub previous: Vec<BranchStatus>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RefreshOutcome {
-    pub mode: RefreshMode,
-    pub branches: Vec<BranchStatus>,
-    /// Repo-level failures (a worktree list that could not be read).
-    pub errors: Vec<String>,
-    pub git_runs: usize,
-    pub skipped_unchanged: usize,
-    pub took: Duration,
-}
-
-impl RefreshOutcome {
-    /// Whether any row's numbers differ from `previous` (same rows, same
-    /// counts, same state), ignoring when they were read.
-    pub fn changed_from(&self, previous: &[BranchStatus]) -> bool {
-        let key = |row: &BranchStatus| {
-            (
-                row.owned.clone(),
-                row.base.clone(),
-                row.status.clone(),
-                row.vs_base,
-                row.error.clone(),
-                row.stamp.clone(),
-            )
-        };
-        self.branches.len() != previous.len()
-            || self
-                .branches
-                .iter()
-                .zip(previous)
-                .any(|(a, b)| key(a) != key(b))
-    }
-}
+// Shared DTOs keep the service and reducer on the same completion contract.
+pub use gitterm_core::work::state::{RefreshMode, RefreshOutcome, RefreshPlan};
 
 /// Runs one refresh: sequential git calls, each with [`GIT_TIMEOUT`], no
 /// new call after [`REFRESH_DEADLINE`]. A checkout whose folder is gone
