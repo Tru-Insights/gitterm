@@ -79,6 +79,9 @@ pub(super) fn work_folds(model: &crate::model::ChatModel) -> Vec<WorkFold> {
                     if boundary {
                         if let Some(start) = first.take()
                             && has_work
+                            // Work between narration paragraphs is a tool run. The
+                            // turn disclosure owns the work before the first reply.
+                            && !segment[..start].iter().any(|row| row.kind == RowKind::Assistant)
                         {
                             folds.push(WorkFold {
                                 range: offset + start..offset + index,

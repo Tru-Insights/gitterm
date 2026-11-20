@@ -53,6 +53,7 @@ pub struct Row {
     pub title: String,
     pub body: String,
     pub images: Vec<gitterm_core::chat::types::ImageAttachment>,
+    pub delivery: Option<gitterm_core::chat::types::DeliveryCard>,
     pub tool: Option<Tool>,
     pub decision: Option<DecisionState>,
     pub request: Option<Request>,
@@ -123,6 +124,7 @@ pub struct ChatModel {
     prompts: HashMap<String, usize>,
     workers: HashMap<String, usize>,
     turn_start: HashMap<String, u64>,
+    turn_end: HashMap<String, u64>,
     next_id: u64,
     recorded_time: Option<u64>,
 }
@@ -159,13 +161,11 @@ impl ChatModel {
         use gitterm_core::chat::state::AgentEvent;
         let entry = match event {
             AgentEvent::Harness(event) => Entry::Harness(event.clone()),
-            AgentEvent::Other(value) if value["kind"] == "turn_timing" => {
-                if let Some(start) = value["start_ms"].as_u64() {
-                    self.turn_start.insert(String::new(), start);
-                }
-                self.recorded_time = value["end_ms"].as_u64();
-                return vec![];
-            }
+            AgentEvent::Other(value) if value["kind"] == "turn_timing" => Entry::TurnTiming {
+                start_ms: value["start_ms"].as_u64(),
+                end_ms: value["end_ms"].as_u64(),
+                split_ms: value["split_ms"].as_u64(),
+            },
             AgentEvent::Other(value) if value["kind"] == "subagent_started_at" => {
                 if let (Some(id), Some(at)) = (value["id"].as_str(), value["at_ms"].as_u64()) {
                     self.turn_start.insert(id.into(), at);
@@ -249,6 +249,7 @@ impl ChatModel {
             title,
             body,
             images: vec![],
+            delivery: None,
             tool: None,
             decision: None,
             request: None,
@@ -272,11 +273,22 @@ impl ChatModel {
                 if let Some(start) = start_ms {
                     self.turn_start.insert(scope.into(), *start);
                 }
-                self.recorded_time = *end_ms;
+                if let Some(end) = end_ms {
+                    self.turn_end.insert(scope.into(), *end);
+                }
             }
             Entry::UserPrompt(text) => {
-                self.streams.remove(scope);
-                changed.push(self.push(RowKind::User, scope, "You".into(), literal(text)));
+                self.event(
+                    &HarnessEvent::UserMessageEcho {
+                        id: None,
+                        text: text.clone(),
+                        image_count: 0,
+                        delivery: None,
+                    },
+                    at,
+                    scope,
+                    changed,
+                );
             }
             Entry::SubmittedPrompt(prompt) => {
                 self.recorded_time = at;
@@ -392,8 +404,6 @@ impl ChatModel {
                 self.turn_row_start.insert(scope.into(), self.rows.len());
                 if let Some(at) = at {
                     self.turn_start.insert(scope.into(), at);
-                } else {
-                    self.turn_start.remove(scope);
                 }
                 if !scope.is_empty() {
                     let index = self.push(
@@ -531,7 +541,7 @@ impl ChatModel {
                 ..
             } => {
                 self.streams.remove(scope);
-                let duration_ms = self.turn_start.remove(scope).zip(at).map(|(start, end)| end.saturating_sub(start));
+                let duration_ms = self.turn_start.remove(scope).zip(self.turn_end.remove(scope).or(at)).map(|(start, end)| end.saturating_sub(start));
                 let start = self.turn_row_start.remove(scope).unwrap_or_else(|| {
                     self.rows.iter().rposition(|row| row.scope == scope && row.kind == RowKind::User).map_or(0, |index| index + 1)
                 });
@@ -578,27 +588,19 @@ impl ChatModel {
                     return;
                 }
                 self.streams.remove(scope);
-                let kind = if delivery.is_some() {
-                    RowKind::Delegation
-                } else {
-                    RowKind::User
-                };
-                let mut body = literal(text);
+                let delivery = delivery.clone().or_else(|| gitterm_core::chat::history::delivery_card(text));
+                let kind = if delivery.is_some() { RowKind::Delegation } else { RowKind::User };
+                let title = delivery.as_ref().map_or_else(|| "You".into(), |card| card.header.clone());
+                let mut body = literal(delivery.as_ref().map_or(text.as_str(), |card| card.body.as_str()));
                 if *image_count > 0 {
-                    body.push_str(&format!(
-                        "\n\n{image_count} image attachment(s) (not relayed)"
-                    ));
+                    body.push_str(&format!("\n\n{image_count} image attachment(s) (not relayed)"));
                 }
-                if let Some(delivery) = delivery {
-                    body.push_str(&format!(
-                        "\n\n{}",
-                        code(
-                            &pretty(&serde_json::to_value(delivery).expect("delivery DTO")),
-                            "json"
-                        )
-                    ));
+                let index = self.push(kind, scope, title, body);
+                self.rows[index].delivery = delivery;
+                self.turn_row_start.entry(scope.into()).or_insert(index + 1);
+                if let Some(at) = at {
+                    self.turn_start.entry(scope.into()).or_insert(at);
                 }
-                let index = self.push(kind, scope, "You".into(), body);
                 if let Some(id) = id {
                     self.prompts.insert(id.clone(), index);
                 }
@@ -606,7 +608,9 @@ impl ChatModel {
             }
             HarnessEvent::MessageLifecycle { id, state } => {
                 if let Some(&index) = self.prompts.get(id) {
-                    self.rows[index].title = format!("You · {state:?}");
+                    if self.rows[index].delivery.is_none() {
+                        self.rows[index].title = format!("You · {state:?}");
+                    }
                     changed.push(index);
                 }
             }
@@ -1210,5 +1214,74 @@ mod transcript_parity_tests {
         assert_eq!(model.rows.len(), 1);
         assert_eq!(model.rows[0].kind, RowKind::Assistant);
         assert_eq!(model.rows[0].title, "");
+    }
+}
+
+#[cfg(test)]
+mod delivery_and_timing_tests {
+    use super::*;
+    use gitterm_core::chat::{history::DELIVERY_SOURCE_LINE, state::AgentEvent};
+
+    #[test]
+    fn source_and_legacy_footer_deliveries_use_the_iced_card_fields() {
+        for state in ["reports done", "is blocked"] {
+            let header = format!("Worker worker-7 (Codex · model) {state}: TRU-274");
+            let content = format!("{header}\nDetails\nFull record: delegation_get worker-7");
+            for text in [
+                content.clone(),
+                format!("{DELIVERY_SOURCE_LINE}\n{content}"),
+            ] {
+                let records = [Record {
+                    at_ms: None,
+                    entry: Entry::UserPrompt(text.clone()),
+                }];
+                let model = ChatModel::from_records(&records);
+                let row = &model.rows[0];
+                assert_eq!(row.kind, RowKind::Delegation);
+                assert!(row.collapsible());
+                assert_eq!(row.title, header);
+                assert_eq!(row.delivery.as_ref().unwrap().delegation_id, "worker-7");
+                assert_eq!(
+                    plain_markdown(&row.body).trim(),
+                    "Details\nFull record: delegation_get worker-7"
+                );
+                let echoed = ChatModel::from_conversation(&[AgentEvent::Other(
+                    serde_json::json!({"type":"user_prompt", "text":text}),
+                )]);
+                assert_eq!(echoed.rows[0].delivery, row.delivery);
+            }
+            let ordinary = ChatModel::from_records(&[Record {
+                at_ms: None,
+                entry: Entry::UserPrompt(header),
+            }]);
+            assert_eq!(
+                ordinary.rows[0].kind,
+                RowKind::User,
+                "worker wording alone is not Iced's detection rule"
+            );
+        }
+    }
+
+    #[test]
+    fn saved_end_marker_survives_intervening_events_and_turn_start_keeps_prompt_time() {
+        let events = vec![
+            AgentEvent::Other(serde_json::json!({"type":"user_prompt", "text":"check"})),
+            AgentEvent::Other(serde_json::json!({"kind":"turn_timing", "start_ms":1000})),
+            AgentEvent::Harness(HarnessEvent::TurnStarted {
+                session_id: None,
+                model: None,
+            }),
+            AgentEvent::Harness(HarnessEvent::ThinkingDelta("checking".into())),
+            AgentEvent::Other(serde_json::json!({"kind":"turn_timing", "end_ms":146000})),
+            AgentEvent::Harness(HarnessEvent::TextDelta("answer".into())),
+            AgentEvent::Harness(HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                usage: Value::Null,
+                cost_usd: None,
+                rate_limit: None,
+            }),
+        ];
+        let model = ChatModel::from_conversation(&events);
+        assert_eq!(model.completed_turns[0].duration_ms, Some(145000));
     }
 }

@@ -1630,6 +1630,9 @@ impl Render for RowView {
                     .map(|diff| div().h(px(260.)).child(Diff::new(diff))),
             )
             .children((!self.row.images.is_empty()).then(|| self.render_sent_images()))
+            .when(self.row.delivery.is_some(), |content| {
+                content.pl(px(22.)).pr(px(10.)).pb(px(8.))
+            })
             .child(self.copyable_text(cx));
         let header = div()
             .text_size(px(self.appearance.size(13.)))
@@ -1699,6 +1702,11 @@ impl Render for RowView {
                     .border_l_2()
                     .border_color(rgb(palette.border))
             })
+            .when(self.row.delivery.is_some(), |view| {
+                let id = self.row.id;
+                view.debug_selector(move || format!("delivery-card-{id}"))
+                    .my(px(8.))
+            })
             .when(self.row.kind == RowKind::User, |view| {
                 view.w_auto()
                     .max_w(gpui::relative(0.85))
@@ -1722,6 +1730,17 @@ impl Render for RowView {
                         .rounded(px(6.))
                 },
             )
+            .when(self.row.delivery.is_some(), |row| {
+                row.relative().border_color(rgb(palette.border)).child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(3.))
+                        .bg(rgb(palette.result)),
+                )
+            })
             .children(work_summary)
             .when(show_work, |row| row.children(run_summary))
             .when(show_card, |row| {
@@ -1755,11 +1774,65 @@ impl Render for RowView {
                                         .when(self.row.kind == RowKind::Thinking, |row| {
                                             row.italic()
                                         })
-                                        .child(format!(
-                                            "{} {}",
-                                            if self.open { "▾" } else { "▸" },
-                                            self.row.title
-                                        ))
+                                        .when(self.row.delivery.is_none(), |header| {
+                                            header.child(format!(
+                                                "{} {}",
+                                                if self.open { "▾" } else { "▸" },
+                                                self.row.title
+                                            ))
+                                        })
+                                        .when_some(
+                                            self.row.delivery.as_ref(),
+                                            |header, delivery| {
+                                                header
+                                                    .px(px(10.))
+                                                    .py(px(6.))
+                                                    .gap(px(8.))
+                                                    .items_baseline()
+                                                    .child(
+                                                        div()
+                                                            .text_color(rgb(palette.muted))
+                                                            .text_size(px(self
+                                                                .appearance
+                                                                .size(10.)))
+                                                            .child(if self.open {
+                                                                "▾"
+                                                            } else {
+                                                                "▸"
+                                                            }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .whitespace_normal()
+                                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                            .child(delivery.header.clone()),
+                                                    )
+                                                    .when(
+                                                        !delivery.delegation_id.is_empty(),
+                                                        |header| {
+                                                            header.child(
+                                                                div()
+                                                                    .w(px(self
+                                                                        .appearance
+                                                                        .size(90.)))
+                                                                    .flex_shrink_0()
+                                                                    .font_family("monospace")
+                                                                    .text_size(px(self
+                                                                        .appearance
+                                                                        .size(11.)))
+                                                                    .text_color(rgb(palette.muted))
+                                                                    .child(
+                                                                        delivery
+                                                                            .delegation_id
+                                                                            .clone(),
+                                                                    ),
+                                                            )
+                                                        },
+                                                    )
+                                            },
+                                        )
                                         .on_click(cx.listener(Self::toggle)),
                                 )
                                 .content(content),
