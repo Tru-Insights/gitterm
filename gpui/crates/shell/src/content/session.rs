@@ -1,6 +1,6 @@
 //! Viewer cover/return bridge. Session entities and selection survive the visit.
 use crate::{FileOpen, Pane, PaneKind, Shell, WorkspaceId, data::SessionId, pane};
-use gpui::*;
+use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
     button::{Button, ButtonVariants},
     dock::PanelId,
@@ -64,6 +64,16 @@ impl Shell {
     }
 
     fn open_viewer_file(&mut self, event: &FileOpen, window: &mut Window, cx: &mut Context<Self>) {
+        if !super::window::supported(&event.path) {
+            self.owner.update(cx, |owner, cx| {
+                owner.error = Some(format!(
+                    "Cannot preview {}: unsupported file type",
+                    event.path.display()
+                ));
+                cx.notify();
+            });
+            return;
+        }
         let Some(state) = self
             .workspaces
             .iter_mut()
@@ -207,7 +217,13 @@ impl Shell {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+            // Content panes expose a focus handle but their retained body has no
+            // focus scope. Keep Escape routed through the visible viewer wrapper.
+            .when(
+                matches!(pane.read(cx).content, pane::PaneContent::Content(_)),
+                |view| view.track_focus(&pane.focus_handle(cx)),
+            )
+            .capture_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
                     this.close_file_viewer(workspace, window, cx);
                     cx.stop_propagation();
@@ -223,6 +239,7 @@ impl Shell {
                     .child(div().flex_1().child(title))
                     .child(
                         Button::new("close-file-viewer")
+                            .debug_selector(|| "close-file-viewer".into())
                             .ghost()
                             .label("Close")
                             .on_click(cx.listener(move |this, _, window, cx| {

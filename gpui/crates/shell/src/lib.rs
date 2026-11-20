@@ -17,6 +17,8 @@ pub mod find_sidebar;
 #[cfg(test)]
 mod h2_tests;
 #[cfg(test)]
+mod h4_tests;
+#[cfg(test)]
 mod hookup_tests;
 mod layout;
 mod owner;
@@ -115,6 +117,10 @@ pub struct Shell {
     park_subscription: Option<Subscription>,
     new_work_sheet: Option<Entity<workspace_sheet::WorkspaceSheet>>,
     new_work_subscription: Option<Subscription>,
+    find_state: Rc<RefCell<gitterm_core::find::state::State>>,
+    find_views: HashMap<String, find_sidebar::FindViews>,
+    #[cfg(test)]
+    find_home: Option<std::path::PathBuf>,
     work_state: Rc<RefCell<gitterm_core::work::state::State>>,
     work_sidebars: HashMap<WorkspaceId, Entity<work_sidebar::WorkSidebar>>,
     work_subscriptions: HashMap<WorkspaceId, Subscription>,
@@ -255,11 +261,7 @@ impl Shell {
             &owner,
             window,
             |this, _, event: &FileOpen, window, cx| {
-                if event.from_files && content::window::supported(&event.path) {
-                    this.open_content(event, window, cx);
-                } else {
-                    this.open_review(event, window, cx);
-                }
+                this.open_file_viewer(event, window, cx);
             },
         ));
         if local {
@@ -284,6 +286,10 @@ impl Shell {
             park_subscription: None,
             new_work_sheet: None,
             new_work_subscription: None,
+            find_state: Default::default(),
+            find_views: HashMap::new(),
+            #[cfg(test)]
+            find_home: None,
             work_state: Default::default(),
             work_sidebars: HashMap::new(),
             work_subscriptions: HashMap::new(),
@@ -294,77 +300,17 @@ impl Shell {
         shell.load_active_iced_history(window, cx);
         Ok(shell)
     }
-    fn open_content(&mut self, event: &FileOpen, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.local {
-            return;
-        }
-        let Some(root) = self.data.terminal_cwd(event.workspace, cx) else {
-            return;
-        };
-        let Ok(relative) = event.path.strip_prefix(&root) else {
-            self.owner.update(cx, |owner, cx| {
-                owner.error = Some(format!(
-                    "Cannot preview {}: outside workspace root",
-                    event.path.display()
-                ));
-                cx.notify();
-            });
-            return;
-        };
-        let Some(state) = self
-            .workspaces
-            .iter_mut()
-            .find(|w| w.workspace.id == event.workspace)
-        else {
-            return;
-        };
-        let id = content_pane_id(event.workspace, &event.path);
-        if !state.panes.contains_key(&id) {
-            let dark = gpui_component::Theme::global(cx).mode.is_dark();
-            let pane = cx.new(|cx| {
-                Pane::new(
-                    id.clone(),
-                    event
-                        .path
-                        .file_name()
-                        .unwrap_or(event.path.as_os_str())
-                        .to_string_lossy()
-                        .into_owned(),
-                    PaneKind::Content(self.content.clone()),
-                    event.workspace,
-                    self.data.clone(),
-                    window,
-                    cx,
-                )
-            });
-            self.content.update(cx, |content, cx| {
-                content.open(
-                    id.clone(),
-                    content::window::ContentRequest {
-                        root: root.clone(),
-                        relative: relative.to_owned(),
-                        workspace: event.workspace.0,
-                        pane: pane.entity_id().as_u64(),
-                        dark,
-                    },
-                    window,
-                    cx,
-                )
-            });
-            self.registry
-                .borrow_mut()
-                .insert(id.clone(), pane.downgrade());
-            state.panes.insert(id.clone(), pane);
-        }
-        self.content
-            .update(cx, |content, _| content.select(Some(id.clone())));
-        self.show_workspace_pane(event.workspace, &id, window, cx);
-    }
     fn sync_content_selection(&self, cx: &mut Context<Self>) {
+        let find_selected = self.active_workspace(cx).is_some()
+            && self
+                .find_state
+                .borrow()
+                .selected(&self.find_owner(cx))
+                .is_some();
         let mut visible: Vec<String> = self
             .workspaces
             .iter()
-            .filter(|w| Some(w.workspace.id) == self.active_workspace(cx))
+            .filter(|w| !find_selected && Some(w.workspace.id) == self.active_workspace(cx))
             .flat_map(|state| {
                 state
                     .panes
@@ -1466,6 +1412,7 @@ impl Shell {
         ] {
             modes = modes.child(
                 Button::new(title)
+                    .debug_selector(move || title.into())
                     .ghost()
                     .label(if regions.sidebar_collapsed {
                         icon
@@ -1513,6 +1460,15 @@ impl Shell {
                     .flex_1()
                     .min_h_0()
                     .children(self.work_sidebars.get(&state.workspace.id).cloned()),
+            );
+        }
+        if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Find {
+            sidebar = sidebar.child(
+                div().flex_1().min_h_0().children(
+                    self.find_views
+                        .get(&self.find_owner(cx))
+                        .map(|views| views.sidebar.clone()),
+                ),
             );
         }
         sidebar
@@ -1741,6 +1697,7 @@ impl Render for Shell {
         self.content
             .update(cx, |content, cx| content.sync_covers(window, cx));
         self.ensure_work_sidebars(window, cx);
+        self.ensure_find_views(window, cx);
         let p = Palette::current(cx);
         if !self.workspaces.iter().any(|state| state.on_bar()) {
             return div()
@@ -1867,7 +1824,7 @@ impl Render for Shell {
                             .flex()
                             .child(sidebar)
                             .child(self.sidebar_divider(cx))
-                            .child(self.session_content(cx)),
+                            .child(self.find_content(cx)),
                     )
                     .children(self.bottom_panel(cx))
                     .child(self.workspace_bar(cx)),
