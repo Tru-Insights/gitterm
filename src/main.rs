@@ -3,6 +3,8 @@ use git2::Status;
 use git2::{DiffOptions, Repository};
 use gitterm::chats::{ChatBackendResume, ChatEntryResume};
 use gitterm_core::session;
+use gitterm_core::task_commands::{TaskProjection, TaskRead, TaskReadCommand};
+use gitterm_core::tasks::state::TaskAuthority;
 use iced::advanced::graphics::core::Element;
 use iced::keyboard::{self, key, Key, Modifiers};
 use iced::widget::{
@@ -315,40 +317,17 @@ fn agent_ipc_stream() -> impl iced::futures::Stream<Item = Event> + Send + 'stat
     stream.map(Event::AgentWebviewIpc)
 }
 
-// ---- Agent-to-GitTerm task control bridge ---------------------------------
-//
-// The task MCP runs on Tokio, while TaskStore and every visible tab are owned
-// by Iced's update loop. Keep that ownership boundary explicit: MCP requests
-// cross this channel and are answered only after the app has applied them.
-static TASK_CONTROL_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<TaskControlEnvelope>> =
-    OnceLock::new();
-static TASK_CONTROL_RX: OnceLock<
-    Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<TaskControlEnvelope>>>,
-> = OnceLock::new();
-
-fn init_task_control_channel() -> tokio::sync::mpsc::UnboundedSender<TaskControlEnvelope> {
-    TASK_CONTROL_TX
-        .get_or_init(|| {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<TaskControlEnvelope>();
-            let _ = TASK_CONTROL_RX.set(Mutex::new(Some(rx)));
-            tx
-        })
-        .clone()
+// The process-owned core ingress is shared by every task/delegation operation.
+fn init_task_control_channel() -> task_mcp::TaskControlSender {
+    task_mcp::command_sender()
 }
 
 fn task_control_stream() -> impl iced::futures::Stream<Item = Event> + Send + 'static {
-    use iced::futures::StreamExt;
-    let rx = TASK_CONTROL_RX
-        .get()
-        .and_then(|receiver| receiver.lock().ok().and_then(|mut slot| slot.take()));
-    let stream = match rx {
-        Some(rx) => tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
-        None => {
-            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<TaskControlEnvelope>();
-            tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
-        }
-    };
-    stream.map(Event::TaskControlRequested)
+    iced::futures::stream::unfold(task_mcp::take_command_receiver(), |receiver| async move {
+        let mut receiver = receiver?;
+        let envelope = receiver.recv().await?;
+        Some((Event::TaskControlRequested(envelope), Some(receiver)))
+    })
 }
 
 // Stable process-owner subscription: taking the receiver never restarts status jobs.
@@ -7727,7 +7706,7 @@ struct App {
     selection: SelectionState,
     next_tab_id: usize,
     // Durable task registry and cross-workspace Tasks UI state.
-    task_store: Option<TaskStore>,
+    task_authority: TaskAuthority,
     missing_task_worktrees_logged: HashSet<String>,
     /// Review… button defaults (config `review`, TRU-142).
     review_config: config::ReviewConfig,
@@ -9891,6 +9870,9 @@ fn rebuild_workspace_overview(
 impl Drop for App {
     fn drop(&mut self) {
         self.status_jobs.runtime.close();
+        if self.task_mcp.is_some() {
+            task_mcp::close_commands();
+        }
     }
 }
 
@@ -11733,7 +11715,7 @@ impl App {
         let task_worktree = tab
             .task_id
             .as_deref()
-            .and_then(|id| self.task_store.as_ref()?.get(id))
+            .and_then(|id| self.task_authority.store().as_ref()?.get(id))
             .and_then(|task| task.worktree.path.clone());
         let label = tab::checkout_label(
             &tab.repo_path,
@@ -11769,7 +11751,11 @@ impl App {
     /// Where a new chat in this workspace may run: the checkout, then the
     /// workspace's prepared task worktrees.
     fn checkout_choices_for(&self, workspace_dir: &Path) -> Vec<tab::CheckoutChoice> {
-        let tasks = self.task_store.as_ref().map_or(&[][..], TaskStore::tasks);
+        let tasks = self
+            .task_authority
+            .store()
+            .as_ref()
+            .map_or(&[][..], TaskStore::tasks);
         tab::checkout_choices(
             workspace_dir,
             tasks.iter().map(|task| tab::TaskWorktreeInfo {
@@ -11969,7 +11955,7 @@ impl App {
     /// the active tab as usual.
     fn task_context_worktree_root(&self) -> Option<PathBuf> {
         let task_id = self.active_task_context_id()?;
-        let task = self.task_store.as_ref()?.get(task_id)?;
+        let task = self.task_authority.store().as_ref()?.get(task_id)?;
         let workspace = self.active_workspace()?;
         let WorkspaceLocationIdentity::Local { directory } = &task.workspace.location else {
             return None;
@@ -12098,12 +12084,17 @@ impl App {
     /// The task (if any) whose registered worktree is `path`. Archived tasks
     /// still count — their worktree is managed until it is cleaned up.
     fn worktree_task(&self, path: &Path) -> Option<&TaskRecord> {
-        self.task_store.as_ref()?.tasks().iter().find(|task| {
-            task.worktree
-                .path
-                .as_deref()
-                .is_some_and(|worktree| paths_equal(worktree, path))
-        })
+        self.task_authority
+            .store()
+            .as_ref()?
+            .tasks()
+            .iter()
+            .find(|task| {
+                task.worktree
+                    .path
+                    .as_deref()
+                    .is_some_and(|worktree| paths_equal(worktree, path))
+            })
     }
 
     /// An unmanaged worktree is a registered git worktree that is neither the
@@ -12156,7 +12147,7 @@ impl App {
         if anchored.is_empty() {
             return;
         }
-        if let Some(store) = self.task_store.as_mut() {
+        if let Some(store) = self.task_authority.store_mut().as_mut() {
             for session in anchored {
                 if let Err(error) = store.upsert_session(task_id, session, &timestamp) {
                     self.task_ui_error = Some(error.to_string());
@@ -12172,7 +12163,7 @@ impl App {
     /// repository workspace, never peer workspaces in the bottom bar. Follow
     /// any worktree ancestry back to that logical workspace.
     fn canonical_task_workspace_directory(&self, directory: &Path) -> PathBuf {
-        let Some(store) = self.task_store.as_ref() else {
+        let Some(store) = self.task_authority.store().as_ref() else {
             return directory.to_path_buf();
         };
         let mut canonical = directory.to_path_buf();
@@ -12321,7 +12312,7 @@ impl App {
         // A late PTY/title/exit observation from a final worker cannot
         // replace its persisted handoff outcome or resurrect its lifecycle.
         let final_session = |tab: &TabState| {
-            self.task_store.as_ref().is_some_and(|store| {
+            self.task_authority.store().as_ref().is_some_and(|store| {
                 store.worker_session_is_final(task_id, tab.task_session_id.as_deref())
             })
         };
@@ -12347,7 +12338,7 @@ impl App {
             (None, Some((state, detail))) => (state, detail),
             (None, None) => return,
         };
-        let Some(store) = self.task_store.as_mut() else {
+        let Some(store) = self.task_authority.store_mut().as_mut() else {
             return;
         };
         if let Err(error) =
@@ -12364,7 +12355,7 @@ impl App {
     /// every Tick for whichever task context is active — merely seeing the
     /// rail never acknowledges anything.
     fn acknowledge_task_attention(&mut self, task_id: &str) {
-        let Some(store) = self.task_store.as_mut() else {
+        let Some(store) = self.task_authority.store_mut().as_mut() else {
             return;
         };
         if store.get(task_id).is_none() {
@@ -12635,7 +12626,7 @@ impl App {
     /// granularity and the store no-ops on identical snapshots, so output
     /// spam costs at most one write per minute.
     fn flush_task_progress(&mut self) {
-        let Some(store) = self.task_store.as_ref() else {
+        let Some(store) = self.task_authority.store().as_ref() else {
             return;
         };
         let mut activity: HashMap<String, Instant> = HashMap::new();
@@ -12694,7 +12685,7 @@ impl App {
             return;
         }
         let timestamp = now.to_rfc3339();
-        let Some(store) = self.task_store.as_mut() else {
+        let Some(store) = self.task_authority.store_mut().as_mut() else {
             return;
         };
         for (task_id, progress, changes) in updates {
@@ -12784,7 +12775,7 @@ impl App {
             needs_attention: false,
             score: 0,
         }];
-        if let (Some(store), Some(workspace)) = (self.task_store.as_ref(), workspace) {
+        if let (Some(store), Some(workspace)) = (self.task_authority.store().as_ref(), workspace) {
             entries.extend(
                 store
                     .tasks()
@@ -12864,6 +12855,29 @@ impl App {
             .min(entries.len().saturating_sub(1))
     }
 
+    fn task_read_requested(
+        &self,
+        query: TaskRead,
+        reply: gitterm_core::task_commands::ReplyId,
+    ) -> Result<serde_json::Value, String> {
+        let effect = self.task_authority.reduce(TaskReadCommand { reply, query });
+        debug_assert_eq!(effect.reply, reply);
+        match effect.projection? {
+            TaskProjection::List(tasks) => {
+                let tasks = tasks
+                    .iter()
+                    .map(|task| self.task_control_value(task))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(serde_json::json!({
+                    "tasks": tasks,
+                    "available_presets": self.agent_presets.iter()
+                        .map(|preset| preset.name.clone()).collect::<Vec<_>>(),
+                }))
+            }
+            TaskProjection::Get(task) => self.task_control_value(&task),
+        }
+    }
+
     fn task_control_value(&self, task: &TaskRecord) -> Result<serde_json::Value, String> {
         let mut value = serde_json::to_value(task)
             .map_err(|error| format!("could not serialize task {}: {error}", task.task_id))?;
@@ -12901,7 +12915,7 @@ impl App {
     /// Startup probes read harness files off the UI thread even when Chats
     /// is hidden. Prompt stability ignores cursor/spinner PTY redraws.
     fn poll_task_watchdogs(&mut self) -> Task<Event> {
-        let Some(store) = self.task_store.as_ref() else {
+        let Some(store) = self.task_authority.store().as_ref() else {
             return Task::none();
         };
         let mut probes = Vec::new();
@@ -12991,7 +13005,8 @@ impl App {
             return;
         };
         let Some(mut session) = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .and_then(|store| store.get(task_id))
             .and_then(|task| {
@@ -13010,7 +13025,7 @@ impl App {
                 session.objective_delivery = ObjectiveDeliveryState::Delivered;
                 session.conversation = Some(conversation.clone());
                 session.updated_at = now.to_rfc3339();
-                if let Some(store) = self.task_store.as_mut() {
+                if let Some(store) = self.task_authority.store_mut().as_mut() {
                     if let Err(error) = store.upsert_session(task_id, session, &now.to_rfc3339()) {
                         eprintln!("[tasks] confirm startup {task_id}/{session_id}: {error}");
                         self.task_store_error = Some(error.to_string());
@@ -13055,7 +13070,7 @@ impl App {
             return;
         }
         // A late probe must not overwrite a worker's already final report.
-        let Some(store) = self.task_store.as_mut() else {
+        let Some(store) = self.task_authority.store_mut().as_mut() else {
             return;
         };
         if !store.open_worker_delegations(task_id).iter().any(|d| d.status.is_active() && matches!(&d.child,
@@ -13098,14 +13113,15 @@ impl App {
         sync_task_sessions_from_chat_index(
             &self.chat_index,
             &self.workspaces,
-            &mut self.task_store,
+            self.task_authority.store_mut(),
             &mut self.task_store_error,
         );
     }
 
     fn resume_task_conversation(&mut self, task_id: &str, chat_id: &str) -> Task<Event> {
         let Some(task) = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .and_then(|store| store.get(task_id))
             .cloned()
@@ -13133,7 +13149,7 @@ impl App {
         };
         if let Some((ws, idx)) = self.find_chat_tab(&chats::ChatRef::local(chat_id)) {
             let tab = &self.workspaces[ws].tabs[idx];
-            if self.task_store.as_ref().is_some_and(|store| {
+            if self.task_authority.store().as_ref().is_some_and(|store| {
                 store.worker_session_is_final(task_id, tab.task_session_id.as_deref())
             }) {
                 self.task_ui_error = Some("This finished worker is closing. Reopen its conversation after its tab closes.".into());
@@ -13152,7 +13168,7 @@ impl App {
             session.conversation = None;
             let timestamp = chrono::Utc::now().to_rfc3339();
             session.updated_at = timestamp.clone();
-            if let Some(store) = self.task_store.as_mut() {
+            if let Some(store) = self.task_authority.store_mut().as_mut() {
                 if let Err(error) = store.upsert_session(task_id, session, &timestamp) {
                     self.task_ui_error = Some(error.to_string());
                     return Task::none();
@@ -13197,7 +13213,7 @@ impl App {
             }
         }
         let timestamp = chrono::Utc::now().to_rfc3339();
-        if let Some(store) = self.task_store.as_mut() {
+        if let Some(store) = self.task_authority.store_mut().as_mut() {
             renew_final_worker_session(store, task_id, &mut session, &timestamp);
             if let Err(error) = store.upsert_session(task_id, session.clone(), &timestamp) {
                 self.task_ui_error = Some(error.to_string());
@@ -13375,7 +13391,8 @@ impl App {
 
     fn enter_task_context(&mut self, task_id: &str) -> Task<Event> {
         let Some(task) = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .and_then(|store| store.get(task_id))
             .cloned()
@@ -13449,7 +13466,7 @@ impl App {
 
     fn record_task_ui_error(&mut self, task_id: &str, detail: String) {
         self.task_ui_error = Some(detail.clone());
-        if let Some(store) = self.task_store.as_mut() {
+        if let Some(store) = self.task_authority.store_mut().as_mut() {
             if let Err(error) =
                 store.record_resumable_error(task_id, detail, &chrono::Utc::now().to_rfc3339())
             {
@@ -13491,7 +13508,8 @@ impl App {
     /// and reclaims one (without re-queuing) when its agent resumes — the
     /// cap can therefore be briefly exceeded after an answer (TRU-129).
     fn local_slot_holders(&self) -> Vec<&TaskRecord> {
-        self.task_store
+        self.task_authority
+            .store()
             .as_ref()
             .map(|store| local_slot_holders(store, &self.workspaces))
             .unwrap_or_default()
@@ -13506,7 +13524,7 @@ impl App {
     /// workspace env var; None lets delivery probe logged-in accounts for one
     /// with access to the repository.
     fn task_gh_account(&self, task_id: &str) -> Option<String> {
-        let task = self.task_store.as_ref()?.get(task_id)?;
+        let task = self.task_authority.store().as_ref()?.get(task_id)?;
         self.workspaces
             .iter()
             .find(|workspace| self.task_belongs_to_workspace(task, workspace))
@@ -13528,7 +13546,8 @@ impl App {
     /// Discovery only reads state — publishing stays behind explicit actions.
     fn probe_task_delivery(&mut self, task_id: &str) -> Task<Event> {
         let Some(task) = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .and_then(|store| store.get(task_id))
         else {
@@ -13550,7 +13569,7 @@ impl App {
             // raise "No such file or directory" at the user — note the state
             // on the record and leave the last known delivery in place.
             let timestamp = chrono::Utc::now().to_rfc3339();
-            if let Some(store) = self.task_store.as_mut() {
+            if let Some(store) = self.task_authority.store_mut().as_mut() {
                 if let Err(error) = store.mark_worktree_missing(task_id, &timestamp) {
                     self.task_ui_error = Some(error.to_string());
                 }
@@ -13597,7 +13616,8 @@ impl App {
     /// (commits and PRs here carry an issue key), otherwise start the work.
     fn request_task_publish(&mut self, task_id: &str, action: TaskPublishAction) -> Task<Event> {
         let Some(task) = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .and_then(|store| store.get(task_id))
         else {
@@ -13617,7 +13637,8 @@ impl App {
     /// a fresh delivery snapshot so the overview reflects the result at once.
     fn start_task_publish(&mut self, task_id: &str, action: TaskPublishAction) -> Task<Event> {
         let Some(task) = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .and_then(|store| store.get(task_id))
         else {
@@ -13676,7 +13697,8 @@ impl App {
             // The queue only holds launches for tasks still marked Queued —
             // anything cancelled, archived, or started by hand just drops out.
             let still_queued = self
-                .task_store
+                .task_authority
+                .store()
                 .as_ref()
                 .and_then(|store| store.get(&entry.task_id))
                 .is_some_and(|task| task.lifecycle == TaskLifecycle::Queued);
@@ -13696,7 +13718,7 @@ impl App {
                     // A queued launch that can no longer start (worktree gone,
                     // preset removed) must not sit "Queued" forever.
                     let timestamp = chrono::Utc::now().to_rfc3339();
-                    if let Some(store) = self.task_store.as_mut() {
+                    if let Some(store) = self.task_authority.store_mut().as_mut() {
                         if let Err(store_error) = store.record_lifecycle_signal(
                             &entry.task_id,
                             TaskLifecycle::Failed,
@@ -13750,7 +13772,8 @@ impl App {
         user_model_choice: bool,
     ) -> Result<TaskChildLaunch, String> {
         let Some(task) = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .and_then(|store| store.get(task_id))
             .cloned()
@@ -13878,7 +13901,8 @@ impl App {
         }
         if launched_agent {
             let store = self
-                .task_store
+                .task_authority
+                .store_mut()
                 .as_mut()
                 .ok_or("GitTerm's task store became unavailable")?;
             if let Some(position) = queue_task_launch_if_full(
@@ -14030,7 +14054,8 @@ impl App {
             updated_at: timestamp.clone(),
         };
         let store = self
-            .task_store
+            .task_authority
+            .store_mut()
             .as_mut()
             .ok_or_else(|| "GitTerm's task store became unavailable".to_string())?;
         store
@@ -14079,7 +14104,7 @@ impl App {
             "workspace": workspace_name,
             "worktree_path": task.worktree.path,
             "preset_name": preset_idx.map(|index| self.agent_presets[index].name.clone()),
-            "conversation_id": self.task_store.as_ref()
+            "conversation_id": self.task_authority.store().as_ref()
                 .and_then(|store| store.get(task_id))
                 .and_then(|task| task.sessions.iter().find(|item| item.task_session_id == session_id))
                 .and_then(|item| item.conversation.as_ref())
@@ -14265,7 +14290,8 @@ impl App {
     /// the task so the bottom bar remains a workspace/machine navigator.
     fn reconcile_managed_task_workspaces(&mut self) -> usize {
         let worktrees = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .map(|store| {
                 store
@@ -15281,7 +15307,7 @@ impl App {
             &self.chat_index,
             &self.workspaces,
             &self.repos,
-            self.task_store.as_ref(),
+            self.task_authority.store().as_ref(),
         );
         for (uid, dirs) in joins {
             for dir in dirs {
@@ -15948,7 +15974,7 @@ impl App {
             .flat_map(|ws| ws.tabs.iter())
             .filter_map(|tab| Some((tab.session_uid.clone(), tab.chat_session_id.clone()?)))
             .collect();
-        if let Some(store) = self.task_store.as_ref() {
+        if let Some(store) = self.task_authority.store().as_ref() {
             for delegation in store.delegations() {
                 if let Some(chat) = &delegation.parent.chat_session_id {
                     uid_to_chat
@@ -15961,7 +15987,7 @@ impl App {
     }
 
     fn chat_child_links(&self) -> Vec<chat_facts::ChildLink> {
-        let Some(store) = self.task_store.as_ref() else {
+        let Some(store) = self.task_authority.store().as_ref() else {
             return Vec::new();
         };
         let uid_to_chat = self.chat_uid_to_chat();
@@ -15969,7 +15995,7 @@ impl App {
     }
 
     fn poll_worker_prs(&mut self) -> Task<Event> {
-        let Some(store) = self.task_store.as_ref() else {
+        let Some(store) = self.task_authority.store().as_ref() else {
             return Task::none();
         };
         let uid_to_chat = self.chat_uid_to_chat();
@@ -16570,7 +16596,8 @@ impl App {
 
     /// Every task's worktree folder: never a repo of a workspace.
     fn task_worktree_dirs(&self) -> Vec<PathBuf> {
-        self.task_store
+        self.task_authority
+            .store()
             .as_ref()
             .map(|store| {
                 store
@@ -16815,7 +16842,7 @@ impl App {
         rebuild_workspace_overview(
             &self.chat_index,
             &self.workspaces,
-            self.task_store.as_ref(),
+            self.task_authority.store().as_ref(),
             &self.overview_focus_picks,
             &mut self.workspace_overviews,
             &mut self.workspace_overview_summary_generation,
@@ -18463,7 +18490,8 @@ impl App {
 
     /// Newest first, including results requested before Resume as Chat.
     fn delegations_for_tab(&self, tab_id: usize) -> Vec<&gitterm::tasks::Delegation> {
-        self.task_store
+        self.task_authority
+            .store()
             .as_ref()
             .map(|store| {
                 store
@@ -18555,7 +18583,7 @@ impl App {
                 return Task::none();
             }
         };
-        if self.task_store.is_none() {
+        if self.task_authority.store().is_none() {
             Self::report_delegation_error(&origin, "GitTerm's task store is unavailable".into());
             return Task::none();
         }
@@ -18607,7 +18635,7 @@ impl App {
         }
         let delegation_id = delegation.delegation_id.clone();
         let session_uid = delegation.parent.session_uid.clone();
-        let Some(store) = self.task_store.as_mut() else {
+        let Some(store) = self.task_authority.store_mut().as_mut() else {
             Self::report_delegation_error(&origin, "GitTerm's task store is unavailable".into());
             return Task::none();
         };
@@ -18624,7 +18652,7 @@ impl App {
                 "status": "requested",
                 "routing": self.plan_limits_routing(),
                 "provider": "codex",
-                "cost_note": self.task_store.as_ref().and_then(|store| store.delegation(&delegation_id)).filter(|delegation| delegation.options.user_model_choice).map(|_| "Explicit user model choice overrides plan limits; this may consume remaining allowance or credits."),
+                "cost_note": self.task_authority.store().as_ref().and_then(|store| store.delegation(&delegation_id)).filter(|delegation| delegation.options.user_model_choice).map(|_| "Explicit user model choice overrides plan limits; this may consume remaining allowance or credits."),
                 "queued": queued,
                 "detail": if queued {
                     "Queued until plan limits and concurrency permit a Codex run. Do not wait or poll: the result appears as a card in the requesting chat tab, and delegation_get reads it."
@@ -18660,7 +18688,7 @@ impl App {
     /// Starts queued Codex runs while slots are free
     /// (`review.max_concurrent_reviews`).
     fn start_queued_delegations(&mut self) -> Task<Event> {
-        let Some(store) = self.task_store.as_ref() else {
+        let Some(store) = self.task_authority.store().as_ref() else {
             return Task::none();
         };
         let running: HashSet<String> = self.delegation_runs.keys().cloned().collect();
@@ -18727,7 +18755,7 @@ impl App {
         match event {
             CodexRunEvent::Started { thread_id } => {
                 let now = chrono::Utc::now().to_rfc3339();
-                if let Some(store) = self.task_store.as_mut() {
+                if let Some(store) = self.task_authority.store_mut().as_mut() {
                     if let Err(error) =
                         store.mark_delegation_started(delegation_id, &thread_id, &now)
                     {
@@ -18758,7 +18786,7 @@ impl App {
         self.delegation_runs.remove(delegation_id);
         self.delegation_activity.remove(delegation_id);
         let now = chrono::Utc::now().to_rfc3339();
-        let Some(store) = self.task_store.as_mut() else {
+        let Some(store) = self.task_authority.store_mut().as_mut() else {
             eprintln!("[delegation] {delegation_id} finished but the task store is unavailable");
             return Task::none();
         };
@@ -18855,7 +18883,7 @@ impl App {
         task_id: &str,
         preset_name: &str,
     ) -> Option<(String, Option<String>, gitterm::tasks::DelegationRunOptions)> {
-        let store = self.task_store.as_ref()?;
+        let store = self.task_authority.store().as_ref()?;
         store
             .open_worker_delegations(task_id)
             .into_iter()
@@ -19071,7 +19099,8 @@ impl App {
             }
             let stopping_boundary = stopping_boundary_from_control(request.stopping_boundary);
             let store = self
-                .task_store
+                .task_authority
+                .store()
                 .as_ref()
                 .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?;
             let owner = self.worktree_task(&checkout).cloned();
@@ -19101,7 +19130,8 @@ impl App {
                     task.stopping_boundary = stopping_boundary;
                     task.updated_at = timestamp;
                     let store = self
-                        .task_store
+                        .task_authority
+                        .store_mut()
                         .as_mut()
                         .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?;
                     store.replace(task).map_err(|error| error.to_string())?;
@@ -19155,7 +19185,8 @@ impl App {
                         path: None,
                     };
                     let store = self
-                        .task_store
+                        .task_authority
+                        .store_mut()
                         .as_mut()
                         .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?;
                     store
@@ -19201,7 +19232,7 @@ impl App {
     /// was relaunched, close its tab (as Stop and close does, which ends the
     /// harness), and fail the delegation as stopped at the time limit.
     fn worker_time_limit_reached(&mut self, delegation_id: &str, session_id: &str) -> Task<Event> {
-        let Some(store) = self.task_store.as_ref() else {
+        let Some(store) = self.task_authority.store().as_ref() else {
             eprintln!("[delegation] {delegation_id}: time limit reached, but the task store is unavailable");
             return Task::none();
         };
@@ -19228,7 +19259,7 @@ impl App {
         let message = gitterm::delegations::time_limit_message(minutes, place.as_deref(), true);
         eprintln!("[delegation] {delegation_id}: {message}");
         let now = chrono::Utc::now().to_rfc3339();
-        if let Some(store) = self.task_store.as_mut() {
+        if let Some(store) = self.task_authority.store_mut().as_mut() {
             if let Err(error) = store.stop_delegation_at_time_limit(delegation_id, message, &now) {
                 eprintln!("[delegation] {delegation_id}: {error}");
             }
@@ -19265,7 +19296,8 @@ impl App {
         reply: TaskControlReply,
     ) -> Task<Event> {
         let Some(task) = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .and_then(|store| store.get(task_id))
             .cloned()
@@ -19292,7 +19324,7 @@ impl App {
         let now = chrono::Utc::now().to_rfc3339();
         let delegation = gitterm::tasks::Delegation::new_requested(new, now);
         let delegation_id = delegation.delegation_id.clone();
-        let inserted = match self.task_store.as_mut() {
+        let inserted = match self.task_authority.store_mut().as_mut() {
             Some(store) => store
                 .insert_delegation(delegation)
                 .map_err(|error| error.to_string()),
@@ -19322,7 +19354,7 @@ impl App {
             Err(error) => {
                 let message = format!("the worker could not start: {error}");
                 eprintln!("[delegation] {delegation_id}: {message}");
-                if let Some(store) = self.task_store.as_mut() {
+                if let Some(store) = self.task_authority.store_mut().as_mut() {
                     if let Err(store_error) = store.set_delegation_status(
                         &delegation_id,
                         gitterm::tasks::DelegationStatus::Failed {
@@ -19406,7 +19438,8 @@ impl App {
         });
         let timestamp = chrono::Utc::now().to_rfc3339();
         let store = self
-            .task_store
+            .task_authority
+            .store_mut()
             .as_mut()
             .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?;
         let task_sessions = store
@@ -19465,7 +19498,8 @@ impl App {
         // A progress line (or any new handoff) shows on the worker cards.
         self.push_worker_cards(&request.task_id);
         let task = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .and_then(|store| store.get(&request.task_id))
             .cloned()
@@ -19520,7 +19554,7 @@ impl App {
         } else {
             TaskLifecycle::WaitingForInput
         };
-        if let Some(store) = self.task_store.as_mut() {
+        if let Some(store) = self.task_authority.store_mut().as_mut() {
             if let Err(error) = store.record_lifecycle_signal(
                 task_id,
                 lifecycle,
@@ -19531,7 +19565,8 @@ impl App {
             }
         }
         let parent = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .and_then(|store| store.delegation(delegation_id))
             .map(|delegation| delegation.parent.session_uid.clone());
@@ -19560,7 +19595,7 @@ impl App {
     }
 
     fn persist_worker_launch_identities(&mut self) {
-        let Some(store) = self.task_store.as_mut() else {
+        let Some(store) = self.task_authority.store_mut().as_mut() else {
             return;
         };
         for tab in self.workspaces.iter_mut().flat_map(|ws| &mut ws.tabs) {
@@ -19573,7 +19608,7 @@ impl App {
     /// Called after durable results have been delivered or queued.
     /// Keep the terminal alive during TERM's grace period, then remove its tab.
     fn close_final_workers(&mut self) -> Task<Event> {
-        let Some(store) = self.task_store.as_ref() else {
+        let Some(store) = self.task_authority.store().as_ref() else {
             return Task::none();
         };
         let ready: HashSet<_> = store
@@ -19645,7 +19680,7 @@ impl App {
                     && tab.task_live_state.is_some()
             });
             if !live {
-                if let Some(store) = self.task_store.as_mut() {
+                if let Some(store) = self.task_authority.store_mut().as_mut() {
                     if let Err(error) = store.record_lifecycle_signal(
                         &task_id,
                         state,
@@ -19676,7 +19711,7 @@ impl App {
     /// Pushes the cards of every worker delegation on `task_id`, after its
     /// sessions' live state or handoff changed.
     fn push_worker_cards(&self, task_id: &str) {
-        let Some(store) = self.task_store.as_ref() else {
+        let Some(store) = self.task_authority.store().as_ref() else {
             return;
         };
         let ids: Vec<String> = store
@@ -19709,7 +19744,8 @@ impl App {
             return None;
         };
         let task = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .and_then(|store| store.get(task_id));
         let tab = task_session_id
@@ -19733,7 +19769,8 @@ impl App {
     /// Updates (or creates) the delegation's card on its parent's chat page.
     fn push_delegation_card(&self, delegation_id: &str) {
         let Some(delegation) = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .and_then(|store| store.delegation(delegation_id))
         else {
@@ -19860,13 +19897,14 @@ impl App {
     /// Collect every finished outcome at the same moment. Idle chats flush
     /// now; busy chats keep the existing held queue until their turn ends.
     fn auto_deliver_delegations(&mut self) -> Task<Event> {
-        if let Some(store) = self.task_store.as_mut() {
+        if let Some(store) = self.task_authority.store_mut().as_mut() {
             if let Err(error) = store.retry_delivery_acknowledgements() {
                 eprintln!("[delegation] retry delivery acknowledgements: {error}");
             }
         }
         let parents: Vec<_> = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .map(|store| {
                 store
@@ -19917,7 +19955,7 @@ impl App {
         let streaming = self.chat_turn_running(tab_id);
         let mut held = self.delegation_held.remove(&tab_id).unwrap_or_default();
         let mut ids: HashSet<String> = held.iter().map(|send| send.delegation_id.clone()).collect();
-        if let Some(store) = &self.task_store {
+        if let Some(store) = self.task_authority.store() {
             // A worker may replace a blocked report before it was delivered.
             held.retain(|send| {
                 store
@@ -19954,7 +19992,8 @@ impl App {
         delegation_id: &str,
     ) -> Result<&gitterm::tasks::Delegation, String> {
         let delegation = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?
             .delegation(delegation_id)
@@ -20369,7 +20408,7 @@ impl App {
             for tab_config in &ws_config.tabs {
                 if !workspace_is_remote_agent
                     && !restore_task_tab(
-                        self.task_store.as_ref(),
+                        self.task_authority.store().as_ref(),
                         tab_config,
                         &mut self.missing_task_worktrees_logged,
                     )
@@ -20478,7 +20517,7 @@ impl App {
                 });
                 if startup_command.is_some() {
                     let conversation = tab_config.task_id.as_ref().and_then(|task_id| {
-                        let task = self.task_store.as_ref()?.get(task_id)?;
+                        let task = self.task_authority.store().as_ref()?.get(task_id)?;
                         let own_session = task.sessions.iter().find(|session| {
                             Some(&session.task_session_id) == tab_config.task_session_id.as_ref()
                         });
@@ -20872,7 +20911,7 @@ impl App {
             bottom_repo_picker_open: false,
             selection: SelectionState::default(),
             next_tab_id: 0,
-            task_store,
+            task_authority: task_store.into(),
             missing_task_worktrees_logged: HashSet::new(),
             review_config: config.review.clone(),
             model_policy: config.policy.clone(),
@@ -22926,7 +22965,7 @@ fi
         // Tasks with durable attention join the rows unless one of their
         // open session tabs is already surfacing live attention — then the
         // tab row above is the more precise entry for the same thing.
-        if let Some(store) = self.task_store.as_ref() {
+        if let Some(store) = self.task_authority.store().as_ref() {
             let tabbed_task_ids = self.task_ids_with_tab_attention();
             for task in store.tasks() {
                 if task.lifecycle == TaskLifecycle::Archived
@@ -23326,7 +23365,7 @@ fi
                 }
             }
         }
-        if let Some(store) = self.task_store.as_ref() {
+        if let Some(store) = self.task_authority.store().as_ref() {
             for delegation in store.delegations() {
                 delegation.delegation_id.hash(&mut hasher);
                 delegation.status.label().hash(&mut hasher);
@@ -23360,13 +23399,15 @@ fi
         };
         let now = std::time::SystemTime::now();
         let delegations: &[gitterm::tasks::Delegation] = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .map(TaskStore::delegations)
             .unwrap_or(&[]);
         let task_title = |delegation: &gitterm::tasks::Delegation| match &delegation.child {
             gitterm::tasks::DelegationChild::TaskSession { task_id, .. } => self
-                .task_store
+                .task_authority
+                .store()
                 .as_ref()
                 .and_then(|store| store.get(task_id))
                 .map(|task| match &task.issue {
@@ -23639,7 +23680,7 @@ fi
             });
         }
         // A task whose tab already raised attention is that tab's news.
-        if let Some(store) = self.task_store.as_ref() {
+        if let Some(store) = self.task_authority.store().as_ref() {
             let tabbed = self.task_ids_with_tab_attention();
             for task in store.tasks() {
                 if task.lifecycle == TaskLifecycle::Archived
@@ -23671,7 +23712,8 @@ fi
                     .find(|tab| tab.id == *tab_id)
                     .map(|tab| self.tab_display_title(tab).to_string()),
                 AttentionTarget::Task(task_id) => self
-                    .task_store
+                    .task_authority
+                    .store()
                     .as_ref()
                     .and_then(|store| store.get(task_id))
                     .map(|task| match &task.issue {
@@ -23909,7 +23951,7 @@ fi
             }),
         ];
 
-        if let Some(store) = &self.task_store {
+        if let Some(store) = self.task_authority.store() {
             subs.extend(worker_time_limit_subscriptions(store, &self.workspaces));
         }
 
@@ -24057,6 +24099,7 @@ fi
         self.record_task_session_focus();
         match event {
             Event::TaskMcpStopped(result) => {
+                task_mcp::close_commands();
                 let error = match result {
                     Ok(()) => {
                         "GitTerm V6 task MCP server stopped before application shutdown".to_string()
@@ -24101,43 +24144,21 @@ fi
                     envelope.reply.send(result);
                 }
                 TaskControlOperation::List(request) => {
-                    let Some(store) = self.task_store.as_ref() else {
-                        envelope
-                            .reply
-                            .send(Err("GitTerm's task store is unavailable".to_string()));
-                        return Task::none();
-                    };
-                    let tasks = store
-                        .tasks()
-                        .iter()
-                        .filter(|task| request.include_archived || task.archived_at.is_none())
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    let values = tasks
-                        .iter()
-                        .map(|task| self.task_control_value(task))
-                        .collect::<Result<Vec<_>, _>>();
-                    match values {
-                        Ok(tasks) => envelope.reply.send(Ok(serde_json::json!({
-                            "tasks": tasks,
-                            "available_presets": self
-                                .agent_presets
-                                .iter()
-                                .map(|preset| preset.name.clone())
-                                .collect::<Vec<_>>(),
-                        }))),
-                        Err(error) => envelope.reply.send(Err(error)),
-                    }
+                    let result = self.task_read_requested(
+                        TaskRead::List {
+                            include_archived: request.include_archived,
+                        },
+                        envelope.reply.id(),
+                    );
+                    envelope.reply.send(result);
                 }
                 TaskControlOperation::Get(request) => {
-                    let task = self
-                        .task_store
-                        .as_ref()
-                        .and_then(|store| store.get(&request.task_id))
-                        .cloned();
-                    let result = task
-                        .ok_or_else(|| format!("Task {} is not available", request.task_id))
-                        .and_then(|task| self.task_control_value(&task));
+                    let result = self.task_read_requested(
+                        TaskRead::Get {
+                            task_id: request.task_id,
+                        },
+                        envelope.reply.id(),
+                    );
                     envelope.reply.send(result);
                 }
                 TaskControlOperation::Create(request) => {
@@ -24235,7 +24256,7 @@ fi
                     }
                     // A worker that reported done goes idle at its prompt;
                     // that turn end is not a request for input (S6).
-                    let reported_done = self.task_store.as_ref().is_some_and(|store| {
+                    let reported_done = self.task_authority.store().as_ref().is_some_and(|store| {
                         store.delegations().iter().any(|delegation| {
                             delegation.status == gitterm::tasks::DelegationStatus::Completed
                                 && matches!(
@@ -24311,7 +24332,8 @@ fi
                         .as_deref()
                         .ok_or_else(|| task_mcp::missing_caller_error("delegation_get"))
                         .and_then(|_| {
-                            self.task_store
+                            self.task_authority
+                                .store()
                                 .as_ref()
                                 .ok_or_else(|| "GitTerm's task store is unavailable".to_string())
                         })
@@ -24343,10 +24365,10 @@ fi
                         .as_deref()
                         .ok_or_else(|| task_mcp::missing_caller_error("delegation_list"))
                         .and_then(|caller| {
-                            let store = self
-                                .task_store
-                                .as_ref()
-                                .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?;
+                            let store =
+                                self.task_authority.store().as_ref().ok_or_else(|| {
+                                    "GitTerm's task store is unavailable".to_string()
+                                })?;
                             gitterm::delegations::delegation_list(
                                 &store.delegations_for_parent(caller),
                                 request.status.as_deref(),
@@ -24581,7 +24603,9 @@ fi
                         .iter()
                         .flat_map(|ws| &ws.tabs)
                         .find(|tab| tab.id == tab_id)
-                        .is_some_and(|tab| !worker_accepts_input(tab, self.task_store.as_ref()))
+                        .is_some_and(|tab| {
+                            !worker_accepts_input(tab, self.task_authority.store().as_ref())
+                        })
                 {
                     return Task::none();
                 }
@@ -24661,7 +24685,7 @@ fi
                         // next report. Input makes it live immediately, before
                         // any delayed harness title/notify event arrives.
                         let resumed_blocked = tab.task_id.as_deref().is_some_and(|task| {
-                            self.task_store.as_ref().is_some_and(|store| store.open_worker_delegations(task).iter().any(|d| {
+                            self.task_authority.store().as_ref().is_some_and(|store| store.open_worker_delegations(task).iter().any(|d| {
                                 d.status == gitterm::tasks::DelegationStatus::Blocked
                                     && matches!(&d.child, gitterm::tasks::DelegationChild::TaskSession { task_session_id, .. } if task_session_id == &tab.task_session_id)
                             }))
@@ -24681,7 +24705,8 @@ fi
                         // observed live state is never overridden here.
                         if tab.task_live_state.is_none() {
                             let interrupted = tab.task_id.as_deref().is_some_and(|task_id| {
-                                self.task_store
+                                self.task_authority
+                                    .store()
                                     .as_ref()
                                     .and_then(|store| store.get(task_id))
                                     .is_some_and(|task| {
@@ -25833,7 +25858,8 @@ fi
                 }
                 if let Some(batch) = delivery {
                     let recorded = self
-                        .task_store
+                        .task_authority
+                        .store_mut()
                         .as_mut()
                         .ok_or_else(|| "GitTerm's task store is unavailable".to_string())
                         .and_then(|store| {
@@ -26255,7 +26281,7 @@ fi
                 let task_base = tab
                     .task_id
                     .as_deref()
-                    .and_then(|id| self.task_store.as_ref()?.get(id))
+                    .and_then(|id| self.task_authority.store().as_ref()?.get(id))
                     .map(|task| task.base.reference.clone());
                 return Task::perform(
                     async move {
@@ -26509,7 +26535,7 @@ fi
                     held.retain(|send| send.delegation_id != delegation_id);
                 }
                 let now = chrono::Utc::now().to_rfc3339();
-                let result = match self.task_store.as_mut() {
+                let result = match self.task_authority.store_mut().as_mut() {
                     Some(store) => {
                         let cancelled = if active {
                             store.cancel_delegation(&delegation_id, &now)
@@ -28503,7 +28529,7 @@ fi
             }
             Event::TaskCreateOpen => {
                 self.task_ui_error = None;
-                if self.task_store.is_none() {
+                if self.task_authority.store().is_none() {
                     self.task_ui_error = Some(
                         self.task_store_error
                             .clone()
@@ -28747,7 +28773,7 @@ fi
                     path: None,
                 };
                 pending.resolved_worktree_path = Some(resolved.proposal.path.clone());
-                let Some(store) = self.task_store.as_mut() else {
+                let Some(store) = self.task_authority.store_mut().as_mut() else {
                     if let Some(reply) = &pending.control_reply {
                         reply.send(Err("GitTerm's task store became unavailable".to_string()));
                     }
@@ -28783,7 +28809,7 @@ fi
             }
             Event::TaskWorktreePrepared(pending, result) => match result {
                 Ok(prepared) => {
-                    let persisted = self.task_store.as_mut().map(|store| {
+                    let persisted = self.task_authority.store_mut().as_mut().map(|store| {
                         store.complete_worktree_preparation(
                             &pending.task_id,
                             prepared.into(),
@@ -28803,7 +28829,8 @@ fi
                             }
                             if let Some(reply) = &pending.control_reply {
                                 let result = self
-                                    .task_store
+                                    .task_authority
+                                    .store()
                                     .as_ref()
                                     .and_then(|store| store.get(&pending.task_id))
                                     .cloned()
@@ -28842,7 +28869,7 @@ fi
                     } else {
                         None
                     };
-                    let persisted = self.task_store.as_mut().map(|store| {
+                    let persisted = self.task_authority.store_mut().as_mut().map(|store| {
                         store.fail_worktree_preparation(
                             &pending.task_id,
                             error.clone(),
@@ -28943,7 +28970,8 @@ fi
             }
             Event::TaskChildAdd(task_id) => {
                 let handoff = self
-                    .task_store
+                    .task_authority
+                    .store()
                     .as_ref()
                     .and_then(|store| store.get(&task_id))
                     .map(|task| task_handoff_prompt(task, None));
@@ -29021,7 +29049,8 @@ fi
                 // that lands back inside the worktree session with context.
                 // Without one, fall through to the Continue picker.
                 let conversation = self
-                    .task_store
+                    .task_authority
+                    .store()
                     .as_ref()
                     .and_then(|store| store.get(&task_id))
                     .and_then(|task| {
@@ -29071,7 +29100,7 @@ fi
             }
             Event::TaskDeliveryDiscovered(task_id, result) => match result {
                 Ok(discovery) => {
-                    let Some(store) = self.task_store.as_mut() else {
+                    let Some(store) = self.task_authority.store_mut().as_mut() else {
                         return Task::none();
                     };
                     let Some(existing) = store.get(&task_id).map(|task| task.delivery.clone())
@@ -29128,7 +29157,7 @@ fi
                 self.task_launch_queue
                     .retain(|entry| entry.task_id != task_id);
                 let timestamp = chrono::Utc::now().to_rfc3339();
-                match self.task_store.as_mut() {
+                match self.task_authority.store_mut().as_mut() {
                     Some(store) => {
                         if let Err(error) = store.record_lifecycle_signal(
                             &task_id,
@@ -29150,7 +29179,8 @@ fi
             }
             Event::TaskArchive(task_id) => {
                 let result = self
-                    .task_store
+                    .task_authority
+                    .store_mut()
                     .as_mut()
                     .map(|store| store.archive(&task_id, &chrono::Utc::now().to_rfc3339()));
                 match result {
@@ -29173,23 +29203,25 @@ fi
             Event::TaskArchiveAllFailed => {
                 // Scoped to the active workspace — the button acknowledges the
                 // failures the user is looking at, not failures everywhere.
-                let failed_ids: Vec<String> =
-                    match (self.task_store.as_ref(), self.active_workspace()) {
-                        (Some(store), Some(workspace)) => store
-                            .tasks()
-                            .iter()
-                            .filter(|task| task.lifecycle == TaskLifecycle::Failed)
-                            .filter(|task| self.task_belongs_to_workspace(task, workspace))
-                            .map(|task| task.task_id.clone())
-                            .collect(),
-                        _ => Vec::new(),
-                    };
+                let failed_ids: Vec<String> = match (
+                    self.task_authority.store().as_ref(),
+                    self.active_workspace(),
+                ) {
+                    (Some(store), Some(workspace)) => store
+                        .tasks()
+                        .iter()
+                        .filter(|task| task.lifecycle == TaskLifecycle::Failed)
+                        .filter(|task| self.task_belongs_to_workspace(task, workspace))
+                        .map(|task| task.task_id.clone())
+                        .collect(),
+                    _ => Vec::new(),
+                };
                 if !failed_ids.is_empty() {
                     let timestamp = chrono::Utc::now().to_rfc3339();
                     let focused = self.active_task_context_id().map(str::to_string);
                     let mut focused_archived = false;
                     let mut archive_error = None;
-                    match self.task_store.as_mut() {
+                    match self.task_authority.store_mut().as_mut() {
                         Some(store) => {
                             for task_id in failed_ids {
                                 match store.archive(&task_id, &timestamp) {
@@ -29216,7 +29248,10 @@ fi
                 }
             }
             Event::TaskArchiveFinished => {
-                let task_ids = match (self.task_store.as_ref(), self.active_workspace()) {
+                let task_ids = match (
+                    self.task_authority.store().as_ref(),
+                    self.active_workspace(),
+                ) {
                     (Some(store), Some(workspace)) => {
                         finished_task_ids_for_workspace(store, |task| {
                             self.task_belongs_to_workspace(task, workspace)
@@ -29229,7 +29264,7 @@ fi
                     let focused = self.active_task_context_id().map(str::to_string);
                     let mut focused_archived = false;
                     let mut archive_error = None;
-                    match self.task_store.as_mut() {
+                    match self.task_authority.store_mut().as_mut() {
                         Some(store) => {
                             for task_id in task_ids {
                                 match store.archive(&task_id, &timestamp) {
@@ -29257,7 +29292,8 @@ fi
             }
             Event::TaskWorktreeDeleteOpen(task_id) => {
                 let Some(task) = self
-                    .task_store
+                    .task_authority
+                    .store()
                     .as_ref()
                     .and_then(|store| store.get(&task_id))
                     .cloned()
@@ -29354,7 +29390,8 @@ fi
                     return self.update(Event::TaskWorktreeDeleteCompleted(task_id, Ok(())));
                 }
                 let repository_path = self
-                    .task_store
+                    .task_authority
+                    .store()
                     .as_ref()
                     .and_then(|store| store.get(&task_id))
                     .and_then(|task| match &task.workspace.location {
@@ -29383,7 +29420,7 @@ fi
                     // clear_worktree resets only the worktree record — the
                     // task's sessions and conversation references survive so
                     // transcripts stay auditable after cleanup.
-                    let updated = match self.task_store.as_mut() {
+                    let updated = match self.task_authority.store_mut().as_mut() {
                         Some(store) => store
                             .clear_worktree(&task_id, &timestamp)
                             .map_err(|error| error.to_string()),
@@ -29421,7 +29458,7 @@ fi
                 }
             },
             Event::WorktreeAdopt(path) => {
-                if self.task_store.is_none() {
+                if self.task_authority.store().is_none() {
                     self.task_ui_error = Some("The task store is unavailable".to_string());
                     return Task::none();
                 }
@@ -29525,7 +29562,7 @@ fi
                     state: TaskWorktreeState::Preparing,
                     path: None,
                 };
-                let Some(store) = self.task_store.as_mut() else {
+                let Some(store) = self.task_authority.store_mut().as_mut() else {
                     let op = self.unmanaged_worktree_ops.entry(path).or_default();
                     op.busy = false;
                     op.error = Some("The task store is unavailable".to_string());
@@ -30517,6 +30554,7 @@ fi
                     self.workspaces_dirty = false;
                     self.next_workspace_save_at = None;
                 }
+                task_mcp::close_commands();
                 // Signal the log server to shut down
                 self.log_server_state.shutdown.notify_one();
                 // Clean up instance-specific configuration
@@ -30625,7 +30663,7 @@ fi
                             .filter(|_| self.workspace_overview_visible());
                         match reload_workspace_overviews(
                             &self.workspaces,
-                            self.task_store.as_ref(),
+                            self.task_authority.store().as_ref(),
                             &self.overview_focus_picks,
                             &mut self.workspace_overviews,
                             &mut self.workspace_overview_summary_generation,
@@ -31370,7 +31408,7 @@ fi
                 // workspace tab there. Task session tabs (task_id set) still
                 // heal normally — their repo_path is the worktree by design.
                 let snapshot_root_is_task_worktree =
-                    self.task_store.as_ref().is_some_and(|store| {
+                    self.task_authority.store().as_ref().is_some_and(|store| {
                         store.tasks().iter().any(|task| {
                             task.worktree
                                 .path
@@ -31984,7 +32022,8 @@ fi
                         .selected_task_id
                         .as_deref()
                         .and_then(|task_id| {
-                            self.task_store
+                            self.task_authority
+                                .store()
                                 .as_ref()
                                 .and_then(|store| store.get(task_id))
                         })
@@ -32826,7 +32865,8 @@ fi
                         .any(|tab| tab.task_id.as_deref() == Some(task_id))
                 };
                 let candidates = self
-                    .task_store
+                    .task_authority
+                    .store()
                     .as_ref()
                     .map(|store| {
                         store
@@ -35221,7 +35261,8 @@ fi
         let mut items = Column::new().spacing(0).width(Length::Fixed(260.0));
         if let Some(task_id) = task_context_id.as_deref() {
             let task_title = self
-                .task_store
+                .task_authority
+                .store()
                 .as_ref()
                 .and_then(|store| store.get(task_id))
                 .map(|task| task.title.as_str())
@@ -38472,7 +38513,8 @@ fi
             let surface0 = theme.surface0();
             let mono = iced::Font::with_name("Menlo");
             let task = self
-                .task_store
+                .task_authority
+                .store()
                 .as_ref()
                 .and_then(|store| store.get(task_id));
             let title = task.map(|task| task.title.as_str()).unwrap_or("Task");
@@ -38571,7 +38613,8 @@ fi
             // over a restored shell title or legacy branch-like repo name.
             let task_session_label = task_context_id.as_deref().and_then(|task_id| {
                 let session_id = tab.task_session_id.as_deref()?;
-                self.task_store
+                self.task_authority
+                    .store()
                     .as_ref()?
                     .get(task_id)?
                     .sessions
@@ -38790,7 +38833,8 @@ fi
         let branch = task_context_id
             .as_deref()
             .and_then(|task_id| {
-                self.task_store
+                self.task_authority
+                    .store()
                     .as_ref()
                     .and_then(|store| store.get(task_id))
                     .map(|task| task.branch.as_str())
@@ -40095,7 +40139,8 @@ fi
                 }
             }
             let running_tasks: HashSet<String> = self
-                .task_store
+                .task_authority
+                .store()
                 .as_ref()
                 .into_iter()
                 .flat_map(TaskStore::tasks)
@@ -40952,7 +40997,8 @@ fi
         });
         let general_selected = self.active_task_context_id().is_none();
         let repo_tasks = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .map(|store| {
                 store
@@ -40980,7 +41026,7 @@ fi
             .iter()
             .filter(|task| task.lifecycle == TaskLifecycle::Failed)
             .count();
-        let finished_count = match (self.task_store.as_ref(), workspace) {
+        let finished_count = match (self.task_authority.store().as_ref(), workspace) {
             (Some(store), Some(workspace)) => finished_task_ids_for_workspace(store, |task| {
                 self.task_belongs_to_workspace(task, workspace)
             })
@@ -41496,7 +41542,8 @@ fi
         let border = theme.border();
 
         let selected = self.active_task_context_id().and_then(|task_id| {
-            self.task_store
+            self.task_authority
+                .store()
                 .as_ref()
                 .and_then(|store| store.get(task_id))
         });
@@ -41747,7 +41794,7 @@ fi
                         text(if open {
                             "Open"
                         } else if worktree_ready {
-                            if self.task_store.as_ref().is_some_and(|store| {
+                            if self.task_authority.store().as_ref().is_some_and(|store| {
                                 store.worker_session_is_final(
                                     &task.task_id,
                                     Some(&session.task_session_id),
@@ -42268,7 +42315,7 @@ fi
             .task_tab_close_prompt
             .as_ref()
             .and_then(|prompt| {
-                self.task_store.as_ref().and_then(|store| {
+                self.task_authority.store().as_ref().and_then(|store| {
                     prompt
                         .target
                         .task_id
@@ -42345,7 +42392,8 @@ fi
             return container(iced::widget::Space::new()).into();
         };
         let task_title = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .and_then(|store| store.get(&prompt.task_id))
             .map(|task| task.title.as_str())
@@ -42511,7 +42559,8 @@ fi
             return container(iced::widget::Space::new()).into();
         };
         let task_title = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .and_then(|store| store.get(&prompt.task_id))
             .map(|task| task.title.as_str())

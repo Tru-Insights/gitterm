@@ -3,7 +3,7 @@ use super::*;
 fn task_app(dir: &Path) -> App {
     let mut app = app_with_tabs(dir);
     add_task(&mut app, dir, dir);
-    let store = app.task_store.as_mut().unwrap();
+    let store = app.task_authority.store_mut().as_mut().unwrap();
     let task = store.get("fixture-task").unwrap().clone();
     store
         .begin_worktree_preparation("fixture-task", "t1")
@@ -39,7 +39,8 @@ fn task_launch_queue_and_store_before_handoff_ack() {
     rows.push(json!({"command":"launch missing", "error":app.try_launch_task_child("absent", None, false, TaskLaunchOrigin::Agent, false).err()}));
     rows.push(json!({"command":"launch invalid preset", "error":app.try_launch_task_child("fixture-task", Some(usize::MAX), false, TaskLaunchOrigin::Agent, false).err()}));
     let original = app
-        .task_store
+        .task_authority
+        .store()
         .as_ref()
         .unwrap()
         .get("fixture-task")
@@ -48,11 +49,21 @@ fn task_launch_queue_and_store_before_handoff_ack() {
     let source: Value = serde_json::from_str(&fixture("tasks/old.tasks.json")).unwrap();
     let mut unprepared: TaskRecord = serde_json::from_value(source["tasks"][0].clone()).unwrap();
     unprepared.task_id = "unprepared".into();
-    app.task_store.as_mut().unwrap().insert(unprepared).unwrap();
+    app.task_authority
+        .store_mut()
+        .as_mut()
+        .unwrap()
+        .insert(unprepared)
+        .unwrap();
     rows.push(json!({"command":"launch unprepared", "error":app.try_launch_task_child("unprepared",None,false,TaskLaunchOrigin::Agent,false).err()}));
     let mut missing = original.clone();
     missing.worktree.path = Some(dir.path().join("missing"));
-    app.task_store.as_mut().unwrap().replace(missing).unwrap();
+    app.task_authority
+        .store_mut()
+        .as_mut()
+        .unwrap()
+        .replace(missing)
+        .unwrap();
     rows.push(json!({"command":"launch missing worktree", "error":app.try_launch_task_child("fixture-task",None,false,TaskLaunchOrigin::Agent,false).err().map(|e|e.replace(&dir.path().display().to_string(),"<fixture>"))}));
     let mut remote = original.clone();
     remote.workspace.location = WorkspaceLocationIdentity::RemoteAgent {
@@ -62,9 +73,19 @@ fn task_launch_queue_and_store_before_handoff_ack() {
     remote.executor = ExecutorTarget::RemoteAgent {
         remote_id: "fixture-remote".into(),
     };
-    app.task_store.as_mut().unwrap().replace(remote).unwrap();
+    app.task_authority
+        .store_mut()
+        .as_mut()
+        .unwrap()
+        .replace(remote)
+        .unwrap();
     rows.push(json!({"command":"launch remote", "error":app.try_launch_task_child("fixture-task",None,false,TaskLaunchOrigin::Agent,false).err()}));
-    app.task_store.as_mut().unwrap().replace(original).unwrap();
+    app.task_authority
+        .store_mut()
+        .as_mut()
+        .unwrap()
+        .replace(original)
+        .unwrap();
     let harness = Some(HarnessSelection {
         kind: HarnessKind::TerminalPreset {
             preset_name: "Codex".into(),
@@ -77,7 +98,7 @@ fn task_launch_queue_and_store_before_handoff_ack() {
         (TaskLaunchOrigin::User, true),
     ] {
         let position = queue_task_launch_if_full(
-            app.task_store.as_mut().unwrap(),
+            app.task_authority.store_mut().as_mut().unwrap(),
             &mut app.task_launch_queue,
             QueuedTaskLaunch {
                 task_id: "fixture-task".into(),
@@ -105,7 +126,8 @@ fn task_launch_queue_and_store_before_handoff_ack() {
     rows.push(json!({"command":"handoff", "ack":result["handoff_status"], "saved_summary":stored.summary, "saved_decisions":stored.decisions,
         "delegation_id":result["delegation_id"], "writer":stored.updated_by_session_id}));
     let before = app
-        .task_store
+        .task_authority
+        .store()
         .as_ref()
         .unwrap()
         .get("fixture-task")
@@ -117,7 +139,7 @@ fn task_launch_queue_and_store_before_handoff_ack() {
         .update_handoff_requested(handoff("Must not acknowledge"), None)
         .unwrap_err();
     rows.push(json!({"command":"handoff failed store", "error_has_operation_and_path":error.contains("tasks.json") && error.contains("atomically write"),
-        "memory_unchanged":app.task_store.as_ref().unwrap().get("fixture-task").unwrap() == &before, "ack":false}));
+        "memory_unchanged":app.task_authority.store().as_ref().unwrap().get("fixture-task").unwrap() == &before, "ack":false}));
     golden("tasks/launch-handoff.trace.json", json!(rows));
 }
 
@@ -369,7 +391,8 @@ fn task_stop_cross_workspace_and_cancel_without_consent() {
     let dir = tempfile::tempdir().unwrap();
     let _trace = Trace::start();
     let mut app = task_app(dir.path());
-    app.task_store
+    app.task_authority
+        .store_mut()
         .as_mut()
         .unwrap()
         .record_lifecycle_signal(
@@ -575,6 +598,6 @@ fn task_mcp_receiver_is_taken_once() {
     let second_closed = matches!(second.next().now_or_never(), Some(None));
     golden(
         "tasks/receiver.trace.json",
-        json!({"first_pending":first_pending,"second_closed":second_closed,"receiver_slot_empty":TASK_CONTROL_RX.get().unwrap().lock().unwrap().is_none()}),
+        json!({"first_pending":first_pending,"second_closed":second_closed,"receiver_slot_empty":task_mcp::take_command_receiver().is_none()}),
     );
 }

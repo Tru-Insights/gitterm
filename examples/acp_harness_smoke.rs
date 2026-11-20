@@ -227,7 +227,8 @@ async fn main() {
     let full = agent == AcpAgent::OpenCode || flag("--full");
     let mut checks = Checks(Vec::new());
 
-    let (task_commands, mut task_requests) = tokio::sync::mpsc::unbounded_channel();
+    let (task_commands, mut task_requests) =
+        gitterm_core::task_commands::runtime::command_channel();
     let (task, task_server) =
         task_mcp::prepare("acp-smoke", task_commands).expect("reserve task MCP endpoint");
     tokio::spawn(task_server.run());

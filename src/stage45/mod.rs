@@ -6,6 +6,7 @@ mod app;
 mod review;
 mod sessions;
 mod stores;
+mod task_authority;
 mod usage;
 mod work;
 
