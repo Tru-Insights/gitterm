@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 struct Folders {
     version: u32,
     folders: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    parked_workspaces: Vec<crate::park::SavedPark>,
 }
 
 pub fn local_folder(path: &Path) -> Result<PathBuf> {
@@ -25,6 +27,7 @@ pub fn local_folder(path: &Path) -> Result<PathBuf> {
 }
 
 pub struct WorkspaceStore {
+    pub(crate) parked: Vec<crate::park::SavedPark>,
     path: PathBuf,
     refused: bool,
     pub(crate) guard: Option<std::sync::Arc<crate::preview::Writer>>,
@@ -33,6 +36,7 @@ impl WorkspaceStore {
     #[cfg(test)]
     pub fn new(config: &Path) -> Self {
         Self {
+            parked: vec![],
             path: config.join("local-workspaces.json"),
             refused: false,
             guard: None,
@@ -40,6 +44,7 @@ impl WorkspaceStore {
     }
     pub(crate) fn guarded(guard: std::sync::Arc<crate::preview::Writer>) -> Self {
         Self {
+            parked: vec![],
             path: guard.preview().layout().join("local-workspaces.json"),
             refused: false,
             guard: Some(guard),
@@ -74,6 +79,8 @@ impl WorkspaceStore {
                     path.display()
                 );
             }
+            crate::park::validate_saved(&stored.parked_workspaces)?;
+            self.parked = stored.parked_workspaces;
             Ok(stored.folders)
         })()
         .with_context(|| format!("load local folders {}", self.path.display()));
@@ -88,6 +95,7 @@ impl WorkspaceStore {
         Ok(serde_json::to_vec_pretty(&Folders {
             version: 1,
             folders: folders.to_vec(),
+            parked_workspaces: self.parked.clone(),
         })?)
     }
     pub(crate) fn save_async(&self, folders: &[PathBuf]) -> Result<crate::preview::SaveResult> {
