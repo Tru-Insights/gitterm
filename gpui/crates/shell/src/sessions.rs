@@ -83,8 +83,11 @@ impl crate::Shell {
         if !can_close(
             pane.read(cx).session.as_ref().unwrap(),
             requested,
-            state.sessions.len() + usize::from(state.store.terminals.is_some()) <= 1,
+            state.sessions.len() <= 1,
         ) {
+            // Dock removal precedes the close decision; keep a protected last tab visible.
+            let workspace = state.workspace.id;
+            self.show_workspace_pane(workspace, &pane_id, window, cx);
             return;
         }
         pane.update(cx, |pane, cx| pane.stop_target(requested, cx));
