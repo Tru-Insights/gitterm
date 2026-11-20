@@ -1,0 +1,1 @@
+{"font_size":19,"chat_font_size":99,"agent_presets":[{"name":"Retired","command":"gemini","resume_command":"old resume","icon":"x","color":"red"},{"name":"Custom","command":"gemini --custom"}],"chat":{"claude_in_chrome":true}}
