@@ -16,13 +16,8 @@ use std::{
 };
 
 pub(crate) fn supported(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("md" | "html" | "htm")
-    ) || cfg!(feature = "excalidraw") && path.extension().is_some_and(|e| e == "excalidraw")
+    path.file_name().is_some()
+        && (cfg!(feature = "excalidraw") || path.extension().is_none_or(|e| e != "excalidraw"))
 }
 
 // Test-platform windows have no AppKit handle. Exercise the same coordinator
@@ -111,6 +106,7 @@ pub(crate) struct ContentRequest {
 }
 pub struct ContentWindow {
     entries: HashMap<String, Entry>,
+    pub(super) visits: super::session::ViewerVisits,
     pub selected: Option<String>,
     covered: [bool; 3],
     pub picker: bool,
@@ -167,6 +163,7 @@ impl ContentWindow {
         });
         Self {
             entries: HashMap::new(),
+            visits: HashMap::new(),
             selected: None,
             covered: [false; 3],
             picker: false,
@@ -251,6 +248,7 @@ impl ContentWindow {
         self.apply_covers(window, cx);
     }
     pub fn close(&mut self, id: &str) {
+        self.visits.retain(|_, visit| visit.pane != id);
         if let Some(mut entry) = self.entries.remove(id) {
             entry.viewer.clear();
         }
@@ -382,7 +380,7 @@ mod tests {
             assert!(supported(Path::new(path)));
         }
         for path in ["a.rs", "a.txt", "a.png", "README", "a.md.txt"] {
-            assert!(!supported(Path::new(path)));
+            assert!(supported(Path::new(path)));
         }
         assert_eq!(
             supported(Path::new("a.excalidraw")),

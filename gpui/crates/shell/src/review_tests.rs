@@ -22,7 +22,7 @@ fn git_status_opens_review(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn files_open_review(cx: &mut TestAppContext) {
+fn files_open_text_then_git_review(cx: &mut TestAppContext) {
     exercise_review(cx, false);
 }
 
@@ -105,8 +105,7 @@ fn exercise_review(cx: &mut TestAppContext, git_first: bool) {
     open_from_files("unchanged.txt", cx);
     cx.run_until_parked();
     cx.read(|cx| assert!(!shell.read(cx).active(cx).panes.contains_key(&review_id)));
-    // Exercise both entry points as the first opening of a workspace review.
-    if git_first {
+    let open_change = |name: &str, cx: &mut VisualTestContext| {
         cx.update(|_, cx| {
             owner.update(cx, |owner, cx| {
                 let file = owner
@@ -114,14 +113,25 @@ fn exercise_review(cx: &mut TestAppContext, git_first: bool) {
                     .status_view(workspace)
                     .files
                     .into_iter()
-                    .find(|f| f.path == "second.txt")
+                    .find(|f| f.path == name)
                     .unwrap();
                 owner.open_changed_file(workspace, file, cx);
-            });
+            })
         });
-    } else {
+    };
+    if !git_first {
         open_from_files("second.txt", cx);
+        cx.run_until_parked();
+        cx.read(|cx| {
+            let shell = shell.read(cx);
+            assert!(!shell.active(cx).panes.contains_key(&review_id));
+            assert_eq!(
+                shell.content.read(cx).selected.as_ref(),
+                Some(&content_pane_id(workspace, &root.join("second.txt")))
+            );
+        });
     }
+    open_change("second.txt", cx);
     cx.run_until_parked();
     let (pane, review) = cx.read(|cx| {
         let pane = shell.read(cx).active(cx).panes[&review_id].clone();
@@ -145,7 +155,7 @@ fn exercise_review(cx: &mut TestAppContext, git_first: bool) {
                 .contains_panel(PanelId::from(pane.entity_id()))
         );
     });
-    open_from_files("first.txt", cx);
+    open_change("first.txt", cx);
     cx.run_until_parked();
     cx.read(|cx| {
         assert_eq!(
