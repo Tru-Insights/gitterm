@@ -15,6 +15,7 @@ mod layout;
 mod owner;
 mod pane;
 mod park;
+pub mod park_sheet;
 pub mod preview;
 pub mod remote;
 mod review_reload;
