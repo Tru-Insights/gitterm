@@ -1,6 +1,9 @@
 use gitterm_core::status::GitStatusSnapshot;
 use std::{collections::BTreeMap, sync::Arc};
 
+mod aggregate;
+pub use aggregate::{AggregateModel, AggregateProjection, FileProjection};
+
 /// A path can have different staged and unstaged patches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]

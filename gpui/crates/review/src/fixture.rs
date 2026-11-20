@@ -96,6 +96,39 @@ pub fn load_model(dir: &Path) -> Result<ReviewModel, String> {
     ReviewModel::new(&snapshot, &patches)
 }
 
+/// Disposable branch/range fixture shared by model and native view tests.
+#[cfg(test)]
+pub(crate) fn aggregate_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let output = gitterm_core::git_status::git_command()
+            .current_dir(dir.path())
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    };
+    git(&["init", "-qb", "main"]);
+    std::fs::write(dir.path().join("hello.rs"), "fn base() {}\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "base"]);
+    git(&["switch", "-qc", "feature"]);
+    for text in ["fn first() {}\n", "fn second() {}\n"] {
+        std::fs::write(dir.path().join("hello.rs"), text).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "change"]);
+    }
+    git(&["branch", "release", "HEAD~1"]);
+    std::fs::write(dir.path().join("hello.rs"), "fn pending() {}\n").unwrap();
+    dir
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
