@@ -81,6 +81,17 @@ impl Palette {
         }
     }
 }
+/// Chat typography is independent of the UI and terminal font sizes.
+struct ChatFontSize(f32);
+impl gpui::Global for ChatFontSize {}
+
+pub fn chat_appearance(cx: &App) -> gitterm_gpui_chat::ChatAppearance {
+    gitterm_gpui_chat::ChatAppearance {
+        light: !Theme::global(cx).mode.is_dark(),
+        font_size: cx.try_global::<ChatFontSize>().map_or(15., |size| size.0),
+    }
+}
+
 /// Apply persisted font/theme settings without reading or writing a config root.
 /// The host supplies the settings from its existing settings owner.
 pub fn apply_settings<C, U, R>(
@@ -88,6 +99,7 @@ pub fn apply_settings<C, U, R>(
     window: Option<&mut Window>,
     cx: &mut App,
 ) {
+    cx.set_global(ChatFontSize(settings.chat_font_size));
     // Iced selects Light only for the exact persisted value "light".
     apply(settings.theme != "light", window, cx);
     let (terminal, ui) = settings.font_size.map_or(

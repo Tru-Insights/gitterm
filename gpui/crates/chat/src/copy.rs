@@ -167,6 +167,15 @@ impl RowView {
         let owner = cx.entity().downgrade();
         let copied: HashSet<_> = self.copied.keys().copied().collect();
         TextView::new(&self.text)
+            .font_family(".SystemUIFont")
+            .text_size(px(self.appearance.font_size))
+            .line_height(gpui::relative(1.5))
+            .inline_code_style(
+                StyleRefinement::default()
+                    .font_family("Menlo")
+                    .text_size(px(self.appearance.size(12.5)))
+                    .bg(rgb(self.appearance.palette().block)),
+            )
             .selectable(true)
             .scrollable(false)
             .stream_fade(true)

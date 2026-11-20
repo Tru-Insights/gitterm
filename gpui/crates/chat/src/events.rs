@@ -11,6 +11,8 @@ pub use gitterm_core::chat::types::{
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Entry {
     UserPrompt(String),
+    /// Local sent prompts retain image bytes when a pane is restored.
+    SubmittedPrompt(gitterm_core::chat::types::UserPrompt),
     Harness(HarnessEvent),
     /// Harness resolution does not tell the UI what the human chose.
     DisplayDecision {
@@ -66,7 +68,11 @@ pub fn parse_fixture(source: &str) -> Result<Vec<Record>, FixtureError> {
                 let kind = value["type"].as_str().unwrap_or("");
                 let entry = if matches!(
                     kind,
-                    "user_prompt" | "harness" | "display_decision" | "display_delegation"
+                    "user_prompt"
+                        | "submitted_prompt"
+                        | "harness"
+                        | "display_decision"
+                        | "display_delegation"
                 ) {
                     serde_json::from_value(value)?
                 } else {
