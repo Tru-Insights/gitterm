@@ -68,6 +68,10 @@ impl FileTree {
         self.directories.clear();
         self.request(workspace, root, PAGE_SIZE)
     }
+    pub(crate) fn set_root(&mut self, root: PathBuf) {
+        self.root = root;
+        self.directories.clear();
+    }
     pub fn toggle(&mut self, workspace: WorkspaceId, path: PathBuf) -> Option<Request> {
         if self.directories.contains_key(&path) {
             self.directories.retain(|key, _| !key.starts_with(&path));

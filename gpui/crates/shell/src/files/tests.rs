@@ -282,3 +282,28 @@ fn permission_denied_directory_is_a_pane_error() {
     tree.complete(Outcome { request, result });
     assert!(tree.rows().iter().any(|row| matches!(row, Row::Error { message, .. } if message.contains("private") && message.contains("Permission denied"))));
 }
+
+#[test]
+fn switching_roots_rejects_inflight_listing_from_prior_visit() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("before"), "").unwrap();
+    let workspace = crate::data::WorkspaceId(1);
+    let mut tree = super::FileTree::default();
+    let old = tree.refresh(workspace, dir.path().to_owned());
+    let old_result = super::list(&old).unwrap();
+    tree.set_root(dir.path().to_owned());
+    let current = tree.toggle(workspace, dir.path().to_owned()).unwrap();
+    tree.complete(super::Outcome {
+        request: old,
+        result: Ok(old_result),
+    });
+    assert!(matches!(
+        tree.rows().as_slice(),
+        [super::Row::Loading { .. }]
+    ));
+    tree.complete(super::Outcome {
+        result: super::list(&current),
+        request: current,
+    });
+    assert!(matches!(tree.rows().as_slice(), [super::Row::Entry { .. }]));
+}

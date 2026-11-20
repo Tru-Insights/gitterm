@@ -451,3 +451,22 @@ fn optional_excalidraw_uses_shared_validation_and_renderer() {
     std::fs::write(&path, "invalid").unwrap();
     assert!(Document::local_file(dir.path(), Path::new("drawing.excalidraw"), true).is_err());
 }
+
+#[test]
+fn general_text_viewer_uses_core_text_and_escapes_html() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("source.rs"),
+        "<script>alert(1)</script> & value",
+    )
+    .unwrap();
+    let document = Document::local_file(root.path(), Path::new("source.rs"), true).unwrap();
+    assert!(
+        document
+            .html()
+            .contains("&lt;script&gt;alert(1)&lt;/script&gt; &amp; value")
+    );
+    std::fs::write(root.path().join("empty"), "").unwrap();
+    assert!(Document::local_file(root.path(), Path::new("empty"), false).is_ok());
+    assert!(Document::local_file(root.path(), Path::new("missing.txt"), false).is_err());
+}
