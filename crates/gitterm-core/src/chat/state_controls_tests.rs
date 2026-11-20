@@ -763,3 +763,187 @@ fn duplicate_old_acknowledgement_cannot_finish_a_new_picker_request() {
     event(&mut state, HarnessEvent::ModelChanged("sonnet".into()));
     assert!(state.pending_change().is_none());
 }
+
+#[test]
+fn prelaunch_setting_configuration_is_validated_without_acknowledging_a_provider() {
+    let mut state = State::default();
+    for (change, valid) in [
+        (SettingChange::Mode("plan".into()), true),
+        (SettingChange::Mode("unknown".into()), false),
+    ] {
+        let effect = state.reduce(Intent::ConfigureSetting {
+            config: config(),
+            process_running: false,
+            change,
+        });
+        assert_eq!(matches!(effect, Effect::SettingConfigured(_)), valid);
+        assert!(state.pending_change().is_none());
+        assert_eq!(state.acknowledged, AcknowledgedSettings::default());
+    }
+    assert!(matches!(
+        state.reduce(Intent::ConfigureSetting {
+            config: config(),
+            process_running: true,
+            change: SettingChange::Mode("plan".into())
+        }),
+        Effect::Rejected(_)
+    ));
+}
+
+#[test]
+fn unreceipted_channel_acceptance_is_uncertain_on_exit_unless_lifecycle_reported_queued() {
+    for reported_queued in [false, true] {
+        let mut state = working();
+        let correlation = queue(&mut state, "unreceipted");
+        state.reduce(Intent::CommandAcceptedWithoutReceipt {
+            runtime: state.runtime_stamp(target()),
+            current: target(),
+            correlation,
+        });
+        assert!(matches!(
+            withdraw(&mut state, "unreceipted"),
+            Effect::Dispatch { .. }
+        ));
+        if reported_queued {
+            event(
+                &mut state,
+                HarnessEvent::MessageLifecycle {
+                    id: "unreceipted".into(),
+                    state: MessageState::Queued,
+                },
+            );
+        }
+        let exit = event(&mut state, HarnessEvent::ProcessExited { code: None });
+        assert_eq!(
+            state.queued_prompts["unreceipted"].status,
+            if reported_queued {
+                PromptStatus::Unsent
+            } else {
+                PromptStatus::Uncertain
+            }
+        );
+        assert_eq!(exit.unsent_prompts.len(), usize::from(reported_queued));
+    }
+}
+
+#[test]
+fn unreceipted_acceptance_is_not_a_write_or_ack_and_is_stale_after_rebind() {
+    for reported_queued in [false, true] {
+        let mut state = working();
+        let correlation = queue(&mut state, "legacy");
+        state.reduce(Intent::CommandAcceptedWithoutReceipt {
+            runtime: state.runtime_stamp(target()),
+            current: target(),
+            correlation,
+        });
+        assert_eq!(state.queued_prompts["legacy"].status, PromptStatus::Pending);
+        if reported_queued {
+            event(
+                &mut state,
+                HarnessEvent::MessageLifecycle {
+                    id: "legacy".into(),
+                    state: MessageState::Queued,
+                },
+            );
+        }
+        let effects = event(&mut state, HarnessEvent::ProcessExited { code: None });
+        assert_eq!(
+            state.queued_prompts["legacy"].status,
+            if reported_queued {
+                PromptStatus::Unsent
+            } else {
+                PromptStatus::Uncertain
+            }
+        );
+        assert_eq!(effects.unsent_prompts.len(), usize::from(reported_queued));
+    }
+    let mut state = working();
+    let correlation = queue(&mut state, "stale");
+    let mut current = target();
+    current.task_id = Some("new-task".into());
+    state.reduce(Intent::CommandAcceptedWithoutReceipt {
+        runtime: state.runtime_stamp(target()),
+        current,
+        correlation,
+    });
+    event(&mut state, HarnessEvent::ProcessExited { code: None });
+    assert_eq!(state.queued_prompts["stale"].status, PromptStatus::Unsent);
+}
+
+#[test]
+fn provider_setting_rejections_after_written_only_clear_matching_kind_and_value() {
+    let cases = [
+        (
+            HarnessEvent::ModelChanged("default".into()),
+            SettingChange::Model("sonnet".into()),
+        ),
+        (
+            HarnessEvent::PermissionModeChanged("default".into()),
+            SettingChange::Mode("plan".into()),
+        ),
+        (
+            HarnessEvent::EffortChanged {
+                effort: None,
+                applied: Some("medium".into()),
+            },
+            SettingChange::Effort(Some("high".into())),
+        ),
+        (
+            HarnessEvent::EffortChanged {
+                effort: Some("high".into()),
+                applied: Some("high".into()),
+            },
+            SettingChange::Effort(None),
+        ),
+    ];
+    for (old, requested) in cases {
+        let mut state = State::default();
+        event(&mut state, old);
+        let before = state.acknowledged.clone();
+        let Effect::Dispatch { correlation, .. } = change(&mut state, requested.clone()) else {
+            panic!()
+        };
+        outcome(&mut state, correlation, DeliveryOutcome::Written);
+        assert!(!state.commands.contains_key(&correlation.0));
+        let mismatches = [
+            SettingChange::Model("plan".into()),
+            SettingChange::Mode("sonnet".into()),
+            SettingChange::Effort(Some("low".into())),
+        ];
+        for mismatch in mismatches {
+            let effects = event(
+                &mut state,
+                HarnessEvent::SettingRejected {
+                    requested: mismatch,
+                },
+            );
+            assert!(effects.settings_changed.is_none());
+            assert_eq!(state.pending_change(), Some(&requested));
+        }
+        event(&mut state, HarnessEvent::Error("unrelated error".into()));
+        assert_eq!(state.pending_change(), Some(&requested));
+        let effects = event(
+            &mut state,
+            HarnessEvent::SettingRejected {
+                requested: requested.clone(),
+            },
+        );
+        assert!(effects.settings_changed.is_none());
+        assert!(effects.notices.is_empty());
+        assert!(state.pending_change().is_none());
+        assert_eq!(state.acknowledged, before);
+        // Duplicate provider responses do not manufacture an acknowledgement.
+        assert!(event(
+            &mut state,
+            HarnessEvent::SettingRejected {
+                requested: requested.clone()
+            }
+        )
+        .settings_changed
+        .is_none());
+        assert!(matches!(
+            change(&mut state, requested),
+            Effect::Dispatch { .. }
+        ));
+    }
+}

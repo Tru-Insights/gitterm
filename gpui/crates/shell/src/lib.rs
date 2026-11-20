@@ -114,9 +114,6 @@ impl Shell {
     ) -> Result<Self> {
         gitterm_gpui_chat::init(cx);
         gitterm_gpui_review::init(cx);
-        if local {
-            cx.bind_keys([KeyBinding::new("cmd-t", NewTerminal, Some("GitTermShell"))]);
-        }
         let content = cx.new(|cx| content::window::ContentWindow::new(window, cx));
         let catalog = data.workspaces(cx);
         let saved_parked = if local {
@@ -826,12 +823,6 @@ fn load_workspace_layout(
                 }
             });
         }
-        let run = state.panes[&format!("workspace-{}-run", state.workspace.layout_key)].clone();
-        state.dock.update(cx, |dock, cx| {
-            if dock.panel(PanelId::from(run.entity_id())).is_none() {
-                dock.add_panel_view(panel_handle(run), DockPlacement::Bottom, None, window, cx);
-            }
-        });
         save_layout(state, cx);
     }
     Ok(())
@@ -992,16 +983,7 @@ fn build_workspace(
             eprintln!("load terminal sessions {}: {error:#}", store.path.display());
             None
         });
-        let cwd = data
-            .terminal_cwd(workspace.id, cx)
-            .expect("local workspace folder");
-        let mut terminals = restored.unwrap_or_else(|| {
-            vec![layout::TerminalSession {
-                // The old single dock terminal used the bare folder hash.
-                id: layout::stable_path_hash(&cwd).wrapping_add(1),
-                cwd,
-            }]
-        });
+        let mut terminals = restored.unwrap_or_default();
         // An identity already owned elsewhere cannot construct a second pane.
         terminals.retain(|session| !session_ids.contains(&session.id));
         let sessions = terminals
@@ -1057,30 +1039,6 @@ fn build_workspace(
         });
         panes.insert(id, pane);
     }
-    if local {
-        let id = format!("workspace-{}-run", workspace.layout_key);
-        panes.insert(
-            id.clone(),
-            cx.new(|cx| {
-                Pane::new(
-                    id,
-                    "Run terminal".into(),
-                    if stopped {
-                        PaneKind::StoppedTerminal(
-                            data.terminal_cwd(workspace.id, cx).expect("local folder"),
-                            false,
-                        )
-                    } else {
-                        PaneKind::Terminal
-                    },
-                    workspace.id,
-                    data.clone(),
-                    window,
-                    cx,
-                )
-            }),
-        );
-    }
     for (name, title, kind) in [
         ("git", "Git status", PaneKind::Git),
         ("files", "Files", PaneKind::Files),
@@ -1134,11 +1092,6 @@ fn default_layout(state: &WorkspaceDock, window: &mut Window, cx: &mut App) {
             center = center.panel_view(pane, cx);
         }
     }
-    if state.store.terminals.is_some() {
-        let run = state.panes[&format!("workspace-{}-run", state.workspace.layout_key)].clone();
-        bottom = bottom.panel_view(panel_handle(run), cx);
-        has_terminal = true;
-    }
     let git = state.panes[&format!("workspace-{}-git", state.workspace.layout_key)].clone();
     let files = state.panes[&format!("workspace-{}-files", state.workspace.layout_key)].clone();
     state.dock.update(cx, |dock, cx| {
@@ -1190,10 +1143,6 @@ impl Render for Shell {
                 .into_any_element();
         }
         let state = self.active(cx);
-        let repository = self
-            .data
-            .status(self.active_workspace(cx).expect("active workspace"), cx)
-            .repository;
         let active_session = state
             .active_session
             .and_then(|id| state.sessions.iter().position(|s| s.id == id))
@@ -1280,22 +1229,7 @@ impl Render for Shell {
                     .items_center()
                     .justify_between()
                     .text_color(rgb(p.muted))
-                    .child("Repositories")
-                    .child(
-                        Button::new("new-task")
-                            .ghost()
-                            .label("+")
-                            .tooltip("New task")
-                            .on_click({
-                                let repository = repository.clone();
-                                let content = self.content.clone();
-                                move |_, window, cx| {
-                                    dialogs::new_task(repository.clone(), window, cx);
-                                    content
-                                        .update(cx, |content, cx| content.sync_covers(window, cx));
-                                }
-                            }),
-                    ),
+                    .child("Repositories"),
             )
             .children(
                 state
@@ -1342,8 +1276,7 @@ impl Render for Shell {
             .and_then(|id| state.panes.get(&session_pane_id(id)))
             .and_then(|pane| pane.read(cx).session.clone());
         let workspace_target = state.park_target(cx);
-        let state_session_count =
-            state.sessions.len() + usize::from(state.store.terminals.is_some());
+        let state_session_count = state.sessions.len();
         let can_park = self.local
             && self
                 .workspaces
@@ -1357,12 +1290,6 @@ impl Render for Shell {
             .find(|session| Some(session.id) == close_session)
             .map(|session| format!("Close {} permanently", session.title))
             .unwrap_or_else(|| "Close session permanently".into());
-        let mut panes: Vec<_> = state
-            .panes
-            .iter()
-            .map(|(id, pane)| (id.clone(), pane.read(cx).title.clone()))
-            .collect();
-        panes.sort_by(|a, b| a.0.cmp(&b.0));
         let chat_owner = weak.clone();
         let history_owner = weak.clone();
         let history = self
@@ -1378,9 +1305,7 @@ impl Render for Shell {
                 let chat_owner = chat_owner.clone();
                 let history_owner = history_owner.clone();
                 let history = history.clone();
-                let repository = repository.clone();
                 let weak = weak.clone();
-                let panes = panes.clone();
                 let close_owner = weak.clone();
                 let park_owner = weak.clone();
                 let stop_target = workspace_target.clone();
@@ -1411,26 +1336,12 @@ impl Render for Shell {
                         )
                     })
                 })
-                .item(
-                    PopupMenuItem::new("New task…")
-                        .on_click(move |_, w, cx| dialogs::new_task(repository.clone(), w, cx)),
-                )
+                .item(PopupMenuItem::new("New task · unavailable").disabled(true))
                 .item(
                     PopupMenuItem::new("Keyboard shortcuts     ⌥/")
                         .on_click(|_, w, cx| dialogs::shortcuts(w, cx)),
                 )
                 .separator()
-                .submenu("Show pane", window, cx, move |menu, _, _| {
-                    panes.iter().fold(menu, |menu, (id, title)| {
-                        let weak = weak.clone();
-                        let id = id.clone();
-                        menu.item(PopupMenuItem::new(title.clone()).on_click(
-                            move |_, window, cx| {
-                                _ = weak.update(cx, |this, cx| this.show_pane(&id, window, cx));
-                            },
-                        ))
-                    })
-                })
                 .item(
                     PopupMenuItem::new("Park workspace · stop terminals")
                         .disabled(!can_park)
@@ -1496,11 +1407,6 @@ impl Render for Shell {
                         );
                     }),
                 )
-                .separator()
-                .item(PopupMenuItem::label("Browser stopped · sample"))
-                .item(PopupMenuItem::new("Open browser").on_click(|_, w, cx| {
-                    dialogs::notice("Open browser · sample action only", w, cx)
-                }))
             });
         let mut content = div().flex_1().min_w_0().h_full().flex().flex_col().child(
             div()
@@ -1509,17 +1415,6 @@ impl Render for Shell {
                 .h(px(38.))
                 .bg(rgb(p.mantle))
                 .child(div().flex_1().min_w_0().child(tabs))
-                .when(self.local, |bar| {
-                    bar.child(
-                        Button::new("new-terminal")
-                            .ghost()
-                            .label("+")
-                            .tooltip("New terminal · ⌘T")
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.new_terminal(window, cx)),
-                            ),
-                    )
-                })
                 .child(more),
         );
         if let Some(error) = &self.owner.read(cx).error {
@@ -1779,27 +1674,6 @@ mod tests {
         });
         let mut store = crate::preview::tests::guarded_store(config_root.as_path());
         assert_eq!(store.load().unwrap(), [repo.path().canonicalize().unwrap()]);
-        // Local terminals start in their workspace folder, not $HOME.
-        let folder = repo.path().canonicalize().unwrap();
-        cx.read(|cx| {
-            let state = shell.read(cx).active(cx);
-            let terminals: Vec<_> = state
-                .panes
-                .values()
-                .filter(|pane| matches!(pane.read(cx).content, pane::PaneContent::Terminal(_)))
-                .collect();
-            assert!(!terminals.is_empty());
-            for terminal in terminals {
-                assert!(
-                    terminal
-                        .read(cx)
-                        .tab_title()
-                        .contains(folder.file_name().unwrap().to_str().unwrap()),
-                    "{}",
-                    terminal.read(cx).tab_title()
-                );
-            }
-        });
         // A real subsequent maintenance request sees a filesystem change.
         std::fs::write(repo.path().join("later.txt"), "later").unwrap();
         cx.update(|_, cx| {

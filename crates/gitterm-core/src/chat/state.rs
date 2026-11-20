@@ -179,12 +179,7 @@ pub struct ConfirmedEffort {
     pub applied: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SettingChange {
-    Model(String),
-    Effort(Option<String>),
-    Mode(String),
-}
+pub use super::types::SettingChange;
 
 impl SettingChange {
     fn command(&self) -> HarnessCommand {
@@ -241,8 +236,9 @@ pub struct QueuedPrompt {
     pub prompt: UserPrompt,
     pub status: PromptStatus,
     pub withdraw_pending: bool,
-    /// A write alone cannot establish whether the provider started the prompt.
-    written: bool,
+    /// A write, or acceptance by a transport without receipts, cannot establish
+    /// whether the provider started the prompt.
+    may_have_written: bool,
 }
 
 #[derive(Debug)]
@@ -275,7 +271,7 @@ pub struct State {
     pub queued_prompts: BTreeMap<String, QueuedPrompt>,
     pub checkout: Option<PathBuf>,
     pending_change: Option<(CommandCorrelation, SettingChange)>,
-    commands: BTreeMap<u64, PendingCommand>,
+    commands: BTreeMap<u64, (RuntimeStamp, PendingCommand)>,
     runtime_exited: bool,
     runtime_generation: u64,
     history_generation: u64,
@@ -304,6 +300,19 @@ impl Default for State {
 
 #[derive(Debug)]
 pub enum Intent {
+    /// Preserve pre-launch picker configuration without claiming a provider ack.
+    ConfigureSetting {
+        config: AgentBackendConfig,
+        process_running: bool,
+        change: SettingChange,
+    },
+    /// Channel acceptance before a write receipt leaves delivery unknown.
+    /// Remote/legacy ports must wait for the provider's prompt lifecycle.
+    CommandAcceptedWithoutReceipt {
+        runtime: RuntimeStamp,
+        current: session::Target,
+        correlation: CommandCorrelation,
+    },
     Queue {
         runtime: RuntimeStamp,
         current: session::Target,
@@ -401,6 +410,7 @@ pub struct EventEffects {
 
 #[derive(Debug)]
 pub enum Effect {
+    SettingConfigured(SettingChange),
     /// Send once, in session order, then feed the correlated delivery outcome
     /// back. Revalidate the full runtime binding immediately before sending.
     Dispatch {
@@ -523,6 +533,14 @@ impl State {
         self.pending_change.as_ref().map(|(_, change)| change)
     }
 
+    /// Dispatch attribution can change while the sole receiver stays installed.
+    /// The host validates receiver incarnation, then resolves this command stamp.
+    pub fn command_runtime(&self, correlation: CommandCorrelation) -> Option<&RuntimeStamp> {
+        self.commands
+            .get(&correlation.0)
+            .map(|(runtime, _)| runtime)
+    }
+
     fn command_allowed(
         &self,
         runtime: &RuntimeStamp,
@@ -540,7 +558,8 @@ impl State {
         echo: Option<AgentEvent>,
     ) -> Effect {
         let correlation = CommandCorrelation(generation());
-        self.commands.insert(correlation.0, pending);
+        self.commands
+            .insert(correlation.0, (runtime.clone(), pending));
         Effect::Dispatch {
             runtime,
             correlation,
@@ -554,7 +573,7 @@ impl State {
             .values_mut()
             .filter_map(|queued| {
                 queued.withdraw_pending = false;
-                if queued.status == PromptStatus::Pending && queued.written {
+                if queued.status == PromptStatus::Pending && queued.may_have_written {
                     queued.status = PromptStatus::Uncertain;
                     None
                 } else if matches!(queued.status, PromptStatus::Pending | PromptStatus::Queued) {
@@ -579,7 +598,7 @@ impl State {
         {
             self.pending_change = None;
             self.commands
-                .retain(|_, command| !matches!(command, PendingCommand::Setting));
+                .retain(|_, (_, command)| !matches!(command, PendingCommand::Setting));
         }
         let changed = match &change {
             SettingChange::Model(value) => {
@@ -603,6 +622,39 @@ impl State {
     /// before/after markers for the host's ordered presentation effects.
     pub fn reduce(&mut self, intent: Intent) -> Effect {
         match intent {
+            Intent::ConfigureSetting {
+                config,
+                process_running,
+                change,
+            } => {
+                if process_running
+                    || !config.backend().is_native()
+                    || config.read_only_note().is_some()
+                    || !change.valid(config.backend())
+                {
+                    return Effect::Rejected(format!("Cannot configure {change:?} before launch"));
+                }
+                Effect::SettingConfigured(change)
+            }
+            Intent::CommandAcceptedWithoutReceipt {
+                runtime,
+                current,
+                correlation,
+            } => {
+                if !self.runtime_exited && self.accepts_runtime(&runtime, &current) {
+                    if let Some((admitted, PendingCommand::Queue(id))) =
+                        self.commands.get(&correlation.0)
+                    {
+                        if admitted != &runtime {
+                            return Effect::None;
+                        }
+                        if let Some(prompt) = self.queued_prompts.get_mut(id) {
+                            prompt.may_have_written = true;
+                        }
+                    }
+                }
+                Effect::None
+            }
             Intent::Queue {
                 runtime,
                 current,
@@ -635,7 +687,7 @@ impl State {
                         prompt: prompt.clone(),
                         status: PromptStatus::Pending,
                         withdraw_pending: false,
-                        written: false,
+                        may_have_written: false,
                     },
                 );
                 self.dispatch(
@@ -718,14 +770,21 @@ impl State {
                 if !self.accepts_runtime(&runtime, &current) {
                     return Effect::None;
                 }
-                let Some(command) = self.commands.remove(&correlation.0) else {
+                if !self
+                    .commands
+                    .get(&correlation.0)
+                    .is_some_and(|(admitted, _)| admitted == &runtime)
+                {
                     return Effect::None;
+                }
+                let Some((_, command)) = self.commands.remove(&correlation.0) else {
+                    unreachable!()
                 };
                 let reason = match outcome {
                     DeliveryOutcome::Written => {
                         if let PendingCommand::Queue(id) = command {
                             if let Some(prompt) = self.queued_prompts.get_mut(&id) {
-                                prompt.written = true;
+                                prompt.may_have_written = true;
                             }
                         }
                         return Effect::None;
@@ -850,6 +909,24 @@ impl State {
                     return Effect::None;
                 }
                 let queued = self.submit_queues(backend, process_running);
+                // Another client's queued echo has the same withdraw authority as
+                // a local echo. Its transport supplies no local write receipt.
+                if queued {
+                    if let Some(id) = id.as_ref().filter(|id| !id.is_empty()) {
+                        self.queued_prompts
+                            .entry(id.clone())
+                            .or_insert_with(|| QueuedPrompt {
+                                prompt: UserPrompt {
+                                    text: text.clone(),
+                                    images: Vec::new(),
+                                    id: Some(id.clone()),
+                                },
+                                status: PromptStatus::Pending,
+                                withdraw_pending: false,
+                                may_have_written: true,
+                            });
+                    }
+                }
                 let echo = AgentEvent::relayed_prompt(id.as_deref(), &text, image_count, queued);
                 if process_running {
                     self.state = AgentSessionState::Streaming;
@@ -973,7 +1050,8 @@ impl State {
                 HarnessEvent::MessageLifecycle { .. }
                 | HarnessEvent::ModelChanged(_)
                 | HarnessEvent::PermissionModeChanged(_)
-                | HarnessEvent::EffortChanged { .. },
+                | HarnessEvent::EffortChanged { .. }
+                | HarnessEvent::SettingRejected { .. },
             ) if self.runtime_exited => {}
             AgentEvent::Harness(event) => match event {
                 HarnessEvent::MessageLifecycle { id, state } => {
@@ -1019,6 +1097,18 @@ impl State {
                     effects
                         .notices
                         .push(format!("Not withdrawn ({id}): {reason}"));
+                }
+                // Written is only a transport receipt; provider rejection can
+                // arrive after that receipt has removed the command entry.
+                HarnessEvent::SettingRejected { requested }
+                    if self
+                        .pending_change
+                        .as_ref()
+                        .is_some_and(|(_, pending)| pending == requested) =>
+                {
+                    if let Some((correlation, _)) = self.pending_change.take() {
+                        self.commands.remove(&correlation.0);
+                    }
                 }
                 HarnessEvent::ModelChanged(value) => {
                     effects.settings_changed =

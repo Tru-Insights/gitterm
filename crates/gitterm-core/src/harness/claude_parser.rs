@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use crate::chat::types::{
     HarnessEvent, ItemKind, MessageState, RateLimitReading, RuntimeDecision, RuntimeRequestKind,
-    TurnStatus, UserPrompt,
+    SettingChange, TurnStatus, UserPrompt,
 };
 
 /// The tool whose `can_use_tool` request is a question for the user rather
@@ -422,6 +422,21 @@ impl ClaudeFrameParser {
                 .to_string())
         };
         let mut out = Vec::new();
+        if result.is_err() {
+            let requested = match &request {
+                HostRequest::SetModel(value) => Some(SettingChange::Model(value.clone())),
+                HostRequest::SetPermissionMode(value) => Some(SettingChange::Mode(value.clone())),
+                HostRequest::SetEffort(value) | HostRequest::ConfirmEffort(value) => {
+                    Some(SettingChange::Effort(value.clone()))
+                }
+                _ => None,
+            };
+            if let Some(requested) = requested {
+                out.push(ParsedFrame::Event(HarnessEvent::SettingRejected {
+                    requested,
+                }));
+            }
+        }
         match (&request, &result) {
             (HostRequest::Initialize { resume }, Ok(body)) => {
                 out.push(ParsedFrame::Event(HarnessEvent::Ready {
@@ -465,7 +480,15 @@ impl ClaudeFrameParser {
             // The session follows up with `ConfirmEffort`.
             (HostRequest::SetEffort(_), Ok(_)) => {}
             (HostRequest::ConfirmEffort(requested), Ok(body)) => {
-                out.push(ParsedFrame::Event(confirm_effort(requested, body)));
+                let confirmation = confirm_effort(requested, body);
+                // A successful read can still reveal that apply_flag_settings
+                // silently ignored the requested effort.
+                if matches!(&confirmation, HarnessEvent::Error(_)) {
+                    out.push(ParsedFrame::Event(HarnessEvent::SettingRejected {
+                        requested: SettingChange::Effort(requested.clone()),
+                    }));
+                }
+                out.push(ParsedFrame::Event(confirmation));
             }
             (HostRequest::Interrupt, Ok(_)) => {}
             // A cancel that took is reported by its `cancelled` lifecycle.
@@ -1615,6 +1638,54 @@ mod tests {
     }
 
     #[test]
+    fn setting_rejections_carry_requested_values_and_keep_exact_error_text() {
+        for (request, requested, message) in [
+            (
+                HostRequest::SetModel("sonnet".into()),
+                SettingChange::Model("sonnet".into()),
+                "Claude rejected model \"sonnet\": denied",
+            ),
+            (
+                HostRequest::SetPermissionMode("plan".into()),
+                SettingChange::Mode("plan".into()),
+                "Claude rejected permission mode \"plan\": denied",
+            ),
+            (
+                HostRequest::SetEffort(Some("high".into())),
+                SettingChange::Effort(Some("high".into())),
+                "Claude did not change the effort to high: denied",
+            ),
+            (
+                HostRequest::ConfirmEffort(Some("high".into())),
+                SettingChange::Effort(Some("high".into())),
+                "Claude did not change the effort to high: denied",
+            ),
+            (
+                HostRequest::SetEffort(None),
+                SettingChange::Effort(None),
+                "Claude did not change the effort to auto: denied",
+            ),
+            (
+                HostRequest::ConfirmEffort(None),
+                SettingChange::Effort(None),
+                "Claude did not change the effort to auto: denied",
+            ),
+        ] {
+            let mut parser = ClaudeFrameParser::new();
+            parser.register_host_request("reject".into(), request);
+            let line = r#"{"type":"control_response","response":{"subtype":"error","request_id":"reject","error":"denied"}}"#;
+            assert_eq!(
+                events(&parser.parse_line(line)),
+                vec![
+                    HarnessEvent::SettingRejected { requested },
+                    HarnessEvent::Error(message.into()),
+                ]
+            );
+            assert!(parser.parse_line(line).is_empty());
+        }
+    }
+
+    #[test]
     fn set_model_reply_confirms_the_model() {
         let mut p = ClaudeFrameParser::new();
         p.register_host_request(
@@ -1641,7 +1712,7 @@ mod tests {
             r#"{"type":"control_response","response":{"subtype":"error","request_id":"m2","error":"Model 'nonsense' not found","error_code":"catalog_unknown"}}"#,
         );
         assert!(
-            matches!(&frames[0], ParsedFrame::Event(HarnessEvent::Error(m)) if m.contains("not found"))
+            matches!(&frames[1], ParsedFrame::Event(HarnessEvent::Error(m)) if m.contains("not found"))
         );
     }
 
@@ -1683,8 +1754,17 @@ mod tests {
         let frames = p.parse_line(
             r#"{"type":"control_response","response":{"subtype":"success","request_id":"c1","response":{"effective":{},"sources":[{"source":"flagSettings","settings":{}}],"applied":{"effort":"low"}}}}"#,
         );
-        assert!(
-            matches!(&frames[0], ParsedFrame::Event(HarnessEvent::Error(m)) if m.contains("bogus"))
+        assert_eq!(
+            events(&frames),
+            vec![
+                HarnessEvent::SettingRejected {
+                    requested: SettingChange::Effort(Some("bogus".into()))
+                },
+                HarnessEvent::Error(
+                    "Claude did not apply effort bogus: its session settings hold no effort level"
+                        .into()
+                ),
+            ]
         );
     }
 
@@ -1802,7 +1882,7 @@ mod tests {
             r#"{"type":"control_response","response":{"subtype":"error","request_id":"m1","error":"bad mode"}}"#,
         );
         assert!(
-            matches!(&frames[0], ParsedFrame::Event(HarnessEvent::Error(m)) if m.contains("bad mode"))
+            matches!(&frames[1], ParsedFrame::Event(HarnessEvent::Error(m)) if m.contains("bad mode"))
         );
         assert_eq!(
             p.parse_line(r#"{"type":"control_cancel_request","request_id":"r9"}"#),
