@@ -1,0 +1,12 @@
+{
+  "issues": {
+    "TRU-999": {
+      "title": "Synthetic issue",
+      "workspace": "fixture-space",
+      "fetched_at": "2000-01-01T00:00:00Z"
+    }
+  },
+  "prefixes": {
+    "TRU": "fixture-space"
+  }
+}

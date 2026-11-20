@@ -2921,6 +2921,89 @@ impl App {
 mod tests {
     use super::*;
 
+    #[test]
+    fn merge_plan_caller_root_safeguards() {
+        const NAME: &str = "work_prs::tests::merge_plan_caller_root_safeguards";
+        if std::env::var_os("GT_PR21_ROOT_CHILD").is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env(config::CONFIG_DIR_ENV, dir.path())
+                .env("GT_PR21_ROOT_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = crate::baseline_tests::app_with_tabs(dir.path());
+        let caller = "fixture-caller";
+        app.workspaces[0].tabs[0].session_uid = caller.into();
+        for tool in ["merge_plan_get", "merge_plan_set"] {
+            assert_eq!(
+                app.merge_plan_root(None, tool).unwrap_err(),
+                task_mcp::missing_plan_caller_error(tool)
+            );
+            assert!(app
+                .merge_plan_root(Some("unknown"), tool)
+                .unwrap_err()
+                .contains("no GitTerm tab"));
+            assert!(app
+                .merge_plan_root(Some(caller), tool)
+                .unwrap_err()
+                .contains("no conversation id yet"));
+        }
+        app.workspaces[0].tabs[0].chat_session_id = Some("fixture-child".into());
+        assert_eq!(
+            app.merge_plan_root(Some(caller), "merge_plan_get").unwrap(),
+            "fixture-child"
+        );
+        Arc::make_mut(&mut app.chat_index).push(gitterm::chats::ChatIndexEntry {
+            id: "fixture-child".into(),
+            backend: gitterm::chats::ChatBackend::Claude,
+            path: dir.path().join("fixture-child.jsonl"),
+            cwd: dir.path().into(),
+            repo_root: None,
+            is_worktree: false,
+            branch: None,
+            title: "Fixture".into(),
+            latest: None,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            size: 0,
+            dead_cwd: false,
+            facts: None,
+            root_id: Some("fixture-root".into()),
+        });
+        assert_eq!(
+            app.merge_plan_root(Some(caller), "merge_plan_set").unwrap(),
+            "fixture-root"
+        );
+        app.workspaces[0].location = WorkspaceLocation::RemoteAgent {
+            remote_id: "fixture-remote".into(),
+            workspace_id: "fixture-workspace".into(),
+            root: "/fixture".into(),
+        };
+        assert!(app
+            .merge_plan_root(Some(caller), "merge_plan_get")
+            .unwrap_err()
+            .contains("no GitTerm tab"));
+        app.workspaces[0].location = WorkspaceLocation::LegacyRemoteSession {
+            session_name: "fixture".into(),
+            root: "/fixture".into(),
+        };
+        assert!(app
+            .merge_plan_root(Some(caller), "merge_plan_set")
+            .unwrap_err()
+            .contains("no GitTerm tab"));
+        assert!(app.prs.plans.is_empty());
+        assert!(!merge_plan::plans_dir(dir.path()).exists());
+    }
+
     fn task_pr(number: u64) -> PrRef {
         let key = PrKey::new("acme/api", number);
         PrRef {
