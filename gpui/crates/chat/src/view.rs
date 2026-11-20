@@ -118,6 +118,7 @@ pub fn init(cx: &mut App) {
 /// Rich-text state is initialized only for visited rows; it is not the event source of truth.
 pub struct ChatView {
     records: Arc<Vec<Record>>,
+    preview: bool,
     composer: Entity<TextareaState>,
     callback: Option<IntentCallback>,
     images: Vec<gitterm_core::chat::types::ImageAttachment>,
@@ -186,6 +187,7 @@ impl ChatView {
         focus.focus(window, cx);
         Self {
             records: Arc::new(records),
+            preview: false,
             composer,
             callback: None,
             images: vec![],
@@ -211,6 +213,11 @@ impl ChatView {
             replay_position: 0,
             _subscriptions: subscriptions,
         }
+    }
+    /// Embedded preview hides fixture replay controls and names its omitted features.
+    pub fn set_preview(&mut self, cx: &mut Context<Self>) {
+        self.preview = true;
+        cx.notify();
     }
     /// Install the app-owned delivery seam. No session/harness is started by the view.
     pub fn set_intent_callback(&mut self, callback: IntentCallback, cx: &mut Context<Self>) {
@@ -627,8 +634,18 @@ impl Render for ChatView {
                     .items_center()
                     .justify_between()
                     .child(div().text_color(rgb(MUTED)).child(format!(
-                        "Native chat · {} rows · synthetic fixture",
-                        self.model.rows.len()
+                        "{} · {} rows{}",
+                        if self.preview {
+                            "Claude preview"
+                        } else {
+                            "Native chat"
+                        },
+                        self.model.rows.len(),
+                        if self.preview {
+                            ""
+                        } else {
+                            " · synthetic fixture"
+                        }
                     )))
                     .child(
                         div().child(
@@ -651,17 +668,24 @@ impl Render for ChatView {
                     } else {
                         ""
                     }))
-                    .child(
-                        Button::new("replay")
-                            .small()
-                            .label(if self.replay.is_some() {
-                                "Restart replay"
-                            } else {
-                                "Replay"
-                            })
-                            .on_click(cx.listener(Self::start_replay)),
-                    ),
+                    .when(!self.preview, |header| {
+                        header.child(
+                            Button::new("replay")
+                                .small()
+                                .label(if self.replay.is_some() {
+                                    "Restart replay"
+                                } else {
+                                    "Replay"
+                                })
+                                .on_click(cx.listener(Self::start_replay)),
+                        )
+                    }),
             )
+            .when(self.preview, |view| {
+                view.child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(
+                    "Images, dictation, review/delegation cards, workers, remember permissions: not in preview yet",
+                ))
+            })
             .when(self.find_open, |view| view.child(self.find_bar(cx)))
             .child(
                 div()

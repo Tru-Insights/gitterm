@@ -5,6 +5,7 @@ pub mod budget;
 pub mod collect;
 pub mod model;
 pub mod patch;
+pub mod state;
 pub mod viewed;
 
 #[cfg(test)]

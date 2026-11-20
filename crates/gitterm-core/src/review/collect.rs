@@ -15,20 +15,7 @@ use crate::turn_snapshots::SnapshotRoots;
 /// Paths per `git hash-object` call.
 const HASH_CHUNK: usize = 200;
 
-/// A loaded review: the diff plus what viewed marks need.
-#[derive(Debug, Clone)]
-pub struct ReviewLoad {
-    pub diff: ReviewDiff,
-    pub commits: Vec<ReviewCommit>,
-    pub turns: Vec<crate::turn_snapshots::Turn>,
-    pub commits_truncated: bool,
-    pub commits_error: Option<String>,
-    /// The marks' key for this checkout.
-    pub canonical_checkout: PathBuf,
-    /// Every path in a review source of the checkout, or `None` when
-    /// a listing was incomplete or failed: marks are then not pruned.
-    pub live_paths: Option<BTreeSet<String>>,
-}
+pub use super::model::ReviewLoad;
 
 // ---------------------------------------------------------------------------
 // Untracked file reads.
