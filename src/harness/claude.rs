@@ -111,12 +111,46 @@ pub struct ClaudeSession {
 }
 
 impl ClaudeSession {
+    /// Wrap a host-owned transport port without spawning a local process.
+    pub fn from_port(commands: mpsc::UnboundedSender<HarnessCommand>) -> Self {
+        Self {
+            inner: Session::from_port(commands, false),
+        }
+    }
+
     pub fn spawn(config: ClaudeSessionConfig) -> (Self, mpsc::UnboundedReceiver<HarnessEvent>) {
         let (inner, events) = Session::spawn(move |token| {
             let program = resolve_claude_program()?;
             Ok(local_launch(config, program, token))
         });
         (Self { inner }, events)
+    }
+    /// Iced consumes delivery receipts and harness events in the same order.
+    pub fn spawn_runtime(
+        config: ClaudeSessionConfig,
+    ) -> (
+        Self,
+        mpsc::UnboundedReceiver<gitterm_core::chat::runtime::RuntimeEvent>,
+    ) {
+        let (inner, events) = Session::spawn_runtime(move |token| {
+            let program = resolve_claude_program()?;
+            Ok(local_launch(config, program, token))
+        });
+        (Self { inner }, events)
+    }
+    /// Returns whether actual write receipts will follow channel acceptance.
+    pub fn send_chat(
+        &self,
+        command: HarnessCommand,
+        correlation: gitterm_core::chat::types::CommandCorrelation,
+    ) -> Result<bool, String> {
+        if self.inner.supports_correlation() {
+            self.inner
+                .send_correlated(command, correlation)
+                .map(|()| true)
+        } else {
+            self.inner.send(command).map(|()| false)
+        }
     }
     pub fn close_turn_snapshots(&self) {
         self.inner.close_turn_snapshots();
@@ -277,12 +311,7 @@ impl ClaudeSession {
         }
         // An older agent stops the process when the stream closes, which
         // dropping the handle does; a newer one keeps it running.
-        (
-            Self {
-                inner: Session::from_port(cmd_tx, false),
-            },
-            ev_rx,
-        )
+        (Self::from_port(cmd_tx), ev_rx)
     }
 }
 

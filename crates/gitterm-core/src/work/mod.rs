@@ -1,6 +1,8 @@
-//! Read-only Work services shared by frontends.
+//! Work rules and read-only services shared by frontends.
 
 pub mod documents;
 pub mod summary;
 
 pub mod state;
+
+pub mod catalog;

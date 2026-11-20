@@ -50,6 +50,18 @@ impl HarnessSession {
         }
     }
 
+    /// Dispatch a reducer command; legacy/remote ports have no write receipts.
+    pub fn send_chat(
+        &self,
+        command: HarnessCommand,
+        correlation: gitterm_core::chat::types::CommandCorrelation,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Claude(session) => session.send_chat(command, correlation),
+            Self::Acp(session) => session.send(command).map(|()| false),
+        }
+    }
+
     /// The running local `claude` process of a Claude chat (TRU-212).
     pub fn claude_pid(&self) -> Option<u32> {
         match self {

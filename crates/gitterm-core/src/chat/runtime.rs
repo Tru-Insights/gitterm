@@ -83,6 +83,11 @@ pub struct Session {
 }
 
 impl Session {
+    /// Whether this port emits ordered correlated delivery receipts.
+    pub fn supports_correlation(&self) -> bool {
+        self.supports_correlation
+    }
+
     /// Preparation is a host port, invoked at the old session-thread boundary.
     /// It supplies all launch inputs, including a recorder sharing this token.
     pub fn spawn(

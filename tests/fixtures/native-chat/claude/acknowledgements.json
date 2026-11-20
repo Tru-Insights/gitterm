@@ -30,12 +30,39 @@
     "type": "message_withdraw_refused"
   },
   {
+    "data": {
+      "requested": {
+        "kind": "model",
+        "value": "unsupported"
+      }
+    },
+    "type": "setting_rejected"
+  },
+  {
     "data": "Claude rejected model \"unsupported\": synthetic rejection",
     "type": "error"
   },
   {
+    "data": {
+      "requested": {
+        "kind": "mode",
+        "value": "unsupported"
+      }
+    },
+    "type": "setting_rejected"
+  },
+  {
     "data": "Claude rejected permission mode \"unsupported\": synthetic rejection",
     "type": "error"
+  },
+  {
+    "data": {
+      "requested": {
+        "kind": "effort",
+        "value": "high"
+      }
+    },
+    "type": "setting_rejected"
   },
   {
     "data": "Claude did not change the effort to high: synthetic rejection",

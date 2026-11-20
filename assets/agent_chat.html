@@ -3957,6 +3957,14 @@
     queued.set(id, { msg, tag, label, x });
   }
   function queuedLifecycle(id, state) {
+    const msg = prompts.get(id);
+    const marker = msg && msg.querySelector('.delivery-uncertain');
+    if (marker) {
+      marker.remove();
+      msg.classList.remove('unsent');
+      if (state === 'queued') markQueued(msg, id);
+      else if (state === 'cancelled') { msg.remove(); return; }
+    }
     const q = queued.get(id);
     if (!q) return;
     const action = queuedMarkerAction(state);
@@ -3971,10 +3979,11 @@
   }
   function queuedWithdrawRefused(id, reason) {
     const q = queued.get(id);
-    if (!q) return;
-    q.label.textContent = queuedText();
-    q.x.disabled = false;
-    note('Not withdrawn: ' + reason, 'warn');
+    if (q) {
+      q.label.textContent = queuedText();
+      q.x.disabled = false;
+    }
+    note(reason.startsWith('Not withdrawn') ? reason : 'Not withdrawn: ' + reason, 'warn');
   }
   // Claude exited: its queue went with it.
   function dropQueued() {
@@ -4084,6 +4093,9 @@
       case 'effort_changed':
         confirmEffort(d.effort, d.applied);
         note('Effort · ' + effortLabel(d.effort) + (d.effort == null && d.applied ? ' (' + d.applied + ')' : ''));
+        break;
+      case 'setting_rejected':
+        // The reducer settles this request; its accompanying error renders below.
         break;
       case 'error':
         // A rejected or undeliverable mode, model or effort change
@@ -4226,11 +4238,33 @@
     return true;
   };
 
+  // A write without a start acknowledgement is ambiguous, never safe to resend.
+  function promptUncertain(id) {
+    const msg = prompts.get(id);
+    if (!msg) return;
+    const q = queued.get(id);
+    if (q) { q.tag.remove(); queued.delete(id); }
+    msg.classList.remove('queued');
+    msg.classList.add('unsent');
+    if (!msg.querySelector('.delivery-uncertain')) {
+      msg.append(el('div', 'user-note delivery-uncertain', 'Delivery uncertain: the agent may have read this message. Check the conversation before sending it again.'));
+    }
+  }
+
+  function pickerPending(event) {
+    if (event.setting === 'mode') { mode.pending = event.value; renderMode(); }
+    else if (event.setting === 'model') { chips.model.pending = event.value; renderModel(); }
+    else if (event.setting === 'effort') { chips.effort.pending = { value: event.value }; renderEffort(); }
+  }
+
   // ---- entry points (called from Rust) -------------------------------------
   window.__appendEvent = function (event) {
     if (!event || typeof event !== 'object') return;
     try {
       if (event.kind === 'harness') harnessEvent(event.event);
+      else if (event.kind === 'prompt_uncertain') promptUncertain(event.id);
+      else if (event.kind === 'prompt_unsent') window.__markPromptUnsent(event.id, event.reason);
+      else if (event.kind === 'picker_pending') pickerPending(event);
       else if (event.kind === 'delegation_anchor') delegationAnchor(event.delegation_id);
       else if (event.kind === 'subagent_started_at') subagentStartedAt(event.id, event.at_ms);
       else if (event.kind === 'turn_timing') turnTiming(event);

@@ -1639,7 +1639,6 @@ impl Render for Shell {
                 let chat_owner = chat_owner.clone();
                 let history_owner = history_owner.clone();
                 let history = history.clone();
-                let repository = repository.clone();
                 let weak = weak.clone();
                 let close_owner = weak.clone();
                 let park_owner = weak.clone();
@@ -1688,10 +1687,6 @@ impl Render for Shell {
                         )
                     })
                 })
-                .item(
-                    PopupMenuItem::new("New task…")
-                        .on_click(move |_, w, cx| dialogs::new_task(repository.clone(), w, cx)),
-                )
                 .item(
                     PopupMenuItem::new("Keyboard shortcuts     ⌥/")
                         .on_click(|_, w, cx| dialogs::shortcuts(w, cx)),

@@ -1973,12 +1973,12 @@ pub struct ParkedInfo {
 impl WorkspaceConfig {
     /// On the Parked list: closed and not done.
     pub fn is_parked(&self) -> bool {
-        !self.active && self.done_at.is_none()
+        gitterm_core::work::catalog::is_parked(self.active, self.done_at.as_deref())
     }
 
     /// The home repo's dir: `home`, else `dir` (files before TRU-180).
     pub fn home_dir(&self) -> &str {
-        self.home.as_deref().unwrap_or(&self.dir)
+        gitterm_core::work::catalog::home_dir(self.home.as_deref(), &self.dir)
     }
 
     /// A tmux-session workspace from before remote agents: its repo is

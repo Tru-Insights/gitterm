@@ -336,3 +336,175 @@ fn ordered_sessions_restore_fresh_shells_and_prune_stale_ids(cx: &mut TestAppCon
         subfolder
     );
 }
+
+#[gpui::test]
+fn fresh_local_workspace_creates_no_terminal(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let folder = tempfile::tempdir().unwrap();
+    let folder = folder.path().canonicalize().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let (shell, cx) =
+        cx.add_window_view(|window, cx| local_shell(&folder, config.path(), window, cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let state = shell.read(cx).active(cx);
+        assert!(state.sessions.is_empty());
+        assert!(state.active_session.is_none());
+        assert_eq!(state.store.terminals, Some(vec![]));
+        assert!(state.panes.values().all(|pane| {
+            pane.read(cx).session.is_none()
+                && !matches!(pane.read(cx).content, pane::PaneContent::Terminal(_))
+        }));
+        assert_eq!(state.panes.len(), 2); // Git and Files only.
+        assert!(state.dock.read(cx).layout(DockPlacement::Bottom).is_none());
+    });
+    cx.simulate_keystrokes("cmd-t");
+    cx.read(|cx| assert!(shell.read(cx).active(cx).sessions.is_empty()));
+}
+
+#[gpui::test]
+fn explicit_terminal_close_reaps_and_hidden_exit_updates_title(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let folder = tempfile::tempdir().unwrap();
+    let folder = folder.path().canonicalize().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let (shell, cx) =
+        cx.add_window_view(|window, cx| local_shell(&folder, config.path(), window, cx));
+    cx.update(|window, cx| shell.update(cx, |shell, cx| shell.new_terminal(window, cx)));
+    let first = cx.read(|cx| {
+        let state = shell.read(cx).active(cx);
+        assert_eq!(state.sessions.len(), 1);
+        let first = view(&shell, 0, cx);
+        assert_eq!(first.read(cx).backend().state(), SessionState::Running);
+        let pane = &state.panes[&session_pane_id(state.sessions[0].id)];
+        assert!(
+            state
+                .dock
+                .read(cx)
+                .layout(DockPlacement::Center)
+                .unwrap()
+                .contains_panel(PanelId::from(pane.entity_id()))
+        );
+        assert!(state.dock.read(cx).layout(DockPlacement::Bottom).is_none());
+        assert_eq!(
+            pane.read(cx).tab_title(),
+            folder.file_name().unwrap().to_str().unwrap()
+        );
+        first
+    });
+    let cwd_file = config.path().join("cwd");
+    write(
+        &first,
+        format!(
+            "pwd > '{}'; echo $$ > '{}'\r",
+            cwd_file.display(),
+            config.path().join("pid").display()
+        ),
+        cx,
+    );
+    wait(cx, |_| {
+        cwd_file.exists() && config.path().join("pid").exists()
+    });
+    assert_eq!(
+        std::fs::read_to_string(&cwd_file).unwrap().trim(),
+        folder.to_str().unwrap()
+    );
+    let pid = std::fs::read_to_string(config.path().join("pid"))
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(process_exists(&pid));
+    // Cmd+T is unbound even with terminal focus; explicit creation still works.
+    cx.update(|window, cx| {
+        first.read(cx).focus_handle().clone().focus(window, cx);
+        window.draw(cx).clear(cx);
+        let bindings = window.bindings_for_action_in(&NewTerminal, first.read(cx).focus_handle());
+        assert!(bindings.is_empty());
+        window.dispatch_action(Box::new(NewTerminal), cx);
+    });
+    cx.run_until_parked();
+    cx.read(|cx| assert_eq!(shell.read(cx).active(cx).sessions.len(), 2));
+    // First terminal is hidden; OSC title/reset/exit must still reach its tab.
+    write(&first, "printf '\\033]2;hidden title\\007'\r".into(), cx);
+    wait(cx, |cx| {
+        shell.read(cx).active(cx).panes[&session_pane_id(shell.read(cx).active(cx).sessions[0].id)]
+            .read(cx)
+            .tab_title()
+            == "hidden title"
+    });
+    write(&first, "printf '\\033]0;\\007'; exit 7\r".into(), cx);
+    wait(cx, |cx| {
+        let state = shell.read(cx).active(cx);
+        state.panes[&session_pane_id(state.sessions[0].id)]
+            .read(cx)
+            .tab_title()
+            .ends_with(" · Exited")
+    });
+    assert_eq!(
+        cx.read(|cx| first.read(cx).backend().state()),
+        SessionState::Exited(Some(7))
+    );
+    assert!(!process_exists(&pid), "exited shell was not reaped");
+    let second = cx.read(|cx| view(&shell, 1, cx));
+    let second_pid_file = config.path().join("second-pid");
+    write(
+        &second,
+        format!("echo $$ > '{}'\r", second_pid_file.display()),
+        cx,
+    );
+    wait(cx, |_| {
+        std::fs::read_to_string(&second_pid_file).is_ok_and(|s| !s.trim().is_empty())
+    });
+    let second_pid = std::fs::read_to_string(&second_pid_file)
+        .unwrap()
+        .trim()
+        .to_string();
+    // Dock tab close must terminate, even while another handle owns the view.
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            let state = shell.active(cx);
+            let pane = state.panes[&session_pane_id(state.sessions[1].id)].clone();
+            state
+                .dock
+                .clone()
+                .update(cx, |dock, cx| dock.remove_panel(pane, window, cx));
+        })
+    });
+    wait(cx, |cx| shell.read(cx).active(cx).sessions.len() == 1);
+    assert!(
+        !process_exists(&second_pid),
+        "closed shell remains alive or zombie"
+    );
+    assert_eq!(
+        cx.read(|cx| second.read(cx).backend().state()),
+        SessionState::Cancelled
+    );
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            let id = shell.active(cx).sessions[0].id;
+            shell.close_session(id, window, cx);
+        })
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            let state = shell.active(cx);
+            let pane = state.panes[&session_pane_id(state.sessions[0].id)].clone();
+            state
+                .dock
+                .update(cx, |dock, cx| dock.remove_panel(pane, window, cx));
+        })
+    });
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let state = shell.read(cx).active(cx);
+        assert_eq!(state.sessions.len(), 1);
+        assert!(pane_id_visible(
+            state,
+            &session_pane_id(state.sessions[0].id),
+            cx
+        ));
+    });
+}
