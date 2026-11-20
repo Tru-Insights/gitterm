@@ -63,6 +63,148 @@ fn process_exists(pid: &str) -> bool {
 }
 
 #[gpui::test]
+fn ordered_sessions_restore_fresh_shells_and_prune_stale_ids(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let folder = tempfile::tempdir().unwrap();
+    let root = folder.path().canonicalize().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let (shell, cx) =
+        cx.add_window_view(|window, cx| local_shell(&root, config.path(), window, cx));
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.new_terminal(window, cx);
+            shell.new_terminal(window, cx);
+            shell.new_terminal(window, cx);
+        })
+    });
+    cx.run_until_parked();
+    let before = cx.read(|cx| {
+        shell
+            .read(cx)
+            .active(cx)
+            .sessions
+            .iter()
+            .map(|s| s.id.0)
+            .collect::<Vec<_>>()
+    });
+    // A user reorder is persisted in the same order as the dock tabs.
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            let state = shell.active(cx);
+            let tabs = state
+                .sessions
+                .iter()
+                .rev()
+                .fold(DockLayout::tabs(), |tabs, session| {
+                    tabs.panel_view(
+                        panel_handle(state.panes[&session_pane_id(session.id)].clone()),
+                        cx,
+                    )
+                });
+            state.dock.clone().update(cx, |dock, cx| {
+                dock.set_center(DockLayout::h_split().child(tabs, None), window, cx)
+            });
+        })
+    });
+    cx.run_until_parked();
+    let (path, expected) = cx.read(|cx| {
+        let state = shell.read(cx).active(cx);
+        (
+            state.store.path.clone(),
+            state.store.terminals.clone().unwrap(),
+        )
+    });
+    assert_eq!(
+        expected.iter().map(|s| s.id).collect::<Vec<_>>(),
+        before.into_iter().rev().collect::<Vec<_>>()
+    );
+    assert_eq!(expected.len(), 3);
+    let first = cx.read(|cx| view(&shell, 0, cx));
+    write(
+        &first,
+        "printf 'SCROLLBACK_only_before_restart\\n'\r".into(),
+        cx,
+    );
+    wait(cx, |cx| {
+        first
+            .read(cx)
+            .backend()
+            .get_all_text()
+            .is_some_and(|text| text.contains("SCROLLBACK_only_before_restart"))
+    });
+    // Distinct launch cwd, plus extra/duplicate dock IDs from stale state.
+    let subfolder = root.join("subfolder");
+    std::fs::create_dir(&subfolder).unwrap();
+    let mut expected = expected;
+    expected[0].cwd = subfolder.clone();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    value["terminal_sessions"] = serde_json::to_value(&expected).unwrap();
+    let center = &mut value["center"]["children"][0]["children"];
+    let first = center[0].clone();
+    center.as_array_mut().unwrap().push(first.clone());
+    let mut stale = first;
+    stale["info"] = serde_json::json!({"panel":"session-stale"});
+    center.as_array_mut().unwrap().push(stale);
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    // Release old PTYs before constructing the restart. No layout writes here.
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, cx| {
+            for pane in shell.active(cx).panes.values() {
+                pane.update(cx, |pane, cx| pane.close_terminal(cx));
+            }
+        })
+    });
+    let restarted =
+        cx.update(|window, cx| cx.new(|cx| local_shell(&root, config.path(), window, cx)));
+    cx.read(|cx| {
+        let state = restarted.read(cx).active(cx);
+        assert_eq!(state.store.terminals.as_ref().unwrap(), &expected);
+        assert!(state.error.is_none());
+        assert!(!state.store.is_refused());
+        assert_eq!(
+            state.sessions.iter().map(|s| s.id.0).collect::<Vec<_>>(),
+            expected.iter().map(|s| s.id).collect::<Vec<_>>()
+        );
+        let ids = layout::pane_order(&state.dock.read(cx).dump(cx));
+        assert!(!ids.iter().any(|id| id == "session-stale"));
+        assert_eq!(
+            ids.iter().filter(|id| id.starts_with("session-")).count(),
+            3
+        );
+        for index in 0..3 {
+            assert!(
+                !view(&restarted, index, cx)
+                    .read(cx)
+                    .backend()
+                    .get_all_text()
+                    .unwrap_or_default()
+                    .contains("SCROLLBACK_only_before_restart")
+            );
+            assert_eq!(
+                view(&restarted, index, cx).read(cx).backend().state(),
+                SessionState::Running
+            );
+        }
+    });
+    let cwd_file = config.path().join("restored-cwd");
+    let restored_first = cx.read(|cx| view(&restarted, 0, cx));
+    write(
+        &restored_first,
+        format!("pwd > '{}'\r", cwd_file.display()),
+        cx,
+    );
+    wait(cx, |_| {
+        std::fs::read_to_string(&cwd_file).is_ok_and(|s| !s.trim().is_empty())
+    });
+    assert_eq!(
+        PathBuf::from(std::fs::read_to_string(cwd_file).unwrap().trim()),
+        subfolder
+    );
+}
+
+#[gpui::test]
 fn fresh_local_workspace_creates_no_terminal(cx: &mut TestAppContext) {
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
@@ -232,146 +374,4 @@ fn explicit_terminal_close_reaps_and_hidden_exit_updates_title(cx: &mut TestAppC
             cx
         ));
     });
-}
-
-#[gpui::test]
-fn ordered_sessions_restore_fresh_shells_and_prune_stale_ids(cx: &mut TestAppContext) {
-    cx.background_executor.allow_parking();
-    cx.update(gpui_component::init);
-    let folder = tempfile::tempdir().unwrap();
-    let root = folder.path().canonicalize().unwrap();
-    let config = tempfile::tempdir().unwrap();
-    let (shell, cx) =
-        cx.add_window_view(|window, cx| local_shell(&root, config.path(), window, cx));
-    cx.update(|window, cx| {
-        shell.update(cx, |shell, cx| {
-            shell.new_terminal(window, cx);
-            shell.new_terminal(window, cx);
-            shell.new_terminal(window, cx);
-        })
-    });
-    cx.run_until_parked();
-    let before = cx.read(|cx| {
-        shell
-            .read(cx)
-            .active(cx)
-            .sessions
-            .iter()
-            .map(|s| s.id.0)
-            .collect::<Vec<_>>()
-    });
-    // A user reorder is persisted in the same order as the dock tabs.
-    cx.update(|window, cx| {
-        shell.update(cx, |shell, cx| {
-            let state = shell.active(cx);
-            let tabs = state
-                .sessions
-                .iter()
-                .rev()
-                .fold(DockLayout::tabs(), |tabs, session| {
-                    tabs.panel_view(
-                        panel_handle(state.panes[&session_pane_id(session.id)].clone()),
-                        cx,
-                    )
-                });
-            state.dock.clone().update(cx, |dock, cx| {
-                dock.set_center(DockLayout::h_split().child(tabs, None), window, cx)
-            });
-        })
-    });
-    cx.run_until_parked();
-    let (path, expected) = cx.read(|cx| {
-        let state = shell.read(cx).active(cx);
-        (
-            state.store.path.clone(),
-            state.store.terminals.clone().unwrap(),
-        )
-    });
-    assert_eq!(
-        expected.iter().map(|s| s.id).collect::<Vec<_>>(),
-        before.into_iter().rev().collect::<Vec<_>>()
-    );
-    assert_eq!(expected.len(), 3);
-    let first = cx.read(|cx| view(&shell, 0, cx));
-    write(
-        &first,
-        "printf 'SCROLLBACK_only_before_restart\\n'\r".into(),
-        cx,
-    );
-    wait(cx, |cx| {
-        first
-            .read(cx)
-            .backend()
-            .get_all_text()
-            .is_some_and(|text| text.contains("SCROLLBACK_only_before_restart"))
-    });
-    // Distinct launch cwd, plus extra/duplicate dock IDs from stale state.
-    let subfolder = root.join("subfolder");
-    std::fs::create_dir(&subfolder).unwrap();
-    let mut expected = expected;
-    expected[0].cwd = subfolder.clone();
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    value["terminal_sessions"] = serde_json::to_value(&expected).unwrap();
-    let center = &mut value["center"]["children"][0]["children"];
-    let first = center[0].clone();
-    center.as_array_mut().unwrap().push(first.clone());
-    let mut stale = first;
-    stale["info"] = serde_json::json!({"panel":"session-stale"});
-    center.as_array_mut().unwrap().push(stale);
-    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-    // Release old PTYs before constructing the restart. No layout writes here.
-    cx.update(|_, cx| {
-        shell.update(cx, |shell, cx| {
-            for pane in shell.active(cx).panes.values() {
-                pane.update(cx, |pane, cx| pane.close_terminal(cx));
-            }
-        })
-    });
-    let restarted =
-        cx.update(|window, cx| cx.new(|cx| local_shell(&root, config.path(), window, cx)));
-    cx.read(|cx| {
-        let state = restarted.read(cx).active(cx);
-        assert_eq!(state.store.terminals.as_ref().unwrap(), &expected);
-        assert!(state.error.is_none());
-        assert!(!state.store.is_refused());
-        assert_eq!(
-            state.sessions.iter().map(|s| s.id.0).collect::<Vec<_>>(),
-            expected.iter().map(|s| s.id).collect::<Vec<_>>()
-        );
-        let ids = layout::pane_order(&state.dock.read(cx).dump(cx));
-        assert!(!ids.iter().any(|id| id == "session-stale"));
-        assert_eq!(
-            ids.iter().filter(|id| id.starts_with("session-")).count(),
-            3
-        );
-        for index in 0..3 {
-            assert!(
-                !view(&restarted, index, cx)
-                    .read(cx)
-                    .backend()
-                    .get_all_text()
-                    .unwrap_or_default()
-                    .contains("SCROLLBACK_only_before_restart")
-            );
-            assert_eq!(
-                view(&restarted, index, cx).read(cx).backend().state(),
-                SessionState::Running
-            );
-        }
-    });
-    let cwd_file = config.path().join("restored-cwd");
-    let restored_first = cx.read(|cx| view(&restarted, 0, cx));
-    write(
-        &restored_first,
-        format!("pwd > '{}'\r", cwd_file.display()),
-        cx,
-    );
-    wait(cx, |_| {
-        std::fs::read_to_string(&cwd_file).is_ok_and(|s| !s.trim().is_empty())
-    });
-    assert_eq!(
-        PathBuf::from(std::fs::read_to_string(cwd_file).unwrap().trim()),
-        subfolder
-    );
 }
