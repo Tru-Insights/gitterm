@@ -318,3 +318,56 @@ pub(crate) fn fixture_task(task_id: &str, title: &str, branch: &str) -> TaskReco
         "2026-01-01T00:00:00Z",
     )
 }
+
+/// Iced's task attention scale, retained independently of persisted lifecycle.
+pub(crate) fn attention_presentation(
+    reason: gitterm_core::tasks::TaskAttentionReason,
+) -> (u8, &'static str, &'static str) {
+    use gitterm_core::tasks::TaskAttentionReason::*;
+    match reason {
+        RequiresInput => (0, "●", "Input or approval needed"),
+        RemoteUnavailable => (0, "●", "Remote unavailable"),
+        ExecutionFailed => (1, "!", "Task failed"),
+        Interrupted => (2, "○", "Interrupted · resume"),
+        CompletedUnread | ReadyForReview => (3, "✓", "Ready to review"),
+    }
+}
+
+pub(crate) fn attention_tasks(tasks: &[TaskRecord]) -> Vec<&TaskRecord> {
+    let mut tasks: Vec<_> = tasks
+        .iter()
+        .filter(|t| t.lifecycle != TaskLifecycle::Archived && t.attention.reason.is_some())
+        .collect();
+    let now = std::time::SystemTime::now();
+    let raised = |t: &TaskRecord| {
+        gitterm_core::work::summary::parse_stamp(
+            t.attention.since.as_deref().unwrap_or(&t.updated_at),
+        )
+        .map_or(now, |at| at.min(now))
+    };
+    tasks.sort_by(|a, b| {
+        let priority = |t: &TaskRecord| {
+            t.attention
+                .reason
+                .map_or(3, |r| attention_presentation(r).0)
+        };
+        priority(a)
+            .cmp(&priority(b))
+            .then_with(|| raised(a).cmp(&raised(b)))
+            .then_with(|| a.task_id.cmp(&b.task_id))
+    });
+    tasks
+}
+
+/// Iced task rail: attention first, then active, ready, and settled tasks.
+pub(crate) fn sort_bucket(task: &TaskRecord) -> u8 {
+    if task.attention.reason.is_some() || task.attention.unread {
+        0
+    } else if task.lifecycle.is_active() {
+        1
+    } else if task.lifecycle == TaskLifecycle::Ready {
+        2
+    } else {
+        3
+    }
+}

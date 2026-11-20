@@ -109,3 +109,29 @@ fn optional_issue_is_trimmed_and_empty_is_absent() {
     };
     assert_eq!(issue_key, None);
 }
+
+#[test]
+fn durable_attention_uses_iced_priority_and_raised_time_with_legacy_fallback() {
+    use gitterm_core::tasks::TaskAttentionReason;
+    let mut old = fixture_task("old", "Old input", "old");
+    old.attention.reason = Some(TaskAttentionReason::RequiresInput);
+    old.updated_at = "2026-01-01T00:00:00Z".into();
+    let mut recent = old.clone();
+    recent.task_id = "recent".into();
+    recent.attention.since = Some("2026-01-02T00:00:00Z".into());
+    let mut failed = old.clone();
+    failed.task_id = "failed".into();
+    failed.attention.reason = Some(TaskAttentionReason::ExecutionFailed);
+    let mut unread = old.clone();
+    unread.task_id = "unread".into();
+    unread.attention.reason = None;
+    unread.attention.unread = true;
+    let tasks = [failed, recent, unread, old];
+    assert_eq!(
+        attention_tasks(&tasks)
+            .iter()
+            .map(|t| t.task_id.as_str())
+            .collect::<Vec<_>>(),
+        ["old", "recent", "failed"]
+    );
+}

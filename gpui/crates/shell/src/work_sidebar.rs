@@ -1,6 +1,7 @@
 //! Standalone Iced Work sidebar port. The host owns the core reducer, executes
 //! its effects, refreshes workspace facts, and subscribes to `WorkSidebarOutcome`.
-//! This view only owns disclosure state and an unsaved run-command draft.
+//! Imported catalogs grant read authority for background Work loads; actions
+//! that mutate Iced state or launch a tool report the preview limitation.
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -22,6 +23,16 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
 };
+
+/// Read authority comes from the owner's resolved Iced catalog. Sample views
+/// and tests without an imported catalog never consult the user's config.
+#[derive(Clone)]
+pub(crate) struct IcedWorkSource {
+    pub config: PathBuf,
+    pub workspaces: Vec<gitterm_core::workspace_config::WorkspaceConfig>,
+    pub owner: gpui::WeakEntity<crate::WorkspaceOwner>,
+}
+impl gpui::Global for IcedWorkSource {}
 
 /// Workspace/repository facts unavailable from the read-only Work reducer.
 /// Paths are the same canonical repo paths supplied to the core summary.
@@ -97,6 +108,31 @@ pub enum WorkSidebarOutcome {
         workspace: u64,
     },
     OpenFind,
+    OpenDocument {
+        workspace: u64,
+        path: PathBuf,
+    },
+    OpenTask {
+        task: String,
+    },
+}
+
+impl WorkSidebarOutcome {
+    pub fn preview_error(&self) -> Option<String> {
+        let action = match self {
+            Self::AddRepo => "Add repo",
+            Self::RemoveRepo { .. } => "Remove repo",
+            Self::UndoAutoRepo { .. } => "Undo auto-added repos",
+            Self::EditRunCommand { .. } => "Save run command",
+            Self::DismissAutoRepos { .. } => "Dismiss auto-added repos",
+            Self::RunRepoCommand { .. } => "Run command",
+            Self::OpenEditor { .. } => "Open in editor",
+            Self::MakeWorkspace { .. } => "Make workspace",
+            Self::OpenTask { .. } => "Task overview",
+            _ => return None,
+        };
+        Some(format!("{action} · not available in preview"))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -107,6 +143,10 @@ enum Fold {
     Focus,
     Older,
     Also,
+    Documents,
+    AllDocuments,
+    Document(String),
+    Copies(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,12 +200,19 @@ impl Row {
 
 pub struct WorkSidebar {
     workspace: WorkspaceFacts,
-    /// Shared with the host; no summary, polling, git or ownership logic here.
+    /// Shared reducer; blocking reads run through the read-only data adapter.
     state: Rc<RefCell<State>>,
     open: HashSet<Fold>,
     dismissed_auto: Vec<PathBuf>,
     editing: Option<(PathBuf, Entity<InputState>)>,
     edit_subscription: Option<Subscription>,
+    tasks: Vec<gitterm_core::tasks::TaskRecord>,
+    workers: Vec<gitterm_core::tasks::Delegation>,
+    source: Option<IcedWorkSource>,
+    loading: bool,
+    loaded_at: Option<std::time::Instant>,
+    focus: Focus,
+    error: Option<String>,
 }
 
 impl WorkSidebar {
@@ -177,7 +224,109 @@ impl WorkSidebar {
             dismissed_auto: vec![],
             editing: None,
             edit_subscription: None,
+            tasks: vec![],
+            workers: vec![],
+            source: None,
+            loading: false,
+            loaded_at: None,
+            focus: Default::default(),
+            error: None,
         }
+    }
+
+    fn load(&mut self, force: bool, cx: &mut Context<Self>) {
+        if self.source.is_none() {
+            self.source = cx.try_global::<IcedWorkSource>().cloned();
+        }
+        let Some(source) = self.source.clone() else {
+            return;
+        };
+        let Some(saved) = self
+            .workspace
+            .id
+            .checked_sub(1)
+            .and_then(|id| source.workspaces.get(id as usize))
+            .cloned()
+        else {
+            return;
+        };
+        if self.loading
+            || (!force
+                && self
+                    .loaded_at
+                    .is_some_and(|at| at.elapsed() < gitterm_core::work::state::VISIBLE_POLL))
+        {
+            return;
+        }
+        self.loading = true;
+        let id = self.workspace.id;
+        let focus = self.focus.clone();
+        let requested_focus = focus.clone();
+        let job = cx.background_executor().spawn(async move {
+            crate::data::IcedWorkData::read(&source.config, id, &saved, focus)
+        });
+        cx.spawn(async move |view, cx| {
+            let result = job.await;
+            _ = view.update(cx, |this, cx| {
+                this.loading = false;
+                if this.focus != requested_focus {
+                    this.load(true, cx);
+                    return;
+                }
+                this.loaded_at = Some(std::time::Instant::now());
+                match result {
+                    Ok(data) => {
+                        data.apply(&mut this.state.borrow_mut());
+                        this.workspace = data.facts;
+                        this.tasks = data.tasks;
+                        this.workers = data.workers;
+                        this.error = None;
+                    }
+                    Err(error) => this.error = Some(format!("Load Iced Work: {error:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn emit(&mut self, outcome: WorkSidebarOutcome, cx: &mut Context<Self>) {
+        let error = outcome.preview_error().or_else(|| match &outcome {
+            WorkSidebarOutcome::OpenChat { chat, .. }
+                if !self.workspace.open_chats.contains(chat) =>
+            {
+                Some("Open chat · not available in preview".into())
+            }
+            _ => None,
+        });
+        if let Some(error) = error {
+            self.error = Some(error.clone());
+            if let Some(source) = &self.source {
+                _ = source.owner.update(cx, |owner, cx| {
+                    owner.error = Some(error);
+                    cx.notify();
+                });
+            }
+        } else {
+            match &outcome {
+                WorkSidebarOutcome::Refresh { .. } => self.load(true, cx),
+                WorkSidebarOutcome::Focus { focus, .. } => {
+                    self.focus = focus.clone();
+                    // The shell's focus outcome also invalidates its reducer.
+                    // Complete a new read after that notification has returned.
+                    self.loaded_at = None;
+                }
+                WorkSidebarOutcome::OpenDocument { workspace, path } => {
+                    if let Some(source) = &self.source {
+                        _ = source.owner.update(cx, |owner, cx| {
+                            owner.open_file(crate::data::WorkspaceId(*workspace), path.clone(), cx)
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        cx.emit(outcome);
     }
 
     /// Call after the host reduces Work intents or changes workspace facts.
@@ -203,7 +352,11 @@ impl WorkSidebar {
             }),
         );
         let mut rows = vec![title];
+        if let Some(error) = &self.error {
+            rows.push(Row::text(error));
+        }
         self.repo_rows(pane, &mut rows);
+        self.task_rows(&mut rows);
         let Some(pane) = pane else {
             rows.push(Row::text("Loading…"));
             return rows;
@@ -294,6 +447,7 @@ impl WorkSidebar {
                 }
             }
         }
+        self.document_rows(&state, &mut rows);
         if !summary.also_worked.is_empty() {
             let mut also = Row::text("Also worked here");
             also.heading = true;
@@ -316,7 +470,187 @@ impl WorkSidebar {
         for error in &pane.errors {
             rows.push(Row::text(summary::shorten(error, 200)));
         }
+        self.attention_rows(&mut rows);
         rows
+    }
+
+    fn task_rows(&self, rows: &mut Vec<Row>) {
+        if !self.tasks.is_empty() {
+            let mut header = Row::text("Tasks");
+            header.heading = true;
+            header.badges.push(self.tasks.len().to_string());
+            rows.push(header);
+            for task in crate::tasks::switcher_rows(&self.tasks) {
+                let mut row = Row::text(task.issue.map_or_else(
+                    || task.title.clone(),
+                    |issue| format!("{issue} · {}", task.title),
+                ));
+                row.badges.push(task.state.into());
+                if task.attention {
+                    row.badges.push("!".into());
+                }
+                if task.unread {
+                    row.badges.push("•".into());
+                }
+                row.details.push(task.branch);
+                row.action = Some(Action::Emit(WorkSidebarOutcome::OpenTask {
+                    task: task.task_id,
+                }));
+                rows.push(row);
+            }
+        }
+        if !self.workers.is_empty() {
+            let mut header = Row::text("Workers");
+            header.heading = true;
+            header.badges.push(self.workers.len().to_string());
+            rows.push(header);
+            for worker in &self.workers {
+                use gitterm_core::tasks::{DelegationChild, DelegationStatus};
+                let mut row = Row::text(summary::shorten(&worker.brief, 70));
+                row.badges.push(worker.kind.label().into());
+                row.badges.push(
+                    match &worker.status {
+                        DelegationStatus::Requested => "Queued",
+                        DelegationStatus::Running => "Running",
+                        DelegationStatus::Completed => "Completed",
+                        DelegationStatus::Failed { .. } => "Failed",
+                        DelegationStatus::Interrupted => "Interrupted",
+                        DelegationStatus::Cancelled => "Cancelled",
+                        DelegationStatus::Blocked => "Blocked",
+                    }
+                    .into(),
+                );
+                if let DelegationChild::TaskSession {
+                    task_id,
+                    conversation,
+                    ..
+                } = &worker.child
+                {
+                    row.action = Some(Action::Emit(if let Some(conversation) = conversation {
+                        WorkSidebarOutcome::OpenChat {
+                            workspace: self.workspace.id,
+                            chat: conversation.session_id.clone(),
+                        }
+                    } else {
+                        WorkSidebarOutcome::OpenTask {
+                            task: task_id.clone(),
+                        }
+                    }));
+                }
+                rows.push(row);
+            }
+        }
+    }
+
+    fn document_rows(&self, state: &State, rows: &mut Vec<Row>) {
+        let Some(documents) = state
+            .documents(self.workspace.id)
+            .and_then(|d| d.result.as_ref())
+        else {
+            return;
+        };
+        if documents.documents.is_empty() {
+            return;
+        }
+        let mut header = Row::text("Documents");
+        header.heading = true;
+        header.badges.push(documents.documents.len().to_string());
+        header.fold = Some(Fold::Documents);
+        header.expanded = self.open.contains(&Fold::Documents);
+        header.action = Some(Action::Toggle(Fold::Documents));
+        rows.push(header);
+        if !self.open.contains(&Fold::Documents) {
+            return;
+        }
+        let all = self.open.contains(&Fold::AllDocuments);
+        for doc in documents
+            .documents
+            .iter()
+            .take(if all { usize::MAX } else { 5 })
+        {
+            let newest = doc.newest();
+            let fold = Fold::Document(doc.key.clone());
+            let copies = Fold::Copies(doc.key.clone());
+            let expanded = self.open.contains(&fold);
+            let copies_open = self.open.contains(&copies);
+            let mut row = Row::text(summary::shorten(&doc.title, 60));
+            row.age = Some(summary::age_label(newest.modified));
+            row.fold = Some(fold);
+            row.expanded = expanded;
+            row.action = Some(Action::Emit(WorkSidebarOutcome::OpenDocument {
+                workspace: self.workspace.id,
+                path: newest.path.clone(),
+            }));
+            if doc.copies.len() > 1 && (expanded || copies_open || doc.differ) {
+                row.control(
+                    format!(
+                        "{} copies{}",
+                        doc.copies.len(),
+                        if doc.differ { " differ" } else { "" }
+                    ),
+                    Action::Toggle(copies),
+                );
+            }
+            if expanded {
+                row.details
+                    .push(format!("{} · {}", newest.source.label(), doc.rel));
+            }
+            rows.push(row);
+            if copies_open {
+                for (index, copy) in doc.copies.iter().enumerate() {
+                    let mut row = Row::text(format!(
+                        "{}{} · {}",
+                        if index == 0 { "newest · " } else { "" },
+                        copy.source.label(),
+                        summary::age_label(copy.modified)
+                    ));
+                    row.indent = true;
+                    row.action = Some(Action::Emit(WorkSidebarOutcome::OpenDocument {
+                        workspace: self.workspace.id,
+                        path: copy.path.clone(),
+                    }));
+                    rows.push(row);
+                }
+            }
+        }
+        if documents.documents.len() > 5 {
+            let mut row = Row::text(if all {
+                "▾ show fewer".into()
+            } else {
+                format!("▸ {} more", documents.documents.len() - 5)
+            });
+            row.action = Some(Action::Toggle(Fold::AllDocuments));
+            rows.push(row);
+        }
+        if documents.truncated {
+            rows.push(Row::text(
+                "Stopped reading at the scan's limit; some documents may be missing.",
+            ));
+        }
+    }
+
+    fn attention_rows(&self, rows: &mut Vec<Row>) {
+        let tasks = crate::tasks::attention_tasks(&self.tasks);
+        if tasks.is_empty() {
+            return;
+        }
+        let mut header = Row::text("Needs you");
+        header.heading = true;
+        header.badges.push(tasks.len().to_string());
+        rows.push(header);
+        for task in tasks {
+            let (_, icon, label) = task
+                .attention
+                .reason
+                .map(crate::tasks::attention_presentation)
+                .unwrap_or((3, "✓", "Ready to review"));
+            let mut row = Row::text(format!("{icon} {}", task.title));
+            row.badges.push(label.into());
+            row.action = Some(Action::Emit(WorkSidebarOutcome::OpenTask {
+                task: task.task_id.clone(),
+            }));
+            rows.push(row);
+        }
     }
 
     fn more_row(count: usize, limit: usize, rows: &mut Vec<Row>) {
@@ -680,7 +1014,7 @@ impl WorkSidebar {
                         if matches!(event, InputEvent::PressEnter { .. }) {
                             let value = input.read(cx).value().to_string();
                             if let Some((repo, _)) = this.editing.take() {
-                                cx.emit(Self::run_command_outcome(repo, &value));
+                                this.emit(Self::run_command_outcome(repo, &value), cx);
                             }
                         }
                         cx.notify();
@@ -689,7 +1023,7 @@ impl WorkSidebar {
             input.update(cx, |input, cx| input.focus(window, cx));
             self.editing = Some((dir, input));
         } else if let Some(outcome) = self.activate(action) {
-            cx.emit(outcome);
+            self.emit(outcome, cx);
         }
         cx.notify();
     }
@@ -745,6 +1079,7 @@ impl EventEmitter<WorkSidebarOutcome> for WorkSidebar {}
 
 impl Render for WorkSidebar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.load(false, cx);
         let p = crate::theme::Palette::current(cx);
         let mut body = div()
             .id("work-sidebar")
