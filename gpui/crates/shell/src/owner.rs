@@ -43,6 +43,13 @@ impl WorkspaceOwner {
         store: Option<WorkspaceStore>,
         cx: &mut Context<Self>,
     ) -> Self {
+        if let Some(catalog) = store.as_ref().and_then(|store| store.iced.as_ref()) {
+            cx.set_global(crate::work_sidebar::IcedWorkSource {
+                config: catalog.source.clone(),
+                workspaces: catalog.workspaces.clone(),
+                owner: cx.entity().downgrade(),
+            });
+        }
         let (jobs, mut receiver) = StatusRuntime::new();
         let jobs = Arc::new(jobs);
         let executor = store.as_ref().map(|_| {

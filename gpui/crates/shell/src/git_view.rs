@@ -338,6 +338,7 @@ impl Render for GitView {
             .p_2()
             .child(
                 Button::new("git-back-work")
+                    .debug_selector(|| "git-back-work".into())
                     .ghost()
                     .label("← Work")
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(GitAction::BackToWork))),
