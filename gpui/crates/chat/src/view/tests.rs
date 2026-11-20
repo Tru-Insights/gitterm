@@ -2011,9 +2011,17 @@ fn history_fold_keeps_short_reply_before_later_tools_and_has_no_empty_tail(
         assert!(!reply_view.read(cx).hidden_by_work);
         assert!(reply_view.read(cx).work_summary.is_none());
         let fold = turns::work_folds(&view.model);
-        assert_eq!(fold.len(), 2);
+        assert_eq!(fold.len(), 1);
         assert!(fold.iter().all(|f| f.label == "Worked for 1m 20s"));
         assert!(fold.iter().all(|f| !f.range.contains(&reply)));
+        let runs = tool_runs::group(&view.model.rows, &view.model.completed_turns);
+        assert_eq!(runs.last().unwrap().label, "Ran 1 command");
+        let mid_turn = view.row(runs.last().unwrap().range.start, window, cx);
+        assert!(mid_turn.read(cx).work_summary.is_none());
+        assert_eq!(
+            mid_turn.read(cx).run_summary.as_deref(),
+            Some("Ran 1 command")
+        );
         assert!(view.scroller.read(cx).is_following_tail());
         (
             view.model.rows[reply].id,
@@ -2084,4 +2092,152 @@ fn read_only_history_chips_use_saved_config_and_recorded_labels(cx: &mut TestApp
     cx.simulate_click(bounds.center(), gpui::Modifiers::none());
     draw(cx);
     chat.read_with(cx, |view, _| assert!(view.composer_state.picker.is_none()));
+}
+
+#[gpui::test]
+fn delivery_uses_a_full_width_collapsible_card_and_separate_id(cx: &mut TestAppContext) {
+    let records = vec![Record {
+        at_ms: None,
+        entry: Entry::UserPrompt("GitTerm delivery (not typed by the user):\nWorker worker-7 (Codex · model) reports done: TRU-274\nFull report\nFull record: delegation_get worker-7".into()),
+    }];
+    let (chat, cx) = setup(records, cx);
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        let row = view.row_views[0].as_ref().unwrap().read(cx);
+        assert_eq!(row.row.kind, RowKind::Delegation);
+        assert!(!row.open);
+        assert_eq!(row.row.delivery.as_ref().unwrap().delegation_id, "worker-7");
+        assert!(!row.row.title.contains("Full report"));
+    });
+    let card = cx.debug_bounds("delivery-card-0").unwrap();
+    let footer = cx.debug_bounds("chat-footer").unwrap();
+    assert!(card.size.width > footer.size.width * 0.85);
+    let fold = cx.debug_bounds("row-fold").unwrap();
+    cx.simulate_click(fold.center(), gpui::Modifiers::none());
+    draw(cx);
+    assert!(chat.read_with(cx, |view, cx| {
+        view.row_views[0].as_ref().unwrap().read(cx).open
+    }));
+}
+
+#[gpui::test]
+fn replayed_timed_delivery_turn_shows_worked_for_duration(cx: &mut TestAppContext) {
+    let records = vec![
+        Record {
+            at_ms: None,
+            entry: Entry::UserPrompt(
+                "Worker worker-7 reports done: TRU-274\nFull record: delegation_get worker-7"
+                    .into(),
+            ),
+        },
+        Record {
+            at_ms: None,
+            entry: Entry::TurnTiming {
+                start_ms: Some(1000),
+                end_ms: None,
+                split_ms: None,
+            },
+        },
+        Record {
+            at_ms: None,
+            entry: Entry::Harness(HarnessEvent::TurnStarted {
+                session_id: None,
+                model: None,
+            }),
+        },
+        Record {
+            at_ms: None,
+            entry: Entry::Harness(HarnessEvent::ThinkingDelta("Checking the report".into())),
+        },
+        Record {
+            at_ms: None,
+            entry: Entry::Harness(HarnessEvent::TextDelta("Merged".into())),
+        },
+        Record {
+            at_ms: None,
+            entry: Entry::TurnTiming {
+                start_ms: None,
+                end_ms: Some(146000),
+                split_ms: None,
+            },
+        },
+        Record {
+            at_ms: None,
+            entry: Entry::Harness(HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                usage: serde_json::Value::Null,
+                cost_usd: None,
+                rate_limit: None,
+            }),
+        },
+    ];
+    let records: Vec<Record> =
+        serde_json::from_str(&serde_json::to_string(&records).unwrap()).unwrap();
+    let (chat, cx) = setup(records, cx);
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        let delivery = view.row_views[0].as_ref().unwrap().read(cx);
+        assert!(delivery.work_summary.is_none());
+        assert!(!delivery.hidden_by_work);
+        let work = view.row_views[1].as_ref().unwrap().read(cx);
+        assert_eq!(work.work_summary.as_deref(), Some("Worked for 2m 25s"));
+    });
+}
+
+#[gpui::test]
+fn mid_turn_three_commands_use_run_wording_after_history_completion(cx: &mut TestAppContext) {
+    let mut records = vec![Record {
+        at_ms: None,
+        entry: Entry::Harness(HarnessEvent::TextDelta(
+            "Checking the implementation".into(),
+        )),
+    }];
+    for id in ["one", "two", "three"] {
+        records.extend([
+            Record {
+                at_ms: None,
+                entry: Entry::Harness(HarnessEvent::ItemStarted {
+                    id: id.into(),
+                    kind: ItemKind::ToolCall {
+                        name: "Bash".into(),
+                        input: serde_json::json!({"command":id}),
+                    },
+                }),
+            },
+            Record {
+                at_ms: None,
+                entry: Entry::Harness(HarnessEvent::ItemCompleted {
+                    id: id.into(),
+                    output: "ok".into(),
+                    is_error: false,
+                }),
+            },
+        ]);
+    }
+    records.extend([
+        Record {
+            at_ms: None,
+            entry: Entry::Harness(HarnessEvent::TextDelta(
+                "The implementation is correct".into(),
+            )),
+        },
+        Record {
+            at_ms: None,
+            entry: Entry::Harness(HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                usage: serde_json::Value::Null,
+                cost_usd: None,
+                rate_limit: None,
+            }),
+        },
+    ]);
+    let (chat, cx) = setup(records, cx);
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        let run = view.row_views[1].as_ref().unwrap().read(cx);
+        assert_eq!(run.run_summary.as_deref(), Some("Ran 3 commands"));
+        assert!(run.work_summary.is_none());
+        assert!(view.row_views[2].as_ref().unwrap().read(cx).hidden_by_run);
+        assert!(!view.row_views[4].as_ref().unwrap().read(cx).hidden_by_run);
+    });
 }

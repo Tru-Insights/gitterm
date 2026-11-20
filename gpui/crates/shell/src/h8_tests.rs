@@ -158,7 +158,7 @@ fn fixture(
     let model = workspace_config::load_iced_workspaces_from(&mut store, &source);
     let layout = store.guard.as_ref().unwrap().preview().layout();
     store.chats.push(chat::SavedChat {
-        uid: "parent".into(),
+        uid: "iced-parent-history".into(),
         cwd: work,
         provider: store.guard.as_ref().unwrap().preview().provider(),
         session_id: Some("parent-history".into()),
@@ -319,6 +319,48 @@ fn new_work_shortcuts_follow_chat_recency_on_both_entry_paths(cx: &mut TestAppCo
         key(cx, "escape");
     }
     assert_eq!(snapshot(&fixture.source), fixture.before);
+}
+
+#[gpui::test]
+fn roster_periodic_read_finds_new_workers_and_preserves_local_dismissal(cx: &mut TestAppContext) {
+    let (fixture, shell, cx) = fixture(cx, false);
+    let path = fixture.source.join("tasks.json");
+    let mut document: TaskStoreDocument =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut worker = document.delegations[0].clone();
+    worker.delegation_id = "new-worker".into();
+    document.delegations.push(worker);
+    let task = document
+        .tasks
+        .iter_mut()
+        .find(|task| task.task_id == "open")
+        .unwrap();
+    task.worktree.state = TaskWorktreeState::Ready;
+    task.worktree.path = Some(fixture.root.path().join("worker-worktree"));
+    std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+    let before = snapshot(&fixture.source);
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(15));
+    draw(cx);
+    assert!(cx.debug_bounds("roster-dlg:new-worker").is_some());
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        let facts = shell.roster_facts.as_ref().unwrap();
+        let rows = roster_entries(&facts.tasks, &facts.workers, |worker| {
+            shell.worker_tab(worker, cx)
+        });
+        assert!(
+            rows.iter()
+                .all(|row| Path::new(&row.checkout).file_name().unwrap() == "worker-worktree")
+        );
+    });
+    click(cx, "roster-dismiss-dlg:new-worker");
+    assert!(cx.debug_bounds("roster-dlg:new-worker").is_none());
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(15));
+    draw(cx);
+    assert!(cx.debug_bounds("roster-dlg:new-worker").is_none());
+    assert_eq!(snapshot(&fixture.source), before);
 }
 
 #[gpui::test]
