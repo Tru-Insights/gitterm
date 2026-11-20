@@ -117,6 +117,10 @@ use gitterm_core::chat::{
     types::{CommandCorrelation, DeliveryOutcome},
 };
 use gitterm_core::review::state::{Effect as ReviewEffect, Intent as ReviewIntent};
+use gitterm_core::run::{
+    self, bottom_selection_after_close, new_bottom_terminal_dir, BottomTerminalFact,
+    QuickCommandTarget, RunCommandFact, RunCommandUnavailable, RunTabAction, RunTabFact,
+};
 #[cfg(test)]
 use gitterm_core::workspace::{next_on_bar, persisted_active_index};
 use gitterm_core::workspace::{SelectionCommand, SelectionEvent, SelectionState, WorkspaceFact};
@@ -6341,57 +6345,19 @@ struct RunTab {
     next_url_scan: Instant,
 }
 
-/// What `▶ <command>` does for repo `repo` in a workspace's terminals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RunTabAction {
-    /// Its run tab is alive: show it.
-    Focus(usize),
-    /// Its run tab exited, failed, or runs an older command: run the
-    /// command again in that tab.
-    Restart(usize),
-    /// No run tab yet: open one.
-    Open,
+fn bottom_terminal_fact(bt: &BottomTerminal) -> BottomTerminalFact<'_, RepoId> {
+    BottomTerminalFact {
+        alive: bt.alive,
+        run: bt.run.as_ref().map(|run| RunTabFact {
+            repo: run.repo,
+            command: &run.command,
+            detected_url: run.detected_url.as_deref(),
+        }),
+    }
 }
 
-/// One run tab per repo per workspace: the action never opens a second.
 fn run_tab_action(terminals: &[BottomTerminal], repo: RepoId, command: &str) -> RunTabAction {
-    let Some(idx) = terminals
-        .iter()
-        .position(|bt| bt.run.as_ref().is_some_and(|run| run.repo == repo))
-    else {
-        return RunTabAction::Open;
-    };
-    let bt = &terminals[idx];
-    let same_command = bt.run.as_ref().is_some_and(|run| run.command == command);
-    if bt.alive && same_command {
-        RunTabAction::Focus(idx)
-    } else {
-        RunTabAction::Restart(idx)
-    }
-}
-
-/// Where a new bottom terminal opens: the folder picked in `+ ▾` (a
-/// listed repo), else the workspace's home dir, never a repo's.
-fn new_bottom_terminal_dir(home: &Path, picked: Option<PathBuf>) -> PathBuf {
-    picked.unwrap_or_else(|| home.to_path_buf())
-}
-
-/// The selected bottom terminal after terminal `closed` is removed,
-/// leaving `remaining`: a later selection shifts down; closing the
-/// selected one selects its neighbour (the one before it at the end).
-fn bottom_selection_after_close(
-    selected: Option<usize>,
-    closed: usize,
-    remaining: usize,
-) -> Option<usize> {
-    if remaining == 0 {
-        return None;
-    }
-    match selected? {
-        idx if idx > closed => Some(idx - 1),
-        idx if idx == closed => Some(closed.min(remaining - 1)),
-        idx => Some(idx),
-    }
+    run::run_tab_action(terminals.iter().map(bottom_terminal_fact), repo, command)
 }
 
 /// How often a run tab's output is read for its URL until one is seen.
@@ -15990,31 +15956,40 @@ impl App {
         let Some(ws) = self.active_workspace() else {
             return Task::none();
         };
-        if !ws.repos.contains(&repo_id) {
-            eprintln!("[run] {:?}: no such repo to run", ws.name);
-            return Task::none();
-        }
-        let Some(repo) = self.repo(repo_id) else {
-            return Task::none();
+        let repo = self.repo(repo_id);
+        let command = match run::resolve_run_command(
+            ws.repos.contains(&repo_id),
+            repo.map(|repo| RunCommandFact {
+                is_local: repo.key.is_local(),
+                command: repo.run_command.as_deref(),
+            }),
+        ) {
+            Ok(command) => command.to_owned(),
+            Err(RunCommandUnavailable::NotListed) => {
+                eprintln!("[run] {:?}: no such repo to run", ws.name);
+                return Task::none();
+            }
+            Err(RunCommandUnavailable::MissingRepo) => return Task::none(),
+            Err(RunCommandUnavailable::RemoteRepo) => {
+                eprintln!("[run] {:?}: only this Mac's repos run here", ws.name);
+                return Task::none();
+            }
+            Err(RunCommandUnavailable::MissingCommand) => {
+                eprintln!(
+                    "[run] {:?}: {} has no run command",
+                    ws.name,
+                    repo.expect("resolved repo").dir.display()
+                );
+                return Task::none();
+            }
         };
-        if !repo.key.is_local() {
-            eprintln!("[run] {:?}: only this Mac's repos run here", ws.name);
-            return Task::none();
-        }
-        let Some(command) = repo.run_command.clone() else {
-            eprintln!(
-                "[run] {:?}: {} has no run command",
-                ws.name,
-                repo.dir.display()
-            );
-            return Task::none();
-        };
+        let repo = repo.expect("resolved repo");
         let dir = repo.dir.clone();
         let name = ws.name.clone();
         let action = run_tab_action(&ws.bottom_terminals, repo_id, &command);
         let idx = match action {
             RunTabAction::Focus(idx) => idx,
-            RunTabAction::Restart(_) | RunTabAction::Open => {
+            RunTabAction::Restart(_) | RunTabAction::Spawn => {
                 let mut bt = self.create_bottom_terminal_for(&name, dir, Some(&command));
                 bt.title = Some(command.clone());
                 bt.run = Some(RunTab {
@@ -28375,20 +28350,22 @@ fi
             }
             Event::RunQuickCommand(idx) => {
                 self.quick_commands_visible = false;
-                if let Some(qc) = self.quick_commands.get(idx).cloned() {
-                    let cmd_bytes = format!("{}\n", qc.command).into_bytes();
-                    // The selected plain bottom terminal (not a run tab),
-                    // else a new one in the workspace's home dir.
-                    let has_plain_terminal = self
-                        .active_bottom_terminal()
-                        .is_some_and(|bt| bt.run.is_none());
-                    if !has_plain_terminal {
+                let launch = match run::resolve_quick_command(
+                    &self.quick_commands,
+                    idx,
+                    self.active_bottom_terminal().map(bottom_terminal_fact),
+                    self.active_workspace().map(|ws| ws.dir.as_path()),
+                ) {
+                    Ok(launch) => launch,
+                    Err(_) => return Task::none(),
+                };
+                if let Some(launch) = launch {
+                    if let QuickCommandTarget::Spawn { cwd } = launch.target {
                         let Some(ws) = self.active_workspace() else {
                             return Task::none();
                         };
                         let name = ws.name.clone();
-                        let dir = new_bottom_terminal_dir(&ws.dir, None);
-                        let bt = self.create_bottom_terminal_for(&name, dir, None);
+                        let bt = self.create_bottom_terminal_for(&name, cwd, None);
                         if let Some(ws) = self.active_workspace_mut() {
                             ws.bottom_terminals.push(bt);
                             ws.active_bottom = Some(ws.bottom_terminals.len() - 1);
@@ -28400,7 +28377,7 @@ fi
                     if let Some(term) = self.active_bottom_terminal_mut() {
                         Self::handle_terminal_backend_command(
                             term,
-                            iced_term::backend::Command::Write(cmd_bytes),
+                            iced_term::backend::Command::Write(launch.bytes),
                             "run_quick_command_bottom_terminal",
                             true, // user-initiated, always redraw
                         );
@@ -33593,10 +33570,8 @@ fi
                 return self.run_repo_command(repo_id);
             }
             Event::RunOpenUrl => {
-                let url = self
-                    .active_bottom_terminal()
-                    .and_then(|bt| bt.run.as_ref())
-                    .and_then(|run| run.detected_url.clone());
+                let url = run::run_tab_url(self.active_bottom_terminal().map(bottom_terminal_fact))
+                    .map(str::to_owned);
                 if let Some(url) = url {
                     if let Err(error) = std::process::Command::new("open").arg(&url).spawn() {
                         eprintln!("[run] cannot open {url}: {error}");
@@ -49491,10 +49466,7 @@ fi
         header_row = header_row.push(iced::widget::Space::new().width(Length::Fill));
 
         // The selected run tab's dev-server URL, once its output shows one.
-        if let Some(url) = self
-            .active_bottom_terminal()
-            .and_then(|bt| bt.run.as_ref())
-            .and_then(|run| run.detected_url.as_deref())
+        if let Some(url) = run::run_tab_url(self.active_bottom_terminal().map(bottom_terminal_fact))
         {
             header_row = header_row.push(small_button(
                 format!("\u{1F517} {url}"),
@@ -56491,7 +56463,7 @@ mod tests {
         // No run tab for the repo yet (a plain terminal is not one): open.
         assert_eq!(
             run_tab_action(&terminals, api, "npm run dev"),
-            RunTabAction::Open
+            RunTabAction::Spawn
         );
         terminals.push(test_run_tab(2, api, "npm run dev", true));
         // Its tab is alive: show it, never a second tab.
@@ -56502,7 +56474,7 @@ mod tests {
         // Another repo's command gets its own tab.
         assert_eq!(
             run_tab_action(&terminals, web, "cargo run"),
-            RunTabAction::Open
+            RunTabAction::Spawn
         );
         // The command exited, or was edited since: run it again in that tab.
         terminals[1].alive = false;
