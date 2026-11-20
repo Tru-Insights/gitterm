@@ -38,70 +38,35 @@ pub struct Colors {
 }
 impl Colors {
     pub fn new(dark: bool) -> Self {
-        if dark {
-            Self {
-                dark,
-                base: 0x1e1e2e,
-                crust: 0x11111b,
-                surface0: 0x313244,
-                surface2: 0x585b70,
-                text: 0xcdd6f4,
-                subtext0: 0xa6adc8,
-                muted: 0x9399b2,
-                overlay0: 0x6c7086,
-                peach: 0xfab387,
-                yellow: 0xf9e2af,
-                red: 0xf38ba8,
-                green: 0xa6e3a1,
-                blue: 0x89b4fa,
-            }
-        } else {
-            Self {
-                dark,
-                base: 0xeff1f5,
-                crust: 0xdce0e8,
-                surface0: 0xccd0da,
-                surface2: 0xacb0be,
-                text: 0x4c4f69,
-                subtext0: 0x6c6f85,
-                muted: 0x7c7f93,
-                overlay0: 0x9ca0b0,
-                peach: 0xfe640b,
-                yellow: 0xdf8e1d,
-                red: 0xd20f39,
-                green: 0x40a02b,
-                blue: 0x1e66f5,
-            }
+        let p = crate::theme::Palette::for_mode(dark);
+        Self {
+            dark,
+            base: p.base,
+            crust: p.crust,
+            surface0: p.surface,
+            surface2: p.surface2,
+            text: p.text,
+            subtext0: p.subtext0,
+            muted: p.muted,
+            overlay0: p.overlay0,
+            peach: p.peach,
+            yellow: p.yellow,
+            red: p.red,
+            green: p.green,
+            blue: p.blue,
         }
     }
     pub fn workspace(self, color: WorkspaceColor) -> u32 {
+        let p = crate::theme::Palette::for_mode(self.dark);
         match color {
-            WorkspaceColor::Lavender => {
-                if self.dark {
-                    0xb4befe
-                } else {
-                    0x7287fd
-                }
-            }
-            WorkspaceColor::Blue => self.blue,
-            WorkspaceColor::Green => self.green,
-            WorkspaceColor::Peach => self.peach,
-            WorkspaceColor::Pink => {
-                if self.dark {
-                    0xf5c2e7
-                } else {
-                    0xea76cb
-                }
-            }
-            WorkspaceColor::Yellow => self.yellow,
-            WorkspaceColor::Red => self.red,
-            WorkspaceColor::Teal => {
-                if self.dark {
-                    0x94e2d5
-                } else {
-                    0x179299
-                }
-            }
+            WorkspaceColor::Lavender => p.lavender,
+            WorkspaceColor::Blue => p.blue,
+            WorkspaceColor::Green => p.green,
+            WorkspaceColor::Peach => p.peach,
+            WorkspaceColor::Pink => p.pink,
+            WorkspaceColor::Yellow => p.yellow,
+            WorkspaceColor::Red => p.red,
+            WorkspaceColor::Teal => p.teal,
         }
     }
 }
@@ -296,7 +261,7 @@ pub(crate) fn control<T: Clone + 'static>(
         .id(id.into())
         .role(gpui::Role::Button)
         .aria_label(hint.clone())
-        .font_family("Menlo")
+        .font_family(crate::theme::LABEL_FONT)
         .text_size(px(11.))
         .text_color(rgb(color))
         .px(px(8.))
@@ -306,7 +271,7 @@ pub(crate) fn control<T: Clone + 'static>(
         .hover(move |s| s.bg(rgb(colors.surface0)).text_color(rgb(colors.text)))
         .tooltip(move |window, cx| {
             Tooltip::new(hint.clone())
-                .font_family("Menlo")
+                .font_family(crate::theme::LABEL_FONT)
                 .build(window, cx)
         })
         .on_click(move |_, window, cx| {
@@ -366,7 +331,7 @@ pub fn render(input: &Input, colors: Colors, emit: Handler<Outcome>) -> gpui::St
                     .cursor_pointer()
                     .tooltip(move |window, cx| {
                         Tooltip::new(hint.clone())
-                            .font_family("Menlo")
+                            .font_family(crate::theme::LABEL_FONT)
                             .build(window, cx)
                     })
                     .on_click(move |_, window, cx| {
@@ -596,13 +561,13 @@ pub fn render(input: &Input, colors: Colors, emit: Handler<Outcome>) -> gpui::St
         .id("pstrip-workspace-bar")
         .debug_selector(|| "pstrip-workspace-bar".into())
         .whitespace_nowrap()
-        .line_height(gpui::relative(1.3))
+        .line_height(gpui::relative(crate::theme::LABEL_LINE_HEIGHT))
         .flex()
         .items_center()
         .w_full()
         .h(px(28.))
         .flex_none()
-        .font_family("Menlo")
+        .font_family(crate::theme::LABEL_FONT)
         .text_size(px(11.))
         .bg(rgb(colors.crust))
         .border_t_1()

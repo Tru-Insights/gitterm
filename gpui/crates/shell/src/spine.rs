@@ -193,8 +193,8 @@ fn tooltip(model: &Dot, c: Colors, pulse: bool) -> gpui::Div {
         .flex()
         .flex_col()
         .gap(px(3.))
-        .font_family("Menlo")
-        .line_height(gpui::relative(1.3))
+        .font_family(crate::theme::LABEL_FONT)
+        .line_height(gpui::relative(crate::theme::LABEL_LINE_HEIGHT))
         .text_size(px(11.))
         .text_color(rgb(c.text))
         .child(model.name.clone());
@@ -293,7 +293,7 @@ pub fn render(input: &Input, c: Colors, emit: Handler<Outcome>) -> gpui::Statefu
     if let Some(badge) = &input.usage_badge {
         usage = usage.child(
             div()
-                .font_family("Menlo")
+                .font_family(crate::theme::LABEL_FONT)
                 .text_size(px(9.))
                 .text_color(rgb(badge.color))
                 .child(badge.label.clone()),
@@ -303,7 +303,7 @@ pub fn render(input: &Input, c: Colors, emit: Handler<Outcome>) -> gpui::Statefu
     usage = usage
         .tooltip(move |window, cx| {
             Tooltip::new(hint.clone())
-                .font_family("Menlo")
+                .font_family(crate::theme::LABEL_FONT)
                 .build(window, cx)
         })
         .on_click(move |_, window, cx| emit(Outcome::ToggleUsage, window, cx));
