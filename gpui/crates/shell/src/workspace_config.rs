@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Folders {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    preview_chats: Vec<crate::chat::SavedChat>,
     version: u32,
     folders: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -27,6 +29,7 @@ pub fn local_folder(path: &Path) -> Result<PathBuf> {
 }
 
 pub struct WorkspaceStore {
+    pub(crate) chats: Vec<crate::chat::SavedChat>,
     pub(crate) parked: Vec<crate::park::SavedPark>,
     path: PathBuf,
     refused: bool,
@@ -36,6 +39,7 @@ impl WorkspaceStore {
     #[cfg(test)]
     pub fn new(config: &Path) -> Self {
         Self {
+            chats: vec![],
             parked: vec![],
             path: config.join("local-workspaces.json"),
             refused: false,
@@ -44,6 +48,7 @@ impl WorkspaceStore {
     }
     pub(crate) fn guarded(guard: std::sync::Arc<crate::preview::Writer>) -> Self {
         Self {
+            chats: vec![],
             parked: vec![],
             path: guard.preview().layout().join("local-workspaces.json"),
             refused: false,
@@ -80,6 +85,10 @@ impl WorkspaceStore {
                 );
             }
             crate::park::validate_saved(&stored.parked_workspaces)?;
+            for chat in &stored.preview_chats {
+                chat.validate()?;
+            }
+            self.chats = stored.preview_chats;
             self.parked = stored.parked_workspaces;
             Ok(stored.folders)
         })()
@@ -93,6 +102,7 @@ impl WorkspaceStore {
             "refusing to overwrite invalid local folders file"
         );
         Ok(serde_json::to_vec_pretty(&Folders {
+            preview_chats: self.chats.clone(),
             version: 1,
             folders: folders.to_vec(),
             parked_workspaces: self.parked.clone(),

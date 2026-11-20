@@ -1,7 +1,8 @@
 //! Frontend-independent workspace ordering and Git status transitions.
 //!
 //! The host retains the workspace catalog, selection,
-//! persistence and remote transport. The optional runtime owns status jobs.
+//! and persistence. The optional runtime owns status jobs and remote transport;
+//! hosts supply credential resolution and local path display.
 
 pub mod chat;
 pub mod harness;
@@ -76,3 +77,5 @@ pub mod prs;
 pub mod settings;
 
 pub mod usage;
+
+pub mod remote;

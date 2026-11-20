@@ -3,6 +3,7 @@ extern crate gpui_kit as gpui;
 
 #[cfg(test)]
 mod center_tests;
+mod chat;
 pub mod content;
 #[cfg(test)]
 mod content_shell_tests;
@@ -17,6 +18,7 @@ mod park;
 pub mod preview;
 mod review_reload;
 mod sessions;
+pub mod settings;
 pub mod tasks;
 mod theme;
 pub mod usage;
@@ -64,7 +66,7 @@ struct SelectSession {
 struct SelectWorkspace {
     index: usize,
 }
-actions!(gitterm_shell, [ShowShortcuts, NewTerminal]);
+actions!(gitterm_shell, [ShowShortcuts, NewTerminal, NewClaudeChat]);
 
 struct WorkspaceDock {
     runtime_uid: u64,
@@ -581,6 +583,78 @@ impl Shell {
                 .active_session = Some(id);
             self.show_pane(&session_pane_id(id), window, cx);
         }
+    }
+    fn new_claude_chat(
+        &mut self,
+        history: Option<chat::SavedChat>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.local {
+            return;
+        }
+        let Some(workspace) = self.active_workspace(cx) else {
+            return;
+        };
+        let Some(cwd) = self.data.terminal_cwd(workspace, cx) else {
+            return;
+        };
+        let Some(preview) = self.owner.read(cx).preview() else {
+            return;
+        };
+        let shutdown = self.owner.read(cx).chat_shutdown.clone();
+        let view = cx.new(|cx| match history {
+            Some(saved) => chat::ChatPane::history(shutdown, saved, window, cx),
+            None => chat::ChatPane::new(shutdown, preview, cwd, window, cx),
+        });
+        let target = view.read(cx).target();
+        let owner = self.owner.clone();
+        self._subscriptions.push(
+            cx.subscribe(&view, move |_, _, saved: &chat::SavedChat, cx| {
+                owner.update(cx, |owner, cx| owner.save_chat(saved.clone(), cx));
+            }),
+        );
+        self.owner.update(cx, |owner, _| {
+            owner.chats.insert(target.session_uid.clone(), view.clone());
+        });
+        let mut id = layout::stable_path_hash(Path::new(&target.session_uid));
+        while self
+            .workspaces
+            .iter()
+            .any(|w| w.sessions.iter().any(|s| s.id.0 == id))
+        {
+            id = id.wrapping_add(1);
+        }
+        let pane_id = session_pane_id(SessionId(id));
+        let pane = cx.new(|cx| {
+            Pane::new(
+                pane_id.clone(),
+                "Claude preview".into(),
+                PaneKind::PreviewChat(view),
+                workspace,
+                self.data.clone(),
+                window,
+                cx,
+            )
+        });
+        self._subscriptions
+            .push(sessions::subscribe(&pane, window, cx));
+        self.registry
+            .borrow_mut()
+            .insert(pane_id.clone(), pane.downgrade());
+        let state = self
+            .workspaces
+            .iter_mut()
+            .find(|state| state.workspace.id == workspace)
+            .expect("selected workspace");
+        state.panes.insert(pane_id.clone(), pane);
+        state.sessions.push(Session {
+            id: SessionId(id),
+            title: "Claude preview".into(),
+            kind: data::SessionKind::Chat,
+        });
+        state.active_session = Some(SessionId(id));
+        self.show_pane(&pane_id, window, cx);
     }
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.local || !self.workspaces.iter().any(|state| state.on_bar()) {
@@ -1288,11 +1362,21 @@ impl Render for Shell {
             .map(|(id, pane)| (id.clone(), pane.read(cx).title.clone()))
             .collect();
         panes.sort_by(|a, b| a.0.cmp(&b.0));
+        let chat_owner = weak.clone();
+        let history_owner = weak.clone();
+        let history = self
+            .owner
+            .read(cx)
+            .chat_history(self.data.terminal_cwd(state.workspace.id, cx).as_deref());
+        let local = self.local;
         let more = Button::new("more")
             .ghost()
             .label("⋯")
             .tooltip("More")
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
+                let chat_owner = chat_owner.clone();
+                let history_owner = history_owner.clone();
+                let history = history.clone();
                 let repository = repository.clone();
                 let weak = weak.clone();
                 let panes = panes.clone();
@@ -1302,6 +1386,31 @@ impl Render for Shell {
                 let keep_target = workspace_target.clone();
                 let close_workspace_target = workspace_target.clone();
                 menu.item(
+                    PopupMenuItem::new("New Claude chat")
+                        .disabled(!local)
+                        .on_click(move |_, window, cx| {
+                            _ = chat_owner
+                                .update(cx, |shell, cx| shell.new_claude_chat(None, window, cx));
+                        }),
+                )
+                .submenu("Claude preview history", window, cx, move |menu, _, _| {
+                    history.iter().fold(menu, |menu, saved| {
+                        let owner = history_owner.clone();
+                        let saved = saved.clone();
+                        menu.item(
+                            PopupMenuItem::new(format!(
+                                "Claude · {}",
+                                saved.session_id.as_deref().unwrap_or(&saved.uid)
+                            ))
+                            .on_click(move |_, window, cx| {
+                                _ = owner.update(cx, |shell, cx| {
+                                    shell.new_claude_chat(Some(saved.clone()), window, cx)
+                                });
+                            }),
+                        )
+                    })
+                })
+                .item(
                     PopupMenuItem::new("New task…")
                         .on_click(move |_, w, cx| dialogs::new_task(repository.clone(), w, cx)),
                 )
@@ -1431,6 +1540,9 @@ impl Render for Shell {
                 }),
             )
             .on_action(cx.listener(|this, _: &NewTerminal, w, cx| this.new_terminal(w, cx)))
+            .on_action(
+                cx.listener(|this, _: &NewClaudeChat, w, cx| this.new_claude_chat(None, w, cx)),
+            )
             .on_action(cx.listener(|this, _: &ShowShortcuts, w, cx| {
                 dialogs::shortcuts(w, cx);
                 this.content

@@ -504,7 +504,8 @@ mod tests {
     }
     #[test]
     fn config_is_gpui_specific_and_rejects_v6_and_relative_paths() {
-        let home = tempfile::tempdir().unwrap();
+        // Use the concrete macOS namespace; /var is itself a symlink alias.
+        let home = tempfile::tempdir_in("/private/tmp").unwrap();
         assert_eq!(
             config_dir(None, home.path()).unwrap(),
             home.path()
