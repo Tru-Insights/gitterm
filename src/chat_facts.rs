@@ -2720,7 +2720,7 @@ branch refs/heads/tracey/tru-12-thing
         );
         let mut resolver = GitResolver::with_repos(&[api.clone(), duplicate]);
         assert_eq!(resolver.resolve_selector("acme/api"), None);
-        let mut resolver = GitResolver::with_repos(&[api.clone()]);
+        let mut resolver = GitResolver::with_repos(std::slice::from_ref(&api));
         assert_eq!(resolver.resolve_selector("other.example/acme/api"), None);
         assert_eq!(resolver.resolve_selector("acme/unknown"), None);
         git(
@@ -4070,8 +4070,10 @@ branch refs/heads/tracey/tru-12-thing
             let path = facts_path(&dir, ChatBackend::Claude, "session").unwrap();
             // Existing unconfirmed records must gain provenance too, even
             // when the workspace scan adds no new PRs.
-            let mut known = ChatFacts::default();
-            known.prs = merge_plan::pr_urls_in("https://github.com/acme/api/pull/42");
+            let known = ChatFacts {
+                prs: merge_plan::pr_urls_in("https://github.com/acme/api/pull/42"),
+                ..ChatFacts::default()
+            };
             write_facts(&path, &known).unwrap();
             match mode {
                 "workspace" => {
@@ -4366,8 +4368,10 @@ branch refs/heads/tracey/tru-12-thing
         std::fs::create_dir_all(&subagents).unwrap();
         // A directory in place of a child transcript cannot be read as lines.
         std::fs::create_dir(subagents.join("agent-broken.jsonl")).unwrap();
-        let mut known = ChatFacts::default();
-        known.prs = merge_plan::pr_urls_in("https://github.com/acme/api/pull/42");
+        let known = ChatFacts {
+            prs: merge_plan::pr_urls_in("https://github.com/acme/api/pull/42"),
+            ..ChatFacts::default()
+        };
         let (caught, added) = catch_up_from_transcript(
             Some(known.clone()),
             &temp.path().join("facts.json"),
@@ -4386,8 +4390,10 @@ branch refs/heads/tracey/tru-12-thing
         let mut bytes = pr_result_lines("search", "grep create x.rs", 42).into_bytes();
         bytes.extend_from_slice(b"\n\xff\n");
         std::fs::write(&transcript, bytes).unwrap();
-        let mut known = ChatFacts::default();
-        known.prs = merge_plan::pr_urls_in("https://github.com/acme/api/pull/42");
+        let known = ChatFacts {
+            prs: merge_plan::pr_urls_in("https://github.com/acme/api/pull/42"),
+            ..ChatFacts::default()
+        };
         let (caught, added) = catch_up_from_transcript(
             Some(known.clone()),
             &temp.path().join("facts.json"),
@@ -4412,8 +4418,10 @@ branch refs/heads/tracey/tru-12-thing
             ),
         )
         .unwrap();
-        let mut known = ChatFacts::default();
-        known.prs = merge_plan::pr_urls_in("https://github.com/acme/api/pull/42");
+        let known = ChatFacts {
+            prs: merge_plan::pr_urls_in("https://github.com/acme/api/pull/42"),
+            ..ChatFacts::default()
+        };
         let (caught, added) = catch_up_from_transcript(
             Some(known.clone()),
             &temp.path().join("facts.json"),
@@ -4449,8 +4457,10 @@ branch refs/heads/tracey/tru-12-thing
             bytes.extend_from_slice(pr_result_lines("create", "gh pr create", 43).as_bytes());
             std::fs::write(children.join("agent-partial.jsonl"), bytes).unwrap();
             let scan = scan_claude_transcript(&transcript, None).unwrap();
-            let mut known = ChatFacts::default();
-            known.prs = merge_plan::pr_urls_in("https://github.com/acme/api/pull/42");
+            let mut known = ChatFacts {
+                prs: merge_plan::pr_urls_in("https://github.com/acme/api/pull/42"),
+                ..ChatFacts::default()
+            };
             let added = scan.reconcile_prs(&mut known);
             assert_eq!(
                 known.prs.iter().map(|pr| pr.number).collect::<Vec<_>>(),

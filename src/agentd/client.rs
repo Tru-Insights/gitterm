@@ -244,6 +244,7 @@ mod wire {
 mod remote_fixture;
 
 #[cfg(test)]
+#[allow(clippy::result_large_err)] // Tonic interceptors return `Status` directly in test services.
 mod tests {
     use super::*;
     use std::sync::Arc;

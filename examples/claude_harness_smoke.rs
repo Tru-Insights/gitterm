@@ -768,7 +768,7 @@ fn solid_png(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
     // Raw scanlines: filter byte 0 then the pixels.
     let mut raw = Vec::new();
     for _ in 0..height {
-        raw.push(0);
+        raw.extend_from_slice(&[0]);
         for _ in 0..width {
             raw.extend_from_slice(&rgb);
         }

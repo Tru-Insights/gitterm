@@ -1695,5 +1695,6 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::duplicate_mod)] // Shared characterization sources are loaded by multiple focused test modules.
 #[path = "../../tests/native-chat/native_chat_phone.rs"]
 mod native_chat_tests;

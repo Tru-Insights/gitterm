@@ -1142,7 +1142,7 @@ mod index {
             })
             .to_string();
             let real = user_line("/tmp/x", "main", "message after large tool output");
-            let mut transcript = vec![
+            let mut transcript = [
                 r#"{"type":"system","cwd":"/tmp/x","gitBranch":"main"}"#.to_string(),
                 large_result.clone(),
                 large_result.clone(),
