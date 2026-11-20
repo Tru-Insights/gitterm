@@ -1581,20 +1581,18 @@ fn host_width_changes_native_column_and_footer_together(cx: &mut TestAppContext)
     let (chat, cx) = setup(vec![], cx);
     cx.simulate_resize(size(px(1600.), px(900.)));
     for (width, expected) in [
-        (ChatWidth::Narrow, 764.),
-        (ChatWidth::Medium, 988.),
-        (ChatWidth::Wide, 1180.),
-        (ChatWidth::Full, 1600.),
+        (ChatWidth::Narrow, 672.),
+        (ChatWidth::Medium, 868.),
+        (ChatWidth::Wide, 1036.),
+        (ChatWidth::Full, 1580.),
     ] {
         chat.update(cx, |view, cx| view.set_width(width, cx));
         draw(cx);
         let bounds = cx.debug_bounds("native-chat").unwrap();
-        assert_eq!(bounds.size.width, px(expected));
-        assert_eq!(bounds.origin.x, px((1600. - expected) / 2.));
-        assert_eq!(
-            cx.debug_bounds("chat-footer").unwrap().size.width,
-            px(expected - 20.)
-        );
+        assert_eq!(bounds.size.width, px(1600.));
+        let footer = cx.debug_bounds("chat-footer").unwrap();
+        assert_eq!(footer.size.width, px(expected));
+        assert_eq!(footer.origin.x, px((1600. - expected) / 2.));
     }
 }
 
@@ -1801,5 +1799,128 @@ fn review_submit_emits_typed_outcome_without_sending_chat_or_clearing_draft(
         assert_eq!(view.review.draft.note, "Check\n\nerrors");
         assert_eq!(view.composer.read(cx).value(), "chat draft");
         assert!(view.records.is_empty());
+    });
+}
+
+#[gpui::test]
+fn iced_transcript_has_one_expandable_run_no_message_chrome_and_a_table(cx: &mut TestAppContext) {
+    let records = parse_fixture(r#"{"type":"user_prompt","data":"Check these commands"}
+{"type":"text_delta","data":"| Name | Result |\n| --- | --- |\n| alpha | ok |\n"}
+{"type":"item_started","data":{"id":"a","kind":{"type":"tool_call","name":"Bash","input":{"command":"one"}}}}
+{"type":"item_completed","data":{"id":"a","output":"null","is_error":false}}
+{"type":"item_started","data":{"id":"b","kind":{"type":"tool_call","name":"Bash","input":{"command":"two"}}}}
+{"type":"item_started","data":{"id":"c","kind":{"type":"tool_call","name":"Bash","input":{"command":"three"}}}}"#).unwrap();
+    let (chat, cx) = setup(records, cx);
+    cx.simulate_resize(size(px(1200.), px(900.)));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("chat-markdown-table").is_some(),
+        "GFM table renderer ran"
+    );
+    for selector in ["copy-reply-markdown", "copy-reply-text", "composer-attach"] {
+        assert!(cx.debug_bounds(selector).is_none(), "unexpected {selector}");
+    }
+    let (first, second, third) = chat.read_with(cx, |view, cx| {
+        assert_eq!(view.model.rows[1].title, "");
+        let first = view.row_views[2].as_ref().unwrap().read(cx);
+        assert_eq!(
+            first.run_summary.as_deref(),
+            Some("Ran 3 commands · now: three")
+        );
+        assert!(!first.run_open);
+        assert!(!first.row.body.contains("null"));
+        for index in [3, 4] {
+            let row = view.row_views[index].as_ref().unwrap().read(cx);
+            assert!(row.hidden_by_run);
+            assert!(row.run_summary.is_none());
+        }
+        (
+            view.model.rows[2].id,
+            view.model.rows[3].id,
+            view.model.rows[4].id,
+        )
+    });
+    let summary = Box::leak(format!("tool-run-{first}").into_boxed_str());
+    let bounds = cx.debug_bounds(summary).unwrap();
+    cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        assert!(view.row_views[2].as_ref().unwrap().read(cx).run_open);
+        assert!(!view.row_views[3].as_ref().unwrap().read(cx).hidden_by_run);
+    });
+    for id in [second, third] {
+        let selector = Box::leak(format!("transcript-row-{id}").into_boxed_str());
+        assert!(cx.debug_bounds(selector).is_some());
+    }
+    let bubble = cx.debug_bounds("transcript-row-0").unwrap();
+    let footer = cx.debug_bounds("chat-footer").unwrap();
+    assert!(bubble.size.width < footer.size.width * 0.85);
+    // Messages line up 14px inside the footer's centred outer width.
+    assert!((bubble.right() - (footer.right() - px(14.))).abs() < px(2.));
+}
+
+#[gpui::test]
+fn run_summary_updates_when_later_tools_finish_or_fail(cx: &mut TestAppContext) {
+    let records = parse_fixture(r#"{"type":"item_started","data":{"id":"a","kind":{"type":"tool_call","name":"Bash","input":{"command":"one"}}}}
+{"type":"item_started","data":{"id":"b","kind":{"type":"tool_call","name":"Bash","input":{"command":"two"}}}}"#).unwrap();
+    let (chat, cx) = setup(records, cx);
+    draw(cx);
+    chat.update(cx, |view, cx| {
+        view.append_event(
+            HarnessEvent::ItemCompleted {
+                id: "a".into(),
+                output: "".into(),
+                is_error: false,
+            },
+            cx,
+        );
+        view.append_event(
+            HarnessEvent::ItemCompleted {
+                id: "b".into(),
+                output: "failed".into(),
+                is_error: true,
+            },
+            cx,
+        );
+    });
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        let first = view.row_views[0].as_ref().unwrap().read(cx);
+        assert_eq!(first.run_summary.as_deref(), Some("Ran 1 command"));
+        let failed = view.row_views[1].as_ref().unwrap().read(cx);
+        assert!(!failed.hidden_by_run);
+        assert!(failed.run_summary.is_none());
+    });
+}
+
+#[gpui::test]
+fn finished_work_uses_iced_fold_and_keeps_final_answer_visible(cx: &mut TestAppContext) {
+    let records = parse_fixture(r#"{"at_ms":0,"entry":{"type":"user_prompt","data":"Check"}}
+{"at_ms":100,"entry":{"type":"harness","data":{"type":"turn_started","data":{"session_id":null,"model":null}}}}
+{"at_ms":200,"entry":{"type":"harness","data":{"type":"thinking_delta","data":"**literal thought**"}}}
+{"at_ms":300,"entry":{"type":"harness","data":{"type":"item_started","data":{"id":"a","kind":{"type":"tool_call","name":"Bash","input":{"command":"check"}}}}}}
+{"at_ms":400,"entry":{"type":"harness","data":{"type":"item_completed","data":{"id":"a","output":"ok","is_error":false}}}}
+{"at_ms":500,"entry":{"type":"harness","data":{"type":"text_delta","data":"Final answer stays visible"}}}
+{"at_ms":1400,"entry":{"type":"harness","data":{"type":"turn_completed","data":{"status":{"state":"completed"},"usage":null,"cost_usd":null}}}}"#).unwrap();
+    let (chat, cx) = setup(records, cx);
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        assert_eq!(view.model.rows.len(), 4, "no synthetic footer");
+        let thinking = view.row_views[1].as_ref().unwrap().read(cx);
+        assert_eq!(thinking.work_summary.as_deref(), Some("Worked for 1.3s"));
+        assert!(!thinking.work_open);
+        assert_eq!(
+            plain_markdown(&thinking.row.body).trim(),
+            "**literal thought**"
+        );
+        assert!(view.row_views[2].as_ref().unwrap().read(cx).hidden_by_work);
+        assert!(!view.row_views[3].as_ref().unwrap().read(cx).hidden_by_work);
+    });
+    let fold = cx.debug_bounds("work-fold-1").unwrap();
+    cx.simulate_click(fold.center(), gpui::Modifiers::none());
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        assert!(view.row_views[1].as_ref().unwrap().read(cx).work_open);
+        assert!(!view.row_views[2].as_ref().unwrap().read(cx).hidden_by_work);
     });
 }

@@ -425,31 +425,6 @@ impl ChatView {
             cx.notify();
         }
     }
-    pub(crate) fn pick_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only_reason.is_some() || self.callback.is_none() {
-            return;
-        }
-        let response = cx.prompt_for_paths(gpui::PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: true,
-            prompt: Some("Attach images".into()),
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let response = response.await;
-            _ = this.update_in(cx, |this, window, cx| {
-                match response {
-                    Ok(Ok(Some(paths))) => this.attach_paths(paths, cx),
-                    Ok(Ok(None)) => {}
-                    Ok(Err(error)) => this.set_status_error(format!("Choose images: {error}"), cx),
-                    Err(error) => this.set_status_error(format!("Choose images: {error}"), cx),
-                }
-                this.composer
-                    .update(cx, |input, cx| input.focus(window, cx));
-            });
-        })
-        .detach();
-    }
 }
 
 #[cfg(test)]

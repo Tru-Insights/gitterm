@@ -349,14 +349,15 @@ fn retained_preview_history_changes_width_without_rebuilding(cx: &mut TestAppCon
         },
         cx,
     );
-    assert_eq!(cx.debug_bounds("native-chat").unwrap().size.width, px(764.));
+    // Iced's narrow column is 46rem at 14px (644px); the footer adds 28px.
+    assert_eq!(cx.debug_bounds("chat-footer").unwrap().size.width, px(672.));
     dispatch(
         SetChatWidth {
             width: gitterm_core::settings::ChatWidth::Full,
         },
         cx,
     );
-    assert!(cx.debug_bounds("native-chat").unwrap().size.width > px(764.));
+    assert!(cx.debug_bounds("chat-footer").unwrap().size.width > px(672.));
     cx.read(|cx| {
         let state = shell.read(cx).active(cx);
         let pane = &state.panes[&session_pane_id(state.active_session.unwrap())];
