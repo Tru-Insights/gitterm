@@ -525,16 +525,16 @@ pub(crate) async fn run_correlated_session_program<C: Into<RuntimeCommand>>(
         temporary_dir,
         mut snapshots,
     } = launch;
-    let mut fail = |msg: String| {
+    let mut fail = async |msg: String| {
         harness_log(&msg);
         events.emit(HarnessEvent::Error(msg));
-        reject_queued(&mut commands, &events);
+        reject_queued(&mut commands, &events).await;
         events.emit(HarnessEvent::ProcessExited { code: None });
     };
     let remote_guidelines = match config.guidelines_content.as_deref() {
         Some(text) => match RemoteGuidelinesFile::create(&temporary_dir, text) {
             Ok(file) => Some(file),
-            Err(error) => return fail(error),
+            Err(error) => return fail(error).await,
         },
         None => None,
     };
@@ -552,6 +552,7 @@ pub(crate) async fn run_correlated_session_program<C: Into<RuntimeCommand>>(
                     "cannot read chat instructions {}: {error}",
                     path.display()
                 ))
+                .await
             }
         },
         None => None,
@@ -587,13 +588,14 @@ pub(crate) async fn run_correlated_session_program<C: Into<RuntimeCommand>>(
                 program.display(),
                 config.cwd.display()
             ))
+            .await
         }
     };
     let pid = child.id().unwrap_or(0);
     let (Some(stdout), Some(stderr), Some(stdin)) =
         (child.stdout.take(), child.stderr.take(), child.stdin.take())
     else {
-        return fail("claude child is missing a stdio pipe".to_string());
+        return fail("claude child is missing a stdio pipe".to_string()).await;
     };
     process_id.store(pid, std::sync::atomic::Ordering::Relaxed);
     let wire = config
@@ -952,7 +954,7 @@ pub(crate) async fn run_correlated_session_program<C: Into<RuntimeCommand>>(
         }
     }
 
-    reject_queued(&mut commands, &io.events);
+    reject_queued(&mut commands, &io.events).await;
     let code = match child.wait().await {
         Ok(status) => status.code(),
         Err(e) => {

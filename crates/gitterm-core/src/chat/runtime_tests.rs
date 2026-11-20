@@ -4,6 +4,7 @@ use crate::harness::claude::{ClaudeSessionConfig, SnapshotFuture, SnapshotRecord
 use crate::turn_snapshots::{Recorder, SnapshotRoots};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -921,4 +922,55 @@ fn correlated_commands_cannot_enter_a_harness_only_port() {
     assert!(rx.try_recv().is_err());
     session.send(HarnessCommand::Interrupt).unwrap();
     assert_eq!(rx.try_recv().unwrap(), HarnessCommand::Interrupt);
+}
+
+#[tokio::test]
+async fn closed_queue_waits_for_reserved_command_and_rejects_it_once() {
+    // Unbounded send reserves internally; a bounded permit exposes the same
+    // in-flight state deterministically without a scheduler-dependent race.
+    let (commands, mut queue) = mpsc::channel(2);
+    commands
+        .send(RuntimeCommand {
+            command: HarnessCommand::Interrupt,
+            correlation: Some(CommandCorrelation(1)),
+        })
+        .await
+        .unwrap();
+    let permit = commands.reserve().await.unwrap();
+    queue.close();
+    let (tx, mut events) = mpsc::unbounded_channel();
+    let sink = EventSink::Runtime(tx);
+    let drain = reject_closed_queue(|cx| queue.poll_recv(cx), &sink);
+    tokio::pin!(drain);
+    // The first command is drained, but the reserved second send still owns
+    // acceptance. Completion here would silently lose its outcome.
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(drain.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    permit.send(RuntimeCommand {
+        command: HarnessCommand::Interrupt,
+        correlation: Some(CommandCorrelation(2)),
+    });
+    tokio::time::timeout(Duration::from_secs(1), drain)
+        .await
+        .unwrap();
+    for id in [1, 2] {
+        assert!(matches!(
+            receipt(&mut events, id).await,
+            DeliveryOutcome::Rejected(_)
+        ));
+    }
+    assert!(
+        events.try_recv().is_err(),
+        "each command gets exactly one outcome"
+    );
+    assert!(commands
+        .send(RuntimeCommand {
+            command: HarnessCommand::Interrupt,
+            correlation: Some(CommandCorrelation(3)),
+        })
+        .await
+        .is_err());
 }

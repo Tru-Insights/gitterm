@@ -139,7 +139,10 @@ impl Session {
                         events.emit(HarnessEvent::Error(format!(
                             "could not start the Claude session runtime: {e}"
                         )));
-                        reject_queued(&mut cmd_rx, &events);
+                        cmd_rx.close();
+                        while let Some(command) = cmd_rx.blocking_recv() {
+                            reject_command(command, &events);
+                        }
                         events.emit(HarnessEvent::ProcessExited { code: None });
                         return;
                     }
@@ -159,7 +162,7 @@ impl Session {
                         Err(msg) => {
                             eprintln!("[claude-harness] {msg}");
                             events.emit(HarnessEvent::Error(msg));
-                            reject_queued(&mut cmd_rx, &events);
+                            reject_queued(&mut cmd_rx, &events).await;
                             events.emit(HarnessEvent::ProcessExited { code: None });
                         }
                     }
@@ -275,17 +278,28 @@ impl Drop for Session {
 mod tests;
 
 /// Closing first makes every accepted but unexecuted command definitively rejected.
-pub(crate) fn reject_queued<C: Into<RuntimeCommand>>(
+pub(crate) async fn reject_queued<C: Into<RuntimeCommand>>(
     commands: &mut mpsc::UnboundedReceiver<C>,
     events: &EventSink,
 ) {
     commands.close();
-    while let Ok(command) = commands.try_recv() {
-        events.outcome(
-            command.into().correlation,
-            DeliveryOutcome::Rejected(
-                "the Claude session exited before executing the command".into(),
-            ),
-        );
+    reject_closed_queue(|cx| commands.poll_recv(cx), events).await;
+}
+
+async fn reject_closed_queue<C: Into<RuntimeCommand>>(
+    mut poll_recv: impl FnMut(&mut std::task::Context<'_>) -> std::task::Poll<Option<C>>,
+    events: &EventSink,
+) {
+    // A send can reserve acceptance before close and publish afterward. Only
+    // Ready(None), not a temporarily empty queue, proves all sends are drained.
+    while let Some(command) = std::future::poll_fn(&mut poll_recv).await {
+        reject_command(command, events);
     }
+}
+
+fn reject_command(command: impl Into<RuntimeCommand>, events: &EventSink) {
+    events.outcome(
+        command.into().correlation,
+        DeliveryOutcome::Rejected("the Claude session exited before executing the command".into()),
+    );
 }
