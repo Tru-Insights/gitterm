@@ -168,7 +168,15 @@ GUI, production-state inspection, push or merge is part of worker verification.
 
 R2 approach consultation `a5f8b0f9-f9d3-4427-a96e-713678343768` timed out without
 findings; coordinator explicitly waived a rerun and resolved scope/account
-choices. R2 code review is required on the finished commit. Prior C8-confine
+choices. R2 code review `3991a38c-e37c-4d36-aa7c-d89276abddf3`
+(`gpt-6-astra`, high) confirmed this task worktree, clean commit `1309d39`,
+and the full diff against `767df25`. Verdict: correct, no findings or concrete
+blockers in the gates, lease lifecycle, outcome ordering or public-data handling.
+The reviewer inspected verification logs without rerunning tests. No review
+fixes were requested; schema verification and the live confinement trial remain
+coordinator prerequisites. GitTerm refused the explicit checkout argument; the
+request without checkout ran in the correct cwd/head as confirmed by
+`delegation_get`. Prior C8-confine
 review `9f3fe814-9fae-4fa2-92fc-7a9f8bab6ac2` closed its four probe corrections;
 it did not approve this new activation gate.
 
