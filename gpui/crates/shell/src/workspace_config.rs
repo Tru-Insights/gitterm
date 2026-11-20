@@ -272,15 +272,44 @@ pub(crate) fn iced_layout_key(w: &gitterm_core::workspace_config::WorkspaceConfi
     crate::layout::workspace_layout_key(Path::new(&identity))
 }
 
+fn iced_config_dir() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    gitterm_core::config_paths::iced_config_dir(
+        std::env::var_os(gitterm_core::config_paths::CONFIG_DIR_ENV),
+        &home,
+    )
+}
+
+// Keep host-owned usage data opaque while parsing the shared settings schema.
+pub(crate) type IcedSettings = gitterm_core::settings::Settings<
+    gitterm_core::settings::WorkspaceColor,
+    serde_json::Value,
+    PathBuf,
+>;
+
+pub(crate) fn load_iced_settings() -> IcedSettings {
+    load_iced_settings_from(&iced_config_dir())
+}
+
+/// Read authority only: no migration, directory creation, lease or write-back.
+pub(crate) fn load_iced_settings_from(config: &Path) -> IcedSettings {
+    let path = config.join("settings.json");
+    let result = (|| -> Result<IcedSettings> {
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("read Iced settings {}", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse Iced settings {}", path.display()))
+    })();
+    result.unwrap_or_else(|error| {
+        eprintln!("{error:#}; using Iced defaults");
+        IcedSettings::default()
+    })
+}
+
 pub(crate) fn load_iced_workspaces(
     store: &mut WorkspaceStore,
 ) -> crate::workspace_status::WorkspaceStatus {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let config = gitterm_core::config_paths::iced_config_dir(
-        std::env::var_os(gitterm_core::config_paths::CONFIG_DIR_ENV),
-        &home,
-    );
-    load_iced_workspaces_from(store, &config)
+    load_iced_workspaces_from(store, &iced_config_dir())
 }
 pub(crate) fn load_iced_workspaces_from(
     store: &mut WorkspaceStore,
@@ -304,6 +333,65 @@ pub(crate) fn load_iced_workspaces_from(
 mod iced_tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn settings_missing_or_invalid_use_iced_defaults_without_writing() {
+        let fixture = tempfile::tempdir().unwrap();
+        let missing = fixture.path().join("absent");
+        let expected = serde_json::to_value(IcedSettings::default()).unwrap();
+        assert_eq!(
+            serde_json::to_value(load_iced_settings_from(&missing)).unwrap(),
+            expected
+        );
+        assert!(!missing.exists());
+        for invalid in [b"{".as_slice(), br#"{"ui_font_size":"invalid"}"#] {
+            let path = fixture.path().join("settings.json");
+            std::fs::write(&path, invalid).unwrap();
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            assert_eq!(
+                serde_json::to_value(load_iced_settings_from(fixture.path())).unwrap(),
+                expected
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), invalid);
+            assert_eq!(
+                std::fs::metadata(path).unwrap().modified().unwrap(),
+                modified
+            );
+        }
+    }
+
+    #[test]
+    fn settings_load_preserves_source_bytes_entries_and_mtimes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("settings.json");
+        let bytes = br#"{ "theme": "light", "ui_font_size": 17, "terminal_font_size": 19,
+            "usage": {"pricing": {"fixture": null}}, "future": true }"#;
+        std::fs::write(&path, bytes).unwrap();
+        let sentinel = fixture.path().join("sentinel");
+        std::fs::write(&sentinel, b"unchanged").unwrap();
+        let modified = |path: &Path| std::fs::metadata(path).unwrap().modified().unwrap();
+        let before = (
+            modified(fixture.path()),
+            modified(&path),
+            modified(&sentinel),
+        );
+        let settings = load_iced_settings_from(fixture.path());
+        assert_eq!(settings.theme, "light");
+        assert_eq!(settings.ui_font_size, 17.);
+        assert_eq!(settings.terminal_font_size, 19.);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+        assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 2);
+        assert_eq!(
+            (
+                modified(fixture.path()),
+                modified(&path),
+                modified(&sentinel)
+            ),
+            before
+        );
+    }
+
     fn fixture(iced: &Path) {
         std::fs::create_dir_all(iced).unwrap();
         std::fs::write(iced.join("sentinel"), b"keep exact bytes").unwrap();

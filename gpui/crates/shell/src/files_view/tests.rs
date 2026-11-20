@@ -160,3 +160,65 @@ fn sample_tree_has_nested_items_and_initial_src_expansion() {
     assert!(items[0].is_expanded());
     assert_eq!(items[0].children[0].label, "main.rs");
 }
+
+#[test]
+fn work_folders_keep_iced_repo_then_docs_order_without_duplicates() {
+    let root = tempfile::tempdir().unwrap();
+    let docs = root.path().join("docs");
+    fs::create_dir(&docs).unwrap();
+    let first = root.path().join("first");
+    let second = root.path().join("second");
+    let repos = vec![
+        first.display().to_string(),
+        second.display().to_string(),
+        first.display().to_string(),
+    ];
+    assert_eq!(
+        super::work_roots(&repos, docs.clone()),
+        vec![first.clone(), second.clone(), docs.clone()]
+    );
+    let mut repos = repos;
+    repos.push(docs.display().to_string());
+    assert_eq!(
+        super::work_roots(&repos, docs.clone()),
+        vec![first.clone(), second.clone(), docs]
+    );
+    assert_eq!(
+        super::work_roots(&repos[..2], root.path().join("missing")),
+        vec![first, second]
+    );
+}
+
+#[gpui::test]
+fn selecting_work_root_loads_its_tree_and_retains_it_after_workspace_refresh(
+    cx: &mut TestAppContext,
+) {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    fs::write(home.path().join("home.txt"), "home").unwrap();
+    fs::write(repo.path().join("repo.txt"), "repo").unwrap();
+    let (view, owner, cx) = setup(cx, home.path(), config.path());
+    wait_for(&view, "home.txt", cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.roots = Some(vec![repo.path().to_owned()]);
+            view.browse_root(repo.path().to_owned(), cx);
+        })
+    });
+    wait_for(&view, "repo.txt", cx);
+    owner.update(cx, |owner, cx| {
+        owner.dispatch(
+            Intent::Activate(crate::data::WorkspaceId(1)),
+            Instant::now(),
+            cx,
+        );
+    });
+    wait_for(&view, "repo.txt", cx);
+    cx.read(|cx| {
+        assert_eq!(
+            owner.read(cx).files[&crate::data::WorkspaceId(1)].root,
+            repo.path()
+        );
+    });
+}

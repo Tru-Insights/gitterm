@@ -75,7 +75,7 @@ impl FindOutcome {
 
 /// In display order: local machine, then configured remotes (including offline
 /// ones). The active machine is `State::filter().machine`, not a second filter.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MachineFacts {
     pub id: Machine,
     pub name: String,
@@ -84,7 +84,7 @@ pub struct MachineFacts {
     pub claude_chat: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenSession {
     pub id: ChatRef,
     pub title: String,
@@ -95,7 +95,7 @@ pub struct OpenSession {
     pub selected: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FindFacts {
     pub machines: Vec<MachineFacts>,
     /// Iced's open-tab order: needs-you, working, idle. Independent of filters.
@@ -678,6 +678,7 @@ impl Render for FindSidebar {
         }
         div()
             .id("find-sidebar")
+            .debug_selector(|| "find-sidebar".into())
             .size_full()
             .flex()
             .flex_col()
@@ -967,5 +968,389 @@ impl Render for FindPreview {
             }
         }
         pane.child(body)
+    }
+}
+
+/// Retained per tab, including subscriptions while another tab is selected.
+pub(crate) struct FindViews {
+    pub(crate) sidebar: Entity<FindSidebar>,
+    preview: Entity<FindPreview>,
+    _subscriptions: [Subscription; 2],
+}
+
+impl crate::Shell {
+    fn find_owner_for(
+        &self,
+        workspace: &crate::WorkspaceDock,
+        session: Option<crate::data::SessionId>,
+        cx: &gpui::App,
+    ) -> String {
+        if let Some(session) = session
+            && let Some(pane) = workspace.panes.get(&crate::session_pane_id(session))
+        {
+            if let Some(target) = &pane.read(cx).session {
+                return target.session_uid.clone();
+            }
+            if let Some(saved) = self.owner.read(cx).iced_workspace(workspace.workspace.id)
+                && let Some(index) = crate::data::iced_sessions(saved)
+                    .iter()
+                    .position(|s| s.id == session)
+                && let Some(uid) = saved
+                    .tabs
+                    .get(index)
+                    .and_then(|tab| tab.session_uid.as_ref())
+            {
+                return uid.clone();
+            }
+            // Legacy imported tabs have no UID or runtime target. Their retained
+            // entity identity is stable for this tab's lifetime, never its index.
+            return format!("gpui-find-tab-{}", pane.entity_id());
+        }
+        format!("gpui-find-workspace-{}", workspace.runtime_uid)
+    }
+
+    pub(crate) fn find_owner(&self, cx: &gpui::App) -> String {
+        let workspace = self.active(cx);
+        self.find_owner_for(workspace, workspace.active_session, cx)
+    }
+
+    fn find_conversation(
+        &self,
+        workspace: &crate::WorkspaceDock,
+        session: &crate::data::Session,
+        cx: &gpui::App,
+    ) -> Option<ChatRef> {
+        // Remote workspaces are intentionally absent from this local-only host.
+        let cwd = self.data.terminal_cwd(workspace.workspace.id, cx)?;
+        if let Some(saved) = self.owner.read(cx).iced_workspace(workspace.workspace.id)
+            && let Some(index) = crate::data::iced_sessions(saved)
+                .iter()
+                .position(|s| s.id == session.id)
+            && let Some(id) = saved
+                .tabs
+                .get(index)
+                .and_then(|t| t.chat_session_id.as_deref())
+        {
+            return Some(ChatRef::new(None, id));
+        }
+        let pane = workspace
+            .panes
+            .get(&crate::session_pane_id(session.id))?
+            .read(cx);
+        let crate::pane::PaneContent::PreviewChat(view) = &pane.content else {
+            return None;
+        };
+        self.owner
+            .read(cx)
+            .chat_history(Some(&cwd))
+            .iter()
+            .find_map(|saved| {
+                let id = saved.session_id.as_deref().unwrap_or(&saved.uid);
+                view.read(cx)
+                    .matches_chat(id)
+                    .then(|| ChatRef::new(None, id))
+            })
+    }
+
+    fn find_facts(&self, cx: &gpui::App) -> FindFacts {
+        let mut sessions = vec![];
+        for workspace in &self.workspaces {
+            for session in &workspace.sessions {
+                let Some(id) = self.find_conversation(workspace, session, cx) else {
+                    continue;
+                };
+                let Some(pane) = workspace.panes.get(&crate::session_pane_id(session.id)) else {
+                    continue;
+                };
+                let pane = pane.read(cx);
+                let title = pane.tab_title();
+                // shortcut: native request priority/wait facts are private to
+                // ChatPane; use exposed title/streaming facts until shared
+                // attention accessors are available to this host.
+                let needs_you = title.starts_with('✳');
+                let working = match &pane.content {
+                    crate::pane::PaneContent::PreviewChat(view) => view.read(cx).is_working(),
+                    _ => title.trim_start().chars().next().is_some_and(|ch| {
+                        matches!(ch, '◐' | '◑' | '◒' | '◓' | '✢' | '✶' | '✻' | '✽' | '·')
+                            || ('\u{2800}'..='\u{28ff}').contains(&ch)
+                    }),
+                };
+                sessions.push((
+                    if needs_you {
+                        0
+                    } else if working {
+                        1
+                    } else {
+                        2
+                    },
+                    OpenSession {
+                        id,
+                        title,
+                        workspace: workspace.workspace.name.clone(),
+                        marker: if needs_you {
+                            "●"
+                        } else if working {
+                            "▶"
+                        } else {
+                            "✦"
+                        }
+                        .into(),
+                        detail: self.data.status(workspace.workspace.id, cx).branch,
+                        selected: Some(workspace.workspace.id) == self.active_workspace(cx)
+                            && workspace.active_session == Some(session.id),
+                    },
+                ));
+            }
+        }
+        // Stable sort preserves workspace/tab order among equal attention classes.
+        sessions.sort_by_key(|(class, _)| *class);
+        FindFacts {
+            machines: vec![MachineFacts {
+                id: None,
+                name: "This Mac".into(),
+                status: String::new(),
+                reachable: true,
+                claude_chat: false,
+            }],
+            open_sessions: sessions.into_iter().map(|(_, session)| session).collect(),
+            running_remote: vec![],
+        }
+    }
+
+    pub(crate) fn ensure_find_views(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        if self.active_workspace(cx).is_none() {
+            return;
+        }
+        let mut alive = HashSet::new();
+        for workspace in &self.workspaces {
+            if workspace.sessions.is_empty() {
+                alive.insert(self.find_owner_for(workspace, None, cx));
+            }
+            for session in &workspace.sessions {
+                alive.insert(self.find_owner_for(workspace, Some(session.id), cx));
+            }
+        }
+        self.find_views.retain(|owner, _| {
+            if alive.contains(owner) {
+                true
+            } else {
+                self.find_state
+                    .borrow_mut()
+                    .reduce(Intent::ClosePreview(owner.clone()));
+                false
+            }
+        });
+        let owner = self.find_owner(cx);
+        let facts = self.find_facts(cx);
+        if !self.find_views.contains_key(&owner) {
+            let sidebar = cx.new(|cx| {
+                FindSidebar::new(
+                    self.find_state.clone(),
+                    owner.clone(),
+                    facts.clone(),
+                    window,
+                    cx,
+                )
+            });
+            let preview =
+                cx.new(|_| FindPreview::new(self.find_state.clone(), owner.clone(), facts.clone()));
+            let sidebar_owner = owner.clone();
+            let preview_owner = owner.clone();
+            let subscriptions = [
+                cx.subscribe_in(
+                    &sidebar,
+                    window,
+                    move |shell, _, outcome: &FindOutcome, window, cx| {
+                        shell.find_outcome(&sidebar_owner, outcome, window, cx)
+                    },
+                ),
+                cx.subscribe_in(
+                    &preview,
+                    window,
+                    move |shell, _, outcome: &FindOutcome, window, cx| {
+                        shell.find_outcome(&preview_owner, outcome, window, cx)
+                    },
+                ),
+            ];
+            self.find_views.insert(
+                owner.clone(),
+                FindViews {
+                    sidebar,
+                    preview,
+                    _subscriptions: subscriptions,
+                },
+            );
+        }
+        let mut filter = self.find_state.borrow().filter().clone();
+        let root = self.data.terminal_cwd(self.active(cx).workspace.id, cx);
+        if filter.machine.is_some() || filter.workspace_root != root {
+            filter.machine = None;
+            filter.workspace_root = root;
+            self.reduce_find(Intent::SetFilter(filter), window, cx);
+        }
+        if self
+            .find_views
+            .values()
+            .any(|views| views.sidebar.read(cx).facts != facts)
+        {
+            self.refresh_find(window, cx);
+        }
+        let regions = &self.active(cx).store.regions;
+        if regions.sidebar_mode == crate::SidebarMode::Find && !regions.sidebar_collapsed {
+            self.reduce_find(
+                Intent::LoadIndex {
+                    machine: None,
+                    now: std::time::Instant::now(),
+                    force: false,
+                },
+                window,
+                cx,
+            );
+        }
+    }
+
+    fn refresh_find(&self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        let facts = self.find_facts(cx);
+        for views in self.find_views.values() {
+            views
+                .sidebar
+                .update(cx, |sidebar, cx| sidebar.refresh(facts.clone(), window, cx));
+            views
+                .preview
+                .update(cx, |preview, cx| preview.refresh(facts.clone(), cx));
+        }
+    }
+
+    fn reduce_find(&mut self, intent: Intent, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        use gitterm_core::find::state::Effect;
+        let loading_index = matches!(&intent, Intent::LoadIndex { .. });
+        let effects = self.find_state.borrow_mut().reduce(intent);
+        // A freshness no-op must not schedule another render/load loop.
+        if effects.is_empty() && loading_index {
+            return;
+        }
+        for effect in effects {
+            match effect {
+                Effect::LoadIndex(stamp) => {
+                    #[cfg(test)]
+                    let home = self.find_home.clone();
+                    #[cfg(not(test))]
+                    let home = dirs::home_dir();
+                    cx.spawn_in(window, async move |shell, cx| {
+                        let result = cx
+                            .background_executor()
+                            .spawn(async move {
+                                home.map(|home| gitterm_core::find::build_local_index(&home))
+                                    .ok_or_else(|| {
+                                        "Local transcript source not available in preview".into()
+                                    })
+                            })
+                            .await;
+                        _ = shell.update_in(cx, |shell, window, cx| {
+                            shell.reduce_find(
+                                Intent::IndexFinished {
+                                    stamp,
+                                    result,
+                                    now: std::time::Instant::now(),
+                                },
+                                window,
+                                cx,
+                            )
+                        });
+                    })
+                    .detach();
+                }
+                Effect::LoadPreview(stamp) => {
+                    let source = stamp.clone();
+                    cx.spawn_in(window, async move |shell, cx| {
+                        let result = cx
+                            .background_executor()
+                            .spawn(async move {
+                                if source.chat.remote_id.is_some() {
+                                    return Err("Remote previews not available in preview".into());
+                                }
+                                std::fs::File::open(&source.path)
+                                    .map_err(|e| format!("Read {}: {e}", source.path.display()))?;
+                                Ok(gitterm_core::find::load_preview(
+                                    &source.path,
+                                    source.backend,
+                                ))
+                            })
+                            .await;
+                        _ = shell.update_in(cx, |shell, window, cx| {
+                            shell.reduce_find(Intent::PreviewFinished { stamp, result }, window, cx)
+                        });
+                    })
+                    .detach();
+                }
+                Effect::FilterChanged | Effect::IndexChanged(_) => {}
+            }
+        }
+        self.refresh_find(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn find_outcome(
+        &mut self,
+        owner: &str,
+        outcome: &FindOutcome,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let intent = outcome.intent(&self.find_state.borrow(), owner);
+        if let Some(intent) = intent {
+            self.reduce_find(intent, window, cx);
+            cx.notify();
+            return;
+        }
+        let (FindOutcome::Open { id } | FindOutcome::Resume { id, .. }) = outcome else {
+            return;
+        };
+        let target = self.workspaces.iter().find_map(|workspace| {
+            workspace
+                .sessions
+                .iter()
+                .enumerate()
+                .find_map(|(index, session)| {
+                    (self.find_conversation(workspace, session, cx).as_ref() == Some(id))
+                        .then_some((workspace.workspace.id, index))
+                })
+        });
+        if let Some((workspace, session)) = target {
+            self.find_state
+                .borrow_mut()
+                .reduce(Intent::ClosePreview(owner.into()));
+            self.reopen_workspace(workspace, window, cx);
+            self.select_workspace_id(workspace, window, cx);
+            self.close_file_viewer(workspace, window, cx);
+            self.select_session(session, window, cx);
+            let target_owner = self.find_owner(cx);
+            self.find_state
+                .borrow_mut()
+                .reduce(Intent::ClosePreview(target_owner));
+            self.refresh_find(window, cx);
+            cx.notify();
+        } else {
+            self.owner.update(cx, |owner, cx| {
+                owner.error = Some("Conversation resume not available in preview".into());
+                cx.notify();
+            });
+        }
+    }
+
+    pub(crate) fn find_content(&self, cx: &gpui::Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let owner = self.find_owner(cx);
+        if self.find_state.borrow().selected(&owner).is_some()
+            && let Some(views) = self.find_views.get(&owner)
+        {
+            return div()
+                .id("find-centre")
+                .debug_selector(|| "find-centre".into())
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .child(views.preview.clone());
+        }
+        self.file_viewer_content(cx)
     }
 }

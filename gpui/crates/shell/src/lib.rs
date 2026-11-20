@@ -1,6 +1,8 @@
 #![cfg(target_os = "macos")]
 extern crate gpui_kit as gpui;
 
+pub mod app_menus;
+pub mod bottom_panel;
 #[cfg(test)]
 mod center_tests;
 mod chat;
@@ -14,6 +16,8 @@ mod files_view;
 pub mod find_sidebar;
 #[cfg(test)]
 mod h2_tests;
+#[cfg(test)]
+mod h4_tests;
 #[cfg(test)]
 mod hookup_tests;
 mod layout;
@@ -67,7 +71,7 @@ use std::{
     path::Path,
     rc::Rc,
 };
-use theme::{Palette, UI_FONT_SIZE};
+use theme::Palette;
 
 #[derive(Clone, PartialEq, Action)]
 #[action(no_json)]
@@ -113,6 +117,10 @@ pub struct Shell {
     park_subscription: Option<Subscription>,
     new_work_sheet: Option<Entity<workspace_sheet::WorkspaceSheet>>,
     new_work_subscription: Option<Subscription>,
+    find_state: Rc<RefCell<gitterm_core::find::state::State>>,
+    find_views: HashMap<String, find_sidebar::FindViews>,
+    #[cfg(test)]
+    find_home: Option<std::path::PathBuf>,
     work_state: Rc<RefCell<gitterm_core::work::state::State>>,
     work_sidebars: HashMap<WorkspaceId, Entity<work_sidebar::WorkSidebar>>,
     work_subscriptions: HashMap<WorkspaceId, Subscription>,
@@ -253,11 +261,7 @@ impl Shell {
             &owner,
             window,
             |this, _, event: &FileOpen, window, cx| {
-                if event.from_files && content::window::supported(&event.path) {
-                    this.open_content(event, window, cx);
-                } else {
-                    this.open_review(event, window, cx);
-                }
+                this.open_file_viewer(event, window, cx);
             },
         ));
         if local {
@@ -282,6 +286,10 @@ impl Shell {
             park_subscription: None,
             new_work_sheet: None,
             new_work_subscription: None,
+            find_state: Default::default(),
+            find_views: HashMap::new(),
+            #[cfg(test)]
+            find_home: None,
             work_state: Default::default(),
             work_sidebars: HashMap::new(),
             work_subscriptions: HashMap::new(),
@@ -292,77 +300,17 @@ impl Shell {
         shell.load_active_iced_history(window, cx);
         Ok(shell)
     }
-    fn open_content(&mut self, event: &FileOpen, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.local {
-            return;
-        }
-        let Some(root) = self.data.terminal_cwd(event.workspace, cx) else {
-            return;
-        };
-        let Ok(relative) = event.path.strip_prefix(&root) else {
-            self.owner.update(cx, |owner, cx| {
-                owner.error = Some(format!(
-                    "Cannot preview {}: outside workspace root",
-                    event.path.display()
-                ));
-                cx.notify();
-            });
-            return;
-        };
-        let Some(state) = self
-            .workspaces
-            .iter_mut()
-            .find(|w| w.workspace.id == event.workspace)
-        else {
-            return;
-        };
-        let id = content_pane_id(event.workspace, &event.path);
-        if !state.panes.contains_key(&id) {
-            let dark = gpui_component::Theme::global(cx).mode.is_dark();
-            let pane = cx.new(|cx| {
-                Pane::new(
-                    id.clone(),
-                    event
-                        .path
-                        .file_name()
-                        .unwrap_or(event.path.as_os_str())
-                        .to_string_lossy()
-                        .into_owned(),
-                    PaneKind::Content(self.content.clone()),
-                    event.workspace,
-                    self.data.clone(),
-                    window,
-                    cx,
-                )
-            });
-            self.content.update(cx, |content, cx| {
-                content.open(
-                    id.clone(),
-                    content::window::ContentRequest {
-                        root: root.clone(),
-                        relative: relative.to_owned(),
-                        workspace: event.workspace.0,
-                        pane: pane.entity_id().as_u64(),
-                        dark,
-                    },
-                    window,
-                    cx,
-                )
-            });
-            self.registry
-                .borrow_mut()
-                .insert(id.clone(), pane.downgrade());
-            state.panes.insert(id.clone(), pane);
-        }
-        self.content
-            .update(cx, |content, _| content.select(Some(id.clone())));
-        self.show_workspace_pane(event.workspace, &id, window, cx);
-    }
     fn sync_content_selection(&self, cx: &mut Context<Self>) {
+        let find_selected = self.active_workspace(cx).is_some()
+            && self
+                .find_state
+                .borrow()
+                .selected(&self.find_owner(cx))
+                .is_some();
         let mut visible: Vec<String> = self
             .workspaces
             .iter()
-            .filter(|w| Some(w.workspace.id) == self.active_workspace(cx))
+            .filter(|w| !find_selected && Some(w.workspace.id) == self.active_workspace(cx))
             .flat_map(|state| {
                 state
                     .panes
@@ -1464,6 +1412,7 @@ impl Shell {
         ] {
             modes = modes.child(
                 Button::new(title)
+                    .debug_selector(move || title.into())
                     .ghost()
                     .label(if regions.sidebar_collapsed {
                         icon
@@ -1503,14 +1452,7 @@ impl Shell {
                 })),
         );
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Files {
-            for (kind, title) in [("git", "Git"), ("files", "Files")] {
-                sidebar = sidebar.child(div().px_2().child(title)).child(
-                    div().flex_1().min_h_0().child(
-                        state.panes[&format!("workspace-{}-{kind}", state.workspace.layout_key)]
-                            .clone(),
-                    ),
-                );
-            }
+            sidebar = self.files_sidebar(sidebar, cx);
         }
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Work {
             sidebar = sidebar.child(
@@ -1518,6 +1460,15 @@ impl Shell {
                     .flex_1()
                     .min_h_0()
                     .children(self.work_sidebars.get(&state.workspace.id).cloned()),
+            );
+        }
+        if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Find {
+            sidebar = sidebar.child(
+                div().flex_1().min_h_0().children(
+                    self.find_views
+                        .get(&self.find_owner(cx))
+                        .map(|views| views.sidebar.clone()),
+                ),
             );
         }
         sidebar
@@ -1626,6 +1577,15 @@ impl Shell {
             .min_w_0()
             .h_full()
             .overflow_hidden()
+            .when(
+                pane.is_some_and(|pane| {
+                    matches!(
+                        pane.read(cx).content,
+                        pane::PaneContent::Chat(_) | pane::PaneContent::PreviewChat(_)
+                    )
+                }),
+                |pane| pane.font_family(".SystemUIFont"),
+            )
             .children(pane.cloned())
     }
     fn bottom_panel(&self, cx: &Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
@@ -1722,16 +1682,30 @@ impl Focusable for Shell {
 }
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for state in &self.workspaces {
+            for pane in state.panes.values() {
+                let terminal = match &pane.read(cx).content {
+                    pane::PaneContent::Terminal(view) => Some(view.clone()),
+                    _ => None,
+                };
+                if let Some(view) = terminal {
+                    theme::sync_terminal_typography(&view, cx);
+                }
+            }
+        }
         self.sync_content_selection(cx);
         self.content
             .update(cx, |content, cx| content.sync_covers(window, cx));
         self.ensure_work_sidebars(window, cx);
+        self.ensure_find_views(window, cx);
         let p = Palette::current(cx);
         if !self.workspaces.iter().any(|state| state.on_bar()) {
             return div()
                 .relative()
                 .size_full()
                 .flex()
+                .font_family(gpui_component::Theme::global(cx).font_family.clone())
+                .text_size(gpui_component::Theme::global(cx).font_size)
                 .bg(rgb(p.base))
                 .text_color(rgb(p.text))
                 .child(self.spine(cx))
@@ -1802,8 +1776,8 @@ impl Render for Shell {
                     .update(cx, |content, cx| content.sync_covers(w, cx));
             }))
             .flex()
-            .font_family(".SystemUIFont")
-            .text_size(px(UI_FONT_SIZE))
+            .font_family(gpui_component::Theme::global(cx).font_family.clone())
+            .text_size(gpui_component::Theme::global(cx).font_size)
             .text_color(rgb(p.text))
             .bg(rgb(p.base))
             .on_mouse_move(
@@ -1850,7 +1824,7 @@ impl Render for Shell {
                             .flex()
                             .child(sidebar)
                             .child(self.sidebar_divider(cx))
-                            .child(self.session_content(cx)),
+                            .child(self.find_content(cx)),
                     )
                     .children(self.bottom_panel(cx))
                     .child(self.workspace_bar(cx)),
@@ -1888,6 +1862,7 @@ fn bind_workspace_keys(cx: &mut App) {
 }
 
 pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
+    let settings = workspace_config::load_iced_settings();
     let preview = preview::PreviewContext::from_environment(sample)?;
     let config = preview.roots.layout();
     let mut store = workspace_config::WorkspaceStore::guarded(preview.writer());
@@ -1904,7 +1879,7 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
     gpui_kit::application().run(move |cx| {
         preview.release_on_quit(cx);
         gpui_kit::init(cx);
-        theme::apply(true, None, cx);
+        theme::apply_settings(&settings, None, cx);
         for (index, (session_key, workspace_key)) in [
             ("cmd-1", "ctrl-1"),
             ("cmd-2", "ctrl-2"),
