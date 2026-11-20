@@ -6,6 +6,7 @@
 //! There are no IPC handlers, URL loading or Page identity/store capabilities.
 pub mod host;
 pub mod overlay;
+mod session;
 pub(crate) mod window;
 
 use std::path::{Path, PathBuf};
@@ -29,17 +30,55 @@ impl Document {
     pub fn local_file(root: &Path, relative: &Path, dark: bool) -> Result<Self, String> {
         let load = gitterm_core::content::collect_contained_file_load(0, root, relative, dark)
             .map_err(|e| format!("Cannot preview {}: {e}", root.join(relative).display()))?;
-        load.webview_content
-            .map(|html| Self { html })
-            .ok_or_else(|| {
-                format!(
-                    "Cannot preview {}: {}",
-                    relative.display(),
-                    load.file_preview_notice
-                        .as_deref()
-                        .unwrap_or("unreadable, invalid or unsupported retained content")
-                )
-            })
+        if let Some(html) = load.webview_content {
+            return Ok(Self { html });
+        }
+        if relative
+            .extension()
+            .is_some_and(|e| matches!(e.to_str(), Some("md" | "html" | "htm" | "excalidraw")))
+        {
+            return Err(format!(
+                "Cannot preview {}: {}",
+                relative.display(),
+                load.file_preview_notice
+                    .as_deref()
+                    .unwrap_or("invalid or unsupported retained content")
+            ));
+        }
+        let path = root.join(relative);
+        // Core owns truncation and preview notices. Verify failed/invalid reads
+        // explicitly because an empty core text payload can also be an empty file.
+        std::fs::File::open(&path).map_err(|error| format!("Read {}: {error}", path.display()))?;
+        if load.image_path.is_some() {
+            return Err(format!(
+                "Cannot preview {}: image preview unavailable",
+                path.display()
+            ));
+        }
+        if load.file_content.is_empty() && std::fs::metadata(&path).is_ok_and(|m| m.len() > 0) {
+            return Err(format!(
+                "Cannot preview {}: binary or invalid text",
+                path.display()
+            ));
+        }
+        let escape = |text: &str| {
+            text.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('\"', "&quot;")
+        };
+        let (background, foreground) = if dark {
+            ("#1e1e2e", "#cdd6f4")
+        } else {
+            ("#eff1f5", "#4c4f69")
+        };
+        Ok(Self {
+            html: format!(
+                "<!doctype html><html><meta charset=\"utf-8\"><body style=\"background:{background};color:{foreground};font:13px monospace\"><p>{}</p><pre>{}</pre></body></html>",
+                escape(load.file_preview_notice.as_deref().unwrap_or("")),
+                escape(&load.file_content)
+            ),
+        })
     }
 
     /// A local plans document, with the same relative-path and canonical-root

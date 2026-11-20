@@ -11,6 +11,7 @@ pub mod data;
 mod dialogs;
 pub mod files;
 mod files_view;
+pub mod find_sidebar;
 #[cfg(test)]
 mod h2_tests;
 #[cfg(test)]
@@ -1502,14 +1503,7 @@ impl Shell {
                 })),
         );
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Files {
-            for (kind, title) in [("git", "Git"), ("files", "Files")] {
-                sidebar = sidebar.child(div().px_2().child(title)).child(
-                    div().flex_1().min_h_0().child(
-                        state.panes[&format!("workspace-{}-{kind}", state.workspace.layout_key)]
-                            .clone(),
-                    ),
-                );
-            }
+            sidebar = self.files_sidebar(sidebar, cx);
         }
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Work {
             sidebar = sidebar.child(

@@ -5,8 +5,8 @@ use crate::{
 use gitterm_core::status::GitStatusSnapshot;
 use gpui::{
     App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, px, rgb, size,
+    IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled, TitlebarOptions,
+    Window, WindowBounds, WindowOptions, actions, div, px, rgb, size,
 };
 use gpui_component::{
     Root, Sizable,
@@ -25,13 +25,7 @@ actions!(native_review, [NextFile, PreviousFile, ToggleViewed]);
 mod aggregate;
 use aggregate::AggregateView;
 
-pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("alt-down", NextFile, Some("NativeReview")),
-        KeyBinding::new("alt-up", PreviousFile, Some("NativeReview")),
-        KeyBinding::new("alt-v", ToggleViewed, Some("NativeReview")),
-    ]);
-}
+pub fn init(_: &mut App) {}
 
 /// Fixture argument validation stays here; the host dispatches review routes.
 pub fn run_fixture(args: Vec<OsString>) {
@@ -294,14 +288,14 @@ impl ReviewView {
             cx.notify();
         }
     }
-    fn toggle_aggregate(&mut self, cx: &mut Context<Self>) {
+    pub fn open_branch_review(&mut self, cx: &mut Context<Self>) {
         if self.aggregate.is_none() {
             let Some(root) = self.repo_path.clone() else {
                 return;
             };
             self.aggregate = Some(cx.new(|cx| AggregateView::new(root, cx)));
         }
-        self.show_aggregate = !self.show_aggregate;
+        self.show_aggregate = true;
         cx.notify();
     }
 }
@@ -312,14 +306,6 @@ impl Focusable for ReviewView {
 }
 impl Render for ReviewView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let switch = Button::new("review-aggregate")
-            .small()
-            .label(if self.show_aggregate {
-                "Status groups"
-            } else {
-                "Branch review"
-            })
-            .on_click(cx.listener(|view, _, _, cx| view.toggle_aggregate(cx)));
         if self.show_aggregate
             && let Some(aggregate) = &self.aggregate
         {
@@ -335,7 +321,6 @@ impl Render for ReviewView {
                 .on_action(cx.listener(Self::next))
                 .on_action(cx.listener(Self::previous))
                 .on_action(cx.listener(Self::toggle_viewed))
-                .child(div().p_2().child(switch))
                 .child(div().flex_1().min_h_0().child(aggregate.clone()));
         }
         let mut sidebar = div()
@@ -441,12 +426,7 @@ impl Render for ReviewView {
             .on_action(cx.listener(Self::next))
             .on_action(cx.listener(Self::previous))
             .on_action(cx.listener(Self::toggle_viewed))
-            .child(
-                div()
-                    .p_2()
-                    .children(self.repo_path.as_ref().map(|_| switch))
-                    .child("Review · Option+↓ / Option+↑ next / previous file · Option+V viewed"),
-            )
+            .child(div().p_2().child("Review"))
             .child(div().flex_1().min_h_0().flex().child(sidebar).child(body))
     }
 }
