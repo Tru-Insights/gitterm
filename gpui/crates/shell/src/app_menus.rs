@@ -292,7 +292,7 @@ shortcuts![
         Some("GitTermShell && IcedMain && IcedTaskContext")
     ),
     ("escape", Escape, Some("GitTermShell")),
-    ("enter", ParkSubmit, Some("GitTermShell && IcedPark")),
+    ("enter", ParkSubmit, Some("GitTermShell > IcedPark > Input")),
     // This branch precedes (and shadows) the terminal SearchPrev branch in Iced.
     (
         "cmd-shift-g",
@@ -524,6 +524,7 @@ shortcuts![
         Some("GitTermShell && IcedMain && IcedTaskContext")
     ),
     // Page-local keys from agent_chat.html; never install these globally.
+    // Composer adapters match at the Input leaf so they outrank component defaults.
     ("cmd-c", Copy, Some("NativeChat")),
     (
         "cmd-shift-c",
@@ -538,9 +539,13 @@ shortcuts![
     (
         "enter",
         SubmitPrompt,
-        Some("NativeChat && IcedComposer && !IcedSlash")
+        Some("(NativeChat && IcedComposer && !IcedSlash) > Input")
     ),
-    ("shift-enter", Newline, Some("NativeChat && IcedComposer")),
+    (
+        "shift-enter",
+        Newline,
+        Some("(NativeChat && IcedComposer) > Input")
+    ),
     ("shift-tab", CycleMode, Some("NativeChat && IcedComposer")),
     ("enter", FindNext, Some("NativeChat && IcedChatFind")),
     (
@@ -549,36 +554,35 @@ shortcuts![
         Some("NativeChat && IcedChatFind")
     ),
     ("escape", CloseFind, Some("NativeChat && IcedChatFind")),
-    ("down", SlashNext, Some("NativeChat && IcedSlash")),
-    ("up", SlashPrevious, Some("NativeChat && IcedSlash")),
-    ("tab", FillSlash, Some("NativeChat && IcedSlash")),
-    ("enter", SubmitSlash, Some("NativeChat && IcedSlash")),
-    ("escape", CloseSlash, Some("NativeChat && IcedSlash")),
+    ("down", SlashNext, Some("(NativeChat && IcedSlash) > Input")),
+    (
+        "up",
+        SlashPrevious,
+        Some("(NativeChat && IcedSlash) > Input")
+    ),
+    ("tab", FillSlash, Some("(NativeChat && IcedSlash) > Input")),
+    (
+        "enter",
+        SubmitSlash,
+        Some("(NativeChat && IcedSlash) > Input")
+    ),
+    (
+        "escape",
+        CloseSlash,
+        Some("(NativeChat && IcedSlash) > Input")
+    ),
     ("cmd-enter", SubmitReview, Some("NativeChat && IcedReview")),
     ("ctrl-enter", SubmitReview, Some("NativeChat && IcedReview")),
 ];
 
 /// Actions without a host adapter remain unregistered, so GPUI's native menu
 /// validation disables their menu items.
-/// Composer/slash keys continue through the native input's existing handlers.
+/// Mode changes are rejected by the native adapter; the review chip is display-only.
+/// Terminal log mirroring has no native backend, and dictation is out of scope.
 pub const MISSING_HOST_ACTIONS: &[&str] = &[
-    "SetChatWidth",
     "ToggleTerminalLogMirroring",
-    "OpenPlansViewer",
     "SttToggle",
-    "ChatsOverviewOpen",
-    "DebugSpawnAgentTab",
-    "LaunchAgentPreset",
-    "TaskChildLaunchPreset",
-    "ParkSubmit",
-    "SubmitPrompt",
-    "Newline",
     "CycleMode",
-    "SlashNext",
-    "SlashPrevious",
-    "FillSlash",
-    "SubmitSlash",
-    "CloseSlash",
     "SubmitReview",
 ];
 

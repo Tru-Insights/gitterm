@@ -32,6 +32,7 @@ pub enum SidebarMode {
 pub struct RegionLayout {
     pub fonts: Option<crate::theme::FontSizes>,
     pub chat_font_size: Option<f32>,
+    pub chat_width: Option<gitterm_core::settings::ChatWidth>,
     pub sidebar_width: f32,
     pub sidebar_collapsed: bool,
     pub sidebar_mode: SidebarMode,
@@ -44,6 +45,7 @@ impl Default for RegionLayout {
         Self {
             fonts: None,
             chat_font_size: None,
+            chat_width: None,
             sidebar_width: 360.,
             sidebar_collapsed: false,
             sidebar_mode: SidebarMode::Work,
@@ -476,6 +478,7 @@ mod tests {
         store.regions = RegionLayout {
             fonts: None,
             chat_font_size: None,
+            chat_width: Some(gitterm_core::settings::ChatWidth::Narrow),
             sidebar_width: 492.,
             sidebar_collapsed: true,
             sidebar_mode: SidebarMode::Files,

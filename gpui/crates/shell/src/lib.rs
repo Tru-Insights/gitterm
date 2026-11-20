@@ -27,6 +27,8 @@ mod h7_tests;
 #[cfg(test)]
 mod h8_tests;
 #[cfg(test)]
+mod h9_tests;
+#[cfg(test)]
 mod hookup_tests;
 mod layout;
 mod owner;
@@ -61,8 +63,9 @@ use data::{Session, SessionId, ShellData, Workspace, WorkspaceId};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, Styled as _, Subscription, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, actions, div, px, rgb, size,
+    IntoElement, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _,
+    Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, px, rgb,
+    size,
 };
 use gpui_component::{
     Root, Selectable,
@@ -104,6 +107,8 @@ pub struct Shell {
     bottom: Entity<bottom_panel::BottomPanel>,
     run_tabs: HashMap<String, bottom_panel::RunTab>,
     run_url_poll: Option<gpui::Task<()>>,
+    plans_open: bool,
+    plans_return_focus: Option<FocusHandle>,
     usage_open: bool,
     usage_return_focus: Option<FocusHandle>,
     usage_page: Entity<usage::UsagePage>,
@@ -345,6 +350,8 @@ impl Shell {
             bottom,
             run_tabs: HashMap::new(),
             run_url_poll: None,
+            plans_open: false,
+            plans_return_focus: None,
             usage_open: false,
             usage_return_focus: None,
             usage_page,
@@ -402,6 +409,13 @@ impl Shell {
             .find_map(|w| w.store.regions.chat_font_size)
         {
             theme::set_chat_font_size(size, cx);
+        }
+        if let Some(width) = shell
+            .workspaces
+            .iter()
+            .find_map(|w| w.store.regions.chat_width)
+        {
+            theme::set_chat_width(width, cx);
         }
         Ok(shell)
     }
@@ -2581,7 +2595,8 @@ impl Shell {
         }
         let chat_pane = self.focused_chat(window, cx);
         let chat = chat_pane.is_some();
-        let modal = self.session_picker.is_some()
+        let modal = self.plans_open
+            || self.session_picker.is_some()
             || self.park_sheet.is_some()
             || self.new_work_sheet.is_some()
             || Self::has_dialog(window, cx);
@@ -2653,6 +2668,70 @@ impl Shell {
             .on_action(cx.listener(|_, _: &Minimize, w, _| w.minimize_window()))
             .on_action(cx.listener(|_, _: &Maximize, w, _| w.zoom_window()))
             .on_action(cx.listener(|_, _: &Fullscreen, w, _| w.toggle_fullscreen()))
+            .on_action(
+                cx.listener(|this, a: &SetChatWidth, _, cx| this.set_chat_width(a.width, cx)),
+            )
+            .on_action(cx.listener(|this, _: &OpenPlansViewer, w, cx| this.toggle_plans(w, cx)))
+            .on_action(cx.listener(|this, _: &ChatsOverviewOpen, w, cx| {
+                if this.active_workspace(cx).is_none() {
+                    return;
+                }
+                if this.usage_open {
+                    this.toggle_usage(w, cx);
+                }
+                if this.plans_open {
+                    this.toggle_plans(w, cx);
+                }
+                this.find_state.borrow_mut().reduce(
+                    gitterm_core::find::state::Intent::ClosePreview(this.find_owner(cx)),
+                );
+                this.update_regions(
+                    |r| {
+                        r.sidebar_mode = SidebarMode::Find;
+                        r.sidebar_collapsed = false;
+                    },
+                    cx,
+                );
+                this.ensure_find_views(w, cx);
+                this.focus.focus(w, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DebugSpawnAgentTab, _, cx| {
+                this.preview_unavailable("Debug agent tab", cx)
+            }))
+            .on_action(cx.listener(|this, _: &LaunchAgentPreset, _, cx| {
+                this.preview_unavailable("Launch agent preset", cx)
+            }))
+            .on_action(cx.listener(|this, _: &TaskChildLaunchPreset, _, cx| {
+                this.preview_unavailable("Launch task child preset", cx)
+            }))
+            .on_action(cx.listener(|this, _: &ParkSubmit, _, cx| {
+                if let Some(sheet) = &this.park_sheet {
+                    sheet.update(cx, |sheet, cx| sheet.submit(cx));
+                }
+            }))
+            .on_action(cx.listener(|_, _: &SubmitPrompt, w, cx| {
+                Self::chat_action("native_chat::SubmitPrompt", w, cx)
+            }))
+            .on_action(
+                cx.listener(|_, _: &Newline, w, cx| {
+                    Self::chat_action("native_chat::Newline", w, cx)
+                }),
+            )
+            .on_action(cx.listener(|_, _: &SlashNext, w, cx| {
+                Self::chat_action("native_chat::SlashNext", w, cx)
+            }))
+            .on_action(cx.listener(|_, _: &SlashPrevious, w, cx| {
+                Self::chat_action("native_chat::SlashPrevious", w, cx)
+            }))
+            .on_action(cx.listener(|_, _: &FillSlash, w, cx| {
+                Self::chat_action("native_chat::FillSlash", w, cx)
+            }))
+            .on_action(cx.listener(|_, _: &SubmitSlash, w, cx| {
+                Self::chat_action("native_chat::SubmitSlash", w, cx)
+            }))
+            .on_action(cx.listener(|_, _: &CloseSlash, w, cx| {
+                Self::chat_action("native_chat::CloseSlash", w, cx)
+            }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.update_regions(|r| r.sidebar_collapsed = !r.sidebar_collapsed, cx);
             }))
@@ -2920,7 +2999,7 @@ impl Shell {
         }
         self.usage_open = !self.usage_open;
         self.content.update(cx, |content, cx| {
-            content.picker = self.task_switcher.is_some() || self.usage_open;
+            content.picker = self.plans_open || self.task_switcher.is_some() || self.usage_open;
             content.sync_covers(window, cx);
         });
         if self.usage_open {
@@ -2976,6 +3055,99 @@ impl Shell {
             self.resize_font(false, delta, cx);
         }
     }
+    fn set_chat_width(&mut self, width: gitterm_core::settings::ChatWidth, cx: &mut Context<Self>) {
+        theme::set_chat_width(width, cx);
+        for state in &mut self.workspaces {
+            state.store.regions.chat_width = Some(width);
+            save_layout(state, cx);
+            for pane in state.panes.values() {
+                pane.update(cx, |pane, cx| {
+                    if let pane::PaneContent::Chat(view) = &pane.content {
+                        view.update(cx, |view, cx| view.set_width(width, cx));
+                    } else if let pane::PaneContent::PreviewChat(view) = &pane.content {
+                        view.update(cx, |view, cx| view.set_width(width, cx));
+                    }
+                    cx.notify();
+                });
+            }
+        }
+        cx.notify();
+    }
+    fn toggle_plans(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.plans_open {
+            self.plans_open = false;
+            if let Some(focus) = self.plans_return_focus.take() {
+                focus.focus(window, cx);
+            }
+        } else if self.active_workspace(cx).is_some() {
+            self.plans_return_focus = window.focused(cx);
+            self.plans_open = true;
+            self.focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+    fn plans_viewer(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let p = Palette::current(cx);
+        let workspace = self.active(cx).workspace.id;
+        let state = self.work_state.borrow();
+        let documents = state.documents(workspace.0);
+        let mut list = div()
+            .id("plans-documents")
+            .debug_selector(|| "plans-documents".into())
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_2();
+        if let Some(result) = documents.and_then(|docs| docs.result.as_ref()) {
+            if result.documents.is_empty() {
+                list = list.child("No documents found.");
+            }
+            for (index, document) in result.documents.iter().enumerate() {
+                let path = document.newest().path.clone();
+                list = list.child(
+                    Button::new(("plan", index))
+                        .debug_selector(move || format!("plan-{index}"))
+                        .label(format!("{} · {}", document.title, document.rel))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.toggle_plans(window, cx);
+                            this.owner.update(cx, |owner, cx| {
+                                owner.open_file(workspace, path.clone(), cx)
+                            });
+                        })),
+                );
+            }
+            if result.truncated {
+                list = list.child("Some documents may be missing: scan limit reached.");
+            }
+        } else {
+            list = list.child("Loading documents…");
+        }
+        if let Some(error) = documents.and_then(|docs| docs.error.as_ref()) {
+            list = list.child(div().text_color(rgb(p.red)).child(error.clone()));
+        }
+        div()
+            .id("plans-viewer")
+            .debug_selector(|| "plans-viewer".into())
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .flex_col()
+            .p_4()
+            .gap_3()
+            .bg(rgb(p.base))
+            .child(
+                div().flex().justify_between().child("Documents").child(
+                    Button::new("close-plans")
+                        .label("Close")
+                        .on_click(cx.listener(|this, _, w, cx| this.toggle_plans(w, cx))),
+                ),
+            )
+            .child(list)
+    }
     fn resize_chat_font(&mut self, delta: f32, cx: &mut Context<Self>) {
         let size = (theme::chat_appearance(cx).font_size + delta).clamp(11., 22.);
         theme::set_chat_font_size(size, cx);
@@ -3016,6 +3188,10 @@ impl Shell {
         cx.notify();
     }
     fn escape(&mut self, _: &app_menus::Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.plans_open {
+            self.toggle_plans(window, cx);
+            return;
+        }
         if self.task_switcher.is_some() {
             self.task_switcher_outcome(&task_switcher::Outcome::Close, window, cx);
             return;
@@ -3136,6 +3312,10 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         for state in &self.workspaces {
             for pane in state.panes.values() {
+                if let pane::PaneContent::Chat(view) = &pane.read(cx).content {
+                    view.clone()
+                        .update(cx, |view, cx| view.set_width(theme::chat_width(cx), cx));
+                }
                 let terminal = match &pane.read(cx).content {
                     pane::PaneContent::Terminal(view) => Some(view.clone()),
                     _ => None,
@@ -3151,7 +3331,8 @@ impl Render for Shell {
             switcher.update(cx, |s, cx| s.set_inputs(inputs, cx));
         }
         self.content.update(cx, |content, cx| {
-            content.picker = self.task_switcher.is_some()
+            content.picker = self.plans_open
+                || self.task_switcher.is_some()
                 || self.usage_open
                 || self.session_picker.is_some()
                 || self.park_sheet.is_some()
@@ -3333,6 +3514,7 @@ impl Render for Shell {
             .children(self.park_sheet.clone())
             .children(self.new_work_sheet.clone())
             .children(self.task_switcher.clone())
+            .when(self.plans_open, |view| view.child(self.plans_viewer(cx)))
             .into_any_element()
     }
 }

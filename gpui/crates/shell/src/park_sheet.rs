@@ -348,6 +348,11 @@ impl Focusable for ParkSheet {
 }
 
 impl ParkSheet {
+    pub(crate) fn submit(&mut self, cx: &mut Context<Self>) {
+        if let Content::Workspace(model) = &self.content {
+            self.emit(model.key("enter"), cx);
+        }
+    }
     pub fn workspace(model: WorkspaceSheet, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         let mut subscriptions = vec![];
@@ -629,6 +634,7 @@ impl Render for ParkSheet {
         div()
             .id("close-park-overlay")
             .track_focus(&self.focus)
+            .key_context("IcedPark")
             .size_full()
             .flex()
             .items_center()

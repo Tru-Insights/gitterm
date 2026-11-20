@@ -34,7 +34,9 @@ fn wait_file(path: &Path, expected: &str, cx: &mut VisualTestContext) {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
-fn fixture(cx: &mut TestAppContext) -> (tempfile::TempDir, Entity<Shell>, &mut VisualTestContext) {
+pub(super) fn fixture(
+    cx: &mut TestAppContext,
+) -> (tempfile::TempDir, Entity<Shell>, &mut VisualTestContext) {
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     cx.update(install_app_menus);

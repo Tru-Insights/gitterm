@@ -101,6 +101,16 @@ impl Palette {
         }
     }
 }
+/// Preview-owned chat column preference, shared by retained and newly opened panes.
+struct ChatColumnWidth(gitterm_core::settings::ChatWidth);
+impl gpui::Global for ChatColumnWidth {}
+pub fn chat_width(cx: &App) -> gitterm_core::settings::ChatWidth {
+    cx.try_global::<ChatColumnWidth>()
+        .map_or_else(Default::default, |width| width.0)
+}
+pub fn set_chat_width(width: gitterm_core::settings::ChatWidth, cx: &mut App) {
+    cx.set_global(ChatColumnWidth(width));
+}
 /// Chat typography is independent of the UI and terminal font sizes.
 struct ChatFontSize(f32);
 impl gpui::Global for ChatFontSize {}
@@ -124,6 +134,7 @@ pub fn apply_settings<C, U, R>(
     cx: &mut App,
 ) {
     cx.set_global(ChatFontSize(settings.chat_font_size));
+    set_chat_width(settings.chat_width, cx);
     // Iced selects Light only for the exact persisted value "light".
     apply(settings.theme != "light", window, cx);
     let (terminal, ui) = settings.font_size.map_or(
