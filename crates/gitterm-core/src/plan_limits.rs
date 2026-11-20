@@ -3130,7 +3130,7 @@ mod policy_tests {
         file.absorb(claude.clone());
         file.history[0].samples = vec![
             UsageSample {
-                observed_at: saturday_reading - 1 * 3600 - 58 * 60,
+                observed_at: saturday_reading - 3600 - 58 * 60,
                 used_percent: 35.0,
             },
             UsageSample {

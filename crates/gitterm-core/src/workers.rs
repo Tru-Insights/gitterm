@@ -738,8 +738,10 @@ mod tests {
 
     #[test]
     fn codex_names_fall_back_to_the_cli_default_when_the_policy_has_none() {
-        let mut policy = ModelPolicy::default();
-        policy.codex = RoleModels::default();
+        let mut policy = ModelPolicy {
+            codex: RoleModels::default(),
+            ..ModelPolicy::default()
+        };
         let choice = resolve_worker(&presets(), None, None, None, &policy).unwrap();
         assert_eq!(choice.provider, WorkerProvider::Codex);
         assert_eq!(
@@ -1665,7 +1667,8 @@ mod reliability_tests {
         let config = temp.path().join("config.toml");
         let secret = "SYNTHETIC_SECRET_MUST_NOT_APPEAR";
         std::fs::write(&config, format!("api_key = \"{secret}\n")).unwrap();
-        let error = codex_task_trust("codex", &root, &[root.clone()], &config).unwrap_err();
+        let error =
+            codex_task_trust("codex", &root, std::slice::from_ref(&root), &config).unwrap_err();
         assert!(error.contains("invalid TOML"));
         assert!(!error.contains(secret), "private config source leaked");
     }

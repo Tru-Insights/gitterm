@@ -430,7 +430,7 @@ mod tests {
             time_limit_deadline_unix_ms: None,
         };
         assert_eq!(
-            delegation_targets(&[&chat], &[delegation.clone()], &[]),
+            delegation_targets(&[&chat], std::slice::from_ref(&delegation), &[]),
             paths(&["/w/reviewed", "/w/extra"])
         );
         let task = TaskRecord::new_draft(

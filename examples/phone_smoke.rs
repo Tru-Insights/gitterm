@@ -520,15 +520,12 @@ async fn main() {
     let mut started = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     while tokio::time::Instant::now() < deadline {
-        match must!(
+        if let Some(HarnessEvent::TurnStarted { .. }) = must!(
             "desktop watches",
             desktop.next_within(Duration::from_millis(500)).await
         ) {
-            Some(HarnessEvent::TurnStarted { .. }) => {
-                started = true;
-                break;
-            }
-            Some(_) | None => {}
+            started = true;
+            break;
         }
     }
     check!(
@@ -596,15 +593,10 @@ async fn main() {
             .map_err(|e| e.to_string())
     );
     let mut closed_with_notice = false;
-    loop {
-        match must!("socket after revoke", next_frame(&mut socket).await) {
-            Some(frame) => {
-                show_frame(&frame);
-                if frame["type"] == "revoked" {
-                    closed_with_notice = true;
-                }
-            }
-            None => break,
+    while let Some(frame) = must!("socket after revoke", next_frame(&mut socket).await) {
+        show_frame(&frame);
+        if frame["type"] == "revoked" {
+            closed_with_notice = true;
         }
     }
     check!(

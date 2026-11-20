@@ -1528,7 +1528,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_endpoint_refuses_a_made_up_key() {
-        let mut client = JevClient::with_endpoint("not-a-real-key", ENDPOINT).unwrap();
+        let client = JevClient::with_endpoint("not-a-real-key", ENDPOINT).unwrap();
         let err = client
             .decide("test", &reference_questions())
             .await

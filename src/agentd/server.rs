@@ -1716,6 +1716,8 @@ mod tests {
         (GitTermAgentClient::new(channel), registry, spawned, server)
     }
 
+    // Tonic exposes `Status` directly as the RPC error type.
+    #[allow(clippy::result_large_err)]
     async fn open_chat(
         client: &mut GitTermAgentClient<tonic::transport::Channel>,
         first: ClaudeChatClientMessage,

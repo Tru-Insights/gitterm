@@ -6,6 +6,8 @@ use tonic::{Request, Response, Status};
 
 #[derive(Clone, Default)]
 pub struct Fixture {
+    // Tests assert the raw protobuf request bytes recorded by the fixture.
+    #[allow(clippy::type_complexity)]
     pub requests: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
 }
 impl Fixture {
