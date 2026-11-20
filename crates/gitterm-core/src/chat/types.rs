@@ -85,6 +85,15 @@ pub struct RateLimitReading {
     pub info: Value,
 }
 
+/// A requested picker value, shared by reducer intents and provider results.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum SettingChange {
+    Model(String),
+    Effort(Option<String>),
+    Mode(String),
+}
+
 /// One normalized event from a harness session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
@@ -200,6 +209,11 @@ pub enum HarnessEvent {
     EffortChanged {
         effort: Option<String>,
         applied: Option<String>,
+    },
+    /// The provider rejected this requested value. An accompanying `Error`
+    /// carries the existing user-visible reason; this event only settles pending state.
+    SettingRejected {
+        requested: SettingChange,
     },
     /// A resumed ACP session's earlier timeline, as the agent replayed it
     /// through `session/load` (TRU-153). Emitted once, before `Ready`; the
@@ -896,6 +910,18 @@ mod tests {
             HarnessEvent::EffortChanged {
                 effort: Some("low".into()),
                 applied: None,
+            },
+            HarnessEvent::SettingRejected {
+                requested: SettingChange::Model("sonnet".into()),
+            },
+            HarnessEvent::SettingRejected {
+                requested: SettingChange::Mode("plan".into()),
+            },
+            HarnessEvent::SettingRejected {
+                requested: SettingChange::Effort(None),
+            },
+            HarnessEvent::SettingRejected {
+                requested: SettingChange::Effort(Some("high".into())),
             },
             HarnessEvent::Error("bad".into()),
             HarnessEvent::ProcessExited { code: Some(0) },

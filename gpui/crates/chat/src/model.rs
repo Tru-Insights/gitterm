@@ -599,7 +599,9 @@ impl ChatModel {
             HarnessEvent::Ready { .. }
             | HarnessEvent::PermissionModeChanged(_)
             | HarnessEvent::ModelChanged(_)
-            | HarnessEvent::EffortChanged { .. } => {}
+            | HarnessEvent::EffortChanged { .. }
+            // The unchanged Error that follows carries the visible text.
+            | HarnessEvent::SettingRejected { .. } => {}
         }
     }
     fn orphan(&mut self, scope: &str, id: &str, operation: &str, changed: &mut Vec<usize>) {
