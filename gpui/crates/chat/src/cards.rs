@@ -1,4 +1,5 @@
 use crate::{
+    adapter::Receipt,
     events::RuntimeRequestKind,
     intents::{ChatIntent, PermissionDecision, Question, QuestionAnswer},
     model::Row,
@@ -28,6 +29,7 @@ pub(crate) struct CardView {
     questions: Result<Vec<Question>, String>,
     drafts: Vec<AnswerDraft>,
     submitted: Option<ChatIntent>,
+    receipt: Option<Receipt>,
     _subscriptions: Vec<Subscription>,
 }
 impl CardView {
@@ -72,6 +74,7 @@ impl CardView {
             questions,
             drafts,
             submitted: None,
+            receipt: None,
             _subscriptions: subscriptions,
         }
     }
@@ -79,10 +82,33 @@ impl CardView {
         self.callback = callback;
         cx.notify();
     }
+    pub fn matches_request(&self, row: &Row) -> bool {
+        self.row.scope == row.scope
+            && self
+                .row
+                .request
+                .as_ref()
+                .zip(row.request.as_ref())
+                .is_some_and(|(old, new)| old.id == new.id && old.kind == new.kind)
+    }
     pub fn sync(&mut self, row: Row, read_only: bool, cx: &mut Context<Self>) {
         self.row = row;
         self.read_only = read_only;
         cx.notify();
+    }
+    pub fn update_receipt(&mut self, receipt: &Receipt, cx: &mut Context<Self>) {
+        if self
+            .receipt
+            .as_ref()
+            .is_some_and(|old| old.accepts_update(receipt))
+            && !self.row.request.as_ref().expect("request").resolved
+        {
+            self.receipt = Some(receipt.clone());
+            if receipt.state.retryable() {
+                self.submitted = None;
+            }
+            cx.notify();
+        }
     }
     fn enabled(&self) -> bool {
         !self.read_only
@@ -92,12 +118,14 @@ impl CardView {
             && !self.row.request.as_ref().expect("request").resolved
             && self.row.scope.is_empty()
     }
-    fn emit(&mut self, intent: ChatIntent, cx: &mut Context<Self>) {
+    pub(super) fn emit(&mut self, intent: ChatIntent, cx: &mut Context<Self>) {
         if !self.enabled() {
             return;
         }
         self.submitted = Some(intent.clone());
-        (self.callback.as_ref().expect("enabled callback"))(intent, cx);
+        let receipt = (self.callback.as_ref().expect("enabled callback"))(intent, cx);
+        self.receipt = Some(receipt.clone());
+        self.update_receipt(&receipt, cx);
         cx.notify();
     }
     fn permission(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
@@ -221,9 +249,25 @@ fn rememberable(value: &serde_json::Value) -> bool {
 impl Render for CardView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut content = div().flex().flex_col().gap(px(6.));
+        if self.row.request.as_ref().expect("request").resolved {
+            return content
+                .child(if self.row.decision.is_some() {
+                    "Recorded answer above"
+                } else {
+                    "Resolved · decision not recorded"
+                })
+                .into_any_element();
+        }
         if let Some(answer) = &self.submitted {
             return content
-                .child(format!("Submitted locally · {}", answer_label(answer)))
+                .child(format!(
+                    "{} · {}",
+                    self.receipt
+                        .as_ref()
+                        .map(|r| r.state.label())
+                        .unwrap_or_else(|| "Preparing command".into()),
+                    answer_label(answer)
+                ))
                 .into_any_element();
         }
         if !self.enabled() {
@@ -238,6 +282,9 @@ impl Render for CardView {
                     "Read-only chat"
                 })
                 .into_any_element();
+        }
+        if let Some(receipt) = &self.receipt {
+            content = content.child(receipt.state.label());
         }
         match &self.row.request.as_ref().unwrap().kind {
             RuntimeRequestKind::Permission { suggestions, .. } => {
@@ -257,7 +304,8 @@ impl Render for CardView {
                     content = content.child(
                         Button::new(("always", index))
                             .small()
-                            .label(label)
+                            .label(format!("{label} · unavailable until destination verified"))
+                            .disabled(true)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.permission(
                                     PermissionDecision::AllowAlways {

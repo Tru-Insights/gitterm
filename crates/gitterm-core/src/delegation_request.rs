@@ -4,28 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// What a `task_update_handoff` says about the work (TRU-142 S6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum HandoffStatus {
-    /// Still working; the delegating chat's card shows the summary line.
-    #[default]
-    Progress,
-    /// The objective is met: the delegation completes with this handoff.
-    Done,
-    /// Cannot go on without a human: blockers say why.
-    Blocked,
-}
-
-impl HandoffStatus {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Progress => "progress",
-            Self::Done => "done",
-            Self::Blocked => "blocked",
-        }
-    }
-}
+pub use crate::tasks::HandoffStatus;
 
 /// What `review_request` reviews.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]

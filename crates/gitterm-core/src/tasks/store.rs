@@ -1,4 +1,5 @@
 use super::model::*;
+use super::{validate_task, validate_task_transition};
 use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -191,16 +192,8 @@ impl TaskStore {
                 ));
             };
             let previous = &candidate.tasks[index];
-            if !previous.lifecycle.can_transition_to(task.lifecycle) {
-                return Err(TaskStoreError::new(
-                    "replace",
-                    &self.path,
-                    format!(
-                        "task {} cannot transition from {:?} to {:?}",
-                        task.task_id, previous.lifecycle, task.lifecycle
-                    ),
-                ));
-            }
+            validate_task_transition(previous, &task)
+                .map_err(|detail| TaskStoreError::new("replace", &self.path, detail))?;
             candidate.tasks[index] = task;
         }
         self.commit_candidate(candidate)
@@ -1745,187 +1738,6 @@ fn validate_document(document: &TaskStoreDocument) -> Result<(), String> {
                 delegation.delegation_id
             ));
         }
-    }
-    Ok(())
-}
-
-fn validate_task(task: &TaskRecord) -> Result<(), String> {
-    if task.schema_version != TASK_STORE_SCHEMA_VERSION {
-        return Err(format!(
-            "task {} has unsupported schema version {}; expected {}",
-            task.task_id, task.schema_version, TASK_STORE_SCHEMA_VERSION
-        ));
-    }
-    for (label, value) in [
-        ("task id", task.task_id.as_str()),
-        ("title", task.title.as_str()),
-        ("objective", task.objective.as_str()),
-        ("created_at timestamp", task.created_at.as_str()),
-        ("updated_at timestamp", task.updated_at.as_str()),
-        ("workspace name", task.workspace.name.as_str()),
-        ("base reference", task.base.reference.as_str()),
-        ("base commit", task.base.commit.as_str()),
-        ("branch", task.branch.as_str()),
-    ] {
-        if value.trim().is_empty() {
-            return Err(format!("task {} has an empty {label}", task.task_id));
-        }
-    }
-    if task.lifecycle == TaskLifecycle::Archived && task.archived_at.is_none() {
-        return Err(format!(
-            "task {} is archived without an archived_at timestamp",
-            task.task_id
-        ));
-    }
-    if task.lifecycle != TaskLifecycle::Archived && task.archived_at.is_some() {
-        return Err(format!(
-            "task {} has archived_at but is not archived",
-            task.task_id
-        ));
-    }
-    match (&task.worktree.state, &task.worktree.path) {
-        (TaskWorktreeState::Ready, None) => {
-            return Err(format!(
-                "task {} has a ready worktree without a path",
-                task.task_id
-            ));
-        }
-        (TaskWorktreeState::Unprepared, Some(_)) => {
-            return Err(format!(
-                "task {} has an unprepared worktree with a path",
-                task.task_id
-            ));
-        }
-        _ => {}
-    }
-    let mut attempt_ids = HashSet::new();
-    let mut active_attempts = Vec::new();
-    for attempt in &task.attempts {
-        if attempt.attempt_id.trim().is_empty() {
-            return Err(format!("task {} has an empty attempt id", task.task_id));
-        }
-        if attempt.started_at.trim().is_empty() {
-            return Err(format!(
-                "task {} attempt {} has an empty started_at timestamp",
-                task.task_id, attempt.attempt_id
-            ));
-        }
-        if !attempt_ids.insert(attempt.attempt_id.as_str()) {
-            return Err(format!(
-                "task {} has duplicate attempt id {}",
-                task.task_id, attempt.attempt_id
-            ));
-        }
-        if attempt.state.is_active() {
-            if attempt.ended_at.is_some() {
-                return Err(format!(
-                    "task {} active attempt {} has an ended_at timestamp",
-                    task.task_id, attempt.attempt_id
-                ));
-            }
-            active_attempts.push(attempt);
-        } else if attempt.ended_at.is_none() {
-            return Err(format!(
-                "task {} inactive attempt {} has no ended_at timestamp",
-                task.task_id, attempt.attempt_id
-            ));
-        }
-    }
-    if active_attempts.len() > 1 {
-        return Err(format!(
-            "task {} has {} active attempts",
-            task.task_id,
-            active_attempts.len()
-        ));
-    }
-    if matches!(
-        task.lifecycle,
-        TaskLifecycle::Queued | TaskLifecycle::Running | TaskLifecycle::WaitingForInput
-    ) && active_attempts.is_empty()
-    {
-        return Err(format!(
-            "task {} is {:?} without an active attempt",
-            task.task_id, task.lifecycle
-        ));
-    }
-    match (&task.active_attempt_id, active_attempts.as_slice()) {
-        (None, []) => {}
-        (Some(active_id), [attempt]) if active_id == &attempt.attempt_id => {
-            if attempt.executor != task.executor {
-                return Err(format!(
-                    "task {} active attempt executor does not match the task executor",
-                    task.task_id
-                ));
-            }
-            if task.lifecycle != attempt.state.lifecycle() {
-                return Err(format!(
-                    "task {} lifecycle {:?} does not match active attempt state {:?}",
-                    task.task_id, task.lifecycle, attempt.state
-                ));
-            }
-        }
-        (Some(active_id), _) => {
-            return Err(format!(
-                "task {} active attempt id {} does not identify its one active attempt",
-                task.task_id, active_id
-            ));
-        }
-        (None, [_]) => {
-            return Err(format!(
-                "task {} has an active attempt without active_attempt_id",
-                task.task_id
-            ));
-        }
-        _ => unreachable!("more than one active attempt was rejected above"),
-    }
-    let mut task_session_ids = HashSet::new();
-    let mut conversation_ids = HashSet::new();
-    for session in &task.sessions {
-        if session.task_session_id.trim().is_empty() {
-            return Err(format!("task {} has an empty session id", task.task_id));
-        }
-        if session.label.trim().is_empty() {
-            return Err(format!(
-                "task {} session {} has an empty label",
-                task.task_id, session.task_session_id
-            ));
-        }
-        if session.created_at.trim().is_empty() || session.updated_at.trim().is_empty() {
-            return Err(format!(
-                "task {} session {} has an empty timestamp",
-                task.task_id, session.task_session_id
-            ));
-        }
-        if !task_session_ids.insert(session.task_session_id.as_str()) {
-            return Err(format!(
-                "task {} has duplicate session id {}",
-                task.task_id, session.task_session_id
-            ));
-        }
-        if let Some(conversation) = &session.conversation {
-            if conversation.session_id.trim().is_empty() {
-                return Err(format!(
-                    "task {} session {} has an empty harness conversation id",
-                    task.task_id, session.task_session_id
-                ));
-            }
-            if !conversation_ids.insert((conversation.backend, conversation.session_id.as_str())) {
-                return Err(format!(
-                    "task {} links the same {:?} conversation {} more than once",
-                    task.task_id, conversation.backend, conversation.session_id
-                ));
-            }
-        }
-    }
-    if task
-        .handoff
-        .as_ref()
-        .is_some_and(|handoff| handoff.summary.trim().is_empty())
-    {
-        return Err(format!(
-            "task {} has an empty handoff summary",
-            task.task_id
-        ));
     }
     Ok(())
 }

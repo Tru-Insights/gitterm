@@ -1,12 +1,17 @@
-//! Single task-store authority. Mutation adapters borrow this same store until
-//! the preparation/launch reducers move in the next task integration slice.
+//! Single task-store authority. Reducers emit effects; the host executes IO.
 
 use super::TaskStore;
+use std::collections::HashMap;
+
+#[path = "mutation.rs"]
+mod mutation;
 use crate::task_commands::{TaskProjection, TaskRead, TaskReadCommand, TaskReadEffect};
 
 #[derive(Debug, Default)]
 pub struct TaskAuthority {
     store: Option<TaskStore>,
+    next_preparation: u64,
+    pending_workers: HashMap<crate::task_commands::WorkerPreparationId, mutation::PendingWorker>,
 }
 
 #[cfg(test)]
@@ -102,7 +107,10 @@ mod tests {
 
 impl From<Option<TaskStore>> for TaskAuthority {
     fn from(store: Option<TaskStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            ..Self::default()
+        }
     }
 }
 

@@ -31,15 +31,10 @@ fixture loading errors exit 1 with the path and JSONL line number.
 
 ## Input and ownership
 
-`events.rs` mirrors the serialized display subset of `HarnessEvent`,
-`ItemKind`, `RuntimeRequestKind`, `TurnStatus`, `MessageState`, and
-`TranscriptEntry` (`Entry::UserPrompt` / `Entry::Harness`) from
-`src/harness/mod.rs` and `src/harness/transcript.rs` at `ab542113`.
-These neutral event types should move to `gitterm-core` in stage 1; the chat
-model, search state, fixture envelopes, and GPUI entities stay here. `Ready`
-is retained as a JSON payload because its composer capabilities are outside
-this viewer. Additional fields such as rate-limit readings are ignored by
-serde; unknown event types fail rather than silently dropping history.
+`events.rs` re-exports the canonical harness DTOs from
+`gitterm_core::chat::types`. There is no native harness event mirror. Only the
+unchanged fixture `Entry`/`Record` display envelopes remain local. The core
+dependency enables no features; the reducer does not require `runtime`.
 
 The loader accepts any of these JSONL line formats:
 
@@ -61,7 +56,7 @@ never implies approval, denial, or an answer that was not recorded. Question
 answers can be shown as the existing question-text → joined-label map, through the app adapter; this crate does not encode a harness protocol. Permission suggestions and ACP options
 remain visible JSON passthrough.
 
-`ChatModel` is deterministic and owns the timeline, scoped tool/request lookup,
+`ChatModel` is a deterministic, disposable row projection with scoped tool/request lookup,
 stream segmentation, and stable row IDs. Nested worker events cannot append to
 the parent's assistant message. Unknown item references produce an explicit
 incomplete-history error. Reset closes lookup scopes and adds a reset marker;
@@ -148,48 +143,64 @@ checks and physical GUI/VoiceOver testing are outside this slice.
 
 ## Adapter API and local state
 
-On macOS, create `ChatView::new(records, window, cx)`, install an app callback
-with `set_intent_callback(Rc::new(|intent, app| { /* deliver intent */ }), cx)`,
-and enable interaction with `set_read_only(None, cx)`. To archive the view,
-call `set_read_only(Some(reason), cx)`: the draft survives, all mutation
-controls disable, and the reason remains visible. Without a callback, controls
-stay disabled. Worker requests remain read-only until a session adapter owns
-worker routing.
+C7 adds a feature-free `ChatAdapter` over the sole core `State::conversation`.
+The shell owner connection belongs to C8. No process, real provider, GUI launch,
+configuration discovery or transcript persistence is added here.
 
-`append_event(HarnessEvent, cx)` accepts normalized events one at a time;
-`append_record(&Record, cx)` additionally accepts timestamps and transcript
-entries. Text deltas, tool starts/completions and turn completion use the same
-model path as fixture loading and replay. Ingestion alone mutates transcript
-rows. Scroll-up preserves the reader anchor for both added rows and in-place
-text deltas. New content then exposes **New messages · Jump to latest**;
-jumping resumes tail-follow. Rich text uses the component's 280 ms stream fade
-and reduced-motion policy.
+The owner installs its sole receiver with `begin_runtime(target)` once and
+captures the returned stamp. Pane focus/show must never call it. Supply current
+catalog facts at `admit`, then `execute` the opaque prepared command against the
+current target. `Prepared::id()` correlates later I/O outcomes. Execution checks
+full `accepts_runtime` again immediately before the synchronous channel send,
+including deferred prompt sends and requests resolved after admission.
 
-`ChatIntent` has typed `Send`, `Stop`, `Permission`, `AnswerQuestion` and
-`DismissQuestion` variants. Permission choices are `Allow`, `AllowAlways`
-(with the exact offered suggestion), and `Deny`. Always is only offered when
-a localSettings rule or ACP option exists, matching the HTML. Question answers
-retain question text, selected labels in fixture order, and optional trimmed
-free text. The adapter can encode the existing question-text → joined-label map.
-Malformed questionnaires show an error and cannot submit; all questions need
-a selected option or nonempty free text.
+| Native action | Core intent/effect | Adapter handling |
+| --- | --- | --- |
+| Send text/images | `Submit` → `Submit(Submission)` | Send the **prepared** prompt, including its assigned ID. On channel acceptance only, apply `SubmissionAccepted` and record the echo once with the supplied host clock. |
+| Allow/deny/question/dismiss | `Answer` → stamped `Send` | Validate the current canonical request kind and offered questionnaire; keep pending until an authoritative resolution. Remember is disabled until destination authority exists. |
+| Stop | `Stop` → stamped `Send(Interrupt)` | Use current session authority; native adapter refuses the legacy task-handle path. |
+| Receiver event | `Event` then `Record` | Gate the entire ingress with `accepts_stream` **before** observers/effects. Present ordered before/event/after markers; recover worker-start timing from the sole conversation. |
+| History start | `BeginHistory` → `LoadHistory` | Return and retain the source `HistoryTicket` with the load ID. |
+| History success/error | `HistoryLoaded` / `HistoryUnavailable` | Validate `accepts_history` for either outcome; surface accepted errors. Consume `ReplayHistory` even when revision is unchanged. |
 
-The only optimistic state is local: Send clears the draft after emitting;
-card submission immediately locks that card and shows **Submitted locally**
-with its answer. Stop waits for a turn-end event. Neither send nor card actions
-append an echo, decision, or resolution to the transcript. The callback must
-arrange authoritative events; no backend acknowledgment is inferred. Replacing
-the callback preserves local submissions. Replay resets transcript/card state
-but retains the composer draft and find query. A future adapter may need a
-rejection/retry API; this fixture slice deliberately provides no guessed
-acknowledgment protocol.
+`HistoryReplayed` receiver frames go through `complete_history` with the ticket
+created for that source; they are deliberately refused by ordinary `receive`.
+Convert their canonical transcript entries with `AgentEvent::from`. Duplicate
+or stale history completions do nothing.
 
-Headless GPUI tests exercise composer Enter/Shift+Enter, empty send, retained
-drafts, read-only and stop intents, each permission decision, questionnaire
-single/multi/free text and validation, read-only/resolved/answered/worker card
-guards, follow versus jump on text deltas, and bounded rich-row retention.
+On macOS, install an `IntentCallback` returning a correlated `Receipt`. Deliver
+adapter updates with `ChatView::present(receiver_stamp, adapter.state(), update,
+window, cx)` and later receipts with `update_receipt`. Keep raw `append_record` /
+`append_event` for fixture playback. History replacement reconciles retained
+cards by request ID, scope and kind, rather than positional row ID. A new
+runtime discards old card controls; stale projection stamps are refused.
 
-Verified for TRU-288 on arm64 macOS: formatting, locked workspace all-target
-Clippy (`-D warnings`), locked workspace tests (**16 chat + 7 shell + 65 terminal**),
-locked workspace build, and dependency boundary check each exited **0**. Both
-lockfiles remain unchanged. No GUI or running app was used.
+| Receipt | Meaning and recovery |
+| --- | --- |
+| Prepared | Admitted locally; no delivery claim. |
+| ChannelAccepted | Command channel accepted it; harness delivery remains unconfirmed. |
+| Written | Correlated actual I/O succeeded; still awaiting the authoritative outcome. |
+| Rejected | Definitive non-delivery. Draft and images remain; an open answer card unlocks for explicit retry. |
+| Uncertain | Delivery may have occurred. Keep the draft/answer and block retry; never auto-resend. |
+| Resolved | Runtime closed the request. It does **not** mean approved. Late rejection cannot reopen it. |
+
+The composer retains text and image bytes until a write or terminal receipt, and clears
+only the unchanged submitted draft, preserving newer edits. Images can enter
+through `set_images`; image preparation/strip/paste remains C13. Receipt IDs
+prevent late outcomes from modifying a newer attempt. Card answers remain
+local intent labels, never fabricated recorded decisions.
+
+**Live activation prerequisite:** the current core `Session::send` exposes
+channel acceptance only; runner write failures surface as uncorrelated errors.
+C7 defines and tests the synthetic `DeliveryOutcome` executor port. C8 must
+supply trustworthy correlated outcomes before claiming harness write receipts;
+never parse error strings to guess delivery. No wire enum or fixture changes
+are used to carry app-local receipts. Remember dispatch remains unavailable
+until a preview-owned destination is verified.
+
+The test suite covers canonical showcase/C0 replay, stale ingress before
+observers, full-binding checks before commands, host-clock echo, rejected
+text/images, answer rejection/explicit retry, uncertain delivery, resolution
+precedence, history source validation and replay without a revision change.
+All test input is synthetic. GUI feel and live owner/provider integration are
+outside C7.
