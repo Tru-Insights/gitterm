@@ -315,6 +315,11 @@ impl<H: SurfaceHost> RetainedViewer<H> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_ticket_for_test(&self) -> SnapshotTicket {
+        self.pending.as_ref().expect("snapshot pending").0.clone()
+    }
+
     pub fn snapshot_image(&self) -> Option<&Arc<Image>> {
         if !self.selected || self.replacing() {
             return None;

@@ -19,7 +19,6 @@
 use std::collections::HashMap;
 #[cfg(feature = "runtime")]
 use std::fs;
-#[cfg(feature = "runtime")]
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -85,6 +84,46 @@ pub fn is_safe_relative_md_path(path: &str) -> bool {
                 && !segment.starts_with('.')
                 && !segment.contains('\\')
         })
+}
+
+/// Failure categories preserve the raw routes' existing status/body contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainmentError {
+    InvalidPath,
+    RootMissing,
+    NotFound,
+}
+
+impl std::fmt::Display for ContainmentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidPath => "invalid document path",
+            Self::RootMissing => "document dir missing",
+            Self::NotFound => "document not found",
+        })
+    }
+}
+impl std::error::Error for ContainmentError {}
+
+/// Resolve an existing candidate beneath a captured root, including symlink containment.
+/// This accepts filesystem paths, not URLs: percent escapes are never decoded.
+/// This extracts the raw routes' canonical check unchanged. Callers must apply
+/// their lexical policy first: plans use `is_safe_relative_md_path`, while the
+/// root-bound content reader requires a nonempty relative path without parents.
+/// Like the raw routes, this checks canonical paths at resolution time; it does
+/// not defend against a concurrent filesystem writer replacing path components.
+pub fn resolve_contained(root: &Path, relative: &Path) -> Result<PathBuf, ContainmentError> {
+    let canon_root = root
+        .canonicalize()
+        .map_err(|_| ContainmentError::RootMissing)?;
+    let canon_path = root
+        .join(relative)
+        .canonicalize()
+        .map_err(|_| ContainmentError::NotFound)?;
+    if !canon_path.starts_with(&canon_root) {
+        return Err(ContainmentError::InvalidPath);
+    }
+    Ok(canon_path)
 }
 
 pub fn extract_title(md: &str, fallback: &str) -> String {
@@ -245,30 +284,18 @@ async fn handle_raw(
         )
         .into_response());
     };
-    let Ok(canon_dir) = dir.canonicalize() else {
-        return Ok(warp::reply::with_status(
-            "document dir missing",
-            warp::http::StatusCode::NOT_FOUND,
-        )
-        .into_response());
+    let canon_path = match resolve_contained(&dir, Path::new(path)) {
+        Ok(path) => path,
+        Err(error) => {
+            let status = match error {
+                ContainmentError::InvalidPath => warp::http::StatusCode::BAD_REQUEST,
+                ContainmentError::RootMissing | ContainmentError::NotFound => {
+                    warp::http::StatusCode::NOT_FOUND
+                }
+            };
+            return Ok(warp::reply::with_status(error.to_string(), status).into_response());
+        }
     };
-    let candidate = dir.join(path);
-    let Ok(canon_path) = candidate.canonicalize() else {
-        return Ok(warp::reply::with_status(
-            "document not found",
-            warp::http::StatusCode::NOT_FOUND,
-        )
-        .into_response());
-    };
-    // Defense in depth: even if validation passed, refuse anything that
-    // canonicalizes outside the source dir (e.g. symlinks).
-    if !canon_path.starts_with(&canon_dir) {
-        return Ok(warp::reply::with_status(
-            "invalid document path",
-            warp::http::StatusCode::BAD_REQUEST,
-        )
-        .into_response());
-    }
     match fs::read(&canon_path) {
         Ok(bytes) => {
             Ok(

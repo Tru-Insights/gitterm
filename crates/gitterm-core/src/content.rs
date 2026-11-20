@@ -54,6 +54,26 @@ macro_rules! perf_log {
     }};
 }
 
+/// Root-bound local preview. Existing unrestricted Iced callers retain their
+/// original reader; new frontends must supply a captured root and relative path.
+pub fn collect_contained_file_load(
+    tab_id: usize,
+    root: &Path,
+    relative: &Path,
+    is_dark_theme: bool,
+) -> Result<FileLoadSnapshot, crate::plans::ContainmentError> {
+    use std::path::Component;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(crate::plans::ContainmentError::InvalidPath);
+    }
+    let path = crate::plans::resolve_contained(root, relative)?;
+    Ok(collect_file_load(tab_id, path, is_dark_theme))
+}
+
 pub fn collect_file_load(tab_id: usize, path: PathBuf, is_dark_theme: bool) -> FileLoadSnapshot {
     let started = Instant::now();
     let mut snapshot = FileLoadSnapshot {
@@ -544,6 +564,123 @@ mod tests {
         {
             assert!(snapshot.webview_content.is_none());
             assert_eq!(snapshot.file_content.as_bytes(), json);
+        }
+    }
+}
+
+#[cfg(test)]
+mod containment_tests {
+    use super::*;
+    use crate::plans::ContainmentError;
+
+    #[test]
+    fn captured_roots_and_invalid_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let plans = workspace.path().join(".plans");
+        let docs = workspace.path().join("docs");
+        std::fs::create_dir(&plans).unwrap();
+        std::fs::create_dir(&docs).unwrap();
+        for (root, text) in [
+            (workspace.path(), "Workspace"),
+            (&plans, "Plans"),
+            (&docs, "Docs"),
+        ] {
+            std::fs::write(root.join("guide.md"), format!("# {text}")).unwrap();
+            let load = collect_contained_file_load(7, root, Path::new("guide.md"), true).unwrap();
+            assert_eq!(load.tab_id, 7);
+            assert!(load.webview_content.unwrap().contains(text));
+        }
+        for relative in [
+            "../guide.md",
+            "nested/../guide.md",
+            "/guide.md",
+            "./guide.md",
+            "",
+        ] {
+            assert_eq!(
+                collect_contained_file_load(0, workspace.path(), Path::new(relative), true)
+                    .unwrap_err(),
+                ContainmentError::InvalidPath
+            );
+        }
+        let absolute_inside = workspace.path().join("guide.md");
+        assert_eq!(
+            collect_contained_file_load(0, workspace.path(), &absolute_inside, true).unwrap_err(),
+            ContainmentError::InvalidPath
+        );
+        for relative in ["missing.md", "%2e%2e%2fguide.md", "%2e%2e/guide.md"] {
+            assert!(
+                collect_contained_file_load(0, workspace.path(), Path::new(relative), true)
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            collect_contained_file_load(
+                0,
+                &workspace.path().join("missing-root"),
+                Path::new("guide.md"),
+                true
+            )
+            .unwrap_err(),
+            ContainmentError::RootMissing
+        );
+        assert_eq!(
+            collect_contained_file_load(0, &plans, Path::new("../docs/guide.md"), true)
+                .unwrap_err(),
+            ContainmentError::InvalidPath
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_symlinks_cannot_cross_the_captured_root() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("guide.md"), "# Inside").unwrap();
+        std::fs::write(outside.path().join("guide.md"), "# Outside").unwrap();
+        symlink(
+            root.path().join("guide.md"),
+            root.path().join("internal.md"),
+        )
+        .unwrap();
+        symlink(
+            outside.path().join("guide.md"),
+            root.path().join("external.md"),
+        )
+        .unwrap();
+        symlink(outside.path(), root.path().join("external-dir")).unwrap();
+        assert!(
+            collect_contained_file_load(0, root.path(), Path::new("internal.md"), true)
+                .unwrap()
+                .webview_content
+                .unwrap()
+                .contains("Inside")
+        );
+        let plans = root.path().join(".plans");
+        std::fs::create_dir(&plans).unwrap();
+        symlink(
+            root.path().join("guide.md"),
+            plans.join("workspace-link.md"),
+        )
+        .unwrap();
+        assert_eq!(
+            collect_contained_file_load(0, &plans, Path::new("workspace-link.md"), true)
+                .unwrap_err(),
+            ContainmentError::InvalidPath
+        );
+        assert!(collect_contained_file_load(
+            0,
+            root.path(),
+            Path::new(".plans/workspace-link.md"),
+            true
+        )
+        .is_ok());
+        for relative in ["external.md", "external-dir/guide.md"] {
+            assert_eq!(
+                collect_contained_file_load(0, root.path(), Path::new(relative), true).unwrap_err(),
+                ContainmentError::InvalidPath
+            );
         }
     }
 }
