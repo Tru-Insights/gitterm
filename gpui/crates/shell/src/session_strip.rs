@@ -175,6 +175,8 @@ pub fn render(input: &Input, c: Colors, emit: Handler<Outcome>) -> gpui::Statefu
     let mut stamp = div()
         .flex()
         .flex_none()
+        .max_w(gpui::relative(0.25))
+        .overflow_hidden()
         .items_center()
         .gap(px(2.))
         .pl(px(8.))
@@ -244,10 +246,11 @@ pub fn render(input: &Input, c: Colors, emit: Handler<Outcome>) -> gpui::Statefu
     }
     let mut tabs = div()
         .id("pstrip-session-scroll")
+        .debug_selector(|| "pstrip-session-scroll".into())
         .flex()
         .items_center()
         .gap(px(2.))
-        .flex_1()
+        .flex_initial()
         .min_w_0()
         .overflow_x_scroll()
         .px(px(8.))
@@ -330,24 +333,28 @@ pub fn render(input: &Input, c: Colors, emit: Handler<Outcome>) -> gpui::Statefu
             ),
         );
     }
-    if let Some(outcome) = input.new_session() {
-        tabs = tabs.child(
-            control(
-                "pstrip-new-session",
-                input.add_label(),
-                "New session",
-                c.muted,
-                c,
-                outcome,
-                emit.clone(),
-            )
-            .flex_none()
-            .debug_selector(|| "pstrip-new-session".into()),
-        );
-    }
+    // Reserve the add control's intrinsic width before shrinking the tab
+    // viewport. Putting it inside that viewport clips it behind metadata.
+    let new_session = input.new_session().map(|outcome| {
+        control(
+            "pstrip-new-session",
+            input.add_label(),
+            "New session",
+            c.muted,
+            c,
+            outcome,
+            emit.clone(),
+        )
+        .flex_none()
+        .debug_selector(|| "pstrip-new-session".into())
+    });
     let mut metadata = div()
+        .id("pstrip-session-metadata")
+        .debug_selector(|| "pstrip-session-metadata".into())
         .flex()
         .flex_none()
+        .max_w(gpui::relative(0.35))
+        .overflow_hidden()
         .items_center()
         .gap(px(4.))
         .px(px(10.));
@@ -420,7 +427,15 @@ pub fn render(input: &Input, c: Colors, emit: Handler<Outcome>) -> gpui::Statefu
         .border_b_1()
         .border_color(rgb(c.surface0))
         .child(stamp)
-        .child(tabs)
+        .child(
+            div()
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .child(tabs)
+                .children(new_session),
+        )
         .child(metadata)
 }
 
@@ -563,6 +578,53 @@ mod tests {
             )
         }
     }
+    #[gpui::test]
+    fn new_session_keeps_its_full_width_when_tabs_overflow(cx: &mut TestAppContext) {
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|_, _| View {
+            input: input(),
+            events: Rc::new(RefCell::new(vec![])),
+        });
+        cx.simulate_resize(gpui::size(px(1400.), px(800.)));
+        view.update(cx, |view, cx| {
+            view.input.sessions.clear();
+            cx.notify();
+        });
+        draw(cx);
+        let full_width = cx.debug_bounds("pstrip-new-session").unwrap().size.width;
+        for width in [320., 640., 1024., 1400.] {
+            for count in [1, 4, 30] {
+                view.update(cx, |view, cx| {
+                    view.input.sessions = (0..count)
+                        .map(|id| {
+                            let mut session = session(id);
+                            session.chat_title =
+                                Some("A long conversation title that truncates".into());
+                            session
+                        })
+                        .collect();
+                    view.input.workspace_name = if count == 30 {
+                        "A very long workspace name that must yield to the session control".into()
+                    } else {
+                        "GitTerm".into()
+                    };
+                    cx.notify();
+                });
+                cx.simulate_resize(gpui::size(px(width), px(800.)));
+                draw(cx);
+                let add = cx.debug_bounds("pstrip-new-session").unwrap();
+                let metadata = cx.debug_bounds("pstrip-session-metadata").unwrap();
+                let strip = cx.debug_bounds("pstrip-session-strip").unwrap();
+                let tabs = cx.debug_bounds("pstrip-session-scroll").unwrap();
+                assert_eq!(add.size.width, full_width, "{count} tabs at {width}px");
+                assert!(tabs.right() <= add.left());
+                assert!(add.right() <= metadata.left());
+                assert!(add.left() >= strip.left() && add.right() <= strip.right());
+            }
+        }
+    }
+
     #[gpui::test]
     fn clicks_emit_select_close_picker_and_workspace_close(cx: &mut TestAppContext) {
         cx.background_executor.allow_parking();
