@@ -310,7 +310,7 @@ mod iced_tests {
         let entry = |name: &str, active: bool, chats: Vec<&str>| {
             serde_json::json!({
                 "name": name, "abbrev":"FX", "dir":"/fixture/shared", "color":"blue", "active":active,
-                "repos":["/fixture/api", "/fixture/shared"], "chats":chats, "active_tab":1,
+                "repos":["/fixture/api", "/fixture/shared"], "home":"/fixture/api", "chats":chats, "active_tab":1,
                 "tabs":[{"dir":"/fixture/shared", "startup_command":"must-never-run", "session_uid":format!("{name}-terminal")},
                         {"dir":"/fixture/api", "tab_kind":"agent", "agent_config":{"backend":"claude", "model":"default"}, "chat_session_id":"chat-1", "session_uid":format!("{name}-agent")}]
             })
@@ -353,6 +353,7 @@ mod iced_tests {
         );
         let model = crate::workspace_status::WorkspaceStatus::from_iced(&catalog);
         assert_eq!(model.workspaces.len(), 2);
+        assert_eq!(model.workspaces[1].folder, PathBuf::from("/fixture/shared"));
         assert_eq!(model.active(), Some(crate::data::WorkspaceId(2)));
         assert_ne!(
             iced_layout_key(&catalog.workspaces[0]),
@@ -533,6 +534,16 @@ mod iced_projection_tests {
             );
             let active = shell.active(cx);
             assert_eq!(active.active_session, Some(active.sessions[1].id));
+            assert!(crate::pane_id_visible(
+                active,
+                &crate::session_pane_id(active.sessions[1].id),
+                cx
+            ));
+            assert!(!crate::pane_id_visible(
+                active,
+                &crate::session_pane_id(active.sessions[0].id),
+                cx
+            ));
             for session in &active.sessions {
                 let pane = active.panes[&crate::session_pane_id(session.id)].read(cx);
                 assert!(matches!(
@@ -543,5 +554,82 @@ mod iced_projection_tests {
             }
             assert!(shell.owner.read(cx).chats.is_empty());
         });
+    }
+}
+
+#[cfg(test)]
+mod preview_terminal_restore_test {
+    use super::*;
+    #[gpui::test]
+    fn imported_work_restores_and_resaves_only_its_preview_terminal_inventory(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext;
+        use std::rc::Rc;
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::preview::tests::guarded_store(&dir.path().join("preview"));
+        let source = dir.path().join("iced");
+        std::fs::create_dir(&source).unwrap();
+        let bytes = br#"{"active_workspace":0,"workspaces":[{"name":"Work","abbrev":"W","dir":"/fixture/work","color":"blue","tabs":[{"dir":"/fixture/work","startup_command":"MUST NOT RUN"}]}]}"#;
+        std::fs::write(source.join("workspaces.json"), bytes).unwrap();
+        let model = load_iced_workspaces_from(&mut store, &source);
+        let layout = store.guard.as_ref().unwrap().preview().layout();
+        let key = iced_layout_key(&store.iced.as_ref().unwrap().workspaces[0]);
+        let path = crate::layout::workspace_layout_path(&layout, &key);
+        let mut saved = crate::layout::LayoutStore::guarded(
+            path.clone(),
+            store.guard.as_ref().unwrap().clone(),
+        );
+        saved.terminals = Some(vec![crate::layout::TerminalSession {
+            id: 777,
+            cwd: dir.path().canonicalize().unwrap(),
+        }]);
+        let state = gpui_component::dock::DockAreaState {
+            version: Some(1),
+            center: gpui_component::dock::PanelState {
+                panel_name: "StackPanel".into(),
+                children: vec![],
+                info: gpui_component::dock::PanelInfo::stack(vec![], gpui::Axis::Horizontal),
+            },
+            ..Default::default()
+        };
+        saved.save(&state).unwrap();
+        let (shell, cx) = cx.add_window_view(|window, cx| {
+            let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, Some(store), cx));
+            crate::Shell::with_owner(
+                Rc::new(crate::data::LocalData(owner.clone())),
+                owner,
+                &layout,
+                true,
+                window,
+                cx,
+            )
+            .unwrap()
+        });
+        cx.read(|cx| {
+            let state = shell.read(cx).active(cx);
+            assert_eq!(state.sessions.len(), 2);
+            let imported = state.panes[&crate::session_pane_id(state.sessions[0].id)].read(cx);
+            assert!(matches!(
+                imported.content,
+                crate::pane::PaneContent::IcedSession(_)
+            ));
+            assert!(imported.session.is_none());
+            assert!(matches!(
+                state.panes["session-777"].read(cx).content,
+                crate::pane::PaneContent::Terminal(_)
+            ));
+            assert_eq!(state.store.terminals.as_ref().unwrap()[0].id, 777);
+            state.store.save(&state.dock.read(cx).dump(cx)).unwrap();
+        });
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved["terminal_sessions"][0]["id"], 777);
+        assert_eq!(
+            std::fs::read(source.join("workspaces.json")).unwrap(),
+            bytes
+        );
     }
 }

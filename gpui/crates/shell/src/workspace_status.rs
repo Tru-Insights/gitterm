@@ -87,7 +87,7 @@ impl WorkspaceStatus {
         let now = Instant::now();
         let mut model = Self::default();
         for (index, saved) in catalog.workspaces.iter().enumerate() {
-            let folder = PathBuf::from(saved.home_dir());
+            let folder = PathBuf::from(&saved.dir);
             model.workspaces.push(LocalWorkspace {
                 id: WorkspaceId(index as u64 + 1),
                 root: folder.clone(),

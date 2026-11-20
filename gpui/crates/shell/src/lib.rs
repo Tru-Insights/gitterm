@@ -198,6 +198,15 @@ impl Shell {
         })];
         for state in &mut workspaces {
             load_workspace_layout(state, window, cx)?;
+            if owner.read(cx).iced_workspace(state.workspace.id).is_some()
+                && let Some(id) = state.active_session
+                && let Some(pane) = state.panes.get(&session_pane_id(id))
+            {
+                let panel = PanelId::from(pane.entity_id());
+                state
+                    .dock
+                    .update(cx, |dock, cx| dock.select_panel(panel, window, cx));
+            }
             subscriptions.push(subscribe_dock(state, cx));
             subscriptions.push(observe_content_dock(&state.dock, cx));
             if local {
@@ -1008,8 +1017,34 @@ fn build_workspace(
         .local_owner()
         .is_some_and(|owner| owner.read(cx).iced_workspace(workspace.id).is_some());
     let sessions = if imported {
-        store.terminals = Some(vec![]);
-        data.sessions(workspace.id, cx)
+        let mut sessions = data.sessions(workspace.id, cx);
+        let mut terminals = store
+            .load_terminals()
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "load preview terminal sessions {}: {error:#}",
+                    store.path.display()
+                );
+                None
+            })
+            .unwrap_or_default();
+        terminals.retain(|terminal| {
+            !session_ids.contains(&terminal.id) && !sessions.iter().any(|s| s.id.0 == terminal.id)
+        });
+        sessions.extend(terminals.iter().map(|terminal| {
+            Session {
+                id: SessionId(terminal.id),
+                title: terminal
+                    .cwd
+                    .file_name()
+                    .unwrap_or(terminal.cwd.as_os_str())
+                    .to_string_lossy()
+                    .into_owned(),
+                kind: data::SessionKind::Terminal,
+            }
+        }));
+        store.terminals = Some(terminals);
+        sessions
     } else if local {
         let restored = store.load_terminals().unwrap_or_else(|error| {
             eprintln!("load terminal sessions {}: {error:#}", store.path.display());
