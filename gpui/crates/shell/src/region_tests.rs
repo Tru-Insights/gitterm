@@ -54,7 +54,7 @@ fn region_order_sizes_and_explicit_bottom_terminal(cx: &mut TestAppContext) {
     assert_eq!(bar.size.height, px(28.));
     assert_eq!(bar.bottom(), px(800.));
     assert_eq!(content.bottom(), bar.origin.y);
-    assert!(cx.debug_bounds("bottom-panel").is_none());
+    assert!(cx.debug_bounds("standalone-bottom-panel").is_none());
     cx.read(|cx| {
         let state = shell.read(cx).active(cx);
         assert!(state.sessions.is_empty());
@@ -63,15 +63,28 @@ fn region_order_sizes_and_explicit_bottom_terminal(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| shell.update(cx, |shell, cx| shell.open_bottom_terminal(window, cx)));
     draw(cx);
-    let bottom = cx.debug_bounds("bottom-panel").unwrap();
-    let divider = cx.debug_bounds("bottom-divider").unwrap();
+    let bottom = cx.debug_bounds("standalone-bottom-panel").unwrap();
+    let divider = cx.debug_bounds("standalone-bottom-divider").unwrap();
     assert_eq!(bottom.size.height, px(200.));
     assert_eq!(divider.size.height, px(3.));
     assert_eq!(divider.bottom(), bottom.origin.y);
     assert_eq!(bottom.bottom(), bar.origin.y);
     cx.update(|window, cx| {
         shell.update(cx, |shell, cx| {
-            shell.new_terminal_in(DockPlacement::Bottom, window, cx)
+            assert!(
+                shell.active(cx).sessions.is_empty(),
+                "toggle opens an empty panel"
+            );
+            shell.bottom_outcome(
+                bottom_panel::Outcome::AddTerminal { repo: None },
+                window,
+                cx,
+            );
+            shell.bottom_outcome(
+                bottom_panel::Outcome::AddTerminal { repo: None },
+                window,
+                cx,
+            );
         })
     });
     draw(cx);
@@ -85,19 +98,51 @@ fn region_order_sizes_and_explicit_bottom_terminal(cx: &mut TestAppContext) {
     let first_id = Box::leak(first_id.into_boxed_str());
     let second_id = Box::leak(second_id.into_boxed_str());
     assert!(cx.debug_bounds(second_id).is_some());
-    cx.update(|window, cx| shell.update(cx, |shell, cx| shell.select_session(0, window, cx)));
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.bottom_outcome(
+                bottom_panel::Outcome::SelectTab {
+                    id: shell.active(cx).sessions[0].id.0 as usize,
+                },
+                window,
+                cx,
+            )
+        })
+    });
     draw(cx);
     assert!(cx.debug_bounds(first_id).is_some());
     assert!(cx.debug_bounds(second_id).is_none());
     cx.update(|window, cx| shell.update(cx, |shell, cx| shell.open_bottom_terminal(window, cx)));
     draw(cx);
-    assert!(cx.debug_bounds("bottom-panel").is_none());
+    assert!(cx.debug_bounds("standalone-bottom-panel").is_none());
     cx.read(|cx| {
         assert_eq!(
             shell.read(cx).active(cx).sessions.len(),
             2,
             "toggle retains the explicit terminals"
         )
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.open_bottom_terminal(window, cx);
+            let ids: Vec<_> = shell
+                .active(cx)
+                .sessions
+                .iter()
+                .map(|s| s.id.0 as usize)
+                .collect();
+            for id in ids {
+                shell.bottom_outcome(bottom_panel::Outcome::CloseTab { id }, window, cx);
+            }
+        })
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("standalone-bottom-panel").is_some());
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        assert!(shell.active(cx).sessions.is_empty());
+        assert!(shell.bottom.read(cx).input.tabs.is_empty());
+        assert!(shell.bottom.read(cx).input.opened);
     });
 }
 

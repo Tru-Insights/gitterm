@@ -90,12 +90,6 @@ impl Controller {
                 },
             );
         }
-        if matches!(&intent, ChatIntent::Send { images, .. } if !images.is_empty()) {
-            return (
-                Receipt::rejected("Images: not in preview yet"),
-                Update::default(),
-            );
-        }
         let answer = match &intent {
             ChatIntent::Answer { answer, .. } => answer.as_ref(),
             intent => intent,
@@ -215,8 +209,10 @@ pub(crate) struct ChatPane {
     view: Entity<ChatView>,
     pending: Vec<Update>,
     shutdown: Arc<RuntimeShutdown>,
+    _roster_subscription: gpui::Subscription,
 }
 impl EventEmitter<SavedChat> for ChatPane {}
+impl EventEmitter<gitterm_gpui_chat::model::roster::RosterOutcome> for ChatPane {}
 impl ChatPane {
     pub fn new(
         shutdown: Arc<RuntimeShutdown>,
@@ -239,6 +235,7 @@ impl ChatPane {
             view.set_read_only(Some("Preview activation unavailable".into()), cx);
             view
         });
+        let roster_subscription = Self::forward_roster(&view, cx);
         let callback = Self::intent_callback(cx.weak_entity());
         view.update(cx, |view, cx| view.set_intent_callback(callback, cx));
         let launch = (|| -> Result<_> {
@@ -259,6 +256,7 @@ impl ChatPane {
             view,
             pending: vec![],
             shutdown,
+            _roster_subscription: roster_subscription,
         };
         match launch {
             Ok((runtime, events)) => pane.install_runtime(runtime, events, window, cx),
@@ -267,6 +265,16 @@ impl ChatPane {
             }),
         }
         pane
+    }
+    /// Shell navigation subscribes to ChatPane's typed roster events. The view
+    /// has already hidden Dismiss locally; Open retains the host's worker id.
+    fn forward_roster(view: &Entity<ChatView>, cx: &mut Context<Self>) -> gpui::Subscription {
+        cx.subscribe(
+            view,
+            |_, _, outcome: &gitterm_gpui_chat::model::roster::RosterOutcome, cx| {
+                cx.emit(outcome.clone());
+            },
+        )
     }
     fn intent_callback(weak: gpui::WeakEntity<Self>) -> gitterm_gpui_chat::IntentCallback {
         Rc::new(move |intent, cx| {
@@ -295,12 +303,14 @@ impl ChatPane {
             );
             view
         });
+        let roster_subscription = Self::forward_roster(&view, cx);
         Self {
             controller,
             saved,
             view,
             pending: vec![],
             shutdown,
+            _roster_subscription: roster_subscription,
         }
     }
     pub(crate) fn is_working(&self) -> bool {

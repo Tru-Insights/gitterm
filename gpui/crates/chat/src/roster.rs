@@ -93,11 +93,28 @@ pub fn rows(input: &[RosterEntry], now_ms: u64) -> Vec<RosterRow> {
         .collect()
 }
 
+/// Navigation belongs to the host; dismissal only hides this chat's roster row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RosterOutcome {
+    Open { id: String },
+    Dismiss { id: String },
+}
+
 #[cfg(target_os = "macos")]
-pub(crate) fn render(input: &[RosterEntry], now_ms: u64) -> impl gpui::IntoElement {
+pub(crate) fn render(
+    input: &[RosterEntry],
+    hidden: &std::collections::HashSet<String>,
+    now_ms: u64,
+    cx: &mut gpui::Context<crate::ChatView>,
+) -> impl gpui::IntoElement {
     use gpui::{
         InteractiveElement, ParentElement, StatefulInteractiveElement, Styled, div, px, rgb,
     };
+    use gpui_component::button::Button;
+    let rows: Vec<_> = rows(input, now_ms)
+        .into_iter()
+        .filter(|row| !hidden.contains(&row.id))
+        .collect();
     div()
         .id("chat-roster")
         .max_h(px(98.))
@@ -108,7 +125,7 @@ pub(crate) fn render(input: &[RosterEntry], now_ms: u64) -> impl gpui::IntoEleme
         .font_family("Menlo")
         .text_size(px(15. * 12. / 14.))
         .text_color(rgb(0x7f849c))
-        .children((!input.is_empty()).then(|| {
+        .children((!rows.is_empty()).then(|| {
             div()
                 .flex()
                 .flex_col()
@@ -118,8 +135,16 @@ pub(crate) fn render(input: &[RosterEntry], now_ms: u64) -> impl gpui::IntoEleme
                 .pt(px(4.))
                 .px(px(6.))
                 .pb(px(6.))
-                .children(rows(input, now_ms).into_iter().map(|row| {
+                .children(rows.into_iter().map(|row| {
+                    let id = row.id.clone();
+                    let dismiss_id = row.id.clone();
                     let selector = format!("roster-{}", row.id);
+                    // Reuse the existing activity tick; no extra animation task per worker.
+                    let opacity = if row.state == WorkerState::Running {
+                        0.3 + 0.7 * ((now_ms % 1400) as f32 / 1400. * std::f32::consts::PI).sin()
+                    } else {
+                        1.
+                    };
                     div()
                         .id(gpui::SharedString::from(selector.clone()))
                         .debug_selector(move || selector.clone())
@@ -128,12 +153,19 @@ pub(crate) fn render(input: &[RosterEntry], now_ms: u64) -> impl gpui::IntoEleme
                         .gap(px(8.))
                         .px(px(4.))
                         .py(px(1.))
+                        .cursor_pointer()
+                        .rounded(px(4.))
+                        .hover(|style| style.bg(rgb(0x45475a)))
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.roster_outcome(RosterOutcome::Open { id: id.clone() }, cx)
+                        }))
                         .child(
                             div()
                                 .size(px(7.))
                                 .flex_shrink_0()
                                 .rounded_full()
-                                .bg(rgb(row.state.color())),
+                                .bg(rgb(row.state.color()))
+                                .opacity(opacity),
                         )
                         .child(
                             div()
@@ -143,6 +175,31 @@ pub(crate) fn render(input: &[RosterEntry], now_ms: u64) -> impl gpui::IntoEleme
                         )
                         .child(div().flex_1().min_w_0().truncate().child(row.what))
                         .child(div().flex_shrink_0().child(row.elapsed))
+                        .child(
+                            Button::new(gpui::SharedString::from(format!(
+                                "roster-dismiss-{}",
+                                row.id
+                            )))
+                            .debug_selector(move || format!("roster-dismiss-{dismiss_id}"))
+                            .label("×")
+                            .tooltip("Hide from this list")
+                            .accessibility_label("Hide from this list")
+                            .h(px(16.))
+                            .min_w(px(16.))
+                            .px(px(4.))
+                            .py_0()
+                            .bg(gpui::rgba(0))
+                            .border_0()
+                            .on_click(cx.listener(
+                                move |view, _, _, cx| {
+                                    cx.stop_propagation();
+                                    view.roster_outcome(
+                                        RosterOutcome::Dismiss { id: row.id.clone() },
+                                        cx,
+                                    );
+                                },
+                            )),
+                        )
                 }))
         }))
 }

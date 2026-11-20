@@ -1,3 +1,4 @@
+mod attachments;
 #[path = "copy.rs"]
 mod copy;
 #[path = "find.rs"]
@@ -128,12 +129,17 @@ pub struct ChatView {
     preview: bool,
     composer: Entity<TextareaState>,
     composer_state: crate::composer::ComposerState,
+    slash_scroll: gpui::ScrollHandle,
     roster: Vec<roster::RosterEntry>,
+    roster_hidden: HashSet<String>,
     activity_tick: Option<Task<()>>,
     /// Raw fixture ingress only; live projection is always supplied by the owner.
     fixture_composer: gitterm_core::chat::state::State,
     callback: Option<IntentCallback>,
     images: Vec<gitterm_core::chat::types::ImageAttachment>,
+    image_previews: Vec<Option<Arc<gpui::Image>>>,
+    image_queue: VecDeque<attachments::Source>,
+    preparing_image: Option<Task<()>>,
     submission: Option<Receipt>,
     control_receipt: Option<Receipt>,
     projection_runtime: Option<gitterm_core::chat::state::RuntimeStamp>,
@@ -157,6 +163,8 @@ pub struct ChatView {
     replay_position: usize,
     _subscriptions: Vec<Subscription>,
 }
+impl gpui::EventEmitter<roster::RosterOutcome> for ChatView {}
+
 impl ChatView {
     pub fn new(records: Vec<Record>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let model = ChatModel::from_records(&records);
@@ -223,11 +231,16 @@ impl ChatView {
             preview: false,
             composer,
             composer_state,
+            slash_scroll: gpui::ScrollHandle::new(),
             roster: vec![],
+            roster_hidden: HashSet::new(),
             activity_tick: None,
             fixture_composer,
             callback: None,
             images: vec![],
+            image_previews: vec![],
+            image_queue: VecDeque::new(),
+            preparing_image: None,
             submission: None,
             control_receipt: None,
             projection_runtime: None,
@@ -261,14 +274,36 @@ impl ChatView {
         cx.notify();
     }
 
+    pub(crate) fn roster_outcome(
+        &mut self,
+        outcome: roster::RosterOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        let id = match &outcome {
+            roster::RosterOutcome::Open { id } | roster::RosterOutcome::Dismiss { id } => id,
+        };
+        if !self.roster.iter().any(|row| &row.id == id) || self.roster_hidden.contains(id) {
+            return;
+        }
+        if let roster::RosterOutcome::Dismiss { id } = &outcome {
+            self.roster_hidden.insert(id.clone());
+            self.sync_activity_tick(cx);
+        }
+        cx.emit(outcome);
+        cx.notify();
+    }
+
     pub fn set_status_error(&mut self, error: String, cx: &mut Context<Self>) {
         self.composer_state.notice = Some(error);
         cx.notify();
     }
 
     fn sync_activity_tick(&mut self, cx: &mut Context<Self>) {
-        let live =
-            self.composer_state.streaming || self.roster.iter().any(|row| row.state.is_live());
+        let live = self.composer_state.streaming
+            || self
+                .roster
+                .iter()
+                .any(|row| row.state.is_live() && !self.roster_hidden.contains(&row.id));
         if !live {
             self.activity_tick = None;
         } else if self.activity_tick.is_none() {
@@ -306,6 +341,10 @@ impl ChatView {
     }
     pub fn set_read_only(&mut self, reason: Option<String>, cx: &mut Context<Self>) {
         self.read_only_reason = reason;
+        if self.read_only_reason.is_some() {
+            self.image_queue.clear();
+            self.preparing_image = None;
+        }
         self.composer.update(cx, |input, cx| {
             input.set_disabled(self.read_only_reason.is_some(), cx)
         });
@@ -318,13 +357,14 @@ impl ChatView {
         }
         cx.notify();
     }
-    /// Attachment preparation/strip is C13; the receipt seam already retains bytes.
+    /// Replace externally prepared image payloads; native ingress also supplies thumbnails.
     pub fn set_images(
         &mut self,
         images: Vec<gitterm_core::chat::types::ImageAttachment>,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         gitterm_core::chat::types::validate_images(&images)?;
+        self.image_previews = vec![None; images.len()];
         self.images = images;
         cx.notify();
         Ok(())
@@ -342,6 +382,7 @@ impl ChatView {
             || self.callback.is_none()
             || self.submission_blocked()
             || self.composer_state.pending_request
+            || self.preparing_image.is_some()
             || self.composer.update(cx, |input, cx| {
                 input.marked_text_range(window, cx).is_some()
             })
@@ -355,6 +396,10 @@ impl ChatView {
             cx.notify();
         }
     }
+    pub(crate) fn reopen_slash(&mut self, cx: &mut Context<Self>) {
+        self.composer_state.slash_dismissed = false;
+        cx.notify();
+    }
     pub(crate) fn select_slash(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.read_only_reason.is_some()
             || self.composer.update(cx, |input, cx| {
@@ -364,7 +409,10 @@ impl ChatView {
             return;
         }
         self.composer.update(cx, |input, cx| {
-            input.set_value(format!("/{name} "), window, cx);
+            let draft = format!("/{name} ");
+            let end = draft.len();
+            input.set_value(draft, window, cx);
+            input.set_selected_range(end..end, cx);
             input.focus_handle(cx).focus(window, cx);
         });
         cx.notify();
@@ -379,26 +427,21 @@ impl ChatView {
             return false;
         }
         let draft = self.composer.read(cx).value();
-        let matches = self.composer_state.slash_matches(&draft);
-        if matches.is_empty() {
+        if self.composer.read(cx).selected_range().start != draft.len() {
             return false;
         }
-        let count = matches.len();
-        let index = self.composer_state.slash_index % count;
-        match key {
-            "down" => self.composer_state.slash_index = (index + 1) % count,
-            "up" => self.composer_state.slash_index = (index + count - 1) % count,
-            "escape" => self.composer_state.slash_dismissed = true,
-            "tab" | "enter" => {
-                let name = matches[index].name.clone();
-                let arguments = !matches[index].argument_hint.is_empty();
+        match self.composer_state.slash_key(&draft, key) {
+            crate::composer::SlashOutcome::Ignored => return false,
+            crate::composer::SlashOutcome::Handled => {}
+            crate::composer::SlashOutcome::Fill { name, submit } => {
                 self.select_slash(&name, window, cx);
-                if key == "enter" && !arguments {
+                if submit {
                     self.send(window, cx);
                 }
             }
-            _ => return false,
         }
+        self.slash_scroll
+            .scroll_to_item(self.composer_state.slash_index + 1);
         window.prevent_default();
         cx.stop_propagation();
         cx.notify();
@@ -453,6 +496,7 @@ impl ChatView {
             self.composer
                 .update(cx, |input, cx| input.set_value("", window, cx));
             self.images.clear();
+            self.image_previews.clear();
         }
         self.sync_receipt(&receipt, cx);
     }
@@ -874,6 +918,7 @@ impl Render for ChatView {
         let copy_owner = owner.clone();
         div()
             .id("native-chat")
+            .debug_selector(|| "native-chat".into())
             .key_context("NativeChat")
             .track_focus(&self.focus)
             .capture_action(cx.listener(|this, action: &InputEnter, window, cx| {
@@ -900,6 +945,10 @@ impl Render for ChatView {
                 if !this.slash_key("escape", window, cx) {
                     cx.propagate();
                 }
+            }))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.composer_state.slash_dismissed = true;
+                cx.notify();
             }))
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -1012,6 +1061,7 @@ impl Render for ChatView {
                                     .child(receipt.state.label())
                             }),
                     )
+                    .children((!self.images.is_empty()).then(|| self.render_attachments(cx)))
                     .child(self.composer_state.render(
                         &self.composer,
                         self.read_only_reason.clone().or_else(|| {
@@ -1020,9 +1070,16 @@ impl Render for ChatView {
                                 .then(|| "No session adapter attached".into())
                         }),
                         send_blocked,
+                        &self.slash_scroll,
+                        window,
                         cx,
                     ))
-                    .child(roster::render(&self.roster, crate::composer::now_ms())),
+                    .child(roster::render(
+                        &self.roster,
+                        &self.roster_hidden,
+                        crate::composer::now_ms(),
+                        cx,
+                    )),
             )
     }
 }

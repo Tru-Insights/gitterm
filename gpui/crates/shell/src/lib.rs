@@ -1,6 +1,7 @@
 #![cfg(target_os = "macos")]
 extern crate gpui_kit as gpui;
 
+pub mod app_menus;
 pub mod bottom_panel;
 #[cfg(test)]
 mod center_tests;
@@ -15,6 +16,10 @@ mod files_view;
 pub mod find_sidebar;
 #[cfg(test)]
 mod h2_tests;
+#[cfg(test)]
+mod h4_tests;
+#[cfg(test)]
+mod h5_tests;
 #[cfg(test)]
 mod hookup_tests;
 mod layout;
@@ -82,7 +87,13 @@ struct SelectWorkspace {
 }
 actions!(
     gitterm_shell,
-    [ShowShortcuts, NewTerminal, NewClaudeChat, CloseWorkspace]
+    [
+        ShowShortcuts,
+        NewTerminal,
+        NewClaudeChat,
+        CloseWorkspace,
+        ToggleBottomPanel
+    ]
 );
 
 struct WorkspaceDock {
@@ -100,6 +111,7 @@ struct WorkspaceDock {
 pub struct Shell {
     data: Rc<dyn ShellData>,
     content: Entity<content::window::ContentWindow>,
+    bottom: Entity<bottom_panel::BottomPanel>,
     workspaces: Vec<WorkspaceDock>,
     owner: Entity<WorkspaceOwner>,
     registry: Rc<RefCell<HashMap<String, gpui::WeakEntity<Pane>>>>,
@@ -114,6 +126,10 @@ pub struct Shell {
     park_subscription: Option<Subscription>,
     new_work_sheet: Option<Entity<workspace_sheet::WorkspaceSheet>>,
     new_work_subscription: Option<Subscription>,
+    find_state: Rc<RefCell<gitterm_core::find::state::State>>,
+    find_views: HashMap<String, find_sidebar::FindViews>,
+    #[cfg(test)]
+    find_home: Option<std::path::PathBuf>,
     work_state: Rc<RefCell<gitterm_core::work::state::State>>,
     work_sidebars: HashMap<WorkspaceId, Entity<work_sidebar::WorkSidebar>>,
     work_subscriptions: HashMap<WorkspaceId, Subscription>,
@@ -132,6 +148,7 @@ impl Shell {
         let owner = cx.new(|cx| WorkspaceOwner::new(model, None, cx));
         Self::with_owner(data, owner, config_dir, false, window, cx)
     }
+    #[cfg(test)]
     fn with_owner(
         data: Rc<dyn ShellData>,
         owner: Entity<WorkspaceOwner>,
@@ -140,6 +157,34 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<Self> {
+        Self::with_owner_settings(
+            data,
+            owner,
+            config_dir,
+            local,
+            &Default::default(),
+            window,
+            cx,
+        )
+    }
+    // Keep the host-loaded settings explicit; shell construction must not reread Iced state.
+    #[allow(clippy::too_many_arguments)]
+    fn with_owner_settings(
+        data: Rc<dyn ShellData>,
+        owner: Entity<WorkspaceOwner>,
+        config_dir: &Path,
+        local: bool,
+        settings: &workspace_config::IcedSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Self> {
+        let client_height = f32::from(window.viewport_size().height);
+        let bottom = cx.new(|_| {
+            bottom_panel::BottomPanel::new(bottom_panel::Input::from_settings(
+                settings,
+                client_height,
+            ))
+        });
         gitterm_gpui_chat::init(cx);
         gitterm_gpui_review::init(cx);
         let content = cx.new(|cx| content::window::ContentWindow::new(window, cx));
@@ -220,7 +265,15 @@ impl Shell {
             cx.notify();
         })];
         for state in &mut workspaces {
+            if !state.store.path.exists() {
+                state.store.regions.bottom_height = bottom.read(cx).input.height;
+                state.store.regions.bottom_visible = settings.console_expanded;
+            }
             load_workspace_layout(state, window, cx)?;
+            if !bottom_pane_ids(state, cx).is_empty() {
+                state.store.regions.bottom_opened = true;
+            }
+            subscriptions.push(subscribe_git(state, window, cx));
             if owner.read(cx).iced_workspace(state.workspace.id).is_some()
                 && let Some(id) = state.active_session
                 && let Some(pane) = state.panes.get(&session_pane_id(id))
@@ -254,11 +307,14 @@ impl Shell {
             &owner,
             window,
             |this, _, event: &FileOpen, window, cx| {
-                if event.from_files && content::window::supported(&event.path) {
-                    this.open_content(event, window, cx);
-                } else {
-                    this.open_review(event, window, cx);
-                }
+                this.open_file_viewer(event, window, cx);
+            },
+        ));
+        subscriptions.push(cx.subscribe_in(
+            &bottom,
+            window,
+            |shell, _, outcome: &bottom_panel::Outcome, window, cx| {
+                shell.bottom_outcome(outcome.clone(), window, cx);
             },
         ));
         if local {
@@ -269,6 +325,7 @@ impl Shell {
         let mut shell = Self {
             data,
             content,
+            bottom,
             workspaces,
             owner,
             registry,
@@ -283,6 +340,10 @@ impl Shell {
             park_subscription: None,
             new_work_sheet: None,
             new_work_subscription: None,
+            find_state: Default::default(),
+            find_views: HashMap::new(),
+            #[cfg(test)]
+            find_home: None,
             work_state: Default::default(),
             work_sidebars: HashMap::new(),
             work_subscriptions: HashMap::new(),
@@ -293,77 +354,17 @@ impl Shell {
         shell.load_active_iced_history(window, cx);
         Ok(shell)
     }
-    fn open_content(&mut self, event: &FileOpen, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.local {
-            return;
-        }
-        let Some(root) = self.data.terminal_cwd(event.workspace, cx) else {
-            return;
-        };
-        let Ok(relative) = event.path.strip_prefix(&root) else {
-            self.owner.update(cx, |owner, cx| {
-                owner.error = Some(format!(
-                    "Cannot preview {}: outside workspace root",
-                    event.path.display()
-                ));
-                cx.notify();
-            });
-            return;
-        };
-        let Some(state) = self
-            .workspaces
-            .iter_mut()
-            .find(|w| w.workspace.id == event.workspace)
-        else {
-            return;
-        };
-        let id = content_pane_id(event.workspace, &event.path);
-        if !state.panes.contains_key(&id) {
-            let dark = gpui_component::Theme::global(cx).mode.is_dark();
-            let pane = cx.new(|cx| {
-                Pane::new(
-                    id.clone(),
-                    event
-                        .path
-                        .file_name()
-                        .unwrap_or(event.path.as_os_str())
-                        .to_string_lossy()
-                        .into_owned(),
-                    PaneKind::Content(self.content.clone()),
-                    event.workspace,
-                    self.data.clone(),
-                    window,
-                    cx,
-                )
-            });
-            self.content.update(cx, |content, cx| {
-                content.open(
-                    id.clone(),
-                    content::window::ContentRequest {
-                        root: root.clone(),
-                        relative: relative.to_owned(),
-                        workspace: event.workspace.0,
-                        pane: pane.entity_id().as_u64(),
-                        dark,
-                    },
-                    window,
-                    cx,
-                )
-            });
-            self.registry
-                .borrow_mut()
-                .insert(id.clone(), pane.downgrade());
-            state.panes.insert(id.clone(), pane);
-        }
-        self.content
-            .update(cx, |content, _| content.select(Some(id.clone())));
-        self.show_workspace_pane(event.workspace, &id, window, cx);
-    }
     fn sync_content_selection(&self, cx: &mut Context<Self>) {
+        let find_selected = self.active_workspace(cx).is_some()
+            && self
+                .find_state
+                .borrow()
+                .selected(&self.find_owner(cx))
+                .is_some();
         let mut visible: Vec<String> = self
             .workspaces
             .iter()
-            .filter(|w| Some(w.workspace.id) == self.active_workspace(cx))
+            .filter(|w| !find_selected && Some(w.workspace.id) == self.active_workspace(cx))
             .flat_map(|state| {
                 state
                     .panes
@@ -557,6 +558,7 @@ impl Shell {
                     .map(|(id, p)| (id.clone(), p.downgrade())),
             );
             load_workspace_layout(&mut state, window, cx)?;
+            self._subscriptions.push(subscribe_git(&state, window, cx));
             self._subscriptions.push(subscribe_dock(&state, cx));
             self._subscriptions
                 .push(observe_content_dock(&state.dock, cx));
@@ -584,7 +586,10 @@ impl Shell {
             .find(|w| Some(w.workspace.id) == self.active_workspace(cx))
             .is_some_and(|w| {
                 !w.store.regions.sidebar_collapsed
-                    && w.store.regions.sidebar_mode == SidebarMode::Files
+                    && matches!(
+                        w.store.regions.sidebar_mode,
+                        SidebarMode::Files | SidebarMode::Git
+                    )
             });
         let reviews: Vec<_> = self
             .workspaces
@@ -657,7 +662,7 @@ impl Shell {
         if self.workspaces.is_empty() {
             return;
         }
-        if let Some(session) = self.active(cx).sessions.get(index) {
+        if let Some(session) = self.strip_input(cx).sessions.get(index) {
             let id = session.id;
             let active = self.active_workspace(cx);
             self.workspaces
@@ -750,6 +755,15 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.new_terminal_at(placement, None, window, cx);
+    }
+    fn new_terminal_at(
+        &mut self,
+        placement: DockPlacement,
+        cwd: Option<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.local || !self.workspaces.iter().any(|state| state.on_bar()) {
             return;
         }
@@ -764,7 +778,7 @@ impl Shell {
             .iter_mut()
             .find(|w| Some(w.workspace.id) == active)
             .unwrap();
-        let Some(cwd) = self.data.terminal_cwd(state.workspace.id, cx) else {
+        let Some(cwd) = cwd.or_else(|| self.data.terminal_cwd(state.workspace.id, cx)) else {
             self.owner.update(cx, |owner, cx| {
                 owner.error =
                     Some("Remote workspace sessions are read-only in this preview".into());
@@ -824,6 +838,7 @@ impl Shell {
                 dock.add_panel_view(panel_handle(pane), placement, None, window, cx);
             });
             state.store.regions.bottom_visible = true;
+            state.store.regions.bottom_opened = true;
         }
         self.show_pane(&pane_id, window, cx);
     }
@@ -965,6 +980,25 @@ fn observe_content_dock(dock: &Entity<DockArea>, cx: &mut Context<Shell>) -> Sub
         shell.sync_content_selection(cx);
         cx.notify();
     })
+}
+fn subscribe_git(
+    state: &WorkspaceDock,
+    window: &mut Window,
+    cx: &mut Context<Shell>,
+) -> Subscription {
+    let workspace = state.workspace.id;
+    let git = state.panes[&format!("workspace-{}-git", state.workspace.layout_key)]
+        .read(cx)
+        .git
+        .clone()
+        .expect("Git pane");
+    cx.subscribe_in(
+        &git,
+        window,
+        move |shell, _, action: &pane::git_view::GitAction, window, cx| {
+            shell.git_action(workspace, action, window, cx);
+        },
+    )
 }
 fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscription {
     let id = state.workspace.id;
@@ -1228,23 +1262,12 @@ fn session_pane_id(id: SessionId) -> String {
 }
 fn default_layout(state: &WorkspaceDock, window: &mut Window, cx: &mut App) {
     let mut center = DockLayout::tabs();
-    let mut bottom = DockLayout::tabs();
-    let mut has_terminal = false;
     for session in &state.sessions {
         let pane = panel_handle(state.panes[&session_pane_id(session.id)].clone());
-        if session.kind == data::SessionKind::Terminal && state.store.terminals.is_none() {
-            bottom = bottom.panel_view(pane, cx);
-            has_terminal = true;
-        } else {
-            center = center.panel_view(pane, cx);
-        }
+        center = center.panel_view(pane, cx);
     }
     state.dock.update(cx, |dock, cx| {
         dock.set_center(DockLayout::h_split().child(center, None), window, cx);
-        if has_terminal {
-            dock.set_dock(DockPlacement::Bottom, bottom, window, cx);
-            dock.set_dock_size(DockPlacement::Bottom, px(200.), window, cx);
-        }
     });
 }
 impl Shell {
@@ -1319,7 +1342,7 @@ impl Shell {
             ready_count: 0,
             ready_news_count: 0,
             parked_count: self.workspaces.iter().filter(|w| !w.on_bar()).count(),
-            terminal_expanded: active.is_some_and(|w| w.store.regions.bottom_visible),
+            terminal_expanded: active.is_some_and(|w| w.store.regions.has_bottom(false)),
             terminal_running: false,
             browser: workspace_bar::Browser {
                 color: colors.muted,
@@ -1367,6 +1390,7 @@ impl Shell {
             sessions: state
                 .into_iter()
                 .flat_map(|w| &w.sessions)
+                .filter(|s| !bottom_pane_ids(state.unwrap(), cx).contains(&session_pane_id(s.id)))
                 .map(|s| session_strip::Session {
                     id: s.id,
                     kind: s.kind,
@@ -1465,6 +1489,7 @@ impl Shell {
         ] {
             modes = modes.child(
                 Button::new(title)
+                    .debug_selector(move || title.into())
                     .ghost()
                     .label(if regions.sidebar_collapsed {
                         icon
@@ -1506,12 +1531,33 @@ impl Shell {
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Files {
             sidebar = self.files_sidebar(sidebar, cx);
         }
+        if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Git {
+            sidebar = self.git_sidebar(sidebar, cx);
+        }
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Work {
+            sidebar = sidebar.child(
+                Button::new("open-git-sidebar")
+                    .ghost()
+                    .label("Git")
+                    .debug_selector(|| "open-git-sidebar".into())
+                    .on_click(cx.listener(|shell, _, _, cx| {
+                        shell.update_regions(|r| r.sidebar_mode = SidebarMode::Git, cx);
+                    })),
+            );
             sidebar = sidebar.child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .children(self.work_sidebars.get(&state.workspace.id).cloned()),
+            );
+        }
+        if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Find {
+            sidebar = sidebar.child(
+                div().flex_1().min_h_0().children(
+                    self.find_views
+                        .get(&self.find_owner(cx))
+                        .map(|views| views.sidebar.clone()),
+                ),
             );
         }
         sidebar
@@ -1631,72 +1677,272 @@ impl Shell {
             )
             .children(pane.cloned())
     }
-    fn bottom_panel(&self, cx: &Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
-        let state = self.active(cx);
+    fn refresh_bottom_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self
+            .workspaces
+            .iter()
+            .find(|w| Some(w.workspace.id) == self.active_workspace(cx))
+        else {
+            return;
+        };
         let ids = bottom_pane_ids(state, cx);
-        let pane = ids.iter().find_map(|id| {
-            state
-                .panes
-                .get(id)
-                .filter(|_| pane_id_visible(state, id, cx))
+        let selected = ids
+            .iter()
+            .find(|id| pane_id_visible(state, id, cx))
+            .or_else(|| ids.first());
+        let mut input = self.bottom.read(cx).input.clone();
+        input.opened = state.store.regions.bottom_opened || !ids.is_empty();
+        input.expanded = state.store.regions.bottom_visible;
+        input.window_height = f32::from(window.viewport_size().height);
+        input.height =
+            bottom_panel::clamp_height(state.store.regions.bottom_height, input.window_height);
+        input.tabs = state
+            .sessions
+            .iter()
+            .filter(|s| ids.contains(&session_pane_id(s.id)))
+            .map(|s| {
+                let pane = state.panes[&session_pane_id(s.id)].read(cx);
+                bottom_panel::TerminalTab {
+                    id: s.id.0 as usize,
+                    title: Some(pane.tab_title()),
+                    alive: pane.terminal_alive(),
+                    run_repo: None,
+                }
+            })
+            .collect();
+        input.active = state
+            .sessions
+            .iter()
+            .find(|s| selected == Some(&session_pane_id(s.id)))
+            .map(|s| s.id.0 as usize);
+        input.repos = self.bottom_repos(cx);
+        let content = selected
+            .and_then(|id| state.panes.get(id))
+            .cloned()
+            .map(|pane| {
+                Rc::new(move |_: &mut Window, _: &mut App| pane.clone().into_any_element())
+                    as bottom_panel::ContentSlot
+            });
+        self.bottom.update(cx, |panel, cx| {
+            panel.set_input(input, cx);
+            panel.set_content(content, cx);
         });
-        if !state.store.regions.has_bottom(pane.is_some()) {
-            return None;
+    }
+    fn bottom_repos(&self, cx: &App) -> Vec<bottom_panel::Repo> {
+        let state = self.active(cx);
+        let owner = self.owner.read(cx);
+        if let Some(saved) = owner.iced_workspace(state.workspace.id) {
+            let dirs = if saved.repos.is_empty() {
+                vec![saved.home_dir().to_owned()]
+            } else {
+                saved.repos.clone()
+            };
+            return dirs
+                .iter()
+                .filter_map(|dir| {
+                    let key = saved.repo_key(dir)?;
+                    let home = saved.own_home_repo();
+                    let command = (home.key() == key)
+                        .then(|| home.run_command.clone())
+                        .flatten();
+                    Some(bottom_panel::Repo {
+                        key,
+                        name: Path::new(dir)
+                            .file_name()
+                            .unwrap_or(Path::new(dir).as_os_str())
+                            .to_string_lossy()
+                            .into_owned(),
+                        command,
+                        run_state: bottom_panel::RunState::Run,
+                        url: None,
+                    })
+                })
+                .collect();
         }
-        Some(
-            div()
-                .id("bottom-region")
-                .flex()
-                .flex_col()
-                .flex_shrink_0()
-                .child(
-                    div()
-                        .id("bottom-divider")
-                        .debug_selector(|| "bottom-divider".into())
-                        .h(px(layout::BOTTOM_DIVIDER))
-                        .flex_shrink_0()
-                        .cursor_row_resize()
-                        .bg(rgb(Palette::current(cx).surface))
-                        .on_mouse_down(
-                            gpui::MouseButton::Left,
-                            cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
-                                this.start_resize(true, f32::from(event.position.y), window, cx);
-                            }),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("bottom-panel")
-                        .debug_selector(|| "bottom-panel".into())
-                        .h(px(state.store.regions.bottom_height))
-                        .overflow_hidden()
-                        .children(pane.cloned()),
-                ),
-        )
+        self.data
+            .terminal_cwd(state.workspace.id, cx)
+            .into_iter()
+            .map(|dir| bottom_panel::Repo {
+                key: gitterm_core::workspace_config::RepoKey::local(&dir),
+                name: state.workspace.name.clone(),
+                command: None,
+                run_state: bottom_panel::RunState::Run,
+                url: None,
+            })
+            .collect()
     }
     fn open_bottom_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.local {
+        if self.active_workspace(cx).is_none() {
             return;
         }
-        let existing = bottom_pane_ids(self.active(cx), cx);
-        if !existing.is_empty() {
+        self.update_regions(
+            |r| {
+                r.bottom_visible = !r.bottom_opened || !r.bottom_visible;
+                r.bottom_opened = true;
+            },
+            cx,
+        );
+        if !self.active(cx).store.regions.bottom_visible {
+            self.focus_main_terminal(window, cx);
+        } else {
             let state = self.active(cx);
-            if !state.dock.read(cx).is_dock_open(DockPlacement::Bottom) {
-                state.dock.update(cx, |dock, cx| {
-                    dock.toggle_dock(DockPlacement::Bottom, window, cx)
+            let ids = bottom_pane_ids(state, cx);
+            if let Some(id) = ids
+                .iter()
+                .find(|id| pane_id_visible(state, id, cx))
+                .or_else(|| ids.first())
+            {
+                self.show_pane(id, window, cx);
+            }
+        }
+    }
+    fn focus_main_terminal(&self, window: &mut Window, cx: &mut App) {
+        let state = self.active(cx);
+        let bottom = bottom_pane_ids(state, cx);
+        let pane = state
+            .active_session
+            .map(session_pane_id)
+            .filter(|id| !bottom.contains(id))
+            .and_then(|id| state.panes.get(&id));
+        pane.map(|p| p.focus_handle(cx))
+            .unwrap_or_else(|| self.focus.clone())
+            .focus(window, cx);
+    }
+    fn preview_unavailable(&self, label: &str, cx: &mut Context<Self>) {
+        self.owner.update(cx, |owner, cx| {
+            owner.error = Some(format!("{label} is not available in preview"));
+            cx.notify();
+        });
+    }
+    fn bottom_outcome(
+        &mut self,
+        outcome: bottom_panel::Outcome,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use bottom_panel::Outcome as O;
+        if self.active_workspace(cx).is_none() {
+            return;
+        }
+        match outcome {
+            O::Toggle => self.open_bottom_terminal(window, cx),
+            O::Resize { height } => self.update_regions(
+                |r| {
+                    r.bottom_height =
+                        bottom_panel::clamp_height(height, f32::from(window.viewport_size().height))
+                },
+                cx,
+            ),
+            O::ToggleMirroring => self.preview_unavailable("Terminal log mirroring", cx),
+            O::AddTerminal { repo } => {
+                let cwd = match repo {
+                    None => None,
+                    Some(key) if self.bottom_repos(cx).iter().any(|r| r.key == key) => match key {
+                        gitterm_core::workspace_config::RepoKey::Local(dir) => Some(dir),
+                        _ => {
+                            self.preview_unavailable("Remote terminal", cx);
+                            return;
+                        }
+                    },
+                    Some(_) => {
+                        self.preview_unavailable("Repository terminal", cx);
+                        return;
+                    }
+                };
+                self.new_terminal_at(DockPlacement::Bottom, cwd, window, cx);
+            }
+            O::SelectTab { id } | O::CloseTab { id } => {
+                let pane_id = session_pane_id(SessionId(id as u64));
+                if !bottom_pane_ids(self.active(cx), cx).contains(&pane_id) {
+                    return;
+                }
+                if matches!(outcome, O::SelectTab { .. }) {
+                    self.show_pane(&pane_id, window, cx);
+                } else {
+                    let target = self.active(cx).panes[&pane_id].read(cx).session.clone();
+                    if let Some(target) = target {
+                        if self.active(cx).sessions.len() > 1 {
+                            self.close_target(&target, window, cx);
+                        } else {
+                            // Iced permits the last bottom terminal to close; its main-session guard does not apply here.
+                            let state = self
+                                .workspaces
+                                .iter_mut()
+                                .find(|w| w.panes.contains_key(&pane_id))
+                                .unwrap();
+                            let pane = state.panes.remove(&pane_id).unwrap();
+                            pane.update(cx, |p, cx| p.stop_target(&target, cx));
+                            self.registry.borrow_mut().remove(&pane_id);
+                            if let Some(terminals) = &mut state.store.terminals {
+                                terminals.retain(|t| t.id != id as u64);
+                            }
+                            state.sessions.clear();
+                            state.active_session = None;
+                            state
+                                .dock
+                                .update(cx, |dock, cx| dock.remove_panel(pane, window, cx));
+                            save_layout(state, cx);
+                        }
+                        self.focus_main_terminal(window, cx);
+                    }
+                }
+            }
+            O::OpenUrl { repo } => {
+                if let Some(url) = self
+                    .bottom_repos(cx)
+                    .iter()
+                    .find(|r| r.key == repo)
+                    .and_then(|r| r.url.as_ref())
+                {
+                    cx.open_url(url);
+                } else {
+                    self.preview_unavailable("Repository URL", cx);
+                }
+            }
+            O::Run { .. } | O::Focus { .. } | O::Restart { .. } => {
+                self.preview_unavailable("Repository run command", cx)
+            }
+            O::QuickCommand { .. } => self.preview_unavailable("Quick command", cx),
+        }
+        cx.notify();
+    }
+    fn git_action(
+        &mut self,
+        workspace: WorkspaceId,
+        action: &pane::git_view::GitAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use pane::git_view::GitAction as A;
+        match action {
+            A::BackToWork => {
+                if let Some(state) = self
+                    .workspaces
+                    .iter_mut()
+                    .find(|w| w.workspace.id == workspace)
+                {
+                    state.store.regions.sidebar_mode = SidebarMode::Work;
+                    save_layout(state, cx);
+                }
+                self.sync_git_visibility(true, cx);
+            }
+            A::EditFile(path) => self.open_file_viewer(
+                &FileOpen {
+                    workspace,
+                    path: path.clone(),
+                    changed: None,
+                    from_files: true,
+                },
+                window,
+                cx,
+            ),
+            A::OpenWorktree(_) | A::AdoptWorktree(_) | A::RemoveWorktree(_) => {
+                self.owner.update(cx, |owner, cx| {
+                    owner.error = Some("Worktree actions are not available in preview".into());
+                    cx.notify();
                 });
             }
-            self.update_regions(|r| r.bottom_visible = !r.bottom_visible, cx);
-            return;
         }
-        self.new_terminal_in(DockPlacement::Bottom, window, cx);
-        let active = self.active_workspace(cx);
-        let state = self
-            .workspaces
-            .iter_mut()
-            .find(|w| Some(w.workspace.id) == active)
-            .unwrap();
-        save_layout(state, cx);
         cx.notify();
     }
 }
@@ -1740,6 +1986,8 @@ impl Render for Shell {
         self.content
             .update(cx, |content, cx| content.sync_covers(window, cx));
         self.ensure_work_sidebars(window, cx);
+        self.ensure_find_views(window, cx);
+        self.refresh_bottom_panel(window, cx);
         let p = Palette::current(cx);
         if !self.workspaces.iter().any(|state| state.on_bar()) {
             return div()
@@ -1810,6 +2058,9 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &CloseWorkspace, w, cx| this.open_park_sheet(w, cx)))
             .on_action(cx.listener(|this, _: &NewTerminal, w, cx| this.new_terminal(w, cx)))
             .on_action(
+                cx.listener(|this, _: &ToggleBottomPanel, w, cx| this.open_bottom_terminal(w, cx)),
+            )
+            .on_action(
                 cx.listener(|this, _: &NewClaudeChat, w, cx| this.new_claude_chat(None, w, cx)),
             )
             .on_action(cx.listener(|this, _: &ShowShortcuts, w, cx| {
@@ -1866,9 +2117,9 @@ impl Render for Shell {
                             .flex()
                             .child(sidebar)
                             .child(self.sidebar_divider(cx))
-                            .child(self.session_content(cx)),
+                            .child(self.find_content(cx)),
                     )
-                    .children(self.bottom_panel(cx))
+                    .child(self.bottom.clone())
                     .child(self.workspace_bar(cx)),
             )
             .children(self.session_picker.clone())
@@ -1896,6 +2147,11 @@ fn load_local_workspaces(
 }
 
 fn bind_workspace_keys(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new(
+        "cmd-j",
+        ToggleBottomPanel,
+        Some("GitTermShell"),
+    )]);
     cx.bind_keys([KeyBinding::new(
         "cmd-shift-w",
         CloseWorkspace,
@@ -1978,16 +2234,20 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
                         let model =
                             WorkspaceStatus::sample(data.workspaces(cx).into_iter().map(|w| w.id));
                         let owner = cx.new(|cx| WorkspaceOwner::new(model, Some(store), cx));
-                        Shell::with_owner(data, owner, &config, false, window, cx)
-                            .expect("create sample shell")
+                        Shell::with_owner_settings(
+                            data, owner, &config, false, &settings, window, cx,
+                        )
+                        .expect("create sample shell")
                     } else {
                         let owner = cx.new(|cx| WorkspaceOwner::new(model, Some(store), cx));
                         if let Some(save) = startup_save {
                             owner.update(cx, |owner, cx| owner.watch_save(save, cx));
                         }
                         let data = Rc::new(data::LocalData(owner.clone()));
-                        let shell = Shell::with_owner(data, owner, &config, true, window, cx)
-                            .expect("create local shell");
+                        let shell = Shell::with_owner_settings(
+                            data, owner, &config, true, &settings, window, cx,
+                        )
+                        .expect("create local shell");
                         shell.sync_git_visibility(false, cx);
                         shell
                     }
@@ -2511,7 +2771,7 @@ mod tests {
                     .contains(path.to_str().unwrap())
             );
             let dock = state.dock.clone();
-            assert!(dock.read(cx).has_dock(DockPlacement::Bottom));
+            assert!(!dock.read(cx).has_dock(DockPlacement::Bottom));
             assert!(!dock.read(cx).has_dock(DockPlacement::Right));
             assert!(
                 dock.read(cx)
@@ -2537,6 +2797,7 @@ mod tests {
             let state = shell.read(cx).active(cx);
             let dock = state.dock.clone();
             dock.update(cx, |dock, cx| {
+                dock.set_dock(DockPlacement::Bottom, DockLayout::tabs(), window, cx);
                 dock.set_dock_size(DockPlacement::Bottom, px(321.), window, cx);
                 dock.toggle_dock(DockPlacement::Bottom, window, cx);
             });
