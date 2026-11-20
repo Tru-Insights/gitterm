@@ -58,6 +58,7 @@ fn setup(
     let mut pending = HashMap::new();
     record_pending(
         &mut pending,
+        &mut HashSet::new(),
         "p1".into(),
         "tool-1".into(),
         json!({}),
@@ -73,6 +74,99 @@ fn setup(
         pending,
         rx,
     )
+}
+
+#[tokio::test]
+async fn canceled_id_reuse_cannot_receive_queued_old_answer() {
+    for replacement_input in [json!({}), json!({"changed": true})] {
+        let (mut io, _, mut events) = setup(Writer::default());
+        let mut pending = HashMap::new();
+        let mut seen = HashSet::new();
+        record_pending(
+            &mut pending,
+            &mut seen,
+            "p1".into(),
+            "original-tool".into(),
+            json!({}),
+            permission_kind(),
+        )
+        .unwrap();
+        let (commands, mut queued) = mpsc::unbounded_channel();
+        commands
+            .send(HarnessCommand::Answer {
+                request_id: "p1".into(),
+                decision: allow(),
+            })
+            .unwrap();
+
+        // The process loop receives cancel and replacement before the answer.
+        assert!(pending.remove("p1").is_some());
+        assert!(record_pending(
+            &mut pending,
+            &mut seen,
+            "p1".into(),
+            "replacement-tool".into(),
+            replacement_input,
+            permission_kind(),
+        )
+        .unwrap_err()
+        .contains("reused Claude request p1"));
+        let HarnessCommand::Answer {
+            request_id,
+            decision,
+        } = queued.recv().await.unwrap()
+        else {
+            panic!("expected queued answer");
+        };
+        let failure = io
+            .answer(&mut pending, request_id, decision)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure.message,
+            "no pending Claude request p1 (already answered or withdrawn)"
+        );
+        assert!(matches!(failure.outcome(), DeliveryOutcome::Rejected(_)));
+        assert_eq!(io.stdin.as_ref().unwrap().calls, 0);
+        assert!(pending.is_empty());
+        assert!(events.try_recv().is_err());
+
+        // Rejecting reuse does not prevent a new, uniquely identified request.
+        record_pending(
+            &mut pending,
+            &mut seen,
+            "p2".into(),
+            "new-tool".into(),
+            json!({}),
+            permission_kind(),
+        )
+        .unwrap();
+        io.answer(&mut pending, "p2".into(), allow()).await.unwrap();
+        assert_eq!(
+            events.try_recv().unwrap(),
+            HarnessEvent::RuntimeRequestResolved {
+                request_id: "p2".into()
+            }
+        );
+        let frame: Value = serde_json::from_slice(&io.stdin.as_ref().unwrap().bytes).unwrap();
+        assert_eq!(frame["response"]["request_id"], "p2");
+        assert_eq!(frame["response"]["response"]["behavior"], "allow");
+
+        // Successful delivery must retain the ID too, for delayed duplicates.
+        assert!(record_pending(
+            &mut pending,
+            &mut seen,
+            "p2".into(),
+            "replacement-tool".into(),
+            json!({}),
+            permission_kind(),
+        )
+        .is_err());
+        let calls = io.stdin.as_ref().unwrap().calls;
+        assert!(io.answer(&mut pending, "p2".into(), allow()).await.is_err());
+        assert_eq!(io.stdin.as_ref().unwrap().calls, calls);
+        assert!(events.try_recv().is_err());
+    }
 }
 
 #[tokio::test]
@@ -137,6 +231,7 @@ async fn answer_partial_and_flush_failures_block_resend_and_duplicate_reset() {
         let calls = writer.calls;
         assert!(record_pending(
             &mut pending,
+            &mut HashSet::new(),
             "p1".into(),
             "forged".into(),
             json!({"changed":true}),

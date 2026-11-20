@@ -9,7 +9,7 @@ use crate::chat::types::{
     HarnessCommand, HarnessEvent, RuntimeDecision, RuntimeRequestKind, TurnStatus,
 };
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::future::Future;
 use std::io::Write as _;
@@ -330,6 +330,7 @@ struct PendingRequest {
 
 fn record_pending(
     pending: &mut HashMap<String, PendingRequest>,
+    seen_request_ids: &mut HashSet<String>,
     request_id: String,
     tool_use_id: String,
     input: Value,
@@ -341,6 +342,14 @@ fn record_pending(
             entry.key()
         )),
         std::collections::hash_map::Entry::Vacant(entry) => {
+            // Answers can already be queued when a request is withdrawn. Never
+            // let their bare ID refer to another request in this runtime.
+            if !seen_request_ids.insert(entry.key().clone()) {
+                return Err(format!(
+                    "reused Claude request {}; IDs must be unique for the runtime; request rejected",
+                    entry.key()
+                ));
+            }
             entry.insert(PendingRequest {
                 tool_use_id,
                 input,
@@ -687,6 +696,8 @@ pub(crate) async fn run_correlated_session_program<C: Into<RuntimeCommand>>(
     };
     let mut parser = ClaudeFrameParser::new();
     let mut pending: HashMap<String, PendingRequest> = HashMap::new();
+    // Keep IDs after every resolution/cancellation, until this process exits.
+    let mut seen_request_ids = HashSet::new();
     let mut next_id: u64 = 0;
     let mut new_request_id = || {
         next_id += 1;
@@ -829,7 +840,7 @@ pub(crate) async fn run_correlated_session_program<C: Into<RuntimeCommand>>(
                                 trim_for_log(&serde_json::to_string(&event).unwrap_or_default(), 300)
                             ));
                             if let HarnessEvent::RuntimeRequest { kind, .. } = &event {
-                                match record_pending(&mut pending, request_id, tool_use_id, input, kind.clone()) {
+                                match record_pending(&mut pending, &mut seen_request_ids, request_id, tool_use_id, input, kind.clone()) {
                                     Ok(()) => io.emit(event),
                                     Err(e) => io.emit(HarnessEvent::Error(e)),
                                 }
