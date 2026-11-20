@@ -1,0 +1,91 @@
+//! Installed CLI capabilities required before every fresh preview launch.
+use anyhow::{Result, ensure};
+
+pub(super) const FLAGS: [&str; 3] = ["--restricted", "--strict-mcp-config", "--safe-mode"];
+
+pub(super) fn check_help(help: &str) -> Result<()> {
+    for flag in FLAGS.into_iter().chain(["--permission-mode"]) {
+        ensure!(
+            option(help, flag).is_some(),
+            "Claude preview requires documented CLI option {flag}"
+        );
+    }
+    let mode = option(help, "--permission-mode").expect("checked option");
+    // The CLI reference documents manual as an alias of default. Keep the
+    // requested literal default in argv, including on CLIs advertising manual.
+    ensure!(
+        mode.contains("\"default\"")
+            || mode.contains("'default'")
+            || mode.contains("\"manual\"")
+            || mode.contains("'manual'"),
+        "Claude preview requires --permission-mode default; installed help does not advertise it"
+    );
+    Ok(())
+}
+
+fn option<'a>(help: &'a str, flag: &str) -> Option<&'a str> {
+    let start = help
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some(flag))?;
+    let offset = help.find(start)?;
+    let section = &help[offset..];
+    let end = section
+        .match_indices('\n')
+        .find_map(|(offset, _)| {
+            let rest = &section[offset + 1..];
+            let line = rest.lines().next().unwrap_or_default().trim_start();
+            (line.starts_with('-') || line == "Commands:").then_some(offset)
+        })
+        .unwrap_or(section.len());
+    Some(&section[..end])
+}
+
+/// The isolated interactive sign-in command uses the same fence.
+pub(super) fn arguments() -> Vec<String> {
+    FLAGS
+        .into_iter()
+        .chain(["--permission-mode", "default"])
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const HELP: &str = "Options:\n  --restricted  restricted tools\n  --strict-mcp-config  no implicit MCP\n  --safe-mode  customizations off\n  --permission-mode <mode>\n    (choices: \"default\", \"acceptEdits\")\n  --model <model>  model\n";
+
+    #[test]
+    fn exact_fence_and_missing_capabilities_fail_closed() {
+        check_help(HELP).unwrap();
+        assert_eq!(
+            arguments(),
+            [
+                "--restricted",
+                "--strict-mcp-config",
+                "--safe-mode",
+                "--permission-mode",
+                "default"
+            ]
+        );
+        for flag in FLAGS {
+            assert!(check_help(&HELP.replace(flag, "--unknown")).is_err());
+        }
+        check_help(&HELP.replace("\"default\"", "\"manual\"")).unwrap();
+        assert!(
+            check_help("description mentions --restricted --strict-mcp-config --safe-mode")
+                .is_err()
+        );
+        assert!(check_help(&HELP.replace("\"default\"", "\"defaultPlus\"")).is_err());
+        for bypass in [
+            "--dangerously-skip-permissions",
+            "--allow-dangerously-skip-permissions",
+            "--add-dir",
+            "--mcp-config",
+            "--tools",
+            "--bare",
+            "--resume",
+        ] {
+            assert!(!arguments().iter().any(|arg| arg == bypass));
+        }
+    }
+}

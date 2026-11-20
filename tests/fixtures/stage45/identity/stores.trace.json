@@ -37,7 +37,11 @@
     },
     "limits": {
       "claude": null,
-      "codex": null
+      "codex": null,
+      "usage_badge": {
+        "level": "on_track",
+        "candidate": null
+      }
     },
     "watch": {
       "prs": {}

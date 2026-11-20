@@ -115,7 +115,7 @@ fn prepared_prompt_is_sent_and_echo_recorded_once_with_host_clock() {
         Ok(())
     });
     assert_eq!(receipt.state, ReceiptState::ChannelAccepted);
-    assert!(receipt.state.label().contains("delivery unconfirmed"));
+    assert!(receipt.state.label().contains("Sending to harness"));
     assert!(matches!(update.presentation, Some(Presentation::Append(_))));
     assert!(adapter.state().shows_prompt("synthetic-message"));
     assert_eq!(adapter.state().conversation.len(), 2);
@@ -181,7 +181,7 @@ fn definitive_rejection_retries_but_uncertainty_and_resolution_never_do() {
         )
         .unwrap();
     assert!(!uncertain.state.retryable());
-    assert!(uncertain.state.label().contains("uncertain"));
+    assert!(uncertain.state.label().contains("Uncertain"));
     assert!(adapter.admit(permission(), facts()).is_err());
     assert!(
         adapter
