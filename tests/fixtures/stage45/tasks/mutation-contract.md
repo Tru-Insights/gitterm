@@ -137,3 +137,12 @@ Pinned main.rs line references at the starting revision:
 | Launch | promote_queued_tasks:13689; try_launch_task_child:13766; LaunchSession dispatch:24187 |
 | Publish | request_task_publish:13617; start_task_publish:13638; TaskPublishConfirm:29142; TaskPublishCompleted:29151 |
 | Delete | TaskWorktreeDeleteOpen:29293; TaskWorktreeDeleteConfirm:29362; TaskWorktreeDeleteCompleted:29417 |
+
+R2 code review `1469ae86-a92a-4d53-952e-06dd576b9ea5`, F1: ordinary
+preparation failures must emit PersistWorkerPreparationFailure after source and
+target checks. The adapter runs existing fail_worktree_preparation before
+returning the preparation error. Preserve the expected path only when the error
+contains "rollback requires attention" and fresh Path::exists facts include it.
+A failure save cannot emit StartWorker; an authority refusal emits no write.
+Regression tests cover ordinary failure, existing/missing rollback paths
+(including a file), actual failure-save errors, and stale source/target refusal.

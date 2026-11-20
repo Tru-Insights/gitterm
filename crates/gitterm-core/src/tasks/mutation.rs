@@ -295,11 +295,29 @@ impl TaskAuthority {
                 let PreparationStage::Bound { before, expected } = pending.stage else {
                     return Err("Worker preparation is not awaiting a completion".into());
                 };
-                let prepared = result?;
                 let current = self.task(&before.task_id)?;
-                if !same_target(current, &before) || prepared != expected {
+                if !same_target(current, &before) {
                     return Err(format!(
                         "Worker preparation target changed; prepared worktree {} was not applied",
+                        expected.path.display()
+                    ));
+                }
+                let prepared = match result {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        let cleanup_path = (error.contains("rollback requires attention")
+                            && facts.existing_paths.contains(&expected.path))
+                        .then_some(expected.path);
+                        return Ok(Effect::PersistWorkerPreparationFailure {
+                            task_id: before.task_id,
+                            error,
+                            cleanup_path,
+                        });
+                    }
+                };
+                if prepared != expected {
+                    return Err(format!(
+                        "Worker preparation result does not match the target; worktree {} was not applied",
                         prepared.path.display()
                     ));
                 }
@@ -837,6 +855,158 @@ mod tests {
                 &facts
             )
             .is_err());
+        }
+    }
+
+    #[test]
+    fn preparation_failure_records_failed_and_preserves_existing_rollback_leftovers() {
+        for (error, leftover) in [
+            ("Git preparation failed", true),
+            ("rollback requires attention", false),
+            ("rollback requires attention", true),
+        ] {
+            for fail_save in [false, true] {
+                let (dir, mut state, mut facts) = fixture();
+                let expected = expected(&state);
+                state
+                    .store
+                    .as_mut()
+                    .unwrap()
+                    .begin_worktree_preparation("fixture-task", "t3")
+                    .unwrap();
+                let id = begin(&mut state, &facts);
+                decide(
+                    &mut state,
+                    TaskMutation::BindWorkerPreparation {
+                        id,
+                        task_id: "fixture-task".into(),
+                        expected: expected.clone(),
+                    },
+                    &facts,
+                )
+                .unwrap();
+                if leftover {
+                    // Path::exists also preserves a partial file, not just a directory.
+                    std::fs::write(&expected.path, "partial checkout").unwrap();
+                    facts.existing_paths.push(expected.path.clone());
+                }
+                let before = std::fs::read(dir.path().join("tasks.json")).unwrap();
+                let TaskMutationAction::PersistWorkerPreparationFailure {
+                    task_id,
+                    error: detail,
+                    cleanup_path,
+                } = decide(
+                    &mut state,
+                    TaskMutation::WorkerPrepared {
+                        id,
+                        result: Err(error.into()),
+                    },
+                    &facts,
+                )
+                .unwrap()
+                else {
+                    panic!("expected failure save only")
+                };
+                assert_eq!(detail, error);
+                let needs_cleanup = leftover && error.contains("rollback requires attention");
+                assert_eq!(cleanup_path.is_some(), needs_cleanup);
+                assert_eq!(
+                    std::fs::read(dir.path().join("tasks.json")).unwrap(),
+                    before
+                );
+                assert!(state.pending_workers.is_empty());
+                if fail_save {
+                    std::fs::remove_file(dir.path().join("tasks.json")).unwrap();
+                    std::fs::create_dir(dir.path().join("tasks.json")).unwrap();
+                }
+                let saved = state.store.as_mut().unwrap().fail_worktree_preparation(
+                    &task_id,
+                    detail,
+                    cleanup_path,
+                    "t4",
+                );
+                if fail_save {
+                    assert!(saved.is_err());
+                    assert_eq!(
+                        state.task(&task_id).unwrap().lifecycle,
+                        TaskLifecycle::Preparing
+                    );
+                } else {
+                    saved.unwrap();
+                    let task = state.task(&task_id).unwrap();
+                    assert_eq!(task.lifecycle, TaskLifecycle::Failed);
+                    assert_eq!(task.last_error.as_deref(), Some(error));
+                    assert_eq!(
+                        task.worktree.state,
+                        if needs_cleanup {
+                            TaskWorktreeState::CleanupRequired
+                        } else {
+                            TaskWorktreeState::Unprepared
+                        }
+                    );
+                    assert_eq!(
+                        task.worktree.path.as_ref(),
+                        needs_cleanup.then_some(&expected.path)
+                    );
+                    assert!(matches!(
+                        decide(&mut state, TaskMutation::Close { task_id }, &facts).unwrap(),
+                        TaskMutationAction::ArchiveTask { .. }
+                    ));
+                }
+                assert!(decide(
+                    &mut state,
+                    TaskMutation::WorkerPreparationSaved { id, result: Ok(()) },
+                    &facts
+                )
+                .is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn preparation_errors_cannot_write_through_stale_caller_or_target_authority() {
+        for stale_caller in [false, true] {
+            let (dir, mut state, mut facts) = fixture();
+            let expected = expected(&state);
+            state
+                .store
+                .as_mut()
+                .unwrap()
+                .begin_worktree_preparation("fixture-task", "t3")
+                .unwrap();
+            let id = begin(&mut state, &facts);
+            decide(
+                &mut state,
+                TaskMutation::BindWorkerPreparation {
+                    id,
+                    task_id: "fixture-task".into(),
+                    expected,
+                },
+                &facts,
+            )
+            .unwrap();
+            if stale_caller {
+                facts.callers.clear();
+            } else {
+                let mut task = state.task("fixture-task").unwrap().clone();
+                task.branch = "task/replaced".into();
+                state.store.as_mut().unwrap().replace(task).unwrap();
+            }
+            let before = std::fs::read(dir.path().join("tasks.json")).unwrap();
+            assert!(decide(
+                &mut state,
+                TaskMutation::WorkerPrepared {
+                    id,
+                    result: Err("rollback requires attention".into())
+                },
+                &facts
+            )
+            .is_err());
+            assert_eq!(
+                std::fs::read(dir.path().join("tasks.json")).unwrap(),
+                before
+            );
+            assert!(state.pending_workers.is_empty());
         }
     }
 

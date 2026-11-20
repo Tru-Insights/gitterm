@@ -201,6 +201,13 @@ pub enum TaskMutationAction {
         task_id: String,
         prepared: CompletedWorktreePreparation,
     },
+    /// Run fail_worktree_preparation before returning the preparation error.
+    /// An authority refusal emits no write; an ordinary failure records Failed.
+    PersistWorkerPreparationFailure {
+        task_id: String,
+        error: String,
+        cleanup_path: Option<PathBuf>,
+    },
     StartWorker {
         task_id: String,
         caller: Box<WorkerCaller>,
@@ -235,6 +242,8 @@ pub struct TaskMutationFacts {
     pub sessions: Vec<session::State>,
     pub callers: Vec<WorkerCaller>,
     pub directories: Vec<PathBuf>,
+    /// Fresh Path::exists facts, including non-directory rollback leftovers.
+    pub existing_paths: Vec<PathBuf>,
     /// Caller UIDs whose task sessions are currently Working (versus idle).
     pub working_sessions: Vec<String>,
     pub publish_busy: Vec<String>,
