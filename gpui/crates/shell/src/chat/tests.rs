@@ -983,3 +983,33 @@ async fn fake_process_rejected_and_partial_write_outcomes_reach_adapter() {
         runtime.completed().await.unwrap();
     }
 }
+
+#[test]
+fn finds_claude_in_home_local_bin_when_finder_path_lacks_it() {
+    let dir = tempfile::tempdir_in("/private/tmp").unwrap();
+    let home = dir.path().join("home");
+    let bin = home.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("claude"), "#!/bin/sh\n").unwrap();
+    // A Finder/Dock launch gets only the system folders on PATH.
+    let finder_path = Some(std::ffi::OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"));
+    assert_eq!(
+        find_claude(finder_path.clone(), Some(home.clone())).unwrap(),
+        bin.join("claude")
+    );
+    // An earlier PATH entry still wins.
+    let first = dir.path().join("first");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::write(first.join("claude"), "#!/bin/sh\n").unwrap();
+    let path = std::env::join_paths([first.clone(), PathBuf::from("/usr/bin")]).unwrap();
+    assert_eq!(
+        find_claude(Some(path), Some(home)).unwrap(),
+        first.join("claude")
+    );
+    // Relative HOME is ignored.
+    assert!(
+        find_claude(finder_path, Some(PathBuf::from("relative-home")))
+            .map(|found| found.is_absolute())
+            .unwrap_or(true)
+    );
+}
