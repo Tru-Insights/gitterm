@@ -371,13 +371,17 @@ mod ui {
     };
 
     impl ComposerState {
-        pub(crate) fn render_activity(&self) -> impl IntoElement {
+        pub(crate) fn render_activity(
+            &self,
+            appearance: crate::ChatAppearance,
+        ) -> impl IntoElement {
+            let palette = appearance.palette();
             let color = if self.pending_request {
-                0xf9e2af
+                palette.warn
             } else if self.streaming {
-                0x89b4fa
+                palette.accent
             } else {
-                0x94e2d5
+                palette.result
             };
             div()
                 .id("chat-activity")
@@ -388,21 +392,25 @@ mod ui {
                 .px(px(6.))
                 .pt(px(4.))
                 .font_family("Menlo")
-                .text_size(px(15. * 12. / 14.))
-                .text_color(rgb(0x7f849c))
+                .text_size(px(appearance.size(12.)))
+                .text_color(rgb(palette.muted))
                 .child(div().size(px(7.)).rounded_full().bg(rgb(color)))
                 .child(self.status_at(now_ms()))
         }
 
+        // Keep host appearance explicit alongside the retained input and delivery state.
+        #[allow(clippy::too_many_arguments)]
         pub(crate) fn render(
             &self,
             input: &Entity<TextareaState>,
             unavailable: Option<String>,
             send_blocked: bool,
             slash_scroll: &gpui::ScrollHandle,
+            appearance: crate::ChatAppearance,
             window: &gpui::Window,
             cx: &mut Context<ChatView>,
         ) -> impl IntoElement {
+            let palette = appearance.palette();
             let disabled = unavailable.is_some();
             let owner = cx.entity().downgrade();
             let draft = input.read(cx).value();
@@ -423,11 +431,11 @@ mod ui {
                             .label("Withdraw").disabled(disabled || !row.withdrawable())
                             .on_click(cx.listener(move |view, _, _, cx| view.withdraw(id.clone(), cx))))
                 })))
-                .children(self.notice.iter().map(|notice| div().text_color(rgb(0xf38ba8)).child(notice.clone())))
+                .children(self.notice.iter().map(|notice| div().text_color(rgb(palette.err)).child(notice.clone())))
                 .child(div().id("composer-input").debug_selector(|| "composer-input".into()).child(Textarea::new(input).disabled(disabled)
                     .on_paste(move |item, _, cx| owner.update(cx, |view, cx| view.paste_images(item, cx)).unwrap_or(false))
-                    .bg(rgb(0x181825))
-                    .text_size(px(15. * 13.5 / 14.)).border_color(rgb(0x585b70)).rounded(px(6.))))
+                    .bg(rgb(palette.alt))
+                    .text_size(px(appearance.size(13.5))).border_color(rgb(palette.strong)).rounded(px(6.))))
                 .children(show_slash.then(|| {
                     let matches = self.slash_matches(&draft);
                     let waiting = !self.commands_ready && !self.slash_dismissed && draft.starts_with('/') && !draft[1..].chars().any(char::is_whitespace);
@@ -436,8 +444,8 @@ mod ui {
                         div().id("slash-commands").debug_selector(|| "slash-commands".into())
                             .absolute().bottom(gpui::relative(1.)).left_0().right_0()
                             .max_h(px(360.)).overflow_y_scroll().track_scroll(slash_scroll)
-                            .flex().flex_col().p(px(6.)).bg(rgb(0x313244)).border_1().border_color(rgb(0x585b70)).rounded(px(6.))
-                            .child(div().text_size(px(12.)).text_color(rgb(0x7f849c)).child(if waiting {
+                            .flex().flex_col().p(px(6.)).bg(rgb(palette.block)).border_1().border_color(rgb(palette.strong)).rounded(px(6.))
+                            .child(div().text_size(px(appearance.size(12.))).text_color(rgb(palette.muted)).child(if waiting {
                                 "Commands · listed after the session starts"
                             } else { "Commands · ↑↓ choose · Enter runs · Tab fills in" }))
                             .children(matches.into_iter().enumerate().map(|(index, command)| {
@@ -447,12 +455,12 @@ mod ui {
                                     .debug_selector(move || selector.clone())
                                     .px(px(8.)).py(px(5.)).cursor_pointer()
                                     .w_full().h_auto().justify_start()
-                                    .bg(rgb(if index == selected { 0x45475a } else { 0x313244 }))
+                                    .bg(rgb(if index == selected { palette.border } else { palette.block }))
                                     .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| { window.prevent_default(); cx.stop_propagation(); })
                                     .on_click(cx.listener(move |view, _, window, cx| view.select_slash(&name, window, cx)))
                                     .child(div().flex().flex_col().items_start()
                                         .child(div().child(format!("/{} {}", command.name, command.argument_hint)))
-                                        .child(div().text_size(px(12.)).text_color(rgb(0x7f849c)).child(command.description.clone())))
+                                        .child(div().text_size(px(appearance.size(12.))).text_color(rgb(palette.muted)).child(command.description.clone())))
                             }))
                     })
                 }).flatten())
@@ -462,20 +470,20 @@ mod ui {
                         .disabled(disabled).on_click(cx.listener(|view, _, window, cx| view.pick_images(window, cx))))
                     .child(div().flex_1())
                     .child(Button::new("send").debug_selector(|| "composer-send".into())
-                        .child(div().text_size(px(15. * 13. / 14.)).child("Send")).px(px(14.)).py(px(5.)).h_auto().bg(rgb(0x89b4fa)).text_color(rgb(0x1e1e2e))
+                        .child(div().text_size(px(appearance.size(13.))).child("Send")).px(px(14.)).py(px(5.)).h_auto().bg(rgb(palette.accent)).text_color(rgb(palette.base))
                         .disabled(send_blocked)
                         .on_click(cx.listener(|view, _, window, cx| view.send(window, cx))))
-                    .child(Button::new("stop").child(div().text_size(px(15. * 13. / 14.)).child("Stop")).px(px(14.)).py(px(5.)).h_auto().bg(rgb(0xf38ba8)).text_color(rgb(0x1e1e2e))
+                    .child(Button::new("stop").child(div().text_size(px(appearance.size(13.))).child("Stop")).px(px(14.)).py(px(5.)).h_auto().bg(rgb(palette.err)).text_color(rgb(palette.base))
                         .disabled(disabled || !self.streaming)
                         .on_click(cx.listener(|view, _, _, cx| view.stop(cx)))))
                 .child(div().id("composer-chips").flex().flex_wrap().gap(px(4.))
-                    .font_family("Menlo").text_size(px(15. * 12. / 14.)).text_color(rgb(0x7f849c))
+                    .font_family("Menlo").text_size(px(appearance.size(12.))).text_color(rgb(palette.muted))
                     .children(self.chips().into_iter().map(|(id, label)| {
                         let mut chip = Button::new(gpui::SharedString::from(format!("composer-{id}")))
                             .debug_selector(move || format!("composer-{id}"))
-                            .child(div().font_family("Menlo").text_size(px(15. * 12. / 14.)).child(label)).disabled(true).opacity(0.4)
-                            .px(px(8.)).py(px(4.)).h_auto().bg(rgb(0x313244))
-                            .text_color(rgb(0x7f849c)).border_1().border_color(rgb(0x585b70)).rounded(px(6.));
+                            .child(div().font_family("Menlo").text_size(px(appearance.size(12.))).child(label)).disabled(true).opacity(0.4)
+                            .px(px(8.)).py(px(4.)).h_auto().bg(rgb(palette.block))
+                            .text_color(rgb(palette.muted)).border_1().border_color(rgb(palette.strong)).rounded(px(6.));
                         if id == "mode" {
                             chip = chip.icon(gpui_component::Icon::default().data(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V6a4 4 0 0 1 8 0v4"/></svg>"#).size(px(12.)));
                         }

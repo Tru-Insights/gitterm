@@ -1469,3 +1469,108 @@ fn image_paste_suppresses_text_adds_thumbnail_sends_payload_and_remove_restores_
         assert!(view.composer.read(cx).focus_handle(cx).is_focused(window));
     });
 }
+
+#[gpui::test]
+fn appearance_restyles_retained_rows_and_scales_message_and_composer_text(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(
+        vec![Record {
+            at_ms: None,
+            entry: Entry::Harness(HarnessEvent::TextDelta("A retained **reply**".into())),
+        }],
+        cx,
+    );
+    draw(cx);
+    let row = chat.read_with(cx, |view, _| view.row_views[0].clone().unwrap());
+    chat.update_in(cx, |view, window, cx| {
+        view.composer.update(cx, |input, cx| {
+            input.set_value("Keep this draft", window, cx)
+        });
+        view.set_appearance(
+            ChatAppearance {
+                light: true,
+                font_size: 20.,
+            },
+            cx,
+        );
+        assert_eq!(view.row_views[0].as_ref().unwrap(), &row);
+    });
+    draw(cx);
+    row.update_in(cx, |row, _, cx| {
+        assert!(row.appearance.light);
+        let mut text = row.copyable_text(cx);
+        let style = gpui::Styled::style(&mut text).text_style();
+        assert_eq!(style.font_size, Some(px(20.).into()));
+        assert_eq!(style.font_family.as_deref(), Some(".SystemUIFont"));
+    });
+    chat.update_in(cx, |view, _, cx| {
+        assert_eq!(view.composer.read(cx).value().as_str(), "Keep this draft");
+        view.set_appearance(
+            ChatAppearance {
+                light: false,
+                font_size: 12.,
+            },
+            cx,
+        );
+    });
+    draw(cx);
+    row.read_with(cx, |row, _| {
+        assert!(!row.appearance.light);
+        assert_eq!(row.appearance.font_size, 12.);
+    });
+}
+
+#[gpui::test]
+fn sent_image_payloads_render_real_transcript_thumbnails(cx: &mut TestAppContext) {
+    use gitterm_core::chat::types::{ImageAttachment, UserPrompt};
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+    let images = vec![
+        ImageAttachment {
+            media_type: "image/png".into(),
+            data: PNG.into()
+        };
+        2
+    ];
+    let (chat, cx) = setup(
+        vec![Record {
+            at_ms: None,
+            entry: Entry::SubmittedPrompt(UserPrompt {
+                text: "Sent with images".into(),
+                images: images.clone(),
+                id: Some("sent".into()),
+            }),
+        }],
+        cx,
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        draw(cx);
+        let done = chat.read_with(cx, |view, cx| {
+            view.row_views[0]
+                .as_ref()
+                .is_some_and(|row| row.read(cx).preparing_sent_images.is_none())
+        });
+        if done {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sent thumbnails did not finish decoding"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    draw(cx);
+    for selector in ["sent-image-0-0", "sent-image-0-1"] {
+        let bounds = cx
+            .debug_bounds(selector)
+            .expect("sent image thumbnail rendered");
+        assert!(bounds.size.width > px(0.) && bounds.size.width <= px(160.));
+        assert!(bounds.size.height > px(0.) && bounds.size.height <= px(120.));
+    }
+    chat.read_with(cx, |view, cx| {
+        assert_eq!(view.model.rows[0].images, images);
+        assert!(!view.model.rows[0].body.contains("not relayed"));
+        let row = view.row_views[0].as_ref().unwrap().read(cx);
+        assert_eq!(row.sent_images.len(), 2);
+        assert!(row.sent_images.iter().all(Result::is_ok));
+    });
+}

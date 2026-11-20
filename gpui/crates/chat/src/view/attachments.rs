@@ -65,6 +65,126 @@ impl Drop for Scratch {
     }
 }
 
+pub(super) struct Thumbnail {
+    image: Arc<gpui::Image>,
+    size: gpui::Size<gpui::Pixels>,
+}
+
+fn transcript_thumbnail(
+    payload: &ImageAttachment,
+    renderer: gpui::SvgRenderer,
+) -> Result<Thumbnail, String> {
+    validate_images(std::slice::from_ref(payload))?;
+    let format = gpui::ImageFormat::from_mime_type(&payload.media_type)
+        .ok_or_else(|| "Unsupported sent image type".to_string())?;
+    // Use the same native codec tooling as composer ingress, off the UI thread.
+    // The private scratch directory prevents attachment data from being public.
+    let scratch = Scratch::new()?;
+    let input = scratch.0.join("input");
+    std::fs::write(&input, &payload.data)
+        .map_err(|error| format!("Prepare sent image: {error}"))?;
+    let decoded = Command::new("/usr/bin/base64")
+        .args(["-D", "-i"])
+        .arg(&input)
+        .output()
+        .map_err(|error| format!("Decode sent image: {error}"))?;
+    if !decoded.status.success() {
+        return Err("Could not decode sent image base64".into());
+    }
+    let image = Arc::new(gpui::Image::from_bytes(format, decoded.stdout));
+    let decoded = image
+        .to_image_data(renderer)
+        .map_err(|_| "Could not decode sent image pixels".to_string())?;
+    let intrinsic = decoded.size(0);
+    let width = intrinsic.width.0 as f32;
+    let height = intrinsic.height.0 as f32;
+    if width <= 0. || height <= 0. {
+        return Err("Sent image has no pixels".into());
+    }
+    let scale = (160. / width).min(120. / height).min(1.);
+    Ok(Thumbnail {
+        image,
+        size: size(px(width * scale), px(height * scale)),
+    })
+}
+
+impl RowView {
+    pub(super) fn prepare_sent_images(&mut self, cx: &mut Context<Self>) {
+        self.preparing_sent_images = None;
+        self.sent_images.clear();
+        if self.row.images.is_empty() {
+            return;
+        }
+        let images = self.row.images.clone();
+        let renderer = cx.svg_renderer().clone();
+        self.preparing_sent_images = Some(cx.spawn(async move |this, cx| {
+            let thumbnails = cx
+                .background_executor()
+                .spawn(async move {
+                    images
+                        .iter()
+                        .map(|image| transcript_thumbnail(image, renderer.clone()))
+                        .collect()
+                })
+                .await;
+            _ = this.update(cx, |row, cx| {
+                row.sent_images = thumbnails;
+                row.preparing_sent_images = None;
+                row.scroller.update(cx, |state, cx| {
+                    state.remeasure_items(row.index..row.index + 1, cx);
+                });
+                cx.notify();
+            });
+        }));
+    }
+
+    pub(super) fn render_sent_images(&self) -> impl IntoElement {
+        let palette = self.appearance.palette();
+        div()
+            .flex()
+            .flex_wrap()
+            .gap(px(6.))
+            .items_start()
+            .children(self.preparing_sent_images.is_some().then(|| {
+                div()
+                    .text_color(rgb(palette.muted))
+                    .child("Loading attached images…")
+            }))
+            .children(
+                self.sent_images
+                    .iter()
+                    .enumerate()
+                    .map(|(index, thumbnail)| {
+                        let selector = format!("sent-image-{}-{index}", self.row.id);
+                        let container = div()
+                            .id(gpui::SharedString::from(selector.clone()))
+                            .debug_selector(move || selector.clone())
+                            .role(gpui::Role::Image)
+                            .aria_label(format!("Attached image {}", index + 1))
+                            .rounded(px(6.))
+                            .overflow_hidden();
+                        match thumbnail {
+                            Ok(thumbnail) => container
+                                .child(
+                                    gpui::img(thumbnail.image.clone())
+                                        .w(thumbnail.size.width)
+                                        .h(thumbnail.size.height)
+                                        .object_fit(gpui::ObjectFit::Contain)
+                                        .border_1()
+                                        .border_color(rgb(palette.border))
+                                        .rounded(px(6.)),
+                                )
+                                .into_any_element(),
+                            Err(error) => container
+                                .text_color(rgb(palette.err))
+                                .child(error.clone())
+                                .into_any_element(),
+                        }
+                    }),
+            )
+    }
+}
+
 fn prepare(source: Source, renderer: gpui::SvgRenderer) -> Result<Prepared, String> {
     let image = match source {
         Source::Clipboard(image) => image,
@@ -175,10 +295,10 @@ impl ChatView {
                     .relative()
                     .size(px(56.))
                     .border_1()
-                    .border_color(rgb(0x585b70))
+                    .border_color(rgb(self.appearance.palette().strong))
                     .overflow_hidden()
                     .rounded(px(6.))
-                    .bg(rgb(MANTLE))
+                    .bg(rgb(self.appearance.palette().alt))
                     .role(gpui::Role::Group)
                     .aria_label(format!("Attached image {}", index + 1))
                     .children(preview.map(|image| {
@@ -353,6 +473,15 @@ mod tests {
         let original = gpui::Image::from_bytes(gpui::ImageFormat::Png, PNG.to_vec())
             .to_image_data(renderer.clone())
             .unwrap();
+        let thumbnail = transcript_thumbnail(&prepared.payload, renderer.clone()).unwrap();
+        assert_eq!(
+            thumbnail.size,
+            size(px(32.), px(32.)),
+            "small sent images are not enlarged"
+        );
+        let mut invalid = prepared.payload.clone();
+        invalid.data = "not-base64!".into();
+        assert!(transcript_thumbnail(&invalid, renderer.clone()).is_err());
         let roundtrip = prepared.preview.to_image_data(renderer.clone()).unwrap();
         assert_eq!(
             original.as_bytes(0),
@@ -391,6 +520,9 @@ mod tests {
         ));
         let renderer = cx.update(|cx| cx.svg_renderer());
         let prepared = prepare(source, renderer.clone()).unwrap();
+        let thumbnail = transcript_thumbnail(&prepared.payload, renderer.clone()).unwrap();
+        assert_eq!(thumbnail.size.height, px(120.));
+        assert!(thumbnail.size.width < px(160.));
         let size = prepared.preview.to_image_data(renderer).unwrap().size(0);
         assert_eq!(size.width.0, 1568);
         assert!(size.height.0 < 1568);
