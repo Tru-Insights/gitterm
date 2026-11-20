@@ -559,12 +559,9 @@ shortcuts![
 ];
 
 /// Actions without a host adapter remain unregistered, so GPUI's native menu
-/// validation disables their menu items. Usage and attention have no shell route.
-/// Chat typography is fixed inside the chat crate (P8c owns the missing accessor).
+/// validation disables their menu items.
 /// Composer/slash keys continue through the native input's existing handlers.
 pub const MISSING_HOST_ACTIONS: &[&str] = &[
-    "IncreaseChatFont",
-    "DecreaseChatFont",
     "SetChatWidth",
     "ToggleTerminalLogMirroring",
     "OpenPlansViewer",
@@ -574,8 +571,6 @@ pub const MISSING_HOST_ACTIONS: &[&str] = &[
     "TaskSwitcherNext",
     "TaskSwitcherPrevious",
     "TaskSwitcherActivateFirst",
-    "RunRepoCommand",
-    "UsageViewToggle",
     "ChatsOverviewOpen",
     "AttentionJumpNext",
     "TaskContextBack",

@@ -209,7 +209,6 @@ fn missing_host_controls_keep_iced_controls_and_report_unavailable(cx: &mut Test
         ("pstrip-repos", "Repos ▾"),
         ("pstrip-browser", "Browser"),
         ("pstrip-settings", "Settings"),
-        ("pstrip-usage", "Usage"),
     ] {
         click(cx, selector);
         cx.read(|cx| {
@@ -219,6 +218,10 @@ fn missing_host_controls_keep_iced_controls_and_report_unavailable(cx: &mut Test
             )
         });
     }
+    click(cx, "pstrip-usage");
+    cx.read(|cx| assert!(shell.read(cx).usage_open));
+    click(cx, "pstrip-usage");
+    cx.read(|cx| assert!(!shell.read(cx).usage_open));
     assert!(cx.debug_bounds("pstrip-ready").is_none());
     assert!(cx.debug_bounds("pstrip-parked").is_none());
     cx.update(|window, cx| {

@@ -31,6 +31,7 @@ pub enum SidebarMode {
 #[serde(default)]
 pub struct RegionLayout {
     pub fonts: Option<crate::theme::FontSizes>,
+    pub chat_font_size: Option<f32>,
     pub sidebar_width: f32,
     pub sidebar_collapsed: bool,
     pub sidebar_mode: SidebarMode,
@@ -42,6 +43,7 @@ impl Default for RegionLayout {
     fn default() -> Self {
         Self {
             fonts: None,
+            chat_font_size: None,
             sidebar_width: 360.,
             sidebar_collapsed: false,
             sidebar_mode: SidebarMode::Work,
@@ -78,6 +80,10 @@ impl RegionLayout {
                 fonts.ui.is_finite() && fonts.terminal.is_finite(),
                 "invalid font sizes"
             );
+        }
+        if let Some(size) = &mut self.chat_font_size {
+            ensure!(size.is_finite(), "invalid chat font size");
+            *size = size.clamp(11., 22.);
         }
         ensure!(self.bottom_height > 0., "invalid bottom panel height");
         Ok(())
@@ -469,6 +475,7 @@ mod tests {
         let mut store = LayoutStore::new(path.clone());
         store.regions = RegionLayout {
             fonts: None,
+            chat_font_size: None,
             sidebar_width: 492.,
             sidebar_collapsed: true,
             sidebar_mode: SidebarMode::Files,
