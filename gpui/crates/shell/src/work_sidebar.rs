@@ -197,6 +197,7 @@ struct Row {
     heading: bool,
     indent: bool,
     editor: Option<PathBuf>,
+    chat: bool,
 }
 
 impl Row {
@@ -487,11 +488,14 @@ impl WorkSidebar {
             } else {
                 self.workspace.owned_chats.len()
             };
-            rows.push(Row::text(format!(
+            let mut ownership = Row::text(format!(
                 "owns {roots} chat{} · new chats start in {}",
                 if roots == 1 { "" } else { "s" },
                 summary::folder_name(&self.workspace.dir)
-            )));
+            ));
+            ownership.small = true;
+            ownership.quiet = true;
+            rows.push(ownership);
         } else if !summary.coordinators.is_empty() {
             let mut focus = Row::text(format!(
                 "Focus: {}",
@@ -968,6 +972,7 @@ impl WorkSidebar {
     fn repo_rows(&self, pane: Option<&Pane>, rows: &mut Vec<Row>) {
         let ws = &self.workspace;
         let listed: Vec<_> = ws.repos.iter().map(|repo| repo.dir.clone()).collect();
+        let docs = ws.dir.join("docs");
         let groups = summary::merge_repo_groups(
             &listed,
             &ws.removed,
@@ -976,7 +981,9 @@ impl WorkSidebar {
         );
         let mut header = Row::text("Repos");
         header.heading = true;
-        header.badges.push(groups.len().to_string());
+        header
+            .badges
+            .push(groups.iter().filter(|group| group.dir != docs).count().to_string());
         if ws.local {
             header.control("+ Add repo…", Action::Emit(WorkSidebarOutcome::AddRepo));
         }
@@ -1006,7 +1013,7 @@ impl WorkSidebar {
             note.control("×", Action::DismissAuto);
             rows.push(note);
         }
-        for group in groups {
+        for group in groups.into_iter().filter(|group| group.dir != docs) {
             let repo = ws.repos.iter().find(|repo| repo.dir == group.dir);
             let local = repo.filter(|repo| repo.local);
             let (gone, live): (Vec<_>, Vec<_>) =
@@ -1197,6 +1204,7 @@ impl WorkSidebar {
         let fold = Fold::Chat(chat.id.clone());
         let expanded = self.open.contains(&fold);
         let mut row = Row::text(format!("✦ {}", summary::shorten(&chat.title, 70)));
+        row.chat = true;
         row.fold = Some(fold);
         row.expanded = expanded;
         row.selected = focused;
@@ -1453,6 +1461,15 @@ impl Render for WorkSidebar {
                     .line_clamp(2)
                     .overflow_hidden();
             }
+            if row.chat {
+                label = label
+                    .flex_1()
+                    .font_family(".SystemUIFont")
+                    .text_size(px(12.))
+                    .whitespace_normal()
+                    .line_clamp(2)
+                    .overflow_hidden();
+            }
             if row.small {
                 label = label
                     .flex_1()
@@ -1499,7 +1516,7 @@ impl Render for WorkSidebar {
                         .child(Input::new(input)),
                 );
             }
-            if !row.heading && !pr && !row.small {
+            if !row.heading && !pr && !row.small && !row.chat {
                 line = line.child(div().flex_1());
             }
             for (badge_index, badge) in row.badges.into_iter().enumerate() {
