@@ -222,6 +222,52 @@ fn fixture_row_order_labels_and_repo_facts_match_iced() {
 }
 
 #[test]
+fn ownership_summary_uses_small_muted_proportional_row_style() {
+    let sidebar = fixture(true);
+    let ownership = sidebar
+        .rows()
+        .into_iter()
+        .find(|row| row.label.starts_with("owns "))
+        .unwrap();
+    assert!(ownership.small);
+    assert!(ownership.quiet);
+}
+
+#[test]
+fn repos_count_and_rows_exclude_the_docs_root() {
+    let mut sidebar = fixture(false);
+    sidebar.workspace.repos.push(RepoFacts {
+        dir: PathBuf::from("/work/docs"),
+        local: true,
+        run_command: None,
+    });
+    let rows = sidebar.rows();
+    let repos = rows.iter().find(|row| row.label == "Repos").unwrap();
+    assert_eq!(repos.badges, ["4"]);
+    assert!(!rows.iter().any(|row| row.label == "docs"));
+}
+
+#[gpui::test]
+fn chat_title_column_never_overlaps_right_aligned_metadata(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let sidebar = fixture(false);
+    let chat_row = sidebar
+        .rows()
+        .iter()
+        .position(|row| row.label == "✦ Ship parity")
+        .unwrap();
+    assert_eq!(chat_row, 9, "fixture chat row index changed");
+    let (_, cx) = cx.add_window_view(|_, _| sidebar);
+    cx.simulate_resize(gpui::size(px(260.), px(700.)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let title = cx.debug_bounds("work-label-9").unwrap();
+    let open = cx.debug_bounds("work-badge-9-0").unwrap();
+    assert!(title.right() <= open.left(), "title {title:?} overlaps open {open:?}");
+    assert!(title.size.height <= px(32.), "title exceeds two lines: {title:?}");
+}
+
+#[test]
 fn disclosure_reveals_branches_age_gone_and_run_editor() {
     let mut sidebar = fixture(false);
     sidebar.activate(Action::Toggle(Fold::Repo("/repos/api".into())));

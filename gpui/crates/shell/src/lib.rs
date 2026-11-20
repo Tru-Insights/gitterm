@@ -145,6 +145,10 @@ pub struct Shell {
     #[cfg(test)]
     find_home: Option<std::path::PathBuf>,
     work_state: Rc<RefCell<gitterm_core::work::state::State>>,
+    saved_facts: workspace_bar::SavedFactsCache,
+    saved_facts_error: Option<workspace_bar::News>,
+    saved_facts_catalog_key: Option<String>,
+    saved_facts_generation: u64,
     work_sidebars: HashMap<WorkspaceId, Entity<work_sidebar::WorkSidebar>>,
     work_subscriptions: HashMap<WorkspaceId, Subscription>,
     #[cfg(test)]
@@ -316,6 +320,7 @@ impl Shell {
                     pane.update(cx, |_, cx| cx.notify());
                 }
             }
+            this.refresh_saved_facts_if_catalog_changed(cx);
             cx.notify();
         }));
         subscriptions.push(cx.subscribe_in(
@@ -388,6 +393,10 @@ impl Shell {
             #[cfg(test)]
             find_home: None,
             work_state: Default::default(),
+            saved_facts: workspace_bar::SavedFactsCache::default(),
+            saved_facts_error: None,
+            saved_facts_catalog_key: None,
+            saved_facts_generation: 0,
             work_sidebars: HashMap::new(),
             work_subscriptions: HashMap::new(),
             #[cfg(test)]
@@ -399,6 +408,20 @@ impl Shell {
             .and_then(|id| shell.session_task(id, cx));
         shell.remember_context(shell.selected_task.clone());
         shell.restore_parked(saved_parked, cx);
+        shell.refresh_saved_facts(cx);
+        let weak = cx.weak_entity();
+        cx.spawn(async move |_, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(15))
+                .await;
+            if weak
+                .update(cx, |shell, cx| shell.refresh_saved_facts(cx))
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
         shell.load_active_iced_history(window, cx);
         if let Some(fonts) = shell.workspaces.iter().find_map(|w| w.store.regions.fonts) {
             theme::set_font_sizes(fonts, cx);
@@ -717,6 +740,7 @@ impl Shell {
         self.owner.update(cx, |owner, cx| {
             owner.dispatch(Intent::Activate(id), Instant::now(), cx)
         });
+        self.refresh_saved_facts(cx);
         self.selected_task = self
             .active(cx)
             .active_session
@@ -1406,6 +1430,63 @@ impl Shell {
                         .map(|w| format!("ssh:{}", w.remote_session.as_ref().unwrap().session_name))
                         .unwrap_or_else(|| "local".into()),
                 };
+                let mut attention = vec![];
+                if let (Some(saved), Some(sidebar)) =
+                    (saved, self.work_sidebars.get(&state.workspace.id))
+                {
+                    use gitterm_core::tasks::{DelegationStatus, TaskAttentionReason};
+                    let sidebar = sidebar.read(cx);
+                    for tab in &saved.tabs {
+                        let task = tab
+                            .task_id
+                            .as_ref()
+                            .and_then(|id| sidebar.tasks().iter().find(|t| &t.task_id == id));
+                        let mut kind = task.and_then(|task| {
+                            if task.attention.reason.is_none() && !task.attention.unread {
+                                return None;
+                            }
+                            Some(match task.attention.reason {
+                                Some(TaskAttentionReason::ExecutionFailed) => {
+                                    workspace_bar::AttentionKind::Failed
+                                }
+                                Some(
+                                    TaskAttentionReason::CompletedUnread
+                                    | TaskAttentionReason::ReadyForReview,
+                                )
+                                | None => workspace_bar::AttentionKind::Review,
+                                _ => workspace_bar::AttentionKind::NeedsYou,
+                            })
+                        });
+                        for worker in sidebar.workers().iter().filter(|worker| {
+                            worker.dismissed_at.is_none()
+                                && tab.session_uid.as_deref()
+                                    == Some(worker.parent.session_uid.as_str())
+                        }) {
+                            let next = match worker.status {
+                                DelegationStatus::Failed { .. } => {
+                                    Some(workspace_bar::AttentionKind::Failed)
+                                }
+                                DelegationStatus::Blocked | DelegationStatus::Interrupted => {
+                                    Some(workspace_bar::AttentionKind::NeedsYou)
+                                }
+                                DelegationStatus::Completed => {
+                                    Some(workspace_bar::AttentionKind::Review)
+                                }
+                                _ => None,
+                            };
+                            let priority = |kind| match kind {
+                                workspace_bar::AttentionKind::NeedsYou => 0,
+                                workspace_bar::AttentionKind::Failed => 1,
+                                workspace_bar::AttentionKind::Review => 2,
+                            };
+                            kind = kind
+                                .into_iter()
+                                .chain(next)
+                                .min_by_key(|kind| priority(*kind));
+                        }
+                        attention.extend(kind);
+                    }
+                }
                 workspace_bar::Workspace {
                     id: state.workspace.id,
                     name: state.workspace.name.clone(),
@@ -1418,7 +1499,18 @@ impl Shell {
                             .is_some_and(|w| gitterm_core::work::catalog::is_work(&w.chats, false)),
                         parked: !state.on_bar(),
                     },
-                    attention: None,
+                    attention: attention
+                        .iter()
+                        .min_by_key(|kind| match kind {
+                            workspace_bar::AttentionKind::NeedsYou => 0,
+                            workspace_bar::AttentionKind::Failed => 1,
+                            workspace_bar::AttentionKind::Review => 2,
+                        })
+                        .map(|kind| workspace_bar::Attention {
+                            count: attention.len(),
+                            kind: *kind,
+                            reason: "Sessions need attention".into(),
+                        }),
                     woke: None,
                     pr_news: None,
                 }
@@ -1437,19 +1529,43 @@ impl Shell {
             .iter()
             .find(|w| Some(w.workspace.id) == self.active_workspace(cx));
         let colors = workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark());
+        let mut workspaces = self.chrome_workspaces(cx);
+        let facts = self.saved_facts.snapshot();
+        let mut machine_news = facts.machines.clone();
+        if let Some(error) = &self.saved_facts_error {
+            machine_news.push(error.clone());
+        }
+        let mut news = facts.news.clone();
+        for workspace in &mut workspaces {
+            workspace.pr_news = news.remove(&workspace.id);
+        }
+        let hidden = gitterm_core::workspace::bar_layout(
+            &workspaces
+                .iter()
+                .map(|w| w.placement.clone())
+                .collect::<Vec<_>>(),
+            workspaces
+                .iter()
+                .position(|w| Some(w.id) == self.active_workspace(cx))
+                .unwrap_or(usize::MAX),
+            self.repos_on_bar(cx),
+        )
+        .hidden
+        .len();
         workspace_bar::Input {
-            workspaces: self.chrome_workspaces(cx),
+            workspaces,
             active: self.active_workspace(cx),
             repos_on_bar: self.repos_on_bar(cx),
             repos_open: false,
-            machine_news: vec![],
+            machine_news,
             pulse_bright: false,
-            ready_count: 0,
-            ready_news_count: 0,
-            // Match Iced's bar count: saved parked workspaces plus open
-            // workspaces hidden by their collapsed repo group.
-            parked_count: self.owner.read(cx).saved_parked().len()
-                + (self.workspaces.len() - self.workspaces.iter().filter(|w| w.on_bar()).count()),
+            ready_count: facts.ready,
+            ready_news_count: facts.news_count,
+            // Iced counts both saved parks and open work hidden in Repos.
+            parked_count: facts.parked
+                + self.owner.read(cx).saved_parked().len()
+                + hidden
+                + self.workspaces.iter().filter(|w| !w.on_bar()).count(),
             terminal_expanded: active.is_some_and(|w| w.store.regions.has_bottom(false)),
             terminal_running: false,
             browser: workspace_bar::Browser {
@@ -1460,6 +1576,105 @@ impl Shell {
             },
             more_open: false,
         }
+    }
+    fn refresh_saved_facts_if_catalog_changed(&mut self, cx: &mut Context<Self>) {
+        let key = self
+            .owner
+            .read(cx)
+            .iced_catalog()
+            .map(Self::saved_facts_catalog_key);
+        if key != self.saved_facts_catalog_key {
+            self.refresh_saved_facts(cx);
+        }
+    }
+    fn saved_facts_catalog_key(catalog: &workspace_config::IcedCatalog) -> String {
+        format!(
+            "{}:{}",
+            catalog.source.display(),
+            serde_json::to_string(&catalog.workspaces).unwrap_or_default()
+        )
+    }
+    fn refresh_saved_facts(&mut self, cx: &mut Context<Self>) {
+        let Some(catalog) = self.owner.read(cx).iced_catalog() else {
+            self.saved_facts.replace(workspace_bar::SavedFacts::default());
+            self.saved_facts_error = None;
+            self.saved_facts_catalog_key = None;
+            self.saved_facts_generation = self.saved_facts_generation.wrapping_add(1);
+            cx.notify();
+            return;
+        };
+        let source = catalog.source.clone();
+        let workspaces = catalog.workspaces.clone();
+        let key = Self::saved_facts_catalog_key(catalog);
+        self.saved_facts_catalog_key = Some(key);
+        self.saved_facts_generation = self.saved_facts_generation.wrapping_add(1);
+        let generation = self.saved_facts_generation;
+        let roots = {
+            let state = self.work_state.borrow();
+            self.workspaces
+                .iter()
+                .map(|workspace| {
+                    (
+                        workspace.workspace.id,
+                        state
+                            .pane(workspace.workspace.id.0)
+                            .map(|pane| {
+                                pane.summary
+                                    .coordinators
+                                    .iter()
+                                    .filter(|root| root.recent)
+                                    .map(|root| root.id.clone())
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect()
+        };
+        let colors = workspace_bar::Colors::new(
+            gpui_component::Theme::global(cx).mode.is_dark(),
+        );
+        cx.spawn(async move |shell, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    workspace_bar::SavedFacts::read_from(&source, &workspaces, &roots, colors)
+                })
+                .await;
+            let _ = shell.update(cx, |shell, cx| {
+                if shell.saved_facts_generation != generation {
+                    return;
+                }
+                let Some(catalog) = shell.owner.read(cx).iced_catalog() else {
+                    return;
+                };
+                if Self::saved_facts_catalog_key(catalog) != shell.saved_facts_catalog_key
+                    .as_deref()
+                    .unwrap_or_default()
+                {
+                    return;
+                }
+                match result {
+                    Ok(facts) => {
+                        shell.saved_facts.replace(facts);
+                        shell.saved_facts_error = None;
+                    }
+                    Err(error) => {
+                        let path = catalog.source.join("workspaces.json");
+                        eprintln!("read workspace bar facts {}: {error:#}", path.display());
+                        shell.saved_facts_error = Some(workspace_bar::News {
+                            label: format!("Workspace bar: {error:#}"),
+                            color: workspace_bar::Colors::new(
+                                gpui_component::Theme::global(cx).mode.is_dark(),
+                            )
+                            .red,
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
     fn spine_input(&self, cx: &App) -> spine::Input {
         spine::Input {
@@ -1634,6 +1849,7 @@ impl Shell {
             .overflow_hidden();
         let mut modes = div()
             .flex()
+            .items_center()
             .when(regions.sidebar_collapsed, |row| row.flex_col());
         for (mode, title, icon) in [
             (SidebarMode::Work, "Work", "W"),
@@ -1650,8 +1866,13 @@ impl Shell {
                         title
                     })
                     .tooltip(title)
-                    .h(px(36.))
-                    .selected(regions.sidebar_mode == mode)
+                    .h(px(28.))
+                    .flex_1()
+                    .selected(
+                        regions.sidebar_mode == mode
+                            || (mode == SidebarMode::Work
+                                && regions.sidebar_mode == SidebarMode::Git),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.update_regions(
                             |regions| {
@@ -1663,42 +1884,25 @@ impl Shell {
                     })),
             );
         }
-        modes = modes
-            .child(div().flex_1())
-            .child(
-                Button::new("open-git-sidebar")
-                    .ghost()
-                    .label("⎇")
-                    .tooltip("Open Git status")
-                    .debug_selector(|| "open-git-sidebar".into())
-                    .on_click(cx.listener(|shell, _, _, cx| {
-                        shell.update_regions(
-                            |r| {
-                                r.sidebar_mode = SidebarMode::Git;
-                                r.sidebar_collapsed = false;
-                            },
-                            cx,
-                        );
-                    })),
-            )
-            .child(
-                Button::new("collapse-sidebar")
-                    .ghost()
-                    .label(if regions.sidebar_collapsed {
-                        "›"
-                    } else {
-                        "‹"
-                    })
-                    .tooltip(if regions.sidebar_collapsed {
-                        "Expand sidebar"
-                    } else {
-                        "Collapse sidebar"
-                    })
-                    .h(px(28.))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.update_regions(|r| r.sidebar_collapsed = !r.sidebar_collapsed, cx)
-                    })),
-            );
+        modes = modes.child(
+            Button::new("collapse-sidebar")
+                .debug_selector(|| "collapse-sidebar".into())
+                .ghost()
+                .label(if regions.sidebar_collapsed {
+                    "▸"
+                } else {
+                    "◂"
+                })
+                .tooltip(if regions.sidebar_collapsed {
+                    "Expand sidebar"
+                } else {
+                    "Collapse sidebar"
+                })
+                .h(px(28.))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.update_regions(|r| r.sidebar_collapsed = !r.sidebar_collapsed, cx)
+                })),
+        );
         sidebar = sidebar.child(modes);
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Files {
             sidebar = self.files_sidebar(sidebar, cx);
