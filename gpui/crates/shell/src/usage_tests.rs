@@ -1,4 +1,49 @@
 use super::*;
+
+#[test]
+fn fixture_usage_scan_runs_off_thread_and_returns_report() {
+    let fixture = tempfile::tempdir().unwrap();
+    let sources = gitterm_core::usage::UsageSources::under(fixture.path());
+    for path in [
+        &sources.claude_projects,
+        &sources.codex_sessions,
+        &sources.pi_sessions,
+    ] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let fixture_transcript = sources.claude_projects.join("-fixture/session.jsonl");
+    std::fs::create_dir_all(fixture_transcript.parent().unwrap()).unwrap();
+    std::fs::write(fixture_transcript, "{}\n").unwrap();
+    let caller = std::thread::current().id();
+    let (scanner, report) = std::thread::spawn(move || {
+        let scanner = std::thread::current().id();
+        let report = gitterm_core::usage::scan_usage_local(
+            &sources,
+            UsageWindow::Days7,
+            &gitterm_core::usage::Pricing::seeded(),
+            &mut gitterm_core::usage::UsageCache::default(),
+        );
+        (scanner, report)
+    })
+    .join()
+    .unwrap();
+
+    assert_ne!(scanner, caller);
+    assert_eq!(report.window, UsageWindow::Days7);
+    assert_eq!(report.stats.files_seen, 1);
+}
+
+#[test]
+fn stale_usage_scan_window_requests_a_follow_up() {
+    assert_eq!(
+        follow_up_window(UsageWindow::Days7, UsageWindow::Days90),
+        Some(UsageWindow::Days90)
+    );
+    assert_eq!(
+        follow_up_window(UsageWindow::Days90, UsageWindow::Days90),
+        None
+    );
+}
 use gitterm_core::usage::{DayRow, ModelRow, RepoRow, ScanStats, Tokens, UsageView};
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
