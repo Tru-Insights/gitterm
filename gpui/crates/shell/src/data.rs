@@ -387,8 +387,9 @@ pub(crate) struct IcedWorkData {
     pub facts: crate::work_sidebar::WorkspaceFacts,
     pub tasks: Vec<gitterm_core::tasks::TaskRecord>,
     pub workers: Vec<gitterm_core::tasks::Delegation>,
+    pub running_task_ids: std::collections::HashSet<String>,
     pub repo_recency: Vec<(std::path::PathBuf, std::time::SystemTime)>,
-    pub pull_requests: Vec<(String, Vec<gitterm_core::prs::WatchedPr>)>,
+    pub pull_requests: Vec<crate::work_sidebar::PullRequestGroup>,
     pub issues: gitterm_core::issues::IssueTitlesFile,
     pub collapsed_issue_groups: Vec<gitterm_core::issues::IssueGroup>,
     inputs: gitterm_core::work::state::Inputs,
@@ -561,7 +562,7 @@ impl IcedWorkData {
                 if !seen.insert(chat.clone()) {
                     continue;
                 }
-                let path = match gitterm_core::chat_facts::facts_path(
+                let fallback_path = match gitterm_core::chat_facts::facts_path(
                     &gitterm_core::chat_facts::facts_dir(config),
                     chats::ChatBackend::Claude,
                     &chat,
@@ -572,14 +573,33 @@ impl IcedWorkData {
                         continue;
                     }
                 };
-                let chat_facts = match gitterm_core::chat_facts::load_facts(&path) {
-                    Ok(facts) => facts,
-                    Err(error) => {
-                        errors.push(error);
-                        None
+                let mut loaded = None;
+                for backend in chats::ChatBackend::ALL {
+                    let path = match gitterm_core::chat_facts::facts_path(
+                        &gitterm_core::chat_facts::facts_dir(config),
+                        backend,
+                        &chat,
+                    ) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            errors.push(error);
+                            break;
+                        }
+                    };
+                    match gitterm_core::chat_facts::load_facts(&path) {
+                        Ok(Some(facts)) => {
+                            loaded = Some((backend, path, facts));
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(error) => errors.push(error),
                     }
+                }
+                let (backend, path, chat_facts) = match loaded {
+                    Some((backend, path, facts)) => (backend, path, Some(facts)),
+                    None => (chats::ChatBackend::Claude, fallback_path, None),
                 };
-                if !indexed && let Some(facts) = &chat_facts {
+                if let Some(facts) = &chat_facts {
                     pending.extend(facts.children.iter().map(|c| {
                         (
                             c.session_id.clone(),
@@ -592,7 +612,7 @@ impl IcedWorkData {
                 }
                 entries.push(chats::ChatIndexEntry {
                     id: chat,
-                    backend: chats::ChatBackend::Claude,
+                    backend,
                     path: path.clone(),
                     cwd: saved.dir.clone().into(),
                     repo_root: None,
@@ -624,7 +644,7 @@ impl IcedWorkData {
             now: SystemTime::now(),
         }
         .build(&entries);
-        let task_worktrees = store
+        let task_worktrees: Vec<PathBuf> = store
             .tasks()
             .iter()
             .filter_map(|t| t.worktree.path.clone())
@@ -648,22 +668,6 @@ impl IcedWorkData {
                     local,
                     run_command,
                 });
-                let common =
-                    gitterm_core::work::documents::GitDiscovery::git_common_dir(&mut git, &path)
-                        .ok();
-                let running = store
-                    .tasks()
-                    .iter()
-                    .filter(|t| {
-                        t.lifecycle == TaskLifecycle::Running
-                            && common
-                                .as_ref()
-                                .is_some_and(|common| equal(&t.repository.common_dir, common))
-                    })
-                    .count();
-                if running > 0 {
-                    facts.running_by_repo.insert(path, running);
-                }
             }
         } else {
             errors.push("The overview reads this Mac's chats and checkouts; this workspace is on another machine.".into());
@@ -672,6 +676,108 @@ impl IcedWorkData {
             Source::Owned(roots) => chats_under(&entries, roots),
             Source::Folder(dir) => work_chats(&entries, dir),
         };
+        // Iced also lists repos with recognized write work and delegated worker
+        // targets, even if no file-edit count has been recorded for them yet.
+        if local {
+            let mut candidates: Vec<PathBuf> =
+                saved.repos_added.iter().map(PathBuf::from).collect();
+            for chat in &work_entries {
+                if let Some(chat_facts) = &chat.facts {
+                    candidates.extend(chat_facts.repo_work.iter().cloned());
+                    candidates.extend(
+                        chat_facts
+                            .repos_touched
+                            .iter()
+                            .filter(|repo| repo.edits > 0)
+                            .map(|repo| repo.dir.clone()),
+                    );
+                    candidates.extend(
+                        chat_facts
+                            .checkouts
+                            .iter()
+                            .filter(|checkout| checkout.edits > 0)
+                            .map(|checkout| checkout.repo.clone()),
+                    );
+                    for child in &chat_facts.children {
+                        if child.kind == gitterm_core::chat_facts::ChildKind::Worker
+                            && let Some(task) =
+                                child.task_id.as_deref().and_then(|id| store.get(id))
+                            && task
+                                .repository
+                                .common_dir
+                                .file_name()
+                                .is_some_and(|name| name == ".git")
+                        {
+                            candidates
+                                .extend(task.repository.common_dir.parent().map(Path::to_path_buf));
+                        }
+                    }
+                }
+                for delegation in store
+                    .delegations()
+                    .iter()
+                    .filter(|d| d.parent.chat_session_id.as_deref() == Some(&chat.id))
+                {
+                    candidates.extend(delegation.options.checkout.iter().cloned());
+                    candidates.extend(delegation.options.add_dirs.iter().cloned());
+                    if let DelegationChild::TaskSession { task_id, .. } = &delegation.child
+                        && let Some(task) = store.get(task_id)
+                        && task
+                            .repository
+                            .common_dir
+                            .file_name()
+                            .is_some_and(|name| name == ".git")
+                    {
+                        candidates
+                            .extend(task.repository.common_dir.parent().map(Path::to_path_buf));
+                    }
+                }
+            }
+            for dir in candidates {
+                if !dir.is_dir()
+                    || task_worktrees
+                        .iter()
+                        .any(|tree: &PathBuf| dir.starts_with(tree))
+                {
+                    continue;
+                }
+                let dir = git.main_checkout(&dir);
+                if facts.home.starts_with(&dir)
+                    || facts.removed.contains(&dir)
+                    || facts.repos.iter().any(|repo| repo.dir == dir)
+                {
+                    continue;
+                }
+                let run_command = catalog
+                    .repos
+                    .iter()
+                    .find(|repo| Path::new(&repo.dir) == dir && repo.key().is_local())
+                    .and_then(|repo| repo.run_command.clone());
+                facts.repos.push(crate::work_sidebar::RepoFacts {
+                    dir,
+                    local: true,
+                    run_command,
+                });
+            }
+        }
+        for repo in &facts.repos {
+            let common =
+                gitterm_core::work::documents::GitDiscovery::git_common_dir(&mut git, &repo.dir)
+                    .ok();
+            let running = store
+                .tasks()
+                .iter()
+                .filter(|task| {
+                    task.lifecycle == TaskLifecycle::Running
+                        && common
+                            .as_ref()
+                            .is_some_and(|common| equal(&task.repository.common_dir, common))
+                })
+                .count();
+            if running > 0 {
+                facts.running_by_repo.insert(repo.dir.clone(), running);
+            }
+        }
         let written = work_entries
             .iter()
             .filter_map(|e| e.facts.as_ref())
@@ -699,18 +805,37 @@ impl IcedWorkData {
             gitterm_core::prs::WatchFile::load(&gitterm_core::prs::WatchFile::path_in(config));
         let plans =
             gitterm_core::merge_plan::load_plans(&gitterm_core::merge_plan::plans_dir(config));
-        let pull_requests = summary
-            .coordinators
+        let roots: Vec<_> = if saved.chats.is_empty() {
+            summary
+                .coordinators
+                .iter()
+                .filter(|root| root.recent)
+                .map(|root| (root.id.clone(), root.title.clone()))
+                .collect()
+        } else {
+            saved
+                .chats
+                .iter()
+                .map(|id| {
+                    let title = entries
+                        .iter()
+                        .find(|entry| entry.id == *id)
+                        .map(|entry| entry.title.clone())
+                        .unwrap_or_else(|| id.chars().take(8).collect());
+                    (id.clone(), title)
+                })
+                .collect()
+        };
+        let pull_requests = roots
             .iter()
-            .filter(|root| summary.focused.contains(&root.id))
-            .filter_map(|root| {
+            .filter_map(|(id, title)| {
                 let mut keys: Vec<_> = plans
-                    .get(&root.id)
+                    .get(id)
                     .into_iter()
                     .flat_map(|plan| &plan.entries)
                     .map(|entry| entry.key())
                     .collect();
-                let roots = vec![root.id.clone()];
+                let roots = vec![id.clone()];
                 for entry in chats_under(&entries, &roots) {
                     for pr in entry.facts.iter().flat_map(|facts| &facts.prs) {
                         if !keys.iter().any(|key| key.id() == pr.key().id()) {
@@ -728,7 +853,11 @@ impl IcedWorkData {
                             .unwrap_or_else(|| gitterm_core::prs::WatchedPr::new(key))
                     })
                     .collect();
-                (!prs.is_empty()).then(|| (root.title.clone(), prs))
+                (!prs.is_empty()).then(|| crate::work_sidebar::PullRequestGroup {
+                    root: id.clone(),
+                    title: title.clone(),
+                    prs,
+                })
             })
             .collect();
         let issues = gitterm_core::issues::IssueTitlesFile::load(
@@ -738,6 +867,12 @@ impl IcedWorkData {
             facts,
             tasks,
             workers,
+            running_task_ids: store
+                .tasks()
+                .iter()
+                .filter(|task| task.lifecycle == TaskLifecycle::Running)
+                .map(|task| task.task_id.clone())
+                .collect(),
             repo_recency,
             pull_requests,
             issues,
@@ -798,11 +933,27 @@ impl IcedWorkData {
                     Err(error) => data.errors.push(error),
                 }
             }
-            for mut owned in
-                resolve_owned(&candidates, &data.summary.issue_keys, &key_repos, &lists)
-            {
-                owned.gone = !owned.checkout.is_dir();
-                data.branches.push(git.branch(owned));
+            let owned = resolve_owned(&candidates, &data.summary.issue_keys, &key_repos, &lists);
+            // Publish ownership/counts before the slower status/base reads. The
+            // subtitle must not say "no live checkout" while these are pending.
+            data.branches = owned
+                .into_iter()
+                .map(|mut owned| {
+                    owned.gone = !owned.checkout.is_dir();
+                    BranchStatus {
+                        owned,
+                        base: None,
+                        status: None,
+                        vs_base: None,
+                        error: None,
+                        stamp: GitdirStamp::default(),
+                        checked_at: SystemTime::now(),
+                    }
+                })
+                .collect();
+            publish(&data);
+            for branch in &mut data.branches {
+                *branch = git.branch(branch.owned.clone());
             }
         }
         eprintln!(
@@ -1005,20 +1156,36 @@ impl gitterm_core::work::documents::GitDiscovery for WorkGit {
         &mut self,
         repo: &std::path::Path,
     ) -> Result<Vec<gitterm_core::work::summary::WorktreeInfo>, String> {
-        let text = self.text(repo, &["worktree", "list", "--porcelain", "-z"])?;
         let mut rows = vec![];
-        for field in text.split('\0') {
-            if let Some(path) = field.strip_prefix("worktree ") {
-                rows.push(gitterm_core::work::summary::WorktreeInfo {
-                    path: path.into(),
-                    branch: None,
-                });
-            } else if let Some(branch) = field.strip_prefix("branch refs/heads/")
-                && let Some(row) = rows.last_mut()
-            {
-                row.branch = Some(branch.into());
-            }
-        }
+        self.0.block_on(gitterm_core::git_facts::run_git_records(
+            repo,
+            &[
+                "--no-optional-locks",
+                "worktree",
+                "list",
+                "--porcelain",
+                "-z",
+            ],
+            gitterm_core::git_facts::GIT_TIMEOUT,
+            b'\0',
+            |record| {
+                let field = std::str::from_utf8(record)
+                    .map_err(|error| format!("read worktrees in {}: {error}", repo.display()))?;
+                if let Some(path) = field.strip_prefix("worktree ") {
+                    rows.push(gitterm_core::work::summary::WorktreeInfo {
+                        path: std::path::Path::new(path)
+                            .canonicalize()
+                            .unwrap_or_else(|_| path.into()),
+                        branch: None,
+                    });
+                } else if let Some(branch) = field.strip_prefix("branch refs/heads/")
+                    && let Some(row) = rows.last_mut()
+                {
+                    row.branch = Some(branch.into());
+                }
+                Ok(true)
+            },
+        ))?;
         Ok(rows)
     }
     fn git_common_dir(&mut self, root: &std::path::Path) -> Result<std::path::PathBuf, String> {
@@ -1030,6 +1197,30 @@ impl gitterm_core::work::documents::GitDiscovery for WorkGit {
     }
 }
 impl WorkGit {
+    fn main_checkout(&self, dir: &std::path::Path) -> std::path::PathBuf {
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_owned());
+        let Some(root) = gitterm_core::workers::checkout_root(&dir) else {
+            return dir;
+        };
+        if root.join(".git").is_dir() {
+            return dir;
+        }
+        match self.text(
+            &root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ) {
+            Ok(common) => {
+                let common = std::path::Path::new(common.trim());
+                if common.file_name().is_some_and(|name| name == ".git")
+                    && let (Some(main), Ok(below)) = (common.parent(), dir.strip_prefix(&root))
+                {
+                    return main.join(below);
+                }
+            }
+            Err(error) => eprintln!("[work-sidebar] fold repo {}: {error}", dir.display()),
+        }
+        dir
+    }
     fn text(&self, root: &std::path::Path, args: &[&str]) -> Result<String, String> {
         let mut read_args = vec!["--no-optional-locks"];
         read_args.extend_from_slice(args);

@@ -1319,10 +1319,20 @@ fn realistic_catalog_partial_index_publishes_repos_chats_docs_before_branch_chec
             publications += 1;
             let state = Rc::new(RefCell::new(State::default()));
             data.apply(&mut state.borrow_mut());
-            assert!(
-                state.borrow().pane(4).unwrap().branches.is_empty(),
-                "overview must precede branch probes"
-            );
+            if publications == 1 {
+                assert!(
+                    state.borrow().pane(4).unwrap().branches.is_empty(),
+                    "overview must precede branch probes"
+                );
+            } else {
+                let state = state.borrow();
+                let branches = &state.pane(4).unwrap().branches;
+                assert!(
+                    !branches.is_empty(),
+                    "ownership must precede detailed probes"
+                );
+                assert!(branches.iter().all(|branch| branch.status.is_none()));
+            }
             let mut sidebar = WorkSidebar::new(data.facts.clone(), state);
             sidebar.pull_requests = data.pull_requests.clone();
             sidebar.issues = data.issues.clone();
@@ -1367,9 +1377,288 @@ fn realistic_catalog_partial_index_publishes_repos_chats_docs_before_branch_chec
         },
     )
     .unwrap();
-    assert_eq!(publications, 1);
+    assert_eq!(publications, 2);
     let mut state = State::default();
     result.apply(&mut state);
     assert!(!state.pane(4).unwrap().branches.is_empty());
     assert_eq!(tree_snapshot(fixture.root.path()), before);
+}
+
+#[test]
+fn pr_fixture_groups_small_labels_done_counts_badges_and_errors_like_iced() {
+    use gitterm_core::{
+        merge_plan::{PrKey, PrState},
+        prs::{PullCore, WatchedPr},
+    };
+    let mut sidebar = fixture(true);
+    let mut unread = WatchedPr::new(PrKey::new("fake/repo", 42));
+    unread.error = Some("gh api repos/fake/repo/pulls/42: HTTP 404: Not Found".into());
+    let mut draft = WatchedPr::new(PrKey::new("example/gitterm", 183));
+    draft.snapshot.core = Some(PullCore {
+        title: "TRU-293 Default task base: fetch and start from the selected branch".into(),
+        state: Some(PrState::Draft),
+        mergeable: Some(false),
+        ..Default::default()
+    });
+    let mut merged = WatchedPr::new(PrKey::new("example/gitterm", 1));
+    merged.snapshot.core = Some(PullCore {
+        state: Some(PrState::Merged),
+        ..Default::default()
+    });
+    let mut old = merged.clone();
+    old.key.number = 2;
+    old.checked_at = Some("2000-01-01T00:00:00Z".into());
+    sidebar.pull_requests = vec![
+        PullRequestGroup {
+            root: "first".into(),
+            title: "lets keep going".into(),
+            prs: vec![unread, merged.clone()],
+        },
+        PullRequestGroup {
+            root: "second".into(),
+            title: "Gemini models missing from model list".into(),
+            prs: vec![draft],
+        },
+        PullRequestGroup {
+            root: "third".into(),
+            title: "Revisiting GPUI discussion".into(),
+            prs: vec![merged.clone(), old.clone()],
+        },
+        PullRequestGroup {
+            root: "stale".into(),
+            title: "Only old PRs".into(),
+            prs: vec![old],
+        },
+    ];
+    let mut rows = vec![];
+    sidebar.pull_request_rows(&mut rows);
+    assert_eq!(rows[0].badges, ["2 open"]);
+    assert_eq!(
+        rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(),
+        [
+            "Pull requests",
+            "lets keep going",
+            "fake/repo#42",
+            "Gemini models missing from model list",
+            "TRU-293 Default task base: fetch and start from the selected branch",
+            "Revisiting GPUI discussion"
+        ]
+    );
+    assert!(rows[1].small && rows[1].quiet);
+    assert_eq!(rows[1].controls[0].label, "1 merged •");
+    assert_eq!(rows[5].controls[0].label, "1 merged •");
+    assert_eq!(rows[2].pr_number, Some((42, 4)));
+    assert_eq!(rows[2].repo_prefix.as_deref(), Some("repo · "));
+    assert_eq!(rows[2].badges, ["not read"]);
+    assert_eq!(rows[4].badges, ["conflicts", "draft"]);
+    assert!(
+        rows.iter()
+            .all(|r| r.details.is_empty() && !r.label.contains("HTTP"))
+    );
+    sidebar.activate(Action::Toggle(Fold::Pr("fake/repo#42".into())));
+    let mut expanded = vec![];
+    sidebar.pull_request_rows(&mut expanded);
+    assert!(
+        expanded[2]
+            .details
+            .iter()
+            .any(|s| s.starts_with("not read: gh api"))
+    );
+    sidebar.pull_requests.truncate(1);
+    let mut single = vec![];
+    sidebar.pull_request_rows(&mut single);
+    assert_eq!(single.len(), 2);
+    assert_eq!(single[0].controls[0].label, "1 merged •");
+}
+
+#[test]
+fn repo_fixture_counts_branch_only_repos_and_iced_subtitles() {
+    use gitterm_core::work::summary::RepoTouched;
+    let mut sidebar = fixture(false);
+    sidebar.workspace.repos = ["home", "gitterm", "design", "agent-kit", "Work"]
+        .into_iter()
+        .map(|name| RepoFacts {
+            dir: format!("/repos/{name}").into(),
+            local: true,
+            run_command: None,
+        })
+        .collect();
+    sidebar.workspace.auto_added.clear();
+    sidebar.workspace.running_by_repo = [
+        (PathBuf::from("/repos/home"), 1),
+        (PathBuf::from("/repos/gitterm"), 1),
+    ]
+    .into();
+    let mut pane = Pane::default();
+    pane.last_full_refresh = Some(Instant::now());
+    pane.summary.repos = [("gitterm", 382), ("design", 17), ("Work", 22)]
+        .into_iter()
+        .map(|(name, edits)| RepoTouched {
+            dir: format!("/repos/{name}").into(),
+            edits,
+        })
+        .collect();
+    for (name, count) in [
+        ("gitterm", 91),
+        ("design", 3),
+        ("agent-kit", 2),
+        ("Work", 1),
+        ("bebop-core", 4),
+    ] {
+        for index in 0..count {
+            let mut row = branch(&format!("/repos/{name}"), &format!("b-{index}"), false);
+            row.owned.task = None;
+            pane.branches.push(row);
+        }
+    }
+    let mut rows = vec![];
+    sidebar.repo_rows(Some(&pane), &mut rows);
+    assert_eq!(rows[0].badges, ["6"]);
+    assert_eq!(
+        rows.iter()
+            .skip(1)
+            .map(|r| r.label.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "home",
+            "gitterm",
+            "design",
+            "agent-kit",
+            "Work",
+            "bebop-core"
+        ]
+    );
+    assert_eq!(
+        rows.iter()
+            .skip(1)
+            .map(|r| r.details[0].as_str())
+            .collect::<Vec<_>>(),
+        [
+            "home · no edits · 1 running",
+            "382 edits · 91 branches · 1 running",
+            "17 edits · 3 branches",
+            "2 branches",
+            "22 edits · 1 branch",
+            "4 branches"
+        ]
+    );
+    assert!(rows.iter().skip(1).all(|r| r.fold.is_some() && !r.expanded));
+}
+
+#[test]
+fn partial_index_reads_saved_codex_children_and_repo_work_without_writing() {
+    use gitterm_core::chat_facts::{ChatChild, ChildKind};
+    let fixture = IcedFixture::new();
+    let home = fixture.root.path().join("harness-home");
+    indexed_transcript(
+        &home,
+        "root-chat",
+        std::path::Path::new(&fixture.workspace.dir),
+        "Root title",
+        "Latest request",
+        "2026-11-20T12:00:00Z",
+    );
+    let facts_dir = gitterm_core::chat_facts::facts_dir(&fixture.config);
+    let root_path =
+        gitterm_core::chat_facts::facts_path(&facts_dir, ChatBackend::Claude, "root-chat").unwrap();
+    let mut facts = gitterm_core::chat_facts::load_facts(&root_path)
+        .unwrap()
+        .unwrap();
+    facts.children.push(ChatChild {
+        session_id: "saved-worker".into(),
+        kind: ChildKind::Worker,
+        delegation_id: None,
+        task_id: None,
+        title: Some("Saved child".into()),
+    });
+    std::fs::write(root_path, serde_json::to_vec(&facts).unwrap()).unwrap();
+    let extra = fixture.root.path().join("bebop-core");
+    std::fs::create_dir(&extra).unwrap();
+    let child = ChatFacts {
+        repo_work: vec![extra.clone()],
+        prs: vec![gitterm_core::chat_facts::PrRef {
+            repo: "example/extra".into(),
+            number: 42,
+            url: "https://github.com/example/extra/pull/42".into(),
+        }],
+        ..Default::default()
+    };
+    std::fs::write(
+        gitterm_core::chat_facts::facts_path(&facts_dir, ChatBackend::Codex, "saved-worker")
+            .unwrap(),
+        serde_json::to_vec(&child).unwrap(),
+    )
+    .unwrap();
+    let before = tree_snapshot(fixture.root.path());
+    let data = crate::data::IcedWorkData::read_with_home(
+        &fixture.config,
+        Some(&home),
+        1,
+        &fixture.workspace,
+        Focus::Latest,
+    )
+    .unwrap();
+    assert_eq!(data.facts.repos.len(), 3);
+    assert!(data.facts.repos.iter().any(|repo| repo.dir == extra));
+    assert_eq!(data.pull_requests.len(), 1);
+    assert_eq!(data.pull_requests[0].prs[0].key.label(), "example/extra#42");
+    assert_eq!(tree_snapshot(fixture.root.path()), before);
+}
+
+#[gpui::test]
+fn long_pr_title_wraps_without_overlapping_number_or_badges(cx: &mut gpui::TestAppContext) {
+    use gitterm_core::{
+        merge_plan::{PrKey, PrState},
+        prs::{PullCore, WatchedPr},
+    };
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let mut sidebar = fixture(true);
+    let mut pr = WatchedPr::new(PrKey::new("example/gitterm", 183));
+    pr.snapshot.core = Some(PullCore { title: "TRU-293 Default task base: fetch and start from the selected branch with a deliberately long title".into(), state: Some(PrState::Draft), mergeable: Some(false), ..Default::default() });
+    sidebar.pull_requests = vec![PullRequestGroup {
+        root: "root".into(),
+        title: "Owning chat".into(),
+        prs: vec![pr],
+    }];
+    let (_, cx) = cx.add_window_view(|_, _| sidebar);
+    cx.simulate_resize(gpui::size(px(360.), px(900.)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let number = cx.debug_bounds("work-pr-number-2").unwrap();
+    let title = cx.debug_bounds("work-label-2").unwrap();
+    let conflicts = cx.debug_bounds("work-badge-2-0").unwrap();
+    let draft = cx.debug_bounds("work-badge-2-1").unwrap();
+    assert!(number.right() <= title.left());
+    assert!(title.right() <= conflicts.left());
+    assert!(conflicts.right() <= draft.left());
+    assert!(draft.right() <= px(360.));
+    assert!(
+        title.size.height > px(20.),
+        "long title must wrap: {title:?}"
+    );
+    assert!(
+        title.size.height < px(40.),
+        "title is limited to two lines: {title:?}"
+    );
+}
+
+#[test]
+fn repo_running_subtitle_includes_live_chat_and_avoids_counted_task_twice() {
+    let mut sidebar = fixture(false);
+    sidebar.running_task_ids.insert("counted-task".into());
+    sidebar.running_chats = vec![
+        ("/repos/home".into(), None),
+        ("/repos/api-tru-274".into(), None),
+        ("/repos/api-tru-274".into(), Some("counted-task".into())),
+        ("/elsewhere".into(), None),
+    ];
+    let rows = sidebar.rows();
+    assert_eq!(
+        rows.iter().find(|row| row.label == "home").unwrap().details,
+        ["home · 2 edits · no live checkout of this work · 1 running"]
+    );
+    assert_eq!(
+        rows.iter().find(|row| row.label == "api").unwrap().details,
+        ["7 edits · 1 branch · 1 PR · 3 running"]
+    );
 }

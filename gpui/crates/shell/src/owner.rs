@@ -171,6 +171,36 @@ impl WorkspaceOwner {
             review_workers,
         }
     }
+    pub(crate) fn running_work_chats(&self, cx: &App) -> Vec<(PathBuf, Option<String>)> {
+        self.chats
+            .iter()
+            .filter_map(|(uid, chat)| {
+                let chat = chat.read(cx);
+                if !chat.is_working() {
+                    return None;
+                }
+                let target = chat.target();
+                let saved_tab = self
+                    .iced_catalog()
+                    .into_iter()
+                    .flat_map(|catalog| &catalog.workspaces)
+                    .flat_map(|workspace| &workspace.tabs)
+                    .find(|tab| tab.session_uid.as_deref() == Some(&target.session_uid));
+                let dir = saved_tab
+                    .map(|tab| PathBuf::from(tab.repo_dir.as_ref().unwrap_or(&tab.dir)))
+                    .or_else(|| {
+                        self.store
+                            .as_ref()?
+                            .chats
+                            .iter()
+                            .find(|chat| &chat.uid == uid)
+                            .map(|chat| chat.cwd.clone())
+                    })?;
+                Some((dir, target.task_id))
+            })
+            .collect()
+    }
+
     pub(crate) fn iced_workspace(
         &self,
         id: crate::data::WorkspaceId,
