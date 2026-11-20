@@ -226,3 +226,36 @@ fn slash_navigation_wraps_escape_hides_tab_fills_and_enter_obeys_argument_hint()
     assert!(state.slash_matches("/").is_empty());
     assert_eq!(state.slash_key("/", "enter"), SlashOutcome::Ignored);
 }
+
+#[test]
+fn completion_usage_lives_in_activity_with_iced_wording_and_no_missing_placeholders() {
+    let mut state = State::default();
+    state
+        .conversation
+        .push(AgentEvent::Harness(HarnessEvent::TurnCompleted {
+            status: gitterm_core::chat::types::TurnStatus::Completed,
+            usage: json!({"output_tokens":42}),
+            cost_usd: Some(0.1234),
+            rate_limit: None,
+        }));
+    let mut view = ComposerState::default();
+    view.project(&state, None);
+    assert_eq!(view.status_at(1000), "Done ↓ 42 tokens · $0.1234 session");
+    state
+        .conversation
+        .push(AgentEvent::Harness(HarnessEvent::TurnCompleted {
+            status: gitterm_core::chat::types::TurnStatus::Interrupted,
+            usage: serde_json::Value::Null,
+            cost_usd: None,
+            rate_limit: None,
+        }));
+    view.project(&state, None);
+    assert_eq!(view.status_at(1000), "Interrupted");
+    state
+        .conversation
+        .push(AgentEvent::Harness(HarnessEvent::ConversationReset {
+            trigger: None,
+        }));
+    view.project(&state, None);
+    assert_eq!(view.status_at(1000), "Ready");
+}

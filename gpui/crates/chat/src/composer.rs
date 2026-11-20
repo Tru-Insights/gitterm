@@ -59,6 +59,8 @@ pub struct ComposerState {
     pub backend: Option<gitterm_core::chat::types::AgentBackend>,
     started_at_ms: Option<u64>,
     ended_at_ms: Option<u64>,
+    output_tokens: Option<u64>,
+    cost_usd: Option<f64>,
     pub(crate) slash_index: usize,
     pub(crate) slash_dismissed: bool,
 }
@@ -90,6 +92,9 @@ impl ComposerState {
         let mut activity = "Working".to_string();
         let mut started = None;
         let mut ended = None;
+        let mut completed = None;
+        self.output_tokens = None;
+        self.cost_usd = None;
         for event in &state.conversation {
             match event {
                 AgentEvent::Other(value) if value["kind"] == "turn_timing" => {
@@ -102,7 +107,24 @@ impl ComposerState {
                     }
                 }
                 AgentEvent::Harness(HarnessEvent::TurnStarted { .. }) => {
-                    activity = "Working".into()
+                    activity = "Working".into();
+                    completed = None;
+                    self.output_tokens = None;
+                    self.cost_usd = None;
+                }
+                AgentEvent::Harness(HarnessEvent::TurnCompleted {
+                    status,
+                    usage,
+                    cost_usd,
+                    ..
+                }) => {
+                    completed = Some(match status {
+                        gitterm_core::chat::types::TurnStatus::Completed => "Done",
+                        gitterm_core::chat::types::TurnStatus::Interrupted => "Interrupted",
+                        gitterm_core::chat::types::TurnStatus::Failed(_) => "Failed",
+                    });
+                    self.output_tokens = usage["output_tokens"].as_u64();
+                    self.cost_usd = *cost_usd;
                 }
                 AgentEvent::Harness(HarnessEvent::ThinkingDelta(_)) => activity = "Thinking".into(),
                 AgentEvent::Harness(HarnessEvent::TextDelta(_)) => activity = "Responding".into(),
@@ -118,6 +140,9 @@ impl ComposerState {
                     reset = true;
                     started = None;
                     ended = None;
+                    completed = None;
+                    self.output_tokens = None;
+                    self.cost_usd = None;
                 }
                 _ => {}
             }
@@ -146,14 +171,15 @@ impl ComposerState {
             "Needs you".into()
         } else {
             match &state.state {
-                AgentSessionState::Idle => if self.started_at_ms.is_some() {
-                    "Done"
-                } else {
-                    "Ready"
-                }
-                .into(),
+                AgentSessionState::Idle => completed
+                    .unwrap_or(if self.started_at_ms.is_some() {
+                        "Done"
+                    } else {
+                        "Ready"
+                    })
+                    .into(),
                 AgentSessionState::Streaming => activity,
-                AgentSessionState::Stopped => "Stopped".into(),
+                AgentSessionState::Stopped => completed.unwrap_or("Stopped").into(),
                 AgentSessionState::Errored(error) => format!("Failed · {error}"),
             }
         };
@@ -319,16 +345,24 @@ impl ComposerState {
     }
 
     pub fn status_at(&self, now: u64) -> String {
-        self.started_at_ms.map_or_else(
-            || self.status.clone(),
-            |start| {
-                format!(
-                    "{} {}",
-                    self.status,
-                    elapsed(self.ended_at_ms.unwrap_or(now).saturating_sub(start))
-                )
-            },
-        )
+        let mut status = self.status.clone();
+        let mut meta = Vec::new();
+        if let Some(start) = self.started_at_ms {
+            meta.push(elapsed(
+                self.ended_at_ms.unwrap_or(now).saturating_sub(start),
+            ));
+        }
+        if let Some(tokens) = self.output_tokens.filter(|tokens| *tokens > 0) {
+            meta.push(format!("↓ {tokens} tokens"));
+        }
+        if let Some(cost) = self.cost_usd {
+            meta.push(format!("${cost:.4} session"));
+        }
+        if !meta.is_empty() {
+            status.push(' ');
+            status.push_str(&meta.join(" · "));
+        }
+        status
     }
 
     pub fn slash_matches(&self, draft: &str) -> Vec<&SlashCommand> {
@@ -516,9 +550,6 @@ mod ui {
                     })
                 }).flatten())
                 .child(div().flex().items_center().gap(px(6.))
-                    .child(Button::new("attach-image").debug_selector(|| "composer-attach".into())
-                        .label("Attach image").tooltip("Attach images, paste, or drop them here")
-                        .disabled(disabled).on_click(cx.listener(|view, _, window, cx| view.pick_images(window, cx))))
                     .child(div().flex_1())
                     .child(Button::new("send").debug_selector(|| "composer-send".into())
                         .child(div().text_size(px(appearance.size(13.))).child("Send")).px(px(14.)).py(px(5.)).h_auto().bg(rgb(palette.accent)).text_color(rgb(palette.base))

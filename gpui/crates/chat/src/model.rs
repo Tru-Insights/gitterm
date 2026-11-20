@@ -105,9 +105,17 @@ impl Row {
     }
 }
 
+#[derive(Debug)]
+pub struct CompletedTurn {
+    pub rows: Range<usize>,
+    pub duration_ms: Option<u64>,
+}
+
 #[derive(Default)]
 pub struct ChatModel {
     pub rows: Vec<Row>,
+    pub completed_turns: Vec<CompletedTurn>,
+    turn_row_start: HashMap<String, usize>,
     streams: HashMap<String, (RowKind, usize)>,
     items: HashMap<(String, String), usize>,
     requests: HashMap<(Vec<String>, String), usize>,
@@ -340,6 +348,9 @@ impl ChatModel {
         }
         match event {
             HarnessEvent::TextDelta(text) | HarnessEvent::ThinkingDelta(text) => {
+                if text.is_empty() {
+                    return;
+                }
                 let kind = if matches!(event, HarnessEvent::TextDelta(_)) {
                     RowKind::Assistant
                 } else {
@@ -351,18 +362,23 @@ impl ChatModel {
                         let title = if kind == RowKind::Thinking {
                             "Thinking"
                         } else {
-                            "Assistant"
+                            ""
                         };
                         let index = self.push(kind, scope, title.into(), String::new());
                         self.streams.insert(scope.into(), (kind, index));
                         index
                     }
                 };
-                self.rows[index].body.push_str(text);
+                if kind == RowKind::Thinking {
+                    self.rows[index].body.push_str(&literal(text));
+                } else {
+                    self.rows[index].body.push_str(text);
+                }
                 changed.push(index);
             }
             HarnessEvent::TurnStarted { model, .. } => {
                 self.streams.remove(scope);
+                self.turn_row_start.insert(scope.into(), self.rows.len());
                 if let Some(at) = at {
                     self.turn_start.insert(scope.into(), at);
                 } else {
@@ -501,49 +517,32 @@ impl ChatModel {
             }
             HarnessEvent::TurnCompleted {
                 status,
-                usage,
-                cost_usd,
                 ..
             } => {
                 self.streams.remove(scope);
-                let duration = self
-                    .turn_start
-                    .remove(scope)
-                    .zip(at)
-                    .map(|(start, at)| format!("{:.2}s", at.saturating_sub(start) as f64 / 1000.))
-                    .unwrap_or_else(|| "Time not recorded".into());
+                let duration_ms = self.turn_start.remove(scope).zip(at).map(|(start, end)| end.saturating_sub(start));
+                let start = self.turn_row_start.remove(scope).unwrap_or_else(|| {
+                    self.rows.iter().rposition(|row| row.scope == scope && row.kind == RowKind::User).map_or(0, |index| index + 1)
+                });
+                if scope.is_empty() {
+                    self.completed_turns.push(CompletedTurn { rows: start..self.rows.len(), duration_ms });
+                    changed.extend(start..self.rows.len());
+                }
                 let status = match status {
                     TurnStatus::Completed => "Done".into(),
                     TurnStatus::Interrupted => "Interrupted".into(),
                     TurnStatus::Failed(reason) => format!("Failed: {reason}"),
                 };
-                let input = usage["input_tokens"].as_u64();
-                let output = usage["output_tokens"].as_u64();
-                let tokens = if input.is_some() || output.is_some() {
-                    format!(
-                        "{} in / {} out tokens",
-                        input.map_or_else(|| "unreported".into(), |value| value.to_string()),
-                        output.map_or_else(|| "unreported".into(), |value| value.to_string())
-                    )
-                } else {
-                    "Tokens not reported".into()
-                };
-                let title = format!(
-                    "{status} · {tokens} · {duration}{}",
-                    cost_usd
-                        .map(|cost| format!(" · ${cost:.4}"))
-                        .unwrap_or_default()
-                );
                 if let Some(&index) = self.workers.get(scope) {
                     self.rows[index].title = format!("Worker {scope} · {status}");
                     changed.push(index);
                 }
-                changed.push(self.push(
-                    RowKind::Status,
-                    scope,
-                    title,
-                    code(&pretty(usage), "json"),
-                ));
+                // Iced reports completion/usage in the activity strip, not a message.
+                match status.as_str() {
+                    "Done" => {}
+                    "Interrupted" => changed.push(self.push(RowKind::Status, scope, status, String::new())),
+                    _ => changed.push(self.push(RowKind::Error, scope, status, String::new())),
+                }
             }
             HarnessEvent::SubagentEvent {
                 parent_tool_use_id,
@@ -632,6 +631,7 @@ impl ChatModel {
                 self.prompts.clear();
                 self.workers.clear();
                 self.turn_start.clear();
+                self.turn_row_start.clear();
                 changed.push(self.push(
                     RowKind::Status,
                     scope,
@@ -714,16 +714,27 @@ impl ChatModel {
         } else {
             tool.partial_input.clone()
         };
-        row.body = format!(
-            "**Input{}**\n\n{}",
-            if tool.output.is_none() && !tool.partial_input.is_empty() {
-                " (streaming / partial JSON)"
-            } else {
-                ""
-            },
-            code(&input, "json")
-        );
-        if let Some(output) = &tool.output {
+        row.body = if tool.partial_input.is_empty()
+            && (tool.input.is_null()
+                || tool.input.as_object().is_some_and(|input| input.is_empty()))
+        {
+            String::new()
+        } else {
+            format!(
+                "**Input{}**\n\n{}",
+                if tool.output.is_none() && !tool.partial_input.is_empty() {
+                    " (streaming / partial JSON)"
+                } else {
+                    ""
+                },
+                code(&input, "json")
+            )
+        };
+        if let Some(output) = tool
+            .output
+            .as_ref()
+            .filter(|text| !text.trim().is_empty() && text.trim() != "null")
+        {
             row.body.push_str(&format!(
                 "\n\n**{}**\n\n{}",
                 if tool.is_error { "Error" } else { "Result" },
@@ -1024,9 +1035,7 @@ mod tests {
             3
         );
         assert_eq!(a.rows.iter().flat_map(Row::edits).count(), 4);
-        assert!(a.rows.iter().any(
-            |row| row.title.contains("456 in / 196 out tokens") && row.title.contains("4.32s")
-        ));
+        assert!(!a.rows.iter().any(|row| row.title.contains("out tokens")));
         assert!(a.rows.iter().any(|row| {
             row.tool
                 .as_ref()
@@ -1115,8 +1124,7 @@ mod tests {
         let records = parse_fixture(r#"{"type":"turn_started","data":{"session_id":null,"model":null}}
 {"type":"turn_completed","data":{"status":{"state":"completed"},"usage":{"output_tokens":12},"cost_usd":null}}"#).unwrap();
         let model = ChatModel::from_records(&records);
-        assert!(model.rows[0].title.contains("Time not recorded"));
-        assert!(model.rows[0].title.contains("unreported in / 12 out"));
+        assert!(model.rows.is_empty());
         assert_eq!(
             plain_markdown(&literal("1. raw **text**\nsecond line")).trim(),
             "1. raw **text**\nsecond line"
@@ -1134,5 +1142,62 @@ mod tests {
                 .contains("a bold phrase")
         );
         assert!(code("```\ntext", "text").starts_with("````text"));
+    }
+}
+
+#[cfg(test)]
+mod transcript_parity_tests {
+    use super::*;
+
+    #[test]
+    fn empty_and_null_results_never_create_code_blocks_or_completion_messages() {
+        for output in ["", " ", "null", "\nnull\n"] {
+            let mut model = ChatModel::default();
+            for event in [
+                HarnessEvent::ItemStarted {
+                    id: "tool".into(),
+                    kind: ItemKind::ToolCall {
+                        name: "Bash".into(),
+                        input: Value::Null,
+                    },
+                },
+                HarnessEvent::ItemCompleted {
+                    id: "tool".into(),
+                    output: output.into(),
+                    is_error: false,
+                },
+                HarnessEvent::TurnCompleted {
+                    status: TurnStatus::Completed,
+                    usage: Value::Null,
+                    cost_usd: None,
+                    rate_limit: None,
+                },
+            ] {
+                model.apply(&Record {
+                    at_ms: None,
+                    entry: Entry::Harness(event),
+                });
+            }
+            assert_eq!(model.rows.len(), 1);
+            assert_eq!(model.rows[0].body, "");
+            assert!(model.rows[0].tool.as_ref().unwrap().output.is_some());
+        }
+    }
+
+    #[test]
+    fn assistant_has_no_heading_and_redacted_thinking_renders_nothing() {
+        let mut model = ChatModel::default();
+        for event in [
+            HarnessEvent::ThinkingDelta(String::new()),
+            HarnessEvent::TextDelta("Hello".into()),
+        ] {
+            model.apply(&Record {
+                at_ms: None,
+                entry: Entry::Harness(event),
+            });
+        }
+        assert_eq!(model.rows.len(), 1);
+        assert_eq!(model.rows[0].kind, RowKind::Assistant);
+        assert_eq!(model.rows[0].title, "");
     }
 }

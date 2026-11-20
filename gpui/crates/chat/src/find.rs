@@ -16,6 +16,8 @@ pub(super) struct TranscriptFind {
     scroll_subscription: Option<Subscription>,
     opened: HashSet<u64>,
     opened_turns: HashSet<u64>,
+    opened_runs: HashSet<u64>,
+    opened_work: HashSet<u64>,
 }
 // HTML searches content roots, excluding native headers and tool labels.
 fn body_ranges(row: &Row, text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
@@ -155,6 +157,26 @@ impl ChatView {
                     self.sync_turn_visibility(cx);
                 }
             }
+            if let Some(work) = turns::work_folds(&self.model)
+                .iter()
+                .find(|fold| fold.range.contains(&found.row))
+            {
+                let id = self.model.rows[work.range.start].id;
+                if self.open_work.insert(id) {
+                    self.find.opened_work.insert(id);
+                    self.sync_runs(cx);
+                }
+            }
+            if let Some(run) = tool_runs::group(&self.model.rows, &self.model.completed_turns)
+                .iter()
+                .find(|run| run.range.contains(&found.row))
+            {
+                let id = self.model.rows[run.range.start].id;
+                if self.open_runs.insert(id) {
+                    self.find.opened_runs.insert(id);
+                    self.sync_runs(cx);
+                }
+            }
             let view = self.row(found.row, window, cx);
             view.update(cx, |view, cx| {
                 if !view.open {
@@ -232,6 +254,13 @@ impl ChatView {
             self.folded_turns.insert(id);
         }
         self.sync_turn_visibility(cx);
+        for id in self.find.opened_runs.drain() {
+            self.open_runs.remove(&id);
+        }
+        for id in self.find.opened_work.drain() {
+            self.open_work.remove(&id);
+        }
+        self.sync_runs(cx);
         self.find.matches.clear();
         self.find.current = None;
         for index in 0..self.row_views.len() {

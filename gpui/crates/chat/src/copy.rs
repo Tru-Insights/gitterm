@@ -8,6 +8,7 @@ const COPIED_FOR: Duration = Duration::from_millis(1200);
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum CopyTarget {
     Code(usize),
+    #[cfg(test)]
     Reply,
 }
 
@@ -128,6 +129,7 @@ impl RowView {
         self.copied_payload(CopyTarget::Code(key), code, cx);
     }
 
+    #[cfg(test)]
     fn copy_reply(&mut self, markdown: bool, cx: &mut Context<Self>) {
         // Row source is synchronized with the model, independently of selection,
         // asynchronous text layout, or a prior rich-row entity's lifetime.
@@ -139,36 +141,16 @@ impl RowView {
         self.copied_payload(CopyTarget::Reply, payload, cx);
     }
 
-    pub(super) fn reply_copy_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .gap(px(6.))
-            .child(
-                Button::new("copy-reply-markdown")
-                    .small()
-                    .debug_selector(|| "copy-reply-markdown".into())
-                    .label(if self.copied.contains_key(&CopyTarget::Reply) {
-                        "Copied"
-                    } else {
-                        "Copy markdown"
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| this.copy_reply(true, cx))),
-            )
-            .child(
-                Button::new("copy-reply-text")
-                    .small()
-                    .debug_selector(|| "copy-reply-text".into())
-                    .label("Copy text")
-                    .on_click(cx.listener(|this, _, _, cx| this.copy_reply(false, cx))),
-            )
-    }
-
     pub(super) fn copyable_text(&self, cx: &mut Context<Self>) -> TextView {
         let owner = cx.entity().downgrade();
         let copied: HashSet<_> = self.copied.keys().copied().collect();
-        TextView::new(&self.text)
+        let view = TextView::new(&self.text)
             .font_family(".SystemUIFont")
-            .text_size(px(self.appearance.font_size))
+            .text_size(px(if self.row.kind == RowKind::Thinking {
+                self.appearance.size(13.)
+            } else {
+                self.appearance.font_size
+            }))
             .line_height(gpui::relative(1.5))
             .inline_code_style(
                 StyleRefinement::default()
@@ -179,6 +161,20 @@ impl RowView {
             .selectable(true)
             .scrollable(false)
             .stream_fade(true)
+            .style(
+                gpui_component::text::TextViewStyle::default()
+                    .table(
+                        StyleRefinement::default()
+                            .border_color(rgb(self.appearance.palette().border)),
+                    )
+                    .table_head(StyleRefinement::default().bg(rgb(self.appearance.palette().alt)))
+                    .table_cell(
+                        StyleRefinement::default()
+                            .px(px(8.))
+                            .py(px(3.))
+                            .border_color(rgb(self.appearance.palette().border)),
+                    ),
+            )
             .code_block_actions(move |block, _, _| {
                 let mut hash = std::hash::DefaultHasher::new();
                 block
@@ -190,21 +186,39 @@ impl RowView {
                 let key = hash.finish() as usize;
                 let code = block.code().to_string();
                 let owner = owner.clone();
-                Button::new(("copy-code", key))
-                    .debug_selector({
-                        let owner = owner.clone();
-                        move || format!("copy-code-{}", owner.entity_id())
-                    })
-                    .small()
-                    .label(if copied.contains(&CopyTarget::Code(key)) {
-                        "Copied"
+                div()
+                    .id(("copy-code-hover", key))
+                    .opacity(if copied.contains(&CopyTarget::Code(key)) {
+                        1.
                     } else {
-                        "Copy"
+                        0.
                     })
-                    .on_click(move |_, _, cx| {
-                        _ = owner.update(cx, |view, cx| view.copy_code(key, code.clone(), cx));
-                    })
-            })
+                    .group_hover("chat-row", |style| style.opacity(1.))
+                    .child(
+                        Button::new(("copy-code", key))
+                            .debug_selector({
+                                let owner = owner.clone();
+                                move || format!("copy-code-{}", owner.entity_id())
+                            })
+                            .small()
+                            .label(if copied.contains(&CopyTarget::Code(key)) {
+                                "Copied"
+                            } else {
+                                "Copy"
+                            })
+                            .on_click(move |_, _, cx| {
+                                _ = owner
+                                    .update(cx, |view, cx| view.copy_code(key, code.clone(), cx));
+                            }),
+                    )
+            });
+        #[cfg(test)]
+        let view = view.table_actions(|_, _, _| {
+            div()
+                .debug_selector(|| "chat-markdown-table".into())
+                .size(px(1.))
+        });
+        view
     }
 }
 
@@ -260,7 +274,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn reply_buttons_copy_full_source_or_plain_independently_of_selection(cx: &mut TestAppContext) {
+    fn no_per_reply_buttons_and_copy_source_remains_independent_of_selection(
+        cx: &mut TestAppContext,
+    ) {
         let (chat, cx) = setup(cx);
         let row = row(&chat, cx);
         let text = row.read_with(cx, |row, _| row.text.clone());
@@ -272,10 +288,12 @@ mod tests {
             text.read_with(cx, |text, _| text.selected_source_range()),
             selected
         );
-        click("copy-reply-markdown", cx);
+        assert!(cx.debug_bounds("copy-reply-markdown").is_none());
+        assert!(cx.debug_bounds("copy-reply-text").is_none());
+        row.update_in(cx, |row, _, cx| row.copy_reply(true, cx));
         assert_eq!(clipboard(cx), REPLY);
         assert!(row.read_with(cx, |row, _| row.copied.contains_key(&CopyTarget::Reply)));
-        click("copy-reply-text", cx);
+        row.update_in(cx, |row, _, cx| row.copy_reply(false, cx));
         assert_eq!(
             clipboard(cx),
             "Bold é and a link\nfirst\n\nsecond inline\n\n  let x = 1;  \n\t// é"

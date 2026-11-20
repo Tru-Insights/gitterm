@@ -5,6 +5,7 @@ mod copy;
 mod find;
 #[path = "review/ui.rs"]
 pub(crate) mod review_ui;
+mod tool_runs;
 #[path = "turns.rs"]
 mod turns;
 use copy::CopyTarget;
@@ -26,7 +27,7 @@ use gpui::{
 };
 use gpui_component::{
     Disableable, Root, Sizable, WindowExt,
-    button::Button,
+    button::{Button, ButtonVariants},
     collapsible::Collapsible,
     diff::{Diff, DiffFile, DiffState},
     input::{
@@ -159,6 +160,8 @@ pub struct ChatView {
     recent_rows: VecDeque<usize>,
     folded: HashMap<u64, bool>,
     folded_turns: HashSet<u64>,
+    open_runs: HashSet<u64>,
+    open_work: HashSet<u64>,
     model: ChatModel,
     row_views: Vec<Option<Entity<RowView>>>,
     scroller: Entity<MessageScrollerState>,
@@ -264,6 +267,8 @@ impl ChatView {
             recent_rows: VecDeque::new(),
             folded: HashMap::new(),
             folded_turns: HashSet::new(),
+            open_runs: HashSet::new(),
+            open_work: HashSet::new(),
             row_views: vec![None; model.rows.len()],
             model,
             scroller,
@@ -281,6 +286,13 @@ impl ChatView {
     pub fn set_width(&mut self, width: gitterm_core::settings::ChatWidth, cx: &mut Context<Self>) {
         if self.width != width {
             self.width = width;
+            let width = self.column_width().map(|width| width - 28.);
+            for row in self.row_views.iter().flatten() {
+                row.update(cx, |row, cx| {
+                    row.column_width = width;
+                    cx.notify();
+                });
+            }
             self.scroller.update(cx, |state, cx| {
                 state.remeasure_items(0..self.model.rows.len(), cx)
             });
@@ -288,13 +300,13 @@ impl ChatView {
         }
     }
 
-    /// Iced's CSS rem is the document's 16px root size, independent of chat fonts.
+    /// Iced fixes the document root at 14px, independently of the chat font.
     fn column_width(&self) -> Option<f32> {
         use gitterm_core::settings::ChatWidth;
         match self.width {
-            ChatWidth::Narrow => Some(46. * 16. + 28.),
-            ChatWidth::Medium => Some(60. * 16. + 28.),
-            ChatWidth::Wide => Some(72. * 16. + 28.),
+            ChatWidth::Narrow => Some(46. * 14. + 28.),
+            ChatWidth::Medium => Some(60. * 14. + 28.),
+            ChatWidth::Wide => Some(72. * 14. + 28.),
             ChatWidth::Full => None,
         }
     }
@@ -719,6 +731,8 @@ impl ChatView {
                 self.recent_rows.clear();
                 self.folded.clear();
                 self.folded_turns.clear();
+                self.open_runs.clear();
+                self.open_work.clear();
                 self.scroller
                     .update(cx, |scroller, cx| scroller.reset(self.model.rows.len(), cx));
                 self.reset_find(cx);
@@ -796,6 +810,19 @@ impl ChatView {
             return view.clone();
         }
         let row = self.model.rows[index].clone();
+        let run = tool_runs::group(&self.model.rows, &self.model.completed_turns)
+            .into_iter()
+            .find(|run| run.range.contains(&index));
+        let run_open = run.as_ref().is_none_or(|run| {
+            self.open_runs
+                .contains(&self.model.rows[run.range.start].id)
+        });
+        let hidden_by_run = run
+            .as_ref()
+            .is_some_and(|run| run.range.start != index && !run_open);
+        let run_summary = run
+            .filter(|run| run.range.start == index)
+            .map(|run| run.label);
         let groups = turns::group(&self.model.rows);
         let turn = groups
             .iter()
@@ -805,35 +832,110 @@ impl ChatView {
             self.folded_turns
                 .contains(&self.model.rows[turn.user_row].id)
         });
-        let turn_rows = turn.as_ref().map_or(0, |turn| turn.end - turn.user_row - 1);
-        let turn_toggle: TurnToggle = {
-            let owner = cx.entity().downgrade();
-            Rc::new(move |id, cx| {
-                _ = owner.update(cx, |view, cx| view.toggle_turn(id, cx));
-            })
-        };
-        let user_turn = row.kind == RowKind::User && turn_rows > 0;
-        let turn_id = row.id;
+        let work = turns::work_folds(&self.model)
+            .into_iter()
+            .find(|fold| fold.range.contains(&index));
+        let work_open = work.as_ref().is_none_or(|fold| {
+            self.open_work
+                .contains(&self.model.rows[fold.range.start].id)
+        });
+        let hidden_by_work = work
+            .as_ref()
+            .is_some_and(|fold| fold.range.start != index && !work_open);
+        let work_summary = work
+            .filter(|fold| fold.range.start == index)
+            .map(|fold| fold.label);
+        let work_owner = cx.entity().downgrade();
+        let work_toggle: TurnToggle = Rc::new(move |id, cx| {
+            _ = work_owner.update(cx, |view, cx| {
+                if !view.open_work.insert(id) {
+                    view.open_work.remove(&id);
+                }
+                view.sync_runs(cx);
+            });
+        });
+        let run_owner = cx.entity().downgrade();
+        let run_toggle: TurnToggle = Rc::new(move |id, cx| {
+            _ = run_owner.update(cx, |view, cx| {
+                if !view.open_runs.insert(id) {
+                    view.open_runs.remove(&id);
+                }
+                view.sync_runs(cx);
+            });
+        });
         let scroller = self.scroller.clone();
         let open = self.folded.get(&row.id).copied();
         let view = cx.new(|cx| {
             let mut view = RowView::new(row, index, scroller, cx);
             if let Some(open) = open {
                 view.open = open;
+            } else if view.row.kind == RowKind::Thinking
+                && self.turn_running
+                && self.read_only_reason.is_none()
+            {
+                view.open = true;
             }
             view.appearance = self.appearance;
-            view.turn_collapsed = turn_collapsed;
+            view.column_width = self.column_width().map(|width| width - 28.);
+            view.work_toggle = work_toggle;
+            view.work_summary = work_summary;
+            view.work_open = work_open;
+            view.hidden_by_work = hidden_by_work;
+            view.run_toggle = run_toggle;
+            view.run_summary = run_summary;
+            view.run_open = run_open;
+            view.hidden_by_run = hidden_by_run;
             view.hidden_by_turn =
                 turn_collapsed && turn.as_ref().is_some_and(|turn| turn.contains(index));
-            view.turn_toggle = turn_toggle;
-            view.user_turn = user_turn;
-            view.turn_id = turn_id;
-            view.turn_rows = turn_rows;
             view
         });
         self.row_views[index] = Some(view.clone());
         self.update_row_find(index, cx);
         view
+    }
+    fn sync_runs(&mut self, cx: &mut Context<Self>) {
+        let runs = tool_runs::group(&self.model.rows, &self.model.completed_turns);
+        let work_folds = turns::work_folds(&self.model);
+        for (index, view) in self.row_views.iter().enumerate() {
+            let Some(view) = view else { continue };
+            let run = runs.iter().find(|run| run.range.contains(&index));
+            let summary = run
+                .filter(|run| run.range.start == index)
+                .map(|run| run.label.clone());
+            let open = run.is_none_or(|run| {
+                self.open_runs
+                    .contains(&self.model.rows[run.range.start].id)
+            });
+            let hidden = run.is_some_and(|run| run.range.start != index && !open);
+            let work = work_folds.iter().find(|fold| fold.range.contains(&index));
+            let work_summary = work
+                .filter(|fold| fold.range.start == index)
+                .map(|fold| fold.label.clone());
+            let work_open = work.is_none_or(|fold| {
+                self.open_work
+                    .contains(&self.model.rows[fold.range.start].id)
+            });
+            let hidden_by_work = work.is_some_and(|fold| fold.range.start != index && !work_open);
+            view.update(cx, |view, cx| {
+                if view.work_summary != work_summary
+                    || view.work_open != work_open
+                    || view.hidden_by_work != hidden_by_work
+                    || view.run_summary != summary
+                    || view.run_open != open
+                    || view.hidden_by_run != hidden
+                {
+                    view.work_summary = work_summary;
+                    view.work_open = work_open;
+                    view.hidden_by_work = hidden_by_work;
+                    view.run_summary = summary;
+                    view.run_open = open;
+                    view.hidden_by_run = hidden;
+                    view.scroller
+                        .update(cx, |state, cx| state.remeasure_items(index..index + 1, cx));
+                    cx.notify();
+                }
+            });
+        }
     }
     fn pending_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let pending = self.model.pending_rows();
@@ -893,6 +995,7 @@ impl ChatView {
             .child(card)
             .into_any_element()
     }
+    #[cfg(test)]
     fn toggle_turn(&mut self, id: u64, cx: &mut Context<Self>) {
         if !self.folded_turns.insert(id) {
             self.folded_turns.remove(&id);
@@ -909,16 +1012,11 @@ impl ChatView {
                 })
             })
             .collect::<Vec<_>>();
-        let folded_turns = self.folded_turns.clone();
         for (index, view) in self.row_views.iter().enumerate() {
             if let Some(view) = view {
                 view.update(cx, |row, cx| {
-                    if row.hidden_by_turn != hidden[index]
-                        || (row.user_turn
-                            && row.turn_collapsed != folded_turns.contains(&row.turn_id))
-                    {
+                    if row.hidden_by_turn != hidden[index] {
                         row.hidden_by_turn = hidden[index];
-                        row.turn_collapsed = row.user_turn && folded_turns.contains(&row.turn_id);
                         cx.notify();
                     }
                 });
@@ -935,6 +1033,8 @@ impl ChatView {
         self.cards.clear();
         self.recent_rows.clear();
         self.folded.clear();
+        self.open_runs.clear();
+        self.open_work.clear();
         self.turn_running = false;
         self.fixture_composer = gitterm_core::chat::state::State::default();
         self.composer_state = crate::composer::ComposerState::default();
@@ -1032,6 +1132,7 @@ impl ChatView {
                 view.update(cx, |view, cx| view.set_row(row, cx));
             }
         }
+        self.sync_runs(cx);
         if self.find_open && !self.find.query.is_empty() {
             self.find.refresh(&self.model, &changed);
             for index in 0..self.row_views.len() {
@@ -1188,7 +1289,6 @@ impl Render for ChatView {
                 cx.listener(|this, _: &CopyMarkdown, window, cx| this.copy(true, window, cx)),
             )
             .size_full()
-            .when_some(self.column_width(), |column, width| column.max_w(px(width)))
             .min_w_0()
             .min_h_0()
             .flex()
@@ -1236,6 +1336,7 @@ impl Render for ChatView {
             )
             .child(
                 div()
+                    .when_some(self.column_width(), |footer, width| footer.max_w(px(width)))
                     .id("chat-footer")
                     .debug_selector(|| "chat-footer".into())
                     .flex_shrink_0()
@@ -1306,6 +1407,15 @@ impl Render for ChatView {
 }
 
 struct RowView {
+    work_summary: Option<String>,
+    work_open: bool,
+    hidden_by_work: bool,
+    work_toggle: TurnToggle,
+    column_width: Option<f32>,
+    run_summary: Option<String>,
+    run_open: bool,
+    hidden_by_run: bool,
+    run_toggle: TurnToggle,
     appearance: ChatAppearance,
     sent_images: Vec<Result<attachments::Thumbnail, String>>,
     preparing_sent_images: Option<Task<()>>,
@@ -1322,12 +1432,7 @@ struct RowView {
     index: usize,
     scroller: Entity<MessageScrollerState>,
     _subscription: Subscription,
-    turn_collapsed: bool,
     hidden_by_turn: bool,
-    user_turn: bool,
-    turn_id: u64,
-    turn_rows: usize,
-    turn_toggle: TurnToggle,
 }
 impl RowView {
     fn new(
@@ -1350,6 +1455,15 @@ impl RowView {
         });
         let open = !row.collapsible();
         let mut view = Self {
+            work_summary: None,
+            work_open: true,
+            hidden_by_work: false,
+            work_toggle: Rc::new(|_, _| {}),
+            column_width: Some(840.),
+            run_summary: None,
+            run_open: true,
+            hidden_by_run: false,
+            run_toggle: Rc::new(|_, _| {}),
             appearance: ChatAppearance::default(),
             sent_images: vec![],
             preparing_sent_images: None,
@@ -1366,12 +1480,7 @@ impl RowView {
             index,
             scroller,
             _subscription: subscription,
-            turn_collapsed: false,
             hidden_by_turn: false,
-            user_turn: false,
-            turn_id: 0,
-            turn_rows: 0,
-            turn_toggle: Rc::new(|_, _| {}),
         };
         view.make_diffs(cx);
         view.prepare_sent_images(cx);
@@ -1415,7 +1524,10 @@ impl RowView {
 }
 impl Render for RowView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.hidden_by_turn {
+        if self.hidden_by_turn
+            || self.hidden_by_work
+            || (self.hidden_by_run && self.work_summary.is_none())
+        {
             return div().h(px(0.)).mb(px(0.)).into_any_element();
         }
         self.highlight(cx);
@@ -1445,7 +1557,15 @@ impl Render for RowView {
             .flex()
             .flex_col()
             .gap(px(8.))
-            .p(px(10.))
+            .when(self.row.kind == RowKind::User, |content| {
+                content.px(px(12.)).py(px(8.))
+            })
+            .when(self.row.kind == RowKind::Thinking, |content| {
+                content
+                    .pl(px(14.))
+                    .border_l_2()
+                    .border_color(rgb(palette.border))
+            })
             .children(
                 self.diff_error
                     .clone()
@@ -1461,26 +1581,57 @@ impl Render for RowView {
         let header = div()
             .text_size(px(self.appearance.size(13.)))
             .text_color(rgb(color))
-            .child(self.row.title.clone())
-            .when(self.row.kind == RowKind::Assistant, |header| {
-                header.child(self.reply_copy_buttons(cx))
-            })
-            .when(self.user_turn, |header| {
-                let id = self.turn_id;
-                let toggle = self.turn_toggle.clone();
-                header.child(
-                    Button::new(("turn-fold", id))
-                        .small()
-                        .label(if self.turn_collapsed {
-                            format!("Unfold turn · {} rows", self.turn_rows)
-                        } else {
-                            format!("Fold turn · {} rows", self.turn_rows)
-                        })
-                        .on_click(move |_, _, cx| toggle(id, cx)),
-                )
-            });
-        div()
+            .child(self.row.title.clone());
+        let run_summary = self.run_summary.clone().map(|label| {
+            let toggle = self.run_toggle.clone();
+            let id = self.row.id;
+            Button::new(("tool-run", id))
+                .ghost()
+                .h_auto()
+                .w_full()
+                .px_0()
+                .justify_start()
+                .debug_selector(move || format!("tool-run-{id}"))
+                .flex()
+                .items_baseline()
+                .gap(px(6.))
+                .py(px(2.))
+                .cursor_pointer()
+                .text_size(px(self.appearance.size(12.5)))
+                .text_color(rgb(palette.muted))
+                .child(div().min_w_0().text_ellipsis().child(label))
+                .child(if self.run_open { "⌄" } else { "›" })
+                .on_click(move |_, _, cx| toggle(id, cx))
+        });
+        let show_work = self.work_summary.is_none() || self.work_open;
+        let show_card = show_work && (self.run_summary.is_none() || self.run_open);
+        let work_summary = self.work_summary.clone().map(|label| {
+            let toggle = self.work_toggle.clone();
+            let id = self.row.id;
+            Button::new(("work-fold", id))
+                .ghost()
+                .h_auto()
+                .w_full()
+                .px_0()
+                .justify_start()
+                .debug_selector(move || format!("work-fold-{id}"))
+                .flex()
+                .gap(px(6.))
+                .py(px(2.))
+                .cursor_pointer()
+                .text_size(px(self.appearance.size(13.)))
+                .text_color(rgb(palette.muted))
+                .child(label)
+                .child(if self.work_open { "⌄" } else { "›" })
+                .on_click(move |_, _, cx| toggle(id, cx))
+        });
+        let row = div()
             .id(("row", self.row.id))
+            .debug_selector({
+                let id = self.row.id;
+                move || format!("transcript-row-{id}")
+            })
+            .group("chat-row")
             .text_size(px(self.appearance.font_size))
             .text_color(rgb(match self.row.kind {
                 RowKind::Thinking | RowKind::Status => palette.muted,
@@ -1489,8 +1640,6 @@ impl Render for RowView {
             }))
             .font_family(".SystemUIFont")
             .w_full()
-            .max_w(px(960.))
-            .mx_auto()
             .mb(px(10.))
             .when(!self.row.scope.is_empty(), |view| {
                 view.ml(px(18.))
@@ -1498,7 +1647,8 @@ impl Render for RowView {
                     .border_color(rgb(palette.border))
             })
             .when(self.row.kind == RowKind::User, |view| {
-                view.max_w(px(816.))
+                view.w_auto()
+                    .max_w(gpui::relative(0.85))
                     .ml_auto()
                     .mr_0()
                     .bg(rgb(palette.block))
@@ -1509,7 +1659,7 @@ impl Render for RowView {
             .when(
                 matches!(
                     self.row.kind,
-                    RowKind::Tool | RowKind::Permission | RowKind::Question | RowKind::Delegation
+                    RowKind::Permission | RowKind::Question | RowKind::Delegation
                 ),
                 |view| {
                     view.bg(rgb(palette.base))
@@ -1519,25 +1669,65 @@ impl Render for RowView {
                         .rounded(px(6.))
                 },
             )
-            .child(if self.row.collapsible() {
-                Collapsible::new()
-                    .open(self.open)
-                    .child(
-                        Button::new("fold")
-                            .small()
-                            .label(format!(
-                                "{} {}",
-                                if self.open { "▾" } else { "▸" },
-                                self.row.title
-                            ))
-                            .text_color(rgb(color))
-                            .on_click(cx.listener(Self::toggle)),
-                    )
-                    .content(content)
-                    .into_any_element()
-            } else {
-                div().child(header).child(content).into_any_element()
+            .children(work_summary)
+            .when(show_work, |row| row.children(run_summary))
+            .when(show_card, |row| {
+                row.child(if self.row.collapsible() {
+                    div()
+                        .when(self.row.kind == RowKind::Tool, |card| {
+                            card.bg(rgb(palette.base))
+                                .border_1()
+                                .border_l_3()
+                                .border_color(rgb(color))
+                                .rounded(px(6.))
+                                .px(px(10.))
+                                .py(px(5.))
+                        })
+                        .child(
+                            Collapsible::new()
+                                .open(self.open)
+                                .child(
+                                    Button::new("fold")
+                                        .ghost()
+                                        .h_auto()
+                                        .w_full()
+                                        .p_0()
+                                        .justify_start()
+                                        .debug_selector(move || "row-fold".into())
+                                        .flex()
+                                        .justify_start()
+                                        .cursor_pointer()
+                                        .text_size(px(self.appearance.size(13.)))
+                                        .text_color(rgb(color))
+                                        .when(self.row.kind == RowKind::Thinking, |row| {
+                                            row.italic()
+                                        })
+                                        .child(format!(
+                                            "{} {}",
+                                            if self.open { "▾" } else { "▸" },
+                                            self.row.title
+                                        ))
+                                        .on_click(cx.listener(Self::toggle)),
+                                )
+                                .content(content),
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .when(
+                            !matches!(self.row.kind, RowKind::Assistant | RowKind::User),
+                            |row| row.child(header),
+                        )
+                        .child(content)
+                        .into_any_element()
+                })
             })
+            .into_any_element();
+        div()
+            .w_full()
+            .when_some(self.column_width, |row, width| row.max_w(px(width)))
+            .mx_auto()
+            .child(row)
             .into_any_element()
     }
 }
