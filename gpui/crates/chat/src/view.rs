@@ -229,6 +229,13 @@ impl ChatView {
                     gitterm_core::chat::state::AgentEvent::Harness(event.clone()),
                 ));
                 if matches!(event, HarnessEvent::Ready { .. }) {
+                    if let HarnessEvent::Ready {
+                        permission_mode: Some(mode),
+                        ..
+                    } = event
+                    {
+                        fixture_composer.acknowledged.mode = Some(mode.clone());
+                    }
                     fixture_composer.conversation =
                         vec![gitterm_core::chat::state::AgentEvent::Harness(
                             event.clone(),
@@ -426,6 +433,42 @@ impl ChatView {
                 });
             }
         }
+        cx.notify();
+    }
+    /// Saved tab settings fill gaps in history; recorded acknowledgements win.
+    /// This is display state only and grants no runtime or picker authority.
+    pub fn set_history_config(
+        &mut self,
+        config: &gitterm_core::chat::types::AgentBackendConfig,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer_state.backend = Some(config.backend());
+        let acknowledged = &mut self.fixture_composer.acknowledged;
+        if acknowledged.model.is_none() {
+            acknowledged.model = config
+                .chat_model()
+                .filter(|m| !m.is_empty())
+                .map(str::to_owned);
+        }
+        if acknowledged.effort.is_none() {
+            acknowledged.effort = Some(gitterm_core::chat::state::ConfirmedEffort {
+                effort: config.chat_effort().map(str::to_owned),
+                applied: None,
+            });
+        }
+        if acknowledged.mode.is_none() {
+            use gitterm_core::chat::types::AgentBackendConfig;
+            acknowledged.mode = match config {
+                AgentBackendConfig::Claude {
+                    permission_mode, ..
+                } => Some(permission_mode.as_deref().unwrap_or("default").into()),
+                AgentBackendConfig::Acp { agent, mode, .. } => {
+                    Some(mode.as_deref().unwrap_or(agent.default_mode()).into())
+                }
+                AgentBackendConfig::Pi { .. } => None,
+            };
+        }
+        self.composer_state.project(&self.fixture_composer, None);
         cx.notify();
     }
     /// Replace externally prepared image payloads; native ingress also supplies thumbnails.
@@ -1084,6 +1127,13 @@ impl ChatView {
                 event,
                 gitterm_core::chat::state::AgentEvent::Harness(HarnessEvent::Ready { .. })
             ) {
+                if let gitterm_core::chat::state::AgentEvent::Harness(HarnessEvent::Ready {
+                    permission_mode: Some(mode),
+                    ..
+                }) = &event
+                {
+                    self.fixture_composer.acknowledged.mode = Some(mode.clone());
+                }
                 self.fixture_composer.conversation = vec![event];
             }
             self.composer_state.project(
@@ -1318,6 +1368,9 @@ impl Render for ChatView {
                             },
                         )
                         .jump_button(false)
+                        // Hidden rows must occupy no space, including the list's
+                        // default per-item padding. Visible rows own their margin.
+                        .with_row_style(StyleRefinement::default().pb(px(0.)))
                         .with_content_style(StyleRefinement::default().px(px(14.)).py(px(12.))),
                     )
                     .context_menu(move |menu, window, cx| {

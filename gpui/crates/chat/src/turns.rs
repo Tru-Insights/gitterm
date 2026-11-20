@@ -33,7 +33,7 @@ pub(super) fn containing(turns: &[Turn], row: usize) -> Option<&Turn> {
     turns.iter().find(|turn| turn.contains(row))
 }
 
-/// Iced folds work before the final answer, leaving substantial prose and attention visible.
+/// Fold tool/thinking work, keeping replies and attention in the timeline.
 pub(super) struct WorkFold {
     pub range: std::ops::Range<usize>,
     pub label: String,
@@ -65,10 +65,7 @@ pub(super) fn work_folds(model: &crate::model::ChatModel) -> Vec<WorkFold> {
                     let row = segment.get(index).filter(|_| index <= last);
                     let boundary = row.is_none_or(|row| {
                         !row.scope.is_empty()
-                            || !matches!(
-                                row.kind,
-                                RowKind::Assistant | RowKind::Thinking | RowKind::Tool
-                            )
+                            || !matches!(row.kind, RowKind::Thinking | RowKind::Tool)
                             || row.tool.as_ref().is_some_and(|tool| {
                                 tool.is_error
                                     || (matches!(tool.name.as_str(), "Agent" | "Task")
@@ -78,7 +75,6 @@ pub(super) fn work_folds(model: &crate::model::ChatModel) -> Vec<WorkFold> {
                                 && model.rows.iter().any(|other| {
                                     other.request.as_ref().is_some_and(|r| !r.resolved)
                                 }))
-                            || substantial(row)
                     });
                     if boundary {
                         if let Some(start) = first.take()
@@ -100,29 +96,6 @@ pub(super) fn work_folds(model: &crate::model::ChatModel) -> Vec<WorkFold> {
         }
     }
     folds
-}
-
-fn substantial(row: &Row) -> bool {
-    if row.kind != RowKind::Assistant {
-        return false;
-    }
-    if row.body.len() >= 280 {
-        return true;
-    }
-    markdown::to_mdast(&row.body, &markdown::ParseOptions::gfm()).map_or(true, |node| {
-        node.children().is_some_and(|children| {
-            children.iter().any(|node| {
-                matches!(
-                    node,
-                    markdown::mdast::Node::Heading(_)
-                        | markdown::mdast::Node::Table(_)
-                        | markdown::mdast::Node::List(_)
-                        | markdown::mdast::Node::Blockquote(_)
-                        | markdown::mdast::Node::Code(_)
-                )
-            })
-        })
-    })
 }
 
 #[cfg(test)]
