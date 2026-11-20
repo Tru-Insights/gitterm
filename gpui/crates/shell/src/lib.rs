@@ -25,6 +25,8 @@ mod h6_tests;
 #[cfg(test)]
 mod h7_tests;
 #[cfg(test)]
+mod h8_tests;
+#[cfg(test)]
 mod hookup_tests;
 mod layout;
 mod owner;
@@ -119,6 +121,14 @@ pub struct Shell {
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
     resize: Option<(bool, f32, f32)>,
+    task_switcher: Option<Entity<task_switcher::TaskSwitcher>>,
+    task_switcher_subscription: Option<Subscription>,
+    task_switcher_return_focus: Option<FocusHandle>,
+    task_last_session: HashMap<String, SessionId>,
+    selected_task: Option<String>,
+    context_mru: Vec<Option<String>>,
+    roster_subscriptions: HashMap<gpui::EntityId, (Subscription, Subscription)>,
+    roster_observers: HashMap<WorkspaceId, Subscription>,
     session_picker: Option<Entity<session_picker::SessionPicker>>,
     picker_subscription: Option<Subscription>,
     park_sheet: Option<Entity<park_sheet::ParkSheet>>,
@@ -352,6 +362,14 @@ impl Shell {
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
             resize: None,
+            task_switcher: None,
+            task_switcher_subscription: None,
+            task_switcher_return_focus: None,
+            task_last_session: HashMap::new(),
+            selected_task: None,
+            context_mru: vec![None],
+            roster_subscriptions: HashMap::new(),
+            roster_observers: HashMap::new(),
             session_picker: None,
             picker_subscription: None,
             park_sheet: None,
@@ -368,6 +386,11 @@ impl Shell {
             #[cfg(test)]
             dock_fixture: false,
         };
+        shell.selected_task = shell
+            .active_workspace(cx)
+            .and_then(|_| shell.active(cx).active_session)
+            .and_then(|id| shell.session_task(id, cx));
+        shell.remember_context(shell.selected_task.clone());
         shell.restore_parked(saved_parked, cx);
         shell.load_active_iced_history(window, cx);
         if let Some(fonts) = shell.workspaces.iter().find_map(|w| w.store.regions.fonts) {
@@ -680,6 +703,11 @@ impl Shell {
         self.owner.update(cx, |owner, cx| {
             owner.dispatch(Intent::Activate(id), Instant::now(), cx)
         });
+        self.selected_task = self
+            .active(cx)
+            .active_session
+            .and_then(|id| self.session_task(id, cx));
+        self.remember_context(self.selected_task.clone());
         self.load_active_iced_history(window, cx);
         self.sync_git_visibility(false, cx);
         self.sync_content_selection(cx);
@@ -698,6 +726,11 @@ impl Shell {
                 .find(|w| Some(w.workspace.id) == active)
                 .expect("active workspace exists")
                 .active_session = Some(id);
+            self.selected_task = self.session_task(id, cx);
+            self.remember_context(self.selected_task.clone());
+            if let Some(task) = &self.selected_task {
+                self.task_last_session.insert(task.clone(), id);
+            }
             self.show_pane(&session_pane_id(id), window, cx);
             self.load_active_iced_history(window, cx);
         }
@@ -1449,6 +1482,7 @@ impl Shell {
                 .into_iter()
                 .flat_map(|w| &w.sessions)
                 .filter(|s| !bottom_pane_ids(state.unwrap(), cx).contains(&session_pane_id(s.id)))
+                .filter(|s| self.session_task(s.id, cx) == self.selected_task)
                 .map(|s| session_strip::Session {
                     id: s.id,
                     kind: s.kind,
@@ -1464,7 +1498,15 @@ impl Shell {
                 .collect(),
             active: state.and_then(|w| w.active_session),
             remote: state.is_some_and(|w| self.data.terminal_cwd(w.workspace.id, cx).is_none()),
-            task: None,
+            task: self
+                .selected_task
+                .as_ref()
+                .and_then(|id| self.task_records(cx).into_iter().find(|t| &t.task_id == id))
+                .map(|t| session_strip::TaskContext {
+                    id: t.task_id,
+                    title: t.title,
+                    issue: t.issue.map(|i| i.key),
+                }),
             branch: state
                 .map(|w| self.data.status(w.workspace.id, cx).branch)
                 .unwrap_or_default(),
@@ -1496,7 +1538,13 @@ impl Shell {
             &self.bar_input(cx),
             workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark()),
             Rc::new(move |outcome, window, cx| {
-                _ = weak.update(cx, |shell, cx| shell.bar_outcome(outcome, window, cx));
+                _ = weak.update(cx, |shell, cx| {
+                    if outcome == workspace_bar::Outcome::NewWork {
+                        shell.open_recent_work_sheet(window, cx);
+                    } else {
+                        shell.bar_outcome(outcome, window, cx);
+                    }
+                });
             }),
         )
         .h(px(layout::WORKSPACE_BAR_HEIGHT))
@@ -1507,7 +1555,13 @@ impl Shell {
             &self.strip_input(cx),
             workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark()),
             Rc::new(move |outcome, window, cx| {
-                _ = weak.update(cx, |shell, cx| shell.strip_outcome(outcome, window, cx));
+                _ = weak.update(cx, |shell, cx| match outcome {
+                    session_strip::Outcome::BackToWorkspace => {
+                        shell.general_context(false, window, cx)
+                    }
+                    session_strip::Outcome::TaskOverview => shell.general_context(true, window, cx),
+                    outcome => shell.strip_outcome(outcome, window, cx),
+                });
             }),
         )
         .h(px(layout::SESSION_HEIGHT + 1.))
@@ -1687,6 +1741,28 @@ impl Shell {
     }
     fn session_content(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
         let state = self.active(cx);
+        if let Some(task) = self
+            .selected_task
+            .as_ref()
+            .and_then(|id| self.task_records(cx).into_iter().find(|t| &t.task_id == id))
+            && state
+                .active_session
+                .and_then(|id| self.session_task(id, cx))
+                .is_none()
+        {
+            return div()
+                .id("task-overview")
+                .debug_selector(|| "task-overview".into())
+                .flex_1()
+                .h_full()
+                .p_4()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(task.title.clone())
+                .child(task_switcher::state_copy(&task, &[], false))
+                .child(task.objective.clone());
+        }
         #[cfg(test)]
         if self.dock_fixture {
             return div()
@@ -1695,6 +1771,14 @@ impl Shell {
                 .min_w_0()
                 .h_full()
                 .child(state.dock.clone());
+        }
+        if state.active_session.is_none() {
+            return div()
+                .id("session-content")
+                .debug_selector(|| "session-content".into())
+                .flex_1()
+                .min_w_0()
+                .h_full();
         }
         let selected = self
             .content
@@ -2488,6 +2572,13 @@ impl Shell {
             context.push_str(" IcedUsage");
             return context;
         }
+        if self.task_switcher.is_some() {
+            context.push_str(" IcedTaskSwitcher");
+            return context;
+        }
+        if self.selected_task.is_some() {
+            context.push_str(" IcedTaskContext");
+        }
         let chat_pane = self.focused_chat(window, cx);
         let chat = chat_pane.is_some();
         let modal = self.session_picker.is_some()
@@ -2577,7 +2668,9 @@ impl Shell {
                 cx.listener(|this, a: &TabSelect, w, cx| this.select_session(a.index, w, cx)),
             )
             .on_action(cx.listener(|this, _: &WorkspaceClose, w, cx| this.open_park_sheet(w, cx)))
-            .on_action(cx.listener(|this, _: &OpenFolder, w, cx| this.open_new_work_sheet(w, cx)))
+            .on_action(
+                cx.listener(|this, _: &OpenFolder, w, cx| this.open_recent_work_sheet(w, cx)),
+            )
             .on_action(cx.listener(|this, _: &ToggleHelp, w, cx| {
                 use gpui_component::WindowExt;
                 if Self::has_dialog(w, cx) {
@@ -2654,6 +2747,28 @@ impl Shell {
                     });
                 }
             }))
+            .on_action(
+                cx.listener(|this, _: &TaskSwitcherOpen, w, cx| this.open_task_switcher(w, cx)),
+            )
+            .on_action(cx.listener(|this, _: &TaskSwitcherClose, _, cx| {
+                this.switcher_command(task_switcher::Command::Close, cx)
+            }))
+            .on_action(cx.listener(|this, _: &TaskSwitcherNext, _, cx| {
+                this.switcher_command(task_switcher::Command::Next, cx)
+            }))
+            .on_action(cx.listener(|this, _: &TaskSwitcherPrevious, _, cx| {
+                this.switcher_command(task_switcher::Command::Previous, cx)
+            }))
+            .on_action(cx.listener(|this, _: &TaskSwitcherActivateFirst, _, cx| {
+                this.switcher_command(task_switcher::Command::Activate, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &TaskContextBack, w, cx| this.general_context(false, w, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &TaskOverview, w, cx| this.general_context(true, w, cx)),
+            )
+            .on_action(cx.listener(|this, _: &AttentionJumpNext, w, cx| this.attention_jump(w, cx)))
             .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(|this, a: &FileSelectByIndex, w, cx| {
                 this.select_file(&a.selection, w, cx)
@@ -2767,10 +2882,7 @@ impl Shell {
                 .background_executor()
                 .spawn(async move {
                     let report = gitterm_core::usage::scan_usage_local(
-                        &sources,
-                        window,
-                        &pricing,
-                        &mut cache,
+                        &sources, window, &pricing, &mut cache,
                     );
                     (report, cache)
                 })
@@ -2808,7 +2920,7 @@ impl Shell {
         }
         self.usage_open = !self.usage_open;
         self.content.update(cx, |content, cx| {
-            content.picker = self.usage_open;
+            content.picker = self.task_switcher.is_some() || self.usage_open;
             content.sync_covers(window, cx);
         });
         if self.usage_open {
@@ -2904,6 +3016,10 @@ impl Shell {
         cx.notify();
     }
     fn escape(&mut self, _: &app_menus::Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.task_switcher.is_some() {
+            self.task_switcher_outcome(&task_switcher::Outcome::Close, window, cx);
+            return;
+        }
         if self.usage_open {
             self.toggle_usage(window, cx);
             return;
@@ -2948,6 +3064,9 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.task_switcher.is_some() {
+            return;
+        }
         if event.keystroke.key == "escape"
             && (self.session_picker.is_some()
                 || self.park_sheet.is_some()
@@ -3027,20 +3146,29 @@ impl Render for Shell {
             }
         }
         self.sync_content_selection(cx);
+        if let Some(switcher) = &self.task_switcher {
+            let inputs = self.switcher_inputs(cx);
+            switcher.update(cx, |s, cx| s.set_inputs(inputs, cx));
+        }
         self.content.update(cx, |content, cx| {
-            content.picker = self.usage_open
+            content.picker = self.task_switcher.is_some()
+                || self.usage_open
                 || self.session_picker.is_some()
                 || self.park_sheet.is_some()
                 || self.new_work_sheet.is_some();
             content.sync_covers(window, cx);
         });
         self.ensure_work_sidebars(window, cx);
+        self.ensure_rosters(window, cx);
         for (id, sidebar) in &self.work_sidebars {
             if !self.run_sidebar_subscriptions.contains_key(id) {
                 let subscription = cx.subscribe_in(
                     sidebar,
                     window,
                     |shell, _, outcome: &work_sidebar::WorkSidebarOutcome, window, cx| {
+                        if let work_sidebar::WorkSidebarOutcome::OpenTask { task } = outcome {
+                            shell.activate_task(task, window, cx);
+                        }
                         if let work_sidebar::WorkSidebarOutcome::RunRepoCommand { repo } = outcome {
                             shell.run_repo(
                                 gitterm_core::workspace_config::RepoKey::local(repo),
@@ -3099,6 +3227,20 @@ impl Render for Shell {
                 .into_any_element();
         }
         let state = self.active(cx);
+        // Work loads on render. Bootstrap its read-only facts even when a
+        // restored workspace has Files/Git selected or its sidebar collapsed.
+        let background_work: Vec<_> = self
+            .work_sidebars
+            .iter()
+            .filter(|(id, sidebar)| {
+                self.owner.read(cx).iced_catalog().is_some()
+                    && !sidebar.read(cx).has_loaded()
+                    && (**id != state.workspace.id
+                        || state.store.regions.sidebar_collapsed
+                        || state.store.regions.sidebar_mode != SidebarMode::Work)
+            })
+            .map(|(_, sidebar)| sidebar.clone())
+            .collect();
         let sidebar = self.sidebar(cx);
         let mut content = div()
             .flex_1()
@@ -3179,9 +3321,18 @@ impl Render for Shell {
                     .child(self.bottom.clone())
                     .child(self.workspace_bar(cx)),
             )
+            .child(
+                div()
+                    .absolute()
+                    .size(px(0.))
+                    .invisible()
+                    .overflow_hidden()
+                    .children(background_work),
+            )
             .children(self.session_picker.clone())
             .children(self.park_sheet.clone())
             .children(self.new_work_sheet.clone())
+            .children(self.task_switcher.clone())
             .into_any_element()
     }
 }
@@ -3294,6 +3445,689 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
         cx.activate(true);
     });
     Ok(())
+}
+
+impl Shell {
+    pub(crate) fn open_recent_work_sheet(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        use gitterm_core::work::catalog::{
+            NewWorkSheet, OpenWork, existing_work, new_work_recent_repos,
+        };
+        use gpui::AppContext as _;
+        self.session_picker = None;
+        self.picker_subscription = None;
+        self.park_sheet = None;
+        self.park_subscription = None;
+        let owner = self.owner.read(cx);
+        let saved = owner
+            .iced_catalog()
+            .map(|c| c.workspaces.as_slice())
+            .unwrap_or_default();
+        let open: Vec<_> = saved
+            .iter()
+            .enumerate()
+            .map(|(i, w)| OpenWork {
+                uid: i as u64 + 1,
+                name: &w.name,
+                dir: &w.dir,
+                chats: &w.chats,
+                claims_new_chats: false,
+                running_park: self.workspaces[i].parked.is_some(),
+            })
+            .collect();
+        let existing = existing_work(&open, &[]);
+        let candidates = self.recent_repo_candidates(cx);
+        let draft = NewWorkSheet {
+            recent: new_work_recent_repos(candidates, |p| p.join(".git").is_dir()),
+            ..Default::default()
+        };
+        let previous_focus = window.focused(cx).unwrap_or_else(|| self.focus.clone());
+        let sheet = cx.new(|cx| {
+            crate::workspace_sheet::WorkspaceSheet::new(
+                draft,
+                existing,
+                dirs::home_dir(),
+                window,
+                cx,
+            )
+        });
+        self.new_work_subscription = Some(cx.subscribe_in(
+            &sheet,
+            window,
+            move |shell, _, outcome: &crate::workspace_sheet::WorkspaceSheetOutcome, window, cx| {
+                shell.new_work_outcome(outcome, window, cx);
+                if shell.new_work_sheet.is_none() {
+                    previous_focus.focus(window, cx);
+                }
+            },
+        ));
+        self.new_work_sheet = Some(sheet);
+        self.cover_sheet(true, window, cx);
+        cx.notify();
+    }
+}
+impl Shell {
+    fn session_tab<'a>(
+        &self,
+        id: SessionId,
+        cx: &'a App,
+    ) -> Option<&'a gitterm_core::workspace_config::WorkspaceTabConfig> {
+        let state = self
+            .workspaces
+            .iter()
+            .find(|w| w.sessions.iter().any(|s| s.id == id))?;
+        let saved = self.owner.read(cx).iced_workspace(state.workspace.id)?;
+        let index = data::iced_sessions(saved).iter().position(|s| s.id == id)?;
+        saved.tabs.get(index)
+    }
+
+    fn session_task(&self, id: SessionId, cx: &App) -> Option<String> {
+        self.session_tab(id, cx)
+            .and_then(|t| t.task_id.clone())
+            .or_else(|| {
+                self.workspaces
+                    .iter()
+                    .find_map(|w| w.panes.get(&session_pane_id(id)))
+                    .and_then(|p| p.read(cx).session.as_ref()?.task_id.clone())
+            })
+    }
+
+    fn task_records(&self, cx: &App) -> Vec<gitterm_core::tasks::TaskRecord> {
+        let mut records = vec![];
+        for w in &self.workspaces {
+            if let Some(sidebar) = self.work_sidebars.get(&w.workspace.id) {
+                for task in sidebar.read(cx).tasks() {
+                    if !records
+                        .iter()
+                        .any(|t: &gitterm_core::tasks::TaskRecord| t.task_id == task.task_id)
+                    {
+                        records.push(task.clone());
+                    }
+                }
+            }
+        }
+        records
+    }
+
+    fn remember_context(&mut self, task: Option<String>) {
+        self.context_mru.retain(|id| id != &task);
+        self.context_mru.insert(0, task);
+    }
+
+    fn switcher_inputs(&self, cx: &App) -> task_switcher::Inputs {
+        let active = self.active_workspace(cx);
+        let tasks = active
+            .and_then(|id| self.work_sidebars.get(&id))
+            .map(|s| s.read(cx).tasks())
+            .unwrap_or_default();
+        task_switcher::Inputs {
+            tasks: tasks.iter().filter_map(|task| {
+                let open: Vec<_> = self.workspaces.iter().flat_map(|w| &w.sessions)
+                    .filter_map(|s| self.session_tab(s.id, cx))
+                    .filter(|t| t.task_id.as_deref() == Some(&task.task_id))
+                    .filter_map(|t| t.task_session_id.as_deref()).collect();
+                let streaming = self.workspaces.iter().flat_map(|w| &w.sessions)
+                    .filter(|s| self.session_task(s.id, cx).as_deref() == Some(&task.task_id))
+                    .any(|s| self.workspaces.iter().find_map(|w| w.panes.get(&session_pane_id(s.id))).is_some_and(|p| {
+                        matches!(&p.read(cx).content, pane::PaneContent::PreviewChat(v) if v.read(cx).is_working())
+                    }));
+                task_switcher::TaskRow::from_task(task, task_switcher::state_copy(task, &open, streaming))
+            }).collect(),
+            general_session_count: self.workspaces.iter().filter(|w| Some(w.workspace.id) == active).flat_map(|w| &w.sessions)
+                .filter(|s| self.session_task(s.id, cx).is_none()).count(),
+            current_task_id: self.selected_task.clone(),
+            context_mru: self.context_mru.clone(),
+        }
+    }
+
+    fn open_task_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspaces.is_empty() || self.task_switcher.is_some() {
+            return;
+        }
+        self.task_switcher_return_focus = window.focused(cx);
+        let inputs = self.switcher_inputs(cx);
+        let switcher = cx.new(|cx| task_switcher::TaskSwitcher::new(inputs.clone(), window, cx));
+        self.task_switcher_subscription = Some(cx.subscribe_in(
+            &switcher,
+            window,
+            move |shell, _, outcome: &task_switcher::Outcome, window, cx| {
+                shell.task_switcher_outcome(outcome, window, cx);
+            },
+        ));
+        switcher.update(cx, |s, cx| s.open(inputs, window, cx));
+        self.task_switcher = Some(switcher);
+        self.cover_sheet(true, window, cx);
+        cx.notify();
+    }
+
+    fn task_switcher_outcome(
+        &mut self,
+        outcome: &task_switcher::Outcome,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.task_switcher = None;
+        self.task_switcher_subscription = None;
+        self.cover_sheet(false, window, cx);
+        let previous_focus = self.task_switcher_return_focus.take();
+        match outcome {
+            task_switcher::Outcome::Activate { task_id } => self.activate_task(task_id, window, cx),
+            task_switcher::Outcome::ContextBack => self.general_context(false, window, cx),
+            task_switcher::Outcome::Close => previous_focus
+                .unwrap_or_else(|| self.focus.clone())
+                .focus(window, cx),
+        }
+        cx.notify();
+    }
+
+    fn switcher_command(&mut self, command: task_switcher::Command, cx: &mut Context<Self>) {
+        if let Some(switcher) = &self.task_switcher {
+            switcher.update(cx, |s, cx| s.command(command, cx));
+        }
+    }
+
+    fn select_host_session(
+        &mut self,
+        workspace: WorkspaceId,
+        id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mru = self.context_mru.clone();
+        if self.active_workspace(cx) != Some(workspace) {
+            self.select_workspace_id(workspace, window, cx);
+        }
+        self.context_mru = mru;
+        self.selected_task = self.session_task(id, cx);
+        if let Some(index) = self
+            .strip_input(cx)
+            .sessions
+            .iter()
+            .position(|s| s.id == id)
+        {
+            self.select_session(index, window, cx);
+        }
+    }
+
+    fn activate_task(&mut self, task: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = self
+            .workspaces
+            .iter()
+            .find(|w| {
+                w.on_bar()
+                    && self
+                        .work_sidebars
+                        .get(&w.workspace.id)
+                        .is_some_and(|s| s.read(cx).tasks().iter().any(|t| t.task_id == task))
+            })
+            .map(|w| w.workspace.id);
+        let Some(workspace) = workspace else {
+            return;
+        };
+        let mru = self.context_mru.clone();
+        if self.active_workspace(cx) != Some(workspace) {
+            self.select_workspace_id(workspace, window, cx);
+        }
+        let state = self.active(cx);
+        let child = self
+            .task_last_session
+            .get(task)
+            .copied()
+            .filter(|id| {
+                state.sessions.iter().any(|s| s.id == *id)
+                    && self.session_task(*id, cx).as_deref() == Some(task)
+            })
+            .or_else(|| {
+                state
+                    .sessions
+                    .iter()
+                    .rev()
+                    .find(|s| self.session_task(s.id, cx).as_deref() == Some(task))
+                    .map(|s| s.id)
+            });
+        if let Some(id) = child {
+            self.select_host_session(workspace, id, window, cx);
+        } else {
+            self.general_context(false, window, cx);
+            self.selected_task = Some(task.into());
+            self.remember_context(self.selected_task.clone());
+        }
+        self.context_mru = mru;
+        self.remember_context(Some(task.into()));
+        self.selected_files.remove(&workspace);
+        self.close_file_viewer(workspace, window, cx);
+        cx.notify();
+    }
+
+    fn general_context(&mut self, overview: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let task = self.selected_task.clone();
+        if overview && task.is_none() {
+            return;
+        }
+        let mru = self.context_mru.clone();
+        let Some(workspace) = self.active_workspace(cx) else {
+            return;
+        };
+        let general = self
+            .active(cx)
+            .sessions
+            .iter()
+            .find(|s| self.session_task(s.id, cx).is_none())
+            .map(|s| s.id);
+        self.selected_task = None;
+        if let Some(id) = general {
+            self.select_host_session(workspace, id, window, cx);
+        } else if let Some(state) = self
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace.id == workspace)
+        {
+            state.active_session = None;
+        }
+        // A read-only preview never creates Iced's missing General host terminal.
+        if overview {
+            self.selected_task = task;
+            self.context_mru = mru;
+        }
+        self.remember_context(self.selected_task.clone());
+        self.selected_files.remove(&workspace);
+        self.close_file_viewer(workspace, window, cx);
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn attention_jump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gitterm_core::tasks::TaskLifecycle;
+        let Some(active) = self
+            .workspaces
+            .iter()
+            .position(|w| Some(w.workspace.id) == self.active_workspace(cx))
+        else {
+            return;
+        };
+        let tab = self.workspaces[active]
+            .sessions
+            .iter()
+            .position(|s| Some(s.id) == self.workspaces[active].active_session)
+            .unwrap_or(0);
+        let tasks = self.task_records(cx);
+        let needs = |task: &gitterm_core::tasks::TaskRecord| {
+            task.attention.reason.is_some() || task.attention.unread
+        };
+        let found = gitterm_core::workspace::next_attention(
+            &self.visible_workspace_indices(cx),
+            active,
+            tab,
+            |w| self.workspaces[w].sessions.len(),
+            |w, t| {
+                self.session_task(self.workspaces[w].sessions[t].id, cx)
+                    .is_some_and(|id| tasks.iter().any(|task| task.task_id == id && needs(task)))
+            },
+        );
+        if self.usage_open {
+            self.toggle_usage(window, cx);
+        }
+        if let Some((w, t)) = found {
+            self.select_host_session(
+                self.workspaces[w].workspace.id,
+                self.workspaces[w].sessions[t].id,
+                window,
+                cx,
+            );
+            return;
+        }
+        let mut candidates: Vec<_> = tasks
+            .iter()
+            .filter(|task| task.lifecycle != TaskLifecycle::Archived && needs(task))
+            .filter(|task| {
+                !self
+                    .workspaces
+                    .iter()
+                    .flat_map(|w| &w.sessions)
+                    .any(|s| self.session_task(s.id, cx).as_deref() == Some(&task.task_id))
+            })
+            .map(|t| &t.task_id)
+            .collect();
+        if let Some(inputs) = self
+            .work_state
+            .borrow()
+            .inputs(self.workspaces[active].workspace.id.0)
+        {
+            candidates.sort_by_key(|id| {
+                inputs
+                    .tasks
+                    .iter()
+                    .position(|t| &t.task_id == *id)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        let next = self
+            .selected_task
+            .as_ref()
+            .and_then(|id| candidates.iter().position(|t| *t == id))
+            .map(|i| (i + 1) % candidates.len())
+            .unwrap_or(0);
+        if let Some(task) = candidates.get(next) {
+            self.activate_task(task, window, cx);
+        }
+    }
+
+    fn recent_repo_candidates(&self, cx: &App) -> Vec<std::path::PathBuf> {
+        use gitterm_core::remote::config::WorkspaceLocationConfig;
+        // Every local Work load reads the same machine-wide chat index. Keep
+        // its exact order, including equal-time ties, rather than re-sorting.
+        let recent = self
+            .workspaces
+            .iter()
+            .filter_map(|w| self.work_sidebars.get(&w.workspace.id))
+            .map(|s| s.read(cx).repo_recency())
+            .find(|rows| !rows.is_empty())
+            .unwrap_or_default();
+        let saved = self
+            .owner
+            .read(cx)
+            .iced_catalog()
+            .map(|c| c.workspaces.as_slice())
+            .unwrap_or_default();
+        let local = |w: &gitterm_core::workspace_config::WorkspaceConfig| {
+            !w.is_legacy_remote()
+                && !matches!(
+                    w.location,
+                    Some(WorkspaceLocationConfig::RemoteAgent { .. })
+                )
+        };
+        let tasks = self.task_records(cx);
+        recent
+            .iter()
+            .map(|(p, _)| p.clone())
+            .chain(
+                saved
+                    .iter()
+                    .filter(|w| local(w))
+                    .map(|w| std::path::PathBuf::from(&w.dir)),
+            )
+            .chain(
+                saved
+                    .iter()
+                    .filter(|w| local(w))
+                    .flat_map(|w| &w.tabs)
+                    .filter(|t| t.task_id.is_none())
+                    .map(|t| std::path::PathBuf::from(t.repo_dir.as_deref().unwrap_or(&t.dir))),
+            )
+            .filter(|dir| {
+                !tasks
+                    .iter()
+                    .filter_map(|t| t.worktree.path.as_ref())
+                    .any(|tree| dir.starts_with(tree))
+            })
+            .collect()
+    }
+
+    fn worker_tab(
+        &self,
+        worker: &gitterm_core::tasks::Delegation,
+        cx: &App,
+    ) -> gitterm_core::delegations::WorkerTab {
+        use gitterm_core::{
+            delegations::WorkerTab,
+            tasks::{DelegationChild, TaskLifecycle},
+        };
+        let DelegationChild::TaskSession {
+            task_id,
+            task_session_id,
+            ..
+        } = &worker.child
+        else {
+            return WorkerTab::Closed;
+        };
+        let open = self.workspaces.iter().flat_map(|w| &w.sessions).find(|s| {
+            self.session_tab(s.id, cx).is_some_and(|t| {
+                t.task_id.as_ref() == Some(task_id)
+                    && task_session_id
+                        .as_ref()
+                        .is_none_or(|id| t.task_session_id.as_ref() == Some(id))
+            })
+        });
+        let Some(open) = open else {
+            return WorkerTab::Closed;
+        };
+        let streaming = self.workspaces.iter().find_map(|w| w.panes.get(&session_pane_id(open.id))).is_some_and(|p| {
+            matches!(&p.read(cx).content, pane::PaneContent::PreviewChat(v) if v.read(cx).is_working())
+        });
+        if streaming {
+            WorkerTab::Working
+        } else if self
+            .task_records(cx)
+            .iter()
+            .any(|t| &t.task_id == task_id && t.lifecycle == TaskLifecycle::WaitingForInput)
+        {
+            WorkerTab::AwaitingInput
+        } else {
+            WorkerTab::Idle
+        }
+    }
+
+    fn sync_rosters(&self, cx: &mut Context<Self>) {
+        for w in &self.workspaces {
+            let Some(sidebar) = self.work_sidebars.get(&w.workspace.id) else {
+                continue;
+            };
+            let sidebar = sidebar.read(cx);
+            let rows = roster_entries(sidebar.tasks(), sidebar.workers(), |worker| {
+                self.worker_tab(worker, cx)
+            });
+            for pane in w.panes.values() {
+                if let pane::PaneContent::PreviewChat(view) = &pane.read(cx).content {
+                    view.clone()
+                        .update(cx, |view, cx| view.set_roster(rows.clone(), cx));
+                }
+            }
+        }
+    }
+
+    fn ensure_rosters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for (id, sidebar) in &self.work_sidebars {
+            if !self.roster_observers.contains_key(id) {
+                let observer = cx.observe(sidebar, |shell, _, cx| {
+                    shell.sync_rosters(cx);
+                    if let Some(switcher) = &shell.task_switcher {
+                        let inputs = shell.switcher_inputs(cx);
+                        switcher.update(cx, |s, cx| s.set_inputs(inputs, cx));
+                    }
+                    cx.notify();
+                });
+                self.roster_observers.insert(*id, observer);
+            }
+        }
+        for w in &self.workspaces {
+            for pane in w.panes.values() {
+                let pane::PaneContent::PreviewChat(view) = &pane.read(cx).content else {
+                    continue;
+                };
+                if self.roster_subscriptions.contains_key(&view.entity_id()) {
+                    continue;
+                }
+                let view = view.clone();
+                let subscription = cx.subscribe_in(
+                    &view,
+                    window,
+                    |shell,
+                     _,
+                     outcome: &gitterm_gpui_chat::model::roster::RosterOutcome,
+                     window,
+                     cx| {
+                        if let gitterm_gpui_chat::model::roster::RosterOutcome::Open { id } =
+                            outcome
+                        {
+                            shell.open_roster(id, window, cx);
+                        }
+                    },
+                );
+                let activity = cx.observe(&view, |shell, _, cx| shell.sync_rosters(cx));
+                self.roster_subscriptions
+                    .insert(view.entity_id(), (subscription, activity));
+                if let Some(sidebar) = self.work_sidebars.get(&w.workspace.id) {
+                    let sidebar = sidebar.read(cx);
+                    let rows = roster_entries(sidebar.tasks(), sidebar.workers(), |worker| {
+                        self.worker_tab(worker, cx)
+                    });
+                    view.update(cx, |view, cx| view.set_roster(rows, cx));
+                }
+            }
+        }
+    }
+
+    fn open_roster(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        use gitterm_core::tasks::DelegationChild;
+        let worker = self
+            .work_sidebars
+            .values()
+            .flat_map(|s| s.read(cx).workers())
+            .find(|w| w.delegation_id == id.trim_start_matches("dlg:"))
+            .cloned();
+        let Some(worker) = worker else {
+            return;
+        };
+        let (task, session, conversation) = match &worker.child {
+            DelegationChild::TaskSession {
+                task_id,
+                task_session_id,
+                conversation,
+                ..
+            } => (
+                Some(task_id.as_str()),
+                task_session_id.as_deref(),
+                conversation.as_ref().map(|c| c.session_id.as_str()),
+            ),
+            DelegationChild::CodexReview { thread_id, .. }
+            | DelegationChild::CodexConsult { thread_id, .. } => (None, None, thread_id.as_deref()),
+            DelegationChild::ClaudeSubagent { .. } => (None, None, None),
+        };
+        let target = self.workspaces.iter().filter(|w| w.on_bar()).find_map(|w| {
+            w.sessions
+                .iter()
+                .find(|s| {
+                    self.session_tab(s.id, cx).is_some_and(|t| {
+                        session.is_some_and(|id| t.task_session_id.as_deref() == Some(id))
+                            || conversation
+                                .is_some_and(|id| t.chat_session_id.as_deref() == Some(id))
+                    })
+                })
+                .map(|s| (w.workspace.id, s.id))
+        });
+        if let Some((workspace, session)) = target {
+            self.select_host_session(workspace, session, window, cx);
+        } else if let Some(task) = task {
+            self.activate_task(task, window, cx);
+        } else {
+            self.preview_unavailable("Open worker history", cx);
+        }
+    }
+}
+
+fn roster_entries(
+    tasks: &[gitterm_core::tasks::TaskRecord],
+    workers: &[gitterm_core::tasks::Delegation],
+    tab: impl Fn(&gitterm_core::tasks::Delegation) -> gitterm_core::delegations::WorkerTab,
+) -> Vec<gitterm_gpui_chat::model::roster::RosterEntry> {
+    use gitterm_core::tasks::{DelegationChild, DelegationKind, DelegationStatus};
+    use gitterm_gpui_chat::model::roster::{RosterEntry, WorkerState};
+    let stamp = |s: &str| {
+        gitterm_core::work::summary::parse_stamp(s)
+            .and_then(|s| s.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_millis() as u64)
+    };
+    workers
+        .iter()
+        .filter(|w| w.dismissed_at.is_none())
+        .map(|worker| {
+            let (name, model, task) = match &worker.child {
+                DelegationChild::TaskSession {
+                    task_id,
+                    preset_name,
+                    model,
+                    ..
+                } => (
+                    format!("Worker · {}", preset_name.as_deref().unwrap_or("agent")),
+                    model.clone().unwrap_or_else(|| "default model".into()),
+                    tasks.iter().find(|t| &t.task_id == task_id),
+                ),
+                DelegationChild::CodexReview { model, .. } => (
+                    "Codex review".into(),
+                    model.clone().unwrap_or_else(|| "default model".into()),
+                    None,
+                ),
+                DelegationChild::CodexConsult { model, .. } => (
+                    "Codex consult".into(),
+                    model.clone().unwrap_or_else(|| "default model".into()),
+                    None,
+                ),
+                DelegationChild::ClaudeSubagent { .. } => (
+                    match worker.kind {
+                        DelegationKind::Review => "Review",
+                        DelegationKind::Consult => "Consult",
+                        DelegationKind::Implement => "Worker",
+                    }
+                    .into(),
+                    String::new(),
+                    None,
+                ),
+            };
+            let state = if matches!(worker.child, DelegationChild::TaskSession { .. }) {
+                match gitterm_core::delegations::worker_session_state(
+                    &worker.status,
+                    task.map(|t| t.lifecycle),
+                    tab(worker),
+                ) {
+                    "queued" | "starting" => WorkerState::Queued,
+                    "running" => WorkerState::Running,
+                    "waiting" | "blocked" => WorkerState::Waiting,
+                    "done" => WorkerState::Done,
+                    _ => WorkerState::Failed,
+                }
+            } else {
+                match worker.status {
+                    DelegationStatus::Requested => WorkerState::Queued,
+                    DelegationStatus::Running => WorkerState::Running,
+                    DelegationStatus::Completed => WorkerState::Done,
+                    DelegationStatus::Blocked => WorkerState::Waiting,
+                    _ => WorkerState::Failed,
+                }
+            };
+            RosterEntry {
+                id: format!("dlg:{}", worker.delegation_id),
+                name,
+                model,
+                checkout: worker
+                    .options
+                    .checkout
+                    .as_ref()
+                    .or_else(|| task.and_then(|t| t.worktree.path.as_ref()))
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                activity: task
+                    .and_then(|t| t.handoff.as_ref())
+                    .or_else(|| worker.result.as_ref().and_then(|r| r.handoff.as_ref()))
+                    .map(|h| {
+                        h.summary
+                            .trim()
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .chars()
+                            .take(200)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                state,
+                started_at_ms: stamp(&worker.created_at),
+                ended_at_ms: (!worker.status.is_active()).then(|| stamp(&worker.updated_at)),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

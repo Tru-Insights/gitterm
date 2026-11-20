@@ -215,6 +215,11 @@ pub struct State {
     generation: u64,
 }
 impl State {
+    /// Read-only source facts, retaining the task store's order for host navigation.
+    pub fn inputs(&self, workspace: u64) -> Option<&Inputs> {
+        self.inputs.get(&workspace)
+    }
+
     pub fn pane(&self, workspace: u64) -> Option<&Pane> {
         self.inputs
             .get(&workspace)

@@ -236,6 +236,18 @@ impl WorkSidebar {
         }
     }
 
+    pub fn has_loaded(&self) -> bool {
+        self.loaded_at.is_some()
+    }
+
+    pub fn tasks(&self) -> &[gitterm_core::tasks::TaskRecord] {
+        &self.tasks
+    }
+
+    pub fn workers(&self) -> &[gitterm_core::tasks::Delegation] {
+        &self.workers
+    }
+
     /// Distinct live repo roots in Iced's newest-chat order, with exact activity
     /// times. Available after the background Work load; shortcut wiring is host-owned.
     pub fn repo_recency(&self) -> &[(PathBuf, std::time::SystemTime)] {
@@ -1258,4 +1270,4 @@ impl Render for WorkSidebar {
 
 #[cfg(test)]
 #[path = "work_sidebar_tests.rs"]
-mod tests;
+pub(crate) mod tests;

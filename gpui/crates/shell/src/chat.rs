@@ -315,6 +315,14 @@ impl ChatPane {
             _roster_subscription: roster_subscription,
         }
     }
+    pub(crate) fn set_roster(
+        &self,
+        rows: Vec<gitterm_gpui_chat::model::roster::RosterEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        self.view.update(cx, |view, cx| view.set_roster(rows, cx));
+    }
+
     pub(crate) fn is_working(&self) -> bool {
         matches!(
             self.controller.adapter.state().state,
