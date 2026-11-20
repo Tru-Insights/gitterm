@@ -116,14 +116,14 @@ fn native_chat_session_history_and_submit_gates_golden() {
     let mut out = Vec::new();
     for config in configs {
         let mut session = AgentSession::new(config);
-        session.session_id = Some("synthetic-session".into());
+        session.bind_session(Some("synthetic-session".into()));
         let mut gates = Vec::new();
         for history in [
             HistoryLoad::NotLoaded,
             HistoryLoad::Loading,
             HistoryLoad::Loaded,
         ] {
-            session.history = history;
+            session.chat.history = history; // Fixture setup, not a production writer.
             gates.push(json!({"history":format!("{history:?}"),"load":session.history_to_load()}));
         }
         let queue: Vec<_> = [AgentSessionState::Idle,AgentSessionState::Streaming,AgentSessionState::Stopped].iter().map(|state|json!({"state":format!("{state:?}"),"with_process":submit_queues(session.backend(),true,state),"without_process":submit_queues(session.backend(),false,state)})).collect();
@@ -318,8 +318,8 @@ fn native_chat_iced_update_trace() {
         effort: None,
     };
     s.task_handle = None;
-    s.history = HistoryLoad::Loading;
-    s.session_id = Some("synthetic-chat".into());
+    s.bind_session(Some("synthetic-chat".into()));
+    s.chat.history = HistoryLoad::Loading; // Model a read already in flight.
     let sequence = [
         HarnessEvent::TurnStarted {
             session_id: Some("synthetic-chat".into()),
@@ -417,4 +417,181 @@ fn native_chat_iced_update_trace() {
     let _ = app.update_event(crate::Event::TabClose(0));
     trace.push(json!({"step":"close-with-sibling","tabs_remaining":app.workspaces[0].tabs.len(),"remaining_id":app.workspaces[0].tabs[0].id}));
     support::golden("claude/iced-update.json", json!(trace));
+}
+
+#[test]
+fn native_chat_c6_iced_terminal_states() {
+    const NAME: &str = "tab::agent::native_chat_tests::native_chat_c6_iced_terminal_states";
+    if std::env::var("GITTERM_V6_CHATC6_CHILD").as_deref() != Ok(NAME) {
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env(crate::config::CONFIG_DIR_ENV, dir.path())
+            .env("HOME", dir.path().join("home"))
+            .env("GITTERM_V6_CHATC6_CHILD", NAME)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = crate::baseline_tests::app_with_tabs(dir.path());
+    app.workspaces[0].tabs[0].kind =
+        crate::tab::TabKind::Agent(AgentSession::new(AgentBackendConfig::Claude {
+            model: "default".into(),
+            permission_mode: None,
+            effort: None,
+        }));
+    let mut trace = Vec::new();
+    for status in [
+        gitterm::harness::TurnStatus::Completed,
+        gitterm::harness::TurnStatus::Interrupted,
+        gitterm::harness::TurnStatus::Failed("Synthetic failure".into()),
+    ] {
+        for event in [
+            HarnessEvent::TurnStarted {
+                session_id: None,
+                model: None,
+            },
+            HarnessEvent::RuntimeRequest {
+                request_id: "permission-1".into(),
+                tool_use_id: "tool-1".into(),
+                kind: gitterm::harness::RuntimeRequestKind::Question {
+                    questions: json!([]),
+                },
+            },
+            HarnessEvent::TurnCompleted {
+                status,
+                usage: json!({}),
+                cost_usd: None,
+                rate_limit: None,
+            },
+            HarnessEvent::ProcessExited { code: Some(0) },
+        ] {
+            let _ = app.update_event(crate::Event::AgentEventReceived(
+                10,
+                AgentEvent::Harness(event),
+            ));
+            let session = app.workspaces[0].tabs[0].agent_session().unwrap();
+            trace.push(
+                json!({"state":format!("{:?}", session.state), "pending":session.pending_requests}),
+            );
+        }
+    }
+    support::golden("claude/iced-terminal-states.json", json!(trace));
+}
+
+#[test]
+fn native_chat_c6_stale_ingress_has_no_host_effects() {
+    const NAME: &str =
+        "tab::agent::native_chat_tests::native_chat_c6_stale_ingress_has_no_host_effects";
+    if std::env::var("GITTERM_V6_CHATC6_CHILD").as_deref() != Ok(NAME) {
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env(crate::config::CONFIG_DIR_ENV, dir.path())
+            .env("HOME", dir.path().join("home"))
+            .env("GITTERM_V6_CHATC6_CHILD", NAME)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = crate::baseline_tests::app_with_tabs(dir.path());
+    let tab = &mut app.workspaces[0].tabs[0];
+    tab.task_id = Some("synthetic-task".into());
+    let target = tab.session_target();
+    let mut session = AgentSession::new(AgentBackendConfig::Claude {
+        model: "default".into(),
+        permission_mode: None,
+        effort: None,
+    });
+    session.bind_session(Some("synthetic-session".into()));
+    session.reduce(ChatIntent::BeginHistory(session.config.clone()));
+    let old_history = session
+        .history_ticket(target.clone(), session.backend())
+        .unwrap();
+    let old_runtime = session.runtime_stamp(target.clone());
+    // Replace in the same tab with the same persisted caller and request ID.
+    let (input_tx, _inputs) = mpsc::unbounded_channel();
+    let (stop_tx, mut stop_rx) = oneshot::channel();
+    let (_event_tx, events) = mpsc::unbounded_channel();
+    let mut replacement = AgentSession::new(session.config.clone());
+    replacement.task_handle = Some(AgentTaskHandle {
+        snapshots_closed: tokio_util::sync::CancellationToken::new(),
+        input_tx,
+        stop_slot: Arc::new(Mutex::new(Some(stop_tx))),
+        pending_event_rx: Mutex::new(Some(events)),
+    });
+    replacement.bind_session(Some("synthetic-session".into()));
+    replacement.reduce(ChatIntent::BeginHistory(replacement.config.clone()));
+    replacement.reduce(ChatIntent::SubmissionAccepted);
+    tab.kind = crate::tab::TabKind::Agent(replacement);
+    for event in [
+        HarnessEvent::ProcessExited { code: Some(7) },
+        HarnessEvent::ModelChanged("stale-model".into()),
+        HarnessEvent::RemoteDisconnected {
+            machine: "synthetic-remote".into(),
+            error: "stale".into(),
+        },
+        HarnessEvent::RemoteReconnected {
+            machine: "synthetic-remote".into(),
+            history_gap: true,
+        },
+        HarnessEvent::UserMessageEcho {
+            id: Some("stale-prompt".into()),
+            text: "Stale echo".into(),
+            image_count: 0,
+            delivery: None,
+        },
+        HarnessEvent::HistoryReplayed {
+            entries: vec![TranscriptEntry::UserPrompt("Stale replay".into())],
+        },
+    ] {
+        let _ = app.update_event(crate::Event::AgentRuntimeEvent(
+            old_runtime.clone(),
+            AgentEvent::Harness(event),
+        ));
+    }
+    for result in [
+        Ok(vec![AgentEvent::user_prompt("Stale history")]),
+        Err("Stale read failure".into()),
+    ] {
+        let _ = app.update_event(crate::Event::AgentHistoryResult(
+            old_history.clone(),
+            result,
+        ));
+    }
+    let _ = app.update_event(crate::Event::AgentRuntimeStop(old_runtime));
+    assert_eq!(stop_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+    assert!(app.task_last_session_tab.is_empty()); // Even common update effects were skipped.
+    let tab = &app.workspaces[0].tabs[0];
+    let s = tab.agent_session().unwrap();
+    assert!(s.conversation.is_empty());
+    assert!(s.remote_disconnected.is_none());
+    assert!(matches!(s.state, AgentSessionState::Streaming));
+    assert_eq!(s.history, HistoryLoad::Loading);
+    assert_eq!(s.config.chat_model(), Some("default"));
+    assert_eq!(s.revision, 0);
+    // The new stream remains usable after rejecting every old completion.
+    let stamp = s.runtime_stamp(tab.session_target());
+    let _ = app.update_event(crate::Event::AgentRuntimeEvent(
+        stamp,
+        AgentEvent::Harness(HarnessEvent::TextDelta("Current event".into())),
+    ));
+    assert_eq!(
+        app.workspaces[0].tabs[0].agent_session().unwrap().revision,
+        1
+    );
 }

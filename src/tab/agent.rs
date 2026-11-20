@@ -1,8 +1,7 @@
 //! Agent tab kind: a Claude Code or pi subprocess driving a wry-hosted chat UI.
 //!
-//! This module defines the data shape only. Step 3 (TRU-29) ports the spike's
-//! subprocess manager (background tokio task + mpsc + stop signal) on top of these
-//! types. Step 4 wires the chat UI in.
+//! The Iced adapter retains process handles and live presentation timing;
+//! `gitterm_core::chat::state` owns chat transitions and the sole timeline.
 //!
 //! The conversation buffer (`AgentSession::conversation`) is the source of truth:
 //! the webview is reinitialized from it on tab activation, not the other way around.
@@ -22,8 +21,10 @@ use gitterm::harness::acp::AcpAgent;
 use gitterm::harness::acp::{AcpMcpServer, AcpSessionConfig, ACP_WIRE_LOG_ENV};
 use gitterm::harness::claude::{ClaudeMcpServer, ClaudeSessionConfig};
 #[cfg(test)]
-use gitterm::harness::UserPrompt;
-use gitterm::harness::{HarnessEvent, HarnessSession};
+use gitterm::harness::transcript::TranscriptEntry;
+use gitterm::harness::HarnessSession;
+#[cfg(test)]
+use gitterm::harness::{HarnessEvent, UserPrompt};
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -53,8 +54,23 @@ pub(crate) use gitterm_core::chat::types::{
     AgentBackend, AgentBackendConfig, AgentSessionState, HistoryLoad,
 };
 
+pub use gitterm_core::chat::state::AgentEvent;
+pub(crate) use gitterm_core::chat::state::{Effect as ChatEffect, Intent as ChatIntent};
 use gitterm_core::harness::pi::parse_line;
-pub use gitterm_core::harness::pi::{subagent_started, subagent_started_at, AgentEvent};
+
+/// The Agent call whose subagent `ev` starts, if it is a subagent start.
+pub(crate) fn subagent_started(ev: &AgentEvent) -> Option<&str> {
+    match ev {
+        AgentEvent::Harness(event) => gitterm::chat_page::subagent_started(event),
+        _ => None,
+    }
+}
+
+/// The timeline marker for when Agent call `parent`'s subagent started
+/// (Unix ms). The chat page uses it when the start was not seen live.
+pub(crate) fn subagent_started_at(parent: &str, at_ms: i64) -> serde_json::Value {
+    gitterm::chat_page::subagent_started_at(parent, at_ms)
+}
 
 fn unix_ms(now: std::time::SystemTime) -> Option<i64> {
     now.duration_since(std::time::UNIX_EPOCH)
@@ -66,11 +82,7 @@ fn unix_ms(now: std::time::SystemTime) -> Option<i64> {
 /// truth — the webview is reinitialized from it on tab activation.
 pub(crate) struct AgentSession {
     pub(crate) config: AgentBackendConfig,
-    pub(crate) conversation: Vec<AgentEvent>,
-    /// Claude `--resume` ID, or pi session-file path. `None` until the first
-    /// `SystemInit` event populates it.
-    pub(crate) session_id: Option<String>,
-    pub(crate) state: AgentSessionState,
+    chat: gitterm_core::chat::state::State,
     /// Background task that owns the subprocess, if one has been spawned.
     /// Lazy: `None` until the first prompt submit, then created and reused
     /// across turns until the tab is closed. Pi only.
@@ -81,19 +93,20 @@ pub(crate) struct AgentSession {
     /// dropping a remote Claude one detaches and leaves the chat running on
     /// its machine (closing the tab sends `Shutdown` first, TRU-152).
     pub(crate) harness: Option<HarnessSession>,
-    /// Runtime requests (permission prompts, questions) awaiting the human.
-    pub(crate) pending_requests: Vec<String>,
-    /// Transcript read-back for a session restored from `workspaces.json`.
-    pub(crate) history: HistoryLoad,
     /// A remote chat's "reconnecting" notice while its connection is down
     /// (TRU-152). Not in the conversation, so a page rebuilt meanwhile is
     /// given it again.
     pub(crate) remote_disconnected: Option<AgentEvent>,
-    /// Bumped on every `record`, merged fragments included, so the Chats
-    /// overview knows when to rebuild its snapshot (TRU-154).
-    pub(crate) revision: u64,
     /// Turn and subagent times seen live; the buffer carries no clock.
     pub(crate) live_times: crate::chat_overview::LiveTimes,
+}
+
+// Read-only compatibility for timeline consumers; all writes use intents.
+impl std::ops::Deref for AgentSession {
+    type Target = gitterm_core::chat::state::State;
+    fn deref(&self) -> &Self::Target {
+        &self.chat
+    }
 }
 
 impl AgentSession {
@@ -102,116 +115,40 @@ impl AgentSession {
     pub(crate) fn new(config: AgentBackendConfig) -> Self {
         Self {
             config,
-            conversation: Vec::new(),
-            session_id: None,
-            state: AgentSessionState::Idle,
+            chat: Default::default(),
             task_handle: None,
             harness: None,
-            pending_requests: Vec::new(),
-            history: HistoryLoad::NotLoaded,
             remote_disconnected: None,
-            revision: 0,
             live_times: crate::chat_overview::LiveTimes::default(),
         }
     }
 
-    /// The session id whose transcript should be read back before this tab
-    /// is shown: a resumed session whose timeline is still empty. An ACP
-    /// tab reads it back by starting its agent, which replays the session
-    /// through `session/load`.
+    pub(crate) fn reduce(&mut self, intent: ChatIntent) -> ChatEffect {
+        self.chat.reduce(intent)
+    }
+
+    pub(crate) fn begin_runtime(&mut self) {
+        self.chat.begin_runtime();
+    }
+
     pub(crate) fn history_to_load(&self) -> Option<&str> {
-        (self.config.read_only_note().is_none()
-            && self.backend().is_native()
-            && self.history == HistoryLoad::NotLoaded
-            && self.conversation.is_empty())
-        .then_some(self.session_id.as_deref())
-        .flatten()
+        self.chat.history_to_load(&self.config)
     }
 
-    /// Whether the conversation already shows the prompt sent under `id`
-    /// (this tab's own echo, or one relayed earlier).
-    pub(crate) fn shows_prompt(&self, id: &str) -> bool {
-        self.conversation
-            .iter()
-            .rev()
-            .any(|ev| ev.prompt_id() == Some(id))
+    pub(crate) fn bind_session(&mut self, id: Option<String>) {
+        self.reduce(ChatIntent::BindSession(id));
     }
 
-    /// Append an event to the conversation buffer, merging consecutive
-    /// streaming fragments so tab switches replay a compact buffer. A
-    /// subagent's start is followed by when it started, so a rebuilt page
-    /// still knows its elapsed time and where it falls in the roster.
     pub(crate) fn record(&mut self, ev: AgentEvent) -> (Vec<AgentEvent>, Vec<AgentEvent>) {
-        self.revision = self.revision.wrapping_add(1);
         let now = std::time::SystemTime::now();
         self.live_times.observe(&ev, now);
-        let now_ms = unix_ms(now);
-        let turn_started = matches!(&ev, AgentEvent::Harness(HarnessEvent::TurnStarted { .. }))
-            || matches!(
-                &ev,
-                AgentEvent::Other(value)
-                    if value.get("type").and_then(|v| v.as_str()) == Some("user_prompt")
-                        && value.get("queued").and_then(|v| v.as_bool()) != Some(true)
-            );
-        let queued_prompt = matches!(
-            &ev,
-            AgentEvent::Other(value)
-                if value.get("type").and_then(|v| v.as_str()) == Some("user_prompt")
-                    && value.get("queued").and_then(|v| v.as_bool()) == Some(true)
-        );
-        let turn_ended = matches!(
-            &ev,
-            AgentEvent::Harness(
-                HarnessEvent::TurnCompleted { .. } | HarnessEvent::ProcessExited { .. }
-            )
-        );
-        let timing =
-            match (turn_started, turn_ended, now_ms) {
-                (true, false, Some(ms)) => Some(AgentEvent::Other(
-                    gitterm::chat_page::turn_timing(Some(ms), None),
-                )),
-                (false, true, Some(ms)) => Some(AgentEvent::Other(
-                    gitterm::chat_page::turn_timing(None, Some(ms)),
-                )),
-                _ => None,
-            };
-        let mut before = Vec::new();
-        let mut after = Vec::new();
-        if turn_ended {
-            if let Some(timing) = timing.clone() {
-                self.conversation.push(timing.clone());
-                before.push(timing);
-            }
+        match self.reduce(ChatIntent::Record {
+            event: ev,
+            now_ms: unix_ms(now),
+        }) {
+            ChatEffect::Recorded { before, after } => (before, after),
+            _ => unreachable!(),
         }
-        if queued_prompt {
-            if let Some(ms) = now_ms {
-                let marker = AgentEvent::Other(gitterm::chat_page::turn_split_time(ms));
-                self.conversation.push(marker.clone());
-                before.push(marker);
-            }
-        }
-        if let (Some(AgentEvent::Harness(last)), AgentEvent::Harness(next)) =
-            (self.conversation.last_mut(), &ev)
-        {
-            if merge_fragment(last, next) {
-                return (before, after);
-            }
-        }
-        let started = subagent_started(&ev).map(str::to_string);
-        self.conversation.push(ev);
-        if turn_started {
-            if let Some(timing) = timing {
-                self.conversation.push(timing.clone());
-                after.push(timing);
-            }
-        }
-        if let Some(parent) = started {
-            if let Some(now_ms) = now_ms {
-                self.conversation
-                    .push(AgentEvent::Other(subagent_started_at(&parent, now_ms)));
-            }
-        }
-        (before, after)
     }
 
     /// The Claude process settings for this tab. `model` "default" (or
@@ -326,16 +263,7 @@ impl AgentSession {
     }
 }
 
-/// See `AgentSession::submit_queues`: a native harness process is running
-/// a turn. Claude queues the message itself; an ACP session holds it until
-/// the turn ends.
-pub(crate) fn submit_queues(
-    backend: AgentBackend,
-    process_running: bool,
-    state: &AgentSessionState,
-) -> bool {
-    backend.is_native() && process_running && matches!(state, AgentSessionState::Streaming)
-}
+pub(crate) use gitterm_core::chat::state::submit_queues;
 
 /// One task's worktree as the chat's checkout chip sees it (TRU-143).
 #[derive(Debug, Clone, Copy)]
@@ -415,43 +343,6 @@ pub(crate) fn checkout_label(
         return CURRENT_CHECKOUT_LABEL.to_string();
     }
     dir_name(tab_dir)
-}
-
-/// Fold `next` into `last` when both are fragments of the same stream:
-/// text, thinking, one tool call's input, or any of those from the same
-/// subagent. Returns whether `next` was absorbed.
-fn merge_fragment(last: &mut HarnessEvent, next: &HarnessEvent) -> bool {
-    use HarnessEvent as H;
-    match (last, next) {
-        (H::TextDelta(a), H::TextDelta(b)) | (H::ThinkingDelta(a), H::ThinkingDelta(b)) => {
-            a.push_str(b);
-            true
-        }
-        (
-            H::ItemInputDelta {
-                id: a_id,
-                partial_json: a,
-            },
-            H::ItemInputDelta {
-                id: b_id,
-                partial_json: b,
-            },
-        ) if a_id == b_id => {
-            a.push_str(b);
-            true
-        }
-        (
-            H::SubagentEvent {
-                parent_tool_use_id: a_parent,
-                event: a,
-            },
-            H::SubagentEvent {
-                parent_tool_use_id: b_parent,
-                event: b,
-            },
-        ) if a_parent == b_parent => merge_fragment(a, b),
-        _ => false,
-    }
 }
 
 // ---- Subprocess manager (Step 3 of TRU-29) -------------------------------
@@ -889,7 +780,7 @@ mod tests {
             .unwrap()
             .contains("can't be continued"));
         let mut session = AgentSession::new(config);
-        session.session_id = Some("legacy-session".into());
+        session.bind_session(Some("legacy-session".into()));
         assert_eq!(session.history_to_load(), None);
         assert!(session
             .acp_session_config(PathBuf::from("/tmp"), Vec::new(), None)
@@ -914,7 +805,7 @@ mod tests {
         let back: AgentBackendConfig = serde_json::from_value(json).unwrap();
         assert_eq!(back.backend(), AgentBackend::Acp(AcpAgent::Antigravity));
         let mut session = AgentSession::new(back);
-        session.session_id = Some("g-1".into());
+        session.bind_session(Some("g-1".into()));
         assert_eq!(session.history_to_load(), Some("g-1"));
         assert_eq!(
             session.configured_permission_mode().as_deref(),
