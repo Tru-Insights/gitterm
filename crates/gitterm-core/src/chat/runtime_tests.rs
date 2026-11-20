@@ -628,3 +628,297 @@ assert not sys.stdin.read(), 'rejected remembers must never reach stdin'
     );
     session.completed().await.unwrap();
 }
+
+async fn runtime_event(events: &mut mpsc::UnboundedReceiver<RuntimeEvent>) -> RuntimeEvent {
+    tokio::time::timeout(Duration::from_secs(10), events.recv())
+        .await
+        .unwrap()
+        .expect("runtime event stream closed")
+}
+
+async fn receipt(events: &mut mpsc::UnboundedReceiver<RuntimeEvent>, id: u64) -> DeliveryOutcome {
+    match runtime_event(events).await {
+        RuntimeEvent::CommandOutcome {
+            correlation,
+            outcome,
+        } => {
+            assert_eq!(correlation, CommandCorrelation(id));
+            outcome
+        }
+        event => panic!("expected receipt {id}, got {event:?}"),
+    }
+}
+
+#[tokio::test]
+async fn correlated_full_write_encode_rejection_and_uncorrelated_compatibility() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let (mut session, mut events) = Session::spawn_runtime(move |token| {
+        Ok(launch(
+            &path,
+            include_str!("../../../../tests/claude-process/write-outcomes.py"),
+            token,
+        ))
+    });
+    assert!(matches!(
+        runtime_event(&mut events).await,
+        RuntimeEvent::Harness(HarnessEvent::Ready { .. })
+    ));
+    assert!(matches!(
+        runtime_event(&mut events).await,
+        RuntimeEvent::Harness(HarnessEvent::RuntimeRequest { .. })
+    ));
+    session
+        .send_correlated(
+            HarnessCommand::Answer {
+                request_id: "q1".into(),
+                decision: RuntimeDecision::AnswerQuestion {
+                    answers: BTreeMap::new(),
+                },
+            },
+            CommandCorrelation(1),
+        )
+        .unwrap();
+    assert!(
+        matches!(receipt(&mut events, 1).await, DeliveryOutcome::Rejected(reason) if reason.contains("not an object"))
+    );
+    assert!(matches!(
+        runtime_event(&mut events).await,
+        RuntimeEvent::Harness(HarnessEvent::Error(_))
+    ));
+    session
+        .send_correlated(
+            HarnessCommand::Answer {
+                request_id: "q1".into(),
+                decision: RuntimeDecision::Deny {
+                    message: "declined".into(),
+                },
+            },
+            CommandCorrelation(2),
+        )
+        .unwrap();
+    // A successful answer still closes the request only after its write/flush.
+    assert!(
+        matches!(runtime_event(&mut events).await, RuntimeEvent::Harness(HarnessEvent::RuntimeRequestResolved { request_id }) if request_id == "q1")
+    );
+    assert_eq!(receipt(&mut events, 2).await, DeliveryOutcome::Written);
+    session
+        .send_correlated(
+            HarnessCommand::SendUserMessage(UserPrompt::from("correlated")),
+            CommandCorrelation(3),
+        )
+        .unwrap();
+    assert_eq!(receipt(&mut events, 3).await, DeliveryOutcome::Written);
+    session
+        .send(HarnessCommand::SendUserMessage(UserPrompt::from(
+            "uncorrelated",
+        )))
+        .unwrap();
+    for (index, command) in [
+        HarnessCommand::WithdrawQueuedMessage("message".into()),
+        HarnessCommand::Interrupt,
+        HarnessCommand::SetPermissionMode("plan".into()),
+        HarnessCommand::SetModel("synthetic".into()),
+        HarnessCommand::SetEffort(Some("high".into())),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = 30 + index as u64;
+        session
+            .send_correlated(command, CommandCorrelation(id))
+            .unwrap();
+        assert_eq!(receipt(&mut events, id).await, DeliveryOutcome::Written);
+    }
+    // Local state changes and shutdown must never claim a stdin write.
+    session
+        .send_correlated(
+            HarnessCommand::SetWorkspaceContext(None),
+            CommandCorrelation(40),
+        )
+        .unwrap();
+    assert!(matches!(
+        receipt(&mut events, 40).await,
+        DeliveryOutcome::Rejected(_)
+    ));
+    session
+        .send_correlated(HarnessCommand::Shutdown, CommandCorrelation(41))
+        .unwrap();
+    assert!(matches!(
+        receipt(&mut events, 41).await,
+        DeliveryOutcome::Rejected(_)
+    ));
+    assert_eq!(
+        runtime_event(&mut events).await,
+        RuntimeEvent::Harness(HarnessEvent::ProcessExited { code: Some(0) })
+    );
+    session.completed().await.unwrap();
+    assert!(
+        events.recv().await.is_none(),
+        "no duplicate or uncorrelated receipts"
+    );
+}
+
+#[tokio::test]
+async fn correlated_partial_write_and_death_mid_write_are_uncertain() {
+    for (dies, answer) in [(false, false), (true, false), (false, true), (true, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_owned();
+        let script = include_str!("../../../../tests/claude-process/write-failure.py")
+            .replace(
+                "EXIT_MID_WRITE = False",
+                &format!("EXIT_MID_WRITE = {}", if dies { "True" } else { "False" }),
+            )
+            .replace(
+                "ANSWER = False",
+                &format!("ANSWER = {}", if answer { "True" } else { "False" }),
+            );
+        let (mut session, mut events) =
+            Session::spawn_runtime(move |token| Ok(launch(&path, &script, token)));
+        assert!(matches!(
+            runtime_event(&mut events).await,
+            RuntimeEvent::Harness(HarnessEvent::Ready { .. })
+        ));
+        let pid = session.local_pid().unwrap();
+        let text = "x".repeat(4 * 1024 * 1024);
+        let command = if answer {
+            assert!(matches!(
+                runtime_event(&mut events).await,
+                RuntimeEvent::Harness(HarnessEvent::RuntimeRequest { .. })
+            ));
+            HarnessCommand::Answer {
+                request_id: "p1".into(),
+                decision: RuntimeDecision::Deny { message: text },
+            }
+        } else {
+            HarnessCommand::SendUserMessage(UserPrompt::from(text.as_str()))
+        };
+        session
+            .send_correlated(command, CommandCorrelation(10))
+            .unwrap();
+        assert!(matches!(
+            receipt(&mut events, 10).await,
+            DeliveryOutcome::Uncertain(_)
+        ));
+        assert!(!std::fs::read(dir.path().join("prefix")).unwrap().is_empty());
+        assert!(matches!(
+            runtime_event(&mut events).await,
+            RuntimeEvent::Harness(HarnessEvent::Error(_))
+        ));
+        if !dies {
+            // The already closed pipe definitively refuses a new command.
+            session
+                .send_correlated(HarnessCommand::Interrupt, CommandCorrelation(11))
+                .unwrap();
+            assert!(matches!(
+                receipt(&mut events, 11).await,
+                DeliveryOutcome::Rejected(_)
+            ));
+            assert!(matches!(
+                runtime_event(&mut events).await,
+                RuntimeEvent::Harness(HarnessEvent::Error(_))
+            ));
+            std::fs::write(dir.path().join("exit"), "").unwrap();
+        }
+        loop {
+            match runtime_event(&mut events).await {
+                RuntimeEvent::Harness(HarnessEvent::ProcessExited { code }) => {
+                    assert_eq!(code, Some(if dies { 17 } else { 0 }));
+                    break;
+                }
+                RuntimeEvent::Harness(HarnessEvent::RuntimeRequestResolved { request_id })
+                    if answer =>
+                {
+                    assert_eq!(request_id, "p1")
+                }
+                RuntimeEvent::Harness(HarnessEvent::Error(_)) => {}
+                event => panic!("unexpected event: {event:?}"),
+            }
+        }
+        session.completed().await.unwrap();
+        process::assert_reaped(pid);
+        assert!(events.recv().await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn correlated_written_receipt_precedes_partial_output_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let (mut session, mut events) = Session::spawn_runtime(move |token| {
+        Ok(launch(
+            &path,
+            include_str!("../../../../tests/claude-process/partial.py"),
+            token,
+        ))
+    });
+    assert!(matches!(
+        runtime_event(&mut events).await,
+        RuntimeEvent::Harness(HarnessEvent::Ready { .. })
+    ));
+    session
+        .send_correlated(
+            HarnessCommand::SendUserMessage(UserPrompt::from("synthetic")),
+            CommandCorrelation(20),
+        )
+        .unwrap();
+    assert_eq!(receipt(&mut events, 20).await, DeliveryOutcome::Written);
+    let mut text = String::new();
+    loop {
+        match runtime_event(&mut events).await {
+            RuntimeEvent::Harness(HarnessEvent::TextDelta(delta)) => text.push_str(&delta),
+            RuntimeEvent::Harness(HarnessEvent::Error(_)) => {}
+            RuntimeEvent::Harness(HarnessEvent::ProcessExited { code: Some(17) }) => break,
+            event => panic!("unexpected event: {event:?}"),
+        }
+    }
+    assert_eq!(text, "partial output final fragment");
+    session.completed().await.unwrap();
+    assert!(events.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn correlated_commands_queued_before_prepare_failure_are_rejected_once() {
+    let (gate, wait) = std::sync::mpsc::channel();
+    let (mut session, mut events) = Session::spawn_runtime(move |_| {
+        wait.recv().unwrap();
+        Err("synthetic preparation failure".into())
+    });
+    for id in [1, 2] {
+        session
+            .send_correlated(HarnessCommand::Interrupt, CommandCorrelation(id))
+            .unwrap();
+    }
+    gate.send(()).unwrap();
+    assert!(matches!(
+        runtime_event(&mut events).await,
+        RuntimeEvent::Harness(HarnessEvent::Error(_))
+    ));
+    for id in [1, 2] {
+        assert!(matches!(
+            receipt(&mut events, id).await,
+            DeliveryOutcome::Rejected(_)
+        ));
+    }
+    assert!(matches!(
+        runtime_event(&mut events).await,
+        RuntimeEvent::Harness(HarnessEvent::ProcessExited { code: None })
+    ));
+    session.completed().await.unwrap();
+    assert!(session
+        .send_correlated(HarnessCommand::Interrupt, CommandCorrelation(3))
+        .is_err());
+    assert!(events.recv().await.is_none());
+}
+
+#[test]
+fn correlated_commands_cannot_enter_a_harness_only_port() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let session = Session::from_port(tx, false);
+    assert!(session
+        .send_correlated(HarnessCommand::Interrupt, CommandCorrelation(1))
+        .is_err());
+    assert!(rx.try_recv().is_err());
+    session.send(HarnessCommand::Interrupt).unwrap();
+    assert_eq!(rx.try_recv().unwrap(), HarnessCommand::Interrupt);
+}
