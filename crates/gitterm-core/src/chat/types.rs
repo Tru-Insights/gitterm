@@ -7,6 +7,18 @@ use serde_json::Value;
 
 use crate::harness::transcript;
 
+/// Opaque caller-owned identity, scoped to one session. Never sent to the provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CommandCorrelation(pub u64);
+
+/// Actual stdin delivery, independent of channel acceptance or provider acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    Written,
+    Rejected(String),
+    Uncertain(String),
+}
+
 /// A `PermissionUpdate` as the Claude control protocol defines it
 /// (`addRules`, `setMode`, `addDirectories`, ... with a `destination`).
 /// GitTerm only ever echoes one of the CLI's own suggestions back, so the

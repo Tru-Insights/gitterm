@@ -7,6 +7,7 @@
 use super::{history, types::*};
 use crate::{harness::transcript::TranscriptEntry, session};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::{collections::BTreeMap, path::PathBuf};
 
 // Process-wide incarnations never repeat when a tab replaces its chat state.
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -163,6 +164,101 @@ pub struct HistoryTicket {
     runtime: Option<u64>,
 }
 
+/// Last values confirmed by the harness, never optimistic picker selections.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcknowledgedSettings {
+    pub model: Option<String>,
+    pub mode: Option<String>,
+    /// None means not yet reported; Some with effort=None means model default.
+    pub effort: Option<ConfirmedEffort>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedEffort {
+    pub effort: Option<String>,
+    pub applied: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingChange {
+    Model(String),
+    Effort(Option<String>),
+    Mode(String),
+}
+
+impl SettingChange {
+    fn command(&self) -> HarnessCommand {
+        match self {
+            Self::Model(value) => HarnessCommand::SetModel(value.clone()),
+            Self::Effort(value) => HarnessCommand::SetEffort(value.clone()),
+            Self::Mode(value) => HarnessCommand::SetPermissionMode(value.clone()),
+        }
+    }
+
+    fn valid(&self, backend: AgentBackend) -> bool {
+        let token = |s: &str| {
+            !s.is_empty()
+                && s.len() <= 256
+                && !s.chars().any(|c| c.is_whitespace() || c.is_control())
+        };
+        match self {
+            Self::Model(value) => token(value),
+            Self::Effort(value) => value.as_deref().is_none_or(|v| {
+                if backend == AgentBackend::Claude {
+                    ["low", "medium", "high", "xhigh", "max"].contains(&v)
+                } else {
+                    token(v)
+                }
+            }),
+            Self::Mode(value) if backend == AgentBackend::Claude => [
+                "default",
+                "acceptEdits",
+                "plan",
+                "auto",
+                "dontAsk",
+                "bypassPermissions",
+            ]
+            .contains(&value.as_str()),
+            Self::Mode(value) => token(value),
+        }
+    }
+}
+
+/// View state only. The harness owns the executable queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptStatus {
+    Pending,
+    Queued,
+    Started,
+    Completed,
+    Cancelled,
+    Unsent,
+    Uncertain,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueuedPrompt {
+    pub prompt: UserPrompt,
+    pub status: PromptStatus,
+    pub withdraw_pending: bool,
+}
+
+#[derive(Debug)]
+enum PendingCommand {
+    Queue(String),
+    Withdraw(String),
+    Setting,
+}
+
+/// Host-owned checkout authority captured at dispatch, not supplied by a view.
+/// Choices must already be normalized workspace/prepared-worktree paths.
+#[derive(Debug)]
+pub struct CheckoutContext {
+    pub choices: Vec<PathBuf>,
+    pub locked_reason: Option<String>,
+    pub process_running: bool,
+}
+
 #[derive(Debug)]
 pub struct State {
     pub conversation: Vec<AgentEvent>,
@@ -173,6 +269,12 @@ pub struct State {
     /// Record counter, including merged fragments. History replacement/reset
     /// uses explicit effects; retain Iced's existing revision semantics.
     pub revision: u64,
+    pub acknowledged: AcknowledgedSettings,
+    pub queued_prompts: BTreeMap<String, QueuedPrompt>,
+    pub checkout: Option<PathBuf>,
+    pending_change: Option<(CommandCorrelation, SettingChange)>,
+    commands: BTreeMap<u64, PendingCommand>,
+    runtime_exited: bool,
     runtime_generation: u64,
     history_generation: u64,
 }
@@ -186,6 +288,12 @@ impl Default for State {
             pending_requests: Vec::new(),
             history: HistoryLoad::NotLoaded,
             revision: 0,
+            acknowledged: AcknowledgedSettings::default(),
+            queued_prompts: BTreeMap::new(),
+            checkout: None,
+            pending_change: None,
+            commands: BTreeMap::new(),
+            runtime_exited: false,
             runtime_generation: generation(),
             history_generation: generation(),
         }
@@ -194,6 +302,41 @@ impl Default for State {
 
 #[derive(Debug)]
 pub enum Intent {
+    Queue {
+        runtime: RuntimeStamp,
+        current: session::Target,
+        config: AgentBackendConfig,
+        process_running: bool,
+        prompt: UserPrompt,
+        message_id: String,
+    },
+    Withdraw {
+        runtime: RuntimeStamp,
+        current: session::Target,
+        process_running: bool,
+        message_id: String,
+    },
+    ChangeSetting {
+        runtime: RuntimeStamp,
+        current: session::Target,
+        config: AgentBackendConfig,
+        process_running: bool,
+        change: SettingChange,
+    },
+    /// Channel send failures must also return here as Rejected. Written is
+    /// a transport receipt only; it never acknowledges a picker or withdraw.
+    CommandOutcome {
+        runtime: RuntimeStamp,
+        current: session::Target,
+        correlation: CommandCorrelation,
+        outcome: DeliveryOutcome,
+    },
+    ChooseCheckout {
+        runtime: RuntimeStamp,
+        current: session::Target,
+        context: CheckoutContext,
+        path: PathBuf,
+    },
     Submit {
         prompt: UserPrompt,
         backend: AgentBackend,
@@ -248,10 +391,26 @@ pub struct EventEffects {
     pub awaiting_input: Option<bool>,
     pub outcome: Option<TurnStatus>,
     pub process_exited: bool,
+    /// Host may persist only these acknowledged changes, once per value.
+    pub settings_changed: Option<SettingChange>,
+    pub unsent_prompts: Vec<UserPrompt>,
+    pub notices: Vec<String>,
 }
 
 #[derive(Debug)]
 pub enum Effect {
+    /// Send once, in session order, then feed the correlated delivery outcome
+    /// back. Revalidate the full runtime binding immediately before sending.
+    Dispatch {
+        runtime: RuntimeStamp,
+        correlation: CommandCorrelation,
+        command: HarnessCommand,
+        echo: Option<AgentEvent>,
+    },
+    CheckoutBound {
+        runtime: RuntimeStamp,
+        path: PathBuf,
+    },
     Submit(Submission),
     RelayedPrompt {
         echo: AgentEvent,
@@ -292,6 +451,11 @@ impl State {
     /// Call exactly once when installing a new sole receiver (including Pi).
     pub fn begin_runtime(&mut self) {
         self.runtime_generation = generation();
+        self.runtime_exited = false;
+        self.pending_change = None;
+        self.commands.clear();
+        self.acknowledged = AcknowledgedSettings::default();
+        self.finish_queue();
         self.pending_requests.clear();
     }
 
@@ -353,10 +517,280 @@ impl State {
         submit_queues(backend, process_running, &self.state)
     }
 
+    pub fn pending_change(&self) -> Option<&SettingChange> {
+        self.pending_change.as_ref().map(|(_, change)| change)
+    }
+
+    fn command_allowed(
+        &self,
+        runtime: &RuntimeStamp,
+        current: &session::Target,
+        running: bool,
+    ) -> bool {
+        running && !self.runtime_exited && self.accepts_runtime(runtime, current)
+    }
+
+    fn dispatch(
+        &mut self,
+        runtime: RuntimeStamp,
+        command: HarnessCommand,
+        pending: PendingCommand,
+        echo: Option<AgentEvent>,
+    ) -> Effect {
+        let correlation = CommandCorrelation(generation());
+        self.commands.insert(correlation.0, pending);
+        Effect::Dispatch {
+            runtime,
+            correlation,
+            command,
+            echo,
+        }
+    }
+
+    fn finish_queue(&mut self) -> Vec<UserPrompt> {
+        self.queued_prompts
+            .values_mut()
+            .filter_map(|queued| {
+                queued.withdraw_pending = false;
+                if matches!(queued.status, PromptStatus::Pending | PromptStatus::Queued) {
+                    queued.status = PromptStatus::Unsent;
+                    Some(queued.prompt.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn acknowledge(
+        &mut self,
+        change: SettingChange,
+        applied: Option<String>,
+    ) -> Option<SettingChange> {
+        if self
+            .pending_change
+            .as_ref()
+            .is_some_and(|(_, pending)| pending == &change)
+        {
+            self.pending_change = None;
+            self.commands
+                .retain(|_, command| !matches!(command, PendingCommand::Setting));
+        }
+        let changed = match &change {
+            SettingChange::Model(value) => {
+                self.acknowledged.model.replace(value.clone()).as_ref() != Some(value)
+            }
+            SettingChange::Mode(value) => {
+                self.acknowledged.mode.replace(value.clone()).as_ref() != Some(value)
+            }
+            SettingChange::Effort(effort) => {
+                let value = ConfirmedEffort {
+                    effort: effort.clone(),
+                    applied,
+                };
+                self.acknowledged.effort.replace(value.clone()).as_ref() != Some(&value)
+            }
+        };
+        changed.then_some(change)
+    }
+
     /// `Event` applies reported lifecycle; `Record` appends once and returns
     /// before/after markers for the host's ordered presentation effects.
     pub fn reduce(&mut self, intent: Intent) -> Effect {
         match intent {
+            Intent::Queue {
+                runtime,
+                current,
+                config,
+                process_running,
+                mut prompt,
+                message_id,
+            } => {
+                if !self.command_allowed(&runtime, &current, process_running)
+                    || config.read_only_note().is_some()
+                    || !self.submit_queues(config.backend(), process_running)
+                    || !self.pending_requests.is_empty()
+                {
+                    return Effect::Rejected("Cannot queue a prompt on this chat runtime".into());
+                }
+                let id = prompt.id.get_or_insert(message_id).clone();
+                if id.is_empty() || self.queued_prompts.contains_key(&id) || self.shows_prompt(&id)
+                {
+                    return Effect::Rejected(format!(
+                        "Cannot queue duplicate or empty message ID {id:?}"
+                    ));
+                }
+                if let Err(error) = validate_images(&prompt.images) {
+                    return Effect::Rejected(error);
+                }
+                let echo = AgentEvent::submitted_prompt(&prompt, true);
+                self.queued_prompts.insert(
+                    id.clone(),
+                    QueuedPrompt {
+                        prompt: prompt.clone(),
+                        status: PromptStatus::Pending,
+                        withdraw_pending: false,
+                    },
+                );
+                self.dispatch(
+                    runtime,
+                    HarnessCommand::SendUserMessage(prompt),
+                    PendingCommand::Queue(id),
+                    Some(echo),
+                )
+            }
+            Intent::Withdraw {
+                runtime,
+                current,
+                process_running,
+                message_id,
+            } => {
+                if !self.command_allowed(&runtime, &current, process_running) {
+                    return Effect::Rejected(format!(
+                        "Not withdrawn: message {message_id} has no live owning runtime"
+                    ));
+                }
+                let Some(prompt) = self.queued_prompts.get_mut(&message_id) else {
+                    return Effect::Rejected(format!(
+                        "Not withdrawn: message {message_id} is not queued"
+                    ));
+                };
+                if !matches!(prompt.status, PromptStatus::Pending | PromptStatus::Queued)
+                    || prompt.withdraw_pending
+                {
+                    return Effect::Rejected(format!("Not withdrawn: message {message_id} has already started or is no longer withdrawable"));
+                }
+                prompt.withdraw_pending = true;
+                self.dispatch(
+                    runtime,
+                    HarnessCommand::WithdrawQueuedMessage(message_id.clone()),
+                    PendingCommand::Withdraw(message_id),
+                    None,
+                )
+            }
+            Intent::ChangeSetting {
+                runtime,
+                current,
+                config,
+                process_running,
+                change,
+            } => {
+                if !self.command_allowed(&runtime, &current, process_running)
+                    || !config.backend().is_native()
+                    || config.read_only_note().is_some()
+                    || !change.valid(config.backend())
+                {
+                    return Effect::Rejected(format!(
+                        "Cannot apply {change:?} on this chat runtime"
+                    ));
+                }
+                // Harness Error has no request ID. Admit one picker at a time
+                // so a rejection cannot save another optimistic selection.
+                if self.pending_change.is_some() {
+                    return Effect::Rejected(
+                        "A picker change is still awaiting acknowledgement".into(),
+                    );
+                }
+                let effect =
+                    self.dispatch(runtime, change.command(), PendingCommand::Setting, None);
+                if let Effect::Dispatch { correlation, .. } = &effect {
+                    self.pending_change = Some((*correlation, change));
+                }
+                effect
+            }
+            Intent::CommandOutcome {
+                runtime,
+                current,
+                correlation,
+                outcome,
+            } => {
+                if !self.accepts_runtime(&runtime, &current) {
+                    return Effect::None;
+                }
+                let Some(command) = self.commands.remove(&correlation.0) else {
+                    return Effect::None;
+                };
+                let reason = match outcome {
+                    DeliveryOutcome::Written => return Effect::None,
+                    DeliveryOutcome::Rejected(reason) => (reason, false),
+                    DeliveryOutcome::Uncertain(reason) => (reason, true),
+                };
+                match command {
+                    PendingCommand::Queue(id) => {
+                        if let Some(prompt) = self.queued_prompts.get_mut(&id) {
+                            if matches!(prompt.status, PromptStatus::Pending | PromptStatus::Queued)
+                            {
+                                prompt.status = if reason.1 {
+                                    PromptStatus::Uncertain
+                                } else {
+                                    PromptStatus::Unsent
+                                };
+                            }
+                        }
+                    }
+                    PendingCommand::Withdraw(id) => {
+                        if let Some(prompt) = self.queued_prompts.get_mut(&id) {
+                            prompt.withdraw_pending = false;
+                        }
+                    }
+                    PendingCommand::Setting => {
+                        if !reason.1
+                            && self
+                                .pending_change
+                                .as_ref()
+                                .is_some_and(|(id, _)| *id == correlation)
+                        {
+                            self.pending_change = None;
+                        }
+                    }
+                }
+                // An uncertain picker remains pending: it may have reached the
+                // provider. Never retry it automatically or treat it as saved.
+                Effect::Rejected(format!(
+                    "Command {correlation:?} delivery {}: {}",
+                    if reason.1 { "uncertain" } else { "rejected" },
+                    reason.0
+                ))
+            }
+            Intent::ChooseCheckout {
+                runtime,
+                current,
+                context,
+                path,
+            } => {
+                if !self.accepts_runtime(&runtime, &current) {
+                    return Effect::Rejected(
+                        "Checkout request belongs to an old chat runtime".into(),
+                    );
+                }
+                if context.process_running
+                    || self.session_id.is_some()
+                    || current.task_id.is_some()
+                    || matches!(self.state, AgentSessionState::Streaming)
+                    || self.pending_change.is_some()
+                {
+                    return Effect::Rejected("Checkout is locked to the chat's session".into());
+                }
+                if let Some(reason) = context.locked_reason {
+                    return Effect::Rejected(reason);
+                }
+                if !path.is_absolute() || !context.choices.contains(&path) {
+                    return Effect::Rejected(format!(
+                        "Checkout {} is no longer offered by this workspace",
+                        path.display()
+                    ));
+                }
+                if self.checkout.as_ref() == Some(&path) {
+                    return Effect::None;
+                }
+                self.checkout = Some(path.clone());
+                self.runtime_generation = generation();
+                self.history_generation = generation();
+                Effect::CheckoutBound {
+                    runtime: self.runtime_stamp(current),
+                    path,
+                }
+            }
             Intent::Submit {
                 mut prompt,
                 backend,
@@ -515,7 +949,80 @@ impl State {
     fn apply_event(&mut self, event: &AgentEvent) -> EventEffects {
         let mut effects = EventEffects::default();
         match event {
+            // Keep C6 presentation/lifecycle semantics, but a dead process
+            // cannot subsequently acknowledge a control or start queued input.
+            AgentEvent::Harness(
+                HarnessEvent::MessageLifecycle { .. }
+                | HarnessEvent::ModelChanged(_)
+                | HarnessEvent::PermissionModeChanged(_)
+                | HarnessEvent::EffortChanged { .. },
+            ) if self.runtime_exited => {}
             AgentEvent::Harness(event) => match event {
+                HarnessEvent::MessageLifecycle { id, state } => {
+                    if let Some(prompt) = self.queued_prompts.get_mut(id) {
+                        let status = match state {
+                            MessageState::Queued => PromptStatus::Queued,
+                            MessageState::Started => PromptStatus::Started,
+                            MessageState::Completed => PromptStatus::Completed,
+                            MessageState::Cancelled => PromptStatus::Cancelled,
+                        };
+                        // Once started, cancellation cannot remove a sent
+                        // prompt, even if an old queue/cancel frame arrives.
+                        let allowed = match prompt.status {
+                            PromptStatus::Pending
+                            | PromptStatus::Queued
+                            | PromptStatus::Uncertain => true,
+                            PromptStatus::Started => {
+                                matches!(state, MessageState::Started | MessageState::Completed)
+                            }
+                            PromptStatus::Completed
+                            | PromptStatus::Cancelled
+                            | PromptStatus::Unsent => false,
+                        };
+                        if allowed {
+                            if prompt.withdraw_pending
+                                && matches!(state, MessageState::Started | MessageState::Completed)
+                            {
+                                effects.notices.push(format!(
+                                    "Not withdrawn ({id}): the message has already started"
+                                ));
+                            }
+                            prompt.status = status;
+                            if *state != MessageState::Queued {
+                                prompt.withdraw_pending = false;
+                            }
+                        }
+                    }
+                }
+                HarnessEvent::MessageWithdrawRefused { id, reason } => {
+                    if let Some(prompt) = self.queued_prompts.get_mut(id) {
+                        prompt.withdraw_pending = false;
+                    }
+                    effects
+                        .notices
+                        .push(format!("Not withdrawn ({id}): {reason}"));
+                }
+                HarnessEvent::ModelChanged(value) => {
+                    effects.settings_changed =
+                        self.acknowledge(SettingChange::Model(value.clone()), None);
+                }
+                HarnessEvent::PermissionModeChanged(value) => {
+                    effects.settings_changed =
+                        self.acknowledge(SettingChange::Mode(value.clone()), None);
+                }
+                HarnessEvent::EffortChanged { effort, applied } => {
+                    effects.settings_changed =
+                        self.acknowledge(SettingChange::Effort(effort.clone()), applied.clone());
+                }
+                HarnessEvent::Error(reason) => {
+                    if let Some((_, change)) = self.pending_change.take() {
+                        effects
+                            .notices
+                            .push(format!("Change {change:?} was not acknowledged: {reason}"));
+                        self.commands
+                            .retain(|_, command| !matches!(command, PendingCommand::Setting));
+                    }
+                }
                 HarnessEvent::TurnStarted { session_id, .. } => {
                     self.state = AgentSessionState::Streaming;
                     if let Some(id) = session_id {
@@ -545,6 +1052,14 @@ impl State {
                 }
                 HarnessEvent::ProcessExited { code } => {
                     effects.process_exited = true;
+                    self.runtime_exited = true;
+                    effects.unsent_prompts = self.finish_queue();
+                    if let Some((_, change)) = self.pending_change.take() {
+                        effects.notices.push(format!(
+                            "Change {change:?} was not acknowledged before the agent exited"
+                        ));
+                    }
+                    self.commands.clear();
                     self.pending_requests.clear();
                     if matches!(self.state, AgentSessionState::Streaming) {
                         let message = format!("The chat's agent exited mid-turn (code {code:?})");
@@ -700,6 +1215,10 @@ fn merge_fragment(last: &mut HarnessEvent, next: &HarnessEvent) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+#[path = "state_controls_tests.rs"]
+mod controls_tests;
 
 #[cfg(test)]
 #[path = "state_tests.rs"]
