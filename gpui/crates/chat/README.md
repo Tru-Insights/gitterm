@@ -97,7 +97,7 @@ not just the older migration-plan audit.
 | Delegations / `:3048`, `:3087` | Display-only | Collapsible fixture/app delivery cards and results; no delivery or task commands. |
 | Turn status / `:784`, `:2668` | Done | Recorded input/output tokens, elapsed time, optional cost; completed/interrupted/failed and explicit errors. |
 | Review / `:2456`, `:2768` | Later | Review targets, findings, file opening, stale-head warnings, rerun/cancel/dismiss and held delivery require core/session integration. |
-| Composer / `:1843`, `:1896` | Done | Per-view multiline draft; Enter sends, Shift+Enter inserts newline; visible read-only reason; Stop while a turn runs. Queue/steer/withdraw, slash commands, attachments, dictation and model controls remain later. |
+| Composer / `:1843`, `:1896` | Done | Per-view multiline draft; Enter sends, Shift+Enter inserts newline; visible read-only reason; Stop while a turn runs. Streaming Queue, withdraw by ID, slash completion and owner-fed status are provided by C11a below. Attachments, dictation and interactive model controls remain later. |
 | HTML results / `:784`, `:3048` | Later | Text/code stays native; interactive HTML preview belongs in a retained Viewer surface. |
 
 ## Synthetic fixtures and verification
@@ -204,3 +204,54 @@ text/images, answer rejection/explicit retry, uncertain delivery, resolution
 precedence, history source validation and replay without a revision change.
 All test input is synthetic. GUI feel and live owner/provider integration are
 outside C7.
+
+
+## C11a composer (TRU-274)
+
+`composer.rs` projects the owner's core state into the native composer. Idle
+Send uses `Submit`; streaming Send is labeled Queue and uses `Queue`. Stop
+interrupts the turn. The queue lists stable message IDs, retained prompt text,
+and the reported pending/queued/started/completed/withdrawn/unsent/uncertain
+state. Withdraw requests go through `Withdraw(message_id)` and remain pending
+until the runtime responds. A start racing withdrawal or a provider refusal
+shows the core's “Not withdrawn” reason without removing the prompt.
+
+The adapter retains each Queue/Withdraw core correlation until the transport
+outcome, including pre-send rejection and channel failure. Known-unsent and
+uncertain prompts come from the core projection; exit never auto-resends them.
+An uncertain submission blocks retry. Both Enter and the Send/Queue button
+recheck pending requests and IME marked text; the adapter also checks pending
+requests at admission and immediately before channel handoff. Draft/image
+retention and matching receipt IDs preserve newer edits.
+
+The slash list uses the session's `Ready.commands` names, descriptions and
+argument hints. Up/Down chooses, Tab fills, Enter runs a command without
+arguments or fills one with arguments, and Escape dismisses suggestions.
+Shift+Enter keeps multiline input. Completion never intercepts IME marked
+text, and slash input with arguments is sent unchanged through the normal gate.
+
+Model, effort, mode and checkout are visibly disabled displays. Model/mode
+values come from acknowledged core state; an unreported value stays labeled
+“Not reported”. Effort distinguishes “Auto” from its reported applied level.
+There is no UI setting/checkout dispatch. Interactive pickers await C10b-core's
+typed provider acknowledgement/rejection contract. `ChangeMode` is a
+rejection-only defensive intent: the preview controller rejects **every** value
+before runtime dispatch with a visible receipt reason. FreshPreview remains in
+its default launch mode. **Shift+Tab mode cycling is disabled**, including while
+composing IME text.
+
+Headless coverage exercises Enter/button and execution gates, IME, slash
+completion, disabled mode dispatch, queue/start/withdraw races, channel failure,
+task rebind and process-exit delivery states. No real Claude or GUI is launched.
+For a later maintainer check in an already isolated preview:
+
+- Confirm disabled model/effort/mode/checkout displays; “Auto” and applied effort
+  remain distinct when reported. Shift+Tab never changes mode.
+- Send while idle, then during a running turn: Send becomes Queue. Withdraw a
+  queued ID; if it starts first, the refusal remains visible.
+- Leave a request pending: Enter and the button retain the draft and send
+  nothing. Commit an IME candidate without sending or changing mode.
+- Complete a session-provided slash command with arrows/Tab/Enter, including an
+  argument-taking command and a dismissed suggestion.
+- Exit with queued input and verify the core-reported Unsent versus Uncertain
+  labels and retained text. Neither path automatically resends.

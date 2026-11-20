@@ -836,7 +836,11 @@ fn correlated_receipts_are_stamped_and_preserve_all_delivery_states() {
                         task_live: false,
                         last_tab: false,
                     },
-                    backend: AgentBackend::Claude,
+                    config: gitterm_core::chat::types::AgentBackendConfig::Claude {
+                        model: String::new(),
+                        permission_mode: Some("default".into()),
+                        effort: None,
+                    },
                     process_running: true,
                     just_spawned: false,
                     message_id: "synthetic".into(),
@@ -981,5 +985,30 @@ async fn fake_process_rejected_and_partial_write_outcomes_reach_adapter() {
         let runtime = controller.runtime.as_mut().unwrap();
         let _ = runtime.send(HarnessCommand::Shutdown);
         runtime.completed().await.unwrap();
+    }
+}
+
+#[test]
+fn preview_rejects_all_forged_mode_intents_without_dispatch_or_pending_setting() {
+    let mut controller = Controller::new();
+    let (sender, mut commands) = tokio::sync::mpsc::unbounded_channel();
+    controller.runtime = Some(Session::from_port(sender, true).into());
+    controller.ready = true;
+    for mode in [
+        "default",
+        "acceptEdits",
+        "plan",
+        "auto",
+        "dontAsk",
+        "bypassPermissions",
+        "forged",
+    ] {
+        let (receipt, update) = controller.dispatch(ChatIntent::ChangeMode { mode: mode.into() });
+        assert!(
+            matches!(receipt.state, ReceiptState::Rejected(ref reason) if reason.contains("FreshPreview remains in default mode"))
+        );
+        assert!(commands.try_recv().is_err());
+        assert!(controller.adapter.state().pending_change().is_none());
+        assert!(update.event.unwrap().notices[0].contains("FreshPreview remains in default mode"));
     }
 }

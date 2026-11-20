@@ -1,9 +1,13 @@
 //! Feature-free owner seam. The owner installs one receiver and supplies current
 //! catalog facts at admission and execution; this module never starts a process.
 use crate::intents::{ChatIntent, PermissionDecision, Question};
+use gitterm_core::chat::types::DeliveryOutcome as CoreOutcome;
 use gitterm_core::{
     chat::{
-        state::{AgentEvent, Effect, EventEffects, HistoryTicket, Intent, RuntimeStamp, State},
+        state::{
+            AgentEvent, Effect, EventEffects, HistoryTicket, Intent, PromptStatus, RuntimeStamp,
+            State,
+        },
         types::*,
     },
     session,
@@ -58,7 +62,9 @@ impl Receipt {
                     ReceiptState::ChannelAccepted => !matches!(next.state, ReceiptState::Prepared),
                     ReceiptState::Written => matches!(
                         next.state,
-                        ReceiptState::Uncertain(_) | ReceiptState::Resolved
+                        ReceiptState::Rejected(_)
+                            | ReceiptState::Uncertain(_)
+                            | ReceiptState::Resolved
                     ),
                     ReceiptState::Uncertain(_) | ReceiptState::Rejected(_) => {
                         matches!(next.state, ReceiptState::Resolved)
@@ -85,7 +91,7 @@ pub enum DeliveryOutcome {
 
 pub struct Admission {
     pub authority: session::State,
-    pub backend: AgentBackend,
+    pub config: AgentBackendConfig,
     pub process_running: bool,
     pub just_spawned: bool,
     pub message_id: String,
@@ -108,6 +114,8 @@ struct Attempt {
     runtime: RuntimeStamp,
     request_id: Option<String>,
     message_id: Option<String>,
+    withdraw_id: Option<String>,
+    correlation: Option<CommandCorrelation>,
     receipt: Receipt,
 }
 
@@ -127,6 +135,7 @@ pub enum Presentation {
 pub struct ChatAdapter {
     state: State,
     attempts: HashMap<AttemptId, Attempt>,
+    exited: bool,
 }
 impl ChatAdapter {
     pub fn state(&self) -> &State {
@@ -139,6 +148,7 @@ impl ChatAdapter {
     pub fn begin_runtime(&mut self, target: session::Target) -> RuntimeStamp {
         self.state.begin_runtime();
         self.attempts.clear();
+        self.exited = false;
         self.state.runtime_stamp(target)
     }
     pub fn receipt(&self, id: AttemptId) -> Option<&Receipt> {
@@ -146,13 +156,18 @@ impl ChatAdapter {
     }
 
     pub fn admit(&mut self, intent: ChatIntent, facts: Admission) -> Result<Prepared, Receipt> {
-        if !facts.backend.is_native() {
+        let backend = facts.config.backend();
+        if !backend.is_native() {
             return Err(Receipt::rejected(
                 "This adapter requires a native harness backend",
             ));
         }
         let runtime = self.state.runtime_stamp(facts.authority.target.clone());
         let request_id = intent.request_id().map(str::to_owned);
+        let withdraw_id = match &intent {
+            ChatIntent::Withdraw { message_id } => Some(message_id.clone()),
+            _ => None,
+        };
         let message_id =
             matches!(&intent, ChatIntent::Send { .. }).then(|| facts.message_id.clone());
         if let Some(attempt) = self.attempts.values().find(|a| {
@@ -167,24 +182,62 @@ impl ChatAdapter {
         }
         let effect = match intent {
             ChatIntent::Send { text, images } => {
-                if !facts.process_running {
+                if !self.state.pending_requests.is_empty() {
+                    return Err(Receipt::rejected(
+                        "Answer the pending request before sending",
+                    ));
+                }
+                if !facts.process_running || self.exited {
                     return Err(Receipt::rejected("No chat runtime is running"));
                 }
                 if text.trim().is_empty() && images.is_empty() {
                     return Err(Receipt::rejected("The prompt is empty"));
                 }
                 validate_images(&images).map_err(Receipt::rejected)?;
-                self.state.reduce(Intent::Submit {
-                    prompt: UserPrompt {
-                        text,
-                        images,
-                        id: None,
-                    },
-                    backend: facts.backend,
-                    process_running: facts.process_running,
-                    just_spawned: facts.just_spawned,
-                    message_id: facts.message_id,
-                })
+                let prompt = UserPrompt {
+                    text,
+                    images,
+                    id: None,
+                };
+                // SubmissionAccepted optimistically marks an idle Submit as
+                // streaming. An explicit retry after definitive non-delivery
+                // must keep that Submit's identity instead of becoming a Queue.
+                let retry_submit = self.attempts.values().any(|attempt| {
+                    attempt.message_id.as_ref() == Some(&facts.message_id)
+                        && attempt.receipt.state.retryable()
+                }) && !self.state.queued_prompts.contains_key(&facts.message_id);
+                if !retry_submit
+                    && !facts.just_spawned
+                    && self.state.submit_queues(backend, facts.process_running)
+                {
+                    self.state.reduce(Intent::Queue {
+                        runtime: runtime.clone(),
+                        current: facts.authority.target,
+                        config: facts.config,
+                        process_running: facts.process_running,
+                        prompt,
+                        message_id: facts.message_id,
+                    })
+                } else {
+                    self.state.reduce(Intent::Submit {
+                        prompt,
+                        backend,
+                        process_running: facts.process_running,
+                        just_spawned: facts.just_spawned,
+                        message_id: facts.message_id,
+                    })
+                }
+            }
+            ChatIntent::Withdraw { message_id } => self.state.reduce(Intent::Withdraw {
+                runtime: runtime.clone(),
+                current: facts.authority.target,
+                process_running: facts.process_running,
+                message_id,
+            }),
+            ChatIntent::ChangeMode { .. } => {
+                return Err(Receipt::rejected(
+                    "Mode changes are disabled until typed provider acknowledgement/rejection is available",
+                ));
             }
             ChatIntent::Stop => {
                 if facts.authority.control != session::TurnControl::Harness
@@ -213,12 +266,19 @@ impl ChatAdapter {
                 })
             }
         };
-        let (command, echo) = match effect {
+        let (command, echo, correlation) = match effect {
             Effect::Submit(submission) => (
                 HarnessCommand::SendUserMessage(submission.prompt),
                 Some(submission.echo),
+                None,
             ),
-            Effect::Send { command, .. } => (command, None),
+            Effect::Dispatch {
+                command,
+                echo,
+                correlation,
+                ..
+            } => (command, echo, Some(correlation)),
+            Effect::Send { command, .. } => (command, None, None),
             Effect::Rejected(error) => return Err(Receipt::rejected(error)),
             // Native C7 never executes the legacy task-handle stop path.
             _ => return Err(Receipt::rejected("No native command was prepared")),
@@ -230,6 +290,8 @@ impl ChatAdapter {
                 runtime: runtime.clone(),
                 request_id,
                 message_id,
+                withdraw_id,
+                correlation,
                 receipt: Receipt {
                     id,
                     state: ReceiptState::Prepared,
@@ -265,7 +327,18 @@ impl ChatAdapter {
                 && a.request_id
                     .as_ref()
                     .is_none_or(|id| self.current_request(id).is_some())
-        }) && self.state.accepts_runtime(&runtime, current);
+        }) && !self.exited
+            && self.state.accepts_runtime(&runtime, current)
+            && match &command {
+                HarnessCommand::SendUserMessage(_) => self.state.pending_requests.is_empty(),
+                HarnessCommand::WithdrawQueuedMessage(id) => {
+                    self.state.queued_prompts.get(id).is_some_and(|p| {
+                        matches!(p.status, PromptStatus::Pending | PromptStatus::Queued)
+                            && p.withdraw_pending
+                    })
+                }
+                _ => true,
+            };
         if !valid {
             let receipt = self
                 .attempts
@@ -282,6 +355,9 @@ impl ChatAdapter {
                     id,
                     state: ReceiptState::Rejected("Chat runtime changed before execution".into()),
                 });
+            if let ReceiptState::Rejected(error) = &receipt.state {
+                self.settle_core(id, current, CoreOutcome::Rejected(error.clone()));
+            }
             return (receipt, Update::default());
         }
         let state = match send(command) {
@@ -293,11 +369,21 @@ impl ChatAdapter {
             .get_mut(&id)
             .expect("validated attempt")
             .receipt = receipt.clone();
+        if let ReceiptState::Rejected(error) = &receipt.state {
+            self.settle_core(id, current, CoreOutcome::Rejected(error.clone()));
+        }
         let mut update = Update::default();
         if receipt.state == ReceiptState::ChannelAccepted
             && let Some(echo) = echo
         {
-            self.state.reduce(Intent::SubmissionAccepted);
+            // Queue must leave the active streaming turn intact.
+            if self
+                .attempts
+                .get(&id)
+                .is_some_and(|a| a.correlation.is_none())
+            {
+                self.state.reduce(Intent::SubmissionAccepted);
+            }
             if !echo
                 .prompt_id()
                 .is_some_and(|id| self.state.shows_prompt(id))
@@ -314,10 +400,24 @@ impl ChatAdapter {
         current: &session::Target,
         outcome: DeliveryOutcome,
     ) -> Option<Receipt> {
+        let core_outcome = match &outcome {
+            DeliveryOutcome::Written => CoreOutcome::Written,
+            DeliveryOutcome::Rejected(error) => CoreOutcome::Rejected(error.clone()),
+            DeliveryOutcome::Uncertain(error) => CoreOutcome::Uncertain(error.clone()),
+        };
         let attempt = self.attempts.get_mut(&id)?;
-        if !self.state.accepts_stream(&attempt.runtime, current)
-            || !matches!(attempt.receipt.state, ReceiptState::ChannelAccepted)
-        {
+        if !self.state.accepts_stream(&attempt.runtime, current) {
+            return None;
+        }
+        if !matches!(attempt.receipt.state, ReceiptState::ChannelAccepted) {
+            if matches!(
+                attempt.receipt.state,
+                ReceiptState::Resolved | ReceiptState::Rejected(_)
+            ) {
+                // Lifecycle may beat the I/O receipt. Settle transport bookkeeping
+                // without reopening the already authoritative display result.
+                self.settle_core(id, current, core_outcome);
+            }
             return None;
         }
         attempt.receipt.state = match outcome {
@@ -325,7 +425,25 @@ impl ChatAdapter {
             DeliveryOutcome::Rejected(error) => ReceiptState::Rejected(error),
             DeliveryOutcome::Uncertain(error) => ReceiptState::Uncertain(error),
         };
-        Some(attempt.receipt.clone())
+        let receipt = attempt.receipt.clone();
+        self.settle_core(id, current, core_outcome);
+        Some(receipt)
+    }
+
+    fn settle_core(&mut self, id: AttemptId, current: &session::Target, outcome: CoreOutcome) {
+        if let Some(attempt) = self.attempts.get_mut(&id)
+            && self.state.accepts_stream(&attempt.runtime, current)
+            && let Some(correlation) = attempt.correlation.take()
+        {
+            // This settles an already admitted operation, never dispatches a
+            // new command. A task rebind must not strand its old bookkeeping.
+            self.state.reduce(Intent::CommandOutcome {
+                runtime: attempt.runtime.clone(),
+                current: attempt.runtime.target.clone(),
+                correlation,
+                outcome,
+            });
+        }
     }
 
     /// Gate the *entire* ingress before every observer, reducer effect and row.
@@ -373,24 +491,70 @@ impl ChatAdapter {
                 id,
                 state: MessageState::Completed | MessageState::Cancelled,
             }) => {
-                for attempt in self
-                    .attempts
-                    .values_mut()
-                    .filter(|a| a.message_id.as_ref() == Some(id))
-                {
+                for attempt in self.attempts.values_mut().filter(|a| {
+                    a.message_id.as_ref() == Some(id) || a.withdraw_id.as_ref() == Some(id)
+                }) {
                     attempt.receipt.state = ReceiptState::Resolved;
                     receipts.push(attempt.receipt.clone());
                 }
             }
+            AgentEvent::Harness(HarnessEvent::MessageLifecycle {
+                id,
+                state: MessageState::Started,
+            }) => {
+                for attempt in self
+                    .attempts
+                    .values_mut()
+                    .filter(|a| a.withdraw_id.as_ref() == Some(id))
+                {
+                    if !matches!(
+                        attempt.receipt.state,
+                        ReceiptState::Resolved | ReceiptState::Rejected(_)
+                    ) {
+                        attempt.receipt.state = ReceiptState::Rejected(format!(
+                            "Not withdrawn ({id}): the message has already started"
+                        ));
+                        receipts.push(attempt.receipt.clone());
+                    }
+                }
+            }
+            AgentEvent::Harness(HarnessEvent::MessageWithdrawRefused { id, reason }) => {
+                for attempt in self
+                    .attempts
+                    .values_mut()
+                    .filter(|a| a.withdraw_id.as_ref() == Some(id))
+                {
+                    if !matches!(
+                        attempt.receipt.state,
+                        ReceiptState::Resolved | ReceiptState::Rejected(_)
+                    ) {
+                        attempt.receipt.state =
+                            ReceiptState::Rejected(format!("Not withdrawn ({id}): {reason}"));
+                        receipts.push(attempt.receipt.clone());
+                    }
+                }
+            }
             AgentEvent::Harness(HarnessEvent::ProcessExited { .. }) => {
+                self.exited = true;
                 for attempt in self.attempts.values_mut() {
                     if matches!(
                         attempt.receipt.state,
                         ReceiptState::ChannelAccepted | ReceiptState::Written
                     ) {
-                        attempt.receipt.state = ReceiptState::Uncertain(
-                            "Process exited before an authoritative outcome".into(),
-                        );
+                        attempt.receipt.state = if attempt.message_id.as_ref().is_some_and(|id| {
+                            self.state
+                                .queued_prompts
+                                .get(id)
+                                .is_some_and(|p| p.status == PromptStatus::Unsent)
+                        }) {
+                            ReceiptState::Rejected(
+                                "Queued prompt was not sent before process exit".into(),
+                            )
+                        } else {
+                            ReceiptState::Uncertain(
+                                "Process exited before an authoritative outcome".into(),
+                            )
+                        };
                         receipts.push(attempt.receipt.clone());
                     }
                 }

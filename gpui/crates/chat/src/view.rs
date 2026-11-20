@@ -15,17 +15,20 @@ use crate::{
     model::*,
 };
 use gpui::{
-    App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, Entity, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, StyleRefinement, Styled,
-    Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions,
-    base::TextSelection, div, prelude::FluentBuilder, px, rgb, size,
+    App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, Entity, EntityInputHandler,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding, ParentElement, Render,
+    StyleRefinement, Styled, Subscription, Task, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, actions, base::TextSelection, div, prelude::FluentBuilder, px, rgb, size,
 };
 use gpui_component::{
     Disableable, Root, Sizable, WindowExt,
     button::Button,
     collapsible::Collapsible,
     diff::{Diff, DiffFile, DiffState},
-    input::{Enter as InputEnter, Input, InputEvent, InputState, Textarea, TextareaState},
+    input::{
+        Enter as InputEnter, Escape as InputEscape, IndentInline, Input, InputEvent, InputState,
+        MoveDown, MoveUp, TextareaState,
+    },
     menu::{ContextMenuExt, PopupMenuItem},
     message_scroller::{MessageScroller, MessageScrollerState},
     text::{RangeHighlight, SelectionFormat, TextView, TextViewMotion, TextViewState},
@@ -123,6 +126,9 @@ pub struct ChatView {
     records: Arc<Vec<Record>>,
     preview: bool,
     composer: Entity<TextareaState>,
+    composer_state: crate::composer::ComposerState,
+    /// Raw fixture ingress only; live projection is always supplied by the owner.
+    fixture_composer: gitterm_core::chat::state::State,
     callback: Option<IntentCallback>,
     images: Vec<gitterm_core::chat::types::ImageAttachment>,
     submission: Option<Receipt>,
@@ -172,6 +178,10 @@ impl ChatView {
         });
         subscriptions.push(
             cx.subscribe_in(&composer, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.composer_state.slash_index = 0;
+                    this.composer_state.slash_dismissed = false;
+                }
                 if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
                     this.send(window, cx);
                 }
@@ -189,10 +199,28 @@ impl ChatView {
         }));
         let focus = cx.focus_handle();
         focus.focus(window, cx);
+        let mut fixture_composer = gitterm_core::chat::state::State::default();
+        for record in &records {
+            if let Entry::Harness(event) = &record.entry {
+                fixture_composer.reduce(gitterm_core::chat::state::Intent::Event(
+                    gitterm_core::chat::state::AgentEvent::Harness(event.clone()),
+                ));
+                if matches!(event, HarnessEvent::Ready { .. }) {
+                    fixture_composer.conversation =
+                        vec![gitterm_core::chat::state::AgentEvent::Harness(
+                            event.clone(),
+                        )];
+                }
+            }
+        }
+        let mut composer_state = crate::composer::ComposerState::default();
+        composer_state.project(&fixture_composer, None);
         Self {
             records: Arc::new(records),
             preview: false,
             composer,
+            composer_state,
+            fixture_composer,
             callback: None,
             images: vec![],
             submission: None,
@@ -265,8 +293,75 @@ impl ChatView {
             )
         })
     }
-    fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only_reason.is_some() || self.submission_blocked() {
+    fn send_blocked(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.read_only_reason.is_some()
+            || self.callback.is_none()
+            || self.submission_blocked()
+            || self.composer_state.pending_request
+            || self.composer.update(cx, |input, cx| {
+                input.marked_text_range(window, cx).is_some()
+            })
+            || (self.composer.read(cx).value().trim().is_empty() && self.images.is_empty())
+    }
+    pub(crate) fn withdraw(&mut self, message_id: String, cx: &mut Context<Self>) {
+        if self.read_only_reason.is_none()
+            && let Some(callback) = &self.callback
+        {
+            self.control_receipt = Some(callback(ChatIntent::Withdraw { message_id }, cx));
+            cx.notify();
+        }
+    }
+    pub(crate) fn select_slash(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only_reason.is_some()
+            || self.composer.update(cx, |input, cx| {
+                input.marked_text_range(window, cx).is_some()
+            })
+        {
+            return;
+        }
+        self.composer.update(cx, |input, cx| {
+            input.set_value(format!("/{name} "), window, cx);
+            input.focus_handle(cx).focus(window, cx);
+        });
+        cx.notify();
+    }
+    fn slash_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.read_only_reason.is_some()
+            || !self.composer.read(cx).focus_handle(cx).is_focused(window)
+            || self.composer.update(cx, |input, cx| {
+                input.marked_text_range(window, cx).is_some()
+            })
+        {
+            return false;
+        }
+        let draft = self.composer.read(cx).value();
+        let matches = self.composer_state.slash_matches(&draft);
+        if matches.is_empty() {
+            return false;
+        }
+        let count = matches.len();
+        let index = self.composer_state.slash_index % count;
+        match key {
+            "down" => self.composer_state.slash_index = (index + 1) % count,
+            "up" => self.composer_state.slash_index = (index + count - 1) % count,
+            "escape" => self.composer_state.slash_dismissed = true,
+            "tab" | "enter" => {
+                let name = matches[index].name.clone();
+                let arguments = !matches[index].argument_hint.is_empty();
+                self.select_slash(&name, window, cx);
+                if key == "enter" && !arguments {
+                    self.send(window, cx);
+                }
+            }
+            _ => return false,
+        }
+        window.prevent_default();
+        cx.stop_propagation();
+        cx.notify();
+        true
+    }
+    pub(crate) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.send_blocked(window, cx) {
             return;
         }
         let text = self.composer.read(cx).value().to_string();
@@ -355,6 +450,7 @@ impl ChatView {
             .is_some_and(|previous| !state.accepts_stream(previous, &source.target))
         {
             self.cards.clear();
+            self.composer_state.notice = None;
             self.row_views.fill(None);
             if let Some(receipt) = &mut self.submission
                 && matches!(
@@ -368,6 +464,7 @@ impl ChatView {
             }
         }
         self.projection_runtime = Some(source.clone());
+        self.composer_state.project(state, update.event.as_ref());
         match update.presentation {
             Some(Presentation::Replay) => {
                 self.model = ChatModel::from_conversation(&state.conversation);
@@ -412,7 +509,7 @@ impl ChatView {
         );
         cx.notify();
     }
-    fn stop(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn stop(&mut self, cx: &mut Context<Self>) {
         if self.read_only_reason.is_none()
             && self.turn_running
             && let Some(callback) = &self.callback
@@ -561,6 +658,8 @@ impl ChatView {
         self.recent_rows.clear();
         self.folded.clear();
         self.turn_running = false;
+        self.fixture_composer = gitterm_core::chat::state::State::default();
+        self.composer_state = crate::composer::ComposerState::default();
         self.new_messages = false;
         self.replay_position = 0;
         self.scroller.update(cx, |state, cx| state.reset(0, cx));
@@ -598,6 +697,25 @@ impl ChatView {
     /// Append a timestamped transcript/fixture entry using the same live path.
     pub fn append_record(&mut self, record: &Record, cx: &mut Context<Self>) {
         self.turn_running = running_after(&record.entry, self.turn_running);
+        if let Entry::Harness(event) = &record.entry {
+            let event = gitterm_core::chat::state::AgentEvent::Harness(event.clone());
+            let effects = self
+                .fixture_composer
+                .reduce(gitterm_core::chat::state::Intent::Event(event.clone()));
+            if matches!(
+                event,
+                gitterm_core::chat::state::AgentEvent::Harness(HarnessEvent::Ready { .. })
+            ) {
+                self.fixture_composer.conversation = vec![event];
+            }
+            self.composer_state.project(
+                &self.fixture_composer,
+                match &effects {
+                    gitterm_core::chat::state::Effect::Event(effects) => Some(effects),
+                    _ => None,
+                },
+            );
+        }
         let following = self.scroller.read(cx).is_following_tail();
         let count = self.model.rows.len();
         let changed = self.model.apply(record);
@@ -651,13 +769,29 @@ impl Focusable for ChatView {
     }
 }
 impl Render for ChatView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let send_blocked = self.send_blocked(window, cx);
         let owner = cx.entity().downgrade();
         let copy_owner = owner.clone();
         div()
             .id("native-chat")
             .key_context("NativeChat")
             .track_focus(&self.focus)
+            .capture_action(cx.listener(|this, action: &InputEnter, window, cx| {
+                if action.shift || action.secondary || !this.slash_key("enter", window, cx) { cx.propagate(); }
+            }))
+            .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
+                if !this.slash_key("down", window, cx) { cx.propagate(); }
+            }))
+            .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
+                if !this.slash_key("up", window, cx) { cx.propagate(); }
+            }))
+            .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                if !this.slash_key("tab", window, cx) { cx.propagate(); }
+            }))
+            .capture_action(cx.listener(|this, _: &InputEscape, window, cx| {
+                if !this.slash_key("escape", window, cx) { cx.propagate(); }
+            }))
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
@@ -787,44 +921,12 @@ impl Render for ChatView {
                     )
                 },
             )
-            .child(
-                Textarea::new(&self.composer)
-                    .disabled(self.read_only_reason.is_some() || self.callback.is_none()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(px(8.))
-                    .child(
-                        Button::new("send")
-                            .label("Send")
-                            .disabled(
-                                self.read_only_reason.is_some()
-                                    || self.callback.is_none()
-                                    || self.submission_blocked()
-                                    || (self.composer.read(cx).value().trim().is_empty()
-                                        && self.images.is_empty()),
-                            )
-                            .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
-                    )
-                    .when(self.turn_running, |view| {
-                        view.child(
-                            Button::new("stop")
-                                .label("Stop")
-                                .disabled(
-                                    self.read_only_reason.is_some() || self.callback.is_none(),
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
-                        )
-                    })
-                    .child(self.read_only_reason.clone().unwrap_or_else(|| {
-                        if self.callback.is_none() {
-                            "No session adapter attached".into()
-                        } else {
-                            "Enter sends · Shift+Enter adds a newline".into()
-                        }
-                    })),
-            )
+            .child(self.composer_state.render(
+                &self.composer,
+                self.read_only_reason.clone().or_else(|| self.callback.is_none().then(|| "No session adapter attached".into())),
+                send_blocked,
+                cx,
+            ))
             .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(
                 if self.replay.is_some() {
                     format!(

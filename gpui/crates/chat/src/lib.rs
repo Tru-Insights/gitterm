@@ -1,5 +1,6 @@
 //! Native reducer adapter, row projection and fixture UI. No process or configuration I/O.
 pub mod adapter;
+pub mod composer;
 pub mod events;
 pub mod intents;
 pub mod model;

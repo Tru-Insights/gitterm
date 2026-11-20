@@ -656,7 +656,11 @@ fn completed_before_written_reconciles_submitted_draft_and_preserves_new_edits(
                         task_live: false,
                         last_tab: false,
                     },
-                    backend: AgentBackend::Claude,
+                    config: gitterm_core::chat::types::AgentBackendConfig::Claude {
+                        model: String::new(),
+                        permission_mode: Some("default".into()),
+                        effort: None,
+                    },
                     process_running: true,
                     just_spawned: false,
                     message_id: "synthetic-message".into(),
@@ -806,4 +810,168 @@ fn replay_without_revision_change_retains_uncertain_card_by_request(cx: &mut Tes
             "uncertain card must remain locked after prepend"
         );
     });
+}
+
+#[gpui::test]
+fn pending_request_and_ime_block_enter_and_button_and_shift_tab_never_changes_mode(
+    cx: &mut TestAppContext,
+) {
+    use std::{cell::RefCell, rc::Rc};
+    let intents = Rc::new(RefCell::new(Vec::new()));
+    let captured = intents.clone();
+    let (chat, cx) = setup(vec![], cx);
+    chat.update_in(cx, |view, window, cx| {
+        view.set_intent_callback(
+            Rc::new(move |intent, _| {
+                captured.borrow_mut().push(intent);
+                Receipt::rejected("synthetic")
+            }),
+            cx,
+        );
+        view.set_read_only(None, cx);
+        view.composer.update(cx, |input, cx| {
+            input.set_value("retained draft", window, cx);
+            input.focus(window, cx);
+        });
+        view.append_event(
+            HarnessEvent::RuntimeRequest {
+                request_id: "gate".into(),
+                tool_use_id: "tool".into(),
+                kind: crate::events::RuntimeRequestKind::Permission {
+                    tool_name: "Write".into(),
+                    input: serde_json::json!({}),
+                    suggestions: vec![],
+                    decision_reason: None,
+                },
+            },
+            cx,
+        );
+    });
+    draw(cx);
+    cx.simulate_keystrokes("enter");
+    draw(cx);
+    let button = cx.debug_bounds("composer-send").unwrap();
+    cx.simulate_click(button.center(), gpui::Modifiers::none());
+    draw(cx);
+    assert!(intents.borrow().is_empty());
+    chat.update_in(cx, |view, window, cx| {
+        assert_eq!(view.composer.read(cx).value().as_str(), "retained draft");
+        view.append_event(
+            HarnessEvent::RuntimeRequestResolved {
+                request_id: "gate".into(),
+            },
+            cx,
+        );
+        view.composer.update(cx, |input, cx| {
+            input.focus(window, cx);
+            input.replace_and_mark_text_in_range(None, "漢", Some(1..1), window, cx);
+        });
+        assert!(view.send_blocked(window, cx));
+        // The same method is the button handler, even before the next draw.
+        view.send(window, cx);
+    });
+    draw(cx);
+    cx.simulate_keystrokes("enter shift-tab");
+    draw(cx);
+    assert!(intents.borrow().is_empty());
+    chat.update_in(cx, |view, window, cx| {
+        view.composer.update(cx, |input, cx| {
+            input.unmark_text(window, cx);
+            input.focus(window, cx);
+            input.set_value("/checkpoint arg", window, cx);
+        });
+    });
+    cx.simulate_keystrokes("shift-tab");
+    draw(cx);
+    assert!(intents.borrow().is_empty());
+    chat.update_in(cx, |view, window, cx| view.send(window, cx));
+    assert!(
+        matches!(&intents.borrow()[0], ChatIntent::Send {text, ..} if text == "/checkpoint arg")
+    );
+}
+
+#[gpui::test]
+fn slash_completion_only_edits_draft_and_retains_arguments_until_send(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    chat.update_in(cx, |view, window, cx| {
+        view.set_read_only(None, cx);
+        view.select_slash("checkpoint", window, cx);
+        assert_eq!(view.composer.read(cx).value().as_str(), "/checkpoint ");
+        view.composer.update(cx, |input, cx| {
+            input.replace_and_mark_text_in_range(None, "漢", Some(1..1), window, cx);
+        });
+        let draft = view.composer.read(cx).value();
+        view.select_slash("other", window, cx);
+        assert_eq!(view.composer.read(cx).value(), draft);
+    });
+}
+
+#[gpui::test]
+fn slash_keyboard_completion_runs_no_arg_commands_and_fills_argument_commands(
+    cx: &mut TestAppContext,
+) {
+    use std::{cell::RefCell, rc::Rc};
+    let intents = Rc::new(RefCell::new(Vec::new()));
+    let captured = intents.clone();
+    let (chat, cx) = setup(
+        vec![Record {
+            at_ms: None,
+            entry: Entry::Harness(HarnessEvent::Ready {
+                session_id: None,
+                permission_mode: Some("default".into()),
+                models: vec![],
+                modes: vec![],
+                commands: vec![
+                    serde_json::json!({"name":"clear","description":"Clear"}),
+                    serde_json::json!({"name":"checkpoint","argumentHint":"[message]"}),
+                ],
+            }),
+        }],
+        cx,
+    );
+    chat.update_in(cx, |view, window, cx| {
+        view.set_intent_callback(
+            Rc::new(move |intent, _| {
+                captured.borrow_mut().push(intent);
+                Receipt::rejected("synthetic")
+            }),
+            cx,
+        );
+        view.set_read_only(None, cx);
+        view.composer.update(cx, |input, cx| {
+            input.set_value("/", window, cx);
+            input.focus(window, cx);
+        });
+    });
+    draw(cx);
+    cx.simulate_keystrokes("down enter");
+    draw(cx);
+    assert!(intents.borrow().is_empty());
+    assert_eq!(
+        chat.read_with(cx, |view, cx| view.composer.read(cx).value().to_string()),
+        "/checkpoint "
+    );
+    chat.update_in(cx, |view, window, cx| {
+        view.composer
+            .update(cx, |input, cx| input.set_value("/cl", window, cx))
+    });
+    draw(cx);
+    cx.simulate_keystrokes("tab");
+    draw(cx);
+    assert_eq!(
+        chat.read_with(cx, |view, cx| view.composer.read(cx).value().to_string()),
+        "/clear "
+    );
+    assert!(intents.borrow().is_empty());
+    cx.simulate_keystrokes("enter");
+    draw(cx);
+    assert!(matches!(&intents.borrow()[0], ChatIntent::Send { text, .. } if text == "/clear "));
+    chat.update_in(cx, |view, window, cx| {
+        view.composer
+            .update(cx, |input, cx| input.set_value("/cl", window, cx))
+    });
+    draw(cx);
+    cx.simulate_keystrokes("escape enter");
+    draw(cx);
+    assert!(matches!(&intents.borrow()[1], ChatIntent::Send { text, .. } if text == "/cl"));
 }
