@@ -12,7 +12,9 @@ fn dispatch(action: impl Action, cx: &mut VisualTestContext) {
     cx.update(|window, cx| window.dispatch_action(Box::new(action), cx));
     draw(cx);
 }
-fn sample(cx: &mut TestAppContext) -> (tempfile::TempDir, Entity<Shell>, &mut VisualTestContext) {
+pub(super) fn sample(
+    cx: &mut TestAppContext,
+) -> (tempfile::TempDir, Entity<Shell>, &mut VisualTestContext) {
     cx.background_executor.allow_parking();
     cx.update(|cx| {
         gpui_component::init(cx);
@@ -106,7 +108,7 @@ fn registered_actions_are_reachable_and_missing_actions_are_unavailable(cx: &mut
                         .any(|registered| registered.name() == action.name())
             );
         }
-        assert!(!window.is_action_available(
+        assert!(window.is_action_available(
             &SetChatWidth {
                 width: gitterm_core::settings::ChatWidth::ALL[0]
             },

@@ -214,6 +214,14 @@ pub(crate) struct ChatPane {
 impl EventEmitter<SavedChat> for ChatPane {}
 impl EventEmitter<gitterm_gpui_chat::model::roster::RosterOutcome> for ChatPane {}
 impl ChatPane {
+    pub(crate) fn set_width(
+        &mut self,
+        width: gitterm_core::settings::ChatWidth,
+        cx: &mut Context<Self>,
+    ) {
+        self.view.update(cx, |view, cx| view.set_width(width, cx));
+        cx.notify();
+    }
     pub fn new(
         shutdown: Arc<RuntimeShutdown>,
         preview: Arc<gitterm_core::preview::Preview>,
@@ -232,6 +240,7 @@ impl ChatPane {
         let view = cx.new(|cx| {
             let mut view = ChatView::new(vec![], window, cx);
             view.set_appearance(crate::theme::chat_appearance(cx), cx);
+            view.set_width(crate::theme::chat_width(cx), cx);
             view.set_preview(cx);
             view.set_read_only(Some("Preview activation unavailable".into()), cx);
             view
@@ -298,6 +307,7 @@ impl ChatPane {
         let view = cx.new(|cx| {
             let mut view = ChatView::new(saved.records.clone(), window, cx);
             view.set_appearance(crate::theme::chat_appearance(cx), cx);
+            view.set_width(crate::theme::chat_width(cx), cx);
             view.set_preview(cx);
             view.set_read_only(
                 Some("Preview history · read only · resume not in preview yet".into()),
@@ -554,6 +564,7 @@ impl Render for ChatPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.view.update(cx, |view, cx| {
             view.set_appearance(crate::theme::chat_appearance(cx), cx);
+            view.set_width(crate::theme::chat_width(cx), cx);
         });
         for update in std::mem::take(&mut self.pending) {
             self.view.update(cx, |view, cx| {

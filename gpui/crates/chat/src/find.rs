@@ -395,8 +395,10 @@ mod tests {
             });
         });
         draw(cx);
+        // Width preferences center the chat; scroll inside its retained column.
+        let center_x = cx.debug_bounds("native-chat").unwrap().center().x;
         cx.simulate_event(gpui::ScrollEvent {
-            position: gpui::point(px(300.), px(300.)),
+            position: gpui::point(center_x, px(300.)),
             delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-37.))),
             ..Default::default()
         });

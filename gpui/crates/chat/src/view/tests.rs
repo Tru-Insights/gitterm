@@ -1574,3 +1574,26 @@ fn sent_image_payloads_render_real_transcript_thumbnails(cx: &mut TestAppContext
         assert!(row.sent_images.iter().all(Result::is_ok));
     });
 }
+
+#[gpui::test]
+fn host_width_changes_native_column_and_footer_together(cx: &mut TestAppContext) {
+    use gitterm_core::settings::ChatWidth;
+    let (chat, cx) = setup(vec![], cx);
+    cx.simulate_resize(size(px(1600.), px(900.)));
+    for (width, expected) in [
+        (ChatWidth::Narrow, 764.),
+        (ChatWidth::Medium, 988.),
+        (ChatWidth::Wide, 1180.),
+        (ChatWidth::Full, 1600.),
+    ] {
+        chat.update(cx, |view, cx| view.set_width(width, cx));
+        draw(cx);
+        let bounds = cx.debug_bounds("native-chat").unwrap();
+        assert_eq!(bounds.size.width, px(expected));
+        assert_eq!(bounds.origin.x, px((1600. - expected) / 2.));
+        assert_eq!(
+            cx.debug_bounds("chat-footer").unwrap().size.width,
+            px(expected - 20.)
+        );
+    }
+}

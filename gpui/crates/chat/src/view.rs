@@ -51,7 +51,14 @@ actions!(
         PreviousMatch,
         CloseFind,
         CopyPlain,
-        CopyMarkdown
+        CopyMarkdown,
+        SubmitPrompt,
+        Newline,
+        SlashNext,
+        SlashPrevious,
+        FillSlash,
+        SubmitSlash,
+        CloseSlash
     ]
 );
 
@@ -120,6 +127,7 @@ pub fn init(cx: &mut App) {
 /// Rich-text state is initialized only for visited rows; it is not the event source of truth.
 pub struct ChatView {
     appearance: ChatAppearance,
+    width: gitterm_core::settings::ChatWidth,
     records: Arc<Vec<Record>>,
     preview: bool,
     composer: Entity<TextareaState>,
@@ -223,6 +231,7 @@ impl ChatView {
         composer_state.project(&fixture_composer, None);
         Self {
             appearance: ChatAppearance::default(),
+            width: Default::default(),
             records: Arc::new(records),
             preview: false,
             composer,
@@ -261,6 +270,28 @@ impl ChatView {
             _subscriptions: subscriptions,
         }
     }
+    /// Change the native column without discarding folds, drafts or selection.
+    pub fn set_width(&mut self, width: gitterm_core::settings::ChatWidth, cx: &mut Context<Self>) {
+        if self.width != width {
+            self.width = width;
+            self.scroller.update(cx, |state, cx| {
+                state.remeasure_items(0..self.model.rows.len(), cx)
+            });
+            cx.notify();
+        }
+    }
+
+    /// Iced's CSS rem is the document's 16px root size, independent of chat fonts.
+    fn column_width(&self) -> Option<f32> {
+        use gitterm_core::settings::ChatWidth;
+        match self.width {
+            ChatWidth::Narrow => Some(46. * 16. + 28.),
+            ChatWidth::Medium => Some(60. * 16. + 28.),
+            ChatWidth::Wide => Some(72. * 16. + 28.),
+            ChatWidth::Full => None,
+        }
+    }
+
     /// Apply host settings to retained rows without discarding folds, drafts or selection.
     pub fn set_appearance(&mut self, appearance: ChatAppearance, cx: &mut Context<Self>) {
         let appearance = appearance.normalized();
@@ -938,11 +969,51 @@ impl Render for ChatView {
         let send_blocked = self.send_blocked(window, cx);
         let owner = cx.entity().downgrade();
         let copy_owner = owner.clone();
-        div()
+        let composer_focused = self.composer.read(cx).focus_handle(cx).is_focused(window);
+        let mut context = String::from("NativeChat");
+        if composer_focused && self.read_only_reason.is_none() {
+            context.push_str(" IcedComposer");
+            let draft = self.composer.read(cx).value();
+            if self.composer.read(cx).selected_range().start == draft.len()
+                && !self.composer_state.slash_matches(&draft).is_empty()
+            {
+                context.push_str(" IcedSlash");
+            }
+        }
+        let column = div()
             .id("native-chat")
             .debug_selector(|| "native-chat".into())
-            .key_context("NativeChat")
+            .key_context(context.as_str())
             .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &SubmitPrompt, window, cx| this.send(window, cx)))
+            .on_action(cx.listener(|this, _: &Newline, window, cx| {
+                if this.read_only_reason.is_none()
+                    && this.composer.read(cx).focus_handle(cx).is_focused(window)
+                {
+                    window.dispatch_action(
+                        Box::new(InputEnter {
+                            shift: true,
+                            secondary: false,
+                        }),
+                        cx,
+                    );
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SlashNext, w, cx| {
+                this.slash_key("down", w, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SlashPrevious, w, cx| {
+                this.slash_key("up", w, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FillSlash, w, cx| {
+                this.slash_key("tab", w, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SubmitSlash, w, cx| {
+                this.slash_key("enter", w, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseSlash, w, cx| {
+                this.slash_key("escape", w, cx);
+            }))
             .capture_action(cx.listener(|this, action: &InputEnter, window, cx| {
                 if action.shift || action.secondary || !this.slash_key("enter", window, cx) {
                     cx.propagate();
@@ -1001,6 +1072,9 @@ impl Render for ChatView {
                 cx.listener(|this, _: &CopyMarkdown, window, cx| this.copy(true, window, cx)),
             )
             .size_full()
+            .when_some(self.column_width(), |column, width| column.max_w(px(width)))
+            .min_w_0()
+            .min_h_0()
             .flex()
             .flex_col()
             .gap(px(8.))
@@ -1047,12 +1121,12 @@ impl Render for ChatView {
             .child(
                 div()
                     .id("chat-footer")
+                    .debug_selector(|| "chat-footer".into())
                     .flex_shrink_0()
                     .flex()
                     .flex_col()
                     .gap(px(6.))
                     .w_full()
-                    .max_w(px(988.))
                     .mx_auto()
                     .px(px(8.))
                     .pt(px(6.))
@@ -1104,7 +1178,13 @@ impl Render for ChatView {
                         self.appearance,
                         cx,
                     )),
-            )
+            );
+        div()
+            .size_full()
+            .flex()
+            .justify_center()
+            .bg(rgb(palette.base))
+            .child(column)
     }
 }
 
