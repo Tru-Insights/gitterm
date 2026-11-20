@@ -4094,6 +4094,9 @@
         confirmEffort(d.effort, d.applied);
         note('Effort · ' + effortLabel(d.effort) + (d.effort == null && d.applied ? ' (' + d.applied + ')' : ''));
         break;
+      case 'setting_rejected':
+        // The reducer settles this request; its accompanying error renders below.
+        break;
       case 'error':
         // A rejected or undeliverable mode, model or effort change
         // surfaces as an error.

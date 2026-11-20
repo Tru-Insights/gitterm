@@ -869,3 +869,81 @@ fn unreceipted_acceptance_is_not_a_write_or_ack_and_is_stale_after_rebind() {
     event(&mut state, HarnessEvent::ProcessExited { code: None });
     assert_eq!(state.queued_prompts["stale"].status, PromptStatus::Unsent);
 }
+
+#[test]
+fn provider_setting_rejections_after_written_only_clear_matching_kind_and_value() {
+    let cases = [
+        (
+            HarnessEvent::ModelChanged("default".into()),
+            SettingChange::Model("sonnet".into()),
+        ),
+        (
+            HarnessEvent::PermissionModeChanged("default".into()),
+            SettingChange::Mode("plan".into()),
+        ),
+        (
+            HarnessEvent::EffortChanged {
+                effort: None,
+                applied: Some("medium".into()),
+            },
+            SettingChange::Effort(Some("high".into())),
+        ),
+        (
+            HarnessEvent::EffortChanged {
+                effort: Some("high".into()),
+                applied: Some("high".into()),
+            },
+            SettingChange::Effort(None),
+        ),
+    ];
+    for (old, requested) in cases {
+        let mut state = State::default();
+        event(&mut state, old);
+        let before = state.acknowledged.clone();
+        let Effect::Dispatch { correlation, .. } = change(&mut state, requested.clone()) else {
+            panic!()
+        };
+        outcome(&mut state, correlation, DeliveryOutcome::Written);
+        assert!(!state.commands.contains_key(&correlation.0));
+        let mismatches = [
+            SettingChange::Model("plan".into()),
+            SettingChange::Mode("sonnet".into()),
+            SettingChange::Effort(Some("low".into())),
+        ];
+        for mismatch in mismatches {
+            let effects = event(
+                &mut state,
+                HarnessEvent::SettingRejected {
+                    requested: mismatch,
+                },
+            );
+            assert!(effects.settings_changed.is_none());
+            assert_eq!(state.pending_change(), Some(&requested));
+        }
+        event(&mut state, HarnessEvent::Error("unrelated error".into()));
+        assert_eq!(state.pending_change(), Some(&requested));
+        let effects = event(
+            &mut state,
+            HarnessEvent::SettingRejected {
+                requested: requested.clone(),
+            },
+        );
+        assert!(effects.settings_changed.is_none());
+        assert!(effects.notices.is_empty());
+        assert!(state.pending_change().is_none());
+        assert_eq!(state.acknowledged, before);
+        // Duplicate provider responses do not manufacture an acknowledgement.
+        assert!(event(
+            &mut state,
+            HarnessEvent::SettingRejected {
+                requested: requested.clone()
+            }
+        )
+        .settings_changed
+        .is_none());
+        assert!(matches!(
+            change(&mut state, requested),
+            Effect::Dispatch { .. }
+        ));
+    }
+}

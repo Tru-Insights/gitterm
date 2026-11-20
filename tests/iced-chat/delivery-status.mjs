@@ -59,3 +59,41 @@ vm.runInContext("pickerPending({setting:'effort',value:null})", context);
 assert.equal(context.chips.effort.pending.value, null);
 assert.match(source, /event.kind === 'prompt_unsent'.*__markPromptUnsent/);
 console.log('Iced queued/uncertain delivery presentation passed');
+
+// A typed rejection is silent; the existing Error renders exactly its data.
+const errors = [];
+context.append = block => errors.push(block);
+context.endSegment = () => {};
+vm.runInContext(fn('clearPendingMode', '  function requestMode'), context);
+vm.runInContext(fn('clearPendingChips', '  function requestModel'), context);
+vm.runInContext(fn('errorBlock', '  function harnessEvent'), context);
+vm.runInContext(fn('harnessEvent', '  // ---- legacy'), context);
+for (const [requested, message] of [
+  [{kind:'model',value:'sonnet'}, 'Claude rejected model "sonnet": denied'],
+  [{kind:'mode',value:'plan'}, 'Claude rejected permission mode "plan": denied'],
+  [{kind:'effort',value:'high'}, 'Claude did not change the effort to high: denied'],
+  [{kind:'effort',value:null}, 'Claude did not change the effort to auto: denied'],
+]) {
+  context.mode.current = 'default';
+  context.chips.model.current = 'default';
+  context.chips.effort.current = 'medium';
+  context.mode.pending = 'plan';
+  context.chips.model.pending = 'sonnet';
+  context.chips.effort.pending = {value: 'high'};
+  context.rejection = {type:'setting_rejected',data:{requested}};
+  context.error = {type:'error',data:message};
+  const count = errors.length;
+  vm.runInContext('harnessEvent(rejection)', context);
+  assert.equal(errors.length, count);
+  vm.runInContext('harnessEvent(error)', context);
+  assert.equal(errors.length, count + 1);
+  assert.equal(errors.at(-1).cls, 'error-block');
+  assert.equal(errors.at(-1).text, message);
+  assert.equal(context.mode.pending, null);
+  assert.equal(context.chips.model.pending, null);
+  assert.equal(context.chips.effort.pending, null);
+  assert.equal(context.mode.current, 'default');
+  assert.equal(context.chips.model.current, 'default');
+  assert.equal(context.chips.effort.current, 'medium');
+}
+console.log('Iced rejection error text and picker presentation passed');

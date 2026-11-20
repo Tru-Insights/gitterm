@@ -179,12 +179,7 @@ pub struct ConfirmedEffort {
     pub applied: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SettingChange {
-    Model(String),
-    Effort(Option<String>),
-    Mode(String),
-}
+pub use super::types::SettingChange;
 
 impl SettingChange {
     fn command(&self) -> HarnessCommand {
@@ -1055,7 +1050,8 @@ impl State {
                 HarnessEvent::MessageLifecycle { .. }
                 | HarnessEvent::ModelChanged(_)
                 | HarnessEvent::PermissionModeChanged(_)
-                | HarnessEvent::EffortChanged { .. },
+                | HarnessEvent::EffortChanged { .. }
+                | HarnessEvent::SettingRejected { .. },
             ) if self.runtime_exited => {}
             AgentEvent::Harness(event) => match event {
                 HarnessEvent::MessageLifecycle { id, state } => {
@@ -1101,6 +1097,18 @@ impl State {
                     effects
                         .notices
                         .push(format!("Not withdrawn ({id}): {reason}"));
+                }
+                // Written is only a transport receipt; provider rejection can
+                // arrive after that receipt has removed the command entry.
+                HarnessEvent::SettingRejected { requested }
+                    if self
+                        .pending_change
+                        .as_ref()
+                        .is_some_and(|(_, pending)| pending == requested) =>
+                {
+                    if let Some((correlation, _)) = self.pending_change.take() {
+                        self.commands.remove(&correlation.0);
+                    }
                 }
                 HarnessEvent::ModelChanged(value) => {
                     effects.settings_changed =

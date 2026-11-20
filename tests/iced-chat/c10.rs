@@ -566,3 +566,85 @@ fn c10_rejected_second_picker_and_generic_errors_reproject_pending_mode() {
         Some(&SettingChange::Mode("plan".into()))
     );
 }
+
+#[test]
+fn c10_provider_rejections_after_written_release_pickers_and_keep_error_payloads() {
+    use gitterm_core::harness::claude_parser::{ClaudeFrameParser, HostRequest, ParsedFrame};
+    for (requested, host_request, message) in [
+        (
+            SettingChange::Model("sonnet".into()),
+            HostRequest::SetModel("sonnet".into()),
+            "Claude rejected model \"sonnet\": denied",
+        ),
+        (
+            SettingChange::Mode("plan".into()),
+            HostRequest::SetPermissionMode("plan".into()),
+            "Claude rejected permission mode \"plan\": denied",
+        ),
+        (
+            SettingChange::Effort(Some("high".into())),
+            HostRequest::SetEffort(Some("high".into())),
+            "Claude did not change the effort to high: denied",
+        ),
+        (
+            SettingChange::Effort(None),
+            HostRequest::ConfirmEffort(None),
+            "Claude did not change the effort to auto: denied",
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = fixture(root.path(), claude());
+        let mut rx = port(&mut app);
+        let current = app.workspaces[0].tabs[0].session_target();
+        let runtime = session(&app).runtime_stamp(current.clone());
+        let config = session(&app).config.clone();
+        let before = serde_json::to_value(&config).unwrap();
+        let ChatEffect::Dispatch { correlation, .. } =
+            session_mut(&mut app).reduce(ChatIntent::ChangeSetting {
+                runtime: runtime.clone(),
+                current,
+                config,
+                process_running: true,
+                change: requested,
+            })
+        else {
+            panic!("expected dispatch")
+        };
+        apply(
+            &mut app,
+            Event::AgentCommandOutcome(runtime, correlation, DeliveryOutcome::Written),
+        );
+        let mut parser = ClaudeFrameParser::new();
+        parser.register_host_request("reject".into(), host_request);
+        app.workspaces_dirty = false;
+        for frame in parser.parse_line(r#"{"type":"control_response","response":{"subtype":"error","request_id":"reject","error":"denied"}}"#) {
+            if let ParsedFrame::Event(event) = frame { stream(&mut app, event); }
+        }
+        assert!(session(&app).pending_change().is_none());
+        assert_eq!(serde_json::to_value(&session(&app).config).unwrap(), before);
+        assert!(!app.workspaces_dirty);
+        let errors: Vec<_> = session(&app)
+            .conversation
+            .iter()
+            .filter_map(|event| {
+                if matches!(event, tab::AgentEvent::Harness(HarnessEvent::Error(_))) {
+                    event.webview_payload()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            errors,
+            vec![
+                tab::AgentEvent::Harness(HarnessEvent::Error(message.into()))
+                    .webview_payload()
+                    .unwrap()
+            ]
+        );
+        apply(&mut app, Event::AgentSetModel(10, "haiku".into()));
+        assert!(
+            matches!(rx.try_recv().unwrap(), HarnessCommand::SetModel(value) if value == "haiku")
+        );
+    }
+}
