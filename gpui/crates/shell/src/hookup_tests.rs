@@ -65,7 +65,7 @@ fn session_trigger_opens_picker_and_new_chat_is_native_not_terminal(cx: &mut Tes
     let (shell, cx) = cx.add_window_view(|window, cx| fixture.shell(window, cx));
     draw(cx);
     assert!(cx.debug_bounds("work-sidebar").is_some());
-    click(cx, "new-session");
+    click(cx, "pstrip-new-session");
     cx.read(|cx| assert!(shell.read(cx).session_picker.is_some()));
     assert!(cx.debug_bounds("session-picker").is_some());
     // The plain fixture directory fails the existing independent-clone gate,
@@ -85,7 +85,7 @@ fn session_trigger_opens_picker_and_new_chat_is_native_not_terminal(cx: &mut Tes
         assert!(state.store.terminals.as_ref().unwrap().is_empty());
         assert_eq!(shell.owner.read(cx).chats.len(), 1);
     });
-    click(cx, "new-session");
+    click(cx, "pstrip-new-session");
     click(cx, "session-picker-row-2");
     cx.read(|cx| {
         let state = shell.read(cx).active(cx);
@@ -130,7 +130,7 @@ fn header_and_shortcut_open_same_sheet_with_bottom_terminal_and_chat_facts(
         assert_eq!(sheet.kind, park_sheet::Kind::Close);
         assert!(sheet.lines()[0].contains("2 terminals"));
     });
-    click(cx, "close-workspace");
+    click(cx, "pstrip-close-workspace");
     cx.read(|cx| assert!(shell.read(cx).park_sheet.is_some()));
     cx.simulate_keystrokes("escape");
     draw(cx);
@@ -157,7 +157,7 @@ fn header_and_shortcut_open_same_sheet_with_bottom_terminal_and_chat_facts(
             park_sheet::Kind::Park
         )
     });
-    click(cx, "close-workspace");
+    click(cx, "pstrip-close-workspace");
     click(cx, "Park");
     cx.read(|cx| {
         let shell = shell.read(cx);
@@ -215,18 +215,16 @@ fn work_outcomes_select_existing_chat_and_other_controls_do_not_mutate(cx: &mut 
 }
 
 #[test]
-fn more_menu_has_no_duplicate_chat_or_workspace_park_close_entries() {
+fn shell_renders_the_iced_components() {
     let source = include_str!("lib.rs");
-    let menu = source
-        .split("let more = Button::new")
-        .nth(1)
-        .unwrap()
-        .split("let mut content =")
-        .next()
-        .unwrap();
-    for duplicate in ["New Claude chat", "Park workspace", "Close workspace"] {
-        assert!(!menu.contains(duplicate), "duplicate {duplicate}");
+    for renderer in [
+        "session_strip::render(",
+        "workspace_bar::render(",
+        "spine::render(",
+    ] {
+        assert!(source.contains(renderer), "missing {renderer}");
     }
+    assert!(!source.contains("TabBar::new(\"sessions\")"));
 }
 
 #[gpui::test]
@@ -238,7 +236,7 @@ fn changing_workspace_dismisses_picker_and_unavailable_outcomes_keep_the_iced_la
     let fixture = Fixture::new();
     let (shell, cx) = cx.add_window_view(|window, cx| fixture.shell(window, cx));
     draw(cx);
-    click(cx, "new-session");
+    click(cx, "pstrip-new-session");
     cx.update(|window, cx| {
         shell.update(cx, |shell, cx| {
             shell.select_workspace(1, window, cx);
