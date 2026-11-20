@@ -3843,10 +3843,25 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
     };
     let title_workspace = model
         .active()
-        .and_then(|active| model.workspaces.iter().find(|workspace| workspace.id == active))
+        .and_then(|active| {
+            model
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == active)
+        })
         .map(|workspace| workspace.status.repo_name.clone())
-        .unwrap_or_else(|| if sample { "Sample data".into() } else { "GitTerm".into() });
-    let window_title = window_title("GitTerm V6 Development", &title_workspace, SidebarMode::Work);
+        .unwrap_or_else(|| {
+            if sample {
+                "Sample data".into()
+            } else {
+                "GitTerm".into()
+            }
+        });
+    let window_title = window_title(
+        "GitTerm V6 Development",
+        &title_workspace,
+        SidebarMode::Work,
+    );
     gpui_kit::application().run(move |cx| {
         preview.release_on_quit(cx);
         gpui_kit::init(cx);
@@ -4986,7 +5001,11 @@ mod tests {
     #[test]
     fn window_title_matches_iced_workspace_and_sidebar_format() {
         assert_eq!(
-            window_title("GitTerm V6 Development", "GitTerm V6 Upgrade", SidebarMode::Work),
+            window_title(
+                "GitTerm V6 Development",
+                "GitTerm V6 Upgrade",
+                SidebarMode::Work
+            ),
             "GitTerm V6 Development - GitTerm V6 Upgrade - Work"
         );
         assert_eq!(

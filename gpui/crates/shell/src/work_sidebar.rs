@@ -663,7 +663,7 @@ impl WorkSidebar {
                     rows.last_mut().unwrap()
                 };
                 target.control(
-                    format!("{count} {}", if done_open { "▾" } else { "•" }),
+                    format!("{count} {}", marker(done_open)),
                     Action::Toggle(done_fold),
                 );
             }
@@ -981,9 +981,13 @@ impl WorkSidebar {
         );
         let mut header = Row::text("Repos");
         header.heading = true;
-        header
-            .badges
-            .push(groups.iter().filter(|group| group.dir != docs).count().to_string());
+        header.badges.push(
+            groups
+                .iter()
+                .filter(|group| group.dir != docs)
+                .count()
+                .to_string(),
+        );
         if ws.local {
             header.control("+ Add repo…", Action::Emit(WorkSidebarOutcome::AddRepo));
         }
@@ -1356,8 +1360,12 @@ impl WorkSidebar {
         }
     }
 
-    fn button(&self, id: String, control: Control, cx: &Context<Self>) -> impl IntoElement {
+    fn button(&self, id: String, control: Control, cx: &Context<Self>) -> Button {
         let p = crate::theme::Palette::current(cx);
+        let run = matches!(
+            control.action,
+            Action::Emit(WorkSidebarOutcome::RunRepoCommand { .. })
+        );
         let color = match control.action {
             Action::Emit(WorkSidebarOutcome::RunRepoCommand { .. }) => p.green,
             Action::Edit(_)
@@ -1375,13 +1383,15 @@ impl WorkSidebar {
             _ => &control.label,
         }
         .to_string();
-        Button::new(id)
+        Button::new(id.clone())
+            .debug_selector(move || id.clone())
             .ghost()
             .compact()
             .xsmall()
             .px_1()
             .flex_shrink_0()
             .text_size(px(10.))
+            .when(run, |button| button.font_family("Menlo"))
             .text_color(rgb(color))
             .tooltip(tooltip)
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -1430,8 +1440,8 @@ impl Render for WorkSidebar {
                     cx.notify();
                 }
             }));
-        for (index, row) in self.rows().into_iter().enumerate() {
-            let repo = matches!(row.fold, Some(Fold::Repo(_)));
+        for (index, mut row) in self.rows().into_iter().enumerate() {
+            let repo = matches!(row.action, Some(Action::Toggle(Fold::Repo(_))));
             let pr = row.pr_number.is_some();
             let compact = row.small || pr || repo;
             let mut label = div()
@@ -1501,7 +1511,26 @@ impl Render for WorkSidebar {
                         .child(format!("#{number}")),
                 );
             }
-            line = line.child(label);
+            if repo {
+                let action = row.action.take().unwrap();
+                line = line.child(
+                    Button::new(format!("work-name-{index}"))
+                        .debug_selector(|| format!("work-name-{index}"))
+                        .ghost()
+                        .compact()
+                        .h_auto()
+                        .px(px(2.))
+                        .py_0()
+                        .flex_shrink_0()
+                        .text_color(rgb(p.text))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.dispatch(action.clone(), window, cx);
+                        }))
+                        .child(label),
+                );
+            } else {
+                line = line.child(label);
+            }
             if let Some(run) = row.run {
                 line = line.child(self.button(format!("work-run-{index}"), run, cx));
             }
@@ -1511,13 +1540,18 @@ impl Render for WorkSidebar {
                 line = line.child(
                     div()
                         .id("work-run-command-input")
+                        .debug_selector(|| "work-run-command-input".into())
                         .w(px(160.))
                         .on_click(|_, _, cx| cx.stop_propagation())
                         .child(Input::new(input)),
                 );
             }
             if !row.heading && !pr && !row.small && !row.chat {
-                line = line.child(div().flex_1());
+                line = line.child(
+                    div()
+                        .debug_selector(|| format!("work-space-{index}"))
+                        .flex_1(),
+                );
             }
             for (badge_index, badge) in row.badges.into_iter().enumerate() {
                 let color = if matches!(
@@ -1580,19 +1614,24 @@ impl Render for WorkSidebar {
             if let Some(fold) = row.fold {
                 let label = if fold == Fold::Focus {
                     if row.expanded { "▴" } else { "▾" }
-                } else if (repo || pr) && !row.expanded {
-                    "•"
                 } else {
                     marker(row.expanded)
                 };
-                line = line.child(self.button(
-                    format!("work-fold-{index}"),
-                    Control {
-                        label: label.into(),
-                        action: Action::Toggle(fold),
-                    },
-                    cx,
-                ));
+                line = line.child(
+                    self.button(
+                        format!("work-fold-{index}"),
+                        Control {
+                            label: label.into(),
+                            action: Action::Toggle(fold),
+                        },
+                        cx,
+                    )
+                    .when(repo || pr, |button| {
+                        button
+                            .w(px(24.))
+                            .debug_selector(move || format!("work-fold-{index}-{label}"))
+                    }),
+                );
             }
             let mut block = div()
                 .w_full()
@@ -1615,8 +1654,9 @@ impl Render for WorkSidebar {
             if row.indent {
                 block = block.ml_2();
             }
-            for detail in row.details {
+            for (detail_index, detail) in row.details.into_iter().enumerate() {
                 let mut detail = div()
+                    .debug_selector(|| format!("work-facts-{index}-{detail_index}"))
                     .text_size(px(10.))
                     .text_color(rgb(p.muted))
                     .child(detail);

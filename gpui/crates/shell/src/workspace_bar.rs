@@ -50,8 +50,8 @@ impl SavedFacts {
         let watch = prs::WatchFile::load(&watch_path);
         let plans_dir = merge_plan::plans_dir(source);
         let plans = merge_plan::load_plans(&plans_dir);
-        let tasks = TaskStore::load(TaskStore::path_for_config_root(source))
-            .map_err(anyhow::Error::msg)?;
+        let tasks =
+            TaskStore::load(TaskStore::path_for_config_root(source)).map_err(anyhow::Error::msg)?;
         let briefs: HashMap<_, _> = watch
             .prs
             .iter()
@@ -118,16 +118,11 @@ impl SavedFacts {
                         continue;
                     }
                     for backend in ChatBackend::ALL {
-                        let path = chat_facts::facts_path(
-                            &chat_facts::facts_dir(source),
-                            backend,
-                            &chat,
-                        )
-                        .map_err(anyhow::Error::msg)?;
-                        if let Some(facts) =
-                            chat_facts::load_facts(&path).map_err(|error| {
-                                anyhow::anyhow!("read {}: {error}", path.display())
-                            })?
+                        let path =
+                            chat_facts::facts_path(&chat_facts::facts_dir(source), backend, &chat)
+                                .map_err(anyhow::Error::msg)?;
+                        if let Some(facts) = chat_facts::load_facts(&path)
+                            .map_err(|error| anyhow::anyhow!("read {}: {error}", path.display()))?
                         {
                             pending
                                 .extend(facts.children.into_iter().map(|child| child.session_id));
@@ -284,9 +279,7 @@ mod attention_count_tests {
                 serde_json::from_value(fixture["tasks"][0].clone()).unwrap();
             record.task_id = id.into();
             record.attention.reason = reason.map(|reason| match reason {
-                "completed_unread" => {
-                    gitterm_core::tasks::TaskAttentionReason::CompletedUnread
-                }
+                "completed_unread" => gitterm_core::tasks::TaskAttentionReason::CompletedUnread,
                 "interrupted" => gitterm_core::tasks::TaskAttentionReason::Interrupted,
                 "requires_input" => gitterm_core::tasks::TaskAttentionReason::RequiresInput,
                 "ready_for_review" => gitterm_core::tasks::TaskAttentionReason::ReadyForReview,
@@ -296,52 +289,51 @@ mod attention_count_tests {
             record.attention.unread = unread;
             record
         };
-        let worker = |id: &str,
-                      uid: &str,
-                      status: DelegationStatus,
-                      dismissed_at: Option<&str>| Delegation {
-            delegation_id: id.into(),
-            kind: DelegationKind::Implement,
-            parent: DelegationParent {
-                session_uid: uid.into(),
-                chat_session_id: None,
-                workspace: "fixture".into(),
-                cwd: "/fixture".into(),
-            },
-            child: DelegationChild::TaskSession {
-                task_id: "needs_input".into(),
-                task_session_id: None,
-                conversation: None,
-                preset_name: None,
-                model: None,
-                role: None,
-            },
-            brief: "fixture".into(),
-            target: None,
-            previous: None,
-            superseded_by: None,
-            result: matches!(&status, DelegationStatus::Completed).then(|| {
-                gitterm_core::tasks::DelegationResult {
-                    handoff: Some(gitterm_core::tasks::TaskHandoff {
-                        summary: "done".into(),
-                        decisions: vec![],
-                        next_steps: vec![],
-                        blockers: vec![],
-                        updated_by_session_id: None,
-                        updated_at: "2026-01-01T00:00:00Z".into(),
-                    }),
-                    ..Default::default()
-                }
-            }),
-            status,
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
-            delivered_at: None,
-            delivered: false,
-            dismissed_at: dismissed_at.map(str::to_owned),
-            options: Default::default(),
-            time_limit_reached_at: None,
-            time_limit_deadline_unix_ms: None,
+        let worker = |id: &str, uid: &str, status: DelegationStatus, dismissed_at: Option<&str>| {
+            Delegation {
+                delegation_id: id.into(),
+                kind: DelegationKind::Implement,
+                parent: DelegationParent {
+                    session_uid: uid.into(),
+                    chat_session_id: None,
+                    workspace: "fixture".into(),
+                    cwd: "/fixture".into(),
+                },
+                child: DelegationChild::TaskSession {
+                    task_id: "needs_input".into(),
+                    task_session_id: None,
+                    conversation: None,
+                    preset_name: None,
+                    model: None,
+                    role: None,
+                },
+                brief: "fixture".into(),
+                target: None,
+                previous: None,
+                superseded_by: None,
+                result: matches!(&status, DelegationStatus::Completed).then(|| {
+                    gitterm_core::tasks::DelegationResult {
+                        handoff: Some(gitterm_core::tasks::TaskHandoff {
+                            summary: "done".into(),
+                            decisions: vec![],
+                            next_steps: vec![],
+                            blockers: vec![],
+                            updated_by_session_id: None,
+                            updated_at: "2026-01-01T00:00:00Z".into(),
+                        }),
+                        ..Default::default()
+                    }
+                }),
+                status,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+                delivered_at: None,
+                delivered: false,
+                dismissed_at: dismissed_at.map(str::to_owned),
+                options: Default::default(),
+                time_limit_reached_at: None,
+                time_limit_deadline_unix_ms: None,
+            }
         };
         let document = TaskStoreDocument {
             tasks: vec![
@@ -357,10 +349,17 @@ mod attention_count_tests {
                 worker(
                     "dismissed",
                     "parent-b",
-                    DelegationStatus::Failed { message: "failed".into() },
+                    DelegationStatus::Failed {
+                        message: "failed".into(),
+                    },
                     Some("now"),
                 ),
-                worker("interrupted", "parent-c", DelegationStatus::Interrupted, None),
+                worker(
+                    "interrupted",
+                    "parent-c",
+                    DelegationStatus::Interrupted,
+                    None,
+                ),
                 worker("completed", "parent-d", DelegationStatus::Completed, None),
             ],
             ..Default::default()
@@ -382,7 +381,8 @@ mod attention_count_tests {
                     {"dir":"/fixture/i", "session_uid":"parent-c"},
                     {"dir":"/fixture/j", "session_uid":"parent-d"}
                 ]
-            })).unwrap();
+            }))
+            .unwrap();
         let counts = iced_tab_attention_counts(&[workspace], &store);
         assert_eq!(counts.get(&WorkspaceId(1)), Some(&6));
     }

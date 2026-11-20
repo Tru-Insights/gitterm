@@ -791,20 +791,25 @@ fn read_iced_history(
     let timestamp_ms = |at: Option<&str>| {
         let timed = gitterm_core::harness::transcript::TimedEntry {
             at: at.map(str::to_string),
-            entry: TranscriptEntry::Harness(gitterm_core::chat::types::HarnessEvent::TurnCompleted {
-                status: gitterm_core::chat::types::TurnStatus::Completed,
-                usage: serde_json::Value::Null,
-                cost_usd: None,
-                rate_limit: None,
-            }),
+            entry: TranscriptEntry::Harness(
+                gitterm_core::chat::types::HarnessEvent::TurnCompleted {
+                    status: gitterm_core::chat::types::TurnStatus::Completed,
+                    usage: serde_json::Value::Null,
+                    cost_usd: None,
+                    rate_limit: None,
+                },
+            ),
         };
         gitterm_core::chat::history::history_timeline(vec![timed], &[])
             .into_iter()
             .find_map(|event| match event {
                 gitterm_core::chat::history::HistoryEvent::Other(value)
-                    if value["kind"] == "turn_timing" => value["end_ms"]
-                    .as_i64()
-                    .and_then(|ms| u64::try_from(ms).ok()),
+                    if value["kind"] == "turn_timing" =>
+                {
+                    value["end_ms"]
+                        .as_i64()
+                        .and_then(|ms| u64::try_from(ms).ok())
+                }
                 _ => None,
             })
     };
@@ -834,7 +839,10 @@ fn read_iced_history(
                 Entry::UserPrompt(text)
             }
             TranscriptEntry::Harness(event) => {
-                if matches!(event, gitterm_core::chat::types::HarnessEvent::TurnCompleted { .. }) {
+                if matches!(
+                    event,
+                    gitterm_core::chat::types::HarnessEvent::TurnCompleted { .. }
+                ) {
                     if let Some(end_ms) = last_activity_ms.take() {
                         records.push(Record {
                             at_ms: None,

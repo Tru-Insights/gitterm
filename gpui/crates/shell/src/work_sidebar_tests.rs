@@ -263,8 +263,138 @@ fn chat_title_column_never_overlaps_right_aligned_metadata(cx: &mut gpui::TestAp
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let title = cx.debug_bounds("work-label-9").unwrap();
     let open = cx.debug_bounds("work-badge-9-0").unwrap();
-    assert!(title.right() <= open.left(), "title {title:?} overlaps open {open:?}");
-    assert!(title.size.height <= px(32.), "title exceeds two lines: {title:?}");
+    assert!(
+        title.right() <= open.left(),
+        "title {title:?} overlaps open {open:?}"
+    );
+    assert!(
+        title.size.height <= px(32.),
+        "title exceeds two lines: {title:?}"
+    );
+}
+
+fn draw_sidebar(cx: &mut gpui::VisualTestContext) {
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+}
+
+fn click_sidebar(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+    let bounds = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("missing {selector}"));
+    cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+    draw_sidebar(cx);
+}
+
+#[gpui::test]
+fn repo_name_and_disclosure_toggle_but_only_run_emits_command(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let (sidebar, cx) = cx.add_window_view(|_, _| fixture(false));
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let received = events.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&sidebar, move |_, outcome: &WorkSidebarOutcome, _| {
+            received.borrow_mut().push(outcome.clone());
+        })
+        .detach();
+    });
+    cx.simulate_resize(gpui::size(px(640.), px(900.)));
+    draw_sidebar(cx);
+    let fold = Fold::Repo("/repos/home".into());
+    assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
+    assert_eq!(
+        cx.debug_bounds("work-fold-3-▸").unwrap().size.width,
+        px(24.)
+    );
+    assert!(cx.debug_bounds("work-control-3-0").is_none());
+
+    // Empty header space and the full-width facts line are passive.
+    let blank = cx.debug_bounds("work-space-3").unwrap();
+    assert!(blank.size.width > px(20.));
+    click_sidebar(cx, "work-space-3");
+    click_sidebar(cx, "work-facts-3-0");
+    assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
+    assert!(events.borrow().is_empty());
+
+    click_sidebar(cx, "work-name-3");
+    assert!(sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
+    assert_eq!(
+        cx.debug_bounds("work-fold-3-▾").unwrap().size.width,
+        px(24.)
+    );
+    assert!(cx.debug_bounds("work-control-3-0").is_some());
+    assert!(events.borrow().is_empty());
+    click_sidebar(cx, "work-fold-3-▾");
+    assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
+    click_sidebar(cx, "work-fold-3-▸");
+    assert!(sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
+    assert!(events.borrow().is_empty());
+
+    click_sidebar(cx, "work-run-3");
+    assert!(sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
+    // The preview limitation adds an error row above Repos after a run event.
+    click_sidebar(cx, "work-name-4");
+    assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
+    click_sidebar(cx, "work-run-4");
+    assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
+    assert_eq!(
+        *events.borrow(),
+        vec![
+            WorkSidebarOutcome::RunRepoCommand {
+                repo: "/repos/home".into(),
+            };
+            2
+        ]
+    );
+    click_sidebar(cx, "work-name-4");
+    click_sidebar(cx, "work-control-4-0");
+    assert!(sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
+    assert_eq!(
+        events.borrow().last(),
+        Some(&WorkSidebarOutcome::OpenEditor {
+            dir: "/repos/home".into(),
+        })
+    );
+    click_sidebar(cx, "work-control-4-1");
+    assert!(sidebar.read_with(cx, |sidebar, _| sidebar.editing.is_some()));
+    assert!(sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
+    assert!(cx.debug_bounds("work-run-4").is_none());
+    assert_eq!(
+        cx.debug_bounds("work-run-command-input")
+            .unwrap()
+            .size
+            .width,
+        px(160.)
+    );
+    assert_eq!(events.borrow().len(), 3);
+}
+
+#[gpui::test]
+fn pr_body_and_disclosure_keep_iced_toggle_targets(cx: &mut gpui::TestAppContext) {
+    use gitterm_core::{merge_plan::PrKey, prs::WatchedPr};
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let mut sidebar = fixture(true);
+    sidebar.pull_requests = vec![PullRequestGroup {
+        root: "root".into(),
+        title: "Owning chat".into(),
+        prs: vec![WatchedPr::new(PrKey::new("example/gitterm", 42))],
+    }];
+    let (sidebar, cx) = cx.add_window_view(|_, _| sidebar);
+    cx.simulate_resize(gpui::size(px(640.), px(900.)));
+    draw_sidebar(cx);
+    let fold = Fold::Pr("example/gitterm#42".into());
+    assert!(cx.debug_bounds("work-fold-2-▸").is_some());
+    // Iced view_pr_row wraps the title, number and facts in its toggle button.
+    click_sidebar(cx, "work-pr-number-2");
+    assert!(sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
+    assert!(cx.debug_bounds("work-fold-2-▾").is_some());
+    click_sidebar(cx, "work-fold-2-▾");
+    assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
+    click_sidebar(cx, "work-fold-2-▸");
+    assert!(sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
 }
 
 #[test]
@@ -1491,8 +1621,8 @@ fn pr_fixture_groups_small_labels_done_counts_badges_and_errors_like_iced() {
         ]
     );
     assert!(rows[1].small && rows[1].quiet);
-    assert_eq!(rows[1].controls[0].label, "1 merged •");
-    assert_eq!(rows[5].controls[0].label, "1 merged •");
+    assert_eq!(rows[1].controls[0].label, "1 merged ▸");
+    assert_eq!(rows[5].controls[0].label, "1 merged ▸");
     assert_eq!(rows[2].pr_number, Some((42, 4)));
     assert_eq!(rows[2].repo_prefix.as_deref(), Some("repo · "));
     assert_eq!(rows[2].badges, ["not read"]);
@@ -1514,7 +1644,12 @@ fn pr_fixture_groups_small_labels_done_counts_badges_and_errors_like_iced() {
     let mut single = vec![];
     sidebar.pull_request_rows(&mut single);
     assert_eq!(single.len(), 2);
-    assert_eq!(single[0].controls[0].label, "1 merged •");
+    assert_eq!(single[0].controls[0].label, "1 merged ▸");
+    sidebar.activate(single[0].controls[0].action.clone());
+    let mut done_open = vec![];
+    sidebar.pull_request_rows(&mut done_open);
+    assert_eq!(done_open[0].controls[0].label, "1 merged ▾");
+    assert_eq!(done_open.len(), 3);
 }
 
 #[test]
