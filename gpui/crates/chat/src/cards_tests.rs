@@ -30,6 +30,46 @@ fn permission_row() -> Row {
     })
 }
 
+#[test]
+fn permission_presentation_matches_iced_offered_order_and_salient_text() {
+    let suggestions = vec![
+        json!({"type":"acp_option", "name":"Allow for session", "option_id":"session"}),
+        json!({"type":"addRules", "destination":"userSettings"}),
+        json!({"type":"addRules", "destination":"localSettings", "rules":[{"toolName":"Bash", "ruleContent":"echo synthetic"}, {"toolName":"Read"}]}),
+        json!({"type":"addRules", "destination":"localSettings", "rules":[]}),
+        json!({"type":"acp_option", "option_id":"always"}),
+    ];
+    let offered = offered_options(&suggestions);
+    assert_eq!(
+        offered
+            .iter()
+            .map(|(_, label)| label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Allow and remember", "Allow for session", "Always allow"]
+    );
+    assert_eq!(offered[0].0, &suggestions[2]);
+    assert_eq!(describe_rule(offered[0].0), "Bash(echo synthetic), Read");
+    assert_eq!(
+        permission_salient(
+            "Bash",
+            &json!({"command":"echo synthetic", "description":"Fixture"})
+        ),
+        "echo synthetic"
+    );
+    assert_eq!(
+        permission_salient("Read", &json!({"file_path":"fixture.rs"})),
+        "fixture.rs"
+    );
+    assert_eq!(
+        permission_salient("NotebookEdit", &json!({"notebook_path":"fixture.ipynb"})),
+        "fixture.ipynb"
+    );
+    assert_eq!(
+        permission_salient("WebFetch", &json!({"url":"https://example.invalid"})),
+        "{\n  \"url\": \"https://example.invalid\"\n}"
+    );
+}
+
 #[gpui::test]
 fn permission_decisions_lock_locally_and_preserve_offered_rule(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
@@ -87,11 +127,86 @@ fn questionnaire_single_multi_other_and_validation(cx: &mut TestAppContext) {
                 QuestionAnswer { question:"Which policy?".into(), selected:vec![], free_text:Some("Custom policy".into()) },
                 QuestionAnswer { question:"Which checks?".into(), selected:vec!["Unit".into(),"Integration".into()], free_text:Some("Manual".into()) },
             ] }]);
+            assert_question_encoding(
+                intents.borrow()[0].clone(),
+                card.row.request.as_ref().unwrap().kind.clone(),
+            );
             card.choose(0, Some("Fixed".into()), cx);
             card.submit(cx);
             assert_eq!(intents.borrow().len(), 1);
         });
     });
+}
+
+fn assert_question_encoding(intent: ChatIntent, kind: RuntimeRequestKind) {
+    use crate::adapter::{Admission, ChatAdapter};
+    use gitterm_core::{
+        chat::{
+            state::AgentEvent,
+            types::{AgentBackendConfig, HarnessCommand, RuntimeDecision},
+        },
+        session,
+    };
+    let target = session::Target {
+        tab_id: 7,
+        session_uid: "synthetic-chat".into(),
+        task_id: None,
+        task_session_id: None,
+    };
+    let mut adapter = ChatAdapter::default();
+    let stamp = adapter.begin_runtime(target.clone());
+    adapter
+        .receive(
+            &stamp,
+            &target,
+            AgentEvent::Harness(HarnessEvent::RuntimeRequest {
+                request_id: "synthetic-request".into(),
+                tool_use_id: "synthetic-tool".into(),
+                kind,
+            }),
+            None,
+            |_, _| {},
+        )
+        .unwrap();
+    let prepared = adapter
+        .admit(
+            intent,
+            Admission {
+                authority: session::State {
+                    target: target.clone(),
+                    control: session::TurnControl::Harness,
+                    task_live: false,
+                    last_tab: false,
+                },
+                config: AgentBackendConfig::Claude {
+                    model: String::new(),
+                    permission_mode: Some("default".into()),
+                    effort: None,
+                },
+                process_running: true,
+                just_spawned: false,
+                message_id: "synthetic-message".into(),
+            },
+        )
+        .unwrap_or_else(|receipt| panic!("{receipt:?}"));
+    let mut delivered = false;
+    adapter.execute(prepared, &target, 1, |command| {
+        let HarnessCommand::Answer {
+            request_id,
+            decision: RuntimeDecision::AnswerQuestion { answers },
+        } = command
+        else {
+            panic!("wrong command: {command:?}")
+        };
+        assert_eq!(request_id, "synthetic-request");
+        assert_eq!(
+            serde_json::to_value(answers).unwrap(),
+            json!({"Which policy?":"Custom policy", "Which checks?":"Unit, Integration, Manual"})
+        );
+        delivered = true;
+        Ok(())
+    });
+    assert!(delivered);
 }
 
 #[gpui::test]
@@ -159,6 +274,81 @@ fn receipts_unlock_only_definitive_rejection_and_resolution_wins(cx: &mut TestAp
             card.update_receipt(&rejected, cx);
             assert!(!card.enabled());
             assert!(card.row.decision.is_none());
+        });
+    });
+}
+
+#[gpui::test]
+fn card_rejects_wrong_request_kind_and_unoffered_rule(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        let callback: IntentCallback = Rc::new(|_, _| panic!("invalid card intent emitted"));
+        let card = cx.new(|cx| CardView::new(permission_row(), Some(callback), false, window, cx));
+        card.update(cx, |card, cx| {
+            card.emit(ChatIntent::Permission { request_id: "another-request".into(), decision: PermissionDecision::Allow }, cx);
+            card.dismiss(cx);
+            card.emit(ChatIntent::AnswerQuestion { request_id:"synthetic-request".into(), answers:vec![] }, cx);
+            card.emit(ChatIntent::Permission { request_id:"synthetic-request".into(), decision:PermissionDecision::AllowAlways { suggestion:json!({"type":"addRules","destination":"userSettings"}) } }, cx);
+            card.permission(PermissionDecision::AllowAlways { suggestion:json!({"type":"addRules","destination":"localSettings","rules":[{"toolName":"Bash","ruleContent":"different"}]}) }, cx);
+            assert!(card.enabled());
+            assert!(card.receipt.is_none());
+        });
+    });
+}
+
+#[gpui::test]
+fn malformed_question_can_dismiss_and_retry_only_after_non_delivery(cx: &mut TestAppContext) {
+    use crate::adapter::ReceiptState;
+    cx.update(gpui_component::init);
+    let cx = cx.add_empty_window();
+    let intents = Rc::new(RefCell::new(vec![]));
+    cx.update(|window, cx| {
+        let captured = intents.clone();
+        let callback: IntentCallback = Rc::new(move |intent, _| {
+            captured.borrow_mut().push(intent);
+            let mut receipt = Receipt::rejected("synthetic");
+            receipt.state = ReceiptState::ChannelAccepted;
+            receipt
+        });
+        let card = cx.new(|cx| {
+            CardView::new(
+                row(RuntimeRequestKind::Question {
+                    questions: json!({"invalid":"array required"}),
+                }),
+                Some(callback),
+                false,
+                window,
+                cx,
+            )
+        });
+        card.update(cx, |card, cx| {
+            assert!(card.questions.is_err());
+            card.submit(cx);
+            assert!(intents.borrow().is_empty());
+            card.dismiss(cx);
+            card.dismiss(cx);
+            assert_eq!(intents.borrow().len(), 1);
+            let mut receipt = card.receipt.clone().unwrap();
+            receipt.state = ReceiptState::Rejected("not written".into());
+            card.update_receipt(&receipt, cx);
+            card.dismiss(cx);
+            assert_eq!(
+                intents.borrow().as_slice(),
+                &[
+                    ChatIntent::DismissQuestion {
+                        request_id: "synthetic-request".into()
+                    },
+                    ChatIntent::DismissQuestion {
+                        request_id: "synthetic-request".into()
+                    },
+                ]
+            );
+            let mut receipt = card.receipt.clone().unwrap();
+            receipt.state = ReceiptState::Uncertain("partial write".into());
+            card.update_receipt(&receipt, cx);
+            card.dismiss(cx);
+            assert_eq!(intents.borrow().len(), 2);
         });
     });
 }
