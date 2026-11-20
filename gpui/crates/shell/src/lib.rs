@@ -134,6 +134,7 @@ pub struct Shell {
     context_mru: Vec<Option<String>>,
     roster_subscriptions: HashMap<gpui::EntityId, (Subscription, Subscription)>,
     roster_observers: HashMap<WorkspaceId, Subscription>,
+    roster_facts: Option<data::RosterFacts>,
     session_picker: Option<Entity<session_picker::SessionPicker>>,
     picker_subscription: Option<Subscription>,
     park_sheet: Option<Entity<park_sheet::ParkSheet>>,
@@ -382,6 +383,7 @@ impl Shell {
             context_mru: vec![None],
             roster_subscriptions: HashMap::new(),
             roster_observers: HashMap::new(),
+            roster_facts: None,
             session_picker: None,
             picker_subscription: None,
             park_sheet: None,
@@ -410,15 +412,17 @@ impl Shell {
         shell.restore_parked(saved_parked, cx);
         shell.refresh_saved_facts(cx);
         let weak = cx.weak_entity();
-        cx.spawn(async move |_, cx| loop {
-            cx.background_executor()
-                .timer(std::time::Duration::from_secs(15))
-                .await;
-            if weak
-                .update(cx, |shell, cx| shell.refresh_saved_facts(cx))
-                .is_err()
-            {
-                break;
+        cx.spawn(async move |_, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(15))
+                    .await;
+                if weak
+                    .update(cx, |shell, cx| shell.refresh_saved_facts(cx))
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();
@@ -1596,7 +1600,9 @@ impl Shell {
     }
     fn refresh_saved_facts(&mut self, cx: &mut Context<Self>) {
         let Some(catalog) = self.owner.read(cx).iced_catalog() else {
-            self.saved_facts.replace(workspace_bar::SavedFacts::default());
+            self.roster_facts = None;
+            self.saved_facts
+                .replace(workspace_bar::SavedFacts::default());
             self.saved_facts_error = None;
             self.saved_facts_catalog_key = None;
             self.saved_facts_generation = self.saved_facts_generation.wrapping_add(1);
@@ -1631,14 +1637,15 @@ impl Shell {
                 })
                 .collect()
         };
-        let colors = workspace_bar::Colors::new(
-            gpui_component::Theme::global(cx).mode.is_dark(),
-        );
+        let colors = workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark());
         cx.spawn(async move |shell, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    workspace_bar::SavedFacts::read_from(&source, &workspaces, &roots, colors)
+                    (
+                        workspace_bar::SavedFacts::read_from(&source, &workspaces, &roots, colors),
+                        data::RosterFacts::read_from(&source),
+                    )
                 })
                 .await;
             let _ = shell.update(cx, |shell, cx| {
@@ -1648,19 +1655,26 @@ impl Shell {
                 let Some(catalog) = shell.owner.read(cx).iced_catalog() else {
                     return;
                 };
-                if Self::saved_facts_catalog_key(catalog) != shell.saved_facts_catalog_key
-                    .as_deref()
-                    .unwrap_or_default()
+                if Self::saved_facts_catalog_key(catalog)
+                    != shell.saved_facts_catalog_key.as_deref().unwrap_or_default()
                 {
                     return;
                 }
-                match result {
+                let source = catalog.source.clone();
+                match result.1 {
+                    Ok(facts) => {
+                        shell.roster_facts = Some(facts);
+                        shell.sync_rosters(cx);
+                    }
+                    Err(error) => eprintln!("read Iced roster: {error:#}"),
+                }
+                match result.0 {
                     Ok(facts) => {
                         shell.saved_facts.replace(facts);
                         shell.saved_facts_error = None;
                     }
                     Err(error) => {
-                        let path = catalog.source.join("workspaces.json");
+                        let path = source.join("workspaces.json");
                         eprintln!("read workspace bar facts {}: {error:#}", path.display());
                         shell.saved_facts_error = Some(workspace_bar::News {
                             label: format!("Workspace bar: {error:#}"),
@@ -4315,6 +4329,9 @@ impl Shell {
         else {
             return WorkerTab::Closed;
         };
+        if let Some(facts) = &self.roster_facts {
+            return facts.worker_tab(task_id, task_session_id.as_deref());
+        }
         let open = self.workspaces.iter().flat_map(|w| &w.sessions).find(|s| {
             self.session_tab(s.id, cx).is_some_and(|t| {
                 t.task_id.as_ref() == Some(task_id)
@@ -4342,19 +4359,101 @@ impl Shell {
         }
     }
 
+    fn roster_for_view(
+        &self,
+        workspace: WorkspaceId,
+        view: &Entity<chat::ChatPane>,
+        cx: &App,
+    ) -> Vec<gitterm_gpui_chat::model::roster::RosterEntry> {
+        let Some(facts) = &self.roster_facts else {
+            // An imported chat waits for the first authoritative store read.
+            if self.owner.read(cx).iced_catalog().is_some() {
+                return vec![];
+            }
+            // Sample/test hosts have no Iced catalog.
+            return self
+                .work_sidebars
+                .get(&workspace)
+                .map(|sidebar| {
+                    let sidebar = sidebar.read(cx);
+                    roster_entries(sidebar.tasks(), sidebar.workers(), |worker| {
+                        self.worker_tab(worker, cx)
+                    })
+                })
+                .unwrap_or_default();
+        };
+        let chats: Vec<_> = self
+            .workspaces
+            .iter()
+            .filter(|w| {
+                self.owner
+                    .read(cx)
+                    .iced_workspace(w.workspace.id)
+                    .is_some_and(|saved| {
+                        !saved.is_legacy_remote()
+                            && !matches!(saved.location,
+                    Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. }))
+                    })
+            })
+            .flat_map(|w| w.panes.iter().map(move |(key, pane)| (w, key, pane)))
+            .filter_map(|(workspace, key, pane)| match &pane.read(cx).content {
+                pane::PaneContent::PreviewChat(view) => {
+                    let tab = workspace
+                        .sessions
+                        .iter()
+                        .find(|session| session_pane_id(session.id) == *key)
+                        .and_then(|session| self.session_tab(session.id, cx));
+                    Some((view, tab))
+                }
+                _ => None,
+            })
+            .collect();
+        let workers: Vec<_> = facts
+            .workers
+            .iter()
+            .filter(|worker| {
+                // An original Iced chat still owns its results even when its
+                // history pane has not been mounted in the preview.
+                if facts.tabs.iter().any(|tab| {
+                    tab.tab_kind.as_deref() == Some("agent")
+                        && tab.session_uid.as_deref() == Some(worker.parent.session_uid.as_str())
+                }) {
+                    return chats
+                        .iter()
+                        .find(|(v, _)| v.entity_id() == view.entity_id())
+                        .is_some_and(|(_, tab)| {
+                            tab.is_some_and(|tab| {
+                                tab.session_uid.as_deref()
+                                    == Some(worker.parent.session_uid.as_str())
+                            })
+                        });
+                }
+                roster_chat_owner(
+                    worker,
+                    chats.iter().map(|(v, _)| v.entity_id()),
+                    |id, identity| {
+                        chats
+                            .iter()
+                            .find(|(v, _)| v.entity_id() == id)
+                            .is_some_and(|(v, tab)| {
+                                tab.is_some_and(|tab| tab.session_uid.as_deref() == Some(identity))
+                                    || v.read(cx).matches_chat(identity)
+                            })
+                    },
+                ) == Some(view.entity_id())
+            })
+            .cloned()
+            .collect();
+        roster_entries(&facts.tasks, &workers, |worker| self.worker_tab(worker, cx))
+    }
+
     fn sync_rosters(&self, cx: &mut Context<Self>) {
         for w in &self.workspaces {
-            let Some(sidebar) = self.work_sidebars.get(&w.workspace.id) else {
-                continue;
-            };
-            let sidebar = sidebar.read(cx);
-            let rows = roster_entries(sidebar.tasks(), sidebar.workers(), |worker| {
-                self.worker_tab(worker, cx)
-            });
             for pane in w.panes.values() {
                 if let pane::PaneContent::PreviewChat(view) = &pane.read(cx).content {
+                    let rows = self.roster_for_view(w.workspace.id, view, cx);
                     view.clone()
-                        .update(cx, |view, cx| view.set_roster(rows.clone(), cx));
+                        .update(cx, |view, cx| view.set_roster(rows, cx));
                 }
             }
         }
@@ -4401,13 +4500,8 @@ impl Shell {
                 let activity = cx.observe(&view, |shell, _, cx| shell.sync_rosters(cx));
                 self.roster_subscriptions
                     .insert(view.entity_id(), (subscription, activity));
-                if let Some(sidebar) = self.work_sidebars.get(&w.workspace.id) {
-                    let sidebar = sidebar.read(cx);
-                    let rows = roster_entries(sidebar.tasks(), sidebar.workers(), |worker| {
-                        self.worker_tab(worker, cx)
-                    });
-                    view.update(cx, |view, cx| view.set_roster(rows, cx));
-                }
+                let rows = self.roster_for_view(w.workspace.id, &view, cx);
+                view.update(cx, |view, cx| view.set_roster(rows, cx));
             }
         }
     }
@@ -4415,9 +4509,14 @@ impl Shell {
     fn open_roster(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         use gitterm_core::tasks::DelegationChild;
         let worker = self
-            .work_sidebars
-            .values()
-            .flat_map(|s| s.read(cx).workers())
+            .roster_facts
+            .iter()
+            .flat_map(|facts| facts.workers.iter())
+            .chain(
+                self.work_sidebars
+                    .values()
+                    .flat_map(|s| s.read(cx).workers()),
+            )
             .find(|w| w.delegation_id == id.trim_start_matches("dlg:"))
             .cloned();
         let Some(worker) = worker else {
@@ -4460,6 +4559,21 @@ impl Shell {
     }
 }
 
+// Prefer the original tab, then a resumed chat, as Iced's parent_tab_id does.
+fn roster_chat_owner<Id: Copy>(
+    worker: &gitterm_core::tasks::Delegation,
+    chats: impl Iterator<Item = Id> + Clone,
+    matches: impl Fn(Id, &str) -> bool,
+) -> Option<Id> {
+    chats
+        .clone()
+        .find(|id| matches(*id, &worker.parent.session_uid))
+        .or_else(|| {
+            let chat = worker.parent.chat_session_id.as_deref()?;
+            chats.into_iter().find(|id| matches(*id, chat))
+        })
+}
+
 fn roster_entries(
     tasks: &[gitterm_core::tasks::TaskRecord],
     workers: &[gitterm_core::tasks::Delegation],
@@ -4472,9 +4586,13 @@ fn roster_entries(
             .and_then(|s| s.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_millis() as u64)
     };
-    workers
+    let mut workers: Vec<_> = workers
         .iter()
         .filter(|w| w.dismissed_at.is_none())
+        .collect();
+    workers.sort_by_key(|worker| std::cmp::Reverse(stamp(&worker.created_at)));
+    let mut rows: Vec<_> = workers
+        .into_iter()
         .map(|worker| {
             let (name, model, task) = match &worker.child {
                 DelegationChild::TaskSession {
@@ -4508,22 +4626,41 @@ fn roster_entries(
                     None,
                 ),
             };
-            let state = if matches!(worker.child, DelegationChild::TaskSession { .. }) {
+            let mut live = false;
+            let state = if worker.superseded_by.is_some() {
+                WorkerState::Failed
+            } else if matches!(worker.child, DelegationChild::TaskSession { .. }) {
                 match gitterm_core::delegations::worker_session_state(
                     &worker.status,
                     task.map(|t| t.lifecycle),
                     tab(worker),
                 ) {
-                    "queued" | "starting" => WorkerState::Queued,
-                    "running" => WorkerState::Running,
-                    "waiting" | "blocked" => WorkerState::Waiting,
+                    "queued" | "starting" => {
+                        live = true;
+                        WorkerState::Queued
+                    }
+                    "running" => {
+                        live = true;
+                        WorkerState::Running
+                    }
+                    "waiting" => {
+                        live = true;
+                        WorkerState::Waiting
+                    }
+                    "blocked" => WorkerState::Waiting,
                     "done" => WorkerState::Done,
                     _ => WorkerState::Failed,
                 }
             } else {
                 match worker.status {
-                    DelegationStatus::Requested => WorkerState::Queued,
-                    DelegationStatus::Running => WorkerState::Running,
+                    DelegationStatus::Requested => {
+                        live = true;
+                        WorkerState::Queued
+                    }
+                    DelegationStatus::Running => {
+                        live = true;
+                        WorkerState::Running
+                    }
                     DelegationStatus::Completed => WorkerState::Done,
                     DelegationStatus::Blocked => WorkerState::Waiting,
                     _ => WorkerState::Failed,
@@ -4549,22 +4686,39 @@ fn roster_entries(
                     })
                     .unwrap_or_default(),
                 state,
-                started_at_ms: stamp(&worker.created_at),
-                ended_at_ms: (!worker.status.is_active()).then(|| stamp(&worker.updated_at)),
+                started_at_ms: stamp(
+                    if !matches!(worker.child, DelegationChild::TaskSession { .. })
+                        && worker.status == DelegationStatus::Running
+                    {
+                        &worker.updated_at
+                    } else {
+                        &worker.created_at
+                    },
+                ),
+                ended_at_ms: (!live).then(|| stamp(&worker.updated_at)),
             }
         })
-        .collect()
+        .collect();
+    // Input is newest first (including equal timestamps), matching card replay.
+    rows.sort_by_key(|row| std::cmp::Reverse(row.ended_at_ms.is_none()));
+    let mut finished = 0;
+    rows.retain(|row| {
+        if row.ended_at_ms.is_some() && row.state != WorkerState::Waiting {
+            finished += 1;
+            finished <= 10
+        } else {
+            true
+        }
+    });
+    rows
 }
 
 fn roster_checkout(
     worker: &gitterm_core::tasks::Delegation,
     task: Option<&gitterm_core::tasks::TaskRecord>,
 ) -> String {
-    worker
-        .options
-        .checkout
-        .as_ref()
-        .or_else(|| task.and_then(|task| task.worktree.path.as_ref()))
+    task.and_then(|task| task.worktree.path.as_ref())
+        .or(worker.options.checkout.as_ref())
         .or(Some(&worker.parent.cwd))
         .map(|path| path.display().to_string())
         .unwrap_or_default()
@@ -4590,7 +4744,10 @@ mod tests {
             "options": {"checkout":"/repo/delegation-checkout"}
         }))
         .unwrap();
-        assert_eq!(roster_checkout(&delegation, None), "/repo/delegation-checkout");
+        assert_eq!(
+            roster_checkout(&delegation, None),
+            "/repo/delegation-checkout"
+        );
 
         let task: gitterm_core::tasks::TaskRecord = serde_json::from_value(serde_json::json!({
             "schema_version":1,
@@ -4620,6 +4777,192 @@ mod tests {
         });
         assert_eq!(rows[0].checkout, "/repo/delegation-checkout");
         assert_eq!(rows[1].checkout, "/repo/task-worktree");
+    }
+
+    fn roster_fixture(source: &Path) -> gitterm_core::tasks::TaskStoreDocument {
+        use gitterm_core::tasks::*;
+        let mut task = tasks::fixture_task("worker-task", "Fixture", "task/worker");
+        task.worktree.path = Some("/other-repo/worktrees/real-worker-tree".into());
+        task.worktree.state = TaskWorktreeState::Ready;
+        let workers = (0..16).map(|i| {
+            serde_json::from_value(serde_json::json!({
+                "delegation_id": format!("worker-{i}"), "kind":"implement",
+                "parent":{"session_uid":"original", "chat_session_id":"conversation", "workspace":"home", "cwd":"/parent-cwd"},
+                "child":{"runner":"task_session", "task_id":"worker-task", "task_session_id":"child", "preset_name":"Codex", "model":"gpt-6-luna"},
+                "brief":"fixture", "status":{"state": if i == 14 { "running" } else if i == 15 { "blocked" } else { "completed" }},
+                "result": if i == 14 { serde_json::Value::Null } else { serde_json::json!({"handoff":{"summary":"Fixture result","updated_at":"2026-01-01T00:01:00Z"}}) },
+                "created_at":format!("2026-01-01T00:00:{i:02}Z"),
+                "updated_at":"2026-01-01T00:01:00Z",
+                "options":{"checkout":"/requested-parent-checkout"}
+            })).unwrap()
+        }).collect();
+        std::fs::write(source.join("workspaces.json"), serde_json::json!({
+            "active_workspace":0,
+            "workspaces":[{"name":"home", "abbrev":"H", "color":"blue", "dir":"/home", "tabs":[
+                {"dir":"/other-repo/worktrees/real-worker-tree", "task_id":"worker-task", "task_session_id":"child"}
+            ]}]
+        }).to_string()).unwrap();
+        TaskStoreDocument {
+            tasks: vec![task],
+            delegations: workers,
+            ..Default::default()
+        }
+    }
+
+    fn write_roster_fixture(source: &Path, document: &gitterm_core::tasks::TaskStoreDocument) {
+        std::fs::write(
+            source.join("tasks.json"),
+            serde_json::to_vec(document).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn fixture_roster(
+        facts: &data::RosterFacts,
+    ) -> Vec<gitterm_gpui_chat::model::roster::RosterEntry> {
+        roster_entries(&facts.tasks, &facts.workers, |_| {
+            facts.worker_tab("worker-task", Some("child"))
+        })
+    }
+
+    #[test]
+    fn roster_store_matches_iced_rows_order_worktrees_and_parent_identity() {
+        let source = tempfile::tempdir().unwrap();
+        let mut document = roster_fixture(source.path());
+        let mut unrelated = document.delegations[14].clone();
+        unrelated.delegation_id = "other-chat".into();
+        unrelated.parent.session_uid = "other".into();
+        unrelated.parent.chat_session_id = Some("other-conversation".into());
+        document.delegations.push(unrelated);
+        write_roster_fixture(source.path(), &document);
+        let before = std::fs::read(source.path().join("tasks.json")).unwrap();
+        let mut facts = data::RosterFacts::read_from(source.path()).unwrap();
+        let chats = [
+            (1, "resumed", "conversation"),
+            (2, "original", "conversation"),
+            (3, "other", "other-conversation"),
+        ];
+        let owner = |worker: &gitterm_core::tasks::Delegation, with_original| {
+            roster_chat_owner(
+                worker,
+                chats
+                    .iter()
+                    .filter(move |(id, _, _)| with_original || *id != 2)
+                    .map(|(id, _, _)| *id),
+                |id, identity| {
+                    chats.iter().any(|(candidate, uid, chat)| {
+                        *candidate == id && (*uid == identity || *chat == identity)
+                    })
+                },
+            )
+        };
+        assert_eq!(owner(&facts.workers[1], true), Some(2));
+        assert_eq!(owner(&facts.workers[1], false), Some(1));
+        facts
+            .workers
+            .retain(|worker| owner(worker, true) == Some(2));
+        let rows = fixture_roster(&facts);
+        let expected: Vec<_> = [14, 15]
+            .into_iter()
+            .chain((4..14).rev())
+            .map(|i| format!("dlg:worker-{i}"))
+            .collect();
+        assert_eq!(
+            rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>(),
+            expected
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.checkout == "/other-repo/worktrees/real-worker-tree")
+        );
+        let rendered = gitterm_gpui_chat::model::roster::rows(&rows, rows[0].started_at_ms + 1_000);
+        assert!(
+            rendered
+                .iter()
+                .all(|row| row.what == "· in real-worker-tree")
+        );
+        assert_eq!(
+            std::fs::read(source.path().join("tasks.json")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn roster_refresh_adds_new_workers_and_removes_dismissed_or_old_finished_rows() {
+        use gitterm_core::tasks::DelegationStatus;
+        let source = tempfile::tempdir().unwrap();
+        let mut document = roster_fixture(source.path());
+        write_roster_fixture(source.path(), &document);
+        let first = data::RosterFacts::read_from(source.path()).unwrap();
+        assert!(
+            fixture_roster(&first)
+                .iter()
+                .any(|row| row.id == "dlg:worker-14")
+        );
+        document.delegations[14].status = DelegationStatus::Completed;
+        document.delegations[14].result = document.delegations[13].result.clone();
+        document.delegations[14].dismissed_at = Some("2026-01-01T00:02:00Z".into());
+        document.delegations[15].status = DelegationStatus::Completed;
+        let mut new = document.delegations[13].clone();
+        new.delegation_id = "new-worker".into();
+        new.status = DelegationStatus::Running;
+        new.result = None;
+        new.created_at = "2026-01-01T00:02:00Z".into();
+        new.updated_at = new.created_at.clone();
+        document.delegations.push(new);
+        write_roster_fixture(source.path(), &document);
+        let next = data::RosterFacts::read_from(source.path()).unwrap();
+        let rows = fixture_roster(&next);
+        assert_eq!(rows[0].id, "dlg:new-worker");
+        assert!(!rows.iter().any(|row| row.id == "dlg:worker-14"));
+        assert!(!rows.iter().any(|row| row.id == "dlg:worker-4"));
+        assert_eq!(rows.len(), 11);
+        assert!(
+            rows.iter()
+                .find(|row| row.id == "dlg:worker-15")
+                .unwrap()
+                .ended_at_ms
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn roster_elapsed_advances_while_running_and_stops_when_finished() {
+        let source = tempfile::tempdir().unwrap();
+        let document = roster_fixture(source.path());
+        write_roster_fixture(source.path(), &document);
+        let facts = data::RosterFacts::read_from(source.path()).unwrap();
+        let rows = fixture_roster(&facts);
+        let start = rows[0].started_at_ms;
+        let first = gitterm_gpui_chat::model::roster::rows(&rows, start + 10_000);
+        let next = gitterm_gpui_chat::model::roster::rows(&rows, start + 11_000);
+        let elapsed = |rows: &[gitterm_gpui_chat::model::roster::RosterRow], id: &str| {
+            rows.iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .elapsed
+                .clone()
+        };
+        assert_eq!(elapsed(&first, "dlg:worker-14"), "10.0s");
+        assert_eq!(elapsed(&next, "dlg:worker-14"), "11.0s");
+        assert_eq!(
+            elapsed(&first, "dlg:worker-13"),
+            elapsed(&next, "dlg:worker-13")
+        );
+        assert_eq!(
+            elapsed(&first, "dlg:worker-15"),
+            elapsed(&next, "dlg:worker-15")
+        );
+        let mut closed = facts;
+        closed.tabs.clear();
+        assert!(
+            fixture_roster(&closed)
+                .iter()
+                .find(|row| row.id == "dlg:worker-14")
+                .unwrap()
+                .ended_at_ms
+                .is_some()
+        );
     }
 
     #[test]
