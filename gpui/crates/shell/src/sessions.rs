@@ -787,6 +787,27 @@ fn read_iced_history(
 ) -> Result<crate::chat::SavedChat, String> {
     use gitterm_core::harness::transcript::TranscriptEntry;
     use gitterm_gpui_chat::events::{Entry, Record};
+    // Reuse the core RFC3339 conversion so this importer follows history_timeline.
+    let timestamp_ms = |at: Option<&str>| {
+        let timed = gitterm_core::harness::transcript::TimedEntry {
+            at: at.map(str::to_string),
+            entry: TranscriptEntry::Harness(gitterm_core::chat::types::HarnessEvent::TurnCompleted {
+                status: gitterm_core::chat::types::TurnStatus::Completed,
+                usage: serde_json::Value::Null,
+                cost_usd: None,
+                rate_limit: None,
+            }),
+        };
+        gitterm_core::chat::history::history_timeline(vec![timed], &[])
+            .into_iter()
+            .find_map(|event| match event {
+                gitterm_core::chat::history::HistoryEvent::Other(value)
+                    if value["kind"] == "turn_timing" => value["end_ms"]
+                    .as_i64()
+                    .and_then(|ms| u64::try_from(ms).ok()),
+                _ => None,
+            })
+    };
     if conversation.is_empty()
         || !conversation
             .chars()
@@ -803,16 +824,47 @@ fn read_iced_history(
         .ok_or_else(|| "Transcript not found".to_string())?;
     let source = std::fs::read_to_string(&path)
         .map_err(|e| format!("Read transcript {}: {e}", path.display()))?;
-    let records: Vec<_> = gitterm_core::chat::history::parse_claude_transcript(&source)
-        .into_iter()
-        .map(|entry| Record {
-            at_ms: None,
-            entry: match entry {
-                TranscriptEntry::UserPrompt(text) => Entry::UserPrompt(text),
-                TranscriptEntry::Harness(event) => Entry::Harness(event),
-            },
-        })
-        .collect();
+    let mut records = Vec::new();
+    let mut last_activity_ms = None;
+    for timed in gitterm_core::chat::history::parse_claude_transcript_timed(&source) {
+        let at_ms = timestamp_ms(timed.at.as_deref());
+        let entry = match timed.entry {
+            TranscriptEntry::UserPrompt(text) => {
+                last_activity_ms = None;
+                Entry::UserPrompt(text)
+            }
+            TranscriptEntry::Harness(event) => {
+                if matches!(event, gitterm_core::chat::types::HarnessEvent::TurnCompleted { .. }) {
+                    if let Some(end_ms) = last_activity_ms.take() {
+                        records.push(Record {
+                            at_ms: None,
+                            entry: Entry::TurnTiming {
+                                start_ms: None,
+                                end_ms: Some(end_ms),
+                                split_ms: None,
+                            },
+                        });
+                    }
+                } else if at_ms.is_some() {
+                    last_activity_ms = at_ms;
+                }
+                Entry::Harness(event)
+            }
+        };
+        let is_prompt = matches!(entry, Entry::UserPrompt(_));
+        records.push(Record { at_ms, entry });
+        // Match history_timeline: start timing markers follow their prompt.
+        if is_prompt && let Some(start_ms) = at_ms {
+            records.push(Record {
+                at_ms: None,
+                entry: Entry::TurnTiming {
+                    start_ms: Some(start_ms),
+                    end_ms: None,
+                    split_ms: None,
+                },
+            });
+        }
+    }
     if records.is_empty() {
         return Err("Transcript has no recorded history".into());
     }
@@ -992,6 +1044,51 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn imported_transcript_keeps_real_work_timing_and_excludes_idle_time() {
+        use gitterm_gpui_chat::events::Entry;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("fixture-project");
+        std::fs::create_dir(&project).unwrap();
+        let source = concat!(
+            "{\"type\":\"user\",\"timestamp\":\"2026-01-01T10:00:00Z\",\"message\":{\"content\":\"Question\"}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-01-01T10:00:30Z\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"tool-1\",\"name\":\"Bash\",\"input\":{\"command\":\"work\"}}]}}\n",
+            "{\"type\":\"user\",\"timestamp\":\"2026-01-01T10:02:00Z\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tool-1\",\"content\":\"done\",\"is_error\":false}]}}\n",
+            "{\"type\":\"user\",\"timestamp\":\"2026-01-01T10:30:00Z\",\"message\":{\"content\":\"Later question\"}}\n"
+        );
+        std::fs::write(project.join("timed-chat.jsonl"), source).unwrap();
+        let saved = read_iced_history(
+            dir.path(),
+            "timed-chat",
+            "/fixture/cwd",
+            "/fixture/provider".into(),
+        )
+        .unwrap();
+        let mut timing = (None, None);
+        for record in &saved.records {
+            if let Entry::TurnTiming {
+                start_ms, end_ms, ..
+            } = &record.entry
+            {
+                timing.0 = timing.0.or(*start_ms);
+                timing.1 = timing.1.or(*end_ms);
+            }
+        }
+        assert_eq!(timing, (Some(1_767_261_600_000), Some(1_767_261_720_000)));
+        assert!(saved.records.iter().any(|record| {
+            matches!(&record.entry, Entry::Harness(_)) && record.at_ms.is_some()
+        }));
+        assert!(saved.records.iter().any(|record| {
+            matches!(
+                &record.entry,
+                Entry::Harness(gitterm_core::chat::types::HarnessEvent::TurnCompleted { .. })
+            ) && record.at_ms.is_none()
+        }));
+        let model = gitterm_gpui_chat::model::ChatModel::from_records(&saved.records);
+        let duration = model.completed_turns[0].duration_ms.unwrap();
+        assert_eq!(duration, 120_000);
     }
     #[test]
     fn runtime_replacement_and_every_stale_binding_are_rejected() {
