@@ -4,7 +4,9 @@ use super::claude_parser::{
     control_request_frame, control_response_frame, permission_result, user_message_frame,
     ClaudeFrameParser, ControlResponseBody, HostRequest, ParsedFrame, SnapshotHook,
 };
-use crate::chat::types::{HarnessCommand, HarnessEvent, RuntimeDecision, TurnStatus};
+use crate::chat::types::{
+    HarnessCommand, HarnessEvent, RuntimeDecision, RuntimeRequestKind, TurnStatus,
+};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
@@ -283,6 +285,7 @@ impl WireLog {
 struct PendingRequest {
     tool_use_id: String,
     input: Value,
+    kind: RuntimeRequestKind,
     delivery_uncertain: bool,
 }
 
@@ -291,6 +294,7 @@ fn record_pending(
     request_id: String,
     tool_use_id: String,
     input: Value,
+    kind: RuntimeRequestKind,
 ) -> Result<(), String> {
     match pending.entry(request_id) {
         std::collections::hash_map::Entry::Occupied(entry) => Err(format!(
@@ -301,6 +305,7 @@ fn record_pending(
             entry.insert(PendingRequest {
                 tool_use_id,
                 input,
+                kind,
                 delivery_uncertain: false,
             });
             Ok(())
@@ -375,6 +380,16 @@ impl<W: AsyncWrite + Unpin> SessionIo<W> {
             return Err(format!(
                 "answer {request_id}: delivery uncertain; resending is blocked"
             ));
+        }
+        if let RuntimeDecision::Allow {
+            remember: Some(update),
+            ..
+        } = &decision
+        {
+            if !matches!(&req.kind, RuntimeRequestKind::Permission { suggestions, .. } if suggestions.contains(update))
+            {
+                return Err(format!("answer {request_id}: remember choice was not offered for this request; not delivered"));
+            }
         }
         let body = permission_result(&decision, &req.tool_use_id, &req.input)?;
         harness_log(&format!(
@@ -724,9 +739,13 @@ pub async fn run_session_program(
                                 "runtime request {request_id}: {}",
                                 trim_for_log(&serde_json::to_string(&event).unwrap_or_default(), 300)
                             ));
-                            match record_pending(&mut pending, request_id, tool_use_id, input) {
-                                Ok(()) => io.emit(event),
-                                Err(e) => io.emit(HarnessEvent::Error(e)),
+                            if let HarnessEvent::RuntimeRequest { kind, .. } = &event {
+                                match record_pending(&mut pending, request_id, tool_use_id, input, kind.clone()) {
+                                    Ok(()) => io.emit(event),
+                                    Err(e) => io.emit(HarnessEvent::Error(e)),
+                                }
+                            } else {
+                                io.emit(HarnessEvent::Error(format!("invalid Claude permission request event {request_id}")));
                             }
                         }
                         ParsedFrame::ControlRequest { request_id, subtype } => {

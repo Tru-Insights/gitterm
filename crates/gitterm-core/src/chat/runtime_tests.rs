@@ -479,3 +479,152 @@ assert not sys.stdin.read(), 'late answers must not be written'
     );
     session.completed().await.unwrap();
 }
+
+#[tokio::test]
+async fn supervisor_validates_remember_before_any_write_and_keeps_plain_flows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let script = r#"#!/usr/bin/env python3
+import json, signal, sys
+signal.alarm(20)
+def emit(v): print(json.dumps(v), flush=True)
+def read(): return json.loads(sys.stdin.readline())
+choice = {'type':'addRules','destination':'localSettings','behavior':'allow','rules':[{'toolName':'Bash','ruleContent':'echo synthetic'}]}
+def request(id, tool='Bash'):
+    emit({'type':'control_request','request_id':id,'request':{'subtype':'can_use_tool','tool_name':tool,'tool_use_id':id,'input':{'questions':[]},'permission_suggestions':[choice]}})
+init = read()
+emit({'type':'control_response','response':{'subtype':'success','request_id':init['request_id'],'response':{}}})
+request('remember')
+answer = read()
+assert answer['response']['request_id'] == 'remember'
+assert answer['response']['response']['updatedPermissions'] == [choice]
+request('question','AskUserQuestion')
+answer = read()
+assert answer['response']['request_id'] == 'question'
+assert answer['response']['response']['updatedInput']['answers'] == {}
+assert 'updatedPermissions' not in answer['response']['response']
+request('plain')
+answer = read()
+assert answer['response']['request_id'] == 'plain'
+assert answer['response']['response']['behavior'] == 'allow'
+assert 'updatedPermissions' not in answer['response']['response']
+request('deny')
+answer = read()
+assert answer['response']['request_id'] == 'deny'
+assert answer['response']['response']['behavior'] == 'deny'
+request('withdrawn')
+emit({'type':'control_cancel_request','request_id':'withdrawn'})
+assert not sys.stdin.read(), 'rejected remembers must never reach stdin'
+"#;
+    let (mut session, mut events) = Session::spawn(move |token| Ok(launch(&path, script, token)));
+    assert!(matches!(
+        event(&mut events).await,
+        HarnessEvent::Ready { .. }
+    ));
+    let kind = match event(&mut events).await {
+        HarnessEvent::RuntimeRequest {
+            request_id, kind, ..
+        } => {
+            assert_eq!(request_id, "remember");
+            kind
+        }
+        e => panic!("{e:?}"),
+    };
+    let offered = match kind {
+        RuntimeRequestKind::Permission { suggestions, .. } => suggestions[0].clone(),
+        _ => panic!("expected permission"),
+    };
+    let remember = |update| RuntimeDecision::Allow {
+        updated_input: None,
+        remember: Some(update),
+    };
+    let answer = |id: &str, decision| {
+        session
+            .send(HarnessCommand::Answer {
+                request_id: id.into(),
+                decision,
+            })
+            .unwrap()
+    };
+    for field in ["rules", "type", "destination", "extra"] {
+        let mut forged = offered.clone();
+        forged[field] = serde_json::json!("forged");
+        answer("remember", remember(forged));
+        assert!(
+            matches!(event(&mut events).await, HarnessEvent::Error(e) if e.contains("not offered") && e.contains("not delivered"))
+        );
+    }
+    answer("unknown", remember(offered.clone()));
+    assert!(matches!(event(&mut events).await, HarnessEvent::Error(e) if e.contains("no pending")));
+    answer("remember", remember(offered.clone()));
+    assert_eq!(
+        event(&mut events).await,
+        HarnessEvent::RuntimeRequestResolved {
+            request_id: "remember".into()
+        }
+    );
+    assert!(
+        matches!(event(&mut events).await, HarnessEvent::RuntimeRequest { request_id, .. } if request_id == "question")
+    );
+    answer("remember", remember(offered.clone()));
+    assert!(matches!(event(&mut events).await, HarnessEvent::Error(e) if e.contains("no pending")));
+    answer("question", remember(offered.clone()));
+    assert!(
+        matches!(event(&mut events).await, HarnessEvent::Error(e) if e.contains("not offered"))
+    );
+    answer(
+        "question",
+        RuntimeDecision::AnswerQuestion {
+            answers: BTreeMap::new(),
+        },
+    );
+    assert_eq!(
+        event(&mut events).await,
+        HarnessEvent::RuntimeRequestResolved {
+            request_id: "question".into()
+        }
+    );
+    for (id, decision) in [
+        (
+            "plain",
+            RuntimeDecision::Allow {
+                updated_input: None,
+                remember: None,
+            },
+        ),
+        (
+            "deny",
+            RuntimeDecision::Deny {
+                message: "denied".into(),
+            },
+        ),
+    ] {
+        assert!(
+            matches!(event(&mut events).await, HarnessEvent::RuntimeRequest { request_id, .. } if request_id == id)
+        );
+        answer(id, decision);
+        assert_eq!(
+            event(&mut events).await,
+            HarnessEvent::RuntimeRequestResolved {
+                request_id: id.into()
+            }
+        );
+    }
+    assert!(
+        matches!(event(&mut events).await, HarnessEvent::RuntimeRequest { request_id, .. } if request_id == "withdrawn")
+    );
+    assert_eq!(
+        event(&mut events).await,
+        HarnessEvent::RuntimeRequestResolved {
+            request_id: "withdrawn".into()
+        }
+    );
+    answer("withdrawn", remember(offered));
+    assert!(matches!(event(&mut events).await, HarnessEvent::Error(e) if e.contains("no pending")));
+    session.send(HarnessCommand::Shutdown).unwrap();
+    assert_eq!(
+        event(&mut events).await,
+        HarnessEvent::ProcessExited { code: Some(0) }
+    );
+    session.completed().await.unwrap();
+}
