@@ -18,6 +18,7 @@ mod park;
 pub mod preview;
 pub mod remote;
 mod review_reload;
+pub mod session_picker;
 mod sessions;
 pub mod settings;
 pub mod tasks;
