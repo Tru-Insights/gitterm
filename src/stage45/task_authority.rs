@@ -205,7 +205,9 @@ fn assert_pending(pending: &mut Pin<Box<PendingReply>>) {
 }
 
 fn fixture_worker_source(path: &Path) -> Repository {
-    let repo = Repository::init(path).unwrap();
+    let mut options = git2::RepositoryInitOptions::new();
+    options.initial_head("fixture");
+    let repo = Repository::init_opts(path, &options).unwrap();
     let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
     let tree_id = repo.index().unwrap().write_tree().unwrap();
     {
