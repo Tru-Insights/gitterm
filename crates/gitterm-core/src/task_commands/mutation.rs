@@ -95,6 +95,9 @@ pub enum TaskMutation {
     InspectDelete {
         task_id: String,
     },
+    CheckWorkerDestination {
+        expected: CompletedWorktreePreparation,
+    },
     CheckWorkerCheckout {
         task_id: String,
         path: PathBuf,
@@ -262,11 +265,17 @@ pub struct WorkerCaller {
     pub target: session::Target,
     pub chat_session_id: Option<String>,
     pub workspace: WorkspaceIdentity,
-    pub repository: RepositoryIdentity,
+    pub repository: Option<RepositoryIdentity>,
     pub checkout: PathBuf,
     pub home: PathBuf,
     pub repos: Vec<PathBuf>,
     pub remote: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerCheckout {
+    pub path: PathBuf,
+    pub repository: RepositoryIdentity,
 }
 
 #[derive(Debug, Clone)]
@@ -282,6 +291,10 @@ pub struct TaskPreset {
 pub struct TaskMutationFacts {
     pub sessions: Vec<session::State>,
     pub callers: Vec<WorkerCaller>,
+    /// Independently resolved, canonical live destination identities.
+    pub checkouts: Vec<WorkerCheckout>,
+    /// Current normalized destinations, including not-yet-created paths.
+    pub preparation_paths: Vec<PathBuf>,
     pub directories: Vec<PathBuf>,
     /// Fresh Path::exists facts, including non-directory rollback leftovers.
     pub existing_paths: Vec<PathBuf>,

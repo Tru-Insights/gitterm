@@ -10,7 +10,7 @@ use gitterm_core::session;
 use gitterm_core::task_commands::{
     HandoffUpdate, SessionLaunch, TaskCreate, TaskCreateOrigin, TaskLaunchOrigin, TaskMutation,
     TaskMutationAction, TaskMutationCommand, TaskMutationFacts, TaskPreset, TaskProjection,
-    TaskPublish, TaskRead, TaskReadCommand, WorkerCaller, WorkerPreparationId,
+    TaskPublish, TaskRead, TaskReadCommand, WorkerCaller, WorkerCheckout, WorkerPreparationId,
 };
 use gitterm_core::tasks::state::TaskAuthority;
 use iced::advanced::graphics::core::Element;
@@ -9903,6 +9903,113 @@ impl Drop for App {
     }
 }
 
+fn normalized_worker_path(path: &Path) -> Result<PathBuf, String> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(mut canonical) => {
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(
+                    ancestor
+                        .file_name()
+                        .ok_or_else(|| {
+                            format!("resolve worker destination {}: {error}", path.display())
+                        })?
+                        .to_os_string(),
+                );
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    format!("resolve worker destination {}: {error}", path.display())
+                })?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "resolve worker destination {}: {error}",
+                    path.display()
+                ))
+            }
+        }
+    }
+}
+
+fn worker_repository_identity(
+    checkout: &Path,
+) -> Result<Option<gitterm::tasks::RepositoryIdentity>, String> {
+    if gitterm::workers::checkout_root(checkout).is_none() {
+        return Ok(None);
+    }
+    let main = gitterm::workers::trust_main_repository(checkout)?;
+    let repository = Repository::open(&main)
+        .map_err(|error| format!("open worker authority {}: {error}", main.display()))?;
+    let source = Repository::discover(checkout).map_err(|error| {
+        format!(
+            "open worker source authority {}: {error}",
+            checkout.display()
+        )
+    })?;
+    let remote_url = match source
+        .config()
+        .and_then(|config| config.get_string("remote.origin.url"))
+    {
+        Ok(url) => Some(url.trim().to_string()),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => None,
+        Err(error) => {
+            return Err(format!(
+                "read worker authority origin {}: {error}",
+                checkout.display()
+            ))
+        }
+    };
+    let common_dir = std::fs::canonicalize(repository.path()).map_err(|error| {
+        format!(
+            "resolve worker common directory {}: {error}",
+            repository.path().display()
+        )
+    })?;
+    Ok(Some(gitterm::tasks::RepositoryIdentity {
+        common_dir,
+        remote_url,
+    }))
+}
+
+fn worker_checkout_fact(path: &Path) -> Result<WorkerCheckout, String> {
+    let path = std::fs::canonicalize(path)
+        .map_err(|error| format!("resolve worker destination {}: {error}", path.display()))?;
+    if !path.is_dir() {
+        return Err(format!(
+            "worker destination {} is not a directory",
+            path.display()
+        ));
+    }
+    let root = gitterm::workers::checkout_root(&path).ok_or_else(|| {
+        format!(
+            "worker destination {} is not a Git checkout",
+            path.display()
+        )
+    })?;
+    if std::fs::canonicalize(root)
+        .map_err(|error| format!("resolve worker checkout root {}: {error}", path.display()))?
+        != path
+    {
+        return Err(format!(
+            "worker destination {} is not the checkout root",
+            path.display()
+        ));
+    }
+    let repository = worker_repository_identity(&path)?.ok_or_else(|| {
+        format!(
+            "worker destination {} is not a Git checkout",
+            path.display()
+        )
+    })?;
+    Ok(WorkerCheckout { path, repository })
+}
+
 impl App {
     /// UI font size
     fn ui_font(&self) -> f32 {
@@ -12963,6 +13070,40 @@ impl App {
                 facts.existing_paths.push(path.clone());
             }
         }
+        let destination = match &mutation {
+            TaskMutation::CheckWorkerDestination { expected } => Some(expected.path.clone()),
+            TaskMutation::CheckWorkerCheckout { path, .. } => Some(path.clone()),
+            TaskMutation::ReuseWorkerCheckout { replacement, .. } => {
+                replacement.worktree.path.clone()
+            }
+            TaskMutation::WorkerPrepared {
+                result: Ok(prepared),
+                ..
+            } => Some(prepared.path.clone()),
+            _ => None,
+        };
+        if matches!(
+            &mutation,
+            TaskMutation::WorkerPreparationSaved { .. }
+                | TaskMutation::WorkerCheckoutReuseSaved { .. }
+        ) {
+            if let Some(store) = self.task_authority.store() {
+                facts.checkouts = store
+                    .tasks()
+                    .iter()
+                    .filter_map(|task| task.worktree.path.as_ref())
+                    .filter_map(|path| worker_checkout_fact(path).ok())
+                    .collect();
+            }
+        }
+        if let Some(path) = destination {
+            if let Ok(normalized) = normalized_worker_path(&path) {
+                facts.preparation_paths.push(normalized);
+            }
+            if let Ok(checkout) = worker_checkout_fact(&path) {
+                facts.checkouts.push(checkout);
+            }
+        }
         self.task_authority
             .reduce_mutation(
                 TaskMutationCommand {
@@ -12992,29 +13133,8 @@ impl App {
                 .map_err(|error| format!("resolve worker authority {}: {error}", path.display()))
         };
         let checkout = canonical(&caller.cwd)?;
-        // Strict local libgit2/file reads: never spawn Git on the update thread.
-        let main = gitterm::workers::trust_main_repository(&checkout)?;
-        let repository = Repository::open(&main)
-            .map_err(|error| format!("open worker authority {}: {error}", main.display()))?;
-        let source_repository = Repository::discover(&checkout).map_err(|error| {
-            format!(
-                "open worker source authority {}: {error}",
-                checkout.display()
-            )
-        })?;
-        let remote_url = match source_repository
-            .config()
-            .and_then(|config| config.get_string("remote.origin.url"))
-        {
-            Ok(url) => Some(url.trim().to_string()),
-            Err(error) if error.code() == git2::ErrorCode::NotFound => None,
-            Err(error) => {
-                return Err(format!(
-                    "read worker authority origin {}: {error}",
-                    main.display()
-                ))
-            }
-        };
+        // A non-repository workspace home can delegate to explicitly listed repos.
+        let repository = worker_repository_identity(&checkout)?;
         let home = canonical(&caller.home)?;
         let WorkspaceLocation::Local { root } = &workspace.location else {
             return Err("Remote workers are not supported yet".into());
@@ -13029,10 +13149,7 @@ impl App {
                 name: caller.workspace,
                 location: source_location,
             },
-            repository: gitterm::tasks::RepositoryIdentity {
-                common_dir: canonical(repository.path())?,
-                remote_url,
-            },
+            repository,
             checkout,
             home,
             repos: caller
@@ -13067,8 +13184,18 @@ impl App {
             .resolved_worktree_path
             .iter()
             .filter(|path| path.exists())
-            .cloned()
+            .filter_map(|path| std::fs::canonicalize(path).ok())
             .collect();
+        if let Some(path) = &pending.resolved_worktree_path {
+            if let Ok(path) = normalized_worker_path(path) {
+                facts.preparation_paths.push(path);
+            }
+        }
+        if let Ok(prepared) = &result {
+            if let Ok(checkout) = worker_checkout_fact(&prepared.path) {
+                facts.checkouts.push(checkout);
+            }
+        }
         let effect = self
             .task_authority
             .reduce_mutation(
@@ -19476,6 +19603,16 @@ impl App {
                 return Err("Linear issue must look like TRU-106".to_string());
             }
             let stopping_boundary = stopping_boundary_from_control(request.stopping_boundary);
+            if let Some(resolution) = &adoption {
+                self.reduce_task_mutation(TaskMutation::CheckWorkerDestination {
+                    expected: CompletedWorktreePreparation {
+                        repository: resolution.repository.identity.clone(),
+                        base: resolution.base.clone(),
+                        branch: resolution.branch.clone(),
+                        path: checkout.clone(),
+                    },
+                })?;
+            }
             let owner = self.worktree_task(&checkout).cloned();
             let task_id = match &owner {
                 Some(task) => task.task_id.clone(),
@@ -29244,7 +29381,16 @@ fi
                         repository: resolved.repository.identity.clone(),
                         base: resolved.base.clone(),
                         branch: resolved.proposal.branch.clone(),
-                        path: resolved.proposal.path.clone(),
+                        path: match normalized_worker_path(&resolved.proposal.path) {
+                            Ok(path) => path,
+                            Err(error) => {
+                                self.cancel_worker_preparation(worker.authority);
+                                if let Some(reply) = &pending.control_reply {
+                                    reply.send(Err(error));
+                                }
+                                return Task::none();
+                            }
+                        },
                     };
                     if let Err(error) =
                         self.reduce_task_mutation(TaskMutation::BindWorkerPreparation {

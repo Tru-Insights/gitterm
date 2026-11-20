@@ -204,6 +204,27 @@ fn assert_pending(pending: &mut Pin<Box<PendingReply>>) {
     assert!(pending.as_mut().now_or_never().is_none());
 }
 
+fn fixture_worker_source(path: &Path) -> Repository {
+    let repo = Repository::init(path).unwrap();
+    let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+    let tree_id = repo.index().unwrap().write_tree().unwrap();
+    {
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "Fixture", &tree, &[])
+            .unwrap();
+    }
+    repo
+}
+
+fn fixture_worker_checkout(source: &Path, path: &Path, name: &str) {
+    let repo = Repository::open(source).unwrap();
+    let commit = repo.head().unwrap().peel_to_commit().unwrap();
+    let reference = repo.branch(name, &commit, false).unwrap().into_reference();
+    let mut options = git2::WorktreeAddOptions::new();
+    options.reference(Some(&reference));
+    repo.worktree(name, path, Some(&options)).unwrap();
+}
+
 fn pending_worker_fixture(
     app: &mut App,
     dir: &Path,
@@ -213,9 +234,22 @@ fn pending_worker_fixture(
     PendingReply,
     gitterm_core::task_commands::runtime::CommandReceiver<()>,
 ) {
+    pending_worker_fixture_at(app, dir, &dir.join("prepared"))
+}
+
+fn pending_worker_fixture_at(
+    app: &mut App,
+    dir: &Path,
+    path: &Path,
+) -> (
+    PendingTaskLaunch,
+    PreparedTaskWorktree,
+    PendingReply,
+    gitterm_core::task_commands::runtime::CommandReceiver<()>,
+) {
     let source = dir.join("source");
     std::fs::create_dir_all(&source).unwrap();
-    Repository::init(&source).unwrap();
+    fixture_worker_source(&source);
     let source = std::fs::canonicalize(source).unwrap();
     app.workspaces[0].dir = source.clone();
     app.workspaces[0].location = WorkspaceLocation::Local {
@@ -234,7 +268,11 @@ fn pending_worker_fixture(
     };
     let repository = gitterm::task_worktree::ResolvedRepository {
         top_level: source.clone(),
-        identity: app.worker_authority_caller(&uid).unwrap().repository,
+        identity: app
+            .worker_authority_caller(&uid)
+            .unwrap()
+            .repository
+            .unwrap(),
         current_branch: Some("main".into()),
     };
     let (sender, mut receiver) = command_channel();
@@ -268,13 +306,13 @@ fn pending_worker_fixture(
         .unwrap()
         .base
         .clone();
-    let path = dir.join("prepared");
-    std::fs::create_dir_all(&path).unwrap();
+    let path = path.to_path_buf();
+    fixture_worker_checkout(&source, &path, "prepared");
     let prepared = PreparedTaskWorktree {
         repository: repository.clone(),
         base: base.clone(),
         branch: "prepared".into(),
-        path: path.clone(),
+        path: std::fs::canonicalize(&path).unwrap(),
     };
     let _effect = app.update_event(Event::TaskMetadataResolved(
         pending.clone(),
@@ -399,7 +437,7 @@ fn iced_worker_completion_observes_actual_save_and_consumes_duplicates() {
             std::fs::create_dir(dir.path().join("tasks.json")).unwrap();
         }
         if outcome == "rollback-file" {
-            std::fs::remove_dir(&prepared.path).unwrap();
+            std::fs::remove_dir_all(&prepared.path).unwrap();
             std::fs::write(&prepared.path, "leftover").unwrap();
         }
         let result = match outcome {
@@ -825,6 +863,8 @@ fn iced_existing_checkout_reuse_preserves_outcomes_and_refuses_before_writes() {
         "stale",
         "archived",
         "save-error",
+        "removed-destination",
+        "replaced-destination",
     ] {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_with_tabs(dir.path());
@@ -842,7 +882,8 @@ fn iced_existing_checkout_reuse_preserves_outcomes_and_refuses_before_writes() {
             panic!("capture");
         };
         let checkout = dir.path().join("reuse");
-        std::fs::create_dir(&checkout).unwrap();
+        fixture_worker_checkout(&app.workspaces[0].tabs[0].repo_path, &checkout, "reuse");
+        let checkout = std::fs::canonicalize(checkout).unwrap();
         let mut record = app
             .task_authority
             .store()
@@ -853,6 +894,7 @@ fn iced_existing_checkout_reuse_preserves_outcomes_and_refuses_before_writes() {
             .clone();
         record.task_id = "reuse-task".into();
         record.worktree.path = Some(checkout.clone());
+        record.repository = worker_repository_identity(&checkout).unwrap().unwrap();
         record.lifecycle = match scenario {
             "failed" => TaskLifecycle::Failed,
             "stopped" => TaskLifecycle::Stopped,
@@ -878,6 +920,12 @@ fn iced_existing_checkout_reuse_preserves_outcomes_and_refuses_before_writes() {
             std::fs::remove_file(dir.path().join("tasks.json")).unwrap();
             std::fs::create_dir(dir.path().join("tasks.json")).unwrap();
         }
+        if matches!(scenario, "removed-destination" | "replaced-destination") {
+            std::fs::rename(&checkout, dir.path().join("old-checkout")).unwrap();
+            if scenario == "replaced-destination" {
+                Repository::init(&checkout).unwrap();
+            }
+        }
         let request = serde_json::from_value(
             json!({"title":"Reused title", "objective":"New objective", "checkout":checkout}),
         )
@@ -902,7 +950,10 @@ fn iced_existing_checkout_reuse_preserves_outcomes_and_refuses_before_writes() {
         assert_eq!(saved.lifecycle, record.lifecycle);
         assert_eq!(saved.attention, record.attention);
         assert_eq!(saved.last_error, record.last_error);
-        if matches!(scenario, "stale" | "archived" | "save-error") {
+        if matches!(
+            scenario,
+            "stale" | "archived" | "save-error" | "removed-destination" | "replaced-destination"
+        ) {
             assert_eq!(saved, &record, "{scenario}: {error}");
             assert!(store.delegations().is_empty());
             if scenario != "save-error" {
@@ -922,4 +973,183 @@ fn iced_existing_checkout_reuse_preserves_outcomes_and_refuses_before_writes() {
         }
         assert!(app.task_launch_queue.is_empty());
     }
+}
+
+#[test]
+fn iced_prepared_destination_replacement_is_refused_before_save() {
+    if isolated(
+        "iced_prepared_destination_replacement_is_refused_before_save",
+        "task_authority",
+    ) {
+        return;
+    }
+    for replace in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_tabs(dir.path());
+        add_task(&mut app, dir.path(), dir.path());
+        let (pending, prepared, response, _receiver) = pending_worker_fixture(&mut app, dir.path());
+        std::fs::rename(&prepared.path, dir.path().join("old-prepared")).unwrap();
+        if replace {
+            Repository::init(&prepared.path).unwrap();
+        }
+        let before = std::fs::read(dir.path().join("tasks.json")).unwrap();
+        let _effect = app.update_event(Event::TaskWorktreePrepared(pending, Ok(prepared)));
+        assert!(iced::futures::executor::block_on(response)
+            .unwrap_err()
+            .contains("destination checkout"));
+        assert_eq!(
+            std::fs::read(dir.path().join("tasks.json")).unwrap(),
+            before
+        );
+        assert!(app
+            .task_authority
+            .store()
+            .as_ref()
+            .unwrap()
+            .delegations()
+            .is_empty());
+        assert!(app.task_launch_queue.is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn iced_symlink_destination_normalization_preserves_authority_and_detects_retargeting() {
+    if isolated(
+        "iced_symlink_destination_normalization_preserves_authority_and_detects_retargeting",
+        "task_authority",
+    ) {
+        return;
+    }
+    for retarget in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("actual-root");
+        std::fs::create_dir(&root).unwrap();
+        let alias = dir.path().join("alias-root");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let mut app = app_with_tabs(dir.path());
+        add_task(&mut app, dir.path(), dir.path());
+        let (pending, prepared, response, _receiver) =
+            pending_worker_fixture_at(&mut app, dir.path(), &alias.join("prepared"));
+        let before = std::fs::read(dir.path().join("tasks.json")).unwrap();
+        if retarget {
+            let other = dir.path().join("other-root");
+            std::fs::create_dir(&other).unwrap();
+            std::fs::remove_file(&alias).unwrap();
+            std::os::unix::fs::symlink(other, &alias).unwrap();
+        }
+        let path = prepared.path.clone();
+        let _effect = app.update_event(Event::TaskWorktreePrepared(pending.clone(), Ok(prepared)));
+        let error = iced::futures::executor::block_on(response).unwrap_err();
+        if retarget {
+            assert!(error.contains("destination checkout changed"), "{error}");
+            assert_eq!(
+                std::fs::read(dir.path().join("tasks.json")).unwrap(),
+                before
+            );
+            assert!(app
+                .task_authority
+                .store()
+                .as_ref()
+                .unwrap()
+                .delegations()
+                .is_empty());
+        } else {
+            assert!(
+                error.contains("selected agent preset is unavailable"),
+                "{error}"
+            );
+            assert_eq!(
+                app.task_authority
+                    .store()
+                    .as_ref()
+                    .unwrap()
+                    .get(&pending.task_id)
+                    .unwrap()
+                    .worktree
+                    .path
+                    .as_ref(),
+                Some(&path)
+            );
+        }
+    }
+}
+
+#[test]
+fn iced_non_repository_caller_can_delegate_to_a_listed_checkout() {
+    if isolated(
+        "iced_non_repository_caller_can_delegate_to_a_listed_checkout",
+        "task_authority",
+    ) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(dir.path());
+    add_task(&mut app, dir.path(), dir.path());
+    let (pending, prepared, _unused_reply, _unused_receiver) =
+        pending_worker_fixture(&mut app, dir.path());
+    let worker = pending.worker.unwrap();
+    app.cancel_worker_preparation(worker.authority);
+    let home = dir.path().join("workspace-home");
+    std::fs::create_dir(&home).unwrap();
+    let listed_source = app.workspaces[0].tabs[0].repo_path.clone();
+    app.workspaces[0].pending_repos.push(listed_source);
+    app.workspaces[0].dir = home.clone();
+    app.workspaces[0].location = WorkspaceLocation::Local { root: home.clone() };
+    app.workspaces[0].tabs[0].repo_path = home;
+    let uid = worker.caller.session_uid.clone();
+    assert!(app
+        .worker_authority_caller(&uid)
+        .unwrap()
+        .repository
+        .is_none());
+    let TaskMutationAction::WorkerAuthorityChecked { id: authority } = app
+        .reduce_task_mutation(TaskMutation::BeginWorkerPreparation {
+            caller: uid.clone(),
+        })
+        .unwrap()
+    else {
+        panic!("capture");
+    };
+    let caller = app.delegation_caller(&uid).unwrap();
+    assert_eq!(
+        gitterm::delegations::resolve_checkout("checkout", &prepared.path, &caller).unwrap(),
+        prepared.path
+    );
+    let request = serde_json::from_value(
+        json!({"title":"Explicit checkout", "objective":"Fixture", "checkout":prepared.path}),
+    )
+    .unwrap();
+    let targets = DelegateTargets {
+        authority,
+        request,
+        caller: Some(uid),
+        tab: caller,
+        choice: worker.choice,
+        place: gitterm::delegations::WorkerPlace::Checkout(prepared.path.clone()),
+        options: worker.options,
+        adoption: Some(AdoptedWorktreeResolution {
+            repository: prepared.repository.clone(),
+            base: prepared.base.clone(),
+            branch: prepared.branch.clone(),
+        }),
+    };
+    let (sender, mut receiver) = command_channel();
+    let response = sender.enqueue((), None).unwrap();
+    let _effect =
+        app.delegate_task_in_checkout(targets, prepared.path, receiver.try_recv().unwrap().reply);
+    let error = iced::futures::executor::block_on(response).unwrap_err();
+    assert!(
+        error.contains("selected agent preset is unavailable"),
+        "{error}"
+    );
+    assert_eq!(
+        app.task_authority
+            .store()
+            .as_ref()
+            .unwrap()
+            .delegations()
+            .len(),
+        1
+    );
 }
