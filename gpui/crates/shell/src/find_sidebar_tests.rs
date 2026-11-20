@@ -130,13 +130,13 @@ fn rows_use_core_order_iced_repo_groups_and_labels() {
     assert_eq!(
         (
             rows[0].title.as_str(),
-            rows[0].workspace.as_str(),
             rows[0].age.as_str(),
             rows[0].backend.label()
         ),
-        ("Title first", "api", "3h", "claude")
+        ("Title first", "3h", "claude")
     );
-    assert_eq!(rows[0].details, ["↳ Latest first", "main"]);
+    assert_eq!(rows[0].details, ["↳ Latest first"]);
+    assert_eq!(rows[0].branch.as_deref(), Some("main"));
     assert_eq!(rows[2].backend.label(), "codex");
 }
 
@@ -253,8 +253,8 @@ fn everywhere_is_configured_machine_order_and_search_expands_sections() {
     assert!(
         rows.last()
             .unwrap()
-            .details
-            .contains(&"main · @ Build machine".into())
+            .meta
+            .contains(&"@ Build machine".into())
     );
 }
 
@@ -540,6 +540,189 @@ fn native_preview_buttons_emit_resume_and_close_and_raw_toggle_is_local(cx: &mut
                 mode: ResumeMode::Chat
             },
             FindOutcome::ClosePreview
+        ]
+    );
+}
+
+#[test]
+fn open_lines_match_iced_title_and_place_limits() {
+    let mut session = OpenSession {
+        id: ChatRef::local("first"),
+        title: "Revisiting GPUI discussion".into(),
+        workspace: "Work".into(),
+        marker: "✳ ".into(),
+        detail: "main — Latest prompt".into(),
+        selected: true,
+    };
+    assert_eq!(
+        open_lines(&session),
+        (
+            "Revisiting GPUI discussion".into(),
+            "Work · main — Latest prompt".into(),
+        )
+    );
+    session.title = "é".repeat(49);
+    session.detail = "界".repeat(80);
+    assert_eq!(
+        open_lines(&session),
+        (
+            format!("{}…", "é".repeat(47)),
+            format!("Work · {}…", "界".repeat(64)),
+        )
+    );
+}
+
+#[gpui::test]
+fn measured_rows_are_left_aligned_and_never_overlap(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (state, mut facts) = fixture();
+    facts.open_sessions = [
+        ("first", "Short", "main"),
+        (
+            "same",
+            "A longer open conversation title that wraps",
+            "feature/long-branch-name",
+        ),
+        ("second", "Third", "main — Last user prompt"),
+    ]
+    .into_iter()
+    .map(|(id, title, detail)| OpenSession {
+        id: ChatRef::local(id),
+        title: title.into(),
+        workspace: "Work".into(),
+        marker: "✳".into(),
+        detail: detail.into(),
+        selected: id == "first",
+    })
+    .collect();
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| {
+            FindSidebar::new(
+                Rc::new(RefCell::new(state)),
+                "tab".into(),
+                facts,
+                window,
+                cx,
+            )
+        });
+        gpui_component::Root::new(view, window, cx)
+    });
+    for width in [280., 480.] {
+        cx.simulate_resize(gpui::size(px(width), px(1200.)));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = |cx: &mut VisualTestContext, selector| cx.debug_bounds(selector).unwrap();
+        let mut previous = bounds(cx, "find-open");
+        for (row, title, detail) in [
+            ("find-open-0", "find-open-title-0", "find-open-detail-0"),
+            ("find-open-1", "find-open-title-1", "find-open-detail-1"),
+            ("find-open-2", "find-open-title-2", "find-open-detail-2"),
+        ] {
+            let row = bounds(cx, row);
+            let title = bounds(cx, title);
+            let detail = bounds(cx, detail);
+            assert!(
+                previous.bottom() <= row.top(),
+                "open rows overlap at {width}px"
+            );
+            assert!(title.bottom() <= detail.top(), "title overlaps detail");
+            assert!(
+                detail.bottom() <= row.bottom(),
+                "two-line content escapes button"
+            );
+            assert_eq!(title.left(), detail.left());
+            assert!(title.left() < row.left() + px(40.), "open text is centred");
+            previous = row;
+        }
+        for selector in [
+            "find-machine-0",
+            "find-group-1",
+            "find-chat-2",
+            "find-chat-3",
+            "find-group-4",
+            "find-chat-5",
+        ] {
+            let row = bounds(cx, selector);
+            assert!(
+                previous.bottom() <= row.top(),
+                "{selector} overlaps preceding row"
+            );
+            assert!(row.left() < px(20.), "{selector} is centred");
+            previous = row;
+        }
+        for (row, title, latest, meta) in [
+            (
+                "find-chat-2",
+                "find-title-2",
+                "find-detail-2-0",
+                "find-meta-2",
+            ),
+            (
+                "find-chat-3",
+                "find-title-3",
+                "find-detail-3-0",
+                "find-meta-3",
+            ),
+        ] {
+            let row = bounds(cx, row);
+            let title = bounds(cx, title);
+            let latest = bounds(cx, latest);
+            let meta = bounds(cx, meta);
+            assert!(title.bottom() <= latest.top());
+            assert!(latest.bottom() <= meta.top());
+            assert!(meta.bottom() <= row.bottom());
+            assert_eq!(title.left(), latest.left());
+            assert_eq!(latest.left(), meta.left());
+            assert!(title.left() < row.left() + px(12.));
+        }
+    }
+}
+
+#[test]
+fn fixture_text_and_order_match_iced_find_sidebar() {
+    let (state, mut facts) = fixture();
+    facts.open_sessions.push(OpenSession {
+        id: ChatRef::local("first"),
+        title: "Title first".into(),
+        workspace: "Work".into(),
+        marker: "✳".into(),
+        detail: "main".into(),
+        selected: false,
+    });
+    // src/main.rs view_chat_row: dot + title, latest, then age, branch,
+    // open-in (when present), and remaining status indicators. No backend
+    // name or workspace/age line is inserted into an indexed chat row.
+    let text: Vec<Vec<String>> = rows(&state, "tab", &facts, &Disclosures::default())
+        .into_iter()
+        .map(|row| match row {
+            Row::Machine { label, .. } => vec![label],
+            Row::Group { label, count } => vec![format!("{label} {count}")],
+            Row::Note(note) => vec![note],
+            Row::Chat(row) => {
+                let mut text = vec![format!("● {}", row.title)];
+                text.extend(row.details);
+                let mut meta = vec![row.age];
+                meta.extend(row.branch);
+                meta.extend(row.open.map(|control| control.label));
+                meta.extend(row.meta);
+                text.push(meta.join(" | "));
+                text
+            }
+        })
+        .collect();
+    assert_eq!(
+        text,
+        [
+            vec!["THIS MAC"],
+            vec!["API 2"],
+            vec![
+                "● Title first",
+                "↳ Latest first",
+                "3h | main | ● open in Work"
+            ],
+            vec!["● Title same", "↳ Latest same", "3h | main"],
+            vec!["WEB 1"],
+            vec!["● Title second", "↳ Latest second", "3h | main"],
         ]
     );
 }
