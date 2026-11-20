@@ -43,6 +43,7 @@ fn launch(dir: &Path, script: &str, token: CancellationToken) -> Launch {
         ("SYNTHETIC_MCP_TOKEN".into(), "synthetic-only".into()),
     ];
     Launch {
+        flags: Default::default(),
         config: ClaudeSessionConfig {
             cwd: dir.into(),
             snapshot_facts_dir: None,

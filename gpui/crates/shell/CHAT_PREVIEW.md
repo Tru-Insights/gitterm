@@ -1,276 +1,196 @@
-# TRU-274 C8b native pane
+# TRU-274 fresh local Claude preview
 
-## C8-confine delivery (activation still blocked)
+## Gate and activation
 
-R2 plan review `ec0b0725-c13c-4382-9d4d-cc49bab6ef73` confirmed this task's
-checkout and base `6b5e61f` and requires real activation to remain closed:
+`chat/provider.rs::Provider::start` is the narrow C2 opening: a new local Claude
+session in the selected root of an independent clone. The generic C2 `Agent`,
+Worker, Helper, Resume, RestoreProcess and remote/phone routes remain closed.
+History is read only and never supplies a resume ID. There is no production
+fake-executable switch or environment bypass.
 
-- The installed Claude Code 2.1.327 `--help` documents `--restricted`,
-  `--strict-mcp-config` and `--safe-mode`. Its permission choices list `manual`,
-  not the requested literal `default`. The current
-  [permission documentation](https://code.claude.com/docs/en/permissions#permission-modes)
-  calls `manual` an alias for `default`; no real session was run to verify that
-  contract and no substitution was made. Synthetic help parsing fails closed
-  when any fence option or the exact `default` choice is missing.
-- `--safe-mode` explicitly preserves managed policy and managed-plugin hooks.
-  [disableAllHooks](https://code.claude.com/docs/en/settings-reference#disableallhooks)
-  outside managed settings cannot disable these writers. Restricted file tools
-  and deny rules cannot sandbox arbitrary managed hook subprocesses. Managed
-  writers need a separately established boundary before login/probing/launch.
-- Core `harness/claude.rs` builds argv internally and its `Launch` has no
-  extra-arguments field. Editing it is outside this task's authorized scope.
-  No wrapper workaround, invented flag, argument injection, or live launcher
-  was added. Provider ownership through child shutdown is another outstanding
-  prerequisite; the catalog writer lease does not establish it.
+**Real chat still refuses until the coordinator verifies the account schema.**
+`gpui/crates/shell/src/chat/auth.rs::AUTH_STATUS_SCHEMA` is the single table of
+accepted JSON names and values. It is marked `UNVERIFIED until coordinator probe`
+(`unverified: true`). Its field list and method/subscription values are empty:
+no installed-version account fields have been guessed. The parser checks typed
+boolean/string/root/empty-policy fields, rejects missing and unknown fields,
+and requires positive signed-in, personal-method, Pro/Max and exact-root evidence.
+Every organization/team/enterprise, API/Console or third-party indicator must
+be mapped and empty. Only verified display-only strings may be informational.
+The coordinator must inspect **all** returned fields, populate the table and
+update tests before setting `unverified: false`. Flipping the boolean alone
+still refuses. Do not put account names or private output in the public repo.
+The only override is the explicit synthetic `FIXTURE_SCHEMA` under `cfg(test)`;
+it uses invented `fixture_*` names and cannot be selected by the app or env.
 
-The shell now requires the selected **root** of an independent clone. Plain
-folders, nested folders, linked worktrees, `.git` symlinks, `commondir`, registered
-worktrees, object alternates, missing/aliased core Git metadata and overlap with
-preview app/provider state are refused without running Git. Existing protected
-root checks and the nine-variable child environment are unchanged. Independent
-here means locally rooted metadata with no discovered redirects; this does not
-prove clone provenance, absence of every hardlink, or prevent concurrent path
-replacement. The first trial must use an exclusively owned disposable clone
-made with `git clone --no-local`.
+Every start holds the provider lease before running the checks. On the session
+thread, under the unchanged nine-variable environment, it runs bounded, timed
+`claude --help`, then `claude auth status --json`. Failed commands, malformed or
+oversized JSON and uncertain account status refuse before a chat is spawned.
+The help must advertise `--restricted`, `--strict-mcp-config`, `--safe-mode` and
+`--permission-mode`; `default` or its documented `manual` alias must be listed.
+The literal argument remains `default`.
+[CLI reference](https://code.claude.com/docs/en/cli-reference#cli-flags).
 
-**Desired fresh launch fence**, not an implemented runtime argv:
+Before help/auth and again before launch, any entry (including dangling symlinks)
+or inspection failure at these local managed-policy locations refuses:
 
-```text
---restricted --strict-mcp-config --safe-mode --permission-mode default
-```
+- `/Library/Application Support/ClaudeCode/` (covers `managed-settings.json`,
+  `managed-settings.d/` and `managed-mcp.json`);
+- `/Library/Managed Preferences/` (conservative whole-directory refusal);
+- `/Library/Preferences/com.anthropic.claudecode.plist` (preferences domain);
+- `/etc/claude-code/` (Linux system directory; conservatively also checked on macOS).
 
-It must be combined with the shared stream-json launch arguments once the core
-API supports it. No resume, MCP config, tools override, bypass flags, `--add-dir`,
-Chrome, or `--bare` is allowed. The displayed sign-in command now includes the
-same desired fence, but remains explicitly labeled as requiring isolation review.
-No settings JSON or deny rules are added: they are optional defense in depth,
-cannot close the managed-process gap, and no real launch is enabled.
+Source: [managed policy locations](https://code.claude.com/docs/en/managed-settings#where-each-mechanism-stores-the-policy).
+`chat/managed.rs` accepts a private temp-root parameter for tests; production
+always uses `/`. Safe mode preserves managed hooks. The accepted boundary is
+therefore **personal Pro/Max only plus no local managed policy**, together with
+restricted tools. Team/Enterprise server-delivered policy is refused by the
+auth gate. No claim is made that safe mode alone disables managed hooks.
 
-Host writers remain disabled for these chats: snapshot capture/`git add`,
-snapshot publication and close-time maintenance (both `snapshot_facts_dir: None`
-and the no-op recorder), generated guideline/context files and reinjection,
-wire logs, injected task/browser MCP services, Chrome, worker/delegation/helper
-launch, remember-permission persistence, remote/phone and resume. Production
-execution remains unavailable; the fake test launcher retains these structural
-disables. No core snapshot code or shared harness/runtime files changed.
+## Launch and writer boundary
 
-### Coordinator-only probe
-
-`scripts/preview-claude-confinement-probe.sh <provider-root> <disposable-clone>`
-is an offline-prepared tool-layer probe. **Do not run it before resolving managed
-writer isolation and ownership.** It does not certify whole-process confinement.
-The agent never runs it against real Claude. It resolves the coordinator's
-`claude` from PATH once, uses an absolute program and the unchanged complete C8b
-environment, validates independent metadata, and checks `--help` before chats.
-
-Exact probe argv per case, with one mode (the sole probe-only exception):
+Exact preview argv (after the resolved absolute Claude executable):
 
 ```text
-<absolute-claude> --restricted --strict-mcp-config --safe-mode --permission-mode acceptEdits -p --output-format stream-json --verbose --permission-prompts none <case-prompt>
+--output-format stream-json --verbose --input-format stream-json --permission-prompt-tool stdio --include-partial-messages --no-chrome --permission-mode default --restricted --strict-mcp-config --safe-mode
 ```
 
-`--permission-prompts none` is documented by installed help and denies protected
-config/Git requests that would need a person. Output must have CLI init/tool
-inventory, a successful result and a valid Write call carrying the exact path
-and marker content. Forbidden cases additionally require the same tool-use ID,
-name and input in the result's authoritative
-[`permission_denials`](https://code.claude.com/docs/en/agent-sdk/typescript#sdkpermissiondenial).
-A schema/IO error, unrelated denial, model refusal, auth failure or missing
-evidence is FAIL/inconclusive.
-The shell case checks the CLI tool inventory and invocation records, never the
-model's explanation. Every invocation independently checks all forbidden paths
-on disk, including after CLI/parse errors. Cases print separate PASS/FAIL:
+Core `harness/claude.rs::LaunchFlags::FreshPreview` supplies only the three fence
+flags and validates the fixed session config before any guideline writes.
+`LaunchFlags::Standard` is the default; Iced's argv is byte-identical. Both are
+pinned by tests. No bypass flag, `--add-dir`, `--bare`, tools override, MCP config
+or resume can enter a preview launch. Host writers stay disabled: snapshot
+capture/`git add`, snapshot publication and close maintenance (`None` facts root
+plus no-op recorder), generated guideline/context files and reinjection, wire
+logs, injected task/browser MCP, Chrome, worker/delegation/helper launch,
+remember-permission persistence, remote/phone and resume.
 
-1. Absolute synthetic `<temp>/host/.config/gitterm-v6/.probe-sentinel`.
-2. Literal real `$HOME/.config/gitterm-v6/.probe-sentinel` (must be absent before
-   and after; never created or removed by the script).
-3. In-clone directory symlink targeting a private outside fixture.
-4. Clone `.claude/settings.json` (preserve existing bytes/identity).
-5. Clone `.git/config` (preserve existing bytes/identity).
-6. Shell tool unavailable, with an outside command-output sentinel unchanged.
-7. Positive plain in-clone file edit with exact expected content.
+The coordinator accepts that `--restricted` removes Bash/code-running tools and
+confines file tools to the working directory, strict MCP loads no implicit
+servers, and safe mode suppresses user/project customizations. With managed
+writers excluded and host helpers disabled, the remaining CLI file tools are
+the writer boundary. The coordinator must demonstrate it with the real probe
+before using a chat. No optional deny-rule JSON is added.
 
-Any failure exits nonzero. Only private scratch and individually tracked fixture
-files are cleaned; existing files are never restored or deleted. A real escaped
-sentinel is left as evidence. Replaced fixture inodes are retained rather than
-mistaken for script-owned files. Child HOME/config/temp directories are retained
-as preview-owned state. Run only against disposable data with no concurrent
-writer. The Python helper uses only the standard library; `-I -B` suppresses
-Python environment/path injection and bytecode writes.
+The clone validator runs no Git. It refuses plain/nested folders, linked
+worktrees, `.git` symlinks, shared common directories/registered worktrees,
+object alternates and aliased/missing core metadata, protected roots and overlap
+with app/provider state. Use an exclusively owned disposable `git clone
+--no-local`. This does not prove clone provenance, exclude every hardlink, or
+prevent concurrent path replacement; keep all trial data exclusively owned.
 
-Offline tests (no sign-in or real CLI) are:
+`chat/lease.rs::ProviderLease` holds an exclusive nonblocking OS lock on the
+persistent `<provider>/.writer` inode. It checks private mode, regular file,
+single link and opened/path device+inode identity after locking. A second chat
+or preview instance refuses. The file is never unlinked. Marker/PID contents
+are never authority and no PID is signalled: the kernel releases a dead owner's
+lock, so stale markers need no PID-based recovery. A shared lease is held by
+both the no-op recorder and `OwnedRuntime`. Close transfers the latter into
+`RuntimeShutdown`; it drops only after `Session::completed()` joins the runtime
+thread through process reaping and cleanup. Quit drains that queue synchronously
+before GPUI's timeout. Tests cover second-owner refusal, stale marker reuse,
+symlink/hardlink refusal and retention through slow shutdown/drain.
+
+## Delivery outcomes
+
+Production `ChatPane::new` calls `Provider::start` → `Session::spawn_runtime` and
+`install_runtime`. `Controller::dispatch` maps each C7 `Prepared::id()` to a
+session-local `CommandCorrelation` and calls `send_correlated`. The one receiver
+stamps and gates **all** ingress before pane mutation, then passes ordered
+`RuntimeEvent::CommandOutcome` through `apply_runtime_outcome` →
+`ChatAdapter::delivery` → exact receipt. Labels are Sending, Written, Rejected
+and Uncertain. Written means stdin delivery, not provider acknowledgement.
+Resolved answers remain Resolved when a later Written event arrives. Outcomes
+are local, never persisted to provider JSONL or phone payloads. Fake children
+cover send, permission denial, question response, interrupt, rejected writes
+and death during a partial write.
+
+## Coordinator-only sign-in, schema probe and confinement probe
+
+These commands are for the coordinator **after review**, never run by the
+worker. Close all preview chats and probe processes first. Use the default
+non-sample preview root below; launch the GPUI shell with this same explicit
+`GITTERM_GPUI_CONFIG_DIR` later. No credentials are copied, linked or exported.
+Use a personal Pro/Max account; never select a Team/Enterprise organization.
 
 ```sh
-python3 -B tests/preview_claude_confinement_probe_test.py
-```
-
-After the blockers are resolved and R2 permits the real trial, the coordinator
-uses an absolute preview root `P`, outside the disposable clone `C`, and the
-verified absolute CLI path `CLAUDE`. Replace placeholders; do not run these
-commands against any production root:
-
-```sh
-# Only after managed-writer confinement and supported default mode are verified.
+P="$HOME/.config/gitterm-gpui"
+CLAUDE="$HOME/.local/bin/claude"  # resolved installed CLI on the coordinator host
+C="$HOME/gitterm-chat-c8-disposable-clone"  # independent, exclusively owned clone
+REPO="$PWD"                  # this checkout, before changing directory
+# If C does not exist, create it once: git clone --no-local "$REPO" "$C"
+umask 077
 mkdir -p "$P/providers/claude" "$P/child/neutral" "$P/child/home" "$P/child/config" "$P/child/tmp"
 cd "$P/child/neutral"
+# (a) One-time isolated sign-in. Then /login; exit the CLI after signing in.
 env -i "CLAUDE_CONFIG_DIR=$P/providers/claude" "GITTERM_GPUI_CONFIG_DIR=$P" \
   "GITTERM_V6_CONFIG_DIR=$P/desktop" "HOME=$P/child/home" "XDG_CONFIG_HOME=$P/child/config" \
   PATH=/usr/bin:/bin "TMPDIR=$P/child/tmp" "TMP=$P/child/tmp" "TEMP=$P/child/tmp" \
   "$CLAUDE" --restricted --strict-mcp-config --safe-mode --permission-mode default
-# Then /login; exit the CLI. Never copy/link production credentials.
+# (b) Inspect locally. Do not paste private output into commits or public reports.
+env -i "CLAUDE_CONFIG_DIR=$P/providers/claude" "GITTERM_GPUI_CONFIG_DIR=$P" \
+  "GITTERM_V6_CONFIG_DIR=$P/desktop" "HOME=$P/child/home" "XDG_CONFIG_HOME=$P/child/config" \
+  PATH=/usr/bin:/bin "TMPDIR=$P/child/tmp" "TMP=$P/child/tmp" "TEMP=$P/child/tmp" \
+  "$CLAUDE" auth status --json
+# Populate AUTH_STATUS_SCHEMA from the observed complete schema and verified
+# personal-account values, add fixtures, then flip unverified to false and review.
+# (c) Run only after confirming personal auth and absence of managed policy.
 cd "$REPO"
 scripts/preview-claude-confinement-probe.sh "$P/providers/claude" "$C"
 ```
 
-The probe is not an activation receipt or a cached authorization. Passing fake
-tests or this file-tool probe cannot open C2. No GUI, real login/session,
-production-state inspection, push or merge is part of this delivery.
+These commands keep the complete allowlist: `CLAUDE_CONFIG_DIR`,
+`GITTERM_GPUI_CONFIG_DIR`, `GITTERM_V6_CONFIG_DIR`, `HOME`, `XDG_CONFIG_HOME`,
+`PATH`, `TMPDIR`, `TMP`, `TEMP`. No inherited API/OAuth tokens, helpers, parent
+session IDs, cloud-provider toggles, proxies, loader overrides or MCP credentials.
+The provider path is literally `$HOME/.config/gitterm-gpui/providers/claude` for
+these commands; the app rule is `<validated selected preview root>/providers/claude`.
 
-C8-confine verification uses `scripts/cargo.sh`,
-`CARGO_TARGET_DIR=/private/tmp/gt-target-chatc8f`, `RUST_TEST_THREADS=4`,
-`nice -n 10` and `-j 4` for compilation (one build at a time):
+The existing tool-layer probe uses the same roots/env and fence, with the sole
+probe-only mode `acceptEdits`, plus `-p --output-format stream-json --verbose
+--permission-prompts none <case-prompt>`. It is a coordinator diagnostic, not an
+app activation receipt or cached authorization. It checks synthetic and literal
+protected sentinels, outside-directory symlink, clone `.claude/settings.json`,
+`.git/config`, missing shell tools and a positive in-clone edit. Actual Write
+input and authoritative correlated permission denials must agree with independent
+disk checks. Auth/model/parse/IO failures are inconclusive failures. Cleanup
+removes only owned fixtures; escaped sentinels remain evidence. Offline test:
+`python3 -B tests/preview_claude_confinement_probe_test.py`.
 
-- GPUI `fmt --all -- --check`: exit 0.
-- GPUI `clippy --workspace --locked --all-targets -- -D warnings`: exit 0.
-- GPUI `test --workspace --locked`: exit 0, 254 tests, plus doc tests.
-- `scripts/check-gpui-deps.sh`: exit 0.
-- Root `fmt --all -- --check`: exit 0. No core changes, so conditional core
-  runtime tests are not required for this diff.
-- `python3 -B tests/preview_claude_confinement_probe_test.py`: exit 0, 14
-  tests, including simulated escapes, refusal/auth/parse failures, exact argv
-  and environment, missing `--restricted`, shared metadata and cleanup aliases.
-- `sh -n scripts/preview-claude-confinement-probe.sh` and `git diff --check`:
-  exit 0. `shellcheck` is not installed.
+Before daily use, verify fresh ID/transcript placement, text/tools, allow/deny,
+questions, stop, hide/dock retention, close/shutdown/reap and read-only history
+after restart, with unchanged production sentinels. Resume, workers, images,
+dictation, remember and remote remain unavailable. No real CLI session, login,
+GUI, production-state inspection, push or merge is part of worker verification.
 
-Sandbox artifacts: `nice` could not set priority in sandboxed commands; Cargo
-still ran. The initial GPUI test run exited 101 because two existing reaping
-tests could not invoke `/bin/ps`; the complete headless rerun with process
-inspection access exited 0. Neither failure was weakened or skipped. Only
-mechanical follow-ons are the two existing fake-launch fixtures gaining local
-Git metadata to satisfy the stricter clone validator. The task-specific checks
-replace the unrelated Iced pre-commit hook; repository hook config is unchanged.
+## Review and verification record
 
-R2 code review `ec75a6b1-cb1f-4b8f-aed8-85fd4de0604d` confirmed the task's
-checkout/commit `0659319` and closed C2 posture, and reported four P2 findings.
-F1 is fixed by validating the complete Write input and requiring correlated
-authoritative denial evidence; schema/IO failures can no longer count as
-confinement. F2 is fixed by tracking directory device/inode and checking its
-parent before cleanup. F3 is fixed by checking all scoped app/provider/Git and
-child roots and treating dangling marker entries as protected. F4 is fixed by
-preserving the visible root, resolved target and resolved-parent namespace for
-every protected path, matching core `ProtectedRoots`. Each has a synthetic
-regression; no real probe was executed. R2 re-review
-`9f3fe814-9fae-4fa2-92fc-7a9f8bab6ac2` verified the clean task checkout at
-`a6e32ac`, confirmed F1–F4 resolved and reported no new concrete defects. Its
-verdict is correct for this safe partial delivery; activation remains blocked.
+R2 approach consultation `a5f8b0f9-f9d3-4427-a96e-713678343768` timed out without
+findings; coordinator explicitly waived a rerun and resolved scope/account
+choices. R2 code review is required on the finished commit. Prior C8-confine
+review `9f3fe814-9fae-4fa2-92fc-7a9f8bab6ac2` closed its four probe corrections;
+it did not approve this new activation gate.
 
-The local shell's More menu opens **New Claude chat** and **Claude preview
-history**. The workspace owner retains each chat entity across dock changes.
-Saved history is a `preview_chats` field in the existing guarded
-`local-workspaces.json` catalog. Saved IDs/events only produce read-only views;
-they never establish runtime authority or supply `--resume`. Catalog writes use
-the existing serialized, atomic writer (concurrent instances retain its existing
-last-writer-wins behavior).
+Mechanical edits outside the provider/shell scope: one default `Launch.flags`
+entry in core `chat/runtime_tests.rs`, and the two Iced `src/harness/claude.rs`
+Launch literals, as explicitly authorized. No other core chat or main.rs edits.
 
-## Activation status
+Continuation verification uses `scripts/cargo.sh`,
+`CARGO_TARGET_DIR=/private/tmp/gt-target-chatc8o`, `RUST_TEST_THREADS=4`,
+`nice -n 10`, `-j 4`, one build at a time. Exit 0:
 
-**Real login probing and chat activation remain closed.** R2 plan consultation
-`19f6332a-ee13-438a-9de6-856932c65c0e` identified an unresolved prerequisite in
-the approved design: demonstrate a process-tree write boundary, including
-settings, hooks, MCP and tool subprocesses. Provider paths and environment
-isolation alone do not establish it. No production fake-executable switch or
-capability bypass exists. General agents, workers/helpers, remote/phone, imported
-sessions and all resume paths remain disabled. The probe executor and fresh
-core `Session` launcher currently compile only in tests.
+- Root `fmt --all -- --check`, `clippy -j 4 -- -D warnings`,
+  `test -j 4 --workspace`, `test -j 4 -p gitterm-core --features runtime`,
+  and `build -j 4`.
+- GPUI `fmt --all -- --check`, `clippy --workspace --locked --all-targets -j 4
+  -- -D warnings`, and `test --workspace --locked -j 4` (275 tests plus doc tests).
+- `scripts/check-gpui-deps.sh`, `python3 -B
+  tests/preview_claude_confinement_probe_test.py` (14 tests), `git diff --check`.
 
-The fixed provider rule is `<validated GITTERM_GPUI_CONFIG_DIR>/providers/claude`
-(or the shell's selected sample root). Relative, protected, overlapping and
-aliased roots fail. Root/provider paths are checked again before private
-creation or fake launch; workspace Git common directories are checked without
-executing Git. The sole core change exposes the existing checked private-directory
-creator. This is a filesystem guard, not a sandbox; concurrent path replacement
-remains a known limitation.
-
-The existing core `ProbeSpec` supplies a complete environment allowlist:
-`CLAUDE_CONFIG_DIR`, `GITTERM_GPUI_CONFIG_DIR`, `GITTERM_V6_CONFIG_DIR`, `HOME`,
-`XDG_CONFIG_HOME`, `PATH`, `TMPDIR`, `TMP`, `TEMP`. HOME/config/temp point inside
-the preview, PATH is `/usr/bin:/bin`, and execution uses `env_clear`. Nothing
-else is inherited, including all Anthropic/Claude API keys, OAuth/auth tokens,
-helpers, cloud-provider credentials/toggles, parent session identities, proxies,
-loader overrides or GitTerm MCP credentials. No credentials are copied, linked
-or read from production. No GitTerm MCP servers are injected; that does not
-claim to suppress MCP loaded from CLI settings.
-
-Status uses the documented `auth status` subcommand, JSON by default. Collection
-is bounded to 16 KiB and timed out. Only exit 0 + `authMethod: claude.ai` + an
-exact matching `configDirectory` reports login; exit 1 + `none` reports signed
-out; every other result is unavailable. Even a reported login denies activation.
-The command shown is generated from that same environment, with shell quoting:
-
-```sh
-cd '<root>/child/neutral' && env -i 'CLAUDE_CONFIG_DIR=<root>/providers/claude' 'GITTERM_GPUI_CONFIG_DIR=<root>' 'GITTERM_V6_CONFIG_DIR=<root>/desktop' 'HOME=<root>/child/home' 'PATH=/usr/bin:/bin' 'TEMP=<root>/child/tmp' 'TMP=<root>/child/tmp' 'TMPDIR=<root>/child/tmp' 'XDG_CONFIG_HOME=<root>/child/config' '<resolved-absolute-claude>' '--restricted' '--strict-mcp-config' '--safe-mode' '--permission-mode' 'default'
-# Then /login
-```
-
-The pane labels sign-in as awaiting isolation review. It never runs this command.
-The fake launch has no resume, Chrome, injected MCP, wire log, snapshots or
-remember-permission writes. Sends, stop and answers go through `ChatAdapter`;
-stream ingress is stamped before presentation and persistence. Channel acceptance
-remains **delivery unconfirmed**. `apply_runtime_outcome` is the one C8a integration
-point; no outcome types or write receipts were guessed.
-
-## Coordinator checks before a real trial
-
-1. Resolve/review the process-tree/settings/MCP boundary and demonstrate denied
-   absolute writes, hooks and shell subprocesses against synthetic protected
-   roots, plus allowed writes in a disposable independent clone. Keep host
-   snapshot/helper execution disabled until covered.
-2. Verify the installed CLI supports config-scoped authentication and the
-   `configDirectory` status field (documented since v2.1.268). Verify no fallback
-   to production login, helpers, Console/third-party auth or service endpoints.
-3. Establish lifetime provider ownership before real execution. Current catalog
-   locks serialize saves, not provider/session ownership. Never promote saved
-   IDs or copied transcript basenames into live authority.
-4. Only after those gates: sign in once using the displayed isolated command;
-   inspect the returned root/method; create a fresh chat in the disposable clone.
-   Check new ID/transcript placement, text/tools, permission allow/deny, questions,
-   stop, dock/hide survival, close/shutdown/reap and read-only history after restart.
-5. Compare synthetic production sentinels before/after. Do not launch/control the
-   running GitTerm instance or share its writable provider/config directories.
-6. Integrate C8a's actual correlated outcomes at the named hook; until then do
-   not label channel acceptance as Written. Images, dictation, review/delegation,
-   workers and remember permissions remain visibly unavailable.
-
-## Automated verification
-
-All commands use `scripts/cargo.sh`, `CARGO_TARGET_DIR=/private/tmp/gt-target-chatc8b`,
-`RUST_TEST_THREADS=4`, `nice -n 10`, and `-j 4` for compilation. One build runs at
-a time. The sandbox denies setpriority, but Cargo still runs successfully.
-
-- GPUI `fmt --all -- --check`: exit 0.
-- GPUI `clippy --workspace --locked --all-targets -- -D warnings`: exit 0.
-- GPUI `test --workspace --locked`: exit 0 (247 tests). The initial sandbox run
-  denied `/bin/ps` in an existing terminal test; the final headless rerun has
-  process-inspection access. The stricter root check also required one existing
-  test fixture to use concrete `/private/tmp` instead of the `/var` alias.
-- `scripts/check-gpui-deps.sh`: exit 0.
-- Root `cargo fmt --all -- --check`: exit 0.
-- Root `cargo test -j 4 -p gitterm-core --features runtime`: exit 0 (616 unit
-  tests and five integration tests passed; one existing unit test ignored).
-
-No real Claude invocation, authentication, GUI launch or production-state access
-was performed. No screenshot/manual live trial is claimed. The unrelated Iced
-build/test pre-commit hook is replaced for this commit by the task's explicit
-GPUI/core acceptance commands; repository hook configuration is not changed.
-
-## R2 review corrections
-
-Code review `0f182865-fbc9-41e9-b366-f3af7fbce84b` found two P2 defects.
-F1 is addressed by an application-owned completion queue: ordinary pane close
-sends shutdown and transfers the runtime handle; quit first closes every active
-chat and synchronously drains the queue before GPUI starts its 200 ms future
-timeout. The last queue owner also drains on drop. A slow fake child proves that
-quit waits past the timeout and later observers see the child already reaped.
-F2 is addressed by forwarding the embedded ChatView focus handle through
-ChatPane and Pane; a headless focus regression covers preview history.
-These changes do not open real activation or resolve its prerequisite.
+Sandbox artifacts: `nice` cannot set priority in sandboxed commands, but Cargo
+runs; the initial headless GPUI tests could not execute `/bin/ps` in two existing
+reaping tests. The complete authorized headless rerun passes; no test was
+skipped or weakened for that restriction. Existing root test warnings and
+upstream `block` future-compatibility warning are unchanged. Optional feature,
+release/bundle and live/manual checks are outside this task's acceptance set.

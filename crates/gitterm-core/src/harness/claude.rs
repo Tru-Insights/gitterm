@@ -83,11 +83,49 @@ impl SnapshotRecorder for crate::turn_snapshots::Recorder {
 /// inherited by the child. MCP environment overrides are already applied by
 /// the host in server order. This is not a sandbox or a preview activation gate.
 pub struct Launch {
+    pub flags: LaunchFlags,
     pub config: ClaudeSessionConfig,
     pub program: PathBuf,
     pub environment: Vec<(OsString, OsString)>,
     pub temporary_dir: PathBuf,
     pub snapshots: Box<dyn SnapshotRecorder>,
+}
+
+/// Typed host launch policy; callers cannot inject arbitrary CLI arguments.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LaunchFlags {
+    #[default]
+    Standard,
+    FreshPreview,
+}
+impl LaunchFlags {
+    pub fn args(self, config: &ClaudeSessionConfig) -> Result<Vec<String>, String> {
+        self.args_with_guidelines_file(config, config.guidelines_file.as_deref())
+    }
+    fn args_with_guidelines_file(
+        self,
+        config: &ClaudeSessionConfig,
+        guidelines: Option<&Path>,
+    ) -> Result<Vec<String>, String> {
+        let mut args = config.args_with_guidelines_file(guidelines);
+        if self == Self::FreshPreview {
+            if config.resume.is_some()
+                || config.chrome
+                || !config.mcp_servers.is_empty()
+                || config.snapshot_facts_dir.is_some()
+                || config.wire_log_dir.is_some()
+                || guidelines.is_some()
+                || config.guidelines_content.is_some()
+                || config.model.is_some()
+                || config.effort.is_some()
+                || config.permission_mode != "default"
+            {
+                return Err("fresh preview requires the fixed launch configuration".into());
+            }
+            args.extend(["--restricted", "--strict-mcp-config", "--safe-mode"].map(str::to_owned));
+        }
+        Ok(args)
+    }
 }
 
 /// One MCP server attached to a session through `--mcp-config`, mirroring
@@ -519,6 +557,7 @@ pub(crate) async fn run_correlated_session_program<C: Into<RuntimeCommand>>(
     process_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) {
     let Launch {
+        flags,
         config,
         program,
         environment,
@@ -531,6 +570,9 @@ pub(crate) async fn run_correlated_session_program<C: Into<RuntimeCommand>>(
         reject_queued(&mut commands, &events).await;
         events.emit(HarnessEvent::ProcessExited { code: None });
     };
+    if let Err(error) = flags.args(&config) {
+        return fail(error).await;
+    }
     let remote_guidelines = match config.guidelines_content.as_deref() {
         Some(text) => match RemoteGuidelinesFile::create(&temporary_dir, text) {
             Ok(file) => Some(file),
@@ -563,7 +605,10 @@ pub(crate) async fn run_correlated_session_program<C: Into<RuntimeCommand>>(
         .as_deref()
         .and_then(crate::guidelines::workspace_checkpoint)
         .map(Path::to_path_buf);
-    let args = config.args_with_guidelines_file(guidelines_file);
+    let args = match flags.args_with_guidelines_file(&config, guidelines_file) {
+        Ok(args) => args,
+        Err(error) => return fail(error).await,
+    };
     let mut cmd = Command::new(&program);
     cmd.args(&args)
         .current_dir(&config.cwd)
@@ -1043,6 +1088,58 @@ mod tests {
             .position(|arg| arg == "--append-system-prompt-file")
             .unwrap();
         assert_eq!(args[at + 1], file.path().to_string_lossy());
+    }
+
+    #[test]
+    fn standard_argv_is_unchanged_and_preview_is_exactly_fenced() {
+        let mut config = ClaudeSessionConfig {
+            cwd: PathBuf::from("/clone"),
+            snapshot_facts_dir: None,
+            model: None,
+            permission_mode: "default".into(),
+            effort: None,
+            resume: None,
+            wire_log_dir: None,
+            mcp_servers: vec![],
+            chrome: false,
+            guidelines_file: None,
+            guidelines_content: None,
+        };
+        let standard = [
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--input-format",
+            "stream-json",
+            "--permission-prompt-tool",
+            "stdio",
+            "--include-partial-messages",
+            "--no-chrome",
+            "--permission-mode",
+            "default",
+        ];
+        assert_eq!(LaunchFlags::default().args(&config).unwrap(), standard);
+        let preview: Vec<_> = standard
+            .into_iter()
+            .chain(["--restricted", "--strict-mcp-config", "--safe-mode"])
+            .collect();
+        assert_eq!(LaunchFlags::FreshPreview.args(&config).unwrap(), preview);
+        config.model = Some("model".into());
+        config.effort = Some("high".into());
+        config.resume = Some("existing-id".into());
+        config.chrome = true;
+        assert_eq!(LaunchFlags::Standard.args(&config).unwrap(), config.args());
+        assert!(LaunchFlags::FreshPreview.args(&config).is_err());
+        config.model = None;
+        config.effort = None;
+        config.chrome = false;
+        assert!(
+            LaunchFlags::FreshPreview.args(&config).is_err(),
+            "resume alone refused"
+        );
+        config.resume = None;
+        config.permission_mode = "bypassPermissions".into();
+        assert!(LaunchFlags::FreshPreview.args(&config).is_err());
     }
 
     #[test]
