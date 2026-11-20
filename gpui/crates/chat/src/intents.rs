@@ -12,10 +12,8 @@ pub enum ChatIntent {
     Withdraw {
         message_id: String,
     },
-    /// Rejection-only defensive seam. C11a never emits setting changes.
-    /// Hosts must reject this even if a caller forges it outside the composer.
-    ChangeMode {
-        mode: String,
+    ChangeSetting {
+        change: gitterm_core::chat::types::SettingChange,
     },
     /// Bind an answer to the exact request the UI displayed.
     Answer {

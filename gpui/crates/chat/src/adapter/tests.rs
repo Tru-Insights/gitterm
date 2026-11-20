@@ -819,26 +819,167 @@ fn exit_projects_core_unsent_versus_uncertain_without_resend() {
 }
 
 #[test]
-fn forged_mode_intent_has_no_adapter_command_path() {
+fn setting_selection_uses_core_commands_and_waits_for_ack_or_typed_rejection() {
+    use crate::{composer::ComposerState, pickers::Picker};
     let mut adapter = ChatAdapter::default();
-    adapter.begin_runtime(target());
-    for mode in [
-        "default",
-        "auto",
-        "dontAsk",
-        "bypassPermissions",
-        "plan",
-        "made-up",
+    let stamp = adapter.begin_runtime(target());
+    for event in [
+        HarnessEvent::Ready {
+            session_id: None,
+            permission_mode: Some("default".into()),
+            models: vec![
+                json!({"value":"opus","supportsEffort":true}),
+                json!({"value":"sonnet","displayName":"Sonnet","supportsEffort":true}),
+            ],
+            modes: vec![],
+            commands: vec![],
+        },
+        HarnessEvent::ModelChanged("opus".into()),
+        HarnessEvent::PermissionModeChanged("default".into()),
+        HarnessEvent::EffortChanged {
+            effort: None,
+            applied: None,
+        },
     ] {
-        let receipt = adapter
-            .admit(ChatIntent::ChangeMode { mode: mode.into() }, facts())
-            .err()
+        adapter
+            .receive(
+                &stamp,
+                &target(),
+                AgentEvent::Harness(event),
+                None,
+                |_, _| {},
+            )
+            .unwrap();
+    }
+    let cases = [
+        (
+            SettingChange::Model("sonnet".into()),
+            HarnessCommand::SetModel("sonnet".into()),
+            HarnessEvent::ModelChanged("sonnet".into()),
+        ),
+        (
+            SettingChange::Effort(Some("high".into())),
+            HarnessCommand::SetEffort(Some("high".into())),
+            HarnessEvent::EffortChanged {
+                effort: Some("high".into()),
+                applied: Some("high".into()),
+            },
+        ),
+        (
+            SettingChange::Mode("plan".into()),
+            HarnessCommand::SetPermissionMode("plan".into()),
+            HarnessEvent::PermissionModeChanged("plan".into()),
+        ),
+    ];
+    let mut view = ComposerState::default();
+    for (change, expected, ack) in cases {
+        view.project(adapter.state(), None);
+        let before = adapter.state().acknowledged.clone();
+        let prepared = adapter
+            .admit(
+                ChatIntent::ChangeSetting {
+                    change: change.clone(),
+                },
+                facts(),
+            )
+            .unwrap();
+        let id = prepared.id();
+        let (receipt, _) = adapter.execute(prepared, &target(), 1, |command| {
+            assert_eq!(command, expected);
+            Ok(())
+        });
+        assert_eq!(receipt.state, ReceiptState::ChannelAccepted);
+        adapter
+            .delivery(id, &target(), DeliveryOutcome::Written)
+            .unwrap();
+        view.project(adapter.state(), None);
+        assert_eq!(adapter.state().acknowledged, before);
+        assert_eq!(view.pending_setting, Some(change.clone()));
+        view.picker = Some(Picker::Model);
+        let rejected = adapter
+            .receive(
+                &stamp,
+                &target(),
+                AgentEvent::Harness(HarnessEvent::SettingRejected {
+                    requested: change.clone(),
+                }),
+                None,
+                |_, _| {},
+            )
+            .unwrap();
+        view.project(adapter.state(), rejected.event.as_ref());
+        assert_eq!(adapter.state().acknowledged, before);
+        assert!(view.pending_setting.is_none());
+        assert!(view.picker.is_none());
+        let error = adapter
+            .receive(
+                &stamp,
+                &target(),
+                AgentEvent::Harness(HarnessEvent::Error(
+                    "Iced provider rejection message".into(),
+                )),
+                None,
+                |_, _| {},
+            )
             .unwrap();
         assert!(
-            matches!(receipt.state, ReceiptState::Rejected(ref reason) if reason.contains("Mode changes are disabled"))
+            matches!(error.presentation, Some(Presentation::Append(ref events)) if events.iter().any(|event| matches!(event, AgentEvent::Harness(HarnessEvent::Error(message)) if message == "Iced provider rejection message")))
         );
-        assert!(adapter.state().pending_change().is_none());
+        let prepared = adapter
+            .admit(
+                ChatIntent::ChangeSetting {
+                    change: change.clone(),
+                },
+                facts(),
+            )
+            .unwrap();
+        adapter.execute(prepared, &target(), 2, |_| Ok(()));
+        view.project(adapter.state(), None);
+        view.picker = Some(Picker::Mode);
+        let update = adapter
+            .receive(&stamp, &target(), AgentEvent::Harness(ack), None, |_, _| {})
+            .unwrap();
+        view.project(adapter.state(), update.event.as_ref());
+        assert!(view.picker.is_none());
+        assert!(view.pending_setting.is_none());
+        match change {
+            SettingChange::Model(value) => {
+                assert_eq!(adapter.state().acknowledged.model, Some(value))
+            }
+            SettingChange::Mode(value) => {
+                assert_eq!(adapter.state().acknowledged.mode, Some(value))
+            }
+            SettingChange::Effort(value) => assert_eq!(
+                adapter.state().acknowledged.effort.as_ref().unwrap().effort,
+                value
+            ),
+        }
     }
+    assert_eq!(view.model, "Sonnet");
+    assert_eq!(view.mode, "Plan mode");
+    assert_eq!(view.effort, "High · 200k");
+    let mut stopped = facts();
+    stopped.process_running = false;
+    assert!(
+        adapter
+            .admit(
+                ChatIntent::ChangeSetting {
+                    change: SettingChange::Mode("auto".into())
+                },
+                stopped
+            )
+            .is_err()
+    );
+    assert!(
+        adapter
+            .admit(
+                ChatIntent::ChangeSetting {
+                    change: SettingChange::Model("not-offered".into())
+                },
+                facts()
+            )
+            .is_err()
+    );
 }
 
 #[test]

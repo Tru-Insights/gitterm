@@ -1597,3 +1597,105 @@ fn host_width_changes_native_column_and_footer_together(cx: &mut TestAppContext)
         );
     }
 }
+
+#[gpui::test]
+fn setting_pickers_open_choose_dismiss_and_keep_acknowledged_labels(cx: &mut TestAppContext) {
+    use crate::pickers::Picker;
+    use gitterm_core::chat::types::SettingChange;
+    let records = [
+        HarnessEvent::Ready { session_id: None, permission_mode: Some("default".into()), models: vec![
+            serde_json::json!({"value":"opus", "displayName":"Opus", "supportsEffort":true, "supportedEffortLevels":["low","high"]}),
+            serde_json::json!({"value":"sonnet", "displayName":"Sonnet", "supportsEffort":true}),
+        ], modes: vec![], commands: vec![] },
+        HarnessEvent::ModelChanged("opus".into()),
+        HarnessEvent::PermissionModeChanged("default".into()),
+        HarnessEvent::EffortChanged { effort: None, applied: None },
+    ].into_iter().map(|event| Record { at_ms: None, entry: Entry::Harness(event) }).collect();
+    let (chat, cx) = setup(records, cx);
+    cx.simulate_resize(size(px(1200.), px(900.)));
+    let intents = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captured = intents.clone();
+    chat.update_in(cx, |view, _, cx| {
+        view.set_intent_callback(
+            Rc::new(move |intent, _| {
+                captured.borrow_mut().push(intent);
+                Receipt::rejected("Fixture setting rejected")
+            }),
+            cx,
+        );
+        view.set_read_only(None, cx);
+    });
+    draw(cx);
+    for (chip, picker, option, expected) in [
+        (
+            "composer-model",
+            Picker::Model,
+            "setting-option-1",
+            SettingChange::Model("sonnet".into()),
+        ),
+        (
+            "composer-effort",
+            Picker::Effort,
+            "setting-option-2",
+            SettingChange::Effort(Some("high".into())),
+        ),
+        (
+            "composer-mode",
+            Picker::Mode,
+            "setting-option-1",
+            SettingChange::Mode("acceptEdits".into()),
+        ),
+    ] {
+        let chip_center = cx.debug_bounds(chip).unwrap().center();
+        cx.simulate_click(chip_center, gpui::Modifiers::none());
+        draw(cx);
+        chat.read_with(cx, |view, _| {
+            assert_eq!(view.composer_state.picker, Some(picker))
+        });
+        let option_center = cx
+            .debug_bounds(option)
+            .expect("picker option visible")
+            .center();
+        cx.simulate_click(option_center, gpui::Modifiers::none());
+        draw(cx);
+        assert_eq!(
+            intents.borrow().last(),
+            Some(&ChatIntent::ChangeSetting { change: expected })
+        );
+        assert!(cx.debug_bounds("setting-picker").is_none());
+        chat.read_with(cx, |view, _| {
+            assert_eq!(view.composer_state.model, "Opus");
+            assert_eq!(view.composer_state.mode, "Default");
+            assert_eq!(view.composer_state.effort, "Auto · 200k");
+        });
+    }
+    // Escape and an outside click close without emitting another setting request.
+    let model_chip = cx.debug_bounds("composer-model").unwrap().center();
+    cx.simulate_click(model_chip, gpui::Modifiers::none());
+    draw(cx);
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    assert!(cx.debug_bounds("setting-picker").is_none());
+    cx.simulate_click(model_chip, gpui::Modifiers::none());
+    draw(cx);
+    let input_center = cx.debug_bounds("composer-input").unwrap().center();
+    cx.simulate_click(input_center, gpui::Modifiers::none());
+    draw(cx);
+    assert!(cx.debug_bounds("setting-picker").is_none());
+    assert_eq!(intents.borrow().len(), 3);
+    // The registered native action follows the same request path.
+    cx.update(|window, cx| window.dispatch_action(Box::new(CycleMode), cx));
+    assert_eq!(
+        intents.borrow().last(),
+        Some(&ChatIntent::ChangeSetting {
+            change: SettingChange::Mode("acceptEdits".into())
+        })
+    );
+    chat.update_in(cx, |view, _, cx| {
+        view.set_read_only(Some("Session stopped".into()), cx)
+    });
+    cx.simulate_click(model_chip, gpui::Modifiers::none());
+    draw(cx);
+    assert!(cx.debug_bounds("setting-picker").is_none());
+    assert_eq!(intents.borrow().len(), 4);
+}

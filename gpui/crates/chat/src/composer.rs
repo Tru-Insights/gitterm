@@ -1,5 +1,4 @@
-//! Disposable composer projection. Settings are acknowledged display values only;
-//! no picker or checkout command is constructed here.
+//! Disposable composer projection, with acknowledged settings and catalog pickers.
 use gitterm_core::chat::{
     state::{AgentEvent, EventEffects, PromptStatus, State},
     types::{AgentSessionState, HarnessEvent, ItemKind},
@@ -54,13 +53,36 @@ pub struct ComposerState {
     pub commands: Vec<SlashCommand>,
     pub commands_ready: bool,
     pub notice: Option<String>,
+    pub catalog: crate::pickers::Catalog,
+    pub picker: Option<crate::pickers::Picker>,
+    pub pending_setting: Option<gitterm_core::chat::types::SettingChange>,
+    pub backend: Option<gitterm_core::chat::types::AgentBackend>,
     started_at_ms: Option<u64>,
     ended_at_ms: Option<u64>,
     pub(crate) slash_index: usize,
     pub(crate) slash_dismissed: bool,
 }
 impl ComposerState {
+    fn is_acp(&self) -> bool {
+        matches!(
+            self.backend,
+            Some(gitterm_core::chat::types::AgentBackend::Acp(_))
+        )
+    }
     pub fn project(&mut self, state: &State, effects: Option<&EventEffects>) {
+        let was_pending = self.pending_setting.is_some();
+        self.catalog = crate::pickers::Catalog::project(state, self.is_acp());
+        self.pending_setting = state.pending_change().cloned();
+        if (was_pending && self.pending_setting.is_none())
+            || self
+                .picker
+                .is_some_and(|picker| self.catalog.options(picker).is_empty())
+            || effects.is_some_and(|effects| {
+                !effects.notices.is_empty() || effects.settings_changed.is_some()
+            })
+        {
+            self.picker = None;
+        }
         self.pending_request = state.has_pending_requests();
         self.streaming = matches!(state.state, AgentSessionState::Streaming);
         let was_streaming = self.started_at_ms.is_some() && self.ended_at_ms.is_none();
@@ -146,15 +168,36 @@ impl ComposerState {
                 _ => None,
             });
         let confirmed_model = state.acknowledged.model.as_deref();
-        let base_model = confirmed_model.map(|value| value.strip_suffix("[1m]").unwrap_or(value));
+        let base_model = confirmed_model.map(|value| {
+            if self.is_acp() {
+                value
+            } else {
+                value.strip_suffix("[1m]").unwrap_or(value)
+            }
+        });
         self.model = base_model.map_or_else(
             || "Model".into(),
             |value| {
                 let info =
                     ready.and_then(|(models, _)| models.iter().find(|info| info["value"] == value));
-                if value == "default" {
+                if self.is_acp() && value == "default" {
+                    if let Some(gitterm_core::chat::types::AgentBackend::Acp(agent)) = self.backend
+                    {
+                        format!("{} default", agent.label())
+                    } else {
+                        value.into()
+                    }
+                } else if value == "default" {
                     info.and_then(|info| info["description"].as_str())
-                        .and_then(|description| description.split(" · ").next())
+                        .map(|description| {
+                            let end = [" · ", " — ", " - "]
+                                .iter()
+                                .filter_map(|separator| description.find(separator))
+                                .min()
+                                .unwrap_or(description.len());
+                            &description[..end]
+                        })
+                        .map(str::trim)
                         .filter(|description| !description.is_empty())
                         .unwrap_or("Claude settings")
                         .into()
@@ -186,17 +229,24 @@ impl ComposerState {
         self.effort = state.acknowledged.effort.as_ref().map_or_else(
             || "Effort".into(),
             |effort| {
-                let level = effort.effort.as_deref().unwrap_or("auto");
-                let mut label = level.to_string();
-                if let Some(first) = label.get_mut(..1) {
-                    first.make_ascii_uppercase();
-                }
+                let label = crate::pickers::effort_name(effort.effort.as_deref());
                 let context = if confirmed_model.is_some_and(|value| value.ends_with("[1m]")) {
                     "1M"
                 } else {
                     "200k"
                 };
-                format!("{label} · {context}")
+                if self.is_acp() {
+                    label.into()
+                } else if self.catalog.efforts.iter().any(|row| {
+                    matches!(
+                        row.change,
+                        gitterm_core::chat::types::SettingChange::Effort(_)
+                    )
+                }) {
+                    format!("{label} · {context}")
+                } else {
+                    context.into()
+                }
             },
         );
         // The reducer owns the acknowledged path; the host's current-checkout
@@ -256,7 +306,7 @@ impl ComposerState {
         }
     }
 
-    /// The same chip sequence as agent_chat.html; these remain display-only.
+    /// The same chip sequence as agent_chat.html.
     pub fn chips(&self) -> [(&'static str, String); 6] {
         [
             ("review", "Review / Consult…".into()),
@@ -419,7 +469,7 @@ mod ui {
                 && input.read(cx).selected_range().start == draft.len();
             div().id("composer-controls").debug_selector(|| "composer-controls".into()).relative().flex().flex_col().gap(px(6.))
                 .capture_any_mouse_down(cx.listener(|view, _, _, cx| view.reopen_slash(cx)))
-                .on_click(cx.listener(|view, _, _, cx| { view.reopen_slash(cx); cx.stop_propagation(); }))
+                .on_click(cx.listener(|view, _, _, cx| { view.close_picker(cx); view.reopen_slash(cx); cx.stop_propagation(); }))
                 .on_drop(cx.listener(|view, paths: &gpui::ExternalPaths, window, cx| {
                     view.attach_paths(paths.0.to_vec(), cx);
                     view.focus_composer(window, cx);
@@ -481,7 +531,12 @@ mod ui {
                     .children(self.chips().into_iter().map(|(id, label)| {
                         let mut chip = Button::new(gpui::SharedString::from(format!("composer-{id}")))
                             .debug_selector(move || format!("composer-{id}"))
-                            .child(div().font_family("Menlo").text_size(px(appearance.size(12.))).child(label)).disabled(true).opacity(0.4)
+                            .child(div().font_family("Menlo").text_size(px(appearance.size(12.))).child(label))
+                            .disabled(disabled || !self.commands_ready || crate::pickers::Picker::from_chip(id).is_none_or(|picker| self.catalog.options(picker).is_empty()))
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                if let Some(picker) = crate::pickers::Picker::from_chip(id) { view.toggle_picker(picker, window, cx); }
+                                cx.stop_propagation();
+                            }))
                             .px(px(8.)).py(px(4.)).h_auto().bg(rgb(palette.block))
                             .text_color(rgb(palette.muted)).border_1().border_color(rgb(palette.strong)).rounded(px(6.));
                         if id == "mode" {
@@ -490,6 +545,28 @@ mod ui {
                         if id == "checkout" && let Some(path) = &self.checkout_path { chip = chip.tooltip(path.clone()); }
                         chip
                     })))
+                .children(self.picker.filter(|_| !disabled).map(|picker| {
+                    let options = self.catalog.options(picker);
+                    div().id("setting-picker").debug_selector(|| "setting-picker".into())
+                        .absolute().bottom(gpui::relative(1.)).left_0().w(px(380.)).max_h(px(360.)).overflow_y_scroll()
+                        .flex().flex_col().p(px(6.)).bg(rgb(palette.block)).border_1().border_color(rgb(palette.strong)).rounded(px(6.))
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .children(options.iter().enumerate().map(|(index, row)| {
+                            let change = row.change.clone();
+                            div().flex().flex_col()
+                                .children((index == 0 || options[index - 1].section != row.section).then(|| div().text_color(rgb(palette.muted)).child(row.section)))
+                                .child(Button::new(gpui::SharedString::from(format!("setting-option-{index}")))
+                                    .debug_selector(move || format!("setting-option-{index}"))
+                                    .w_full().h_auto().justify_start().disabled(row.disabled)
+                                    .on_click(cx.listener(move |view, _, window, cx| {
+                                        view.choose_setting(change.clone(), window, cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child(div().flex().flex_col().items_start()
+                                        .child(format!("{} {}", if row.selected { "✓" } else { " " }, row.label))
+                                        .children((!row.description.is_empty()).then(|| div().text_color(rgb(palette.muted)).child(row.description.clone())))))
+                        }))
+                }))
         }
     }
 }

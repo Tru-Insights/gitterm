@@ -45,7 +45,10 @@ fn iced_chips_use_acknowledged_labels_in_reference_order() {
         .push(AgentEvent::Harness(HarnessEvent::Ready {
             session_id: None,
             permission_mode: None,
-            models: vec![json!({"value": "opus", "displayName": "Opus 5.5"})],
+            models: vec![
+                json!({"value": "opus", "displayName": "Opus 5.5", "supportsEffort":true}),
+                json!({"value":"opus[1m]", "supportsEffort":true}),
+            ],
             modes: vec![],
             commands: vec![],
         }));
