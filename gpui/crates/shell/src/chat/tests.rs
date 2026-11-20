@@ -240,7 +240,8 @@ fn pane_owns_one_receiver_projects_adapter_and_saves_only_accepted_events(
         session_id: None,
         records: vec![],
     };
-    let (pane, cx) = cx.add_window_view(|window, cx| ChatPane::history(saved, window, cx));
+    let (pane, cx) = cx
+        .add_window_view(|window, cx| ChatPane::history(RuntimeShutdown::new(), saved, window, cx));
     let (sender, mut commands) = tokio::sync::mpsc::unbounded_channel();
     let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
     pane.update_in(cx, |pane, window, cx| {
@@ -501,4 +502,121 @@ fn sign_in_command_quotes_provider_and_executable_paths_without_shell_expansion(
         env.lines()
             .any(|line| line == format!("CLAUDE_CONFIG_DIR={}", preview.provider().display()))
     );
+}
+
+#[gpui::test]
+fn quit_drains_a_closed_slow_child_before_gpui_timeout_and_later_observers(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.background_executor.allow_parking();
+    let (dir, preview) = fixture();
+    let python = std::process::Command::new("python3")
+        .args(["-I", "-S", "-c", "import sys; print(sys.executable)"])
+        .output()
+        .unwrap();
+    assert!(python.status.success());
+    let fake = script(
+        dir.path(),
+        "fake-slow-claude",
+        &format!(
+            r##"#!{}
+import json, sys, os, time
+from pathlib import Path
+if sys.argv[1:] == ['auth', 'status']:
+    print(json.dumps({{'authMethod':'claude.ai','configDirectory':os.environ['CLAUDE_CONFIG_DIR']}}))
+    sys.exit(0)
+init = json.loads(sys.stdin.readline())
+print(json.dumps({{'type':'control_response','response':{{'subtype':'success','request_id':init['request_id'],'response':{{'models':[]}}}}}}), flush=True)
+assert not sys.stdin.read()
+time.sleep(0.45)
+Path('reaped-marker').write_text('finished')
+"##,
+            String::from_utf8(python.stdout).unwrap().trim()
+        ),
+    );
+    let provider = Arc::new(Provider::new(preview, &fake).unwrap());
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cwd = dir.path().join("checkout");
+    std::fs::create_dir(&cwd).unwrap();
+    let (runtime, mut events) = executor
+        .block_on(provider.fake_start(cwd.clone()))
+        .unwrap()
+        .unwrap();
+    executor.block_on(async {
+        loop {
+            if matches!(events.recv().await.unwrap(), HarnessEvent::Ready { .. }) {
+                break;
+            }
+        }
+    });
+    let pid = runtime.local_pid().unwrap();
+    // Explicit pane close gives up the view, but the application still owns the
+    // completion via its queue. This is exactly the prior detached-close gap.
+    let mut app = cx.new_app();
+    let owner = app.new(|cx| {
+        crate::WorkspaceOwner::new(
+            crate::workspace_status::WorkspaceStatus::default(),
+            None,
+            cx,
+        )
+    });
+    let shutdown = owner.read_with(&app, |owner, _| owner.chat_shutdown.clone());
+    assert!(shutdown.enqueue(runtime).is_ok());
+    let marker = cwd.join("reaped-marker");
+    app.update(|app| {
+        app.on_app_quit(move |_| {
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "finished");
+            let output = std::process::Command::new("/bin/ps")
+                .args(["-p", &pid.to_string(), "-o", "stat="])
+                .output()
+                .unwrap();
+            assert!(
+                output.stdout.is_empty(),
+                "fake child still exists after quit drain"
+            );
+            std::future::ready(())
+        })
+        .detach();
+    });
+    let start = std::time::Instant::now();
+    app.update(|app| app.shutdown());
+    assert!(start.elapsed() > gpui::SHUTDOWN_TIMEOUT);
+}
+
+#[gpui::test]
+fn preview_pane_focus_forwards_to_the_native_chat(cx: &mut gpui::TestAppContext) {
+    use gpui::Focusable as _;
+    cx.update(gpui_component::init);
+    let (dir, preview) = fixture();
+    let saved = SavedChat {
+        uid: "synthetic-focus".into(),
+        cwd: dir.path().to_owned(),
+        provider: preview.provider(),
+        session_id: None,
+        records: vec![],
+    };
+    let (pane, cx) = cx.add_window_view(|window, cx| {
+        let chat = cx.new(|cx| ChatPane::history(RuntimeShutdown::new(), saved, window, cx));
+        crate::pane::Pane::new(
+            "preview-focus".into(),
+            "Claude preview".into(),
+            crate::pane::PaneKind::PreviewChat(chat),
+            crate::data::WorkspaceId(1),
+            Rc::new(crate::data::SampleData),
+            window,
+            cx,
+        )
+    });
+    pane.update_in(cx, |pane, window, cx| {
+        let crate::pane::PaneContent::PreviewChat(chat) = &pane.content else {
+            unreachable!()
+        };
+        let expected = chat.read(cx).view.focus_handle(cx);
+        assert_eq!(pane.focus_handle(cx), expected);
+        pane.focus_handle(cx).focus(window, cx);
+        assert!(expected.is_focused(window));
+    });
 }

@@ -17,6 +17,8 @@ pub struct WorkspaceOwner {
     pub(crate) stopped_workspaces: std::collections::HashSet<crate::data::WorkspaceId>,
     pub model: WorkspaceStatus,
     pub error: Option<String>,
+    pub(crate) chat_shutdown: Arc<crate::chat::RuntimeShutdown>,
+    _chat_quit: Subscription,
     pub(crate) chats: std::collections::HashMap<String, Entity<crate::chat::ChatPane>>,
     pub files: std::collections::HashMap<crate::data::WorkspaceId, crate::files::FileTree>,
     file_jobs: crate::files::FileJobs,
@@ -130,6 +132,16 @@ impl WorkspaceOwner {
                 }
             }));
         }
+        let chat_shutdown = crate::chat::RuntimeShutdown::new();
+        let chat_quit = cx.on_app_quit(|owner: &mut Self, cx| {
+            for chat in owner.chats.values() {
+                chat.update(cx, |chat, _| chat.shutdown_runtime());
+            }
+            if let Err(error) = owner.chat_shutdown.drain() {
+                eprintln!("Drain preview Claude runtimes on quit: {error:#}");
+            }
+            std::future::ready(())
+        });
         Self {
             stopped_workspaces: Default::default(),
             model,
@@ -139,6 +151,8 @@ impl WorkspaceOwner {
             file_sender,
             error: None,
             chats: Default::default(),
+            chat_shutdown,
+            _chat_quit: chat_quit,
             store,
             jobs,
             executor,

@@ -20,8 +20,8 @@ use gitterm_gpui_chat::{
     events::{Entry, Record},
 };
 use gpui::{
-    AppContext, Context, Entity, EventEmitter, IntoElement, ParentElement, Render, Styled,
-    Subscription, Window, div,
+    AppContext, Context, Entity, EventEmitter, IntoElement, ParentElement, Render, Styled, Window,
+    div,
 };
 use gpui_component::{Disableable, button::Button};
 use provider::Provider;
@@ -152,11 +152,12 @@ pub(crate) struct ChatPane {
     view: Entity<ChatView>,
     status: String,
     pending: Vec<Update>,
-    _quit: Subscription,
+    shutdown: Arc<RuntimeShutdown>,
 }
 impl EventEmitter<SavedChat> for ChatPane {}
 impl ChatPane {
     pub fn new(
+        shutdown: Arc<RuntimeShutdown>,
         preview: Arc<gitterm_core::preview::Preview>,
         cwd: PathBuf,
         window: &mut Window,
@@ -178,17 +179,6 @@ impl ChatPane {
         });
         let callback = Self::intent_callback(cx.weak_entity());
         view.update(cx, |view, cx| view.set_intent_callback(callback, cx));
-        let quit = cx.on_app_quit(|pane: &mut Self, _| {
-            let runtime = pane.controller.runtime.take();
-            async move {
-                if let Some(mut runtime) = runtime {
-                    let _ = runtime.send(gitterm_core::chat::types::HarnessCommand::Shutdown);
-                    if let Err(error) = runtime.completed().await {
-                        eprintln!("Close preview Claude: {error}");
-                    }
-                }
-            }
-        });
         let status = (|| -> Result<String> {
             let program = claude_program()?;
             let provider = Provider::new(preview, &program)?;
@@ -207,7 +197,7 @@ impl ChatPane {
             view,
             status,
             pending: vec![],
-            _quit: quit,
+            shutdown,
         }
     }
     fn intent_callback(weak: gpui::WeakEntity<Self>) -> gitterm_gpui_chat::IntentCallback {
@@ -221,7 +211,12 @@ impl ChatPane {
             .unwrap_or_else(|_| Receipt::rejected("Preview chat closed"))
         })
     }
-    pub fn history(saved: SavedChat, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn history(
+        shutdown: Arc<RuntimeShutdown>,
+        saved: SavedChat,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let controller = Controller::new();
         let view = cx.new(|cx| {
             let mut view = ChatView::new(saved.records.clone(), window, cx);
@@ -238,7 +233,7 @@ impl ChatPane {
             view,
             status: "Preview history · no process attached".into(),
             pending: vec![],
-            _quit: cx.on_app_quit(|_, _| std::future::ready(())),
+            shutdown,
         }
     }
     pub fn target(&self) -> session::Target {
@@ -246,23 +241,21 @@ impl ChatPane {
     }
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.controller.ready = false;
-        if let Some(runtime) = self.controller.runtime.take() {
-            let _ = runtime.send(gitterm_core::chat::types::HarnessCommand::Shutdown);
-            // Retain shutdown ownership until the child is reaped even after the
-            // panel/owner disappears. No UI callback blocks on a process join.
-            cx.background_spawn(async move {
-                let mut runtime = runtime;
-                if let Err(error) = runtime.completed().await {
-                    eprintln!("Close preview Claude: {error}");
-                }
-            })
-            .detach();
-        }
+        self.shutdown_runtime();
         self.status = "Preview chat closed · history retained".into();
         self.view.update(cx, |view, cx| {
             view.set_read_only(Some("Chat closed".into()), cx)
         });
         cx.notify();
+    }
+    pub(crate) fn shutdown_runtime(&mut self) {
+        self.controller.ready = false;
+        if let Some(runtime) = self.controller.runtime.take()
+            && let Err(runtime) = self.shutdown.enqueue(runtime)
+        {
+            self.controller.runtime = Some(runtime);
+            eprintln!("Close preview Claude: shutdown queue stopped; retaining runtime ownership");
+        }
     }
     fn changed(&mut self, cx: &mut Context<Self>) {
         self.saved.session_id = self.controller.adapter.state().session_id.clone();
@@ -321,6 +314,90 @@ impl ChatPane {
             .update(cx, |view, cx| view.set_read_only(None, cx));
     }
 }
+impl Drop for ChatPane {
+    fn drop(&mut self) {
+        self.shutdown_runtime();
+    }
+}
+impl gpui::Focusable for ChatPane {
+    fn focus_handle(&self, cx: &gpui::App) -> gpui::FocusHandle {
+        self.view.focus_handle(cx)
+    }
+}
+
+/// The application retains completion ownership after a pane is closed. Quit
+/// drains synchronously before GPUI starts its 200 ms future timeout, as the
+/// existing preview disk queue does. Ordinary close callbacks only enqueue.
+pub(crate) struct RuntimeShutdown {
+    sender: std::sync::mpsc::Sender<ShutdownCommand>,
+}
+enum ShutdownCommand {
+    Session(Session),
+    Drain(std::sync::mpsc::SyncSender<std::result::Result<(), String>>),
+}
+impl RuntimeShutdown {
+    pub fn new() -> Arc<Self> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("preview-chat-shutdown".into())
+            .spawn(move || {
+                let executor = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("create preview chat shutdown executor");
+                let mut errors = Vec::new();
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        ShutdownCommand::Session(mut session) => {
+                            if let Err(error) = executor.block_on(session.completed()) {
+                                eprintln!("Reap preview Claude: {error}");
+                                errors.push(error);
+                            }
+                        }
+                        ShutdownCommand::Drain(reply) => {
+                            let result = if errors.is_empty() {
+                                Ok(())
+                            } else {
+                                Err(std::mem::take(&mut errors).join("; "))
+                            };
+                            let _ = reply.send(result);
+                        }
+                    }
+                }
+            })
+            .expect("create preview chat shutdown thread");
+        Arc::new(Self { sender })
+    }
+    fn enqueue(&self, session: Session) -> std::result::Result<(), Session> {
+        // A closed channel means the child has already exited. Completion still
+        // owns snapshot cleanup and the thread join, so always queue the handle.
+        let _ = session.send(gitterm_core::chat::types::HarnessCommand::Shutdown);
+        self.sender
+            .send(ShutdownCommand::Session(session))
+            .map_err(|error| match error.0 {
+                ShutdownCommand::Session(session) => session,
+                ShutdownCommand::Drain(_) => unreachable!(),
+            })
+    }
+    pub(crate) fn drain(&self) -> Result<()> {
+        use anyhow::Context as _;
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        self.sender
+            .send(ShutdownCommand::Drain(reply))
+            .map_err(|_| anyhow::anyhow!("preview chat shutdown queue stopped"))?;
+        result
+            .recv()
+            .context("preview chat shutdown drain stopped")?
+            .map_err(anyhow::Error::msg)
+    }
+}
+impl Drop for RuntimeShutdown {
+    fn drop(&mut self) {
+        if let Err(error) = self.drain() {
+            eprintln!("Drain preview Claude runtimes: {error:#}");
+        }
+    }
+}
+
 impl Render for ChatPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         for update in std::mem::take(&mut self.pending) {

@@ -274,6 +274,7 @@ impl Focusable for Pane {
         match &self.content {
             PaneContent::Terminal(view) => view.read(cx).focus_handle().clone(),
             PaneContent::Chat(view) => view.focus_handle(cx),
+            PaneContent::PreviewChat(view) => view.focus_handle(cx),
             PaneContent::Review(view) => view.focus_handle(cx),
             _ => self.focus.clone(),
         }

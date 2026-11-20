@@ -85,7 +85,7 @@ a time. The sandbox denies setpriority, but Cargo still runs successfully.
 
 - GPUI `fmt --all -- --check`: exit 0.
 - GPUI `clippy --workspace --locked --all-targets -- -D warnings`: exit 0.
-- GPUI `test --workspace --locked`: exit 0 (245 tests). The initial sandbox run
+- GPUI `test --workspace --locked`: exit 0 (247 tests). The initial sandbox run
   denied `/bin/ps` in an existing terminal test; the final headless rerun has
   process-inspection access. The stricter root check also required one existing
   test fixture to use concrete `/private/tmp` instead of the `/var` alias.
@@ -98,3 +98,15 @@ No real Claude invocation, authentication, GUI launch or production-state access
 was performed. No screenshot/manual live trial is claimed. The unrelated Iced
 build/test pre-commit hook is replaced for this commit by the task's explicit
 GPUI/core acceptance commands; repository hook configuration is not changed.
+
+## R2 review corrections
+
+Code review `0f182865-fbc9-41e9-b366-f3af7fbce84b` found two P2 defects.
+F1 is addressed by an application-owned completion queue: ordinary pane close
+sends shutdown and transfers the runtime handle; quit first closes every active
+chat and synchronously drains the queue before GPUI starts its 200 ms future
+timeout. The last queue owner also drains on drop. A slow fake child proves that
+quit waits past the timeout and later observers see the child already reaped.
+F2 is addressed by forwarding the embedded ChatView focus handle through
+ChatPane and Pane; a headless focus regression covers preview history.
+These changes do not open real activation or resolve its prerequisite.

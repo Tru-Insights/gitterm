@@ -601,9 +601,10 @@ impl Shell {
         let Some(preview) = self.owner.read(cx).preview() else {
             return;
         };
+        let shutdown = self.owner.read(cx).chat_shutdown.clone();
         let view = cx.new(|cx| match history {
-            Some(saved) => chat::ChatPane::history(saved, window, cx),
-            None => chat::ChatPane::new(preview, cwd, window, cx),
+            Some(saved) => chat::ChatPane::history(shutdown, saved, window, cx),
+            None => chat::ChatPane::new(shutdown, preview, cwd, window, cx),
         });
         let target = view.read(cx).target();
         let owner = self.owner.clone();
