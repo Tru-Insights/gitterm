@@ -114,6 +114,7 @@ pub struct ContentWindow {
     pub selected: Option<String>,
     covered: [bool; 3],
     pub picker: bool,
+    pub resizing: bool,
     prior_focus: Option<WeakFocusHandle>,
     fallback_focus: FocusHandle,
     focus_scope: Option<FocusHandle>,
@@ -169,6 +170,7 @@ impl ContentWindow {
             selected: None,
             covered: [false; 3],
             picker: false,
+            resizing: false,
             prior_focus: None,
             fallback_focus: cx.focus_handle(),
             focus_scope: None,
@@ -274,7 +276,7 @@ impl ContentWindow {
             || (window.root::<Root>().flatten().is_some()
                 && (window.has_active_dialog(cx) || window.has_active_sheet(cx)));
         let popup = gpui::base::GlobalState::is_in_deferred_context(cx);
-        let motion = cx.has_active_drag();
+        let motion = self.resizing || cx.has_active_drag();
         let next = [modal, popup, motion];
         if next == self.covered {
             return;

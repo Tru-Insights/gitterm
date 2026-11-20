@@ -11,6 +11,67 @@ use std::{
 #[cfg(test)]
 use crate::preview::config_dir;
 
+pub const WINDOW_WIDTH: f32 = 1400.;
+pub const WINDOW_HEIGHT: f32 = 800.;
+pub const SPINE_WIDTH: f32 = 36.;
+pub const SESSION_HEIGHT: f32 = 36.;
+pub const WORKSPACE_BAR_HEIGHT: f32 = 28.;
+pub const BOTTOM_DIVIDER: f32 = 3.;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SidebarMode {
+    #[default]
+    Work,
+    Files,
+    Find,
+}
+
+/// Stored alongside the retained pane inventory in the existing layout file.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct RegionLayout {
+    pub sidebar_width: f32,
+    pub sidebar_collapsed: bool,
+    pub sidebar_mode: SidebarMode,
+    pub bottom_height: f32,
+    pub bottom_visible: bool,
+}
+impl Default for RegionLayout {
+    fn default() -> Self {
+        Self {
+            sidebar_width: 360.,
+            sidebar_collapsed: false,
+            sidebar_mode: SidebarMode::Work,
+            bottom_height: 200.,
+            bottom_visible: true,
+        }
+    }
+}
+impl RegionLayout {
+    pub fn resize_sidebar(&mut self, width: f32) {
+        self.sidebar_width = width.clamp(150., 600.);
+    }
+    pub fn sidebar_size(&self) -> f32 {
+        if self.sidebar_collapsed {
+            36.
+        } else {
+            self.sidebar_width
+        }
+    }
+    pub fn has_bottom(&self, explicit_terminal: bool) -> bool {
+        explicit_terminal && self.bottom_visible
+    }
+    fn validate(&mut self) -> Result<()> {
+        ensure!(
+            self.sidebar_width.is_finite() && self.bottom_height.is_finite(),
+            "invalid region geometry"
+        );
+        self.resize_sidebar(self.sidebar_width);
+        ensure!(self.bottom_height > 0., "invalid bottom panel height");
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TerminalSession {
     pub id: u64,
@@ -19,6 +80,7 @@ pub struct TerminalSession {
 
 pub struct LayoutStore {
     pub terminals: Option<Vec<TerminalSession>>,
+    pub regions: RegionLayout,
     pub path: PathBuf,
     refused: Option<String>,
     guard: Option<std::sync::Arc<crate::preview::Writer>>,
@@ -29,6 +91,7 @@ impl LayoutStore {
         Self {
             path,
             terminals: None,
+            regions: RegionLayout::default(),
             refused: None,
             guard: None,
         }
@@ -37,6 +100,7 @@ impl LayoutStore {
         Self {
             path,
             terminals: None,
+            regions: RegionLayout::default(),
             refused: None,
             guard: Some(guard),
         }
@@ -84,8 +148,22 @@ impl LayoutStore {
             if let Some(reason) = &self.refused {
                 bail!("{reason}");
             }
-            let mut state: DockAreaState = serde_json::from_slice(&bytes)?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let mut regions: RegionLayout = value
+                .get("regions")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default();
+            let has_regions = value.get("regions").is_some();
+            let mut state: DockAreaState = serde_json::from_value(value)?;
             validate(&state, self.terminals.is_some())?;
+            if !has_regions && let Some(bottom) = &state.bottom_dock {
+                regions.bottom_height = f32::from(bottom.size());
+                regions.bottom_visible = bottom.open();
+            }
+            regions.validate()?;
+            self.regions = regions;
             let mut seen = HashSet::new();
             prune_unknown(&mut state.center, known, &mut seen);
             for dock in [
@@ -121,6 +199,7 @@ impl LayoutStore {
             bail!("refusing to overwrite {}: {reason}", self.path.display());
         }
         let mut value = serde_json::to_value(state)?;
+        value["regions"] = serde_json::to_value(&self.regions)?;
         if let Some(terminals) = &self.terminals {
             value["terminal_sessions"] = serde_json::to_value(terminals)?;
         }
@@ -354,6 +433,54 @@ mod tests {
             )),
             ..Default::default()
         }
+    }
+    #[test]
+    fn region_defaults_clamp_collapse_and_require_explicit_terminal() {
+        let mut regions = RegionLayout::default();
+        assert_eq!(regions.sidebar_size(), 360.);
+        assert_eq!(regions.bottom_height, 200.);
+        assert!(!regions.has_bottom(false));
+        assert!(regions.has_bottom(true));
+        regions.resize_sidebar(0.);
+        assert_eq!(regions.sidebar_size(), 150.);
+        regions.resize_sidebar(1000.);
+        assert_eq!(regions.sidebar_size(), 600.);
+        regions.sidebar_collapsed = true;
+        assert_eq!(regions.sidebar_size(), 36.);
+        regions.sidebar_collapsed = false;
+        assert_eq!(regions.sidebar_size(), 600.);
+    }
+    #[test]
+    fn region_settings_round_trip_in_existing_layout_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        let mut store = LayoutStore::new(path.clone());
+        store.regions = RegionLayout {
+            sidebar_width: 492.,
+            sidebar_collapsed: true,
+            sidebar_mode: SidebarMode::Files,
+            bottom_height: 321.,
+            bottom_visible: false,
+        };
+        store.save(&fixture()).unwrap();
+        let mut restored = LayoutStore::new(path);
+        restored
+            .load(&HashSet::from(["session-11".into()]))
+            .unwrap();
+        assert_eq!(restored.regions, store.regions);
+        let legacy = serde_json::to_vec(&fixture()).unwrap();
+        std::fs::write(&restored.path, legacy).unwrap();
+        restored
+            .load(&HashSet::from(["session-11".into()]))
+            .unwrap();
+        assert_eq!(
+            restored.regions,
+            RegionLayout {
+                bottom_height: 280.,
+                bottom_visible: false,
+                ..Default::default()
+            }
+        );
     }
     #[test]
     fn layout_round_trip_preserves_tabs_sizes_and_collapsed_dock() {
