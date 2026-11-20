@@ -12,7 +12,7 @@ if sys.argv[1:] == ['--help']:
 if sys.argv[1:] == ['auth', 'status', '--json']:
     print(json.dumps({'fixture_signed_in': True, 'fixture_method': 'fixture_personal',
                       'fixture_plan': 'fixture_pro', 'fixture_root': os.environ['CLAUDE_CONFIG_DIR'],
-                      'fixture_policy': None}))
+                      'fixture_provider': 'fixture_first_party'}))
     sys.exit(0)
 if sys.argv[1:] == ['auth', 'status']:
     print(json.dumps({'authMethod': 'claude.ai',

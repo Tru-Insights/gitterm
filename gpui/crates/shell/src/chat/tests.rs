@@ -65,8 +65,16 @@ fn fake_help_missing_restricted_refuses_and_success_does_not_grant_authority() {
             super::fence::check_help(std::str::from_utf8(&output.stdout).unwrap()).is_ok(),
             supported
         );
-        // Even supported CLI evidence cannot bypass the unresolved R2 gates.
-        assert!(provider.authorize().is_err());
+        // Help alone cannot supply account evidence to the launch gate.
+        assert!(
+            super::auth::personal_auth(
+                Some(0),
+                &output.stdout,
+                &preview.provider(),
+                super::auth::AUTH_STATUS_SCHEMA
+            )
+            .is_err()
+        );
     }
 }
 
@@ -158,7 +166,17 @@ async fn probe_both_states_and_environment_are_rooted_and_success_does_not_open_
         );
         let provider = Provider::fixture(preview.clone(), &fake).unwrap();
         assert_eq!(provider.fake_probe().await.unwrap(), expected);
-        assert!(provider.authorize().is_err());
+        // The display probe's partial schema cannot authorize a launch.
+        let partial = serde_json::json!({"authMethod":method,"configDirectory":preview.provider()});
+        assert!(
+            super::auth::personal_auth(
+                Some(code),
+                &serde_json::to_vec(&partial).unwrap(),
+                &preview.provider(),
+                super::auth::AUTH_STATUS_SCHEMA
+            )
+            .is_err()
+        );
         let env = std::fs::read_to_string(dir.path().join("environment")).unwrap();
         for forbidden in [
             "ANTHROPIC_API_KEY",
@@ -420,7 +438,7 @@ if sys.argv[1:] == ['--help']:
     print('  --restricted\n  --strict-mcp-config\n  --safe-mode\n  --permission-mode <mode> (choices: "manual")')
     sys.exit(0)
 if sys.argv[1:] == ['auth', 'status', '--json']:
-    print(json.dumps({{'fixture_signed_in':True,'fixture_method':'fixture_personal','fixture_plan':'fixture_pro','fixture_root':os.environ['CLAUDE_CONFIG_DIR'],'fixture_policy':None}}))
+    print(json.dumps({{'fixture_signed_in':True,'fixture_method':'fixture_personal','fixture_plan':'fixture_pro','fixture_root':os.environ['CLAUDE_CONFIG_DIR'],'fixture_provider':'fixture_first_party'}}))
     sys.exit(0)
 if sys.argv[1:] == ['auth', 'status']:
     print(json.dumps({{'authMethod':'claude.ai', 'configDirectory':os.environ['CLAUDE_CONFIG_DIR']}}))
@@ -569,7 +587,6 @@ assert not sys.stdin.read()
         controller.adapter.state().session_id.as_deref(),
         Some("preview-created-id")
     );
-    assert!(provider.authorize().is_err());
     let launch: serde_json::Value =
         serde_json::from_slice(&std::fs::read(cwd.join("launch.json")).unwrap()).unwrap();
     assert_eq!(launch["cwd"], cwd.to_str().unwrap());
@@ -678,7 +695,7 @@ if sys.argv[1:] == ['--help']:
     print('  --restricted\n  --strict-mcp-config\n  --safe-mode\n  --permission-mode <mode> (choices: "manual")')
     sys.exit(0)
 if sys.argv[1:] == ['auth', 'status', '--json']:
-    print(json.dumps({{'fixture_signed_in':True,'fixture_method':'fixture_personal','fixture_plan':'fixture_pro','fixture_root':os.environ['CLAUDE_CONFIG_DIR'],'fixture_policy':None}}))
+    print(json.dumps({{'fixture_signed_in':True,'fixture_method':'fixture_personal','fixture_plan':'fixture_pro','fixture_root':os.environ['CLAUDE_CONFIG_DIR'],'fixture_provider':'fixture_first_party'}}))
     sys.exit(0)
 if sys.argv[1:] == ['auth', 'status']:
     print(json.dumps({{'authMethod':'claude.ai','configDirectory':os.environ['CLAUDE_CONFIG_DIR']}}))
