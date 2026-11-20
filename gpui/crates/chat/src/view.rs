@@ -17,8 +17,9 @@ use crate::{
 use gpui::{
     App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, Entity, EntityInputHandler,
     FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding, ParentElement, Render,
-    StyleRefinement, Styled, Subscription, Task, TitlebarOptions, Window, WindowBounds,
-    WindowOptions, actions, base::TextSelection, div, prelude::FluentBuilder, px, rgb, size,
+    StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, TitlebarOptions,
+    Window, WindowBounds, WindowOptions, actions, base::TextSelection, div, prelude::FluentBuilder,
+    px, rgb, size,
 };
 use gpui_component::{
     Disableable, Root, Sizable, WindowExt,
@@ -250,6 +251,12 @@ impl ChatView {
     /// Embedded preview hides fixture replay controls and names its omitted features.
     pub fn set_preview(&mut self, cx: &mut Context<Self>) {
         self.preview = true;
+        for card in self.cards.values() {
+            card.update(cx, |card, cx| {
+                card.preview = true;
+                cx.notify();
+            });
+        }
         cx.notify();
     }
     /// Install the app-owned delivery seam. No session/harness is started by the view.
@@ -468,6 +475,15 @@ impl ChatView {
         match update.presentation {
             Some(Presentation::Replay) => {
                 self.model = ChatModel::from_conversation(&state.conversation);
+                for row in &mut self.model.rows {
+                    if let Some(request) = &mut row.request
+                        && !request.resolved
+                    {
+                        request.identity =
+                            state.request_identity(source, &request.owner, &request.id);
+                        request.resolved = request.identity.is_none();
+                    }
+                }
                 // Row IDs are positional after prepend; never reuse a card under a new request.
                 let old_cards = std::mem::take(&mut self.cards);
                 for row in &self.model.rows {
@@ -500,6 +516,21 @@ impl ChatView {
             }
             None => {}
         }
+        for row in &mut self.model.rows {
+            if let Some(request) = &mut row.request
+                && !request.resolved
+            {
+                request.identity = state.request_identity(source, &request.owner, &request.id);
+                request.resolved = request.identity.is_none();
+            }
+            if let Some(card) = self.cards.get(&row.id) {
+                card.update(cx, |card, cx| {
+                    card.sync(row.clone(), self.read_only_reason.is_some(), cx)
+                });
+            }
+        }
+        // Create the first card even before the transcript has ever been measured.
+        self.pending_panel(window, cx);
         for receipt in update.receipts {
             self.update_receipt(receipt, window, cx);
         }
@@ -531,7 +562,7 @@ impl ChatView {
     fn row(
         &mut self,
         index: usize,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<RowView> {
         self.recent_rows.retain(|value| *value != index);
@@ -567,38 +598,9 @@ impl ChatView {
         let user_turn = row.kind == RowKind::User && turn_rows > 0;
         let turn_id = row.id;
         let scroller = self.scroller.clone();
-        let card = if row.request.is_some() {
-            Some(
-                self.cards
-                    .entry(row.id)
-                    .or_insert_with(|| {
-                        cx.new(|cx| {
-                            CardView::new(
-                                row.clone(),
-                                self.callback.clone(),
-                                self.read_only_reason.is_some(),
-                                window,
-                                cx,
-                            )
-                        })
-                    })
-                    .clone(),
-            )
-        } else {
-            None
-        };
         let open = self.folded.get(&row.id).copied();
         let view = cx.new(|cx| {
             let mut view = RowView::new(row, index, scroller, cx);
-            view._card_subscription = card.as_ref().map(|card| {
-                cx.observe(card, |this, _, cx| {
-                    this.scroller.update(cx, |state, cx| {
-                        state.remeasure_items(this.index..this.index + 1, cx);
-                    });
-                    cx.notify();
-                })
-            });
-            view.card = card;
             if let Some(open) = open {
                 view.open = open;
             }
@@ -614,6 +616,64 @@ impl ChatView {
         self.row_views[index] = Some(view.clone());
         self.update_row_find(index, cx);
         view
+    }
+    fn pending_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let pending = self.model.pending_rows();
+        if pending.is_empty() {
+            return div().into_any_element();
+        }
+        // Worker delivery is gated; it must not strand a parent's answerable request.
+        let position = pending
+            .iter()
+            .position(|&index| {
+                self.model.rows[index]
+                    .request
+                    .as_ref()
+                    .unwrap()
+                    .owner
+                    .is_empty()
+            })
+            .unwrap_or(0);
+        let index = pending[position];
+        let row = self.model.rows[index].clone();
+        let card = self
+            .cards
+            .entry(row.id)
+            .or_insert_with(|| {
+                cx.new(|cx| {
+                    let mut card = CardView::new(
+                        row,
+                        self.callback.clone(),
+                        self.read_only_reason.is_some(),
+                        window,
+                        cx,
+                    );
+                    card.preview = self.preview;
+                    card
+                })
+            })
+            .clone();
+        div()
+            .id("pending-request-panel")
+            .debug_selector(|| "pending-request-panel".into())
+            .max_h(window.viewport_size().height * 0.45)
+            .overflow_y_scroll()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .p(px(10.))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .rounded(px(6.))
+            .when(position > 0, |panel| {
+                panel.child("Earlier worker requests · read-only")
+            })
+            .when(pending.len() > 1, |panel| {
+                panel.child(format!("{} of {}", position + 1, pending.len()))
+            })
+            .child(card)
+            .into_any_element()
     }
     fn toggle_turn(&mut self, id: u64, cx: &mut Context<Self>) {
         if !self.folded_turns.insert(id) {
@@ -921,6 +981,7 @@ impl Render for ChatView {
                     )
                 },
             )
+            .child(self.pending_panel(window, cx))
             .child(self.composer_state.render(
                 &self.composer,
                 self.read_only_reason.clone().or_else(|| self.callback.is_none().then(|| "No session adapter attached".into())),
@@ -942,8 +1003,6 @@ impl Render for ChatView {
 }
 
 struct RowView {
-    card: Option<Entity<CardView>>,
-    _card_subscription: Option<Subscription>,
     row: Row,
     text: Entity<TextViewState>,
     diffs: Vec<Entity<DiffState>>,
@@ -985,8 +1044,6 @@ impl RowView {
         });
         let open = !row.collapsible();
         let mut view = Self {
-            card: None,
-            _card_subscription: None,
             row,
             text,
             diffs: vec![],
@@ -1083,7 +1140,6 @@ impl Render for RowView {
                     .map(|diff| div().h(px(260.)).child(Diff::new(diff))),
             )
             .child(self.copyable_text(cx));
-        let content = content.children(self.card.clone());
         let header = div()
             .text_size(px(13.))
             .text_color(rgb(color))

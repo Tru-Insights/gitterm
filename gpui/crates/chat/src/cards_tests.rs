@@ -81,7 +81,7 @@ fn permission_decisions_lock_locally_and_preserve_offered_rule(cx: &mut TestAppC
             let callback: IntentCallback = Rc::new(move |intent, _| { captured.borrow_mut().push(intent); let mut r = Receipt::rejected("synthetic"); r.state = crate::adapter::ReceiptState::ChannelAccepted; r });
             let card = cx.new(|cx| CardView::new(permission_row(), Some(callback), false, window, cx));
             card.update(cx, |card, cx| {
-                let decision = match mode { 0 => PermissionDecision::Allow, 1 => PermissionDecision::AllowAlways { suggestion: json!({"type":"addRules", "destination":"localSettings", "rules":[{"toolName":"Bash", "ruleContent":"echo synthetic"}]}) }, _ => PermissionDecision::Deny };
+                let decision = match mode { 0 => PermissionDecision::Allow, 1 => PermissionDecision::AllowAlways { suggestion: json!({"type":"addRules", "destination":"localSettings", "rules":[{"toolName":"Bash", "ruleContent":"echo synthetic"}]}) }, _ => PermissionDecision::Deny { reason: String::new() } };
                 card.permission(decision.clone(), cx);
                 assert_eq!(intents.borrow().last(), Some(&ChatIntent::Permission { request_id:"synthetic-request".into(), decision }));
                 assert!(!card.enabled());
@@ -170,7 +170,13 @@ fn assert_question_encoding(intent: ChatIntent, kind: RuntimeRequestKind) {
         .unwrap();
     let prepared = adapter
         .admit(
-            intent,
+            ChatIntent::Answer {
+                identity: adapter
+                    .state()
+                    .request_identity(&stamp, &[], "synthetic-request")
+                    .unwrap(),
+                answer: Box::new(intent),
+            },
             Admission {
                 authority: session::State {
                     target: target.clone(),
@@ -249,7 +255,12 @@ fn receipts_unlock_only_definitive_rejection_and_resolution_wins(cx: &mut TestAp
         });
         let card = cx.new(|cx| CardView::new(permission_row(), Some(callback), false, window, cx));
         card.update(cx, |card, cx| {
-            card.permission(PermissionDecision::Deny, cx);
+            card.permission(
+                PermissionDecision::Deny {
+                    reason: String::new(),
+                },
+                cx,
+            );
             let mut rejected = card.receipt.clone().unwrap();
             rejected.state = ReceiptState::Rejected("not written".into());
             card.update_receipt(&rejected, cx);
@@ -387,4 +398,53 @@ fn question_description_fits_selected_and_unselected_options(cx: &mut TestAppCon
         assert!(description.left() >= button.left());
         assert!(description.right() <= button.right());
     }
+}
+
+#[gpui::test]
+fn deny_reason_enter_emits_typed_text_without_submitting_composer(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let cx = cx.add_empty_window();
+    let captured = Rc::new(RefCell::new(vec![]));
+    cx.update(|window, cx| {
+        let output = captured.clone();
+        let callback: IntentCallback = Rc::new(move |intent, _| {
+            output.borrow_mut().push(intent);
+            Receipt::rejected("fixture")
+        });
+        let card = cx.new(|cx| CardView::new(permission_row(), Some(callback), false, window, cx));
+        card.update(cx, |card, cx| {
+            card.deny_reason.update(cx, |input, cx| {
+                input.set_value("  preserve this reason  ", window, cx)
+            });
+            card.deny(cx);
+        });
+    });
+    assert!(
+        matches!(&captured.borrow()[0], ChatIntent::Permission { decision: PermissionDecision::Deny { reason }, .. } if reason == "  preserve this reason  ")
+    );
+}
+
+#[gpui::test]
+fn preview_remember_stays_disabled_at_card_boundary(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        let callback: IntentCallback = Rc::new(|_, _| panic!("preview remember reached dispatch"));
+        let card = cx.new(|cx| CardView::new(permission_row(), Some(callback), false, window, cx));
+        card.update(cx, |card, cx| {
+            card.preview = true;
+            let RuntimeRequestKind::Permission { suggestions, .. } =
+                &card.row.request.as_ref().unwrap().kind
+            else {
+                unreachable!()
+            };
+            card.permission(
+                PermissionDecision::AllowAlways {
+                    suggestion: suggestions[0].clone(),
+                },
+                cx,
+            );
+            assert!(card.submitted.is_none());
+        });
+    });
 }

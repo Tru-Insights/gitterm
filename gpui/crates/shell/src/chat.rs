@@ -97,15 +97,19 @@ impl Controller {
                 Update::default(),
             );
         }
+        let answer = match &intent {
+            ChatIntent::Answer { answer, .. } => answer.as_ref(),
+            intent => intent,
+        };
         if matches!(
-            &intent,
+            answer,
             ChatIntent::Permission {
                 decision: gitterm_gpui_chat::PermissionDecision::AllowAlways { .. },
                 ..
             }
         ) {
             return (
-                Receipt::rejected("Remember permission: not in preview yet"),
+                Receipt::rejected("Allow and remember · not saved in preview"),
                 Update::default(),
             );
         }
