@@ -8,6 +8,9 @@ use gpui::*;
 use gpui_component::dock::{BasePanel, Panel, PanelEvent, PanelInfo, PanelState};
 use std::rc::Rc;
 
+#[path = "git_view.rs"]
+pub(crate) mod git_view;
+
 pub const PANEL_NAME: &str = "GitTermShellPane";
 #[derive(Clone)]
 pub enum PaneKind {
@@ -55,6 +58,7 @@ pub struct Pane {
     data: Rc<dyn ShellData>,
     focus: FocusHandle,
     files: Option<Entity<crate::files_view::FilesView>>,
+    pub(crate) git: Option<Entity<git_view::GitView>>,
     _terminal_events: Option<Subscription>,
 }
 impl Pane {
@@ -201,6 +205,8 @@ impl Pane {
             workspace,
             data: data.clone(),
             focus: cx.focus_handle(),
+            git: matches!(kind, PaneKind::Git)
+                .then(|| cx.new(|cx| git_view::GitView::new(workspace, data.clone(), cx))),
             files: matches!(kind, PaneKind::Files).then(|| {
                 cx.new(|cx| crate::files_view::FilesView::new(workspace, data.clone(), cx))
             }),
@@ -246,6 +252,7 @@ impl Pane {
             cx,
         );
     }
+    #[cfg(test)]
     pub(crate) fn status_view(&self, cx: &App) -> crate::data::GitStatus {
         self.data.status(self.workspace, cx)
     }
@@ -358,62 +365,11 @@ impl Render for Pane {
             ),
             PaneContent::IcedSession(text) => body.child(text.clone()),
             PaneContent::Error(error) => body.text_color(rgb(p.red)).child(error.clone()),
-            PaneContent::Git => {
-                let status = self.status_view(cx);
-                body.child(status.repository)
-                    .child(
-                        div()
-                            .text_color(rgb(p.muted))
-                            .child(format!("⑂ {}", status.branch)),
-                    )
-                    .children(status.loading.then(|| div().child("Loading Git status…")))
-                    .children(
-                        status
-                            .error
-                            .map(|error| div().text_color(rgb(p.red)).child(error)),
-                    )
-                    .children(
-                        (!status.loading && !status.is_git_repo)
-                            .then(|| div().child("Not a Git repository")),
-                    )
-                    .child(format!("Changes · {}", status.files.len()))
-                    .children(status.files.into_iter().map(|file| {
-                        let group = if file.staged {
-                            "staged"
-                        } else if file.status == "??" {
-                            "untracked"
-                        } else {
-                            "unstaged"
-                        };
-                        let data = self.data.clone();
-                        let workspace = self.workspace;
-                        let selected = file.clone();
-                        div()
-                            .id(SharedString::from(format!(
-                                "git-file-{group}-{}",
-                                file.path
-                            )))
-                            .cursor_pointer()
-                            .on_click(move |_, _, cx| {
-                                if let Some(owner) = data.local_owner() {
-                                    owner.update(cx, |owner, cx| {
-                                        owner.open_changed_file(workspace, selected.clone(), cx)
-                                    });
-                                }
-                            })
-                            .flex()
-                            .gap_2()
-                            .py_1()
-                            .child(
-                                div()
-                                    .w(px(24.))
-                                    .text_color(rgb(if file.staged { p.green } else { p.blue }))
-                                    .child(file.status),
-                            )
-                            .child(div().flex_1().child(file.path))
-                            .child(div().text_color(rgb(p.muted)).child(group))
-                    }))
-            }
+            PaneContent::Git => div()
+                .id("git-left-view")
+                .size_full()
+                .min_h_0()
+                .children(self.git.clone()),
             PaneContent::Files => {
                 let folder = self
                     .data
@@ -425,5 +381,18 @@ impl Render for Pane {
                     .child(div().flex_1().min_h_0().children(self.files.clone()))
             }
         }
+    }
+}
+
+impl crate::Shell {
+    /// Mount the retained Git subview when the Work repo route is selected.
+    #[allow(dead_code)] // Coordinator mounts this from the Work repo route in lib.rs.
+    pub(crate) fn git_sidebar(&self, sidebar: Stateful<Div>, cx: &Context<Self>) -> Stateful<Div> {
+        let state = self.active(cx);
+        sidebar.child(
+            div().flex_1().min_h_0().child(
+                state.panes[&format!("workspace-{}-git", state.workspace.layout_key)].clone(),
+            ),
+        )
     }
 }
