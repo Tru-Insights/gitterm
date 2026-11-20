@@ -1,0 +1,15 @@
+{
+ "editor":"synthetic-editor --wait", "terminal_font_size":17.0, "ui_font_size":12.0,
+ "chat_font_size":18.0, "chat_width":"full", "sidebar_width":420.0,
+ "scrollback_lines":12345, "font_size":16.0, "theme":"light", "show_hidden":true,
+ "console_height":230.0, "console_expanded":false, "terminal_log_mirroring_enabled":true,
+ "stt_enabled":false, "stt_model_path":"/synthetic/voice/model.bin",
+ "agent_presets":[{"name":"Synthetic","command":"synthetic-agent --safe","resume_command":"synthetic-agent resume","icon":"S","color":"teal"}],
+ "quick_commands":[{"name":"Inspect","command":"synthetic-inspect"}],
+ "task_worktree_root":"/synthetic/worktrees", "max_concurrent_local_tasks":0,
+ "review":{"default_reviewer":"codex","subagent_model":"synthetic-review","codex_model":"synthetic-codex","max_concurrent_reviews":0},
+ "chat":{"default_model":"synthetic-chat","default_effort":"high","remember_last":false,"last":{"model":"synthetic-last","effort":"low"},"antigravity_model":"synthetic-agy","opencode_model":"synthetic-open"},
+ "policy":{"claude":{"scoped":"synthetic-scoped"},"codex":{"judgment":"synthetic-judgment"},"antigravity":{}},
+ "usage":{"pricing":{"synthetic-model":{"input":1.25,"output":2.5,"cache_read":0.125,"cache_write":0.25,"cache_write_1h":0.5},"synthetic-unpriced":null}},
+ "notifications":{"needs_you":false},"pr_watch":{"auto_tell":false},"delegations":{"auto_tell":false},"work_notes":{"auto_commit":false}
+}

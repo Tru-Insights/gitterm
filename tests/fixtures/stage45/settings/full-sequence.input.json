@@ -1,0 +1,84 @@
+[
+  "synthetic-editor --wait",
+  17.0,
+  12.0,
+  18.0,
+  "full",
+  420.0,
+  12345,
+  16.0,
+  "light",
+  true,
+  230.0,
+  false,
+  true,
+  false,
+  "/synthetic/voice/model.bin",
+  [
+    {
+      "name": "Synthetic",
+      "command": "synthetic-agent --safe",
+      "resume_command": "synthetic-agent resume",
+      "icon": "S",
+      "color": "teal"
+    }
+  ],
+  [
+    {
+      "name": "Inspect",
+      "command": "synthetic-inspect"
+    }
+  ],
+  "/synthetic/worktrees",
+  0,
+  {
+    "default_reviewer": "codex",
+    "subagent_model": "synthetic-review",
+    "codex_model": "synthetic-codex",
+    "max_concurrent_reviews": 0
+  },
+  {
+    "default_model": "synthetic-chat",
+    "default_effort": "high",
+    "remember_last": false,
+    "last": {
+      "model": "synthetic-last",
+      "effort": "low"
+    },
+    "antigravity_model": "synthetic-agy",
+    "opencode_model": "synthetic-open"
+  },
+  {
+    "claude": {
+      "scoped": "synthetic-scoped"
+    },
+    "codex": {
+      "judgment": "synthetic-judgment"
+    },
+    "antigravity": {}
+  },
+  {
+    "pricing": {
+      "synthetic-model": {
+        "input": 1.25,
+        "output": 2.5,
+        "cache_read": 0.125,
+        "cache_write": 0.25,
+        "cache_write_1h": 0.5
+      },
+      "synthetic-unpriced": null
+    }
+  },
+  {
+    "needs_you": false
+  },
+  {
+    "auto_tell": false
+  },
+  {
+    "auto_tell": false
+  },
+  {
+    "auto_commit": false
+  }
+]
