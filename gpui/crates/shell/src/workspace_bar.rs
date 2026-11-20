@@ -577,6 +577,19 @@ pub fn render(input: &Input, colors: Colors, emit: Handler<Outcome>) -> gpui::St
 }
 
 #[cfg(test)]
+fn right_side_labels(input: &Input) -> Vec<String> {
+    let mut labels = Vec::new();
+    if input.ready_count > 0 || input.ready_news_count > 0 {
+        labels.push(format!("↑{}", input.ready_count));
+    }
+    if input.parked_count > 0 {
+        labels.push(format!("⏸{}", input.parked_count));
+    }
+    labels.extend([">_".to_string(), "Browser".to_string(), "⋯".to_string()]);
+    labels
+}
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use gpui::{Context, Render, TestAppContext, VisualTestContext};
@@ -717,6 +730,20 @@ pub(crate) mod tests {
             reason: "Input".into(),
         });
         assert!(!i.hidden_news(), "parked work is omitted entirely");
+    }
+    #[test]
+    fn right_controls_match_iced_order_and_hide_zero_counts() {
+        let mut i = input();
+        i.ready_count = 2;
+        i.parked_count = 16;
+        assert_eq!(
+            right_side_labels(&i),
+            ["↑2", "⏸16", ">_", "Browser", "⋯"]
+        );
+        i.ready_count = 0;
+        i.parked_count = 0;
+        i.ready_news_count = 0;
+        assert_eq!(right_side_labels(&i), [">_", "Browser", "⋯"]);
     }
     pub(crate) fn draw(cx: &mut VisualTestContext) {
         cx.run_until_parked();

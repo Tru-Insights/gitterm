@@ -47,6 +47,7 @@ impl WorkspaceOwner {
             cx.set_global(crate::work_sidebar::IcedWorkSource {
                 config: catalog.source.clone(),
                 workspaces: catalog.workspaces.clone(),
+                repos: catalog.repos.clone(),
                 owner: cx.entity().downgrade(),
             });
         }

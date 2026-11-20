@@ -539,11 +539,102 @@ impl crate::Shell {
         cx.notify();
     }
 
+    fn load_iced_strip_titles(&self, window: &mut gpui::Window, cx: &mut gpui::Context<Self>) {
+        let Some(catalog) = self.owner.read(cx).iced_catalog() else {
+            return;
+        };
+        let config = catalog.source.clone();
+        let mut bindings = vec![];
+        let mut conversations = vec![];
+        for state in &self.workspaces {
+            let Some(saved) = self.owner.read(cx).iced_workspace(state.workspace.id) else {
+                continue;
+            };
+            if saved.is_legacy_remote()
+                || matches!(
+                    saved.location,
+                    Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. })
+                )
+            {
+                continue;
+            }
+            conversations.extend(saved.chats.iter().cloned());
+            for (session, tab) in crate::data::iced_sessions(saved).iter().zip(&saved.tabs) {
+                if tab.tab_kind.as_deref() != Some("agent") {
+                    continue;
+                }
+                let Some(conversation) = &tab.chat_session_id else {
+                    continue;
+                };
+                conversations.push(conversation.clone());
+                let Some(current) = state.sessions.iter().find(|s| s.id == session.id) else {
+                    continue;
+                };
+                if let Some(pane) = state.panes.get(&crate::session_pane_id(session.id)) {
+                    bindings.push((
+                        state.workspace.id,
+                        session.id,
+                        pane.clone(),
+                        current.title.clone(),
+                        conversation.clone(),
+                    ));
+                }
+            }
+        }
+        if bindings.is_empty() {
+            return;
+        }
+        // Headless tests only use explicitly supplied synthetic transcript homes.
+        #[cfg(test)]
+        let home: Option<std::path::PathBuf> = None;
+        #[cfg(not(test))]
+        let home = dirs::home_dir();
+        cx.spawn_in(window, async move |shell, cx| {
+            let titles = cx
+                .background_executor()
+                .spawn(
+                    async move { read_iced_strip_titles(&config, home.as_deref(), &conversations) },
+                )
+                .await;
+            _ = shell.update_in(cx, |shell, _, cx| {
+                for (workspace, id, pane, previous, conversation) in bindings {
+                    let Some(title) = titles.get(&conversation) else {
+                        continue;
+                    };
+                    let Some(state) = shell
+                        .workspaces
+                        .iter_mut()
+                        .find(|s| s.workspace.id == workspace)
+                    else {
+                        continue;
+                    };
+                    // A closed/replaced pane or newer title must not receive stale work.
+                    if state.panes.get(&crate::session_pane_id(id)) != Some(&pane) {
+                        continue;
+                    }
+                    if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id)
+                        && session.title == previous
+                    {
+                        session.title = title.clone();
+                        pane.update(cx, |pane, cx| {
+                            pane.title = title.clone();
+                            cx.notify();
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn load_active_iced_history(
         &mut self,
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        // Labels belong to every open tab, independently of history availability.
+        self.load_iced_strip_titles(window, cx);
         let Some(workspace) = self.active_workspace(cx) else {
             return;
         };
@@ -588,7 +679,7 @@ impl crate::Shell {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    saved.map(|s| (s, None)).map(Ok).unwrap_or_else(|| {
+                    saved.map(Ok).unwrap_or_else(|| {
                         let projects =
                             projects.ok_or_else(|| "transcript source unavailable".to_string())?;
                         read_iced_history(&projects, &conversation, &tab.dir, provider)
@@ -612,16 +703,10 @@ impl crate::Shell {
                     return;
                 }
                 match result {
-                    Ok((saved, title)) => {
+                    Ok(saved) => {
                         use gpui::AppContext as _;
                         let view = cx
                             .new(|cx| crate::chat::ChatPane::history(shutdown, saved, window, cx));
-                        if let Some(title) = title {
-                            if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
-                                session.title = title.clone();
-                            }
-                            pane.update(cx, |p, _| p.title = title);
-                        }
                         // Imported history has no live target and is never registered
                         // as a preview-owned runtime or persisted as a preview chat.
                         pane.update(cx, |p, cx| {
@@ -644,12 +729,62 @@ impl crate::Shell {
     }
 }
 
+/// Use Iced's index rules (generated title, summary/first real user message),
+/// even for tabs whose history has never been opened or cannot be imported.
+fn read_iced_strip_titles(
+    config: &std::path::Path,
+    home: Option<&std::path::Path>,
+    conversations: &[String],
+) -> std::collections::HashMap<String, String> {
+    use gitterm_core::{chat_facts, chats::ChatBackend};
+    let entries = home
+        .map(|home| crate::workspace_config::read_iced_chat_index(config, home))
+        .unwrap_or_default();
+    let mut titles = std::collections::HashMap::new();
+    let mut add_children = |facts: &chat_facts::ChatFacts| {
+        for child in &facts.children {
+            if let Some(title) = child
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                titles
+                    .entry(child.session_id.clone())
+                    .or_insert_with(|| title.to_owned());
+            }
+        }
+    };
+    for facts in entries.iter().filter_map(|entry| entry.facts.as_ref()) {
+        add_children(facts);
+    }
+    // Facts can name children whose transcript is absent. A facts file has no
+    // title for its own chat; never mistake issue keys or a UUID for that title.
+    for conversation in conversations {
+        for backend in [ChatBackend::Claude, ChatBackend::Pi, ChatBackend::Codex] {
+            let facts =
+                chat_facts::facts_path(&chat_facts::facts_dir(config), backend, conversation)
+                    .and_then(|path| chat_facts::load_facts(&path));
+            match facts {
+                Ok(Some(facts)) => add_children(&facts),
+                Ok(None) => {}
+                Err(error) => eprintln!("[strip-titles] {error}"),
+            }
+        }
+    }
+    // A conversation's own indexed title wins over a parent's recorded brief.
+    for entry in entries {
+        titles.insert(entry.id, entry.title);
+    }
+    titles
+}
+
 fn read_iced_history(
     projects: &std::path::Path,
     conversation: &str,
     cwd: &str,
     provider: std::path::PathBuf,
-) -> Result<(crate::chat::SavedChat, Option<String>), String> {
+) -> Result<crate::chat::SavedChat, String> {
     use gitterm_core::harness::transcript::TranscriptEntry;
     use gitterm_gpui_chat::events::{Entry, Record};
     if conversation.is_empty()
@@ -681,74 +816,116 @@ fn read_iced_history(
     if records.is_empty() {
         return Err("Transcript has no recorded history".into());
     }
-    // Match Iced's latest generated title, then its first summary/user title.
-    let mut generated = None;
-    let mut first = None;
-    for value in source
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-    {
-        if value["type"] == "ai-title" {
-            generated = value["aiTitle"]
-                .as_str()
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(str::to_owned)
-                .or(generated);
-        }
-        if first.is_none() && value["type"] == "summary" {
-            first = value["summary"]
-                .as_str()
-                .filter(|t| !t.is_empty())
-                .map(str::to_owned);
-        }
-        if first.is_none()
-            && value["type"] == "user"
-            && value["isMeta"] != true
-            && value["isSidechain"] != true
-        {
-            let text = match &value["message"]["content"] {
-                serde_json::Value::String(text) => text.clone(),
-                serde_json::Value::Array(blocks) => blocks
-                    .iter()
-                    .filter(|b| b["type"] == "text")
-                    .filter_map(|b| b["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                _ => String::new(),
-            };
-            if !text.trim().is_empty() && !text.starts_with('<') {
-                let line = text
-                    .lines()
-                    .find(|line| !line.trim().is_empty())
-                    .unwrap_or(&text)
-                    .trim();
-                let mut title: String = line.chars().take(90).collect();
-                if line.chars().count() > 90 {
-                    title.push('…');
-                }
-                first = Some(title);
-            }
-        }
-    }
-    let title = generated.or(first);
-    Ok((
-        crate::chat::SavedChat {
-            uid: format!("iced-{conversation}"),
-            cwd: cwd.into(),
-            provider,
-            session_id: Some(conversation.into()),
-            records,
-        },
-        title,
-    ))
+    Ok(crate::chat::SavedChat {
+        uid: format!("iced-{conversation}"),
+        cwd: cwd.into(),
+        provider,
+        session_id: Some(conversation.into()),
+        records,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn imported_transcript_is_read_only_and_uses_iced_generated_title() {
+    fn strip_fixture_resolves_all_saved_tabs_and_facts_without_loading_history() {
+        use gitterm_core::workspace_config::WorkspacesFile;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("iced");
+        let home = dir.path().join("home");
+        let projects = home.join(".claude/projects/fixture");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(config.join("chat-meta")).unwrap();
+        // workspaces.json has identities/config, not a persisted chat-title field.
+        let source = serde_json::json!({
+            "active_workspace": 0,
+            "workspaces": [{
+                "name": "Synthetic work", "abbrev": "SW", "dir": "/fixture/repo",
+                "color": "lavender", "chats": ["parent"],
+                "tabs": (["saved", "summary", "first", "facts-child", "uuid-only"]
+                    .map(|id| serde_json::json!({
+                        "dir": "/fixture/repo", "tab_kind": "agent",
+                        "agent_config": {"backend": "claude", "model": "fixture"},
+                        "chat_session_id": id
+                    })))
+            }]
+        });
+        let bytes = serde_json::to_vec(&source).unwrap();
+        std::fs::write(config.join("workspaces.json"), &bytes).unwrap();
+        let saved: WorkspacesFile = serde_json::from_slice(&bytes).unwrap();
+        let transcripts = [
+            (
+                "saved",
+                concat!(
+                    "{\"type\":\"user\",\"cwd\":\"/fixture/repo\",\"message\":{\"content\":\"Original prompt\"}}\n",
+                    "{\"type\":\"ai-title\",\"aiTitle\":\"Old title\"}\n",
+                    "{\"type\":\"ai-title\",\"aiTitle\":\" Saved generated title \"}\n"
+                ),
+            ),
+            (
+                "summary",
+                concat!(
+                    "{\"type\":\"summary\",\"cwd\":\"/fixture/repo\",\"summary\":\"Summary title\"}\n",
+                    "{\"type\":\"user\",\"message\":{\"content\":\"Later question\"}}\n"
+                ),
+            ),
+            (
+                "first",
+                concat!(
+                    "{\"type\":\"user\",\"cwd\":\"/fixture/repo\",\"isMeta\":true,\"message\":{\"content\":\"Skip metadata\"}}\n",
+                    "{\"type\":\"user\",\"message\":{\"content\":\"<system-reminder>skip</system-reminder>\"}}\n",
+                    "{\"type\":\"user\",\"message\":{\"content\":\"First real question\\nMore text\"}}\n"
+                ),
+            ),
+        ];
+        for (id, source) in &transcripts {
+            std::fs::write(projects.join(format!("{id}.jsonl")), source).unwrap();
+        }
+        let facts = serde_json::json!({"children": [
+            {"session_id": "facts-child", "kind": "worker", "title": "Recorded child title"},
+            {"session_id": "saved", "kind": "worker", "title": "Older parent brief"}
+        ]});
+        let facts_bytes = serde_json::to_vec(&facts).unwrap();
+        let facts_path = config.join("chat-meta/claude-parent.json");
+        std::fs::write(&facts_path, &facts_bytes).unwrap();
+        let workspace = &saved.workspaces[0];
+        let conversations: Vec<_> = workspace
+            .chats
+            .iter()
+            .cloned()
+            .chain(
+                workspace
+                    .tabs
+                    .iter()
+                    .filter_map(|tab| tab.chat_session_id.clone()),
+            )
+            .collect();
+        let titles = read_iced_strip_titles(&config, Some(&home), &conversations);
+        assert_eq!(titles["saved"], "Saved generated title");
+        assert_eq!(titles["summary"], "Summary title");
+        assert_eq!(titles["first"], "First real question");
+        assert_eq!(titles["facts-child"], "Recorded child title");
+        assert!(!titles.contains_key("uuid-only"));
+        assert_eq!(
+            crate::session_strip::label(None, &workspace.tabs[4].dir, false, false),
+            "repo"
+        );
+        assert_eq!(
+            std::fs::read(config.join("workspaces.json")).unwrap(),
+            bytes
+        );
+        assert_eq!(std::fs::read(facts_path).unwrap(), facts_bytes);
+        for (id, source) in transcripts {
+            assert_eq!(
+                std::fs::read_to_string(projects.join(format!("{id}.jsonl"))).unwrap(),
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn imported_transcript_is_read_only_and_preserves_recorded_history() {
         use gitterm_gpui_chat::events::Entry;
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("fixture-project");
@@ -763,14 +940,13 @@ mod tests {
             "{\"type\":\"ai-title\",\"aiTitle\":\" Current Iced title \"}\n"
         );
         std::fs::write(&path, source).unwrap();
-        let (saved, title) = read_iced_history(
+        let saved = read_iced_history(
             dir.path(),
             "fixture-chat",
             "/fixture/cwd",
             "/fixture/provider".into(),
         )
         .unwrap();
-        assert_eq!(title.as_deref(), Some("Current Iced title"));
         assert_eq!(saved.session_id.as_deref(), Some("fixture-chat"));
         assert!(
             saved.records.iter().any(
