@@ -15,6 +15,7 @@ pub(super) struct TranscriptFind {
     saved_scroller: Option<Entity<MessageScrollerState>>,
     scroll_subscription: Option<Subscription>,
     opened: HashSet<u64>,
+    opened_turns: HashSet<u64>,
 }
 // HTML searches content roots, excluding native headers and tool labels.
 fn body_ranges(row: &Row, text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
@@ -147,6 +148,13 @@ impl ChatView {
             self.update_row_find(index, cx);
         }
         if let Some(found) = self.find.active().cloned() {
+            if let Some(turn) = turns::containing(&turns::group(&self.model.rows), found.row) {
+                let id = self.model.rows[turn.user_row].id;
+                if self.folded_turns.remove(&id) {
+                    self.find.opened_turns.insert(id);
+                    self.sync_turn_visibility(cx);
+                }
+            }
             let view = self.row(found.row, window, cx);
             view.update(cx, |view, cx| {
                 if !view.open {
@@ -220,6 +228,10 @@ impl ChatView {
                 });
             }
         }
+        for id in self.find.opened_turns.drain() {
+            self.folded_turns.insert(id);
+        }
+        self.sync_turn_visibility(cx);
         self.find.matches.clear();
         self.find.current = None;
         for index in 0..self.row_views.len() {
@@ -241,6 +253,7 @@ impl ChatView {
     }
     pub(super) fn reset_find(&mut self, cx: &mut Context<Self>) {
         self.find.opened.clear();
+        self.find.opened_turns.clear();
         self.find.search(&self.model, self.find.query.clone());
         // Replay replaces the history. Reset both lists, retaining the original
         // entity and its scroll observer for when find closes.
