@@ -4,6 +4,7 @@ use super::claude_parser::{
     control_request_frame, control_response_frame, permission_result, user_message_frame,
     ClaudeFrameParser, ControlResponseBody, HostRequest, ParsedFrame, SnapshotHook,
 };
+use crate::chat::runtime::{reject_queued, DeliveryOutcome, EventSink, RuntimeCommand};
 use crate::chat::types::{
     HarnessCommand, HarnessEvent, RuntimeDecision, RuntimeRequestKind, TurnStatus,
 };
@@ -319,10 +320,29 @@ struct WriteFailure {
     uncertain: bool,
 }
 
+impl From<String> for WriteFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            uncertain: false,
+        }
+    }
+}
+
+impl WriteFailure {
+    fn outcome(&self) -> DeliveryOutcome {
+        if self.uncertain {
+            DeliveryOutcome::Uncertain(self.message.clone())
+        } else {
+            DeliveryOutcome::Rejected(self.message.clone())
+        }
+    }
+}
+
 struct SessionIo<W = ChildStdin> {
     stdin: Option<W>,
     wire: Option<WireLog>,
-    events: mpsc::UnboundedSender<HarnessEvent>,
+    events: EventSink,
 }
 
 impl<W: AsyncWrite + Unpin> SessionIo<W> {
@@ -372,14 +392,14 @@ impl<W: AsyncWrite + Unpin> SessionIo<W> {
         pending: &mut HashMap<String, PendingRequest>,
         request_id: String,
         decision: RuntimeDecision,
-    ) -> Result<(), String> {
+    ) -> Result<(), WriteFailure> {
         let req = pending.get_mut(&request_id).ok_or_else(|| {
             format!("no pending Claude request {request_id} (already answered or withdrawn)")
         })?;
         if req.delivery_uncertain {
-            return Err(format!(
-                "answer {request_id}: delivery uncertain; resending is blocked"
-            ));
+            return Err(
+                format!("answer {request_id}: delivery uncertain; resending is blocked").into(),
+            );
         }
         if let RuntimeDecision::Allow {
             remember: Some(update),
@@ -388,7 +408,7 @@ impl<W: AsyncWrite + Unpin> SessionIo<W> {
         {
             if !matches!(&req.kind, RuntimeRequestKind::Permission { suggestions, .. } if suggestions.contains(update))
             {
-                return Err(format!("answer {request_id}: remember choice was not offered for this request; not delivered"));
+                return Err(format!("answer {request_id}: remember choice was not offered for this request; not delivered").into());
             }
         }
         let body = permission_result(&decision, &req.tool_use_id, &req.input)?;
@@ -408,22 +428,25 @@ impl<W: AsyncWrite + Unpin> SessionIo<W> {
             }
             Err(e) => {
                 req.delivery_uncertain = e.uncertain;
-                Err(format!(
-                    "answer {request_id}: {}; {}",
-                    e.message,
-                    if e.uncertain {
-                        "delivery uncertain; resending is blocked"
-                    } else {
-                        "not delivered; request remains pending"
-                    }
-                ))
+                Err(WriteFailure {
+                    uncertain: e.uncertain,
+                    message: format!(
+                        "answer {request_id}: {}; {}",
+                        e.message,
+                        if e.uncertain {
+                            "delivery uncertain; resending is blocked"
+                        } else {
+                            "not delivered; request remains pending"
+                        }
+                    ),
+                })
             }
         }
     }
 
     fn emit(&self, ev: HarnessEvent) {
         // The receiver is gone only when the tab is; nothing to report to.
-        let _ = self.events.send(ev);
+        self.events.emit(ev);
     }
 }
 
@@ -470,10 +493,28 @@ fn workspace_context_response(
     )
 }
 
+/// Compatibility entry point: uncorrelated harness commands and events only.
 pub async fn run_session_program(
     launch: Launch,
-    mut commands: mpsc::UnboundedReceiver<HarnessCommand>,
+    commands: mpsc::UnboundedReceiver<HarnessCommand>,
     events: mpsc::UnboundedSender<HarnessEvent>,
+    close_token: tokio_util::sync::CancellationToken,
+    process_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
+) {
+    run_correlated_session_program(
+        launch,
+        commands,
+        EventSink::Harness(events),
+        close_token,
+        process_id,
+    )
+    .await;
+}
+
+pub(crate) async fn run_correlated_session_program<C: Into<RuntimeCommand>>(
+    launch: Launch,
+    mut commands: mpsc::UnboundedReceiver<C>,
+    events: EventSink,
     close_token: tokio_util::sync::CancellationToken,
     process_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) {
@@ -484,15 +525,16 @@ pub async fn run_session_program(
         temporary_dir,
         mut snapshots,
     } = launch;
-    let fail = |msg: String| {
+    let mut fail = async |msg: String| {
         harness_log(&msg);
-        let _ = events.send(HarnessEvent::Error(msg));
-        let _ = events.send(HarnessEvent::ProcessExited { code: None });
+        events.emit(HarnessEvent::Error(msg));
+        reject_queued(&mut commands, &events).await;
+        events.emit(HarnessEvent::ProcessExited { code: None });
     };
     let remote_guidelines = match config.guidelines_content.as_deref() {
         Some(text) => match RemoteGuidelinesFile::create(&temporary_dir, text) {
             Ok(file) => Some(file),
-            Err(error) => return fail(error),
+            Err(error) => return fail(error).await,
         },
         None => None,
     };
@@ -510,6 +552,7 @@ pub async fn run_session_program(
                     "cannot read chat instructions {}: {error}",
                     path.display()
                 ))
+                .await
             }
         },
         None => None,
@@ -545,13 +588,14 @@ pub async fn run_session_program(
                 program.display(),
                 config.cwd.display()
             ))
+            .await
         }
     };
     let pid = child.id().unwrap_or(0);
     let (Some(stdout), Some(stderr), Some(stdin)) =
         (child.stdout.take(), child.stderr.take(), child.stdin.take())
     else {
-        return fail("claude child is missing a stdio pipe".to_string());
+        return fail("claude child is missing a stdio pipe".to_string()).await;
     };
     process_id.store(pid, std::sync::atomic::Ordering::Relaxed);
     let wire = config
@@ -810,7 +854,9 @@ pub async fn run_session_program(
                     io.stdin = None;
                     continue;
                 };
-                let result = match cmd {
+                let RuntimeCommand { command, correlation } = cmd.into();
+                let writes_stdin = !matches!(&command, HarnessCommand::SetWorkspaceContext(_) | HarnessCommand::Shutdown);
+                let result = match command {
                     HarnessCommand::SendUserMessage(prompt) => {
                         harness_log(&format!(
                             "user message ({} chars, {} images, id {:?})",
@@ -821,13 +867,13 @@ pub async fn run_session_program(
                         if !in_turn {
                             interrupt_requested = false;
                         }
-                        io.write(user_message_frame(&prompt)).await
+                        io.write_delivery(user_message_frame(&prompt)).await
                     }
                     HarnessCommand::WithdrawQueuedMessage(message_id) => {
                         let id = new_request_id();
                         harness_log(&format!("cancel_async_message {message_id} ({id})"));
                         parser.register_host_request(id.clone(), HostRequest::WithdrawMessage(message_id.clone()));
-                        io.write(control_request_frame(
+                        io.write_delivery(control_request_frame(
                             &id,
                             json!({"subtype": "cancel_async_message", "message_uuid": message_id}),
                         ))
@@ -841,13 +887,13 @@ pub async fn run_session_program(
                         harness_log(&format!("interrupt ({id})"));
                         parser.register_host_request(id.clone(), HostRequest::Interrupt);
                         interrupt_requested = true;
-                        io.write(control_request_frame(&id, json!({"subtype": "interrupt"}))).await
+                        io.write_delivery(control_request_frame(&id, json!({"subtype": "interrupt"}))).await
                     }
                     HarnessCommand::SetPermissionMode(mode) => {
                         let id = new_request_id();
                         harness_log(&format!("set_permission_mode {mode:?} ({id})"));
                         parser.register_host_request(id.clone(), HostRequest::SetPermissionMode(mode.clone()));
-                        io.write(control_request_frame(
+                        io.write_delivery(control_request_frame(
                             &id,
                             json!({"subtype": "set_permission_mode", "mode": mode}),
                         ))
@@ -857,7 +903,7 @@ pub async fn run_session_program(
                         let id = new_request_id();
                         harness_log(&format!("set_model {model:?} ({id})"));
                         parser.register_host_request(id.clone(), HostRequest::SetModel(model.clone()));
-                        io.write(control_request_frame(
+                        io.write_delivery(control_request_frame(
                             &id,
                             json!({"subtype": "set_model", "model": model}),
                         ))
@@ -867,7 +913,7 @@ pub async fn run_session_program(
                         let id = new_request_id();
                         harness_log(&format!("apply_flag_settings effortLevel={effort:?} ({id})"));
                         parser.register_host_request(id.clone(), HostRequest::SetEffort(effort.clone()));
-                        io.write(control_request_frame(
+                        io.write_delivery(control_request_frame(
                             &id,
                             json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": effort}}),
                         ))
@@ -886,9 +932,15 @@ pub async fn run_session_program(
                         Ok(())
                     }
                 };
+                let outcome = match &result {
+                    Ok(()) if writes_stdin => DeliveryOutcome::Written,
+                    Ok(()) => DeliveryOutcome::Rejected("command does not write to Claude stdin".into()),
+                    Err(error) => error.outcome(),
+                };
+                io.events.outcome(correlation, outcome);
                 if let Err(e) = result {
-                    harness_log(&e);
-                    io.emit(HarnessEvent::Error(e));
+                    harness_log(&e.message);
+                    io.emit(HarnessEvent::Error(e.message));
                 }
             }
             _ = tokio::time::sleep_until(shutdown_deadline.unwrap_or_else(tokio::time::Instant::now)),
@@ -902,6 +954,7 @@ pub async fn run_session_program(
         }
     }
 
+    reject_queued(&mut commands, &io.events).await;
     let code = match child.wait().await {
         Ok(status) => status.code(),
         Err(e) => {

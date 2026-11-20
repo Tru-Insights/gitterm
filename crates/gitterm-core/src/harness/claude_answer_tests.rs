@@ -68,7 +68,7 @@ fn setup(
         SessionIo {
             stdin: Some(writer),
             wire: None,
-            events: tx,
+            events: EventSink::Harness(tx),
         },
         pending,
         rx,
@@ -86,6 +86,7 @@ async fn answer_zero_delivery_can_be_explicitly_retried() {
             .answer(&mut pending, "p1".into(), allow())
             .await
             .unwrap_err()
+            .message
             .contains("not delivered"));
         assert!(!pending["p1"].delivery_uncertain);
         assert!(events.try_recv().is_err());
@@ -124,6 +125,7 @@ async fn answer_partial_and_flush_failures_block_resend_and_duplicate_reset() {
             .answer(&mut pending, "p1".into(), allow())
             .await
             .unwrap_err()
+            .message
             .contains("delivery uncertain"));
         let writer = io.stdin.as_ref().unwrap();
         if writer.fail_flush {
@@ -147,6 +149,7 @@ async fn answer_partial_and_flush_failures_block_resend_and_duplicate_reset() {
             .answer(&mut pending, "p1".into(), allow())
             .await
             .unwrap_err()
+            .message
             .contains("resending is blocked"));
         assert_eq!(io.stdin.as_ref().unwrap().calls, calls);
         assert!(events.try_recv().is_err());
@@ -173,6 +176,7 @@ async fn answer_interrupted_write_preserves_frame_and_closed_stdin_is_not_delive
         .answer(&mut pending, "p1".into(), allow())
         .await
         .unwrap_err()
+        .message
         .contains("not delivered"));
     assert!(pending.contains_key("p1"));
     assert!(events.try_recv().is_err());
@@ -210,6 +214,7 @@ async fn remember_must_exactly_match_authoritative_permission_suggestion() {
             .answer(&mut pending, "p1".into(), answer(update))
             .await
             .unwrap_err()
+            .message
             .contains("not offered"));
         assert_eq!(io.stdin.as_ref().unwrap().calls, 0);
         assert!(events.try_recv().is_err());
@@ -228,6 +233,7 @@ async fn remember_must_exactly_match_authoritative_permission_suggestion() {
             .answer(&mut pending, "p1".into(), answer(offered.clone()))
             .await
             .unwrap_err()
+            .message
             .contains("no pending"));
         assert_eq!(io.stdin.as_ref().unwrap().calls, calls);
     }
@@ -268,5 +274,60 @@ async fn remember_rejects_unknown_question_and_unoffered_requests_without_writes
         .await
         .unwrap();
         assert!(events.try_recv().is_ok());
+    }
+}
+
+#[tokio::test]
+async fn delivery_classification_uses_bytes_and_flush_not_error_text() {
+    for (writer, uncertain) in [
+        (
+            Writer {
+                steps: [Ok(0)].into(),
+                ..Default::default()
+            },
+            false,
+        ),
+        (
+            Writer {
+                steps: [Err(std::io::ErrorKind::BrokenPipe)].into(),
+                ..Default::default()
+            },
+            false,
+        ),
+        (
+            Writer {
+                steps: [Ok(4), Ok(0)].into(),
+                ..Default::default()
+            },
+            true,
+        ),
+        (
+            Writer {
+                steps: [Ok(4), Err(std::io::ErrorKind::BrokenPipe)].into(),
+                ..Default::default()
+            },
+            true,
+        ),
+        (
+            Writer {
+                fail_flush: true,
+                ..Default::default()
+            },
+            true,
+        ),
+    ] {
+        let (mut io, _, _) = setup(writer);
+        let error = io
+            .write_delivery("synthetic frame".into())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            matches!(error.outcome(), DeliveryOutcome::Uncertain(_)),
+            uncertain
+        );
+        assert_eq!(
+            matches!(error.outcome(), DeliveryOutcome::Rejected(_)),
+            !uncertain
+        );
     }
 }
