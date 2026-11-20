@@ -4,7 +4,7 @@ use super::claude_parser::{
     control_request_frame, control_response_frame, permission_result, user_message_frame,
     ClaudeFrameParser, ControlResponseBody, HostRequest, ParsedFrame, SnapshotHook,
 };
-use crate::chat::types::{HarnessCommand, HarnessEvent, TurnStatus};
+use crate::chat::types::{HarnessCommand, HarnessEvent, RuntimeDecision, TurnStatus};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
@@ -283,32 +283,127 @@ impl WireLog {
 struct PendingRequest {
     tool_use_id: String,
     input: Value,
+    delivery_uncertain: bool,
 }
 
-struct SessionIo {
-    stdin: Option<ChildStdin>,
+fn record_pending(
+    pending: &mut HashMap<String, PendingRequest>,
+    request_id: String,
+    tool_use_id: String,
+    input: Value,
+) -> Result<(), String> {
+    match pending.entry(request_id) {
+        std::collections::hash_map::Entry::Occupied(entry) => Err(format!(
+            "duplicate pending Claude request {}; original request retained",
+            entry.key()
+        )),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(PendingRequest {
+                tool_use_id,
+                input,
+                delivery_uncertain: false,
+            });
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WriteFailure {
+    message: String,
+    uncertain: bool,
+}
+
+struct SessionIo<W = ChildStdin> {
+    stdin: Option<W>,
     wire: Option<WireLog>,
     events: mpsc::UnboundedSender<HarnessEvent>,
 }
 
-impl SessionIo {
+impl<W: AsyncWrite + Unpin> SessionIo<W> {
     async fn write(&mut self, line: String) -> Result<(), String> {
+        self.write_delivery(line).await.map_err(|e| e.message)
+    }
+
+    async fn write_delivery(&mut self, line: String) -> Result<(), WriteFailure> {
         if let Some(wire) = self.wire.as_mut() {
             if let Err(e) = writeln!(wire.stdin, "{line}") {
                 harness_log(&format!("wire log write failed: {e}"));
             }
         }
-        let stdin = self.stdin.as_mut().ok_or("claude stdin is closed")?;
+        let stdin = self.stdin.as_mut().ok_or_else(|| WriteFailure {
+            message: "claude stdin is closed".into(),
+            uncertain: false,
+        })?;
         let mut bytes = line.into_bytes();
         bytes.push(b'\n');
-        stdin
-            .write_all(&bytes)
-            .await
-            .map_err(|e| format!("write to claude stdin: {e}"))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|e| format!("flush claude stdin: {e}"))
+        let mut written = 0;
+        while written < bytes.len() {
+            match stdin.write(&bytes[written..]).await {
+                Ok(0) => {
+                    return Err(WriteFailure {
+                        message: "write to claude stdin: write zero".into(),
+                        uncertain: written != 0,
+                    })
+                }
+                Ok(n) => written += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    return Err(WriteFailure {
+                        message: format!("write to claude stdin: {e}"),
+                        uncertain: written != 0,
+                    })
+                }
+            }
+        }
+        stdin.flush().await.map_err(|e| WriteFailure {
+            message: format!("flush claude stdin: {e}"),
+            uncertain: true,
+        })
+    }
+
+    async fn answer(
+        &mut self,
+        pending: &mut HashMap<String, PendingRequest>,
+        request_id: String,
+        decision: RuntimeDecision,
+    ) -> Result<(), String> {
+        let req = pending.get_mut(&request_id).ok_or_else(|| {
+            format!("no pending Claude request {request_id} (already answered or withdrawn)")
+        })?;
+        if req.delivery_uncertain {
+            return Err(format!(
+                "answer {request_id}: delivery uncertain; resending is blocked"
+            ));
+        }
+        let body = permission_result(&decision, &req.tool_use_id, &req.input)?;
+        harness_log(&format!(
+            "answer {request_id}: {}",
+            trim_for_log(&body.to_string(), 300)
+        ));
+        let frame = control_response_frame(ControlResponseBody::Success {
+            request_id: request_id.clone(),
+            response: body,
+        });
+        match self.write_delivery(frame).await {
+            Ok(()) => {
+                pending.remove(&request_id);
+                self.emit(HarnessEvent::RuntimeRequestResolved { request_id });
+                Ok(())
+            }
+            Err(e) => {
+                req.delivery_uncertain = e.uncertain;
+                Err(format!(
+                    "answer {request_id}: {}; {}",
+                    e.message,
+                    if e.uncertain {
+                        "delivery uncertain; resending is blocked"
+                    } else {
+                        "not delivered; request remains pending"
+                    }
+                ))
+            }
+        }
     }
 
     fn emit(&self, ev: HarnessEvent) {
@@ -629,8 +724,10 @@ pub async fn run_session_program(
                                 "runtime request {request_id}: {}",
                                 trim_for_log(&serde_json::to_string(&event).unwrap_or_default(), 300)
                             ));
-                            pending.insert(request_id, PendingRequest { tool_use_id, input });
-                            io.emit(event);
+                            match record_pending(&mut pending, request_id, tool_use_id, input) {
+                                Ok(()) => io.emit(event),
+                                Err(e) => io.emit(HarnessEvent::Error(e)),
+                            }
                         }
                         ParsedFrame::ControlRequest { request_id, subtype } => {
                             if let Err(e) = answer_unhandled_control(&mut io, &request_id, &subtype).await {
@@ -718,33 +815,7 @@ pub async fn run_session_program(
                         .await
                     }
                     HarnessCommand::Answer { request_id, decision } => {
-                        match pending.remove(&request_id) {
-                            None => Err(format!(
-                                "no pending Claude request {request_id} (already answered or withdrawn)"
-                            )),
-                            Some(req) => {
-                                match permission_result(&decision, &req.tool_use_id, &req.input) {
-                                    Ok(body) => {
-                                        harness_log(&format!(
-                                            "answer {request_id}: {}",
-                                            trim_for_log(&body.to_string(), 300)
-                                        ));
-                                        let frame = control_response_frame(ControlResponseBody::Success {
-                                            request_id: request_id.clone(),
-                                            response: body,
-                                        });
-                                        let written = io.write(frame).await;
-                                        io.emit(HarnessEvent::RuntimeRequestResolved { request_id });
-                                        written
-                                    }
-                                    Err(e) => {
-                                        // Keep it answerable; the UI can retry.
-                                        pending.insert(request_id, req);
-                                        Err(e)
-                                    }
-                                }
-                            }
-                        }
+                        io.answer(&mut pending, request_id, decision).await
                     }
                     HarnessCommand::Interrupt => {
                         let id = new_request_id();
@@ -907,3 +978,7 @@ mod tests {
         assert!(session_hooks(false, false).as_object().unwrap().is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "claude_answer_tests.rs"]
+mod answer_tests;
