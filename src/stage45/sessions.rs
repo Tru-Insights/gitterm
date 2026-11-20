@@ -241,3 +241,262 @@ fn terminal_restore_selects_caller_before_launch_and_never_injects_objective() {
         assert!(tab.worker_process.is_none());
     }
 }
+
+// These bytes and ordered effects were captured before the park reducer moved.
+fn park_app(dir: &Path) -> App {
+    let mut app = app_with_tabs(dir);
+    app.notifications_config.needs_you = false;
+    for (idx, ws) in app.workspaces.iter_mut().enumerate() {
+        let tab = &mut ws.tabs[0];
+        tab.session_uid = format!("caller-{idx}");
+        tab.chat_session_id = Some(format!("conversation-{idx}"));
+        let mut session = AgentSession::new(tab::AgentBackendConfig::Claude {
+            model: "default".into(),
+            permission_mode: None,
+            effort: None,
+        });
+        session.session_id = tab.chat_session_id.clone();
+        tab.kind = TabKind::Agent(session);
+    }
+    app
+}
+
+fn park_row(app: &App, command: &str) -> Value {
+    json!({"command": command, "effects": Trace::take(),
+        "active": app.active_workspace().map(|ws| ws.name.as_str()),
+        "open": app.workspaces.iter().map(|ws| json!({"name": ws.name,
+            "running_park": ws.running_park.is_some(), "woke": ws.woke.map(WakeReason::label),
+            "callers": ws.tabs.iter().map(|tab| tab.session_uid.as_str()).collect::<Vec<_>>()})).collect::<Vec<_>>(),
+        "closed": app.closed_workspace_configs.iter().map(|cfg| json!({"name": cfg.name,
+            "parked": cfg.is_parked(), "done": cfg.done_at.is_some(),
+            "note": cfg.parked.as_ref().map(|p| p.note.as_str())})).collect::<Vec<_>>()})
+}
+
+fn stable_park_bytes(mut cfg: WorkspaceConfig) -> WorkspaceConfig {
+    if let Some(info) = &mut cfg.parked {
+        info.parked_at = "2000-01-01T00:00:00Z".into();
+    }
+    if cfg.done_at.is_some() {
+        cfg.done_at = Some("2000-01-02T00:00:00Z".into());
+    }
+    cfg
+}
+
+#[test]
+fn park_restore_done_close_characterization() {
+    if isolated("park_restore_done_close_characterization", "sessions") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let _trace = Trace::start();
+    let mut rows = Vec::new();
+    let mut bytes = Vec::new();
+    for mode in [ParkMode::Stop, ParkMode::KeepRunning] {
+        let mut app = park_app(dir.path());
+        let uid = app.workspaces[0].uid;
+        let key = ParkedKey::of(&app.workspace_config(&app.workspaces[0]));
+        Trace::take();
+        let _ = app.park_workspace(uid, "  synthetic note  ", mode);
+        rows.push(park_row(&app, &format!("park {mode:?}")));
+        let cfg = match app.workspace_index_by_uid(uid) {
+            Some(i) => running_parked_config(
+                app.workspace_config(&app.workspaces[i]),
+                app.workspaces[i].running_park.as_ref().unwrap(),
+            ),
+            None => app.closed_workspace_configs[0].clone(),
+        };
+        bytes.push(stable_park_bytes(cfg));
+        let _ = app.resume_parked_workspace(&key);
+        rows.push(park_row(&app, &format!("resume {mode:?}")));
+        bytes.push(stable_park_bytes(
+            app.workspace_config(app.active_workspace().unwrap()),
+        ));
+        let _ = app.park_workspace(
+            app.active_workspace().unwrap().uid,
+            "done note",
+            ParkMode::KeepRunning,
+        );
+        Trace::take();
+        let _ = app.mark_parked_done(&key);
+        rows.push(park_row(&app, &format!("done {mode:?}")));
+        bytes.push(stable_park_bytes(
+            app.closed_workspace_configs.last().unwrap().clone(),
+        ));
+    }
+    let mut app = park_app(dir.path());
+    let uid = app.workspaces[0].uid;
+    let _ = app.park_workspace(uid, "wake", ParkMode::KeepRunning);
+    Trace::take();
+    let _ = app.wake_running_parked(uid, WakeReason::Finished);
+    rows.push(park_row(&app, "wake without focus"));
+    let _ = app.close_workspace(uid);
+    rows.push(park_row(&app, "close"));
+    let _ = app.close_workspace(uid);
+    rows.push(park_row(&app, "stale close"));
+    let _ = app.park_workspace(app.workspaces[0].uid, "", ParkMode::Stop);
+    Trace::take();
+    let last = app.workspaces[0].uid;
+    let _ = app.close_workspace(last);
+    rows.push(park_row(&app, "last bar close"));
+    let _ = app.park_workspace(last, "", ParkMode::KeepRunning);
+    rows.push(park_row(&app, "last bar park"));
+    // Equal names/folders intentionally choose the first matching closed entry.
+    let mut app = park_app(dir.path());
+    let uid = app.workspaces[0].uid;
+    let mut duplicate = app.workspace_config(&app.workspaces[0]);
+    duplicate.active = false;
+    app.closed_workspace_configs.push(duplicate);
+    Trace::take();
+    let _ = app.close_workspace(uid);
+    rows.push(park_row(&app, "duplicate key close"));
+    // Close re-runs Done after appending, including a different running duplicate.
+    let mut app = park_app(dir.path());
+    let uid = app.workspaces[0].uid;
+    let key = ParkedKey::of(&app.workspace_config(&app.workspaces[0]));
+    let mut old = app.workspace_config(&app.workspaces[0]);
+    old.active = false;
+    app.closed_workspace_configs.push(old);
+    app.workspaces[1].name = key.name.clone();
+    app.workspaces[1].dir = PathBuf::from(&key.dir);
+    app.workspaces[1].running_park = Some(ParkedInfo {
+        note: "running duplicate".into(),
+        parked_at: "old".into(),
+    });
+    Trace::take();
+    let _ = app.close_workspace(uid);
+    rows.push(park_row(&app, "close with stopped and running duplicate"));
+    assert_eq!(app.workspaces.len(), 1);
+    assert_eq!(app.closed_workspace_configs.len(), 3);
+    assert!(app.closed_workspace_configs[0].done_at.is_some());
+    assert!(app.closed_workspace_configs[1..]
+        .iter()
+        .all(WorkspaceConfig::is_parked));
+    // Cleanup sees the first closed key, even if Done will mark a later one.
+    let mut app = park_app(dir.path());
+    let mut old = app.workspace_config(&app.workspaces[0]);
+    let key = ParkedKey::of(&old);
+    old.active = false;
+    old.done_at = Some("old".into());
+    old.chats = vec!["old-snapshot".into()];
+    old.tabs.clear();
+    let mut newer = old.clone();
+    newer.done_at = None;
+    newer.chats = vec!["new-snapshot".into()];
+    app.closed_workspace_configs = vec![old, newer];
+    let cleanup = parked_snapshot_chats(&app.workspaces, &app.closed_workspace_configs, &key);
+    assert_eq!(cleanup, vec!["old-snapshot".to_string()]);
+    Trace::take();
+    let _ = app.mark_parked_done(&key);
+    rows.push(park_row(&app, "done with older done duplicate"));
+    assert!(app
+        .closed_workspace_configs
+        .iter()
+        .all(|cfg| cfg.done_at.is_some()));
+    golden("sessions/park.trace.json", json!(rows));
+    assert_eq!(
+        serde_json::to_string(&bytes).unwrap(),
+        fixture("sessions/park.saved.json").trim()
+    );
+}
+
+#[test]
+fn parked_restore_dedup_is_source_scoped_and_maps_the_active_tab() {
+    if isolated(
+        "parked_restore_dedup_is_source_scoped_and_maps_the_active_tab",
+        "sessions",
+    ) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let _trace = Trace::start();
+    let mut app = park_app(dir.path());
+    let mut cfg = app.workspace_config(&app.workspaces[0]);
+    let mut second = cfg.tabs[0].clone();
+    second.chat_session_id = Some("unopened".into());
+    second.session_uid = Some("kept-caller".into());
+    cfg.tabs.push(second);
+    for remote in [None, Some("fixture-remote")] {
+        cfg.location = remote.map(|id| config::WorkspaceLocationConfig::RemoteAgent {
+            remote_id: id.into(),
+            workspace_id: "fixture-workspace".into(),
+            root: "opaque/root".into(),
+        });
+        for (active, expected) in [
+            (Some(0), None),
+            (Some(1), Some(0)),
+            (Some(99), None),
+            (None, None),
+        ] {
+            let mut filtered = cfg.clone();
+            filtered.active_tab = active;
+            app.drop_tabs_open_elsewhere(&mut filtered);
+            if remote.is_none() {
+                assert_eq!(filtered.tabs.len(), 1);
+                assert_eq!(filtered.tabs[0].session_uid.as_deref(), Some("kept-caller"));
+                assert_eq!(filtered.active_tab, expected);
+            } else {
+                assert_eq!(filtered.tabs.len(), 2);
+                assert_eq!(filtered.active_tab, active.filter(|i| *i < 2));
+            }
+        }
+    }
+    app.workspaces[1].location = WorkspaceLocation::RemoteAgent {
+        remote_id: "fixture-remote".into(),
+        workspace_id: "fixture-workspace".into(),
+        root: "opaque/root".into(),
+    };
+    app.workspaces[1].tabs[0].chat_session_id = Some("unopened".into());
+    // Dedup includes hidden running tabs, but never dedups within the saved entry.
+    app.workspaces[1].running_park = Some(ParkedInfo {
+        note: String::new(),
+        parked_at: "old".into(),
+    });
+    cfg.tabs.push(cfg.tabs[0].clone());
+    cfg.active_tab = Some(0);
+    app.drop_tabs_open_elsewhere(&mut cfg);
+    assert_eq!(cfg.tabs.len(), 2);
+    assert_eq!(cfg.tabs[0].session_uid.as_deref(), Some("caller-0"));
+    assert_eq!(cfg.active_tab, Some(0));
+}
+
+#[test]
+fn stopped_task_resume_launches_only_the_recorded_command() {
+    if isolated(
+        "stopped_task_resume_launches_only_the_recorded_command",
+        "sessions",
+    ) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let _trace = Trace::start();
+    let mut app = app_with_tabs(dir.path());
+    add_task(&mut app, dir.path(), dir.path());
+    let mut saved = app.workspace_config(&app.workspaces[0]);
+    saved.active = false;
+    saved.dir = dir.path().display().to_string();
+    saved.tabs[0].dir = saved.dir.clone();
+    saved.tabs[0].repo_dir = Some(saved.dir.clone());
+    saved.tabs[0].session_uid = Some("persisted-caller".into());
+    saved.tabs[0].startup_command = Some("codex resume conversation-1".into());
+    saved.tabs[0].chat_session_id = Some("conversation-1".into());
+    saved.tabs[0].task_id = Some("fixture-task".into());
+    saved.tabs[0].task_session_id = Some("child-1".into());
+    let key = ParkedKey::of(&saved);
+    app.closed_workspace_configs.push(saved);
+    Trace::take();
+    let _ = app.resume_parked_workspace(&key);
+    let effects = Trace::take();
+    let launch: Vec<_> = effects
+        .iter()
+        .filter(|s| s.starts_with("session-launch:"))
+        .collect();
+    assert_eq!(
+        launch,
+        vec!["session-launch:persisted-caller:codex resume conversation-1"]
+    );
+    let tab = &app.active_workspace().unwrap().tabs[0];
+    assert_eq!(tab.session_uid, "persisted-caller");
+    assert_eq!(tab.task_session_id.as_deref(), Some("child-1"));
+    assert_eq!(tab.startup_command(), Some("codex resume conversation-1"));
+    assert!(tab.worker_process.is_none());
+}

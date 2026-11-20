@@ -5,6 +5,7 @@
 
 pub mod chat;
 pub mod harness;
+pub mod park;
 pub mod preview;
 pub mod session;
 pub mod status;

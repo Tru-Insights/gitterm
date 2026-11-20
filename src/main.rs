@@ -2603,6 +2603,7 @@ fn park_note_chats<'a>(
 
 /// Done (TRU-171): takes the parked entry matching `key` off the Parked
 /// list. Close (TRU-190) parks, then ends here.
+#[cfg(test)]
 fn finish_parked(configs: &mut [WorkspaceConfig], key: &ParkedKey, stamp: String) -> bool {
     match configs
         .iter_mut()
@@ -14481,38 +14482,95 @@ impl App {
     // Parking (TRU-171): × parks a workspace with a note; the Parked list
     // resumes it or marks it done.
 
-    /// One conversation, one tab: a parked tab whose conversation was
-    /// opened elsewhere meanwhile is not restored.
+    /// Project the sole host catalog for one synchronous park decision. No
+    /// process handles or persistence ownership move into the shared reducer.
+    fn park_state(&self) -> gitterm_core::park::State {
+        use gitterm_core::park;
+        park::State {
+            open: self
+                .workspaces
+                .iter()
+                .map(|ws| park::OpenWorkspace {
+                    target: park::Target {
+                        uid: ws.uid,
+                        tabs: ws.tabs.iter().map(TabState::session_target).collect(),
+                    },
+                    key: park::Key {
+                        name: ws.name.clone(),
+                        dir: workspace_config_dir(ws),
+                    },
+                    running: ws.running_park.as_ref().map(|info| park::Info {
+                        note: info.note.clone(),
+                        parked_at: info.parked_at.clone(),
+                    }),
+                    remote_id: self.remote_agent_id_for_workspace(ws).map(String::from),
+                    conversations: ws
+                        .tabs
+                        .iter()
+                        .filter_map(|tab| tab.chat_session_id.clone())
+                        .collect(),
+                })
+                .collect(),
+            closed: self
+                .closed_workspace_configs
+                .iter()
+                .map(|cfg| park::ClosedWorkspace {
+                    key: Self::park_key(&ParkedKey::of(cfg)),
+                    parked: cfg.is_parked(),
+                })
+                .collect(),
+        }
+    }
+
+    fn park_key(key: &ParkedKey) -> gitterm_core::park::Key {
+        gitterm_core::park::Key {
+            name: key.name.clone(),
+            dir: key.dir.clone(),
+        }
+    }
+
+    /// One conversation, one tab: filter only conversations already open on
+    /// this source, retaining saved duplicates and mapping the original active tab.
     fn drop_tabs_open_elsewhere(&self, cfg: &mut WorkspaceConfig) {
+        use gitterm_core::park;
         let remote_id = match &cfg.location {
             Some(config::WorkspaceLocationConfig::RemoteAgent { remote_id, .. }) => {
                 Some(remote_id.clone())
             }
             _ => None,
         };
-        let active = cfg.active_tab;
-        let mut kept = Vec::with_capacity(cfg.tabs.len());
-        let mut kept_active = None;
-        for (idx, tab) in std::mem::take(&mut cfg.tabs).into_iter().enumerate() {
-            if let Some(id) = tab.chat_session_id.as_deref() {
-                if self
-                    .find_chat_tab(&chats::ChatRef::new(remote_id.as_deref(), id))
-                    .is_some()
-                {
-                    eprintln!(
-                        "[workspace] not restoring {:?}'s tab for chat {id}: it is open in another tab",
-                        cfg.name
-                    );
-                    continue;
+        let park::Effect::FilteredRestore {
+            indices,
+            active_tab,
+        } = self.park_state().reduce(park::Intent::FilterRestore {
+            remote_id,
+            tabs: cfg
+                .tabs
+                .iter()
+                .map(WorkspaceTabConfig::session_identity)
+                .collect(),
+            active_tab: cfg.active_tab,
+        })
+        else {
+            unreachable!("restore filtering always returns retained tab indices")
+        };
+        let mut retained = indices.into_iter().peekable();
+        cfg.tabs = std::mem::take(&mut cfg.tabs)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, tab)| {
+                if retained.peek() == Some(&idx) {
+                    retained.next();
+                    Some(tab)
+                } else {
+                    if let Some(id) = tab.chat_session_id.as_deref() {
+                        eprintln!("[workspace] not restoring {:?}'s tab for chat {id}: it is open in another tab", cfg.name);
+                    }
+                    None
                 }
-            }
-            if active == Some(idx) {
-                kept_active = Some(kept.len());
-            }
-            kept.push(tab);
-        }
-        cfg.tabs = kept;
-        cfg.active_tab = kept_active;
+            })
+            .collect();
+        cfg.active_tab = active_tab;
     }
 
     /// The chats a workspace's overview reads: its owned roots and their
@@ -14652,18 +14710,32 @@ impl App {
     /// and the note. With `ParkMode::Stop` its processes stop with the
     /// tabs; with `KeepRunning` (TRU-186) it only leaves the bar.
     fn park_workspace(&mut self, uid: u64, note: &str, mode: ParkMode) -> Task<Event> {
-        let Some(idx) = self.workspace_index_by_uid(uid) else {
-            eprintln!("[workspace] cannot park uid={uid}: no longer open");
+        use gitterm_core::park;
+        let mode = if mode.stops_processes() {
+            park::Mode::Stop
+        } else {
+            park::Mode::KeepRunning
+        };
+        let park::Effect::Park { target, mode, info } =
+            self.park_state().reduce(park::Intent::Park {
+                uid,
+                mode,
+                info: park::Info::new(note, chrono::Utc::now().to_rfc3339()),
+            })
+        else {
+            if self.workspace_index_by_uid(uid).is_none() {
+                eprintln!("[workspace] cannot park uid={uid}: no longer open");
+            } else {
+                eprintln!("[workspace] cannot park uid={uid}: it is the last open workspace");
+            }
             return self.apply_webview_surfaces();
         };
-        let on_bar = self.workspaces[idx].running_park.is_none();
-        if on_bar && self.bar_workspace_count() <= 1 {
-            eprintln!("[workspace] cannot park uid={uid}: it is the last open workspace");
+        let Some(idx) = self.park_state().resolve(&target) else {
             return self.apply_webview_surfaces();
-        }
+        };
         let info = ParkedInfo {
-            note: note.trim().to_string(),
-            parked_at: chrono::Utc::now().to_rfc3339(),
+            note: info.note,
+            parked_at: info.parked_at,
         };
         // Its notes are committed now, not ten minutes on (TRU-201);
         // Close parks first, so it lands here too.
@@ -14677,10 +14749,9 @@ impl App {
         } else {
             Task::none()
         };
-        let parked = if mode.stops_processes() {
-            self.park_stopping(idx, info)
-        } else {
-            self.park_keep_running(idx, info)
+        let parked = match mode {
+            park::Mode::Stop => self.park_stopping(idx, info),
+            park::Mode::KeepRunning => self.park_keep_running(idx, info),
         };
         Task::batch([parked, notes])
     }
@@ -14701,9 +14772,13 @@ impl App {
         );
         self.closed_workspace_configs.push(cfg);
         // Its tabs are dropped, so its remote chats stop too.
-        let tab_ids: Vec<usize> = self.workspaces[idx].tabs.iter().map(|tab| tab.id).collect();
-        for tab_id in tab_ids {
-            self.stop_remote_chat_for_closing_tab(tab_id);
+        let targets: Vec<_> = self.workspaces[idx]
+            .tabs
+            .iter()
+            .map(TabState::session_target)
+            .collect();
+        for tab in targets {
+            self.stop_remote_chat_for_closing_tab(tab.tab_id);
         }
         // Its repos stop unless another open workspace lists them.
         remove_workspace_overview_presentation(&mut self.workspace_overview_presentations, uid);
@@ -14780,11 +14855,35 @@ impl App {
 
     /// A running parked workspace returns to the bar as it is (TRU-186):
     /// nothing restarts. `woke` is why, when it came back on its own.
-    fn return_running_parked(&mut self, idx: usize, woke: Option<WakeReason>) {
+    fn return_running_parked(&mut self, idx: usize, woke: Option<WakeReason>) -> bool {
+        use gitterm_core::park;
+        let Some(ws) = self.workspaces.get(idx) else {
+            return false;
+        };
+        let woke = woke.map(|reason| match reason {
+            WakeReason::NeedsYou => park::WakeReason::NeedsYou,
+            WakeReason::Finished => park::WakeReason::Finished,
+            WakeReason::Failed => park::WakeReason::Failed,
+        });
+        let effect = self
+            .park_state()
+            .reduce(park::Intent::Return { uid: ws.uid, woke });
+        self.apply_park_return(effect).is_some()
+    }
+
+    fn apply_park_return(&mut self, effect: gitterm_core::park::Effect) -> Option<usize> {
+        use gitterm_core::park;
+        let park::Effect::Return { uid, woke, .. } = effect else {
+            return None;
+        };
+        let idx = self.workspace_index_by_uid(uid)?;
         let ws = &mut self.workspaces[idx];
-        if ws.running_park.take().is_none() {
-            return;
-        }
+        ws.running_park.take()?;
+        let woke = woke.map(|reason| match reason {
+            park::WakeReason::NeedsYou => WakeReason::NeedsYou,
+            park::WakeReason::Finished => WakeReason::Finished,
+            park::WakeReason::Failed => WakeReason::Failed,
+        });
         ws.woke = woke;
         eprintln!(
             "[workspace] {:?} is back on the bar{}",
@@ -14794,6 +14893,7 @@ impl App {
         );
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
+        Some(idx)
     }
 
     /// Wake (TRU-186): a chat of running parked workspace `uid` asked,
@@ -14807,10 +14907,9 @@ impl App {
             eprintln!("[workspace] cannot wake uid={uid}: no longer open");
             return Task::none();
         };
-        if self.workspaces[idx].running_park.is_none() {
+        if !self.return_running_parked(idx, Some(reason)) {
             return Task::none();
         }
-        self.return_running_parked(idx, Some(reason));
         if reason != WakeReason::NeedsYou && self.notifications_config.needs_you {
             post_needs_you_notification(
                 &self.workspaces[idx].name,
@@ -14842,25 +14941,30 @@ impl App {
     /// stopped one comes back with its tabs through the path startup
     /// restores workspaces with. Either becomes active.
     fn resume_parked_workspace(&mut self, key: &ParkedKey) -> Task<Event> {
-        if let Some(idx) = running_parked_index(&self.workspaces, key) {
-            self.return_running_parked(idx, None);
-            self.parked_list_open = false;
-            self.activate_workspace_at(idx);
-            self.snap_slide_to_active_workspace();
-            self.sync_visible_terminals();
-            self.sync_plans_dir();
-            return Task::batch([self.after_resume(), self.scroll_content_slide_to_target()]);
-        }
-        let Some(pos) = self
-            .closed_workspace_configs
-            .iter()
-            .position(|cfg| cfg.is_parked() && key.matches(cfg))
-        else {
-            eprintln!(
-                "[workspace] cannot resume {:?} ({}): not parked",
-                key.name, key.dir
-            );
-            return Task::none();
+        use gitterm_core::park;
+        let effect = self
+            .park_state()
+            .reduce(park::Intent::Resume(Self::park_key(key)));
+        let pos = match effect {
+            park::Effect::Return { activate: true, .. } => {
+                let Some(idx) = self.apply_park_return(effect) else {
+                    return Task::none();
+                };
+                self.parked_list_open = false;
+                self.activate_workspace_at(idx);
+                self.snap_slide_to_active_workspace();
+                self.sync_visible_terminals();
+                self.sync_plans_dir();
+                return Task::batch([self.after_resume(), self.scroll_content_slide_to_target()]);
+            }
+            park::Effect::RestoreStopped { index } => index,
+            _ => {
+                eprintln!(
+                    "[workspace] cannot resume {:?} ({}): not parked",
+                    key.name, key.dir
+                );
+                return Task::none();
+            }
         };
         let mut cfg = self.closed_workspace_configs.remove(pos);
         self.drop_tabs_open_elsewhere(&mut cfg);
@@ -14910,24 +15014,43 @@ impl App {
     /// running parked one stops first, the way park stops (TRU-186).
     fn mark_parked_done(&mut self, key: &ParkedKey) -> Task<Event> {
         let chats = parked_snapshot_chats(&self.workspaces, &self.closed_workspace_configs, key);
-        let task = match running_parked_index(&self.workspaces, key) {
-            Some(idx) => {
+        use gitterm_core::park;
+        let park::Effect::Done { stop, finish } = self
+            .park_state()
+            .reduce(park::Intent::Done(Self::park_key(key)))
+        else {
+            eprintln!(
+                "[workspace] cannot mark {:?} ({}) done: not parked",
+                key.name, key.dir
+            );
+            return Task::none();
+        };
+        let task = match stop {
+            Some((target, info)) => {
+                let Some(idx) = self.park_state().resolve(&target) else {
+                    return Task::none();
+                };
                 for tab in &self.workspaces[idx].tabs {
                     close_turn_snapshots(tab);
                 }
-                let info = self.workspaces[idx]
-                    .running_park
-                    .clone()
-                    .expect("running_parked_index finds only running parked workspaces");
-                self.park_stopping(idx, info)
+                self.park_stopping(
+                    idx,
+                    ParkedInfo {
+                        note: info.note,
+                        parked_at: info.parked_at,
+                    },
+                )
             }
             None => Task::none(),
         };
-        let cleanup = if finish_parked(
-            &mut self.closed_workspace_configs,
-            key,
-            chrono::Utc::now().to_rfc3339(),
-        ) {
+        // The reducer chose the first parked match, which can precede the
+        // just-appended config. Snapshot cleanup above intentionally has its own lookup.
+        let cfg = self
+            .closed_workspace_configs
+            .get_mut(finish)
+            .filter(|cfg| cfg.is_parked() && key.matches(cfg));
+        let cleanup = if let Some(cfg) = cfg {
+            cfg.done_at = Some(chrono::Utc::now().to_rfc3339());
             eprintln!("[workspace] {:?} marked done", key.name);
             self.mark_workspaces_dirty();
             self.maintain_turn_snapshots(Some(chats))
@@ -14944,18 +15067,26 @@ impl App {
     /// Close (TRU-190): park the workspace, stopping it, then mark that
     /// entry done, the same as Done in the Parked list.
     fn close_workspace(&mut self, uid: u64) -> Task<Event> {
-        let Some(idx) = self.workspace_index_by_uid(uid) else {
+        use gitterm_core::park;
+        if self.workspace_index_by_uid(uid).is_none() {
             eprintln!("[workspace] cannot close uid={uid}: no longer open");
             return self.apply_webview_surfaces();
-        };
-        if self.workspaces[idx].running_park.is_none() && self.bar_workspace_count() <= 1 {
-            return self.park_workspace(uid, "", ParkMode::Stop);
         }
+        let park::Effect::Close { target, key } =
+            self.park_state().reduce(park::Intent::Close(uid))
+        else {
+            return self.park_workspace(uid, "", ParkMode::Stop);
+        };
+        let Some(idx) = self.park_state().resolve(&target) else {
+            return self.apply_webview_surfaces();
+        };
         for tab in &self.workspaces[idx].tabs {
             close_turn_snapshots(tab);
         }
-        let cfg = self.workspace_config(&self.workspaces[idx]);
-        let key = ParkedKey::of(&cfg);
+        let key = ParkedKey {
+            name: key.name,
+            dir: key.dir,
+        };
         let before = self.closed_workspace_configs.len();
         let task = self.park_workspace(uid, "", ParkMode::Stop);
         if self.closed_workspace_configs.len() > before {

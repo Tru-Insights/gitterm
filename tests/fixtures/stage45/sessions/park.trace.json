@@ -1,0 +1,558 @@
+[
+  {
+    "active": "beta",
+    "closed": [
+      {
+        "done": false,
+        "name": "alpha",
+        "note": "synthetic note",
+        "parked": true
+      }
+    ],
+    "command": "park Stop",
+    "effects": [
+      "dismiss",
+      "terminals",
+      "dirty",
+      "plans+docs",
+      "connect",
+      "present",
+      "surfaces"
+    ],
+    "open": [
+      {
+        "callers": [
+          "caller-1"
+        ],
+        "name": "beta",
+        "running_park": false,
+        "woke": null
+      },
+      {
+        "callers": [
+          "caller-2"
+        ],
+        "name": "gamma",
+        "running_park": false,
+        "woke": null
+      }
+    ]
+  },
+  {
+    "active": "alpha",
+    "closed": [],
+    "command": "resume Stop",
+    "effects": [
+      "dirty",
+      "plans+docs",
+      "terminals",
+      "local:0:/fixture/alpha",
+      "worktrees",
+      "files",
+      "connect",
+      "present",
+      "surfaces"
+    ],
+    "open": [
+      {
+        "callers": [
+          "caller-1"
+        ],
+        "name": "beta",
+        "running_park": false,
+        "woke": null
+      },
+      {
+        "callers": [
+          "caller-2"
+        ],
+        "name": "gamma",
+        "running_park": false,
+        "woke": null
+      },
+      {
+        "callers": [
+          "caller-0"
+        ],
+        "name": "alpha",
+        "running_park": false,
+        "woke": null
+      }
+    ]
+  },
+  {
+    "active": "gamma",
+    "closed": [
+      {
+        "done": true,
+        "name": "alpha",
+        "note": "done note",
+        "parked": false
+      }
+    ],
+    "command": "done Stop",
+    "effects": [
+      "dismiss",
+      "terminals",
+      "dirty",
+      "plans+docs",
+      "connect",
+      "present",
+      "surfaces",
+      "dirty"
+    ],
+    "open": [
+      {
+        "callers": [
+          "caller-1"
+        ],
+        "name": "beta",
+        "running_park": false,
+        "woke": null
+      },
+      {
+        "callers": [
+          "caller-2"
+        ],
+        "name": "gamma",
+        "running_park": false,
+        "woke": null
+      }
+    ]
+  },
+  {
+    "active": "beta",
+    "closed": [],
+    "command": "park KeepRunning",
+    "effects": [
+      "dismiss",
+      "terminals",
+      "dirty",
+      "plans+docs",
+      "connect",
+      "present",
+      "surfaces"
+    ],
+    "open": [
+      {
+        "callers": [
+          "caller-0"
+        ],
+        "name": "alpha",
+        "running_park": true,
+        "woke": null
+      },
+      {
+        "callers": [
+          "caller-1"
+        ],
+        "name": "beta",
+        "running_park": false,
+        "woke": null
+      },
+      {
+        "callers": [
+          "caller-2"
+        ],
+        "name": "gamma",
+        "running_park": false,
+        "woke": null
+      }
+    ]
+  },
+  {
+    "active": "alpha",
+    "closed": [],
+    "command": "resume KeepRunning",
+    "effects": [
+      "dirty",
+      "terminals",
+      "plans+docs",
+      "local:10:/fixture/alpha",
+      "worktrees",
+      "files",
+      "connect",
+      "present",
+      "surfaces"
+    ],
+    "open": [
+      {
+        "callers": [
+          "caller-0"
+        ],
+        "name": "alpha",
+        "running_park": false,
+        "woke": null
+      },
+      {
+        "callers": [
+          "caller-1"
+        ],
+        "name": "beta",
+        "running_park": false,
+        "woke": null
+      },
+      {
+        "callers": [
+          "caller-2"
+        ],
+        "name": "gamma",
+        "running_park": false,
+        "woke": null
+      }
+    ]
+  },
+  {
+    "active": "beta",
+    "closed": [
+      {
+        "done": true,
+        "name": "alpha",
+        "note": "done note",
+        "parked": false
+      }
+    ],
+    "command": "done KeepRunning",
+    "effects": [
+      "dismiss",
+      "terminals",
+      "dirty",
+      "plans+docs",
+      "connect",
+      "present",
+      "surfaces",
+      "dirty"
+    ],
+    "open": [
+      {
+        "callers": [
+          "caller-1"
+        ],
+        "name": "beta",
+        "running_park": false,
+        "woke": null
+      },
+      {
+        "callers": [
+          "caller-2"
+        ],
+        "name": "gamma",
+        "running_park": false,
+        "woke": null
+      }
+    ]
+  },
+  {
+    "active": "beta",
+    "closed": [],
+    "command": "wake without focus",
+    "effects": [
+      "dirty"
+    ],
+    "open": [
+      {
+        "callers": [
+          "caller-0"
+        ],
+        "name": "alpha",
+        "running_park": false,
+        "woke": "finished"
+      },
+      {
+        "callers": [
+          "caller-1"
+        ],
+        "name": "beta",
+        "running_park": false,
+        "woke": null
+      },
+      {
+        "callers": [
+          "caller-2"
+        ],
+        "name": "gamma",
+        "running_park": false,
+        "woke": null
+      }
+    ]
+  },
+  {
+    "active": "beta",
+    "closed": [
+      {
+        "done": true,
+        "name": "alpha",
+        "note": "",
+        "parked": false
+      }
+    ],
+    "command": "close",
+    "effects": [
+      "dismiss",
+      "terminals",
+      "dirty",
+      "plans+docs",
+      "connect",
+      "present",
+      "surfaces",
+      "dirty"
+    ],
+    "open": [
+      {
+        "callers": [
+          "caller-1"
+        ],
+        "name": "beta",
+        "running_park": false,
+        "woke": null
+      },
+      {
+        "callers": [
+          "caller-2"
+        ],
+        "name": "gamma",
+        "running_park": false,
+        "woke": null
+      }
+    ]
+  },
+  {
+    "active": "beta",
+    "closed": [
+      {
+        "done": true,
+        "name": "alpha",
+        "note": "",
+        "parked": false
+      }
+    ],
+    "command": "stale close",
+    "effects": [
+      "surfaces"
+    ],
+    "open": [
+      {
+        "callers": [
+          "caller-1"
+        ],
+        "name": "beta",
+        "running_park": false,
+        "woke": null
+      },
+      {
+        "callers": [
+          "caller-2"
+        ],
+        "name": "gamma",
+        "running_park": false,
+        "woke": null
+      }
+    ]
+  },
+  {
+    "active": "gamma",
+    "closed": [
+      {
+        "done": true,
+        "name": "alpha",
+        "note": "",
+        "parked": false
+      },
+      {
+        "done": false,
+        "name": "beta",
+        "note": "",
+        "parked": true
+      }
+    ],
+    "command": "last bar close",
+    "effects": [
+      "surfaces"
+    ],
+    "open": [
+      {
+        "callers": [
+          "caller-2"
+        ],
+        "name": "gamma",
+        "running_park": false,
+        "woke": null
+      }
+    ]
+  },
+  {
+    "active": "gamma",
+    "closed": [
+      {
+        "done": true,
+        "name": "alpha",
+        "note": "",
+        "parked": false
+      },
+      {
+        "done": false,
+        "name": "beta",
+        "note": "",
+        "parked": true
+      }
+    ],
+    "command": "last bar park",
+    "effects": [
+      "surfaces"
+    ],
+    "open": [
+      {
+        "callers": [
+          "caller-2"
+        ],
+        "name": "gamma",
+        "running_park": false,
+        "woke": null
+      }
+    ]
+  },
+  {
+    "active": "beta",
+    "closed": [
+      {
+        "done": true,
+        "name": "alpha",
+        "note": null,
+        "parked": false
+      },
+      {
+        "done": false,
+        "name": "alpha",
+        "note": "",
+        "parked": true
+      }
+    ],
+    "command": "duplicate key close",
+    "effects": [
+      "dismiss",
+      "terminals",
+      "dirty",
+      "plans+docs",
+      "connect",
+      "present",
+      "surfaces",
+      "dirty"
+    ],
+    "open": [
+      {
+        "callers": [
+          "caller-1"
+        ],
+        "name": "beta",
+        "running_park": false,
+        "woke": null
+      },
+      {
+        "callers": [
+          "caller-2"
+        ],
+        "name": "gamma",
+        "running_park": false,
+        "woke": null
+      }
+    ]
+  },
+  {
+    "active": "gamma",
+    "closed": [
+      {
+        "done": true,
+        "name": "alpha",
+        "note": null,
+        "parked": false
+      },
+      {
+        "done": false,
+        "name": "alpha",
+        "note": "",
+        "parked": true
+      },
+      {
+        "done": false,
+        "name": "alpha",
+        "note": "running duplicate",
+        "parked": true
+      }
+    ],
+    "command": "close with stopped and running duplicate",
+    "effects": [
+      "dismiss",
+      "terminals",
+      "dirty",
+      "plans+docs",
+      "connect",
+      "present",
+      "surfaces",
+      "dismiss",
+      "terminals",
+      "dirty",
+      "plans+docs",
+      "connect",
+      "present",
+      "surfaces",
+      "dirty"
+    ],
+    "open": [
+      {
+        "callers": [
+          "caller-2"
+        ],
+        "name": "gamma",
+        "running_park": false,
+        "woke": null
+      }
+    ]
+  },
+  {
+    "active": "alpha",
+    "closed": [
+      {
+        "done": true,
+        "name": "alpha",
+        "note": null,
+        "parked": false
+      },
+      {
+        "done": true,
+        "name": "alpha",
+        "note": null,
+        "parked": false
+      }
+    ],
+    "command": "done with older done duplicate",
+    "effects": [
+      "dirty"
+    ],
+    "open": [
+      {
+        "callers": [
+          "caller-0"
+        ],
+        "name": "alpha",
+        "running_park": false,
+        "woke": null
+      },
+      {
+        "callers": [
+          "caller-1"
+        ],
+        "name": "beta",
+        "running_park": false,
+        "woke": null
+      },
+      {
+        "callers": [
+          "caller-2"
+        ],
+        "name": "gamma",
+        "running_park": false,
+        "woke": null
+      }
+    ]
+  }
+]
