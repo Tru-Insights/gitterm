@@ -334,10 +334,10 @@ fn repo_name_and_disclosure_toggle_but_only_run_emits_command(cx: &mut gpui::Tes
 
     click_sidebar(cx, "work-run-3");
     assert!(sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
-    // The preview limitation adds an error row above Repos after a run event.
-    click_sidebar(cx, "work-name-4");
+    // Run adds no banner row, so the repo row keeps its index.
+    click_sidebar(cx, "work-name-3");
     assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
-    click_sidebar(cx, "work-run-4");
+    click_sidebar(cx, "work-run-3");
     assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
     assert_eq!(
         *events.borrow(),
@@ -348,8 +348,10 @@ fn repo_name_and_disclosure_toggle_but_only_run_emits_command(cx: &mut gpui::Tes
             2
         ]
     );
-    click_sidebar(cx, "work-name-4");
-    click_sidebar(cx, "work-control-4-0");
+    click_sidebar(cx, "work-name-3");
+    // Open in editor is still unavailable in the preview; its banner row
+    // moves the repo row to index 4 from here on.
+    click_sidebar(cx, "work-control-3-0");
     assert!(sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
     assert_eq!(
         events.borrow().last(),
@@ -1002,9 +1004,6 @@ fn write_outcomes_report_unavailable_and_still_emit_typed_events(cx: &mut gpui::
             command: Some("cargo run".into()),
         },
         WorkSidebarOutcome::DismissAutoRepos { workspace: 7 },
-        WorkSidebarOutcome::RunRepoCommand {
-            repo: "/repos/tools".into(),
-        },
         WorkSidebarOutcome::OpenEditor {
             dir: "/repos/tools".into(),
         },
@@ -1031,6 +1030,17 @@ fn write_outcomes_report_unavailable_and_still_emit_typed_events(cx: &mut gpui::
             .preview_error()
             .is_none()
     );
+    // The shell carries these out, as Iced does: no "not available" banner.
+    for handled in [
+        WorkSidebarOutcome::RunRepoCommand {
+            repo: "/repos/tools".into(),
+        },
+        WorkSidebarOutcome::OpenTask {
+            task: "task".into(),
+        },
+    ] {
+        assert!(handled.preview_error().is_none(), "{handled:?}");
+    }
 }
 
 #[gpui::test]
