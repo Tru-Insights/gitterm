@@ -34,10 +34,11 @@ use std::{
     fmt, io,
     net::{Ipv4Addr, SocketAddrV4},
     path::PathBuf,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{Arc, OnceLock},
 };
-use tokio::sync::{mpsc, oneshot};
+
+#[cfg(test)]
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -48,11 +49,41 @@ pub const TASK_MCP_URL_ENV: &str = "GITTERM_V6_TASK_MCP_URL";
 pub const TASK_MCP_CALLER_QUERY: &str = "caller";
 const TASK_MCP_BASE_PORT: u16 = 35_030;
 const TASK_MCP_PORTS_PER_INSTANCE: u16 = 10;
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
+pub use gitterm_core::task_commands::runtime::{CommandReply as TaskControlReply, COMMAND_TIMEOUT};
+pub type TaskControlSender =
+    gitterm_core::task_commands::runtime::CommandSender<TaskControlOperation>;
+pub type TaskControlReceiver =
+    gitterm_core::task_commands::runtime::CommandReceiver<TaskControlOperation>;
+pub type TaskControlEnvelope =
+    gitterm_core::task_commands::runtime::CommandEnvelope<TaskControlOperation>;
 
-pub type TaskControlSender = mpsc::UnboundedSender<TaskControlEnvelope>;
-type TaskControlResult = Result<Value, String>;
-type TaskControlResponseSender = oneshot::Sender<TaskControlResult>;
+static TASK_INGRESS: OnceLock<
+    gitterm_core::task_commands::runtime::CommandIngress<TaskControlOperation>,
+> = OnceLock::new();
+
+fn task_ingress(
+) -> &'static gitterm_core::task_commands::runtime::CommandIngress<TaskControlOperation> {
+    TASK_INGRESS.get_or_init(Default::default)
+}
+
+pub fn command_sender() -> TaskControlSender {
+    task_ingress().sender()
+}
+
+pub fn take_command_receiver() -> Option<TaskControlReceiver> {
+    task_ingress().take_receiver()
+}
+
+pub fn close_commands() {
+    if let Some(ingress) = TASK_INGRESS.get() {
+        ingress.close();
+    }
+}
+
+#[cfg(test)]
+use gitterm_core::task_commands::runtime::command_channel;
+#[cfg(test)]
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct CreateTaskRequest {
@@ -348,44 +379,6 @@ pub enum TaskControlOperation {
     MergePlanGet,
 }
 
-#[derive(Clone)]
-pub struct TaskControlReply {
-    sender: Arc<Mutex<Option<TaskControlResponseSender>>>,
-}
-
-impl fmt::Debug for TaskControlReply {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TaskControlReply")
-            .finish_non_exhaustive()
-    }
-}
-
-impl TaskControlReply {
-    fn new(sender: TaskControlResponseSender) -> Self {
-        Self {
-            sender: Arc::new(Mutex::new(Some(sender))),
-        }
-    }
-
-    pub fn send(&self, result: TaskControlResult) {
-        let sender = self.sender.lock().ok().and_then(|mut slot| slot.take());
-        if let Some(sender) = sender {
-            let _ = sender.send(result);
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TaskControlEnvelope {
-    pub operation: TaskControlOperation,
-    /// The calling tab's `session_uid`, read from the `caller` query of the
-    /// MCP URL GitTerm handed that tab. `None` for calls from a URL without
-    /// it (bottom-panel terminals, external clients, the notify route).
-    pub caller: Option<String>,
-    pub reply: TaskControlReply,
-}
-
 /// The task MCP URL handed to one tab: the shared endpoint plus
 /// `?caller=<session_uid>`. Without a caller the bare endpoint is returned.
 pub fn caller_endpoint(endpoint: &str, caller: Option<&str>) -> String {
@@ -643,18 +636,7 @@ async fn dispatch_operation(
     operation: TaskControlOperation,
     caller: Option<String>,
 ) -> Result<Value, String> {
-    let (reply, response) = oneshot::channel();
-    commands
-        .send(TaskControlEnvelope {
-            operation,
-            caller,
-            reply: TaskControlReply::new(reply),
-        })
-        .map_err(|_| "GitTerm's task command bridge is unavailable".to_string())?;
-    tokio::time::timeout(COMMAND_TIMEOUT, response)
-        .await
-        .map_err(|_| "GitTerm timed out while handling the task command".to_string())?
-        .map_err(|_| "GitTerm closed the task command without a response".to_string())?
+    commands.dispatch(operation, caller).await
 }
 
 #[derive(Clone)]
@@ -1299,7 +1281,7 @@ mod tests {
 
     #[test]
     fn connection_uses_v6_task_range_and_memory_only_token_environment() {
-        let (commands, _requests) = mpsc::unbounded_channel();
+        let (commands, _requests) = command_channel();
         let (connection, _server) = prepare("connection-test", commands).unwrap();
         let port = connection
             .endpoint()
@@ -1415,7 +1397,7 @@ mod tests {
 
     #[tokio::test]
     async fn plan_limits_bridges_a_read_only_snapshot_with_its_output_shape() {
-        let (commands, mut requests) = mpsc::unbounded_channel();
+        let (commands, mut requests) = command_channel();
         let tool = TaskMcpTools::new(commands);
         let bridge = tokio::spawn(async move {
             let envelope = requests.recv().await.unwrap();
@@ -1500,7 +1482,7 @@ mod tests {
 
     #[test]
     fn every_injection_path_carries_the_caller_and_keeps_the_token_in_the_environment() {
-        let (commands, _requests) = mpsc::unbounded_channel();
+        let (commands, _requests) = command_channel();
         let (connection, _server) = prepare("caller-injection-test", commands).unwrap();
         let caller = "7d1c2a4e-0b3f-4e8a-9c55-2f1e6d7a8b90";
         let expected_url = format!("{}?caller={caller}", connection.endpoint());
@@ -1621,7 +1603,7 @@ mod tests {
 
     #[tokio::test]
     async fn notify_route_requires_auth_and_bridges_session_events() {
-        let (commands, mut requests) = mpsc::unbounded_channel();
+        let (commands, mut requests) = command_channel();
         let (connection, server) = prepare("notify-test", commands).unwrap();
         let url = format!(
             "{}?task_id=task-9&session_id=session-9",
@@ -1676,7 +1658,7 @@ mod tests {
 
     #[tokio::test]
     async fn endpoint_requires_auth_and_forwards_commands_to_the_app_bridge() {
-        let (commands, mut requests) = mpsc::unbounded_channel();
+        let (commands, mut requests) = command_channel();
         let (connection, server) = prepare("endpoint-test", commands).unwrap();
         let endpoint = connection.endpoint().to_string();
         let token = connection.token.clone();
@@ -1758,7 +1740,7 @@ mod tests {
 
     #[tokio::test]
     async fn caller_query_reaches_the_bridged_envelope() {
-        let (commands, mut requests) = mpsc::unbounded_channel();
+        let (commands, mut requests) = command_channel();
         let (connection, server) = prepare("caller-test", commands).unwrap();
         let endpoint = caller_endpoint(connection.endpoint(), Some("abc"));
         let token = connection.token.clone();
@@ -1855,7 +1837,7 @@ mod tests {
     /// temporary directory and the same pure rules the app uses, but no
     /// Codex runner, so a request stays `requested`.
     fn spawn_delegation_bridge(
-        mut requests: mpsc::UnboundedReceiver<TaskControlEnvelope>,
+        mut requests: TaskControlReceiver,
         store_dir: PathBuf,
         bridged: Arc<Mutex<Vec<(String, Option<String>)>>>,
     ) -> tokio::task::JoinHandle<()> {
@@ -1932,7 +1914,7 @@ mod tests {
 
     #[tokio::test]
     async fn delegation_tools_need_a_caller_return_ids_at_once_and_list_newest_first() {
-        let (commands, requests) = mpsc::unbounded_channel();
+        let (commands, requests) = command_channel();
         let (connection, server) = prepare("delegation-test", commands).unwrap();
         let token = connection.token.clone();
         let server_task = tokio::spawn(server.run());
@@ -2103,7 +2085,7 @@ mod tests {
     /// of a git worktree and a simulated launch (no terminal) whose session
     /// is hosted by the tab `worker_caller`.
     fn spawn_worker_bridge(
-        mut requests: mpsc::UnboundedReceiver<TaskControlEnvelope>,
+        mut requests: TaskControlReceiver,
         store_dir: PathBuf,
         worker_caller: &'static str,
         bridged: Arc<Mutex<Vec<(String, Option<String>)>>>,
@@ -2248,7 +2230,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_delegated_worker_reports_done_to_the_parent_delegation() {
-        let (commands, requests) = mpsc::unbounded_channel();
+        let (commands, requests) = command_channel();
         let (connection, server) = prepare("worker-test", commands).unwrap();
         let token = connection.token.clone();
         let server_task = tokio::spawn(server.run());

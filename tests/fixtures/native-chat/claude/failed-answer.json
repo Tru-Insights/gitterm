@@ -24,14 +24,14 @@
     "type": "runtime_request"
   },
   {
+    "data": "answer p1: write to claude stdin: <broken pipe>; not delivered; request remains pending",
+    "type": "error"
+  },
+  {
     "data": {
       "request_id": "p1"
     },
     "type": "runtime_request_resolved"
-  },
-  {
-    "data": "write to claude stdin: <broken pipe>",
-    "type": "error"
   },
   {
     "data": {

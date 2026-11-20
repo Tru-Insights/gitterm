@@ -1,0 +1,7 @@
+[
+  {"tool":"task_list","request":{},"operation":"List(ListTasksRequest { include_archived: false })","reply":{"tasks":[],"available_presets":["Codex"]}},
+  {"tool":"task_get","request":{"task_id":"fixture-task"},"operation":"Get(GetTaskRequest { task_id: \"fixture-task\" })","reply":{"task_id":"fixture-task","open_sessions":[]}},
+  {"tool":"task_create","request":{"title":"Synthetic","objective":"Check fixtures","repository_path":"/fixture/repo"},"operation":"Create(CreateTaskRequest { title: \"Synthetic\", objective: \"Check fixtures\", repository_path: \"/fixture/repo\", workspace_name: None, issue_key: None, base_reference: None, stopping_boundary: None })","reply":{"task_id":"fixture-task","lifecycle":"ready"}},
+  {"tool":"task_launch_session","request":{"task_id":"fixture-task","preset_name":"Codex"},"operation":"LaunchSession(LaunchTaskSessionRequest { task_id: \"fixture-task\", preset_name: Some(\"Codex\"), user_model_choice: false })","reply":{"task_id":"fixture-task","queued":true,"queue_position":1,"cost_note":null,"detail":"Concurrency or plan limits deferred this launch; it starts automatically when capacity permits."}},
+  {"tool":"task_update_handoff","request":{"task_id":"fixture-task","summary":"Synthetic progress"},"operation":"UpdateHandoff(UpdateTaskHandoffRequest { task_id: \"fixture-task\", summary: \"Synthetic progress\", decisions: [], next_steps: [], blockers: [], session_id: None, status: None })","reply":{"task_id":"fixture-task","handoff_status":"progress","delegation_id":null,"delegation_status":null}}
+]

@@ -24,7 +24,7 @@ use gitterm::codex_runner::{self, CodexRunEvent};
 use gitterm::delegations::{self, CallerTab};
 use gitterm::harness::claude::{ClaudeSession, ClaudeSessionConfig};
 use gitterm::harness::{HarnessCommand, HarnessEvent, RuntimeDecision, TurnStatus};
-use gitterm::task_mcp::{self, TaskControlEnvelope, TaskControlOperation};
+use gitterm::task_mcp::{self, TaskControlOperation};
 use gitterm::tasks::{Delegation, DelegationStatus, TaskStore};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::StreamableHttpClientTransport;
@@ -138,7 +138,7 @@ async fn smoke(workdir: &Path) -> Result<(), String> {
         log: Mutex::new(BridgeLog::default()),
     });
 
-    let (commands, requests) = mpsc::unbounded_channel();
+    let (commands, requests) = gitterm_core::task_commands::runtime::command_channel();
     let (task, server) =
         task_mcp::prepare("delegation-smoke", commands).map_err(|error| error.to_string())?;
     tokio::spawn(server.run());
@@ -376,10 +376,7 @@ async fn call_tool(
 
 /// The stand-in for the app's `TaskControlRequested` handling of the four
 /// delegation tools.
-async fn run_bridge(
-    mut requests: mpsc::UnboundedReceiver<TaskControlEnvelope>,
-    bridge: Arc<Bridge>,
-) {
+async fn run_bridge(mut requests: task_mcp::TaskControlReceiver, bridge: Arc<Bridge>) {
     while let Some(envelope) = requests.recv().await {
         let received = Instant::now();
         let caller = envelope.caller.clone();
