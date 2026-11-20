@@ -618,6 +618,11 @@ fn rejected_send_retains_images_and_draft_and_receipts_preserve_new_edits(cx: &m
         assert_eq!(view.composer.read(cx).value().as_str(), "newer draft");
         assert_eq!(view.images, images);
     });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("chat-command-error").is_some(),
+        "delivery errors stay visible after telemetry chrome is removed"
+    );
 }
 
 #[gpui::test]
@@ -1193,4 +1198,71 @@ fn worker_first_panel_keeps_same_id_parent_answer_reachable(cx: &mut TestAppCont
     assert!(
         matches!(&intents.borrow()[0], ChatIntent::Answer { identity, .. } if identity.request_id == "same" && identity.owner.is_empty())
     );
+}
+
+#[gpui::test]
+fn iced_footer_chip_order_and_host_roster_render_below_input(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    cx.simulate_resize(size(px(1200.), px(900.)));
+    chat.update_in(cx, |view, _, cx| {
+        view.set_preview(cx);
+        view.set_roster(
+            vec![roster::RosterEntry {
+                id: "worker-1".into(),
+                name: "Worker · Codex".into(),
+                model: "gpt-6.1-sol".into(),
+                checkout: "/tmp/TRU-274".into(),
+                activity: "Running Bash".into(),
+                state: roster::WorkerState::Running,
+                started_at_ms: crate::composer::now_ms().saturating_sub(186_000),
+                ended_at_ms: None,
+            }],
+            cx,
+        );
+    });
+    draw(cx);
+    let selectors = [
+        "composer-review",
+        "composer-model",
+        "composer-effort",
+        "composer-mode",
+        "composer-checkout",
+        "composer-guidelines",
+    ];
+    let bounds = selectors.map(|selector| cx.debug_bounds(selector).expect("Iced chip rendered"));
+    for pair in bounds.windows(2) {
+        assert!(pair[0].origin.x < pair[1].origin.x);
+    }
+    let status = cx.debug_bounds("chat-activity").unwrap();
+    let send = cx.debug_bounds("composer-send").unwrap();
+    let worker = cx
+        .debug_bounds("roster-worker-1")
+        .expect("host-fed worker rendered");
+    assert!(status.origin.y < send.origin.y);
+    assert!(send.origin.y < bounds[0].origin.y);
+    assert!(bounds[0].origin.y < worker.origin.y);
+    let intents = std::rc::Rc::new(std::cell::Cell::new(0));
+    let captured = intents.clone();
+    chat.update_in(cx, |view, _, cx| {
+        view.set_intent_callback(
+            Rc::new(move |_, _| {
+                captured.set(captured.get() + 1);
+                Receipt::rejected("must stay display-only")
+            }),
+            cx,
+        )
+    });
+    for bounds in bounds {
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+    }
+    draw(cx);
+    assert_eq!(
+        intents.get(),
+        0,
+        "chips cannot mutate acknowledged settings"
+    );
+    chat.update_in(cx, |view, _, cx| view.set_roster(vec![], cx));
+    draw(cx);
+    assert!(cx.debug_bounds("roster-worker-1").is_none());
+    chat.read_with(cx, |view, _| assert!(view.activity_tick.is_none()));
 }

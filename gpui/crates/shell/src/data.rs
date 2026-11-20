@@ -64,6 +64,14 @@ pub trait ShellData {
     ) -> Option<String> {
         None
     }
+    fn imported_chat(
+        &self,
+        _workspace: WorkspaceId,
+        _id: SessionId,
+        _cx: &App,
+    ) -> Option<gitterm_core::workspace_config::WorkspaceTabConfig> {
+        None
+    }
     fn status(&self, workspace: WorkspaceId, cx: &App) -> GitStatus;
     fn files(&self, workspace: WorkspaceId, cx: &App) -> Vec<FileNode>;
     /// Folder new terminals start in; `None` means the user's home folder.
@@ -251,7 +259,44 @@ impl ShellData for LocalData {
             .get(index)
             .and_then(|tab| tab.chat_session_id.as_deref())
             .unwrap_or("Terminal");
-        Some(format!("Iced session (read-only)\n{dir}\n{conversation}"))
+        Some(format!(
+            "{}\nIced session (read-only)\n{dir}\n{conversation}{}",
+            sessions[index].title,
+            if sessions[index].kind == SessionKind::Chat {
+                "\nhistory unavailable in preview"
+            } else {
+                ""
+            }
+        ))
+    }
+    fn imported_chat(
+        &self,
+        workspace: WorkspaceId,
+        id: SessionId,
+        cx: &App,
+    ) -> Option<gitterm_core::workspace_config::WorkspaceTabConfig> {
+        let owner = self.0.read(cx);
+        let saved = owner.iced_workspace(workspace)?;
+        if saved.is_legacy_remote()
+            || matches!(
+                saved.location,
+                Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. })
+            )
+        {
+            return None;
+        }
+        let index = iced_sessions(saved).iter().position(|s| s.id == id)?;
+        saved
+            .tabs
+            .get(index)
+            .filter(|t| {
+                t.tab_kind.as_deref() == Some("agent")
+                    && matches!(
+                        t.agent_config,
+                        Some(gitterm_core::chat::types::AgentBackendConfig::Claude { .. })
+                    )
+            })
+            .cloned()
     }
     fn status(&self, workspace: WorkspaceId, cx: &App) -> GitStatus {
         self.0.read(cx).model.status_view(workspace)

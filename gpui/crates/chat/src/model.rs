@@ -1,3 +1,6 @@
+#[path = "roster.rs"]
+pub mod roster;
+
 use crate::events::*;
 use serde_json::Value;
 use std::{collections::HashMap, ops::Range};

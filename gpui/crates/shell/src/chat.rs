@@ -28,7 +28,6 @@ use gpui::{
     AppContext, Context, Entity, EventEmitter, IntoElement, ParentElement, Render, Styled, Window,
     div,
 };
-use gpui_component::{Disableable, button::Button};
 use provider::Provider;
 use std::{collections::HashMap, path::PathBuf, rc::Rc, sync::Arc};
 
@@ -214,7 +213,6 @@ pub(crate) struct ChatPane {
     controller: Controller,
     saved: SavedChat,
     view: Entity<ChatView>,
-    status: String,
     pending: Vec<Update>,
     shutdown: Arc<RuntimeShutdown>,
 }
@@ -259,13 +257,14 @@ impl ChatPane {
             controller,
             saved,
             view,
-            status: String::new(),
             pending: vec![],
             shutdown,
         };
         match launch {
             Ok((runtime, events)) => pane.install_runtime(runtime, events, window, cx),
-            Err(error) => pane.status = format!("Claude preview unavailable: {error:#}"),
+            Err(error) => pane.view.update(cx, |view, cx| {
+                view.set_status_error(format!("Claude unavailable: {error:#}"), cx)
+            }),
         }
         pane
     }
@@ -300,7 +299,6 @@ impl ChatPane {
             controller,
             saved,
             view,
-            status: "Preview history · no process attached".into(),
             pending: vec![],
             shutdown,
         }
@@ -320,7 +318,6 @@ impl ChatPane {
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.controller.ready = false;
         self.shutdown_runtime();
-        self.status = "Preview chat closed · history retained".into();
         self.view.update(cx, |view, cx| {
             view.set_read_only(Some("Chat closed".into()), cx)
         });
@@ -381,9 +378,6 @@ impl ChatPane {
                         {
                             return;
                         }
-                        if let RuntimeEvent::Harness(HarnessEvent::Error(error)) = &event {
-                            pane.status = format!("Claude preview unavailable: {error}");
-                        }
                         let exited = matches!(
                             &event,
                             RuntimeEvent::Harness(HarnessEvent::ProcessExited { .. })
@@ -407,7 +401,6 @@ impl ChatPane {
             }
         })
         .detach();
-        self.status = "Fresh isolated Claude preview · personal Pro/Max gate".into();
         self.view
             .update(cx, |view, cx| view.set_read_only(None, cx));
     }
@@ -541,12 +534,6 @@ impl Render for ChatPane {
             .size_full()
             .flex()
             .flex_col()
-            .child(div().p_2().child(self.status.clone()))
-            .child(
-                Button::new("preview-status")
-                    .label("Fresh local chat · resume, workers and remote unavailable")
-                    .disabled(true),
-            )
             .child(div().flex_1().min_h_0().child(self.view.clone()))
     }
 }
