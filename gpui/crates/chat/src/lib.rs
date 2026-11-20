@@ -19,3 +19,4 @@ mod view;
 pub use view::{ChatView, IntentCallback, init, run};
 
 pub mod pickers;
+pub mod review;

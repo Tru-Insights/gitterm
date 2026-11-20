@@ -25,8 +25,8 @@ use gitterm_gpui_chat::{
     events::{Entry, Record},
 };
 use gpui::{
-    AppContext, Context, Entity, EventEmitter, IntoElement, ParentElement, Render, Styled, Window,
-    div,
+    AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
+    Render, Styled, Window, div,
 };
 use provider::Provider;
 use std::{collections::HashMap, path::PathBuf, rc::Rc, sync::Arc};
@@ -227,10 +227,16 @@ pub(crate) struct ChatPane {
     pending: Vec<Update>,
     shutdown: Arc<RuntimeShutdown>,
     _roster_subscription: gpui::Subscription,
+    _review_subscription: gpui::Subscription,
+    _review_context_load: Option<gpui::Task<()>>,
 }
 impl EventEmitter<SavedChat> for ChatPane {}
 impl EventEmitter<gitterm_gpui_chat::model::roster::RosterOutcome> for ChatPane {}
 impl ChatPane {
+    #[cfg(test)]
+    pub(crate) fn test_view(&self) -> Entity<ChatView> {
+        self.view.clone()
+    }
     pub(crate) fn set_width(
         &mut self,
         width: gitterm_core::settings::ChatWidth,
@@ -264,6 +270,7 @@ impl ChatPane {
             view
         });
         let roster_subscription = Self::forward_roster(&view, cx);
+        let review_subscription = Self::handle_review(&view, saved.cwd.clone(), window, cx);
         let callback = Self::intent_callback(cx.weak_entity());
         view.update(cx, |view, cx| view.set_intent_callback(callback, cx));
         let launch = (|| -> Result<_> {
@@ -285,6 +292,8 @@ impl ChatPane {
             pending: vec![],
             shutdown,
             _roster_subscription: roster_subscription,
+            _review_subscription: review_subscription,
+            _review_context_load: None,
         };
         match launch {
             Ok((runtime, events)) => pane.install_runtime(runtime, events, window, cx),
@@ -301,6 +310,66 @@ impl ChatPane {
             view,
             |_, _, outcome: &gitterm_gpui_chat::model::roster::RosterOutcome, cx| {
                 cx.emit(outcome.clone());
+            },
+        )
+    }
+    /// The popover emits requests only. Preview cannot start a runner or mutate
+    /// Iced's task store, so rejection leaves its inputs and chat draft intact.
+    fn handle_review(
+        view: &Entity<ChatView>,
+        cwd: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Subscription {
+        let config = cx
+            .try_global::<crate::work_sidebar::IcedWorkSource>()
+            .map(|source| source.config.clone());
+        cx.subscribe_in(
+            view,
+            window,
+            move |pane, view, outcome: &gitterm_gpui_chat::review::ReviewOutcome, window, cx| {
+                use gitterm_gpui_chat::review::{ReviewContext, ReviewOutcome};
+                match outcome {
+                    ReviewOutcome::Submit { .. } => {
+                        view.update(cx, |view, cx| {
+                            view.show_review_error(
+                                "Review / Consult is not available in preview".into(),
+                                cx,
+                            )
+                        });
+                    }
+                    ReviewOutcome::ContextRequested => {
+                        let cwd = cwd.clone();
+                        let config = config.clone();
+                        let load = cx.background_executor().spawn(async move {
+                            let context = gitterm_core::review_request::review_context(&cwd, None);
+                            ReviewContext {
+                                base: context.base,
+                                base_source: context.base_source,
+                                ahead: context.ahead,
+                                head: context.head,
+                                dirty: context.dirty,
+                                error: context.error,
+                                config: config
+                                    .map(|config| {
+                                        crate::workspace_config::load_iced_settings_from(&config)
+                                            .review
+                                    })
+                                    .unwrap_or_default(),
+                            }
+                        });
+                        let view = view.downgrade();
+                        // Reopening replaces the task, so an earlier context
+                        // cannot reset a newer opening's draft.
+                        pane._review_context_load =
+                            Some(cx.spawn_in(window, async move |_, cx| {
+                                let context = load.await;
+                                let _ = view.update_in(cx, |view, window, cx| {
+                                    view.set_review_context(context, window, cx)
+                                });
+                            }));
+                    }
+                }
             },
         )
     }
@@ -335,6 +404,7 @@ impl ChatPane {
             view
         });
         let roster_subscription = Self::forward_roster(&view, cx);
+        let review_subscription = Self::handle_review(&view, saved.cwd.clone(), window, cx);
         Self {
             controller,
             saved,
@@ -342,6 +412,8 @@ impl ChatPane {
             pending: vec![],
             shutdown,
             _roster_subscription: roster_subscription,
+            _review_subscription: review_subscription,
+            _review_context_load: None,
         }
     }
     pub(crate) fn set_roster(
@@ -597,6 +669,16 @@ impl Render for ChatPane {
             });
         }
         div()
+            .on_action(
+                cx.listener(|pane, _: &crate::app_menus::Escape, window, cx| {
+                    if !pane
+                        .view
+                        .update(cx, |view, cx| view.dismiss_review(window, cx))
+                    {
+                        cx.propagate();
+                    }
+                }),
+            )
             .size_full()
             .flex()
             .flex_col()

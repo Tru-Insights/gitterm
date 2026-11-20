@@ -453,6 +453,7 @@ mod ui {
         pub(crate) fn render(
             &self,
             input: &Entity<TextareaState>,
+            review: &crate::view::review_ui::ReviewComposer,
             unavailable: Option<String>,
             send_blocked: bool,
             slash_scroll: &gpui::ScrollHandle,
@@ -469,7 +470,7 @@ mod ui {
                 && input.read(cx).selected_range().start == draft.len();
             div().id("composer-controls").debug_selector(|| "composer-controls".into()).relative().flex().flex_col().gap(px(6.))
                 .capture_any_mouse_down(cx.listener(|view, _, _, cx| view.reopen_slash(cx)))
-                .on_click(cx.listener(|view, _, _, cx| { view.close_picker(cx); view.reopen_slash(cx); cx.stop_propagation(); }))
+                .on_click(cx.listener(|view, _, window, cx| { if view.review.open { view.close_review(window, cx); } view.close_picker(cx); view.reopen_slash(cx); cx.stop_propagation(); }))
                 .on_drop(cx.listener(|view, paths: &gpui::ExternalPaths, window, cx| {
                     view.attach_paths(paths.0.to_vec(), cx);
                     view.focus_composer(window, cx);
@@ -526,15 +527,16 @@ mod ui {
                     .child(Button::new("stop").child(div().text_size(px(appearance.size(13.))).child("Stop")).px(px(14.)).py(px(5.)).h_auto().bg(rgb(palette.err)).text_color(rgb(palette.base))
                         .disabled(disabled || !self.streaming)
                         .on_click(cx.listener(|view, _, _, cx| view.stop(cx)))))
-                .child(div().id("composer-chips").flex().flex_wrap().gap(px(4.))
+                .child(div().id("composer-chips").relative().flex().flex_wrap().gap(px(4.))
                     .font_family("Menlo").text_size(px(appearance.size(12.))).text_color(rgb(palette.muted))
                     .children(self.chips().into_iter().map(|(id, label)| {
                         let mut chip = Button::new(gpui::SharedString::from(format!("composer-{id}")))
                             .debug_selector(move || format!("composer-{id}"))
                             .child(div().font_family("Menlo").text_size(px(appearance.size(12.))).child(label))
-                            .disabled(disabled || !self.commands_ready || crate::pickers::Picker::from_chip(id).is_none_or(|picker| self.catalog.options(picker).is_empty()))
+                            .disabled(if id == "review" { !matches!(self.backend, Some(gitterm_core::chat::types::AgentBackend::Claude)) } else { disabled || !self.commands_ready || crate::pickers::Picker::from_chip(id).is_none_or(|picker| self.catalog.options(picker).is_empty()) })
                             .on_click(cx.listener(move |view, _, window, cx| {
-                                if let Some(picker) = crate::pickers::Picker::from_chip(id) { view.toggle_picker(picker, window, cx); }
+                                if id == "review" { view.toggle_review(window, cx); }
+                                else if let Some(picker) = crate::pickers::Picker::from_chip(id) { view.toggle_picker(picker, window, cx); }
                                 cx.stop_propagation();
                             }))
                             .px(px(8.)).py(px(4.)).h_auto().bg(rgb(palette.block))
@@ -544,7 +546,8 @@ mod ui {
                         }
                         if id == "checkout" && let Some(path) = &self.checkout_path { chip = chip.tooltip(path.clone()); }
                         chip
-                    })))
+                    }))
+                    .children(review.open.then(|| review.render(self.streaming || self.pending_request, appearance, cx))))
                 .children(self.picker.filter(|_| !disabled).map(|picker| {
                     let options = self.catalog.options(picker);
                     div().id("setting-picker").debug_selector(|| "setting-picker".into())

@@ -581,10 +581,8 @@ shortcuts![
 
 /// Actions without a host adapter remain unregistered, so GPUI's native menu
 /// validation disables their menu items.
-/// The review chip is display-only.
 /// Terminal log mirroring has no native backend, and dictation is out of scope.
-pub const MISSING_HOST_ACTIONS: &[&str] =
-    &["ToggleTerminalLogMirroring", "SttToggle", "SubmitReview"];
+pub const MISSING_HOST_ACTIONS: &[&str] = &["ToggleTerminalLogMirroring", "SttToggle"];
 
 #[cfg(test)]
 mod tests {

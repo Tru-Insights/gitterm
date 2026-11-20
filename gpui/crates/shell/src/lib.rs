@@ -2712,6 +2712,9 @@ impl Shell {
             .on_action(cx.listener(|_, _: &CycleMode, w, cx| {
                 Self::chat_action("native_chat::CycleMode", w, cx)
             }))
+            .on_action(cx.listener(|_, _: &SubmitReview, w, cx| {
+                Self::chat_action("native_chat::SubmitReview", w, cx)
+            }))
             .on_action(cx.listener(|_, _: &SubmitPrompt, w, cx| {
                 Self::chat_action("native_chat::SubmitPrompt", w, cx)
             }))
