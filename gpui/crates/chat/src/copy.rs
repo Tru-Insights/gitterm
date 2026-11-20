@@ -146,11 +146,13 @@ impl RowView {
         let copied: HashSet<_> = self.copied.keys().copied().collect();
         let view = TextView::new(&self.text)
             .font_family(".SystemUIFont")
-            .text_size(px(if self.row.kind == RowKind::Thinking {
-                self.appearance.size(13.)
-            } else {
-                self.appearance.font_size
-            }))
+            .text_size(px(
+                if self.row.kind == RowKind::Thinking || self.row.delivery.is_some() {
+                    self.appearance.size(13.)
+                } else {
+                    self.appearance.font_size
+                },
+            ))
             .line_height(gpui::relative(1.5))
             .inline_code_style(
                 StyleRefinement::default()
