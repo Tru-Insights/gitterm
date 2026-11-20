@@ -8,6 +8,94 @@ use gitterm_core::{
 use std::path::PathBuf;
 use tokio::runtime::Handle;
 
+use gitterm_core::{
+    git_facts::{
+        BaseChoice, BaseSource, GIT_TIMEOUT, base_candidates, choose_nearest, git_text,
+        measure_bases, run_git_lines,
+    },
+    review::{
+        model::ReviewTarget,
+        state::{CollectStamp, Intent},
+    },
+    work::summary::StatusCounts,
+};
+
+/// Read-only branch choices; default selection uses the shared nearest-base policy.
+pub async fn aggregate_target(root: PathBuf) -> Result<(ReviewTarget, Vec<BaseChoice>), String> {
+    let mut counts = StatusCounts::default();
+    run_git_lines(
+        &root,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v2",
+            "--branch",
+        ],
+        GIT_TIMEOUT,
+        |line| counts.observe(line, 1),
+    )
+    .await?;
+    let mut candidates = base_candidates(None, counts.head.as_deref(), counts.upstream.as_deref());
+    let measured = measure_bases(&root, &mut candidates, &mut 0).await?;
+    let base = choose_nearest(&candidates, &measured).map(|(base, _)| base);
+    let refs = git_text(
+        &root,
+        &[
+            "--no-optional-locks",
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/",
+            "refs/remotes/",
+        ],
+        GIT_TIMEOUT,
+    )
+    .await?;
+    let mut choices = Vec::new();
+    for reference in refs.lines() {
+        let (reference, source) = if let Some(local) = reference.strip_prefix("refs/heads/") {
+            (local, BaseSource::Local)
+        } else if let Some(remote) = reference.strip_prefix("refs/remotes/") {
+            if remote.ends_with("/HEAD") {
+                continue;
+            }
+            (remote, BaseSource::Remote)
+        } else {
+            continue;
+        };
+        choices.push(BaseChoice {
+            reference: reference.into(),
+            source,
+            considered: 1,
+        });
+    }
+    let target = ReviewTarget {
+        repo: root
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        checkout: root,
+        branch: counts.head.unwrap_or_else(|| "(detached)".into()),
+        owner: "local review".into(),
+        base,
+    };
+    Ok((target, choices))
+}
+
+/// Preserve the effect's stamp verbatim. Only State decides whether it still applies.
+pub async fn collect_aggregate(stamp: CollectStamp) -> Intent {
+    let result = gitterm_core::review::collect::load_review_source_with_snapshots(
+        stamp.target.clone(),
+        stamp.source.clone(),
+        async { Err("turn review requires a host-provided snapshot source".into()) },
+    )
+    .await;
+    Intent::CollectFinished {
+        stamp,
+        result: Box::new(result),
+    }
+}
+
 pub async fn load(
     handle: &Handle,
     owner: usize,
