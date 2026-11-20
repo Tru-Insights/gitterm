@@ -125,14 +125,15 @@ C="$HOME/gitterm-chat-c8-disposable-clone"  # independent, exclusively owned clo
 REPO="$PWD"                  # this checkout, before changing directory
 # If C does not exist, create it once: git clone --no-local "$REPO" "$C"
 umask 077
-mkdir -p "$P/providers/claude" "$P/child/neutral" "$P/child/home" "$P/child/config" "$P/child/tmp"
 if [ "$(uname -s)" = Darwin ]; then
   # Run in the parent environment, before HOME is substituted. Never overwrite.
   python3 - "$P/child/home" <<'PY' || exit 1
 from pathlib import Path
 import sys
 library = Path(sys.argv[1]) / "Library"
-library.mkdir(mode=0o700, exist_ok=True)
+if not library.is_absolute() or library.resolve() != library:
+    raise SystemExit(f"Refusing aliased directory or ancestor: {library}")
+library.mkdir(mode=0o700, parents=True, exist_ok=True)
 if library.is_symlink() or not library.is_dir() or library.stat().st_mode & 0o077:
     raise SystemExit(f"Refusing aliased or non-private directory: {library}")
 link = library / "Keychains"
@@ -144,6 +145,7 @@ except FileExistsError:
         raise SystemExit(f"Refusing existing keychain path: {link}")
 PY
 fi
+mkdir -p "$P/providers/claude" "$P/child/neutral" "$P/child/home" "$P/child/config" "$P/child/tmp"
 cd "$P/child/neutral"
 # (a) One-time isolated sign-in. Then /login; exit the CLI after signing in.
 env -i "CLAUDE_CONFIG_DIR=$P/providers/claude" "GITTERM_GPUI_CONFIG_DIR=$P" \

@@ -152,6 +152,27 @@ for event in events: print(json.dumps(event))
         self.assertEqual((link.lstat().st_dev, link.lstat().st_ino), (before.st_dev, before.st_ino))
         self.assertEqual(sentinel.read_text(), "synthetic-keychain")
 
+    @unittest.skipUnless(sys.platform == "darwin", "macOS keychain setup")
+    def test_documented_keychain_setup_refuses_aliased_ancestors_before_writing(self):
+        doc = (ROOT / "gpui/crates/shell/CHAT_PREVIEW.md").read_text()
+        setup = "umask 077\n" + doc.split("umask 077\n", 1)[1].split('cd "$P/child/neutral"', 1)[0]
+        for name in ("child", "child/home", "child/home/Library"):
+            with self.subTest(ancestor=name):
+                preview = self.root / name.replace("/", "-")
+                alias = preview / name
+                alias.parent.mkdir(parents=True)
+                outside = self.root / (name.replace("/", "-") + "-outside")
+                outside.mkdir()
+                alias.symlink_to(outside, target_is_directory=True)
+                output = subprocess.run(
+                    ["/bin/sh", "-c", setup], env=dict(self.env, P=str(preview)),
+                    text=True, capture_output=True, timeout=10,
+                )
+                self.assertNotEqual(output.returncode, 0, output.stdout + output.stderr)
+                self.assertIn(str(preview / "child/home/Library"), output.stderr)
+                self.assertEqual(list(outside.iterdir()), [])
+                self.assertEqual(alias.readlink(), outside)
+
     def test_escapes_are_found_and_existing_files_never_restored_or_removed(self):
         self.fake("escape")
         # Fake real protected root is entirely inside our synthetic HOME.
