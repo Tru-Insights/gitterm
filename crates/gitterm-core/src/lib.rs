@@ -72,3 +72,5 @@ pub mod turn_snapshots;
 pub mod issues;
 pub mod merge_plan;
 pub mod prs;
+
+pub mod settings;

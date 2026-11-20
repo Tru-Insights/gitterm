@@ -1289,61 +1289,14 @@ pub fn cleanup_instance_config() {
     }
 }
 
-// Default functions for serde
-fn default_agent_color() -> WorkspaceColor {
-    WorkspaceColor::Lavender
-}
-
-fn default_agent_presets() -> Vec<AgentPreset> {
-    vec![
-        AgentPreset {
-            name: "Pi".to_string(),
-            command: "pi".to_string(),
-            resume_command: Some("pi --resume".to_string()),
-            icon: "\u{03c0}".to_string(), // π
-            color: WorkspaceColor::Pink,
-        },
-        AgentPreset {
-            name: "Claude Code".to_string(),
-            command: "claude".to_string(),
-            resume_command: Some("claude --resume".to_string()),
-            icon: "\u{276f}".to_string(),
-            color: WorkspaceColor::Peach,
-        },
-        AgentPreset {
-            name: "Codex".to_string(),
-            command: "codex".to_string(),
-            resume_command: Some("codex resume".to_string()),
-            icon: "\u{2261}".to_string(),
-            color: WorkspaceColor::Green,
-        },
-        AgentPreset {
-            name: "Antigravity".to_string(),
-            command: "agy".to_string(),
-            resume_command: Some("agy --continue".to_string()),
-            icon: "\u{2727}".to_string(),
-            color: WorkspaceColor::Blue,
-        },
-    ]
-}
-
-/// Field-level migration also covers older instance settings carried over
-/// on first load. Only the exact retired executable is replaced.
-fn deserialize_agent_presets<'de, D>(deserializer: D) -> Result<Vec<AgentPreset>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let mut presets = Vec::<AgentPreset>::deserialize(deserializer)?;
-    for preset in &mut presets {
-        if preset.command == "gemini" {
-            *preset = default_agent_presets()
-                .into_iter()
-                .find(|preset| preset.command == "agy")
-                .expect("default Antigravity preset");
-        }
-    }
-    Ok(presets)
-}
+// Preserve the facade names, including those currently used only by tests.
+#[allow(unused_imports)]
+pub use gitterm_core::settings::{
+    ChatDefaults, ChatSelection, ChatWidth, DelegationsConfig, NotificationsConfig, PrWatchConfig,
+    QuickCommand, ReviewConfig, ReviewerKind, WorkNotesConfig, DEFAULT_MAX_CONCURRENT_REVIEWS,
+    MAX_CHAT_FONT_SIZE, MIN_CHAT_FONT_SIZE,
+};
+pub type AgentPreset = gitterm_core::settings::AgentPreset<WorkspaceColor>;
 
 pub fn default_task_worktree_root() -> PathBuf {
     task_worktree_root_for_config_root(&global_config_dir())
@@ -1351,51 +1304,6 @@ pub fn default_task_worktree_root() -> PathBuf {
 
 pub fn task_worktree_root_for_config_root(config_root: &Path) -> PathBuf {
     config_root.join("worktrees")
-}
-
-fn is_default_task_worktree_root(root: &Path) -> bool {
-    *root == default_task_worktree_root()
-}
-
-fn default_theme() -> String {
-    "dark".to_string()
-}
-
-fn default_terminal_font() -> f32 {
-    14.0
-}
-
-fn default_ui_font() -> f32 {
-    13.0
-}
-
-pub const MIN_CHAT_FONT_SIZE: f32 = 11.0;
-pub const MAX_CHAT_FONT_SIZE: f32 = 22.0;
-
-fn default_chat_font() -> f32 {
-    15.0
-}
-
-fn deserialize_chat_font<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<f32, D::Error> {
-    Ok(f32::deserialize(deserializer)?.clamp(MIN_CHAT_FONT_SIZE, MAX_CHAT_FONT_SIZE))
-}
-
-fn default_sidebar_width() -> f32 {
-    360.0
-}
-
-fn default_scrollback_lines() -> usize {
-    100_000
-}
-
-fn default_console_height() -> f32 {
-    200.0
-}
-
-fn default_console_expanded() -> bool {
-    true
 }
 
 fn default_remote_session_shell() -> String {
@@ -1414,410 +1322,166 @@ pub fn default_remote_agents() -> Vec<RemoteAgentConfig> {
     Vec::new()
 }
 
-#[cfg(feature = "stt")]
-fn default_stt_enabled() -> bool {
-    true
-}
-
-// Local task slots gate agent launches, not tabs or sessions. The number is
-// a guard against a runaway dispatch fan-out rather than a throughput
-// budget — the task system's value is worktree organization, so the cap
-// should rarely be the thing a user bumps into (TRU-129).
-fn default_max_concurrent_local_tasks() -> usize {
-    4
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ChatWidth {
-    Narrow,
-    #[default]
-    Medium,
-    Wide,
-    Full,
-}
-
-impl ChatWidth {
-    pub const ALL: [Self; 4] = [Self::Narrow, Self::Medium, Self::Wide, Self::Full];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Narrow => "narrow",
-            Self::Medium => "medium",
-            Self::Wide => "wide",
-            Self::Full => "full",
-        }
-    }
-}
-
-impl std::fmt::Display for ChatWidth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Narrow => f.write_str("Narrow"),
-            Self::Medium => f.write_str("Medium"),
-            Self::Wide => f.write_str("Wide"),
-            Self::Full => f.write_str("Full"),
-        }
-    }
-}
-
 // Persistent configuration: the shared `settings.json` (TRU-181), see
 // `SETTINGS_FILE`. Every field is a setting the user expects to keep.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "SettingsData", into = "SettingsData")]
 pub struct Config {
     /// Editor used by "Open in editor"; custom values are argv templates.
-    #[serde(default = "default_editor")]
     pub editor: String,
-    #[serde(default = "default_terminal_font")]
     pub terminal_font_size: f32,
-    #[serde(default = "default_ui_font")]
     pub ui_font_size: f32,
-    #[serde(
-        default = "default_chat_font",
-        deserialize_with = "deserialize_chat_font"
-    )]
     pub chat_font_size: f32,
-    #[serde(default)]
     pub chat_width: ChatWidth,
-    #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
-    #[serde(default = "default_scrollback_lines")]
     pub scrollback_lines: usize,
     // Legacy field for migration
-    #[serde(default)]
     pub font_size: Option<f32>,
     /// Defaulted so a hand-written `settings.json` may leave it out.
-    #[serde(default = "default_theme")]
     pub theme: String,
-    #[serde(default)]
     pub show_hidden: bool,
-    #[serde(default = "default_console_height")]
     pub console_height: f32,
-    #[serde(default = "default_console_expanded")]
     pub console_expanded: bool,
     /// Whether full terminal scrollback is mirrored into the local HTTP viewer.
     /// This is intentionally opt-in because collecting long histories is expensive.
-    #[serde(default)]
     pub terminal_log_mirroring_enabled: bool,
     #[cfg(feature = "stt")]
-    #[serde(default = "default_stt_enabled")]
     pub stt_enabled: bool,
     #[cfg(feature = "stt")]
-    #[serde(default)]
     pub stt_model_path: Option<String>,
-    #[serde(
-        default = "default_agent_presets",
-        deserialize_with = "deserialize_agent_presets"
-    )]
     pub agent_presets: Vec<AgentPreset>,
-    #[serde(default)]
     pub quick_commands: Vec<QuickCommand>,
     /// Written only when changed from the default: the shared
     /// `settings.json` must not pin one config dir's worktree root, so a
     /// copy of it in another (isolated) config dir keeps its own.
-    #[serde(
-        default = "default_task_worktree_root",
-        skip_serializing_if = "is_default_task_worktree_root"
-    )]
     pub task_worktree_root: PathBuf,
     /// How many local tasks may run agent sessions at once. Dispatching past
     /// the limit queues the task; capacity release starts the next in FIFO
     /// order. Zero is treated as 1 — a limit that can never start anything
     /// would strand every dispatch.
-    #[serde(default = "default_max_concurrent_local_tasks")]
     pub max_concurrent_local_tasks: usize,
     /// Defaults for the chat tab's Review… button (TRU-142).
-    #[serde(default)]
     pub review: ReviewConfig,
     /// Model and effort for new chats, and the last selection (TRU-143).
-    #[serde(default)]
     pub chat: ChatDefaults,
     /// Which model each worker role runs on, per provider, for
     /// `delegate_task` (TRU-142 S6, TRU-144). Seeded with the routing table;
     /// see `gitterm::workers::ModelPolicy`.
-    #[serde(default)]
     pub policy: gitterm::workers::ModelPolicy,
     /// Usage panel settings: per-model price overrides (TRU-145); see
     /// `gitterm::usage::UsageConfig`.
-    #[serde(default)]
     pub usage: gitterm::usage::UsageConfig,
     /// macOS notifications (TRU-148).
-    #[serde(default)]
     pub notifications: NotificationsConfig,
     /// The PR watch (TRU-197).
-    #[serde(default)]
     pub pr_watch: PrWatchConfig,
     /// Automatic delegation results in chat (TRU-218).
-    #[serde(default)]
     pub delegations: DelegationsConfig,
     /// ~/Work committing and pushing itself (TRU-201).
-    #[serde(default)]
     pub work_notes: WorkNotesConfig,
 }
 
-/// The PR watch (TRU-197). Edit the `pr_watch` object in `settings.json`:
-///
-/// ```json
-/// "pr_watch": { "auto_tell": true }
-/// ```
-///
-/// `auto_tell`: send actionable PR news (merge conflicts, failed checks,
-/// review comments, changes requested) to the coordinator's open chat by
-/// itself when its turn is idle. Off, news only shows on the overview and
-/// the chip.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PrWatchConfig {
-    #[serde(default = "default_true")]
-    pub auto_tell: bool,
-}
+// Keep host path resolution out of core while retaining its exact Serde default
+// and skip policy (which use the global root, not the load/save directory).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct SettingsWorktreeRoot(PathBuf);
 
-impl Default for PrWatchConfig {
+impl Default for SettingsWorktreeRoot {
     fn default() -> Self {
-        Self { auto_tell: true }
+        Self(default_task_worktree_root())
     }
 }
 
-/// `"delegations": { "auto_tell": false }` in settings.json leaves
-/// results on their cards for manual delivery. Defaults on.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DelegationsConfig {
-    #[serde(default = "default_true")]
-    pub auto_tell: bool,
-}
+#[cfg(feature = "stt")]
+type SettingsData = gitterm_core::settings::SettingsWithVoice<
+    WorkspaceColor,
+    gitterm::usage::UsageConfig,
+    SettingsWorktreeRoot,
+>;
+#[cfg(not(feature = "stt"))]
+type SettingsData = gitterm_core::settings::Settings<
+    WorkspaceColor,
+    gitterm::usage::UsageConfig,
+    SettingsWorktreeRoot,
+>;
 
-impl Default for DelegationsConfig {
-    fn default() -> Self {
-        Self { auto_tell: true }
-    }
-}
-
-/// The work-notes folder (TRU-201). Edit the `work_notes` object in
-/// `settings.json`:
-///
-/// ```json
-/// "work_notes": { "auto_commit": true }
-/// ```
-///
-/// `auto_commit`: when `~/Work` is a git repo with an `origin` remote,
-/// commit what changed there about ten minutes after the last change, and
-/// at once when a work workspace is parked or closed, then push it. Off,
-/// GitTerm runs no git there.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkNotesConfig {
-    #[serde(default = "default_true")]
-    pub auto_commit: bool,
-}
-
-impl Default for WorkNotesConfig {
-    fn default() -> Self {
-        Self { auto_commit: true }
-    }
-}
-
-/// Which macOS notifications GitTerm posts (TRU-148). Edit the
-/// `notifications` object in `settings.json`:
-///
-/// ```json
-/// "notifications": { "needs_you": true }
-/// ```
-///
-/// `needs_you`: notify when a tab that is not in front starts waiting on the
-/// human (an input or approval request, a blocked worker, a task needing
-/// input).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NotificationsConfig {
-    #[serde(default = "default_true")]
-    pub needs_you: bool,
-}
-
-impl Default for NotificationsConfig {
-    fn default() -> Self {
-        Self { needs_you: true }
-    }
-}
-
-fn default_chat_model() -> String {
-    "opus".to_string()
-}
-
-/// Antigravity's effort-qualified chat default (TRU-273).
-fn default_antigravity_model() -> String {
-    "gemini-4-argon-medium".to_string()
-}
-
-/// What a new chat tab starts with (TRU-143). The app has no settings
-/// panel; edit the `chat` object in `settings.json`:
-///
-/// ```json
-/// "chat": { "default_model": "opus", "default_effort": "high", "remember_last": true }
-/// ```
-///
-/// `default_model` is a Claude model alias (`default` leaves the choice to
-/// the user's Claude settings); `default_effort` is one of the CLI's effort
-/// levels (`low`, `medium`, `high`, `xhigh`, `max`), or absent for the
-/// model's own default. With `remember_last`, a new chat starts with the
-/// model and effort last picked on any chat (`last`, written by the app)
-/// instead of the defaults.
-///
-/// Claude in Chrome is per workspace (`WorkspaceConfig::claude_in_chrome`,
-/// TRU-181); a `claude_in_chrome` key here, from an earlier build, is
-/// ignored.
-///
-/// `antigravity_model` and `opencode_model` are what new Antigravity and OpenCode
-/// chats start on (TRU-153): a model id as the agent lists it, such as
-/// `gemini-4-argon-medium` or `openrouter/google/gemini-3.6-flash`. An empty
-/// `opencode_model` (the default) keeps the model OpenCode itself picks.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChatDefaults {
-    #[serde(default = "default_chat_model")]
-    pub default_model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_effort: Option<String>,
-    #[serde(default = "default_true")]
-    pub remember_last: bool,
-    /// The model and effort last picked on any chat. One global selection,
-    /// not per workspace.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last: Option<ChatSelection>,
-    #[serde(default = "default_antigravity_model")]
-    pub antigravity_model: String,
-    #[serde(default)]
-    pub opencode_model: String,
-}
-
-/// A chat's model and effort (`effort: None` is the model's default).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChatSelection {
-    pub model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
-}
-
-impl Default for ChatDefaults {
-    fn default() -> Self {
+impl From<SettingsData> for Config {
+    fn from(data: SettingsData) -> Self {
         Self {
-            default_model: default_chat_model(),
-            default_effort: None,
-            remember_last: true,
-            last: None,
-            antigravity_model: default_antigravity_model(),
-            opencode_model: String::new(),
+            editor: data.editor,
+            terminal_font_size: data.terminal_font_size,
+            ui_font_size: data.ui_font_size,
+            chat_font_size: data.chat_font_size,
+            chat_width: data.chat_width,
+            sidebar_width: data.sidebar_width,
+            scrollback_lines: data.scrollback_lines,
+            font_size: data.font_size,
+            theme: data.theme,
+            show_hidden: data.show_hidden,
+            console_height: data.console_height,
+            console_expanded: data.console_expanded,
+            terminal_log_mirroring_enabled: data.terminal_log_mirroring_enabled,
+            #[cfg(feature = "stt")]
+            stt_enabled: data.stt_enabled,
+            #[cfg(feature = "stt")]
+            stt_model_path: data.stt_model_path,
+            agent_presets: data.agent_presets,
+            quick_commands: data.quick_commands,
+            task_worktree_root: data.task_worktree_root.0,
+            max_concurrent_local_tasks: data.max_concurrent_local_tasks,
+            review: data.review,
+            chat: data.chat,
+            policy: data.policy,
+            usage: data.usage,
+            notifications: data.notifications,
+            pr_watch: data.pr_watch,
+            delegations: data.delegations,
+            work_notes: data.work_notes,
         }
     }
 }
 
-impl ChatDefaults {
-    /// The configured defaults, ignoring any remembered selection.
-    fn defaults(&self) -> ChatSelection {
-        ChatSelection {
-            model: self.default_model.clone(),
-            effort: self.default_effort.clone(),
-        }
-    }
-
-    /// What a new chat starts with: the last selection when remembering is
-    /// on and one exists, else the configured defaults.
-    pub fn new_chat_selection(&self) -> ChatSelection {
-        match &self.last {
-            Some(last) if self.remember_last => last.clone(),
-            _ => self.defaults(),
-        }
-    }
-
-    /// Record a model picked on a chat; the effort stays as the next new
-    /// chat would have it.
-    pub fn remember_model(&mut self, model: &str) {
-        let mut selection = self.new_chat_selection();
-        selection.model = model.to_string();
-        self.last = Some(selection);
-    }
-
-    /// Record an effort picked on a chat.
-    pub fn remember_effort(&mut self, effort: Option<&str>) {
-        let mut selection = self.new_chat_selection();
-        selection.effort = effort.map(str::to_string);
-        self.last = Some(selection);
-    }
-}
-
-/// Who reviews code when the chat tab's Review… button is pressed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum ReviewerKind {
-    /// A subagent spawned by the chat's own Claude through its Agent tool.
-    #[default]
-    ClaudeSubagent,
-    /// An independent `codex exec review` run owned by GitTerm (TRU-142).
-    Codex,
-}
-
-impl ReviewerKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ClaudeSubagent => "claude-subagent",
-            Self::Codex => "codex",
-        }
-    }
-}
-
-fn default_review_subagent_model() -> String {
-    "opus".to_string()
-}
-
-/// Concurrent Codex runs (reviews and consults) before new requests queue
-/// (TRU-142 decision D7).
-pub const DEFAULT_MAX_CONCURRENT_REVIEWS: usize = 2;
-
-fn default_max_concurrent_reviews() -> usize {
-    DEFAULT_MAX_CONCURRENT_REVIEWS
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewConfig {
-    #[serde(default)]
-    pub default_reviewer: ReviewerKind,
-    /// The Agent tool `model` a Claude-subagent review runs on.
-    #[serde(default = "default_review_subagent_model")]
-    pub subagent_model: String,
-    /// `codex -m <model>` for Codex reviews and consults; `None` keeps
-    /// Codex's configured default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex_model: Option<String>,
-    /// Codex runs (reviews and consults) that may run at once; further
-    /// requests wait as `requested` and start when a slot frees. Zero is
-    /// treated as 1.
-    #[serde(default = "default_max_concurrent_reviews")]
-    pub max_concurrent_reviews: usize,
-}
-
-impl Default for ReviewConfig {
-    fn default() -> Self {
+impl From<Config> for SettingsData {
+    fn from(data: Config) -> Self {
         Self {
-            default_reviewer: ReviewerKind::default(),
-            subagent_model: default_review_subagent_model(),
-            codex_model: None,
-            max_concurrent_reviews: default_max_concurrent_reviews(),
+            editor: data.editor,
+            terminal_font_size: data.terminal_font_size,
+            ui_font_size: data.ui_font_size,
+            chat_font_size: data.chat_font_size,
+            chat_width: data.chat_width,
+            sidebar_width: data.sidebar_width,
+            scrollback_lines: data.scrollback_lines,
+            font_size: data.font_size,
+            theme: data.theme,
+            show_hidden: data.show_hidden,
+            console_height: data.console_height,
+            console_expanded: data.console_expanded,
+            terminal_log_mirroring_enabled: data.terminal_log_mirroring_enabled,
+            #[cfg(feature = "stt")]
+            stt_enabled: data.stt_enabled,
+            #[cfg(feature = "stt")]
+            stt_model_path: data.stt_model_path,
+            agent_presets: data.agent_presets,
+            quick_commands: data.quick_commands,
+            task_worktree_root: SettingsWorktreeRoot(data.task_worktree_root),
+            max_concurrent_local_tasks: data.max_concurrent_local_tasks,
+            review: data.review,
+            chat: data.chat,
+            policy: data.policy,
+            usage: data.usage,
+            notifications: data.notifications,
+            pr_watch: data.pr_watch,
+            delegations: data.delegations,
+            work_notes: data.work_notes,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QuickCommand {
-    pub name: String,
-    pub command: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentPreset {
-    pub name: String,
-    pub command: String,
-    /// Command to resume the last session (e.g. "claude --resume", "codex resume")
-    #[serde(default)]
-    pub resume_command: Option<String>,
-    #[serde(default)]
-    pub icon: String,
-    #[serde(default = "default_agent_color")]
-    pub color: WorkspaceColor,
+impl Default for Config {
+    fn default() -> Self {
+        SettingsData::default().into()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -1831,6 +1495,21 @@ pub enum WorkspaceColor {
     Yellow,
     Red,
     Teal,
+}
+
+impl From<gitterm_core::settings::WorkspaceColor> for WorkspaceColor {
+    fn from(color: gitterm_core::settings::WorkspaceColor) -> Self {
+        match color {
+            gitterm_core::settings::WorkspaceColor::Lavender => Self::Lavender,
+            gitterm_core::settings::WorkspaceColor::Blue => Self::Blue,
+            gitterm_core::settings::WorkspaceColor::Green => Self::Green,
+            gitterm_core::settings::WorkspaceColor::Peach => Self::Peach,
+            gitterm_core::settings::WorkspaceColor::Pink => Self::Pink,
+            gitterm_core::settings::WorkspaceColor::Yellow => Self::Yellow,
+            gitterm_core::settings::WorkspaceColor::Red => Self::Red,
+            gitterm_core::settings::WorkspaceColor::Teal => Self::Teal,
+        }
+    }
 }
 
 impl WorkspaceColor {
@@ -1883,46 +1562,6 @@ impl WorkspaceColor {
             .copied()
             .unwrap_or_else(|| Self::from_index(used.len()))
     }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            editor: default_editor(),
-            terminal_font_size: 14.0,
-            ui_font_size: 13.0,
-            chat_font_size: default_chat_font(),
-            chat_width: ChatWidth::default(),
-            sidebar_width: 360.0,
-            scrollback_lines: 30_000,
-            font_size: None,
-            theme: "dark".to_string(),
-            show_hidden: true,
-            console_height: 200.0,
-            console_expanded: true,
-            terminal_log_mirroring_enabled: false,
-            #[cfg(feature = "stt")]
-            stt_enabled: true,
-            #[cfg(feature = "stt")]
-            stt_model_path: None,
-            agent_presets: default_agent_presets(),
-            quick_commands: Vec::new(),
-            task_worktree_root: default_task_worktree_root(),
-            max_concurrent_local_tasks: default_max_concurrent_local_tasks(),
-            review: ReviewConfig::default(),
-            chat: ChatDefaults::default(),
-            policy: gitterm::workers::ModelPolicy::default(),
-            usage: gitterm::usage::UsageConfig::default(),
-            notifications: NotificationsConfig::default(),
-            pr_watch: PrWatchConfig::default(),
-            delegations: DelegationsConfig::default(),
-            work_notes: WorkNotesConfig::default(),
-        }
-    }
-}
-
-fn default_editor() -> String {
-    "vscode".to_string()
 }
 
 /// The user's settings (TRU-181): every `Config` field, in the shared config
@@ -2684,3 +2323,7 @@ impl RemoteAgentsFile {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/settings_characterization.rs"]
+mod settings_characterization;
