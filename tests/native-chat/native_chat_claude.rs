@@ -200,10 +200,7 @@ fn native_chat_local_close_remote_detach_golden() {
     for (local, explicit_close) in [(true, false), (false, false), (false, true)] {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let session = ClaudeSession {
-            commands: tx,
-            shutdown_on_drop: local,
-            snapshots_closed: tokio_util::sync::CancellationToken::new(),
-            pid: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            inner: Session::from_port(tx, local),
         };
         if explicit_close {
             session.send(HarnessCommand::Shutdown).unwrap();
