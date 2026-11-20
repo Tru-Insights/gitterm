@@ -352,3 +352,39 @@ fn malformed_question_can_dismiss_and_retry_only_after_non_delivery(cx: &mut Tes
         });
     });
 }
+
+#[gpui::test]
+fn question_description_fits_selected_and_unselected_options(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let callback: IntentCallback = Rc::new(|_, _| panic!("selection must not submit"));
+        let card = cx.new(|cx| CardView::new(row(RuntimeRequestKind::Question { questions:json!([
+            {"question":"Which checks?", "multiSelect":true, "options":[{"label":"Unit", "description":"Run the focused checks and inspect the resulting output before continuing."}]}
+        ]) }), Some(callback), false, window, cx));
+        gpui_component::Root::new(card, window, cx)
+    });
+    let card = root.read_with(cx, |root, _| {
+        root.view().clone().downcast::<CardView>().unwrap()
+    });
+    cx.simulate_resize(gpui::size(px(320.), px(600.)));
+    for selected in [false, true] {
+        if selected {
+            card.update(cx, |card, cx| {
+                card.choose(0, Some("Unit".into()), cx);
+                card.choose(0, None, cx);
+            });
+        }
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        let button = cx.debug_bounds("question-option-0-0").unwrap();
+        let description = cx.debug_bounds("question-option-description-0-0").unwrap();
+        assert!(button.size.height > px(24.));
+        assert!(description.size.height > px(16.));
+        assert!(description.top() >= button.top());
+        assert!(description.bottom() <= button.bottom());
+        assert!(description.left() >= button.left());
+        assert!(description.right() <= button.right());
+    }
+}

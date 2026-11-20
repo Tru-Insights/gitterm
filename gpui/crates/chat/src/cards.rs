@@ -6,8 +6,8 @@ use crate::{
     view::IntentCallback,
 };
 use gpui::{
-    AppContext, Context, Entity, Focusable, IntoElement, ParentElement, Render, Styled,
-    Subscription, Window, div, px,
+    AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
+    Styled, Subscription, Window, div, px,
 };
 use gpui_component::{
     Disableable, Selectable, Sizable,
@@ -435,12 +435,25 @@ impl Render for CardView {
                                 content = content.child(
                                     Button::new(("option", index * 1000 + oi))
                                         .small()
-                                        .label(if option.description.is_empty() {
+                                        .h_auto()
+                                        .min_h(px(24.))
+                                        .py(px(4.))
+                                        .debug_selector(move || format!("question-option-{index}-{oi}"))
+                                        .accessibility_label(if option.description.is_empty() {
                                             label.clone()
                                         } else {
-                                            format!("{label}\n{}", option.description)
+                                            format!("{label}: {}", option.description)
                                         })
+                                        .child(div().flex().flex_col().w_full().items_start().whitespace_normal()
+                                            .child(label.clone())
+                                            .children((!option.description.is_empty()).then(|| div()
+                                                .debug_selector(move || format!("question-option-description-{index}-{oi}"))
+                                                .w_full()
+                                                .text_size(px(11.))
+                                                .line_height(px(16.))
+                                                .child(option.description.clone()))))
                                         .selected(draft.selected.contains(&label))
+                                        .toggled(draft.selected.contains(&label))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.choose(index, Some(label.clone()), cx)
                                         })),
@@ -451,6 +464,7 @@ impl Render for CardView {
                                     .small()
                                     .label("Other…")
                                     .selected(draft.other_on)
+                                    .toggled(draft.other_on)
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.choose(index, None, cx);
                                         if this.enabled() && this.drafts[index].other_on {
