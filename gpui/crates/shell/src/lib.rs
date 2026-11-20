@@ -1497,17 +1497,35 @@ impl Shell {
                 .flat_map(|w| &w.sessions)
                 .filter(|s| !bottom_pane_ids(state.unwrap(), cx).contains(&session_pane_id(s.id)))
                 .filter(|s| self.session_task(s.id, cx) == self.selected_task)
-                .map(|s| session_strip::Session {
-                    id: s.id,
-                    kind: s.kind,
-                    display_title: state.unwrap().panes[&session_pane_id(s.id)]
-                        .read(cx)
-                        .tab_title(),
-                    chat_title: (s.kind == data::SessionKind::Chat).then(|| s.title.clone()),
-                    task_session_label: None,
-                    attention: None,
-                    running: false,
-                    pending_requests: 0,
+                .map(|s| {
+                    let tab = saved.and_then(|saved| {
+                        data::iced_sessions(saved)
+                            .iter()
+                            .position(|session| session.id == s.id)
+                            .and_then(|index| saved.tabs.get(index))
+                    });
+                    // Imported UUIDs are identities, never chat titles. Until the
+                    // index resolves one, use Iced's ordinary folder fallback.
+                    let untitled = tab.is_some_and(|tab| {
+                        tab.chat_session_id.as_deref() == Some(s.title.as_str())
+                    });
+                    session_strip::Session {
+                        id: s.id,
+                        kind: s.kind,
+                        display_title: if untitled {
+                            tab.unwrap().dir.clone()
+                        } else {
+                            state.unwrap().panes[&session_pane_id(s.id)]
+                                .read(cx)
+                                .tab_title()
+                        },
+                        chat_title: (s.kind == data::SessionKind::Chat && !untitled)
+                            .then(|| s.title.clone()),
+                        task_session_label: None,
+                        attention: None,
+                        running: false,
+                        pending_requests: 0,
+                    }
                 })
                 .collect(),
             active: state.and_then(|w| w.active_session),
