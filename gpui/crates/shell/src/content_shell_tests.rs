@@ -145,6 +145,12 @@ fn zoomed_split_selects_its_content_and_non_content_zoom_hides_all_surfaces(
     });
     cx.update(|window, cx| {
         dock.update(cx, |dock, cx| {
+            dock.set_dock(
+                DockPlacement::Right,
+                DockLayout::tabs().panel_view(panel_handle(git.clone()), cx),
+                window,
+                cx,
+            );
             dock.set_center(
                 DockLayout::h_split()
                     .child(

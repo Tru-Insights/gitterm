@@ -41,7 +41,15 @@ impl Fixture {
         store.load().unwrap();
         let owner = cx.new(|cx| WorkspaceOwner::new(model, Some(store), cx));
         let data: Rc<dyn ShellData> = Rc::new(LocalData(owner.clone()));
-        Shell::with_owner(data, owner, &self.config, true, window, cx).unwrap()
+        let mut shell = Shell::with_owner(data, owner, &self.config, true, window, cx).unwrap();
+        for index in 0..shell.workspaces.len() {
+            shell.select_workspace(index, window, cx);
+            if shell.active(cx).sessions.is_empty() {
+                shell.new_terminal(window, cx);
+            }
+        }
+        shell.select_workspace(0, window, cx);
+        shell
     }
 }
 

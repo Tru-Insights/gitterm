@@ -16,6 +16,8 @@ mod owner;
 mod pane;
 mod park;
 pub mod preview;
+#[cfg(test)]
+mod region_tests;
 pub mod remote;
 mod review_reload;
 mod sessions;
@@ -34,9 +36,9 @@ use data::{Session, SessionId, ShellData, Workspace, WorkspaceId};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Action, Anchor, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable,
-    FontWeight, InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render,
-    Styled as _, Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
-    px, rgb, size,
+    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, Styled as _,
+    Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, px, rgb,
+    size,
 };
 use gpui_component::{
     Root, Selectable,
@@ -48,7 +50,7 @@ use gpui_component::{
     menu::{DropdownMenu, PopupMenuItem},
     tab::{Tab, TabBar},
 };
-use layout::LayoutStore;
+use layout::{LayoutStore, SidebarMode};
 use pane::{PANEL_NAME, Pane, PaneKind};
 use std::{
     collections::{HashMap, HashSet},
@@ -91,6 +93,9 @@ pub struct Shell {
     local: bool,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
+    resize: Option<(bool, f32, f32)>,
+    #[cfg(test)]
+    dock_fixture: bool,
 }
 impl Shell {
     #[cfg(test)]
@@ -114,9 +119,6 @@ impl Shell {
     ) -> Result<Self> {
         gitterm_gpui_chat::init(cx);
         gitterm_gpui_review::init(cx);
-        if local {
-            cx.bind_keys([KeyBinding::new("cmd-t", NewTerminal, Some("GitTermShell"))]);
-        }
         let content = cx.new(|cx| content::window::ContentWindow::new(window, cx));
         let catalog = data.workspaces(cx);
         let saved_parked = if local {
@@ -240,6 +242,9 @@ impl Shell {
             local,
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
+            resize: None,
+            #[cfg(test)]
+            dock_fixture: false,
         };
         shell.restore_parked(saved_parked, cx);
         Ok(shell)
@@ -407,12 +412,6 @@ impl Shell {
         // Use the event's workspace even if selection changed before delivery.
         self.show_workspace_pane(event.workspace, &id, window, cx);
     }
-    fn add_folder_button(&self, cx: &Context<Self>) -> Button {
-        Button::new("add-folder")
-            .ghost()
-            .label("Add folder…")
-            .on_click(cx.listener(|this, _, window, cx| this.pick_folder(window, cx)))
-    }
     fn pick_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.content.update(cx, |content, cx| {
             content.picker = true;
@@ -525,7 +524,10 @@ impl Shell {
             .workspaces
             .iter()
             .find(|w| Some(w.workspace.id) == self.active_workspace(cx))
-            .is_some_and(|w| pane_visible(w, "git", cx));
+            .is_some_and(|w| {
+                !w.store.regions.sidebar_collapsed
+                    && w.store.regions.sidebar_mode == SidebarMode::Files
+            });
         let reviews: Vec<_> = self
             .workspaces
             .iter()
@@ -658,6 +660,14 @@ impl Shell {
         self.show_pane(&pane_id, window, cx);
     }
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_terminal_in(DockPlacement::Center, window, cx);
+    }
+    fn new_terminal_in(
+        &mut self,
+        placement: DockPlacement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.local || !self.workspaces.iter().any(|state| state.on_bar()) {
             return;
         }
@@ -719,7 +729,16 @@ impl Shell {
             .as_mut()
             .expect("local sessions")
             .push(layout::TerminalSession { id, cwd });
-        state.active_session = Some(SessionId(id));
+        if placement == DockPlacement::Center {
+            state.active_session = Some(SessionId(id));
+        }
+        if placement == DockPlacement::Bottom {
+            let pane = state.panes[&pane_id].clone();
+            state.dock.update(cx, |dock, cx| {
+                dock.add_panel_view(panel_handle(pane), placement, None, window, cx);
+            });
+            state.store.regions.bottom_visible = true;
+        }
         self.show_pane(&pane_id, window, cx);
     }
     #[cfg(test)]
@@ -826,12 +845,6 @@ fn load_workspace_layout(
                 }
             });
         }
-        let run = state.panes[&format!("workspace-{}-run", state.workspace.layout_key)].clone();
-        state.dock.update(cx, |dock, cx| {
-            if dock.panel(PanelId::from(run.entity_id())).is_none() {
-                dock.add_panel_view(panel_handle(run), DockPlacement::Bottom, None, window, cx);
-            }
-        });
         save_layout(state, cx);
     }
     Ok(())
@@ -992,16 +1005,7 @@ fn build_workspace(
             eprintln!("load terminal sessions {}: {error:#}", store.path.display());
             None
         });
-        let cwd = data
-            .terminal_cwd(workspace.id, cx)
-            .expect("local workspace folder");
-        let mut terminals = restored.unwrap_or_else(|| {
-            vec![layout::TerminalSession {
-                // The old single dock terminal used the bare folder hash.
-                id: layout::stable_path_hash(&cwd).wrapping_add(1),
-                cwd,
-            }]
-        });
+        let mut terminals = restored.unwrap_or_default();
         // An identity already owned elsewhere cannot construct a second pane.
         terminals.retain(|session| !session_ids.contains(&session.id));
         let sessions = terminals
@@ -1057,30 +1061,6 @@ fn build_workspace(
         });
         panes.insert(id, pane);
     }
-    if local {
-        let id = format!("workspace-{}-run", workspace.layout_key);
-        panes.insert(
-            id.clone(),
-            cx.new(|cx| {
-                Pane::new(
-                    id,
-                    "Run terminal".into(),
-                    if stopped {
-                        PaneKind::StoppedTerminal(
-                            data.terminal_cwd(workspace.id, cx).expect("local folder"),
-                            false,
-                        )
-                    } else {
-                        PaneKind::Terminal
-                    },
-                    workspace.id,
-                    data.clone(),
-                    window,
-                    cx,
-                )
-            }),
-        );
-    }
     for (name, title, kind) in [
         ("git", "Git status", PaneKind::Git),
         ("files", "Files", PaneKind::Files),
@@ -1134,30 +1114,420 @@ fn default_layout(state: &WorkspaceDock, window: &mut Window, cx: &mut App) {
             center = center.panel_view(pane, cx);
         }
     }
-    if state.store.terminals.is_some() {
-        let run = state.panes[&format!("workspace-{}-run", state.workspace.layout_key)].clone();
-        bottom = bottom.panel_view(panel_handle(run), cx);
-        has_terminal = true;
-    }
-    let git = state.panes[&format!("workspace-{}-git", state.workspace.layout_key)].clone();
-    let files = state.panes[&format!("workspace-{}-files", state.workspace.layout_key)].clone();
     state.dock.update(cx, |dock, cx| {
         dock.set_center(DockLayout::h_split().child(center, None), window, cx);
-        dock.set_dock(
-            DockPlacement::Right,
-            DockLayout::tabs()
-                .panel_view(panel_handle(git), cx)
-                .panel_view(panel_handle(files), cx),
-            window,
-            cx,
-        );
-        dock.set_dock_size(DockPlacement::Right, px(300.), window, cx);
         if has_terminal {
             dock.set_dock(DockPlacement::Bottom, bottom, window, cx);
-            dock.set_dock_size(DockPlacement::Bottom, px(265.), window, cx);
+            dock.set_dock_size(DockPlacement::Bottom, px(200.), window, cx);
         }
     });
 }
+impl Shell {
+    fn spine(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let p = Palette::current(cx);
+        div()
+            .id("spine")
+            .debug_selector(|| "spine".into())
+            .w(px(layout::SPINE_WIDTH + 1.))
+            .h_full()
+            .flex_shrink_0()
+            .border_r_1()
+            .border_color(rgb(p.surface))
+            .bg(rgb(p.mantle))
+            .flex()
+            .flex_col()
+            .children(
+                self.workspaces
+                    .iter()
+                    .filter(|w| w.on_bar())
+                    .enumerate()
+                    .map(|(index, state)| {
+                        Button::new(("spine-workspace", index))
+                            .ghost()
+                            .label(
+                                state
+                                    .workspace
+                                    .name
+                                    .chars()
+                                    .take(2)
+                                    .collect::<String>()
+                                    .to_uppercase(),
+                            )
+                            .tooltip(state.workspace.name.clone())
+                            .w(px(36.))
+                            .h(px(36.))
+                            .selected(Some(state.workspace.id) == self.active_workspace(cx))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.select_workspace(index, window, cx)
+                            }))
+                    }),
+            )
+    }
+    fn workspace_bar_items(&self, cx: &App) -> Vec<(usize, WorkspaceId, String)> {
+        self.workspaces
+            .iter()
+            .filter(|w| w.on_bar())
+            .enumerate()
+            .map(|(index, state)| {
+                let active = Some(state.workspace.id) == self.active_workspace(cx);
+                let label = if active {
+                    state.workspace.name.clone()
+                } else {
+                    state
+                        .workspace
+                        .name
+                        .chars()
+                        .take(2)
+                        .collect::<String>()
+                        .to_uppercase()
+                };
+                (index, state.workspace.id, label)
+            })
+            .collect()
+    }
+    fn workspace_bar(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let p = Palette::current(cx);
+        div()
+            .id("workspace-bar")
+            .debug_selector(|| "workspace-bar".into())
+            .h(px(layout::WORKSPACE_BAR_HEIGHT))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .bg(rgb(p.mantle))
+            .border_t_1()
+            .border_color(rgb(p.surface))
+            .children(
+                self.workspace_bar_items(cx)
+                    .into_iter()
+                    .map(|(index, id, label)| {
+                        div()
+                            .id(("workspace-chip", index))
+                            .debug_selector(move || format!("workspace-chip-{index}"))
+                            .h_full()
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .bg(rgb(if Some(id) == self.active_workspace(cx) {
+                                p.surface
+                            } else {
+                                p.mantle
+                            }))
+                            .child(
+                                Button::new(("workspace", index))
+                                    .ghost()
+                                    .selected(Some(id) == self.active_workspace(cx))
+                                    .label(label)
+                                    .h(px(27.))
+                                    .accessibility_label(
+                                        self.workspaces
+                                            .iter()
+                                            .find(|w| w.workspace.id == id)
+                                            .expect("bar workspace")
+                                            .workspace
+                                            .name
+                                            .clone(),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.select_workspace(index, window, cx)
+                                    })),
+                            )
+                    }),
+            )
+            .child(
+                Button::new("new-workspace")
+                    .ghost()
+                    .label("+")
+                    .tooltip("New workspace")
+                    .h(px(27.))
+                    .on_click(cx.listener(|this, _, window, cx| this.pick_folder(window, cx))),
+            )
+    }
+    fn update_regions(
+        &mut self,
+        change: impl FnOnce(&mut layout::RegionLayout),
+        cx: &mut Context<Self>,
+    ) {
+        let active = self.active_workspace(cx);
+        if let Some(state) = self
+            .workspaces
+            .iter_mut()
+            .find(|w| Some(w.workspace.id) == active)
+        {
+            change(&mut state.store.regions);
+            save_layout(state, cx);
+        }
+        self.sync_git_visibility(true, cx);
+        cx.notify();
+    }
+    fn sidebar(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let state = self.active(cx);
+        let regions = &state.store.regions;
+        let p = Palette::current(cx);
+        let mut sidebar = div()
+            .id("sidebar")
+            .debug_selector(|| "sidebar".into())
+            .w(px(regions.sidebar_size()))
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .bg(rgb(p.mantle))
+            .overflow_hidden();
+        let mut modes = div()
+            .flex()
+            .when(regions.sidebar_collapsed, |row| row.flex_col());
+        for (mode, title, icon) in [
+            (SidebarMode::Work, "Work", "W"),
+            (SidebarMode::Files, "Files", "F"),
+            (SidebarMode::Find, "Find", "⌕"),
+        ] {
+            modes = modes.child(
+                Button::new(title)
+                    .ghost()
+                    .label(if regions.sidebar_collapsed {
+                        icon
+                    } else {
+                        title
+                    })
+                    .tooltip(title)
+                    .h(px(36.))
+                    .selected(regions.sidebar_mode == mode)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.update_regions(
+                            |regions| {
+                                regions.sidebar_mode = mode;
+                                regions.sidebar_collapsed = false;
+                            },
+                            cx,
+                        )
+                    })),
+            );
+        }
+        sidebar = sidebar.child(modes).child(
+            Button::new("collapse-sidebar")
+                .ghost()
+                .label(if regions.sidebar_collapsed {
+                    "›"
+                } else {
+                    "‹"
+                })
+                .tooltip(if regions.sidebar_collapsed {
+                    "Expand sidebar"
+                } else {
+                    "Collapse sidebar"
+                })
+                .h(px(28.))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.update_regions(|r| r.sidebar_collapsed = !r.sidebar_collapsed, cx)
+                })),
+        );
+        if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Files {
+            for (kind, title) in [("git", "Git"), ("files", "Files")] {
+                sidebar = sidebar.child(div().px_2().child(title)).child(
+                    div().flex_1().min_h_0().child(
+                        state.panes[&format!("workspace-{}-{kind}", state.workspace.layout_key)]
+                            .clone(),
+                    ),
+                );
+            }
+        }
+        sidebar
+    }
+    fn start_resize(
+        &mut self,
+        bottom: bool,
+        position: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let regions = &self.active(cx).store.regions;
+        self.resize = Some((
+            bottom,
+            position,
+            if bottom {
+                regions.bottom_height
+            } else {
+                regions.sidebar_width
+            },
+        ));
+        self.content.update(cx, |content, cx| {
+            content.resizing = true;
+            content.sync_covers(window, cx);
+        });
+        cx.stop_propagation();
+    }
+    fn finish_resize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.resize.take().is_none() {
+            return;
+        }
+        let active = self.active_workspace(cx);
+        if let Some(state) = self
+            .workspaces
+            .iter_mut()
+            .find(|w| Some(w.workspace.id) == active)
+        {
+            save_layout(state, cx);
+        }
+        self.content.update(cx, |content, cx| {
+            content.resizing = false;
+            content.sync_covers(window, cx);
+        });
+    }
+    fn sidebar_divider(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let collapsed = self.active(cx).store.regions.sidebar_collapsed;
+        div()
+            .id("sidebar-divider")
+            .debug_selector(|| "sidebar-divider".into())
+            .w(px(if collapsed { 1. } else { 4. }))
+            .h_full()
+            .flex_shrink_0()
+            .bg(rgb(Palette::current(cx).surface))
+            .cursor_col_resize()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    if !collapsed {
+                        this.start_resize(false, f32::from(event.position.x), window, cx);
+                    }
+                }),
+            )
+    }
+    fn session_content(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let state = self.active(cx);
+        #[cfg(test)]
+        if self.dock_fixture {
+            return div()
+                .id("dock-fixture")
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .child(state.dock.clone());
+        }
+        let selected = self
+            .content
+            .read(cx)
+            .selected
+            .as_ref()
+            .and_then(|id| state.panes.get(id));
+        let bottom = bottom_pane_ids(state, cx);
+        let active = state.active_session.map(session_pane_id);
+        let pane = selected
+            .or_else(|| {
+                active
+                    .as_ref()
+                    .filter(|id| pane_id_visible(state, id, cx) && !bottom.contains(id))
+                    .and_then(|id| state.panes.get(id))
+            })
+            .or_else(|| {
+                state
+                    .panes
+                    .iter()
+                    .find(|(id, _)| {
+                        !id.ends_with("-git")
+                            && !id.ends_with("-files")
+                            && pane_id_visible(state, id, cx)
+                            && !bottom.contains(id)
+                    })
+                    .map(|(_, pane)| pane)
+            });
+        div()
+            .id("session-content")
+            .debug_selector(|| "session-content".into())
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_hidden()
+            .children(pane.cloned())
+    }
+    fn bottom_panel(&self, cx: &Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
+        let state = self.active(cx);
+        let ids = bottom_pane_ids(state, cx);
+        let pane = ids.iter().find_map(|id| {
+            state
+                .panes
+                .get(id)
+                .filter(|_| pane_id_visible(state, id, cx))
+        });
+        if !state.store.regions.has_bottom(pane.is_some()) {
+            return None;
+        }
+        Some(
+            div()
+                .id("bottom-region")
+                .flex()
+                .flex_col()
+                .flex_shrink_0()
+                .child(
+                    div()
+                        .id("bottom-divider")
+                        .debug_selector(|| "bottom-divider".into())
+                        .h(px(layout::BOTTOM_DIVIDER))
+                        .flex_shrink_0()
+                        .cursor_row_resize()
+                        .bg(rgb(Palette::current(cx).surface))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                                this.start_resize(true, f32::from(event.position.y), window, cx);
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("bottom-panel")
+                        .debug_selector(|| "bottom-panel".into())
+                        .h(px(state.store.regions.bottom_height))
+                        .overflow_hidden()
+                        .children(pane.cloned()),
+                ),
+        )
+    }
+    fn open_bottom_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.local {
+            return;
+        }
+        let existing = bottom_pane_ids(self.active(cx), cx);
+        if !existing.is_empty() {
+            let state = self.active(cx);
+            if !state.dock.read(cx).is_dock_open(DockPlacement::Bottom) {
+                state.dock.update(cx, |dock, cx| {
+                    dock.toggle_dock(DockPlacement::Bottom, window, cx)
+                });
+            }
+            self.update_regions(|r| r.bottom_visible = !r.bottom_visible, cx);
+            return;
+        }
+        self.new_terminal_in(DockPlacement::Bottom, window, cx);
+        let active = self.active_workspace(cx);
+        let state = self
+            .workspaces
+            .iter_mut()
+            .find(|w| Some(w.workspace.id) == active)
+            .unwrap();
+        save_layout(state, cx);
+        cx.notify();
+    }
+}
+fn bottom_pane_ids(state: &WorkspaceDock, cx: &App) -> Vec<String> {
+    let mut layout = state.dock.read(cx).dump(cx);
+    let Some(bottom) = layout.bottom_dock.take() else {
+        return vec![];
+    };
+    layout.center = bottom.panel().clone();
+    layout.left_dock = None;
+    layout.right_dock = None;
+    layout::pane_order(&layout)
+        .into_iter()
+        .filter(|id| {
+            state.sessions.iter().any(|session| {
+                session.kind == data::SessionKind::Terminal && session_pane_id(session.id) == *id
+            })
+        })
+        .collect()
+}
+
 impl Focusable for Shell {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -1173,19 +1543,39 @@ impl Render for Shell {
             return div()
                 .size_full()
                 .flex()
-                .flex_col()
-                .p_4()
-                .gap_3()
-                .child("No local workspaces yet")
-                .child("Add a local folder to see live Git status.")
-                .child(self.add_folder_button(cx))
-                .child(self.parked_controls(cx))
-                .children(
-                    self.owner
-                        .read(cx)
-                        .error
-                        .clone()
-                        .map(|error| div().text_color(rgb(p.red)).child(error)),
+                .bg(rgb(p.base))
+                .text_color(rgb(p.text))
+                .child(self.spine(cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .h(px(layout::SESSION_HEIGHT + 1.))
+                                .flex_shrink_0()
+                                .border_b_1()
+                                .border_color(rgb(p.surface)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .p_4()
+                                .child("No local workspaces yet")
+                                .child(self.parked_controls(cx))
+                                .children(
+                                    self.owner
+                                        .read(cx)
+                                        .error
+                                        .clone()
+                                        .map(|error| div().text_color(rgb(p.red)).child(error)),
+                                ),
+                        )
+                        .child(self.workspace_bar(cx)),
                 )
                 .into_any_element();
         }
@@ -1198,134 +1588,11 @@ impl Render for Shell {
             .active_session
             .and_then(|id| state.sessions.iter().position(|s| s.id == id))
             .unwrap_or(0);
-        let sidebar = div()
-            .flex()
-            .flex_col()
-            .w(px(224.))
-            .flex_shrink_0()
-            .h_full()
-            .bg(rgb(p.mantle))
-            .border_r_1()
-            .border_color(rgb(p.surface))
-            .p_3()
-            .gap_2()
-            .child(
-                div()
-                    .text_size(px(16.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("GitTerm"),
-            )
-            .child(div().text_color(rgb(p.muted)).mb_4().child("Workspaces"))
-            .when(self.local, |sidebar| {
-                sidebar.child(self.add_folder_button(cx))
-            })
-            .children(
-                self.workspaces
-                    .iter()
-                    .filter(|state| state.on_bar())
-                    .enumerate()
-                    .map(|(index, state)| {
-                        let workspace = &state.workspace;
-                        let status = self.data.status(workspace.id, cx);
-                        let count = status.files.len();
-                        // Not polled yet: don't show the placeholder "0 main".
-                        let (count_label, branch_label) = if status.checked {
-                            (count.to_string(), status.branch.clone())
-                        } else {
-                            (String::new(), "Not checked yet".to_string())
-                        };
-                        Button::new(("workspace", index))
-                            .ghost()
-                            .selected(Some(workspace.id) == self.active_workspace(cx))
-                            .accessibility_label(if status.checked {
-                                format!("{}, {}, {} changes", workspace.name, status.branch, count)
-                            } else {
-                                format!("{}, not checked yet", workspace.name)
-                            })
-                            .h(px(62.))
-                            .w_full()
-                            .flex()
-                            .flex_col()
-                            .items_start()
-                            .p_2()
-                            .rounded_md()
-                            .bg(rgb(if Some(workspace.id) == self.active_workspace(cx) {
-                                p.surface
-                            } else {
-                                p.mantle
-                            }))
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .child(workspace.name.clone())
-                                    .child(div().text_color(rgb(p.blue)).child(count_label)),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(p.muted))
-                                    .child(branch_label),
-                            )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.select_workspace(index, window, cx)
-                            }))
-                    }),
-            )
-            .child(self.parked_controls(cx))
-            .child(
-                div()
-                    .mt_4()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .text_color(rgb(p.muted))
-                    .child("Repositories")
-                    .child(
-                        Button::new("new-task")
-                            .ghost()
-                            .label("+")
-                            .tooltip("New task")
-                            .on_click({
-                                let repository = repository.clone();
-                                let content = self.content.clone();
-                                move |_, window, cx| {
-                                    dialogs::new_task(repository.clone(), window, cx);
-                                    content
-                                        .update(cx, |content, cx| content.sync_covers(window, cx));
-                                }
-                            }),
-                    ),
-            )
-            .children(
-                state
-                    .workspace
-                    .repositories
-                    .iter()
-                    .map(|repo| div().p_2().child(format!("⌄  {repo}"))),
-            )
-            .child(
-                div().pl_4().text_color(rgb(p.muted)).child(
-                    self.data
-                        .status(self.active_workspace(cx).expect("active workspace"), cx)
-                        .branch,
-                ),
-            )
-            .child(div().flex_1())
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(rgb(p.muted))
-                    .child(if self.local {
-                        "Local · Live Git status"
-                    } else {
-                        "Local · GPUI sample data"
-                    }),
-            );
+        let sidebar = self.sidebar(cx);
         let tabs = TabBar::new("sessions")
             .underline()
             .selected_index(active_session)
-            .h(px(38.))
+            .h(px(layout::SESSION_HEIGHT))
             .children(state.sessions.iter().map(|s| {
                 Tab::from(if self.local {
                     state.panes[&session_pane_id(s.id)].read(cx).tab_title()
@@ -1357,12 +1624,6 @@ impl Render for Shell {
             .find(|session| Some(session.id) == close_session)
             .map(|session| format!("Close {} permanently", session.title))
             .unwrap_or_else(|| "Close session permanently".into());
-        let mut panes: Vec<_> = state
-            .panes
-            .iter()
-            .map(|(id, pane)| (id.clone(), pane.read(cx).title.clone()))
-            .collect();
-        panes.sort_by(|a, b| a.0.cmp(&b.0));
         let chat_owner = weak.clone();
         let history_owner = weak.clone();
         let history = self
@@ -1380,7 +1641,6 @@ impl Render for Shell {
                 let history = history.clone();
                 let repository = repository.clone();
                 let weak = weak.clone();
-                let panes = panes.clone();
                 let close_owner = weak.clone();
                 let park_owner = weak.clone();
                 let stop_target = workspace_target.clone();
@@ -1394,6 +1654,23 @@ impl Render for Shell {
                                 .update(cx, |shell, cx| shell.new_claude_chat(None, window, cx));
                         }),
                 )
+                .item({
+                    let owner = weak.clone();
+                    PopupMenuItem::new("New terminal")
+                        .disabled(!local)
+                        .on_click(move |_, window, cx| {
+                            _ = owner.update(cx, |shell, cx| shell.new_terminal(window, cx));
+                        })
+                })
+                .item({
+                    let owner = weak.clone();
+                    PopupMenuItem::new("Open bottom terminal")
+                        .disabled(!local)
+                        .on_click(move |_, window, cx| {
+                            _ = owner
+                                .update(cx, |shell, cx| shell.open_bottom_terminal(window, cx));
+                        })
+                })
                 .submenu("Claude preview history", window, cx, move |menu, _, _| {
                     history.iter().fold(menu, |menu, saved| {
                         let owner = history_owner.clone();
@@ -1420,17 +1697,6 @@ impl Render for Shell {
                         .on_click(|_, w, cx| dialogs::shortcuts(w, cx)),
                 )
                 .separator()
-                .submenu("Show pane", window, cx, move |menu, _, _| {
-                    panes.iter().fold(menu, |menu, (id, title)| {
-                        let weak = weak.clone();
-                        let id = id.clone();
-                        menu.item(PopupMenuItem::new(title.clone()).on_click(
-                            move |_, window, cx| {
-                                _ = weak.update(cx, |this, cx| this.show_pane(&id, window, cx));
-                            },
-                        ))
-                    })
-                })
                 .item(
                     PopupMenuItem::new("Park workspace · stop terminals")
                         .disabled(!can_park)
@@ -1496,31 +1762,21 @@ impl Render for Shell {
                         );
                     }),
                 )
-                .separator()
-                .item(PopupMenuItem::label("Browser stopped · sample"))
-                .item(PopupMenuItem::new("Open browser").on_click(|_, w, cx| {
-                    dialogs::notice("Open browser · sample action only", w, cx)
-                }))
             });
         let mut content = div().flex_1().min_w_0().h_full().flex().flex_col().child(
             div()
                 .flex()
                 .items_center()
-                .h(px(38.))
+                .h(px(layout::SESSION_HEIGHT))
                 .bg(rgb(p.mantle))
                 .child(div().flex_1().min_w_0().child(tabs))
-                .when(self.local, |bar| {
-                    bar.child(
-                        Button::new("new-terminal")
-                            .ghost()
-                            .label("+")
-                            .tooltip("New terminal · ⌘T")
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.new_terminal(window, cx)),
-                            ),
-                    )
-                })
-                .child(more),
+                .child(more)
+                .border_b_1()
+                .border_color(rgb(p.surface))
+                .h(px(layout::SESSION_HEIGHT + 1.))
+                .flex_shrink_0()
+                .id("session-strip")
+                .debug_selector(|| "session-strip".into()),
         );
         if let Some(error) = &self.owner.read(cx).error {
             content = content.child(div().p_2().text_color(rgb(p.red)).child(error.clone()));
@@ -1554,8 +1810,55 @@ impl Render for Shell {
             .text_size(px(UI_FONT_SIZE))
             .text_color(rgb(p.text))
             .bg(rgb(p.base))
-            .child(sidebar)
-            .child(content.child(div().flex_1().min_h_0().child(state.dock.clone())))
+            .on_mouse_move(
+                cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
+                    if let Some((bottom, start, original)) = this.resize {
+                        let active = this.active_workspace(cx);
+                        if let Some(state) = this
+                            .workspaces
+                            .iter_mut()
+                            .find(|w| Some(w.workspace.id) == active)
+                        {
+                            if bottom {
+                                state.store.regions.bottom_height =
+                                    (original + start - f32::from(event.position.y)).clamp(
+                                        32.,
+                                        (f32::from(window.viewport_size().height) - 140.).max(32.),
+                                    );
+                            } else {
+                                state
+                                    .store
+                                    .regions
+                                    .resize_sidebar(original + f32::from(event.position.x) - start);
+                            }
+                            cx.notify();
+                        }
+                    }
+                }),
+            )
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.finish_resize(window, cx)),
+            )
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.finish_resize(window, cx)),
+            )
+            .child(self.spine(cx))
+            .child(
+                content
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .child(sidebar)
+                            .child(self.sidebar_divider(cx))
+                            .child(self.session_content(cx)),
+                    )
+                    .children(self.bottom_panel(cx))
+                    .child(self.workspace_bar(cx)),
+            )
             .into_any_element()
     }
 }
@@ -1622,7 +1925,7 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
-                    size(px(1440.), px(900.)),
+                    size(px(layout::WINDOW_WIDTH), px(layout::WINDOW_HEIGHT)),
                     cx,
                 ))),
                 titlebar: Some(TitlebarOptions {
@@ -1781,6 +2084,7 @@ mod tests {
         assert_eq!(store.load().unwrap(), [repo.path().canonicalize().unwrap()]);
         // Local terminals start in their workspace folder, not $HOME.
         let folder = repo.path().canonicalize().unwrap();
+        cx.update(|window, cx| shell.update(cx, |shell, cx| shell.new_terminal(window, cx)));
         cx.read(|cx| {
             let state = shell.read(cx).active(cx);
             let terminals: Vec<_> = state
@@ -1895,6 +2199,16 @@ mod tests {
                 ],
                 state.panes["workspace-1-git"].clone(),
             )
+        });
+        cx.update(|window, cx| {
+            dock.update(cx, |dock, cx| {
+                dock.set_dock(
+                    DockPlacement::Right,
+                    DockLayout::tabs().panel_view(panel_handle(git.clone()), cx),
+                    window,
+                    cx,
+                );
+            })
         });
         let terminal = cx.read(|cx| terminal(&held[1], cx));
         terminal.update_in(cx, |view, _, _| {
@@ -2015,6 +2329,7 @@ mod tests {
         let (shell, cx) = cx.add_window_view(|w, cx| {
             Shell::new(Rc::new(data::SampleData), dir.path(), w, cx).unwrap()
         });
+        shell.update(cx, |shell, _| shell.dock_fixture = true);
         let (first, second, dock) = cx.read(|cx| {
             let shell = shell.read(cx);
             (
@@ -2041,7 +2356,7 @@ mod tests {
                 );
             })
         });
-        cx.simulate_resize(size(px(1440.), px(900.)));
+        cx.simulate_resize(size(px(layout::WINDOW_WIDTH), px(layout::WINDOW_HEIGHT)));
         draw(cx);
         let first_view = cx.read(|cx| terminal(&first, cx));
         let second_view = cx.read(|cx| terminal(&second, cx));
@@ -2167,7 +2482,7 @@ mod tests {
             );
             let dock = state.dock.clone();
             assert!(dock.read(cx).has_dock(DockPlacement::Bottom));
-            assert!(dock.read(cx).has_dock(DockPlacement::Right));
+            assert!(!dock.read(cx).has_dock(DockPlacement::Right));
             assert!(
                 dock.read(cx)
                     .panel(PanelId::from(state.panes["session-11"].entity_id()))

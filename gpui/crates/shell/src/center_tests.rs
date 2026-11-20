@@ -13,7 +13,7 @@ fn local_shell(
     let mut model = WorkspaceStatus::default();
     model.add(folder.to_path_buf(), Instant::now());
     let owner = cx.new(|cx| WorkspaceOwner::new(model, None, cx));
-    Shell::with_owner(
+    let mut shell = Shell::with_owner(
         Rc::new(data::LocalData(owner.clone())),
         owner,
         config,
@@ -21,7 +21,11 @@ fn local_shell(
         window,
         cx,
     )
-    .unwrap()
+    .unwrap();
+    if shell.active(cx).sessions.is_empty() {
+        shell.new_terminal(window, cx);
+    }
+    shell
 }
 fn view(shell: &Entity<Shell>, index: usize, cx: &App) -> Entity<TerminalView> {
     let state = shell.read(cx).active(cx);
@@ -85,7 +89,7 @@ fn center_startup_new_terminal_close_reaps_and_hidden_exit_updates_title(cx: &mu
                 .unwrap()
                 .contains_panel(PanelId::from(pane.entity_id()))
         );
-        assert!(state.dock.read(cx).layout(DockPlacement::Bottom).is_some());
+        assert!(state.dock.read(cx).layout(DockPlacement::Bottom).is_none());
         assert_eq!(
             pane.read(cx).tab_title(),
             folder.file_name().unwrap().to_str().unwrap()
@@ -114,15 +118,15 @@ fn center_startup_new_terminal_close_reaps_and_hidden_exit_updates_title(cx: &mu
         .trim()
         .to_string();
     assert!(process_exists(&pid));
-    // Inspect the actual binding with terminal focus, then dispatch its action.
+    // Explicit terminal action remains available; Cmd+T is reserved for the
+    // Iced session flow, rather than allocating a terminal implicitly.
     cx.update(|window, cx| {
         first.read(cx).focus_handle().clone().focus(window, cx);
         window.draw(cx).clear(cx);
-        let bindings = window.bindings_for_action_in(&NewTerminal, first.read(cx).focus_handle());
-        assert_eq!(bindings.len(), 1);
-        assert_eq!(
-            bindings[0].keystrokes(),
-            KeyBinding::new("cmd-t", NewTerminal, Some("GitTermShell")).keystrokes()
+        assert!(
+            window
+                .bindings_for_action_in(&NewTerminal, first.read(cx).focus_handle())
+                .is_empty()
         );
         window.dispatch_action(Box::new(NewTerminal), cx);
     });
