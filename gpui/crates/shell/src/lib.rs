@@ -41,6 +41,7 @@ pub mod session_strip;
 mod sessions;
 pub mod settings;
 pub mod spine;
+pub mod task_switcher;
 pub mod tasks;
 mod theme;
 pub mod usage;
