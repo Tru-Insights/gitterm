@@ -163,11 +163,14 @@ fn runtime_stamps_reject_replacements_and_every_session_binding() {
             _ => changed.task_session_id = Some("other".into()),
         }
         assert!(!state.accepts_runtime(&stamp, &changed));
+        assert_eq!(state.accepts_stream(&stamp, &changed), field >= 2);
     }
     state.begin_runtime();
     assert!(!state.accepts_runtime(&stamp, &target()));
+    assert!(!state.accepts_stream(&stamp, &target()));
     let replacement = State::default();
     assert!(!replacement.accepts_runtime(&state.runtime_stamp(target()), &target()));
+    assert!(!replacement.accepts_stream(&state.runtime_stamp(target()), &target()));
 }
 
 #[test]
@@ -345,4 +348,50 @@ fn remote_echo_deduplicates_ids_and_never_collapses_equal_text() {
         }),
         Effect::Rejected(_)
     ));
+}
+
+#[test]
+fn history_source_survives_task_rebinding_but_commands_keep_full_binding() {
+    let mut state = State::default();
+    state.reduce(Intent::BindSession(Some("synthetic-session".into())));
+    let read = load(&mut state);
+    let stream = state.runtime_stamp(target());
+    let mut attached = target();
+    attached.task_id = Some("synthetic-task".into());
+    attached.task_session_id = Some("attached-child".into());
+    for child in ["attached-child", "resumed-child"] {
+        attached.task_session_id = Some(child.into());
+        assert!(state.accepts_stream(&stream, &attached));
+        assert!(state.accepts_history(&read, &attached, AgentBackend::Claude));
+        assert!(!state.accepts_runtime(&stream, &attached));
+        state.reduce(Intent::Event(request("permission-1", false)));
+        assert!(matches!(
+            state.reduce(Intent::Answer {
+                runtime: stream.clone(),
+                current: attached.clone(),
+                request_id: "permission-1".into(),
+                decision: RuntimeDecision::Deny {
+                    message: "Synthetic denial".into()
+                },
+                process_running: true
+            }),
+            Effect::Rejected(_)
+        ));
+        let current = state.runtime_stamp(attached.clone());
+        assert!(matches!(
+            state.reduce(Intent::Answer {
+                runtime: current,
+                current: attached.clone(),
+                request_id: "permission-1".into(),
+                decision: RuntimeDecision::Deny {
+                    message: "Synthetic denial".into()
+                },
+                process_running: true
+            }),
+            Effect::Send { .. }
+        ));
+    }
+    attached.session_uid = "replacement-caller".into();
+    assert!(!state.accepts_history(&read, &attached, AgentBackend::Claude));
+    assert!(!state.accepts_stream(&stream, &attached));
 }

@@ -24083,9 +24083,16 @@ fi
         // Validate complete chat ingress before even the common focus/heartbeat
         // effects. Normalize synchronously so no target can change in between.
         let admitted = match &event {
-            Event::AgentRuntimeEvent(stamp, _)
-            | Event::AgentRuntimeAnswer(stamp, ..)
-            | Event::AgentRuntimeStop(stamp) => self
+            Event::AgentRuntimeEvent(stamp, _) => self
+                .workspaces
+                .iter()
+                .flat_map(|ws| &ws.tabs)
+                .find(|tab| tab.id == stamp.target.tab_id)
+                .is_some_and(|tab| {
+                    tab.agent_session()
+                        .is_some_and(|s| s.accepts_stream(stamp, &tab.session_target()))
+                }),
+            Event::AgentRuntimeAnswer(stamp, ..) | Event::AgentRuntimeStop(stamp) => self
                 .workspaces
                 .iter()
                 .flat_map(|ws| &ws.tabs)

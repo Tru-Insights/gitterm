@@ -1,7 +1,8 @@
 //! Authoritative, frontend-independent chat transitions and timeline.
 //!
 //! The host owns handles and the session catalog. It must validate the complete
-//! ingress with `accepts_runtime`/`accepts_history` before applying host effects.
+//! ingress with `accepts_stream`/`accepts_history` before applying host effects;
+//! deferred commands additionally require the full `accepts_runtime` binding.
 //! Channel acceptance is not a harness write receipt. No types here are persisted.
 use super::{history, types::*};
 use crate::{harness::transcript::TranscriptEntry, session};
@@ -11,6 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 fn generation() -> u64 {
     NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+fn same_chat(a: &session::Target, b: &session::Target) -> bool {
+    a.tab_id == b.tab_id && a.session_uid == b.session_uid
 }
 
 /// Parsed stream-json events from the agent subprocess. The variant taxonomy is
@@ -290,6 +295,14 @@ impl State {
         self.pending_requests.clear();
     }
 
+    /// Task attachment/resume changes attribution without replacing the chat's
+    /// receiver. Stream ownership follows the stable caller and incarnation;
+    /// host effects use task attribution from the current catalog entry.
+    pub fn accepts_stream(&self, stamp: &RuntimeStamp, current: &session::Target) -> bool {
+        same_chat(&stamp.target, current) && stamp.generation == self.runtime_generation
+    }
+
+    /// Commands admitted before a task rebind must not act under its new binding.
     pub fn accepts_runtime(&self, stamp: &RuntimeStamp, current: &session::Target) -> bool {
         stamp.target == *current && stamp.generation == self.runtime_generation
     }
@@ -317,7 +330,7 @@ impl State {
         current: &session::Target,
         backend: AgentBackend,
     ) -> bool {
-        ticket.target == *current
+        same_chat(&ticket.target, current)
             && ticket.generation == self.history_generation
             && ticket.backend == backend
             && self.session_id.as_ref() == Some(&ticket.session_id)
