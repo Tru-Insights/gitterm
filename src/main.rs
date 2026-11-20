@@ -2,6 +2,7 @@
 use git2::Status;
 use git2::{DiffOptions, Repository};
 use gitterm::chats::{ChatBackendResume, ChatEntryResume};
+use gitterm_core::session;
 use iced::advanced::graphics::core::Element;
 use iced::keyboard::{self, key, Key, Modifiers};
 use iced::widget::{
@@ -5022,9 +5023,7 @@ fn worker_time_limit_subscriptions(
 
 #[derive(Debug, Clone)]
 struct TaskTabClosePrompt {
-    workspace_idx: usize,
-    tab_idx: usize,
-    task_id: String,
+    target: session::Target,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5299,6 +5298,28 @@ struct TabState {
 }
 
 impl TabState {
+    fn session_target(&self) -> session::Target {
+        session::Target {
+            tab_id: self.id,
+            session_uid: self.session_uid.clone(),
+            task_id: self.task_id.clone(),
+            task_session_id: self.task_session_id.clone(),
+        }
+    }
+
+    fn session_state(&self, last_tab: bool) -> session::State {
+        session::State {
+            target: self.session_target(),
+            control: match self.agent_session() {
+                Some(agent) if agent.harness.is_some() => session::TurnControl::Harness,
+                Some(_) => session::TurnControl::TaskHandle,
+                None => session::TurnControl::Terminal,
+            },
+            task_live: self.task_live_state.is_some(),
+            last_tab,
+        }
+    }
+
     fn new(id: usize, repo_path: PathBuf) -> Self {
         let repo_name = repo_path
             .file_name()
@@ -5342,7 +5363,10 @@ impl TabState {
             chat_session_id: None,
             task_id: None,
             task_session_id: None,
-            session_uid: uuid::Uuid::new_v4().to_string(),
+            session_uid: session::SavedIdentity::default()
+                .open(|| uuid::Uuid::new_v4().to_string())
+                .identity
+                .session_uid,
             task_live_state: None,
             task_last_activity: None,
             task_prompt_watch: Default::default(),
@@ -12224,40 +12248,52 @@ impl App {
     /// task rail. Shared by the confirmed stop-and-close and the silent close
     /// of a tab whose session is no longer live.
     fn close_task_tab(&mut self, prompt: TaskTabClosePrompt) -> Task<Event> {
-        let valid = self
-            .workspaces
-            .get(prompt.workspace_idx)
-            .and_then(|workspace| workspace.tabs.get(prompt.tab_idx))
-            .is_some_and(|tab| tab.task_id.as_deref() == Some(&prompt.task_id));
-        if !valid {
+        let Some(task_id) = prompt.target.task_id.clone() else {
+            return Task::none();
+        };
+        let Some((workspace_idx, tab_idx)) =
+            self.workspaces.iter().enumerate().find_map(|(wi, ws)| {
+                ws.tabs
+                    .iter()
+                    .position(|tab| tab.id == prompt.target.tab_id)
+                    .map(|ti| (wi, ti))
+            })
+        else {
+            return Task::none();
+        };
+        let workspace = &self.workspaces[workspace_idx];
+        let decision = workspace.tabs[tab_idx]
+            .session_state(workspace.tabs.len() == 1)
+            .reduce(session::Intent::Close {
+                target: prompt.target,
+                confirmed: true,
+            });
+        if !matches!(decision, session::Effect::Close(_)) {
             return Task::none();
         }
-        let cleanup =
-            turn_snapshot_chat_id(&self.workspaces[prompt.workspace_idx].tabs[prompt.tab_idx])
-                .map(|chat| self.maintain_turn_snapshots(Some(vec![chat])))
-                .unwrap_or_else(Task::none);
-        close_turn_snapshots(&self.workspaces[prompt.workspace_idx].tabs[prompt.tab_idx]);
-        let closed_live_session = self.workspaces[prompt.workspace_idx].tabs[prompt.tab_idx]
+        let cleanup = turn_snapshot_chat_id(&self.workspaces[workspace_idx].tabs[tab_idx])
+            .map(|chat| self.maintain_turn_snapshots(Some(vec![chat])))
+            .unwrap_or_else(Task::none);
+        close_turn_snapshots(&self.workspaces[workspace_idx].tabs[tab_idx]);
+        let closed_live_session = self.workspaces[workspace_idx].tabs[tab_idx]
             .task_live_state
             .is_some();
-        if self.workspaces[prompt.workspace_idx].tabs.len() == 1 {
-            let workspace_name = self.workspaces[prompt.workspace_idx].name.clone();
-            let workspace_dir = self.workspaces[prompt.workspace_idx].dir.clone();
+        if self.workspaces[workspace_idx].tabs.len() == 1 {
+            let workspace_name = self.workspaces[workspace_idx].name.clone();
+            let workspace_dir = self.workspaces[workspace_idx].dir.clone();
             let replacement =
                 self.create_tab_for_workspace(workspace_dir, None, Some(&workspace_name));
-            self.workspaces[prompt.workspace_idx].tabs.push(replacement);
+            self.workspaces[workspace_idx].tabs.push(replacement);
         }
-        self.workspaces[prompt.workspace_idx]
-            .tabs
-            .remove(prompt.tab_idx);
+        self.workspaces[workspace_idx].tabs.remove(tab_idx);
         self.apply_task_session_signal(
-            &prompt.task_id,
+            &task_id,
             closed_live_session.then_some((TaskLifecycle::Stopped, None)),
         );
-        let sibling = task_tab_indices(&self.workspaces[prompt.workspace_idx], &prompt.task_id)
+        let sibling = task_tab_indices(&self.workspaces[workspace_idx], &task_id)
             .into_iter()
             .next();
-        let workspace = &mut self.workspaces[prompt.workspace_idx];
+        let workspace = &mut self.workspaces[workspace_idx];
         if let Some(sibling) = sibling {
             workspace.active_tab = sibling;
         } else {
@@ -12267,7 +12303,7 @@ impl App {
                 .position(|tab| tab.task_id.is_none())
                 .unwrap_or(0);
             workspace.tabs[workspace.active_tab].sidebar_mode = SidebarMode::Tasks;
-            self.selected_task_id = Some(prompt.task_id);
+            self.selected_task_id = Some(task_id);
         }
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
@@ -20210,9 +20246,12 @@ impl App {
                     continue;
                 }
                 // Tabs saved before caller identity existed get a
-                // fresh uid (TabState::new); save once so it sticks.
-                let restored_session_uid = tab_config.session_uid.clone();
-                if restored_session_uid.is_none() {
+                // fresh uid before any launch env; save once so it sticks.
+                let opened = tab_config
+                    .session_identity()
+                    .open(|| uuid::Uuid::new_v4().to_string());
+                let restored_session_uid = Some(opened.identity.session_uid);
+                if opened.needs_persist {
                     self.workspaces_dirty = true;
                     self.next_workspace_save_at =
                         Some(Instant::now() + Duration::from_millis(WORKSPACES_SAVE_DEBOUNCE_MS));
@@ -21682,9 +21721,13 @@ fi
         self.next_tab_id += 1;
 
         let mut tab = TabState::new(id, repo_path.clone());
-        if let Some(session_uid) = session_uid {
-            tab.session_uid = session_uid;
+        tab.session_uid = session::SavedIdentity {
+            session_uid,
+            ..Default::default()
         }
+        .open(|| tab.session_uid.clone())
+        .identity
+        .session_uid;
         tab.set_startup_command(startup_command.clone());
 
         // Read env fresh from the global workspaces.json. Caller passes the workspace name
@@ -21739,6 +21782,16 @@ fi
         }
         if let Some(connection) = &self.task_mcp {
             extra_env.extend(connection.terminal_environment(Some(&tab.session_uid)));
+        }
+        // The headless lifecycle trace stops at the launch boundary, before
+        // trust/config discovery or any worker/PTY process can be created.
+        #[cfg(test)]
+        if baseline_tests::request(format!(
+            "session-launch:{}:{}",
+            tab.session_uid,
+            startup_command.as_deref().unwrap_or("<shell>")
+        )) {
+            return tab;
         }
         if task_launch && startup_command.is_some() {
             match gitterm::worker_process::WorkerProcess::new() {
@@ -24979,29 +25032,30 @@ fi
                 ]);
             }
             Event::TabClose(idx) => {
-                if let Some(tab) = self
+                let decision = self
                     .active_workspace()
-                    .and_then(|workspace| workspace.tabs.get(idx))
-                {
-                    if let Some(task_id) = tab.task_id.clone() {
-                        let prompt = TaskTabClosePrompt {
-                            workspace_idx: self.active_workspace_index(),
-                            tab_idx: idx,
-                            task_id,
-                        };
-                        // Only a live session warrants a confirm — closing a
-                        // tab whose harness already exited stops nothing.
-                        if tab.task_live_state.is_some() {
-                            self.task_tab_close_prompt = Some(prompt);
-                            return Task::none();
-                        }
-                        return self.close_task_tab(prompt);
+                    .and_then(|workspace| {
+                        workspace.tabs.get(idx).map(|tab| {
+                            tab.session_state(workspace.tabs.len() == 1).reduce(
+                                session::Intent::Close {
+                                    target: tab.session_target(),
+                                    confirmed: false,
+                                },
+                            )
+                        })
+                    })
+                    .unwrap_or(session::Effect::None);
+                let closing = match decision {
+                    session::Effect::ConfirmClose(target) => {
+                        self.task_tab_close_prompt = Some(TaskTabClosePrompt { target });
+                        return Task::none();
                     }
-                }
-                let closing = self
-                    .active_workspace()
-                    .filter(|ws| idx < ws.tabs.len() && ws.tabs.len() > 1)
-                    .map(|ws| ws.tabs[idx].id);
+                    session::Effect::Close(target) if target.task_id.is_some() => {
+                        return self.close_task_tab(TaskTabClosePrompt { target });
+                    }
+                    session::Effect::Close(target) => Some(target.tab_id),
+                    _ => None,
+                };
                 let cleanup = closing
                     .and_then(|id| {
                         self.workspaces
@@ -25024,7 +25078,9 @@ fi
                     self.stop_remote_chat_for_closing_tab(tab_id);
                 }
                 if let Some(ws) = self.active_workspace_mut() {
-                    if idx < ws.tabs.len() && ws.tabs.len() > 1 {
+                    if let Some(idx) =
+                        closing.and_then(|id| ws.tabs.iter().position(|tab| tab.id == id))
+                    {
                         ws.tabs.remove(idx);
                         if ws.active_tab >= ws.tabs.len() {
                             ws.active_tab = ws.tabs.len() - 1;
@@ -26205,7 +26261,7 @@ fi
                         return Task::none();
                     }
                     tab.task_live_state = None;
-                    if let Some(task_id) = tab.task_id.clone() {
+                    if tab.task_id.is_some() {
                         let workspace = &self.workspaces[workspace_idx];
                         let active_id = workspace
                             .tabs
@@ -26215,11 +26271,8 @@ fi
                         let preserve_selection =
                             active_id.is_some() || workspace_idx != self.active_workspace_index();
                         let selection = self.selected_task_id.clone();
-                        let close = self.close_task_tab(TaskTabClosePrompt {
-                            workspace_idx,
-                            tab_idx,
-                            task_id,
-                        });
+                        let target = self.workspaces[workspace_idx].tabs[tab_idx].session_target();
+                        let close = self.close_task_tab(TaskTabClosePrompt { target });
                         if let Some(active_id) = active_id {
                             if let Some(idx) = self.workspaces[workspace_idx]
                                 .tabs
@@ -26638,28 +26691,37 @@ fi
             }
             Event::AgentStopRequested(tab_id) => {
                 let mut task_signal: Option<String> = None;
-                'outer_stop: for ws in &mut self.workspaces {
-                    for t in &mut ws.tabs {
-                        if t.id == tab_id {
-                            if let Some(session) = t.agent_session_mut() {
-                                if let Some(claude) = session.harness.as_ref() {
-                                    // The process stays alive; the turn ends
-                                    // with TurnCompleted { Interrupted }.
-                                    if let Err(e) = claude.send(HarnessCommand::Interrupt) {
-                                        eprintln!("AgentStopRequested: interrupt failed: {e}");
-                                    }
-                                    break 'outer_stop;
+                if let Some(tab) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| &mut ws.tabs)
+                    .find(|tab| tab.id == tab_id)
+                {
+                    let decision = tab.session_state(false).reduce(session::Intent::StopTurn {
+                        target: tab.session_target(),
+                    });
+                    match decision {
+                        session::Effect::InterruptHarness(_) => {
+                            if let Some(harness) =
+                                tab.agent_session().and_then(|s| s.harness.as_ref())
+                            {
+                                if let Err(e) = harness.send(HarnessCommand::Interrupt) {
+                                    eprintln!("AgentStopRequested: interrupt failed: {e}");
                                 }
+                            }
+                        }
+                        session::Effect::CancelTaskTurn(_) => {
+                            if let Some(session) = tab.agent_session_mut() {
                                 if let Some(handle) = session.task_handle.as_ref() {
                                     handle.request_stop();
                                 }
                                 session.state = tab::AgentSessionState::Stopped;
-                                if t.task_live_state.take().is_some() {
-                                    task_signal = t.task_id.clone();
+                                if tab.task_live_state.take().is_some() {
+                                    task_signal = tab.task_id.clone();
                                 }
                             }
-                            break 'outer_stop;
                         }
+                        _ => {}
                     }
                 }
                 if let Some(task_id) = task_signal {
@@ -42075,9 +42137,13 @@ fi
             .task_tab_close_prompt
             .as_ref()
             .and_then(|prompt| {
-                self.task_store
-                    .as_ref()
-                    .and_then(|store| store.get(&prompt.task_id))
+                self.task_store.as_ref().and_then(|store| {
+                    prompt
+                        .target
+                        .task_id
+                        .as_deref()
+                        .and_then(|id| store.get(id))
+                })
             })
             .map(|task| task.title.as_str())
             .unwrap_or("this task");

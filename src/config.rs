@@ -2445,6 +2445,19 @@ pub struct WorkspaceTabConfig {
     pub session_uid: Option<String>,
 }
 
+impl WorkspaceTabConfig {
+    /// Project identity without changing the persisted DTO or reconstructing
+    /// a tab/workspace and losing unrelated settings.
+    pub fn session_identity(&self) -> gitterm_core::session::SavedIdentity {
+        gitterm_core::session::SavedIdentity {
+            session_uid: self.session_uid.clone(),
+            task_id: self.task_id.clone(),
+            task_session_id: self.task_session_id.clone(),
+            chat_session_id: self.chat_session_id.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BottomTerminalConfig {
     pub dir: String,
