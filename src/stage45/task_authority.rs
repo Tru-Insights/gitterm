@@ -409,3 +409,207 @@ fn iced_create_is_deferred_and_only_acknowledges_saved_preparation() {
         drop(deferred);
     }
 }
+
+#[test]
+fn iced_mutation_input_fixture_preserves_control_normalization_and_errors() {
+    if isolated(
+        "iced_mutation_input_fixture_preserves_control_normalization_and_errors",
+        "task_authority",
+    ) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let app = app_with_tabs(dir.path());
+    let cases: Vec<Value> = serde_json::from_str(&fixture("tasks/mutation-inputs.json")).unwrap();
+    for case in cases {
+        let mut input = case.clone();
+        input["repository_path"] = json!(dir.path());
+        let request = serde_json::from_value(input).unwrap();
+        let (sender, mut receiver) = command_channel();
+        let _pending = sender.enqueue((), None).unwrap();
+        let result =
+            app.pending_task_from_control(request, receiver.try_recv().unwrap().reply, None);
+        if let Some(error) = case["error"].as_str() {
+            assert_eq!(result.err().unwrap(), error);
+        } else {
+            let pending = result.unwrap();
+            assert_eq!(pending.title, case["title_out"]);
+            assert_eq!(pending.objective, case["objective_out"]);
+            assert_eq!(json!(pending.issue_key), case["issue_out"]);
+            assert_eq!(
+                pending.request.base_reference,
+                case["base_out"].as_str().unwrap_or(DEFAULT_TASK_BASE)
+            );
+        }
+    }
+}
+
+#[test]
+fn iced_mutation_refusals_do_not_change_the_store() {
+    if isolated(
+        "iced_mutation_refusals_do_not_change_the_store",
+        "task_authority",
+    ) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(dir.path());
+    add_task(&mut app, dir.path(), dir.path());
+    let store = app.task_authority.store_mut().as_mut().unwrap();
+    let mut task = store.get("fixture-task").unwrap().clone();
+    task.worktree = TaskWorktree {
+        state: TaskWorktreeState::Unprepared,
+        path: None,
+    };
+    store.replace(task).unwrap();
+    let before = std::fs::read(dir.path().join("tasks.json")).unwrap();
+    for (summary, session, error) in [
+        (" ", None, "handoff summary is required"),
+        (
+            "note",
+            Some("not-a-session"),
+            "Task fixture-task does not contain session not-a-session",
+        ),
+    ] {
+        let request = serde_json::from_value(
+            json!({"task_id":"fixture-task", "summary":summary,"session_id":session}),
+        )
+        .unwrap();
+        assert_eq!(
+            control(&mut app, TaskControlOperation::UpdateHandoff(request), None).unwrap_err(),
+            error
+        );
+    }
+    // Missing-worktree publishing is a silent no-op, even after issue confirmation.
+    let _ = app.start_task_publish("absent", TaskPublishAction::PushBranch);
+    let _ = app.start_task_publish("fixture-task", TaskPublishAction::OpenDraftPr);
+    assert!(app.task_publish_busy.is_empty());
+    let _ = app.update_event(Event::TaskWorktreeDeleteOpen("absent".into()));
+    assert_eq!(
+        app.task_ui_error.as_deref(),
+        Some("Task is no longer in the task store")
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("tasks.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn iced_close_archive_states_match_the_shared_fixture() {
+    if isolated(
+        "iced_close_archive_states_match_the_shared_fixture",
+        "task_authority",
+    ) {
+        return;
+    }
+    let cases: Vec<Value> = serde_json::from_str(&fixture("tasks/close-states.json")).unwrap();
+    for case in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_tabs(dir.path());
+        add_task(&mut app, dir.path(), dir.path());
+        let lifecycle: TaskLifecycle = serde_json::from_value(case["state"].clone()).unwrap();
+        let store = app.task_authority.store_mut().as_mut().unwrap();
+        if lifecycle != TaskLifecycle::Draft {
+            store
+                .begin_worktree_preparation("fixture-task", "t1")
+                .unwrap();
+            if lifecycle != TaskLifecycle::Preparing {
+                let task = store.get("fixture-task").unwrap();
+                let prepared = CompletedWorktreePreparation {
+                    repository: task.repository.clone(),
+                    base: task.base.clone(),
+                    branch: task.branch.clone(),
+                    path: dir.path().join("worktree"),
+                };
+                store
+                    .complete_worktree_preparation("fixture-task", prepared, "t2")
+                    .unwrap();
+                if lifecycle == TaskLifecycle::Archived {
+                    store.archive("fixture-task", "t3").unwrap();
+                } else if lifecycle != TaskLifecycle::Ready {
+                    store
+                        .record_lifecycle_signal("fixture-task", lifecycle, None, "t3")
+                        .unwrap();
+                }
+            }
+        }
+        let _ = app.update_event(Event::TaskArchive("fixture-task".into()));
+        assert_eq!(
+            app.task_ui_error.is_none(),
+            case["allowed"].as_bool().unwrap(),
+            "{case}"
+        );
+        let saved = TaskStore::load(dir.path().join("tasks.json")).unwrap();
+        assert_eq!(
+            saved.get("fixture-task").unwrap().lifecycle == TaskLifecycle::Archived,
+            case["allowed"].as_bool().unwrap()
+        );
+    }
+}
+
+#[test]
+fn iced_cleanup_confirmation_blocks_risky_removal_and_preserves_history_when_record_only() {
+    if isolated(
+        "iced_cleanup_confirmation_blocks_risky_removal_and_preserves_history_when_record_only",
+        "task_authority",
+    ) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(dir.path());
+    add_task(&mut app, dir.path(), dir.path());
+    let session: TaskSessionRecord = serde_json::from_str(&fixture("tasks/session.json")).unwrap();
+    app.task_authority
+        .store_mut()
+        .as_mut()
+        .unwrap()
+        .upsert_session("fixture-task", session, "t1")
+        .unwrap();
+    let inspection = CleanupInspection {
+        path_exists: true,
+        registered: true,
+        dirty: false,
+        unpushed_commits: 0,
+        upstream: None,
+        risks: vec![],
+    };
+    let before = std::fs::read(dir.path().join("tasks.json")).unwrap();
+    for risk in [
+        CleanupRisk::ActiveProcess,
+        CleanupRisk::UncommittedChanges,
+        CleanupRisk::UnpushedCommits { count: 1 },
+    ] {
+        let mut blocked = inspection.clone();
+        blocked.risks.push(risk);
+        app.task_worktree_delete_prompt = Some(TaskWorktreeDeletePrompt {
+            task_id: "fixture-task".into(),
+            worktree_path: dir.path().into(),
+            inspection: Some(Ok(blocked)),
+            deleting: false,
+            error: None,
+        });
+        let _ = app.update_event(Event::TaskWorktreeDeleteConfirm);
+        assert!(!app.task_worktree_delete_prompt.as_ref().unwrap().deleting);
+        assert_eq!(
+            std::fs::read(dir.path().join("tasks.json")).unwrap(),
+            before
+        );
+    }
+    let mut record_only = inspection;
+    record_only.path_exists = false;
+    record_only.risks = vec![
+        CleanupRisk::WorktreeMissing,
+        CleanupRisk::ExistingPullRequest {
+            url: "https://example.invalid/pr/1".into(),
+        },
+    ];
+    app.task_worktree_delete_prompt.as_mut().unwrap().inspection = Some(Ok(record_only));
+    let _ = app.update_event(Event::TaskWorktreeDeleteConfirm);
+    let saved = TaskStore::load(dir.path().join("tasks.json")).unwrap();
+    let task = saved.get("fixture-task").unwrap();
+    assert!(task.worktree.path.is_none());
+    assert_eq!(task.sessions.len(), 1);
+    assert!(dir.path().is_dir());
+    assert!(app.task_worktree_delete_prompt.is_none());
+}

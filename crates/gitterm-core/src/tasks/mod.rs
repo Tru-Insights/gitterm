@@ -8,3 +8,9 @@ pub mod state;
 pub mod store;
 #[cfg(feature = "runtime")]
 pub use store::{TaskStore, TaskStoreError};
+
+mod validation;
+pub use validation::*;
+
+#[cfg(feature = "runtime")]
+pub use crate::task_worktree::validate_branch;
