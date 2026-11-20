@@ -97,6 +97,9 @@ use gitterm::workspace_overview as overview;
 use gitterm::worktree_follow::{
     self, CacheLookup, WorktreeFollow, WorktreeInfo, WorktreeListCache,
 };
+use gitterm_core::chat::state::{
+    Effect as ChatEffect, HistoryTicket, Intent as ChatIntent, RuntimeStamp,
+};
 #[cfg(test)]
 use gitterm_core::workspace::{next_on_bar, persisted_active_index};
 use gitterm_core::workspace::{SelectionCommand, SelectionEvent, SelectionState, WorkspaceFact};
@@ -4590,7 +4593,7 @@ fn resumed_claude_chat_session(
     session_id: &str,
 ) -> AgentSession {
     let mut session = AgentSession::new(new_claude_chat_config(chat_config));
-    session.session_id = Some(session_id.to_string());
+    session.bind_session(Some(session_id.to_string()));
     session
 }
 
@@ -7299,6 +7302,11 @@ pub enum Event {
     /// One streaming event from the agent subprocess (Step 4 will refine the
     /// payload once the parser lands; today every line arrives as `Other`).
     AgentEventReceived(usize, tab::AgentEvent),
+    /// Every real receiver is stamped before any domain or UI effects.
+    AgentRuntimeEvent(RuntimeStamp, tab::AgentEvent),
+    AgentHistoryResult(HistoryTicket, Result<Vec<tab::AgentEvent>, String>),
+    AgentRuntimeAnswer(RuntimeStamp, String, RuntimeDecision),
+    AgentRuntimeStop(RuntimeStamp),
     /// A resumed Claude chat tab's earlier timeline, read back from its
     /// transcript (TRU-140). Empty when the transcript is missing.
     AgentHistoryLoaded(usize, Vec<tab::AgentEvent>),
@@ -11509,6 +11517,7 @@ impl App {
         else {
             return history;
         };
+        let target = tab.session_target();
         let repo_path = tab.repo_path.clone();
         let Some(session) = tab.agent_session_mut() else {
             return history;
@@ -11529,9 +11538,11 @@ impl App {
         let (claude, rx) =
             gitterm::harness::claude::ClaudeSession::attach_remote(client, config, chat_id);
         session.harness = Some(gitterm::harness::HarnessSession::Claude(claude));
+        session.begin_runtime();
+        let stamp = session.runtime_stamp(target);
         let bridge = Task::run(
             tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
-            move |ev| Event::AgentEventReceived(tab_id, tab::AgentEvent::Harness(ev)),
+            move |ev| Event::AgentRuntimeEvent(stamp.clone(), tab::AgentEvent::Harness(ev)),
         );
         Task::batch([history, bridge])
     }
@@ -11609,10 +11620,7 @@ impl App {
                 );
                 // The transcript replaces everything; what is still in force
                 // (a running turn, open prompts) is redelivered after this.
-                session.conversation.clear();
-                session.pending_requests.clear();
-                session.state = tab::AgentSessionState::Idle;
-                session.history = tab::HistoryLoad::NotLoaded;
+                session.reduce(ChatIntent::ResetHistory);
                 if webview::is_active(WebviewSurface::Agent(tab_id)) {
                     reset_agent_webview(tab_id);
                 }
@@ -11651,19 +11659,17 @@ impl App {
             eprintln!("[remote-chat] tab {tab_id}: a prompt echo for a tab that is not a chat");
             return Task::none();
         };
-        if id.as_deref().is_some_and(|id| session.shows_prompt(id)) {
+        let ChatEffect::RelayedPrompt { echo, running } =
+            session.reduce(ChatIntent::RelayedPrompt {
+                id,
+                text,
+                image_count,
+                backend: session.backend(),
+                process_running: session.harness.is_some(),
+            })
+        else {
             return Task::none();
-        }
-        eprintln!(
-            "[remote-chat] tab {tab_id}: another client sent a prompt ({} chars, {image_count} images, id {id:?})",
-            text.chars().count()
-        );
-        let queued = session.submit_queues();
-        let echo = tab::AgentEvent::relayed_prompt(id.as_deref(), &text, image_count, queued);
-        let running = session.harness.is_some();
-        if running {
-            session.state = tab::AgentSessionState::Streaming;
-        }
+        };
         push_agent_event_to_webview(tab_id, &echo);
         session.record(echo);
         let Some(task_id) = task_id.filter(|_| running) else {
@@ -20456,7 +20462,7 @@ impl App {
                             .clone()
                             .unwrap_or_else(|| root.to_string());
                         let mut session = AgentSession::new(agent_config.clone());
-                        session.session_id = tab_config.chat_session_id.clone();
+                        session.bind_session(tab_config.chat_session_id.clone());
                         let mut tab = self.new_remote_claude_chat_tab(&dir, session);
                         tab.chat_session_id = tab_config.chat_session_id.clone();
                         if let Some(uid) = restored_session_uid {
@@ -20671,7 +20677,7 @@ impl App {
                         // agent) resumes its conversation.
                         if let Some(session) = tab.agent_session_mut() {
                             if session.backend().is_native() {
-                                session.session_id = Some(session_id.clone());
+                                session.bind_session(Some(session_id.clone()));
                             }
                         }
                         tab.chat_session_id = Some(session_id);
@@ -24074,6 +24080,56 @@ fi
     }
 
     fn update_event(&mut self, event: Event) -> Task<Event> {
+        // Validate complete chat ingress before even the common focus/heartbeat
+        // effects. Normalize synchronously so no target can change in between.
+        let admitted = match &event {
+            Event::AgentRuntimeEvent(stamp, _) => self
+                .workspaces
+                .iter()
+                .flat_map(|ws| &ws.tabs)
+                .find(|tab| tab.id == stamp.target.tab_id)
+                .is_some_and(|tab| {
+                    tab.agent_session()
+                        .is_some_and(|s| s.accepts_stream(stamp, &tab.session_target()))
+                }),
+            Event::AgentRuntimeAnswer(stamp, ..) | Event::AgentRuntimeStop(stamp) => self
+                .workspaces
+                .iter()
+                .flat_map(|ws| &ws.tabs)
+                .find(|tab| tab.id == stamp.target.tab_id)
+                .is_some_and(|tab| {
+                    tab.agent_session()
+                        .is_some_and(|s| s.accepts_runtime(stamp, &tab.session_target()))
+                }),
+            Event::AgentHistoryResult(ticket, _) => self
+                .workspaces
+                .iter()
+                .flat_map(|ws| &ws.tabs)
+                .find(|tab| tab.id == ticket.target.tab_id)
+                .is_some_and(|tab| {
+                    tab.agent_session().is_some_and(|s| {
+                        s.accepts_history(ticket, &tab.session_target(), s.backend())
+                    })
+                }),
+            _ => true,
+        };
+        if !admitted {
+            return Task::none();
+        }
+        let event = match event {
+            Event::AgentRuntimeEvent(stamp, event) => {
+                Event::AgentEventReceived(stamp.target.tab_id, event)
+            }
+            Event::AgentHistoryResult(ticket, result) => match result {
+                Ok(history) => Event::AgentHistoryLoaded(ticket.target.tab_id, history),
+                Err(error) => Event::AgentHistoryUnavailable(ticket.target.tab_id, error),
+            },
+            Event::AgentRuntimeAnswer(stamp, request_id, decision) => {
+                Event::AgentAnswerRequest(stamp.target.tab_id, request_id, decision)
+            }
+            Event::AgentRuntimeStop(stamp) => Event::AgentStopRequested(stamp.target.tab_id),
+            event => event,
+        };
         // Heartbeat for freeze watchdog — skip high-frequency terminal events
         match &event {
             Event::Terminal(_, _)
@@ -25347,9 +25403,18 @@ fi
                             },
                         ))
                     }
-                    AgentIpcMessage::Stop { tab_id } => {
-                        Task::done(Event::AgentStopRequested(tab_id))
-                    }
+                    AgentIpcMessage::Stop { tab_id } => self
+                        .workspaces
+                        .iter()
+                        .flat_map(|ws| &ws.tabs)
+                        .find(|tab| tab.id == tab_id)
+                        .and_then(|tab| {
+                            tab.agent_session()
+                                .map(|s| s.runtime_stamp(tab.session_target()))
+                        })
+                        .map_or_else(Task::none, |stamp| {
+                            Task::done(Event::AgentRuntimeStop(stamp))
+                        }),
                     AgentIpcMessage::Withdraw { tab_id, id } => {
                         let claude = self
                             .workspaces
@@ -25383,7 +25448,18 @@ fi
                         tab_id,
                         request_id,
                         decision,
-                    } => Task::done(Event::AgentAnswerRequest(tab_id, request_id, decision)),
+                    } => self
+                        .workspaces
+                        .iter()
+                        .flat_map(|ws| &ws.tabs)
+                        .find(|tab| tab.id == tab_id)
+                        .and_then(|tab| {
+                            tab.agent_session()
+                                .map(|s| s.runtime_stamp(tab.session_target()))
+                        })
+                        .map_or_else(Task::none, |stamp| {
+                            Task::done(Event::AgentRuntimeAnswer(stamp, request_id, decision))
+                        }),
                     AgentIpcMessage::SetPermissionMode { tab_id, mode } => {
                         Task::done(Event::AgentSetPermissionMode(tab_id, mode))
                     }
@@ -25486,6 +25562,10 @@ fi
                     }
                 };
             }
+            Event::AgentRuntimeEvent(..)
+            | Event::AgentHistoryResult(..)
+            | Event::AgentRuntimeAnswer(..)
+            | Event::AgentRuntimeStop(..) => unreachable!("chat ingress normalized above"),
             event @ (Event::AgentSubmitPrompt(..) | Event::AgentSubmitDelegations(..)) => {
                 let (tab_id, prompt, delivery) = match event {
                     Event::AgentSubmitPrompt(tab_id, prompt) => (tab_id, prompt, None),
@@ -25542,6 +25622,7 @@ fi
                 let mut harness_bridge: Option<tokio::sync::mpsc::UnboundedReceiver<HarnessEvent>> =
                     None;
                 let mut claude_spawned = false;
+                let mut bridge_stamp = None;
                 // A chat tab in a remote-agent workspace runs `claude` on
                 // that machine (TRU-152). Resolved before the tab is
                 // borrowed; only consulted when a process is spawned.
@@ -25610,6 +25691,7 @@ fi
                             .chat_session_id
                             .clone()
                             .unwrap_or_else(|| t.session_uid.clone());
+                        let target = t.session_target();
                         let Some(session) = t.agent_session_mut() else {
                             eprintln!("AgentSubmitPrompt: tab {} is not an agent tab", tab_id);
                             return Task::none();
@@ -25660,23 +25742,32 @@ fi
                                 // respawn of a chat already on screen
                                 // ignores the replay.
                                 if session.history_to_load().is_some() {
-                                    session.history = tab::HistoryLoad::Loading;
+                                    session
+                                        .reduce(ChatIntent::BeginHistory(session.config.clone()));
                                 }
+                                session.begin_runtime();
+                                bridge_stamp = Some(session.runtime_stamp(target.clone()));
                                 harness_bridge = Some(rx);
                                 claude_spawned = true;
                             }
                             // Mid-turn the session holds the message and
                             // sends it when the turn ends.
-                            let queued = !claude_spawned && session.submit_queues();
-                            if prompt.id.is_none() {
-                                prompt.id = Some(uuid::Uuid::new_v4().to_string());
-                            }
-                            echo = tab::AgentEvent::submitted_prompt(&prompt, queued);
+                            let ChatEffect::Submit(prepared) = session.reduce(ChatIntent::Submit {
+                                prompt,
+                                backend: session.backend(),
+                                process_running: session.harness.is_some(),
+                                just_spawned: claude_spawned,
+                                message_id: uuid::Uuid::new_v4().to_string(),
+                            }) else {
+                                unreachable!()
+                            };
+                            prompt = prepared.prompt;
+                            echo = prepared.echo;
                             if let Some(harness) = session.harness.as_ref() {
                                 match harness.send(HarnessCommand::SendUserMessage(prompt.clone()))
                                 {
                                     Ok(()) => {
-                                        session.state = tab::AgentSessionState::Streaming;
+                                        session.reduce(ChatIntent::SubmissionAccepted);
                                         submitted = true;
                                     }
                                     Err(e) => {
@@ -25717,7 +25808,7 @@ fi
                                         eprintln!(
                                             "[agent] Claude session {id} has no transcript; starting a new session"
                                         );
-                                        session.session_id = None;
+                                        session.bind_session(None);
                                     }
                                 }
                                 // A chat given the task server is told how
@@ -25762,22 +25853,30 @@ fi
                                 };
                                 session.harness =
                                     Some(gitterm::harness::HarnessSession::Claude(claude));
+                                session.begin_runtime();
+                                bridge_stamp = Some(session.runtime_stamp(target.clone()));
                                 harness_bridge = Some(rx);
                                 claude_spawned = true;
                             }
                             // Mid-turn the CLI queues the message itself and
                             // hands it to the running turn at its next tool
                             // boundary, or runs it as the next turn.
-                            let queued = !claude_spawned && session.submit_queues();
-                            if prompt.id.is_none() {
-                                prompt.id = Some(uuid::Uuid::new_v4().to_string());
-                            }
-                            echo = tab::AgentEvent::submitted_prompt(&prompt, queued);
+                            let ChatEffect::Submit(prepared) = session.reduce(ChatIntent::Submit {
+                                prompt,
+                                backend: session.backend(),
+                                process_running: session.harness.is_some(),
+                                just_spawned: claude_spawned,
+                                message_id: uuid::Uuid::new_v4().to_string(),
+                            }) else {
+                                unreachable!()
+                            };
+                            prompt = prepared.prompt;
+                            echo = prepared.echo;
                             let mut send_failed = None;
                             if let Some(claude) = session.harness.as_ref() {
                                 match claude.send(HarnessCommand::SendUserMessage(prompt.clone())) {
                                     Ok(()) => {
-                                        session.state = tab::AgentSessionState::Streaming;
+                                        session.reduce(ChatIntent::SubmissionAccepted);
                                         submitted = true;
                                     }
                                     Err(e) => {
@@ -25809,10 +25908,18 @@ fi
                             }
                             break 'outer_submit;
                         }
-                        if !prompt.images.is_empty() {
-                            images_not_sent = prompt.images.len();
-                            echo = tab::AgentEvent::user_prompt(&prompt.text);
-                        }
+                        let ChatEffect::Submit(prepared) = session.reduce(ChatIntent::Submit {
+                            prompt,
+                            backend: session.backend(),
+                            process_running: session.task_handle.is_some(),
+                            just_spawned: false,
+                            message_id: String::new(),
+                        }) else {
+                            unreachable!()
+                        };
+                        prompt = prepared.prompt;
+                        echo = prepared.echo;
+                        images_not_sent = prepared.images_not_sent;
                         if session.task_handle.is_none() {
                             // A per-turn pi process gets no MCP servers.
                             let guidelines_file = launch_instructions(
@@ -25832,13 +25939,15 @@ fi
                             // Take the receiver up-front so this turn can wire
                             // it into a Task::run; it lives for the tab's lifetime.
                             bridge = handle.take_event_receiver();
+                            session.begin_runtime();
+                            bridge_stamp = Some(session.runtime_stamp(target.clone()));
                             session.task_handle = Some(handle);
                         }
                         if let Some(handle) = session.task_handle.as_ref() {
                             if let Err(e) = handle.submit_prompt(prompt.text.clone()) {
                                 eprintln!("AgentSubmitPrompt failed: {}", e);
                             } else {
-                                session.state = tab::AgentSessionState::Streaming;
+                                session.reduce(ChatIntent::SubmissionAccepted);
                                 submitted = true;
                             }
                         }
@@ -25913,39 +26022,57 @@ fi
                 if let Some(rx) = bridge {
                     use tokio_stream::wrappers::UnboundedReceiverStream;
                     let stream = UnboundedReceiverStream::new(rx);
-                    return Task::run(stream, move |ev| Event::AgentEventReceived(tab_id, ev));
+                    let stamp = bridge_stamp.expect("installed Pi receiver has runtime identity");
+                    return Task::run(stream, move |ev| {
+                        Event::AgentRuntimeEvent(stamp.clone(), ev)
+                    });
                 }
                 if let Some(rx) = harness_bridge {
                     use tokio_stream::wrappers::UnboundedReceiverStream;
                     let stream = UnboundedReceiverStream::new(rx);
+                    let stamp =
+                        bridge_stamp.expect("installed harness receiver has runtime identity");
                     return Task::run(stream, move |ev| {
-                        Event::AgentEventReceived(tab_id, tab::AgentEvent::Harness(ev))
+                        Event::AgentRuntimeEvent(stamp.clone(), tab::AgentEvent::Harness(ev))
                     });
                 }
                 return Task::none();
             }
             Event::AgentAnswerRequest(tab_id, request_id, decision) => {
-                let Some(session) = self
+                let Some(tab) = self
                     .workspaces
-                    .iter()
-                    .flat_map(|ws| ws.tabs.iter())
-                    .find(|t| t.id == tab_id)
-                    .and_then(|t| t.agent_session())
+                    .iter_mut()
+                    .flat_map(|ws| &mut ws.tabs)
+                    .find(|tab| tab.id == tab_id)
                 else {
-                    eprintln!("AgentAnswerRequest: tab {tab_id} is not an agent tab");
                     return Task::none();
                 };
-                let Some(claude) = session.harness.as_ref() else {
-                    eprintln!(
-                        "AgentAnswerRequest: tab {tab_id} has no live Claude session for request {request_id}"
-                    );
+                let current = tab.session_target();
+                let Some(session) = tab.agent_session_mut() else {
                     return Task::none();
                 };
-                if let Err(e) = claude.send(HarnessCommand::Answer {
-                    request_id: request_id.clone(),
+                let effect = session.reduce(ChatIntent::Answer {
+                    runtime: session.runtime_stamp(current.clone()),
+                    current: current.clone(),
+                    request_id,
                     decision,
-                }) {
-                    eprintln!("AgentAnswerRequest {request_id} on tab {tab_id} failed: {e}");
+                    process_running: session.harness.is_some(),
+                });
+                match effect {
+                    ChatEffect::Send { runtime, command } => {
+                        if !session.accepts_runtime(&runtime, &current) {
+                            return Task::none();
+                        }
+                        if let Some(harness) = session.harness.as_ref() {
+                            if let Err(error) = harness.send(command) {
+                                eprintln!("AgentAnswerRequest on tab {tab_id} failed: {error}");
+                            }
+                        }
+                    }
+                    ChatEffect::Rejected(error) => {
+                        eprintln!("AgentAnswerRequest on tab {tab_id}: {error}")
+                    }
+                    _ => {}
                 }
                 return Task::none();
             }
@@ -26854,31 +26981,34 @@ fi
                     .flat_map(|ws| &mut ws.tabs)
                     .find(|tab| tab.id == tab_id)
                 {
-                    let decision = tab.session_state(false).reduce(session::Intent::StopTurn {
-                        target: tab.session_target(),
-                    });
-                    match decision {
-                        session::Effect::InterruptHarness(_) => {
-                            if let Some(harness) =
-                                tab.agent_session().and_then(|s| s.harness.as_ref())
-                            {
-                                if let Err(e) = harness.send(HarnessCommand::Interrupt) {
-                                    eprintln!("AgentStopRequested: interrupt failed: {e}");
+                    let authority = tab.session_state(false);
+                    let target = tab.session_target();
+                    if let Some(session) = tab.agent_session_mut() {
+                        match session.reduce(ChatIntent::Stop {
+                            runtime: session.runtime_stamp(target.clone()),
+                            authority,
+                            target: target.clone(),
+                        }) {
+                            ChatEffect::Send { runtime, command } => {
+                                if !session.accepts_runtime(&runtime, &target) {
+                                    return Task::none();
+                                }
+                                if let Some(harness) = session.harness.as_ref() {
+                                    if let Err(error) = harness.send(command) {
+                                        eprintln!("AgentStopRequested: interrupt failed: {error}");
+                                    }
                                 }
                             }
-                        }
-                        session::Effect::CancelTaskTurn(_) => {
-                            if let Some(session) = tab.agent_session_mut() {
+                            ChatEffect::CancelLegacyTurn => {
                                 if let Some(handle) = session.task_handle.as_ref() {
                                     handle.request_stop();
                                 }
-                                session.state = tab::AgentSessionState::Stopped;
                                 if tab.task_live_state.take().is_some() {
                                     task_signal = tab.task_id.clone();
                                 }
                             }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
                 if let Some(task_id) = task_signal {
@@ -26976,7 +27106,11 @@ fi
                     // Not retried on every show; the next turn still runs.
                     // Recorded, so a page still being built (or rebuilt
                     // later) shows it too.
-                    session.history = tab::HistoryLoad::Loaded;
+                    let ChatEffect::Rejected(error) =
+                        session.reduce(ChatIntent::HistoryUnavailable(error))
+                    else {
+                        unreachable!()
+                    };
                     let ev = tab::AgentEvent::Harness(HarnessEvent::Error(error));
                     push_agent_event_to_webview(tab_id, &ev);
                     session.record(ev);
@@ -26993,18 +27127,12 @@ fi
                 else {
                     return Task::none();
                 };
-                session.history = tab::HistoryLoad::Loaded;
-                if history.is_empty() {
+                if !matches!(
+                    session.reduce(ChatIntent::HistoryLoaded(history)),
+                    ChatEffect::ReplayHistory
+                ) {
                     return Task::none();
                 }
-                eprintln!(
-                    "[agent] tab {tab_id}: read back {} events from the session transcript",
-                    history.len()
-                );
-                // The human may have sent a prompt while the file was being
-                // read; whatever is buffered already comes after the history.
-                let live = std::mem::replace(&mut session.conversation, history);
-                session.conversation.extend(live);
                 // A page still being built replays the merged buffer when
                 // it is done (`AgentWebviewCreated`).
                 if webview::is_active(WebviewSurface::Agent(tab_id)) {
@@ -27048,28 +27176,26 @@ fi
                 // history read-back (TRU-153), merged ahead of anything live.
                 // A respawn of a chat whose timeline is already on screen
                 // replays it again; that copy is dropped.
-                let loading = self
+                let ticket = self
                     .workspaces
                     .iter()
-                    .flat_map(|ws| ws.tabs.iter())
-                    .find(|t| t.id == tab_id)
-                    .and_then(|t| t.agent_session())
-                    .is_some_and(|session| session.history == tab::HistoryLoad::Loading);
-                if !loading {
-                    eprintln!(
-                        "[agent] tab {tab_id}: dropping a replayed history of {} entries; the timeline is already shown",
-                        entries.len()
-                    );
+                    .flat_map(|ws| &ws.tabs)
+                    .find(|tab| tab.id == tab_id)
+                    .and_then(|tab| {
+                        tab.agent_session()
+                            .and_then(|s| s.history_ticket(tab.session_target(), s.backend()))
+                    });
+                let Some(ticket) = ticket else {
                     return Task::none();
-                }
+                };
                 let delegations = self.delegation_times_for_tab(tab_id);
                 let timed = entries
                     .into_iter()
                     .map(|entry| gitterm::harness::transcript::TimedEntry { at: None, entry })
                     .collect();
-                return Task::done(Event::AgentHistoryLoaded(
-                    tab_id,
-                    history_timeline(timed, &delegations),
+                return Task::done(Event::AgentHistoryResult(
+                    ticket,
+                    Ok(history_timeline(timed, &delegations)),
                 ));
             }
             Event::AgentEventReceived(tab_id, ev) => {
@@ -27193,55 +27319,31 @@ fi
                             let mut live_edge: Option<TaskSessionLiveState> = None;
                             let mut new_session_id: Option<String> = None;
                             if let Some(session) = t.agent_session_mut() {
-                                if let tab::AgentEvent::Harness(harness_event) = &ev {
-                                    // A turn the CLI starts on its own (a
-                                    // queued message, a finished background
-                                    // subagent) is in flight like any other.
-                                    if matches!(harness_event, HarnessEvent::TurnStarted { .. }) {
-                                        session.state = tab::AgentSessionState::Streaming;
+                                let ChatEffect::Event(effects) =
+                                    session.reduce(ChatIntent::Event(ev.clone()))
+                                else {
+                                    unreachable!()
+                                };
+                                new_session_id = effects.session_id;
+                                live_edge = effects.awaiting_input.map(|awaiting| {
+                                    if awaiting {
+                                        TaskSessionLiveState::AwaitingInput
+                                    } else {
+                                        TaskSessionLiveState::Working
                                     }
+                                });
+                                session_ended = effects.outcome.map(|outcome| match outcome {
+                                    TurnStatus::Completed => (TaskLifecycle::Completed, None),
+                                    TurnStatus::Interrupted => (TaskLifecycle::Stopped, None),
+                                    TurnStatus::Failed(message) => {
+                                        (TaskLifecycle::Failed, Some(message))
+                                    }
+                                });
+                                if effects.process_exited {
+                                    session.harness = None;
+                                }
+                                if let tab::AgentEvent::Harness(harness_event) = &ev {
                                     match harness_event {
-                                        HarnessEvent::TurnStarted {
-                                            session_id: Some(id),
-                                            ..
-                                        } if session.session_id.as_deref() != Some(id) => {
-                                            session.session_id = Some(id.clone());
-                                            new_session_id = Some(id.clone());
-                                        }
-                                        HarnessEvent::RuntimeRequest { request_id, .. } => {
-                                            session.pending_requests.push(request_id.clone());
-                                            live_edge = Some(TaskSessionLiveState::AwaitingInput);
-                                        }
-                                        HarnessEvent::RuntimeRequestResolved { request_id } => {
-                                            session.pending_requests.retain(|id| id != request_id);
-                                            if session.pending_requests.is_empty() {
-                                                live_edge = Some(TaskSessionLiveState::Working);
-                                            }
-                                        }
-                                        HarnessEvent::TurnCompleted { status, .. } => {
-                                            session.pending_requests.clear();
-                                            match status {
-                                                TurnStatus::Completed => {
-                                                    session.state = tab::AgentSessionState::Idle;
-                                                    session_ended =
-                                                        Some((TaskLifecycle::Completed, None));
-                                                }
-                                                TurnStatus::Interrupted => {
-                                                    session.state = tab::AgentSessionState::Idle;
-                                                    session_ended =
-                                                        Some((TaskLifecycle::Stopped, None));
-                                                }
-                                                TurnStatus::Failed(message) => {
-                                                    session.state = tab::AgentSessionState::Errored(
-                                                        message.clone(),
-                                                    );
-                                                    session_ended = Some((
-                                                        TaskLifecycle::Failed,
-                                                        Some(message.clone()),
-                                                    ));
-                                                }
-                                            }
-                                        }
                                         HarnessEvent::PermissionModeChanged(mode) => {
                                             // Confirmed by the harness: a
                                             // respawn or restart starts in
@@ -27300,51 +27402,7 @@ fi
                                             }
                                             tab::AgentBackendConfig::Pi { .. } => {}
                                         },
-                                        HarnessEvent::ProcessExited { code } => {
-                                            // Next prompt respawns with --resume.
-                                            session.harness = None;
-                                            session.pending_requests.clear();
-                                            if matches!(
-                                                session.state,
-                                                tab::AgentSessionState::Streaming
-                                            ) {
-                                                let message = format!(
-                                                    "The chat's agent exited mid-turn (code {code:?})"
-                                                );
-                                                session.state = tab::AgentSessionState::Errored(
-                                                    message.clone(),
-                                                );
-                                                session_ended =
-                                                    Some((TaskLifecycle::Failed, Some(message)));
-                                            }
-                                        }
                                         _ => {}
-                                    }
-                                }
-                                if matches!(&ev, tab::AgentEvent::Result(_)) {
-                                    session.state = tab::AgentSessionState::Idle;
-                                    session_ended = Some((TaskLifecycle::Completed, None));
-                                }
-                                // Heuristic state transition until typed parser
-                                // lands (Step 9): `done`/`stopped` sentinels
-                                // flip back to Idle/Stopped.
-                                if let tab::AgentEvent::Other(value) = &ev {
-                                    if let Some(t) = value.get("type").and_then(|v| v.as_str()) {
-                                        if t == "done" {
-                                            session.state = tab::AgentSessionState::Idle;
-                                            session_ended = Some((TaskLifecycle::Completed, None));
-                                        } else if t == "stopped" {
-                                            session.state = tab::AgentSessionState::Stopped;
-                                            session_ended = Some((TaskLifecycle::Stopped, None));
-                                        } else if t == "error" || t == "failed" {
-                                            session.state = tab::AgentSessionState::Errored(
-                                                "Agent reported an error".to_string(),
-                                            );
-                                            session_ended = Some((
-                                                TaskLifecycle::Failed,
-                                                Some("Agent reported an error".to_string()),
-                                            ));
-                                        }
                                     }
                                 }
                                 let (before, after) = session.record(ev.clone());
@@ -33723,12 +33781,13 @@ fi
                 (
                     t.repo_path.clone(),
                     t.session_uid.clone(),
+                    t.session_target(),
                     ws.guidelines_off,
                     self.document_places(ws),
                 )
             })
         });
-        let Some((repo_path, caller, guidelines_off, document_places)) = tab_info else {
+        let Some((repo_path, caller, target, guidelines_off, document_places)) = tab_info else {
             return Task::none();
         };
         let acp_mcp_servers: Vec<gitterm::harness::acp::AcpMcpServer> = if remote_id.is_some() {
@@ -33753,14 +33812,14 @@ fi
         else {
             return Task::none();
         };
-        if session.config.read_only_note().is_some() {
-            session.history = tab::HistoryLoad::Loaded;
-            return Task::none();
-        }
-        let Some(session_id) = session.history_to_load().map(str::to_string) else {
+        let ChatEffect::LoadHistory(session_id) =
+            session.reduce(ChatIntent::BeginHistory(session.config.clone()))
+        else {
             return Task::none();
         };
-        session.history = tab::HistoryLoad::Loading;
+        let ticket = session
+            .history_ticket(target.clone(), session.backend())
+            .expect("history load has a source");
         if let tab::AgentBackend::Acp(agent) = session.backend() {
             // An ACP agent replays the session itself: start it, and its
             // `session/load` history arrives as `HistoryReplayed` on this
@@ -33773,7 +33832,7 @@ fi
                     "[agent] tab {tab_id}: {} chats are local only; not resuming on {remote_id}",
                     agent.label()
                 );
-                session.history = tab::HistoryLoad::Loaded;
+                session.reduce(ChatIntent::FinishHistory);
                 return Task::none();
             }
             let task_tools = acp_mcp_servers
@@ -33796,9 +33855,11 @@ fi
             );
             let (acp, rx) = gitterm::harness::acp::AcpSession::spawn(config);
             session.harness = Some(gitterm::harness::HarnessSession::Acp(acp));
+            session.begin_runtime();
+            let stamp = session.runtime_stamp(target);
             use tokio_stream::wrappers::UnboundedReceiverStream;
             return Task::run(UnboundedReceiverStream::new(rx), move |ev| {
-                Event::AgentEventReceived(tab_id, tab::AgentEvent::Harness(ev))
+                Event::AgentRuntimeEvent(stamp.clone(), tab::AgentEvent::Harness(ev))
             });
         }
         if let (Some(remote_id), Some(client)) = (remote_id, remote_client) {
@@ -33823,10 +33884,7 @@ fi
                         )),
                     }
                 },
-                move |result| match result {
-                    Ok(events) => Event::AgentHistoryLoaded(tab_id, events),
-                    Err(error) => Event::AgentHistoryUnavailable(tab_id, error),
-                },
+                move |result| Event::AgentHistoryResult(ticket, result),
             );
         }
         let claude = session.backend() == tab::AgentBackend::Claude;
@@ -33852,7 +33910,7 @@ fi
                     Vec::new()
                 })
             },
-            move |events| Event::AgentHistoryLoaded(tab_id, events),
+            move |events| Event::AgentHistoryResult(ticket, Ok(events)),
         );
         if !claude {
             return history;
@@ -49003,8 +49061,8 @@ impl App {
         };
         tab.chat_session_id = Some(session_id.clone());
         if let Some(session) = tab.agent_session_mut() {
-            session.session_id = Some(session_id.clone());
-            session.history = tab::HistoryLoad::NotLoaded;
+            session.bind_session(Some(session_id.clone()));
+            session.reduce(ChatIntent::ResetHistory);
         }
         eprintln!(
             "{}: tab {tab_id}: continuing V5 conversation {session_id}",
@@ -55500,7 +55558,7 @@ mod tests {
         // folder, so moving it could lose the conversation.
         let mut resumed =
             AgentSession::new(new_claude_chat_config(&config::ChatDefaults::default()));
-        resumed.session_id = Some("example-session".into());
+        resumed.bind_session(Some("example-session".into()));
         let spawn = resumed
             .claude_session_config(status.root.clone(), Vec::new(), false, None)
             .unwrap();

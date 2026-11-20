@@ -47,7 +47,7 @@ fn open_stop_close_and_native_restore_preserve_session_identity() {
     };
     for ws in app.workspaces.iter_mut().take(2) {
         let mut session = AgentSession::new(config.clone());
-        session.state = tab::AgentSessionState::Streaming;
+        session.reduce(gitterm_core::chat::state::Intent::SubmissionAccepted);
         ws.tabs[0].kind = TabKind::Agent(session);
     }
     let _ = app.update_event(Event::AgentStopRequested(20));
@@ -102,7 +102,9 @@ fn park_restore_native_session_never_replays_a_prompt() {
             effort: None,
         }));
         tab.chat_session_id = Some("conversation-1".into());
-        tab.agent_session_mut().unwrap().session_id = Some("conversation-1".into());
+        tab.agent_session_mut()
+            .unwrap()
+            .bind_session(Some("conversation-1".into()));
         let caller = tab.session_uid.clone();
         let key = ParkedKey::of(&app.workspace_config(&app.workspaces[0]));
         let uid = app.workspaces[0].uid;
@@ -255,7 +257,7 @@ fn park_app(dir: &Path) -> App {
             permission_mode: None,
             effort: None,
         });
-        session.session_id = tab.chat_session_id.clone();
+        session.bind_session(tab.chat_session_id.clone());
         tab.kind = TabKind::Agent(session);
     }
     app
@@ -499,4 +501,95 @@ fn stopped_task_resume_launches_only_the_recorded_command() {
     assert_eq!(tab.task_session_id.as_deref(), Some("child-1"));
     assert_eq!(tab.startup_command(), Some("codex resume conversation-1"));
     assert!(tab.worker_process.is_none());
+}
+
+#[test]
+fn chat_receiver_survives_task_attachment_and_existing_tab_resume() {
+    if isolated(
+        "chat_receiver_survives_task_attachment_and_existing_tab_resume",
+        "sessions",
+    ) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let _trace = Trace::start();
+    let mut app = app_with_tabs(dir.path());
+    add_task(&mut app, dir.path(), dir.path());
+    let tab = &mut app.workspaces[0].tabs[0];
+    tab.repo_path = dir.path().into();
+    tab.set_local_dir(dir.path().into());
+    tab.chat_session_id = Some("synthetic-pi".into());
+    let mut chat = AgentSession::new(tab::AgentBackendConfig::Pi {
+        model: "synthetic-model".into(),
+        session_path: None,
+        thinking: None,
+    });
+    chat.bind_session(Some("synthetic-pi".into()));
+    chat.reduce(gitterm_core::chat::state::Intent::SubmissionAccepted);
+    let receiver = chat.runtime_stamp(tab.session_target());
+    tab.kind = TabKind::Agent(chat);
+
+    app.anchor_open_sessions_to_task("fixture-task", dir.path());
+    assert_eq!(
+        app.workspaces[0].tabs[0].task_id.as_deref(),
+        Some("fixture-task")
+    );
+    let attached = app.workspaces[0].tabs[0].session_target();
+    let _ = app.update_event(Event::AgentRuntimeEvent(receiver.clone(), tab::AgentEvent::Other(json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after attach"}}))));
+    assert_eq!(
+        app.workspaces[0].tabs[0].agent_session().unwrap().revision,
+        1
+    );
+    // Deferred commands retain the original task binding even though the
+    // receiver remains current and follows the chat into its task.
+    let _ = app.update_event(Event::AgentRuntimeStop(receiver.clone()));
+    assert!(matches!(
+        app.workspaces[0].tabs[0].agent_session().unwrap().state,
+        tab::AgentSessionState::Streaming
+    ));
+
+    let stamp_before_resume = app.workspaces[0].tabs[0]
+        .agent_session()
+        .unwrap()
+        .runtime_stamp(attached);
+    let store = app.task_authority.store_mut().as_mut().unwrap();
+    let mut saved = store
+        .get("fixture-task")
+        .unwrap()
+        .sessions
+        .last()
+        .unwrap()
+        .clone();
+    saved.task_session_id = "resumed-child".into();
+    saved.conversation = Some(HarnessConversationRef {
+        backend: HarnessConversationBackend::Pi,
+        session_id: "synthetic-pi".into(),
+    });
+    store
+        .upsert_session("fixture-task", saved, "2000-01-01T00:05:00Z")
+        .unwrap();
+    let _ = app.resume_task_conversation("fixture-task", "synthetic-pi");
+    assert!(app.task_ui_error.is_none(), "{:?}", app.task_ui_error);
+    assert_eq!(
+        app.workspaces[0].tabs[0].task_session_id.as_deref(),
+        Some("resumed-child")
+    );
+    assert_eq!(app.workspaces[0].tabs.len(), 1);
+    let _ = app.update_event(Event::AgentRuntimeStop(stamp_before_resume));
+    assert!(matches!(
+        app.workspaces[0].tabs[0].agent_session().unwrap().state,
+        tab::AgentSessionState::Streaming
+    ));
+    let _ = app.update_event(Event::AgentRuntimeEvent(receiver.clone(), tab::AgentEvent::Other(json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after resume"}}))));
+    assert_eq!(
+        app.workspaces[0].tabs[0].agent_session().unwrap().revision,
+        2
+    );
+    let _ = app.update_event(Event::AgentRuntimeEvent(
+        receiver,
+        tab::AgentEvent::Other(json!({"type":"done"})),
+    ));
+    let chat = app.workspaces[0].tabs[0].agent_session().unwrap();
+    assert_eq!(chat.revision, 3);
+    assert!(matches!(chat.state, tab::AgentSessionState::Idle));
 }
