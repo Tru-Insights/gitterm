@@ -67,3 +67,36 @@ fn named_work_workspace_bytes_and_roots_are_pinned() {
         .unwrap()
         .contains("claims_new_chats"));
 }
+
+#[test]
+fn core_workspace_dtos_preserve_iced_serialized_bytes() {
+    for input in [
+        include_str!("fixtures/core/persistence/old.workspaces.json"),
+        include_str!("fixtures/core/persistence/new.workspaces.json"),
+    ] {
+        let iced: config::WorkspacesFile = serde_json::from_str(input).unwrap();
+        let mut core: gitterm_core::workspace_config::WorkspacesFile =
+            serde_json::from_str(input).unwrap();
+        assert_eq!(
+            serde_json::to_value(&iced).unwrap(),
+            serde_json::to_value(&core).unwrap()
+        );
+        // HashMap iteration is randomized independently of the wire DTO. Reuse
+        // the map layouts after comparing values so the byte check pins field order.
+        for (core, iced) in core.workspaces.iter_mut().zip(&iced.workspaces) {
+            core.env = iced.env.clone();
+            core.env_overrides = iced.env_overrides.clone();
+        }
+        for (core, iced) in core.repos.iter_mut().zip(&iced.repos) {
+            core.env = iced.env.clone();
+        }
+        assert_eq!(
+            serde_json::to_vec(&iced).unwrap(),
+            serde_json::to_vec(&core).unwrap()
+        );
+    }
+    let input = include_str!("fixtures/stage45/sessions/workspaces.saved.json").trim();
+    let core: Vec<gitterm_core::workspace_config::WorkspaceConfig> =
+        serde_json::from_str(input).unwrap();
+    assert_eq!(serde_json::to_string(&core).unwrap(), input);
+}

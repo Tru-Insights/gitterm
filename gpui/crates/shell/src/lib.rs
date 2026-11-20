@@ -41,7 +41,7 @@ use gpui::{
     size,
 };
 use gpui_component::{
-    Root, Selectable,
+    Disableable, Root, Selectable,
     button::{Button, ButtonVariants},
     dock::{
         DockArea, DockEvent, DockLayout, DockPlacement, DockSkin, PanelId, PanelStyle,
@@ -138,7 +138,9 @@ impl Shell {
             .map(|workspace| workspace.id)
             .collect();
         owner.update(cx, |owner, _| owner.stopped_workspaces = stopped_workspaces);
-        if let Some(first) = catalog.first() {
+        if owner.read(cx).model.active().is_none()
+            && let Some(first) = catalog.first()
+        {
             owner.update(cx, |owner, cx| {
                 owner.dispatch(Intent::Activate(first.id), Instant::now(), cx)
             });
@@ -557,11 +559,9 @@ impl Shell {
     }
     fn select_workspace(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(id) = self
-            .workspaces
-            .iter()
-            .filter(|state| state.on_bar())
-            .nth(index)
-            .map(|state| state.workspace.id)
+            .visible_workspace_indices(cx)
+            .get(index)
+            .map(|&i| self.workspaces[i].workspace.id)
         {
             self.owner.update(cx, |owner, cx| {
                 owner.dispatch(Intent::Activate(id), Instant::now(), cx)
@@ -682,10 +682,14 @@ impl Shell {
             .iter_mut()
             .find(|w| Some(w.workspace.id) == active)
             .unwrap();
-        let cwd = self
-            .data
-            .terminal_cwd(state.workspace.id, cx)
-            .expect("local workspace folder");
+        let Some(cwd) = self.data.terminal_cwd(state.workspace.id, cx) else {
+            self.owner.update(cx, |owner, cx| {
+                owner.error =
+                    Some("Remote workspace sessions are read-only in this preview".into());
+                cx.notify();
+            });
+            return;
+        };
         let mut id = layout::stable_path_hash(&cwd);
         while used.contains(&id) {
             id = id.wrapping_add(1);
@@ -1000,7 +1004,13 @@ fn build_workspace(
     let stopped = data
         .local_owner()
         .is_some_and(|owner| owner.read(cx).stopped_workspaces.contains(&workspace.id));
-    let sessions = if local {
+    let imported = data
+        .local_owner()
+        .is_some_and(|owner| owner.read(cx).iced_workspace(workspace.id).is_some());
+    let sessions = if imported {
+        store.terminals = Some(vec![]);
+        data.sessions(workspace.id, cx)
+    } else if local {
         let restored = store.load_terminals().unwrap_or_else(|error| {
             eprintln!("load terminal sessions {}: {error:#}", store.path.display());
             None
@@ -1038,7 +1048,9 @@ fn build_workspace(
             Pane::new(
                 id.clone(),
                 session.title.clone(),
-                if let Some(terminals) = &store.terminals {
+                if let Some(text) = data.imported_session(workspace.id, session.id, cx) {
+                    PaneKind::IcedSession(text)
+                } else if let Some(terminals) = &store.terminals {
                     let cwd = terminals
                         .iter()
                         .find(|t| t.id == session.id.0)
@@ -1088,7 +1100,9 @@ fn build_workspace(
     Ok(WorkspaceDock {
         runtime_uid: sessions::fresh_target().tab_id as u64,
         parked: None,
-        active_session: sessions.first().map(|s| s.id),
+        active_session: data
+            .active_session(workspace.id, cx)
+            .or_else(|| sessions.first().map(|s| s.id)),
         store,
         workspace,
         sessions,
@@ -1137,11 +1151,11 @@ impl Shell {
             .flex()
             .flex_col()
             .children(
-                self.workspaces
-                    .iter()
-                    .filter(|w| w.on_bar())
+                self.visible_workspace_indices(cx)
+                    .into_iter()
                     .enumerate()
-                    .map(|(index, state)| {
+                    .map(|(index, i)| {
+                        let state = &self.workspaces[i];
                         Button::new(("spine-workspace", index))
                             .ghost()
                             .label(
@@ -1163,12 +1177,27 @@ impl Shell {
                     }),
             )
     }
-    fn workspace_bar_items(&self, cx: &App) -> Vec<(usize, WorkspaceId, String)> {
+    fn visible_workspace_indices(&self, cx: &App) -> Vec<usize> {
+        if let Some(catalog) = self.owner.read(cx).iced_catalog() {
+            let visible = catalog.visible_order(self.active_workspace(cx));
+            return visible
+                .into_iter()
+                .filter(|&i| self.workspaces[i].on_bar())
+                .collect();
+        }
         self.workspaces
             .iter()
-            .filter(|w| w.on_bar())
             .enumerate()
-            .map(|(index, state)| {
+            .filter(|(_, w)| w.on_bar())
+            .map(|(i, _)| i)
+            .collect()
+    }
+    fn workspace_bar_items(&self, cx: &App) -> Vec<(usize, WorkspaceId, String)> {
+        self.visible_workspace_indices(cx)
+            .into_iter()
+            .enumerate()
+            .map(|(index, i)| {
+                let state = &self.workspaces[i];
                 let active = Some(state.workspace.id) == self.active_workspace(cx);
                 let label = if active {
                     state.workspace.name.clone()
@@ -1187,6 +1216,64 @@ impl Shell {
     }
     fn workspace_bar(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
         let p = Palette::current(cx);
+        let layout = self
+            .owner
+            .read(cx)
+            .iced_catalog()
+            .map(|catalog| catalog.bar_layout(self.active_workspace(cx)));
+        let menu_items: Vec<_> = layout
+            .as_ref()
+            .into_iter()
+            .flat_map(|layout| &layout.sections)
+            .flat_map(|section| &section.workspaces)
+            .filter_map(|&i| self.workspaces.get(i))
+            .filter(|w| w.on_bar())
+            .map(|w| (w.workspace.id, w.workspace.name.clone()))
+            .collect();
+        let owner = cx.entity().downgrade();
+        let mut chips: Vec<_> = self
+            .workspace_bar_items(cx)
+            .into_iter()
+            .map(|(index, id, label)| {
+                div()
+                    .id(("workspace-chip", index))
+                    .debug_selector(move || format!("workspace-chip-{index}"))
+                    .h_full()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .bg(rgb(if Some(id) == self.active_workspace(cx) {
+                        p.surface
+                    } else {
+                        p.mantle
+                    }))
+                    .child(
+                        Button::new(("workspace", index))
+                            .ghost()
+                            .selected(Some(id) == self.active_workspace(cx))
+                            .label(label)
+                            .h(px(27.))
+                            .accessibility_label(
+                                self.workspaces
+                                    .iter()
+                                    .find(|w| w.workspace.id == id)
+                                    .expect("bar workspace")
+                                    .workspace
+                                    .name
+                                    .clone(),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.select_workspace(index, window, cx)
+                            })),
+                    )
+            })
+            .collect();
+        let split = layout
+            .as_ref()
+            .map(|layout| layout.work.len())
+            .unwrap_or(chips.len());
+        let after = chips.split_off(split.min(chips.len()));
         div()
             .id("workspace-bar")
             .debug_selector(|| "workspace-bar".into())
@@ -1197,49 +1284,44 @@ impl Shell {
             .bg(rgb(p.mantle))
             .border_t_1()
             .border_color(rgb(p.surface))
-            .children(
-                self.workspace_bar_items(cx)
-                    .into_iter()
-                    .map(|(index, id, label)| {
-                        div()
-                            .id(("workspace-chip", index))
-                            .debug_selector(move || format!("workspace-chip-{index}"))
-                            .h_full()
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .cursor_pointer()
-                            .bg(rgb(if Some(id) == self.active_workspace(cx) {
-                                p.surface
-                            } else {
-                                p.mantle
-                            }))
-                            .child(
-                                Button::new(("workspace", index))
-                                    .ghost()
-                                    .selected(Some(id) == self.active_workspace(cx))
-                                    .label(label)
-                                    .h(px(27.))
-                                    .accessibility_label(
-                                        self.workspaces
-                                            .iter()
-                                            .find(|w| w.workspace.id == id)
-                                            .expect("bar workspace")
-                                            .workspace
-                                            .name
-                                            .clone(),
-                                    )
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.select_workspace(index, window, cx)
-                                    })),
-                            )
-                    }),
-            )
+            .children(chips)
+            .when(layout.is_some(), |bar| {
+                bar.child(
+                    Button::new("iced-workspaces-menu")
+                        .ghost()
+                        .label("Repos ▾")
+                        .dropdown_menu(move |menu, _, _| {
+                            menu_items.iter().fold(menu, |menu, (id, name)| {
+                                let owner = owner.clone();
+                                let id = *id;
+                                menu.item(PopupMenuItem::new(name.clone()).on_click(
+                                    move |_, window, cx| {
+                                        _ = owner.update(cx, |shell, cx| {
+                                            shell.owner.update(cx, |owner, cx| {
+                                                owner.dispatch(
+                                                    Intent::Activate(id),
+                                                    Instant::now(),
+                                                    cx,
+                                                )
+                                            });
+                                            shell.sync_git_visibility(false, cx);
+                                            shell.sync_content_selection(cx);
+                                            shell.focus.focus(window, cx);
+                                            cx.notify();
+                                        });
+                                    },
+                                ))
+                            })
+                        }),
+                )
+            })
+            .children(after)
             .child(
                 Button::new("new-workspace")
                     .ghost()
                     .label("+")
-                    .tooltip("New workspace")
+                    .tooltip("Workspaces are read from Iced GitTerm")
+                    .disabled(self.owner.read(cx).iced_catalog().is_some())
                     .h(px(27.))
                     .on_click(cx.listener(|this, _, window, cx| this.pick_folder(window, cx))),
             )
@@ -1853,6 +1935,7 @@ impl Render for Shell {
     }
 }
 
+#[cfg(test)]
 fn load_local_workspaces(
     store: &mut workspace_config::WorkspaceStore,
     folders: Vec<std::path::PathBuf>,
@@ -1876,8 +1959,12 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
     let (model, startup_save) = if sample {
         (WorkspaceStatus::default(), None)
     } else {
-        let (model, save) = load_local_workspaces(&mut store, folders)?;
-        (model, Some(save))
+        ensure!(
+            folders.is_empty(),
+            "Preview workspaces come from Iced; add work in Iced GitTerm"
+        );
+        let model = workspace_config::load_iced_workspaces(&mut store);
+        (model, None)
     };
     gpui_kit::application().run(move |cx| {
         preview.release_on_quit(cx);

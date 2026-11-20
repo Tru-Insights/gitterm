@@ -53,6 +53,17 @@ pub trait ShellData {
     }
     fn workspaces(&self, cx: &App) -> Vec<Workspace>;
     fn sessions(&self, workspace: WorkspaceId, _cx: &App) -> Vec<Session>;
+    fn active_session(&self, _workspace: WorkspaceId, _cx: &App) -> Option<SessionId> {
+        None
+    }
+    fn imported_session(
+        &self,
+        _workspace: WorkspaceId,
+        _id: SessionId,
+        _cx: &App,
+    ) -> Option<String> {
+        None
+    }
     fn status(&self, workspace: WorkspaceId, cx: &App) -> GitStatus;
     fn files(&self, workspace: WorkspaceId, cx: &App) -> Vec<FileNode>;
     /// Folder new terminals start in; `None` means the user's home folder.
@@ -164,7 +175,7 @@ impl ShellData for LocalData {
             .model
             .workspaces
             .iter()
-            .find(|w| w.id == workspace)
+            .find(|w| w.id == workspace && !w.remote)
             .map(|w| w.folder.clone())
     }
     fn workspaces(&self, cx: &App) -> Vec<Workspace> {
@@ -173,21 +184,38 @@ impl ShellData for LocalData {
             .model
             .workspaces
             .iter()
-            .map(|w| Workspace {
-                id: w.id,
-                layout_key: crate::layout::workspace_layout_key(&w.folder),
-                name: w
-                    .folder
-                    .file_name()
-                    .unwrap_or(w.folder.as_os_str())
-                    .to_string_lossy()
-                    .into_owned(),
-                status: w.status.branch_name.clone(),
-                repositories: vec![w.status.repo_name.clone()],
+            .map(|w| {
+                if let Some(saved) = self.0.read(cx).iced_workspace(w.id) {
+                    let home = saved.home_dir().to_owned();
+                    let mut repositories = vec![home.clone()];
+                    repositories.extend(saved.repos.iter().filter(|r| **r != home).cloned());
+                    return Workspace {
+                        id: w.id,
+                        layout_key: crate::workspace_config::iced_layout_key(saved),
+                        name: saved.name.clone(),
+                        status: w.status.branch_name.clone(),
+                        repositories,
+                    };
+                }
+                Workspace {
+                    id: w.id,
+                    layout_key: crate::layout::workspace_layout_key(&w.folder),
+                    name: w
+                        .folder
+                        .file_name()
+                        .unwrap_or(w.folder.as_os_str())
+                        .to_string_lossy()
+                        .into_owned(),
+                    status: w.status.branch_name.clone(),
+                    repositories: vec![w.status.repo_name.clone()],
+                }
             })
             .collect()
     }
     fn sessions(&self, workspace: WorkspaceId, cx: &App) -> Vec<Session> {
+        if let Some(saved) = self.0.read(cx).iced_workspace(workspace) {
+            return iced_sessions(saved);
+        }
         let model = &self.0.read(cx).model;
         let folder = &model
             .workspaces
@@ -201,10 +229,108 @@ impl ShellData for LocalData {
             kind: SessionKind::Terminal,
         }]
     }
+    fn active_session(&self, workspace: WorkspaceId, cx: &App) -> Option<SessionId> {
+        let owner = self.0.read(cx);
+        let saved = owner.iced_workspace(workspace)?;
+        let sessions = iced_sessions(saved);
+        let active = iced_active_tab(saved);
+        sessions.get(active).map(|s| s.id)
+    }
+    fn imported_session(&self, workspace: WorkspaceId, id: SessionId, cx: &App) -> Option<String> {
+        let owner = self.0.read(cx);
+        let saved = owner.iced_workspace(workspace)?;
+        let sessions = iced_sessions(saved);
+        let index = sessions.iter().position(|s| s.id == id)?;
+        let dir = saved
+            .tabs
+            .get(index)
+            .map(|tab| tab.dir.as_str())
+            .unwrap_or(&saved.dir);
+        let conversation = saved
+            .tabs
+            .get(index)
+            .and_then(|tab| tab.chat_session_id.as_deref())
+            .unwrap_or("Terminal");
+        Some(format!("Iced session (read-only)\n{dir}\n{conversation}"))
+    }
     fn status(&self, workspace: WorkspaceId, cx: &App) -> GitStatus {
         self.0.read(cx).model.status_view(workspace)
     }
     fn files(&self, _: WorkspaceId, _: &App) -> Vec<FileNode> {
         vec![]
     }
+}
+
+pub(crate) fn iced_sessions(
+    saved: &gitterm_core::workspace_config::WorkspaceConfig,
+) -> Vec<Session> {
+    let key = crate::workspace_config::iced_layout_key(saved);
+    let mut sessions: Vec<_> = saved
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(index, tab)| {
+            let identity = tab
+                .session_uid
+                .as_ref()
+                .map(|uid| format!("{key}:tab:{uid}"))
+                .unwrap_or_else(|| format!("{key}:tab-index:{index}"));
+            Session {
+                id: SessionId(crate::layout::stable_path_hash(std::path::Path::new(
+                    &identity,
+                ))),
+                title: tab.chat_session_id.clone().unwrap_or_else(|| {
+                    if tab.tab_kind.as_deref() == Some("agent") {
+                        "Agent".into()
+                    } else {
+                        "Shell".into()
+                    }
+                }),
+                kind: if tab.tab_kind.as_deref() == Some("agent") {
+                    SessionKind::Chat
+                } else {
+                    SessionKind::Terminal
+                },
+            }
+        })
+        .collect();
+    // Owned root chats classify the work; only saved tabs are open sessions.
+    // Iced gives an empty local workspace its default root shell tab.
+    if sessions.is_empty()
+        && !saved.is_legacy_remote()
+        && !matches!(
+            saved.location,
+            Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. })
+        )
+    {
+        sessions.push(Session {
+            id: SessionId(crate::layout::stable_path_hash(std::path::Path::new(
+                &format!("{key}:default"),
+            ))),
+            title: "Shell".into(),
+            kind: SessionKind::Terminal,
+        });
+    }
+    sessions
+}
+
+pub(crate) fn iced_active_tab(saved: &gitterm_core::workspace_config::WorkspaceConfig) -> usize {
+    saved
+        .active_tab
+        .filter(|&i| i < saved.tabs.len())
+        .or_else(|| {
+            saved.tabs.iter().position(|tab| {
+                let equal =
+                    |a: &str, b: &str| match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+                        (Ok(a), Ok(b)) => a == b,
+                        _ => a == b,
+                    };
+                equal(&tab.dir, &saved.dir)
+                    || tab
+                        .repo_dir
+                        .as_deref()
+                        .is_some_and(|dir| equal(dir, &saved.dir))
+            })
+        })
+        .unwrap_or(0)
 }
