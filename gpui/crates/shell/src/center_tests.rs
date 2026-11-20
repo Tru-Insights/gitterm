@@ -98,9 +98,7 @@ fn explicit_terminal_close_reaps_and_hidden_exit_updates_title(cx: &mut TestAppC
     let config = tempfile::tempdir().unwrap();
     let (shell, cx) =
         cx.add_window_view(|window, cx| local_shell(&folder, config.path(), window, cx));
-    cx.update(|window, cx| {
-        shell.update(cx, |shell, cx| shell.new_terminal(window, cx))
-    });
+    cx.update(|window, cx| shell.update(cx, |shell, cx| shell.new_terminal(window, cx)));
     let first = cx.read(|cx| {
         let state = shell.read(cx).active(cx);
         assert_eq!(state.sessions.len(), 1);
@@ -219,14 +217,20 @@ fn explicit_terminal_close_reaps_and_hidden_exit_updates_title(cx: &mut TestAppC
         shell.update(cx, |shell, cx| {
             let state = shell.active(cx);
             let pane = state.panes[&session_pane_id(state.sessions[0].id)].clone();
-            state.dock.update(cx, |dock, cx| dock.remove_panel(pane, window, cx));
+            state
+                .dock
+                .update(cx, |dock, cx| dock.remove_panel(pane, window, cx));
         })
     });
     cx.run_until_parked();
     cx.read(|cx| {
         let state = shell.read(cx).active(cx);
         assert_eq!(state.sessions.len(), 1);
-        assert!(pane_id_visible(state, &session_pane_id(state.sessions[0].id), cx));
+        assert!(pane_id_visible(
+            state,
+            &session_pane_id(state.sessions[0].id),
+            cx
+        ));
     });
 }
 
