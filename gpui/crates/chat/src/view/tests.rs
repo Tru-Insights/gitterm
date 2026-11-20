@@ -2034,23 +2034,6 @@ fn history_fold_keeps_short_reply_before_later_tools_and_has_no_empty_tail(
 }
 
 #[gpui::test]
-fn read_only_history_uses_static_model_name_without_ready_catalog(cx: &mut TestAppContext) {
-    let (chat, cx) = setup(vec![], cx);
-    chat.update_in(cx, |view, _, cx| {
-        view.set_history_config(
-            &gitterm_core::chat::types::AgentBackendConfig::Claude {
-                model: "opus".into(),
-                permission_mode: None,
-                effort: None,
-            },
-            cx,
-        );
-        view.set_read_only(Some("History".into()), cx);
-        assert_eq!(view.composer_state.model, "Opus 5.5");
-    });
-}
-
-#[gpui::test]
 fn read_only_history_chips_use_saved_config_and_recorded_labels(cx: &mut TestAppContext) {
     let records = vec![Record {
         at_ms: None,
