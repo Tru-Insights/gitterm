@@ -109,7 +109,12 @@ use gitterm::worktree_follow::{
     self, CacheLookup, WorktreeFollow, WorktreeInfo, WorktreeListCache,
 };
 use gitterm_core::chat::state::{
-    Effect as ChatEffect, HistoryTicket, Intent as ChatIntent, RuntimeStamp,
+    CheckoutContext, Effect as ChatEffect, HistoryTicket, Intent as ChatIntent, PromptStatus,
+    RuntimeStamp, SettingChange,
+};
+use gitterm_core::chat::{
+    runtime::RuntimeEvent,
+    types::{CommandCorrelation, DeliveryOutcome},
 };
 use gitterm_core::review::state::{Effect as ReviewEffect, Intent as ReviewIntent};
 #[cfg(test)]
@@ -4547,6 +4552,120 @@ fn is_harness_token(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && !value.contains(char::is_whitespace)
 }
 
+/// Execute reducer dispatch synchronously, against the complete current binding.
+/// Channel acceptance never stands in for a write receipt or provider ack.
+fn dispatch_chat_effect(
+    session: &mut AgentSession,
+    current: &session::Target,
+    effect: ChatEffect,
+) -> (Option<tab::AgentEvent>, Option<String>) {
+    let ChatEffect::Dispatch {
+        runtime,
+        correlation,
+        command,
+        echo,
+    } = effect
+    else {
+        return (
+            None,
+            match effect {
+                ChatEffect::Rejected(error) => Some(error),
+                ChatEffect::None => None,
+                _ => unreachable!("only dispatch, rejection or no-op effects reach this adapter"),
+            },
+        );
+    };
+    let sent = if session.accepts_runtime(&runtime, current) {
+        session
+            .harness
+            .as_ref()
+            .ok_or_else(|| "The chat's agent is not running".to_string())
+            .and_then(|harness| harness.send_chat(command, correlation))
+    } else {
+        Err("The chat runtime changed before dispatch".into())
+    };
+    match sent {
+        Ok(false) => {
+            session.reduce(ChatIntent::CommandAcceptedWithoutReceipt {
+                runtime,
+                current: current.clone(),
+                correlation,
+            });
+            (echo, None)
+        }
+        Ok(true) => (echo, None),
+        Err(error) => {
+            let effect = session.reduce(ChatIntent::CommandOutcome {
+                runtime,
+                current: current.clone(),
+                correlation,
+                outcome: DeliveryOutcome::Rejected(error.clone()),
+            });
+            (
+                echo,
+                Some(match effect {
+                    ChatEffect::Rejected(reason) => reason,
+                    _ => error,
+                }),
+            )
+        }
+    }
+}
+
+/// One config mapping for acknowledged live values and next-launch choices.
+fn apply_chat_setting(config: &mut AgentBackendConfig, change: &SettingChange) -> bool {
+    match (config, change) {
+        (
+            AgentBackendConfig::Claude { model, .. } | AgentBackendConfig::Acp { model, .. },
+            SettingChange::Model(value),
+        ) => model.clone_from(value),
+        (
+            AgentBackendConfig::Claude {
+                permission_mode: mode,
+                ..
+            }
+            | AgentBackendConfig::Acp { mode, .. },
+            SettingChange::Mode(value),
+        ) => *mode = Some(value.clone()),
+        (
+            AgentBackendConfig::Claude { effort, .. } | AgentBackendConfig::Acp { effort, .. },
+            SettingChange::Effort(value),
+        ) => effort.clone_from(value),
+        _ => return false,
+    }
+    true
+}
+
+fn configured_setting_event(change: SettingChange) -> HarnessEvent {
+    match change {
+        SettingChange::Model(value) => HarnessEvent::ModelChanged(value),
+        SettingChange::Mode(value) => HarnessEvent::PermissionModeChanged(value),
+        SettingChange::Effort(effort) => HarnessEvent::EffortChanged {
+            effort,
+            applied: None,
+        },
+    }
+}
+
+/// Persist the reducer's uncertainty before ProcessExited reaches the page,
+/// whose legacy exit handler otherwise calls every queued bubble unsent.
+fn surface_chat_uncertainty(tab_id: usize, session: &mut AgentSession) {
+    let ids: Vec<_> = session
+        .queued_prompts
+        .iter()
+        .filter(|(_, prompt)| prompt.status == PromptStatus::Uncertain)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in ids {
+        if session.conversation.iter().any(|event| matches!(event, tab::AgentEvent::Other(value) if value["kind"] == "prompt_uncertain" && value["id"] == id)) {
+            continue;
+        }
+        let event = tab::AgentEvent::Other(serde_json::json!({"kind":"prompt_uncertain", "id":id}));
+        push_agent_event_to_webview(tab_id, &event);
+        session.record(event);
+    }
+}
+
 /// The config a new Antigravity or OpenCode chat tab starts with (TRU-153): the
 /// configured model (`chat.antigravity_model` / `chat.opencode_model`; empty
 /// keeps the agent's own) and the agent's default mode, which asks before
@@ -7307,6 +7426,7 @@ pub enum Event {
     AgentEventReceived(usize, tab::AgentEvent),
     /// Every real receiver is stamped before any domain or UI effects.
     AgentRuntimeEvent(RuntimeStamp, tab::AgentEvent),
+    AgentCommandOutcome(RuntimeStamp, CommandCorrelation, DeliveryOutcome),
     AgentHistoryResult(HistoryTicket, Result<Vec<tab::AgentEvent>, String>),
     AgentRuntimeAnswer(RuntimeStamp, String, RuntimeDecision),
     AgentRuntimeStop(RuntimeStamp),
@@ -24706,7 +24826,9 @@ fi
                     tab.agent_session()
                         .is_some_and(|s| s.accepts_stream(stamp, &tab.session_target()))
                 }),
-            Event::AgentRuntimeAnswer(stamp, ..) | Event::AgentRuntimeStop(stamp) => self
+            Event::AgentCommandOutcome(stamp, ..)
+            | Event::AgentRuntimeAnswer(stamp, ..)
+            | Event::AgentRuntimeStop(stamp) => self
                 .workspaces
                 .iter()
                 .flat_map(|ws| &ws.tabs)
@@ -24731,6 +24853,33 @@ fi
             return Task::none();
         }
         let event = match event {
+            Event::AgentCommandOutcome(runtime, correlation, outcome) => {
+                let tab_id = runtime.target.tab_id;
+                if let Some(tab) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| &mut ws.tabs)
+                    .find(|tab| tab.id == tab_id)
+                {
+                    let current = tab.session_target();
+                    if let Some(session) = tab.agent_session_mut() {
+                        if let ChatEffect::Rejected(reason) =
+                            session.reduce(ChatIntent::CommandOutcome {
+                                runtime,
+                                current,
+                                correlation,
+                                outcome,
+                            })
+                        {
+                            let event = tab::AgentEvent::Harness(HarnessEvent::Error(reason));
+                            push_agent_event_to_webview(tab_id, &event);
+                            session.record(event);
+                        }
+                        surface_chat_uncertainty(tab_id, session);
+                    }
+                }
+                return Task::none();
+            }
             Event::AgentRuntimeEvent(stamp, event) => {
                 Event::AgentEventReceived(stamp.target.tab_id, event)
             }
@@ -26030,31 +26179,39 @@ fi
                             Task::done(Event::AgentRuntimeStop(stamp))
                         }),
                     AgentIpcMessage::Withdraw { tab_id, id } => {
-                        let claude = self
+                        let Some(tab) = self
                             .workspaces
-                            .iter()
-                            .flat_map(|ws| ws.tabs.iter())
-                            .find(|t| t.id == tab_id)
-                            .and_then(|t| t.agent_session())
-                            .and_then(|session| session.harness.as_ref());
-                        match claude {
-                            Some(claude) => {
-                                if let Err(e) =
-                                    claude.send(HarnessCommand::WithdrawQueuedMessage(id.clone()))
-                                {
-                                    eprintln!("[agent-ipc] tab {tab_id}: withdraw {id}: {e}");
-                                    agent_webview_note(tab_id, &format!("Not withdrawn: {e}"));
-                                }
-                            }
-                            None => {
-                                eprintln!(
-                                    "[agent-ipc] tab {tab_id}: withdraw {id}: no Claude process"
+                            .iter_mut()
+                            .flat_map(|ws| &mut ws.tabs)
+                            .find(|tab| tab.id == tab_id)
+                        else {
+                            agent_webview_note(
+                                tab_id,
+                                "Not withdrawn: this chat is no longer open.",
+                            );
+                            return Task::none();
+                        };
+                        let current = tab.session_target();
+                        if let Some(session) = tab.agent_session_mut() {
+                            let effect = session.reduce(ChatIntent::Withdraw {
+                                runtime: session.runtime_stamp(current.clone()),
+                                current: current.clone(),
+                                process_running: session.harness.is_some(),
+                                message_id: id.clone(),
+                            });
+                            let (_, error) = dispatch_chat_effect(session, &current, effect);
+                            if let Some(reason) = error {
+                                let event = tab::AgentEvent::Harness(
+                                    HarnessEvent::MessageWithdrawRefused { id, reason },
                                 );
-                                agent_webview_note(
-                                    tab_id,
-                                    "Not withdrawn: Claude is not running in this tab.",
-                                );
+                                push_agent_event_to_webview(tab_id, &event);
+                                session.record(event);
                             }
+                        } else {
+                            agent_webview_note(
+                                tab_id,
+                                "Not withdrawn: this is no longer an agent chat.",
+                            );
                         }
                         Task::none()
                     }
@@ -26075,19 +26232,19 @@ fi
                             Task::done(Event::AgentRuntimeAnswer(stamp, request_id, decision))
                         }),
                     AgentIpcMessage::SetPermissionMode { tab_id, mode } => {
-                        Task::done(Event::AgentSetPermissionMode(tab_id, mode))
+                        self.update(Event::AgentSetPermissionMode(tab_id, mode))
                     }
                     AgentIpcMessage::SetModel { tab_id, model } => {
-                        Task::done(Event::AgentSetModel(tab_id, model))
+                        self.update(Event::AgentSetModel(tab_id, model))
                     }
                     AgentIpcMessage::SetEffort { tab_id, effort } => {
-                        Task::done(Event::AgentSetEffort(tab_id, effort))
+                        self.update(Event::AgentSetEffort(tab_id, effort))
                     }
                     AgentIpcMessage::CheckoutContext { tab_id } => {
                         Task::done(Event::AgentCheckoutContextRequested(tab_id))
                     }
                     AgentIpcMessage::SetCheckout { tab_id, path } => {
-                        Task::done(Event::AgentSetCheckout(tab_id, path))
+                        self.update(Event::AgentSetCheckout(tab_id, path))
                     }
                     AgentIpcMessage::ReviewContext { tab_id } => {
                         Task::done(Event::AgentReviewContextRequested(tab_id))
@@ -26177,6 +26334,7 @@ fi
                 };
             }
             Event::AgentRuntimeEvent(..)
+            | Event::AgentCommandOutcome(..)
             | Event::AgentHistoryResult(..)
             | Event::AgentRuntimeAnswer(..)
             | Event::AgentRuntimeStop(..) => unreachable!("chat ingress normalized above"),
@@ -26213,6 +26371,7 @@ fi
                 // its queue state and a queued one can be withdrawn.
                 let mut prompt = prompt;
                 let mut prompt_markers = Vec::new();
+                let mut show_echo = true;
                 // Issue keys the human names feed the chat's facts (TRU-166);
                 // written with the turn's tool calls.
                 for ws in &mut self.workspaces {
@@ -26235,6 +26394,7 @@ fi
                 let mut task_started: Option<String> = None;
                 let mut harness_bridge: Option<tokio::sync::mpsc::UnboundedReceiver<HarnessEvent>> =
                     None;
+                let mut runtime_bridge = None;
                 let mut claude_spawned = false;
                 let mut bridge_stamp = None;
                 // A chat tab in a remote-agent workspace runs `claude` on
@@ -26310,6 +26470,44 @@ fi
                             eprintln!("AgentSubmitPrompt: tab {} is not an agent tab", tab_id);
                             return Task::none();
                         };
+                        if session.submit_queues() {
+                            let effect = session.reduce(ChatIntent::Queue {
+                                runtime: session.runtime_stamp(target.clone()),
+                                current: target.clone(),
+                                config: session.config.clone(),
+                                process_running: session.harness.is_some(),
+                                prompt,
+                                message_id: uuid::Uuid::new_v4().to_string(),
+                            });
+                            let (queued_echo, error) =
+                                dispatch_chat_effect(session, &target, effect);
+                            show_echo = queued_echo.is_some();
+                            if let Some(queued_echo) = queued_echo {
+                                echo = queued_echo;
+                                let (_, after) = session.record(echo.clone());
+                                prompt_markers.extend(after);
+                                if error.is_none() {
+                                    session.reduce(ChatIntent::SubmissionAccepted);
+                                    submitted = true;
+                                } else {
+                                    session.harness = None;
+                                }
+                            }
+                            if let Some(error) = error {
+                                let event = tab::AgentEvent::Harness(HarnessEvent::Error(format!(
+                                    "The prompt was not delivered: {error}"
+                                )));
+                                push_agent_event_to_webview(tab_id, &event);
+                                session.record(event);
+                            }
+                            if submitted {
+                                if let Some(task_id) = tab_task_id {
+                                    t.task_live_state = Some(TaskSessionLiveState::Working);
+                                    task_started = Some(task_id);
+                                }
+                            }
+                            break 'outer_submit;
+                        }
                         if let tab::AgentBackend::Acp(agent) = session.backend() {
                             // ACP agents run on this Mac only (TRU-153).
                             if let Some((remote_id, _)) = remote_chat.as_ref() {
@@ -26447,15 +26645,24 @@ fi
                                     return Task::none();
                                 };
                                 let (claude, rx) = match remote_chat.take() {
-                                    None => gitterm::harness::claude::ClaudeSession::spawn(config),
+                                    None => {
+                                        let (claude, rx) =
+                                            gitterm::harness::claude::ClaudeSession::spawn_runtime(
+                                                config,
+                                            );
+                                        runtime_bridge = Some(rx);
+                                        (claude, None)
+                                    }
                                     Some((remote_id, Ok(client))) => {
                                         eprintln!(
                                             "[remote-chat] tab {tab_id}: starting Claude on {remote_id} in {}",
                                             config.cwd.display()
                                         );
-                                        gitterm::harness::claude::ClaudeSession::spawn_remote(
-                                            client, config,
-                                        )
+                                        let (claude, rx) =
+                                            gitterm::harness::claude::ClaudeSession::spawn_remote(
+                                                client, config,
+                                            );
+                                        (claude, Some(rx))
                                     }
                                     Some((remote_id, Err(error))) => {
                                         eprintln!(
@@ -26469,7 +26676,7 @@ fi
                                     Some(gitterm::harness::HarnessSession::Claude(claude));
                                 session.begin_runtime();
                                 bridge_stamp = Some(session.runtime_stamp(target.clone()));
-                                harness_bridge = Some(rx);
+                                harness_bridge = rx;
                                 claude_spawned = true;
                             }
                             // Mid-turn the CLI queues the message itself and
@@ -26611,10 +26818,11 @@ fi
                 if let Some(task_id) = task_started {
                     self.apply_task_session_signal(&task_id, None);
                 }
-                // Also push the echo into the tab's chat page, if it has one.
-                push_agent_event_to_webview(tab_id, &echo);
-                for marker in &prompt_markers {
-                    push_agent_event_to_webview(tab_id, marker);
+                if show_echo {
+                    push_agent_event_to_webview(tab_id, &echo);
+                    for marker in &prompt_markers {
+                        push_agent_event_to_webview(tab_id, marker);
+                    }
                 }
                 if images_not_sent > 0 {
                     eprintln!(
@@ -26628,6 +26836,15 @@ fi
                     );
                 }
                 if claude_spawned {
+                    if let Some(session) = self
+                        .workspaces
+                        .iter_mut()
+                        .flat_map(|ws| &mut ws.tabs)
+                        .find(|tab| tab.id == tab_id)
+                        .and_then(|tab| tab.agent_session_mut())
+                    {
+                        surface_chat_uncertainty(tab_id, session);
+                    }
                     // The session is now bound to its directory.
                     if let Some(state) = self.chat_checkout_state(tab_id) {
                         push_checkout_state_to_webview(tab_id, &state);
@@ -26639,6 +26856,19 @@ fi
                     let stamp = bridge_stamp.expect("installed Pi receiver has runtime identity");
                     return Task::run(stream, move |ev| {
                         Event::AgentRuntimeEvent(stamp.clone(), ev)
+                    });
+                }
+                if let Some(rx) = runtime_bridge {
+                    use tokio_stream::wrappers::UnboundedReceiverStream;
+                    let stamp = bridge_stamp.expect("installed runtime receiver has identity");
+                    return Task::run(UnboundedReceiverStream::new(rx), move |event| match event {
+                        RuntimeEvent::Harness(event) => {
+                            Event::AgentRuntimeEvent(stamp.clone(), tab::AgentEvent::Harness(event))
+                        }
+                        RuntimeEvent::CommandOutcome {
+                            correlation,
+                            outcome,
+                        } => Event::AgentCommandOutcome(stamp.clone(), correlation, outcome),
                     });
                 }
                 if let Some(rx) = harness_bridge {
@@ -26690,226 +26920,85 @@ fi
                 }
                 return Task::none();
             }
-            Event::AgentSetPermissionMode(tab_id, mode) => {
-                let Some(session) = self
+            event @ (Event::AgentSetPermissionMode(..)
+            | Event::AgentSetModel(..)
+            | Event::AgentSetEffort(..)) => {
+                let (tab_id, change) = match event {
+                    Event::AgentSetPermissionMode(id, value) => (id, SettingChange::Mode(value)),
+                    Event::AgentSetEffort(id, value) => (id, SettingChange::Effort(value)),
+                    Event::AgentSetModel(id, value) => {
+                        let value = value.trim().to_string();
+                        if !is_harness_token(&value) {
+                            return Task::none();
+                        }
+                        (id, SettingChange::Model(value))
+                    }
+                    _ => unreachable!(),
+                };
+                let Some(tab) = self
                     .workspaces
                     .iter_mut()
-                    .flat_map(|ws| ws.tabs.iter_mut())
-                    .find(|t| t.id == tab_id)
-                    .and_then(|t| t.agent_session_mut())
+                    .flat_map(|ws| &mut ws.tabs)
+                    .find(|tab| tab.id == tab_id)
                 else {
-                    eprintln!("AgentSetPermissionMode: tab {tab_id} is not an agent tab");
+                    return Task::none();
+                };
+                let current = tab.session_target();
+                let Some(session) = tab.agent_session_mut() else {
                     return Task::none();
                 };
                 if let Some(note) = session.config.read_only_note() {
                     agent_webview_note(tab_id, note);
                     return Task::none();
                 }
-                // Claude's modes are known here; an ACP agent lists its own
-                // and refuses one it does not offer.
-                let permission_mode = match &mut session.config {
-                    tab::AgentBackendConfig::Claude {
-                        permission_mode, ..
-                    } => {
-                        if !tab::CLAUDE_PERMISSION_MODES.contains(&mode.as_str()) {
-                            eprintln!(
-                                "AgentSetPermissionMode: tab {tab_id}: unknown mode {mode:?}"
-                            );
-                            return Task::none();
-                        }
-                        permission_mode
-                    }
-                    tab::AgentBackendConfig::Acp {
-                        mode: permission_mode,
-                        ..
-                    } => {
-                        if !is_harness_token(&mode) {
-                            eprintln!(
-                                "AgentSetPermissionMode: tab {tab_id}: refusing mode {mode:?}"
-                            );
-                            return Task::none();
-                        }
-                        permission_mode
-                    }
-                    tab::AgentBackendConfig::Pi { .. } => {
-                        eprintln!("AgentSetPermissionMode: tab {tab_id} is not a native chat tab");
-                        return Task::none();
-                    }
+                let configured = session.reduce(ChatIntent::ConfigureSetting {
+                    config: session.config.clone(),
+                    process_running: false,
+                    change: change.clone(),
+                });
+                if let ChatEffect::Rejected(reason) = configured {
+                    eprintln!("Chat picker on tab {tab_id}: {reason}");
+                    return Task::none();
+                }
+                let effect = if session.harness.is_some() {
+                    session.reduce(ChatIntent::ChangeSetting {
+                        runtime: session.runtime_stamp(current.clone()),
+                        current: current.clone(),
+                        config: session.config.clone(),
+                        process_running: true,
+                        change,
+                    })
+                } else {
+                    configured
                 };
-                let (ev, config_changed) = if let Some(claude) = session.harness.as_ref() {
-                    // Live process: the CLI decides. The tab config (and the
-                    // page) follow its confirmation, PermissionModeChanged in
-                    // AgentEventReceived, so a rejected mode is never saved.
-                    match claude.send(HarnessCommand::SetPermissionMode(mode.clone())) {
-                        Ok(()) => return Task::none(),
-                        Err(e) => {
-                            eprintln!(
-                                "AgentSetPermissionMode {mode:?} on tab {tab_id} failed: {e}"
-                            );
-                            let message =
-                                format!("Could not change the permission mode to {mode}: {e}");
-                            (HarnessEvent::Error(message), false)
+                if let ChatEffect::SettingConfigured(change) = effect {
+                    let configured = apply_chat_setting(&mut session.config, &change);
+                    let save_defaults = !matches!(change, SettingChange::Mode(_));
+                    if session.backend() == tab::AgentBackend::Claude {
+                        match &change {
+                            SettingChange::Model(value) => self.chat_config.remember_model(value),
+                            SettingChange::Effort(value) => {
+                                self.chat_config.remember_effort(value.as_deref())
+                            }
+                            _ => {}
+                        }
+                    }
+                    let event = tab::AgentEvent::Harness(configured_setting_event(change));
+                    push_agent_event_to_webview(tab_id, &event);
+                    session.record(event);
+                    if configured {
+                        self.mark_workspaces_dirty();
+                        if save_defaults {
+                            self.save_config();
                         }
                     }
                 } else {
-                    // No process yet (or it exited): the next spawn passes
-                    // `--permission-mode` from this config, so the mode is in
-                    // effect now and the page may show it as current at once.
-                    *permission_mode = Some(mode.clone());
-                    (HarnessEvent::PermissionModeChanged(mode), true)
-                };
-                let ev = tab::AgentEvent::Harness(ev);
-                push_agent_event_to_webview(tab_id, &ev);
-                session.record(ev);
-                if config_changed {
-                    self.mark_workspaces_dirty();
-                }
-                return Task::none();
-            }
-            Event::AgentSetModel(tab_id, model) => {
-                let model = model.trim().to_string();
-                if model.is_empty() || model.len() > 256 || model.contains(char::is_whitespace) {
-                    eprintln!("AgentSetModel: tab {tab_id}: refusing model {model:?}");
-                    return Task::none();
-                }
-                let Some(session) = self
-                    .workspaces
-                    .iter_mut()
-                    .flat_map(|ws| ws.tabs.iter_mut())
-                    .find(|t| t.id == tab_id)
-                    .and_then(|t| t.agent_session_mut())
-                else {
-                    eprintln!("AgentSetModel: tab {tab_id} is not an agent tab");
-                    return Task::none();
-                };
-                if let Some(note) = session.config.read_only_note() {
-                    agent_webview_note(tab_id, note);
-                    return Task::none();
-                }
-                let is_claude = session.backend() == tab::AgentBackend::Claude;
-                let configured = match &mut session.config {
-                    tab::AgentBackendConfig::Claude {
-                        model: configured, ..
+                    let (_, error) = dispatch_chat_effect(session, &current, effect);
+                    if let Some(error) = error {
+                        let event = tab::AgentEvent::Harness(HarnessEvent::Error(error));
+                        push_agent_event_to_webview(tab_id, &event);
+                        session.record(event);
                     }
-                    | tab::AgentBackendConfig::Acp {
-                        model: configured, ..
-                    } => configured,
-                    tab::AgentBackendConfig::Pi { .. } => {
-                        eprintln!("AgentSetModel: tab {tab_id} is not a native chat tab");
-                        return Task::none();
-                    }
-                };
-                let (ev, config_changed) = if let Some(claude) = session.harness.as_ref() {
-                    // Live process: the tab config, the last selection and
-                    // the page follow ModelChanged in AgentEventReceived.
-                    match claude.send(HarnessCommand::SetModel(model.clone())) {
-                        Ok(()) => return Task::none(),
-                        Err(e) => {
-                            eprintln!("AgentSetModel {model:?} on tab {tab_id} failed: {e}");
-                            let message = format!("Could not change the model to {model}: {e}");
-                            (HarnessEvent::Error(message), false)
-                        }
-                    }
-                } else {
-                    // No process yet (or it exited): the next spawn passes
-                    // `--model` from this config (an ACP session applies it
-                    // once the session exists).
-                    configured.clone_from(&model);
-                    if is_claude {
-                        self.chat_config.remember_model(&model);
-                    }
-                    (HarnessEvent::ModelChanged(model), true)
-                };
-                let ev = tab::AgentEvent::Harness(ev);
-                push_agent_event_to_webview(tab_id, &ev);
-                session.record(ev);
-                if config_changed {
-                    self.mark_workspaces_dirty();
-                    self.save_config();
-                }
-                return Task::none();
-            }
-            Event::AgentSetEffort(tab_id, effort) => {
-                let Some(session) = self
-                    .workspaces
-                    .iter_mut()
-                    .flat_map(|ws| ws.tabs.iter_mut())
-                    .find(|t| t.id == tab_id)
-                    .and_then(|t| t.agent_session_mut())
-                else {
-                    eprintln!("AgentSetEffort: tab {tab_id} is not an agent tab");
-                    return Task::none();
-                };
-                if let Some(note) = session.config.read_only_note() {
-                    agent_webview_note(tab_id, note);
-                    return Task::none();
-                }
-                let is_claude = session.backend() == tab::AgentBackend::Claude;
-                let configured = match &mut session.config {
-                    tab::AgentBackendConfig::Claude {
-                        effort: configured, ..
-                    } => {
-                        if effort
-                            .as_deref()
-                            .is_some_and(|level| !tab::CLAUDE_EFFORT_LEVELS.contains(&level))
-                        {
-                            eprintln!("AgentSetEffort: tab {tab_id}: unknown effort {effort:?}");
-                            return Task::none();
-                        }
-                        configured
-                    }
-                    // The agent lists its own levels and refuses others.
-                    tab::AgentBackendConfig::Acp {
-                        effort: configured, ..
-                    } => {
-                        if effort
-                            .as_deref()
-                            .is_some_and(|level| !is_harness_token(level))
-                        {
-                            eprintln!("AgentSetEffort: tab {tab_id}: refusing effort {effort:?}");
-                            return Task::none();
-                        }
-                        configured
-                    }
-                    tab::AgentBackendConfig::Pi { .. } => {
-                        eprintln!("AgentSetEffort: tab {tab_id} is not a native chat tab");
-                        return Task::none();
-                    }
-                };
-                let (ev, config_changed) = if let Some(claude) = session.harness.as_ref() {
-                    // Live process: confirmed by EffortChanged (the
-                    // session reads its settings back after the change).
-                    match claude.send(HarnessCommand::SetEffort(effort.clone())) {
-                        Ok(()) => return Task::none(),
-                        Err(e) => {
-                            eprintln!("AgentSetEffort {effort:?} on tab {tab_id} failed: {e}");
-                            let message = format!(
-                                "Could not change the effort to {}: {e}",
-                                effort.as_deref().unwrap_or("auto")
-                            );
-                            (HarnessEvent::Error(message), false)
-                        }
-                    }
-                } else {
-                    // The next spawn passes `--effort` from this config.
-                    configured.clone_from(&effort);
-                    if is_claude {
-                        self.chat_config.remember_effort(effort.as_deref());
-                    }
-                    (
-                        HarnessEvent::EffortChanged {
-                            effort,
-                            applied: None,
-                        },
-                        true,
-                    )
-                };
-                let ev = tab::AgentEvent::Harness(ev);
-                push_agent_event_to_webview(tab_id, &ev);
-                session.record(ev);
-                if config_changed {
-                    self.mark_workspaces_dirty();
-                    self.save_config();
                 }
                 return Task::none();
             }
@@ -26927,17 +27016,6 @@ fi
                     eprintln!("AgentSetCheckout: tab {tab_id} is not a Claude chat");
                     return Task::none();
                 };
-                if state["locked"] == true {
-                    eprintln!("AgentSetCheckout: tab {tab_id}: checkout is locked");
-                    agent_webview_note(
-                        tab_id,
-                        state["reason"]
-                            .as_str()
-                            .unwrap_or("The checkout cannot change now."),
-                    );
-                    push_checkout_state_to_webview(tab_id, &state);
-                    return Task::none();
-                }
                 let Some(workspace_dir) = self
                     .workspaces
                     .iter()
@@ -26967,14 +27045,45 @@ fi
                     return Task::none();
                 };
                 let is_active = self.active_tab().is_some_and(|t| t.id == tab_id);
+                let choices = self
+                    .checkout_choices_for(&workspace_dir)
+                    .into_iter()
+                    .map(|choice| choice.path)
+                    .collect();
                 if let Some(tab) = self
                     .workspaces
                     .iter_mut()
-                    .flat_map(|ws| ws.tabs.iter_mut())
-                    .find(|t| t.id == tab_id)
+                    .flat_map(|ws| &mut ws.tabs)
+                    .find(|tab| tab.id == tab_id)
                 {
-                    tab.repo_path = choice.path.clone();
-                    tab.set_local_dir(choice.path.clone());
+                    let current = tab.session_target();
+                    let Some(session) = tab.agent_session_mut() else {
+                        return Task::none();
+                    };
+                    let effect = session.reduce(ChatIntent::ChooseCheckout {
+                        runtime: session.runtime_stamp(current.clone()),
+                        current: current.clone(),
+                        context: CheckoutContext {
+                            choices,
+                            locked_reason: state["reason"].as_str().map(str::to_owned),
+                            process_running: session.harness.is_some(),
+                        },
+                        path: choice.path.clone(),
+                    });
+                    match effect {
+                        ChatEffect::CheckoutBound { runtime, path }
+                            if session.accepts_runtime(&runtime, &current) =>
+                        {
+                            tab.repo_path = path.clone();
+                            tab.set_local_dir(path);
+                        }
+                        ChatEffect::Rejected(reason) => {
+                            agent_webview_note(tab_id, &reason);
+                            push_checkout_state_to_webview(tab_id, &state);
+                            return Task::none();
+                        }
+                        _ => return Task::none(),
+                    }
                 }
                 eprintln!(
                     "[agent] tab {tab_id}: chat checkout set to {}",
@@ -27960,76 +28069,82 @@ fi
                                 if effects.process_exited {
                                     session.harness = None;
                                 }
-                                if let tab::AgentEvent::Harness(harness_event) = &ev {
-                                    match harness_event {
-                                        HarnessEvent::PermissionModeChanged(mode) => {
-                                            // Confirmed by the harness: a
-                                            // respawn or restart starts in
-                                            // this mode.
-                                            match &mut session.config {
-                                                tab::AgentBackendConfig::Claude {
-                                                    permission_mode,
-                                                    ..
-                                                }
-                                                | tab::AgentBackendConfig::Acp {
-                                                    mode: permission_mode,
-                                                    ..
-                                                } => {
-                                                    *permission_mode = Some(mode.clone());
-                                                    config_changed = true;
-                                                }
-                                                tab::AgentBackendConfig::Pi { .. } => {}
-                                            }
-                                        }
-                                        HarnessEvent::ModelChanged(confirmed) => {
-                                            // Confirmed by the harness: a
-                                            // respawn starts on this model,
-                                            // and new Claude chats may start
-                                            // on it too (ACP chats start on
-                                            // `chat.antigravity_model` /
-                                            // `chat.opencode_model`).
-                                            match &mut session.config {
-                                                tab::AgentBackendConfig::Claude {
-                                                    model, ..
-                                                } => {
-                                                    model.clone_from(confirmed);
-                                                    config_changed = true;
-                                                    self.chat_config.remember_model(confirmed);
-                                                    chat_config_changed = true;
-                                                }
-                                                tab::AgentBackendConfig::Acp { model, .. } => {
-                                                    model.clone_from(confirmed);
-                                                    config_changed = true;
-                                                }
-                                                tab::AgentBackendConfig::Pi { .. } => {}
-                                            }
-                                        }
-                                        HarnessEvent::EffortChanged {
-                                            effort: confirmed, ..
-                                        } => match &mut session.config {
-                                            tab::AgentBackendConfig::Claude { effort, .. } => {
-                                                effort.clone_from(confirmed);
-                                                config_changed = true;
-                                                self.chat_config
-                                                    .remember_effort(confirmed.as_deref());
+                                let picker_event = matches!(
+                                    &ev,
+                                    tab::AgentEvent::Harness(
+                                        HarnessEvent::PermissionModeChanged(_)
+                                            | HarnessEvent::ModelChanged(_)
+                                            | HarnessEvent::EffortChanged { .. }
+                                    )
+                                );
+                                let lifecycle_applied = match &ev {
+                                    tab::AgentEvent::Harness(HarnessEvent::MessageLifecycle {
+                                        id,
+                                        state,
+                                    }) => session.queued_prompts.get(id).is_none_or(|prompt| {
+                                        use gitterm::harness::MessageState;
+                                        matches!(
+                                            (prompt.status, state),
+                                            (PromptStatus::Queued, MessageState::Queued)
+                                                | (PromptStatus::Started, MessageState::Started)
+                                                | (
+                                                    PromptStatus::Completed,
+                                                    MessageState::Completed
+                                                )
+                                                | (
+                                                    PromptStatus::Cancelled,
+                                                    MessageState::Cancelled
+                                                )
+                                        )
+                                    }),
+                                    _ => true,
+                                };
+                                let show_event = lifecycle_applied
+                                    && (!picker_event || effects.settings_changed.is_some());
+                                if let Some(change) = effects.settings_changed {
+                                    config_changed |=
+                                        apply_chat_setting(&mut session.config, &change);
+                                    if session.backend() == tab::AgentBackend::Claude {
+                                        match change {
+                                            SettingChange::Model(value) => {
+                                                self.chat_config.remember_model(&value);
                                                 chat_config_changed = true;
                                             }
-                                            tab::AgentBackendConfig::Acp { effort, .. } => {
-                                                effort.clone_from(confirmed);
-                                                config_changed = true;
+                                            SettingChange::Effort(value) => {
+                                                self.chat_config.remember_effort(value.as_deref());
+                                                chat_config_changed = true;
                                             }
-                                            tab::AgentBackendConfig::Pi { .. } => {}
-                                        },
-                                        _ => {}
+                                            _ => {}
+                                        }
                                     }
                                 }
-                                let (before, after) = session.record(ev.clone());
-                                for marker in &before {
-                                    push_agent_event_to_webview(tab_id, marker);
+                                if effects.process_exited {
+                                    surface_chat_uncertainty(tab_id, session);
                                 }
-                                push_agent_event_to_webview(tab_id, &ev);
-                                for marker in &after {
-                                    push_agent_event_to_webview(tab_id, marker);
+                                for notice in effects.notices {
+                                    // The withdraw-refused event already renders its own notice.
+                                    if matches!(
+                                        &ev,
+                                        tab::AgentEvent::Harness(
+                                            HarnessEvent::MessageWithdrawRefused { .. }
+                                        )
+                                    ) {
+                                        continue;
+                                    }
+                                    let event =
+                                        tab::AgentEvent::Harness(HarnessEvent::Error(notice));
+                                    push_agent_event_to_webview(tab_id, &event);
+                                    session.record(event);
+                                }
+                                if show_event {
+                                    let (before, after) = session.record(ev.clone());
+                                    for marker in &before {
+                                        push_agent_event_to_webview(tab_id, marker);
+                                    }
+                                    push_agent_event_to_webview(tab_id, &ev);
+                                    for marker in &after {
+                                        push_agent_event_to_webview(tab_id, marker);
+                                    }
                                 }
                             }
                             if let Some(id) = new_session_id {
@@ -56556,6 +56671,10 @@ mod tests {
 #[cfg(test)]
 #[path = "baseline_tests.rs"]
 mod baseline_tests;
+
+#[cfg(test)]
+#[path = "../tests/iced-chat/c10.rs"]
+mod iced_chat_c10;
 
 #[cfg(test)]
 mod status_runtime_adapter_tests {

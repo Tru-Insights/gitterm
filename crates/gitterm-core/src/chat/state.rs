@@ -241,8 +241,9 @@ pub struct QueuedPrompt {
     pub prompt: UserPrompt,
     pub status: PromptStatus,
     pub withdraw_pending: bool,
-    /// A write alone cannot establish whether the provider started the prompt.
-    written: bool,
+    /// A write, or acceptance by a transport without receipts, cannot establish
+    /// whether the provider started the prompt.
+    may_have_written: bool,
 }
 
 #[derive(Debug)]
@@ -304,6 +305,19 @@ impl Default for State {
 
 #[derive(Debug)]
 pub enum Intent {
+    /// Preserve pre-launch picker configuration without claiming a provider ack.
+    ConfigureSetting {
+        config: AgentBackendConfig,
+        process_running: bool,
+        change: SettingChange,
+    },
+    /// Remote/legacy ports cannot report writes. Channel acceptance means
+    /// delivery is unknown until the provider reports the prompt's lifecycle.
+    CommandAcceptedWithoutReceipt {
+        runtime: RuntimeStamp,
+        current: session::Target,
+        correlation: CommandCorrelation,
+    },
     Queue {
         runtime: RuntimeStamp,
         current: session::Target,
@@ -401,6 +415,7 @@ pub struct EventEffects {
 
 #[derive(Debug)]
 pub enum Effect {
+    SettingConfigured(SettingChange),
     /// Send once, in session order, then feed the correlated delivery outcome
     /// back. Revalidate the full runtime binding immediately before sending.
     Dispatch {
@@ -554,7 +569,7 @@ impl State {
             .values_mut()
             .filter_map(|queued| {
                 queued.withdraw_pending = false;
-                if queued.status == PromptStatus::Pending && queued.written {
+                if queued.status == PromptStatus::Pending && queued.may_have_written {
                     queued.status = PromptStatus::Uncertain;
                     None
                 } else if matches!(queued.status, PromptStatus::Pending | PromptStatus::Queued) {
@@ -603,6 +618,34 @@ impl State {
     /// before/after markers for the host's ordered presentation effects.
     pub fn reduce(&mut self, intent: Intent) -> Effect {
         match intent {
+            Intent::ConfigureSetting {
+                config,
+                process_running,
+                change,
+            } => {
+                if process_running
+                    || !config.backend().is_native()
+                    || config.read_only_note().is_some()
+                    || !change.valid(config.backend())
+                {
+                    return Effect::Rejected(format!("Cannot configure {change:?} before launch"));
+                }
+                Effect::SettingConfigured(change)
+            }
+            Intent::CommandAcceptedWithoutReceipt {
+                runtime,
+                current,
+                correlation,
+            } => {
+                if !self.runtime_exited && self.accepts_runtime(&runtime, &current) {
+                    if let Some(PendingCommand::Queue(id)) = self.commands.get(&correlation.0) {
+                        if let Some(prompt) = self.queued_prompts.get_mut(id) {
+                            prompt.may_have_written = true;
+                        }
+                    }
+                }
+                Effect::None
+            }
             Intent::Queue {
                 runtime,
                 current,
@@ -635,7 +678,7 @@ impl State {
                         prompt: prompt.clone(),
                         status: PromptStatus::Pending,
                         withdraw_pending: false,
-                        written: false,
+                        may_have_written: false,
                     },
                 );
                 self.dispatch(
@@ -725,7 +768,7 @@ impl State {
                     DeliveryOutcome::Written => {
                         if let PendingCommand::Queue(id) = command {
                             if let Some(prompt) = self.queued_prompts.get_mut(&id) {
-                                prompt.written = true;
+                                prompt.may_have_written = true;
                             }
                         }
                         return Effect::None;
@@ -850,6 +893,24 @@ impl State {
                     return Effect::None;
                 }
                 let queued = self.submit_queues(backend, process_running);
+                // Another client's queued echo has the same withdraw authority as
+                // a local echo. Its transport supplies no local write receipt.
+                if queued {
+                    if let Some(id) = id.as_ref().filter(|id| !id.is_empty()) {
+                        self.queued_prompts
+                            .entry(id.clone())
+                            .or_insert_with(|| QueuedPrompt {
+                                prompt: UserPrompt {
+                                    text: text.clone(),
+                                    images: Vec::new(),
+                                    id: Some(id.clone()),
+                                },
+                                status: PromptStatus::Pending,
+                                withdraw_pending: false,
+                                may_have_written: true,
+                            });
+                    }
+                }
                 let echo = AgentEvent::relayed_prompt(id.as_deref(), &text, image_count, queued);
                 if process_running {
                     self.state = AgentSessionState::Streaming;
