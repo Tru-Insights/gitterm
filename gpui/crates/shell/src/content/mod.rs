@@ -1,14 +1,12 @@
-//! Leaf retained Viewer adapter. No shell registration, IPC, URL loading or Page stores.
+//! Local retained Viewer documents and native overlay state.
 //!
-//! PR9 must own one coordinator per window, prepare documents off the UI thread,
-//! route every cover (including popup menus and dock motion) through it before
-//! drawing controls, drain native navigation results into `complete_navigation`,
-//! drain snapshots into `complete_snapshot`, and tick snapshot deadlines.
-//! Render `backdrop()` in the pane, one `dim_layer()` above native content, then
-//! controls. Recompute window-relative geometry before final cover close. Honor
-//! `RestoreFocus` using the saved valid native focus target or active pane.
+//! `window` owns the shell's surfaces, off-thread preparation, native result
+//! draining, deadlines, selection and window-relative pane geometry. Component
+//! popup/dialog state and native pickers cover the selected surface before paint.
+//! There are no IPC handlers, URL loading or Page identity/store capabilities.
 pub mod host;
 pub mod overlay;
+pub(crate) mod window;
 
 use std::path::{Path, PathBuf};
 
@@ -28,14 +26,15 @@ pub struct Document {
 impl Document {
     /// Run on a worker. Keep core size limits, Markdown assets and optional
     /// Excalidraw validation; a failed/unsupported read is an explicit error.
-    pub fn local_file(path: &Path, dark: bool) -> Result<Self, String> {
-        let load = gitterm_core::content::collect_file_load(0, path.to_owned(), dark);
+    pub fn local_file(root: &Path, relative: &Path, dark: bool) -> Result<Self, String> {
+        let load = gitterm_core::content::collect_contained_file_load(0, root, relative, dark)
+            .map_err(|e| format!("Cannot preview {}: {e}", root.join(relative).display()))?;
         load.webview_content
             .map(|html| Self { html })
             .ok_or_else(|| {
                 format!(
                     "Cannot preview {}: {}",
-                    path.display(),
+                    relative.display(),
                     load.file_preview_notice
                         .as_deref()
                         .unwrap_or("unreadable, invalid or unsupported retained content")
@@ -50,17 +49,7 @@ impl Document {
         if !gitterm_core::plans::is_safe_relative_md_path(relative) {
             return Err(format!("Invalid plan path: {relative}"));
         }
-        let root = root
-            .canonicalize()
-            .map_err(|e| format!("Cannot resolve plans root {}: {e}", root.display()))?;
-        let path = root
-            .join(relative)
-            .canonicalize()
-            .map_err(|e| format!("Cannot resolve plan {}: {e}", root.join(relative).display()))?;
-        if !path.starts_with(&root) {
-            return Err(format!("Plan escapes root: {relative}"));
-        }
-        Self::local_file(&path, dark)
+        Self::local_file(root, Path::new(relative), dark)
     }
 
     pub fn html(&self) -> &str {

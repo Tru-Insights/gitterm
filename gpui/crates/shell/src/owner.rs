@@ -257,6 +257,7 @@ impl WorkspaceOwner {
             workspace,
             path,
             changed,
+            from_files: true,
         };
         eprintln!(
             "FileOpen workspace={} path={} changed={}",
@@ -277,6 +278,7 @@ impl WorkspaceOwner {
                 workspace,
                 path: local.root.join(&changed.path),
                 changed: Some(changed),
+                from_files: false,
             });
         }
     }
@@ -422,6 +424,7 @@ pub struct FileOpen {
     pub workspace: crate::data::WorkspaceId,
     pub path: PathBuf,
     pub changed: Option<crate::data::ChangedFile>,
+    pub from_files: bool,
 }
 impl EventEmitter<FileOpen> for WorkspaceOwner {}
 

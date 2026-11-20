@@ -1,7 +1,8 @@
 # GitTerm GPUI preview (TRU-275 / TRU-280 / TRU-283, parent TRU-274)
 
 This macOS-only app opens a 1440×900 shell with explicit local workspaces and
-live Git status. Start with `gitterm-gpui --workspace <dir>` (repeatable), or
+live Git status. Local retained Markdown/HTML tabs and their coordinator live-check
+list are documented in [LOCAL_CONTENT_CHECKS.md](LOCAL_CONTENT_CHECKS.md). Start with `gitterm-gpui --workspace <dir>` (repeatable), or
 choose **Add folder…** in the sidebar. With no saved/seeded folders it shows an
 empty state with Add folder. Names come from folder names; branches and the Git
 pane's staged, unstaged and untracked lists, loading and errors come from the

@@ -2,7 +2,7 @@ use gpui::*;
 use gpui_component::{
     WindowExt,
     button::{Button, ButtonVariants},
-    dialog::DialogFooter,
+    dialog::{DialogEntrance, DialogFooter},
     input::{Input, InputState, Textarea, TextareaState},
     menu::{DropdownMenu, PopupMenuItem},
     notification::Notification,
@@ -13,17 +13,22 @@ pub fn notice(message: impl Into<SharedString>, window: &mut Window, cx: &mut Ap
 }
 pub fn shortcuts(window: &mut Window, cx: &mut App) {
     window.open_dialog(cx, |dialog, _, _| {
-        dialog.title("Keyboard shortcuts").child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child("⌃1–9    Switch workspace")
-                .child("⌘1–9    Switch session")
-                .child("⌥/       Keyboard shortcuts")
-                .child("Drag pane tabs to move or group; drag dividers to resize.")
-                .child("Reopen closed panes from More → Show pane."),
-        )
+        // Keep modal visibility and the root's single dim layer in the same frame
+        // as native content restoration; active-dialog excludes exit animations.
+        dialog
+            .entrance(DialogEntrance::None)
+            .title("Keyboard shortcuts")
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child("⌃1–9    Switch workspace")
+                    .child("⌘1–9    Switch session")
+                    .child("⌥/       Keyboard shortcuts")
+                    .child("Drag pane tabs to move or group; drag dividers to resize.")
+                    .child("Reopen closed panes from More → Show pane."),
+            )
     });
 }
 pub fn new_task(repository: String, window: &mut Window, cx: &mut App) {
@@ -49,6 +54,7 @@ pub fn new_task(repository: String, window: &mut Window, cx: &mut App) {
                 .child(Input::new(input))
         };
         dialog
+            .entrance(DialogEntrance::None)
             .title("New task")
             .w(px(620.))
             .child(
