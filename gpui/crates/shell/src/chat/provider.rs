@@ -177,14 +177,6 @@ impl Provider {
         self.preview.scoped(&self.preview.provider())?;
         Ok(())
     }
-    #[cfg(test)]
-    pub fn authorize(&self) -> Result<()> {
-        ensure!(
-            !super::auth::AUTH_STATUS_SCHEMA.unverified,
-            "Claude preview auth schema is UNVERIFIED until coordinator probe (chat/auth.rs AUTH_STATUS_SCHEMA); launch refused"
-        );
-        Ok(())
-    }
     pub fn start(
         self: Arc<Self>,
         cwd: PathBuf,
@@ -565,7 +557,7 @@ mod gate_tests {
         let release = dir.path().join("release-auth");
         let spawned = dir.path().join("chat-spawned");
         let help = "  --restricted\n  --strict-mcp-config\n  --safe-mode\n  --permission-mode <mode> (choices: \"manual\")\n";
-        let status = serde_json::json!({"fixture_signed_in":true,"fixture_method":"fixture_personal","fixture_plan":"fixture_pro","fixture_root":preview.provider(),"fixture_policy":null});
+        let status = serde_json::json!({"fixture_signed_in":true,"fixture_method":"fixture_personal","fixture_plan":"fixture_pro","fixture_root":preview.provider(),"fixture_provider":"fixture_first_party"});
         let fake = script(
             dir.path(),
             "fake-close-gate",
@@ -608,10 +600,15 @@ mod gate_tests {
         let (dir, preview) = fixture();
         let help = "  --restricted\n  --strict-mcp-config\n  --safe-mode\n  --permission-mode <mode> (choices: \"manual\")\n";
         let marker = dir.path().join("calls");
-        let good = serde_json::json!({"fixture_signed_in":true,"fixture_method":"fixture_personal","fixture_plan":"fixture_max","fixture_root":preview.provider(),"fixture_policy":null});
+        let good = serde_json::json!({"fixture_signed_in":true,"fixture_method":"fixture_personal","fixture_plan":"fixture_max","fixture_root":preview.provider(),"fixture_provider":"fixture_first_party"});
         for (help, status, schema, pass) in [
             (help.to_owned(), good.to_string(), FIXTURE_SCHEMA, true),
-            (help.to_owned(), good.to_string(), AUTH_STATUS_SCHEMA, false),
+            (
+                help.to_owned(),
+                super::super::auth::tests::signed_in(&preview.provider()).to_string(),
+                AUTH_STATUS_SCHEMA,
+                true,
+            ),
             (
                 help.replace("--restricted", "--missing"),
                 good.to_string(),
