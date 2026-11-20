@@ -15,6 +15,12 @@ fn click(cx: &mut VisualTestContext, selector: &'static str) {
     draw(cx);
 }
 fn fixture(cx: &mut TestAppContext) -> (tempfile::TempDir, Entity<Shell>, &mut VisualTestContext) {
+    fixture_catalog(cx, false)
+}
+fn fixture_catalog(
+    cx: &mut TestAppContext,
+    counts: bool,
+) -> (tempfile::TempDir, Entity<Shell>, &mut VisualTestContext) {
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let root = tempfile::tempdir_in("/private/tmp").unwrap();
@@ -24,6 +30,74 @@ fn fixture(cx: &mut TestAppContext) -> (tempfile::TempDir, Entity<Shell>, &mut V
         {"name":"Folder","abbrev":"F","dir":"/fixture/folder","color":"blue","tabs":[{"dir":"/fixture/folder","startup_command":"MUST NOT RUN"}]},
         {"name":"Named work","abbrev":"N","dir":"/fixture/work","color":"green","chats":["saved-chat"],"active_tab":1,"tabs":[{"dir":"/fixture/work","startup_command":"MUST NOT RUN"},{"dir":"/fixture/work","tab_kind":"agent","agent_config":{"backend":"claude","model":"default"},"chat_session_id":"saved-chat"},{"dir":"/fixture/work","tab_kind":"agent","agent_config":{"backend":"claude","model":"default"},"chat_session_id":"missing-chat"}]}
     ]}"#).unwrap();
+    if counts {
+        use gitterm_core::{merge_plan::*, prs::*, tasks::*};
+        let path = source.join("workspaces.json");
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        file["remote_agents"] = serde_json::json!([{"id":"fixture-mac","name":"Fixture Mac","endpoint":"http://127.0.0.1:1","auth":{"type":"token","token_ref":"fixture"}}]);
+        file["workspaces"][0]["tabs"] = serde_json::Value::Array(
+            (0..7)
+                .map(|n| {
+                    serde_json::json!({
+                        "dir":"/fixture/folder", "task_id":format!("attention-{n}")
+                    })
+                })
+                .collect(),
+        );
+        for n in 0..16 {
+            file["workspaces"].as_array_mut().unwrap().push(serde_json::json!({
+                "name":format!("Parked {n}"),"abbrev":"P","dir":"/fixture/parked","color":"blue","tabs":[],"active":false,
+                "chats": if n == 0 {vec!["parked-chat"]} else {vec![]}
+            }));
+        }
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        let mut tasks = TaskStoreDocument::default();
+        for n in 0..7 {
+            let mut task =
+                crate::tasks::fixture_task(&format!("attention-{n}"), "Needs input", "task/input");
+            task.workspace.location = WorkspaceLocationIdentity::Local {
+                directory: "/fixture/folder".into(),
+            };
+            task.attention = TaskAttention::raised(
+                TaskAttentionReason::RequiresInput,
+                &TaskAttention::default(),
+                "2026-01-01T00:00:00Z",
+            );
+            tasks.tasks.push(task);
+        }
+        std::fs::write(
+            source.join("tasks.json"),
+            serde_json::to_vec(&tasks).unwrap(),
+        )
+        .unwrap();
+        for (root, number) in [("saved-chat", 1), ("parked-chat", 2)] {
+            let plan: MergePlan = serde_json::from_value(serde_json::json!({
+                "root_chat_id":root, "entries":[{"repo":"fixture/repo","number":number,"step":1}]
+            }))
+            .unwrap();
+            write_plan(&plans_dir(&source), &plan).unwrap();
+        }
+        let mut watch = WatchFile::default();
+        for number in 1..=2 {
+            let mut pr = WatchedPr::new(PrKey::new("fixture/repo", number));
+            pr.snapshot.core = Some(PullCore {
+                state: Some(PrState::Open),
+                ..Default::default()
+            });
+            pr.news.push(NewsItem {
+                key: format!("news-{number}"),
+                kind: NewsKind::RequiredChecksPassed,
+                text: "checks passed".into(),
+                at: "2026-01-01T00:00:00Z".into(),
+                dismissed: false,
+                told: false,
+                approvals_only: false,
+            });
+            watch.prs.insert(pr.key.id(), pr);
+        }
+        watch.save(&WatchFile::path_in(&source)).unwrap();
+    }
     let mut store = preview::tests::guarded_store(&root.path().join("preview"));
     let model = workspace_config::load_iced_workspaces_from(&mut store, &source);
     let layout = store.guard.as_ref().unwrap().preview().layout();
@@ -242,7 +316,6 @@ fn sheet_folder_picker_returns_selection_and_cancel_without_creating_work(cx: &m
 fn missing_host_controls_keep_iced_controls_and_report_unavailable(cx: &mut TestAppContext) {
     let (_root, shell, cx) = fixture(cx);
     for (selector, label) in [
-        ("pstrip-repos", "Repos ▾"),
         ("pstrip-browser", "Browser"),
         ("pstrip-settings", "Settings"),
     ] {
@@ -357,4 +430,69 @@ fn review_consult_shell_shortcuts_reject_in_preview_and_keep_the_draft(cx: &mut 
     let after = ["workspaces.json", "settings.json", "tasks.json"]
         .map(|file| std::fs::read(source.join(file)).ok());
     assert_eq!(before, after, "review preview never writes Iced's stores");
+}
+
+#[gpui::test]
+fn catalog_bar_renders_repos_folder_badge_plus_and_real_counts_read_only(cx: &mut TestAppContext) {
+    let (root, shell, cx) = fixture_catalog(cx, true);
+    cx.simulate_resize(size(px(1600.), px(800.)));
+    draw(cx);
+    let source = root.path().join("iced");
+    let before = ["workspaces.json", "tasks.json", "pr-watch.json"]
+        .map(|name| std::fs::read(source.join(name)).unwrap());
+    cx.read(|cx| {
+        let input = shell.read(cx).bar_input(cx);
+        assert_eq!(
+            input.items(),
+            [
+                workspace_bar::Item::Workspace(1),
+                workspace_bar::Item::Repos,
+                workspace_bar::Item::Workspace(0),
+                workspace_bar::Item::NewWork
+            ]
+        );
+        assert_eq!(
+            (
+                input.ready_count,
+                input.ready_news_count,
+                input.parked_count
+            ),
+            (2, 2, 16)
+        );
+        assert_eq!(input.workspaces[0].attention().unwrap().count, 7);
+        assert!(input.workspaces[1].pr_news.is_some());
+        assert_eq!(input.machine_news.len(), 1);
+        assert!(input.machine_news[0].label.contains("Fixture Mac"));
+    });
+    let selectors = [
+        "pstrip-workspace-2",
+        "pstrip-repos",
+        "pstrip-workspace-1",
+        "pstrip-new-work",
+        "pstrip-ready",
+        "pstrip-parked",
+        "pstrip-terminal",
+        "pstrip-browser",
+    ];
+    let bounds: Vec<_> = selectors
+        .iter()
+        .map(|selector| cx.debug_bounds(selector).unwrap())
+        .collect();
+    assert!(
+        bounds
+            .windows(2)
+            .all(|pair| pair[0].right() <= pair[1].left())
+    );
+    assert!(cx.debug_bounds("pstrip-attention-1").is_some());
+    assert!(cx.debug_bounds("pstrip-more").is_none());
+    click(cx, "pstrip-repos");
+    assert!(cx.debug_bounds("pstrip-repos-list").is_some());
+    click(cx, "pstrip-repo-1");
+    cx.read(|cx| assert_eq!(shell.read(cx).active_workspace(cx), Some(WorkspaceId(1))));
+    for (name, bytes) in ["workspaces.json", "tasks.json", "pr-watch.json"]
+        .into_iter()
+        .zip(before)
+    {
+        assert_eq!(std::fs::read(source.join(name)).unwrap(), bytes);
+    }
 }
