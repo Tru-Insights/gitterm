@@ -36,17 +36,10 @@ pub struct RosterRow {
     pub state: WorkerState,
 }
 
-/// Live rows first, newest first, matching agent_chat.html's rosterRows.
+/// Preserve the host's roster order; Iced supplies rows in its display order.
 pub fn rows(input: &[RosterEntry], now_ms: u64) -> Vec<RosterRow> {
-    let mut input: Vec<_> = input.iter().collect();
-    input.sort_by_key(|row| {
-        (
-            std::cmp::Reverse(row.state.is_live()),
-            std::cmp::Reverse(row.started_at_ms),
-        )
-    });
     input
-        .into_iter()
+        .iter()
         .map(|row| {
             let backend = row
                 .name
@@ -204,9 +197,9 @@ mod tests {
             ended_at_ms,
         };
         let input = vec![
-            worker("done", WorkerState::Done, 10_000, Some(12_000)),
-            worker("old", WorkerState::Running, 1_000, None),
             worker("new", WorkerState::Running, 2_000, None),
+            worker("old", WorkerState::Running, 1_000, None),
+            worker("done", WorkerState::Done, 10_000, Some(12_000)),
         ];
         let rows = rows(&input, 187_000);
         assert_eq!(
@@ -228,6 +221,32 @@ mod tests {
         assert_eq!(
             format!("{} {} {} ×", row.name, row.what, row.elapsed),
             "Codex · gpt-6.1-sol · in TRU-274 16m 54s ×"
+        );
+    }
+
+    #[test]
+    fn roster_preserves_iced_order_for_live_waiting_ended_and_finished_rows() {
+        let worker = |id: &str, state, started_at_ms, ended_at_ms| RosterEntry {
+            id: id.into(),
+            name: "Worker · Codex".into(),
+            model: "gpt-6.1-sol".into(),
+            checkout: String::new(),
+            activity: String::new(),
+            state,
+            started_at_ms,
+            ended_at_ms,
+        };
+        let iced_order = vec![
+            worker("live", WorkerState::Running, 3_000, None),
+            worker("finished", WorkerState::Done, 4_000, Some(5_000)),
+            worker("waiting-ended", WorkerState::Waiting, 2_000, Some(6_000)),
+        ];
+
+        let rows = rows(&iced_order, 10_000);
+
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["live", "finished", "waiting-ended"]
         );
     }
 }
