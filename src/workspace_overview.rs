@@ -36,10 +36,7 @@ pub use gitterm_core::git_facts::{
     ahead_behind_args, base_candidates, choose_nearest, parse_ahead_behind, parse_left_right,
     BaseCandidate, BaseChoice, BaseSource, DiffSource, GIT_TIMEOUT,
 };
-pub(crate) use gitterm_core::git_facts::{
-    git_text, measure_bases, resolve_commit, run_git_lines, run_git_records,
-    run_git_records_bounded,
-};
+pub(crate) use gitterm_core::git_facts::{git_text, measure_bases, run_git_lines};
 
 #[cfg(test)]
 use crate::chat_facts;
