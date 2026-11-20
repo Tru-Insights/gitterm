@@ -145,6 +145,10 @@ pub struct Shell {
     #[cfg(test)]
     find_home: Option<std::path::PathBuf>,
     work_state: Rc<RefCell<gitterm_core::work::state::State>>,
+    saved_facts: workspace_bar::SavedFactsCache,
+    saved_facts_error: Option<workspace_bar::News>,
+    saved_facts_catalog_key: Option<String>,
+    saved_facts_generation: u64,
     work_sidebars: HashMap<WorkspaceId, Entity<work_sidebar::WorkSidebar>>,
     work_subscriptions: HashMap<WorkspaceId, Subscription>,
     #[cfg(test)]
@@ -316,6 +320,7 @@ impl Shell {
                     pane.update(cx, |_, cx| cx.notify());
                 }
             }
+            this.refresh_saved_facts_if_catalog_changed(cx);
             cx.notify();
         }));
         subscriptions.push(cx.subscribe_in(
@@ -388,6 +393,10 @@ impl Shell {
             #[cfg(test)]
             find_home: None,
             work_state: Default::default(),
+            saved_facts: workspace_bar::SavedFactsCache::default(),
+            saved_facts_error: None,
+            saved_facts_catalog_key: None,
+            saved_facts_generation: 0,
             work_sidebars: HashMap::new(),
             work_subscriptions: HashMap::new(),
             #[cfg(test)]
@@ -399,6 +408,20 @@ impl Shell {
             .and_then(|id| shell.session_task(id, cx));
         shell.remember_context(shell.selected_task.clone());
         shell.restore_parked(saved_parked, cx);
+        shell.refresh_saved_facts(cx);
+        let weak = cx.weak_entity();
+        cx.spawn(async move |_, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(15))
+                .await;
+            if weak
+                .update(cx, |shell, cx| shell.refresh_saved_facts(cx))
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
         shell.load_active_iced_history(window, cx);
         if let Some(fonts) = shell.workspaces.iter().find_map(|w| w.store.regions.fonts) {
             theme::set_font_sizes(fonts, cx);
@@ -717,6 +740,7 @@ impl Shell {
         self.owner.update(cx, |owner, cx| {
             owner.dispatch(Intent::Activate(id), Instant::now(), cx)
         });
+        self.refresh_saved_facts(cx);
         self.selected_task = self
             .active(cx)
             .active_session
@@ -1506,43 +1530,14 @@ impl Shell {
             .find(|w| Some(w.workspace.id) == self.active_workspace(cx));
         let colors = workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark());
         let mut workspaces = self.chrome_workspaces(cx);
-        let mut facts = workspace_bar::SavedFacts::default();
-        let mut machine_news = vec![];
-        if let Some(catalog) = self.owner.read(cx).iced_catalog() {
-            let state = self.work_state.borrow();
-            let roots = self
-                .workspaces
-                .iter()
-                .map(|w| {
-                    (
-                        w.workspace.id,
-                        state
-                            .pane(w.workspace.id.0)
-                            .map(|pane| {
-                                pane.summary
-                                    .coordinators
-                                    .iter()
-                                    .filter(|root| root.recent)
-                                    .map(|root| root.id.clone())
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    )
-                })
-                .collect();
-            match workspace_bar::SavedFacts::read(catalog, &roots, colors) {
-                Ok(mut saved) => {
-                    machine_news.append(&mut saved.machines);
-                    facts = saved;
-                }
-                Err(error) => machine_news.push(workspace_bar::News {
-                    label: format!("Workspace bar: {error:#}"),
-                    color: colors.red,
-                }),
-            }
-            for workspace in &mut workspaces {
-                workspace.pr_news = facts.news.remove(&workspace.id);
-            }
+        let facts = self.saved_facts.snapshot();
+        let mut machine_news = facts.machines.clone();
+        if let Some(error) = &self.saved_facts_error {
+            machine_news.push(error.clone());
+        }
+        let mut news = facts.news.clone();
+        for workspace in &mut workspaces {
+            workspace.pr_news = news.remove(&workspace.id);
         }
         let hidden = gitterm_core::workspace::bar_layout(
             &workspaces
@@ -1581,6 +1576,105 @@ impl Shell {
             },
             more_open: false,
         }
+    }
+    fn refresh_saved_facts_if_catalog_changed(&mut self, cx: &mut Context<Self>) {
+        let key = self
+            .owner
+            .read(cx)
+            .iced_catalog()
+            .map(Self::saved_facts_catalog_key);
+        if key != self.saved_facts_catalog_key {
+            self.refresh_saved_facts(cx);
+        }
+    }
+    fn saved_facts_catalog_key(catalog: &workspace_config::IcedCatalog) -> String {
+        format!(
+            "{}:{}",
+            catalog.source.display(),
+            serde_json::to_string(&catalog.workspaces).unwrap_or_default()
+        )
+    }
+    fn refresh_saved_facts(&mut self, cx: &mut Context<Self>) {
+        let Some(catalog) = self.owner.read(cx).iced_catalog() else {
+            self.saved_facts.replace(workspace_bar::SavedFacts::default());
+            self.saved_facts_error = None;
+            self.saved_facts_catalog_key = None;
+            self.saved_facts_generation = self.saved_facts_generation.wrapping_add(1);
+            cx.notify();
+            return;
+        };
+        let source = catalog.source.clone();
+        let workspaces = catalog.workspaces.clone();
+        let key = Self::saved_facts_catalog_key(catalog);
+        self.saved_facts_catalog_key = Some(key);
+        self.saved_facts_generation = self.saved_facts_generation.wrapping_add(1);
+        let generation = self.saved_facts_generation;
+        let roots = {
+            let state = self.work_state.borrow();
+            self.workspaces
+                .iter()
+                .map(|workspace| {
+                    (
+                        workspace.workspace.id,
+                        state
+                            .pane(workspace.workspace.id.0)
+                            .map(|pane| {
+                                pane.summary
+                                    .coordinators
+                                    .iter()
+                                    .filter(|root| root.recent)
+                                    .map(|root| root.id.clone())
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect()
+        };
+        let colors = workspace_bar::Colors::new(
+            gpui_component::Theme::global(cx).mode.is_dark(),
+        );
+        cx.spawn(async move |shell, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    workspace_bar::SavedFacts::read_from(&source, &workspaces, &roots, colors)
+                })
+                .await;
+            let _ = shell.update(cx, |shell, cx| {
+                if shell.saved_facts_generation != generation {
+                    return;
+                }
+                let Some(catalog) = shell.owner.read(cx).iced_catalog() else {
+                    return;
+                };
+                if Self::saved_facts_catalog_key(catalog) != shell.saved_facts_catalog_key
+                    .as_deref()
+                    .unwrap_or_default()
+                {
+                    return;
+                }
+                match result {
+                    Ok(facts) => {
+                        shell.saved_facts.replace(facts);
+                        shell.saved_facts_error = None;
+                    }
+                    Err(error) => {
+                        let path = catalog.source.join("workspaces.json");
+                        eprintln!("read workspace bar facts {}: {error:#}", path.display());
+                        shell.saved_facts_error = Some(workspace_bar::News {
+                            label: format!("Workspace bar: {error:#}"),
+                            color: workspace_bar::Colors::new(
+                                gpui_component::Theme::global(cx).mode.is_dark(),
+                            )
+                            .red,
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
     fn spine_input(&self, cx: &App) -> spine::Input {
         spine::Input {

@@ -20,9 +20,9 @@ use gpui_component::{
 
 use crate::data::WorkspaceId;
 
-/// A fresh, read-only projection of Iced's saved PR and parked facts. The
-/// catalog retains only open workspaces, so closed entries come from its source.
-#[derive(Default)]
+/// A read-only projection of Iced's saved PR and parked facts. The catalog
+/// retains only open workspaces, so closed entries come from its source.
+#[derive(Clone, Default)]
 pub(crate) struct SavedFacts {
     pub ready: usize,
     pub news_count: usize,
@@ -31,21 +31,24 @@ pub(crate) struct SavedFacts {
     pub machines: Vec<News>,
 }
 impl SavedFacts {
-    pub fn read(
-        catalog: &crate::workspace_config::IcedCatalog,
+    pub(crate) fn read_from(
+        source: &std::path::Path,
+        workspaces: &[gitterm_core::workspace_config::WorkspaceConfig],
         roots: &std::collections::HashMap<WorkspaceId, Vec<String>>,
         colors: Colors,
     ) -> anyhow::Result<Self> {
         use anyhow::Context as _;
         use gitterm_core::{chat_facts, chats::ChatBackend, merge_plan, prs};
         use std::collections::{HashMap, HashSet};
-        let path = catalog.source.join("workspaces.json");
+        let path = source.join("workspaces.json");
         let file: gitterm_core::workspace_config::WorkspacesFile = serde_json::from_slice(
             &std::fs::read(&path).with_context(|| format!("read {}", path.display()))?,
         )
         .with_context(|| format!("parse {}", path.display()))?;
-        let watch = prs::WatchFile::load(&prs::WatchFile::path_in(&catalog.source));
-        let plans = merge_plan::load_plans(&merge_plan::plans_dir(&catalog.source));
+        let watch_path = prs::WatchFile::path_in(source);
+        let watch = prs::WatchFile::load(&watch_path);
+        let plans_dir = merge_plan::plans_dir(source);
+        let plans = merge_plan::load_plans(&plans_dir);
         let briefs: HashMap<_, _> = watch
             .prs
             .iter()
@@ -63,8 +66,7 @@ impl SavedFacts {
                 color: colors.muted,
             })
             .collect();
-        let homes = catalog
-            .workspaces
+        let homes = workspaces
             .iter()
             .enumerate()
             .map(|(i, w)| (Some(WorkspaceId(i as u64 + 1)), w))
@@ -113,13 +115,15 @@ impl SavedFacts {
                     }
                     for backend in ChatBackend::ALL {
                         let path = chat_facts::facts_path(
-                            &chat_facts::facts_dir(&catalog.source),
+                            &chat_facts::facts_dir(source),
                             backend,
                             &chat,
                         )
                         .map_err(anyhow::Error::msg)?;
                         if let Some(facts) =
-                            chat_facts::load_facts(&path).map_err(anyhow::Error::msg)?
+                            chat_facts::load_facts(&path).map_err(|error| {
+                                anyhow::anyhow!("read {}: {error}", path.display())
+                            })?
                         {
                             pending
                                 .extend(facts.children.into_iter().map(|child| child.session_id));
@@ -160,6 +164,51 @@ impl SavedFacts {
             }
         }
         Ok(result)
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SavedFactsCache(SavedFacts);
+impl SavedFactsCache {
+    pub fn snapshot(&self) -> SavedFacts {
+        self.0.clone()
+    }
+
+    pub fn replace(&mut self, facts: SavedFacts) {
+        self.0 = facts;
+    }
+}
+
+#[cfg(test)]
+mod saved_facts_cache_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn render_snapshots_do_not_read_and_refresh_replaces_counts() {
+        let reads = Cell::new(0);
+        let mut cache = SavedFactsCache::default();
+        let read = || {
+            reads.set(reads.get() + 1);
+            SavedFacts {
+                ready: reads.get(),
+                parked: reads.get() * 2,
+                ..Default::default()
+            }
+        };
+
+        cache.replace(read());
+        let first_render = cache.snapshot();
+        let second_render = cache.snapshot();
+        assert_eq!(reads.get(), 1);
+        assert_eq!(first_render.ready, 1);
+        assert_eq!(second_render.parked, 2);
+
+        cache.replace(read());
+        let refreshed_render = cache.snapshot();
+        assert_eq!(reads.get(), 2);
+        assert_eq!(refreshed_render.ready, 2);
+        assert_eq!(refreshed_render.parked, 4);
     }
 }
 
