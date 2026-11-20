@@ -1531,6 +1531,24 @@ impl Shell {
         let colors = workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark());
         let mut workspaces = self.chrome_workspaces(cx);
         let facts = self.saved_facts.snapshot();
+        for workspace in &mut workspaces {
+            let count = facts
+                .attention_counts
+                .get(&workspace.id)
+                .copied()
+                .filter(|count| *count > 0);
+            let kind = workspace
+                .attention
+                .as_ref()
+                .map_or(workspace_bar::AttentionKind::NeedsYou, |attention| {
+                    attention.kind
+                });
+            workspace.attention = count.map(|count| workspace_bar::Attention {
+                count,
+                kind,
+                reason: "Sessions need attention".into(),
+            });
+        }
         let mut machine_news = facts.machines.clone();
         if let Some(error) = &self.saved_facts_error {
             machine_news.push(error.clone());
