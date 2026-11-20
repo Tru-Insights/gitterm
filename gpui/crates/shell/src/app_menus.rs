@@ -1,14 +1,7 @@
-//! Standalone Iced menu/shortcut inventory. Nothing is installed by this module.
-//!
-//! Future hookup (after registering action handlers and focus/state contexts):
-//! `cx.bind_keys(app_menus::key_bindings()); cx.set_menus(app_menus::menus());`
+//! Iced menu/shortcut inventory installed by the shell's `install_app_menus`.
 //! Bind first: GPUI derives native menu accelerators from its keymap.
-//!
-//! Replace the shell's cmd/ctrl-1..9 loop, `bind_workspace_keys`, and alt-/
-//! ShowShortcuts registration. Remove any cmd-t -> NewTerminal registration
-//! (already absent on this branch): Iced's cmd-t opens the task switcher.
-//! Local chat find/copy and terminal find handlers must delegate to this table
-//! when the host adopts it, rather than dispatching the same chord twice.
+//! Chat find/copy actions are adapted to the existing NativeChat implementation;
+//! the shell does not install NativeChat's superseded local key registrations.
 //!
 //! `IcedMain` means the main key handler is reachable (no consuming modal or
 //! Usage view); `IcedChat` means a chat page owns focus and forwards host keys.
@@ -565,22 +558,14 @@ shortcuts![
     ("ctrl-enter", SubmitReview, Some("NativeChat && IcedReview")),
 ];
 
-/// TODO(host): these shortcut commands have no matching shell action/route yet.
-/// Existing local capabilities (find, copy, composer, park, workspace/session
-/// selection, slash menus, theme) still need adapters to the new Iced-named action types.
-/// Native About/Hide/ShowAll/Quit/Window actions also need platform handlers.
+/// Actions without a host adapter remain unregistered, so GPUI's native menu
+/// validation disables their menu items. Usage and attention have no shell route.
+/// Chat typography is fixed inside the chat crate (P8c owns the missing accessor).
+/// Composer/slash keys continue through the native input's existing handlers.
 pub const MISSING_HOST_ACTIONS: &[&str] = &[
-    "Hide",
-    "HideOthers",
-    "Quit",
-    "Minimize",
-    "Fullscreen",
-    "IncreaseTerminalFont",
-    "DecreaseTerminalFont",
-    "IncreaseUiFont",
-    "DecreaseUiFont",
     "IncreaseChatFont",
     "DecreaseChatFont",
+    "SetChatWidth",
     "ToggleTerminalLogMirroring",
     "OpenPlansViewer",
     "SttToggle",
@@ -589,23 +574,25 @@ pub const MISSING_HOST_ACTIONS: &[&str] = &[
     "TaskSwitcherNext",
     "TaskSwitcherPrevious",
     "TaskSwitcherActivateFirst",
-    "ToggleSidebar",
-    "ConsoleToggle",
     "RunRepoCommand",
     "UsageViewToggle",
     "ChatsOverviewOpen",
     "AttentionJumpNext",
-    "OpenFolder",
     "TaskContextBack",
     "TaskOverview",
     "DebugSpawnAgentTab",
     "LaunchAgentPreset",
     "TaskChildLaunchPreset",
-    "FileSelectByIndex",
-    "EditFile",
+    "ParkSubmit",
+    "SubmitPrompt",
+    "Newline",
     "CycleMode",
+    "SlashNext",
+    "SlashPrevious",
+    "FillSlash",
+    "SubmitSlash",
+    "CloseSlash",
     "SubmitReview",
-    "Escape",
 ];
 
 #[cfg(test)]
@@ -1042,7 +1029,7 @@ mod tests {
         }
         for action in MISSING_HOST_ACTIONS {
             assert!(
-                iced_shortcuts().iter().any(|(_, a, _)| a == action),
+                iced_shortcuts().iter().any(|(_, a, _)| a == action) || *action == "SetChatWidth",
                 "Missing definition for host TODO {action}"
             );
         }

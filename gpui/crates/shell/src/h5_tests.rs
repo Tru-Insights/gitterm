@@ -14,10 +14,12 @@ fn click(cx: &mut VisualTestContext, selector: &'static str) {
     cx.simulate_click(bounds.center(), gpui::Modifiers::none());
     draw(cx);
 }
-fn fixture(cx: &mut TestAppContext) -> (tempfile::TempDir, Entity<Shell>, &mut VisualTestContext) {
+pub(super) fn fixture(
+    cx: &mut TestAppContext,
+) -> (tempfile::TempDir, Entity<Shell>, &mut VisualTestContext) {
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
-    cx.update(bind_workspace_keys);
+    cx.update(install_app_menus);
     let root = tempfile::tempdir_in("/private/tmp").unwrap();
     let source = root.path().join("iced");
     let work = root.path().join("work");

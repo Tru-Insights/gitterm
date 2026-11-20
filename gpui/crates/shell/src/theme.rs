@@ -6,6 +6,26 @@ pub const LABEL_FONT: &str = "Menlo";
 pub const LABEL_LINE_HEIGHT: f32 = 1.3;
 pub const UI_FONT_SIZE: f32 = 13.;
 pub const TERMINAL_FONT_SIZE: f32 = 14.;
+/// Preview-owned font preferences, persisted with the guarded region settings.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FontSizes {
+    pub ui: f32,
+    pub terminal: f32,
+}
+pub fn font_sizes(cx: &App) -> FontSizes {
+    let theme = Theme::global(cx);
+    FontSizes {
+        ui: theme.font_size.into(),
+        terminal: theme.mono_font_size.into(),
+    }
+}
+pub fn set_font_sizes(fonts: FontSizes, cx: &mut App) {
+    Theme::update(cx, |theme| {
+        theme.font_size = px(fonts.ui.clamp(10., 24.));
+        theme.mono_font_size = px(fonts.terminal.clamp(10., 24.));
+    });
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Palette {
     pub base: u32,
