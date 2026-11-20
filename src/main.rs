@@ -7237,7 +7237,13 @@ pub enum Event {
         delegation_state::RequestId,
         Box<gitterm::tasks::NewDelegation>,
         DelegationOrigin,
-        Result<(), String>,
+        Result<delegation_state::Authority, String>,
+    ),
+    /// Off-thread validation of a policy-reserved start.
+    DelegationStartChecked(
+        String,
+        delegation_state::RequestId,
+        Result<delegation_state::Authority, String>,
     ),
     /// Progress from a running Codex delegation.
     DelegationProgress(String, gitterm::codex_runner::CodexRunEvent),
@@ -18787,6 +18793,50 @@ fn delegation_run_stream(
     .boxed()
 }
 
+/// Blocking: retain the existing target authorization and capture its Git
+/// identity for the queued preflight. Unavailable optional roots stay optional.
+fn check_delegation_run(
+    new: &mut gitterm::tasks::NewDelegation,
+    caller: &gitterm::delegations::CallerTab,
+) -> Result<delegation_state::Authority, String> {
+    gitterm::delegations::check_run(new, caller)?;
+    let path = new.options.checkout.as_deref().unwrap_or(&new.parent.cwd);
+    let checkout = std::fs::canonicalize(path)
+        .map_err(|error| format!("resolve delegation checkout {}: {error}", path.display()))?;
+    let repository = worker_repository_identity(&checkout)?.ok_or_else(|| {
+        format!(
+            "delegation checkout {} is no longer a Git repository",
+            checkout.display()
+        )
+    })?;
+    let live = Repository::discover(&checkout)
+        .map_err(|error| format!("open delegation checkout {}: {error}", checkout.display()))?;
+    let workdir = live.workdir().ok_or_else(|| {
+        format!(
+            "delegation checkout {} has no working directory",
+            checkout.display()
+        )
+    })?;
+    let workdir = std::fs::canonicalize(workdir).map_err(|error| {
+        format!(
+            "resolve delegation working directory {}: {error}",
+            workdir.display()
+        )
+    })?;
+    // Matches check_run's known_roots: a missing unrelated repository does
+    // not invalidate a target that another available root authorizes.
+    let roots = std::iter::once(&caller.home)
+        .chain(caller.repos.iter())
+        .map(|root| std::fs::canonicalize(root).ok())
+        .collect();
+    Ok(delegation_state::Authority {
+        checkout,
+        repository,
+        workdir,
+        roots,
+    })
+}
+
 /// Delegations a chat tab requested (TRU-142 S3b/S4/S5): request, run,
 /// card, attention, send.
 impl App {
@@ -18866,10 +18916,27 @@ impl App {
         ))
     }
 
+    // Only catalog facts here. Filesystem authority is checked off-thread.
     fn delegation_identity(&self, uid: &str) -> Result<delegation_state::Caller, String> {
+        let tab = self.delegation_caller(uid)?;
+        let (workspace, live) = self
+            .workspaces
+            .iter()
+            .find_map(|ws| {
+                ws.tabs
+                    .iter()
+                    .find(|t| t.session_uid == uid)
+                    .map(|t| (ws, t))
+            })
+            .ok_or("The calling GitTerm tab is no longer available")?;
         Ok(delegation_state::Caller {
-            tab: self.delegation_caller(uid)?,
-            authority: self.worker_authority_caller(uid)?,
+            tab,
+            target: live.session_target(),
+            workspace_uid: workspace.uid,
+            local_root: match &workspace.location {
+                WorkspaceLocation::Local { root } => Some(root.clone()),
+                _ => None,
+            },
         })
     }
 
@@ -18957,7 +19024,7 @@ impl App {
             async move {
                 tokio::task::spawn_blocking(move || {
                     let mut new = new;
-                    let result = gitterm::delegations::check_run(&mut new, &caller);
+                    let result = check_delegation_run(&mut new, &caller);
                     (new, result)
                 })
                 .await
@@ -18977,7 +19044,7 @@ impl App {
         request: delegation_state::RequestId,
         new: gitterm::tasks::NewDelegation,
         origin: DelegationOrigin,
-        result: Result<(), String>,
+        result: Result<delegation_state::Authority, String>,
     ) -> Task<Event> {
         let caller = self.delegation_identity(&new.parent.session_uid).ok();
         let effect = self
@@ -18989,8 +19056,12 @@ impl App {
                 result,
             })
             .pop();
-        let (new, caller) = match effect {
-            Some(DelegationEffect::Insert { new, caller }) => (*new, *caller),
+        let (new, caller, authority) = match effect {
+            Some(DelegationEffect::Insert {
+                new,
+                caller,
+                authority,
+            }) => (*new, *caller, *authority),
             Some(DelegationEffect::Rejected(error)) => {
                 Self::report_delegation_error(&origin, error);
                 return Task::none();
@@ -19018,10 +19089,11 @@ impl App {
         self.delegation_state.reduce(DelegationIntent::Stored {
             id: delegation_id.clone(),
             caller,
+            authority,
         });
         self.anchor_delegation_card(&session_uid, &delegation_id);
         let start = self.start_queued_delegations();
-        let queued = !self.delegation_runs.contains_key(&delegation_id);
+        let queued = !self.delegation_state.admitted(&delegation_id);
         if let DelegationOrigin::Mcp(reply) = &origin {
             reply.send(Ok(serde_json::json!({
                 "delegation_id": delegation_id,
@@ -19063,14 +19135,11 @@ impl App {
 
     /// Starts queued Codex runs while slots are free
     /// (`review.max_concurrent_reviews`).
-    fn start_queued_delegations(&mut self) -> Task<Event> {
+    fn admit_delegations(&mut self) -> Vec<DelegationEffect> {
         let Some(store) = self.task_authority.store().as_ref() else {
-            return Task::none();
+            return Vec::new();
         };
         let running: HashSet<String> = self.delegation_runs.keys().cloned().collect();
-        let config_root = config::global_config_dir();
-        let mut runs = Vec::new();
-        let mut unrunnable = Vec::new();
         let callers = store
             .delegations()
             .iter()
@@ -19085,72 +19154,132 @@ impl App {
                     .map(|caller| (d.parent.session_uid.clone(), caller))
             })
             .collect();
-        let effects = self.delegation_state.reduce(DelegationIntent::Admit {
+        self.delegation_state.reduce(DelegationIntent::Admit {
             delegations: store.delegations(),
             running: &running,
             callers: &callers,
             max_concurrent: self.review_config.max_concurrent_reviews,
             policy: &self.plan_limits.evaluation_for_launch(),
             running_workers: self.plan_limit_running_workers(gitterm::plan_limits::Provider::Codex),
-        });
-        let mut rejected = Vec::new();
-        for effect in effects {
-            let delegation_id = match effect {
-                DelegationEffect::Start(id) => id,
+        })
+    }
+
+    fn start_queued_delegations(&mut self) -> Task<Event> {
+        let mut tasks = Vec::new();
+        for effect in self.admit_delegations() {
+            match effect {
+                DelegationEffect::CheckStart {
+                    id,
+                    check,
+                    new,
+                    caller,
+                } => tasks.push(Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let mut new = *new;
+                            check_delegation_run(&mut new, &caller)
+                        })
+                        .await
+                        .unwrap_or_else(|error| {
+                            Err(format!("the queued checkout check failed: {error}"))
+                        })
+                    },
+                    move |result| Event::DelegationStartChecked(id, check, result),
+                )),
                 DelegationEffect::StartRejected { id, error } => {
-                    rejected.push((id, error));
-                    continue;
+                    tasks.push(self.record_delegation_outcome(
+                        &id,
+                        Err(gitterm::delegations::RunFailure::Failed(error)),
+                    ))
                 }
                 _ => unreachable!("admission effect"),
-            };
-            let Some(delegation) = store.delegation(&delegation_id) else {
-                continue;
-            };
-            match gitterm::delegations::codex_run(delegation, &config_root) {
-                Ok(mut run) => {
-                    // A Codex review or consult runs without the task
-                    // tools, so it is not told to use them.
-                    run.guidelines = launch_instructions(
-                        &run.cwd,
-                        gitterm::guidelines::InstructionFile::AgentsMd,
-                        self.workspace_guidelines_off(&delegation.parent.workspace),
-                        self.workspace_document_places(&delegation.parent.workspace)
-                            .as_ref(),
-                        false,
-                    );
-                    runs.push((delegation_id, run))
-                }
-                Err(error) => unrunnable.push((delegation_id, error)),
             }
         }
+        Task::batch(tasks)
+    }
+
+    fn delegation_start_checked(
+        &mut self,
+        id: String,
+        check: delegation_state::RequestId,
+        result: Result<delegation_state::Authority, String>,
+    ) -> Task<Event> {
+        let Some(store) = self.task_authority.store().as_ref() else {
+            return Task::none();
+        };
+        let Some(delegation) = store.delegation(&id) else {
+            return Task::none();
+        };
+        let caller = self
+            .delegation_identity(&delegation.parent.session_uid)
+            .ok();
+        let running = self.delegation_runs.keys().cloned().collect();
+        let effects = self
+            .delegation_state
+            .reduce(DelegationIntent::StartChecked {
+                delegation,
+                check,
+                caller: caller.as_ref(),
+                result,
+                running: &running,
+                max_concurrent: self.review_config.max_concurrent_reviews,
+                policy: &self.plan_limits.evaluation_for_launch(),
+                running_workers: self
+                    .plan_limit_running_workers(gitterm::plan_limits::Provider::Codex),
+            });
         let mut tasks = Vec::new();
-        for (delegation_id, run) in runs {
-            eprintln!(
-                "[delegation] starting {delegation_id} in {} (log {})",
-                run.cwd.display(),
-                run.log_path.display()
-            );
-            let (task, handle) =
-                Task::run(delegation_run_stream(delegation_id.clone(), run), |event| {
-                    event
-                })
-                .abortable();
-            self.delegation_runs.insert(delegation_id, handle);
-            tasks.push(task);
-        }
-        for (delegation_id, error) in unrunnable {
-            tasks.push(self.finish_delegation(
-                &delegation_id,
-                Err(gitterm::delegations::RunFailure::Failed(error)),
-            ));
-        }
-        for (id, error) in rejected {
-            tasks.push(self.record_delegation_outcome(
-                &id,
-                Err(gitterm::delegations::RunFailure::Failed(error)),
-            ));
+        for effect in effects {
+            match effect {
+                DelegationEffect::Start(id) => tasks.push(self.start_delegation_run(&id)),
+                DelegationEffect::StartRejected { id, error } => {
+                    tasks.push(self.record_delegation_outcome(
+                        &id,
+                        Err(gitterm::delegations::RunFailure::Failed(error)),
+                    ))
+                }
+                DelegationEffect::Refresh(id) => self.push_delegation_card(&id),
+                _ => unreachable!("checked start effect"),
+            }
         }
         Task::batch(tasks)
+    }
+
+    fn start_delegation_run(&mut self, id: &str) -> Task<Event> {
+        let Some(delegation) = self
+            .task_authority
+            .store()
+            .as_ref()
+            .and_then(|store| store.delegation(id))
+        else {
+            return Task::none();
+        };
+        let mut run =
+            match gitterm::delegations::codex_run(delegation, &config::global_config_dir()) {
+                Ok(run) => run,
+                Err(error) => {
+                    return self.finish_delegation(
+                        id,
+                        Err(gitterm::delegations::RunFailure::Failed(error)),
+                    )
+                }
+            };
+        run.guidelines = launch_instructions(
+            &run.cwd,
+            gitterm::guidelines::InstructionFile::AgentsMd,
+            self.workspace_guidelines_off(&delegation.parent.workspace),
+            self.workspace_document_places(&delegation.parent.workspace)
+                .as_ref(),
+            false,
+        );
+        eprintln!(
+            "[delegation] starting {id} in {} (log {})",
+            run.cwd.display(),
+            run.log_path.display()
+        );
+        let (task, handle) =
+            Task::run(delegation_run_stream(id.to_string(), run), |event| event).abortable();
+        self.delegation_runs.insert(id.to_string(), handle);
+        task
     }
 
     fn delegation_progress(
@@ -27016,6 +27145,9 @@ fi
             Event::DelegationChecked(request, new, origin, result) => {
                 return self.delegation_checked(request, *new, origin, result);
             }
+            Event::DelegationStartChecked(id, check, result) => {
+                return self.delegation_start_checked(id, check, result);
+            }
             Event::DelegationProgress(delegation_id, event) => {
                 self.delegation_progress(&delegation_id, event);
                 return Task::none();
@@ -27121,9 +27253,9 @@ fi
                 return Task::none();
             }
             Event::DelegationRerunRequested(tab_id, delegation_id) => {
-                let new = self
-                    .tab_delegation(tab_id, &delegation_id)
-                    .and_then(gitterm::delegations::rerun_delegation);
+                let new = self.tab_delegation(tab_id, &delegation_id).and_then(|d| {
+                    delegation_state::rerun(d, &self.delegation_caller_for_tab(tab_id)?)
+                });
                 return self.request_delegation(new, DelegationOrigin::Page(tab_id));
             }
             Event::DelegationDismissRequested(tab_id, delegation_id) => {

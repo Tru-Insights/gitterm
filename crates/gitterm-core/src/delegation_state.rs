@@ -6,15 +6,43 @@ use std::collections::{HashMap, HashSet};
 use crate::codex_runner::CodexRunEvent;
 use crate::delegations::{self, CallerTab, HeldSend, SendBatch, SendDecision};
 use crate::plan_limits::PolicyEvaluation;
-use crate::task_commands::WorkerCaller;
+use crate::session::Target;
+use crate::tasks::RepositoryIdentity;
 use crate::tasks::{Delegation, NewDelegation};
+use std::path::PathBuf;
 
-/// Includes a runtime incarnation, repository identity and authorization roots.
+/// Catalog facts and runtime incarnation, captured without filesystem IO.
 /// A persisted caller UID alone cannot authorize an async continuation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caller {
     pub tab: CallerTab,
-    pub authority: WorkerCaller,
+    pub target: Target,
+    pub workspace_uid: u64,
+    pub local_root: Option<PathBuf>,
+}
+
+/// Filesystem facts collected off-thread after the existing checkout checks.
+/// Missing optional authorization roots are represented, not made mandatory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Authority {
+    pub checkout: PathBuf,
+    pub repository: RepositoryIdentity,
+    pub workdir: PathBuf,
+    pub roots: Vec<Option<PathBuf>>,
+}
+
+/// A new user-authorized rerun belongs to the current caller. Its historical
+/// default checkout remains an explicit target if the caller moved meanwhile.
+pub fn rerun(delegation: &Delegation, caller: &CallerTab) -> Result<NewDelegation, String> {
+    let mut new = delegations::rerun_delegation(delegation)?;
+    if new.options.checkout.is_none() && new.parent.cwd != caller.cwd {
+        new.options.checkout = Some(new.parent.cwd.clone());
+    }
+    new.parent.session_uid = caller.session_uid.clone();
+    new.parent.chat_session_id = caller.chat_session_id.clone();
+    new.parent.workspace = caller.workspace.clone();
+    new.parent.cwd = caller.cwd.clone();
+    Ok(new)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -29,17 +57,28 @@ pub enum Intent<'a> {
         request: RequestId,
         new: Box<NewDelegation>,
         caller: Option<&'a Caller>,
-        result: Result<(), String>,
+        result: Result<Authority, String>,
     },
     /// Sent only after the host successfully inserts the requested record.
     Stored {
         id: String,
         caller: Caller,
+        authority: Authority,
     },
     Admit {
         delegations: &'a [Delegation],
         running: &'a HashSet<String>,
         callers: &'a HashMap<String, Caller>,
+        max_concurrent: usize,
+        policy: &'a PolicyEvaluation,
+        running_workers: usize,
+    },
+    StartChecked {
+        delegation: &'a Delegation,
+        check: RequestId,
+        caller: Option<&'a Caller>,
+        result: Result<Authority, String>,
+        running: &'a HashSet<String>,
         max_concurrent: usize,
         policy: &'a PolicyEvaluation,
         running_workers: usize,
@@ -79,6 +118,13 @@ pub enum Effect {
     Insert {
         new: Box<NewDelegation>,
         caller: Box<Caller>,
+        authority: Box<Authority>,
+    },
+    CheckStart {
+        id: String,
+        check: RequestId,
+        new: Box<NewDelegation>,
+        caller: CallerTab,
     },
     Start(String),
     StartRejected {
@@ -115,7 +161,8 @@ struct PendingRequest {
 pub struct State {
     next_request: u64,
     pending: HashMap<RequestId, PendingRequest>,
-    callers: HashMap<String, Caller>,
+    callers: HashMap<String, (Caller, Authority)>,
+    checks: HashMap<String, RequestId>,
     reserved: HashSet<String>,
     // Terminal/cancelled attempts stay settled even if their store write failed.
     // A rerun gets a fresh durable delegation ID and new policy admission.
@@ -125,6 +172,12 @@ pub struct State {
 }
 
 impl State {
+    pub fn pending_start(&self, id: &str) -> Option<RequestId> {
+        self.checks.get(id).copied()
+    }
+    pub fn admitted(&self, id: &str) -> bool {
+        self.reserved.contains(id)
+    }
     pub fn busy(&self) -> bool {
         !self.reserved.is_empty()
     }
@@ -184,19 +237,25 @@ impl State {
                 let Some(pending) = self.pending.remove(&request) else {
                     return Vec::new();
                 };
-                if let Err(error) = result {
-                    return vec![Effect::Rejected(error)];
-                }
+                let authority = match result {
+                    Ok(authority) => authority,
+                    Err(error) => return vec![Effect::Rejected(error)],
+                };
                 if caller != Some(&pending.caller) {
                     return vec![Effect::Rejected("The calling GitTerm tab changed while the checkout was checked; request the delegation again".into())];
                 }
                 vec![Effect::Insert {
                     new,
                     caller: Box::new(pending.caller),
+                    authority: Box::new(authority),
                 }]
             }
-            Intent::Stored { id, caller } => {
-                self.callers.insert(id, caller);
+            Intent::Stored {
+                id,
+                caller,
+                authority,
+            } => {
+                self.callers.insert(id, (caller, authority));
                 Vec::new()
             }
             Intent::Admit {
@@ -221,7 +280,9 @@ impl State {
                     if self
                         .callers
                         .get(&d.delegation_id)
-                        .is_none_or(|expected| callers.get(&d.parent.session_uid) != Some(expected))
+                        .is_none_or(|(expected, _)| {
+                            callers.get(&d.parent.session_uid) != Some(expected)
+                        })
                     {
                         self.settled.insert(d.delegation_id.clone());
                         effects.push(Effect::StartRejected { id: d.delegation_id.clone(), error: "The calling GitTerm tab changed before the queued delegation could start; request it again".into() });
@@ -236,14 +297,81 @@ impl State {
                     policy,
                     running_workers,
                 ) {
+                    let d = delegations.iter().find(|d| d.delegation_id == id).unwrap();
+                    let new = match delegations::rerun_delegation(d) {
+                        Ok(new) => new,
+                        Err(error) => {
+                            self.settled.insert(id.clone());
+                            effects.push(Effect::StartRejected { id, error });
+                            continue;
+                        }
+                    };
+                    self.next_request += 1;
+                    let check = RequestId(self.next_request);
+                    self.checks.insert(id.clone(), check);
                     self.reserved.insert(id.clone());
-                    effects.push(Effect::Start(id));
+                    effects.push(Effect::CheckStart {
+                        id: id.clone(),
+                        check,
+                        new: Box::new(new),
+                        caller: self.callers[&id].0.tab.clone(),
+                    });
                 }
                 effects
             }
+            Intent::StartChecked {
+                delegation,
+                check,
+                caller,
+                result,
+                running,
+                max_concurrent,
+                policy,
+                running_workers,
+            } => {
+                let id = &delegation.delegation_id;
+                if self.checks.get(id) != Some(&check) {
+                    return Vec::new();
+                }
+                self.checks.remove(id);
+                if !delegation.status.is_active() {
+                    self.reserved.remove(id);
+                    self.settled.insert(id.clone());
+                    return Vec::new();
+                }
+                let (expected, authority) = &self.callers[id];
+                let error = match result {
+                    Err(error) => Some(error),
+                    Ok(current) if caller != Some(expected) || current != *authority => Some("The calling GitTerm tab or checkout changed before the delegation could start; request it again".into()),
+                    Ok(_) => None,
+                };
+                if let Some(error) = error {
+                    self.reserved.remove(id);
+                    self.settled.insert(id.clone());
+                    return vec![Effect::StartRejected {
+                        id: id.clone(),
+                        error,
+                    }];
+                }
+                let occupied: HashSet<_> = self.reserved.union(running).collect();
+                if occupied.len() > max_concurrent.max(1)
+                    || !policy.allows_start(
+                        crate::plan_limits::Provider::Codex,
+                        running_workers > 0 || occupied.iter().any(|other| *other != id),
+                        delegation.options.user_model_choice,
+                    )
+                {
+                    self.reserved.remove(id);
+                    return vec![Effect::Refresh(id.clone())];
+                }
+                vec![Effect::Start(id.clone())]
+            }
             Intent::Progress { delegation, event } => {
                 let id = &delegation.delegation_id;
-                if !self.reserved.contains(id) || !delegation.status.is_active() {
+                if !self.reserved.contains(id)
+                    || self.checks.contains_key(id)
+                    || !delegation.status.is_active()
+                {
                     return Vec::new();
                 }
                 let mut effects = Vec::new();
@@ -263,7 +391,8 @@ impl State {
             Intent::Finished { delegation } => {
                 let id = &delegation.delegation_id;
                 self.activity.remove(id);
-                if !self.reserved.remove(id)
+                if self.checks.contains_key(id)
+                    || !self.reserved.remove(id)
                     || !self.settled.insert(id.clone())
                     || !delegation.status.is_active()
                 {
@@ -278,6 +407,7 @@ impl State {
                     effects.push(Effect::Abort(id.clone()));
                 }
                 self.reserved.remove(id);
+                self.checks.remove(id);
                 self.activity.remove(id);
                 for held in self.held.values_mut() {
                     held.retain(|s| s.delegation_id != *id);

@@ -1,9 +1,7 @@
 use super::*;
 use crate::delegation_request::ConsultDelegationRequest;
 use crate::plan_limits::{evaluate_policy, LimitWindow, PlanLimits, PlanLimitsFile, Provider};
-use crate::tasks::{
-    DelegationResult, DelegationStatus, TaskHandoff, WorkspaceIdentity, WorkspaceLocationIdentity,
-};
+use crate::tasks::{DelegationResult, DelegationStatus, RepositoryIdentity, TaskHandoff};
 
 fn caller() -> Caller {
     let tab = CallerTab {
@@ -16,30 +14,29 @@ fn caller() -> Caller {
         repos: vec![],
     };
     Caller {
-        authority: WorkerCaller {
-            target: crate::session::Target {
-                tab_id: 1,
-                session_uid: tab.session_uid.clone(),
-                task_id: None,
-                task_session_id: None,
-            },
-            chat_session_id: tab.chat_session_id.clone(),
-            workspace: WorkspaceIdentity {
-                name: tab.workspace.clone(),
-                location: WorkspaceLocationIdentity::Local {
-                    directory: tab.home.clone(),
-                },
-            },
-            repository: None,
-            repository_workdir: None,
-            checkout: tab.cwd.clone(),
-            home: tab.home.clone(),
-            repos: vec![],
-            remote: false,
+        target: crate::session::Target {
+            tab_id: 1,
+            session_uid: tab.session_uid.clone(),
+            task_id: None,
+            task_session_id: None,
         },
+        workspace_uid: 1,
+        local_root: Some(tab.home.clone()),
         tab,
     }
 }
+fn authority() -> Authority {
+    Authority {
+        checkout: "/fixture/repo".into(),
+        repository: RepositoryIdentity {
+            common_dir: "/fixture/repo/.git".into(),
+            remote_url: None,
+        },
+        workdir: "/fixture/repo".into(),
+        roots: vec![Some("/fixture/repo".into())],
+    }
+}
+
 fn request(previous: Option<String>) -> Box<NewDelegation> {
     Box::new(
         delegations::consult_delegation(
@@ -63,6 +60,7 @@ fn stored(state: &mut State, id: &str) {
     state.reduce(Intent::Stored {
         id: id.into(),
         caller: caller(),
+        authority: authority(),
     });
 }
 fn admit(
@@ -72,20 +70,39 @@ fn admit(
     limits: &PlanLimitsFile,
     workers: usize,
 ) -> Vec<Effect> {
-    state.reduce(Intent::Admit {
+    let effects = state.reduce(Intent::Admit {
         delegations: records,
         running: &HashSet::new(),
         callers: &HashMap::from([("caller".into(), caller())]),
         max_concurrent: cap,
         policy: &evaluate_policy(limits, 1_800_000_000),
         running_workers: workers,
-    })
+    });
+    let mut completed = Vec::new();
+    for effect in effects {
+        match effect {
+            Effect::CheckStart { id, check, .. } => {
+                completed.extend(state.reduce(Intent::StartChecked {
+                    delegation: records.iter().find(|d| d.delegation_id == id).unwrap(),
+                    check,
+                    caller: Some(&caller()),
+                    result: Ok(authority()),
+                    running: &HashSet::new(),
+                    max_concurrent: cap,
+                    policy: &evaluate_policy(limits, 1_800_000_000),
+                    running_workers: workers,
+                }))
+            }
+            effect => completed.push(effect),
+        }
+    }
+    completed
 }
 fn starts(effects: &[Effect]) -> Vec<&str> {
     effects
         .iter()
         .filter_map(|e| match e {
-            Effect::Start(id) => Some(id.as_str()),
+            Effect::Start(id) | Effect::CheckStart { id, .. } => Some(id.as_str()),
             _ => None,
         })
         .collect()
@@ -185,13 +202,13 @@ fn checked_request_rejects_stale_incarnations_roots_and_duplicate_callbacks() {
         };
         let mut live = caller();
         match change {
-            0 => live.authority.target.tab_id += 1,
+            0 => live.target.tab_id += 1,
             1 => live.tab.chat_session_id = Some("other".into()),
-            2 => live.authority.checkout = "/other".into(),
+            2 => live.tab.cwd = "/other".into(),
             3 => live.tab.repos.push("/extra".into()),
-            4 => live.authority.workspace.name = "moved".into(),
+            4 => live.tab.workspace = "moved".into(),
             5 => live.tab.remote = true,
-            _ => live.authority.home = "/other".into(),
+            _ => live.local_root = Some("/other".into()),
         }
         assert!(matches!(
             state
@@ -199,7 +216,7 @@ fn checked_request_rejects_stale_incarnations_roots_and_duplicate_callbacks() {
                     request: ticket,
                     new: new.clone(),
                     caller: Some(&live),
-                    result: Ok(())
+                    result: Ok(authority())
                 })
                 .as_slice(),
             [Effect::Rejected(_)]
@@ -209,7 +226,7 @@ fn checked_request_rejects_stale_incarnations_roots_and_duplicate_callbacks() {
                 request: ticket,
                 new,
                 caller: Some(&caller()),
-                result: Ok(())
+                result: Ok(authority())
             })
             .is_empty());
     }
@@ -220,7 +237,7 @@ fn queued_admission_revalidates_the_original_caller() {
     let mut state = State::default();
     stored(&mut state, "a");
     let mut live = caller();
-    live.authority.target.tab_id += 1;
+    live.target.tab_id += 1;
     let effects = state.reduce(Intent::Admit {
         delegations: &[record("a")],
         running: &HashSet::new(),
@@ -308,7 +325,7 @@ fn finish_cancel_and_rerun_are_idempotent_when_store_writes_fail() {
                     request: ticket,
                     new,
                     caller: Some(&caller()),
-                    result: Ok(())
+                    result: Ok(authority())
                 })
                 .as_slice(),
             [Effect::Insert { .. }]
@@ -432,5 +449,150 @@ fn burst_policy_accounts_for_existing_workers_and_same_batch_admissions() {
             starts(&effects),
             if workers == 0 { vec!["a"] } else { vec![] }
         );
+    }
+}
+
+#[test]
+fn rerun_rebinds_a_fresh_authorized_request_but_keeps_its_checkout() {
+    let mut old = record("old");
+    old.parent.chat_session_id = None;
+    old.parent.workspace = "previous name".into();
+    let mut live = caller();
+    live.tab.cwd = "/fixture/another".into();
+    let new = rerun(&old, &live.tab).unwrap();
+    assert_eq!(new.parent.chat_session_id, live.tab.chat_session_id);
+    assert_eq!(new.parent.workspace, live.tab.workspace);
+    assert_eq!(new.parent.cwd, live.tab.cwd);
+    assert_eq!(
+        new.options.checkout.as_deref(),
+        Some(std::path::Path::new("/fixture/repo"))
+    );
+    assert!(matches!(
+        State::default()
+            .reduce(Intent::Request {
+                new: Box::new(new),
+                caller: live
+            })
+            .as_slice(),
+        [Effect::Check { .. }]
+    ));
+}
+
+fn reserve_check(state: &mut State, d: &Delegation) -> RequestId {
+    let effects = state.reduce(Intent::Admit {
+        delegations: std::slice::from_ref(d),
+        running: &HashSet::new(),
+        callers: &HashMap::from([("caller".into(), caller())]),
+        max_concurrent: 1,
+        policy: &evaluate_policy(&PlanLimitsFile::default(), 1_800_000_000),
+        running_workers: 0,
+    });
+    let [Effect::CheckStart { check, .. }] = effects.as_slice() else {
+        panic!("expected one preflight: {effects:?}");
+    };
+    *check
+}
+fn checked_start(
+    state: &mut State,
+    d: &Delegation,
+    check: RequestId,
+    result: Result<Authority, String>,
+    limits: &PlanLimitsFile,
+) -> Vec<Effect> {
+    state.reduce(Intent::StartChecked {
+        delegation: d,
+        check,
+        caller: Some(&caller()),
+        result,
+        running: &HashSet::new(),
+        max_concurrent: 1,
+        policy: &evaluate_policy(limits, 1_800_000_000),
+        running_workers: 0,
+    })
+}
+
+#[test]
+fn preflight_rechecks_policy_and_ignores_cancelled_duplicate_and_superseded_tickets() {
+    let mut state = State::default();
+    let d = record("a");
+    stored(&mut state, "a");
+    let old = reserve_check(&mut state, &d);
+    assert!(state.busy());
+    assert!(matches!(
+        checked_start(&mut state, &d, old, Ok(authority()), &hold()).as_slice(),
+        [Effect::Refresh(_)]
+    ));
+    assert!(!state.busy());
+    let current = reserve_check(&mut state, &d);
+    assert_ne!(old, current);
+    assert!(checked_start(
+        &mut state,
+        &d,
+        old,
+        Ok(authority()),
+        &PlanLimitsFile::default()
+    )
+    .is_empty());
+    assert_eq!(
+        starts(&checked_start(
+            &mut state,
+            &d,
+            current,
+            Ok(authority()),
+            &PlanLimitsFile::default()
+        )),
+        vec!["a"]
+    );
+    assert!(checked_start(
+        &mut state,
+        &d,
+        current,
+        Ok(authority()),
+        &PlanLimitsFile::default()
+    )
+    .is_empty());
+    state.reduce(Intent::Dismiss { delegation: &d });
+    assert!(checked_start(
+        &mut state,
+        &d,
+        current,
+        Ok(authority()),
+        &PlanLimitsFile::default()
+    )
+    .is_empty());
+
+    let mut state = State::default();
+    stored(&mut state, "a");
+    let check = reserve_check(&mut state, &d);
+    state.reduce(Intent::Dismiss { delegation: &d });
+    assert!(checked_start(
+        &mut state,
+        &d,
+        check,
+        Ok(authority()),
+        &PlanLimitsFile::default()
+    )
+    .is_empty());
+}
+
+#[test]
+fn changed_or_failed_filesystem_preflight_cannot_launch_or_retry() {
+    for fails in [false, true] {
+        let mut state = State::default();
+        let d = record("a");
+        stored(&mut state, "a");
+        let check = reserve_check(&mut state, &d);
+        let mut changed = authority();
+        changed.repository.common_dir = "/fixture/replaced/.git".into();
+        let result = if fails {
+            Err("checkout check failed".into())
+        } else {
+            Ok(changed)
+        };
+        assert!(matches!(
+            checked_start(&mut state, &d, check, result, &PlanLimitsFile::default()).as_slice(),
+            [Effect::StartRejected { .. }]
+        ));
+        assert!(admit(&mut state, &[d], 1, &PlanLimitsFile::default(), 0).is_empty());
     }
 }

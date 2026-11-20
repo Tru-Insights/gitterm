@@ -7,10 +7,11 @@ the old Iced helpers before extraction and passes through the reducer adapter.
 
 | Intent | State/decision | Effects executed by Iced |
 | --- | --- | --- |
-| Request (review/consult/rerun) | Capture caller incarnation, repository and authorization roots; deduplicate pending rerun | Check checkout off-thread, with opaque request ID |
-| Checked | Consume request once; refuse changed caller | Insert durable requested record, then reply/anchor |
-| Stored | Bind successful insertion to its original caller | None |
-| Admit | Revalidate queued caller; preserve policy/cap/store order and reserve before launch | Start Codex stream, or record refusal |
+| Request (review/consult/rerun) | Capture catalog caller incarnation/roots; deduplicate pending rerun; bind newly authorized reruns to the live caller | Check checkout and capture Git/authorization-root facts off-thread, with opaque request ID |
+| Checked | Consume request once; refuse changed catalog caller | Insert durable requested record; retain checked filesystem facts in memory; reply/anchor |
+| Stored | Bind successful insertion to its caller and checked filesystem snapshot | None |
+| Admit | Revalidate catalog caller; preserve policy/cap/store order; reserve before asynchronous preflight | Check checkout/Git/roots off-thread with a generation ticket, or record refusal |
+| StartChecked | Consume the current ticket once; compare captured catalog/filesystem authority; recheck current policy/cap/worker occupancy | Start Codex stream, requeue a policy hold, or record refusal |
 | Progress | Ignore stale/settled events; retain activity | Record thread identity and refresh card |
 | Finished | Settle once before terminal IO; release reservation | Record completion/failure/time-limit outcome, attention and next admission |
 | Dismiss | Settle before IO; remove activity and held sends | Abort exact delegation handle once, cancel if active, remove queued worker launch, persist dismissal |
@@ -19,7 +20,8 @@ the old Iced helpers before extraction and passes through the reducer adapter.
 
 Process launch/abort handles, filesystem checks, store writes, clocks, MCP
 replies, notifications, attention and chat submission remain host effects.
-Worker launch policy occupancy includes the reducer's reservations. A settled
+Worker launch policy occupancy includes the reducer's reservations, including
+preflight checks. No queued filesystem checks run on the UI thread. A settled
 ID cannot auto-restart even if started/terminal/cancellation saves fail. A
 rerun uses a new ID and policy admission. Durable delivery receipts retain the
 existing in-process retry behavior; crash-proof exactly-once delivery is not
@@ -58,3 +60,11 @@ confirmed this task checkout and HEAD `503ede5`. Its caller incarnation,
 reservation/save-failure, union accounting, synchronous delivery and shared
 held-state reader requirements are reflected above. Code review IDs and final
 command exit codes belong in the durable task handoff.
+
+Code review `357d5042-28cf-406c-b0f2-c04a5e284374` requested three fixes:
+F1 live caller rebinding for newly authorized reruns; F2 optional unavailable
+unrelated repository roots; F3 asynchronous queued filesystem validation.
+The follow-up uses catalog-only caller facts, checked filesystem snapshots,
+and generation-bound preflights with a second policy/cap gate. Regression tests
+cover these paths, cancelled/duplicate/superseded tickets, policy changes during
+preflight and changed checkout authority. Final review IDs are in the handoff.
