@@ -1580,10 +1580,6 @@ impl Render for Shell {
                 .into_any_element();
         }
         let state = self.active(cx);
-        let repository = self
-            .data
-            .status(self.active_workspace(cx).expect("active workspace"), cx)
-            .repository;
         let active_session = state
             .active_session
             .and_then(|id| state.sessions.iter().position(|s| s.id == id))
@@ -1609,8 +1605,7 @@ impl Render for Shell {
             .and_then(|id| state.panes.get(&session_pane_id(id)))
             .and_then(|pane| pane.read(cx).session.clone());
         let workspace_target = state.park_target(cx);
-        let state_session_count =
-            state.sessions.len() + usize::from(state.store.terminals.is_some());
+        let state_session_count = state.sessions.len();
         let can_park = self.local
             && self
                 .workspaces
