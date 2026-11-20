@@ -100,7 +100,8 @@ fn chrome_uses_catalog_order_and_workspace_selection_opens_its_active_history(
         let s = shell.read(cx);
         let input = s.strip_input(cx);
         assert_eq!(input.workspace, Some(WorkspaceId(2)));
-        assert_eq!(input.sessions.iter().map(|t| t.display_title.as_str()).collect::<Vec<_>>(), ["Shell", "saved-chat", "missing-chat"]);
+        assert_eq!(input.sessions.iter().map(|t| t.display_title.as_str()).collect::<Vec<_>>(), ["Shell", "/fixture/work", "/fixture/work"]);
+        assert!(input.sessions[1..].iter().all(|session| session.chat_title.is_none()));
         assert_eq!(input.active, Some(input.sessions[1].id));
         let state = s.active(cx);
         let pane = state.panes[&session_pane_id(state.sessions[1].id)].read(cx);
@@ -134,6 +135,41 @@ fn chrome_uses_catalog_order_and_workspace_selection_opens_its_active_history(
         std::fs::read(root.path().join("iced/workspaces.json")).unwrap(),
         before
     );
+}
+
+#[gpui::test]
+fn strip_titles_resolve_inactive_facts_tabs_and_preserve_saved_titles(cx: &mut TestAppContext) {
+    let (root, shell, cx) = fixture(cx);
+    let facts_dir = root.path().join("iced/chat-meta");
+    std::fs::create_dir(&facts_dir).unwrap();
+    let source = r#"{"children":[{"session_id":"missing-chat","kind":"worker","title":"Recorded child title"}]}"#;
+    let facts_path = facts_dir.join("claude-saved-chat.json");
+    std::fs::write(&facts_path, source).unwrap();
+    shell.update_in(cx, |shell, window, cx| {
+        let state = &mut shell.workspaces[1];
+        let session = &mut state.sessions[1];
+        session.title = "Previously saved title".into();
+        state.panes[&session_pane_id(session.id)].update(cx, |pane, _| {
+            pane.title = "Previously saved title".into();
+        });
+        shell.load_active_iced_history(window, cx);
+    });
+    draw(cx);
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        // Neither chat has been selected or imported into a history view.
+        assert_eq!(shell.active_workspace(cx), Some(WorkspaceId(1)));
+        let state = &shell.workspaces[1];
+        assert_eq!(state.sessions[1].title, "Previously saved title");
+        assert_eq!(state.sessions[2].title, "Recorded child title");
+        assert!(
+            state
+                .panes
+                .values()
+                .all(|pane| !matches!(pane.read(cx).content, pane::PaneContent::PreviewChat(_)))
+        );
+    });
+    assert_eq!(std::fs::read_to_string(facts_path).unwrap(), source);
 }
 
 #[gpui::test]
