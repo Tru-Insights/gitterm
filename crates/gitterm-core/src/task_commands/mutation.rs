@@ -66,6 +66,23 @@ pub struct WorkerPreparationId(pub(crate) u64);
 #[derive(Debug)]
 pub enum TaskMutation {
     Create(TaskCreate),
+    InsertPreparing {
+        record: Box<TaskRecord>,
+    },
+    PreparationCompleted {
+        task_id: String,
+        result: Result<CompletedWorktreePreparation, String>,
+        cleanup_path: Option<PathBuf>,
+    },
+    WorktreeRemoved {
+        task_id: String,
+    },
+    RecordDelivery {
+        task_id: String,
+        commit_sha: String,
+        pr_url: Option<String>,
+        pr_number: Option<u64>,
+    },
     UpdateHandoff(HandoffUpdate),
     /// Close/archive the durable task, preserving its worktree and history.
     Close {
@@ -77,6 +94,9 @@ pub enum TaskMutation {
     },
     InspectDelete {
         task_id: String,
+    },
+    CheckWorkerDestination {
+        expected: CompletedWorktreePreparation,
     },
     CheckWorkerCheckout {
         task_id: String,
@@ -106,6 +126,15 @@ pub enum TaskMutation {
         id: WorkerPreparationId,
         task_id: String,
         expected: CompletedWorktreePreparation,
+    },
+    /// Existing-checkout reuse preserves lifecycle, worktree and attention.
+    ReuseWorkerCheckout {
+        id: WorkerPreparationId,
+        replacement: Box<TaskRecord>,
+    },
+    WorkerCheckoutReuseSaved {
+        id: WorkerPreparationId,
+        result: Result<(), String>,
     },
     WorkerPrepared {
         id: WorkerPreparationId,
@@ -137,6 +166,17 @@ pub struct TaskMutationEffect {
 pub enum TaskMutationAction {
     None,
     PrepareTask(TaskCreate),
+    PersistPreparing {
+        record: Box<TaskRecord>,
+    },
+    PersistPreparation {
+        task_id: String,
+        prepared: CompletedWorktreePreparation,
+    },
+    PersistDelivery {
+        task_id: String,
+        delivery: DeliveryState,
+    },
     /// Run record_handoff, which rechecks report authority before its first
     /// write. Only its successful result permits notification/UI completion.
     PersistHandoff {
@@ -208,6 +248,10 @@ pub enum TaskMutationAction {
         error: String,
         cleanup_path: Option<PathBuf>,
     },
+    PersistWorkerCheckoutReuse {
+        id: WorkerPreparationId,
+        replacement: Box<TaskRecord>,
+    },
     StartWorker {
         task_id: String,
         caller: Box<WorkerCaller>,
@@ -221,11 +265,18 @@ pub struct WorkerCaller {
     pub target: session::Target,
     pub chat_session_id: Option<String>,
     pub workspace: WorkspaceIdentity,
-    pub repository: RepositoryIdentity,
+    pub repository: Option<RepositoryIdentity>,
+    pub repository_workdir: Option<PathBuf>,
     pub checkout: PathBuf,
     pub home: PathBuf,
     pub repos: Vec<PathBuf>,
     pub remote: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerCheckout {
+    pub path: PathBuf,
+    pub repository: RepositoryIdentity,
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +292,10 @@ pub struct TaskPreset {
 pub struct TaskMutationFacts {
     pub sessions: Vec<session::State>,
     pub callers: Vec<WorkerCaller>,
+    /// Independently resolved, canonical live destination identities.
+    pub checkouts: Vec<WorkerCheckout>,
+    /// Current normalized destinations, including not-yet-created paths.
+    pub preparation_paths: Vec<PathBuf>,
     pub directories: Vec<PathBuf>,
     /// Fresh Path::exists facts, including non-directory rollback leftovers.
     pub existing_paths: Vec<PathBuf>,

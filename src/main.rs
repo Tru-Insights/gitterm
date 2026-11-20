@@ -2,8 +2,16 @@
 use git2::Status;
 use git2::{DiffOptions, Repository};
 use gitterm::chats::{ChatBackendResume, ChatEntryResume};
+#[cfg(test)]
+use gitterm::task_worktree::DEFAULT_TASK_BASE;
+#[cfg(test)]
+use gitterm::tasks::TaskHandoff;
 use gitterm_core::session;
-use gitterm_core::task_commands::{TaskProjection, TaskRead, TaskReadCommand};
+use gitterm_core::task_commands::{
+    HandoffUpdate, SessionLaunch, TaskCreate, TaskCreateOrigin, TaskLaunchOrigin, TaskMutation,
+    TaskMutationAction, TaskMutationCommand, TaskMutationFacts, TaskPreset, TaskProjection,
+    TaskPublish, TaskRead, TaskReadCommand, WorkerCaller, WorkerCheckout, WorkerPreparationId,
+};
 use gitterm_core::tasks::state::TaskAuthority;
 use iced::advanced::graphics::core::Element;
 use iced::keyboard::{self, key, Key, Modifiers};
@@ -78,20 +86,20 @@ use gitterm::task_mcp::{
     TaskControlReply, TaskMcpConnection, TaskStoppingBoundary,
 };
 use gitterm::task_worktree::{
-    discover_task_delivery, inspect_task_cleanup, open_task_draft_pr, pr_base_branch,
-    prepare_task_worktree, prune_worktrees, push_task_branch, remove_task_worktree,
-    resolve_task_preparation, resolve_worktree_adoption, suggested_task_branch,
-    suggested_task_worktree_path, AdoptWorktreeRequest, AdoptedWorktreeResolution, CleanupContext,
-    CleanupInspection, CleanupRisk, DeliveryDiscovery, PrepareTaskWorktreeRequest,
-    PreparedTaskWorktree, ResolvedTaskPreparation, DEFAULT_TASK_BASE,
+    discover_task_delivery, inspect_task_cleanup, open_task_draft_pr, prepare_task_worktree,
+    prune_worktrees, push_task_branch, remove_task_worktree, resolve_task_preparation,
+    resolve_worktree_adoption, suggested_task_branch, suggested_task_worktree_path,
+    AdoptWorktreeRequest, AdoptedWorktreeResolution, CleanupContext, CleanupInspection,
+    CleanupRisk, DeliveryDiscovery, PrepareTaskWorktreeRequest, PreparedTaskWorktree,
+    ResolvedTaskPreparation,
 };
 use gitterm::tasks::{
-    ChangedFilesSummary, CompletedWorktreePreparation, DeliveryState, ExecutorTarget,
-    HarnessConversationBackend, HarnessConversationRef, HarnessKind, HarnessSelection,
-    IssueProvider, IssueReference, NewTaskRecord, ObjectiveDeliveryState, StoppingBoundary,
-    TaskAttentionReason, TaskCreator, TaskCreatorKind, TaskHandoff, TaskLifecycle, TaskProgress,
-    TaskRecord, TaskSessionRecord, TaskStore, TaskStoreError, TaskWorktree, TaskWorktreeState,
-    VerificationState, WorkspaceIdentity as TaskWorkspaceIdentity, WorkspaceLocationIdentity,
+    ChangedFilesSummary, CompletedWorktreePreparation, ExecutorTarget, HarnessConversationBackend,
+    HarnessConversationRef, HarnessKind, HarnessSelection, IssueProvider, IssueReference,
+    NewTaskRecord, ObjectiveDeliveryState, StoppingBoundary, TaskAttentionReason, TaskCreator,
+    TaskCreatorKind, TaskLifecycle, TaskProgress, TaskRecord, TaskSessionRecord, TaskStore,
+    TaskStoreError, TaskWorktree, TaskWorktreeState, VerificationState,
+    WorkspaceIdentity as TaskWorkspaceIdentity, WorkspaceLocationIdentity,
 };
 use gitterm::workspace_overview as overview;
 use gitterm::worktree_follow::{
@@ -4866,6 +4874,7 @@ pub struct PendingTaskLaunch {
 /// creation.
 #[derive(Debug, Clone)]
 pub struct PendingWorker {
+    authority: WorkerPreparationId,
     caller: gitterm::delegations::CallerTab,
     choice: gitterm::workers::WorkerChoice,
     /// The request's run options, checked (TRU-212).
@@ -4876,6 +4885,7 @@ pub struct PendingWorker {
 /// (TRU-212).
 #[derive(Debug, Clone)]
 pub struct DelegateTargets {
+    authority: WorkerPreparationId,
     request: task_mcp::DelegateTaskRequest,
     caller: Option<String>,
     tab: gitterm::delegations::CallerTab,
@@ -4983,13 +4993,17 @@ struct TaskTabClosePrompt {
     target: session::Target,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum TaskLaunchOrigin {
-    User,
-    Agent,
+trait TaskLaunchPolicy {
+    fn policy_blocked(
+        self,
+        evaluation: &gitterm::plan_limits::PolicyEvaluation,
+        provider: gitterm::plan_limits::Provider,
+        parallel: bool,
+        user_model_choice: bool,
+    ) -> bool;
 }
 
-impl TaskLaunchOrigin {
+impl TaskLaunchPolicy for TaskLaunchOrigin {
     fn policy_blocked(
         self,
         evaluation: &gitterm::plan_limits::PolicyEvaluation,
@@ -6716,6 +6730,7 @@ fn finished_task_ids_for_workspace(
 /// `session_uid`) is the writer: the task session it hosts when that tab
 /// belongs to this task, otherwise (a coordinator tab outside the task) its
 /// `session_uid` itself. No explicit id and no caller records nobody.
+#[cfg(test)]
 fn handoff_writer(
     workspaces: &[Workspace],
     task_id: &str,
@@ -7224,7 +7239,11 @@ pub enum Event {
     DelegationProgress(String, gitterm::codex_runner::CodexRunEvent),
     /// A `delegate_task` request's checkout, repo and extra folders were
     /// checked off the UI thread (TRU-212).
-    DelegateTaskTargetsChecked(Result<Box<DelegateTargets>, String>, TaskControlReply),
+    DelegateTaskTargetsChecked(
+        WorkerPreparationId,
+        Result<Box<DelegateTargets>, String>,
+        TaskControlReply,
+    ),
     /// A worker's time limit is up: delegation, worker task session
     /// (TRU-212).
     WorkerTimeLimitReached(String, String),
@@ -9857,6 +9876,116 @@ impl Drop for App {
     }
 }
 
+fn normalized_worker_path(path: &Path) -> Result<PathBuf, String> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(mut canonical) => {
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(
+                    ancestor
+                        .file_name()
+                        .ok_or_else(|| {
+                            format!("resolve worker destination {}: {error}", path.display())
+                        })?
+                        .to_os_string(),
+                );
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    format!("resolve worker destination {}: {error}", path.display())
+                })?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "resolve worker destination {}: {error}",
+                    path.display()
+                ))
+            }
+        }
+    }
+}
+
+fn worker_repository_identity(
+    checkout: &Path,
+) -> Result<Option<gitterm::tasks::RepositoryIdentity>, String> {
+    if gitterm::workers::checkout_root(checkout).is_none() {
+        return Ok(None);
+    }
+    let main = gitterm::workers::trust_main_repository(checkout)?;
+    let repository = Repository::open(&main)
+        .map_err(|error| format!("open worker authority {}: {error}", main.display()))?;
+    let source = Repository::discover(checkout).map_err(|error| {
+        format!(
+            "open worker source authority {}: {error}",
+            checkout.display()
+        )
+    })?;
+    let remote_url = match source
+        .config()
+        .and_then(|config| config.get_string("remote.origin.url"))
+    {
+        Ok(url) => Some(url.trim().to_string()),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => None,
+        Err(error) => {
+            return Err(format!(
+                "read worker authority origin {}: {error}",
+                checkout.display()
+            ))
+        }
+    };
+    let common_dir = std::fs::canonicalize(repository.path()).map_err(|error| {
+        format!(
+            "resolve worker common directory {}: {error}",
+            repository.path().display()
+        )
+    })?;
+    Ok(Some(gitterm::tasks::RepositoryIdentity {
+        common_dir,
+        remote_url,
+    }))
+}
+
+fn worker_checkout_fact(path: &Path) -> Result<WorkerCheckout, String> {
+    let path = std::fs::canonicalize(path)
+        .map_err(|error| format!("resolve worker destination {}: {error}", path.display()))?;
+    if !path.is_dir() {
+        return Err(format!(
+            "worker destination {} is not a directory",
+            path.display()
+        ));
+    }
+    // core.worktree can redirect Git while leaving the old .git entry intact.
+    let live = Repository::discover(&path)
+        .map_err(|error| format!("open worker destination {}: {error}", path.display()))?;
+    let root = live.workdir().ok_or_else(|| {
+        format!(
+            "worker destination {} has no Git working directory",
+            path.display()
+        )
+    })?;
+    if std::fs::canonicalize(root)
+        .map_err(|error| format!("resolve worker checkout root {}: {error}", path.display()))?
+        != path
+    {
+        return Err(format!(
+            "worker destination {} is not Git's current checkout root",
+            path.display()
+        ));
+    }
+    let repository = worker_repository_identity(&path)?.ok_or_else(|| {
+        format!(
+            "worker destination {} is not a Git checkout",
+            path.display()
+        )
+    })?;
+    Ok(WorkerCheckout { path, repository })
+}
+
 impl App {
     /// UI font size
     fn ui_font(&self) -> f32 {
@@ -12232,14 +12361,14 @@ impl App {
         else {
             return Task::none();
         };
-        let workspace = &self.workspaces[workspace_idx];
-        let decision = workspace.tabs[tab_idx]
-            .session_state(workspace.tabs.len() == 1)
-            .reduce(session::Intent::Close {
-                target: prompt.target,
-                confirmed: true,
-            });
-        if !matches!(decision, session::Effect::Close(_)) {
+        let decision = self.reduce_task_mutation(TaskMutation::CloseSession {
+            target: prompt.target,
+            confirmed: true,
+        });
+        if !matches!(
+            decision,
+            Ok(TaskMutationAction::Session(session::Effect::Close(_)))
+        ) {
             return Task::none();
         }
         let cleanup = turn_snapshot_chat_id(&self.workspaces[workspace_idx].tabs[tab_idx])
@@ -12834,6 +12963,332 @@ impl App {
             .min(entries.len().saturating_sub(1))
     }
 
+    fn task_mutation_facts(&self) -> TaskMutationFacts {
+        let mut facts = TaskMutationFacts {
+            sessions: self
+                .workspaces
+                .iter()
+                .flat_map(|ws| {
+                    ws.tabs
+                        .iter()
+                        .map(|tab| tab.session_state(ws.tabs.len() == 1))
+                })
+                .collect(),
+            working_sessions: self
+                .workspaces
+                .iter()
+                .flat_map(|ws| &ws.tabs)
+                .filter(|tab| tab.task_live_state == Some(TaskSessionLiveState::Working))
+                .map(|tab| tab.session_uid.clone())
+                .collect(),
+            publish_busy: self.task_publish_busy.iter().cloned().collect(),
+            presets: self
+                .agent_presets
+                .iter()
+                .map(|preset| TaskPreset {
+                    name: preset.name.clone(),
+                    command: preset.command.clone(),
+                })
+                .collect(),
+            slot_holders: self
+                .local_slot_holders()
+                .iter()
+                .map(|task| task.task_id.clone())
+                .collect(),
+            queue: self
+                .task_launch_queue
+                .iter()
+                .map(|entry| entry.task_id.clone())
+                .collect(),
+            concurrency_limit: self.max_concurrent_local_tasks,
+            ..Default::default()
+        };
+        if let Some(store) = self.task_authority.store() {
+            facts.directories = store
+                .tasks()
+                .iter()
+                .filter_map(|task| task.worktree.path.as_ref())
+                .filter(|path| path.is_dir())
+                .cloned()
+                .collect();
+        }
+        facts
+    }
+
+    fn reduce_task_mutation(
+        &mut self,
+        mutation: TaskMutation,
+    ) -> Result<TaskMutationAction, String> {
+        let mut facts = self.task_mutation_facts();
+        if matches!(
+            &mutation,
+            TaskMutation::BeginWorkerPreparation { .. }
+                | TaskMutation::CheckWorkerPreparation { .. }
+                | TaskMutation::BindWorkerPreparation { .. }
+                | TaskMutation::WorkerPrepared { .. }
+                | TaskMutation::WorkerPreparationSaved { .. }
+                | TaskMutation::ReuseWorkerCheckout { .. }
+                | TaskMutation::WorkerCheckoutReuseSaved { .. }
+        ) {
+            facts.callers = self
+                .workspaces
+                .iter()
+                .flat_map(|ws| &ws.tabs)
+                .filter_map(|tab| self.worker_authority_caller(&tab.session_uid).ok())
+                .collect();
+        }
+        if let TaskMutation::PreparationCompleted {
+            cleanup_path: Some(path),
+            ..
+        } = &mutation
+        {
+            if path.exists() {
+                facts.existing_paths.push(path.clone());
+            }
+        }
+        let destination = match &mutation {
+            TaskMutation::CheckWorkerDestination { expected } => Some(expected.path.clone()),
+            TaskMutation::CheckWorkerCheckout { path, .. } => Some(path.clone()),
+            TaskMutation::ReuseWorkerCheckout { replacement, .. } => {
+                replacement.worktree.path.clone()
+            }
+            TaskMutation::WorkerPrepared {
+                result: Ok(prepared),
+                ..
+            } => Some(prepared.path.clone()),
+            _ => None,
+        };
+        if matches!(
+            &mutation,
+            TaskMutation::WorkerPreparationSaved { .. }
+                | TaskMutation::WorkerCheckoutReuseSaved { .. }
+        ) {
+            if let Some(store) = self.task_authority.store() {
+                facts.checkouts = store
+                    .tasks()
+                    .iter()
+                    .filter_map(|task| task.worktree.path.as_ref())
+                    .filter_map(|path| worker_checkout_fact(path).ok())
+                    .collect();
+            }
+        }
+        if let Some(path) = destination {
+            if let Ok(normalized) = normalized_worker_path(&path) {
+                facts.preparation_paths.push(normalized);
+            }
+            if let Ok(checkout) = worker_checkout_fact(&path) {
+                facts.checkouts.push(checkout);
+            }
+        }
+        self.task_authority
+            .reduce_mutation(
+                TaskMutationCommand {
+                    reply: None,
+                    mutation,
+                },
+                &facts,
+            )
+            .action
+    }
+
+    fn worker_authority_caller(&self, uid: &str) -> Result<WorkerCaller, String> {
+        let caller = self.delegation_caller(uid)?;
+        let (workspace, tab) = self
+            .workspaces
+            .iter()
+            .find_map(|workspace| {
+                workspace
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.session_uid == uid)
+                    .map(|tab| (workspace, tab))
+            })
+            .ok_or("The calling GitTerm tab is no longer available")?;
+        let canonical = |path: &Path| {
+            std::fs::canonicalize(path)
+                .map_err(|error| format!("resolve worker authority {}: {error}", path.display()))
+        };
+        let checkout = canonical(&caller.cwd)?;
+        // A non-repository workspace home can delegate to explicitly listed repos.
+        let repository = worker_repository_identity(&checkout)?;
+        let repository_workdir = if repository.is_some() {
+            let live = Repository::discover(&checkout)
+                .map_err(|error| format!("open caller checkout {}: {error}", checkout.display()))?;
+            live.workdir().map(canonical).transpose()?
+        } else {
+            None
+        };
+        let home = canonical(&caller.home)?;
+        let WorkspaceLocation::Local { root } = &workspace.location else {
+            return Err("Remote workers are not supported yet".into());
+        };
+        let source_location = WorkspaceLocationIdentity::Local {
+            directory: canonical(root)?,
+        };
+        Ok(WorkerCaller {
+            target: tab.session_target(),
+            chat_session_id: tab.chat_session_id.clone(),
+            workspace: TaskWorkspaceIdentity {
+                name: caller.workspace,
+                location: source_location,
+            },
+            repository,
+            repository_workdir,
+            checkout,
+            home,
+            repos: caller
+                .repos
+                .iter()
+                .map(|path| canonical(path))
+                .collect::<Result<_, _>>()?,
+            remote: caller.remote,
+        })
+    }
+
+    fn cancel_worker_preparation(&mut self, id: WorkerPreparationId) {
+        let _ = self.reduce_task_mutation(TaskMutation::CancelWorkerPreparation { id });
+    }
+
+    fn complete_worker_preparation(
+        &mut self,
+        pending: &PendingTaskLaunch,
+        result: Result<PreparedTaskWorktree, String>,
+    ) -> Task<Event> {
+        let worker = pending.worker.clone().expect("worker completion");
+        let reply = pending.control_reply.clone().expect("worker reply");
+        let id = worker.authority;
+        let mut facts = self.task_mutation_facts();
+        facts.callers = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| &ws.tabs)
+            .filter_map(|tab| self.worker_authority_caller(&tab.session_uid).ok())
+            .collect();
+        facts.existing_paths = pending
+            .resolved_worktree_path
+            .iter()
+            .filter(|path| path.exists())
+            .filter_map(|path| std::fs::canonicalize(path).ok())
+            .collect();
+        if let Some(path) = &pending.resolved_worktree_path {
+            if let Ok(path) = normalized_worker_path(path) {
+                facts.preparation_paths.push(path);
+            }
+        }
+        if let Ok(prepared) = &result {
+            if let Ok(checkout) = worker_checkout_fact(&prepared.path) {
+                facts.checkouts.push(checkout);
+            }
+        }
+        let effect = self
+            .task_authority
+            .reduce_mutation(
+                TaskMutationCommand {
+                    reply: Some(reply.id()),
+                    mutation: TaskMutation::WorkerPrepared {
+                        id,
+                        result: result.map(Into::into),
+                    },
+                },
+                &facts,
+            )
+            .action;
+        let result = (|| match effect? {
+            TaskMutationAction::PersistWorkerPreparation {
+                task_id, prepared, ..
+            } => {
+                let saved = self
+                    .task_authority
+                    .store_mut()
+                    .as_mut()
+                    .ok_or("The task store became unavailable".to_string())
+                    .and_then(|store| {
+                        store
+                            .complete_worktree_preparation(
+                                &task_id,
+                                prepared,
+                                &chrono::Utc::now().to_rfc3339(),
+                            )
+                            .map_err(|error| error.to_string())
+                    });
+                if let Err(error) = &saved {
+                    self.task_store_error = Some(error.clone());
+                }
+                self.reduce_task_mutation(TaskMutation::WorkerPreparationSaved {
+                    id,
+                    result: saved,
+                })
+            }
+            TaskMutationAction::PersistWorkerPreparationFailure {
+                task_id,
+                error,
+                cleanup_path,
+            } => {
+                if let Some(store) = self.task_authority.store_mut().as_mut() {
+                    if let Err(store_error) = store.fail_worktree_preparation(
+                        &task_id,
+                        error.clone(),
+                        cleanup_path,
+                        &chrono::Utc::now().to_rfc3339(),
+                    ) {
+                        self.task_store_error = Some(store_error.to_string());
+                    }
+                }
+                Err(error)
+            }
+            _ => unreachable!("worker completion effect"),
+        })();
+        match result {
+            Ok(effect) => self.start_delegated_worker(effect, worker, reply),
+            Err(error) => {
+                reply.send(Err(error));
+                Task::none()
+            }
+        }
+    }
+
+    fn insert_preparing_task(&mut self, record: TaskRecord) -> Result<(), String> {
+        let TaskMutationAction::PersistPreparing { record } =
+            self.reduce_task_mutation(TaskMutation::InsertPreparing {
+                record: Box::new(record),
+            })?
+        else {
+            unreachable!("metadata effect")
+        };
+        self.task_authority
+            .store_mut()
+            .as_mut()
+            .ok_or("GitTerm's task store became unavailable")?
+            .insert(*record)
+            .map_err(|error| error.to_string())
+    }
+
+    fn archive_task(&mut self, task_id: &str, timestamp: &str) -> Result<(), String> {
+        let effect = self.reduce_task_mutation(TaskMutation::Close {
+            task_id: task_id.into(),
+        });
+        let effect = effect.map_err(|error| match self.task_authority.store().as_ref() {
+            None => "GitTerm's task store is unavailable".into(),
+            Some(store) if store.get(task_id).is_none() => format!(
+                "failed to archive task store {}: task {task_id} does not exist",
+                store.path().display()
+            ),
+            Some(store) => format!(
+                "failed to replace task store {}: {error}",
+                store.path().display()
+            ),
+        })?;
+        let TaskMutationAction::ArchiveTask { task_id } = effect else {
+            unreachable!("archive effect")
+        };
+        self.task_authority
+            .store_mut()
+            .as_mut()
+            .ok_or("GitTerm's task store is unavailable")?
+            .archive(&task_id, timestamp)
+            .map_err(|error| error.to_string())
+    }
+
     fn task_read_requested(
         &self,
         query: TaskRead,
@@ -13286,40 +13741,29 @@ impl App {
     }
 
     fn pending_task_from_control(
-        &self,
+        &mut self,
         input: McpCreateTaskRequest,
         reply: TaskControlReply,
         caller: Option<String>,
     ) -> Result<PendingTaskLaunch, String> {
-        let title = input.title.trim().to_string();
-        let objective = input.objective.trim().to_string();
-        if title.is_empty() {
-            return Err("title is required".to_string());
-        }
-        if objective.is_empty() {
-            return Err("objective is required".to_string());
-        }
-        if !input.repository_path.is_absolute() {
-            return Err(format!(
-                "repository_path must be absolute: {}",
-                input.repository_path.display()
-            ));
-        }
-        let issue_key = input
-            .issue_key
-            .map(|key| key.trim().to_uppercase())
-            .filter(|key| !key.is_empty());
-        if issue_key
-            .as_deref()
-            .is_some_and(|key| !is_linear_issue_key(key))
-        {
-            return Err("Linear issue must look like TRU-106".to_string());
-        }
-        let base_reference = input
-            .base_reference
-            .map(|base| base.trim().to_string())
-            .filter(|base| !base.is_empty())
-            .unwrap_or_else(|| DEFAULT_TASK_BASE.to_string());
+        let TaskMutationAction::PrepareTask(input) =
+            self.reduce_task_mutation(TaskMutation::Create(TaskCreate {
+                title: input.title,
+                objective: input.objective,
+                repository_path: input.repository_path,
+                workspace_name: input.workspace_name,
+                issue_key: input.issue_key,
+                base_reference: input.base_reference,
+                stopping_boundary: stopping_boundary_from_control(input.stopping_boundary),
+                origin: TaskCreateOrigin::Control,
+            }))?
+        else {
+            unreachable!("create must prepare a task")
+        };
+        let title = input.title;
+        let objective = input.objective;
+        let issue_key = input.issue_key;
+        let base_reference = input.base_reference.expect("normalized base");
         let repository_path = self.canonical_task_workspace_directory(&input.repository_path);
         let came_from_managed_worktree = !paths_equal(&repository_path, &input.repository_path);
         let workspace_name = (!came_from_managed_worktree)
@@ -13333,16 +13777,7 @@ impl App {
                     .map(|name| name.to_string_lossy().into_owned())
             })
             .unwrap_or_else(|| "Task workspace".to_string());
-        let stopping_boundary = match input
-            .stopping_boundary
-            .unwrap_or(TaskStoppingBoundary::ImplementUntilTestsPass)
-        {
-            TaskStoppingBoundary::PlanOnly => StoppingBoundary::PlanOnly,
-            TaskStoppingBoundary::ImplementUntilTestsPass => {
-                StoppingBoundary::ImplementUntilTestsPass
-            }
-            TaskStoppingBoundary::PrepareDraftPr => StoppingBoundary::PrepareDraftPr,
-        };
+        let stopping_boundary = input.stopping_boundary;
         let task_id = uuid::Uuid::new_v4().to_string();
         let request = PrepareTaskWorktreeRequest {
             repository_path: repository_path.clone(),
@@ -13594,63 +14029,73 @@ impl App {
     /// Route a publish verb: warn first when the task has no linked issue
     /// (commits and PRs here carry an issue key), otherwise start the work.
     fn request_task_publish(&mut self, task_id: &str, action: TaskPublishAction) -> Task<Event> {
-        let Some(task) = self
-            .task_authority
-            .store()
-            .as_ref()
-            .and_then(|store| store.get(task_id))
-        else {
-            return Task::none();
-        };
-        if task.issue.is_none() {
-            self.task_publish_prompt = Some(TaskPublishPrompt {
-                task_id: task_id.to_string(),
-                action,
-            });
-            return Task::none();
-        }
-        self.start_task_publish(task_id, action)
+        self.reduce_task_publish(task_id, action, false)
     }
 
-    /// Kick off the actual push or draft-PR work for a task. Both finish with
-    /// a fresh delivery snapshot so the overview reflects the result at once.
     fn start_task_publish(&mut self, task_id: &str, action: TaskPublishAction) -> Task<Event> {
-        let Some(task) = self
-            .task_authority
-            .store()
-            .as_ref()
-            .and_then(|store| store.get(task_id))
-        else {
-            return Task::none();
+        self.reduce_task_publish(task_id, action, true)
+    }
+
+    fn reduce_task_publish(
+        &mut self,
+        task_id: &str,
+        action: TaskPublishAction,
+        confirmed: bool,
+    ) -> Task<Event> {
+        let action = match action {
+            TaskPublishAction::PushBranch => TaskPublish::PushBranch,
+            TaskPublishAction::OpenDraftPr => TaskPublish::OpenDraftPr,
         };
-        let Some(worktree_path) = task.worktree.path.clone() else {
-            return Task::none();
-        };
-        if self.task_publish_busy.contains(task_id) {
-            return Task::none();
-        }
-        let branch = task.branch.clone();
-        let completed = {
-            let task_id = task_id.to_string();
-            move |result: Result<DeliveryDiscovery, gitterm::task_worktree::TaskWorktreeError>| {
-                Event::TaskPublishCompleted(task_id, result.map_err(|error| error.to_string()))
+        match self.reduce_task_mutation(TaskMutation::Publish {
+            task_id: task_id.into(),
+            action,
+            confirmed,
+        }) {
+            Ok(TaskMutationAction::ConfirmPublish { task_id, action }) => {
+                self.task_publish_prompt = Some(TaskPublishPrompt {
+                    task_id,
+                    action: match action {
+                        TaskPublish::PushBranch => TaskPublishAction::PushBranch,
+                        TaskPublish::OpenDraftPr => TaskPublishAction::OpenDraftPr,
+                    },
+                });
+                Task::none()
             }
-        };
-        let gh_account = self.task_gh_account(task_id);
-        self.task_publish_busy.insert(task_id.to_string());
-        match action {
-            TaskPublishAction::PushBranch => Task::perform(
-                push_task_branch(worktree_path, branch, gh_account),
-                completed,
-            ),
-            TaskPublishAction::OpenDraftPr => {
-                let base = pr_base_branch(&task.base.reference).to_string();
-                let (title, body) = task.draft_pr_copy();
-                Task::perform(
-                    open_task_draft_pr(worktree_path, branch, base, title, body, gh_account),
-                    completed,
-                )
+            Ok(TaskMutationAction::Publish {
+                task_id,
+                action,
+                path,
+                branch,
+                base,
+                title,
+                body,
+            }) => {
+                let gh_account = self.task_gh_account(&task_id);
+                self.task_publish_busy.insert(task_id.clone());
+                let completed = move |result: Result<
+                    DeliveryDiscovery,
+                    gitterm::task_worktree::TaskWorktreeError,
+                >| {
+                    Event::TaskPublishCompleted(
+                        task_id.clone(),
+                        result.map_err(|error| error.to_string()),
+                    )
+                };
+                match action {
+                    TaskPublish::PushBranch => {
+                        Task::perform(push_task_branch(path, branch, gh_account), completed)
+                    }
+                    TaskPublish::OpenDraftPr => Task::perform(
+                        open_task_draft_pr(path, branch, base, title, body, gh_account),
+                        completed,
+                    ),
+                }
             }
+            Err(error) => {
+                self.task_ui_error = Some(error);
+                Task::none()
+            }
+            _ => Task::none(),
         }
     }
 
@@ -13765,6 +14210,8 @@ impl App {
                 task.title
             ));
         };
+        // Preserve the host's indexed-preset error order; the reducer checks
+        // these fresh directory facts again at admission below.
         if task.worktree.state != TaskWorktreeState::Ready || !worktree_path.is_dir() {
             return Err(format!(
                 "Task {} worktree is not ready at {}",
@@ -13875,31 +14322,68 @@ impl App {
             .iter()
             .map(|task| task.task_id.clone())
             .collect::<HashSet<_>>();
-        if policy_blocked && holders.contains(task_id) {
-            return Err(self.plan_limits_routing().reason);
-        }
-        if launched_agent {
-            let store = self
-                .task_authority
-                .store_mut()
-                .as_mut()
-                .ok_or("GitTerm's task store became unavailable")?;
-            if let Some(position) = queue_task_launch_if_full(
-                store,
-                &mut self.task_launch_queue,
-                QueuedTaskLaunch {
-                    task_id: task_id.to_string(),
+        let request = SessionLaunch {
+            task_id: task_id.into(),
+            preset_name: preset_idx.map(|index| self.agent_presets[index].name.clone()),
+            origin,
+            user_model_choice: worker_options.user_model_choice || user_model_choice,
+        };
+        let mut facts = self.task_mutation_facts();
+        facts.policy_blocked = policy_blocked;
+        facts.policy_reason = self.plan_limits_routing().reason;
+        facts.slot_holders = holders.iter().cloned().collect();
+        let decision = self
+            .task_authority
+            .reduce_mutation(
+                TaskMutationCommand {
+                    reply: None,
+                    mutation: TaskMutation::LaunchSession(request),
+                },
+                &facts,
+            )
+            .action?;
+        match decision {
+            TaskMutationAction::QueueSession { position, .. } => {
+                // Admission is acknowledged only after the durable queue write.
+                if let Some(position) = update_queued_task_request(
+                    &mut self.task_launch_queue,
+                    task_id,
+                    origin,
+                    user_model_choice,
+                ) {
+                    return Ok(TaskChildLaunch::Queued {
+                        position: position + 1,
+                    });
+                }
+                let store = self
+                    .task_authority
+                    .store_mut()
+                    .as_mut()
+                    .ok_or("GitTerm's task store became unavailable")?;
+                let timestamp = chrono::Utc::now().to_rfc3339();
+                if let Some(selection) = harness.clone() {
+                    store
+                        .record_requested_harness(task_id, selection, &timestamp)
+                        .map_err(|error| error.to_string())?;
+                }
+                store
+                    .record_lifecycle_signal(task_id, TaskLifecycle::Queued, None, &timestamp)
+                    .map_err(|error| error.to_string())?;
+                self.task_launch_queue.push(QueuedTaskLaunch {
+                    task_id: task_id.into(),
                     preset_idx,
                     origin,
                     user_model_choice,
-                },
-                harness.clone(),
-                &holders,
-                policy_blocked,
-                self.max_concurrent_local_tasks,
-            )? {
+                });
                 return Ok(TaskChildLaunch::Queued { position });
             }
+            TaskMutationAction::LaunchSession { .. } => {
+                if launched_agent && !holders.contains(task_id) {
+                    self.task_launch_queue
+                        .retain(|entry| entry.task_id != task_id);
+                }
+            }
+            _ => unreachable!("launch effect"),
         }
         let original_workspace_dir = self
             .active_workspace()
@@ -18804,7 +19288,16 @@ impl App {
                 &options.add_dirs,
             )
             .map_err(|error| format!("preset {}: {error}", choice.preset_name))?;
+            self.worker_authority_caller(&tab.session_uid)?;
+            let TaskMutationAction::WorkerAuthorityChecked { id: authority } = self
+                .reduce_task_mutation(TaskMutation::BeginWorkerPreparation {
+                    caller: tab.session_uid.clone(),
+                })?
+            else {
+                unreachable!("capture worker authority")
+            };
             Ok(DelegateTargets {
+                authority,
                 request,
                 caller: caller.clone(),
                 tab,
@@ -18824,15 +19317,20 @@ impl App {
         if targets.place == gitterm::delegations::WorkerPlace::TabRepository
             && targets.options.add_dirs.is_empty()
         {
-            return self.delegate_task_targets_checked(Ok(Box::new(targets)), reply);
+            return self.delegate_task_targets_checked(
+                targets.authority,
+                Ok(Box::new(targets)),
+                reply,
+            );
         }
+        let authority = targets.authority;
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || check_delegate_targets(targets))
                     .await
                     .unwrap_or_else(|error| Err(format!("the target check failed: {error}")))
             },
-            move |result| Event::DelegateTaskTargetsChecked(result.map(Box::new), reply),
+            move |result| Event::DelegateTaskTargetsChecked(authority, result.map(Box::new), reply),
         )
     }
 
@@ -18841,12 +19339,20 @@ impl App {
     /// around the requested checkout.
     fn delegate_task_targets_checked(
         &mut self,
+        authority: WorkerPreparationId,
         result: Result<Box<DelegateTargets>, String>,
         reply: TaskControlReply,
     ) -> Task<Event> {
+        if let Err(error) =
+            self.reduce_task_mutation(TaskMutation::CheckWorkerPreparation { id: authority })
+        {
+            reply.send(Err(error));
+            return Task::none();
+        }
         let targets = match result {
             Ok(targets) => *targets,
             Err(error) => {
+                self.cancel_worker_preparation(authority);
                 reply.send(Err(error));
                 return Task::none();
             }
@@ -18889,6 +19395,7 @@ impl App {
                 &options,
             )?;
             pending.worker = Some(PendingWorker {
+                authority,
                 caller: tab,
                 choice,
                 options,
@@ -18898,6 +19405,7 @@ impl App {
         let pending = match prepared {
             Ok(pending) => pending,
             Err(error) => {
+                self.cancel_worker_preparation(authority);
                 reply.send(Err(error));
                 return Task::none();
             }
@@ -18920,6 +19428,7 @@ impl App {
         reply: TaskControlReply,
     ) -> Task<Event> {
         let DelegateTargets {
+            authority,
             request,
             caller,
             tab,
@@ -18929,6 +19438,7 @@ impl App {
             ..
         } = targets;
         let prepared = (|| {
+            self.reduce_task_mutation(TaskMutation::CheckWorkerPreparation { id: authority })?;
             let title = request.title.trim().to_string();
             let objective = request.objective.trim().to_string();
             let issue_key = request
@@ -18943,11 +19453,16 @@ impl App {
                 return Err("Linear issue must look like TRU-106".to_string());
             }
             let stopping_boundary = stopping_boundary_from_control(request.stopping_boundary);
-            let store = self
-                .task_authority
-                .store()
-                .as_ref()
-                .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?;
+            if let Some(resolution) = &adoption {
+                self.reduce_task_mutation(TaskMutation::CheckWorkerDestination {
+                    expected: CompletedWorktreePreparation {
+                        repository: resolution.repository.identity.clone(),
+                        base: resolution.base.clone(),
+                        branch: resolution.branch.clone(),
+                        path: checkout.clone(),
+                    },
+                })?;
+            }
             let owner = self.worktree_task(&checkout).cloned();
             let task_id = match &owner {
                 Some(task) => task.task_id.clone(),
@@ -18964,7 +19479,10 @@ impl App {
             });
             match owner {
                 Some(mut task) => {
-                    validate_worker_checkout(store, &task, &checkout, &self.workspaces)?;
+                    self.reduce_task_mutation(TaskMutation::CheckWorkerCheckout {
+                        task_id: task_id.clone(),
+                        path: checkout.clone(),
+                    })?;
                     // The task now carries this work; its last handoff
                     // stays as the worker's context.
                     task.title = title;
@@ -18974,12 +19492,28 @@ impl App {
                     }
                     task.stopping_boundary = stopping_boundary;
                     task.updated_at = timestamp;
-                    let store = self
+                    let TaskMutationAction::PersistWorkerCheckoutReuse { replacement, .. } =
+                        self.reduce_task_mutation(TaskMutation::ReuseWorkerCheckout {
+                            id: authority,
+                            replacement: Box::new(task),
+                        })?
+                    else {
+                        unreachable!("reuse effect")
+                    };
+                    let saved = self
                         .task_authority
                         .store_mut()
                         .as_mut()
-                        .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?;
-                    store.replace(task).map_err(|error| error.to_string())?;
+                        .ok_or("GitTerm's task store is unavailable".to_string())
+                        .and_then(|store| {
+                            store
+                                .replace(*replacement)
+                                .map_err(|error| error.to_string())
+                        });
+                    self.reduce_task_mutation(TaskMutation::WorkerCheckoutReuseSaved {
+                        id: authority,
+                        result: saved,
+                    })
                 }
                 None => {
                     let resolution = adoption.ok_or_else(|| {
@@ -19029,36 +19563,50 @@ impl App {
                         state: TaskWorktreeState::Preparing,
                         path: None,
                     };
-                    let store = self
+                    self.insert_preparing_task(record)?;
+                    let expected = CompletedWorktreePreparation {
+                        repository: resolution.repository.identity.clone(),
+                        base: resolution.base.clone(),
+                        branch: resolution.branch.clone(),
+                        path: checkout.clone(),
+                    };
+                    self.reduce_task_mutation(TaskMutation::BindWorkerPreparation {
+                        id: authority,
+                        task_id: task_id.clone(),
+                        expected: expected.clone(),
+                    })?;
+                    let TaskMutationAction::PersistWorkerPreparation { prepared, .. } = self
+                        .reduce_task_mutation(TaskMutation::WorkerPrepared {
+                            id: authority,
+                            result: Ok(expected),
+                        })?
+                    else {
+                        unreachable!("adoption effect")
+                    };
+                    let saved = self
                         .task_authority
                         .store_mut()
                         .as_mut()
-                        .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?;
-                    store
-                        .insert(record)
-                        .and_then(|()| {
-                            store.complete_worktree_preparation(
-                                &task_id,
-                                CompletedWorktreePreparation {
-                                    repository: resolution.repository.identity.clone(),
-                                    base: resolution.base.clone(),
-                                    branch: resolution.branch.clone(),
-                                    path: checkout.clone(),
-                                },
-                                &timestamp,
-                            )
-                        })
-                        .map_err(|error| error.to_string())?;
+                        .ok_or("GitTerm's task store is unavailable".to_string())
+                        .and_then(|store| {
+                            store
+                                .complete_worktree_preparation(&task_id, prepared, &timestamp)
+                                .map_err(|error| error.to_string())
+                        });
+                    self.reduce_task_mutation(TaskMutation::WorkerPreparationSaved {
+                        id: authority,
+                        result: saved,
+                    })
                 }
             }
-            Ok(task_id)
         })();
         match prepared {
-            Ok(task_id) => {
+            Ok(effect) => {
                 self.mark_log_server_dirty();
                 self.start_delegated_worker(
-                    &task_id,
+                    effect,
                     PendingWorker {
+                        authority,
                         caller: tab,
                         choice,
                         options,
@@ -19067,6 +19615,7 @@ impl App {
                 )
             }
             Err(error) => {
+                self.cancel_worker_preparation(authority);
                 reply.send(Err(error));
                 Task::none()
             }
@@ -19136,10 +19685,15 @@ impl App {
     /// tab (focus stays where it is), and answer `delegate_task`.
     fn start_delegated_worker(
         &mut self,
-        task_id: &str,
+        effect: TaskMutationAction,
         worker: PendingWorker,
         reply: TaskControlReply,
     ) -> Task<Event> {
+        let TaskMutationAction::StartWorker { task_id, caller } = effect else {
+            unreachable!("worker start effect")
+        };
+        debug_assert_eq!(caller.target.session_uid, worker.caller.session_uid);
+        let task_id = task_id.as_str();
         let Some(task) = self
             .task_authority
             .store()
@@ -19257,60 +19811,31 @@ impl App {
         caller: Option<&str>,
     ) -> Result<serde_json::Value, String> {
         use task_mcp::HandoffStatus;
-        let status = request.status.unwrap_or_default();
-        let summary = request.summary.trim().to_string();
-        if summary.is_empty() {
-            return Err("handoff summary is required".to_string());
-        }
-        let clean = |items: Vec<String>| {
-            items
-                .into_iter()
-                .map(|item| item.trim().to_string())
-                .filter(|item| !item.is_empty())
-                .collect::<Vec<_>>()
-        };
-        // The task session the calling tab hosts in this task (S1). Only
-        // this, never a typed session id, may report done or blocked.
-        let hosted_session = caller.and_then(|caller| {
-            self.workspaces
-                .iter()
-                .flat_map(|workspace| workspace.tabs.iter())
-                .find(|tab| {
-                    tab.session_uid == caller
-                        && tab.task_id.as_deref() == Some(request.task_id.as_str())
-                })
-                .and_then(|tab| tab.task_session_id.clone())
-        });
         let timestamp = chrono::Utc::now().to_rfc3339();
+        let TaskMutationAction::PersistHandoff {
+            handoff,
+            status,
+            hosted_session,
+            ..
+        } = self.reduce_task_mutation(TaskMutation::UpdateHandoff(HandoffUpdate {
+            task_id: request.task_id.clone(),
+            summary: request.summary,
+            decisions: request.decisions,
+            next_steps: request.next_steps,
+            blockers: request.blockers,
+            session_id: request.session_id,
+            caller: caller.map(str::to_string),
+            status: request.status.unwrap_or_default(),
+            timestamp: timestamp.clone(),
+        }))?
+        else {
+            unreachable!("handoff must persist")
+        };
         let store = self
             .task_authority
             .store_mut()
             .as_mut()
-            .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?;
-        let task_sessions = store
-            .get(&request.task_id)
-            .map(|task| {
-                task.sessions
-                    .iter()
-                    .map(|session| session.task_session_id.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let updated_by_session_id = handoff_writer(
-            &self.workspaces,
-            &request.task_id,
-            &task_sessions,
-            request.session_id.as_deref(),
-            caller,
-        )?;
-        let handoff = TaskHandoff {
-            summary,
-            decisions: clean(request.decisions),
-            next_steps: clean(request.next_steps),
-            blockers: clean(request.blockers),
-            updated_by_session_id,
-            updated_at: timestamp.clone(),
-        };
+            .ok_or("GitTerm's task store is unavailable")?;
         let report_to = gitterm::delegations::record_handoff(
             store,
             &request.task_id,
@@ -19891,6 +20416,7 @@ fn local_slot_holders<'a>(store: &'a TaskStore, workspaces: &[Workspace]) -> Vec
         .collect()
 }
 
+#[cfg(test)]
 fn queue_task_launch_if_full(
     store: &mut TaskStore,
     queue: &mut Vec<QueuedTaskLaunch>,
@@ -19935,6 +20461,7 @@ fn queue_task_launch_if_full(
     Ok(None)
 }
 
+#[cfg(test)]
 fn validate_worker_checkout(
     store: &TaskStore,
     task: &TaskRecord,
@@ -24078,27 +24605,23 @@ fi
                     );
                 }
                 TaskControlOperation::LaunchSession(request) => {
-                    let preset_idx = match request.preset_name.as_deref() {
-                        Some(name) => match self
-                            .agent_presets
-                            .iter()
-                            .position(|preset| preset.name.eq_ignore_ascii_case(name.trim()))
-                        {
-                            Some(index) => Some(index),
-                            None => {
-                                let available = self
-                                    .agent_presets
-                                    .iter()
-                                    .map(|preset| preset.name.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                envelope.reply.send(Err(format!(
-                                    "Agent preset {name:?} is unavailable. Configured presets: {available}"
-                                )));
-                                return Task::none();
-                            }
-                        },
-                        None => None,
+                    let decision =
+                        self.reduce_task_mutation(TaskMutation::LaunchSession(SessionLaunch {
+                            task_id: request.task_id.clone(),
+                            preset_name: request.preset_name.clone(),
+                            origin: TaskLaunchOrigin::Agent,
+                            user_model_choice: request.user_model_choice,
+                        }));
+                    let preset_idx = match decision {
+                        Ok(TaskMutationAction::LaunchSession { preset_index, .. }) => preset_index,
+                        Ok(TaskMutationAction::QueueSession { preset_index, .. }) => {
+                            Some(preset_index)
+                        }
+                        Err(error) => {
+                            envelope.reply.send(Err(error));
+                            return Task::none();
+                        }
+                        _ => unreachable!("launch effect"),
                     };
                     match self.try_launch_task_child(
                         &request.task_id,
@@ -25081,17 +25604,21 @@ fi
                 ]);
             }
             Event::TabClose(idx) => {
-                let decision = self
+                let target = self
                     .active_workspace()
-                    .and_then(|workspace| {
-                        workspace.tabs.get(idx).map(|tab| {
-                            tab.session_state(workspace.tabs.len() == 1).reduce(
-                                session::Intent::Close {
-                                    target: tab.session_target(),
-                                    confirmed: false,
-                                },
-                            )
+                    .and_then(|ws| ws.tabs.get(idx))
+                    .map(TabState::session_target);
+                let decision = target
+                    .and_then(|target| {
+                        self.reduce_task_mutation(TaskMutation::CloseSession {
+                            target,
+                            confirmed: false,
                         })
+                        .ok()
+                    })
+                    .and_then(|effect| match effect {
+                        TaskMutationAction::Session(effect) => Some(effect),
+                        _ => None,
                     })
                     .unwrap_or(session::Effect::None);
                 let closing = match decision {
@@ -26369,8 +26896,8 @@ fi
                 self.delegation_progress(&delegation_id, event);
                 return Task::none();
             }
-            Event::DelegateTaskTargetsChecked(result, reply) => {
-                return self.delegate_task_targets_checked(result, reply);
+            Event::DelegateTaskTargetsChecked(authority, result, reply) => {
+                return self.delegate_task_targets_checked(authority, result, reply);
             }
             Event::FinalWorkerStopped(session_id, result) => {
                 if let Some((workspace_idx, tab_idx)) =
@@ -28550,35 +29077,35 @@ fi
                 }
             }
             Event::TaskCreateSubmit => {
-                let Some(form) = self.new_task_form.as_mut() else {
+                let Some(form) = self.new_task_form.as_ref() else {
                     return Task::none();
                 };
                 if form.submitting {
                     return Task::none();
                 }
-                let title = form.title.trim().to_string();
-                let objective = form.objective.trim().to_string();
-                let issue_key =
-                    (!form.issue_key.trim().is_empty()).then(|| form.issue_key.trim().to_string());
-                let base_reference = form.base_reference.trim().to_string();
-                let error = if title.is_empty() {
-                    Some("Title is required".to_string())
-                } else if objective.is_empty() {
-                    Some("Objective is required".to_string())
-                } else if base_reference.is_empty() {
-                    Some("Base reference is required".to_string())
-                } else if issue_key
-                    .as_deref()
-                    .is_some_and(|key| !is_linear_issue_key(key))
-                {
-                    Some("Linear issue must look like TRU-105".to_string())
-                } else {
-                    None
+                let input = TaskCreate {
+                    title: form.title.clone(),
+                    objective: form.objective.clone(),
+                    repository_path: form.repository_path.clone(),
+                    workspace_name: Some(form.workspace_name.clone()),
+                    issue_key: Some(form.issue_key.clone()),
+                    base_reference: Some(form.base_reference.clone()),
+                    stopping_boundary: form.stopping_boundary,
+                    origin: TaskCreateOrigin::Form,
                 };
-                if let Some(error) = error {
-                    form.error = Some(error);
-                    return Task::none();
-                }
+                let input = match self.reduce_task_mutation(TaskMutation::Create(input)) {
+                    Ok(TaskMutationAction::PrepareTask(input)) => input,
+                    Err(error) => {
+                        self.new_task_form.as_mut().unwrap().error = Some(error);
+                        return Task::none();
+                    }
+                    _ => unreachable!("create must prepare a task"),
+                };
+                let form = self.new_task_form.as_mut().unwrap();
+                let title = input.title;
+                let objective = input.objective;
+                let issue_key = input.issue_key;
+                let base_reference = input.base_reference.expect("normalized base");
                 let request = PrepareTaskWorktreeRequest {
                     repository_path: form.repository_path.clone(),
                     worktree_root: self.task_worktree_root.clone(),
@@ -28608,9 +29135,24 @@ fi
                 });
             }
             Event::TaskMetadataResolved(mut pending, result) => {
+                if let Some(worker) = &pending.worker {
+                    if let Err(error) =
+                        self.reduce_task_mutation(TaskMutation::CheckWorkerPreparation {
+                            id: worker.authority,
+                        })
+                    {
+                        if let Some(reply) = &pending.control_reply {
+                            reply.send(Err(error));
+                        }
+                        return Task::none();
+                    }
+                }
                 let resolved = match result {
                     Ok(resolved) => resolved,
                     Err(error) => {
+                        if let Some(worker) = &pending.worker {
+                            self.cancel_worker_preparation(worker.authority);
+                        }
                         if let Some(reply) = &pending.control_reply {
                             reply.send(Err(error.clone()));
                         }
@@ -28668,13 +29210,11 @@ fi
                     path: None,
                 };
                 pending.resolved_worktree_path = Some(resolved.proposal.path.clone());
-                let Some(store) = self.task_authority.store_mut().as_mut() else {
-                    if let Some(reply) = &pending.control_reply {
-                        reply.send(Err("GitTerm's task store became unavailable".to_string()));
+                let persisted = self.insert_preparing_task(record);
+                if let Err(error) = persisted {
+                    if let Some(worker) = &pending.worker {
+                        self.cancel_worker_preparation(worker.authority);
                     }
-                    return Task::none();
-                };
-                if let Err(error) = store.insert(record) {
                     if let Some(reply) = &pending.control_reply {
                         reply.send(Err(error.to_string()));
                     }
@@ -28683,6 +29223,35 @@ fi
                         form.error = Some(error.to_string());
                     }
                     return Task::none();
+                }
+                if let Some(worker) = &pending.worker {
+                    let expected = CompletedWorktreePreparation {
+                        repository: resolved.repository.identity.clone(),
+                        base: resolved.base.clone(),
+                        branch: resolved.proposal.branch.clone(),
+                        path: match normalized_worker_path(&resolved.proposal.path) {
+                            Ok(path) => path,
+                            Err(error) => {
+                                self.cancel_worker_preparation(worker.authority);
+                                if let Some(reply) = &pending.control_reply {
+                                    reply.send(Err(error));
+                                }
+                                return Task::none();
+                            }
+                        },
+                    };
+                    if let Err(error) =
+                        self.reduce_task_mutation(TaskMutation::BindWorkerPreparation {
+                            id: worker.authority,
+                            task_id: pending.task_id.clone(),
+                            expected,
+                        })
+                    {
+                        if let Some(reply) = &pending.control_reply {
+                            reply.send(Err(error));
+                        }
+                        return Task::none();
+                    }
                 }
                 if pending.control_reply.is_none() {
                     // Spec: focus never moves on task creation. Show the rail
@@ -28702,86 +29271,94 @@ fi
                     Event::TaskWorktreePrepared(pending, result.map_err(|error| error.to_string()))
                 });
             }
-            Event::TaskWorktreePrepared(pending, result) => match result {
-                Ok(prepared) => {
-                    let persisted = self.task_authority.store_mut().as_mut().map(|store| {
-                        store.complete_worktree_preparation(
-                            &pending.task_id,
-                            prepared.into(),
-                            &chrono::Utc::now().to_rfc3339(),
-                        )
-                    });
-                    match persisted {
-                        Some(Ok(())) => {
-                            if let (Some(reply), Some(worker)) =
-                                (&pending.control_reply, pending.worker.clone())
-                            {
-                                return self.start_delegated_worker(
-                                    &pending.task_id,
-                                    worker,
-                                    reply.clone(),
-                                );
-                            }
-                            if let Some(reply) = &pending.control_reply {
-                                let result = self
-                                    .task_authority
-                                    .store()
-                                    .as_ref()
-                                    .and_then(|store| store.get(&pending.task_id))
-                                    .cloned()
-                                    .ok_or_else(|| {
-                                        format!(
-                                            "Task {} disappeared after worktree preparation",
-                                            pending.task_id
-                                        )
-                                    })
-                                    .and_then(|task| self.task_control_value(&task));
-                                reply.send(result);
-                                return Task::none();
-                            }
-                            return self.enter_task_context(&pending.task_id);
-                        }
-                        Some(Err(error)) => {
-                            let message = error.to_string();
-                            eprintln!("GitTerm V6 could not save prepared task: {message}");
-                            if let Some(reply) = &pending.control_reply {
-                                reply.send(Err(message.clone()));
-                            }
-                            self.task_store_error = Some(message);
-                        }
-                        None => {
-                            let message = "The task store became unavailable".to_string();
-                            if let Some(reply) = &pending.control_reply {
-                                reply.send(Err(message.clone()));
-                            }
-                            self.task_store_error = Some(message);
-                        }
-                    }
+            Event::TaskWorktreePrepared(pending, result) => {
+                if pending.worker.is_some() {
+                    return self.complete_worker_preparation(&pending, result);
                 }
-                Err(error) => {
-                    let cleanup_path = if error.contains("rollback requires attention") {
-                        pending.resolved_worktree_path.filter(|path| path.exists())
-                    } else {
-                        None
-                    };
-                    let persisted = self.task_authority.store_mut().as_mut().map(|store| {
-                        store.fail_worktree_preparation(
-                            &pending.task_id,
-                            error.clone(),
-                            cleanup_path,
-                            &chrono::Utc::now().to_rfc3339(),
-                        )
-                    });
-                    if let Some(Err(store_error)) = persisted {
-                        self.task_store_error = Some(store_error.to_string());
+                let effect = self.reduce_task_mutation(TaskMutation::PreparationCompleted {
+                    task_id: pending.task_id.clone(),
+                    result: result.map(Into::into),
+                    cleanup_path: pending.resolved_worktree_path.clone(),
+                });
+                match effect {
+                    Ok(TaskMutationAction::PersistPreparation { prepared, .. }) => {
+                        let persisted = self.task_authority.store_mut().as_mut().map(|store| {
+                            store.complete_worktree_preparation(
+                                &pending.task_id,
+                                prepared,
+                                &chrono::Utc::now().to_rfc3339(),
+                            )
+                        });
+                        match persisted {
+                            Some(Ok(())) => {
+                                if let Some(reply) = &pending.control_reply {
+                                    let result = self
+                                        .task_authority
+                                        .store()
+                                        .as_ref()
+                                        .and_then(|store| store.get(&pending.task_id))
+                                        .cloned()
+                                        .ok_or_else(|| {
+                                            format!(
+                                                "Task {} disappeared after worktree preparation",
+                                                pending.task_id
+                                            )
+                                        })
+                                        .and_then(|task| self.task_control_value(&task));
+                                    reply.send(result);
+                                    return Task::none();
+                                }
+                                return self.enter_task_context(&pending.task_id);
+                            }
+                            Some(Err(error)) => {
+                                let message = error.to_string();
+                                eprintln!("GitTerm V6 could not save prepared task: {message}");
+                                if let Some(reply) = &pending.control_reply {
+                                    reply.send(Err(message.clone()));
+                                }
+                                self.task_store_error = Some(message);
+                            }
+                            None => {
+                                let message = "The task store became unavailable".to_string();
+                                if let Some(reply) = &pending.control_reply {
+                                    reply.send(Err(message.clone()));
+                                }
+                                self.task_store_error = Some(message);
+                            }
+                        }
                     }
-                    if let Some(reply) = &pending.control_reply {
-                        reply.send(Err(error));
-                    } else {
-                        self.task_ui_error = Some(error);
+                    Ok(TaskMutationAction::PersistWorkerPreparationFailure {
+                        error,
+                        cleanup_path,
+                        ..
+                    }) => {
+                        let persisted = self.task_authority.store_mut().as_mut().map(|store| {
+                            store.fail_worktree_preparation(
+                                &pending.task_id,
+                                error.clone(),
+                                cleanup_path,
+                                &chrono::Utc::now().to_rfc3339(),
+                            )
+                        });
+                        if let Some(Err(store_error)) = persisted {
+                            self.task_store_error = Some(store_error.to_string());
+                        }
+                        if let Some(reply) = &pending.control_reply {
+                            reply.send(Err(error));
+                        } else {
+                            self.task_ui_error = Some(error);
+                        }
                     }
+                    Err(error) => {
+                        if let Some(reply) = &pending.control_reply {
+                            reply.send(Err(error));
+                        } else {
+                            self.task_ui_error = Some(error);
+                        }
+                    }
+                    _ => unreachable!("preparation effect"),
                 }
-            },
+            }
             Event::TaskSelected(task_id) => {
                 self.task_rail_pinned = true;
                 self.task_rows_seen.insert(task_id.clone());
@@ -28995,28 +29572,18 @@ fi
             }
             Event::TaskDeliveryDiscovered(task_id, result) => match result {
                 Ok(discovery) => {
+                    let effect = self.reduce_task_mutation(TaskMutation::RecordDelivery {
+                        task_id: task_id.clone(),
+                        commit_sha: discovery.local_head.clone(),
+                        pr_url: discovery.pull_request.as_ref().map(|pr| pr.url.clone()),
+                        pr_number: discovery.pull_request.as_ref().map(|pr| pr.number),
+                    });
+                    let delivery = match effect {
+                        Ok(TaskMutationAction::PersistDelivery { delivery, .. }) => delivery,
+                        _ => return Task::none(),
+                    };
                     let Some(store) = self.task_authority.store_mut().as_mut() else {
                         return Task::none();
-                    };
-                    let Some(existing) = store.get(&task_id).map(|task| task.delivery.clone())
-                    else {
-                        return Task::none();
-                    };
-                    // gh only reports open PRs; keep the last-known record
-                    // when none is found — a merged or closed PR still
-                    // matters to cleanup guards and the audit trail.
-                    let delivery = DeliveryState {
-                        commit_sha: Some(discovery.local_head.clone()),
-                        pr_url: discovery
-                            .pull_request
-                            .as_ref()
-                            .map(|pr| pr.url.clone())
-                            .or(existing.pr_url),
-                        pr_number: discovery
-                            .pull_request
-                            .as_ref()
-                            .map(|pr| pr.number)
-                            .or(existing.pr_number),
                     };
                     let timestamp = chrono::Utc::now().to_rfc3339();
                     if let Err(error) = store.record_delivery(&task_id, delivery, &timestamp) {
@@ -29073,13 +29640,8 @@ fi
                 self.task_rail_filter = filter;
             }
             Event::TaskArchive(task_id) => {
-                let result = self
-                    .task_authority
-                    .store_mut()
-                    .as_mut()
-                    .map(|store| store.archive(&task_id, &chrono::Utc::now().to_rfc3339()));
-                match result {
-                    Some(Ok(())) => {
+                match self.archive_task(&task_id, &chrono::Utc::now().to_rfc3339()) {
+                    Ok(()) => {
                         // Only leave task context when the archived task is
                         // the one being viewed — archiving another task from
                         // its rail row must not move focus.
@@ -29089,10 +29651,7 @@ fi
                             return self.update(Event::TaskContextBack);
                         }
                     }
-                    Some(Err(error)) => self.task_ui_error = Some(error.to_string()),
-                    None => {
-                        self.task_ui_error = Some("GitTerm's task store is unavailable".to_string())
-                    }
+                    Err(error) => self.task_ui_error = Some(error),
                 }
             }
             Event::TaskArchiveAllFailed => {
@@ -29116,22 +29675,16 @@ fi
                     let focused = self.active_task_context_id().map(str::to_string);
                     let mut focused_archived = false;
                     let mut archive_error = None;
-                    match self.task_authority.store_mut().as_mut() {
-                        Some(store) => {
-                            for task_id in failed_ids {
-                                match store.archive(&task_id, &timestamp) {
-                                    Ok(()) => {
-                                        if focused.as_deref() == Some(task_id.as_str()) {
-                                            focused_archived = true;
-                                        }
-                                        self.task_rows_seen.insert(task_id);
-                                    }
-                                    Err(error) => archive_error = Some(error.to_string()),
+                    for task_id in failed_ids {
+                        let result = self.archive_task(&task_id, &timestamp);
+                        match result {
+                            Ok(()) => {
+                                if focused.as_deref() == Some(task_id.as_str()) {
+                                    focused_archived = true;
                                 }
+                                self.task_rows_seen.insert(task_id);
                             }
-                        }
-                        None => {
-                            archive_error = Some("GitTerm's task store is unavailable".to_string());
+                            Err(error) => archive_error = Some(error),
                         }
                     }
                     if let Some(error) = archive_error {
@@ -29159,22 +29712,16 @@ fi
                     let focused = self.active_task_context_id().map(str::to_string);
                     let mut focused_archived = false;
                     let mut archive_error = None;
-                    match self.task_authority.store_mut().as_mut() {
-                        Some(store) => {
-                            for task_id in task_ids {
-                                match store.archive(&task_id, &timestamp) {
-                                    Ok(()) => {
-                                        if focused.as_deref() == Some(task_id.as_str()) {
-                                            focused_archived = true;
-                                        }
-                                        self.task_rows_seen.insert(task_id);
-                                    }
-                                    Err(error) => archive_error = Some(error.to_string()),
+                    for task_id in task_ids {
+                        let result = self.archive_task(&task_id, &timestamp);
+                        match result {
+                            Ok(()) => {
+                                if focused.as_deref() == Some(task_id.as_str()) {
+                                    focused_archived = true;
                                 }
+                                self.task_rows_seen.insert(task_id);
                             }
-                        }
-                        None => {
-                            archive_error = Some("GitTerm's task store is unavailable".to_string());
+                            Err(error) => archive_error = Some(error),
                         }
                     }
                     if let Some(error) = archive_error {
@@ -29186,32 +29733,33 @@ fi
                 }
             }
             Event::TaskWorktreeDeleteOpen(task_id) => {
-                let Some(task) = self
-                    .task_authority
-                    .store()
-                    .as_ref()
-                    .and_then(|store| store.get(&task_id))
-                    .cloned()
-                else {
-                    self.task_ui_error = Some("Task is no longer in the task store".to_string());
-                    return Task::none();
-                };
-                let Some(worktree_path) = task.worktree.path.clone() else {
-                    self.task_ui_error =
-                        Some("This task has no prepared worktree to delete".to_string());
-                    return Task::none();
-                };
-                let WorkspaceLocationIdentity::Local { directory } = &task.workspace.location
-                else {
-                    self.task_ui_error =
-                        Some("Remote task worktrees are managed on their remote Mac".to_string());
-                    return Task::none();
-                };
-                let repository_path = directory.clone();
-                let context = CleanupContext {
-                    process_running: task.lifecycle.is_active()
-                        || self.task_session_count(&task_id) > 0,
-                    pull_request_url: task.delivery.pr_url.clone(),
+                let (repository_path, worktree_path, branch, base_commit, context) = match self
+                    .reduce_task_mutation(TaskMutation::InspectDelete {
+                        task_id: task_id.clone(),
+                    }) {
+                    Ok(TaskMutationAction::InspectCleanup {
+                        repository,
+                        path,
+                        branch,
+                        base_commit,
+                        process_running,
+                        pull_request_url,
+                        ..
+                    }) => (
+                        repository,
+                        path,
+                        branch,
+                        base_commit,
+                        CleanupContext {
+                            process_running,
+                            pull_request_url,
+                        },
+                    ),
+                    Err(error) => {
+                        self.task_ui_error = Some(error);
+                        return Task::none();
+                    }
+                    _ => unreachable!("inspection effect"),
                 };
                 self.task_worktree_delete_prompt = Some(TaskWorktreeDeletePrompt {
                     task_id: task_id.clone(),
@@ -29224,8 +29772,8 @@ fi
                     inspect_task_cleanup(
                         repository_path,
                         worktree_path,
-                        task.branch.clone(),
-                        task.base.commit.clone(),
+                        branch,
+                        base_commit,
                         context,
                     ),
                     move |result| {
@@ -29255,7 +29803,7 @@ fi
                 }
             }
             Event::TaskWorktreeDeleteConfirm => {
-                let Some(prompt) = self.task_worktree_delete_prompt.as_mut() else {
+                let Some(prompt) = self.task_worktree_delete_prompt.as_ref() else {
                     return Task::none();
                 };
                 if prompt.deleting {
@@ -29264,53 +29812,48 @@ fi
                 let Some(Ok(inspection)) = prompt.inspection.as_ref() else {
                     return Task::none();
                 };
-                let blocking = inspection.risks.iter().any(|risk| {
-                    matches!(
-                        risk,
-                        CleanupRisk::ActiveProcess
-                            | CleanupRisk::UncommittedChanges
-                            | CleanupRisk::UnpushedCommits { .. }
-                    )
-                });
-                if blocking {
-                    return Task::none();
-                }
-                let record_only = !inspection.path_exists || !inspection.registered;
                 let task_id = prompt.task_id.clone();
-                let worktree_path = prompt.worktree_path.clone();
-                prompt.deleting = true;
-                prompt.error = None;
-                if record_only {
-                    // Nothing on disk to remove — just clear the record.
-                    return self.update(Event::TaskWorktreeDeleteCompleted(task_id, Ok(())));
+                let decision = self.reduce_task_mutation(TaskMutation::DeleteWorktree {
+                    task_id: task_id.clone(),
+                    path: prompt.worktree_path.clone(),
+                    inspection: inspection.clone(),
+                });
+                match decision {
+                    Ok(TaskMutationAction::None) => return Task::none(),
+                    Ok(TaskMutationAction::ClearWorktree { .. }) => {
+                        return self.update(Event::TaskWorktreeDeleteCompleted(task_id, Ok(())))
+                    }
+                    Ok(TaskMutationAction::RemoveWorktree {
+                        repository, path, ..
+                    }) => {
+                        let prompt = self.task_worktree_delete_prompt.as_mut().unwrap();
+                        prompt.deleting = true;
+                        prompt.error = None;
+                        return Task::perform(
+                            remove_task_worktree(repository, path, false),
+                            move |result| {
+                                Event::TaskWorktreeDeleteCompleted(
+                                    task_id.clone(),
+                                    result.map_err(|error| error.to_string()),
+                                )
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        self.task_worktree_delete_prompt.as_mut().unwrap().error = Some(error);
+                        return Task::none();
+                    }
+                    _ => unreachable!("delete effect"),
                 }
-                let repository_path = self
-                    .task_authority
-                    .store()
-                    .as_ref()
-                    .and_then(|store| store.get(&task_id))
-                    .and_then(|task| match &task.workspace.location {
-                        WorkspaceLocationIdentity::Local { directory } => Some(directory.clone()),
-                        WorkspaceLocationIdentity::RemoteAgent { .. } => None,
-                    });
-                let Some(repository_path) = repository_path else {
-                    prompt.deleting = false;
-                    prompt.error =
-                        Some("Could not resolve the task's repository directory".to_string());
-                    return Task::none();
-                };
-                return Task::perform(
-                    remove_task_worktree(repository_path, worktree_path, false),
-                    move |result| {
-                        Event::TaskWorktreeDeleteCompleted(
-                            task_id,
-                            result.map_err(|error| error.to_string()),
-                        )
-                    },
-                );
             }
             Event::TaskWorktreeDeleteCompleted(task_id, result) => match result {
                 Ok(()) => {
+                    let effect = self.reduce_task_mutation(TaskMutation::WorktreeRemoved {
+                        task_id: task_id.clone(),
+                    });
+                    if !matches!(effect, Ok(TaskMutationAction::ClearWorktree { .. })) {
+                        return Task::none();
+                    }
                     let timestamp = chrono::Utc::now().to_rfc3339();
                     // clear_worktree resets only the worktree record — the
                     // task's sessions and conversation references survive so
