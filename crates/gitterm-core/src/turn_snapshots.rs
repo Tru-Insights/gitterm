@@ -763,13 +763,7 @@ async fn save_locked(
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Turn {
-    pub number: u64,
-    pub start: Option<String>,
-    pub end: Option<String>,
-    pub timestamp: i64,
-}
+pub use crate::review::model::ReviewTurn as Turn;
 async fn refs(
     root: &SnapshotRoots,
     dir: &Path,

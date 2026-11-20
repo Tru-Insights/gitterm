@@ -482,3 +482,25 @@ pub struct EditReview {
     pub source: DiffSource,
     pub focus: String,
 }
+
+/// A captured turn's immutable snapshot endpoints. Available without runtime IO.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewTurn {
+    pub number: u64,
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub timestamp: i64,
+}
+
+/// A collected review plus the metadata needed by the review authority.
+#[derive(Debug, Clone)]
+pub struct ReviewLoad {
+    pub diff: ReviewDiff,
+    pub commits: Vec<ReviewCommit>,
+    pub turns: Vec<ReviewTurn>,
+    pub commits_truncated: bool,
+    pub commits_error: Option<String>,
+    pub canonical_checkout: PathBuf,
+    /// None means listing failed or was incomplete; do not prune viewed marks.
+    pub live_paths: Option<std::collections::BTreeSet<String>>,
+}

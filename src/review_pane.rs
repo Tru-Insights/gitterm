@@ -68,11 +68,19 @@ impl ViewedMarks {
     }
 
     pub fn save(&self, dir: &Path) -> Result<(), String> {
-        std::fs::create_dir_all(dir)
-            .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
-        let json = self.0.encode()?;
-        crate::merge_plan::write_atomically(&dir.join(VIEWED_FILE), &json)
+        save_viewed_marks(&self.0, dir)
     }
+}
+
+/// Desktop persistence keeps its existing atomic replacement and failure behavior.
+pub fn save_viewed_marks(
+    marks: &gitterm_core::review::viewed::ViewedMarks,
+    dir: &Path,
+) -> Result<(), String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    let json = marks.encode()?;
+    crate::merge_plan::write_atomically(&dir.join(VIEWED_FILE), &json)
 }
 
 pub use gitterm_core::review::collect::{branch_commits, commit_diff_endpoints, ReviewLoad};
@@ -119,64 +127,7 @@ pub async fn load_review_source(
 // ---------------------------------------------------------------------------
 // IPC from the page.
 
-/// A message the review page posts with `window.ipc.postMessage`. Every
-/// message carries the page's `token`; main.rs drops messages whose token
-/// is not the open pane's.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReviewIpc {
-    /// The Uncommitted / vs base switch; `hide_noise` is the toggle's state
-    /// to keep across the reload.
-    SetSource {
-        token: String,
-        source: DiffSource,
-        hide_noise: bool,
-    },
-    ShowTurns {
-        token: String,
-    },
-    SelectTurn {
-        token: String,
-        number: u64,
-    },
-    ShowCommits {
-        token: String,
-    },
-    SelectCommits {
-        token: String,
-        first: String,
-        last: String,
-        pending: bool,
-    },
-    /// A file's Viewed checkbox.
-    SetViewed {
-        token: String,
-        path: String,
-        viewed: bool,
-    },
-    Close {
-        token: String,
-    },
-    /// Open a listed file in GitTerm's file viewer.
-    OpenFile {
-        token: String,
-        path: String,
-    },
-}
-
-impl ReviewIpc {
-    pub fn token(&self) -> &str {
-        match self {
-            ReviewIpc::SetSource { token, .. }
-            | ReviewIpc::ShowTurns { token }
-            | ReviewIpc::SelectTurn { token, .. }
-            | ReviewIpc::ShowCommits { token }
-            | ReviewIpc::SelectCommits { token, .. }
-            | ReviewIpc::SetViewed { token, .. }
-            | ReviewIpc::Close { token }
-            | ReviewIpc::OpenFile { token, .. } => token,
-        }
-    }
-}
+pub use gitterm_core::review::state::ReviewIpc;
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]

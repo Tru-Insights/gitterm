@@ -100,6 +100,7 @@ use gitterm::worktree_follow::{
 use gitterm_core::chat::state::{
     Effect as ChatEffect, HistoryTicket, Intent as ChatIntent, RuntimeStamp,
 };
+use gitterm_core::review::state::{Effect as ReviewEffect, Intent as ReviewIntent};
 #[cfg(test)]
 use gitterm_core::workspace::{next_on_bar, persisted_active_index};
 use gitterm_core::workspace::{SelectionCommand, SelectionEvent, SelectionState, WorkspaceFact};
@@ -2052,33 +2053,6 @@ pub enum GitViewMode {
 enum GitSelection {
     Worktree(PathBuf),
     Branch(String),
-}
-
-/// The review pane (TRU-178): a Workspace overview branch row's checkout,
-/// read as a structured diff and shown on the Viewer surface. Lives while
-/// the Viewer shows it (`ViewerWebview::Review`).
-#[derive(Debug, Clone)]
-struct ReviewPaneState {
-    target: review_pane::ReviewTarget,
-    source: review_pane::ReviewSource,
-    commits: Vec<review_pane::ReviewCommit>,
-    turns: Vec<gitterm::turn_snapshots::Turn>,
-    commits_truncated: bool,
-    commits_error: Option<String>,
-    /// Which load this pane waits for.
-    generation: u64,
-    /// Stamped on every message from this page; others are dropped.
-    token: String,
-    /// The page's CSP nonce.
-    nonce: String,
-    /// "Hide tests & generated", kept across a source switch.
-    hide_noise: bool,
-    /// The checkout-relative file the page scrolls to (opened from a
-    /// chat's edit card, TRU-179), kept across a source switch.
-    focus: Option<String>,
-    /// The diff and the canonical checkout its viewed marks are keyed by.
-    loaded: Option<(review_pane::ReviewDiff, PathBuf)>,
-    error: Option<String>,
 }
 
 /// Whose overview a state is. A folder-scoped workspace reads the chats in
@@ -7476,7 +7450,10 @@ pub enum Event {
     ReviewOpen(PathBuf, overview::DiffSource),
     TurnSnapshotsCleaned(Result<(), String>),
     /// A review load finished, for this generation.
-    ReviewLoaded(u64, Box<Result<review_pane::ReviewLoad, String>>),
+    ReviewLoaded(
+        gitterm_core::review::state::CollectStamp,
+        Box<Result<review_pane::ReviewLoad, String>>,
+    ),
     /// A chat tab's Open in review resolved its file's checkout (TRU-179).
     ReviewOpenFromChat(usize, Box<Result<review_pane::EditReview, String>>),
     /// The review pane's Close (the Iced header or Escape).
@@ -7929,12 +7906,8 @@ struct App {
     /// `github-accounts.json` (shared config dir): gh account per GitHub owner.
     github_accounts: std::collections::BTreeMap<String, String>,
     turn_snapshot_sweep_at: Option<Instant>,
-    /// The review pane (TRU-178) while the Viewer shows it.
-    review_pane: Option<ReviewPaneState>,
-    /// Generation counter for review loads.
-    review_generation: u64,
-    /// `review-viewed.json`, read on first use; an `Err` is never written.
-    review_marks: Option<Result<review_pane::ViewedMarks, String>>,
+    /// The sole review authority; Iced owns only effects and presentation.
+    review: gitterm_core::review::state::State,
     chat_index_loading: bool,
     chat_index_loaded_at: Option<Instant>,
     /// Empty chat tabs whose V5 offer (TRU-183) lists a conversation the
@@ -8124,7 +8097,7 @@ enum ViewerWebview {
     PlansViewer,
     /// A GitHub PR, Linear issue, or other page opened from the Work sidebar.
     Page,
-    /// The review pane (TRU-178), state in `App::review_pane`.
+    /// The review pane (TRU-178), state in `App::review`.
     Review,
 }
 
@@ -17082,8 +17055,8 @@ impl App {
     /// "Hide tests & generated" for a pane opening on `checkout`: reopening
     /// the same checkout keeps the toggle where it was; on by default.
     fn review_hide_noise(&self, checkout: &Path) -> bool {
-        self.review_pane
-            .as_ref()
+        self.review
+            .pane()
             .filter(|pane| pane.target.checkout == checkout)
             .is_none_or(|pane| pane.hide_noise)
     }
@@ -17194,7 +17167,7 @@ impl App {
         )
     }
 
-    /// Shows the loading page and asynchronously reads the selected diff.
+    /// Shows the loading page and executes the reducer's collection effect.
     fn start_review(
         &mut self,
         target: review_pane::ReviewTarget,
@@ -17202,103 +17175,98 @@ impl App {
         hide_noise: bool,
         focus: Option<String>,
     ) -> Task<Event> {
-        self.review_generation += 1;
-        let generation = self.review_generation;
-        self.review_pane = Some(ReviewPaneState {
-            target: target.clone(),
-            source: source.clone(),
-            commits: Vec::new(),
-            turns: Vec::new(),
-            commits_truncated: false,
-            commits_error: None,
-            generation,
-            token: uuid::Uuid::new_v4().simple().to_string(),
-            nonce: uuid::Uuid::new_v4().simple().to_string(),
+        let effects = self.review.reduce(ReviewIntent::Open {
+            target,
+            source,
             hide_noise,
             focus,
-            loaded: None,
-            error: None,
+            page: Self::review_page_identity(),
         });
-        let show = self.show_review_page();
-        let load = Task::perform(
-            review_pane::load_review_source(target, source),
-            move |result| Event::ReviewLoaded(generation, Box::new(result)),
-        );
-        Task::batch([show, load])
+        self.apply_review_effects(effects)
     }
 
-    /// The checkout the open review pane shows, for the overview's
-    /// selected row.
+    fn review_page_identity() -> gitterm_core::review::state::PageIdentity {
+        gitterm_core::review::state::PageIdentity {
+            token: uuid::Uuid::new_v4().simple().to_string(),
+            nonce: uuid::Uuid::new_v4().simple().to_string(),
+        }
+    }
+
+    /// The host keeps git/file IO, transport, and surface presentation.
+    fn apply_review_effects(&mut self, effects: Vec<ReviewEffect>) -> Task<Event> {
+        let mut tasks = Vec::new();
+        for effect in effects {
+            match effect {
+                ReviewEffect::Render => tasks.push(self.show_review_page()),
+                ReviewEffect::Collect(stamp) => {
+                    let target = stamp.target.clone();
+                    let source = stamp.source.clone();
+                    tasks.push(Task::perform(
+                        review_pane::load_review_source(target, source),
+                        move |result| Event::ReviewLoaded(stamp.clone(), Box::new(result)),
+                    ));
+                }
+                ReviewEffect::SaveMarks => {
+                    if let Some(Ok(marks)) = self.review.marks() {
+                        if let Err(error) =
+                            review_pane::save_viewed_marks(marks, &config::global_config_dir())
+                        {
+                            eprintln!("[review] {error}");
+                        }
+                    }
+                }
+                ReviewEffect::Rejected(error) => eprintln!("[review] {error}"),
+                ReviewEffect::Close => tasks.push(self.present_active_tab_surfaces()),
+                ReviewEffect::OpenFile(full) => {
+                    if !full.is_file() {
+                        eprintln!("[review] open: {} is not a file", full.display());
+                        continue;
+                    }
+                    tasks.push(self.present_active_tab_surfaces());
+                    tasks.push(Task::done(Event::ViewFile(SourcePath::Local(full))));
+                }
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    /// The checkout the open review pane shows, for the overview's selected row.
     fn open_review_checkout(&self) -> Option<&Path> {
-        self.review_pane
-            .as_ref()
+        self.review
+            .pane()
             .filter(|_| self.viewer_webview == ViewerWebview::Review)
             .map(|pane| pane.target.checkout.as_path())
     }
 
     fn review_loaded(
         &mut self,
-        generation: u64,
+        stamp: gitterm_core::review::state::CollectStamp,
         result: Result<review_pane::ReviewLoad, String>,
     ) -> Task<Event> {
-        if self.viewer_webview != ViewerWebview::Review
-            || self
-                .review_pane
-                .as_ref()
-                .is_none_or(|pane| pane.generation != generation)
-        {
+        if self.viewer_webview != ViewerWebview::Review || !self.review.accepts(&stamp) {
             return Task::none();
         }
-        let loaded = match result {
-            Ok(load) => {
-                if let Some(pane) = self.review_pane.as_mut() {
-                    pane.commits = load.commits.clone();
-                    pane.turns = load.turns.clone();
-                    pane.commits_truncated = load.commits_truncated;
-                    pane.commits_error = load.commits_error.clone();
-                }
-                if let Some(live) = &load.live_paths {
-                    match self.review_marks() {
-                        Ok(marks) => {
-                            if marks.prune(&load.canonical_checkout, live) {
-                                if let Err(error) = marks.save(&config::global_config_dir()) {
-                                    eprintln!("[review] {error}");
-                                }
-                            }
-                        }
-                        Err(error) => eprintln!("[review] viewed marks unavailable: {error}"),
-                    }
-                }
-                Ok((load.diff, load.canonical_checkout))
-            }
-            Err(error) => {
-                eprintln!("[review] loading the review failed: {error}");
-                Err(error)
-            }
-        };
-        if let Some(pane) = self.review_pane.as_mut() {
-            match loaded {
-                Ok(loaded) => {
-                    pane.loaded = Some(loaded);
-                    pane.error = None;
-                }
-                Err(error) => {
-                    pane.loaded = None;
-                    pane.error = Some(error);
-                }
-            }
+        if let Err(error) = self.review_marks() {
+            eprintln!("[review] viewed marks unavailable: {error}");
         }
-        self.show_review_page()
+        if let Err(error) = &result {
+            eprintln!("[review] loading the review failed: {error}");
+        }
+        let effects = self.review.reduce(ReviewIntent::CollectFinished {
+            stamp,
+            result: Box::new(result),
+        });
+        self.apply_review_effects(effects)
     }
 
-    /// The viewed marks, read from the shared config dir on first use (and
-    /// again after a failure). `Err` when the file cannot be read or parsed:
-    /// marks are then neither shown nor written, so it is never overwritten.
-    fn review_marks(&mut self) -> Result<&mut review_pane::ViewedMarks, String> {
-        if !matches!(self.review_marks, Some(Ok(_))) {
-            self.review_marks = Some(review_pane::ViewedMarks::load(&config::global_config_dir()));
+    /// Read on first use and retry failures; never overwrite an unreadable store.
+    fn review_marks(&mut self) -> Result<&gitterm_core::review::viewed::ViewedMarks, String> {
+        if !matches!(self.review.marks(), Some(Ok(_))) {
+            let marks =
+                gitterm_core::review::viewed::ViewedMarks::load(&config::global_config_dir());
+            self.review.reduce(ReviewIntent::MarksLoaded(marks));
         }
-        match self.review_marks.as_mut() {
+        match self.review.marks() {
             Some(Ok(marks)) => Ok(marks),
             Some(Err(error)) => Err(error.clone()),
             None => unreachable!("review marks were just loaded"),
@@ -17310,13 +17278,10 @@ impl App {
         if let Err(error) = self.review_marks() {
             eprintln!("[review] viewed marks unavailable: {error}");
         }
-        let Some(pane) = self.review_pane.as_ref() else {
+        let Some(pane) = self.review.pane() else {
             return Task::none();
         };
-        let marks = self
-            .review_marks
-            .as_ref()
-            .and_then(|marks| marks.as_ref().ok());
+        let marks = self.review.marks().and_then(|marks| marks.as_ref().ok());
         let viewed: Vec<review_pane::ViewedState> = match &pane.loaded {
             Some((diff, canonical)) => diff
                 .files
@@ -17361,154 +17326,28 @@ impl App {
         self.show_viewer_html(html, bounds, ViewerWebview::Review)
     }
 
-    /// A message from the review page. Dropped unless the pane is showing
-    /// and the message carries its token.
+    /// The reducer validates the page capability and all selected members.
     fn handle_review_ipc(&mut self, message: review_pane::ReviewIpc) -> Task<Event> {
-        use review_pane::ReviewIpc;
-        let Some(pane) = self
-            .review_pane
-            .as_ref()
-            .filter(|_| self.viewer_webview == ViewerWebview::Review)
-            .filter(|pane| pane.token == message.token())
-        else {
-            eprintln!(
-                "[review] dropping a message for a review pane that is not open: {message:?}"
-            );
-            return Task::none();
-        };
-        match message {
-            ReviewIpc::SetSource {
-                source, hide_noise, ..
-            } => {
-                if source == overview::DiffSource::VsBase && pane.target.base.is_none() {
-                    eprintln!(
-                        "[review] {} has no base to compare with",
-                        pane.target.checkout.display()
-                    );
-                    return Task::none();
-                }
-                let target = pane.target.clone();
-                let focus = pane.focus.clone();
-                self.start_review(target, source.into(), hide_noise, focus)
-            }
-            ReviewIpc::ShowTurns { .. } => {
-                let chat = self
-                    .active_workspace()
-                    .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
-                    .and_then(|ws| ws.tabs.get(ws.active_tab))
-                    .and_then(turn_snapshot_chat_id);
-                let Some(chat) = chat else {
-                    eprintln!("[review] Turns needs an active chat");
-                    return Task::none();
-                };
-                self.start_review(
-                    pane.target.clone(),
-                    review_pane::ReviewSource::Turns {
-                        chat,
-                        selected: None,
-                    },
-                    pane.hide_noise,
-                    pane.focus.clone(),
-                )
-            }
-            ReviewIpc::SelectTurn { number, .. } => {
-                let review_pane::ReviewSource::Turns { chat, .. } = &pane.source else {
-                    return Task::none();
-                };
-                if !pane
-                    .turns
-                    .iter()
-                    .any(|turn| turn.number == number && turn.start.is_some() && turn.end.is_some())
-                {
-                    return Task::none();
-                }
-                self.start_review(
-                    pane.target.clone(),
-                    review_pane::ReviewSource::Turns {
-                        chat: chat.clone(),
-                        selected: Some(number),
-                    },
-                    pane.hide_noise,
-                    pane.focus.clone(),
-                )
-            }
-            ReviewIpc::ShowCommits { .. } => {
-                if pane.target.base.is_none() {
-                    eprintln!("[review] commits unavailable without a branch base");
-                    return Task::none();
-                }
-                self.start_review(
-                    pane.target.clone(),
-                    review_pane::ReviewSource::Commits(None),
-                    pane.hide_noise,
-                    pane.focus.clone(),
-                )
-            }
-            ReviewIpc::SelectCommits {
-                first,
-                last,
-                pending,
-                ..
-            } => {
-                let first_index = pane.commits.iter().position(|commit| commit.sha == first);
-                let last_index = pane.commits.iter().position(|commit| commit.sha == last);
-                let (Some(first_index), Some(last_index)) = (first_index, last_index) else {
-                    eprintln!("[review] selected commit is not in the loaded branch commit list");
-                    return Task::none();
-                };
-                let older = first_index.max(last_index);
-                let newer = first_index.min(last_index);
-                let range = review_pane::CommitRange {
-                    first: pane.commits[older].sha.clone(),
-                    last: pane.commits[newer].sha.clone(),
-                    pending,
-                };
-                self.start_review(
-                    pane.target.clone(),
-                    review_pane::ReviewSource::Commits(Some(range)),
-                    pane.hide_noise,
-                    pane.focus.clone(),
-                )
-            }
-            ReviewIpc::SetViewed { path, viewed, .. } => {
-                let Some((file, canonical)) = pane.loaded.as_ref().and_then(|(diff, canonical)| {
-                    diff.file(&path)
-                        .map(|file| (file.clone(), canonical.clone()))
-                }) else {
-                    eprintln!("[review] viewed: {path} is not in the review");
-                    return Task::none();
-                };
-                match self.review_marks() {
-                    Ok(marks) => {
-                        if !marks.set(&canonical, &file, viewed) {
-                            eprintln!("[review] {path} has no content hash; not marked viewed");
-                        } else if let Err(error) = marks.save(&config::global_config_dir()) {
-                            eprintln!("[review] {error}");
-                        }
-                    }
-                    Err(error) => eprintln!("[review] viewed marks unavailable: {error}"),
-                }
-                Task::none()
-            }
-            ReviewIpc::Close { .. } => self.present_active_tab_surfaces(),
-            ReviewIpc::OpenFile { path, .. } => {
-                let Some(file) = pane.loaded.as_ref().and_then(|(diff, _)| diff.file(&path)) else {
-                    eprintln!("[review] open: {path} is not in the review");
-                    return Task::none();
-                };
-                if file.status == review_pane::FileStatus::Deleted {
-                    eprintln!("[review] open: {path} was deleted");
-                    return Task::none();
-                }
-                let full = pane.target.checkout.join(&path);
-                if !full.is_file() {
-                    eprintln!("[review] open: {} is not a file", full.display());
-                    return Task::none();
-                }
-                let close = self.present_active_tab_surfaces();
-                Task::batch([close, Task::done(Event::ViewFile(SourcePath::Local(full)))])
+        let visible = self.viewer_webview == ViewerWebview::Review;
+        if matches!(&message, review_pane::ReviewIpc::SetViewed { .. })
+            && self.review.accepts_ipc(&message, visible)
+        {
+            if let Err(error) = self.review_marks() {
+                eprintln!("[review] viewed marks unavailable: {error}");
             }
         }
+        let active_chat = self
+            .active_workspace()
+            .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
+            .and_then(|ws| ws.tabs.get(ws.active_tab))
+            .and_then(turn_snapshot_chat_id);
+        let effects = self.review.reduce(ReviewIntent::IpcRequest {
+            message,
+            visible,
+            active_chat,
+            page: Self::review_page_identity(),
+        });
+        self.apply_review_effects(effects)
     }
 
     fn request_chat_preview(
@@ -21081,9 +20920,7 @@ impl App {
             plan_limits: plan_limits_view::PlanLimitsState::load(&config::global_config_dir()),
             github_accounts: config::load_github_accounts(),
             turn_snapshot_sweep_at: None,
-            review_pane: None,
-            review_generation: 0,
-            review_marks: None,
+            review: gitterm_core::review::state::State::default(),
             chat_index_loading: false,
             chat_index_loaded_at: None,
             v5_offer_awaiting_titles: HashSet::new(),
@@ -31287,8 +31124,8 @@ fi
             Event::ReviewOpen(checkout, source) => {
                 return self.open_review(checkout, source);
             }
-            Event::ReviewLoaded(generation, result) => {
-                return self.review_loaded(generation, *result);
+            Event::ReviewLoaded(stamp, result) => {
+                return self.review_loaded(stamp, *result);
             }
             Event::ReviewOpenFromChat(tab_id, result) => {
                 return self.review_opened_from_chat(tab_id, *result);
@@ -33040,7 +32877,7 @@ fi
             self.viewer_page_generation += 1;
         }
         if viewer != ViewerWebview::Review {
-            self.review_pane = None;
+            self.review.reduce(ReviewIntent::Close);
         }
     }
 
@@ -35044,7 +34881,7 @@ fi
         let font = self.ui_font();
         let font_small = self.ui_font_small();
         let header_bg = theme.bg_overlay();
-        let title = match &self.review_pane {
+        let title = match self.review.pane() {
             Some(pane) => format!(
                 "Review \u{00B7} {} \u{00B7} {}",
                 pane.target.repo, pane.target.branch
