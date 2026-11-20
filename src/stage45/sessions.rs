@@ -47,7 +47,7 @@ fn open_stop_close_and_native_restore_preserve_session_identity() {
     };
     for ws in app.workspaces.iter_mut().take(2) {
         let mut session = AgentSession::new(config.clone());
-        session.state = tab::AgentSessionState::Streaming;
+        session.reduce(gitterm_core::chat::state::Intent::SubmissionAccepted);
         ws.tabs[0].kind = TabKind::Agent(session);
     }
     let _ = app.update_event(Event::AgentStopRequested(20));
@@ -102,7 +102,9 @@ fn park_restore_native_session_never_replays_a_prompt() {
             effort: None,
         }));
         tab.chat_session_id = Some("conversation-1".into());
-        tab.agent_session_mut().unwrap().session_id = Some("conversation-1".into());
+        tab.agent_session_mut()
+            .unwrap()
+            .bind_session(Some("conversation-1".into()));
         let caller = tab.session_uid.clone();
         let key = ParkedKey::of(&app.workspace_config(&app.workspaces[0]));
         let uid = app.workspaces[0].uid;
@@ -255,7 +257,7 @@ fn park_app(dir: &Path) -> App {
             permission_mode: None,
             effort: None,
         });
-        session.session_id = tab.chat_session_id.clone();
+        session.bind_session(tab.chat_session_id.clone());
         tab.kind = TabKind::Agent(session);
     }
     app
