@@ -23,6 +23,8 @@ mod h5_tests;
 #[cfg(test)]
 mod h6_tests;
 #[cfg(test)]
+mod h7_tests;
+#[cfg(test)]
 mod hookup_tests;
 mod layout;
 mod owner;
@@ -97,6 +99,13 @@ pub struct Shell {
     data: Rc<dyn ShellData>,
     content: Entity<content::window::ContentWindow>,
     bottom: Entity<bottom_panel::BottomPanel>,
+    run_tabs: HashMap<String, bottom_panel::RunTab>,
+    run_url_poll: Option<gpui::Task<()>>,
+    usage_open: bool,
+    usage_return_focus: Option<FocusHandle>,
+    usage_page: Entity<usage::UsagePage>,
+    usage_input: usage::UsageInput,
+    run_sidebar_subscriptions: HashMap<WorkspaceId, Subscription>,
     workspaces: Vec<WorkspaceDock>,
     owner: Entity<WorkspaceOwner>,
     registry: Rc<RefCell<HashMap<String, gpui::WeakEntity<Pane>>>>,
@@ -172,6 +181,8 @@ impl Shell {
                 client_height,
             ))
         });
+        let usage_input = usage::UsageInput::default();
+        let usage_page = cx.new(|_| usage::UsagePage::from_input(usage_input.clone()));
         gitterm_gpui_review::init(cx);
         let content = cx.new(|cx| content::window::ContentWindow::new(window, cx));
         let catalog = data.workspaces(cx);
@@ -304,6 +315,12 @@ impl Shell {
                 shell.bottom_outcome(outcome.clone(), window, cx);
             },
         ));
+        subscriptions.push(cx.subscribe(
+            &usage_page,
+            |shell, _, intent: &usage::UsageIntent, cx| {
+                shell.usage_intent(intent.clone(), cx);
+            },
+        ));
         if local {
             owner.update(cx, |owner, cx| {
                 owner.dispatch(Intent::Opened, Instant::now(), cx)
@@ -313,6 +330,13 @@ impl Shell {
             data,
             content,
             bottom,
+            run_tabs: HashMap::new(),
+            run_url_poll: None,
+            usage_open: false,
+            usage_return_focus: None,
+            usage_page,
+            usage_input,
+            run_sidebar_subscriptions: HashMap::new(),
             workspaces,
             owner,
             registry,
@@ -343,6 +367,13 @@ impl Shell {
         shell.load_active_iced_history(window, cx);
         if let Some(fonts) = shell.workspaces.iter().find_map(|w| w.store.regions.fonts) {
             theme::set_font_sizes(fonts, cx);
+        }
+        if let Some(size) = shell
+            .workspaces
+            .iter()
+            .find_map(|w| w.store.regions.chat_font_size)
+        {
+            theme::set_chat_font_size(size, cx);
         }
         Ok(shell)
     }
@@ -756,6 +787,16 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.new_terminal_launch(placement, cwd, None, window, cx);
+    }
+    fn new_terminal_launch(
+        &mut self,
+        placement: DockPlacement,
+        cwd: Option<std::path::PathBuf>,
+        launch: Option<gitterm_terminal::TerminalLaunch>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.local || !self.workspaces.iter().any(|state| state.on_bar()) {
             return;
         }
@@ -792,7 +833,11 @@ impl Shell {
             Pane::new(
                 pane_id.clone(),
                 title.clone(),
-                PaneKind::CenterTerminal(cwd.clone()),
+                if launch.is_some() {
+                    PaneKind::StoppedTerminal(cwd.clone(), true)
+                } else {
+                    PaneKind::CenterTerminal(cwd.clone())
+                },
                 state.workspace.id,
                 self.data.clone(),
                 window,
@@ -831,6 +876,10 @@ impl Shell {
             });
             state.store.regions.bottom_visible = true;
             state.store.regions.bottom_opened = true;
+        }
+        if let Some(launch) = launch {
+            let pane = self.active(cx).panes[&pane_id].clone();
+            self.launch_run_terminal(&pane, launch, window, cx);
         }
         self.show_pane(&pane_id, window, cx);
     }
@@ -897,6 +946,18 @@ impl Shell {
         self.sync_content_selection(cx);
         pane.focus_handle(cx).focus(window, cx);
         cx.notify();
+    }
+}
+fn terminal_alive(pane: &Pane, cx: &App) -> bool {
+    match &pane.content {
+        pane::PaneContent::Terminal(view) => {
+            pane.terminal_alive()
+                && matches!(
+                    view.read(cx).backend().state(),
+                    gitterm_terminal::SessionState::Running
+                )
+        }
+        _ => false,
     }
 }
 fn load_workspace_layout(
@@ -1361,7 +1422,7 @@ impl Shell {
                 }),
             running: vec![],
             pulse_bright: false,
-            usage_open: false,
+            usage_open: self.usage_open,
             usage_hint: "Usage".into(),
             usage_badge: None,
         }
@@ -1413,7 +1474,13 @@ impl Shell {
             &self.spine_input(cx),
             workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark()),
             Rc::new(move |outcome, window, cx| {
-                _ = weak.update(cx, |shell, cx| shell.spine_outcome(outcome, window, cx));
+                _ = weak.update(cx, |shell, cx| {
+                    if matches!(outcome, spine::Outcome::ToggleUsage) {
+                        shell.toggle_usage(window, cx);
+                    } else {
+                        shell.spine_outcome(outcome, window, cx);
+                    }
+                });
             }),
         )
         .w(px(layout::SPINE_WIDTH + 1.))
@@ -1685,6 +1752,30 @@ impl Shell {
             .children(pane.cloned())
     }
     fn refresh_bottom_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_tabs.retain(|id, _| {
+            self.workspaces
+                .iter()
+                .any(|state| state.panes.contains_key(id))
+        });
+        let now = Instant::now();
+        for state in &self.workspaces {
+            for (id, pane) in &state.panes {
+                if let Some(run) = self.run_tabs.get_mut(id)
+                    && run.detected_url.is_none()
+                    && now >= run.next_url_scan
+                {
+                    run.next_url_scan = now + std::time::Duration::from_secs(2);
+                    if let pane::PaneContent::Terminal(view) = &pane.read(cx).content {
+                        run.detected_url = view
+                            .read(cx)
+                            .backend()
+                            .get_all_text()
+                            .as_deref()
+                            .and_then(bottom_panel::output_url);
+                    }
+                }
+            }
+        }
         let Some(state) = self
             .workspaces
             .iter()
@@ -1712,8 +1803,11 @@ impl Shell {
                 bottom_panel::TerminalTab {
                     id: s.id.0 as usize,
                     title: Some(pane.tab_title()),
-                    alive: pane.terminal_alive(),
-                    run_repo: None,
+                    alive: terminal_alive(pane, cx),
+                    run_repo: self
+                        .run_tabs
+                        .get(&session_pane_id(s.id))
+                        .map(|run| run.repo.clone()),
                 }
             })
             .collect();
@@ -1763,9 +1857,28 @@ impl Shell {
                 .filter_map(|dir| {
                     let key = saved.repo_key(dir)?;
                     let home = saved.own_home_repo();
-                    let command = (home.key() == key)
-                        .then(|| home.run_command.clone())
-                        .flatten();
+                    let repo = owner
+                        .iced_catalog()
+                        .and_then(|catalog| catalog.repos.iter().find(|repo| repo.key() == key))
+                        .or_else(|| (home.key() == key).then_some(&home));
+                    let command = repo.and_then(|repo| repo.run_command.clone());
+                    let action = command.as_deref().map(|command| {
+                        gitterm_core::run::run_tab_action(self.bottom_facts(cx), &key, command)
+                    });
+                    let run_state = match action {
+                        Some(gitterm_core::run::RunTabAction::Focus(_)) => {
+                            bottom_panel::RunState::Focus
+                        }
+                        Some(gitterm_core::run::RunTabAction::Restart(_)) => {
+                            bottom_panel::RunState::Restart
+                        }
+                        _ => bottom_panel::RunState::Run,
+                    };
+                    let url = self
+                        .run_tabs
+                        .values()
+                        .find(|run| run.repo == key)
+                        .and_then(|run| run.detected_url.clone());
                     Some(bottom_panel::Repo {
                         key,
                         name: Path::new(dir)
@@ -1774,8 +1887,8 @@ impl Shell {
                             .to_string_lossy()
                             .into_owned(),
                         command,
-                        run_state: bottom_panel::RunState::Run,
-                        url: None,
+                        run_state,
+                        url,
                     })
                 })
                 .collect();
@@ -1870,7 +1983,11 @@ impl Shell {
                         return;
                     }
                 };
-                self.new_terminal_at(DockPlacement::Bottom, cwd, window, cx);
+                let Some(home) = self.data.terminal_cwd(self.active(cx).workspace.id, cx) else {
+                    return;
+                };
+                let cwd = gitterm_core::run::new_bottom_terminal_dir(&home, cwd);
+                self.new_terminal_at(DockPlacement::Bottom, Some(cwd), window, cx);
             }
             O::SelectTab { id } | O::CloseTab { id } => {
                 let pane_id = session_pane_id(SessionId(id as u64));
@@ -1880,6 +1997,24 @@ impl Shell {
                 if matches!(outcome, O::SelectTab { .. }) {
                     self.show_pane(&pane_id, window, cx);
                 } else {
+                    let tabs = &self.bottom.read(cx).input;
+                    let closed = tabs.tabs.iter().position(|tab| tab.id == id).unwrap();
+                    let selected = tabs.tabs.iter().position(|tab| Some(tab.id) == tabs.active);
+                    let after = gitterm_core::run::bottom_selection_after_close(
+                        selected,
+                        closed,
+                        tabs.tabs.len() - 1,
+                    );
+                    let remaining: Vec<_> = tabs
+                        .tabs
+                        .iter()
+                        .filter(|tab| tab.id != id)
+                        .map(|tab| tab.id)
+                        .collect();
+                    let previous_focus = window.focused(cx);
+                    let closed_had_focus = self.active(cx).panes[&pane_id]
+                        .focus_handle(cx)
+                        .contains_focused(window, cx);
                     let target = self.active(cx).panes[&pane_id].read(cx).session.clone();
                     if let Some(target) = target {
                         if self.active(cx).sessions.len() > 1 {
@@ -1904,28 +2039,330 @@ impl Shell {
                                 .update(cx, |dock, cx| dock.remove_panel(pane, window, cx));
                             save_layout(state, cx);
                         }
-                        self.focus_main_terminal(window, cx);
+                        self.run_tabs.remove(&pane_id);
+                        if let Some(id) = after.and_then(|index| remaining.get(index)) {
+                            self.show_pane(&session_pane_id(SessionId(*id as u64)), window, cx);
+                            if selected == Some(closed) && closed_had_focus {
+                                self.focus_main_terminal(window, cx);
+                            } else if let Some(focus) = previous_focus {
+                                focus.focus(window, cx);
+                            }
+                        } else {
+                            self.focus_main_terminal(window, cx);
+                        }
                     }
                 }
             }
             O::OpenUrl { repo } => {
-                if let Some(url) = self
-                    .bottom_repos(cx)
-                    .iter()
-                    .find(|r| r.key == repo)
-                    .and_then(|r| r.url.as_ref())
+                let tabs = &self.bottom.read(cx).input;
+                if let Some(index) = tabs.tabs.iter().position(|tab| {
+                    Some(tab.id) == tabs.active && tab.run_repo.as_ref() == Some(&repo)
+                }) && let Some(url) =
+                    gitterm_core::run::run_tab_url(self.bottom_facts(cx).get(index).copied())
                 {
                     cx.open_url(url);
-                } else {
-                    self.preview_unavailable("Repository URL", cx);
                 }
             }
-            O::Run { .. } | O::Focus { .. } | O::Restart { .. } => {
-                self.preview_unavailable("Repository run command", cx)
+            O::Run { repo } | O::Focus { repo } | O::Restart { repo } => {
+                self.run_repo(repo, window, cx)
             }
-            O::QuickCommand { .. } => self.preview_unavailable("Quick command", cx),
+            O::QuickCommand { id } => self.quick_command(id, window, cx),
         }
         cx.notify();
+    }
+    fn bottom_facts<'a>(
+        &'a self,
+        cx: &'a App,
+    ) -> Vec<gitterm_core::run::BottomTerminalFact<'a, &'a gitterm_core::workspace_config::RepoKey>>
+    {
+        let state = self.active(cx);
+        let ids = bottom_pane_ids(state, cx);
+        state
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                let id = session_pane_id(session.id);
+                if !ids.contains(&id) {
+                    return None;
+                }
+                let pane = state.panes[&id].read(cx);
+                Some(gitterm_core::run::BottomTerminalFact {
+                    alive: terminal_alive(pane, cx),
+                    run: self
+                        .run_tabs
+                        .get(&id)
+                        .map(|run| gitterm_core::run::RunTabFact {
+                            repo: &run.repo,
+                            command: &run.command,
+                            detected_url: run.detected_url.as_deref(),
+                        }),
+                })
+            })
+            .collect()
+    }
+    fn run_repo(
+        &mut self,
+        key: gitterm_core::workspace_config::RepoKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gitterm_core::run::{self, RunCommandUnavailable as U, RunTabAction};
+        let repos = self.bottom_repos(cx);
+        let repo = repos.iter().find(|repo| repo.key == key);
+        let command = match run::resolve_run_command(
+            repo.is_some(),
+            repo.map(|repo| run::RunCommandFact {
+                is_local: key.is_local(),
+                command: repo.command.as_deref(),
+            }),
+        ) {
+            Ok(command) => command.to_owned(),
+            Err(reason) => {
+                let message = match reason {
+                    U::NotListed => "no such repo to run".to_owned(),
+                    U::MissingRepo => return,
+                    U::RemoteRepo => "only this Mac's repos run here".to_owned(),
+                    U::MissingCommand => format!(
+                        "{} has no run command",
+                        match &key {
+                            gitterm_core::workspace_config::RepoKey::Local(dir) =>
+                                dir.display().to_string(),
+                            _ => repo.map(|r| r.name.clone()).unwrap_or_default(),
+                        }
+                    ),
+                };
+                self.owner.update(cx, |owner, cx| {
+                    owner.error = Some(message);
+                    cx.notify();
+                });
+                return;
+            }
+        };
+        let action = run::run_tab_action(self.bottom_facts(cx), &key, &command);
+        let ids: Vec<_> = self
+            .bottom
+            .read(cx)
+            .input
+            .tabs
+            .iter()
+            .map(|tab| session_pane_id(SessionId(tab.id as u64)))
+            .collect();
+        if let RunTabAction::Focus(index) = action {
+            self.update_regions(
+                |regions| {
+                    regions.bottom_visible = true;
+                    regions.bottom_opened = true;
+                },
+                cx,
+            );
+            self.show_pane(&ids[index], window, cx);
+            return;
+        }
+        let gitterm_core::workspace_config::RepoKey::Local(cwd) = &key else {
+            return;
+        };
+        let owner = self.owner.read(cx);
+        let env = owner
+            .iced_catalog()
+            .and_then(|catalog| catalog.repos.iter().find(|repo| repo.key() == key))
+            .map(|repo| repo.env.clone())
+            .unwrap_or_default();
+        let overrides = owner
+            .iced_workspace(self.active(cx).workspace.id)
+            .map(|ws| ws.env_overrides.clone())
+            .unwrap_or_default();
+        let launch = gitterm_terminal::TerminalLaunch {
+            cwd: Some(cwd.clone()),
+            env: gitterm_core::workspace_config::layered_env(&env, &overrides)
+                .into_iter()
+                .map(|(k, v)| (k, Some(v)))
+                .collect(),
+            startup_command: Some(command.clone()),
+            ..Default::default()
+        };
+        let id = if let RunTabAction::Restart(index) = action {
+            let id = ids[index].clone();
+            let pane = self.active(cx).panes[&id].clone();
+            self.launch_run_terminal(&pane, launch, window, cx);
+            id
+        } else {
+            self.new_terminal_launch(
+                DockPlacement::Bottom,
+                Some(cwd.clone()),
+                Some(launch),
+                window,
+                cx,
+            );
+            let Some(id) = self
+                .active(cx)
+                .sessions
+                .last()
+                .map(|s| session_pane_id(s.id))
+            else {
+                return;
+            };
+            id
+        };
+        self.run_tabs.insert(
+            id.clone(),
+            bottom_panel::RunTab {
+                repo: key,
+                command: command.clone(),
+                detected_url: None,
+                next_url_scan: Instant::now(),
+            },
+        );
+        if self.run_url_poll.is_none() {
+            self.run_url_poll = Some(cx.spawn(async move |shell, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(2))
+                        .await;
+                    if shell
+                        .update(cx, |shell, cx| {
+                            if shell
+                                .run_tabs
+                                .values()
+                                .any(|run| run.detected_url.is_none())
+                            {
+                                cx.notify();
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+        }
+        self.active(cx).panes[&id].update(cx, |pane, cx| {
+            pane.title = command;
+            cx.notify();
+        });
+        self.update_regions(
+            |regions| {
+                regions.bottom_opened = true;
+                regions.bottom_visible = true;
+            },
+            cx,
+        );
+        self.show_pane(&id, window, cx);
+    }
+    fn launch_run_terminal(
+        &mut self,
+        pane: &Entity<Pane>,
+        launch: gitterm_terminal::TerminalLaunch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(test)]
+        let launch = {
+            let mut launch = launch;
+            launch.program = "/bin/zsh".into();
+            launch.args = vec!["-d".into(), "-l".into()];
+            launch.env.insert(
+                "HOME".into(),
+                Some(self.config_dir.to_string_lossy().into_owned()),
+            );
+            launch.env.insert(
+                "ZDOTDIR".into(),
+                Some(self.config_dir.to_string_lossy().into_owned()),
+            );
+            launch
+        };
+        let preview = self.owner.read(cx).preview();
+        if let Err(error) = preview::executable(
+            preview.as_deref(),
+            gitterm_core::preview::Effect::Terminal,
+            launch.cwd.as_deref().unwrap_or(Path::new("<terminal>")),
+        ) {
+            self.owner.update(cx, |owner, cx| {
+                owner.error = Some(error.to_string());
+                cx.notify();
+            });
+            return;
+        }
+        pane.update(cx, |pane, cx| {
+            pane.close_terminal(cx);
+            pane.session = Some(sessions::fresh_target());
+            pane.exit_pending = false;
+        });
+        let target = pane.read(cx).session.clone();
+        let weak = pane.downgrade();
+        let view = cx.new(|cx| {
+            gitterm_terminal::TerminalView::launch(launch, Default::default(), cx)
+                .with_exit_callback(move |_, cx| {
+                    _ = weak.update(cx, |pane, cx| {
+                        if pane.session == target {
+                            pane.exit_pending = true;
+                            cx.notify();
+                        }
+                    });
+                })
+        });
+        self._subscriptions
+            .push(cx.observe_in(&view, window, |_, view, window, cx| {
+                let view = view.clone();
+                window.defer(cx, move |window, cx| {
+                    view.update(cx, |view, cx| view.process_events(window, cx));
+                });
+                cx.notify();
+            }));
+        pane.update(cx, |pane, cx| {
+            pane.content = pane::PaneContent::Terminal(view);
+            cx.notify();
+        });
+    }
+    fn quick_command(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        use gitterm_core::run::{self, QuickCommandTarget};
+        let panel = &self.bottom.read(cx).input;
+        let selected = panel
+            .tabs
+            .iter()
+            .position(|tab| Some(tab.id) == panel.active);
+        let home = self.data.terminal_cwd(self.active(cx).workspace.id, cx);
+        let launch = run::resolve_quick_command(
+            &panel.quick_commands,
+            id,
+            selected.and_then(|index| self.bottom_facts(cx).get(index).copied()),
+            home.as_deref(),
+        );
+        let Ok(Some(launch)) = launch else {
+            return;
+        };
+        let pane = match launch.target {
+            QuickCommandTarget::SelectedPlainTerminal => {
+                let Some(id) = panel.active else {
+                    return;
+                };
+                self.active(cx).panes[&session_pane_id(SessionId(id as u64))].clone()
+            }
+            QuickCommandTarget::Spawn { cwd } => {
+                self.new_terminal_at(DockPlacement::Bottom, Some(cwd), window, cx);
+                let Some(session) = self.active(cx).sessions.last() else {
+                    return;
+                };
+                self.active(cx).panes[&session_pane_id(session.id)].clone()
+            }
+        };
+        let view = match &pane.read(cx).content {
+            pane::PaneContent::Terminal(view) => Some(view.clone()),
+            _ => None,
+        };
+        if let Some(view) = view {
+            view.update(cx, |view, _| {
+                view.backend_mut()
+                    .handle(gitterm_terminal::Command::Write(launch.bytes));
+            });
+        }
+        self.update_regions(
+            |regions| {
+                regions.bottom_visible = true;
+                regions.bottom_opened = true;
+            },
+            cx,
+        );
+        pane.focus_handle(cx).focus(window, cx);
     }
     fn git_action(
         &mut self,
@@ -2042,6 +2479,10 @@ impl Shell {
     fn menu_context(&self, window: &mut Window, cx: &mut App) -> String {
         use gpui_component::WindowExt;
         let mut context = String::from("GitTermShell");
+        if self.usage_open {
+            context.push_str(" IcedUsage");
+            return context;
+        }
         let chat_pane = self.focused_chat(window, cx);
         let chat = chat_pane.is_some();
         let modal = self.session_picker.is_some()
@@ -2148,16 +2589,30 @@ impl Shell {
             .on_action(
                 cx.listener(|this, _: &DecreaseUiFont, _, cx| this.resize_font(true, -1., cx)),
             )
-            // Iced redirects these menu actions to chat on an agent tab.
-            // P8c exposes no chat-font setter yet, so disable that route as well.
-            .when(!self.active_agent_tab(cx), |root| {
-                root.on_action(cx.listener(|this, _: &IncreaseTerminalFont, _, cx| {
-                    this.resize_font(false, 1., cx)
-                }))
-                .on_action(cx.listener(
-                    |this, _: &DecreaseTerminalFont, _, cx| this.resize_font(false, -1., cx),
-                ))
-            })
+            .on_action(
+                cx.listener(|this, _: &IncreaseChatFont, _, cx| this.resize_chat_font(1., cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &DecreaseChatFont, _, cx| this.resize_chat_font(-1., cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &IncreaseTerminalFont, _, cx| {
+                    this.resize_content_font(1., cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &DecreaseTerminalFont, _, cx| {
+                this.resize_content_font(-1., cx)
+            }))
+            .on_action(cx.listener(|this, _: &UsageViewToggle, w, cx| this.toggle_usage(w, cx)))
+            .on_action(cx.listener(|this, _: &RunRepoCommand, w, cx| {
+                if let Some(saved) = this
+                    .active_workspace(cx)
+                    .and_then(|id| this.owner.read(cx).iced_workspace(id))
+                    && let Some(repo) = saved.repo_key(saved.home_dir())
+                {
+                    this.run_repo(repo, w, cx);
+                }
+            }))
             .on_action(cx.listener(|_, _: &ToggleTheme, w, cx| {
                 theme::apply(
                     !gpui_component::Theme::global(cx).mode.is_dark(),
@@ -2282,6 +2737,105 @@ impl Shell {
             .expect("native chat action is registered");
         window.dispatch_action(action, cx);
     }
+    fn request_usage_scan(&mut self, cx: &mut Context<Self>) {
+        // TODO(TRU-274): core exposes scan_usage_in with chrono arguments, but
+        // this shell has no chrono dependency or public local-time scan accessor.
+        self.usage_input.error = Some("Usage scanning is not available in preview".into());
+        self.sync_usage(cx);
+    }
+    fn sync_usage(&self, cx: &mut Context<Self>) {
+        self.usage_page.update(cx, |page, cx| {
+            let mut input = self.usage_input.clone();
+            input.now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            page.set_input(input);
+            cx.notify();
+        });
+        cx.notify();
+    }
+    fn toggle_usage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.usage_open {
+            self.usage_return_focus = window.focused(cx);
+        }
+        self.usage_open = !self.usage_open;
+        self.content.update(cx, |content, cx| {
+            content.picker = self.usage_open;
+            content.sync_covers(window, cx);
+        });
+        if self.usage_open {
+            self.refresh_usage_limits(cx);
+            self.request_usage_scan(cx);
+            self.focus.focus(window, cx);
+        } else if let Some(focus) = self.usage_return_focus.take() {
+            focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+    fn refresh_usage_limits(&mut self, cx: &mut Context<Self>) {
+        if let Some(source) = self
+            .owner
+            .read(cx)
+            .iced_catalog()
+            .map(|catalog| catalog.source.clone())
+            .filter(|source| source.is_absolute())
+        {
+            self.usage_input.plan_limits = gitterm_core::plan_limits::PlanLimitsFile::load(
+                &gitterm_core::plan_limits::PlanLimitsFile::path_in(&source),
+            );
+        }
+    }
+    fn usage_intent(&mut self, intent: usage::UsageIntent, cx: &mut Context<Self>) {
+        use usage::UsageIntent as I;
+        match intent {
+            I::SelectWindow(window) => {
+                if self.usage_input.window != window {
+                    self.usage_input.window = window;
+                    self.request_usage_scan(cx);
+                }
+            }
+            I::Refresh => {
+                self.refresh_usage_limits(cx);
+                self.request_usage_scan(cx);
+            }
+            I::SelectRepo(repo) => self.usage_input.repo = repo,
+            I::ChartTokens(tokens) => self.usage_input.chart_tokens = tokens,
+            I::ToggleHeadless => self.usage_input.show_headless = !self.usage_input.show_headless,
+            I::PinChanged(pin) => {
+                if self.usage_input.plan_limits.pin != pin {
+                    self.preview_unavailable("Routing pin", cx);
+                }
+            }
+        }
+        self.sync_usage(cx);
+    }
+    fn resize_content_font(&mut self, delta: f32, cx: &mut Context<Self>) {
+        if self.active_agent_tab(cx) {
+            self.resize_chat_font(delta, cx);
+        } else {
+            self.resize_font(false, delta, cx);
+        }
+    }
+    fn resize_chat_font(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let size = (theme::chat_appearance(cx).font_size + delta).clamp(11., 22.);
+        theme::set_chat_font_size(size, cx);
+        for state in &mut self.workspaces {
+            state.store.regions.chat_font_size = Some(size);
+            save_layout(state, cx);
+            for pane in state.panes.values() {
+                pane.update(cx, |pane, cx| {
+                    if let pane::PaneContent::Chat(view) = &pane.content {
+                        view.update(cx, |view, cx| {
+                            view.set_appearance(theme::chat_appearance(cx), cx)
+                        });
+                    }
+                    cx.notify();
+                });
+            }
+        }
+        cx.notify();
+    }
     fn resize_font(&mut self, ui: bool, delta: f32, cx: &mut Context<Self>) {
         let mut fonts = theme::font_sizes(cx);
         let value = if ui {
@@ -2303,6 +2857,10 @@ impl Shell {
         cx.notify();
     }
     fn escape(&mut self, _: &app_menus::Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.usage_open {
+            self.toggle_usage(window, cx);
+            return;
+        }
         if self.session_picker.is_some()
             || self.park_sheet.is_some()
             || self.new_work_sheet.is_some()
@@ -2422,9 +2980,32 @@ impl Render for Shell {
             }
         }
         self.sync_content_selection(cx);
-        self.content
-            .update(cx, |content, cx| content.sync_covers(window, cx));
+        self.content.update(cx, |content, cx| {
+            content.picker = self.usage_open
+                || self.session_picker.is_some()
+                || self.park_sheet.is_some()
+                || self.new_work_sheet.is_some();
+            content.sync_covers(window, cx);
+        });
         self.ensure_work_sidebars(window, cx);
+        for (id, sidebar) in &self.work_sidebars {
+            if !self.run_sidebar_subscriptions.contains_key(id) {
+                let subscription = cx.subscribe_in(
+                    sidebar,
+                    window,
+                    |shell, _, outcome: &work_sidebar::WorkSidebarOutcome, window, cx| {
+                        if let work_sidebar::WorkSidebarOutcome::RunRepoCommand { repo } = outcome {
+                            shell.run_repo(
+                                gitterm_core::workspace_config::RepoKey::local(repo),
+                                window,
+                                cx,
+                            );
+                        }
+                    },
+                );
+                self.run_sidebar_subscriptions.insert(*id, subscription);
+            }
+        }
         self.ensure_find_views(window, cx);
         self.refresh_bottom_panel(window, cx);
         let p = Palette::current(cx);
@@ -2452,8 +3033,11 @@ impl Render for Shell {
                                 .flex_1()
                                 .min_h_0()
                                 .p_4()
-                                .child("No local workspaces yet")
-                                .child(self.parked_controls(cx))
+                                .when(self.usage_open, |area| area.child(self.usage_page.clone()))
+                                .when(!self.usage_open, |area| {
+                                    area.child("No local workspaces yet")
+                                        .child(self.parked_controls(cx))
+                                })
                                 .children(
                                     self.owner
                                         .read(cx)
@@ -2534,7 +3118,16 @@ impl Render for Shell {
                             .flex()
                             .child(sidebar)
                             .child(self.sidebar_divider(cx))
-                            .child(self.find_content(cx)),
+                            .child(if self.usage_open {
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .child(self.usage_page.clone())
+                                    .into_any_element()
+                            } else {
+                                self.find_content(cx).into_any_element()
+                            }),
                     )
                     .child(self.bottom.clone())
                     .child(self.workspace_bar(cx)),

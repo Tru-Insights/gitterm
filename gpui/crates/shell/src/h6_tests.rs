@@ -290,10 +290,24 @@ fn native_chat_find_uses_canonical_adapter_without_local_binding(cx: &mut TestAp
     draw(cx);
     cx.read(|cx| assert!(!shell.read(cx).chat_find.is_empty()));
     cx.update(|window, cx| {
-        assert!(!window.is_action_available(&IncreaseTerminalFont, cx));
-        assert!(!window.is_action_available(&DecreaseTerminalFont, cx));
-        assert!(!window.is_action_available(&IncreaseChatFont, cx));
-        assert!(!window.is_action_available(&DecreaseChatFont, cx));
+        assert!(window.is_action_available(&IncreaseTerminalFont, cx));
+        assert!(window.is_action_available(&DecreaseTerminalFont, cx));
+        assert!(window.is_action_available(&IncreaseChatFont, cx));
+        assert!(window.is_action_available(&DecreaseChatFont, cx));
+    });
+    let (chat_size, terminal_size) = cx.read(|cx| {
+        (
+            theme::chat_appearance(cx).font_size,
+            theme::font_sizes(cx).terminal,
+        )
+    });
+    dispatch(IncreaseTerminalFont, cx);
+    cx.read(|cx| {
+        assert_eq!(
+            theme::chat_appearance(cx).font_size,
+            (chat_size + 1.).clamp(11., 22.)
+        );
+        assert_eq!(theme::font_sizes(cx).terminal, terminal_size);
     });
     dispatch(WorkspaceSelect { index: 1 }, cx);
     cx.simulate_keystrokes("escape");
