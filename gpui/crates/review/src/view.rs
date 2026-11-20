@@ -22,6 +22,9 @@ use std::{
 
 actions!(native_review, [NextFile, PreviousFile, ToggleViewed]);
 
+mod aggregate;
+use aggregate::AggregateView;
+
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("alt-down", NextFile, Some("NativeReview")),
@@ -130,6 +133,9 @@ pub struct ReviewView {
     loading: bool,
     generation: u64,
     pending_selection: Option<FileKey>,
+    repo_path: Option<PathBuf>,
+    aggregate: Option<Entity<AggregateView>>,
+    show_aggregate: bool,
 }
 impl ReviewView {
     pub fn new(model: ReviewModel, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -143,6 +149,9 @@ impl ReviewView {
             loading: false,
             generation: 0,
             pending_selection: None,
+            repo_path: None,
+            aggregate: None,
+            show_aggregate: false,
         };
         view.prepare(cx);
         view
@@ -154,6 +163,7 @@ impl ReviewView {
         self.loading
     }
     pub fn select_file(&mut self, key: FileKey, cx: &mut Context<Self>) {
+        self.show_aggregate = false;
         self.pending_selection = Some(key);
         self.apply_selection(cx);
         cx.notify();
@@ -206,6 +216,11 @@ impl ReviewView {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         self.model.replace(snapshot, patches)?;
+        if snapshot.is_git_repo && self.repo_path.as_ref() != Some(&snapshot.repo_path) {
+            self.repo_path = Some(snapshot.repo_path.clone());
+            self.aggregate = None;
+            self.show_aggregate = false;
+        }
         self.prepare(cx);
         cx.notify();
         Ok(())
@@ -243,6 +258,13 @@ impl ReviewView {
         self.navigate(true, window, cx);
     }
     fn navigate(&mut self, previous: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_aggregate
+            && let Some(aggregate) = &self.aggregate
+        {
+            aggregate.update(cx, |view, cx| view.navigate(previous, cx));
+            self.focus.focus(window, cx);
+            return;
+        }
         self.pending_selection = None;
         let before = self.model.selected;
         self.model.navigate(previous);
@@ -253,6 +275,12 @@ impl ReviewView {
         cx.notify();
     }
     fn toggle_viewed(&mut self, _: &ToggleViewed, _: &mut Window, cx: &mut Context<Self>) {
+        if self.show_aggregate {
+            if let Some(aggregate) = &self.aggregate {
+                aggregate.update(cx, |view, cx| view.toggle_viewed(cx));
+            }
+            return;
+        }
         if let Some(index) = self.model.selected {
             self.model.files[index].viewed = !self.model.files[index].viewed;
             cx.notify();
@@ -266,6 +294,16 @@ impl ReviewView {
             cx.notify();
         }
     }
+    fn toggle_aggregate(&mut self, cx: &mut Context<Self>) {
+        if self.aggregate.is_none() {
+            let Some(root) = self.repo_path.clone() else {
+                return;
+            };
+            self.aggregate = Some(cx.new(|cx| AggregateView::new(root, cx)));
+        }
+        self.show_aggregate = !self.show_aggregate;
+        cx.notify();
+    }
 }
 impl Focusable for ReviewView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -274,6 +312,32 @@ impl Focusable for ReviewView {
 }
 impl Render for ReviewView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let switch = Button::new("review-aggregate")
+            .small()
+            .label(if self.show_aggregate {
+                "Status groups"
+            } else {
+                "Branch review"
+            })
+            .on_click(cx.listener(|view, _, _, cx| view.toggle_aggregate(cx)));
+        if self.show_aggregate
+            && let Some(aggregate) = &self.aggregate
+        {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(rgb(0x1e1e2e))
+                .text_color(rgb(0xcdd6f4))
+                .text_size(px(13.))
+                .key_context("NativeReview")
+                .track_focus(&self.focus)
+                .on_action(cx.listener(Self::next))
+                .on_action(cx.listener(Self::previous))
+                .on_action(cx.listener(Self::toggle_viewed))
+                .child(div().p_2().child(switch))
+                .child(div().flex_1().min_h_0().child(aggregate.clone()));
+        }
         let mut sidebar = div()
             .flex()
             .flex_col()
@@ -380,6 +444,7 @@ impl Render for ReviewView {
             .child(
                 div()
                     .p_2()
+                    .children(self.repo_path.as_ref().map(|_| switch))
                     .child("Review · Option+↓ / Option+↑ next / previous file · Option+V viewed"),
             )
             .child(div().flex_1().min_h_0().flex().child(sidebar).child(body))

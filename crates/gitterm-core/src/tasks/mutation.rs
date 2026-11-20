@@ -13,6 +13,9 @@ pub(super) struct PendingWorker {
 #[derive(Debug)]
 enum PreparationStage {
     Captured,
+    Reusing {
+        expected: Box<TaskRecord>,
+    },
     Bound {
         before: Box<TaskRecord>,
         expected: CompletedWorktreePreparation,
@@ -109,6 +112,44 @@ impl TaskAuthority {
                     input.base_reference = Some(DEFAULT_TASK_BASE.into());
                 }
                 Ok(Effect::PrepareTask(input))
+            }
+            TaskMutation::InsertPreparing { record } => {
+                validate_task(&record)?;
+                Ok(Effect::PersistPreparing { record })
+            }
+            TaskMutation::PreparationCompleted {
+                task_id,
+                result,
+                cleanup_path,
+            } => match result {
+                Ok(prepared) => Ok(Effect::PersistPreparation { task_id, prepared }),
+                Err(error) => Ok(Effect::PersistWorkerPreparationFailure {
+                    task_id,
+                    cleanup_path: cleanup_path.filter(|path| {
+                        error.contains("rollback requires attention")
+                            && facts.existing_paths.contains(path)
+                    }),
+                    error,
+                }),
+            },
+            TaskMutation::WorktreeRemoved { task_id } => Ok(Effect::ClearWorktree { task_id }),
+            TaskMutation::RecordDelivery {
+                task_id,
+                commit_sha,
+                pr_url,
+                pr_number,
+            } => {
+                let Some(task) = self.store.as_ref().and_then(|store| store.get(&task_id)) else {
+                    return Ok(Effect::None);
+                };
+                Ok(Effect::PersistDelivery {
+                    task_id,
+                    delivery: DeliveryState {
+                        commit_sha: Some(commit_sha),
+                        pr_url: pr_url.or_else(|| task.delivery.pr_url.clone()),
+                        pr_number: pr_number.or(task.delivery.pr_number),
+                    },
+                })
             }
             TaskMutation::UpdateHandoff(input) => self.handoff(input, facts),
             TaskMutation::Close { task_id } => {
@@ -213,6 +254,10 @@ impl TaskAuthority {
                 })
             }
             TaskMutation::LaunchSession(request) => self.launch(request, facts),
+            TaskMutation::CheckWorkerDestination { expected } => {
+                check_destination(&expected.path, &expected.repository, facts)?;
+                Ok(Effect::None)
+            }
             TaskMutation::CheckWorkerCheckout { task_id, path } => {
                 self.worker_checkout(&task_id, &path, facts)?;
                 Ok(Effect::None)
@@ -286,6 +331,70 @@ impl TaskAuthority {
                     PreparationStage::Bound { before, expected };
                 Ok(Effect::WorkerAuthorityChecked { id })
             }
+            TaskMutation::ReuseWorkerCheckout { id, replacement } => {
+                let result = (|| {
+                    let pending = self.current_worker(id, facts)?;
+                    if !matches!(pending.stage, PreparationStage::Captured) {
+                        return Err("Worker preparation is already bound".into());
+                    }
+                    let current = self.task(&replacement.task_id)?;
+                    // Only requested work metadata may change on reuse.
+                    let mut allowed = current.clone();
+                    allowed.title = replacement.title.clone();
+                    allowed.objective = replacement.objective.clone();
+                    allowed.issue = replacement.issue.clone();
+                    allowed.stopping_boundary = replacement.stopping_boundary;
+                    allowed.updated_at = replacement.updated_at.clone();
+                    if &allowed != replacement.as_ref() {
+                        return Err("Worker checkout reuse changed task authority".into());
+                    }
+                    let path = current
+                        .worktree
+                        .path
+                        .as_ref()
+                        .ok_or("Worker checkout is missing")?;
+                    self.worker_checkout(&current.task_id, path, facts)?;
+                    validate_task(&replacement)?;
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    self.pending_workers.remove(&id);
+                    return Err(error);
+                }
+                self.pending_workers.get_mut(&id).unwrap().stage = PreparationStage::Reusing {
+                    expected: replacement.clone(),
+                };
+                Ok(Effect::PersistWorkerCheckoutReuse { id, replacement })
+            }
+            TaskMutation::WorkerCheckoutReuseSaved { id, result } => {
+                let pending = self
+                    .pending_workers
+                    .remove(&id)
+                    .ok_or("Worker preparation is no longer pending")?;
+                result?;
+                check_caller(&pending.caller, facts)?;
+                let PreparationStage::Reusing { expected } = pending.stage else {
+                    return Err("Worker preparation is not awaiting a reuse save".into());
+                };
+                if self.task(&expected.task_id)? != expected.as_ref() {
+                    return Err(
+                        "Saved worker checkout reuse no longer matches the target task".into(),
+                    );
+                }
+                self.worker_checkout(
+                    &expected.task_id,
+                    expected
+                        .worktree
+                        .path
+                        .as_ref()
+                        .ok_or("Worker checkout is missing")?,
+                    facts,
+                )?;
+                Ok(Effect::StartWorker {
+                    task_id: expected.task_id,
+                    caller: Box::new(pending.caller),
+                })
+            }
             TaskMutation::WorkerPrepared { id, result } => {
                 let mut pending = self
                     .pending_workers
@@ -295,6 +404,9 @@ impl TaskAuthority {
                 let PreparationStage::Bound { before, expected } = pending.stage else {
                     return Err("Worker preparation is not awaiting a completion".into());
                 };
+                if !facts.preparation_paths.contains(&expected.path) {
+                    return Err("Worker preparation destination checkout changed; any prepared worktree remains for explicit cleanup".into());
+                }
                 let current = self.task(&before.task_id)?;
                 if !same_target(current, &before) {
                     return Err(format!(
@@ -321,6 +433,7 @@ impl TaskAuthority {
                         prepared.path.display()
                     ));
                 }
+                check_destination(&expected.path, &expected.repository, facts)?;
                 // Preserve this operation only while its store result is pending.
                 let task_id = before.task_id.clone();
                 pending.stage = PreparationStage::Saving { before, expected };
@@ -547,6 +660,7 @@ impl TaskAuthority {
         if task.archived_at.is_some() {
             return Err(format!("checkout {} is the worktree of archived task \"{}\" ({}); delegate to another checkout", checkout.display(), task.title, task.task_id));
         }
+        check_destination(checkout, &task.repository, facts)?;
         let blocked = store.open_worker_delegations(task_id);
         if let Some(open) = blocked
             .iter()
@@ -566,6 +680,21 @@ impl TaskAuthority {
         }
         Ok(())
     }
+}
+
+fn check_destination(
+    path: &std::path::Path,
+    repository: &RepositoryIdentity,
+    facts: &TaskMutationFacts,
+) -> Result<(), String> {
+    if !facts
+        .checkouts
+        .iter()
+        .any(|checkout| checkout.path == path && &checkout.repository == repository)
+    {
+        return Err(format!("Worker destination checkout {} changed or is unavailable; no task write or worker launch was authorized", path.display()));
+    }
+    Ok(())
 }
 
 fn check_caller(expected: &WorkerCaller, facts: &TaskMutationFacts) -> Result<(), String> {
@@ -644,13 +773,19 @@ mod tests {
             },
             chat_session_id: Some("source-chat".into()),
             workspace: store.get("fixture-task").unwrap().workspace.clone(),
-            repository: store.get("fixture-task").unwrap().repository.clone(),
+            repository: Some(store.get("fixture-task").unwrap().repository.clone()),
+            repository_workdir: Some(dir.path().join("source")),
             checkout: dir.path().join("source"),
             home: dir.path().into(),
             repos: vec![dir.path().join("source")],
             remote: false,
         };
         let facts = TaskMutationFacts {
+            checkouts: vec![WorkerCheckout {
+                path: dir.path().join("worktree"),
+                repository: store.get("fixture-task").unwrap().repository.clone(),
+            }],
+            preparation_paths: vec![dir.path().join("worktree")],
             callers: vec![caller],
             directories: vec![dir.path().join("worktree")],
             presets: vec![TaskPreset {
@@ -704,8 +839,113 @@ mod tests {
     }
 
     #[test]
+    fn stale_destination_refuses_reuse_and_preparation_before_persistence() {
+        for reuse in [false, true] {
+            for missing in [false, true] {
+                let (dir, mut state, mut facts) = fixture();
+                let id = if reuse {
+                    begin(&mut state, &facts)
+                } else {
+                    bound(&mut state, &facts)
+                };
+                if missing {
+                    facts.checkouts.clear();
+                } else {
+                    facts.checkouts[0].repository.common_dir = dir.path().join("replacement.git");
+                }
+                let mutation = if reuse {
+                    TaskMutation::ReuseWorkerCheckout {
+                        id,
+                        replacement: Box::new(state.task("fixture-task").unwrap().clone()),
+                    }
+                } else {
+                    TaskMutation::WorkerPrepared {
+                        id,
+                        result: Ok(expected(&state)),
+                    }
+                };
+                let before = std::fs::read(dir.path().join("tasks.json")).unwrap();
+                assert!(decide(&mut state, mutation, &facts)
+                    .unwrap_err()
+                    .contains("destination checkout"));
+                assert_eq!(
+                    std::fs::read(dir.path().join("tasks.json")).unwrap(),
+                    before
+                );
+                assert!(decide(
+                    &mut state,
+                    TaskMutation::CheckWorkerPreparation { id },
+                    &facts
+                )
+                .is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn checkout_reuse_requires_actual_save_fresh_authority_and_one_shot_completion() {
+        for outcome in ["saved", "save-error", "caller", "target"] {
+            let (dir, mut state, mut facts) = fixture();
+            let id = begin(&mut state, &facts);
+            let mut replacement = state.task("fixture-task").unwrap().clone();
+            replacement.title = "Replacement work".into();
+            let TaskMutationAction::PersistWorkerCheckoutReuse { replacement, .. } = decide(
+                &mut state,
+                TaskMutation::ReuseWorkerCheckout {
+                    id,
+                    replacement: Box::new(replacement),
+                },
+                &facts,
+            )
+            .unwrap() else {
+                panic!("reuse save");
+            };
+            let result = if outcome == "save-error" {
+                Err("actual store failure".into())
+            } else {
+                state
+                    .store_mut()
+                    .as_mut()
+                    .unwrap()
+                    .replace(*replacement)
+                    .map_err(|error| error.to_string())
+            };
+            match outcome {
+                "caller" => facts.callers[0].target.tab_id += 1,
+                "target" => {
+                    let store = state.store_mut().as_mut().unwrap();
+                    let mut task = store.get("fixture-task").unwrap().clone();
+                    task.objective = "Changed after save".into();
+                    store.replace(task).unwrap();
+                }
+                _ => {}
+            }
+            let before = std::fs::read(dir.path().join("tasks.json")).unwrap();
+            let effect = decide(
+                &mut state,
+                TaskMutation::WorkerCheckoutReuseSaved { id, result },
+                &facts,
+            );
+            assert_eq!(
+                matches!(effect, Ok(TaskMutationAction::StartWorker { .. })),
+                outcome == "saved"
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("tasks.json")).unwrap(),
+                before
+            );
+            assert!(decide(
+                &mut state,
+                TaskMutation::WorkerCheckoutReuseSaved { id, result: Ok(()) },
+                &facts
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn authority_fix_rechecks_caller_session_and_checkout_before_preparation_save() {
-        for change in 0..12 {
+        for change in 0..13 {
             let (dir, mut state, mut facts) = fixture();
             let id = bound(&mut state, &facts);
             let prepared = expected(&state);
@@ -717,10 +957,14 @@ mod tests {
                 4 => facts.callers[0].target.task_id = Some("other-task".into()),
                 5 => facts.callers[0].chat_session_id = Some("other-chat".into()),
                 6 => facts.callers[0].checkout = dir.path().join("other"),
-                7 => facts.callers[0].repository.common_dir = dir.path().join("replacement.git"),
+                7 => {
+                    facts.callers[0].repository.as_mut().unwrap().common_dir =
+                        dir.path().join("replacement.git")
+                }
                 8 => facts.callers[0].home = dir.path().join("other-home"),
                 9 => facts.callers[0].repos.clear(),
                 10 => facts.callers[0].remote = true,
+                12 => facts.callers[0].repository_workdir = Some(dir.path().join("redirected")),
                 _ => facts.callers[0].workspace.name = "changed workspace".into(),
             }
             let before = std::fs::read(dir.path().join("tasks.json")).unwrap();

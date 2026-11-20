@@ -47,6 +47,45 @@ It shares status jobs' cancellation, removed-owner discard, and explicit teardow
 Both lockfiles only gain edges to already-resolved packages: core's test-only
 `tempfile`, and review's `tokio` plus test-only `tempfile`. No package versions change.
 
+## Aggregate branch review (Stage 4 PR 5)
+
+After a repository status load, **Branch review** opens a separate aggregate
+view. **Status groups** returns to the original Staged / Unstaged / Untracked
+preview, including separate patches for the same path. Shell file selection
+also returns to that preview. No shell registration changes are required.
+
+The native toolbar offers **Uncommitted**, **Against base**, **Commits**, a
+**Base** branch picker, and **Refresh**. The initial base uses core's shared
+tracked/integration candidates and nearest-base policy. The picker lists local
+and remote branches. Source buttons emit `SelectBase`; a new branch reference
+emits `Open` with the updated target because core's `SelectBase` only switches
+diff source. Commits opens through `IpcRequest(ShowCommits)`. Clicking one commit
+emits `SelectCommit` with `pending: true`; clicking another completes the range.
+Core validates and normalizes the endpoints. Refresh emits `Collect`.
+
+`AggregateModel` owns one core `State`; its projection borrows the accepted
+diff, commit metadata and marks. Collect effects use the bounded core collector
+and return `CollectFinished` with the original stamp. The view never checks
+completion freshness. It renders collected hunk lines in a virtual list with
+old/new line numbers, additions/deletions, rename/binary/metadata notices, and
+explicit omitted, truncated, unlisted-file and commit-cap notices. Aggregate
+review never uses the unlimited status-patch collector or offers expansion past
+the shared collection limits.
+
+**Mark viewed** / **Option+V** emits `ToggleViewed`; marks and changed-since-viewed
+labels derive from core content identities. `MarksLoaded` immediately changes
+the projection, including malformed-marks errors. Marks in this preview are
+session-only, as the toolbar states: no ambient config discovery or disk writes.
+The native adapter repaints marks changes even though core emits no `Render`
+for `MarksLoaded` or `ToggleViewed`. Persistence and turn-source wiring remain
+host responsibilities. Core, Iced, shell, dependencies and lockfiles are unchanged.
+
+Live checks (not performed by the headless tests): open repository review;
+switch to Branch review; change Base; switch Uncommitted / Against base; open
+Commits and select two endpoints; Refresh; mark a file viewed and edit/refresh
+to see Changed since viewed; inspect a large-file truncation notice; return to
+Status groups and confirm the original groups and file-click behavior.
+
 ## Synthetic fixture format
 
 A directory contains `review.json` and one UTF-8 unified patch per entry:
