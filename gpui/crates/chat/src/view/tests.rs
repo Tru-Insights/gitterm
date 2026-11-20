@@ -1699,3 +1699,107 @@ fn setting_pickers_open_choose_dismiss_and_keep_acknowledged_labels(cx: &mut Tes
     assert!(cx.debug_bounds("setting-picker").is_none());
     assert_eq!(intents.borrow().len(), 4);
 }
+
+#[gpui::test]
+fn review_chip_opens_iced_composer_and_escape_cancel_close_it(cx: &mut TestAppContext) {
+    use crate::review::{ReviewContext, ReviewOutcome};
+    let (chat, cx) = setup(vec![], cx);
+    cx.simulate_resize(size(px(1200.), px(900.)));
+    chat.update_in(cx, |view, _, cx| {
+        view.set_backend(gitterm_core::chat::types::AgentBackend::Claude, cx)
+    });
+    let requests = Rc::new(std::cell::Cell::new(0));
+    let captured = requests.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&chat, move |_, outcome: &ReviewOutcome, _| {
+            if matches!(outcome, ReviewOutcome::ContextRequested) {
+                captured.set(captured.get() + 1);
+            }
+        })
+        .detach();
+    });
+    draw(cx);
+    let chip = cx.debug_bounds("composer-review").unwrap().center();
+    cx.simulate_click(chip, gpui::Modifiers::none());
+    draw(cx);
+    assert_eq!(requests.get(), 1);
+    assert!(cx.debug_bounds("review-composer").is_some());
+    chat.update_in(cx, |view, window, cx| {
+        view.set_review_context(ReviewContext::default(), window, cx)
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("review-submit").is_some());
+    cx.simulate_input("retain focus text");
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    assert!(cx.debug_bounds("review-composer").is_none());
+    chat.read_with(cx, |view, _| {
+        assert_eq!(view.review.draft.note, "retain focus text")
+    });
+    cx.simulate_click(chip, gpui::Modifiers::none());
+    chat.update_in(cx, |view, window, cx| {
+        view.set_review_context(ReviewContext::default(), window, cx)
+    });
+    draw(cx);
+    let button = cx.debug_bounds("review-cancel").unwrap().center();
+    cx.simulate_click(button, gpui::Modifiers::none());
+    draw(cx);
+    assert!(cx.debug_bounds("review-composer").is_none());
+}
+
+#[gpui::test]
+fn review_submit_emits_typed_outcome_without_sending_chat_or_clearing_draft(
+    cx: &mut TestAppContext,
+) {
+    use crate::review::*;
+    let (chat, cx) = setup(vec![], cx);
+    cx.simulate_resize(size(px(1200.), px(900.)));
+    chat.update_in(cx, |view, window, cx| {
+        view.set_backend(gitterm_core::chat::types::AgentBackend::Claude, cx);
+        view.composer
+            .update(cx, |input, cx| input.set_value("chat draft", window, cx));
+        view.toggle_review(window, cx);
+        view.set_review_context(ReviewContext::default(), window, cx);
+    });
+    let outcomes = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captured = outcomes.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&chat, move |_, outcome: &ReviewOutcome, _| {
+            captured.borrow_mut().push(outcome.clone())
+        })
+        .detach();
+    });
+    draw(cx);
+    cx.simulate_input("Check");
+    cx.simulate_keystrokes("enter shift-enter");
+    cx.simulate_input("errors");
+    draw(cx);
+    assert!(
+        outcomes.borrow().is_empty(),
+        "plain Enter and Shift+Enter edit the note"
+    );
+    cx.simulate_keystrokes("cmd-enter");
+    draw(cx);
+    assert_eq!(outcomes.borrow().len(), 1);
+
+    let button = cx.debug_bounds("review-submit").unwrap().center();
+    cx.simulate_click(button, gpui::Modifiers::none());
+    draw(cx);
+    assert_eq!(outcomes.borrow().len(), 2);
+    let expected = ReviewOutcome::Submit {
+        kind: ReviewKind::Review,
+        scope: ReviewScope {
+            reviewer: gitterm_core::settings::ReviewerKind::ClaudeSubagent,
+            model: "opus".into(),
+            target: Some(ReviewTarget::Uncommitted),
+        },
+        note: "Check\n\nerrors".into(),
+    };
+    assert!(outcomes.borrow().iter().all(|outcome| outcome == &expected));
+    chat.read_with(cx, |view, cx| {
+        assert!(view.review.open);
+        assert_eq!(view.review.draft.note, "Check\n\nerrors");
+        assert_eq!(view.composer.read(cx).value(), "chat draft");
+        assert!(view.records.is_empty());
+    });
+}

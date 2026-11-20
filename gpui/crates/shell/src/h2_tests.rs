@@ -239,3 +239,86 @@ fn missing_host_controls_keep_iced_controls_and_report_unavailable(cx: &mut Test
         })
     });
 }
+
+#[gpui::test]
+fn review_consult_shell_shortcuts_reject_in_preview_and_keep_the_draft(cx: &mut TestAppContext) {
+    use gitterm_gpui_chat::review::{ReviewKind, ReviewOutcome};
+    cx.update(install_app_menus);
+    let (root, shell, cx) = fixture(cx);
+    let source = root.path().join("iced");
+    std::fs::write(source.join("settings.json"), r#"{"review":{"default_reviewer":"codex","subagent_model":"fable","codex_model":"gpt-6.1-sol"}}"#).unwrap();
+    let before = ["workspaces.json", "settings.json", "tasks.json"]
+        .map(|file| std::fs::read(source.join(file)).ok());
+    shell.update_in(cx, |shell, window, cx| {
+        shell.select_workspace_id(WorkspaceId(2), window, cx)
+    });
+    draw(cx);
+    let chat = cx.read(|cx| {
+        let shell = shell.read(cx);
+        let state = shell.active(cx);
+        let pane = state.panes[&session_pane_id(state.active_session.unwrap())].read(cx);
+        let pane::PaneContent::PreviewChat(chat) = &pane.content else {
+            panic!("preview chat");
+        };
+        chat.read(cx).test_view()
+    });
+    let outcomes = Rc::new(RefCell::new(vec![]));
+    let captured = outcomes.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&chat, move |_, outcome: &ReviewOutcome, _| {
+            if matches!(outcome, ReviewOutcome::Submit { .. }) {
+                captured.borrow_mut().push(outcome.clone());
+            }
+        })
+        .detach();
+    });
+    click(cx, "composer-review");
+    // The context load is read-only and runs on the background executor.
+    for _ in 0..100 {
+        if cx.debug_bounds("review-submit").is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        draw(cx);
+    }
+    assert!(cx.debug_bounds("review-submit").is_some());
+    click(cx, "review-kind-consult");
+    cx.simulate_input("Explain the lifecycle");
+    draw(cx);
+    cx.simulate_keystrokes("cmd-enter");
+    draw(cx);
+    assert!(
+        cx.debug_bounds("review-error").is_some(),
+        "preview rejection is visible"
+    );
+    assert!(
+        cx.debug_bounds("review-composer").is_some(),
+        "failed submission retains the form"
+    );
+    cx.simulate_keystrokes("ctrl-enter");
+    draw(cx);
+    click(cx, "review-submit");
+    assert_eq!(
+        outcomes.borrow().len(),
+        3,
+        "both shortcuts and the button submit once"
+    );
+    let first = outcomes.borrow()[0].clone();
+    assert!(
+        matches!(&first, ReviewOutcome::Submit { kind: ReviewKind::Consult, scope, note }
+        if note == "Explain the lifecycle" && scope.target.is_none()
+        && scope.reviewer == gitterm_core::settings::ReviewerKind::Codex && scope.model == "gpt-6.1-sol")
+    );
+    assert!(
+        outcomes.borrow().iter().all(|outcome| outcome == &first),
+        "preview rejection keeps the exact draft"
+    );
+    cx.update(|window, cx| chat.focus_handle(cx).focus(window, cx));
+    draw(cx);
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    assert!(cx.debug_bounds("review-composer").is_none());
+    let after = ["workspaces.json", "settings.json", "tasks.json"]
+        .map(|file| std::fs::read(source.join(file)).ok());
+    assert_eq!(before, after, "review preview never writes Iced's stores");
+}

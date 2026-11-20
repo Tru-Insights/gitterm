@@ -3,6 +3,8 @@ mod attachments;
 mod copy;
 #[path = "find.rs"]
 mod find;
+#[path = "review/ui.rs"]
+pub(crate) mod review_ui;
 #[path = "turns.rs"]
 mod turns;
 use copy::CopyTarget;
@@ -59,7 +61,8 @@ actions!(
         FillSlash,
         SubmitSlash,
         CloseSlash,
-        CycleMode
+        CycleMode,
+        SubmitReview
     ]
 );
 
@@ -133,6 +136,7 @@ pub struct ChatView {
     preview: bool,
     composer: Entity<TextareaState>,
     composer_state: crate::composer::ComposerState,
+    pub(crate) review: review_ui::ReviewComposer,
     slash_scroll: gpui::ScrollHandle,
     roster: Vec<roster::RosterEntry>,
     roster_hidden: HashSet<String>,
@@ -168,6 +172,7 @@ pub struct ChatView {
     _subscriptions: Vec<Subscription>,
 }
 impl gpui::EventEmitter<roster::RosterOutcome> for ChatView {}
+impl gpui::EventEmitter<crate::review::ReviewOutcome> for ChatView {}
 
 impl ChatView {
     pub fn new(records: Vec<Record>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -237,6 +242,7 @@ impl ChatView {
             preview: false,
             composer,
             composer_state,
+            review: review_ui::ReviewComposer::new(window, cx),
             slash_scroll: gpui::ScrollHandle::new(),
             roster: vec![],
             roster_hidden: HashSet::new(),
@@ -428,6 +434,9 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) {
         self.composer_state.backend = Some(backend);
+        if backend != gitterm_core::chat::types::AgentBackend::Claude {
+            self.review.open = false;
+        }
         cx.notify();
     }
     fn settings_enabled(&self) -> bool {
@@ -449,6 +458,7 @@ impl ChatView {
             return;
         }
         self.focus_composer(window, cx);
+        self.review.open = false;
         self.composer_state.picker = if self.composer_state.picker == Some(picker) {
             None
         } else {
@@ -1045,6 +1055,9 @@ impl Render for ChatView {
         let copy_owner = owner.clone();
         let composer_focused = self.composer.read(cx).focus_handle(cx).is_focused(window);
         let mut context = String::from("NativeChat");
+        if self.review.open {
+            context.push_str(" IcedReview");
+        }
         if composer_focused && self.read_only_reason.is_none() {
             context.push_str(" IcedComposer");
             let draft = self.composer.read(cx).value();
@@ -1059,6 +1072,14 @@ impl Render for ChatView {
             .debug_selector(|| "native-chat".into())
             .key_context(context.as_str())
             .track_focus(&self.focus)
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if this.review.open && event.keystroke.key == "escape" {
+                    this.close_review(window, cx);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SubmitReview, _, cx| this.submit_review(cx)))
             .on_action(cx.listener(|this, _: &CycleMode, window, cx| this.cycle_mode(window, cx)))
             .on_action(cx.listener(|this, _: &SubmitPrompt, window, cx| this.send(window, cx)))
             .on_action(cx.listener(|this, _: &Newline, window, cx| {
@@ -1090,7 +1111,13 @@ impl Render for ChatView {
                 this.slash_key("escape", w, cx);
             }))
             .capture_action(cx.listener(|this, action: &InputEnter, window, cx| {
-                if action.shift || action.secondary || !this.slash_key("enter", window, cx) {
+                // The native Input binding owns Cmd+Enter before the ancestor
+                // host keymap. Route its secondary Enter through the same outcome.
+                if this.review.open && action.secondary {
+                    this.submit_review(cx);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                } else if action.shift || action.secondary || !this.slash_key("enter", window, cx) {
                     cx.propagate();
                 }
             }))
@@ -1110,13 +1137,18 @@ impl Render for ChatView {
                 }
             }))
             .capture_action(cx.listener(|this, _: &InputEscape, window, cx| {
-                if this.composer_state.picker.take().is_some() {
+                if this.review.open {
+                    this.close_review(window, cx);
+                } else if this.composer_state.picker.take().is_some() {
                     cx.notify();
                 } else if !this.slash_key("escape", window, cx) {
                     cx.propagate();
                 }
             }))
-            .on_click(cx.listener(|this, _, _, cx| {
+            .on_click(cx.listener(|this, _, window, cx| {
+                if this.review.open {
+                    this.close_review(window, cx);
+                }
                 this.composer_state.picker = None;
                 this.composer_state.slash_dismissed = true;
                 cx.notify();
@@ -1138,7 +1170,13 @@ impl Render for ChatView {
                 }
             }))
             .on_action(cx.listener(Self::open_find))
-            .on_action(cx.listener(Self::close_find))
+            .on_action(cx.listener(|this, action: &CloseFind, window, cx| {
+                if this.review.open {
+                    this.close_review(window, cx);
+                } else {
+                    this.close_find(action, window, cx);
+                }
+            }))
             .on_action(
                 cx.listener(|this, _: &NextMatch, window, cx| this.navigate(false, window, cx)),
             )
@@ -1238,6 +1276,7 @@ impl Render for ChatView {
                     .children((!self.images.is_empty()).then(|| self.render_attachments(cx)))
                     .child(self.composer_state.render(
                         &self.composer,
+                        &self.review,
                         self.read_only_reason.clone().or_else(|| {
                             self.callback
                                 .is_none()
