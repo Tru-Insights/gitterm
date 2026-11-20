@@ -945,6 +945,7 @@ fn slash_keyboard_completion_runs_no_arg_commands_and_fills_argument_commands(
         view.set_read_only(None, cx);
         view.composer.update(cx, |input, cx| {
             input.set_value("/", window, cx);
+            input.set_selected_range(1..1, cx);
             input.focus(window, cx);
         });
     });
@@ -957,8 +958,10 @@ fn slash_keyboard_completion_runs_no_arg_commands_and_fills_argument_commands(
         "/checkpoint "
     );
     chat.update_in(cx, |view, window, cx| {
-        view.composer
-            .update(cx, |input, cx| input.set_value("/cl", window, cx))
+        view.composer.update(cx, |input, cx| {
+            input.set_value("/cl", window, cx);
+            input.set_selected_range(3..3, cx);
+        })
     });
     draw(cx);
     cx.simulate_keystrokes("tab");
@@ -972,8 +975,10 @@ fn slash_keyboard_completion_runs_no_arg_commands_and_fills_argument_commands(
     draw(cx);
     assert!(matches!(&intents.borrow()[0], ChatIntent::Send { text, .. } if text == "/clear "));
     chat.update_in(cx, |view, window, cx| {
-        view.composer
-            .update(cx, |input, cx| input.set_value("/cl", window, cx))
+        view.composer.update(cx, |input, cx| {
+            input.set_value("/cl", window, cx);
+            input.set_selected_range(3..3, cx);
+        })
     });
     draw(cx);
     cx.simulate_keystrokes("escape enter");
@@ -1265,4 +1270,202 @@ fn iced_footer_chip_order_and_host_roster_render_below_input(cx: &mut TestAppCon
     draw(cx);
     assert!(cx.debug_bounds("roster-worker-1").is_none());
     chat.read_with(cx, |view, _| assert!(view.activity_tick.is_none()));
+}
+
+#[gpui::test]
+fn roster_click_and_dismiss_emit_typed_outcomes_and_dismissal_survives_refresh(
+    cx: &mut TestAppContext,
+) {
+    use roster::RosterOutcome;
+    let (chat, cx) = setup(vec![], cx);
+    let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captured = events.clone();
+    let _subscription = cx.update(|_, cx| {
+        cx.subscribe(&chat, move |_, outcome: &RosterOutcome, _| {
+            captured.borrow_mut().push(outcome.clone())
+        })
+    });
+    let row = roster::RosterEntry {
+        id: "worker".into(),
+        name: "Worker".into(),
+        model: String::new(),
+        checkout: String::new(),
+        activity: "Working".into(),
+        state: roster::WorkerState::Running,
+        started_at_ms: 0,
+        ended_at_ms: None,
+    };
+    chat.update_in(cx, |view, _, cx| view.set_roster(vec![row.clone()], cx));
+    draw(cx);
+    let bounds = cx.debug_bounds("roster-worker").unwrap();
+    cx.simulate_click(
+        bounds.origin + gpui::point(px(20.), px(8.)),
+        gpui::Modifiers::none(),
+    );
+    draw(cx);
+    assert_eq!(
+        *events.borrow(),
+        [RosterOutcome::Open {
+            id: "worker".into()
+        }]
+    );
+    let dismiss = cx.debug_bounds("roster-dismiss-worker").unwrap();
+    cx.simulate_click(dismiss.center(), gpui::Modifiers::none());
+    draw(cx);
+    assert_eq!(
+        *events.borrow(),
+        [
+            RosterOutcome::Open {
+                id: "worker".into()
+            },
+            RosterOutcome::Dismiss {
+                id: "worker".into()
+            }
+        ]
+    );
+    chat.update_in(cx, |view, _, cx| view.set_roster(vec![row], cx));
+    draw(cx);
+    assert!(cx.debug_bounds("roster-worker").is_none());
+}
+
+#[gpui::test]
+fn slash_click_fills_without_sending_and_caret_before_end_hides_menu(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(
+        vec![Record {
+            at_ms: None,
+            entry: Entry::Harness(HarnessEvent::Ready {
+                session_id: None,
+                permission_mode: None,
+                models: vec![],
+                modes: vec![],
+                commands: vec![serde_json::json!({"name":"clear"})],
+            }),
+        }],
+        cx,
+    );
+    let sends = Rc::new(std::cell::Cell::new(0));
+    let captured = sends.clone();
+    chat.update_in(cx, |view, window, cx| {
+        view.set_read_only(None, cx);
+        view.set_intent_callback(
+            Rc::new(move |_, _| {
+                captured.set(captured.get() + 1);
+                Receipt::rejected("fixture")
+            }),
+            cx,
+        );
+        view.composer.update(cx, |input, cx| {
+            input.set_value("/cl", window, cx);
+            input.set_selected_range(3..3, cx);
+            input.focus(window, cx);
+        });
+    });
+    draw(cx);
+    let outside = cx.debug_bounds("native-chat").unwrap().origin + gpui::point(px(2.), px(2.));
+    cx.simulate_click(outside, gpui::Modifiers::none());
+    draw(cx);
+    assert!(cx.debug_bounds("slash-commands").is_none());
+    let composer = cx.debug_bounds("composer-input").unwrap();
+    // Click beyond the draft on the text area's first line.
+    cx.simulate_click(
+        composer.origin + gpui::point(composer.size.width - px(20.), composer.size.height / 2.),
+        gpui::Modifiers::none(),
+    );
+    draw(cx);
+    chat.update_in(cx, |view, window, cx| {
+        let input = view.composer.read(cx);
+        assert!(
+            !view.composer_state.slash_dismissed
+                && input.selected_range().start == input.value().len()
+                && input.focus_handle(cx).is_focused(window),
+            "dismissed={} range={:?} focused={} draft={:?}",
+            view.composer_state.slash_dismissed,
+            input.selected_range(),
+            input.focus_handle(cx).is_focused(window),
+            input.value()
+        );
+    });
+    let command = cx.debug_bounds("slash-clear").unwrap();
+    cx.simulate_click(command.center(), gpui::Modifiers::none());
+    draw(cx);
+    assert_eq!(sends.get(), 0);
+    assert_eq!(
+        chat.read_with(cx, |view, cx| view.composer.read(cx).value().to_string()),
+        "/clear "
+    );
+    chat.update_in(cx, |view, window, cx| {
+        view.composer.update(cx, |input, cx| {
+            input.set_value("/cl", window, cx);
+            input.set_selected_range(1..1, cx);
+        })
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("slash-commands").is_none());
+}
+
+#[gpui::test]
+fn image_paste_suppresses_text_adds_thumbnail_sends_payload_and_remove_restores_focus(
+    cx: &mut TestAppContext,
+) {
+    let (chat, cx) = setup(vec![], cx);
+    let intents = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captured = intents.clone();
+    chat.update_in(cx, |view, window, cx| {
+        view.set_read_only(None, cx);
+        view.set_intent_callback(
+            Rc::new(move |intent, _| {
+                captured.borrow_mut().push(intent);
+                Receipt::rejected("synthetic rejection retains images")
+            }),
+            cx,
+        );
+        view.focus_composer(window, cx);
+        let image = gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            include_bytes!("../../../../../assets/icon.iconset/icon_32x32.png").to_vec(),
+        );
+        cx.write_to_clipboard(ClipboardItem {
+            entries: vec![
+                gpui::ClipboardEntry::Image(image),
+                gpui::ClipboardEntry::String("image file name".to_string().into()),
+            ],
+        });
+    });
+    draw(cx);
+    cx.simulate_keystrokes("cmd-v");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        draw(cx);
+        if chat.read_with(cx, |view, _| view.preparing_image.is_none()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "image preparation did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    chat.read_with(cx, |view, cx| {
+        assert_eq!(view.images.len(), 1, "{:?}", view.composer_state.notice);
+        assert!(view.image_previews[0].is_some());
+        assert!(
+            view.composer.read(cx).value().is_empty(),
+            "image paste must consume its text form"
+        );
+    });
+    cx.simulate_keystrokes("enter");
+    draw(cx);
+    assert!(
+        matches!(&intents.borrow()[0], ChatIntent::Send { text, images } if text.is_empty() && images.len() == 1 && images[0].media_type == "image/png")
+    );
+    let remove = cx
+        .debug_bounds("remove-image-0")
+        .expect("thumbnail remove control");
+    cx.simulate_click(remove.center(), gpui::Modifiers::none());
+    draw(cx);
+    chat.update_in(cx, |view, window, cx| {
+        assert!(view.images.is_empty());
+        assert!(view.image_previews.is_empty());
+        assert!(view.composer.read(cx).focus_handle(cx).is_focused(window));
+    });
 }
