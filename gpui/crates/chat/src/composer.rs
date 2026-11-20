@@ -33,7 +33,7 @@ impl QueuedRow {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashCommand {
     pub name: String,
     pub description: String,
@@ -52,6 +52,7 @@ pub struct ComposerState {
     pub checkout: String,
     pub checkout_path: Option<String>,
     pub commands: Vec<SlashCommand>,
+    pub commands_ready: bool,
     pub notice: Option<String>,
     started_at_ms: Option<u64>,
     ended_at_ms: Option<u64>,
@@ -215,6 +216,7 @@ impl ComposerState {
                 withdraw_pending: queued.withdraw_pending,
             })
             .collect();
+        self.commands_ready = ready.is_some();
         self.commands = state
             .conversation
             .iter()
@@ -289,11 +291,54 @@ impl ComposerState {
         if prefix.chars().any(char::is_whitespace) {
             return vec![];
         }
-        self.commands
+        let query = prefix.to_lowercase();
+        let mut matches: Vec<_> = self
+            .commands
             .iter()
-            .filter(|command| command.name.starts_with(prefix))
-            .collect()
+            .filter(|command| command.name.to_lowercase().contains(&query))
+            .collect();
+        // Stable sort keeps the harness order within Iced's exact/prefix/within groups.
+        matches.sort_by_key(|command| {
+            let name = command.name.to_lowercase();
+            if name == query {
+                0
+            } else if name.starts_with(&query) {
+                1
+            } else {
+                2
+            }
+        });
+        matches
     }
+
+    pub fn slash_key(&mut self, draft: &str, key: &str) -> SlashOutcome {
+        let matches = self.slash_matches(draft);
+        if matches.is_empty() {
+            return SlashOutcome::Ignored;
+        }
+        let count = matches.len();
+        let index = self.slash_index.min(count - 1);
+        match key {
+            "down" => self.slash_index = (index + 1) % count,
+            "up" => self.slash_index = (index + count - 1) % count,
+            "escape" => self.slash_dismissed = true,
+            "tab" | "enter" => {
+                return SlashOutcome::Fill {
+                    name: matches[index].name.clone(),
+                    submit: key == "enter" && matches[index].argument_hint.is_empty(),
+                };
+            }
+            _ => return SlashOutcome::Ignored,
+        }
+        SlashOutcome::Handled
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SlashOutcome {
+    Ignored,
+    Handled,
+    Fill { name: String, submit: bool },
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -316,7 +361,7 @@ mod ui {
     use super::*;
     use crate::view::ChatView;
     use gpui::{
-        Context, Entity, InteractiveElement, IntoElement, ParentElement,
+        Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement,
         StatefulInteractiveElement, Styled, div, px, rgb,
     };
     use gpui_component::{
@@ -354,11 +399,23 @@ mod ui {
             input: &Entity<TextareaState>,
             unavailable: Option<String>,
             send_blocked: bool,
+            slash_scroll: &gpui::ScrollHandle,
+            window: &gpui::Window,
             cx: &mut Context<ChatView>,
         ) -> impl IntoElement {
             let disabled = unavailable.is_some();
+            let owner = cx.entity().downgrade();
             let draft = input.read(cx).value();
-            div().flex().flex_col().gap(px(6.))
+            let show_slash = !disabled
+                && input.read(cx).focus_handle(cx).is_focused(window)
+                && input.read(cx).selected_range().start == draft.len();
+            div().id("composer-controls").debug_selector(|| "composer-controls".into()).relative().flex().flex_col().gap(px(6.))
+                .capture_any_mouse_down(cx.listener(|view, _, _, cx| view.reopen_slash(cx)))
+                .on_click(cx.listener(|view, _, _, cx| { view.reopen_slash(cx); cx.stop_propagation(); }))
+                .on_drop(cx.listener(|view, paths: &gpui::ExternalPaths, window, cx| {
+                    view.attach_paths(paths.0.to_vec(), cx);
+                    view.focus_composer(window, cx);
+                }))
                 .child(div().id("composer-queue").max_h(px(160.)).overflow_y_scroll().children(self.queue.iter().map(|row| {
                     let id = row.id.clone();
                     div().flex().gap(px(8.)).child(div().flex_1().child(format!("{} · {} · {}", row.id, row.label(), row.text)))
@@ -367,20 +424,43 @@ mod ui {
                             .on_click(cx.listener(move |view, _, _, cx| view.withdraw(id.clone(), cx))))
                 })))
                 .children(self.notice.iter().map(|notice| div().text_color(rgb(0xf38ba8)).child(notice.clone())))
-                .child(Textarea::new(input).disabled(disabled).bg(rgb(0x181825))
-                    .text_size(px(15. * 13.5 / 14.)).border_color(rgb(0x585b70)).rounded(px(6.)))
-                .child(div().id("slash-commands").max_h(px(100.)).overflow_y_scroll().children(self.slash_matches(&draft).into_iter().enumerate().map(|(index, command)| {
-                    let name = command.name.clone();
-                    let arguments = !command.argument_hint.is_empty();
-                    Button::new(gpui::SharedString::from(format!("slash-{name}")))
-                        .label(format!("{} /{} {} · {}", if index == self.slash_index { "›" } else { "" }, name, command.argument_hint, command.description))
-                        .disabled(disabled)
-                        .on_click(cx.listener(move |view, _, window, cx| {
-                            view.select_slash(&name, window, cx);
-                            if !arguments { view.send(window, cx); }
-                        }))
-                })))
-                .child(div().flex().justify_end().gap(px(6.))
+                .child(div().id("composer-input").debug_selector(|| "composer-input".into()).child(Textarea::new(input).disabled(disabled)
+                    .on_paste(move |item, _, cx| owner.update(cx, |view, cx| view.paste_images(item, cx)).unwrap_or(false))
+                    .bg(rgb(0x181825))
+                    .text_size(px(15. * 13.5 / 14.)).border_color(rgb(0x585b70)).rounded(px(6.))))
+                .children(show_slash.then(|| {
+                    let matches = self.slash_matches(&draft);
+                    let waiting = !self.commands_ready && !self.slash_dismissed && draft.starts_with('/') && !draft[1..].chars().any(char::is_whitespace);
+                    let selected = self.slash_index.min(matches.len().saturating_sub(1));
+                    (!matches.is_empty() || waiting).then(|| {
+                        div().id("slash-commands").debug_selector(|| "slash-commands".into())
+                            .absolute().bottom(gpui::relative(1.)).left_0().right_0()
+                            .max_h(px(360.)).overflow_y_scroll().track_scroll(slash_scroll)
+                            .flex().flex_col().p(px(6.)).bg(rgb(0x313244)).border_1().border_color(rgb(0x585b70)).rounded(px(6.))
+                            .child(div().text_size(px(12.)).text_color(rgb(0x7f849c)).child(if waiting {
+                                "Commands · listed after the session starts"
+                            } else { "Commands · ↑↓ choose · Enter runs · Tab fills in" }))
+                            .children(matches.into_iter().enumerate().map(|(index, command)| {
+                                let name = command.name.clone();
+                                let selector = format!("slash-{name}");
+                                Button::new(gpui::SharedString::from(format!("slash-{name}")))
+                                    .debug_selector(move || selector.clone())
+                                    .px(px(8.)).py(px(5.)).cursor_pointer()
+                                    .w_full().h_auto().justify_start()
+                                    .bg(rgb(if index == selected { 0x45475a } else { 0x313244 }))
+                                    .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| { window.prevent_default(); cx.stop_propagation(); })
+                                    .on_click(cx.listener(move |view, _, window, cx| view.select_slash(&name, window, cx)))
+                                    .child(div().flex().flex_col().items_start()
+                                        .child(div().child(format!("/{} {}", command.name, command.argument_hint)))
+                                        .child(div().text_size(px(12.)).text_color(rgb(0x7f849c)).child(command.description.clone())))
+                            }))
+                    })
+                }).flatten())
+                .child(div().flex().items_center().gap(px(6.))
+                    .child(Button::new("attach-image").debug_selector(|| "composer-attach".into())
+                        .label("Attach image").tooltip("Attach images, paste, or drop them here")
+                        .disabled(disabled).on_click(cx.listener(|view, _, window, cx| view.pick_images(window, cx))))
+                    .child(div().flex_1())
                     .child(Button::new("send").debug_selector(|| "composer-send".into())
                         .child(div().text_size(px(15. * 13. / 14.)).child("Send")).px(px(14.)).py(px(5.)).h_auto().bg(rgb(0x89b4fa)).text_color(rgb(0x1e1e2e))
                         .disabled(send_blocked)

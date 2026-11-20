@@ -145,3 +145,81 @@ fn normal_chat_sources_do_not_render_fixture_or_capability_banners() {
         }
     }
 }
+
+#[test]
+fn slash_matches_iced_exact_prefix_within_case_and_catalog_order() {
+    let state = ComposerState {
+        commands: ["pr-ready", "help", "pr", "checkpoint", "PRint", "ship-pr"]
+            .into_iter()
+            .map(|name| SlashCommand {
+                name: name.into(),
+                description: String::new(),
+                argument_hint: String::new(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let names = |draft: &str| {
+        state
+            .slash_matches(draft)
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names("/"),
+        ["pr-ready", "help", "pr", "checkpoint", "PRint", "ship-pr"]
+    );
+    assert_eq!(names("/PR"), ["pr", "pr-ready", "PRint", "ship-pr"]);
+    assert_eq!(names("/e"), ["pr-ready", "help", "checkpoint"]);
+    for draft in ["text /pr", "/pr ", "/pr\n", "/missing"] {
+        assert!(names(draft).is_empty());
+    }
+}
+
+#[test]
+fn slash_navigation_wraps_escape_hides_tab_fills_and_enter_obeys_argument_hint() {
+    let mut state = ComposerState {
+        commands: vec![
+            SlashCommand {
+                name: "clear".into(),
+                description: String::new(),
+                argument_hint: String::new(),
+            },
+            SlashCommand {
+                name: "checkpoint".into(),
+                description: String::new(),
+                argument_hint: "[message]".into(),
+            },
+        ],
+        ..Default::default()
+    };
+    assert_eq!(state.slash_key("/", "up"), SlashOutcome::Handled);
+    assert_eq!(state.slash_index, 1);
+    assert_eq!(
+        state.slash_key("/", "enter"),
+        SlashOutcome::Fill {
+            name: "checkpoint".into(),
+            submit: false
+        }
+    );
+    state.slash_key("/", "down");
+    assert_eq!(state.slash_index, 0);
+    assert_eq!(
+        state.slash_key("/", "tab"),
+        SlashOutcome::Fill {
+            name: "clear".into(),
+            submit: false
+        }
+    );
+    assert_eq!(
+        state.slash_key("/", "enter"),
+        SlashOutcome::Fill {
+            name: "clear".into(),
+            submit: true
+        }
+    );
+    assert_eq!(state.slash_key("/", "escape"), SlashOutcome::Handled);
+    assert!(state.slash_matches("/").is_empty());
+    assert_eq!(state.slash_key("/", "enter"), SlashOutcome::Ignored);
+}
