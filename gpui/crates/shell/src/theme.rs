@@ -83,7 +83,6 @@ impl Palette {
 }
 /// Apply persisted font/theme settings without reading or writing a config root.
 /// The host supplies the settings from its existing settings owner.
-#[allow(dead_code)] // Host settings hookup is outside this theme-only task.
 pub fn apply_settings<C, U, R>(
     settings: &gitterm_core::settings::Settings<C, U, R>,
     window: Option<&mut Window>,
@@ -99,6 +98,18 @@ pub fn apply_settings<C, U, R>(
         t.font_size = px(ui.clamp(10., 24.));
         t.mono_font_size = px(terminal.clamp(10., 24.));
     });
+}
+
+pub fn sync_terminal_typography(view: &gpui::Entity<gitterm_terminal::TerminalView>, cx: &mut App) {
+    let theme = Theme::global(cx);
+    let current = view.read(cx).config();
+    if current.font_family == theme.mono_font_family && current.font_size == theme.mono_font_size {
+        return;
+    }
+    let mut config = current.clone();
+    config.font_family = theme.mono_font_family.to_string();
+    config.font_size = theme.mono_font_size;
+    view.update(cx, |view, cx| view.update_config(config, cx));
 }
 
 pub fn apply(dark: bool, window: Option<&mut Window>, cx: &mut App) {
@@ -191,7 +202,62 @@ pub fn apply(dark: bool, window: Option<&mut Window>, cx: &mut App) {
 mod tests {
     use super::*;
     use crate::settings::FixtureSettings;
-    use gpui::{Hsla, TestAppContext};
+    use gpui::{AppContext as _, Hsla, TestAppContext};
+
+    #[gpui::test]
+    fn terminal_view_uses_shared_font_settings(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let view = cx.new(|cx| {
+            gitterm_terminal::TerminalView::new_deferred(
+                gitterm_terminal::BackendSettings::default(),
+                gitterm_terminal::TerminalConfig::default(),
+                cx,
+            )
+        });
+        cx.update(|cx| {
+            let settings = FixtureSettings {
+                terminal_font_size: 19.,
+                ..Default::default()
+            };
+            apply_settings(&settings, None, cx);
+            sync_terminal_typography(&view, cx);
+            sync_terminal_typography(&view, cx);
+            // Headless GPUI has no installed fonts and resolves Menlo to its fallback.
+            assert_eq!(
+                view.read(cx).config().font_family,
+                Theme::global(cx).mono_font_family
+            );
+            assert_eq!(view.read(cx).config().font_size, px(19.));
+            assert_eq!(view.read(cx).config().scrollback, 100_000);
+        });
+    }
+
+    #[gpui::test]
+    fn startup_settings_fixture_applies_light_and_missing_uses_defaults(cx: &mut TestAppContext) {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(
+            fixture.path().join("settings.json"),
+            br#"{"theme":"light","ui_font_size":17,"terminal_font_size":19}"#,
+        )
+        .unwrap();
+        let settings = crate::workspace_config::load_iced_settings_from(fixture.path());
+        let defaults =
+            crate::workspace_config::load_iced_settings_from(&fixture.path().join("absent"));
+        cx.update(gpui_component::init);
+        cx.update(|cx| {
+            apply_settings(&settings, None, cx);
+            let theme = Theme::global(cx);
+            assert_eq!(theme.mode, ThemeMode::Light);
+            assert_eq!(theme.font_family, LABEL_FONT);
+            assert_eq!(theme.font_size, px(17.));
+            assert_eq!(theme.mono_font_size, px(19.));
+            apply_settings(&defaults, None, cx);
+            let theme = Theme::global(cx);
+            assert_eq!(theme.mode, ThemeMode::Dark);
+            assert_eq!(theme.font_size, px(UI_FONT_SIZE));
+            assert_eq!(theme.mono_font_size, px(TERMINAL_FONT_SIZE));
+        });
+    }
 
     // Read the authoritative constants so a future Iced palette change cannot
     // leave the GPUI expectations silently pinned to an obsolete copy.

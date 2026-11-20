@@ -1,6 +1,7 @@
 #![cfg(target_os = "macos")]
 extern crate gpui_kit as gpui;
 
+pub mod bottom_panel;
 #[cfg(test)]
 mod center_tests;
 mod chat;
@@ -67,7 +68,7 @@ use std::{
     path::Path,
     rc::Rc,
 };
-use theme::{Palette, UI_FONT_SIZE};
+use theme::Palette;
 
 #[derive(Clone, PartialEq, Action)]
 #[action(no_json)]
@@ -1619,6 +1620,15 @@ impl Shell {
             .min_w_0()
             .h_full()
             .overflow_hidden()
+            .when(
+                pane.is_some_and(|pane| {
+                    matches!(
+                        pane.read(cx).content,
+                        pane::PaneContent::Chat(_) | pane::PaneContent::PreviewChat(_)
+                    )
+                }),
+                |pane| pane.font_family(".SystemUIFont"),
+            )
             .children(pane.cloned())
     }
     fn bottom_panel(&self, cx: &Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
@@ -1715,6 +1725,17 @@ impl Focusable for Shell {
 }
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for state in &self.workspaces {
+            for pane in state.panes.values() {
+                let terminal = match &pane.read(cx).content {
+                    pane::PaneContent::Terminal(view) => Some(view.clone()),
+                    _ => None,
+                };
+                if let Some(view) = terminal {
+                    theme::sync_terminal_typography(&view, cx);
+                }
+            }
+        }
         self.sync_content_selection(cx);
         self.content
             .update(cx, |content, cx| content.sync_covers(window, cx));
@@ -1725,6 +1746,8 @@ impl Render for Shell {
                 .relative()
                 .size_full()
                 .flex()
+                .font_family(gpui_component::Theme::global(cx).font_family.clone())
+                .text_size(gpui_component::Theme::global(cx).font_size)
                 .bg(rgb(p.base))
                 .text_color(rgb(p.text))
                 .child(self.spine(cx))
@@ -1795,8 +1818,8 @@ impl Render for Shell {
                     .update(cx, |content, cx| content.sync_covers(w, cx));
             }))
             .flex()
-            .font_family(".SystemUIFont")
-            .text_size(px(UI_FONT_SIZE))
+            .font_family(gpui_component::Theme::global(cx).font_family.clone())
+            .text_size(gpui_component::Theme::global(cx).font_size)
             .text_color(rgb(p.text))
             .bg(rgb(p.base))
             .on_mouse_move(
@@ -1881,6 +1904,7 @@ fn bind_workspace_keys(cx: &mut App) {
 }
 
 pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
+    let settings = workspace_config::load_iced_settings();
     let preview = preview::PreviewContext::from_environment(sample)?;
     let config = preview.roots.layout();
     let mut store = workspace_config::WorkspaceStore::guarded(preview.writer());
@@ -1897,7 +1921,7 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
     gpui_kit::application().run(move |cx| {
         preview.release_on_quit(cx);
         gpui_kit::init(cx);
-        theme::apply(true, None, cx);
+        theme::apply_settings(&settings, None, cx);
         for (index, (session_key, workspace_key)) in [
             ("cmd-1", "ctrl-1"),
             ("cmd-2", "ctrl-2"),
