@@ -11,6 +11,8 @@ pub mod data;
 mod dialogs;
 pub mod files;
 mod files_view;
+#[cfg(test)]
+mod hookup_tests;
 mod layout;
 mod owner;
 mod pane;
@@ -22,12 +24,15 @@ mod region_tests;
 pub mod remote;
 mod review_reload;
 pub mod session_picker;
+pub mod session_strip;
 mod sessions;
 pub mod settings;
+pub mod spine;
 pub mod tasks;
 mod theme;
 pub mod usage;
 pub mod work_sidebar;
+pub mod workspace_bar;
 pub mod workspace_config;
 pub mod workspace_sheet;
 pub mod workspace_status;
@@ -45,7 +50,7 @@ use gpui::{
     size,
 };
 use gpui_component::{
-    Root, Selectable,
+    Disableable, Root, Selectable,
     button::{Button, ButtonVariants},
     dock::{
         DockArea, DockEvent, DockLayout, DockPlacement, DockSkin, PanelId, PanelStyle,
@@ -73,7 +78,10 @@ struct SelectSession {
 struct SelectWorkspace {
     index: usize,
 }
-actions!(gitterm_shell, [ShowShortcuts, NewTerminal, NewClaudeChat]);
+actions!(
+    gitterm_shell,
+    [ShowShortcuts, NewTerminal, NewClaudeChat, CloseWorkspace]
+);
 
 struct WorkspaceDock {
     runtime_uid: u64,
@@ -98,6 +106,13 @@ pub struct Shell {
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
     resize: Option<(bool, f32, f32)>,
+    session_picker: Option<Entity<session_picker::SessionPicker>>,
+    picker_subscription: Option<Subscription>,
+    park_sheet: Option<Entity<park_sheet::ParkSheet>>,
+    park_subscription: Option<Subscription>,
+    work_state: Rc<RefCell<gitterm_core::work::state::State>>,
+    work_sidebars: HashMap<WorkspaceId, Entity<work_sidebar::WorkSidebar>>,
+    work_subscriptions: HashMap<WorkspaceId, Subscription>,
     #[cfg(test)]
     dock_fixture: bool,
 }
@@ -142,7 +157,9 @@ impl Shell {
             .map(|workspace| workspace.id)
             .collect();
         owner.update(cx, |owner, _| owner.stopped_workspaces = stopped_workspaces);
-        if let Some(first) = catalog.first() {
+        if owner.read(cx).model.active().is_none()
+            && let Some(first) = catalog.first()
+        {
             owner.update(cx, |owner, cx| {
                 owner.dispatch(Intent::Activate(first.id), Instant::now(), cx)
             });
@@ -200,6 +217,15 @@ impl Shell {
         })];
         for state in &mut workspaces {
             load_workspace_layout(state, window, cx)?;
+            if owner.read(cx).iced_workspace(state.workspace.id).is_some()
+                && let Some(id) = state.active_session
+                && let Some(pane) = state.panes.get(&session_pane_id(id))
+            {
+                let panel = PanelId::from(pane.entity_id());
+                state
+                    .dock
+                    .update(cx, |dock, cx| dock.select_panel(panel, window, cx));
+            }
             subscriptions.push(subscribe_dock(state, cx));
             subscriptions.push(observe_content_dock(&state.dock, cx));
             if local {
@@ -247,6 +273,13 @@ impl Shell {
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
             resize: None,
+            session_picker: None,
+            picker_subscription: None,
+            park_sheet: None,
+            park_subscription: None,
+            work_state: Default::default(),
+            work_sidebars: HashMap::new(),
+            work_subscriptions: HashMap::new(),
             #[cfg(test)]
             dock_fixture: false,
         };
@@ -561,12 +594,17 @@ impl Shell {
     }
     fn select_workspace(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(id) = self
-            .workspaces
-            .iter()
-            .filter(|state| state.on_bar())
-            .nth(index)
-            .map(|state| state.workspace.id)
+            .visible_workspace_indices(cx)
+            .get(index)
+            .map(|&i| self.workspaces[i].workspace.id)
         {
+            if Some(id) != self.active_workspace(cx) {
+                self.session_picker = None;
+                self.picker_subscription = None;
+                self.park_sheet = None;
+                self.park_subscription = None;
+                self.cover_sheet(false, window, cx);
+            }
             self.owner.update(cx, |owner, cx| {
                 owner.dispatch(Intent::Activate(id), Instant::now(), cx)
             });
@@ -686,10 +724,14 @@ impl Shell {
             .iter_mut()
             .find(|w| Some(w.workspace.id) == active)
             .unwrap();
-        let cwd = self
-            .data
-            .terminal_cwd(state.workspace.id, cx)
-            .expect("local workspace folder");
+        let Some(cwd) = self.data.terminal_cwd(state.workspace.id, cx) else {
+            self.owner.update(cx, |owner, cx| {
+                owner.error =
+                    Some("Remote workspace sessions are read-only in this preview".into());
+                cx.notify();
+            });
+            return;
+        };
         let mut id = layout::stable_path_hash(&cwd);
         while used.contains(&id) {
             id = id.wrapping_add(1);
@@ -1004,7 +1046,39 @@ fn build_workspace(
     let stopped = data
         .local_owner()
         .is_some_and(|owner| owner.read(cx).stopped_workspaces.contains(&workspace.id));
-    let sessions = if local {
+    let imported = data
+        .local_owner()
+        .is_some_and(|owner| owner.read(cx).iced_workspace(workspace.id).is_some());
+    let sessions = if imported {
+        let mut sessions = data.sessions(workspace.id, cx);
+        let mut terminals = store
+            .load_terminals()
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "load preview terminal sessions {}: {error:#}",
+                    store.path.display()
+                );
+                None
+            })
+            .unwrap_or_default();
+        terminals.retain(|terminal| {
+            !session_ids.contains(&terminal.id) && !sessions.iter().any(|s| s.id.0 == terminal.id)
+        });
+        sessions.extend(terminals.iter().map(|terminal| {
+            Session {
+                id: SessionId(terminal.id),
+                title: terminal
+                    .cwd
+                    .file_name()
+                    .unwrap_or(terminal.cwd.as_os_str())
+                    .to_string_lossy()
+                    .into_owned(),
+                kind: data::SessionKind::Terminal,
+            }
+        }));
+        store.terminals = Some(terminals);
+        sessions
+    } else if local {
         let restored = store.load_terminals().unwrap_or_else(|error| {
             eprintln!("load terminal sessions {}: {error:#}", store.path.display());
             None
@@ -1042,7 +1116,9 @@ fn build_workspace(
             Pane::new(
                 id.clone(),
                 session.title.clone(),
-                if let Some(terminals) = &store.terminals {
+                if let Some(text) = data.imported_session(workspace.id, session.id, cx) {
+                    PaneKind::IcedSession(text)
+                } else if let Some(terminals) = &store.terminals {
                     let cwd = terminals
                         .iter()
                         .find(|t| t.id == session.id.0)
@@ -1092,7 +1168,9 @@ fn build_workspace(
     Ok(WorkspaceDock {
         runtime_uid: sessions::fresh_target().tab_id as u64,
         parked: None,
-        active_session: sessions.first().map(|s| s.id),
+        active_session: data
+            .active_session(workspace.id, cx)
+            .or_else(|| sessions.first().map(|s| s.id)),
         store,
         workspace,
         sessions,
@@ -1141,11 +1219,11 @@ impl Shell {
             .flex()
             .flex_col()
             .children(
-                self.workspaces
-                    .iter()
-                    .filter(|w| w.on_bar())
+                self.visible_workspace_indices(cx)
+                    .into_iter()
                     .enumerate()
-                    .map(|(index, state)| {
+                    .map(|(index, i)| {
+                        let state = &self.workspaces[i];
                         Button::new(("spine-workspace", index))
                             .ghost()
                             .label(
@@ -1167,12 +1245,27 @@ impl Shell {
                     }),
             )
     }
-    fn workspace_bar_items(&self, cx: &App) -> Vec<(usize, WorkspaceId, String)> {
+    fn visible_workspace_indices(&self, cx: &App) -> Vec<usize> {
+        if let Some(catalog) = self.owner.read(cx).iced_catalog() {
+            let visible = catalog.visible_order(self.active_workspace(cx));
+            return visible
+                .into_iter()
+                .filter(|&i| self.workspaces[i].on_bar())
+                .collect();
+        }
         self.workspaces
             .iter()
-            .filter(|w| w.on_bar())
             .enumerate()
-            .map(|(index, state)| {
+            .filter(|(_, w)| w.on_bar())
+            .map(|(i, _)| i)
+            .collect()
+    }
+    fn workspace_bar_items(&self, cx: &App) -> Vec<(usize, WorkspaceId, String)> {
+        self.visible_workspace_indices(cx)
+            .into_iter()
+            .enumerate()
+            .map(|(index, i)| {
+                let state = &self.workspaces[i];
                 let active = Some(state.workspace.id) == self.active_workspace(cx);
                 let label = if active {
                     state.workspace.name.clone()
@@ -1191,6 +1284,64 @@ impl Shell {
     }
     fn workspace_bar(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
         let p = Palette::current(cx);
+        let layout = self
+            .owner
+            .read(cx)
+            .iced_catalog()
+            .map(|catalog| catalog.bar_layout(self.active_workspace(cx)));
+        let menu_items: Vec<_> = layout
+            .as_ref()
+            .into_iter()
+            .flat_map(|layout| &layout.sections)
+            .flat_map(|section| &section.workspaces)
+            .filter_map(|&i| self.workspaces.get(i))
+            .filter(|w| w.on_bar())
+            .map(|w| (w.workspace.id, w.workspace.name.clone()))
+            .collect();
+        let owner = cx.entity().downgrade();
+        let mut chips: Vec<_> = self
+            .workspace_bar_items(cx)
+            .into_iter()
+            .map(|(index, id, label)| {
+                div()
+                    .id(("workspace-chip", index))
+                    .debug_selector(move || format!("workspace-chip-{index}"))
+                    .h_full()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .bg(rgb(if Some(id) == self.active_workspace(cx) {
+                        p.surface
+                    } else {
+                        p.mantle
+                    }))
+                    .child(
+                        Button::new(("workspace", index))
+                            .ghost()
+                            .selected(Some(id) == self.active_workspace(cx))
+                            .label(label)
+                            .h(px(27.))
+                            .accessibility_label(
+                                self.workspaces
+                                    .iter()
+                                    .find(|w| w.workspace.id == id)
+                                    .expect("bar workspace")
+                                    .workspace
+                                    .name
+                                    .clone(),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.select_workspace(index, window, cx)
+                            })),
+                    )
+            })
+            .collect();
+        let split = layout
+            .as_ref()
+            .map(|layout| layout.work.len())
+            .unwrap_or(chips.len());
+        let after = chips.split_off(split.min(chips.len()));
         div()
             .id("workspace-bar")
             .debug_selector(|| "workspace-bar".into())
@@ -1201,49 +1352,44 @@ impl Shell {
             .bg(rgb(p.mantle))
             .border_t_1()
             .border_color(rgb(p.surface))
-            .children(
-                self.workspace_bar_items(cx)
-                    .into_iter()
-                    .map(|(index, id, label)| {
-                        div()
-                            .id(("workspace-chip", index))
-                            .debug_selector(move || format!("workspace-chip-{index}"))
-                            .h_full()
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .cursor_pointer()
-                            .bg(rgb(if Some(id) == self.active_workspace(cx) {
-                                p.surface
-                            } else {
-                                p.mantle
-                            }))
-                            .child(
-                                Button::new(("workspace", index))
-                                    .ghost()
-                                    .selected(Some(id) == self.active_workspace(cx))
-                                    .label(label)
-                                    .h(px(27.))
-                                    .accessibility_label(
-                                        self.workspaces
-                                            .iter()
-                                            .find(|w| w.workspace.id == id)
-                                            .expect("bar workspace")
-                                            .workspace
-                                            .name
-                                            .clone(),
-                                    )
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.select_workspace(index, window, cx)
-                                    })),
-                            )
-                    }),
-            )
+            .children(chips)
+            .when(layout.is_some(), |bar| {
+                bar.child(
+                    Button::new("iced-workspaces-menu")
+                        .ghost()
+                        .label("Repos ▾")
+                        .dropdown_menu(move |menu, _, _| {
+                            menu_items.iter().fold(menu, |menu, (id, name)| {
+                                let owner = owner.clone();
+                                let id = *id;
+                                menu.item(PopupMenuItem::new(name.clone()).on_click(
+                                    move |_, window, cx| {
+                                        _ = owner.update(cx, |shell, cx| {
+                                            shell.owner.update(cx, |owner, cx| {
+                                                owner.dispatch(
+                                                    Intent::Activate(id),
+                                                    Instant::now(),
+                                                    cx,
+                                                )
+                                            });
+                                            shell.sync_git_visibility(false, cx);
+                                            shell.sync_content_selection(cx);
+                                            shell.focus.focus(window, cx);
+                                            cx.notify();
+                                        });
+                                    },
+                                ))
+                            })
+                        }),
+                )
+            })
+            .children(after)
             .child(
                 Button::new("new-workspace")
                     .ghost()
                     .label("+")
-                    .tooltip("New workspace")
+                    .tooltip("Workspaces are read from Iced GitTerm")
+                    .disabled(self.owner.read(cx).iced_catalog().is_some())
                     .h(px(27.))
                     .on_click(cx.listener(|this, _, window, cx| this.pick_folder(window, cx))),
             )
@@ -1336,6 +1482,14 @@ impl Shell {
                     ),
                 );
             }
+        }
+        if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Work {
+            sidebar = sidebar.child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .children(self.work_sidebars.get(&state.workspace.id).cloned()),
+            );
         }
         sidebar
     }
@@ -1542,6 +1696,7 @@ impl Render for Shell {
         self.sync_content_selection(cx);
         self.content
             .update(cx, |content, cx| content.sync_covers(window, cx));
+        self.ensure_work_sidebars(window, cx);
         let p = Palette::current(cx);
         if !self.workspaces.iter().any(|state| state.on_bar()) {
             return div()
@@ -1608,22 +1763,13 @@ impl Render for Shell {
         let close_target = close_session
             .and_then(|id| state.panes.get(&session_pane_id(id)))
             .and_then(|pane| pane.read(cx).session.clone());
-        let workspace_target = state.park_target(cx);
         let state_session_count = state.sessions.len();
-        let can_park = self.local
-            && self
-                .workspaces
-                .iter()
-                .filter(|state| state.on_bar())
-                .count()
-                > 1;
         let close_label = state
             .sessions
             .iter()
             .find(|session| Some(session.id) == close_session)
             .map(|session| format!("Close {} permanently", session.title))
             .unwrap_or_else(|| "Close session permanently".into());
-        let chat_owner = weak.clone();
         let history_owner = weak.clone();
         let history = self
             .owner
@@ -1634,25 +1780,13 @@ impl Render for Shell {
             .ghost()
             .label("⋯")
             .tooltip("More")
+            .debug_selector(|| "more".into())
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
-                let chat_owner = chat_owner.clone();
                 let history_owner = history_owner.clone();
                 let history = history.clone();
                 let weak = weak.clone();
                 let close_owner = weak.clone();
-                let park_owner = weak.clone();
-                let stop_target = workspace_target.clone();
-                let keep_target = workspace_target.clone();
-                let close_workspace_target = workspace_target.clone();
-                menu.item(
-                    PopupMenuItem::new("New Claude chat")
-                        .disabled(!local)
-                        .on_click(move |_, window, cx| {
-                            _ = chat_owner
-                                .update(cx, |shell, cx| shell.new_claude_chat(None, window, cx));
-                        }),
-                )
-                .item({
+                menu.item({
                     let owner = weak.clone();
                     PopupMenuItem::new("New terminal")
                         .disabled(!local)
@@ -1690,51 +1824,6 @@ impl Render for Shell {
                     PopupMenuItem::new("Keyboard shortcuts     ⌥/")
                         .on_click(|_, w, cx| dialogs::shortcuts(w, cx)),
                 )
-                .separator()
-                .item(
-                    PopupMenuItem::new("Park workspace · stop terminals")
-                        .disabled(!can_park)
-                        .on_click(move |_, window, cx| {
-                            _ = park_owner.update(cx, |shell, cx| {
-                                shell.park_workspace(
-                                    &stop_target,
-                                    gitterm_core::park::Mode::Stop,
-                                    window,
-                                    cx,
-                                )
-                            });
-                        }),
-                )
-                .item({
-                    let weak = close_owner.clone();
-                    PopupMenuItem::new("Park workspace · keep running")
-                        .disabled(!can_park)
-                        .on_click(move |_, window, cx| {
-                            _ = weak.update(cx, |shell, cx| {
-                                shell.park_workspace(
-                                    &keep_target,
-                                    gitterm_core::park::Mode::KeepRunning,
-                                    window,
-                                    cx,
-                                )
-                            });
-                        })
-                })
-                .item({
-                    let weak = close_owner.clone();
-                    PopupMenuItem::new("Close workspace")
-                        .disabled(!can_park)
-                        .on_click(move |_, window, cx| {
-                            _ = weak.update(cx, |shell, cx| {
-                                shell.park_intent(
-                                    Some(&close_workspace_target),
-                                    gitterm_core::park::Intent::Close(close_workspace_target.uid),
-                                    window,
-                                    cx,
-                                )
-                            });
-                        })
-                })
                 .item({
                     let weak = close_owner.clone();
                     let close_target = close_target.clone();
@@ -1764,7 +1853,26 @@ impl Render for Shell {
                 .h(px(layout::SESSION_HEIGHT))
                 .bg(rgb(p.mantle))
                 .child(div().flex_1().min_w_0().child(tabs))
+                .child(
+                    Button::new("new-session")
+                        .ghost()
+                        .label("+ Session")
+                        .debug_selector(|| "new-session".into())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_session_picker(window, cx)),
+                        ),
+                )
                 .child(more)
+                .child(
+                    Button::new("close-workspace")
+                        .ghost()
+                        .label("×")
+                        .tooltip("Close workspace (⌘⇧W)")
+                        .debug_selector(|| "close-workspace".into())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_park_sheet(window, cx)),
+                        ),
+                )
                 .border_b_1()
                 .border_color(rgb(p.surface))
                 .h(px(layout::SESSION_HEIGHT + 1.))
@@ -1779,6 +1887,7 @@ impl Render for Shell {
             content = content.child(div().p_2().text_color(rgb(p.red)).child(error.clone()));
         }
         div()
+            .relative()
             .size_full()
             .track_focus(&self.focus)
             .key_context("GitTermShell")
@@ -1790,6 +1899,7 @@ impl Render for Shell {
                     this.select_workspace(a.index, w, cx)
                 }),
             )
+            .on_action(cx.listener(|this, _: &CloseWorkspace, w, cx| this.open_park_sheet(w, cx)))
             .on_action(cx.listener(|this, _: &NewTerminal, w, cx| this.new_terminal(w, cx)))
             .on_action(
                 cx.listener(|this, _: &NewClaudeChat, w, cx| this.new_claude_chat(None, w, cx)),
@@ -1853,10 +1963,13 @@ impl Render for Shell {
                     .children(self.bottom_panel(cx))
                     .child(self.workspace_bar(cx)),
             )
+            .children(self.session_picker.clone())
+            .children(self.park_sheet.clone())
             .into_any_element()
     }
 }
 
+#[cfg(test)]
 fn load_local_workspaces(
     store: &mut workspace_config::WorkspaceStore,
     folders: Vec<std::path::PathBuf>,
@@ -1873,6 +1986,14 @@ fn load_local_workspaces(
     Ok((model, save))
 }
 
+fn bind_workspace_keys(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new(
+        "cmd-shift-w",
+        CloseWorkspace,
+        Some("GitTermShell"),
+    )]);
+}
+
 pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
     let preview = preview::PreviewContext::from_environment(sample)?;
     let config = preview.roots.layout();
@@ -1880,8 +2001,12 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
     let (model, startup_save) = if sample {
         (WorkspaceStatus::default(), None)
     } else {
-        let (model, save) = load_local_workspaces(&mut store, folders)?;
-        (model, Some(save))
+        ensure!(
+            folders.is_empty(),
+            "Preview workspaces come from Iced; add work in Iced GitTerm"
+        );
+        let model = workspace_config::load_iced_workspaces(&mut store);
+        (model, None)
     };
     gpui_kit::application().run(move |cx| {
         preview.release_on_quit(cx);
@@ -1910,6 +2035,7 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
                 ),
             ]);
         }
+        bind_workspace_keys(cx);
         cx.bind_keys([KeyBinding::new(
             "alt-/",
             ShowShortcuts,

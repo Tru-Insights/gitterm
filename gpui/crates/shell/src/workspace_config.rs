@@ -1,4 +1,4 @@
-//! Explicit GPUI folders only; no import from the Iced workspace store.
+//! Iced workspace reads and isolated preview metadata persistence.
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -29,6 +29,7 @@ pub fn local_folder(path: &Path) -> Result<PathBuf> {
 }
 
 pub struct WorkspaceStore {
+    pub(crate) iced: Option<IcedCatalog>,
     pub(crate) chats: Vec<crate::chat::SavedChat>,
     pub(crate) parked: Vec<crate::park::SavedPark>,
     path: PathBuf,
@@ -39,6 +40,7 @@ impl WorkspaceStore {
     #[cfg(test)]
     pub fn new(config: &Path) -> Self {
         Self {
+            iced: None,
             chats: vec![],
             parked: vec![],
             path: config.join("local-workspaces.json"),
@@ -48,6 +50,7 @@ impl WorkspaceStore {
     }
     pub(crate) fn guarded(guard: std::sync::Arc<crate::preview::Writer>) -> Self {
         Self {
+            iced: None,
             chats: vec![],
             parked: vec![],
             path: guard.preview().layout().join("local-workspaces.json"),
@@ -104,7 +107,11 @@ impl WorkspaceStore {
         Ok(serde_json::to_vec_pretty(&Folders {
             preview_chats: self.chats.clone(),
             version: 1,
-            folders: folders.to_vec(),
+            folders: if self.iced.is_some() {
+                vec![]
+            } else {
+                folders.to_vec()
+            },
             parked_workspaces: self.parked.clone(),
         })?)
     }
@@ -175,5 +182,454 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&store.path).unwrap(), invalid);
         }
         assert!(local_folder(&store.path).is_err());
+    }
+}
+
+/// Explicit read authority only. This reader never enters the preview writer or
+/// claims an Iced lease, including when the source is absent or half-written.
+#[derive(Default)]
+pub(crate) struct IcedCatalog {
+    pub workspaces: Vec<gitterm_core::workspace_config::WorkspaceConfig>,
+    pub active: usize,
+    pub repos_on_bar: bool,
+}
+impl IcedCatalog {
+    pub fn read(config: &Path) -> Result<Self> {
+        let path = config.join("workspaces.json");
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("read Iced workspaces {}", path.display()))?;
+        let file: gitterm_core::workspace_config::WorkspacesFile =
+            serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse Iced workspaces {}", path.display()))?;
+        let mut open: Vec<_> = file
+            .workspaces
+            .into_iter()
+            .filter(|w| w.active)
+            .enumerate()
+            .collect();
+        let selected = file.active_workspace.min(open.len().saturating_sub(1));
+        // Iced normalizes machines before building the bar, stably within each.
+        open.sort_by_key(|(_, w)| match &w.location {
+            Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent {
+                remote_id,
+                ..
+            }) => {
+                1 + file
+                    .remote_agents
+                    .iter()
+                    .position(|a| a.id == *remote_id)
+                    .unwrap_or(usize::MAX / 2)
+            }
+            _ if w.remote_session.is_some() && w.location.is_none() => usize::MAX / 2 + 1,
+            _ => 0,
+        });
+        let active = open.iter().position(|(i, _)| *i == selected).unwrap_or(0);
+        Ok(Self {
+            workspaces: open.into_iter().map(|(_, w)| w).collect(),
+            active,
+            repos_on_bar: !file.collapsed_repo_groups.iter().any(|g| g == "local"),
+        })
+    }
+    pub fn bar_layout(
+        &self,
+        active: Option<crate::data::WorkspaceId>,
+    ) -> gitterm_core::workspace::BarLayout {
+        use gitterm_core::workspace::{BarChip, bar_layout};
+        let chips: Vec<_> = self
+            .workspaces
+            .iter()
+            .map(|w| BarChip {
+                group: iced_group(w),
+                work: gitterm_core::work::catalog::is_work(&w.chats, false),
+                parked: false,
+            })
+            .collect();
+        let active = active
+            .and_then(|id| id.0.checked_sub(1))
+            .map(|i| i as usize)
+            .unwrap_or(self.active);
+        bar_layout(&chips, active, self.repos_on_bar)
+    }
+    pub fn visible_order(&self, active: Option<crate::data::WorkspaceId>) -> Vec<usize> {
+        gitterm_core::workspace::visible_order(&self.bar_layout(active))
+    }
+}
+fn iced_group(w: &gitterm_core::workspace_config::WorkspaceConfig) -> String {
+    match &w.location {
+        Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent {
+            remote_id,
+            ..
+        }) => format!("agent:{remote_id}"),
+        _ if w.location.is_none() && w.remote_session.is_some() => {
+            format!("ssh:{}", w.remote_session.as_ref().unwrap().session_name)
+        }
+        _ => "local".into(),
+    }
+}
+pub(crate) fn iced_layout_key(w: &gitterm_core::workspace_config::WorkspaceConfig) -> String {
+    // A named piece of work owns a layout even when another work shares its home.
+    let identity = serde_json::to_string(&(&w.name, &w.dir, &w.location)).expect("string identity");
+    crate::layout::workspace_layout_key(Path::new(&identity))
+}
+
+pub(crate) fn load_iced_workspaces(
+    store: &mut WorkspaceStore,
+) -> crate::workspace_status::WorkspaceStatus {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let config = gitterm_core::config_paths::iced_config_dir(
+        std::env::var_os(gitterm_core::config_paths::CONFIG_DIR_ENV),
+        &home,
+    );
+    load_iced_workspaces_from(store, &config)
+}
+pub(crate) fn load_iced_workspaces_from(
+    store: &mut WorkspaceStore,
+    config: &Path,
+) -> crate::workspace_status::WorkspaceStatus {
+    // Only preview chat/park metadata comes from this store. Its old folder list
+    // must never become a fallback catalog when Iced's file is missing or invalid.
+    if let Err(error) = store.load() {
+        eprintln!("Load preview metadata: {error:#}");
+    }
+    let catalog = IcedCatalog::read(config).unwrap_or_else(|error| {
+        eprintln!("{error:#}");
+        IcedCatalog::default()
+    });
+    let model = crate::workspace_status::WorkspaceStatus::from_iced(&catalog);
+    store.iced = Some(catalog);
+    model
+}
+
+#[cfg(test)]
+mod iced_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    fn fixture(iced: &Path) {
+        std::fs::create_dir_all(iced).unwrap();
+        std::fs::write(iced.join("sentinel"), b"keep exact bytes").unwrap();
+        let entry = |name: &str, active: bool, chats: Vec<&str>| {
+            serde_json::json!({
+                "name": name, "abbrev":"FX", "dir":"/fixture/shared", "color":"blue", "active":active,
+                "repos":["/fixture/api", "/fixture/shared"], "home":"/fixture/api", "chats":chats, "active_tab":1,
+                "tabs":[{"dir":"/fixture/shared", "startup_command":"must-never-run", "session_uid":format!("{name}-terminal")},
+                        {"dir":"/fixture/api", "tab_kind":"agent", "agent_config":{"backend":"claude", "model":"default"}, "chat_session_id":"chat-1", "session_uid":format!("{name}-agent")}]
+            })
+        };
+        std::fs::write(iced.join("workspaces.json"), serde_json::to_vec(&serde_json::json!({
+            "active_workspace":1, "workspaces":[entry("Folder", true, vec![]), entry("Closed", false, vec![]), entry("Named work", true, vec!["chat-1", "chat-2"]) ]
+        })).unwrap()).unwrap();
+    }
+    fn snapshot(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| {
+                let path = e.unwrap().path();
+                (
+                    path.file_name().unwrap().into(),
+                    std::fs::read(path).unwrap(),
+                )
+            })
+            .collect()
+    }
+    #[test]
+    fn reads_named_work_same_folder_tabs_selection_and_iced_bar_order() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let before = snapshot(dir.path());
+        let catalog = IcedCatalog::read(dir.path()).unwrap();
+        assert_eq!(
+            catalog
+                .workspaces
+                .iter()
+                .map(|w| w.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Folder", "Named work"]
+        );
+        assert_eq!(catalog.active, 1); // Saved index addresses OPEN entries.
+        assert_eq!(catalog.visible_order(None), [1, 0]);
+        assert_eq!(
+            catalog.workspaces[1].repos,
+            ["/fixture/api", "/fixture/shared"]
+        );
+        let model = crate::workspace_status::WorkspaceStatus::from_iced(&catalog);
+        assert_eq!(model.workspaces.len(), 2);
+        assert_eq!(model.workspaces[1].folder, PathBuf::from("/fixture/shared"));
+        assert_eq!(model.active(), Some(crate::data::WorkspaceId(2)));
+        assert_ne!(
+            iced_layout_key(&catalog.workspaces[0]),
+            iced_layout_key(&catalog.workspaces[1])
+        );
+        let sessions = crate::data::iced_sessions(&catalog.workspaces[1]);
+        assert_eq!(sessions.len(), 2); // Owned chats are not extra open tabs.
+        assert_eq!(catalog.workspaces[1].chats, ["chat-1", "chat-2"]);
+        assert_eq!(sessions[1].title, "chat-1");
+        assert_ne!(sessions[0].id, sessions[1].id);
+        assert_eq!(snapshot(dir.path()), before);
+    }
+    #[test]
+    fn source_and_all_entries_unchanged_after_preview_layout_and_metadata_saves() {
+        use gitterm_core::preview::{Preview, ProtectedRoots};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let iced = dir.path().join("iced");
+        fixture(&iced);
+        let before = snapshot(&iced);
+        let protected = ProtectedRoots::new(&dir.path().join("home"), [iced.clone()]).unwrap();
+        let roots = Arc::new(Preview::validate(&dir.path().join("preview"), protected).unwrap());
+        let writer = Arc::new(crate::preview::Writer::new(roots.claim_writer().unwrap()));
+        let mut store = WorkspaceStore::guarded(writer.clone());
+        let model = load_iced_workspaces_from(&mut store, &iced);
+        assert_eq!(model.workspaces.len(), 2);
+        writer
+            .replace_layout(&roots.layout().join("layout-1.json"), b"{}")
+            .unwrap();
+        store
+            .save_async(&model.folders())
+            .unwrap()
+            .blocking_recv()
+            .unwrap()
+            .unwrap();
+        assert!(
+            writer
+                .submit(iced.join("workspaces.json"), b"bad".to_vec())
+                .is_err()
+        );
+        assert!(roots.scoped(&iced.join("new-file")).is_err());
+        assert!(
+            Preview::validate(
+                &iced,
+                ProtectedRoots::new(&dir.path().join("home"), [iced.clone()]).unwrap()
+            )
+            .is_err()
+        );
+        assert_eq!(snapshot(&iced), before);
+    }
+    #[test]
+    fn missing_or_partial_source_is_empty_despite_saved_local_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = WorkspaceStore::new(&dir.path().join("preview"));
+        store.save(&[dir.path().join("stale-folder")]).unwrap();
+        let source = dir.path().join("missing-iced");
+        assert!(
+            load_iced_workspaces_from(&mut store, &source)
+                .workspaces
+                .is_empty()
+        );
+        assert!(!source.exists());
+        std::fs::create_dir(&source).unwrap();
+        for bytes in ["{", "null", r#"{"workspaces":[]}"#] {
+            std::fs::write(source.join("workspaces.json"), bytes).unwrap();
+            let before = snapshot(&source);
+            assert!(
+                load_iced_workspaces_from(&mut store, &source)
+                    .workspaces
+                    .is_empty()
+            );
+            assert_eq!(snapshot(&source), before);
+        }
+    }
+    #[test]
+    fn env_override_reads_fixture() {
+        const CHILD: &str = "GITTERM_PSRC_FIXTURE_CHILD";
+        if let Some(preview) = std::env::var_os(CHILD) {
+            let mut store = WorkspaceStore::new(Path::new(&preview));
+            let model = load_iced_workspaces(&mut store);
+            assert_eq!(model.workspaces.len(), 2);
+            assert_eq!(
+                store.iced.as_ref().unwrap().workspaces[1].name,
+                "Named work"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let iced = dir.path().join("iced");
+        fixture(&iced);
+        let before = snapshot(&iced);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace_config::iced_tests::env_override_reads_fixture",
+                "--nocapture",
+            ])
+            .env(CHILD, dir.path().join("preview"))
+            .env("GITTERM_V6_CONFIG_DIR", &iced)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(snapshot(&iced), before);
+    }
+}
+
+#[cfg(test)]
+mod iced_projection_tests {
+    use super::*;
+    #[test]
+    fn remote_group_order_collapsed_repos_and_invalid_saved_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspaces.json");
+        std::fs::write(&path, r#"{"active_workspace":999,"collapsed_repo_groups":["local"],"workspaces":[
+            {"name":"Remote","abbrev":"R","dir":"opaque:remote","color":"blue","location":{"kind":"remote_agent","remote_id":"r","workspace_id":"w","root":"opaque:remote"},"tabs":[]},
+            {"name":"Folder","abbrev":"F","dir":"/fixture/folder","color":"blue","tabs":[]},
+            {"name":"Work","abbrev":"W","dir":"/fixture/work","color":"blue","chats":["c"],"active_tab":99,"tabs":[{"dir":"/fixture/other"},{"dir":"/fixture/work"}]}
+        ]}"#).unwrap();
+        let catalog = IcedCatalog::read(dir.path()).unwrap();
+        assert_eq!(
+            catalog
+                .workspaces
+                .iter()
+                .map(|w| w.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Folder", "Work", "Remote"]
+        );
+        assert_eq!(catalog.active, 1);
+        assert_eq!(catalog.visible_order(None), [1]);
+        assert_eq!(
+            catalog.visible_order(Some(crate::data::WorkspaceId(3))),
+            [1, 2]
+        );
+        assert_eq!(crate::data::iced_active_tab(&catalog.workspaces[1]), 1);
+        let mut model = crate::workspace_status::WorkspaceStatus::from_iced(&catalog);
+        model.dispatch(
+            crate::workspace_status::Intent::Activate(crate::data::WorkspaceId(3)),
+            std::time::Instant::now(),
+        );
+        assert!(
+            model
+                .dispatch(
+                    crate::workspace_status::Intent::Opened,
+                    std::time::Instant::now()
+                )
+                .is_empty()
+        );
+        assert!(model.workspaces[2].remote);
+    }
+    #[gpui::test]
+    fn imported_panes_keep_selection_without_terminal_or_agent_construction(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext;
+        use std::rc::Rc;
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::preview::tests::guarded_store(&dir.path().join("preview"));
+        let path = dir.path().join("iced");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("workspaces.json"), r#"{"active_workspace":1,"workspaces":[
+            {"name":"First","abbrev":"F","dir":"/fixture/same","color":"blue","tabs":[]},
+            {"name":"Selected work","abbrev":"S","dir":"/fixture/same","color":"green","chats":["owned-chat"],"active_tab":1,"tabs":[{"dir":"/fixture/same","startup_command":"MUST NOT RUN"},{"dir":"/fixture/same","tab_kind":"agent","agent_config":{"backend":"claude","model":"default"},"chat_session_id":"owned-chat"}]}
+        ]}"#).unwrap();
+        let model = load_iced_workspaces_from(&mut store, &path);
+        let layout = store.guard.as_ref().unwrap().preview().layout();
+        let (shell, cx) = cx.add_window_view(|window, cx| {
+            let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, Some(store), cx));
+            let data = Rc::new(crate::data::LocalData(owner.clone()));
+            crate::Shell::with_owner(data, owner, &layout, true, window, cx).unwrap()
+        });
+        cx.read(|cx| {
+            let shell = shell.read(cx);
+            assert_eq!(
+                shell.active_workspace(cx),
+                Some(crate::data::WorkspaceId(2))
+            );
+            let active = shell.active(cx);
+            assert_eq!(active.active_session, Some(active.sessions[1].id));
+            assert!(crate::pane_id_visible(
+                active,
+                &crate::session_pane_id(active.sessions[1].id),
+                cx
+            ));
+            assert!(!crate::pane_id_visible(
+                active,
+                &crate::session_pane_id(active.sessions[0].id),
+                cx
+            ));
+            for session in &active.sessions {
+                let pane = active.panes[&crate::session_pane_id(session.id)].read(cx);
+                assert!(matches!(
+                    pane.content,
+                    crate::pane::PaneContent::IcedSession(_)
+                ));
+                assert!(pane.session.is_none());
+            }
+            assert!(shell.owner.read(cx).chats.is_empty());
+        });
+    }
+}
+
+#[cfg(test)]
+mod preview_terminal_restore_test {
+    use super::*;
+    #[gpui::test]
+    fn imported_work_restores_and_resaves_only_its_preview_terminal_inventory(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext;
+        use std::rc::Rc;
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::preview::tests::guarded_store(&dir.path().join("preview"));
+        let source = dir.path().join("iced");
+        std::fs::create_dir(&source).unwrap();
+        let bytes = br#"{"active_workspace":0,"workspaces":[{"name":"Work","abbrev":"W","dir":"/fixture/work","color":"blue","tabs":[{"dir":"/fixture/work","startup_command":"MUST NOT RUN"}]}]}"#;
+        std::fs::write(source.join("workspaces.json"), bytes).unwrap();
+        let model = load_iced_workspaces_from(&mut store, &source);
+        let layout = store.guard.as_ref().unwrap().preview().layout();
+        let key = iced_layout_key(&store.iced.as_ref().unwrap().workspaces[0]);
+        let path = crate::layout::workspace_layout_path(&layout, &key);
+        let mut saved = crate::layout::LayoutStore::guarded(
+            path.clone(),
+            store.guard.as_ref().unwrap().clone(),
+        );
+        saved.terminals = Some(vec![crate::layout::TerminalSession {
+            id: 777,
+            cwd: dir.path().canonicalize().unwrap(),
+        }]);
+        let state = gpui_component::dock::DockAreaState {
+            version: Some(1),
+            center: gpui_component::dock::PanelState {
+                panel_name: "StackPanel".into(),
+                children: vec![],
+                info: gpui_component::dock::PanelInfo::stack(vec![], gpui::Axis::Horizontal),
+            },
+            ..Default::default()
+        };
+        saved.save(&state).unwrap();
+        let (shell, cx) = cx.add_window_view(|window, cx| {
+            let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, Some(store), cx));
+            crate::Shell::with_owner(
+                Rc::new(crate::data::LocalData(owner.clone())),
+                owner,
+                &layout,
+                true,
+                window,
+                cx,
+            )
+            .unwrap()
+        });
+        cx.read(|cx| {
+            let state = shell.read(cx).active(cx);
+            assert_eq!(state.sessions.len(), 2);
+            let imported = state.panes[&crate::session_pane_id(state.sessions[0].id)].read(cx);
+            assert!(matches!(
+                imported.content,
+                crate::pane::PaneContent::IcedSession(_)
+            ));
+            assert!(imported.session.is_none());
+            assert!(matches!(
+                state.panes["session-777"].read(cx).content,
+                crate::pane::PaneContent::Terminal(_)
+            ));
+            assert_eq!(state.store.terminals.as_ref().unwrap()[0].id, 777);
+            state.store.save(&state.dock.read(cx).dump(cx)).unwrap();
+        });
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved["terminal_sessions"][0]["id"], 777);
+        assert_eq!(
+            std::fs::read(source.join("workspaces.json")).unwrap(),
+            bytes
+        );
     }
 }

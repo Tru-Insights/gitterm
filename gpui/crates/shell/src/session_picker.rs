@@ -363,6 +363,19 @@ impl SessionPicker {
         self.model.affordance_label()
     }
 
+    /// Preserve Iced's exact row label when the host cannot dispatch an outcome.
+    pub fn outcome_label(&self, outcome: &SessionPickerOutcome) -> Option<String> {
+        self.model
+            .entries()
+            .into_iter()
+            .find_map(|entry| match entry {
+                PickerEntry::Row(row) if row.action == RowAction::Select(outcome.clone()) => {
+                    Some(row.label)
+                }
+                _ => None,
+            })
+    }
+
     /// Replaces the snapshot on every opening, so no store or stale catalog is retained.
     pub fn open(&mut self, inputs: PickerInputs, window: &mut Window, cx: &mut Context<Self>) {
         self.model = PickerModel::new(inputs);
@@ -453,6 +466,7 @@ impl Render for SessionPicker {
                     card.child(
                         div()
                             .id(("session-picker-row", index))
+                            .debug_selector(move || format!("session-picker-row-{index}"))
                             .role(Role::Button)
                             .aria_label(row.label.clone())
                             .aria_description(row.description.clone())
@@ -496,6 +510,7 @@ impl Render for SessionPicker {
         }
         div()
             .id("session-picker")
+            .debug_selector(|| "session-picker".into())
             .absolute()
             .inset_0()
             .occlude()

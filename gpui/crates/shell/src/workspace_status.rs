@@ -15,6 +15,7 @@ pub struct LocalWorkspace {
     /// False until the first status result arrives. Only the active workspace
     /// is polled (as in Iced), so others show placeholders until visited.
     pub checked: bool,
+    pub(crate) remote: bool,
 }
 #[derive(Debug)]
 pub enum Intent {
@@ -78,8 +79,32 @@ impl WorkspaceStatus {
             folder,
             status: GitStatusState::new(name, false, now),
             checked: false,
+            remote: false,
         });
         id
+    }
+    pub(crate) fn from_iced(catalog: &crate::workspace_config::IcedCatalog) -> Self {
+        let now = Instant::now();
+        let mut model = Self::default();
+        for (index, saved) in catalog.workspaces.iter().enumerate() {
+            let folder = PathBuf::from(&saved.dir);
+            model.workspaces.push(LocalWorkspace {
+                id: WorkspaceId(index as u64 + 1),
+                root: folder.clone(),
+                folder,
+                status: GitStatusState::new(saved.name.clone(), false, now),
+                checked: false,
+                remote: matches!(
+                    saved.location,
+                    Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. })
+                ) || saved.is_legacy_remote(),
+            });
+        }
+        model.next_id = model.workspaces.len() as u64;
+        if let Some(workspace) = model.workspaces.get(catalog.active) {
+            model.dispatch(Intent::Activate(workspace.id), now);
+        }
+        model
     }
     pub fn active(&self) -> Option<WorkspaceId> {
         self.selection.active().map(WorkspaceId)
@@ -216,6 +241,9 @@ impl WorkspaceStatus {
         event: StatusEvent,
         now: Instant,
     ) -> Vec<Command> {
+        if workspace.remote {
+            return vec![];
+        }
         workspace
             .status
             .reduce(event, now)

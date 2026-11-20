@@ -163,6 +163,20 @@ impl WorkspaceOwner {
             review_workers,
         }
     }
+    pub(crate) fn iced_workspace(
+        &self,
+        id: crate::data::WorkspaceId,
+    ) -> Option<&gitterm_core::workspace_config::WorkspaceConfig> {
+        self.store
+            .as_ref()?
+            .iced
+            .as_ref()?
+            .workspaces
+            .get(id.0.checked_sub(1)? as usize)
+    }
+    pub(crate) fn iced_catalog(&self) -> Option<&crate::workspace_config::IcedCatalog> {
+        self.store.as_ref()?.iced.as_ref()
+    }
     pub(crate) fn chat_history(
         &self,
         cwd: Option<&std::path::Path>,
@@ -273,7 +287,7 @@ impl WorkspaceOwner {
                 .model
                 .workspaces
                 .iter()
-                .find(|w| Some(w.id) == self.model.active())
+                .find(|w| Some(w.id) == self.model.active() && !w.remote)
         {
             let request = self
                 .files
@@ -459,6 +473,10 @@ impl WorkspaceOwner {
         folder: PathBuf,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<crate::data::WorkspaceId> {
+        anyhow::ensure!(
+            self.iced_catalog().is_none(),
+            "Workspaces come from Iced; add work in Iced GitTerm"
+        );
         let mut folders = self.model.folders();
         if !folders.contains(&folder) {
             folders.push(folder.clone());

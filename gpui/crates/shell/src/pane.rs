@@ -11,6 +11,7 @@ use std::rc::Rc;
 pub const PANEL_NAME: &str = "GitTermShellPane";
 #[derive(Clone)]
 pub enum PaneKind {
+    IcedSession(String),
     Terminal,
     CenterTerminal(std::path::PathBuf),
     StoppedTerminal(std::path::PathBuf, bool),
@@ -30,6 +31,7 @@ impl From<SessionKind> for PaneKind {
     }
 }
 pub enum PaneContent {
+    IcedSession(String),
     Terminal(Entity<TerminalView>),
     Chat(Entity<ChatView>),
     PreviewChat(Entity<crate::chat::ChatPane>),
@@ -71,6 +73,7 @@ impl Pane {
         let session = matches!(kind, PaneKind::Terminal | PaneKind::CenterTerminal(_))
             .then(crate::sessions::fresh_target);
         let content = match kind.clone() {
+            PaneKind::IcedSession(text) => PaneContent::IcedSession(text),
             PaneKind::StoppedTerminal(..) => PaneContent::Error("Terminal stopped".into()),
             PaneKind::Terminal | PaneKind::CenterTerminal(_) => {
                 let launch = TerminalLaunch {
@@ -353,6 +356,7 @@ impl Render for Pane {
             PaneContent::Content(view) => div().id("content-pane").size_full().min_h_0().child(
                 crate::content::window::ContentWindow::body(view, &self.id, cx),
             ),
+            PaneContent::IcedSession(text) => body.child(text.clone()),
             PaneContent::Error(error) => body.text_color(rgb(p.red)).child(error.clone()),
             PaneContent::Git => {
                 let status = self.status_view(cx);
