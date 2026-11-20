@@ -217,7 +217,7 @@ fn native_chat_local_close_remote_detach_golden() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn native_chat_claude_failed_answer_still_resolves_current_oddity() {
+async fn native_chat_claude_failed_answer_remains_pending_until_process_exit() {
     let dir = tempfile::tempdir().unwrap();
     let program = process::script(
         dir.path(),
@@ -269,7 +269,11 @@ async fn native_chat_claude_failed_answer_still_resolves_current_oddity() {
                 })
                 .unwrap(),
             HarnessEvent::Error(e) => {
-                assert!(e.starts_with("write to claude stdin:"), "{e}");
+                assert!(e.starts_with("answer p1: write to claude stdin:"), "{e}");
+                assert!(e.ends_with("not delivered; request remains pending"), "{e}");
+                assert!(!seen
+                    .iter()
+                    .any(|e| matches!(e, HarnessEvent::RuntimeRequestResolved { .. })));
                 commands.send(HarnessCommand::Shutdown).unwrap();
                 std::fs::write(dir.path().join("exit"), "").unwrap();
             }
@@ -294,7 +298,7 @@ async fn native_chat_claude_failed_answer_still_resolves_current_oddity() {
     let mut value = json!(seen);
     for e in value.as_array_mut().unwrap() {
         if e["type"] == "error" {
-            e["data"] = json!("write to claude stdin: <broken pipe>");
+            e["data"] = json!("answer p1: write to claude stdin: <broken pipe>; not delivered; request remains pending");
         }
     }
     support::golden("claude/failed-answer.json", value);

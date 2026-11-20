@@ -932,7 +932,27 @@ async fn run_session_program(
     program: PathBuf,
     pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) {
-    let launch = local_launch(config, program, token.clone());
+    let root = config.cwd.clone();
+    let snapshots = crate::turn_snapshots::Recorder::new(
+        root.clone(),
+        config.resume.clone(),
+        config.snapshot_facts_dir.clone(),
+    )
+    .with_close_token(token.clone());
+    let launch = Launch {
+        config,
+        program,
+        environment: vec![
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("HOME".into(), root.join("home").into_os_string()),
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                root.join("provider").into_os_string(),
+            ),
+        ],
+        temporary_dir: root,
+        snapshots: Box::new(snapshots),
+    };
     gitterm_core::harness::claude::run_session_program(launch, commands, events, token, pid).await;
 }
 
