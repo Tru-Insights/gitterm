@@ -1,0 +1,10 @@
+{
+  "root_chat_id": "fixture-chat",
+  "updated_at": "2000-01-01T00:00:00Z",
+  "entries": [
+    {
+      "repo": "example/fixture",
+      "number": 1
+    }
+  ]
+}

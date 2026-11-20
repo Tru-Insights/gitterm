@@ -6,6 +6,7 @@
 pub mod chat;
 pub mod harness;
 pub mod preview;
+pub mod session;
 pub mod status;
 pub mod workspace;
 
@@ -59,3 +60,13 @@ pub mod delegations;
 pub mod review_request;
 #[cfg(feature = "runtime")]
 pub mod runner_guidelines;
+
+#[cfg(feature = "runtime")]
+pub mod guidelines;
+#[cfg(feature = "runtime")]
+pub mod turn_snapshots;
+
+// PR/issue/merge-plan leaf state and optional runtime services.
+pub mod issues;
+pub mod merge_plan;
+pub mod prs;
