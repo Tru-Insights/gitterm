@@ -1,6 +1,7 @@
 #![cfg(target_os = "macos")]
 extern crate gpui_kit as gpui;
 
+pub mod app_menus;
 pub mod bottom_panel;
 #[cfg(test)]
 mod center_tests;
