@@ -215,6 +215,7 @@ mod tests {
         );
         assert_eq!(rows[0].name, "Codex · gpt-6.1-sol");
         assert_eq!(rows[0].what, "· in TRU-274");
+        assert!(rows.iter().all(|row| row.what == "· in TRU-274"));
         assert_eq!(rows[1].elapsed, "3m 6s");
         assert_eq!(rows[2].elapsed, "2.0s");
         assert!(super::rows(&[], 0).is_empty());
