@@ -40,11 +40,11 @@ fn region_order_sizes_and_explicit_bottom_terminal(cx: &mut TestAppContext) {
         cx.add_window_view(|window, cx| empty_local(&folder, config.path(), window, cx));
     cx.simulate_resize(size(px(layout::WINDOW_WIDTH), px(layout::WINDOW_HEIGHT)));
     draw(cx);
-    let spine = cx.debug_bounds("spine").unwrap();
-    let strip = cx.debug_bounds("session-strip").unwrap();
+    let spine = cx.debug_bounds("pstrip-spine").unwrap();
+    let strip = cx.debug_bounds("pstrip-session-strip").unwrap();
     let sidebar = cx.debug_bounds("sidebar").unwrap();
     let content = cx.debug_bounds("session-content").unwrap();
-    let bar = cx.debug_bounds("workspace-bar").unwrap();
+    let bar = cx.debug_bounds("pstrip-workspace-bar").unwrap();
     assert_eq!(spine.size, size(px(37.), px(800.)));
     assert_eq!(strip.origin.x, spine.right());
     assert_eq!(strip.size.height, px(37.));
@@ -113,22 +113,33 @@ fn workspace_bar_lists_names_and_click_selects(cx: &mut TestAppContext) {
     draw(cx);
     cx.read(|cx| {
         assert_eq!(
-            shell.read(cx).workspace_bar_items(cx),
+            shell
+                .read(cx)
+                .bar_input(cx)
+                .workspaces
+                .iter()
+                .enumerate()
+                .map(|(i, w)| (
+                    i,
+                    w.id,
+                    w.label(Some(w.id) == shell.read(cx).active_workspace(cx))
+                ))
+                .collect::<Vec<_>>(),
             vec![
                 (0, WorkspaceId(1), "acme-api".into()),
-                (1, WorkspaceId(2), "WE".into()),
-                (2, WorkspaceId(3), "DE".into()),
+                (1, WorkspaceId(2), "web-app".into()),
+                (2, WorkspaceId(3), "design-system".into()),
             ]
         )
     });
-    let chip = cx.debug_bounds("workspace-chip-1").unwrap();
+    let chip = cx.debug_bounds("pstrip-workspace-2").unwrap();
     cx.simulate_click(chip.center(), gpui::Modifiers::none());
     draw(cx);
     cx.read(|cx| {
         let shell = shell.read(cx);
         assert_eq!(shell.active_workspace(cx), Some(WorkspaceId(2)));
-        assert_eq!(shell.workspace_bar_items(cx)[1].2, "web-app");
-        assert_eq!(shell.workspace_bar_items(cx)[0].2, "AC");
+        assert_eq!(shell.bar_input(cx).workspaces[1].label(true), "web-app");
+        assert_eq!(shell.bar_input(cx).workspaces[0].label(false), "acme-api");
     });
 }
 
