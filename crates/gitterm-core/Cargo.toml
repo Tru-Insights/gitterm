@@ -18,7 +18,8 @@ codex-trust = ["runtime", "dep:toml"]
 tokio-util = { version = "0.7", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-chrono = "0.4"
+url = "2.5"
+chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 schemars = "1.0"
 libc = { version = "0.2", optional = true }

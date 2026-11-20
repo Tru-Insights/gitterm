@@ -2592,6 +2592,7 @@ dependencies = [
  "shell-words",
  "tokio",
  "tokio-util",
+ "url",
  "uuid",
  "warp",
 ]
