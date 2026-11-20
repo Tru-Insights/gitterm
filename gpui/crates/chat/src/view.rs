@@ -7,6 +7,7 @@ use find::TranscriptFind;
 
 use crate::{
     ChatIntent,
+    adapter::{Presentation, Receipt, ReceiptState, Update},
     cards::CardView,
     events::{Entry, HarnessEvent, Record},
     model::*,
@@ -53,7 +54,7 @@ actions!(
     ]
 );
 
-pub type IntentCallback = Rc<dyn Fn(ChatIntent, &mut App)>;
+pub type IntentCallback = Rc<dyn Fn(ChatIntent, &mut App) -> Receipt>;
 
 pub fn run(records: Vec<Record>) {
     let live = std::env::args_os()
@@ -81,7 +82,10 @@ pub fn run(records: Vec<Record>) {
                     let mut view = ChatView::new(records, window, cx);
                     if live {
                         view.set_intent_callback(
-                            Rc::new(|intent, _| eprintln!("ChatIntent: {intent:?}")),
+                            Rc::new(|intent, _| {
+                                eprintln!("ChatIntent: {intent:?}");
+                                Receipt::rejected("Fixture demo has no runtime")
+                            }),
                             cx,
                         );
                         view.set_read_only(None, cx);
@@ -116,6 +120,11 @@ pub struct ChatView {
     records: Arc<Vec<Record>>,
     composer: Entity<TextareaState>,
     callback: Option<IntentCallback>,
+    images: Vec<gitterm_core::chat::types::ImageAttachment>,
+    submission: Option<Receipt>,
+    control_receipt: Option<Receipt>,
+    projection_runtime: Option<gitterm_core::chat::state::RuntimeStamp>,
+    submitted_draft: Option<gitterm_core::chat::types::UserPrompt>,
     read_only_reason: Option<String>,
     turn_running: bool,
     new_messages: bool,
@@ -179,6 +188,11 @@ impl ChatView {
             records: Arc::new(records),
             composer,
             callback: None,
+            images: vec![],
+            submission: None,
+            control_receipt: None,
+            projection_runtime: None,
+            submitted_draft: None,
             read_only_reason: Some("Recorded fixture · read-only".into()),
             turn_running,
             new_messages: false,
@@ -220,19 +234,169 @@ impl ChatView {
         }
         cx.notify();
     }
+    /// Attachment preparation/strip is C13; the receipt seam already retains bytes.
+    pub fn set_images(
+        &mut self,
+        images: Vec<gitterm_core::chat::types::ImageAttachment>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        gitterm_core::chat::types::validate_images(&images)?;
+        self.images = images;
+        cx.notify();
+        Ok(())
+    }
+    fn submission_blocked(&self) -> bool {
+        self.submission.as_ref().is_some_and(|receipt| {
+            !matches!(
+                receipt.state,
+                ReceiptState::Rejected(_) | ReceiptState::Written | ReceiptState::Resolved
+            )
+        })
+    }
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only_reason.is_some() {
+        if self.read_only_reason.is_some() || self.submission_blocked() {
             return;
         }
-        let text = self.composer.read(cx).value().trim().to_owned();
-        if text.is_empty() {
+        let text = self.composer.read(cx).value().to_string();
+        if text.trim().is_empty() && self.images.is_empty() {
             return;
         }
         if let Some(callback) = &self.callback {
-            callback(ChatIntent::Send { text }, cx);
+            self.submitted_draft = Some(gitterm_core::chat::types::UserPrompt {
+                text: text.clone(),
+                images: self.images.clone(),
+                id: None,
+            });
+            let receipt = callback(
+                ChatIntent::Send {
+                    text,
+                    images: self.images.clone(),
+                },
+                cx,
+            );
+            self.submission = Some(receipt.clone());
+            self.update_receipt(receipt, window, cx);
+        }
+        cx.notify();
+    }
+    /// Apply only the matching attempt. Keep rejected/uncertain drafts intact;
+    /// a write or terminal receipt clears only the exact draft, preserving newer edits.
+    pub fn update_receipt(
+        &mut self,
+        receipt: Receipt,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .submission
+            .as_ref()
+            .is_some_and(|old| old.accepts_update(&receipt))
+            && matches!(
+                receipt.state,
+                ReceiptState::Written | ReceiptState::Resolved
+            )
+            && let Some(draft) = self.submitted_draft.take()
+            && self.composer.read(cx).value().as_str() == draft.text
+            && self.images == draft.images
+        {
             self.composer
                 .update(cx, |input, cx| input.set_value("", window, cx));
+            self.images.clear();
         }
+        self.sync_receipt(&receipt, cx);
+    }
+    fn sync_receipt(&mut self, receipt: &Receipt, cx: &mut Context<Self>) {
+        if self
+            .submission
+            .as_ref()
+            .is_some_and(|old| old.accepts_update(receipt))
+        {
+            self.submission = Some(receipt.clone());
+        }
+        if self
+            .control_receipt
+            .as_ref()
+            .is_some_and(|old| old.accepts_update(receipt))
+        {
+            self.control_receipt = Some(receipt.clone());
+        }
+        for card in self.cards.values() {
+            card.update(cx, |card, cx| card.update_receipt(receipt, cx));
+        }
+        cx.notify();
+    }
+    /// Consume reducer presentation effects even when State::revision is unchanged.
+    pub fn present(
+        &mut self,
+        source: &gitterm_core::chat::state::RuntimeStamp,
+        state: &gitterm_core::chat::state::State,
+        update: Update,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !state.accepts_stream(source, &source.target) {
+            return;
+        }
+        if self
+            .projection_runtime
+            .as_ref()
+            .is_some_and(|previous| !state.accepts_stream(previous, &source.target))
+        {
+            self.cards.clear();
+            self.row_views.fill(None);
+            if let Some(receipt) = &mut self.submission
+                && matches!(
+                    receipt.state,
+                    ReceiptState::ChannelAccepted | ReceiptState::Written
+                )
+            {
+                receipt.state = ReceiptState::Uncertain(
+                    "Runtime replaced before an authoritative outcome".into(),
+                );
+            }
+        }
+        self.projection_runtime = Some(source.clone());
+        match update.presentation {
+            Some(Presentation::Replay) => {
+                self.model = ChatModel::from_conversation(&state.conversation);
+                // Row IDs are positional after prepend; never reuse a card under a new request.
+                let old_cards = std::mem::take(&mut self.cards);
+                for row in &self.model.rows {
+                    if row.request.is_some()
+                        && let Some(card) = old_cards
+                            .values()
+                            .find(|card| card.read(cx).matches_request(row))
+                    {
+                        card.update(cx, |card, cx| {
+                            card.sync(row.clone(), self.read_only_reason.is_some(), cx)
+                        });
+                        self.cards.insert(row.id, card.clone());
+                    }
+                }
+                self.row_views = vec![None; self.model.rows.len()];
+                self.recent_rows.clear();
+                self.folded.clear();
+                self.scroller
+                    .update(cx, |scroller, cx| scroller.reset(self.model.rows.len(), cx));
+                self.reset_find(cx);
+            }
+            Some(Presentation::Append(events)) => {
+                for event in events {
+                    let following = self.scroller.read(cx).is_following_tail();
+                    let count = self.model.rows.len();
+                    let changed = self.model.apply_agent(&event);
+                    self.refresh_rows(count, following, changed, cx);
+                }
+            }
+            None => {}
+        }
+        for receipt in update.receipts {
+            self.update_receipt(receipt, window, cx);
+        }
+        self.turn_running = matches!(
+            state.state,
+            gitterm_core::chat::types::AgentSessionState::Streaming
+        );
         cx.notify();
     }
     fn stop(&mut self, cx: &mut Context<Self>) {
@@ -240,7 +404,8 @@ impl ChatView {
             && self.turn_running
             && let Some(callback) = &self.callback
         {
-            callback(ChatIntent::Stop, cx);
+            self.control_receipt = Some(callback(ChatIntent::Stop, cx));
+            cx.notify();
         }
     }
     fn jump(&mut self, cx: &mut Context<Self>) {
@@ -363,6 +528,15 @@ impl ChatView {
         let following = self.scroller.read(cx).is_following_tail();
         let count = self.model.rows.len();
         let changed = self.model.apply(record);
+        self.refresh_rows(count, following, changed, cx);
+    }
+    fn refresh_rows(
+        &mut self,
+        count: usize,
+        following: bool,
+        changed: Vec<usize>,
+        cx: &mut Context<Self>,
+    ) {
         self.row_views.resize(self.model.rows.len(), None);
         if !changed.is_empty() && !following {
             self.new_messages = true;
@@ -456,6 +630,22 @@ impl Render for ChatView {
                         "Native chat · {} rows · synthetic fixture",
                         self.model.rows.len()
                     )))
+                    .child(
+                        div().child(
+                            self.submission
+                                .as_ref()
+                                .map(|r| r.state.label())
+                                .unwrap_or_default(),
+                        ),
+                    )
+                    .child(
+                        div().child(
+                            self.control_receipt
+                                .as_ref()
+                                .map(|r| r.state.label())
+                                .unwrap_or_default(),
+                        ),
+                    )
                     .child(div().child(if self.selection_copied.is_some() {
                         "Copied"
                     } else {
@@ -521,7 +711,9 @@ impl Render for ChatView {
                             .disabled(
                                 self.read_only_reason.is_some()
                                     || self.callback.is_none()
-                                    || self.composer.read(cx).value().trim().is_empty(),
+                                    || self.submission_blocked()
+                                    || (self.composer.read(cx).value().trim().is_empty()
+                                        && self.images.is_empty()),
                             )
                             .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
                     )
@@ -754,9 +946,21 @@ fn running_after(entry: &Entry, previous: bool) -> bool {
             | HarnessEvent::ConversationReset { .. }
             | HarnessEvent::RemoteDisconnected { .. },
         ) => false,
-        Entry::Harness(HarnessEvent::HistoryReplayed { entries }) => entries
-            .iter()
-            .fold(previous, |running, entry| running_after(entry, running)),
+        Entry::Harness(HarnessEvent::HistoryReplayed { entries }) => {
+            entries.iter().fold(previous, |running, entry| {
+                running_after(
+                    &match entry {
+                        gitterm_core::harness::transcript::TranscriptEntry::UserPrompt(text) => {
+                            Entry::UserPrompt(text.clone())
+                        }
+                        gitterm_core::harness::transcript::TranscriptEntry::Harness(event) => {
+                            Entry::Harness(event.clone())
+                        }
+                    },
+                    running,
+                )
+            })
+        }
         _ => previous,
     }
 }

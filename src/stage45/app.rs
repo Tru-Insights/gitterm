@@ -338,8 +338,9 @@ fn review_ipc_range_normalization_and_stale_completions() {
     );
     let mut rows = Vec::new();
     for pending in [true, false] {
-        let pane = app.review_pane.as_mut().unwrap();
-        pane.commits = ["newest", "oldest"]
+        let stamp = app.review.pane().unwrap().stamp();
+        let mut load = empty_review_load(app.review.pane().unwrap());
+        load.commits = ["newest", "oldest"]
             .into_iter()
             .map(|id| ReviewCommit {
                 sha: id.into(),
@@ -349,8 +350,9 @@ fn review_ipc_range_normalization_and_stale_completions() {
                 authored_at: 0,
             })
             .collect();
-        let token = pane.token.clone();
-        let old_generation = pane.generation;
+        let _ = app.review_loaded(stamp.clone(), Ok(load));
+        let token = app.review.pane().unwrap().token.clone();
+        let old_generation = stamp;
         let _ = app.handle_review_ipc(ReviewIpc::SelectCommits {
             token,
             first: "newest".into(),
@@ -358,25 +360,21 @@ fn review_ipc_range_normalization_and_stale_completions() {
             pending,
         });
         let _ = app.review_loaded(old_generation, Err("stale completion".into()));
-        let pane = app.review_pane.as_ref().unwrap();
+        let pane = app.review.pane().unwrap();
         rows.push(json!({"command":"select commits","pending":pending,"source":format!("{:?}",pane.source),"generation":pane.generation,"focus":pane.focus,"hide_noise":pane.hide_noise,"error":pane.error}));
     }
-    let generation = app.review_pane.as_ref().unwrap().generation;
+    let generation = app.review.pane().unwrap().stamp();
     let _ = app.handle_review_ipc(ReviewIpc::Close {
         token: "old-token".into(),
     });
     rows.push(
         json!({"command":"wrong token","still_open":app.viewer_webview==ViewerWebview::Review}),
     );
-    let _ = app.review_loaded(generation, Err("current completion".into()));
-    rows.push(
-        json!({"command":"current completion","error":app.review_pane.as_ref().unwrap().error}),
-    );
+    let _ = app.review_loaded(generation.clone(), Err("current completion".into()));
+    rows.push(json!({"command":"current completion","error":app.review.pane().unwrap().error}));
     app.viewer_webview = ViewerWebview::None;
     let _ = app.review_loaded(generation, Err("completion after close".into()));
-    rows.push(
-        json!({"command":"completion after close","error":app.review_pane.as_ref().unwrap().error}),
-    );
+    rows.push(json!({"command":"completion after close","error":app.review.pane().unwrap().error}));
     golden("review/iced.trace.json", json!(rows));
 }
 
@@ -524,7 +522,7 @@ fn review_viewed_ipc_loaded_identity_and_corrupt_store() {
         base: None,
     };
     let _ = app.start_review(target, ReviewSource::Uncommitted, false, None);
-    let token = app.review_pane.as_ref().unwrap().token.clone();
+    let token = app.review.pane().unwrap().token.clone();
     let path = config::global_config_dir().join(VIEWED_FILE);
     let _ = app.handle_review_ipc(ReviewIpc::SetViewed {
         token: token.clone(),
@@ -550,19 +548,11 @@ fn review_viewed_ipc_loaded_identity_and_corrupt_store() {
     no_id.content_id = None;
     let files = vec![file, no_id];
     let totals = ReviewTotals::of(&files);
-    app.review_pane.as_mut().unwrap().loaded = Some((
-        ReviewDiff {
-            checkout: dir.path().into(),
-            branch: "fixture".into(),
-            base: None,
-            source: overview::DiffSource::Uncommitted,
-            merge_base: None,
-            files,
-            totals,
-            unlisted: 0,
-        },
-        dir.path().into(),
-    ));
+    let stamp = app.review.pane().unwrap().stamp();
+    let mut load = empty_review_load(app.review.pane().unwrap());
+    load.diff.files = files;
+    load.diff.totals = totals;
+    let _ = app.review_loaded(stamp, Ok(load));
     for file in ["a.rs", "unhashable.rs", "unlisted.rs"] {
         let _ = app.handle_review_ipc(ReviewIpc::SetViewed {
             token: token.clone(),
@@ -573,7 +563,8 @@ fn review_viewed_ipc_loaded_identity_and_corrupt_store() {
     let stored = read_json(&path);
     let marked = stored["checkouts"][dir.path().display().to_string()].clone();
     std::fs::write(&path, "{broken").unwrap();
-    app.review_marks = None;
+    app.review
+        .reduce(ReviewIntent::MarksLoaded(Err("retry fixture".into())));
     let _ = app.handle_review_ipc(ReviewIpc::SetViewed {
         token,
         path: "a.rs".into(),
@@ -600,4 +591,98 @@ fn task_mcp_receiver_is_taken_once() {
         "tasks/receiver.trace.json",
         json!({"first_pending":first_pending,"second_closed":second_closed,"receiver_slot_empty":task_mcp::take_command_receiver().is_none()}),
     );
+}
+
+#[test]
+fn review_target_switch_and_base_guards() {
+    if isolated("review_target_switch_and_base_guards", "app") {
+        return;
+    }
+    use gitterm::review_pane::*;
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(dir.path());
+    let _trace = Trace::start();
+    let target = ReviewTarget {
+        checkout: dir.path().join("first"),
+        repo: "fixture".into(),
+        branch: "feature".into(),
+        owner: "synthetic".into(),
+        base: None,
+    };
+    let _ = app.start_review(
+        target.clone(),
+        ReviewSource::Uncommitted,
+        true,
+        Some("a.rs".into()),
+    );
+    let first = app.review.pane().unwrap().clone();
+    let _ = app.handle_review_ipc(ReviewIpc::SetSource {
+        token: first.token.clone(),
+        source: overview::DiffSource::VsBase,
+        hide_noise: false,
+    });
+    let refused_base = app.review.pane().unwrap().generation == first.generation;
+    let _ = app.handle_review_ipc(ReviewIpc::ShowCommits {
+        token: first.token.clone(),
+    });
+    let refused_commits = app.review.pane().unwrap().generation == first.generation;
+    let mut second = target;
+    second.checkout = dir.path().join("second");
+    let _ = app.start_review(second.clone(), ReviewSource::Uncommitted, false, None);
+    let _ = app.review_loaded(first.stamp(), Err("wrong target".into()));
+    let _ = app.handle_review_ipc(ReviewIpc::Close { token: first.token });
+    let pane = app.review.pane().unwrap();
+    let target_unchanged = pane.target == second;
+    let stale_error = pane.error.clone();
+    let generation = pane.stamp();
+    let _ = app.review_loaded(
+        generation,
+        Ok(ReviewLoad {
+            diff: ReviewDiff {
+                checkout: second.checkout.clone(),
+                branch: second.branch.clone(),
+                base: None,
+                source: overview::DiffSource::Uncommitted,
+                merge_base: None,
+                files: Vec::new(),
+                totals: ReviewTotals::default(),
+                unlisted: 0,
+            },
+            commits: Vec::new(),
+            turns: Vec::new(),
+            commits_truncated: true,
+            commits_error: Some("fixture metadata".into()),
+            canonical_checkout: second.checkout.clone(),
+            live_paths: None,
+        }),
+    );
+    let pane = app.review.pane().unwrap();
+    golden(
+        "review/target.trace.json",
+        json!({"missing_base_refused":refused_base,"missing_commit_base_refused":refused_commits,
+        "target_unchanged":target_unchanged,"stale_error":stale_error,"still_open":app.viewer_webview==ViewerWebview::Review,
+        "loaded":pane.loaded.is_some(),"commits_truncated":pane.commits_truncated,"commits_error":pane.commits_error}),
+    );
+}
+
+fn empty_review_load(pane: &gitterm_core::review::state::Pane) -> gitterm::review_pane::ReviewLoad {
+    use gitterm::review_pane::*;
+    ReviewLoad {
+        diff: ReviewDiff {
+            checkout: pane.target.checkout.clone(),
+            branch: pane.target.branch.clone(),
+            base: pane.target.base.clone(),
+            source: overview::DiffSource::Uncommitted,
+            merge_base: None,
+            files: Vec::new(),
+            totals: ReviewTotals::default(),
+            unlisted: 0,
+        },
+        commits: Vec::new(),
+        turns: Vec::new(),
+        commits_truncated: false,
+        commits_error: None,
+        canonical_checkout: pane.target.checkout.clone(),
+        live_paths: None,
+    }
 }

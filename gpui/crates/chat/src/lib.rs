@@ -1,4 +1,5 @@
-//! Fixture-driven, interactive native chat. No session processes or configuration I/O.
+//! Native reducer adapter, row projection and fixture UI. No process or configuration I/O.
+pub mod adapter;
 pub mod events;
 pub mod intents;
 pub mod model;
