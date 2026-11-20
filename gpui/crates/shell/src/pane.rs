@@ -16,6 +16,7 @@ pub enum PaneKind {
     Chat,
     Git,
     Files,
+    Content(Entity<crate::content::window::ContentWindow>),
     Review(Entity<gitterm_gpui_review::ReviewView>),
 }
 impl From<SessionKind> for PaneKind {
@@ -31,6 +32,7 @@ pub enum PaneContent {
     Chat(Entity<ChatView>),
     Git,
     Files,
+    Content(Entity<crate::content::window::ContentWindow>),
     Review(Entity<gitterm_gpui_review::ReviewView>),
     Error(String),
 }
@@ -125,6 +127,7 @@ impl Pane {
             })),
             PaneKind::Git => PaneContent::Git,
             PaneKind::Files => PaneContent::Files,
+            PaneKind::Content(view) => PaneContent::Content(view),
             PaneKind::Review(view) => PaneContent::Review(view),
         };
         let terminal_cwd = matches!(content, PaneContent::Terminal(_))
@@ -265,6 +268,9 @@ impl Render for Pane {
                 .size_full()
                 .min_h_0()
                 .child(view.clone()),
+            PaneContent::Content(view) => div().id("content-pane").size_full().min_h_0().child(
+                crate::content::window::ContentWindow::body(view, &self.id, cx),
+            ),
             PaneContent::Error(error) => body.text_color(rgb(p.red)).child(error.clone()),
             PaneContent::Git => {
                 let status = self.status_view(cx);

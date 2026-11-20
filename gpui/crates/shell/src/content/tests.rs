@@ -1,8 +1,4 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Instant,
-};
+use std::{path::Path, sync::Arc, time::Instant};
 
 use gpui::{Image, ImageFormat};
 
@@ -91,7 +87,8 @@ fn origin(path: &str) -> Origin {
 }
 fn document() -> Document {
     Document::local_file(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/content/fixtures/viewer.html"),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        Path::new("src/content/fixtures/viewer.html"),
         true,
     )
     .unwrap()
@@ -430,7 +427,9 @@ fn local_renderers_and_plan_root_switch_use_captured_roots() {
     )
     .unwrap();
     assert!(Document::plan(first.path(), "escape.md", true).is_err());
-    assert!(Document::local_file(&PathBuf::from("/nonexistent/viewer.html"), true).is_err());
+    assert!(
+        Document::local_file(Path::new("/nonexistent"), Path::new("viewer.html"), true).is_err()
+    );
 }
 
 #[cfg(feature = "excalidraw")]
@@ -444,11 +443,11 @@ fn optional_excalidraw_uses_shared_validation_and_renderer() {
     )
     .unwrap();
     assert!(
-        Document::local_file(&path, true)
+        Document::local_file(dir.path(), Path::new("drawing.excalidraw"), true)
             .unwrap()
             .html()
             .contains("excalidraw")
     );
     std::fs::write(&path, "invalid").unwrap();
-    assert!(Document::local_file(&path, true).is_err());
+    assert!(Document::local_file(dir.path(), Path::new("drawing.excalidraw"), true).is_err());
 }
