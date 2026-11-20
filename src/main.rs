@@ -18803,12 +18803,9 @@ fn check_delegation_run(
     let path = new.options.checkout.as_deref().unwrap_or(&new.parent.cwd);
     let checkout = std::fs::canonicalize(path)
         .map_err(|error| format!("resolve delegation checkout {}: {error}", path.display()))?;
-    let repository = worker_repository_identity(&checkout)?.ok_or_else(|| {
-        format!(
-            "delegation checkout {} is no longer a Git repository",
-            checkout.display()
-        )
-    })?;
+    // Review/consult authority tracks Git's actual common directory, including
+    // bare-backed worktrees and submodules; worker main-checkout trust is separate.
+    let repository = gitterm::delegations::repository_identity(&checkout)?;
     let live = Repository::discover(&checkout)
         .map_err(|error| format!("open delegation checkout {}: {error}", checkout.display()))?;
     let workdir = live.workdir().ok_or_else(|| {
@@ -49734,6 +49731,224 @@ mod tests {
     use gitterm::tasks::{GitBase, RepositoryIdentity};
     use std::path::Path;
     use std::sync::Arc;
+
+    fn assert_delegation_common_directory_authority(submodule: bool, linked: bool) {
+        use delegation_state::{Effect, Intent, State};
+        use gitterm::task_mcp::{ConsultDelegationRequest, ReviewDelegationRequest};
+
+        fn git(dir: &Path, args: &[&str]) {
+            let output = gitterm_core::git_status::git_command()
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "protocol.file.allow=always",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        }
+
+        for review in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path();
+            // Win32 aliases trailing spaces; exercise exact path preservation on Unix.
+            let bare_name = if cfg!(unix) {
+                "repository.git "
+            } else {
+                "repository.git"
+            };
+            let checkout_name = if cfg!(unix) { "checkout " } else { "checkout" };
+            git(root, &["init", "-q", "-b", "main", "source"]);
+            git(
+                &root.join("source"),
+                &["commit", "-qm", "initial", "--allow-empty"],
+            );
+            let checkout = if submodule {
+                git(root, &["init", "-q", "-b", "main", "super"]);
+                git(
+                    &root.join("super"),
+                    &["submodule", "add", "-q", "../source", "library"],
+                );
+                root.join("super/library")
+            } else {
+                git(root, &["clone", "-q", "--bare", "source", bare_name]);
+                git(
+                    &root.join(bare_name),
+                    &[
+                        "worktree",
+                        "add",
+                        "-q",
+                        root.join(checkout_name).to_str().unwrap(),
+                        "main",
+                    ],
+                );
+                root.join(checkout_name)
+            };
+            let checkout = if submodule && linked {
+                let linked_checkout = root.join("module-checkout");
+                git(
+                    &checkout,
+                    &[
+                        "worktree",
+                        "add",
+                        "-q",
+                        "-b",
+                        "linked",
+                        linked_checkout.to_str().unwrap(),
+                        "HEAD",
+                    ],
+                );
+                linked_checkout
+            } else {
+                checkout
+            };
+            let checkout = std::fs::canonicalize(checkout).unwrap();
+            let common = std::fs::canonicalize(if submodule {
+                root.join("super/.git/modules/library")
+            } else {
+                root.join(bare_name)
+            })
+            .unwrap();
+            let caller = delegation_state::Caller {
+                tab: gitterm::delegations::CallerTab {
+                    session_uid: "caller".into(),
+                    chat_session_id: None,
+                    workspace: "fixture".into(),
+                    cwd: checkout.clone(),
+                    remote: false,
+                    home: checkout.clone(),
+                    repos: vec![],
+                },
+                target: gitterm_core::session::Target {
+                    tab_id: 1,
+                    session_uid: "caller".into(),
+                    task_id: None,
+                    task_session_id: None,
+                },
+                workspace_uid: 1,
+                local_root: Some(checkout.clone()),
+            };
+            let new = if review {
+                let request: ReviewDelegationRequest =
+                    serde_json::from_value(serde_json::json!({"target": "uncommitted"})).unwrap();
+                gitterm::delegations::review_delegation(&request, &caller.tab, None, None).unwrap()
+            } else {
+                gitterm::delegations::consult_delegation(
+                    &ConsultDelegationRequest {
+                        brief: "Inspect fixture".into(),
+                        ..Default::default()
+                    },
+                    &caller.tab,
+                    None,
+                    None,
+                )
+                .unwrap()
+            };
+            let mut state = State::default();
+            let mut effects = state.reduce(Intent::Request {
+                new: Box::new(new),
+                caller: caller.clone(),
+            });
+            let Effect::Check {
+                request, mut new, ..
+            } = effects.pop().unwrap()
+            else {
+                panic!("expected checkout check");
+            };
+            // The original authorization boundary still accepts both request kinds.
+            gitterm::delegations::check_run(&mut new, &caller.tab).unwrap();
+            let original = check_delegation_run(&mut new, &caller.tab).unwrap();
+            assert_eq!(original.repository.common_dir, common);
+            let mut effects = state.reduce(Intent::Checked {
+                request,
+                new,
+                caller: Some(&caller),
+                result: Ok(original.clone()),
+            });
+            let Effect::Insert { new, .. } = effects.pop().unwrap() else {
+                panic!("expected authorized insertion");
+            };
+            let record = gitterm::tasks::Delegation::new_requested(*new, "t0");
+            let policy = gitterm::plan_limits::evaluate_policy(&Default::default(), 1_800_000_000);
+            for changed in [false, true] {
+                let mut state = State::default();
+                state.reduce(Intent::Stored {
+                    id: record.delegation_id.clone(),
+                    caller: caller.clone(),
+                    authority: original.clone(),
+                });
+                let mut effects = state.reduce(Intent::Admit {
+                    delegations: std::slice::from_ref(&record),
+                    running: &HashSet::new(),
+                    callers: &HashMap::from([("caller".into(), caller.clone())]),
+                    max_concurrent: 1,
+                    policy: &policy,
+                    running_workers: 0,
+                });
+                let Effect::CheckStart { check, .. } = effects.pop().unwrap() else {
+                    panic!("expected start preflight");
+                };
+                if changed {
+                    // Move the actual common directory while retaining a usable checkout.
+                    let admin =
+                        std::fs::canonicalize(Repository::open(&checkout).unwrap().path()).unwrap();
+                    let moved = common.with_file_name("moved.git");
+                    std::fs::rename(&common, &moved).unwrap();
+                    let admin = moved.join(admin.strip_prefix(&common).unwrap());
+                    std::fs::write(
+                        checkout.join(".git"),
+                        format!("gitdir: {}\n", admin.display()),
+                    )
+                    .unwrap();
+                }
+                let mut new = gitterm::delegations::rerun_delegation(&record).unwrap();
+                let current = check_delegation_run(&mut new, &caller.tab).unwrap();
+                assert_eq!(current.repository.common_dir == common, !changed);
+                let mut expected = original.clone();
+                expected.repository.common_dir = current.repository.common_dir.clone();
+                assert_eq!(current, expected);
+                let effects = state.reduce(Intent::StartChecked {
+                    delegation: &record,
+                    check,
+                    caller: Some(&caller),
+                    result: Ok(current),
+                    running: &HashSet::new(),
+                    max_concurrent: 1,
+                    policy: &policy,
+                    running_workers: 0,
+                });
+                if changed {
+                    assert!(matches!(effects.as_slice(), [Effect::StartRejected { .. }]));
+                    assert!(!state.busy());
+                } else {
+                    assert!(matches!(effects.as_slice(), [Effect::Start(_)]));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delegation_authority_accepts_bare_backed_worktrees_and_refuses_changed_common_dir() {
+        assert_delegation_common_directory_authority(false, true);
+    }
+
+    #[test]
+    fn delegation_authority_accepts_submodules_and_refuses_changed_common_dir() {
+        for linked in [false, true] {
+            assert_delegation_common_directory_authority(true, linked);
+        }
+    }
 
     #[test]
     fn copy_markdown_freeze_label_redacts_copied_text() {

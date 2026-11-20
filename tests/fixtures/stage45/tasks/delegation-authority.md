@@ -68,3 +68,15 @@ The follow-up uses catalog-only caller facts, checked filesystem snapshots,
 and generation-bound preflights with a second policy/cap gate. Regression tests
 cover these paths, cancelled/duplicate/superseded tickets, policy changes during
 preflight and changed checkout authority. Final review IDs are in the handoff.
+
+Re-review `bc4265fe-431c-4202-a4bd-af62f9a1a0e6` confirmed F1–F3 and found
+F4: review/consult authority had inherited worker trust's main-checkout layout
+restriction. The fix captures Git's canonical common-directory identity using the
+delegation service's existing path-preserving parser, without changing worker
+trust. Temporary bare-backed worktree, submodule and linked submodule worktree
+fixtures exercise both review and consult requests through insertion and start
+admission. Moving the actual common directory while keeping the checkout valid
+rejects the stale queued
+authority. On Unix, the bare-backed fixture also preserves trailing spaces in
+checkout and common-directory paths. This follows the reviewed F4 diagnosis and
+remedy (R2: repository identity); no new authority policy is added.
