@@ -274,24 +274,26 @@ fn picker_requests_are_pending_until_acknowledged_and_rejections_are_not_saved()
         };
         assert_eq!(state.pending_change(), Some(&requested));
         assert_eq!(state.acknowledged, before);
-        outcome(&mut state, correlation, DeliveryOutcome::Written);
-        assert_eq!(state.acknowledged, before);
         assert!(matches!(
             change(&mut state, requested.clone()),
             Effect::Rejected(_)
         ));
-        let effects = event(
-            &mut state,
-            HarnessEvent::Error("Synthetic rejection".into()),
-        );
-        assert_eq!(effects.notices.len(), 1);
-        assert!(effects.settings_changed.is_none());
+        assert!(matches!(
+            outcome(
+                &mut state,
+                correlation,
+                DeliveryOutcome::Rejected("Synthetic rejection".into()),
+            ),
+            Effect::Rejected(_)
+        ));
         assert!(state.pending_change().is_none());
         assert_eq!(state.acknowledged, before);
-        assert!(matches!(
-            change(&mut state, requested.clone()),
-            Effect::Dispatch { .. }
-        ));
+        let Effect::Dispatch { correlation, .. } = change(&mut state, requested.clone()) else {
+            panic!()
+        };
+        outcome(&mut state, correlation, DeliveryOutcome::Written);
+        assert_eq!(state.pending_change(), Some(&requested));
+        assert_eq!(state.acknowledged, before);
         assert_eq!(
             event(&mut state, acknowledged.clone()).settings_changed,
             Some(requested)
@@ -299,6 +301,113 @@ fn picker_requests_are_pending_until_acknowledged_and_rejections_are_not_saved()
         assert!(state.pending_change().is_none());
         assert!(event(&mut state, acknowledged).settings_changed.is_none());
     }
+}
+
+#[test]
+fn uncorrelated_errors_preserve_pending_settings_after_uncertain_or_written_delivery() {
+    for (requested, acknowledged) in [
+        (
+            SettingChange::Model("sonnet".into()),
+            HarnessEvent::ModelChanged("sonnet".into()),
+        ),
+        (
+            SettingChange::Effort(Some("high".into())),
+            HarnessEvent::EffortChanged {
+                effort: Some("high".into()),
+                applied: Some("high".into()),
+            },
+        ),
+        (
+            SettingChange::Mode("plan".into()),
+            HarnessEvent::PermissionModeChanged("plan".into()),
+        ),
+    ] {
+        for delivery in [
+            DeliveryOutcome::Uncertain("partial picker write".into()),
+            DeliveryOutcome::Written,
+        ] {
+            let mut state = State::default();
+            let before = state.acknowledged.clone();
+            let Effect::Dispatch { correlation, .. } = change(&mut state, requested.clone()) else {
+                panic!()
+            };
+            outcome(&mut state, correlation, delivery);
+            for reason in ["partial picker write", "failed interrupt"] {
+                let effects = event(&mut state, HarnessEvent::Error(reason.into()));
+                assert!(effects.settings_changed.is_none());
+                assert_eq!(state.acknowledged, before);
+                assert_eq!(state.pending_change(), Some(&requested));
+                assert!(matches!(
+                    change(&mut state, requested.clone()),
+                    Effect::Rejected(_)
+                ));
+            }
+            assert_eq!(
+                event(&mut state, acknowledged.clone()).settings_changed,
+                Some(requested.clone())
+            );
+            assert!(state.pending_change().is_none());
+            assert!(event(&mut state, acknowledged.clone())
+                .settings_changed
+                .is_none());
+        }
+    }
+}
+
+#[test]
+fn written_prompt_without_lifecycle_stays_uncertain_on_exit_and_restart() {
+    let mut state = working();
+    let correlation = queue(&mut state, "written");
+    outcome(&mut state, correlation, DeliveryOutcome::Written);
+    assert_eq!(
+        state.queued_prompts["written"].status,
+        PromptStatus::Pending
+    );
+    let effects = event(&mut state, HarnessEvent::ProcessExited { code: Some(1) });
+    assert!(effects.unsent_prompts.is_empty());
+    assert_eq!(
+        state.queued_prompts["written"].status,
+        PromptStatus::Uncertain
+    );
+    assert_eq!(
+        state.queued_prompts["written"].prompt.text,
+        "Synthetic queued prompt"
+    );
+    assert_eq!(state.queued_prompts["written"].prompt.images.len(), 1);
+    assert!(
+        event(&mut state, HarnessEvent::ProcessExited { code: None })
+            .unsent_prompts
+            .is_empty()
+    );
+    state.begin_runtime();
+    assert_eq!(
+        state.queued_prompts["written"].status,
+        PromptStatus::Uncertain
+    );
+    assert!(matches!(
+        withdraw(&mut state, "written"),
+        Effect::Rejected(_)
+    ));
+}
+
+#[test]
+fn selecting_confirmed_mode_is_a_noop_and_does_not_block_other_pickers() {
+    let mut state = State::default();
+    change(&mut state, SettingChange::Mode("plan".into()));
+    event(
+        &mut state,
+        HarnessEvent::PermissionModeChanged("plan".into()),
+    );
+    assert!(matches!(
+        change(&mut state, SettingChange::Mode("plan".into())),
+        Effect::None
+    ));
+    assert!(state.pending_change().is_none());
+    assert_eq!(state.acknowledged.mode.as_deref(), Some("plan"));
+    assert!(matches!(
+        change(&mut state, SettingChange::Model("sonnet".into())),
+        Effect::Dispatch { .. }
+    ));
 }
 
 #[test]

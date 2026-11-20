@@ -241,6 +241,8 @@ pub struct QueuedPrompt {
     pub prompt: UserPrompt,
     pub status: PromptStatus,
     pub withdraw_pending: bool,
+    /// A write alone cannot establish whether the provider started the prompt.
+    written: bool,
 }
 
 #[derive(Debug)]
@@ -552,7 +554,10 @@ impl State {
             .values_mut()
             .filter_map(|queued| {
                 queued.withdraw_pending = false;
-                if matches!(queued.status, PromptStatus::Pending | PromptStatus::Queued) {
+                if queued.status == PromptStatus::Pending && queued.written {
+                    queued.status = PromptStatus::Uncertain;
+                    None
+                } else if matches!(queued.status, PromptStatus::Pending | PromptStatus::Queued) {
                     queued.status = PromptStatus::Unsent;
                     Some(queued.prompt.clone())
                 } else {
@@ -630,6 +635,7 @@ impl State {
                         prompt: prompt.clone(),
                         status: PromptStatus::Pending,
                         withdraw_pending: false,
+                        written: false,
                     },
                 );
                 self.dispatch(
@@ -684,12 +690,17 @@ impl State {
                         "Cannot apply {change:?} on this chat runtime"
                     ));
                 }
-                // Harness Error has no request ID. Admit one picker at a time
-                // so a rejection cannot save another optimistic selection.
+                // Admit one picker at a time until its acknowledgement or
+                // correlated rejection; generic harness errors cannot settle it.
                 if self.pending_change.is_some() {
                     return Effect::Rejected(
                         "A picker change is still awaiting acknowledgement".into(),
                     );
+                }
+                // The parser suppresses repeated mode acknowledgements.
+                if matches!(&change, SettingChange::Mode(value) if self.acknowledged.mode.as_ref() == Some(value))
+                {
+                    return Effect::None;
                 }
                 let effect =
                     self.dispatch(runtime, change.command(), PendingCommand::Setting, None);
@@ -711,7 +722,14 @@ impl State {
                     return Effect::None;
                 };
                 let reason = match outcome {
-                    DeliveryOutcome::Written => return Effect::None,
+                    DeliveryOutcome::Written => {
+                        if let PendingCommand::Queue(id) = command {
+                            if let Some(prompt) = self.queued_prompts.get_mut(&id) {
+                                prompt.written = true;
+                            }
+                        }
+                        return Effect::None;
+                    }
                     DeliveryOutcome::Rejected(reason) => (reason, false),
                     DeliveryOutcome::Uncertain(reason) => (reason, true),
                 };
@@ -1013,15 +1031,6 @@ impl State {
                 HarnessEvent::EffortChanged { effort, applied } => {
                     effects.settings_changed =
                         self.acknowledge(SettingChange::Effort(effort.clone()), applied.clone());
-                }
-                HarnessEvent::Error(reason) => {
-                    if let Some((_, change)) = self.pending_change.take() {
-                        effects
-                            .notices
-                            .push(format!("Change {change:?} was not acknowledged: {reason}"));
-                        self.commands
-                            .retain(|_, command| !matches!(command, PendingCommand::Setting));
-                    }
                 }
                 HarnessEvent::TurnStarted { session_id, .. } => {
                     self.state = AgentSessionState::Streaming;
