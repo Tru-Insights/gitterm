@@ -16,7 +16,6 @@ use gitterm_core::{
     chat::{
         runtime::{CommandCorrelation, Session},
         state::{AgentEvent, RuntimeStamp},
-        types::AgentBackend,
     },
     session,
 };
@@ -77,6 +76,21 @@ impl Controller {
         }
     }
     fn dispatch(&mut self, intent: ChatIntent) -> (Receipt, Update) {
+        // FreshPreview's launch policy is default-only. Do not let a forged
+        // native intent bypass that policy through the runtime control channel.
+        if matches!(&intent, ChatIntent::ChangeMode { .. }) {
+            let reason = "Preview mode changes are disabled; FreshPreview remains in default mode";
+            return (
+                Receipt::rejected(reason),
+                Update {
+                    event: Some(gitterm_core::chat::state::EventEffects {
+                        notices: vec![reason.into()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
         if matches!(&intent, ChatIntent::Send { images, .. } if !images.is_empty()) {
             return (
                 Receipt::rejected("Images: not in preview yet"),
@@ -103,7 +117,11 @@ impl Controller {
                 task_live: false,
                 last_tab: false,
             },
-            backend: AgentBackend::Claude,
+            config: gitterm_core::chat::types::AgentBackendConfig::Claude {
+                model: String::new(),
+                permission_mode: Some("default".into()),
+                effort: None,
+            },
             process_running: self.ready && self.runtime.is_some(),
             just_spawned: false,
             message_id: format!("{}-{}", self.target.session_uid, self.message),
