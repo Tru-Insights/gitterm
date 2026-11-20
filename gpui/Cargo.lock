@@ -2617,6 +2617,7 @@ dependencies = [
 name = "gitterm-gpui-chat"
 version = "0.0.0"
 dependencies = [
+ "gitterm-core",
  "gpui-component",
  "gpui-kit",
  "gpui-pre",
