@@ -11,6 +11,9 @@ pub(crate) struct Provider {
     pub spec: ProbeSpec,
     real_home: PathBuf,
 }
+const HELP_LIMIT: usize = 256 * 1024;
+const AUTH_LIMIT: usize = 16 * 1024;
+
 impl Provider {
     pub fn new(preview: Arc<Preview>, executable: &Path) -> Result<Self> {
         let home = dirs::home_dir().context("resolve GitTerm process home for Claude keychain")?;
@@ -177,14 +180,6 @@ impl Provider {
         self.preview.scoped(&self.preview.provider())?;
         Ok(())
     }
-    #[cfg(test)]
-    pub fn authorize(&self) -> Result<()> {
-        ensure!(
-            !super::auth::AUTH_STATUS_SCHEMA.unverified,
-            "Claude preview auth schema is UNVERIFIED until coordinator probe (chat/auth.rs AUTH_STATUS_SCHEMA); launch refused"
-        );
-        Ok(())
-    }
     pub fn start(
         self: Arc<Self>,
         cwd: PathBuf,
@@ -244,18 +239,21 @@ impl Provider {
     }
     async fn check_launch(&self, schema: super::auth::Schema, managed_root: &Path) -> Result<()> {
         super::managed::check(managed_root)?;
-        let (exit, help) = self.output(&["--help"]).await?;
+        // Claude Code 2.1.327 help is ~22 KiB; auth status keeps the tighter auth cap.
+        let (exit, help) = self.output(&["--help"], HELP_LIMIT).await?;
         ensure!(
             exit == Some(0),
             "Claude --help failed; preview launch refused"
         );
         super::fence::check_help(std::str::from_utf8(&help).context("unparseable Claude help")?)?;
-        let (exit, status) = self.output(&["auth", "status", "--json"]).await?;
+        let (exit, status) = self
+            .output(&["auth", "status", "--json"], AUTH_LIMIT)
+            .await?;
         super::auth::personal_auth(exit, &status, &self.preview.provider(), schema)?;
         // Recheck immediately before returning launch authority.
         super::managed::check(managed_root)
     }
-    async fn output(&self, args: &[&str]) -> Result<(Option<i32>, Vec<u8>)> {
+    async fn output(&self, args: &[&str], limit: usize) -> Result<(Option<i32>, Vec<u8>)> {
         use tokio::io::AsyncReadExt;
         let mut child = tokio::process::Command::new(self.spec.executable())
             .args(args)
@@ -272,11 +270,11 @@ impl Provider {
             .stdout
             .take()
             .context("Claude gate stdout missing")?
-            .take(16 * 1024 + 1);
+            .take(limit as u64 + 1);
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let mut bytes = Vec::new();
             stdout.read_to_end(&mut bytes).await?;
-            ensure!(bytes.len() <= 16 * 1024, "Claude gate output exceeds limit");
+            ensure!(bytes.len() <= limit, "Claude gate output exceeds limit");
             Ok::<_, anyhow::Error>((child.wait().await?.code(), bytes))
         })
         .await;
@@ -565,7 +563,7 @@ mod gate_tests {
         let release = dir.path().join("release-auth");
         let spawned = dir.path().join("chat-spawned");
         let help = "  --restricted\n  --strict-mcp-config\n  --safe-mode\n  --permission-mode <mode> (choices: \"manual\")\n";
-        let status = serde_json::json!({"fixture_signed_in":true,"fixture_method":"fixture_personal","fixture_plan":"fixture_pro","fixture_root":preview.provider(),"fixture_policy":null});
+        let status = serde_json::json!({"fixture_signed_in":true,"fixture_method":"fixture_personal","fixture_plan":"fixture_pro","fixture_root":preview.provider(),"fixture_provider":"fixture_first_party"});
         let fake = script(
             dir.path(),
             "fake-close-gate",
@@ -608,10 +606,15 @@ mod gate_tests {
         let (dir, preview) = fixture();
         let help = "  --restricted\n  --strict-mcp-config\n  --safe-mode\n  --permission-mode <mode> (choices: \"manual\")\n";
         let marker = dir.path().join("calls");
-        let good = serde_json::json!({"fixture_signed_in":true,"fixture_method":"fixture_personal","fixture_plan":"fixture_max","fixture_root":preview.provider(),"fixture_policy":null});
+        let good = serde_json::json!({"fixture_signed_in":true,"fixture_method":"fixture_personal","fixture_plan":"fixture_max","fixture_root":preview.provider(),"fixture_provider":"fixture_first_party"});
         for (help, status, schema, pass) in [
             (help.to_owned(), good.to_string(), FIXTURE_SCHEMA, true),
-            (help.to_owned(), good.to_string(), AUTH_STATUS_SCHEMA, false),
+            (
+                help.to_owned(),
+                super::super::auth::tests::signed_in(&preview.provider()).to_string(),
+                AUTH_STATUS_SCHEMA,
+                true,
+            ),
             (
                 help.replace("--restricted", "--missing"),
                 good.to_string(),
@@ -619,6 +622,19 @@ mod gate_tests {
                 false,
             ),
             (help.to_owned(), "{}".into(), FIXTURE_SCHEMA, false),
+            // Real 2.1.327 help is ~22 KiB, over the auth cap.
+            (
+                format!("{help}{}", "x".repeat(24 * 1024)),
+                good.to_string(),
+                FIXTURE_SCHEMA,
+                true,
+            ),
+            (
+                format!("{help}{}", "x".repeat(HELP_LIMIT)),
+                good.to_string(),
+                FIXTURE_SCHEMA,
+                false,
+            ),
         ] {
             let fake = script(
                 dir.path(),
@@ -646,7 +662,7 @@ mod gate_tests {
                 .lines()
                 .filter(|line| *line == "auth status --json")
                 .count(),
-            3
+            4
         );
         assert!(
             calls

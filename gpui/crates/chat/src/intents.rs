@@ -9,6 +9,14 @@ pub enum ChatIntent {
         images: Vec<gitterm_core::chat::types::ImageAttachment>,
     },
     Stop,
+    Withdraw {
+        message_id: String,
+    },
+    /// Rejection-only defensive seam. C11a never emits setting changes.
+    /// Hosts must reject this even if a caller forges it outside the composer.
+    ChangeMode {
+        mode: String,
+    },
     Permission {
         request_id: String,
         decision: PermissionDecision,

@@ -16,7 +16,6 @@ use gitterm_core::{
     chat::{
         runtime::{CommandCorrelation, Session},
         state::{AgentEvent, RuntimeStamp},
-        types::AgentBackend,
     },
     session,
 };
@@ -77,6 +76,21 @@ impl Controller {
         }
     }
     fn dispatch(&mut self, intent: ChatIntent) -> (Receipt, Update) {
+        // FreshPreview's launch policy is default-only. Do not let a forged
+        // native intent bypass that policy through the runtime control channel.
+        if matches!(&intent, ChatIntent::ChangeMode { .. }) {
+            let reason = "Preview mode changes are disabled; FreshPreview remains in default mode";
+            return (
+                Receipt::rejected(reason),
+                Update {
+                    event: Some(gitterm_core::chat::state::EventEffects {
+                        notices: vec![reason.into()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
         if matches!(&intent, ChatIntent::Send { images, .. } if !images.is_empty()) {
             return (
                 Receipt::rejected("Images: not in preview yet"),
@@ -103,7 +117,11 @@ impl Controller {
                 task_live: false,
                 last_tab: false,
             },
-            backend: AgentBackend::Claude,
+            config: gitterm_core::chat::types::AgentBackendConfig::Claude {
+                model: String::new(),
+                permission_mode: Some("default".into()),
+                effort: None,
+            },
             process_running: self.ready && self.runtime.is_some(),
             just_spawned: false,
             message_id: format!("{}-{}", self.target.session_uid, self.message),
@@ -520,12 +538,29 @@ impl Render for ChatPane {
     }
 }
 fn claude_program() -> Result<PathBuf> {
-    // Resolve only; neither --version nor any real CLI subcommand runs here.
-    let path = std::env::var_os("PATH")
-        .ok_or_else(|| anyhow::anyhow!("PATH unavailable; Claude executable not found"))?;
-    std::env::split_paths(&path)
-        .filter(|path| path.is_absolute())
-        .map(|path| path.join("claude"))
-        .find(|path| path.is_file())
-        .ok_or_else(|| anyhow::anyhow!("Claude executable not found in PATH"))
+    find_claude(
+        std::env::var_os("PATH"),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+/// Resolve only; neither --version nor any real CLI subcommand runs here.
+/// A Finder/Dock launch gets a minimal PATH, so also search the install
+/// folders Iced adds for terminal tabs (`src/harness/claude.rs` `extra_bin_dirs`).
+fn find_claude(path: Option<std::ffi::OsString>, home: Option<PathBuf>) -> Result<PathBuf> {
+    let mut dirs: Vec<PathBuf> = path
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    if let Some(home) = home.filter(|home| home.is_absolute()) {
+        dirs.push(home.join(".local/bin"));
+        dirs.push(home.join(".cargo/bin"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs.into_iter()
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("claude"))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Claude executable not found in PATH or the usual install folders")
+        })
 }

@@ -65,8 +65,16 @@ fn fake_help_missing_restricted_refuses_and_success_does_not_grant_authority() {
             super::fence::check_help(std::str::from_utf8(&output.stdout).unwrap()).is_ok(),
             supported
         );
-        // Even supported CLI evidence cannot bypass the unresolved R2 gates.
-        assert!(provider.authorize().is_err());
+        // Help alone cannot supply account evidence to the launch gate.
+        assert!(
+            super::auth::personal_auth(
+                Some(0),
+                &output.stdout,
+                &preview.provider(),
+                super::auth::AUTH_STATUS_SCHEMA
+            )
+            .is_err()
+        );
     }
 }
 
@@ -158,7 +166,17 @@ async fn probe_both_states_and_environment_are_rooted_and_success_does_not_open_
         );
         let provider = Provider::fixture(preview.clone(), &fake).unwrap();
         assert_eq!(provider.fake_probe().await.unwrap(), expected);
-        assert!(provider.authorize().is_err());
+        // The display probe's partial schema cannot authorize a launch.
+        let partial = serde_json::json!({"authMethod":method,"configDirectory":preview.provider()});
+        assert!(
+            super::auth::personal_auth(
+                Some(code),
+                &serde_json::to_vec(&partial).unwrap(),
+                &preview.provider(),
+                super::auth::AUTH_STATUS_SCHEMA
+            )
+            .is_err()
+        );
         let env = std::fs::read_to_string(dir.path().join("environment")).unwrap();
         for forbidden in [
             "ANTHROPIC_API_KEY",
@@ -420,7 +438,7 @@ if sys.argv[1:] == ['--help']:
     print('  --restricted\n  --strict-mcp-config\n  --safe-mode\n  --permission-mode <mode> (choices: "manual")')
     sys.exit(0)
 if sys.argv[1:] == ['auth', 'status', '--json']:
-    print(json.dumps({{'fixture_signed_in':True,'fixture_method':'fixture_personal','fixture_plan':'fixture_pro','fixture_root':os.environ['CLAUDE_CONFIG_DIR'],'fixture_policy':None}}))
+    print(json.dumps({{'fixture_signed_in':True,'fixture_method':'fixture_personal','fixture_plan':'fixture_pro','fixture_root':os.environ['CLAUDE_CONFIG_DIR'],'fixture_provider':'fixture_first_party'}}))
     sys.exit(0)
 if sys.argv[1:] == ['auth', 'status']:
     print(json.dumps({{'authMethod':'claude.ai', 'configDirectory':os.environ['CLAUDE_CONFIG_DIR']}}))
@@ -569,7 +587,6 @@ assert not sys.stdin.read()
         controller.adapter.state().session_id.as_deref(),
         Some("preview-created-id")
     );
-    assert!(provider.authorize().is_err());
     let launch: serde_json::Value =
         serde_json::from_slice(&std::fs::read(cwd.join("launch.json")).unwrap()).unwrap();
     assert_eq!(launch["cwd"], cwd.to_str().unwrap());
@@ -678,7 +695,7 @@ if sys.argv[1:] == ['--help']:
     print('  --restricted\n  --strict-mcp-config\n  --safe-mode\n  --permission-mode <mode> (choices: "manual")')
     sys.exit(0)
 if sys.argv[1:] == ['auth', 'status', '--json']:
-    print(json.dumps({{'fixture_signed_in':True,'fixture_method':'fixture_personal','fixture_plan':'fixture_pro','fixture_root':os.environ['CLAUDE_CONFIG_DIR'],'fixture_policy':None}}))
+    print(json.dumps({{'fixture_signed_in':True,'fixture_method':'fixture_personal','fixture_plan':'fixture_pro','fixture_root':os.environ['CLAUDE_CONFIG_DIR'],'fixture_provider':'fixture_first_party'}}))
     sys.exit(0)
 if sys.argv[1:] == ['auth', 'status']:
     print(json.dumps({{'authMethod':'claude.ai','configDirectory':os.environ['CLAUDE_CONFIG_DIR']}}))
@@ -819,7 +836,11 @@ fn correlated_receipts_are_stamped_and_preserve_all_delivery_states() {
                         task_live: false,
                         last_tab: false,
                     },
-                    backend: AgentBackend::Claude,
+                    config: gitterm_core::chat::types::AgentBackendConfig::Claude {
+                        model: String::new(),
+                        permission_mode: Some("default".into()),
+                        effort: None,
+                    },
                     process_running: true,
                     just_spawned: false,
                     message_id: "synthetic".into(),
@@ -965,4 +986,59 @@ async fn fake_process_rejected_and_partial_write_outcomes_reach_adapter() {
         let _ = runtime.send(HarnessCommand::Shutdown);
         runtime.completed().await.unwrap();
     }
+}
+
+#[test]
+fn preview_rejects_all_forged_mode_intents_without_dispatch_or_pending_setting() {
+    let mut controller = Controller::new();
+    let (sender, mut commands) = tokio::sync::mpsc::unbounded_channel();
+    controller.runtime = Some(Session::from_port(sender, true).into());
+    controller.ready = true;
+    for mode in [
+        "default",
+        "acceptEdits",
+        "plan",
+        "auto",
+        "dontAsk",
+        "bypassPermissions",
+        "forged",
+    ] {
+        let (receipt, update) = controller.dispatch(ChatIntent::ChangeMode { mode: mode.into() });
+        assert!(
+            matches!(receipt.state, ReceiptState::Rejected(ref reason) if reason.contains("FreshPreview remains in default mode"))
+        );
+        assert!(commands.try_recv().is_err());
+        assert!(controller.adapter.state().pending_change().is_none());
+        assert!(update.event.unwrap().notices[0].contains("FreshPreview remains in default mode"));
+    }
+}
+
+#[test]
+fn finds_claude_in_home_local_bin_when_finder_path_lacks_it() {
+    let dir = tempfile::tempdir_in("/private/tmp").unwrap();
+    let home = dir.path().join("home");
+    let bin = home.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("claude"), "#!/bin/sh\n").unwrap();
+    // A Finder/Dock launch gets only the system folders on PATH.
+    let finder_path = Some(std::ffi::OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"));
+    assert_eq!(
+        find_claude(finder_path.clone(), Some(home.clone())).unwrap(),
+        bin.join("claude")
+    );
+    // An earlier PATH entry still wins.
+    let first = dir.path().join("first");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::write(first.join("claude"), "#!/bin/sh\n").unwrap();
+    let path = std::env::join_paths([first.clone(), PathBuf::from("/usr/bin")]).unwrap();
+    assert_eq!(
+        find_claude(Some(path), Some(home)).unwrap(),
+        first.join("claude")
+    );
+    // Relative HOME is ignored.
+    assert!(
+        find_claude(finder_path, Some(PathBuf::from("relative-home")))
+            .map(|found| found.is_absolute())
+            .unwrap_or(true)
+    );
 }

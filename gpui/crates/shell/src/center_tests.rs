@@ -63,7 +63,7 @@ fn process_exists(pid: &str) -> bool {
 }
 
 #[gpui::test]
-fn center_startup_new_terminal_close_reaps_and_hidden_exit_updates_title(cx: &mut TestAppContext) {
+fn fresh_local_workspace_creates_no_terminal(cx: &mut TestAppContext) {
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let folder = tempfile::tempdir().unwrap();
@@ -71,6 +71,36 @@ fn center_startup_new_terminal_close_reaps_and_hidden_exit_updates_title(cx: &mu
     let config = tempfile::tempdir().unwrap();
     let (shell, cx) =
         cx.add_window_view(|window, cx| local_shell(&folder, config.path(), window, cx));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let state = shell.read(cx).active(cx);
+        assert!(state.sessions.is_empty());
+        assert!(state.active_session.is_none());
+        assert_eq!(state.store.terminals, Some(vec![]));
+        assert!(state.panes.values().all(|pane| {
+            pane.read(cx).session.is_none()
+                && !matches!(pane.read(cx).content, pane::PaneContent::Terminal(_))
+        }));
+        assert_eq!(state.panes.len(), 2); // Git and Files only.
+        assert!(state.dock.read(cx).layout(DockPlacement::Bottom).is_none());
+    });
+    cx.simulate_keystrokes("cmd-t");
+    cx.read(|cx| assert!(shell.read(cx).active(cx).sessions.is_empty()));
+}
+
+#[gpui::test]
+fn explicit_terminal_close_reaps_and_hidden_exit_updates_title(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let folder = tempfile::tempdir().unwrap();
+    let folder = folder.path().canonicalize().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let (shell, cx) =
+        cx.add_window_view(|window, cx| local_shell(&folder, config.path(), window, cx));
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| shell.new_terminal(window, cx))
+    });
     let first = cx.read(|cx| {
         let state = shell.read(cx).active(cx);
         assert_eq!(state.sessions.len(), 1);
@@ -85,7 +115,7 @@ fn center_startup_new_terminal_close_reaps_and_hidden_exit_updates_title(cx: &mu
                 .unwrap()
                 .contains_panel(PanelId::from(pane.entity_id()))
         );
-        assert!(state.dock.read(cx).layout(DockPlacement::Bottom).is_some());
+        assert!(state.dock.read(cx).layout(DockPlacement::Bottom).is_none());
         assert_eq!(
             pane.read(cx).tab_title(),
             folder.file_name().unwrap().to_str().unwrap()
@@ -114,16 +144,12 @@ fn center_startup_new_terminal_close_reaps_and_hidden_exit_updates_title(cx: &mu
         .trim()
         .to_string();
     assert!(process_exists(&pid));
-    // Inspect the actual binding with terminal focus, then dispatch its action.
+    // Cmd+T is unbound even with terminal focus; explicit creation still works.
     cx.update(|window, cx| {
         first.read(cx).focus_handle().clone().focus(window, cx);
         window.draw(cx).clear(cx);
         let bindings = window.bindings_for_action_in(&NewTerminal, first.read(cx).focus_handle());
-        assert_eq!(bindings.len(), 1);
-        assert_eq!(
-            bindings[0].keystrokes(),
-            KeyBinding::new("cmd-t", NewTerminal, Some("GitTermShell")).keystrokes()
-        );
+        assert!(bindings.is_empty());
         window.dispatch_action(Box::new(NewTerminal), cx);
     });
     cx.run_until_parked();
@@ -189,7 +215,19 @@ fn center_startup_new_terminal_close_reaps_and_hidden_exit_updates_title(cx: &mu
             shell.close_session(id, window, cx);
         })
     });
-    cx.read(|cx| assert!(shell.read(cx).active(cx).sessions.is_empty()));
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            let state = shell.active(cx);
+            let pane = state.panes[&session_pane_id(state.sessions[0].id)].clone();
+            state.dock.update(cx, |dock, cx| dock.remove_panel(pane, window, cx));
+        })
+    });
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let state = shell.read(cx).active(cx);
+        assert_eq!(state.sessions.len(), 1);
+        assert!(pane_id_visible(state, &session_pane_id(state.sessions[0].id), cx));
+    });
 }
 
 #[gpui::test]
@@ -203,6 +241,7 @@ fn ordered_sessions_restore_fresh_shells_and_prune_stale_ids(cx: &mut TestAppCon
         cx.add_window_view(|window, cx| local_shell(&root, config.path(), window, cx));
     cx.update(|window, cx| {
         shell.update(cx, |shell, cx| {
+            shell.new_terminal(window, cx);
             shell.new_terminal(window, cx);
             shell.new_terminal(window, cx);
         })

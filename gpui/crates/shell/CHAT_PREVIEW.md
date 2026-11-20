@@ -8,20 +8,29 @@ Worker, Helper, Resume, RestoreProcess and remote/phone routes remain closed.
 History is read only and never supplies a resume ID. There is no production
 fake-executable switch or environment bypass.
 
-**Real chat still refuses until the coordinator verifies the account schema.**
-`gpui/crates/shell/src/chat/auth.rs::AUTH_STATUS_SCHEMA` is the single table of
-accepted JSON names and values. It is marked `UNVERIFIED until coordinator probe`
-(`unverified: true`). Its field list and method/subscription values are empty:
-no installed-version account fields have been guessed. The parser checks typed
-boolean/string/root/empty-policy fields, rejects missing and unknown fields,
-and requires positive signed-in, personal-method, Pro/Max and exact-root evidence.
-Every organization/team/enterprise, API/Console or third-party indicator must
-be mapped and empty. Only verified display-only strings may be informational.
-The coordinator must inspect **all** returned fields, populate the table and
-update tests before setting `unverified: false`. Flipping the boolean alone
-still refuses. Do not put account names or private output in the public repo.
-The only override is the explicit synthetic `FIXTURE_SCHEMA` under `cfg(test)`;
-it uses invented `fixture_*` names and cannot be selected by the app or env.
+`chat/auth.rs::AUTH_STATUS_SCHEMA` is verified against the coordinator's isolated
+Claude Code **2.1.327** `claude auth status --json` probe (`unverified: false`).
+Launch requires `loggedIn: true`, `authMethod: "claude.ai"`,
+`apiProvider: "firstParty"`, `subscriptionType: "pro"` or `"max"`, and
+`configDirectory` equal to the isolated provider root. Team, Enterprise, unknown
+or missing plans, other authentication methods/providers and signed-out status
+refuse. Personal accounts have organization fields: `orgId` and `orgName` do
+not determine account policy.
+
+The complete signed-in schema also requires string `email`, `orgId`, `orgName`,
+`planTier`, `projectsDirectory` and `loginExpiresAt`, plus boolean
+`storedClaudeAiLogin`, `analyticsDisabled` and `consoleProfileSignInOffered`.
+These fields are type-checked only; their values are never logged, retained or
+included in errors. No org field must be empty. The existing exact-key rule
+remains: **unknown or missing keys refuse**, as do incorrect field types.
+The observed signed-out shape (including null `loginExpiresAt` and absent
+account/plan fields) refuses. Synthetic fixtures cover both shapes and Pro/Max
+policy. `Field::PersonalOnly(EmptyIndicator)` was replaced with explicit provider
+validation and informational boolean/string types because empty org indicators
+cannot express personal subscription policy. The test-only `FIXTURE_SCHEMA`
+remains unavailable to app/environment selection. The only mechanical follow-on
+outside the chat/doc scope is `tests/claude-process/preview_outcomes.py`: its
+synthetic auth response now supplies the fixture provider field.
 
 Every start holds the provider lease before running the checks. On the session
 thread, under the unchanged nine-variable environment, it runs bounded, timed
@@ -157,8 +166,8 @@ env -i "CLAUDE_CONFIG_DIR=$P/providers/claude" "GITTERM_GPUI_CONFIG_DIR=$P" \
   "GITTERM_V6_CONFIG_DIR=$P/desktop" "HOME=$P/child/home" "XDG_CONFIG_HOME=$P/child/config" \
   PATH=/usr/bin:/bin "TMPDIR=$P/child/tmp" "TMP=$P/child/tmp" "TEMP=$P/child/tmp" \
   "$CLAUDE" auth status --json
-# Populate AUTH_STATUS_SCHEMA from the observed complete schema and verified
-# personal-account values, add fixtures, then flip unverified to false and review.
+# Schema is verified for 2.1.327; changed/unknown fields still refuse.
+# Re-verify the complete schema and review before supporting a different shape.
 # (c) Run only after confirming personal auth and absence of managed policy.
 cd "$REPO"
 scripts/preview-claude-confinement-probe.sh "$P/providers/claude" "$C"
@@ -197,9 +206,11 @@ choices. R2 code review `3991a38c-e37c-4d36-aa7c-d89276abddf3`
 and the full diff against `767df25`. Verdict: correct, no findings or concrete
 blockers in the gates, lease lifecycle, outcome ordering or public-data handling.
 The reviewer inspected verification logs without rerunning tests. No review
-fixes were requested; schema verification and the live confinement trial remain
-coordinator prerequisites. GitTerm refused the explicit checkout argument; the
-request without checkout ran in the correct cwd/head as confirmed by
+fixes were requested; the live confinement trial remains a coordinator
+prerequisite. The subsequent 2.1.327 schema verification is recorded above; the
+new activation-gate review is recorded in the durable task handoff. GitTerm
+refused the explicit checkout argument; the request without checkout ran in the
+correct cwd/head as confirmed by
 `delegation_get`. Prior C8-confine
 review `9f3fe814-9fae-4fa2-92fc-7a9f8bab6ac2` closed its four probe corrections;
 it did not approve this new activation gate.
