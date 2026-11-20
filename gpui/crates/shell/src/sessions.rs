@@ -88,6 +88,9 @@ impl crate::Shell {
             return;
         }
         pane.update(cx, |pane, cx| pane.stop_target(requested, cx));
+        self.owner.update(cx, |owner, _| {
+            owner.chats.remove(&requested.session_uid);
+        });
         let pane = state.panes.remove(&pane_id).unwrap();
         self.registry.borrow_mut().remove(&pane_id);
         if let Some(terminals) = &mut state.store.terminals {

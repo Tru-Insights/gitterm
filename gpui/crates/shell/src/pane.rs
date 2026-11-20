@@ -15,6 +15,7 @@ pub enum PaneKind {
     CenterTerminal(std::path::PathBuf),
     StoppedTerminal(std::path::PathBuf, bool),
     Chat,
+    PreviewChat(Entity<crate::chat::ChatPane>),
     Git,
     Files,
     Content(Entity<crate::content::window::ContentWindow>),
@@ -31,6 +32,7 @@ impl From<SessionKind> for PaneKind {
 pub enum PaneContent {
     Terminal(Entity<TerminalView>),
     Chat(Entity<ChatView>),
+    PreviewChat(Entity<crate::chat::ChatPane>),
     Git,
     Files,
     Content(Entity<crate::content::window::ContentWindow>),
@@ -147,6 +149,7 @@ impl Pane {
                     cx,
                 )
             })),
+            PaneKind::PreviewChat(view) => PaneContent::PreviewChat(view),
             PaneKind::Git => PaneContent::Git,
             PaneKind::Files => PaneContent::Files,
             PaneKind::Content(view) => PaneContent::Content(view),
@@ -176,7 +179,10 @@ impl Pane {
             None
         };
         Self {
-            session,
+            session: match &kind {
+                PaneKind::PreviewChat(view) => Some(view.read(cx).target()),
+                _ => session,
+            },
             _terminal_events: terminal_events,
             id,
             title,
@@ -206,6 +212,9 @@ impl Pane {
     pub(crate) fn stop_target(&mut self, target: &gitterm_core::session::Target, cx: &mut App) {
         if self.session.as_ref() != Some(target) {
             return;
+        }
+        if let PaneContent::PreviewChat(view) = &self.content {
+            view.update(cx, |view, cx| view.close(cx));
         }
         self.close_terminal(cx);
         self.session = None;
@@ -318,6 +327,11 @@ impl Render for Pane {
                     let id = self.id.clone();
                     move || id
                 })
+                .size_full()
+                .min_h_0()
+                .child(view.clone()),
+            PaneContent::PreviewChat(view) => div()
+                .id("preview-chat-pane")
                 .size_full()
                 .min_h_0()
                 .child(view.clone()),

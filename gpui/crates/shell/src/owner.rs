@@ -17,6 +17,7 @@ pub struct WorkspaceOwner {
     pub(crate) stopped_workspaces: std::collections::HashSet<crate::data::WorkspaceId>,
     pub model: WorkspaceStatus,
     pub error: Option<String>,
+    pub(crate) chats: std::collections::HashMap<String, Entity<crate::chat::ChatPane>>,
     pub files: std::collections::HashMap<crate::data::WorkspaceId, crate::files::FileTree>,
     file_jobs: crate::files::FileJobs,
     pub(crate) reviews: std::collections::HashMap<
@@ -137,6 +138,7 @@ impl WorkspaceOwner {
             file_jobs: Default::default(),
             file_sender,
             error: None,
+            chats: Default::default(),
             store,
             jobs,
             executor,
@@ -145,6 +147,48 @@ impl WorkspaceOwner {
             git_visible: true,
             review_loads: Default::default(),
             review_workers,
+        }
+    }
+    pub(crate) fn chat_history(
+        &self,
+        cwd: Option<&std::path::Path>,
+    ) -> Vec<crate::chat::SavedChat> {
+        self.store
+            .as_ref()
+            .map(|store| {
+                store
+                    .chats
+                    .iter()
+                    .filter(|chat| {
+                        Some(chat.cwd.as_path()) == cwd
+                            && self
+                                .preview()
+                                .is_some_and(|p| p.provider() == chat.provider)
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    pub(crate) fn save_chat(&mut self, chat: crate::chat::SavedChat, cx: &mut Context<Self>) {
+        let Some(preview) = self.preview() else {
+            return;
+        };
+        if chat.provider != preview.provider() || !self.chats.contains_key(&chat.uid) {
+            return;
+        }
+        let Some(store) = &mut self.store else { return };
+        if let Some(saved) = store.chats.iter_mut().find(|saved| saved.uid == chat.uid) {
+            *saved = chat;
+        } else {
+            store.chats.push(chat);
+        }
+        match store.save_async(&self.model.folders()) {
+            Ok(save) => self.watch_save(save, cx),
+            Err(error) => {
+                self.error = Some(format!("Save preview chat history: {error:#}"));
+                cx.notify();
+            }
         }
     }
     pub(crate) fn writer(&self) -> Option<Arc<crate::preview::Writer>> {
