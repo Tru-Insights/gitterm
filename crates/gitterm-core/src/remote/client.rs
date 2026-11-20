@@ -103,17 +103,7 @@ pub struct RemoteAgentClientConfig {
     pub token_ref: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteAgentHandshake {
-    pub remote_id: String,
-    pub endpoint: String,
-    pub agent_name: String,
-    pub agent_version: String,
-    pub protocol_version: u32,
-    pub capabilities: Vec<String>,
-    /// Agent user's $HOME; empty from agents that predate the field.
-    pub home_dir: String,
-}
+pub use super::state::RemoteAgentHandshake;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteAgentDirectory {

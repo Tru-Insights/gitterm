@@ -538,12 +538,29 @@ impl Render for ChatPane {
     }
 }
 fn claude_program() -> Result<PathBuf> {
-    // Resolve only; neither --version nor any real CLI subcommand runs here.
-    let path = std::env::var_os("PATH")
-        .ok_or_else(|| anyhow::anyhow!("PATH unavailable; Claude executable not found"))?;
-    std::env::split_paths(&path)
-        .filter(|path| path.is_absolute())
-        .map(|path| path.join("claude"))
-        .find(|path| path.is_file())
-        .ok_or_else(|| anyhow::anyhow!("Claude executable not found in PATH"))
+    find_claude(
+        std::env::var_os("PATH"),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+/// Resolve only; neither --version nor any real CLI subcommand runs here.
+/// A Finder/Dock launch gets a minimal PATH, so also search the install
+/// folders Iced adds for terminal tabs (`src/harness/claude.rs` `extra_bin_dirs`).
+fn find_claude(path: Option<std::ffi::OsString>, home: Option<PathBuf>) -> Result<PathBuf> {
+    let mut dirs: Vec<PathBuf> = path
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    if let Some(home) = home.filter(|home| home.is_absolute()) {
+        dirs.push(home.join(".local/bin"));
+        dirs.push(home.join(".cargo/bin"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs.into_iter()
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("claude"))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Claude executable not found in PATH or the usual install folders")
+        })
 }
