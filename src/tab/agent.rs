@@ -56,6 +56,7 @@ pub(crate) use gitterm_core::chat::types::{
 
 pub use gitterm_core::chat::state::AgentEvent;
 pub(crate) use gitterm_core::chat::state::{Effect as ChatEffect, Intent as ChatIntent};
+use gitterm_core::harness::pi::parse_line;
 
 /// The Agent call whose subagent `ev` starts, if it is a subagent start.
 pub(crate) fn subagent_started(ev: &AgentEvent) -> Option<&str> {
@@ -546,33 +547,9 @@ async fn run_turn(
             maybe_line = lines.next_line() => {
                 match maybe_line {
                     Ok(Some(line)) => {
-                        // Step 3: emit each line as `Other(value)`. The parser that
-                        // turns these into `AssistantText` / `ToolCallStart` / etc.
-                        // lands in Step 4, alongside the chat UI that consumes them.
-                        let value = serde_json::from_str::<serde_json::Value>(&line)
-                            .unwrap_or(serde_json::Value::String(line));
-                        // Drop high-volume / low-value events at the source. The
-                        // tool-call info we want is in `turn_end.message.content`,
-                        // which already renders. Filtering here keeps Iced's
-                        // event channel from saturating (caused a panic in Step 3
-                        // testing) and keeps the conversation buffer compact.
-                        let drop = value
-                            .get("type")
-                            .and_then(|v| v.as_str())
-                            .map(|t| {
-                                matches!(
-                                    t,
-                                    "message_update"
-                                        | "message_start"
-                                        | "message_end"
-                                        | "tool_execution_start"
-                                        | "tool_execution_end"
-                                )
-                            })
-                            .unwrap_or(false);
-                        if drop {
+                        let Some(value) = parse_line(line) else {
                             continue;
-                        }
+                        };
                         if event_tx.send(AgentEvent::Other(value)).is_err() {
                             // Receiver dropped — tab is gone, abort.
                             let _ = child.start_kill();

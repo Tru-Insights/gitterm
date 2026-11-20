@@ -13,8 +13,11 @@ mod files_view;
 mod layout;
 mod owner;
 mod pane;
+mod park;
 pub mod preview;
 mod review_reload;
+mod sessions;
+pub mod tasks;
 mod theme;
 pub mod workspace_config;
 pub mod workspace_status;
@@ -63,11 +66,13 @@ struct SelectWorkspace {
 actions!(gitterm_shell, [ShowShortcuts, NewTerminal]);
 
 struct WorkspaceDock {
+    runtime_uid: u64,
+    parked: Option<park::Parked>,
     workspace: Workspace,
     sessions: Vec<Session>,
     active_session: Option<SessionId>,
     dock: Entity<DockArea>,
-    // Lifetime owner: dock removal hides a pane; session close releases it.
+    // Lifetime owner: hiding retains the pane; explicit session close releases it.
     panes: HashMap<String, Entity<Pane>>,
     store: LayoutStore,
     error: Option<String>,
@@ -110,6 +115,23 @@ impl Shell {
         }
         let content = cx.new(|cx| content::window::ContentWindow::new(window, cx));
         let catalog = data.workspaces(cx);
+        let saved_parked = if local {
+            owner.read(cx).saved_parked()
+        } else {
+            vec![]
+        };
+        let stopped_workspaces = catalog
+            .iter()
+            .filter(|workspace| {
+                data.terminal_cwd(workspace.id, cx).is_some_and(|dir| {
+                    saved_parked
+                        .iter()
+                        .any(|record| record.matches(&workspace.name, &dir))
+                })
+            })
+            .map(|workspace| workspace.id)
+            .collect();
+        owner.update(cx, |owner, _| owner.stopped_workspaces = stopped_workspaces);
         if let Some(first) = catalog.first() {
             owner.update(cx, |owner, cx| {
                 owner.dispatch(Intent::Activate(first.id), Instant::now(), cx)
@@ -172,7 +194,11 @@ impl Shell {
             subscriptions.push(observe_content_dock(&state.dock, cx));
             if local {
                 for pane in state.panes.values() {
-                    subscriptions.push(cx.observe(pane, |_, _, cx| cx.notify()));
+                    subscriptions.push(sessions::subscribe(pane, window, cx));
+                    subscriptions.push(cx.observe_in(pane, window, |shell, pane, window, cx| {
+                        shell.wake_terminal(pane.clone(), window, cx);
+                        cx.notify();
+                    }));
                 }
             }
         }
@@ -200,7 +226,7 @@ impl Shell {
                 owner.dispatch(Intent::Opened, Instant::now(), cx)
             });
         }
-        Ok(Self {
+        let mut shell = Self {
             data,
             content,
             workspaces,
@@ -210,7 +236,9 @@ impl Shell {
             local,
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
-        })
+        };
+        shell.restore_parked(saved_parked, cx);
+        Ok(shell)
     }
     fn open_content(&mut self, event: &FileOpen, window: &mut Window, cx: &mut Context<Self>) {
         if !self.local {
@@ -473,10 +501,16 @@ impl Shell {
                 .push(observe_content_dock(&state.dock, cx));
             for pane in state.panes.values() {
                 self._subscriptions
-                    .push(cx.observe(pane, |_, _, cx| cx.notify()));
+                    .push(sessions::subscribe(pane, window, cx));
+                self._subscriptions
+                    .push(cx.observe_in(pane, window, |shell, pane, window, cx| {
+                        shell.wake_terminal(pane.clone(), window, cx);
+                        cx.notify();
+                    }));
             }
             self.workspaces.push(state);
         }
+        self.reopen_workspace(id, window, cx);
         self.sync_git_visibility(false, cx);
         self.focus.focus(window, cx);
         cx.notify();
@@ -516,9 +550,15 @@ impl Shell {
             .expect("active workspace exists")
     }
     fn select_workspace(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.workspaces.get(index).is_some() {
+        if let Some(id) = self
+            .workspaces
+            .iter()
+            .filter(|state| state.on_bar())
+            .nth(index)
+            .map(|state| state.workspace.id)
+        {
             self.owner.update(cx, |owner, cx| {
-                owner.dispatch(Intent::SelectIndex(index), Instant::now(), cx)
+                owner.dispatch(Intent::Activate(id), Instant::now(), cx)
             });
             self.sync_git_visibility(false, cx);
             self.sync_content_selection(cx);
@@ -542,7 +582,7 @@ impl Shell {
         }
     }
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.local || self.workspaces.is_empty() {
+        if !self.local || !self.workspaces.iter().any(|state| state.on_bar()) {
             return;
         }
         let used: HashSet<_> = self
@@ -582,7 +622,12 @@ impl Shell {
             )
         });
         self._subscriptions
-            .push(cx.observe(&pane, |_, _, cx| cx.notify()));
+            .push(sessions::subscribe(&pane, window, cx));
+        self._subscriptions
+            .push(cx.observe_in(&pane, window, |shell, pane, window, cx| {
+                shell.wake_terminal(pane.clone(), window, cx);
+                cx.notify();
+            }));
         self.registry
             .borrow_mut()
             .insert(pane_id.clone(), pane.downgrade());
@@ -601,28 +646,15 @@ impl Shell {
         state.active_session = Some(SessionId(id));
         self.show_pane(&pane_id, window, cx);
     }
+    #[cfg(test)]
     fn close_session(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<Self>) {
-        let active = self.active_workspace(cx);
-        let state = self
-            .workspaces
-            .iter_mut()
-            .find(|state| Some(state.workspace.id) == active)
-            .expect("active workspace exists");
-        if let Some(pane) = state.panes.remove(&session_pane_id(id)) {
-            pane.update(cx, |pane, cx| pane.close_terminal(cx));
-            self.registry.borrow_mut().remove(&session_pane_id(id));
-            if let Some(terminals) = &mut state.store.terminals {
-                terminals.retain(|terminal| terminal.id != id.0);
-            }
-            state.sessions.retain(|session| session.id != id);
-            state
-                .dock
-                .update(cx, |dock, cx| dock.remove_panel(pane, window, cx));
-            if state.active_session == Some(id) {
-                state.active_session = state.sessions.first().map(|session| session.id);
-            }
-            self.focus.focus(window, cx);
-            cx.notify();
+        let target = self
+            .active(cx)
+            .panes
+            .get(&session_pane_id(id))
+            .and_then(|pane| pane.read(cx).session.clone());
+        if let Some(target) = target {
+            self.close_target(&target, window, cx);
         }
     }
     fn show_pane(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -768,25 +800,6 @@ fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscriptio
             .find(|w| w.workspace.id == id)
             .expect("owned workspace");
         if let Some(terminals) = &mut state.store.terminals {
-            let removed: HashSet<_> = state
-                .sessions
-                .iter()
-                .filter(|session| {
-                    let pane = &state.panes[&session_pane_id(session.id)];
-                    dock.read(cx)
-                        .panel(PanelId::from(pane.entity_id()))
-                        .is_none()
-                })
-                .map(|session| session.id.0)
-                .collect();
-            for id in &removed {
-                let id = session_pane_id(SessionId(*id));
-                if let Some(pane) = state.panes.remove(&id) {
-                    pane.update(cx, |pane, cx| pane.close_terminal(cx));
-                }
-                this.registry.borrow_mut().remove(&id);
-            }
-            terminals.retain(|session| !removed.contains(&session.id));
             let layout = dock.read(cx).dump(cx);
             let order = layout::pane_order(&layout);
             terminals.sort_by_key(|session| {
@@ -801,15 +814,6 @@ fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscriptio
                     .position(|t| t.id == session.id.0)
                     .unwrap_or(usize::MAX)
             });
-            state
-                .sessions
-                .retain(|session| !removed.contains(&session.id.0));
-            if state
-                .active_session
-                .is_some_and(|id| removed.contains(&id.0))
-            {
-                state.active_session = state.sessions.first().map(|s| s.id);
-            }
         }
         let removed: Vec<_> = state
             .panes
@@ -904,6 +908,9 @@ fn build_workspace(
         }
     };
     let local = data.local_owner().is_some();
+    let stopped = data
+        .local_owner()
+        .is_some_and(|owner| owner.read(cx).stopped_workspaces.contains(&workspace.id));
     let sessions = if local {
         let restored = store.load_terminals().unwrap_or_else(|error| {
             eprintln!("load terminal sessions {}: {error:#}", store.path.display());
@@ -952,14 +959,17 @@ fn build_workspace(
                 id.clone(),
                 session.title.clone(),
                 if let Some(terminals) = &store.terminals {
-                    PaneKind::CenterTerminal(
-                        terminals
-                            .iter()
-                            .find(|t| t.id == session.id.0)
-                            .unwrap()
-                            .cwd
-                            .clone(),
-                    )
+                    let cwd = terminals
+                        .iter()
+                        .find(|t| t.id == session.id.0)
+                        .unwrap()
+                        .cwd
+                        .clone();
+                    if stopped {
+                        PaneKind::StoppedTerminal(cwd, true)
+                    } else {
+                        PaneKind::CenterTerminal(cwd)
+                    }
                 } else {
                     session.kind.into()
                 },
@@ -979,7 +989,14 @@ fn build_workspace(
                 Pane::new(
                     id,
                     "Run terminal".into(),
-                    PaneKind::Terminal,
+                    if stopped {
+                        PaneKind::StoppedTerminal(
+                            data.terminal_cwd(workspace.id, cx).expect("local folder"),
+                            false,
+                        )
+                    } else {
+                        PaneKind::Terminal
+                    },
                     workspace.id,
                     data.clone(),
                     window,
@@ -1013,6 +1030,8 @@ fn build_workspace(
     skin.set_panel_style(PanelStyle::TabBar, cx);
     skin.set_close_button_visible(true, cx);
     Ok(WorkspaceDock {
+        runtime_uid: sessions::fresh_target().tab_id as u64,
+        parked: None,
         active_session: sessions.first().map(|s| s.id),
         store,
         workspace,
@@ -1074,7 +1093,7 @@ impl Render for Shell {
         self.content
             .update(cx, |content, cx| content.sync_covers(window, cx));
         let p = Palette::current(cx);
-        if self.workspaces.is_empty() {
+        if !self.workspaces.iter().any(|state| state.on_bar()) {
             return div()
                 .size_full()
                 .flex()
@@ -1084,6 +1103,7 @@ impl Render for Shell {
                 .child("No local workspaces yet")
                 .child("Add a local folder to see live Git status.")
                 .child(self.add_folder_button(cx))
+                .child(self.parked_controls(cx))
                 .children(
                     self.owner
                         .read(cx)
@@ -1123,53 +1143,60 @@ impl Render for Shell {
             .when(self.local, |sidebar| {
                 sidebar.child(self.add_folder_button(cx))
             })
-            .children(self.workspaces.iter().enumerate().map(|(index, state)| {
-                let workspace = &state.workspace;
-                let status = self.data.status(workspace.id, cx);
-                let count = status.files.len();
-                // Not polled yet: don't show the placeholder "0 main".
-                let (count_label, branch_label) = if status.checked {
-                    (count.to_string(), status.branch.clone())
-                } else {
-                    (String::new(), "Not checked yet".to_string())
-                };
-                Button::new(("workspace", index))
-                    .ghost()
-                    .selected(Some(workspace.id) == self.active_workspace(cx))
-                    .accessibility_label(if status.checked {
-                        format!("{}, {}, {} changes", workspace.name, status.branch, count)
-                    } else {
-                        format!("{}, not checked yet", workspace.name)
-                    })
-                    .h(px(62.))
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .items_start()
-                    .p_2()
-                    .rounded_md()
-                    .bg(rgb(if Some(workspace.id) == self.active_workspace(cx) {
-                        p.surface
-                    } else {
-                        p.mantle
-                    }))
-                    .child(
-                        div()
+            .children(
+                self.workspaces
+                    .iter()
+                    .filter(|state| state.on_bar())
+                    .enumerate()
+                    .map(|(index, state)| {
+                        let workspace = &state.workspace;
+                        let status = self.data.status(workspace.id, cx);
+                        let count = status.files.len();
+                        // Not polled yet: don't show the placeholder "0 main".
+                        let (count_label, branch_label) = if status.checked {
+                            (count.to_string(), status.branch.clone())
+                        } else {
+                            (String::new(), "Not checked yet".to_string())
+                        };
+                        Button::new(("workspace", index))
+                            .ghost()
+                            .selected(Some(workspace.id) == self.active_workspace(cx))
+                            .accessibility_label(if status.checked {
+                                format!("{}, {}, {} changes", workspace.name, status.branch, count)
+                            } else {
+                                format!("{}, not checked yet", workspace.name)
+                            })
+                            .h(px(62.))
+                            .w_full()
                             .flex()
-                            .gap_2()
-                            .child(workspace.name.clone())
-                            .child(div().text_color(rgb(p.blue)).child(count_label)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(p.muted))
-                            .child(branch_label),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.select_workspace(index, window, cx)
-                    }))
-            }))
+                            .flex_col()
+                            .items_start()
+                            .p_2()
+                            .rounded_md()
+                            .bg(rgb(if Some(workspace.id) == self.active_workspace(cx) {
+                                p.surface
+                            } else {
+                                p.mantle
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(workspace.name.clone())
+                                    .child(div().text_color(rgb(p.blue)).child(count_label)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(p.muted))
+                                    .child(branch_label),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.select_workspace(index, window, cx)
+                            }))
+                    }),
+            )
+            .child(self.parked_controls(cx))
             .child(
                 div()
                     .mt_4()
@@ -1235,6 +1262,19 @@ impl Render for Shell {
             }));
         let weak = cx.weak_entity();
         let close_session = state.active_session;
+        let close_target = close_session
+            .and_then(|id| state.panes.get(&session_pane_id(id)))
+            .and_then(|pane| pane.read(cx).session.clone());
+        let workspace_target = state.park_target(cx);
+        let state_session_count =
+            state.sessions.len() + usize::from(state.store.terminals.is_some());
+        let can_park = self.local
+            && self
+                .workspaces
+                .iter()
+                .filter(|state| state.on_bar())
+                .count()
+                > 1;
         let close_label = state
             .sessions
             .iter()
@@ -1256,6 +1296,10 @@ impl Render for Shell {
                 let weak = weak.clone();
                 let panes = panes.clone();
                 let close_owner = weak.clone();
+                let park_owner = weak.clone();
+                let stop_target = workspace_target.clone();
+                let keep_target = workspace_target.clone();
+                let close_workspace_target = workspace_target.clone();
                 menu.item(
                     PopupMenuItem::new("New task…")
                         .on_click(move |_, w, cx| dialogs::new_task(repository.clone(), w, cx)),
@@ -1276,13 +1320,59 @@ impl Render for Shell {
                         ))
                     })
                 })
+                .item(
+                    PopupMenuItem::new("Park workspace · stop terminals")
+                        .disabled(!can_park)
+                        .on_click(move |_, window, cx| {
+                            _ = park_owner.update(cx, |shell, cx| {
+                                shell.park_workspace(
+                                    &stop_target,
+                                    gitterm_core::park::Mode::Stop,
+                                    window,
+                                    cx,
+                                )
+                            });
+                        }),
+                )
                 .item({
                     let weak = close_owner.clone();
-                    PopupMenuItem::new(close_label.clone())
-                        .disabled(close_session.is_none())
+                    PopupMenuItem::new("Park workspace · keep running")
+                        .disabled(!can_park)
                         .on_click(move |_, window, cx| {
-                            if let Some(id) = close_session {
-                                _ = weak.update(cx, |this, cx| this.close_session(id, window, cx));
+                            _ = weak.update(cx, |shell, cx| {
+                                shell.park_workspace(
+                                    &keep_target,
+                                    gitterm_core::park::Mode::KeepRunning,
+                                    window,
+                                    cx,
+                                )
+                            });
+                        })
+                })
+                .item({
+                    let weak = close_owner.clone();
+                    PopupMenuItem::new("Close workspace")
+                        .disabled(!can_park)
+                        .on_click(move |_, window, cx| {
+                            _ = weak.update(cx, |shell, cx| {
+                                shell.park_intent(
+                                    Some(&close_workspace_target),
+                                    gitterm_core::park::Intent::Close(close_workspace_target.uid),
+                                    window,
+                                    cx,
+                                )
+                            });
+                        })
+                })
+                .item({
+                    let weak = close_owner.clone();
+                    let close_target = close_target.clone();
+                    PopupMenuItem::new(close_label.clone())
+                        .disabled(close_target.is_none() || state_session_count <= 1)
+                        .on_click(move |_, window, cx| {
+                            if let Some(target) = close_target.clone() {
+                                _ = weak
+                                    .update(cx, |this, cx| this.close_target(&target, window, cx));
                             }
                         })
                 })

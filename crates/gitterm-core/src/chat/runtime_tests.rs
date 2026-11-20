@@ -347,3 +347,284 @@ async fn supervisor_partial_output_crash_and_spawn_failure() {
     session.completed().await.unwrap();
     assert_eq!(session.local_pid(), None);
 }
+
+// The child accepts a prefix, then closes its pipe while keeping stdout alive.
+// The answer exceeds pipe capacity, so the host cannot have accepted it all.
+#[tokio::test]
+async fn supervisor_partial_answer_is_uncertain_and_never_resent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let script = r#"#!/usr/bin/env python3
+import json, os, signal, sys, time
+from pathlib import Path
+signal.alarm(20)
+init = json.loads(sys.stdin.readline())
+print(json.dumps({'type':'control_response','response':{'subtype':'success','request_id':init['request_id'],'response':{}}}), flush=True)
+print(json.dumps({'type':'control_request','request_id':'p1','request':{'subtype':'can_use_tool','tool_name':'Bash','tool_use_id':'t1','input':{}}}), flush=True)
+Path('prefix').write_bytes(os.read(0, 16))
+os.close(0)
+while not Path('exit').exists(): time.sleep(0.01)
+"#;
+    let (mut session, mut events) = Session::spawn(move |token| Ok(launch(&path, script, token)));
+    assert!(matches!(
+        event(&mut events).await,
+        HarnessEvent::Ready { .. }
+    ));
+    assert!(matches!(
+        event(&mut events).await,
+        HarnessEvent::RuntimeRequest { .. }
+    ));
+    let pid = session.local_pid().unwrap();
+    session
+        .send(HarnessCommand::Answer {
+            request_id: "p1".into(),
+            decision: RuntimeDecision::Deny {
+                message: "x".repeat(4 * 1024 * 1024),
+            },
+        })
+        .unwrap();
+    assert!(
+        matches!(event(&mut events).await, HarnessEvent::Error(e) if e.contains("delivery uncertain"))
+    );
+    assert!(!std::fs::read(dir.path().join("prefix")).unwrap().is_empty());
+    session
+        .send(HarnessCommand::Answer {
+            request_id: "p1".into(),
+            decision: RuntimeDecision::Deny {
+                message: "retry".into(),
+            },
+        })
+        .unwrap();
+    assert!(
+        matches!(event(&mut events).await, HarnessEvent::Error(e) if e.contains("resending is blocked"))
+    );
+    std::fs::write(dir.path().join("exit"), "").unwrap();
+    // Resolution here closes a request whose process is gone; it is not a write receipt.
+    assert_eq!(
+        event(&mut events).await,
+        HarnessEvent::RuntimeRequestResolved {
+            request_id: "p1".into()
+        }
+    );
+    assert_eq!(
+        event(&mut events).await,
+        HarnessEvent::ProcessExited { code: Some(0) }
+    );
+    session.completed().await.unwrap();
+    process::assert_reaped(pid);
+    assert!(session
+        .send(HarnessCommand::Answer {
+            request_id: "p1".into(),
+            decision: RuntimeDecision::Deny {
+                message: "late".into()
+            }
+        })
+        .is_err());
+    assert!(events.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn supervisor_withdrawal_and_turn_end_close_requests_before_late_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let script = r#"#!/usr/bin/env python3
+import json, signal, sys
+signal.alarm(20)
+def emit(v): print(json.dumps(v), flush=True)
+init = json.loads(sys.stdin.readline())
+emit({'type':'control_response','response':{'subtype':'success','request_id':init['request_id'],'response':{}}})
+for id in ['withdrawn', 'turn-ended']:
+    emit({'type':'control_request','request_id':id,'request':{'subtype':'can_use_tool','tool_name':'Bash','tool_use_id':id,'input':{}}})
+    if id == 'withdrawn': emit({'type':'control_cancel_request','request_id':id})
+emit({'type':'result','subtype':'success','is_error':False,'usage':{}})
+assert not sys.stdin.read(), 'late answers must not be written'
+"#;
+    let (mut session, mut events) = Session::spawn(move |token| Ok(launch(&path, script, token)));
+    assert!(matches!(
+        event(&mut events).await,
+        HarnessEvent::Ready { .. }
+    ));
+    for id in ["withdrawn", "turn-ended"] {
+        assert!(
+            matches!(event(&mut events).await, HarnessEvent::RuntimeRequest { request_id, .. } if request_id == id)
+        );
+        assert_eq!(
+            event(&mut events).await,
+            HarnessEvent::RuntimeRequestResolved {
+                request_id: id.into()
+            }
+        );
+    }
+    assert!(matches!(
+        event(&mut events).await,
+        HarnessEvent::TurnCompleted { .. }
+    ));
+    for id in ["withdrawn", "turn-ended"] {
+        session
+            .send(HarnessCommand::Answer {
+                request_id: id.into(),
+                decision: RuntimeDecision::Deny {
+                    message: "late".into(),
+                },
+            })
+            .unwrap();
+        assert!(
+            matches!(event(&mut events).await, HarnessEvent::Error(e) if e.contains("no pending Claude request"))
+        );
+    }
+    session.send(HarnessCommand::Shutdown).unwrap();
+    assert_eq!(
+        event(&mut events).await,
+        HarnessEvent::ProcessExited { code: Some(0) }
+    );
+    session.completed().await.unwrap();
+}
+
+#[tokio::test]
+async fn supervisor_validates_remember_before_any_write_and_keeps_plain_flows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let script = r#"#!/usr/bin/env python3
+import json, signal, sys
+signal.alarm(20)
+def emit(v): print(json.dumps(v), flush=True)
+def read(): return json.loads(sys.stdin.readline())
+choice = {'type':'addRules','destination':'localSettings','behavior':'allow','rules':[{'toolName':'Bash','ruleContent':'echo synthetic'}]}
+def request(id, tool='Bash'):
+    emit({'type':'control_request','request_id':id,'request':{'subtype':'can_use_tool','tool_name':tool,'tool_use_id':id,'input':{'questions':[]},'permission_suggestions':[choice]}})
+init = read()
+emit({'type':'control_response','response':{'subtype':'success','request_id':init['request_id'],'response':{}}})
+request('remember')
+answer = read()
+assert answer['response']['request_id'] == 'remember'
+assert answer['response']['response']['updatedPermissions'] == [choice]
+request('question','AskUserQuestion')
+answer = read()
+assert answer['response']['request_id'] == 'question'
+assert answer['response']['response']['updatedInput']['answers'] == {}
+assert 'updatedPermissions' not in answer['response']['response']
+request('plain')
+answer = read()
+assert answer['response']['request_id'] == 'plain'
+assert answer['response']['response']['behavior'] == 'allow'
+assert 'updatedPermissions' not in answer['response']['response']
+request('deny')
+answer = read()
+assert answer['response']['request_id'] == 'deny'
+assert answer['response']['response']['behavior'] == 'deny'
+request('withdrawn')
+emit({'type':'control_cancel_request','request_id':'withdrawn'})
+assert not sys.stdin.read(), 'rejected remembers must never reach stdin'
+"#;
+    let (mut session, mut events) = Session::spawn(move |token| Ok(launch(&path, script, token)));
+    assert!(matches!(
+        event(&mut events).await,
+        HarnessEvent::Ready { .. }
+    ));
+    let kind = match event(&mut events).await {
+        HarnessEvent::RuntimeRequest {
+            request_id, kind, ..
+        } => {
+            assert_eq!(request_id, "remember");
+            kind
+        }
+        e => panic!("{e:?}"),
+    };
+    let offered = match kind {
+        RuntimeRequestKind::Permission { suggestions, .. } => suggestions[0].clone(),
+        _ => panic!("expected permission"),
+    };
+    let remember = |update| RuntimeDecision::Allow {
+        updated_input: None,
+        remember: Some(update),
+    };
+    let answer = |id: &str, decision| {
+        session
+            .send(HarnessCommand::Answer {
+                request_id: id.into(),
+                decision,
+            })
+            .unwrap()
+    };
+    for field in ["rules", "type", "destination", "extra"] {
+        let mut forged = offered.clone();
+        forged[field] = serde_json::json!("forged");
+        answer("remember", remember(forged));
+        assert!(
+            matches!(event(&mut events).await, HarnessEvent::Error(e) if e.contains("not offered") && e.contains("not delivered"))
+        );
+    }
+    answer("unknown", remember(offered.clone()));
+    assert!(matches!(event(&mut events).await, HarnessEvent::Error(e) if e.contains("no pending")));
+    answer("remember", remember(offered.clone()));
+    assert_eq!(
+        event(&mut events).await,
+        HarnessEvent::RuntimeRequestResolved {
+            request_id: "remember".into()
+        }
+    );
+    assert!(
+        matches!(event(&mut events).await, HarnessEvent::RuntimeRequest { request_id, .. } if request_id == "question")
+    );
+    answer("remember", remember(offered.clone()));
+    assert!(matches!(event(&mut events).await, HarnessEvent::Error(e) if e.contains("no pending")));
+    answer("question", remember(offered.clone()));
+    assert!(
+        matches!(event(&mut events).await, HarnessEvent::Error(e) if e.contains("not offered"))
+    );
+    answer(
+        "question",
+        RuntimeDecision::AnswerQuestion {
+            answers: BTreeMap::new(),
+        },
+    );
+    assert_eq!(
+        event(&mut events).await,
+        HarnessEvent::RuntimeRequestResolved {
+            request_id: "question".into()
+        }
+    );
+    for (id, decision) in [
+        (
+            "plain",
+            RuntimeDecision::Allow {
+                updated_input: None,
+                remember: None,
+            },
+        ),
+        (
+            "deny",
+            RuntimeDecision::Deny {
+                message: "denied".into(),
+            },
+        ),
+    ] {
+        assert!(
+            matches!(event(&mut events).await, HarnessEvent::RuntimeRequest { request_id, .. } if request_id == id)
+        );
+        answer(id, decision);
+        assert_eq!(
+            event(&mut events).await,
+            HarnessEvent::RuntimeRequestResolved {
+                request_id: id.into()
+            }
+        );
+    }
+    assert!(
+        matches!(event(&mut events).await, HarnessEvent::RuntimeRequest { request_id, .. } if request_id == "withdrawn")
+    );
+    assert_eq!(
+        event(&mut events).await,
+        HarnessEvent::RuntimeRequestResolved {
+            request_id: "withdrawn".into()
+        }
+    );
+    answer("withdrawn", remember(offered));
+    assert!(matches!(event(&mut events).await, HarnessEvent::Error(e) if e.contains("no pending")));
+    session.send(HarnessCommand::Shutdown).unwrap();
+    assert_eq!(
+        event(&mut events).await,
+        HarnessEvent::ProcessExited { code: Some(0) }
+    );
+    session.completed().await.unwrap();
+}
