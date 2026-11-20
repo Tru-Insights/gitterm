@@ -883,6 +883,36 @@ fn canonical_git_dir(cwd: &Path, flag: &str) -> Result<PathBuf, String> {
     canonical(flag, &cwd.join(printed))
 }
 
+/// Capture repository identity without imposing worker main-checkout trust.
+/// Blocking; call off the UI thread after the existing checkout authorization.
+pub fn repository_identity(cwd: &Path) -> Result<crate::tasks::RepositoryIdentity, String> {
+    let common_dir = canonical_git_dir(cwd, "--git-common-dir").map_err(|error| {
+        format!(
+            "resolve delegation common directory {}: {error}",
+            cwd.display()
+        )
+    })?;
+    let source = git2::Repository::discover(cwd)
+        .map_err(|error| format!("open delegation authority {}: {error}", cwd.display()))?;
+    let remote_url = match source
+        .config()
+        .and_then(|config| config.get_string("remote.origin.url"))
+    {
+        Ok(url) => Some(url.trim().to_string()),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => None,
+        Err(error) => {
+            return Err(format!(
+                "read delegation authority origin {}: {error}",
+                cwd.display()
+            ))
+        }
+    };
+    Ok(crate::tasks::RepositoryIdentity {
+        common_dir,
+        remote_url,
+    })
+}
+
 fn worktree_matches_repo(worktree: &ListedWorktree, repo: &Path) -> Result<bool, String> {
     let path = &worktree.path;
     if git_top_level("worktree", path)? != *path {

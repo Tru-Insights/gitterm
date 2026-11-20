@@ -1,0 +1,7 @@
+{
+  "first": {"state":"cancelled"},
+  "second": {"state":"failed", "message":"fixture failure"},
+  "first_dismissed": true,
+  "running": 0,
+  "rerun_previous": "second"
+}
