@@ -2,6 +2,8 @@
 mod copy;
 #[path = "find.rs"]
 mod find;
+#[path = "turns.rs"]
+mod turns;
 use copy::CopyTarget;
 use find::TranscriptFind;
 
@@ -55,6 +57,7 @@ actions!(
 );
 
 pub type IntentCallback = Rc<dyn Fn(ChatIntent, &mut App) -> Receipt>;
+type TurnToggle = Rc<dyn Fn(u64, &mut App)>;
 
 pub fn run(records: Vec<Record>) {
     let live = std::env::args_os()
@@ -132,6 +135,7 @@ pub struct ChatView {
     cards: HashMap<u64, Entity<CardView>>,
     recent_rows: VecDeque<usize>,
     folded: HashMap<u64, bool>,
+    folded_turns: HashSet<u64>,
     model: ChatModel,
     row_views: Vec<Option<Entity<RowView>>>,
     scroller: Entity<MessageScrollerState>,
@@ -201,6 +205,7 @@ impl ChatView {
             cards: HashMap::new(),
             recent_rows: VecDeque::new(),
             folded: HashMap::new(),
+            folded_turns: HashSet::new(),
             row_views: vec![None; model.rows.len()],
             model,
             scroller,
@@ -383,6 +388,7 @@ impl ChatView {
                 self.row_views = vec![None; self.model.rows.len()];
                 self.recent_rows.clear();
                 self.folded.clear();
+                self.folded_turns.clear();
                 self.scroller
                     .update(cx, |scroller, cx| scroller.reset(self.model.rows.len(), cx));
                 self.reset_find(cx);
@@ -445,6 +451,24 @@ impl ChatView {
             return view.clone();
         }
         let row = self.model.rows[index].clone();
+        let groups = turns::group(&self.model.rows);
+        let turn = groups
+            .iter()
+            .find(|turn| turn.user_row == index || turn.contains(index))
+            .cloned();
+        let turn_collapsed = turn.as_ref().is_some_and(|turn| {
+            self.folded_turns
+                .contains(&self.model.rows[turn.user_row].id)
+        });
+        let turn_rows = turn.as_ref().map_or(0, |turn| turn.end - turn.user_row - 1);
+        let turn_toggle: TurnToggle = {
+            let owner = cx.entity().downgrade();
+            Rc::new(move |id, cx| {
+                _ = owner.update(cx, |view, cx| view.toggle_turn(id, cx));
+            })
+        };
+        let user_turn = row.kind == RowKind::User && turn_rows > 0;
+        let turn_id = row.id;
         let scroller = self.scroller.clone();
         let card = if row.request.is_some() {
             Some(
@@ -481,11 +505,53 @@ impl ChatView {
             if let Some(open) = open {
                 view.open = open;
             }
+            view.turn_collapsed = turn_collapsed;
+            view.hidden_by_turn =
+                turn_collapsed && turn.as_ref().is_some_and(|turn| turn.contains(index));
+            view.turn_toggle = turn_toggle;
+            view.user_turn = user_turn;
+            view.turn_id = turn_id;
+            view.turn_rows = turn_rows;
             view
         });
         self.row_views[index] = Some(view.clone());
         self.update_row_find(index, cx);
         view
+    }
+    fn toggle_turn(&mut self, id: u64, cx: &mut Context<Self>) {
+        if !self.folded_turns.insert(id) {
+            self.folded_turns.remove(&id);
+        }
+        self.sync_turn_visibility(cx);
+    }
+    fn sync_turn_visibility(&mut self, cx: &mut Context<Self>) {
+        let groups = turns::group(&self.model.rows);
+        let hidden = (0..self.model.rows.len())
+            .map(|index| {
+                turns::containing(&groups, index).is_some_and(|turn| {
+                    self.folded_turns
+                        .contains(&self.model.rows[turn.user_row].id)
+                })
+            })
+            .collect::<Vec<_>>();
+        let folded_turns = self.folded_turns.clone();
+        for (index, view) in self.row_views.iter().enumerate() {
+            if let Some(view) = view {
+                view.update(cx, |row, cx| {
+                    if row.hidden_by_turn != hidden[index]
+                        || (row.user_turn
+                            && row.turn_collapsed != folded_turns.contains(&row.turn_id))
+                    {
+                        row.hidden_by_turn = hidden[index];
+                        row.turn_collapsed = row.user_turn && folded_turns.contains(&row.turn_id);
+                        cx.notify();
+                    }
+                });
+            }
+        }
+        self.scroller
+            .update(cx, |state, cx| state.remeasure_items(0..hidden.len(), cx));
+        cx.notify();
     }
     fn start_replay(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.replay.take();
@@ -789,6 +855,12 @@ struct RowView {
     index: usize,
     scroller: Entity<MessageScrollerState>,
     _subscription: Subscription,
+    turn_collapsed: bool,
+    hidden_by_turn: bool,
+    user_turn: bool,
+    turn_id: u64,
+    turn_rows: usize,
+    turn_toggle: TurnToggle,
 }
 impl RowView {
     fn new(
@@ -826,6 +898,12 @@ impl RowView {
             index,
             scroller,
             _subscription: subscription,
+            turn_collapsed: false,
+            hidden_by_turn: false,
+            user_turn: false,
+            turn_id: 0,
+            turn_rows: 0,
+            turn_toggle: Rc::new(|_, _| {}),
         };
         view.make_diffs(cx);
         view
@@ -864,6 +942,9 @@ impl RowView {
 }
 impl Render for RowView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.hidden_by_turn {
+            return div().h(px(0.)).mb(px(0.)).into_any_element();
+        }
         self.highlight(cx);
         let color = match self.row.kind {
             RowKind::User => 0xa6e3a1,
@@ -907,6 +988,20 @@ impl Render for RowView {
             .child(self.row.title.clone())
             .when(self.row.kind == RowKind::Assistant, |header| {
                 header.child(self.reply_copy_buttons(cx))
+            })
+            .when(self.user_turn, |header| {
+                let id = self.turn_id;
+                let toggle = self.turn_toggle.clone();
+                header.child(
+                    Button::new(("turn-fold", id))
+                        .small()
+                        .label(if self.turn_collapsed {
+                            format!("Unfold turn · {} rows", self.turn_rows)
+                        } else {
+                            format!("Fold turn · {} rows", self.turn_rows)
+                        })
+                        .on_click(move |_, _, cx| toggle(id, cx)),
+                )
             });
         div()
             .id(("row", self.row.id))
@@ -958,6 +1053,7 @@ impl Render for RowView {
             } else {
                 div().child(header).child(content).into_any_element()
             })
+            .into_any_element()
     }
 }
 
