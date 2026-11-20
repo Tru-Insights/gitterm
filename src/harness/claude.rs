@@ -856,6 +856,7 @@ fn local_launch(
     .with_close_token(token);
     let environment = child_environment(std::env::vars_os(), child_path(), &config.mcp_servers);
     Launch {
+        flags: Default::default(),
         config,
         program,
         environment,
@@ -940,6 +941,7 @@ async fn run_session_program(
     )
     .with_close_token(token.clone());
     let launch = Launch {
+        flags: Default::default(),
         config,
         program,
         environment: vec![

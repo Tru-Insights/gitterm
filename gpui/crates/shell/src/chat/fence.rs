@@ -1,11 +1,8 @@
-//! A proposed launch contract, not execution authority. Keep C2 closed until the
-//! shared launch API carries these arguments and managed writers are confined.
-#[cfg(test)]
+//! Installed CLI capabilities required before every fresh preview launch.
 use anyhow::{Result, ensure};
 
 pub(super) const FLAGS: [&str; 3] = ["--restricted", "--strict-mcp-config", "--safe-mode"];
 
-#[cfg(test)]
 pub(super) fn check_help(help: &str) -> Result<()> {
     for flag in FLAGS.into_iter().chain(["--permission-mode"]) {
         ensure!(
@@ -14,16 +11,18 @@ pub(super) fn check_help(help: &str) -> Result<()> {
         );
     }
     let mode = option(help, "--permission-mode").expect("checked option");
-    // Do not guess aliases from the mode's UI label. The installed help must
-    // advertise the exact requested mode before this contract can be used.
+    // The CLI reference documents manual as an alias of default. Keep the
+    // requested literal default in argv, including on CLIs advertising manual.
     ensure!(
-        mode.contains("\"default\"") || mode.contains("'default'"),
+        mode.contains("\"default\"")
+            || mode.contains("'default'")
+            || mode.contains("\"manual\"")
+            || mode.contains("'manual'"),
         "Claude preview requires --permission-mode default; installed help does not advertise it"
     );
     Ok(())
 }
 
-#[cfg(test)]
 fn option<'a>(help: &'a str, flag: &str) -> Option<&'a str> {
     let start = help
         .lines()
@@ -41,7 +40,7 @@ fn option<'a>(help: &'a str, flag: &str) -> Option<&'a str> {
     Some(&section[..end])
 }
 
-/// For the denial diagnostic/tests until the core launch port can carry the fence.
+/// The isolated interactive sign-in command uses the same fence.
 pub(super) fn arguments() -> Vec<String> {
     FLAGS
         .into_iter()
@@ -71,7 +70,7 @@ mod tests {
         for flag in FLAGS {
             assert!(check_help(&HELP.replace(flag, "--unknown")).is_err());
         }
-        assert!(check_help(&HELP.replace("\"default\"", "\"manual\"")).is_err());
+        check_help(&HELP.replace("\"default\"", "\"manual\"")).unwrap();
         assert!(
             check_help("description mentions --restricted --strict-mcp-config --safe-mode")
                 .is_err()
