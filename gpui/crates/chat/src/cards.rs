@@ -6,11 +6,11 @@ use crate::{
     view::IntentCallback,
 };
 use gpui::{
-    AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Window,
-    div, px,
+    AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
+    Styled, Subscription, Window, div, px,
 };
 use gpui_component::{
-    Disableable, Sizable,
+    Disableable, Selectable, Sizable,
     button::Button,
     input::{Input, InputEvent, InputState},
 };
@@ -119,8 +119,28 @@ impl CardView {
             && self.row.scope.is_empty()
     }
     pub(super) fn emit(&mut self, intent: ChatIntent, cx: &mut Context<Self>) {
-        if !self.enabled() {
+        let request = self.row.request.as_ref().expect("request");
+        if !self.enabled() || intent.request_id() != Some(request.id.as_str()) {
             return;
+        }
+        match (&intent, &request.kind) {
+            (
+                ChatIntent::Permission { decision, .. },
+                RuntimeRequestKind::Permission { suggestions, .. },
+            ) => {
+                if let PermissionDecision::AllowAlways { suggestion } = decision
+                    && !offered_options(suggestions)
+                        .iter()
+                        .any(|(offered, _)| *offered == suggestion)
+                {
+                    return;
+                }
+            }
+            (
+                ChatIntent::AnswerQuestion { .. } | ChatIntent::DismissQuestion { .. },
+                RuntimeRequestKind::Question { .. },
+            ) => {}
+            _ => return,
         }
         self.submitted = Some(intent.clone());
         let receipt = (self.callback.as_ref().expect("enabled callback"))(intent, cx);
@@ -128,20 +148,15 @@ impl CardView {
         self.update_receipt(&receipt, cx);
         cx.notify();
     }
+    fn dismiss(&mut self, cx: &mut Context<Self>) {
+        self.emit(
+            ChatIntent::DismissQuestion {
+                request_id: self.row.request.as_ref().expect("request").id.clone(),
+            },
+            cx,
+        );
+    }
     fn permission(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
-        // Validate offered rules at the UI boundary, including programmatic invocations.
-        let RuntimeRequestKind::Permission { suggestions, .. } =
-            &self.row.request.as_ref().unwrap().kind
-        else {
-            return;
-        };
-        if let PermissionDecision::AllowAlways { suggestion } = &decision
-            && !suggestions
-                .iter()
-                .any(|offered| offered == suggestion && rememberable(offered))
-        {
-            return;
-        }
         self.emit(
             ChatIntent::Permission {
                 request_id: self.row.request.as_ref().unwrap().id.clone(),
@@ -243,8 +258,64 @@ fn answer_label(intent: &ChatIntent) -> String {
         _ => unreachable!("only card intents are submitted"),
     }
 }
-fn rememberable(value: &serde_json::Value) -> bool {
-    value["destination"] == "localSettings" || value["type"] == "acp_option"
+fn offered_options(suggestions: &[serde_json::Value]) -> Vec<(&serde_json::Value, String)> {
+    suggestions
+        .iter()
+        .find(|value| value["destination"] == "localSettings")
+        .map(|value| (value, "Allow and remember".into()))
+        .into_iter()
+        .chain(
+            suggestions
+                .iter()
+                .filter(|value| value["type"] == "acp_option")
+                .map(|value| {
+                    (
+                        value,
+                        value["name"]
+                            .as_str()
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or("Always allow")
+                            .to_owned(),
+                    )
+                }),
+        )
+        .collect()
+}
+
+fn permission_salient(tool: &str, input: &serde_json::Value) -> String {
+    let key = match tool {
+        "Bash" => Some("command"),
+        "Read" | "Write" | "Edit" | "MultiEdit" => Some("file_path"),
+        "NotebookEdit" => Some("notebook_path"),
+        _ => None,
+    };
+    key.and_then(|key| input[key].as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| serde_json::to_string_pretty(input).expect("JSON value"))
+}
+
+fn describe_rule(value: &serde_json::Value) -> String {
+    if let Some(rules) = value["rules"].as_array() {
+        return rules
+            .iter()
+            .map(|rule| {
+                let name = rule["toolName"].as_str().unwrap_or("");
+                match rule["ruleContent"]
+                    .as_str()
+                    .filter(|content| !content.is_empty())
+                {
+                    Some(content) => format!("{name}({content})"),
+                    None => name.to_owned(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+    }
+    if let Some(mode) = value["mode"].as_str() {
+        return format!("mode {mode}");
+    }
+    value["type"].as_str().unwrap_or("").to_owned()
 }
 impl Render for CardView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -287,24 +358,43 @@ impl Render for CardView {
             content = content.child(receipt.state.label());
         }
         match &self.row.request.as_ref().unwrap().kind {
-            RuntimeRequestKind::Permission { suggestions, .. } => {
-                content = content.child(Button::new("allow").small().label("Allow").on_click(
+            RuntimeRequestKind::Permission {
+                tool_name,
+                input,
+                suggestions,
+                decision_reason,
+            } => {
+                content = content.child(format!("Allow {tool_name}?"));
+                if let Some(description) = input["description"]
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                {
+                    content = content.child(description.to_owned());
+                }
+                if let Some(reason) = decision_reason.as_ref().filter(|value| !value.is_empty()) {
+                    content = content.child(reason.clone());
+                }
+                content = content.child(permission_salient(tool_name, input));
+                content = content.child(Button::new("allow").small().label("Allow once").on_click(
                     cx.listener(|this, _, _, cx| this.permission(PermissionDecision::Allow, cx)),
                 ));
-                for (index, suggestion) in suggestions
-                    .iter()
-                    .filter(|value| rememberable(value))
-                    .enumerate()
+                for (index, (suggestion, label)) in
+                    offered_options(suggestions).into_iter().enumerate()
                 {
                     let suggestion = suggestion.clone();
-                    let label = suggestion["name"]
-                        .as_str()
-                        .map(|name| format!("Allow always · {name}"))
-                        .unwrap_or_else(|| "Allow always".into());
+                    let tooltip = if suggestion["destination"] == "localSettings" {
+                        format!(
+                            "Saves {} to .claude/settings.local.json · unavailable until destination verified",
+                            describe_rule(&suggestion)
+                        )
+                    } else {
+                        "Answers with the agent's own option · unavailable in preview".into()
+                    };
                     content = content.child(
                         Button::new(("always", index))
                             .small()
-                            .label(format!("{label} · unavailable until destination verified"))
+                            .label(label)
+                            .tooltip(tooltip)
                             .disabled(true)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.permission(
@@ -320,80 +410,93 @@ impl Render for CardView {
                     cx.listener(|this, _, _, cx| this.permission(PermissionDecision::Deny, cx)),
                 ));
             }
-            RuntimeRequestKind::Question { .. } => match &self.questions {
-                Err(error) => {
-                    content = content.child(error.clone());
-                }
-                Ok(questions) => {
-                    for (index, question) in questions.iter().enumerate() {
-                        let draft = &self.drafts[index];
-                        content = content.child(format!(
-                            "{} · {}{}",
-                            question.header,
-                            question.question,
-                            if question.multi_select {
-                                " (choose any)"
-                            } else {
-                                ""
+            RuntimeRequestKind::Question { .. } => {
+                match &self.questions {
+                    Err(error) => {
+                        content = content.child(error.clone());
+                    }
+                    Ok(questions) => {
+                        content = content.child(if questions.len() == 1 {
+                            "Claude has a question".into()
+                        } else {
+                            format!("Claude has {} questions", questions.len())
+                        });
+                        for (index, question) in questions.iter().enumerate() {
+                            let draft = &self.drafts[index];
+                            if !question.header.is_empty() {
+                                content = content.child(question.header.clone());
                             }
-                        ));
-                        for (oi, option) in question.options.iter().enumerate() {
-                            let label = option.label.clone();
-                            content = content.child(
-                                Button::new(("option", index * 1000 + oi))
-                                    .small()
-                                    .label(format!(
-                                        "{} {} {}",
-                                        if draft.selected.contains(&label) {
-                                            "✓"
+                            content = content.child(question.question.clone());
+                            if question.multi_select {
+                                content = content.child("choose any");
+                            }
+                            for (oi, option) in question.options.iter().enumerate() {
+                                let label = option.label.clone();
+                                content = content.child(
+                                    Button::new(("option", index * 1000 + oi))
+                                        .small()
+                                        .h_auto()
+                                        .min_h(px(24.))
+                                        .py(px(4.))
+                                        .debug_selector(move || format!("question-option-{index}-{oi}"))
+                                        .accessibility_label(if option.description.is_empty() {
+                                            label.clone()
                                         } else {
-                                            "○"
-                                        },
-                                        label,
-                                        option.description
-                                    ))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.choose(index, Some(label.clone()), cx)
+                                            format!("{label}: {}", option.description)
+                                        })
+                                        .child(div().flex().flex_col().w_full().items_start().whitespace_normal()
+                                            .child(label.clone())
+                                            .children((!option.description.is_empty()).then(|| div()
+                                                .debug_selector(move || format!("question-option-description-{index}-{oi}"))
+                                                .w_full()
+                                                .text_size(px(11.))
+                                                .line_height(px(16.))
+                                                .child(option.description.clone()))))
+                                        .selected(draft.selected.contains(&label))
+                                        .toggled(draft.selected.contains(&label))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.choose(index, Some(label.clone()), cx)
+                                        })),
+                                );
+                            }
+                            content = content.child(
+                                Button::new(("other", index))
+                                    .small()
+                                    .label("Other…")
+                                    .selected(draft.other_on)
+                                    .toggled(draft.other_on)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.choose(index, None, cx);
+                                        if this.enabled() && this.drafts[index].other_on {
+                                            this.drafts[index]
+                                                .other
+                                                .read(cx)
+                                                .focus_handle(cx)
+                                                .focus(window, cx);
+                                        }
                                     })),
                             );
+                            if draft.other_on {
+                                content = content.child(Input::new(&draft.other));
+                            }
                         }
+                        let disabled = self.answers(cx).is_none();
                         content = content.child(
-                            Button::new(("other", index))
+                            Button::new("submit")
                                 .small()
-                                .label(if draft.other_on {
-                                    "✓ Other…"
-                                } else {
-                                    "Other…"
-                                })
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.choose(index, None, cx)),
-                                ),
+                                .label("Submit")
+                                .disabled(disabled)
+                                .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
                         );
-                        if draft.other_on {
-                            content = content.child(Input::new(&draft.other));
-                        }
                     }
-                    let disabled = self.answers(cx).is_none();
-                    content = content.child(
-                        Button::new("submit")
-                            .small()
-                            .label("Submit answers")
-                            .disabled(disabled)
-                            .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
-                    );
-                    content =
-                        content.child(Button::new("dismiss").small().label("Dismiss").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.emit(
-                                    ChatIntent::DismissQuestion {
-                                        request_id: this.row.request.as_ref().unwrap().id.clone(),
-                                    },
-                                    cx,
-                                )
-                            }),
-                        ));
                 }
-            },
+                content = content.child(
+                    Button::new("dismiss")
+                        .small()
+                        .label("Dismiss")
+                        .on_click(cx.listener(|this, _, _, cx| this.dismiss(cx))),
+                );
+            }
         }
         content.into_any_element()
     }
