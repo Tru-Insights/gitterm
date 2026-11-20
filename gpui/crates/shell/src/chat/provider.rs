@@ -29,6 +29,10 @@ impl Provider {
         }
         command.push(' ');
         command.push_str(&quote(&self.spec.executable().to_string_lossy()));
+        for arg in super::fence::arguments() {
+            command.push(' ');
+            command.push_str(&quote(&arg));
+        }
         format!(
             "cd {} && {command}\nThen /login",
             quote(&self.spec.cwd().to_string_lossy())
@@ -65,7 +69,58 @@ impl Provider {
             "Claude workspace is aliased: {}",
             cwd.display()
         );
-        gitterm_core::preview::inspect_git(cwd, self.preview.protected())?;
+        ensure!(
+            !cwd.starts_with(self.preview.root()) && !self.preview.root().starts_with(cwd),
+            "Claude clone must not overlap preview app/provider state"
+        );
+        let git = gitterm_core::preview::inspect_git(cwd, self.preview.protected())?
+            .context("Claude preview requires an independent clone, not a plain folder")?;
+        let dotgit = cwd.join(".git");
+        ensure!(
+            git.checkout == cwd
+                && std::fs::symlink_metadata(&dotgit)?.is_dir()
+                && git.administrative == dotgit
+                && git.common == dotgit,
+            "Claude preview requires the root of an independent clone with local .git metadata"
+        );
+        for (path, directory) in [
+            ("config", false),
+            ("HEAD", false),
+            ("objects", true),
+            ("refs", true),
+        ] {
+            let path = dotgit.join(path);
+            let meta = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("independent clone metadata {}", path.display()))?;
+            ensure!(
+                if directory {
+                    meta.is_dir()
+                } else {
+                    meta.is_file()
+                },
+                "missing or aliased Git metadata: {}",
+                path.display()
+            );
+        }
+        match std::fs::symlink_metadata(dotgit.join("objects/info")) {
+            Ok(meta) => ensure!(meta.is_dir(), "aliased Git objects/info"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        // Validate parent directories before inspecting redirects so discovery
+        // never follows an objects/info symlink into another checkout.
+        for redirect in [
+            "commondir",
+            "worktrees",
+            "objects/info/alternates",
+            "objects/info/http-alternates",
+        ] {
+            match std::fs::symlink_metadata(dotgit.join(redirect)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+                Ok(_) => anyhow::bail!("independent clone cannot contain .git/{redirect}"),
+            }
+        }
         self.preview.scoped(&self.preview.provider())?;
         Ok(())
     }
@@ -77,10 +132,13 @@ impl Provider {
             gitterm_core::preview::Effect::Agent,
             &self.preview.provider(),
         )
-        .context("Claude preview activation awaits verified process-tree and settings isolation")
+        .with_context(|| format!(
+            "Claude preview activation awaits a reviewed launch API and managed-hook confinement; required fence: {}",
+            super::fence::arguments().join(" ")
+        ))
     }
 }
-fn quote(value: &str) -> String {
+pub(super) fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
