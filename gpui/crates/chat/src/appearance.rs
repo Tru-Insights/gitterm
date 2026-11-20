@@ -1,6 +1,7 @@
 /// Host-owned chat settings, independent of the shell's UI/terminal typography.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ChatAppearance {
+    // Retained from the host setting; GPUI chat does not render Iced's HTML visual replies.
     pub light: bool,
     pub font_size: f32,
 }
@@ -29,41 +30,21 @@ impl ChatAppearance {
     }
 
     pub fn palette(self) -> ChatPalette {
-        if self.light {
-            // Iced's Latte counterparts to the Mocha chat CSS variables.
-            ChatPalette {
-                base: 0xeff1f5,
-                alt: 0xe6e9ef,
-                block: 0xccd0da,
-                footer: 0xdce0e8,
-                fg: 0x4c4f69,
-                muted: 0x8c8fa1,
-                accent: 0x1e66f5,
-                border: 0xccd0da,
-                strong: 0xacb0be,
-                user: 0x40a02b,
-                result: 0x179299,
-                tool: 0xfe640b,
-                warn: 0xdf8e1d,
-                err: 0xd20f39,
-            }
-        } else {
-            ChatPalette {
-                base: 0x1e1e2e,
-                alt: 0x181825,
-                block: 0x313244,
-                footer: 0x2a2b3d,
-                fg: 0xbac2de,
-                muted: 0x7f849c,
-                accent: 0x89b4fa,
-                border: 0x45475a,
-                strong: 0x585b70,
-                user: 0xa6e3a1,
-                result: 0x94e2d5,
-                tool: 0xfab387,
-                warn: 0xf9e2af,
-                err: 0xf38ba8,
-            }
+        ChatPalette {
+            base: 0x1e1e2e,
+            alt: 0x181825,
+            block: 0x313244,
+            footer: 0x2a2b3d,
+            fg: 0xbac2de,
+            muted: 0x7f849c,
+            accent: 0x89b4fa,
+            border: 0x45475a,
+            strong: 0x585b70,
+            user: 0xa6e3a1,
+            result: 0x94e2d5,
+            tool: 0xfab387,
+            warn: 0xf9e2af,
+            err: 0xf38ba8,
         }
     }
 }
@@ -91,7 +72,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dark_palette_matches_chat_css_and_light_uses_latte() {
+    fn palette_matches_chat_css_and_stays_dark_with_light_appearance() {
         let dark = ChatAppearance::default().palette();
         let css = include_str!("../../../../assets/agent_chat.html");
         for (name, color) in [
@@ -117,10 +98,7 @@ mod tests {
             ..Default::default()
         }
         .palette();
-        assert_ne!(light, dark);
-        assert_eq!(light.base, 0xeff1f5);
-        assert_eq!(light.fg, 0x4c4f69);
-        assert_eq!(light.accent, 0x1e66f5);
+        assert_eq!(light, dark);
     }
 
     #[test]
