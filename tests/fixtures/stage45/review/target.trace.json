@@ -1,0 +1,10 @@
+{
+  "missing_base_refused": true,
+  "missing_commit_base_refused": true,
+  "target_unchanged": true,
+  "stale_error": null,
+  "still_open": true,
+  "loaded": true,
+  "commits_truncated": true,
+  "commits_error": "fixture metadata"
+}
