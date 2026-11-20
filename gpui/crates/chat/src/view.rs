@@ -58,7 +58,8 @@ actions!(
         SlashPrevious,
         FillSlash,
         SubmitSlash,
-        CloseSlash
+        CloseSlash,
+        CycleMode
     ]
 );
 
@@ -393,6 +394,7 @@ impl ChatView {
     pub fn set_read_only(&mut self, reason: Option<String>, cx: &mut Context<Self>) {
         self.read_only_reason = reason;
         if self.read_only_reason.is_some() {
+            self.composer_state.picker = None;
             self.image_queue.clear();
             self.preparing_image = None;
         }
@@ -419,6 +421,78 @@ impl ChatView {
         self.images = images;
         cx.notify();
         Ok(())
+    }
+    pub fn set_backend(
+        &mut self,
+        backend: gitterm_core::chat::types::AgentBackend,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer_state.backend = Some(backend);
+        cx.notify();
+    }
+    fn settings_enabled(&self) -> bool {
+        self.read_only_reason.is_none()
+            && self.callback.is_some()
+            && self.composer_state.commands_ready
+    }
+    pub(crate) fn close_picker(&mut self, cx: &mut Context<Self>) {
+        self.composer_state.picker = None;
+        cx.notify();
+    }
+    pub(crate) fn toggle_picker(
+        &mut self,
+        picker: crate::pickers::Picker,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.settings_enabled() || self.composer_state.catalog.options(picker).is_empty() {
+            return;
+        }
+        self.focus_composer(window, cx);
+        self.composer_state.picker = if self.composer_state.picker == Some(picker) {
+            None
+        } else {
+            Some(picker)
+        };
+        cx.notify();
+    }
+    pub(crate) fn choose_setting(
+        &mut self,
+        change: gitterm_core::chat::types::SettingChange,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer_state.picker = None;
+        if self.settings_enabled() && self.composer_state.catalog.offers(&change) {
+            let selected = self
+                .composer_state
+                .catalog
+                .models
+                .iter()
+                .chain(&self.composer_state.catalog.efforts)
+                .chain(&self.composer_state.catalog.modes)
+                .any(|row| row.change == change && row.selected);
+            if !selected && let Some(callback) = &self.callback {
+                let receipt = callback(ChatIntent::ChangeSetting { change }, cx);
+                self.control_receipt = Some(receipt.clone());
+                if let ReceiptState::Rejected(reason) | ReceiptState::Uncertain(reason) =
+                    receipt.state
+                {
+                    self.composer_state.notice = Some(reason);
+                }
+            }
+        }
+        self.focus_composer(window, cx);
+        cx.notify();
+    }
+    fn cycle_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(change) = self
+            .composer_state
+            .catalog
+            .cycle_mode(self.composer_state.pending_setting.as_ref())
+        {
+            self.choose_setting(change, window, cx);
+        }
     }
     fn submission_blocked(&self) -> bool {
         self.submission.as_ref().is_some_and(|receipt| {
@@ -985,6 +1059,7 @@ impl Render for ChatView {
             .debug_selector(|| "native-chat".into())
             .key_context(context.as_str())
             .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &CycleMode, window, cx| this.cycle_mode(window, cx)))
             .on_action(cx.listener(|this, _: &SubmitPrompt, window, cx| this.send(window, cx)))
             .on_action(cx.listener(|this, _: &Newline, window, cx| {
                 if this.read_only_reason.is_none()
@@ -1035,11 +1110,14 @@ impl Render for ChatView {
                 }
             }))
             .capture_action(cx.listener(|this, _: &InputEscape, window, cx| {
-                if !this.slash_key("escape", window, cx) {
+                if this.composer_state.picker.take().is_some() {
+                    cx.notify();
+                } else if !this.slash_key("escape", window, cx) {
                     cx.propagate();
                 }
             }))
             .on_click(cx.listener(|this, _, _, cx| {
+                this.composer_state.picker = None;
                 this.composer_state.slash_dismissed = true;
                 cx.notify();
             }))

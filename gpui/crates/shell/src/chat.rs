@@ -64,6 +64,24 @@ impl Controller {
         let mut adapter = ChatAdapter::default();
         let target = crate::sessions::fresh_target();
         let source = adapter.begin_runtime(target.clone());
+        // As in Iced, Rust confirms the launch configuration before the first
+        // provider acknowledgement. No picker is enabled until Ready.
+        for event in [
+            HarnessEvent::ModelChanged("default".into()),
+            HarnessEvent::PermissionModeChanged("default".into()),
+            HarnessEvent::EffortChanged {
+                effort: None,
+                applied: None,
+            },
+        ] {
+            adapter.receive(
+                &source,
+                &target,
+                AgentEvent::Harness(event),
+                None,
+                |_, _| {},
+            );
+        }
         Self {
             adapter,
             target,
@@ -75,21 +93,6 @@ impl Controller {
         }
     }
     fn dispatch(&mut self, intent: ChatIntent) -> (Receipt, Update) {
-        // FreshPreview's launch policy is default-only. Do not let a forged
-        // native intent bypass that policy through the runtime control channel.
-        if matches!(&intent, ChatIntent::ChangeMode { .. }) {
-            let reason = "Preview mode changes are disabled; FreshPreview remains in default mode";
-            return (
-                Receipt::rejected(reason),
-                Update {
-                    event: Some(gitterm_core::chat::state::EventEffects {
-                        notices: vec![reason.into()],
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-            );
-        }
         let answer = match &intent {
             ChatIntent::Answer { answer, .. } => answer.as_ref(),
             intent => intent,
@@ -178,6 +181,20 @@ impl Controller {
                 });
             }
         };
+        // The initialize reply is an authoritative mode acknowledgement too.
+        if let HarnessEvent::Ready {
+            permission_mode: Some(mode),
+            ..
+        } = &event
+        {
+            self.adapter.receive(
+                source,
+                &self.target,
+                AgentEvent::Harness(HarnessEvent::PermissionModeChanged(mode.clone())),
+                Some(now_ms()),
+                |_, _| {},
+            );
+        }
         let ready = matches!(event, HarnessEvent::Ready { .. });
         let exited = matches!(event, HarnessEvent::ProcessExited { .. });
         let update = self.adapter.receive(
@@ -242,6 +259,7 @@ impl ChatPane {
             view.set_appearance(crate::theme::chat_appearance(cx), cx);
             view.set_width(crate::theme::chat_width(cx), cx);
             view.set_preview(cx);
+            view.set_backend(gitterm_core::chat::types::AgentBackend::Claude, cx);
             view.set_read_only(Some("Preview activation unavailable".into()), cx);
             view
         });
@@ -309,6 +327,7 @@ impl ChatPane {
             view.set_appearance(crate::theme::chat_appearance(cx), cx);
             view.set_width(crate::theme::chat_width(cx), cx);
             view.set_preview(cx);
+            view.set_backend(gitterm_core::chat::types::AgentBackend::Claude, cx);
             view.set_read_only(
                 Some("Preview history · read only · resume not in preview yet".into()),
                 cx,

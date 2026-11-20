@@ -1021,31 +1021,34 @@ async fn fake_process_rejected_and_partial_write_outcomes_reach_adapter() {
 }
 
 #[test]
-fn preview_rejects_all_forged_mode_intents_without_dispatch_or_pending_setting() {
+fn mode_picker_rejects_unoffered_stopped_or_uncorrelated_sessions() {
+    use gitterm_core::chat::types::SettingChange;
     let mut controller = Controller::new();
     let (sender, mut commands) = tokio::sync::mpsc::unbounded_channel();
     controller.runtime = Some(Session::from_port(sender, true).into());
     controller.ready = true;
-    for mode in [
-        "default",
-        "acceptEdits",
-        "plan",
-        "auto",
-        "dontAsk",
-        "bypassPermissions",
-        "forged",
-    ] {
-        let (receipt, update) = controller.dispatch(bound(
-            &controller,
-            ChatIntent::ChangeMode { mode: mode.into() },
-        ));
+    for mode in ["forged", "bypassPermissions"] {
+        let (receipt, _) = controller.dispatch(ChatIntent::ChangeSetting {
+            change: SettingChange::Mode(mode.into()),
+        });
         assert!(
-            matches!(receipt.state, ReceiptState::Rejected(ref reason) if reason.contains("FreshPreview remains in default mode"))
+            matches!(receipt.state, ReceiptState::Rejected(ref reason) if reason == "This setting is not offered by the provider")
         );
         assert!(commands.try_recv().is_err());
-        assert!(controller.adapter.state().pending_change().is_none());
-        assert!(update.event.unwrap().notices[0].contains("FreshPreview remains in default mode"));
     }
+    let (receipt, _) = controller.dispatch(ChatIntent::ChangeSetting {
+        change: SettingChange::Mode("plan".into()),
+    });
+    assert!(
+        matches!(receipt.state, ReceiptState::Rejected(ref reason) if reason.contains("correlated writes require"))
+    );
+    assert!(controller.adapter.state().pending_change().is_none());
+    controller.ready = false;
+    let (receipt, _) = controller.dispatch(ChatIntent::ChangeSetting {
+        change: SettingChange::Mode("plan".into()),
+    });
+    assert!(matches!(receipt.state, ReceiptState::Rejected(_)));
+    assert!(commands.try_recv().is_err());
 }
 
 #[test]
@@ -1151,4 +1154,164 @@ fn shell_hookup_reports_chat_identity_and_actual_working_state(cx: &mut gpui::Te
             .unwrap();
         assert!(!pane.is_working());
     });
+}
+
+#[tokio::test]
+async fn fake_process_picker_requests_acknowledge_and_reject_without_sticking() {
+    use gitterm_core::chat::types::SettingChange;
+    let (dir, preview) = fixture();
+    let python = std::process::Command::new("python3")
+        .args(["-I", "-S", "-c", "import sys; print(sys.executable)"])
+        .output()
+        .unwrap();
+    assert!(python.status.success());
+    let program = format!(
+        r##"#!{}
+import json, sys, os
+if sys.argv[1:] == ['--help']:
+    print('  --restricted\n  --strict-mcp-config\n  --safe-mode\n  --permission-mode <mode> (choices: "manual")')
+    sys.exit(0)
+if sys.argv[1:] == ['auth', 'status', '--json']:
+    print(json.dumps({{'fixture_signed_in':True,'fixture_method':'fixture_personal','fixture_plan':'fixture_pro','fixture_root':os.environ['CLAUDE_CONFIG_DIR'],'fixture_provider':'fixture_first_party'}}))
+    sys.exit(0)
+if sys.argv[1:] == ['auth', 'status']:
+    print(json.dumps({{'authMethod':'claude.ai', 'configDirectory':os.environ['CLAUDE_CONFIG_DIR']}}))
+    sys.exit(0)
+def read(): return json.loads(sys.stdin.readline())
+def reply(request, body=None, error=None):
+    response = {{'subtype':'error' if error else 'success', 'request_id':request['request_id']}}
+    if error: response['error'] = error
+    else: response['response'] = body or {{}}
+    print(json.dumps({{'type':'control_response','response':response}}), flush=True)
+init = read()
+reply(init, {{'current_permission_mode':'default', 'models':[{{'value':'default','displayName':'Default','supportsEffort':True}},{{'value':'sonnet','displayName':'Sonnet','supportsEffort':True,'supportedEffortLevels':['low','high']}}]}})
+model = read()
+assert model['request'] == {{'subtype':'set_model','model':'sonnet'}}
+reply(model)
+effort = read()
+assert effort['request'] == {{'subtype':'apply_flag_settings','settings':{{'effortLevel':'high'}}}}
+reply(effort, error='fixture refused high')
+effort = read()
+assert effort['request'] == {{'subtype':'apply_flag_settings','settings':{{'effortLevel':'low'}}}}
+reply(effort)
+confirm = read()
+assert confirm['request']['subtype'] == 'get_settings'
+reply(confirm, {{'effective':{{'effortLevel':'low'}},'sources':[{{'source':'flagSettings','settings':{{'effortLevel':'low'}}}}], 'applied':{{'effort':'low'}}}})
+mode = read()
+assert mode['request'] == {{'subtype':'set_permission_mode','mode':'plan'}}
+reply(mode, {{'mode':'plan'}})
+assert not sys.stdin.read()
+"##,
+        String::from_utf8(python.stdout).unwrap().trim()
+    );
+    let fake = script(dir.path(), "fake-picker-claude", &program);
+    let provider = Arc::new(Provider::fixture(preview, &fake).unwrap());
+    let cwd = dir.path().join("checkout");
+    independent_clone(&cwd);
+    let (runtime, mut events) = provider.fake_start(cwd).await.unwrap().unwrap();
+    let mut controller = Controller::new();
+    controller.runtime = Some(runtime);
+    let source = controller.source.clone();
+    let mut stage = 0;
+    let mut rejection_message = false;
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let change = match &event {
+            RuntimeEvent::Harness(HarnessEvent::Ready { .. }) => {
+                stage = 1;
+                Some(SettingChange::Model("sonnet".into()))
+            }
+            RuntimeEvent::Harness(HarnessEvent::ModelChanged(value)) if stage == 1 => {
+                assert_eq!(value, "sonnet");
+                stage = 2;
+                Some(SettingChange::Effort(Some("high".into())))
+            }
+            RuntimeEvent::Harness(HarnessEvent::SettingRejected { requested }) => {
+                assert_eq!(requested, &SettingChange::Effort(Some("high".into())));
+                assert_eq!(
+                    controller
+                        .adapter
+                        .state()
+                        .acknowledged
+                        .effort
+                        .as_ref()
+                        .unwrap()
+                        .effort,
+                    None
+                );
+                stage = 3;
+                Some(SettingChange::Effort(Some("low".into())))
+            }
+            RuntimeEvent::Harness(HarnessEvent::Error(message)) => {
+                assert_eq!(
+                    message,
+                    "Claude did not change the effort to high: fixture refused high"
+                );
+                rejection_message = true;
+                None
+            }
+            RuntimeEvent::Harness(HarnessEvent::EffortChanged { effort, .. }) if stage == 3 => {
+                assert_eq!(effort.as_deref(), Some("low"));
+                stage = 4;
+                Some(SettingChange::Mode("plan".into()))
+            }
+            RuntimeEvent::Harness(HarnessEvent::PermissionModeChanged(value)) if stage == 4 => {
+                assert_eq!(value, "plan");
+                stage = 5;
+                None
+            }
+            RuntimeEvent::Harness(HarnessEvent::ProcessExited { code }) => {
+                assert_eq!(*code, Some(0));
+                break;
+            }
+            _ => None,
+        };
+        controller.apply_runtime_outcome(&source, event);
+        if let Some(change) = change {
+            let (receipt, _) = controller.dispatch(ChatIntent::ChangeSetting { change });
+            assert_eq!(receipt.state, ReceiptState::ChannelAccepted);
+        }
+        if stage == 5 {
+            assert!(rejection_message);
+            assert!(controller.adapter.state().pending_change().is_none());
+            assert_eq!(
+                controller.adapter.state().acknowledged.model.as_deref(),
+                Some("sonnet")
+            );
+            assert_eq!(
+                controller.adapter.state().acknowledged.mode.as_deref(),
+                Some("plan")
+            );
+            assert_eq!(
+                controller
+                    .adapter
+                    .state()
+                    .acknowledged
+                    .effort
+                    .as_ref()
+                    .unwrap()
+                    .effort
+                    .as_deref(),
+                Some("low")
+            );
+            controller
+                .runtime
+                .as_ref()
+                .unwrap()
+                .send(HarnessCommand::Shutdown)
+                .unwrap();
+            stage = 6;
+        }
+    }
+    assert_eq!(stage, 6);
+    controller
+        .runtime
+        .as_mut()
+        .unwrap()
+        .completed()
+        .await
+        .unwrap();
 }

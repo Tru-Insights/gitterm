@@ -546,7 +546,11 @@ shortcuts![
         Newline,
         Some("(NativeChat && IcedComposer) > Input")
     ),
-    ("shift-tab", CycleMode, Some("NativeChat && IcedComposer")),
+    (
+        "shift-tab",
+        CycleMode,
+        Some("(NativeChat && IcedComposer) > Input")
+    ),
     ("enter", FindNext, Some("NativeChat && IcedChatFind")),
     (
         "shift-enter",
@@ -577,14 +581,10 @@ shortcuts![
 
 /// Actions without a host adapter remain unregistered, so GPUI's native menu
 /// validation disables their menu items.
-/// Mode changes are rejected by the native adapter; the review chip is display-only.
+/// The review chip is display-only.
 /// Terminal log mirroring has no native backend, and dictation is out of scope.
-pub const MISSING_HOST_ACTIONS: &[&str] = &[
-    "ToggleTerminalLogMirroring",
-    "SttToggle",
-    "CycleMode",
-    "SubmitReview",
-];
+pub const MISSING_HOST_ACTIONS: &[&str] =
+    &["ToggleTerminalLogMirroring", "SttToggle", "SubmitReview"];
 
 #[cfg(test)]
 mod tests {

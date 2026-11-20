@@ -287,10 +287,23 @@ impl ChatAdapter {
                 process_running: facts.process_running,
                 message_id,
             }),
-            ChatIntent::ChangeMode { .. } => {
-                return Err(Receipt::rejected(
-                    "Mode changes are disabled until typed provider acknowledgement/rejection is available",
-                ));
+            ChatIntent::ChangeSetting { change } => {
+                let catalog = crate::pickers::Catalog::project(
+                    &self.state,
+                    matches!(backend, AgentBackend::Acp(_)),
+                );
+                if !catalog.offers(&change) {
+                    return Err(Receipt::rejected(
+                        "This setting is not offered by the provider",
+                    ));
+                }
+                self.state.reduce(Intent::ChangeSetting {
+                    runtime: runtime.clone(),
+                    current: facts.authority.target,
+                    config: facts.config,
+                    process_running: facts.process_running && !self.exited,
+                    change,
+                })
             }
             ChatIntent::Stop => {
                 if facts.authority.control != session::TurnControl::Harness

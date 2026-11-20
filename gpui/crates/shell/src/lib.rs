@@ -2709,6 +2709,9 @@ impl Shell {
                     sheet.update(cx, |sheet, cx| sheet.submit(cx));
                 }
             }))
+            .on_action(cx.listener(|_, _: &CycleMode, w, cx| {
+                Self::chat_action("native_chat::CycleMode", w, cx)
+            }))
             .on_action(cx.listener(|_, _: &SubmitPrompt, w, cx| {
                 Self::chat_action("native_chat::SubmitPrompt", w, cx)
             }))
