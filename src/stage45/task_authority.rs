@@ -346,6 +346,7 @@ fn iced_stale_worker_completion_refuses_writes_and_launch_end_to_end() {
         "workspace",
         "membership",
         "repository",
+        "workdir",
         "target",
     ] {
         for success in [false, true] {
@@ -368,6 +369,16 @@ fn iced_stale_worker_completion_refuses_writes_and_launch_end_to_end() {
                 }
                 "workspace" => app.workspaces[0].name = "replacement-workspace".into(),
                 "membership" => app.workspaces[0].pending_repos.push(dir.path().into()),
+                "workdir" => {
+                    let redirected = dir.path().join("redirected-source");
+                    std::fs::create_dir(&redirected).unwrap();
+                    Repository::open(&app.workspaces[0].tabs[0].repo_path)
+                        .unwrap()
+                        .config()
+                        .unwrap()
+                        .set_str("core.worktree", redirected.to_str().unwrap())
+                        .unwrap();
+                }
                 "repository" => {
                     Repository::open(&app.workspaces[0].tabs[0].repo_path)
                         .unwrap()
@@ -1152,4 +1163,101 @@ fn iced_non_repository_caller_can_delegate_to_a_listed_checkout() {
             .len(),
         1
     );
+}
+
+#[test]
+fn iced_git_workdir_redirection_after_target_resolution_refuses_all_writes() {
+    if isolated(
+        "iced_git_workdir_redirection_after_target_resolution_refuses_all_writes",
+        "task_authority",
+    ) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(dir.path());
+    add_task(&mut app, dir.path(), dir.path());
+    let (pending, _, _unused_reply, _unused_receiver) =
+        pending_worker_fixture(&mut app, dir.path());
+    let worker = pending.worker.unwrap();
+    app.cancel_worker_preparation(worker.authority);
+    let target = dir.path().join("primary-target");
+    std::fs::create_dir(&target).unwrap();
+    let repository = fixture_worker_source(&target);
+    repository
+        .branch(
+            "main",
+            &repository.head().unwrap().peel_to_commit().unwrap(),
+            false,
+        )
+        .unwrap();
+    drop(repository);
+    let target = std::fs::canonicalize(target).unwrap();
+    app.workspaces[0].pending_repos.push(target.clone());
+    let caller = app.delegation_caller(&worker.caller.session_uid).unwrap();
+    let TaskMutationAction::WorkerAuthorityChecked { id: authority } = app
+        .reduce_task_mutation(TaskMutation::BeginWorkerPreparation {
+            caller: caller.session_uid.clone(),
+        })
+        .unwrap()
+    else {
+        panic!("capture");
+    };
+    let request: task_mcp::DelegateTaskRequest = serde_json::from_value(
+        json!({"title":"Redirected checkout", "objective":"Fixture", "checkout":target}),
+    )
+    .unwrap();
+    let (place, options) = gitterm::delegations::worker_targets(&request).unwrap();
+    let targets = check_delegate_targets(DelegateTargets {
+        authority,
+        request,
+        caller: Some(caller.session_uid.clone()),
+        tab: caller,
+        choice: worker.choice,
+        place,
+        options,
+        adoption: None,
+    })
+    .unwrap();
+    assert_eq!(worker_checkout_fact(&target).unwrap().path, target);
+    let redirected = dir.path().join("different-workdir");
+    std::fs::create_dir(&redirected).unwrap();
+    Repository::open(&target)
+        .unwrap()
+        .config()
+        .unwrap()
+        .set_str("core.worktree", redirected.to_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        std::fs::canonicalize(Repository::discover(&target).unwrap().workdir().unwrap()).unwrap(),
+        std::fs::canonicalize(&redirected).unwrap()
+    );
+    assert!(worker_checkout_fact(&target).is_err());
+    let before = std::fs::read(dir.path().join("tasks.json")).unwrap();
+    let count = app.task_authority.store().as_ref().unwrap().tasks().len();
+    let (sender, mut receiver) = command_channel();
+    let response = sender.enqueue((), None).unwrap();
+    let _effect = app.update_event(Event::DelegateTaskTargetsChecked(
+        authority,
+        Ok(Box::new(targets)),
+        receiver.try_recv().unwrap().reply,
+    ));
+    assert!(iced::futures::executor::block_on(response)
+        .unwrap_err()
+        .contains("destination checkout"));
+    assert_eq!(
+        std::fs::read(dir.path().join("tasks.json")).unwrap(),
+        before
+    );
+    assert_eq!(
+        app.task_authority.store().as_ref().unwrap().tasks().len(),
+        count
+    );
+    assert!(app
+        .task_authority
+        .store()
+        .as_ref()
+        .unwrap()
+        .delegations()
+        .is_empty());
+    assert!(app.task_launch_queue.is_empty());
 }

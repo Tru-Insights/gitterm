@@ -266,6 +266,7 @@ pub struct WorkerCaller {
     pub chat_session_id: Option<String>,
     pub workspace: WorkspaceIdentity,
     pub repository: Option<RepositoryIdentity>,
+    pub repository_workdir: Option<PathBuf>,
     pub checkout: PathBuf,
     pub home: PathBuf,
     pub repos: Vec<PathBuf>,

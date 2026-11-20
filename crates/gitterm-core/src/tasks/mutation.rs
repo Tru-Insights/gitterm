@@ -774,6 +774,7 @@ mod tests {
             chat_session_id: Some("source-chat".into()),
             workspace: store.get("fixture-task").unwrap().workspace.clone(),
             repository: Some(store.get("fixture-task").unwrap().repository.clone()),
+            repository_workdir: Some(dir.path().join("source")),
             checkout: dir.path().join("source"),
             home: dir.path().into(),
             repos: vec![dir.path().join("source")],
@@ -944,7 +945,7 @@ mod tests {
 
     #[test]
     fn authority_fix_rechecks_caller_session_and_checkout_before_preparation_save() {
-        for change in 0..12 {
+        for change in 0..13 {
             let (dir, mut state, mut facts) = fixture();
             let id = bound(&mut state, &facts);
             let prepared = expected(&state);
@@ -963,6 +964,7 @@ mod tests {
                 8 => facts.callers[0].home = dir.path().join("other-home"),
                 9 => facts.callers[0].repos.clear(),
                 10 => facts.callers[0].remote = true,
+                12 => facts.callers[0].repository_workdir = Some(dir.path().join("redirected")),
                 _ => facts.callers[0].workspace.name = "changed workspace".into(),
             }
             let before = std::fs::read(dir.path().join("tasks.json")).unwrap();

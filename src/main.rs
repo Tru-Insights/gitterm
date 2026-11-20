@@ -9986,9 +9986,12 @@ fn worker_checkout_fact(path: &Path) -> Result<WorkerCheckout, String> {
             path.display()
         ));
     }
-    let root = gitterm::workers::checkout_root(&path).ok_or_else(|| {
+    // core.worktree can redirect Git while leaving the old .git entry intact.
+    let live = Repository::discover(&path)
+        .map_err(|error| format!("open worker destination {}: {error}", path.display()))?;
+    let root = live.workdir().ok_or_else(|| {
         format!(
-            "worker destination {} is not a Git checkout",
+            "worker destination {} has no Git working directory",
             path.display()
         )
     })?;
@@ -9997,7 +10000,7 @@ fn worker_checkout_fact(path: &Path) -> Result<WorkerCheckout, String> {
         != path
     {
         return Err(format!(
-            "worker destination {} is not the checkout root",
+            "worker destination {} is not Git's current checkout root",
             path.display()
         ));
     }
@@ -13135,6 +13138,13 @@ impl App {
         let checkout = canonical(&caller.cwd)?;
         // A non-repository workspace home can delegate to explicitly listed repos.
         let repository = worker_repository_identity(&checkout)?;
+        let repository_workdir = if repository.is_some() {
+            let live = Repository::discover(&checkout)
+                .map_err(|error| format!("open caller checkout {}: {error}", checkout.display()))?;
+            live.workdir().map(canonical).transpose()?
+        } else {
+            None
+        };
         let home = canonical(&caller.home)?;
         let WorkspaceLocation::Local { root } = &workspace.location else {
             return Err("Remote workers are not supported yet".into());
@@ -13150,6 +13160,7 @@ impl App {
                 location: source_location,
             },
             repository,
+            repository_workdir,
             checkout,
             home,
             repos: caller
