@@ -45,6 +45,7 @@ pub mod chats;
 pub mod find;
 
 pub mod work;
+pub mod work_notes;
 
 // Delegation services and runtime lifecycle authority; hosts execute effects.
 #[cfg(feature = "runtime")]
