@@ -37,6 +37,20 @@ fn prompt() -> ChatIntent {
         }],
     }
 }
+fn bound(adapter: &ChatAdapter, intent: ChatIntent) -> ChatIntent {
+    if let Some(id) = intent.request_id()
+        && let Some(identity) =
+            adapter
+                .state()
+                .request_identity(&adapter.state().runtime_stamp(target()), &[], id)
+    {
+        return ChatIntent::Answer {
+            identity,
+            answer: Box::new(intent),
+        };
+    }
+    intent
+}
 fn permission() -> ChatIntent {
     ChatIntent::Permission {
         request_id: "synthetic-request".into(),
@@ -159,7 +173,7 @@ fn definitive_rejection_retries_but_uncertainty_and_resolution_never_do() {
     let stamp = adapter.begin_runtime(target());
     request(&mut adapter, &stamp);
     let first = adapter
-        .admit(permission(), facts())
+        .admit(bound(&adapter, permission()), facts())
         .unwrap_or_else(|r| panic!("{r:?}"));
     let first = accepted(&mut adapter, first);
     assert!(
@@ -174,7 +188,7 @@ fn definitive_rejection_retries_but_uncertainty_and_resolution_never_do() {
             .retryable()
     );
     let retry = adapter
-        .admit(permission(), facts())
+        .admit(bound(&adapter, permission()), facts())
         .unwrap_or_else(|r| panic!("{r:?}"));
     let retry = accepted(&mut adapter, retry);
     let uncertain = adapter
@@ -186,7 +200,11 @@ fn definitive_rejection_retries_but_uncertainty_and_resolution_never_do() {
         .unwrap();
     assert!(!uncertain.state.retryable());
     assert!(uncertain.state.label().contains("Uncertain"));
-    assert!(adapter.admit(permission(), facts()).is_err());
+    assert!(
+        adapter
+            .admit(bound(&adapter, permission()), facts())
+            .is_err()
+    );
     assert!(
         adapter
             .delivery(
@@ -220,7 +238,11 @@ fn definitive_rejection_retries_but_uncertainty_and_resolution_never_do() {
             )
             .is_none()
     );
-    assert!(adapter.admit(permission(), facts()).is_err());
+    assert!(
+        adapter
+            .admit(bound(&adapter, permission()), facts())
+            .is_err()
+    );
     assert!(
         ChatModel::from_conversation(&adapter.state().conversation).rows[0]
             .title
@@ -239,7 +261,7 @@ fn uncertain_answer_stays_blocked_across_task_rebindings() {
         let stamp = adapter.begin_runtime(target());
         request(&mut adapter, &stamp);
         let prepared = adapter
-            .admit(permission(), facts())
+            .admit(bound(&adapter, permission()), facts())
             .unwrap_or_else(|r| panic!("{r:?}"));
         let mut receipt = accepted(&mut adapter, prepared);
         if let Some(outcome) = outcome {
@@ -253,7 +275,7 @@ fn uncertain_answer_stays_blocked_across_task_rebindings() {
                 .state()
                 .accepts_stream(&stamp, &rebound_facts.authority.target)
         );
-        let result = adapter.admit(permission(), rebound_facts);
+        let result = adapter.admit(bound(&adapter, permission()), rebound_facts);
         if receipt.state.retryable() {
             assert!(result.is_ok(), "known non-delivery must permit retry");
         } else {
@@ -303,7 +325,7 @@ fn deferred_commands_revalidate_full_binding_and_pending_request() {
             request(&mut adapter, &stamp);
         }
         let prepared = adapter
-            .admit(intent, facts())
+            .admit(bound(&adapter, intent), facts())
             .unwrap_or_else(|r| panic!("{r:?}"));
         let mut rebound = target();
         rebound.task_session_id = Some("new-binding".into());
@@ -316,7 +338,7 @@ fn deferred_commands_revalidate_full_binding_and_pending_request() {
     let stamp = adapter.begin_runtime(target());
     request(&mut adapter, &stamp);
     let prepared = adapter
-        .admit(permission(), facts())
+        .admit(bound(&adapter, permission()), facts())
         .unwrap_or_else(|r| panic!("{r:?}"));
     adapter
         .receive(
@@ -357,7 +379,7 @@ fn wrong_kind_and_remember_are_rejected_before_dispatch() {
             },
         },
     ] {
-        assert!(adapter.admit(intent, facts()).is_err());
+        assert!(adapter.admit(bound(&adapter, intent), facts()).is_err());
     }
 }
 fn config() -> AgentBackendConfig {
@@ -522,7 +544,7 @@ fn reset_cannot_retarget_a_previous_request_and_old_receipts_do_nothing() {
     let stamp = adapter.begin_runtime(target());
     request(&mut adapter, &stamp);
     let prepared = adapter
-        .admit(permission(), facts())
+        .admit(bound(&adapter, permission()), facts())
         .unwrap_or_else(|r| panic!("{r:?}"));
     let receipt = accepted(&mut adapter, prepared);
     adapter
@@ -534,7 +556,11 @@ fn reset_cannot_retarget_a_previous_request_and_old_receipts_do_nothing() {
             |_, _| {},
         )
         .unwrap();
-    assert!(adapter.admit(permission(), facts()).is_err());
+    assert!(
+        adapter
+            .admit(bound(&adapter, permission()), facts())
+            .is_err()
+    );
     adapter.begin_runtime(target());
     assert!(
         adapter
@@ -990,5 +1016,385 @@ fn explicit_same_caller_retry_of_unsent_queue_uses_fresh_tracked_delivery_id() {
             "uncertainty must never retry"
         );
         assert_eq!(adapter.state().queued_prompts.len(), 2);
+    }
+}
+
+#[test]
+fn deny_and_dismiss_match_iced_wire_messages_and_remember_preserves_offer() {
+    let offered =
+        json!({"destination":"localSettings","type":"addRules","rules":[{"toolName":"Read"}]});
+    let kind = RuntimeRequestKind::Permission {
+        tool_name: "Read".into(),
+        input: json!({}),
+        suggestions: vec![offered.clone()],
+        decision_reason: None,
+    };
+    for (reason, expected) in [
+        ("  no thanks\n", "no thanks"),
+        (" \n ", "The user denied this tool call."),
+    ] {
+        assert_eq!(
+            decision(
+                &ChatIntent::Permission {
+                    request_id: "r".into(),
+                    decision: PermissionDecision::Deny {
+                        reason: reason.into()
+                    }
+                },
+                &kind
+            )
+            .unwrap(),
+            RuntimeDecision::Deny {
+                message: expected.into()
+            }
+        );
+    }
+    assert_eq!(
+        decision(
+            &ChatIntent::DismissQuestion {
+                request_id: "r".into()
+            },
+            &RuntimeRequestKind::Question {
+                questions: json!([])
+            }
+        )
+        .unwrap(),
+        RuntimeDecision::Deny {
+            message: "The user declined to answer.".into()
+        }
+    );
+    assert_eq!(
+        decision(
+            &ChatIntent::Permission {
+                request_id: "r".into(),
+                decision: PermissionDecision::AllowAlways {
+                    suggestion: offered.clone()
+                }
+            },
+            &kind
+        )
+        .unwrap(),
+        RuntimeDecision::Allow {
+            updated_input: None,
+            remember: Some(offered)
+        }
+    );
+    assert!(
+        decision(
+            &ChatIntent::Permission {
+                request_id: "r".into(),
+                decision: PermissionDecision::AllowAlways {
+                    suggestion: json!({"destination":"userSettings"})
+                }
+            },
+            &kind
+        )
+        .is_err()
+    );
+}
+
+fn permission_event(id: &str, command: &str) -> HarnessEvent {
+    HarnessEvent::RuntimeRequest {
+        request_id: id.into(),
+        tool_use_id: format!("tool-{command}"),
+        kind: RuntimeRequestKind::Permission {
+            tool_name: "Bash".into(),
+            input: json!({"command":command}),
+            suggestions: vec![],
+            decision_reason: None,
+        },
+    }
+}
+fn ingress(adapter: &mut ChatAdapter, stamp: &RuntimeStamp, event: HarnessEvent) -> Update {
+    adapter
+        .receive(
+            stamp,
+            &target(),
+            AgentEvent::Harness(event),
+            None,
+            |_, _| {},
+        )
+        .unwrap()
+}
+#[test]
+fn parent_worker_same_id_never_collide_and_worker_answers_stay_gated() {
+    let mut adapter = ChatAdapter::default();
+    let stamp = adapter.begin_runtime(target());
+    ingress(
+        &mut adapter,
+        &stamp,
+        permission_event("synthetic-request", "parent"),
+    );
+    let parent = adapter
+        .state()
+        .request_identity(&stamp, &[], "synthetic-request")
+        .unwrap();
+    let prepared = adapter
+        .admit(bound(&adapter, permission()), facts())
+        .unwrap_or_else(|r| panic!("{r:?}"));
+    ingress(
+        &mut adapter,
+        &stamp,
+        HarnessEvent::SubagentEvent {
+            parent_tool_use_id: "worker".into(),
+            event: Box::new(permission_event("synthetic-request", "child")),
+        },
+    );
+    let child = adapter
+        .state()
+        .request_identity(&stamp, &["worker".into()], "synthetic-request")
+        .unwrap();
+    assert_ne!(parent, child);
+    let model = ChatModel::from_conversation(&adapter.state().conversation);
+    assert_eq!(model.pending_rows(), vec![0, 1]);
+    assert!(
+        adapter
+            .admit(
+                ChatIntent::Answer {
+                    identity: child,
+                    answer: Box::new(permission())
+                },
+                facts()
+            )
+            .is_err()
+    );
+    let update = ingress(
+        &mut adapter,
+        &stamp,
+        HarnessEvent::SubagentEvent {
+            parent_tool_use_id: "worker".into(),
+            event: Box::new(HarnessEvent::RuntimeRequestResolved {
+                request_id: "synthetic-request".into(),
+            }),
+        },
+    );
+    assert!(update.receipts.is_empty());
+    assert!(adapter.state().accepts_request(&parent, &target()));
+    assert_eq!(
+        ChatModel::from_conversation(&adapter.state().conversation).pending_rows(),
+        vec![0]
+    );
+    let (receipt, _) = adapter.execute(prepared, &target(), 1, |command| {
+        assert!(matches!(command, HarnessCommand::Answer { request_id, decision: RuntimeDecision::Allow { .. } } if request_id == "synthetic-request")); Ok(())
+    });
+    assert_eq!(receipt.state, ReceiptState::ChannelAccepted);
+}
+#[test]
+fn replacement_between_display_admit_and_execute_rejects_old_instance() {
+    for same_payload in [true, false] {
+        let mut adapter = ChatAdapter::default();
+        let stamp = adapter.begin_runtime(target());
+        ingress(
+            &mut adapter,
+            &stamp,
+            permission_event("synthetic-request", "original"),
+        );
+        let old = bound(&adapter, permission());
+        let prepared = adapter
+            .admit(old.clone(), facts())
+            .unwrap_or_else(|r| panic!("{r:?}"));
+        ingress(&mut adapter, &stamp, permission_event("second", "second"));
+        ingress(
+            &mut adapter,
+            &stamp,
+            permission_event(
+                "synthetic-request",
+                if same_payload {
+                    "original"
+                } else {
+                    "replacement"
+                },
+            ),
+        );
+        assert!(adapter.admit(old, facts()).is_err());
+        assert!(
+            adapter
+                .execute(prepared, &target(), 1, |_| panic!("old request sent"))
+                .0
+                .state
+                .retryable()
+        );
+        let model = ChatModel::from_conversation(&adapter.state().conversation);
+        assert_eq!(model.pending_rows(), vec![2, 1]);
+        let fresh = adapter
+            .admit(bound(&adapter, permission()), facts())
+            .unwrap_or_else(|r| panic!("{r:?}"));
+        assert_eq!(
+            accepted(&mut adapter, fresh).state,
+            ReceiptState::ChannelAccepted
+        );
+    }
+}
+#[test]
+fn resolution_and_late_delivery_are_instance_scoped_after_replacement() {
+    let mut adapter = ChatAdapter::default();
+    let stamp = adapter.begin_runtime(target());
+    request(&mut adapter, &stamp);
+    let prepared = adapter
+        .admit(bound(&adapter, permission()), facts())
+        .unwrap_or_else(|r| panic!("{r:?}"));
+    let old = accepted(&mut adapter, prepared);
+    request(&mut adapter, &stamp);
+    let prepared = adapter
+        .admit(bound(&adapter, permission()), facts())
+        .unwrap_or_else(|r| panic!("{r:?}"));
+    let fresh = accepted(&mut adapter, prepared);
+    let update = ingress(
+        &mut adapter,
+        &stamp,
+        HarnessEvent::RuntimeRequestResolved {
+            request_id: "synthetic-request".into(),
+        },
+    );
+    assert_eq!(
+        update.receipts.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![fresh.id]
+    );
+    assert_eq!(
+        adapter.receipt(old.id).unwrap().state,
+        ReceiptState::ChannelAccepted
+    );
+    adapter.delivery(old.id, &target(), DeliveryOutcome::Written);
+    assert_eq!(
+        adapter.receipt(fresh.id).unwrap().state,
+        ReceiptState::Resolved
+    );
+}
+#[test]
+fn unbound_and_previous_runtime_answers_are_rejected() {
+    let mut adapter = ChatAdapter::default();
+    let stamp = adapter.begin_runtime(target());
+    request(&mut adapter, &stamp);
+    assert!(adapter.admit(permission(), facts()).is_err());
+    let stale = bound(&adapter, permission());
+    let stamp = adapter.begin_runtime(target());
+    request(&mut adapter, &stamp);
+    assert!(adapter.admit(stale, facts()).is_err());
+}
+
+#[test]
+fn nested_owner_segments_are_not_slash_joined_request_identity() {
+    fn worker(path: &[&str], event: HarnessEvent) -> HarnessEvent {
+        path.iter()
+            .rev()
+            .fold(event, |event, id| HarnessEvent::SubagentEvent {
+                parent_tool_use_id: (*id).into(),
+                event: Box::new(event),
+            })
+    }
+    let mut adapter = ChatAdapter::default();
+    let stamp = adapter.begin_runtime(target());
+    ingress(
+        &mut adapter,
+        &stamp,
+        worker(&["a/b"], permission_event("same", "one")),
+    );
+    ingress(
+        &mut adapter,
+        &stamp,
+        worker(&["a", "b"], permission_event("same", "two")),
+    );
+    let one = adapter
+        .state()
+        .request_identity(&stamp, &["a/b".into()], "same")
+        .unwrap();
+    let two = adapter
+        .state()
+        .request_identity(&stamp, &["a".into(), "b".into()], "same")
+        .unwrap();
+    assert_ne!(one, two);
+    ingress(
+        &mut adapter,
+        &stamp,
+        worker(
+            &["a/b"],
+            HarnessEvent::RuntimeRequestResolved {
+                request_id: "same".into(),
+            },
+        ),
+    );
+    assert!(!adapter.state().accepts_request(&one, &target()));
+    assert!(adapter.state().accepts_request(&two, &target()));
+    let model = ChatModel::from_conversation(&adapter.state().conversation);
+    assert_eq!(model.pending_rows(), vec![1]);
+}
+
+#[test]
+fn offered_remember_options_dispatch_exactly_through_bound_adapter() {
+    for suggestion in [
+        json!({"destination":"localSettings","type":"addRules","rules":[{"toolName":"Read"}]}),
+        json!({"type":"acp_option","name":"Always allow","option_id":"always"}),
+    ] {
+        let mut adapter = ChatAdapter::default();
+        let stamp = adapter.begin_runtime(target());
+        ingress(
+            &mut adapter,
+            &stamp,
+            HarnessEvent::RuntimeRequest {
+                request_id: "synthetic-request".into(),
+                tool_use_id: "tool".into(),
+                kind: RuntimeRequestKind::Permission {
+                    tool_name: "Read".into(),
+                    input: json!({}),
+                    suggestions: vec![suggestion.clone()],
+                    decision_reason: None,
+                },
+            },
+        );
+        let intent = bound(
+            &adapter,
+            ChatIntent::Permission {
+                request_id: "synthetic-request".into(),
+                decision: PermissionDecision::AllowAlways {
+                    suggestion: suggestion.clone(),
+                },
+            },
+        );
+        let prepared = adapter
+            .admit(intent, facts())
+            .unwrap_or_else(|r| panic!("{r:?}"));
+        let (receipt, _) = adapter.execute(prepared, &target(), 1, |command| { assert!(matches!(command, HarnessCommand::Answer { decision:RuntimeDecision::Allow { remember:Some(ref update), .. }, .. } if *update == suggestion)); Ok(()) });
+        assert_eq!(receipt.state, ReceiptState::ChannelAccepted);
+    }
+}
+
+#[test]
+fn worker_reset_and_completion_do_not_hide_or_invalidate_parent_request() {
+    for lifecycle in [
+        HarnessEvent::ConversationReset { trigger: None },
+        HarnessEvent::ProcessExited { code: Some(0) },
+        HarnessEvent::TurnCompleted {
+            status: TurnStatus::Completed,
+            usage: json!({}),
+            cost_usd: None,
+            rate_limit: None,
+        },
+    ] {
+        let mut adapter = ChatAdapter::default();
+        let stamp = adapter.begin_runtime(target());
+        ingress(&mut adapter, &stamp, permission_event("same", "parent"));
+        let parent = adapter
+            .state()
+            .request_identity(&stamp, &[], "same")
+            .unwrap();
+        ingress(
+            &mut adapter,
+            &stamp,
+            HarnessEvent::SubagentEvent {
+                parent_tool_use_id: "worker".into(),
+                event: Box::new(permission_event("same", "worker")),
+            },
+        );
+        ingress(
+            &mut adapter,
+            &stamp,
+            HarnessEvent::SubagentEvent {
+                parent_tool_use_id: "worker".into(),
+                event: Box::new(lifecycle),
+            },
+        );
+        assert!(adapter.state().accepts_request(&parent, &target()));
+        let model = ChatModel::from_conversation(&adapter.state().conversation);
+        assert_eq!(model.pending_rows(), vec![0]);
     }
 }

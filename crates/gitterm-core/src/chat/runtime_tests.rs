@@ -516,6 +516,7 @@ assert answer['response']['request_id'] == 'deny'
 assert answer['response']['response']['behavior'] == 'deny'
 request('withdrawn')
 emit({'type':'control_cancel_request','request_id':'withdrawn'})
+request('withdrawn')
 assert not sys.stdin.read(), 'rejected remembers must never reach stdin'
 "#;
     let (mut session, mut events) = Session::spawn(move |token| Ok(launch(&path, script, token)));
@@ -620,6 +621,9 @@ assert not sys.stdin.read(), 'rejected remembers must never reach stdin'
         HarnessEvent::RuntimeRequestResolved {
             request_id: "withdrawn".into()
         }
+    );
+    assert!(
+        matches!(event(&mut events).await, HarnessEvent::Error(e) if e.contains("reused Claude request withdrawn"))
     );
     answer("withdrawn", remember(offered));
     assert!(matches!(event(&mut events).await, HarnessEvent::Error(e) if e.contains("no pending")));

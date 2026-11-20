@@ -35,6 +35,9 @@ pub struct Tool {
 #[derive(Debug, Clone)]
 pub struct Request {
     pub id: String,
+    pub owner: Vec<String>,
+    pub order: u64,
+    pub identity: Option<gitterm_core::chat::state::RequestIdentity>,
     pub kind: RuntimeRequestKind,
     pub resolved: bool,
 }
@@ -103,7 +106,8 @@ pub struct ChatModel {
     pub rows: Vec<Row>,
     streams: HashMap<String, (RowKind, usize)>,
     items: HashMap<(String, String), usize>,
-    requests: HashMap<String, usize>,
+    requests: HashMap<(Vec<String>, String), usize>,
+    request_owner: Vec<String>,
     prompts: HashMap<String, usize>,
     workers: HashMap<String, usize>,
     turn_start: HashMap<String, u64>,
@@ -111,6 +115,19 @@ pub struct ChatModel {
     recorded_time: Option<u64>,
 }
 impl ChatModel {
+    pub fn pending_rows(&self) -> Vec<usize> {
+        let mut ordered: Vec<_> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                let request = row.request.as_ref()?;
+                (!request.resolved && row.decision.is_none()).then_some((request.order, index))
+            })
+            .collect();
+        ordered.sort_by_key(|(order, _)| *order);
+        ordered.into_iter().map(|(_, index)| index).collect()
+    }
     pub fn from_records(records: &[Record]) -> Self {
         let mut model = Self::default();
         for record in records {
@@ -216,7 +233,10 @@ impl ChatModel {
                 state,
                 detail,
             } => {
-                if let Some(&index) = self.requests.get(request_id) {
+                if let Some(&index) = self
+                    .requests
+                    .get(&(self.request_owner.clone(), request_id.clone()))
+                {
                     let row = &mut self.rows[index];
                     row.decision = Some(*state);
                     row.title = format!(
@@ -264,6 +284,19 @@ impl ChatModel {
         scope: &str,
         changed: &mut Vec<usize>,
     ) {
+        if matches!(
+            event,
+            HarnessEvent::TurnCompleted { .. }
+                | HarnessEvent::ProcessExited { .. }
+                | HarnessEvent::ConversationReset { .. }
+        ) {
+            for ((owner, _), &index) in &self.requests {
+                if owner.starts_with(&self.request_owner) {
+                    self.rows[index].request.as_mut().unwrap().resolved = true;
+                    changed.push(index);
+                }
+            }
+        }
         match event {
             HarnessEvent::TextDelta(text) | HarnessEvent::ThinkingDelta(text) => {
                 let kind = if matches!(event, HarnessEvent::TextDelta(_)) {
@@ -394,14 +427,23 @@ impl ChatModel {
                 );
                 self.rows[index].request = Some(Request {
                     id: request_id.clone(),
+                    order: self.rows[index].id,
+                    owner: self.request_owner.clone(),
+                    identity: None,
                     kind: kind.clone(),
                     resolved: false,
                 });
-                self.requests.insert(request_id.clone(), index);
+                if let Some(old) = self.requests.insert((self.request_owner.clone(), request_id.clone()), index) {
+                    if !self.rows[old].request.as_ref().unwrap().resolved {
+                        self.rows[index].request.as_mut().unwrap().order = self.rows[old].request.as_ref().unwrap().order;
+                    }
+                    self.rows[old].request.as_mut().unwrap().resolved = true;
+                    changed.push(old);
+                }
                 changed.push(index);
             }
             HarnessEvent::RuntimeRequestResolved { request_id } => {
-                if let Some(&index) = self.requests.get(request_id) {
+                if let Some(&index) = self.requests.get(&(self.request_owner.clone(), request_id.clone())) {
                     let row = &mut self.rows[index];
                     if let Some(request) = &mut row.request {
                         request.resolved = true;
@@ -471,7 +513,9 @@ impl ChatModel {
                 } else {
                     format!("{scope}/{parent_tool_use_id}")
                 };
+                self.request_owner.push(parent_tool_use_id.clone());
                 self.event(event, at, &child_scope, changed);
+                self.request_owner.pop();
             }
             HarnessEvent::UserMessageEcho {
                 id,
@@ -532,7 +576,8 @@ impl ChatModel {
                 // Keep prior rows as history; new item/request IDs cannot target the old turn.
                 self.streams.clear();
                 self.items.clear();
-                for &index in self.requests.values() {
+                for ((owner, _), &index) in &self.requests {
+                    if !owner.starts_with(&self.request_owner) { continue; }
                     let row = &mut self.rows[index];
                     if let Some(request) = &mut row.request {
                         request.resolved = true;
@@ -542,7 +587,7 @@ impl ChatModel {
                     }
                     changed.push(index);
                 }
-                self.requests.clear();
+                self.requests.retain(|(owner, _), _| !owner.starts_with(&self.request_owner));
                 self.prompts.clear();
                 self.workers.clear();
                 self.turn_start.clear();

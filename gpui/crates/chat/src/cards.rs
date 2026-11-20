@@ -26,8 +26,10 @@ pub(crate) struct CardView {
     row: Row,
     callback: Option<IntentCallback>,
     read_only: bool,
+    pub(super) preview: bool,
     questions: Result<Vec<Question>, String>,
     drafts: Vec<AnswerDraft>,
+    deny_reason: Entity<InputState>,
     submitted: Option<ChatIntent>,
     receipt: Option<Receipt>,
     _subscriptions: Vec<Subscription>,
@@ -67,7 +69,18 @@ impl CardView {
                 }
             })
             .collect();
+        let deny_reason =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Reason for denying (optional)"));
+        subscriptions.push(
+            cx.subscribe_in(&deny_reason, window, |this, _, event, _, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.deny(cx);
+                }
+            }),
+        );
         Self {
+            deny_reason,
+            preview: false,
             row,
             callback,
             read_only,
@@ -89,7 +102,9 @@ impl CardView {
                 .request
                 .as_ref()
                 .zip(row.request.as_ref())
-                .is_some_and(|(old, new)| old.id == new.id && old.kind == new.kind)
+                .is_some_and(|(old, new)| {
+                    old.id == new.id && old.kind == new.kind && old.identity == new.identity
+                })
     }
     pub fn sync(&mut self, row: Row, read_only: bool, cx: &mut Context<Self>) {
         self.row = row;
@@ -129,9 +144,10 @@ impl CardView {
                 RuntimeRequestKind::Permission { suggestions, .. },
             ) => {
                 if let PermissionDecision::AllowAlways { suggestion } = decision
-                    && !offered_options(suggestions)
-                        .iter()
-                        .any(|(offered, _)| *offered == suggestion)
+                    && (self.preview
+                        || !offered_options(suggestions)
+                            .iter()
+                            .any(|(offered, _)| *offered == suggestion))
                 {
                     return;
                 }
@@ -143,6 +159,14 @@ impl CardView {
             _ => return,
         }
         self.submitted = Some(intent.clone());
+        let intent = if let Some(identity) = &request.identity {
+            ChatIntent::Answer {
+                identity: identity.clone(),
+                answer: Box::new(intent),
+            }
+        } else {
+            intent
+        };
         let receipt = (self.callback.as_ref().expect("enabled callback"))(intent, cx);
         self.receipt = Some(receipt.clone());
         self.update_receipt(&receipt, cx);
@@ -152,6 +176,14 @@ impl CardView {
         self.emit(
             ChatIntent::DismissQuestion {
                 request_id: self.row.request.as_ref().expect("request").id.clone(),
+            },
+            cx,
+        );
+    }
+    fn deny(&mut self, cx: &mut Context<Self>) {
+        self.permission(
+            PermissionDecision::Deny {
+                reason: self.deny_reason.read(cx).value().to_string(),
             },
             cx,
         );
@@ -243,7 +275,7 @@ fn answer_label(intent: &ChatIntent) -> String {
         ChatIntent::Permission { decision, .. } => match decision {
             PermissionDecision::Allow => "Allow".into(),
             PermissionDecision::AllowAlways { .. } => "Allow always".into(),
-            PermissionDecision::Deny => "Deny".into(),
+            PermissionDecision::Deny { .. } => "Deny".into(),
         },
         ChatIntent::AnswerQuestion { answers, .. } => answers
             .iter()
@@ -384,18 +416,18 @@ impl Render for CardView {
                     let suggestion = suggestion.clone();
                     let tooltip = if suggestion["destination"] == "localSettings" {
                         format!(
-                            "Saves {} to .claude/settings.local.json · unavailable until destination verified",
+                            "Saves {} to .claude/settings.local.json",
                             describe_rule(&suggestion)
                         )
                     } else {
-                        "Answers with the agent's own option · unavailable in preview".into()
+                        "Answers with the agent's own option".into()
                     };
                     content = content.child(
                         Button::new(("always", index))
                             .small()
                             .label(label)
                             .tooltip(tooltip)
-                            .disabled(true)
+                            .disabled(self.preview)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.permission(
                                     PermissionDecision::AllowAlways {
@@ -406,9 +438,21 @@ impl Render for CardView {
                             })),
                     );
                 }
-                content = content.child(Button::new("deny").small().label("Deny").on_click(
-                    cx.listener(|this, _, _, cx| this.permission(PermissionDecision::Deny, cx)),
-                ));
+                content = content.child(
+                    div()
+                        .id("deny-reason")
+                        .debug_selector(|| "deny-reason".into())
+                        .child(Input::new(&self.deny_reason)),
+                );
+                if self.preview && !offered_options(suggestions).is_empty() {
+                    content = content.child("not saved in preview");
+                }
+                content = content.child(
+                    Button::new("deny")
+                        .small()
+                        .label("Deny")
+                        .on_click(cx.listener(|this, _, _, cx| this.deny(cx))),
+                );
             }
             RuntimeRequestKind::Question { .. } => {
                 match &self.questions {
@@ -498,7 +542,23 @@ impl Render for CardView {
                 );
             }
         }
-        content.into_any_element()
+        content
+            .on_action(
+                cx.listener(|this, _: &gpui_component::input::Enter, window, cx| {
+                    if this
+                        .deny_reason
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window)
+                    {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    } else {
+                        cx.propagate();
+                    }
+                }),
+            )
+            .into_any_element()
     }
 }
 
