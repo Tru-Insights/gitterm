@@ -66,6 +66,23 @@ pub struct WorkerPreparationId(pub(crate) u64);
 #[derive(Debug)]
 pub enum TaskMutation {
     Create(TaskCreate),
+    InsertPreparing {
+        record: Box<TaskRecord>,
+    },
+    PreparationCompleted {
+        task_id: String,
+        result: Result<CompletedWorktreePreparation, String>,
+        cleanup_path: Option<PathBuf>,
+    },
+    WorktreeRemoved {
+        task_id: String,
+    },
+    RecordDelivery {
+        task_id: String,
+        commit_sha: String,
+        pr_url: Option<String>,
+        pr_number: Option<u64>,
+    },
     UpdateHandoff(HandoffUpdate),
     /// Close/archive the durable task, preserving its worktree and history.
     Close {
@@ -107,6 +124,15 @@ pub enum TaskMutation {
         task_id: String,
         expected: CompletedWorktreePreparation,
     },
+    /// Existing-checkout reuse preserves lifecycle, worktree and attention.
+    ReuseWorkerCheckout {
+        id: WorkerPreparationId,
+        replacement: Box<TaskRecord>,
+    },
+    WorkerCheckoutReuseSaved {
+        id: WorkerPreparationId,
+        result: Result<(), String>,
+    },
     WorkerPrepared {
         id: WorkerPreparationId,
         result: Result<CompletedWorktreePreparation, String>,
@@ -137,6 +163,17 @@ pub struct TaskMutationEffect {
 pub enum TaskMutationAction {
     None,
     PrepareTask(TaskCreate),
+    PersistPreparing {
+        record: Box<TaskRecord>,
+    },
+    PersistPreparation {
+        task_id: String,
+        prepared: CompletedWorktreePreparation,
+    },
+    PersistDelivery {
+        task_id: String,
+        delivery: DeliveryState,
+    },
     /// Run record_handoff, which rechecks report authority before its first
     /// write. Only its successful result permits notification/UI completion.
     PersistHandoff {
@@ -207,6 +244,10 @@ pub enum TaskMutationAction {
         task_id: String,
         error: String,
         cleanup_path: Option<PathBuf>,
+    },
+    PersistWorkerCheckoutReuse {
+        id: WorkerPreparationId,
+        replacement: Box<TaskRecord>,
     },
     StartWorker {
         task_id: String,
