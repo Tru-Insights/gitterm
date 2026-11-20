@@ -1446,7 +1446,10 @@ impl Shell {
             pulse_bright: false,
             ready_count: 0,
             ready_news_count: 0,
-            parked_count: self.workspaces.iter().filter(|w| !w.on_bar()).count(),
+            // Match Iced's bar count: saved parked workspaces plus open
+            // workspaces hidden by their collapsed repo group.
+            parked_count: self.owner.read(cx).saved_parked().len()
+                + (self.workspaces.len() - self.workspaces.iter().filter(|w| w.on_bar()).count()),
             terminal_expanded: active.is_some_and(|w| w.store.regions.has_bottom(false)),
             terminal_running: false,
             browser: workspace_bar::Browser {
@@ -1497,17 +1500,35 @@ impl Shell {
                 .flat_map(|w| &w.sessions)
                 .filter(|s| !bottom_pane_ids(state.unwrap(), cx).contains(&session_pane_id(s.id)))
                 .filter(|s| self.session_task(s.id, cx) == self.selected_task)
-                .map(|s| session_strip::Session {
-                    id: s.id,
-                    kind: s.kind,
-                    display_title: state.unwrap().panes[&session_pane_id(s.id)]
-                        .read(cx)
-                        .tab_title(),
-                    chat_title: (s.kind == data::SessionKind::Chat).then(|| s.title.clone()),
-                    task_session_label: None,
-                    attention: None,
-                    running: false,
-                    pending_requests: 0,
+                .map(|s| {
+                    let tab = saved.and_then(|saved| {
+                        data::iced_sessions(saved)
+                            .iter()
+                            .position(|session| session.id == s.id)
+                            .and_then(|index| saved.tabs.get(index))
+                    });
+                    // Imported UUIDs are identities, never chat titles. Until the
+                    // index resolves one, use Iced's ordinary folder fallback.
+                    let untitled = tab.is_some_and(|tab| {
+                        tab.chat_session_id.as_deref() == Some(s.title.as_str())
+                    });
+                    session_strip::Session {
+                        id: s.id,
+                        kind: s.kind,
+                        display_title: if untitled {
+                            tab.unwrap().dir.clone()
+                        } else {
+                            state.unwrap().panes[&session_pane_id(s.id)]
+                                .read(cx)
+                                .tab_title()
+                        },
+                        chat_title: (s.kind == data::SessionKind::Chat && !untitled)
+                            .then(|| s.title.clone()),
+                        task_session_label: None,
+                        attention: None,
+                        running: false,
+                        pending_requests: 0,
+                    }
                 })
                 .collect(),
             active: state.and_then(|w| w.active_session),
@@ -3584,6 +3605,12 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
         let model = workspace_config::load_iced_workspaces(&mut store);
         (model, None)
     };
+    let title_workspace = model
+        .active()
+        .and_then(|active| model.workspaces.iter().find(|workspace| workspace.id == active))
+        .map(|workspace| workspace.status.repo_name.clone())
+        .unwrap_or_else(|| if sample { "Sample data".into() } else { "GitTerm".into() });
+    let window_title = window_title("GitTerm V6 Development", &title_workspace, SidebarMode::Work);
     gpui_kit::application().run(move |cx| {
         preview.release_on_quit(cx);
         gpui_kit::init(cx);
@@ -3597,14 +3624,7 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
                     cx,
                 ))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some(
-                        if sample {
-                            "GitTerm · GPUI shell · Sample data"
-                        } else {
-                            "GitTerm · GPUI · Local workspaces"
-                        }
-                        .into(),
-                    ),
+                    title: Some(window_title.clone().into()),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -3643,6 +3663,16 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
         cx.activate(true);
     });
     Ok(())
+}
+
+fn window_title(app_name: &str, workspace: &str, sidebar_mode: SidebarMode) -> String {
+    let mode = match sidebar_mode {
+        SidebarMode::Work => "Work",
+        SidebarMode::Files => "Files",
+        SidebarMode::Find => "Find",
+        SidebarMode::Git => "Git",
+    };
+    format!("{app_name} - {workspace} - {mode}")
 }
 
 impl Shell {
@@ -4333,6 +4363,18 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
     use gpui_component::dock::{InsertTarget, PaneRef};
+
+    #[test]
+    fn window_title_matches_iced_workspace_and_sidebar_format() {
+        assert_eq!(
+            window_title("GitTerm V6 Development", "GitTerm V6 Upgrade", SidebarMode::Work),
+            "GitTerm V6 Development - GitTerm V6 Upgrade - Work"
+        );
+        assert_eq!(
+            window_title("GitTerm V6 Development", "GitRepo", SidebarMode::Git),
+            "GitTerm V6 Development - GitRepo - Git"
+        );
+    }
 
     #[gpui::test]
     fn live_local_status_crosses_application_bridge_and_survives_closed_git_pane(
