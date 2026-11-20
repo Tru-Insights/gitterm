@@ -388,6 +388,64 @@ fn code_copy_feedback_and_cross_row_selection(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn folded_turn_remains_searchable_and_escape_restores_its_fold(cx: &mut TestAppContext) {
+    let records = vec![
+        Record {
+            at_ms: None,
+            entry: Entry::UserPrompt("question".into()),
+        },
+        Record {
+            at_ms: None,
+            entry: Entry::Harness(HarnessEvent::TextDelta("folded answer marker".into())),
+        },
+        Record {
+            at_ms: None,
+            entry: Entry::UserPrompt("next question".into()),
+        },
+    ];
+    let (chat, cx) = setup(records, cx);
+    draw(cx);
+    let (id, initial_ids) = chat.read_with(cx, |view, _| {
+        (
+            view.model.rows[0].id,
+            view.model.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+        )
+    });
+    chat.update_in(cx, |view, _, cx| view.toggle_turn(id, cx));
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        assert!(view.folded_turns.contains(&id));
+        assert!(view.row_views[1].as_ref().unwrap().read(cx).hidden_by_turn);
+        assert_eq!(
+            view.model.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            initial_ids
+        );
+    });
+    chat.update_in(cx, |view, window, cx| {
+        view.open_find(&Find, window, cx);
+        view.change_find("marker".into(), window, cx);
+    });
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        assert_eq!(view.find.active().unwrap().row, 1);
+        assert!(!view.folded_turns.contains(&id));
+        assert!(!view.row_views[1].as_ref().unwrap().read(cx).hidden_by_turn);
+    });
+    chat.update_in(cx, |view, window, cx| {
+        view.close_find(&CloseFind, window, cx)
+    });
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        assert!(view.folded_turns.contains(&id));
+        assert!(view.row_views[1].as_ref().unwrap().read(cx).hidden_by_turn);
+        assert_eq!(
+            view.model.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            initial_ids
+        );
+    });
+}
+
+#[gpui::test]
 fn composer_keys_draft_read_only_stop_and_intent_ownership(cx: &mut TestAppContext) {
     use std::{cell::RefCell, rc::Rc};
     let intents = Rc::new(RefCell::new(Vec::new()));
