@@ -17,6 +17,7 @@ mod park;
 pub mod preview;
 mod review_reload;
 mod sessions;
+pub mod tasks;
 mod theme;
 pub mod usage;
 pub mod workspace_config;
