@@ -2,9 +2,112 @@
 use super::*;
 use serde_json::json;
 
+// These synthetic responses characterize transport wrapping, not application
+// persistence. launch-handoff.trace.json separately exercises the real owner.
+#[tokio::test]
+async fn stage45_task_tools_wire_and_batch_order() {
+    let rows: Vec<Value> = serde_json::from_str(include_str!(
+        "../../tests/fixtures/stage45/tasks/tools.wire.json"
+    ))
+    .unwrap();
+    for row in rows {
+        let (commands, mut receiver) = command_channel();
+        let tool = TaskMcpTools::new(commands);
+        let expected = row.clone();
+        let bridge = tokio::spawn(async move {
+            let envelope = receiver.recv().await.unwrap();
+            assert_eq!(format!("{:?}", envelope.operation), expected["operation"]);
+            assert_eq!(envelope.caller.as_deref(), Some("fixture-caller"));
+            envelope.reply.send(Ok(expected["reply"].clone()));
+        });
+        let (parts, _) = Request::builder()
+            .uri("/mcp?caller=fixture-caller")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let args = row["request"].clone();
+        let result = match row["tool"].as_str().unwrap() {
+            "task_list" => {
+                tool.task_list(
+                    Parameters(serde_json::from_value(args).unwrap()),
+                    Extension(parts),
+                )
+                .await
+            }
+            "task_get" => {
+                tool.task_get(
+                    Parameters(serde_json::from_value(args).unwrap()),
+                    Extension(parts),
+                )
+                .await
+            }
+            "task_create" => {
+                tool.task_create(
+                    Parameters(serde_json::from_value(args).unwrap()),
+                    Extension(parts),
+                )
+                .await
+            }
+            "task_launch_session" => {
+                tool.task_launch_session(
+                    Parameters(serde_json::from_value(args).unwrap()),
+                    Extension(parts),
+                )
+                .await
+            }
+            "task_update_handoff" => {
+                tool.task_update_handoff(
+                    Parameters(serde_json::from_value(args).unwrap()),
+                    Extension(parts),
+                )
+                .await
+            }
+            other => panic!("unhandled task tool {other}"),
+        };
+        bridge.await.unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        assert_eq!(result.structured_content, Some(row["reply"].clone()));
+    }
+
+    let (commands, mut receiver) = command_channel();
+    let tool = TaskMcpTools::new(commands);
+    let bridge = tokio::spawn(async move {
+        let first = receiver.recv().await.unwrap();
+        assert!(receiver.try_recv().is_err(), "batch waits for each reply");
+        first.reply.send(Err("synthetic save failure".into()));
+        let second = receiver.recv().await.unwrap();
+        second.reply.send(Ok(json!({"task_id":"second"})));
+    });
+    let (parts, _) = Request::builder()
+        .uri("/mcp")
+        .body(())
+        .unwrap()
+        .into_parts();
+    let result = tool
+        .task_create_batch(
+            Parameters(
+                serde_json::from_value(json!({"tasks":[
+                    {"title":"first","objective":"one","repository_path":"/fixture/repo"},
+                    {"title":"second","objective":"two","repository_path":"/fixture/repo"}
+                ]}))
+                .unwrap(),
+            ),
+            Extension(parts),
+        )
+        .await;
+    bridge.await.unwrap();
+    assert_eq!(
+        result.structured_content,
+        Some(json!({"results":[
+            {"title":"first","ok":false,"error":"synthetic save failure"},
+            {"title":"second","ok":true,"task":{"task_id":"second"}}
+        ]}))
+    );
+}
+
 #[tokio::test]
 async fn stage45_mcp_dispatch_order_caller_ack_and_errors() {
-    let (commands, mut receiver) = mpsc::unbounded_channel();
+    let (commands, mut receiver) = command_channel();
     let dispatch = tokio::spawn({
         let commands = commands.clone();
         async move {
@@ -41,7 +144,7 @@ async fn stage45_mcp_dispatch_order_caller_ack_and_errors() {
     );
     drop(receiver);
     trace.push(json!({"point":"bridge closed","error":dispatch_operation(&commands,TaskControlOperation::PlanLimits,None).await.unwrap_err()}));
-    let (sender, mut requests) = mpsc::unbounded_channel();
+    let (sender, mut requests) = command_channel();
     let tools = TaskMcpTools::new(sender);
     let (parts, _) = Request::builder()
         .uri("/mcp")

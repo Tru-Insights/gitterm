@@ -871,7 +871,8 @@ impl App {
     /// live tabs saw since, plus delegated tasks' cached branch PRs.
     fn root_fact_prs(&self, root: &str) -> Vec<PrRef> {
         let branches = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .map(|store| task_branches(store, chrono::Utc::now(), &self.chat_uid_to_chat()))
             .unwrap_or_default();
@@ -1133,7 +1134,7 @@ impl App {
     }
 
     pub(super) fn request_finished_task_prs(&mut self, delegation_id: &str) {
-        if let Some(store) = &self.task_store {
+        if let Some(store) = self.task_authority.store() {
             self.prs.request_finished_task_branch(
                 store,
                 delegation_id,
@@ -1148,7 +1149,8 @@ impl App {
             return Task::none();
         }
         let branches = self
-            .task_store
+            .task_authority
+            .store()
             .as_ref()
             .map(|store| task_branches(store, chrono::Utc::now(), &self.chat_uid_to_chat()))
             .unwrap_or_default();

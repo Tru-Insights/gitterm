@@ -27,7 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use gitterm::delegations::{self, CallerTab};
 use gitterm::harness::claude::{ClaudeSession, ClaudeSessionConfig};
 use gitterm::harness::{HarnessCommand, HarnessEvent, RuntimeDecision, TurnStatus};
-use gitterm::task_mcp::{self, TaskControlEnvelope, TaskControlOperation, TaskStoppingBoundary};
+use gitterm::task_mcp::{self, TaskControlOperation, TaskStoppingBoundary};
 use gitterm::task_worktree::{
     prepare_task_worktree_blocking, resolve_task_preparation_blocking, PrepareTaskWorktreeRequest,
     DEFAULT_TASK_BASE,
@@ -43,7 +43,6 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::ServiceExt;
 use serde_json::Value;
-use tokio::sync::mpsc;
 
 const PARENT: &str = "worker-smoke-chat-tab-7e2a";
 const WORKER: &str = "worker-smoke-worker-tab-91bf";
@@ -117,7 +116,7 @@ async fn smoke(workdir: &Path) -> Result<(), String> {
         briefs: Mutex::new(Vec::new()),
     });
 
-    let (commands, requests) = mpsc::unbounded_channel();
+    let (commands, requests) = gitterm_core::task_commands::runtime::command_channel();
     let (task, server) =
         task_mcp::prepare("worker-smoke", commands).map_err(|error| error.to_string())?;
     tokio::spawn(server.run());
@@ -420,10 +419,7 @@ async fn call_tool(
 }
 
 /// The stand-in for the app's `TaskControlRequested` handling.
-async fn run_bridge(
-    mut requests: mpsc::UnboundedReceiver<TaskControlEnvelope>,
-    bridge: Arc<Bridge>,
-) {
+async fn run_bridge(mut requests: task_mcp::TaskControlReceiver, bridge: Arc<Bridge>) {
     while let Some(envelope) = requests.recv().await {
         let received = Instant::now();
         let caller = envelope.caller.clone();

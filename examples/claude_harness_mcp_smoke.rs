@@ -23,7 +23,6 @@ use gitterm::browser_mcp;
 use gitterm::harness::claude::{ClaudeSession, ClaudeSessionConfig};
 use gitterm::harness::{HarnessCommand, HarnessEvent, RuntimeDecision, TurnStatus};
 use gitterm::task_mcp::{self, TaskControlOperation};
-use tokio::sync::mpsc;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(180);
 const SENTINEL: &str = "mcp-smoke-sentinel-7f3a";
@@ -43,7 +42,8 @@ async fn main() {
     let workdir = PathBuf::from(arg("--workdir").expect("--workdir <dir> is required"));
     std::fs::create_dir_all(&workdir).expect("create workdir");
 
-    let (task_commands, mut task_requests) = mpsc::unbounded_channel();
+    let (task_commands, mut task_requests) =
+        gitterm_core::task_commands::runtime::command_channel();
     let (task, task_server) =
         task_mcp::prepare("mcp-smoke", task_commands).expect("reserve task MCP endpoint");
     tokio::spawn(task_server.run());

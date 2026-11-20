@@ -71,7 +71,7 @@ fn headless(fixture: &Path) -> App {
         bottom_repo_picker_open: false,
         selection: SelectionState::default(),
         next_tab_id: 0,
-        task_store: None,
+        task_authority: TaskAuthority::default(),
         missing_task_worktrees_logged: HashSet::new(),
         review_config: config.review.clone(),
         model_policy: config.policy.clone(),
@@ -715,7 +715,7 @@ fn add_task(app: &mut App, fixture: &Path, root: &Path) {
     } else {
         store.insert(task).unwrap();
     }
-    app.task_store = Some(store);
+    app.task_authority = Some(store).into();
     app.selected_task_id = Some("fixture-task".into());
 }
 fn follow(tab: &mut TabState, root: &Path) {
