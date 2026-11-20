@@ -53,8 +53,10 @@ fn files_open_content_reopen_focus_close_and_refuse_outside_root(cx: &mut TestAp
         assert_eq!(shell.content.read(cx).selected.as_ref(), Some(&id));
     });
     let before = cx.read(|cx| shell.read(cx).active(cx).panes.len());
-    open("unsupported.rs", cx);
-    cx.read(|cx| assert_eq!(shell.read(cx).active(cx).panes.len(), before));
+    std::fs::write(folder.join("source.rs"), "fn main() {}\n").unwrap();
+    open("source.rs", cx);
+    cx.read(|cx| assert_eq!(shell.read(cx).active(cx).panes.len(), before + 1));
+    let before = before + 1;
     owner.update(cx, |owner, cx| {
         owner.open_file(workspace, folder.parent().unwrap().join("outside.md"), cx)
     });
@@ -208,4 +210,81 @@ fn zoomed_split_selects_its_content_and_non_content_zoom_hides_all_surfaces(
     cx.update(|window, cx| dock.update(cx, |dock, cx| dock.set_zoomed_out(window, cx)));
     cx.run_until_parked();
     cx.read(|cx| assert!(shell.read(cx).content.read(cx).selected.is_some()));
+}
+
+#[gpui::test]
+fn file_and_diff_visits_cover_and_return_to_same_session_entity(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let folder = tempfile::tempdir().unwrap();
+    let folder = folder.path().canonicalize().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    std::fs::write(folder.join("first.txt"), "first").unwrap();
+    std::fs::write(folder.join("second.txt"), "second").unwrap();
+    let (shell, cx) =
+        cx.add_window_view(|window, cx| local_shell(&folder, config.path(), window, cx));
+    cx.update(|window, cx| shell.update(cx, |shell, cx| shell.new_terminal(window, cx)));
+    let (workspace, session, entity) = cx.read(|cx| {
+        let shell = shell.read(cx);
+        let state = shell.active(cx);
+        let session = state.active_session.unwrap();
+        (
+            state.workspace.id,
+            session,
+            state.panes[&session_pane_id(session)].entity_id(),
+        )
+    });
+    for (name, from_files) in [
+        ("first.txt", true),
+        ("second.txt", true),
+        ("second.txt", false),
+    ] {
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_file_viewer(
+                    &FileOpen {
+                        workspace,
+                        path: folder.join(name),
+                        from_files,
+                        changed: (!from_files).then(|| data::ChangedFile {
+                            path: name.into(),
+                            status: "M".into(),
+                            staged: false,
+                        }),
+                    },
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            let shell = shell.read(cx);
+            assert_eq!(shell.active(cx).active_session, Some(session));
+            assert_eq!(
+                shell.active(cx).panes[&session_pane_id(session)].entity_id(),
+                entity
+            );
+        });
+    }
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.close_file_viewer(workspace, window, cx)
+        })
+    });
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        assert_eq!(shell.active(cx).active_session, Some(session));
+        assert_eq!(
+            shell.active(cx).panes[&session_pane_id(session)].entity_id(),
+            entity
+        );
+        assert!(pane_id_visible(
+            shell.active(cx),
+            &session_pane_id(session),
+            cx
+        ));
+        assert!(shell.content.read(cx).selected.is_none());
+    });
 }

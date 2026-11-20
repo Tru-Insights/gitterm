@@ -128,6 +128,8 @@ pub struct ChatView {
     preview: bool,
     composer: Entity<TextareaState>,
     composer_state: crate::composer::ComposerState,
+    roster: Vec<roster::RosterEntry>,
+    activity_tick: Option<Task<()>>,
     /// Raw fixture ingress only; live projection is always supplied by the owner.
     fixture_composer: gitterm_core::chat::state::State,
     callback: Option<IntentCallback>,
@@ -221,6 +223,8 @@ impl ChatView {
             preview: false,
             composer,
             composer_state,
+            roster: vec![],
+            activity_tick: None,
             fixture_composer,
             callback: None,
             images: vec![],
@@ -248,7 +252,40 @@ impl ChatView {
             _subscriptions: subscriptions,
         }
     }
-    /// Embedded preview hides fixture replay controls and names its omitted features.
+    /// Supply the chat's worker/task roster without giving the view runtime ownership.
+    // TODO: shell::chat::ChatPane should project its task/delegation registry here
+    // once the shared workspace owner exposes those workers to this pane.
+    pub fn set_roster(&mut self, rows: Vec<roster::RosterEntry>, cx: &mut Context<Self>) {
+        self.roster = rows;
+        self.sync_activity_tick(cx);
+        cx.notify();
+    }
+
+    pub fn set_status_error(&mut self, error: String, cx: &mut Context<Self>) {
+        self.composer_state.notice = Some(error);
+        cx.notify();
+    }
+
+    fn sync_activity_tick(&mut self, cx: &mut Context<Self>) {
+        let live =
+            self.composer_state.streaming || self.roster.iter().any(|row| row.state.is_live());
+        if !live {
+            self.activity_tick = None;
+        } else if self.activity_tick.is_none() {
+            self.activity_tick = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(500))
+                        .await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+    }
+
+    /// Retain the embedded session's capability restrictions without extra chrome.
     pub fn set_preview(&mut self, cx: &mut Context<Self>) {
         self.preview = true;
         for card in self.cards.values() {
@@ -472,6 +509,7 @@ impl ChatView {
         }
         self.projection_runtime = Some(source.clone());
         self.composer_state.project(state, update.event.as_ref());
+        self.sync_activity_tick(cx);
         match update.presentation {
             Some(Presentation::Replay) => {
                 self.model = ChatModel::from_conversation(&state.conversation);
@@ -779,6 +817,7 @@ impl ChatView {
         let following = self.scroller.read(cx).is_following_tail();
         let count = self.model.rows.len();
         let changed = self.model.apply(record);
+        self.sync_activity_tick(cx);
         self.refresh_rows(count, following, changed, cx);
     }
     fn refresh_rows(
@@ -838,19 +877,29 @@ impl Render for ChatView {
             .key_context("NativeChat")
             .track_focus(&self.focus)
             .capture_action(cx.listener(|this, action: &InputEnter, window, cx| {
-                if action.shift || action.secondary || !this.slash_key("enter", window, cx) { cx.propagate(); }
+                if action.shift || action.secondary || !this.slash_key("enter", window, cx) {
+                    cx.propagate();
+                }
             }))
             .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
-                if !this.slash_key("down", window, cx) { cx.propagate(); }
+                if !this.slash_key("down", window, cx) {
+                    cx.propagate();
+                }
             }))
             .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
-                if !this.slash_key("up", window, cx) { cx.propagate(); }
+                if !this.slash_key("up", window, cx) {
+                    cx.propagate();
+                }
             }))
             .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
-                if !this.slash_key("tab", window, cx) { cx.propagate(); }
+                if !this.slash_key("tab", window, cx) {
+                    cx.propagate();
+                }
             }))
             .capture_action(cx.listener(|this, _: &InputEscape, window, cx| {
-                if !this.slash_key("escape", window, cx) { cx.propagate(); }
+                if !this.slash_key("escape", window, cx) {
+                    cx.propagate();
+                }
             }))
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -887,65 +936,8 @@ impl Render for ChatView {
             .p(px(10.))
             .bg(rgb(BASE))
             .text_color(rgb(FG))
+            .font_family(".SystemUIFont")
             .text_size(px(15.))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(div().text_color(rgb(MUTED)).child(format!(
-                        "{} · {} rows{}",
-                        if self.preview {
-                            "Claude preview"
-                        } else {
-                            "Native chat"
-                        },
-                        self.model.rows.len(),
-                        if self.preview {
-                            ""
-                        } else {
-                            " · synthetic fixture"
-                        }
-                    )))
-                    .child(
-                        div().child(
-                            self.submission
-                                .as_ref()
-                                .map(|r| r.state.label())
-                                .unwrap_or_default(),
-                        ),
-                    )
-                    .child(
-                        div().child(
-                            self.control_receipt
-                                .as_ref()
-                                .map(|r| r.state.label())
-                                .unwrap_or_default(),
-                        ),
-                    )
-                    .child(div().child(if self.selection_copied.is_some() {
-                        "Copied"
-                    } else {
-                        ""
-                    }))
-                    .when(!self.preview, |header| {
-                        header.child(
-                            Button::new("replay")
-                                .small()
-                                .label(if self.replay.is_some() {
-                                    "Restart replay"
-                                } else {
-                                    "Replay"
-                                })
-                                .on_click(cx.listener(Self::start_replay)),
-                        )
-                    }),
-            )
-            .when(self.preview, |view| {
-                view.child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(
-                    "Images, dictation, review/delegation cards, workers, remember permissions: not in preview yet",
-                ))
-            })
             .when(self.find_open, |view| view.child(self.find_bar(cx)))
             .child(
                 div()
@@ -981,24 +973,57 @@ impl Render for ChatView {
                     )
                 },
             )
-            .child(self.pending_panel(window, cx))
-            .child(self.composer_state.render(
-                &self.composer,
-                self.read_only_reason.clone().or_else(|| self.callback.is_none().then(|| "No session adapter attached".into())),
-                send_blocked,
-                cx,
-            ))
-            .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(
-                if self.replay.is_some() {
-                    format!(
-                        "Replaying · {} / {} events",
-                        self.replay_position,
-                        self.records.len()
+            .child(
+                div()
+                    .id("chat-footer")
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .w_full()
+                    .max_w(px(988.))
+                    .mx_auto()
+                    .px(px(8.))
+                    .pt(px(6.))
+                    .pb(px(8.))
+                    .bg(rgb(0x2a2b3d))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .rounded(px(10.))
+                    .child(self.composer_state.render_activity())
+                    .child(self.pending_panel(window, cx))
+                    .children(
+                        self.submission
+                            .iter()
+                            .chain(self.control_receipt.iter())
+                            .filter(|receipt| {
+                                matches!(
+                                    receipt.state,
+                                    ReceiptState::Rejected(_) | ReceiptState::Uncertain(_)
+                                )
+                            })
+                            .enumerate()
+                            .map(|(index, receipt)| {
+                                div()
+                                    .id(("chat-command-error", index))
+                                    .debug_selector(|| "chat-command-error".into())
+                                    .text_size(px(15. * 12. / 14.))
+                                    .text_color(rgb(0xf38ba8))
+                                    .child(receipt.state.label())
+                            }),
                     )
-                } else {
-                    "Cmd+F Find · Cmd+G Next · Cmd+C Copy · Cmd+Shift+C Copy as Markdown".into()
-                },
-            ))
+                    .child(self.composer_state.render(
+                        &self.composer,
+                        self.read_only_reason.clone().or_else(|| {
+                            self.callback
+                                .is_none()
+                                .then(|| "No session adapter attached".into())
+                        }),
+                        send_blocked,
+                        cx,
+                    ))
+                    .child(roster::render(&self.roster, crate::composer::now_ms())),
+            )
     }
 }
 

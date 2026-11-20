@@ -38,28 +38,34 @@ fn draw(cx: &mut VisualTestContext) {
     cx.run_until_parked();
 }
 #[gpui::test]
-fn keyboard_navigation_including_focused_diff_and_viewed_toggle(cx: &mut TestAppContext) {
+fn removed_extra_bindings_leave_selection_and_viewed_marks_unchanged(cx: &mut TestAppContext) {
     let (view, cx) = setup(cx);
     draw(cx);
-    cx.simulate_keystrokes("alt-up alt-v");
+    let before = view.read_with(cx, |v, _| {
+        (
+            v.model.selected,
+            v.model.files.iter().map(|f| f.viewed).collect::<Vec<_>>(),
+        )
+    });
+    cx.simulate_keystrokes("alt-up alt-v alt-down");
     draw(cx);
-    assert!(view.read_with(cx, |v, _| v.model.files[0].viewed));
-    // Child focus still routes the parent's file commands.
+    assert_eq!(
+        view.read_with(cx, |v, _| (
+            v.model.selected,
+            v.model.files.iter().map(|f| f.viewed).collect::<Vec<_>>()
+        )),
+        before
+    );
     let diff = view.read_with(cx, |v, _| v.diff.clone().unwrap());
     cx.update(|window, cx| diff.focus_handle(cx).focus(window, cx));
-    cx.simulate_keystrokes("alt-down");
+    cx.simulate_keystrokes("alt-down alt-v");
     draw(cx);
+    assert_eq!(view.read_with(cx, |v, _| v.model.selected), before.0);
+    // The existing native actions remain available to Iced-style controls.
+    view.update_in(cx, |v, window, cx| v.next(&NextFile, window, cx));
     assert_eq!(view.read_with(cx, |v, _| v.model.selected), Some(1));
-    cx.simulate_keystrokes("alt-down alt-down");
-    draw(cx);
-    view.read_with(cx, |v, _| {
-        assert_eq!(v.model.selected, Some(3));
-        assert!(v.diff.is_none());
-    });
-    cx.simulate_keystrokes("alt-up");
-    draw(cx);
-    assert_eq!(view.read_with(cx, |v, _| v.model.selected), Some(2));
 }
+
 #[gpui::test]
 fn edge_cases_use_real_diff_parser_and_large_button_handler(cx: &mut TestAppContext) {
     let (view, cx) = setup(cx);
