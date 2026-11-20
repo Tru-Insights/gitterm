@@ -1357,3 +1357,44 @@ fn offered_remember_options_dispatch_exactly_through_bound_adapter() {
         assert_eq!(receipt.state, ReceiptState::ChannelAccepted);
     }
 }
+
+#[test]
+fn worker_reset_and_completion_do_not_hide_or_invalidate_parent_request() {
+    for lifecycle in [
+        HarnessEvent::ConversationReset { trigger: None },
+        HarnessEvent::ProcessExited { code: Some(0) },
+        HarnessEvent::TurnCompleted {
+            status: TurnStatus::Completed,
+            usage: json!({}),
+            cost_usd: None,
+            rate_limit: None,
+        },
+    ] {
+        let mut adapter = ChatAdapter::default();
+        let stamp = adapter.begin_runtime(target());
+        ingress(&mut adapter, &stamp, permission_event("same", "parent"));
+        let parent = adapter
+            .state()
+            .request_identity(&stamp, &[], "same")
+            .unwrap();
+        ingress(
+            &mut adapter,
+            &stamp,
+            HarnessEvent::SubagentEvent {
+                parent_tool_use_id: "worker".into(),
+                event: Box::new(permission_event("same", "worker")),
+            },
+        );
+        ingress(
+            &mut adapter,
+            &stamp,
+            HarnessEvent::SubagentEvent {
+                parent_tool_use_id: "worker".into(),
+                event: Box::new(lifecycle),
+            },
+        );
+        assert!(adapter.state().accepts_request(&parent, &target()));
+        let model = ChatModel::from_conversation(&adapter.state().conversation);
+        assert_eq!(model.pending_rows(), vec![0]);
+    }
+}

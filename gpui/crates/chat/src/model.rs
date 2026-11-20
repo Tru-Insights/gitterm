@@ -576,7 +576,8 @@ impl ChatModel {
                 // Keep prior rows as history; new item/request IDs cannot target the old turn.
                 self.streams.clear();
                 self.items.clear();
-                for &index in self.requests.values() {
+                for ((owner, _), &index) in &self.requests {
+                    if !owner.starts_with(&self.request_owner) { continue; }
                     let row = &mut self.rows[index];
                     if let Some(request) = &mut row.request {
                         request.resolved = true;
@@ -586,7 +587,7 @@ impl ChatModel {
                     }
                     changed.push(index);
                 }
-                self.requests.clear();
+                self.requests.retain(|(owner, _), _| !owner.starts_with(&self.request_owner));
                 self.prompts.clear();
                 self.workers.clear();
                 self.turn_start.clear();
