@@ -112,6 +112,10 @@ pub fn chat_appearance(cx: &App) -> gitterm_gpui_chat::ChatAppearance {
     }
 }
 
+pub fn set_chat_font_size(size: f32, cx: &mut App) {
+    cx.set_global(ChatFontSize(size.clamp(11., 22.)));
+}
+
 /// Apply persisted font/theme settings without reading or writing a config root.
 /// The host supplies the settings from its existing settings owner.
 pub fn apply_settings<C, U, R>(

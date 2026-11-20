@@ -6,8 +6,7 @@
 //! settings alone never create a terminal. Refresh `input` with `set_input` and
 //! provide the selected native terminal using `set_content`. The slot callback
 //! returns an element referencing the host's retained terminal entity, never a
-//! new PTY. RunState is resolved by the host's Iced `run_tab_action` policy (not
-//! yet in core). Outcomes enter existing host launch/focus/close/URL policy;
+//! new PTY. RunState is resolved by core's Iced `run_tab_action` policy. Outcomes enter existing host launch/focus/close/URL policy;
 //! Toggle and Resize must update and persist console_expanded/console_height.
 //! On collapse or active-tab close the host restores main-terminal focus, and
 //! on SelectTab it focuses that bottom terminal. Keeping `opened` after the last
@@ -642,3 +641,43 @@ impl Render for BottomPanel {
 #[cfg(test)]
 #[path = "bottom_panel_tests.rs"]
 mod tests;
+
+/// Host-owned run identity; core only borrows its facts.
+pub(crate) struct RunTab {
+    pub repo: RepoKey,
+    pub command: String,
+    pub detected_url: Option<String>,
+    pub next_url_scan: std::time::Instant,
+}
+
+pub(crate) fn output_url(output: &str) -> Option<String> {
+    let lines: Vec<_> = output.lines().collect();
+    lines[lines.len().saturating_sub(200)..]
+        .iter()
+        .find_map(|line| {
+            for prefix in ["http://", "https://localhost"] {
+                if let Some(start) = line.find(prefix) {
+                    let url = &line[start..];
+                    let end = url
+                        .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | ']'))
+                        .unwrap_or(url.len());
+                    return Some(url[..end].to_owned());
+                }
+            }
+            let lower = line.to_lowercase();
+            for pattern in ["listening on :", "port ", "on port "] {
+                if let Some(pos) = lower.find(pattern) {
+                    let port: String = line[pos + pattern.len()..]
+                        .chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect();
+                    if let Ok(port) = port.parse::<u16>()
+                        && port > 0
+                    {
+                        return Some(format!("http://localhost:{port}"));
+                    }
+                }
+            }
+            None
+        })
+}
