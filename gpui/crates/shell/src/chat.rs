@@ -391,12 +391,30 @@ impl ChatPane {
         cx: &mut Context<Self>,
     ) -> Self {
         let controller = Controller::new();
+        let config = cx
+            .try_global::<crate::work_sidebar::IcedWorkSource>()
+            .and_then(|source| source.owner.upgrade())
+            .and_then(|owner| {
+                let owner = owner.read(cx);
+                let catalog = owner.iced_catalog()?;
+                saved_history_config(&catalog.workspaces, saved.session_id.as_deref()).cloned()
+            });
         let view = cx.new(|cx| {
             let mut view = ChatView::new(saved.records.clone(), window, cx);
+            if let Some(config) = &config {
+                view.set_history_config(config, cx);
+            }
             view.set_appearance(crate::theme::chat_appearance(cx), cx);
             view.set_width(crate::theme::chat_width(cx), cx);
             view.set_preview(cx);
-            view.set_backend(gitterm_core::chat::types::AgentBackend::Claude, cx);
+            view.set_backend(
+                config
+                    .as_ref()
+                    .map_or(gitterm_core::chat::types::AgentBackend::Claude, |config| {
+                        config.backend()
+                    }),
+                cx,
+            );
             view.set_read_only(
                 Some("Preview history · read only · resume not in preview yet".into()),
                 cx,
@@ -485,6 +503,14 @@ impl ChatPane {
                         entry: Entry::UserPrompt(text.into()),
                     })
                 }
+                AgentEvent::Other(value) if value["kind"] == "turn_timing" => Some(Record {
+                    at_ms: None,
+                    entry: Entry::TurnTiming {
+                        start_ms: value["start_ms"].as_u64(),
+                        end_ms: value["end_ms"].as_u64(),
+                        split_ms: value["split_ms"].as_u64(),
+                    },
+                }),
                 _ => None,
             })
             .collect();
@@ -537,6 +563,42 @@ impl ChatPane {
         .detach();
         self.view
             .update(cx, |view, cx| view.set_read_only(None, cx));
+    }
+}
+
+fn saved_history_config<'a>(
+    workspaces: &'a [gitterm_core::workspace_config::WorkspaceConfig],
+    session_id: Option<&str>,
+) -> Option<&'a gitterm_core::chat::types::AgentBackendConfig> {
+    let session_id = session_id?;
+    workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.tabs)
+        .find(|tab| tab.chat_session_id.as_deref() == Some(session_id))?
+        .agent_config
+        .as_ref()
+}
+
+#[cfg(test)]
+mod history_projection_tests {
+    use super::*;
+
+    #[test]
+    fn saved_chips_match_conversation_identity_instead_of_checkout() {
+        let workspaces = serde_json::from_value::<Vec<gitterm_core::workspace_config::WorkspaceConfig>>(serde_json::json!([
+            {"name":"Work", "abbrev":"W", "dir":"/fixture", "color":"green", "tabs":[
+                {"dir":"/fixture", "chat_session_id":"other", "agent_config":{"backend":"claude", "model":"sonnet"}},
+                {"dir":"/fixture", "chat_session_id":"saved", "agent_config":{"backend":"claude", "model":"opus", "permission_mode":"auto", "effort":"high"}}
+            ]}
+        ])).unwrap();
+        let config = saved_history_config(&workspaces, Some("saved")).unwrap();
+        assert_eq!(config.chat_model(), Some("opus"));
+        assert_eq!(config.chat_effort(), Some("high"));
+        assert!(
+            matches!(config, gitterm_core::chat::types::AgentBackendConfig::Claude { permission_mode: Some(mode), .. } if mode == "auto")
+        );
+        assert!(saved_history_config(&workspaces, Some("missing")).is_none());
+        assert!(saved_history_config(&workspaces, None).is_none());
     }
 }
 impl Drop for ChatPane {

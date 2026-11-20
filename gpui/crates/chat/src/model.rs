@@ -266,6 +266,14 @@ impl ChatModel {
     }
     fn entry(&mut self, entry: &Entry, at: Option<u64>, scope: &str, changed: &mut Vec<usize>) {
         match entry {
+            Entry::TurnTiming {
+                start_ms, end_ms, ..
+            } => {
+                if let Some(start) = start_ms {
+                    self.turn_start.insert(scope.into(), *start);
+                }
+                self.recorded_time = *end_ms;
+            }
             Entry::UserPrompt(text) => {
                 self.streams.remove(scope);
                 changed.push(self.push(RowKind::User, scope, "You".into(), literal(text)));
@@ -276,7 +284,10 @@ impl ChatModel {
                     &gitterm_core::chat::state::AgentEvent::submitted_prompt(prompt, false),
                 ));
             }
-            Entry::Harness(event) => self.event(event, at, scope, changed),
+            Entry::Harness(event) => {
+                let at = at.or(self.recorded_time.take());
+                self.event(event, at, scope, changed);
+            }
             Entry::DisplayDecision {
                 request_id,
                 state,

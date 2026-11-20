@@ -13,25 +13,6 @@ impl WorkerState {
     pub fn is_live(self) -> bool {
         matches!(self, Self::Queued | Self::Running | Self::Waiting)
     }
-    fn label(self) -> &'static str {
-        match self {
-            Self::Queued => "queued",
-            Self::Running => "running",
-            Self::Waiting => "waiting",
-            Self::Done => "done",
-            Self::Failed => "failed",
-        }
-    }
-    #[cfg(target_os = "macos")]
-    fn color(self, palette: crate::ChatPalette) -> u32 {
-        match self {
-            Self::Queued => palette.muted,
-            Self::Running => palette.accent,
-            Self::Waiting => palette.warn,
-            Self::Done => palette.result,
-            Self::Failed => palette.err,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -67,19 +48,31 @@ pub fn rows(input: &[RosterEntry], now_ms: u64) -> Vec<RosterRow> {
     input
         .into_iter()
         .map(|row| {
-            let mut what = row.state.label().to_string();
-            if !row.checkout.is_empty() {
-                what.push_str(&format!(" · in {}", row.checkout));
-            }
-            if !row.activity.is_empty() {
-                what.push_str(&format!(" — {}", row.activity));
-            }
+            let backend = row
+                .name
+                .strip_prefix("Worker · ")
+                .or_else(|| row.name.strip_prefix("Consult · "))
+                .or_else(|| row.name.strip_prefix("Review · "))
+                .unwrap_or(&row.name);
+            let backend = match backend {
+                "Codex review" | "Codex consult" => "Codex",
+                other => other,
+            };
+            let checkout = std::path::Path::new(&row.checkout)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&row.checkout);
+            let what = if checkout.is_empty() {
+                String::new()
+            } else {
+                format!("· in {checkout}")
+            };
             RosterRow {
                 id: row.id.clone(),
                 name: if row.model.is_empty() {
-                    row.name.clone()
+                    backend.into()
                 } else {
-                    format!("{} · {}", row.name, row.model)
+                    format!("{} · {}", backend, row.model)
                 },
                 what,
                 elapsed: elapsed(
@@ -121,6 +114,7 @@ pub(crate) fn render(
         .id("chat-roster")
         .max_h(px(98.))
         .overflow_y_scroll()
+        .overflow_x_scroll()
         .flex()
         .flex_col()
         .gap(px(2.))
@@ -141,16 +135,12 @@ pub(crate) fn render(
                     let id = row.id.clone();
                     let dismiss_id = row.id.clone();
                     let selector = format!("roster-{}", row.id);
-                    // Reuse the existing activity tick; no extra animation task per worker.
-                    let opacity = if row.state == WorkerState::Running {
-                        0.3 + 0.7 * ((now_ms % 1400) as f32 / 1400. * std::f32::consts::PI).sin()
-                    } else {
-                        1.
-                    };
                     div()
                         .id(gpui::SharedString::from(selector.clone()))
                         .debug_selector(move || selector.clone())
                         .flex()
+                        .flex_shrink_0()
+                        .whitespace_nowrap()
                         .items_center()
                         .gap(px(8.))
                         .px(px(4.))
@@ -163,19 +153,11 @@ pub(crate) fn render(
                         }))
                         .child(
                             div()
-                                .size(px(7.))
-                                .flex_shrink_0()
-                                .rounded_full()
-                                .bg(rgb(row.state.color(palette)))
-                                .opacity(opacity),
-                        )
-                        .child(
-                            div()
                                 .flex_shrink_0()
                                 .text_color(rgb(palette.fg))
                                 .child(row.name),
                         )
-                        .child(div().flex_1().min_w_0().truncate().child(row.what))
+                        .child(div().flex_shrink_0().child(row.what))
                         .child(div().flex_shrink_0().child(row.elapsed))
                         .child(
                             Button::new(gpui::SharedString::from(format!(
@@ -210,7 +192,7 @@ pub(crate) fn render(
 mod tests {
     use super::*;
     #[test]
-    fn roster_projects_model_worktree_activity_and_elapsed_from_input() {
+    fn roster_matches_iced_backend_model_worktree_and_elapsed() {
         let worker = |id: &str, state, started_at_ms, ended_at_ms| RosterEntry {
             id: id.into(),
             name: "Worker · Codex".into(),
@@ -231,11 +213,20 @@ mod tests {
             rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
             ["new", "old", "done"]
         );
-        assert_eq!(rows[0].name, "Worker · Codex · gpt-6.1-sol");
-        assert_eq!(rows[0].what, "running · in /tmp/TRU-274 — Running Bash");
+        assert_eq!(rows[0].name, "Codex · gpt-6.1-sol");
+        assert_eq!(rows[0].what, "· in TRU-274");
         assert_eq!(rows[1].elapsed, "3m 6s");
         assert_eq!(rows[2].elapsed, "2.0s");
         assert!(super::rows(&[], 0).is_empty());
         assert_eq!(elapsed(0), "0.0s");
+        let row = super::rows(
+            &[worker("saved", WorkerState::Waiting, 0, Some(1_014_000))],
+            2_000_000,
+        )
+        .remove(0);
+        assert_eq!(
+            format!("{} {} {} ×", row.name, row.what, row.elapsed),
+            "Codex · gpt-6.1-sol · in TRU-274 16m 54s ×"
+        );
     }
 }

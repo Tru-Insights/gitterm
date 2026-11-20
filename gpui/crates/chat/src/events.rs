@@ -14,6 +14,12 @@ pub enum Entry {
     /// Local sent prompts retain image bytes when a pane is restored.
     SubmittedPrompt(gitterm_core::chat::types::UserPrompt),
     Harness(HarnessEvent),
+    /// Replay clocks are presentation metadata, retained when a chat is saved.
+    TurnTiming {
+        start_ms: Option<u64>,
+        end_ms: Option<u64>,
+        split_ms: Option<u64>,
+    },
     /// Harness resolution does not tell the UI what the human chose.
     DisplayDecision {
         request_id: String,
@@ -71,6 +77,7 @@ pub fn parse_fixture(source: &str) -> Result<Vec<Record>, FixtureError> {
                     "user_prompt"
                         | "submitted_prompt"
                         | "harness"
+                        | "turn_timing"
                         | "display_decision"
                         | "display_delegation"
                 ) {

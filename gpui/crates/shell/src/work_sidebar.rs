@@ -142,6 +142,8 @@ impl WorkSidebarOutcome {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Fold {
     Repo(PathBuf),
+    Pr(String),
+    Done(String),
     Branch(PathBuf),
     Chat(String),
     Focus,
@@ -168,9 +170,19 @@ struct Control {
     action: Action,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PullRequestGroup {
+    pub root: String,
+    pub title: String,
+    pub prs: Vec<gitterm_core::prs::WatchedPr>,
+}
+
 #[derive(Default)]
 struct Row {
     label: String,
+    small: bool,
+    pr_number: Option<(u64, usize)>,
+    repo_prefix: Option<String>,
     badges: Vec<String>,
     age: Option<String>,
     details: Vec<String>,
@@ -213,9 +225,11 @@ pub struct WorkSidebar {
     edit_subscription: Option<Subscription>,
     tasks: Vec<gitterm_core::tasks::TaskRecord>,
     workers: Vec<gitterm_core::tasks::Delegation>,
+    running_task_ids: HashSet<String>,
+    running_chats: Vec<(PathBuf, Option<String>)>,
     repo_recency: Vec<(PathBuf, std::time::SystemTime)>,
     source: Option<IcedWorkSource>,
-    pull_requests: Vec<(String, Vec<gitterm_core::prs::WatchedPr>)>,
+    pull_requests: Vec<PullRequestGroup>,
     issues: gitterm_core::issues::IssueTitlesFile,
     collapsed_issue_groups: Vec<gitterm_core::issues::IssueGroup>,
     loading: bool,
@@ -235,6 +249,8 @@ impl WorkSidebar {
             edit_subscription: None,
             tasks: vec![],
             workers: vec![],
+            running_task_ids: HashSet::new(),
+            running_chats: vec![],
             repo_recency: vec![],
             source: None,
             pull_requests: vec![],
@@ -353,6 +369,7 @@ impl WorkSidebar {
                             this.workspace = data.facts;
                             this.tasks = data.tasks;
                             this.workers = data.workers;
+                            this.running_task_ids = data.running_task_ids;
                             this.repo_recency = data.repo_recency;
                             this.pull_requests = data.pull_requests;
                             this.issues = data.issues;
@@ -579,56 +596,143 @@ impl WorkSidebar {
     }
 
     fn pull_request_rows(&self, rows: &mut Vec<Row>) {
-        if self.pull_requests.is_empty() {
+        use gitterm_core::{
+            merge_plan::PrState,
+            prs::{ChecksState, ReviewDecision},
+        };
+        let now = std::time::SystemTime::now().into();
+        let groups: Vec<_> = self
+            .pull_requests
+            .iter()
+            .filter_map(|group| {
+                let prs: Vec<_> = group
+                    .prs
+                    .iter()
+                    .filter(|pr| !pr.done() || gitterm_core::prs::done_pr_shown(pr.done_at(), now))
+                    .collect();
+                (!prs.is_empty()).then_some((group, prs))
+            })
+            .collect();
+        if groups.is_empty() {
             return;
         }
+        let several = groups.len() > 1;
         let mut heading = Row::text("Pull requests");
         heading.heading = true;
-        let count = self
-            .pull_requests
+        let count = groups
             .iter()
             .flat_map(|(_, prs)| prs)
             .filter(|pr| !pr.done())
             .count();
         heading.badges.push(format!("{count} open"));
+        let number_chars = groups
+            .iter()
+            .flat_map(|(group, prs)| {
+                let done_open = self.open.contains(&Fold::Done(group.root.clone()));
+                prs.iter().filter(move |pr| !pr.done() || done_open)
+            })
+            .map(|pr| pr.key.number.to_string().len() + 1)
+            .max()
+            .unwrap_or(0);
         rows.push(heading);
-        for (title, prs) in &self.pull_requests {
-            if self.pull_requests.len() > 1 {
-                rows.push(Row::text(title));
+        for (group, prs) in groups {
+            let done = prs.iter().filter(|pr| pr.done()).count();
+            let done_fold = Fold::Done(group.root.clone());
+            let done_open = self.open.contains(&done_fold);
+            let mut label = Row::text(summary::shorten(&group.title, 50));
+            label.small = true;
+            label.quiet = true;
+            if done > 0 {
+                let merged = prs
+                    .iter()
+                    .filter(|pr| pr.snapshot.state() == Some(PrState::Merged))
+                    .count();
+                let closed = done - merged;
+                let count = match (merged, closed) {
+                    (m, 0) => format!("{m} merged"),
+                    (0, c) => format!("{c} closed"),
+                    (m, c) => format!("{m} merged · {c} closed"),
+                };
+                let target = if several {
+                    &mut label
+                } else {
+                    rows.last_mut().unwrap()
+                };
+                target.control(
+                    format!("{count} {}", if done_open { "▾" } else { "•" }),
+                    Action::Toggle(done_fold),
+                );
             }
-            for pr in prs.iter().filter(|pr| !pr.done()) {
-                let mut row = Row::text(format!(
-                    "{} · {}",
-                    pr.key.label(),
-                    pr.snapshot
-                        .core
-                        .as_ref()
-                        .map(|c| c.title.as_str())
-                        .unwrap_or("not read")
-                ));
-                row.action = Some(Action::Emit(WorkSidebarOutcome::OpenUrl {
-                    url: pr.key.url(),
-                }));
-                if let Some(core) = &pr.snapshot.core {
-                    row.badges
-                        .extend(core.state.map(|state| state.label().to_string()));
+            if several {
+                rows.push(label);
+            }
+            for pr in prs
+                .iter()
+                .filter(|pr| !pr.done())
+                .chain(prs.iter().filter(|pr| pr.done() && done_open))
+            {
+                let core = pr.snapshot.core.as_ref();
+                let mut row = Row::text(
+                    core.map(|c| c.title.as_str())
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| pr.key.label()),
+                );
+                row.pr_number = Some((pr.key.number, number_chars));
+                let fold = Fold::Pr(pr.key.id());
+                row.expanded = self.open.contains(&fold);
+                row.fold = Some(fold.clone());
+                row.action = Some(Action::Toggle(fold));
+                if !row.expanded {
+                    row.repo_prefix = Some(format!(
+                        "{} · ",
+                        pr.key.repo.rsplit('/').next().unwrap_or(&pr.key.repo)
+                    ));
+                }
+                if core.is_some() && !pr.done() {
+                    match pr.snapshot.checks() {
+                        ChecksState::Pass => row.badges.push("✓".into()),
+                        ChecksState::Fail => row.badges.push("✗".into()),
+                        ChecksState::Pending => row.badges.push("●".into()),
+                        ChecksState::None => {}
+                    }
+                    if pr.snapshot.review_decision() == ReviewDecision::ChangesRequested {
+                        row.badges.push("changes requested".into());
+                    }
+                    if pr.unseen_comments > 0 {
+                        row.badges.push(format!("{} new", pr.unseen_comments));
+                    }
                     if pr.snapshot.conflicting() == Some(true) {
                         row.badges.push("conflicts".into());
                     }
-                    row.badges.push(pr.snapshot.checks().label().into());
-                    row.badges
-                        .push(pr.snapshot.review_decision().label().into());
-                } else {
+                }
+                if pr.snapshot.state() == Some(PrState::Draft) {
+                    row.badges.push("draft".into());
+                }
+                if pr.error.is_some() {
                     row.badges.push("not read".into());
                 }
-                if let Some(error) = &pr.error {
-                    row.details.push(error.clone());
+                if row.expanded {
+                    let mut meta = vec![pr.key.repo.clone()];
+                    if let Some(core) = core {
+                        if !core.head_ref.is_empty() && !core.base_ref.is_empty() {
+                            meta.push(format!("{} → {}", core.head_ref, core.base_ref));
+                        }
+                        if !core.author.is_empty() {
+                            meta.push(core.author.clone());
+                        }
+                    }
+                    row.details.push(meta.join(" · "));
+                    row.detail_controls.push(Control {
+                        label: "Open in browser".into(),
+                        action: Action::Emit(WorkSidebarOutcome::OpenUrl { url: pr.key.url() }),
+                    });
+                    if let Some(error) = &pr.error {
+                        row.details
+                            .push(summary::shorten(&format!("not read: {error}"), 160));
+                    }
                 }
                 rows.push(row);
-            }
-            let done = prs.iter().filter(|pr| pr.done()).count();
-            if done > 0 {
-                rows.push(Row::text(format!("{title} · {done} merged/closed")));
             }
         }
     }
@@ -910,7 +1014,7 @@ impl WorkSidebar {
             let empty_note = (live.is_empty() && gone.is_empty()).then(|| {
                 if group.edits.is_none() {
                     "no edits yet"
-                } else if pane.is_some_and(|p| p.last_full_refresh.is_none()) {
+                } else if self.loading || pane.is_some_and(|p| p.last_full_refresh.is_none()) {
                     "reading…"
                 } else {
                     "no live checkout of this work"
@@ -990,12 +1094,20 @@ impl WorkSidebar {
             if prs > 0 {
                 facts.push(format!("{prs} PR{}", if prs == 1 { "" } else { "s" }));
             }
-            if let Some(count) = ws
-                .running_by_repo
-                .get(&group.dir)
-                .filter(|count| **count > 0)
-            {
-                facts.push(format!("{count} running"));
+            let running = ws.running_by_repo.get(&group.dir).copied().unwrap_or(0)
+                + self
+                    .running_chats
+                    .iter()
+                    .filter(|(checkout, task)| {
+                        !task
+                            .as_ref()
+                            .is_some_and(|id| self.running_task_ids.contains(id))
+                            && (*checkout == group.dir
+                                || live.iter().any(|branch| branch.owned.checkout == *checkout))
+                    })
+                    .count();
+            if running > 0 {
+                facts.push(format!("{running} running"));
             }
             row.details.push(
                 facts
@@ -1260,6 +1372,7 @@ impl WorkSidebar {
             .compact()
             .xsmall()
             .px_1()
+            .flex_shrink_0()
             .text_size(px(10.))
             .text_color(rgb(color))
             .tooltip(tooltip)
@@ -1280,6 +1393,12 @@ impl EventEmitter<WorkSidebarOutcome> for WorkSidebar {}
 impl Render for WorkSidebar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.load(false, cx);
+        self.running_chats = self
+            .source
+            .as_ref()
+            .and_then(|source| source.owner.upgrade())
+            .map(|owner| owner.read(cx).running_work_chats(cx))
+            .unwrap_or_default();
         let p = crate::theme::Palette::current(cx);
         let mut body = div()
             .id("work-sidebar")
@@ -1305,12 +1424,46 @@ impl Render for WorkSidebar {
             }));
         for (index, row) in self.rows().into_iter().enumerate() {
             let repo = matches!(row.fold, Some(Fold::Repo(_)));
+            let pr = row.pr_number.is_some();
+            let compact = row.small || pr || repo;
             let mut label = div()
                 .id(format!("work-label-{index}"))
-                .min_w_0()
-                .child(row.label);
+                .debug_selector(|| format!("work-label-{index}"))
+                .min_w_0();
+            if let Some(prefix) = row.repo_prefix {
+                let prefix_len = prefix.len();
+                label = label.child(
+                    gpui::StyledText::new(format!("{prefix}{}", row.label)).with_highlights([(
+                        0..prefix_len,
+                        gpui::HighlightStyle {
+                            color: Some(rgb(p.muted).into()),
+                            ..Default::default()
+                        },
+                    )]),
+                );
+            } else {
+                label = label.child(row.label);
+            }
+            if pr {
+                label = label
+                    .flex_1()
+                    .font_family(".SystemUIFont")
+                    .text_size(px(12.))
+                    .whitespace_normal()
+                    .line_clamp(2)
+                    .overflow_hidden();
+            }
+            if row.small {
+                label = label
+                    .flex_1()
+                    .font_family(".SystemUIFont")
+                    .text_size(px(10.));
+            }
             if row.quiet {
-                label = label.text_color(rgb(p.muted));
+                label = label.text_color(rgb(if row.small { p.subtext0 } else { p.muted }));
+            }
+            if repo {
+                label = label.font_family("Menlo").text_size(px(12.));
             }
             if row.heading || repo {
                 label = label.font_weight(gpui::FontWeight::BOLD);
@@ -1318,7 +1471,20 @@ impl Render for WorkSidebar {
             if row.indent {
                 label = label.font_family("Menlo");
             }
-            let mut line = div().flex().items_center().gap_1().child(label);
+            let mut line = div().w_full().min_w_0().flex().items_center().gap(px(6.));
+            if let Some((number, chars)) = row.pr_number {
+                line = line.child(
+                    div()
+                        .debug_selector(|| format!("work-pr-number-{index}"))
+                        .w(px(chars as f32 * 12. * 0.61))
+                        .text_size(px(12.))
+                        .flex_shrink_0()
+                        .font_family("Menlo")
+                        .text_color(rgb(p.muted))
+                        .child(format!("#{number}")),
+                );
+            }
+            line = line.child(label);
             if let Some(run) = row.run {
                 line = line.child(self.button(format!("work-run-{index}"), run, cx));
             }
@@ -1333,18 +1499,33 @@ impl Render for WorkSidebar {
                         .child(Input::new(input)),
                 );
             }
-            if !row.heading {
+            if !row.heading && !pr && !row.small {
                 line = line.child(div().flex_1());
             }
-            for badge in row.badges {
-                let color = if badge == "open" {
+            for (badge_index, badge) in row.badges.into_iter().enumerate() {
+                let color = if matches!(
+                    badge.as_str(),
+                    "conflicts" | "not read" | "changes requested" | "✗"
+                ) {
+                    rgb(p.red).into()
+                } else if matches!(badge.as_str(), "draft" | "●") {
+                    rgb(p.yellow).into()
+                } else if badge == "open" || badge == "✓" {
                     rgb(p.green).into()
                 } else if badge.contains("dirty") {
                     gpui_component::Theme::global(cx).warning
                 } else {
                     rgb(p.muted).into()
                 };
-                line = line.child(div().text_size(px(10.)).text_color(color).child(badge));
+                line = line.child(
+                    div()
+                        .debug_selector(|| format!("work-badge-{index}-{badge_index}"))
+                        .flex_shrink_0()
+                        .font_family("Menlo")
+                        .text_size(px(10.))
+                        .text_color(color)
+                        .child(badge),
+                );
             }
             if row.heading {
                 line = line.child(div().flex_1());
@@ -1382,6 +1563,8 @@ impl Render for WorkSidebar {
             if let Some(fold) = row.fold {
                 let label = if fold == Fold::Focus {
                     if row.expanded { "▴" } else { "▾" }
+                } else if (repo || pr) && !row.expanded {
+                    "•"
                 } else {
                     marker(row.expanded)
                 };
@@ -1396,11 +1579,18 @@ impl Render for WorkSidebar {
             }
             let mut block = div()
                 .w_full()
+                .flex_shrink_0()
                 .flex()
                 .flex_col()
                 .rounded_md()
                 .px_1()
-                .py_1()
+                .py(px(if row.small {
+                    0.
+                } else if compact {
+                    3.
+                } else {
+                    4.
+                }))
                 .child(line);
             if row.selected {
                 block = block.bg(rgb(p.surface));
