@@ -301,6 +301,15 @@ impl ChatPane {
             shutdown,
         }
     }
+    pub(crate) fn is_working(&self) -> bool {
+        matches!(
+            self.controller.adapter.state().state,
+            gitterm_core::chat::types::AgentSessionState::Streaming
+        )
+    }
+    pub(crate) fn matches_chat(&self, id: &str) -> bool {
+        self.saved.uid == id || self.saved.session_id.as_deref() == Some(id)
+    }
     pub fn target(&self) -> session::Target {
         self.controller.target.clone()
     }

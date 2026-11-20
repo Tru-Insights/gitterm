@@ -112,6 +112,229 @@ impl crate::Shell {
     }
 }
 
+impl crate::Shell {
+    fn picker_inputs(&self) -> crate::session_picker::PickerInputs {
+        crate::session_picker::PickerInputs {
+            chat: gitterm_core::settings::ChatDefaults::default().new_chat_selection(),
+            local_workspace: self.local,
+            // TODO(TRU-274 P-src): project the settings/ACP/task catalogs here.
+            acp_chats: vec![],
+            presets: vec![],
+            task: None,
+        }
+    }
+    pub(crate) fn open_session_picker(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        use gpui::AppContext as _;
+        if self.active_workspace(cx).is_none() || self.park_sheet.is_some() {
+            return;
+        }
+        let inputs = self.picker_inputs();
+        let previous_focus = window.focused(cx).unwrap_or_else(|| self.focus.clone());
+        let opening_workspace = self.active_workspace(cx);
+        let picker = cx.new(|cx| crate::session_picker::SessionPicker::new(inputs.clone(), cx));
+        self.picker_subscription = Some(cx.subscribe_in(
+            &picker,
+            window,
+            move |shell, picker, event: &crate::session_picker::SessionPickerEvent, window, cx| {
+                let label = match event {
+                    crate::session_picker::SessionPickerEvent::Selected(outcome) => {
+                        picker.read(cx).outcome_label(outcome)
+                    }
+                    _ => None,
+                };
+                shell.session_picker = None;
+                shell.picker_subscription = None;
+                shell.cover_sheet(false, window, cx);
+                previous_focus.focus(window, cx);
+                if opening_workspace == shell.active_workspace(cx)
+                    && let crate::session_picker::SessionPickerEvent::Selected(outcome) = event
+                {
+                    shell.select_picker_outcome(
+                        outcome,
+                        label
+                            .as_deref()
+                            .expect("selected picker row has its Iced label"),
+                        window,
+                        cx,
+                    );
+                }
+                cx.notify();
+            },
+        ));
+        self.cover_sheet(true, window, cx);
+        picker.update(cx, |picker, cx| picker.open(inputs, window, cx));
+        self.session_picker = Some(picker);
+        cx.notify();
+    }
+    pub(crate) fn select_picker_outcome(
+        &mut self,
+        outcome: &crate::session_picker::SessionPickerOutcome,
+        label: &str,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        use crate::session_picker::SessionPickerOutcome as O;
+        match outcome {
+            O::NewChat if self.local => self.new_claude_chat(None, window, cx),
+            O::Terminal if self.local => self.new_terminal(window, cx),
+            _ => {
+                self.owner.update(cx, |owner, cx| {
+                    owner.error = Some(format!("{label} · unavailable in preview"));
+                    cx.notify();
+                });
+            }
+        }
+    }
+    pub(crate) fn cover_sheet(
+        &self,
+        covered: bool,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.content.update(cx, |content, cx| {
+            content.picker = covered;
+            content.sync_covers(window, cx);
+        });
+    }
+    pub(crate) fn ensure_work_sidebars(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        use gitterm_core::work::state::{Inputs, Intent, Source};
+        use gpui::AppContext as _;
+        for workspace in &self.workspaces {
+            let id = workspace.workspace.id;
+            if self.work_sidebars.contains_key(&id) {
+                continue;
+            }
+            let dir = self.data.terminal_cwd(id, cx).unwrap_or_default();
+            // TODO(TRU-274 Work source slice): share the owner's Work reducer and
+            // index when available. Until then this is a fixture-free empty pane.
+            self.work_state
+                .borrow_mut()
+                .reduce(Intent::SetInputs(Inputs {
+                    workspace: id.0,
+                    source: Source::Folder(dir.clone()),
+                    tasks: vec![],
+                    focus: Default::default(),
+                    documents: None,
+                }));
+            let facts = crate::work_sidebar::WorkspaceFacts {
+                id: id.0,
+                name: workspace.workspace.name.clone(),
+                home: dir.clone(),
+                dir,
+                local: self.local,
+                repos: vec![],
+                removed: vec![],
+                auto_added: vec![],
+                open_chats: Default::default(),
+                owned_chats: vec![],
+                chat_owners: Default::default(),
+                running_by_repo: Default::default(),
+                selected_checkout: None,
+            };
+            let sidebar =
+                cx.new(|_| crate::work_sidebar::WorkSidebar::new(facts, self.work_state.clone()));
+            self.work_subscriptions.insert(
+                id,
+                cx.subscribe_in(
+                    &sidebar,
+                    window,
+                    |shell, _, outcome: &crate::work_sidebar::WorkSidebarOutcome, window, cx| {
+                        shell.work_outcome(outcome, window, cx);
+                    },
+                ),
+            );
+            self.work_sidebars.insert(id, sidebar);
+        }
+    }
+    pub(crate) fn work_outcome(
+        &mut self,
+        outcome: &crate::work_sidebar::WorkSidebarOutcome,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        use crate::work_sidebar::WorkSidebarOutcome as O;
+        match outcome {
+            O::OpenChat { workspace, chat } => self.select_work_chat(*workspace, chat, window, cx),
+            O::Focus { workspace, focus } => {
+                if let Some(index) = self
+                    .workspaces
+                    .iter()
+                    .filter(|s| s.on_bar())
+                    .position(|s| s.workspace.id.0 == *workspace)
+                {
+                    self.select_workspace(index, window, cx);
+                }
+                if let gitterm_core::work::summary::Focus::Coordinator(chat) = focus {
+                    self.select_work_chat(*workspace, chat, window, cx);
+                }
+                if let Some(dir) = self.data.terminal_cwd(crate::WorkspaceId(*workspace), cx) {
+                    self.work_state.borrow_mut().reduce(
+                        gitterm_core::work::state::Intent::SetInputs(
+                            gitterm_core::work::state::Inputs {
+                                workspace: *workspace,
+                                source: gitterm_core::work::state::Source::Folder(dir),
+                                tasks: vec![],
+                                focus: focus.clone(),
+                                documents: None,
+                            },
+                        ),
+                    );
+                }
+                cx.notify();
+            }
+            // TODO(TRU-274 Work actions slice): wire repo editing, run/review/editor,
+            // ownership, refresh/index and Find after the owner exposes those paths.
+            _ => {}
+        }
+    }
+    fn select_work_chat(
+        &mut self,
+        workspace: u64,
+        chat: &str,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let selected = self
+            .workspaces
+            .iter()
+            .filter(|s| s.on_bar())
+            .enumerate()
+            .find_map(|(index, state)| {
+                if state.workspace.id.0 != workspace {
+                    return None;
+                }
+                state
+                    .sessions
+                    .iter()
+                    .enumerate()
+                    .find_map(|(session_index, session)| {
+                        let pane = state
+                            .panes
+                            .get(&crate::session_pane_id(session.id))?
+                            .read(cx);
+                        let crate::pane::PaneContent::PreviewChat(view) = &pane.content else {
+                            return None;
+                        };
+                        view.read(cx)
+                            .matches_chat(chat)
+                            .then_some((index, session_index))
+                    })
+            });
+        if let Some((workspace, session)) = selected {
+            self.select_workspace(workspace, window, cx);
+            self.select_session(session, window, cx);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
