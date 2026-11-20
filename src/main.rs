@@ -4585,7 +4585,7 @@ fn dispatch_chat_effect(
         Err("The chat runtime changed before dispatch".into())
     };
     match sent {
-        Ok(false) => {
+        Ok(_) => {
             session.reduce(ChatIntent::CommandAcceptedWithoutReceipt {
                 runtime,
                 current: current.clone(),
@@ -4593,7 +4593,6 @@ fn dispatch_chat_effect(
             });
             (echo, None)
         }
-        Ok(true) => (echo, None),
         Err(error) => {
             let effect = session.reduce(ChatIntent::CommandOutcome {
                 runtime,
@@ -4664,6 +4663,22 @@ fn surface_chat_uncertainty(tab_id: usize, session: &mut AgentSession) {
         push_agent_event_to_webview(tab_id, &event);
         session.record(event);
     }
+}
+
+fn surface_pending_picker(tab_id: usize, session: &mut AgentSession) {
+    let Some(change) = session.pending_change() else {
+        return;
+    };
+    let (setting, value) = match change {
+        SettingChange::Mode(value) => ("mode", serde_json::json!(value)),
+        SettingChange::Model(value) => ("model", serde_json::json!(value)),
+        SettingChange::Effort(value) => ("effort", serde_json::json!(value)),
+    };
+    let event = tab::AgentEvent::Other(
+        serde_json::json!({"kind":"picker_pending", "setting":setting, "value":value}),
+    );
+    push_agent_event_to_webview(tab_id, &event);
+    session.record(event);
 }
 
 /// The config a new Antigravity or OpenCode chat tab starts with (TRU-153): the
@@ -24817,7 +24832,7 @@ fi
         // Validate complete chat ingress before even the common focus/heartbeat
         // effects. Normalize synchronously so no target can change in between.
         let admitted = match &event {
-            Event::AgentRuntimeEvent(stamp, _) => self
+            Event::AgentRuntimeEvent(stamp, _) | Event::AgentCommandOutcome(stamp, ..) => self
                 .workspaces
                 .iter()
                 .flat_map(|ws| &ws.tabs)
@@ -24826,9 +24841,7 @@ fi
                     tab.agent_session()
                         .is_some_and(|s| s.accepts_stream(stamp, &tab.session_target()))
                 }),
-            Event::AgentCommandOutcome(stamp, ..)
-            | Event::AgentRuntimeAnswer(stamp, ..)
-            | Event::AgentRuntimeStop(stamp) => self
+            Event::AgentRuntimeAnswer(stamp, ..) | Event::AgentRuntimeStop(stamp) => self
                 .workspaces
                 .iter()
                 .flat_map(|ws| &ws.tabs)
@@ -24863,6 +24876,9 @@ fi
                 {
                     let current = tab.session_target();
                     if let Some(session) = tab.agent_session_mut() {
+                        let Some(runtime) = session.command_runtime(correlation).cloned() else {
+                            return Task::none();
+                        };
                         if let ChatEffect::Rejected(reason) =
                             session.reduce(ChatIntent::CommandOutcome {
                                 runtime,
@@ -24874,6 +24890,7 @@ fi
                             let event = tab::AgentEvent::Harness(HarnessEvent::Error(reason));
                             push_agent_event_to_webview(tab_id, &event);
                             session.record(event);
+                            surface_pending_picker(tab_id, session);
                         }
                         surface_chat_uncertainty(tab_id, session);
                     }
@@ -26371,7 +26388,6 @@ fi
                 // its queue state and a queued one can be withdrawn.
                 let mut prompt = prompt;
                 let mut prompt_markers = Vec::new();
-                let mut show_echo = true;
                 // Issue keys the human names feed the chat's facts (TRU-166);
                 // written with the turn's tool calls.
                 for ws in &mut self.workspaces {
@@ -26471,6 +26487,7 @@ fi
                             return Task::none();
                         };
                         if session.submit_queues() {
+                            let mut recovery = prompt.clone();
                             let effect = session.reduce(ChatIntent::Queue {
                                 runtime: session.runtime_stamp(target.clone()),
                                 current: target.clone(),
@@ -26481,7 +26498,6 @@ fi
                             });
                             let (queued_echo, error) =
                                 dispatch_chat_effect(session, &target, effect);
-                            show_echo = queued_echo.is_some();
                             if let Some(queued_echo) = queued_echo {
                                 echo = queued_echo;
                                 let (_, after) = session.record(echo.clone());
@@ -26492,13 +26508,25 @@ fi
                                 } else {
                                     session.harness = None;
                                 }
+                            } else {
+                                // A distinct ID keeps rejected duplicate IDs recoverable too.
+                                recovery.id = Some(uuid::Uuid::new_v4().to_string());
+                                echo = tab::AgentEvent::submitted_prompt(&recovery, true);
+                                let (_, after) = session.record(echo.clone());
+                                prompt_markers.extend(after);
                             }
                             if let Some(error) = error {
+                                let marker = tab::AgentEvent::Other(
+                                    serde_json::json!({"kind":"prompt_unsent", "id":echo.prompt_id(), "reason":error}),
+                                );
+                                session.record(marker.clone());
+                                prompt_markers.push(marker);
                                 let event = tab::AgentEvent::Harness(HarnessEvent::Error(format!(
                                     "The prompt was not delivered: {error}"
                                 )));
                                 push_agent_event_to_webview(tab_id, &event);
                                 session.record(event);
+                                surface_pending_picker(tab_id, session);
                             }
                             if submitted {
                                 if let Some(task_id) = tab_task_id {
@@ -26818,11 +26846,9 @@ fi
                 if let Some(task_id) = task_started {
                     self.apply_task_session_signal(&task_id, None);
                 }
-                if show_echo {
-                    push_agent_event_to_webview(tab_id, &echo);
-                    for marker in &prompt_markers {
-                        push_agent_event_to_webview(tab_id, marker);
-                    }
+                push_agent_event_to_webview(tab_id, &echo);
+                for marker in &prompt_markers {
+                    push_agent_event_to_webview(tab_id, marker);
                 }
                 if images_not_sent > 0 {
                     eprintln!(
@@ -26998,6 +27024,7 @@ fi
                         let event = tab::AgentEvent::Harness(HarnessEvent::Error(error));
                         push_agent_event_to_webview(tab_id, &event);
                         session.record(event);
+                        surface_pending_picker(tab_id, session);
                     }
                 }
                 return Task::none();
@@ -28135,6 +28162,7 @@ fi
                                         tab::AgentEvent::Harness(HarnessEvent::Error(notice));
                                     push_agent_event_to_webview(tab_id, &event);
                                     session.record(event);
+                                    surface_pending_picker(tab_id, session);
                                 }
                                 if show_event {
                                     let (before, after) = session.record(ev.clone());
@@ -28145,6 +28173,9 @@ fi
                                     for marker in &after {
                                         push_agent_event_to_webview(tab_id, marker);
                                     }
+                                }
+                                if matches!(&ev, tab::AgentEvent::Harness(HarnessEvent::Error(_))) {
+                                    surface_pending_picker(tab_id, session);
                                 }
                             }
                             if let Some(id) = new_session_id {

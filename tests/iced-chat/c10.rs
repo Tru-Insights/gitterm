@@ -425,3 +425,144 @@ fn c10_relayed_midturn_prompt_keeps_iced_withdraw_authority() {
     );
     assert!(rx.try_recv().is_err());
 }
+
+#[test]
+fn c10_receipts_after_task_attachment_use_each_dispatch_binding() {
+    let root = tempfile::tempdir().unwrap();
+    let mut app = fixture(root.path(), acp());
+    let _rx = port(&mut app);
+    let receiver = session(&app).runtime_stamp(app.workspaces[0].tabs[0].session_target());
+    app.workspaces[0].tabs[0].task_id = Some("attached-task".into());
+    let current = app.workspaces[0].tabs[0].session_target();
+    let config = session(&app).config.clone();
+    let runtime = session(&app).runtime_stamp(current.clone());
+    let ChatEffect::Dispatch { correlation, .. } =
+        session_mut(&mut app).reduce(ChatIntent::ChangeSetting {
+            runtime: runtime.clone(),
+            current: current.clone(),
+            config: config.clone(),
+            process_running: true,
+            change: SettingChange::Mode("plan".into()),
+        })
+    else {
+        panic!()
+    };
+    apply(
+        &mut app,
+        Event::AgentCommandOutcome(
+            receiver.clone(),
+            correlation,
+            DeliveryOutcome::Rejected("not written".into()),
+        ),
+    );
+    assert!(session(&app).pending_change().is_none());
+    session_mut(&mut app).reduce(ChatIntent::SubmissionAccepted);
+    let ChatEffect::Dispatch {
+        correlation,
+        echo: Some(echo),
+        ..
+    } = session_mut(&mut app).reduce(ChatIntent::Queue {
+        runtime,
+        current,
+        config,
+        process_running: true,
+        prompt: "queued".into(),
+        message_id: "rebound".into(),
+    })
+    else {
+        panic!()
+    };
+    session_mut(&mut app).record(echo);
+    apply(
+        &mut app,
+        Event::AgentCommandOutcome(receiver.clone(), correlation, DeliveryOutcome::Written),
+    );
+    apply(
+        &mut app,
+        Event::AgentRuntimeEvent(
+            receiver,
+            tab::AgentEvent::Harness(HarnessEvent::ProcessExited { code: None }),
+        ),
+    );
+    assert_eq!(
+        session(&app).queued_prompts["rebound"].status,
+        PromptStatus::Uncertain
+    );
+}
+
+#[test]
+fn c10_queue_rejection_keeps_text_images_and_replayable_unsent_marker() {
+    let root = tempfile::tempdir().unwrap();
+    let mut app = fixture(root.path(), acp());
+    let mut rx = port(&mut app);
+    session_mut(&mut app).reduce(ChatIntent::SubmissionAccepted);
+    stream(
+        &mut app,
+        HarnessEvent::RuntimeRequest {
+            request_id: "permission".into(),
+            tool_use_id: "tool".into(),
+            kind: gitterm::harness::RuntimeRequestKind::Question {
+                questions: serde_json::json!([]),
+            },
+        },
+    );
+    apply(
+        &mut app,
+        Event::AgentSubmitPrompt(
+            10,
+            UserPrompt {
+                text: "recover this".into(),
+                images: vec![gitterm::harness::ImageAttachment {
+                    media_type: "image/png".into(),
+                    data: "AA==".into(),
+                }],
+                id: Some("rejected".into()),
+            },
+        ),
+    );
+    assert!(rx.try_recv().is_err());
+    let recovery = session(&app)
+        .conversation
+        .iter()
+        .filter_map(tab::AgentEvent::webview_payload)
+        .find(|value| value["type"] == "user_prompt" && value["text"] == "recover this")
+        .unwrap();
+    assert_eq!(recovery["images"][0]["data"], "AA==");
+    assert_eq!(recovery["queued"], true);
+    assert!(session(&app).conversation.iter().any(|event| matches!(event, tab::AgentEvent::Other(value) if value["kind"] == "prompt_unsent" && value["id"] == recovery["id"])));
+}
+
+#[test]
+fn c10_rejected_second_picker_and_generic_errors_reproject_pending_mode() {
+    let root = tempfile::tempdir().unwrap();
+    let mut app = fixture(root.path(), acp());
+    let mut rx = port(&mut app);
+    apply(&mut app, Event::AgentSetPermissionMode(10, "plan".into()));
+    rx.try_recv().unwrap();
+    apply(&mut app, Event::AgentSetModel(10, "second".into()));
+    assert!(rx.try_recv().is_err());
+    let expected = serde_json::json!({"kind":"picker_pending", "setting":"mode", "value":"plan"});
+    assert_eq!(
+        session(&app)
+            .conversation
+            .last()
+            .unwrap()
+            .webview_payload()
+            .unwrap(),
+        expected
+    );
+    stream(&mut app, HarnessEvent::Error("uncorrelated error".into()));
+    assert_eq!(
+        session(&app)
+            .conversation
+            .last()
+            .unwrap()
+            .webview_payload()
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        session(&app).pending_change(),
+        Some(&SettingChange::Mode("plan".into()))
+    );
+}

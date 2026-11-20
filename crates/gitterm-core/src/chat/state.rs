@@ -276,7 +276,7 @@ pub struct State {
     pub queued_prompts: BTreeMap<String, QueuedPrompt>,
     pub checkout: Option<PathBuf>,
     pending_change: Option<(CommandCorrelation, SettingChange)>,
-    commands: BTreeMap<u64, PendingCommand>,
+    commands: BTreeMap<u64, (RuntimeStamp, PendingCommand)>,
     runtime_exited: bool,
     runtime_generation: u64,
     history_generation: u64,
@@ -311,8 +311,8 @@ pub enum Intent {
         process_running: bool,
         change: SettingChange,
     },
-    /// Remote/legacy ports cannot report writes. Channel acceptance means
-    /// delivery is unknown until the provider reports the prompt's lifecycle.
+    /// Channel acceptance before a write receipt leaves delivery unknown.
+    /// Remote/legacy ports must wait for the provider's prompt lifecycle.
     CommandAcceptedWithoutReceipt {
         runtime: RuntimeStamp,
         current: session::Target,
@@ -538,6 +538,14 @@ impl State {
         self.pending_change.as_ref().map(|(_, change)| change)
     }
 
+    /// Dispatch attribution can change while the sole receiver stays installed.
+    /// The host validates receiver incarnation, then resolves this command stamp.
+    pub fn command_runtime(&self, correlation: CommandCorrelation) -> Option<&RuntimeStamp> {
+        self.commands
+            .get(&correlation.0)
+            .map(|(runtime, _)| runtime)
+    }
+
     fn command_allowed(
         &self,
         runtime: &RuntimeStamp,
@@ -555,7 +563,8 @@ impl State {
         echo: Option<AgentEvent>,
     ) -> Effect {
         let correlation = CommandCorrelation(generation());
-        self.commands.insert(correlation.0, pending);
+        self.commands
+            .insert(correlation.0, (runtime.clone(), pending));
         Effect::Dispatch {
             runtime,
             correlation,
@@ -594,7 +603,7 @@ impl State {
         {
             self.pending_change = None;
             self.commands
-                .retain(|_, command| !matches!(command, PendingCommand::Setting));
+                .retain(|_, (_, command)| !matches!(command, PendingCommand::Setting));
         }
         let changed = match &change {
             SettingChange::Model(value) => {
@@ -638,7 +647,12 @@ impl State {
                 correlation,
             } => {
                 if !self.runtime_exited && self.accepts_runtime(&runtime, &current) {
-                    if let Some(PendingCommand::Queue(id)) = self.commands.get(&correlation.0) {
+                    if let Some((admitted, PendingCommand::Queue(id))) =
+                        self.commands.get(&correlation.0)
+                    {
+                        if admitted != &runtime {
+                            return Effect::None;
+                        }
                         if let Some(prompt) = self.queued_prompts.get_mut(id) {
                             prompt.may_have_written = true;
                         }
@@ -761,8 +775,15 @@ impl State {
                 if !self.accepts_runtime(&runtime, &current) {
                     return Effect::None;
                 }
-                let Some(command) = self.commands.remove(&correlation.0) else {
+                if !self
+                    .commands
+                    .get(&correlation.0)
+                    .is_some_and(|(admitted, _)| admitted == &runtime)
+                {
                     return Effect::None;
+                }
+                let Some((_, command)) = self.commands.remove(&correlation.0) else {
+                    unreachable!()
                 };
                 let reason = match outcome {
                     DeliveryOutcome::Written => {

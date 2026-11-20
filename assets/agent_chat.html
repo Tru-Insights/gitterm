@@ -4248,12 +4248,20 @@
     }
   }
 
+  function pickerPending(event) {
+    if (event.setting === 'mode') { mode.pending = event.value; renderMode(); }
+    else if (event.setting === 'model') { chips.model.pending = event.value; renderModel(); }
+    else if (event.setting === 'effort') { chips.effort.pending = { value: event.value }; renderEffort(); }
+  }
+
   // ---- entry points (called from Rust) -------------------------------------
   window.__appendEvent = function (event) {
     if (!event || typeof event !== 'object') return;
     try {
       if (event.kind === 'harness') harnessEvent(event.event);
       else if (event.kind === 'prompt_uncertain') promptUncertain(event.id);
+      else if (event.kind === 'prompt_unsent') window.__markPromptUnsent(event.id, event.reason);
+      else if (event.kind === 'picker_pending') pickerPending(event);
       else if (event.kind === 'delegation_anchor') delegationAnchor(event.delegation_id);
       else if (event.kind === 'subagent_started_at') subagentStartedAt(event.id, event.at_ms);
       else if (event.kind === 'turn_timing') turnTiming(event);

@@ -22,6 +22,8 @@ const unknown = bubble(), known = bubble();
 const queued = new Map([['unknown', {msg: unknown, tag: {remove() {}}, label: {}, x: {remove() {}}}], ['known', {msg: known, label: {}, x: {remove() {}}}]]);
 const notices = [];
 const context = vm.createContext({
+  mode: { pending: null }, chips: { model: { pending: null }, effort: { pending: null } },
+  renderMode() {}, renderModel() {}, renderEffort() {},
   prompts: new Map([['unknown', unknown], ['known', known]]), queued,
   el: (_tag, cls, text) => ({ cls, text, remove() { this.removed = true; } }),
   harnessName: () => 'Agent', note: x => notices.push(x),
@@ -51,4 +53,9 @@ vm.runInContext("promptUncertain('unknown'); queuedLifecycle('unknown', 'cancell
 assert.equal(unknown.removed, true);
 vm.runInContext("queuedWithdrawRefused('already-started', 'Not withdrawn: already started')", context);
 assert.equal(notices.at(-1), 'Not withdrawn: already started');
+vm.runInContext("pickerPending({setting:'mode',value:'plan'})", context);
+assert.equal(context.mode.pending, 'plan');
+vm.runInContext("pickerPending({setting:'effort',value:null})", context);
+assert.equal(context.chips.effort.pending.value, null);
+assert.match(source, /event.kind === 'prompt_unsent'.*__markPromptUnsent/);
 console.log('Iced queued/uncertain delivery presentation passed');
