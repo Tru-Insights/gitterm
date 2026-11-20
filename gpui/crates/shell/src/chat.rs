@@ -224,6 +224,7 @@ impl ChatPane {
         let launch = (|| -> Result<_> {
             let program = claude_program()?;
             let provider = Arc::new(Provider::new(preview, &program)?);
+            provider.prepare()?;
             let command = provider.sign_in_command();
             let (runtime, events) = provider.start(saved.cwd.clone()).with_context(|| {
                 format!(

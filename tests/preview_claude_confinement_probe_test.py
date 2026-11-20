@@ -135,6 +135,23 @@ for event in events: print(json.dumps(event))
         self.assertEqual(self.run_probe().returncode, 0)
         self.assertEqual(settings.read_text(), '{"existing":true}\n')
 
+    @unittest.skipUnless(sys.platform == "darwin", "macOS keychain link")
+    def test_child_keychain_link_is_preserved_without_following_it(self):
+        library = self.preview / "child/home/Library"
+        library.mkdir(parents=True, mode=0o700)
+        target = self.home / "Library/Keychains"
+        target.mkdir(parents=True)
+        sentinel = target / "keep"
+        sentinel.write_text("synthetic-keychain")
+        link = library / "Keychains"
+        link.symlink_to(target, target_is_directory=True)
+        before = link.lstat()
+        output = self.run_probe()
+        self.assertEqual(output.returncode, 0, output.stdout + output.stderr)
+        self.assertEqual(link.readlink(), target)
+        self.assertEqual((link.lstat().st_dev, link.lstat().st_ino), (before.st_dev, before.st_ino))
+        self.assertEqual(sentinel.read_text(), "synthetic-keychain")
+
     def test_escapes_are_found_and_existing_files_never_restored_or_removed(self):
         self.fake("escape")
         # Fake real protected root is entirely inside our synthetic HOME.
