@@ -343,3 +343,94 @@ async fn native_chat_claude_startup_failure() {
     assert_eq!(pid.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert!(commands.is_closed());
 }
+
+// Match the Iced WebView card: choose the offered localSettings object and
+// send that exact object as remember, without rebuilding the permission rule.
+#[cfg(unix)]
+#[tokio::test]
+async fn native_chat_claude_iced_offered_remember_flow() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = process::script(
+        dir.path(),
+        "fake-remember",
+        r#"#!/usr/bin/env python3
+import json, signal, sys
+signal.alarm(20)
+def emit(v): print(json.dumps(v), flush=True)
+init = json.loads(sys.stdin.readline())
+emit({'type':'control_response','response':{'subtype':'success','request_id':init['request_id'],'response':{}}})
+choice = {'type':'addRules','destination':'localSettings','behavior':'allow','rules':[{'toolName':'Bash','ruleContent':'echo synthetic'}]}
+emit({'type':'control_request','request_id':'remember','request':{'subtype':'can_use_tool','tool_name':'Bash','tool_use_id':'t1','input':{'command':'echo synthetic'},'permission_suggestions':[choice]}})
+answer = json.loads(sys.stdin.readline())
+assert answer['response']['response'] == {'behavior':'allow','toolUseID':'t1','updatedInput':{'command':'echo synthetic'},'updatedPermissions':[choice]}
+assert not sys.stdin.read()
+"#,
+    );
+    let (commands, rx) = mpsc::unbounded_channel();
+    let (tx, mut events) = mpsc::unbounded_channel();
+    let task = tokio::spawn(run_session_program(
+        ClaudeSessionConfig {
+            snapshot_facts_dir: None,
+            cwd: dir.path().into(),
+            model: None,
+            permission_mode: "default".into(),
+            effort: None,
+            resume: None,
+            wire_log_dir: None,
+            mcp_servers: Vec::new(),
+            chrome: false,
+            guidelines_file: None,
+            guidelines_content: None,
+        },
+        rx,
+        tx,
+        tokio_util::sync::CancellationToken::new(),
+        program,
+        std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+    ));
+    let mut resolved = false;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            HarnessEvent::RuntimeRequest {
+                request_id,
+                kind: RuntimeRequestKind::Permission { suggestions, .. },
+                ..
+            } => {
+                let choice = suggestions
+                    .into_iter()
+                    .find(|s| s["destination"] == "localSettings")
+                    .unwrap();
+                commands
+                    .send(HarnessCommand::Answer {
+                        request_id,
+                        decision: RuntimeDecision::Allow {
+                            updated_input: None,
+                            remember: Some(choice),
+                        },
+                    })
+                    .unwrap();
+            }
+            HarnessEvent::RuntimeRequestResolved { request_id } => {
+                assert_eq!(request_id, "remember");
+                assert!(!resolved);
+                resolved = true;
+                commands.send(HarnessCommand::Shutdown).unwrap();
+            }
+            HarnessEvent::Error(e) => panic!("{e}"),
+            HarnessEvent::ProcessExited { code } => {
+                assert_eq!(code, Some(0));
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(resolved);
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
