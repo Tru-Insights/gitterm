@@ -125,6 +125,10 @@ pub enum WorkSidebarOutcome {
         url: String,
         store: gitterm_core::page_store::PageStore,
     },
+    /// The skills · MCPs · hooks line opens the Agent sidebar.
+    OpenAgentConfig {
+        workspace: u64,
+    },
 }
 
 impl WorkSidebarOutcome {
@@ -251,6 +255,7 @@ pub struct WorkSidebar {
     error: Option<String>,
     /// The checkout whose review is shown, as Iced's `open_review_checkout`.
     review_checkout: Option<PathBuf>,
+    agent_line: Option<String>,
 }
 
 impl WorkSidebar {
@@ -299,6 +304,14 @@ impl WorkSidebar {
             focus: Default::default(),
             error: None,
             review_checkout: None,
+            agent_line: None,
+        }
+    }
+
+    pub fn set_agent_line(&mut self, line: Option<String>, cx: &mut Context<Self>) {
+        if self.agent_line != line {
+            self.agent_line = line;
+            cx.notify();
         }
     }
 
@@ -549,6 +562,18 @@ impl WorkSidebar {
         }
         self.pull_request_rows(&mut rows);
         self.repo_rows(pane, &mut rows);
+        // What the agent has here (Iced TRU-192): opens the Agent view.
+        if let Some(line) = &self.agent_line {
+            let mut row = Row::text("");
+            row.small = true;
+            row.control(
+                line.clone(),
+                Action::Emit(WorkSidebarOutcome::OpenAgentConfig {
+                    workspace: self.workspace.id,
+                }),
+            );
+            rows.push(row);
+        }
         let Some(pane) = pane else {
             rows.push(Row::text("Loading…"));
             return rows;
@@ -1550,6 +1575,11 @@ impl WorkSidebar {
             control.action,
             Action::Emit(WorkSidebarOutcome::RunRepoCommand { .. })
         );
+        let mono = run
+            || matches!(
+                control.action,
+                Action::Emit(WorkSidebarOutcome::OpenAgentConfig { .. })
+            );
         let color = control_color(&control.action, repo_row, &p);
         let tooltip = match control.label.as_str() {
             "↗" => "Open chat",
@@ -1571,8 +1601,8 @@ impl WorkSidebar {
             .px_1()
             .flex_shrink_0()
             .text_size(px(10.))
-            .when(run, |button| button.font_family("Menlo"))
-            .when(repo_row && !run, |button| {
+            .when(mono, |button| button.font_family("Menlo"))
+            .when(repo_row && !mono, |button| {
                 button.font_family(".SystemUIFont")
             })
             .text_color(rgb(color))
@@ -1881,12 +1911,15 @@ impl Render for WorkSidebar {
                         line = line.child(age);
                     }
                 }
-                let button = self.button(
-                    format!("work-control-{index}-{control_index}"),
-                    control,
-                    repo,
-                    cx,
-                );
+                let id = if matches!(
+                    control.action,
+                    Action::Emit(WorkSidebarOutcome::OpenAgentConfig { .. })
+                ) {
+                    "work-agent-config".to_string()
+                } else {
+                    format!("work-control-{index}-{control_index}")
+                };
+                let button = self.button(id, control, repo, cx);
                 if repo {
                     actions = actions.child(button);
                 } else {

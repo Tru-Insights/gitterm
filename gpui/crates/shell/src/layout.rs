@@ -24,6 +24,8 @@ pub enum SidebarMode {
     Files,
     Find,
     Git,
+    /// Iced's agent configuration view, opened from Work.
+    Agent,
 }
 
 /// Stored alongside the retained pane inventory in the existing layout file.

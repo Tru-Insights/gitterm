@@ -1,7 +1,7 @@
 /// Host-owned chat settings, independent of the shell's UI/terminal typography.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ChatAppearance {
-    // Retained from the host setting; GPUI chat does not render Iced's HTML visual replies.
+    // Retained from the host setting; the theme of HTML visual replies.
     pub light: bool,
     pub font_size: f32,
 }

@@ -10,6 +10,10 @@ mod tool_runs;
 mod transcript;
 pub use scroll::TranscriptScrollerState;
 use scroll::TranscriptScrollerState as MessageScrollerState;
+mod visual;
+pub use visual::{
+    VisualFactory, VisualHost, VisualMessage, VisualPlacement, VisualSurface, visual_link,
+};
 #[path = "turns.rs"]
 mod turns;
 use copy::CopyTarget;
@@ -180,6 +184,8 @@ pub struct ChatView {
     focus: FocusHandle,
     replay: Option<Task<()>>,
     replay_position: usize,
+    /// The visual reply shown over the chat, as Iced's `.html-render.expanded`.
+    expanded_visual: Option<Entity<visual::VisualReply>>,
     _subscriptions: Vec<Subscription>,
 }
 impl gpui::EventEmitter<roster::RosterOutcome> for ChatView {}
@@ -293,6 +299,7 @@ impl ChatView {
             turn_running,
             new_messages: false,
             cards: HashMap::new(),
+            expanded_visual: None,
             recent_rows: VecDeque::new(),
             folded: HashMap::new(),
             retained_edit_expansion: HashMap::new(),
@@ -965,6 +972,13 @@ impl ChatView {
         let action: RowAction = Rc::new(move |action, cx| {
             _ = owner.update(cx, |view, cx| view.transcript_action(action, cx));
         });
+        let visual_owner = cx.entity().downgrade();
+        let visual_expand: visual::VisualExpand = Rc::new(move |reply, cx| {
+            _ = visual_owner.update(cx, |view, cx| {
+                view.expanded_visual = reply;
+                cx.notify();
+            });
+        });
         let scroller = self.scroller.clone();
         let open = self.folded.get(&row.id).copied();
         let view = cx.new(|cx| {
@@ -998,6 +1012,8 @@ impl ChatView {
             view.hidden_by_run = hidden_by_run;
             view.hidden_by_turn =
                 turn_collapsed && turn.as_ref().is_some_and(|turn| turn.contains(index));
+            view.visual_expand = visual_expand;
+            view.sync_visual(cx);
             view
         });
         self.row_views[index] = Some(view.clone());
@@ -1302,6 +1318,14 @@ impl Render for ChatView {
             .key_context(context.as_str())
             .track_focus(&self.focus)
             .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape"
+                    && let Some(visual) = this.expanded_visual.clone()
+                {
+                    visual.update(cx, |visual, cx| visual.collapse(cx));
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.review.open && event.keystroke.key == "escape" {
                     this.close_review(window, cx);
                     window.prevent_default();
@@ -1516,7 +1540,19 @@ impl Render for ChatView {
             .flex()
             .justify_center()
             .bg(rgb(palette.base))
+            .relative()
             .child(column)
+            .children(self.expanded_visual.clone().map(|visual| {
+                div()
+                    .absolute()
+                    .top(px(8.))
+                    .left(px(8.))
+                    .right(px(8.))
+                    .bottom(px(8.))
+                    .flex()
+                    .flex_col()
+                    .child(visual)
+            }))
     }
 }
 
@@ -1551,6 +1587,9 @@ struct RowView {
     scroller: Entity<MessageScrollerState>,
     _subscription: Subscription,
     hidden_by_turn: bool,
+    visual: Option<Entity<visual::VisualReply>>,
+    visual_expand: visual::VisualExpand,
+    visual_subscription: Option<Subscription>,
 }
 impl RowView {
     fn new(
@@ -1606,6 +1645,9 @@ impl RowView {
             scroller,
             _subscription: subscription,
             hidden_by_turn: false,
+            visual: None,
+            visual_expand: Rc::new(|_, _| {}),
+            visual_subscription: None,
         };
         view.update_edit_text(cx);
         view.prepare_sent_images(cx);
@@ -1629,10 +1671,39 @@ impl RowView {
         }
         self.row = row;
         self.update_edit_text(cx);
+        if self.visual.is_none() {
+            self.sync_visual(cx);
+            if self.visual.is_some() {
+                self.scroller.update(cx, |state, cx| {
+                    state.remeasure_items(self.index..self.index + 1, cx);
+                });
+            }
+        }
         if images_changed {
             self.prepare_sent_images(cx);
         }
         cx.notify();
+    }
+    /// A completed html_render result gets its visual reply once. Called
+    /// while the list lays the row out, so the caller remeasures.
+    fn sync_visual(&mut self, cx: &mut Context<Self>) {
+        if self.visual.is_some() {
+            return;
+        }
+        let Some(request) = self.row.tool.as_ref().and_then(visual::visual_request) else {
+            return;
+        };
+        let (id, light) = (self.row.id, self.appearance.light);
+        let expand = self.visual_expand.clone();
+        let reply = cx.new(|cx| visual::VisualReply::new(id, request, light, expand, cx));
+        // Expanding moves the reply over the chat; the row gives up its space.
+        self.visual_subscription = Some(cx.observe(&reply, |this, _, cx| {
+            this.scroller.update(cx, |state, cx| {
+                state.remeasure_items(this.index..this.index + 1, cx);
+            });
+            cx.notify();
+        }));
+        self.visual = Some(reply);
     }
     fn toggle(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.open = !self.open;
@@ -1644,11 +1715,27 @@ impl RowView {
 }
 impl Render for RowView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.hidden_by_turn
-            || self.hidden_by_work
-            || (self.hidden_by_run && self.work_summary.is_none())
+        if let Some(visual) = &self.visual
+            && visual.read(cx).light != self.appearance.light
         {
+            let light = self.appearance.light;
+            visual.update(cx, |visual, cx| visual.set_light(light, cx));
+        }
+        // Iced appends the visual reply after its tool item, outside the fold.
+        let visual = self
+            .visual
+            .clone()
+            .filter(|visual| !visual.read(cx).expanded);
+        if self.hidden_by_turn || self.hidden_by_work {
             return div().h(px(0.)).mb(px(0.)).into_any_element();
+        }
+        if self.hidden_by_run && self.work_summary.is_none() {
+            return div()
+                .w_full()
+                .when_some(self.column_width, |row, width| row.max_w(px(width)))
+                .mx_auto()
+                .children(visual)
+                .into_any_element();
         }
         self.highlight(cx);
         let palette = self.appearance.palette();
@@ -1954,6 +2041,7 @@ impl Render for RowView {
             .when_some(self.column_width, |row, width| row.max_w(px(width)))
             .mx_auto()
             .child(row)
+            .when(show_work, |row| row.children(visual))
             .into_any_element()
     }
 }
