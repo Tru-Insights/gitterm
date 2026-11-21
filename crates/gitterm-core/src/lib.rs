@@ -77,6 +77,7 @@ pub mod turn_snapshots;
 // PR/issue/merge-plan leaf state and optional runtime services.
 pub mod issues;
 pub mod merge_plan;
+pub mod page_store;
 pub mod prs;
 
 pub mod settings;

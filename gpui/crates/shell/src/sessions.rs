@@ -315,12 +315,7 @@ impl crate::Shell {
                 }
                 cx.notify();
             }
-            O::OpenPrViewer { .. } => {
-                self.owner.update(cx, |owner, cx| {
-                    owner.error = Some("PR viewer · not available in preview".into());
-                    cx.notify();
-                });
-            }
+            O::OpenPage { url, store } => self.open_page(url.clone(), store.clone(), window, cx),
             // Write/launch controls stop at the sidebar's preview notice.
             _ => {}
         }

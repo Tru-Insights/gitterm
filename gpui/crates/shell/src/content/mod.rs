@@ -3,8 +3,8 @@
 //! `window` owns the shell's surfaces, off-thread preparation, native result
 //! draining, deadlines, selection and window-relative pane geometry. Component
 //! popup/dialog state and native pickers cover the selected surface before paint.
-//! There are no IPC handlers or Page identity/store capabilities. Document links
-//! follow the Iced Viewer network/navigation policy.
+//! There are no IPC handlers. Document links follow the Iced Viewer
+//! network/navigation policy; a remote Page has its own login store and policy.
 pub(crate) mod actions;
 pub mod host;
 pub mod overlay;
@@ -24,6 +24,8 @@ pub struct Origin {
 #[derive(Debug)]
 pub struct Document {
     html: String,
+    /// A remote HTTP(S) Page, loaded by URL instead of `html`.
+    page_url: Option<String>,
 }
 
 impl Document {
@@ -33,7 +35,10 @@ impl Document {
         let load = gitterm_core::content::collect_contained_file_load(0, root, relative, dark)
             .map_err(|e| format!("Cannot preview {}: {e}", root.join(relative).display()))?;
         if let Some(html) = load.webview_content {
-            return Ok(Self { html });
+            return Ok(Self {
+                html,
+                page_url: None,
+            });
         }
         if actions::is_rendered(relative) {
             return Err(format!(
@@ -77,6 +82,7 @@ impl Document {
                 escape(load.file_preview_notice.as_deref().unwrap_or("")),
                 escape(&load.file_content)
             ),
+            page_url: None,
         })
     }
 
@@ -90,8 +96,21 @@ impl Document {
         Self::local_file(root, Path::new(relative), dark)
     }
 
+    /// A remote Page. Only HTTP(S) URLs are accepted.
+    pub fn page(url: &str) -> Result<Self, String> {
+        gitterm_core::page_store::browser_url(url)?;
+        Ok(Self {
+            html: String::new(),
+            page_url: Some(url.to_owned()),
+        })
+    }
+
     pub fn html(&self) -> &str {
         &self.html
+    }
+
+    pub fn page_url(&self) -> Option<&str> {
+        self.page_url.as_deref()
     }
 }
 

@@ -35,6 +35,8 @@ mod hookup_tests;
 mod layout;
 mod owner;
 mod pane;
+#[cfg(test)]
+mod page_tests;
 mod park;
 pub mod park_sheet;
 pub mod preview;

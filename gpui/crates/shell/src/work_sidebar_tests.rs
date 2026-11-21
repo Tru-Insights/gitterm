@@ -1005,6 +1005,130 @@ fn expanded_repo_disclosure_stays_inside_default_sidebar_and_collapses(
 }
 
 #[gpui::test]
+fn pr_number_click_requests_the_pr_page_in_the_pr_store(cx: &mut gpui::TestAppContext) {
+    use gitterm_core::{merge_plan::PrKey, prs::WatchedPr};
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let mut sidebar = fixture(true);
+    sidebar.pull_requests = vec![PullRequestGroup {
+        root: "root".into(),
+        title: "Owning chat".into(),
+        prs: vec![WatchedPr::new(PrKey::new("example/gitterm", 42))],
+    }];
+    sidebar.pr_accounts = BTreeMap::from([("example".into(), "Sample-Login".into())]);
+    let (sidebar, cx) = cx.add_window_view(|_, _| sidebar);
+    let shell = cx.update(|window, cx| {
+        cx.new(|cx| {
+            let mut model = crate::WorkspaceStatus::default();
+            model.add(root.path().to_path_buf(), Instant::now());
+            let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, None, cx));
+            crate::Shell::with_owner(
+                Rc::new(crate::data::LocalData(owner.clone())),
+                owner,
+                config.path(),
+                true,
+                window,
+                cx,
+            )
+            .unwrap()
+        })
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |_, cx| {
+            cx.subscribe_in(
+                &sidebar,
+                window,
+                |shell, _, outcome: &WorkSidebarOutcome, window, cx| {
+                    shell.work_outcome(outcome, window, cx)
+                },
+            )
+            .detach();
+        })
+    });
+    cx.simulate_resize(gpui::size(px(640.), px(900.)));
+    draw_sidebar(cx);
+    click_sidebar(cx, "work-pr-number-2");
+    assert_eq!(
+        crate::page_tests::page(&shell, cx),
+        Some((
+            "https://github.com/example/gitterm/pull/42".into(),
+            gitterm_core::page_store::PageStore::GitHub("sample-login".into())
+        ))
+    );
+    assert!(
+        cx.opened_url().is_none(),
+        "the PR opens embedded, not externally"
+    );
+}
+
+#[test]
+fn issue_rows_with_a_url_open_the_page_in_the_workspace_store() {
+    use gitterm_core::{issues::CachedIssue, page_store::PageStore};
+    let mut sidebar = fixture(true);
+    let issue = |url: Option<&str>, workspace: Option<&str>| CachedIssue {
+        title: Some("Sample issue".into()),
+        url: url.map(str::to_owned),
+        workspace: workspace.map(str::to_owned),
+        ..Default::default()
+    };
+    for (key, cached) in [
+        (
+            "SAMPLE-1",
+            issue(
+                Some("https://linear.app/sample-a/issue/SAMPLE-1/x"),
+                Some("sample-b"),
+            ),
+        ),
+        (
+            "SAMPLE-2",
+            issue(Some("https://linear.app/sample-a/issue/SAMPLE-2/y"), None),
+        ),
+        ("SAMPLE-3", issue(Some("https://example.com/issue/3"), None)),
+        ("SAMPLE-4", issue(None, Some("sample-b"))),
+    ] {
+        sidebar.issues.issues.insert(key.into(), cached);
+    }
+    let keys: Vec<String> = (1..=4).map(|n| format!("SAMPLE-{n}")).collect();
+    let mut rows = vec![];
+    sidebar.issue_rows(&keys, &mut rows);
+    let action = |key: &str| {
+        rows.iter()
+            .find(|row| row.label.starts_with(key))
+            .unwrap_or_else(|| panic!("missing {key}"))
+            .action
+            .clone()
+    };
+    let page = |url: &str, store| {
+        Some(Action::Emit(WorkSidebarOutcome::OpenPage {
+            url: url.into(),
+            store,
+        }))
+    };
+    // The resolving workspace wins; older caches fall back to the URL's workspace.
+    assert_eq!(
+        action("SAMPLE-1"),
+        page(
+            "https://linear.app/sample-a/issue/SAMPLE-1/x",
+            PageStore::Linear("sample-b".into())
+        )
+    );
+    assert_eq!(
+        action("SAMPLE-2"),
+        page(
+            "https://linear.app/sample-a/issue/SAMPLE-2/y",
+            PageStore::Linear("sample-a".into())
+        )
+    );
+    assert_eq!(
+        action("SAMPLE-3"),
+        page("https://example.com/issue/3", PageStore::Default)
+    );
+    assert_eq!(action("SAMPLE-4"), None, "unknown URL stays text");
+}
+
+#[gpui::test]
 fn pr_body_and_disclosure_keep_iced_toggle_targets(cx: &mut gpui::TestAppContext) {
     use gitterm_core::{merge_plan::PrKey, prs::WatchedPr};
     cx.background_executor.allow_parking();
@@ -1017,6 +1141,7 @@ fn pr_body_and_disclosure_keep_iced_toggle_targets(cx: &mut gpui::TestAppContext
         title: "Owning chat".into(),
         prs: vec![WatchedPr::new(PrKey::new("example/gitterm", 42))],
     }];
+    sidebar.pr_accounts = BTreeMap::from([("Example".into(), "Sample-Login".into())]);
     let (sidebar, cx) = cx.add_window_view(|_, _| sidebar);
     cx.simulate_resize(gpui::size(px(640.), px(900.)));
     draw_sidebar(cx);
@@ -1027,8 +1152,9 @@ fn pr_body_and_disclosure_keep_iced_toggle_targets(cx: &mut gpui::TestAppContext
     assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
     assert_eq!(
         *events.borrow(),
-        [WorkSidebarOutcome::OpenPrViewer {
-            url: "https://github.com/example/gitterm/pull/42".into()
+        [WorkSidebarOutcome::OpenPage {
+            url: "https://github.com/example/gitterm/pull/42".into(),
+            store: gitterm_core::page_store::PageStore::GitHub("sample-login".into()),
         }]
     );
     assert!(
