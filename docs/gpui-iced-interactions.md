@@ -39,7 +39,7 @@ Each row is a control or a repeated control family whose instances share behavio
 
 ## Verdict counts
 
-Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this refresh the map showed 143 MATCH and 193 DIFF; it now shows 209 MATCH, 81 PREVIEW and 46 DIFF (336 rows) after the TRU-274 small-parity pass.
+Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this refresh the map showed 143 MATCH and 193 DIFF; it now shows 207 MATCH, 84 PREVIEW and 45 DIFF (336 rows; counts taken from the row verdicts) after the TRU-274 small-parity pass.
 
 | Section | MATCH | PREVIEW | DIFF |
 | --- | ---: | ---: | ---: |
@@ -48,15 +48,15 @@ Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this
 | Work sidebar | 23 | 17 | 0 |
 | Find sidebar and preview | 18 | 7 | 0 |
 | Content area and file viewer | 10 | 1 | 0 |
-| Chat transcript, cards, roster | 29 | 6 | 0 |
-| Composer and Review / Consult | 22 | 2 | 1 |
+| Chat transcript, cards, roster | 27 | 6 | 2 |
+| Composer and Review / Consult | 20 | 1 | 4 |
 | Bottom panel and terminal find | 16 | 1 | 0 |
-| Workspace bar, menus, settings | 12 | 21 | 3 |
-| Sheets and dialogs | 23 | 8 | 5 |
+| Workspace bar, menus, settings | 12 | 23 | 1 |
+| Sheets and dialogs | 25 | 10 | 1 |
 | Task detail and other dialogs | 4 | 7 | 31 |
 | Usage page | 8 | 2 | 0 |
 | Native menus and shortcuts | 23 | 4 | 2 |
-| **Total** | **209** | **81** | **46** |
+| **Total** | **207** | **84** | **45** |
 
 `PREVIEW` means a deliberate preview limit (write/launch control shows "not available in preview"), kept until cutover.
 
@@ -336,8 +336,8 @@ Sources: [Iced bar](../src/main.rs#L37831), [repos/more menus](../src/main.rs#L3
 | A12h remote workspace **P/W** | `+ {remote workspace}` | Absent | I row H/status; G native selection hints | Click | `RemoteWorkspaceOpen` → remote workspace/session | — | **PREVIEW** `+ {remote workspace}` present, preview control (workspace_bar.rs:1180-1190). |
 | A13 new workspace | `+`, T `New workspace` | Same | Delayed hint; native T | Click | `NewWorkOpen` | Mounted override → `open_recent_work_sheet` | **MATCH** sheet entry; creation itself differs (D08). |
 | A14 browser **P/X** | Browser outline; running/focus, stopped/error/open, busy disabled, driving highlight | Muted browser outline, always supplied Open; no driving state | I stateful hint; G `Browser` | Click when enabled | `BrowserOpen` / `BrowserFocus` | `Browser(Open)` → unavailable | **PREVIEW** `Browser` → "Browser" preview notice (sessions.rs:~385); state always idle (lib.rs:1676). |
-| A15 Ready count | `↑n`, hidden at no count/news; news color | Same component count | Count/news bar hint; native T | Click | `Pr(ReadyListToggle)` → Ready list | `OpenReady` → unavailable | **DIFF** Ready count mounted but `OpenReady` → "Ready · not available in preview"; no Ready list (sessions.rs:~382). |
-| A16 Parked count **P/W** | `⏸n`, hidden at none | Same label | Parked count hint; native T | Click | `ParkedListToggle` → Resume/Done list | `OpenParked` → unavailable | **DIFF** Parked count mounted (lib.rs:1662) but `OpenParked` → "Parked · not available in preview"; no Resume/Done list. |
+| A15 Ready count | `↑n`, hidden at no count/news; news color | Same component count | Count/news bar hint; native T | Click | `Pr(ReadyListToggle)` → Ready list | `OpenReady` → unavailable | **PREVIEW** the count opens Iced's `Ready to merge` list (`park_sheet.rs`; groups from `workspaces.json`, plans and `pr-watch.json`, read-only): group name with `Open` (live work, selects the workspace) or `Resume` (parked work → `Resume · not available in preview`), `#n next: {title}` rows and news lines, `Close`/Esc. No PR facts row, no PR-number/news controls (W17/W20a) and no workspace overview to open into. Test lists_tests.rs |
+| A16 Parked count **P/W** | `⏸n`, hidden at none | Same label | Parked count hint; native T | Click | `ParkedListToggle` → Resume/Done list | `OpenParked` → unavailable | **PREVIEW** the count opens Iced's `Parked` list (live parks first, then newest first; chats, running badge, age, note, PR news line). `Resume`/`Done` on a saved Iced entry show `Resume`/`Done · not available in preview`; this preview's own parks resume plain terminals (a chat in one adds `Resume chats · not available in preview`). Test lists_tests.rs |
 | A17 terminal toggle | `>_`; color varies folded/running/open | `>_`; mounted `terminal_running=false` | Both `Terminal panel (⌘J)` / fold/running variants in component | Click or eligible `⌘J` | `ConsoleToggle` | `ToggleTerminal` → `open_bottom_terminal` | **MATCH** `terminal_running` from live run tabs (lib.rs:1667); colors (workspace_bar.rs:~795). |
 | A18 more menu | `⋯` | Not rendered | I hint `Help and browser actions`; — | Click | `BarMenuToggle(More)` | `OpenMoreMenu` enum fallback unavailable; no control | **MATCH** `⋯` popover `Help and browser actions` (workspace_bar.rs:1317-1340); test `more_entries`. |
 | A18a help entry | `Keyboard shortcuts` with `⌥/` | Not rendered | I hint `Help and browser actions`; — | Click or ⌥/ | `ToggleHelp` | No menu entry; shortcut opens reduced dialog | **MATCH** `Keyboard shortcuts ⌥/` entry (workspace_bar.rs:1363-1375, app_menus.rs:282). |
@@ -365,11 +365,11 @@ Sources: [Iced new work](../src/main.rs#L36426), [picker](../src/main.rs#L36020)
 | D11 terminal **P/W** | `Terminal` | `Terminal` | Row H/description; native H | Click | `NewPlainTab` → terminal | `Terminal` → local `new_terminal` | **MATCH** local plain terminal; nonlocal launch unavailable. |
 | D12 CLI preset/resume **P/W** | Preset label/color; adjacent Resume where command configured | Same entries/ordering | Row H/description; native H | Click; presets `⌥⇧1…9` | `LaunchAgentPreset` / `ResumeAgentPreset` | `Cli` / `CliResume` → unavailable | **PREVIEW** CLI preset/resume → "unavailable in preview" (sessions.rs:186-192). |
 | D13 task continue **P/W/C** | `CONTINUE TASK` header, preset and tools/Terminal; handoff-copy state | Same projected task header/rows | Row H; native H | Click preset/terminal | `TaskChildLaunchPreset` / `TaskChildLaunchTerminal` | `Continue {task,…}` → unavailable | **PREVIEW** task Continue → "unavailable in preview" (sessions.rs:186-192). |
-| D14 park note | Note input, suggested note context | Same input; mounted facts omit Iced note-chat/shared-repo detail | Input focus; native | Type; Enter parks | `ParkNoteChanged` / `ParkSubmit` | Input draft / submit Outcome | **DIFF** mounted facts leave `shared_repos`/`note_chats` empty (park.rs:~503-519); the sheet supports them (park_sheet.rs:105-150). |
+| D14 park note | Note input, suggested note context | Same input; facts carry shared repos and note chats | Input focus; native | Type; Enter parks | `ParkNoteChanged` / `ParkSubmit` | Input draft / submit Outcome | **MATCH** the facts now carry the other workspaces' chats line and `{repo} stays open in {workspace}.` lines, and the note prefill is scoped as Iced's `park_note_chats` from the work sidebar's loaded chat index (park.rs `workspace_sheet`). Limit: a late-landing index does not refill an unedited note. Test lists_tests.rs |
 | D15 keep running **P/W** | `Keep running` checkbox, changes explanatory text; working warning when stop mode | Same component states | Checkbox H; native | Click/Space | `ParkKeepRunningToggled` | Sheet draft bool | **MATCH** selects stop versus keep-running mode before submit. |
 | D16 Park **P/W** | `Park` | `Park` | H/—; N/— | Click/Enter (including note focus) | `ParkSubmit` → park current workspace, possibly stop processes | `Outcome::Park` → core park policy, stop owned targets or leave running, save | **MATCH** owned GPUI sessions park; imported-session ownership limits apply. |
 | D17 Close permanently **P/W** | `Close` in close sheet; separate from Park | Same | H/—; N/— | Click | `CloseConfirm` → close workspace | `Outcome::Close` → core Close, stop/mark done | **MATCH** owned-workspace close effect; not the same as hiding a pane. |
-| D18 parked Resume/Done **P/W** | `Resume`, `Done`; running badge; Done keeps list open | Same standalone component; mounted bar cannot reach it | H/—; N/— | Click | `ParkedResume` / `ParkedDone` | Core restore/done exists; stopped restoration resumes plain terminals only | **DIFF** mounted (lib.rs:3970) but labels `Resume`/`Mark done`/`Stop terminals`, bar entry is a preview notice, restore handles plain terminals only (park.rs:132-195, 361-380). |
+| D18 parked Resume/Done **P/W** | `Resume`, `Done`; running badge; Done keeps list open | Same component, mounted from the Parked count | H/—; N/— | Click | `ParkedResume` / `ParkedDone` | Core restore/done exists; stopped restoration resumes plain terminals only | **PREVIEW** mounted from the Parked count with Iced's `Resume`/`Done` labels (`Mark done`/`Stop terminals` removed); Done keeps the list open, Resume closes it; Iced-saved entries and chat resume show the preview notice. Test lists_tests.rs |
 | D19 park/list cancel | `Cancel` or list `Close` | Same | H/—; N/— | Click/Esc; backdrop policy in sheet | `ParkCancel` / `ParkedListToggle` | `Cancel` → close/restore focus | **MATCH** cancel does not park/close underlying workspace. |
 | D20 switcher query | `SWITCH CONTEXT`, search input; no-match state | Same | Input focus; native | `⌘T` opens/closes; type | `TaskSwitcherQueryChanged` | Query change → model filtering | **MATCH** name filtering, reset highlight. |
 | D21 switcher row | General workspace + task rows, `CURRENT`, attention/unread facts | Same projection/sort rules | Selected/H; selected/H | Click; ↑↓ clamp, Enter highlighted | `TaskSwitcherSelect` / `ActivateFirst` | `Activate`/`ContextBack` → mounted task/general navigation | **MATCH** switcher selection; task launch is separate. |
@@ -385,8 +385,8 @@ Sources: [Iced new work](../src/main.rs#L36426), [picker](../src/main.rs#L36020)
 | D24e native browse **X** | `Use macOS dialog…` for local machine | Same, this Mac only | I row/input H; G button | Click | `FolderPickerNativeDialog` | `NativeDialog` → close picker, OS `prompt_for_paths` | **MATCH** explicit alternate picker. |
 | D24f folder cancel | `Cancel` | Same; backdrop click | I row/input H; G button | Click/Esc | `FolderPickerCancel` | `Cancel` → close picker | **MATCH** cancels folder choice. |
 | D24g use folder **P/W** | `Use this folder`, disabled loading/error | Same enablement | I row/input H; G button | Click | `FolderPickerConfirm` → purpose-specific add/open/create | This Mac: the preview's folder add (sheet draft or local folder); remote: `Use this folder · not available in preview` | **PREVIEW** remote → "Use this folder · not available in preview" (remote_shell.rs:296-303); local adds the folder. |
-| D25 Ready workspace **P/W** | `Open` for live work / `Resume` for parked work | Absent | I H/—; — | Click | `Pr(ReadyGo(home))` → workspace navigation/resume | — | **DIFF** no Ready list; `OpenReady` is a preview notice (lib.rs:2004). |
-| D26 Ready close | `Close`; PR number/news controls reuse W17/W20a | Absent | I H/—; — | Click/Esc | `Pr(ReadyListToggle)` → dismiss | — | **DIFF** no mounted Ready list, so no Close. |
+| D25 Ready workspace **P/W** | `Open` for live work / `Resume` for parked work | Ready list rows/buttons in `ParkSheet` | I H/—; — | Click | `Pr(ReadyGo(home))` → workspace navigation/resume | — | **PREVIEW** `Open`/`Resume` per group; `Open` selects the live workspace (no overview page to show), `Resume` on a parked home shows `Resume · not available in preview`. Test lists_tests.rs |
+| D26 Ready close | `Close`; PR number/news controls reuse W17/W20a | `Close` button, Esc | I H/—; — | Click/Esc | `Pr(ReadyListToggle)` → dismiss | — | **MATCH** `Close` button and Esc dismiss the list. Test lists_tests.rs |
 | D27 session picker backdrop | Outside dim area; no extra launch button | Outside catcher | — | Outside click/Esc | `HideTabPicker` | `SessionPickerEvent::Dismissed` | **MATCH** dismisses picker without launching. |
 
 ## Task detail and other Iced-only dialog controls
@@ -503,27 +503,31 @@ Refreshed 2026-11-21 against `7c3b587` (after PRs #280–#310). Only rows still 
 3. S02 — imported Iced sessions cannot be closed from `×` (sessions.rs:459-468).
 4. S07 — worktree-follow control never renders (`worktree_follow: None`, lib.rs:1963).
 
+**Chat transcript**
+5. H02 — tool-run fold: grouping/folding match; the summary tooltip listing tool counts is missing.
+6. H11 — delegation fold: generic fold lacks the actionable delegation card body below.
+
 **Composer**
-5. C10 — picker entries, lock rule and tooltip match; a pick shows `{label} · not available in preview` (preview limit) and the locked chip has no `Open in editor` (C11).
+7. C04 — queued withdraw: same operation; label, placement and tooltip differ.
+8. C05 — slash row: gestures match; per-command tooltip missing.
+9. C10 — picker entries, lock rule and tooltip match; a pick shows `{label} · not available in preview` (preview limit) and the locked chip has no `Open in editor` (C11).
+10. C11 — checkout `Open in editor` action missing.
 
 **Workspace bar, sheets and menus**
-6. A12b — `New workspace…` is a preview control.
-7. A15 / D25 / D26 — Ready count and list: no Ready list to open, resume or close.
-8. A16 / D18 — Parked count has no list; the mounted park list uses different labels (`Mark done`, `Stop terminals`) and restores plain terminals only.
-9. D14 — park sheet facts omit shared repos and note chats.
-10. D23b — no PR confirmation panel, so no Cancel/Close.
-11. M08 — attention jump reads mounted GPUI facts only, not live Iced urgency.
-12. M11 — dictation (`SttToggle`) has no handler or mic state.
+11. A12b — `New workspace…` is a preview control.
+12. D23b — no PR confirmation panel, so no Cancel/Close.
+13. M08 — attention jump reads mounted GPUI facts only, not live Iced urgency.
+14. M11 — dictation (`SttToggle`) has no handler or mic state.
 
 **Task detail (not mounted)**
-13. T01–T01d — new-task, filter chips and archive controls absent.
-14. T05–T06c — Review changes, Push branch, Open draft PR, publish confirmation absent.
-15. T07 / T07a — Stop and Cancel queue absent.
-16. T08–T08b — worktree delete opener and confirmation absent.
-17. T09–T09f — task create form is a fixture only.
-18. T10 / T10a — Stop and close / Keep open absent.
-19. T12–T12e — phone pairing and revocation absent.
-20. T13 — browser evidence viewer absent.
+15. T01–T01d — new-task, filter chips and archive controls absent.
+16. T05–T06c — Review changes, Push branch, Open draft PR, publish confirmation absent.
+17. T07 / T07a — Stop and Cancel queue absent.
+18. T08–T08b — worktree delete opener and confirmation absent.
+19. T09–T09f — task create form is a fixture only.
+20. T10 / T10a — Stop and close / Keep open absent.
+21. T12–T12e — phone pairing and revocation absent.
+22. T13 — browser evidence viewer absent.
 
 ## Verification boundary
 

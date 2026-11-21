@@ -390,8 +390,8 @@ impl crate::Shell {
             }
             O::OpenSettings(id) => self.open_settings_sheet(id, window, cx),
             O::OpenReposMenu => self.unavailable("Repos ▾", cx),
-            O::OpenReady => self.unavailable("Ready", cx),
-            O::OpenParked => self.unavailable("Parked", cx),
+            O::OpenReady => self.open_ready_list(window, cx),
+            O::OpenParked => self.open_parked_list(window, cx),
             O::Browser(_) => self.unavailable("Browser", cx),
             O::OpenMoreMenu => self.unavailable("Help and browser actions", cx),
             O::ToggleTerminal => self.unavailable("Terminal", cx),
@@ -850,20 +850,25 @@ fn read_iced_history(
     let timestamp_ms = |at: Option<&str>| {
         let timed = gitterm_core::harness::transcript::TimedEntry {
             at: at.map(str::to_string),
-            entry: TranscriptEntry::Harness(gitterm_core::chat::types::HarnessEvent::TurnCompleted {
-                status: gitterm_core::chat::types::TurnStatus::Completed,
-                usage: serde_json::Value::Null,
-                cost_usd: None,
-                rate_limit: None,
-            }),
+            entry: TranscriptEntry::Harness(
+                gitterm_core::chat::types::HarnessEvent::TurnCompleted {
+                    status: gitterm_core::chat::types::TurnStatus::Completed,
+                    usage: serde_json::Value::Null,
+                    cost_usd: None,
+                    rate_limit: None,
+                },
+            ),
         };
         gitterm_core::chat::history::history_timeline(vec![timed], &[])
             .into_iter()
             .find_map(|event| match event {
                 gitterm_core::chat::history::HistoryEvent::Other(value)
-                    if value["kind"] == "turn_timing" => value["end_ms"]
-                    .as_i64()
-                    .and_then(|ms| u64::try_from(ms).ok()),
+                    if value["kind"] == "turn_timing" =>
+                {
+                    value["end_ms"]
+                        .as_i64()
+                        .and_then(|ms| u64::try_from(ms).ok())
+                }
                 _ => None,
             })
     };
@@ -893,7 +898,10 @@ fn read_iced_history(
                 Entry::UserPrompt(text)
             }
             TranscriptEntry::Harness(event) => {
-                if matches!(event, gitterm_core::chat::types::HarnessEvent::TurnCompleted { .. }) {
+                if matches!(
+                    event,
+                    gitterm_core::chat::types::HarnessEvent::TurnCompleted { .. }
+                ) {
                     if let Some(end_ms) = last_activity_ms.take() {
                         records.push(Record {
                             at_ms: None,

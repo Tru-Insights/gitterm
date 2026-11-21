@@ -2,12 +2,12 @@
 use super::*;
 use gpui::{TestAppContext, VisualTestContext};
 
-fn draw(cx: &mut VisualTestContext) {
+pub(crate) fn draw(cx: &mut VisualTestContext) {
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
     cx.run_until_parked();
 }
-fn click(cx: &mut VisualTestContext, selector: &'static str) {
+pub(crate) fn click(cx: &mut VisualTestContext, selector: &'static str) {
     let bounds = cx
         .debug_bounds(selector)
         .unwrap_or_else(|| panic!("missing {selector}"));
@@ -17,9 +17,17 @@ fn click(cx: &mut VisualTestContext, selector: &'static str) {
 fn fixture(cx: &mut TestAppContext) -> (tempfile::TempDir, Entity<Shell>, &mut VisualTestContext) {
     fixture_catalog(cx, false)
 }
-fn fixture_catalog(
+pub(crate) fn fixture_catalog(
     cx: &mut TestAppContext,
     counts: bool,
+) -> (tempfile::TempDir, Entity<Shell>, &mut VisualTestContext) {
+    fixture_with(cx, counts, |_| {})
+}
+/// `edit` changes the fixture's `workspaces.json` document before it is loaded.
+pub(crate) fn fixture_with(
+    cx: &mut TestAppContext,
+    counts: bool,
+    edit: impl FnOnce(&mut serde_json::Value),
 ) -> (tempfile::TempDir, Entity<Shell>, &mut VisualTestContext) {
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
@@ -97,6 +105,13 @@ fn fixture_catalog(
             watch.prs.insert(pr.key.id(), pr);
         }
         watch.save(&WatchFile::path_in(&source)).unwrap();
+    }
+    {
+        let path = source.join("workspaces.json");
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        edit(&mut file);
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
     }
     let mut store = preview::tests::guarded_store(&root.path().join("preview"));
     let model = workspace_config::load_iced_workspaces_from(&mut store, &source);
@@ -346,20 +361,6 @@ fn missing_host_controls_keep_iced_controls_and_report_unavailable(cx: &mut Test
     cx.read(|cx| assert!(!shell.read(cx).usage_open));
     assert!(cx.debug_bounds("pstrip-ready").is_none());
     assert!(cx.debug_bounds("pstrip-parked").is_none());
-    cx.update(|window, cx| {
-        shell.update(cx, |shell, cx| {
-            for (outcome, label) in [
-                (workspace_bar::Outcome::OpenReady, "Ready"),
-                (workspace_bar::Outcome::OpenParked, "Parked"),
-            ] {
-                shell.bar_outcome(outcome, window, cx);
-                assert_eq!(
-                    shell.owner.read(cx).error,
-                    Some(format!("{label} · unavailable in preview"))
-                );
-            }
-        })
-    });
 }
 
 #[gpui::test]

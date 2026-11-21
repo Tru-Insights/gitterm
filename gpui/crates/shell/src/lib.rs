@@ -2008,8 +2008,8 @@ impl Shell {
                     match outcome {
                         O::NewWork => shell.open_recent_work_sheet(window, cx),
                         O::OpenSettings(id) => shell.open_settings_sheet(id, window, cx),
-                        O::OpenReady => shell.chrome_unavailable("Ready", cx),
-                        O::OpenParked => shell.chrome_unavailable("Parked", cx),
+                        O::OpenReady => shell.open_ready_list(window, cx),
+                        O::OpenParked => shell.open_parked_list(window, cx),
                         O::Browser(workspace_bar::BrowserAction::Open) => {
                             shell.chrome_unavailable("Open browser", cx)
                         }
@@ -4035,7 +4035,6 @@ impl Render for Shell {
                                 .when(!self.usage_open, |area| {
                                     area.child("No local workspaces yet")
                                         .child(self.open_folder_button(cx))
-                                        .child(self.parked_controls(cx))
                                 })
                                 .children(
                                     self.owner

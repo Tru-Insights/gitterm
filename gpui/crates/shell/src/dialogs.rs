@@ -336,8 +336,6 @@ mod interaction_tests {
         let before = snapshot(dir.path());
         for (selector, label) in [
             ("pstrip-settings", "Workspace settings"),
-            ("pstrip-ready", "Ready"),
-            ("pstrip-parked", "Parked"),
             ("pstrip-browser", "Open browser"),
         ] {
             click(cx, selector);

@@ -330,6 +330,13 @@ impl WorkSidebar {
         self.loaded_at.is_some()
     }
 
+    /// Iced's chat index as last read for this workspace (empty until loaded).
+    pub fn indexed_chats(&self) -> &[gitterm_core::chats::ChatIndexEntry] {
+        self.previous_data
+            .as_ref()
+            .map_or(&[], |data| data.indexed_chats.as_slice())
+    }
+
     pub fn tasks(&self) -> &[gitterm_core::tasks::TaskRecord] {
         &self.tasks
     }
