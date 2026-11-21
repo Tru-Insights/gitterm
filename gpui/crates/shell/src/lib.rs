@@ -54,6 +54,7 @@ pub mod usage;
 pub mod work_sidebar;
 pub mod workspace_bar;
 pub mod workspace_config;
+pub mod workspace_settings_sheet;
 pub mod workspace_sheet;
 pub mod workspace_status;
 pub use owner::{FileOpen, WorkspaceOwner};
@@ -142,6 +143,8 @@ pub struct Shell {
     park_sheet: Option<Entity<park_sheet::ParkSheet>>,
     park_subscription: Option<Subscription>,
     new_work_sheet: Option<Entity<workspace_sheet::WorkspaceSheet>>,
+    settings_sheet: Option<Entity<workspace_settings_sheet::WorkspaceSettingsSheet>>,
+    settings_subscription: Option<Subscription>,
     new_work_subscription: Option<Subscription>,
     find_state: Rc<RefCell<find_sidebar::State>>,
     find_views: HashMap<String, find_sidebar::FindViews>,
@@ -395,6 +398,8 @@ impl Shell {
             park_sheet: None,
             park_subscription: None,
             new_work_sheet: None,
+            settings_sheet: None,
+            settings_subscription: None,
             new_work_subscription: None,
             find_state: Default::default(),
             find_views: HashMap::new(),
@@ -745,13 +750,16 @@ impl Shell {
         {
             return;
         }
-        if Some(id) != self.active_workspace(cx) || self.new_work_sheet.is_some() {
+        if Some(id) != self.active_workspace(cx) || self.new_work_sheet.is_some()
+            || self.settings_sheet.is_some() {
             self.session_picker = None;
             self.picker_subscription = None;
             self.park_sheet = None;
             self.park_subscription = None;
             self.new_work_sheet = None;
             self.new_work_subscription = None;
+            self.settings_sheet = None;
+            self.settings_subscription = None;
             self.cover_sheet(false, window, cx);
         }
         self.owner.update(cx, |owner, cx| {
@@ -1941,7 +1949,7 @@ impl Shell {
                     use workspace_bar::Outcome as O;
                     match outcome {
                         O::NewWork => shell.open_recent_work_sheet(window, cx),
-                        O::OpenSettings(_) => shell.chrome_unavailable("Workspace settings", cx),
+                        O::OpenSettings(id) => shell.open_settings_sheet(id, window, cx),
                         O::OpenReady => shell.chrome_unavailable("Ready", cx),
                         O::OpenParked => shell.chrome_unavailable("Parked", cx),
                         O::Browser(workspace_bar::BrowserAction::Open) => {
@@ -3019,6 +3027,7 @@ impl Shell {
             || self.session_picker.is_some()
             || self.park_sheet.is_some()
             || self.new_work_sheet.is_some()
+            || self.settings_sheet.is_some()
             || Self::has_dialog(window, cx);
         if !modal {
             context.push_str(" IcedMain");
@@ -3632,6 +3641,7 @@ impl Shell {
         if self.session_picker.is_some()
             || self.park_sheet.is_some()
             || self.new_work_sheet.is_some()
+            || self.settings_sheet.is_some()
             || Self::has_dialog(window, cx)
         {
             cx.propagate();
@@ -3717,6 +3727,7 @@ impl Shell {
             && self.session_picker.is_none()
             && self.park_sheet.is_none()
             && self.new_work_sheet.is_none()
+            && self.settings_sheet.is_none()
             && !Self::has_dialog(window, cx)
             && self.bar_menu.is_none()
             && self.focused_chat(window, cx).is_some()
@@ -3728,6 +3739,7 @@ impl Shell {
             && self.session_picker.is_none()
             && self.park_sheet.is_none()
             && self.new_work_sheet.is_none()
+            && self.settings_sheet.is_none()
             && !Self::has_dialog(window, cx)
             && self
                 .bottom
@@ -3740,6 +3752,7 @@ impl Shell {
             && (self.session_picker.is_some()
                 || self.park_sheet.is_some()
                 || self.new_work_sheet.is_some()
+            || self.settings_sheet.is_some()
                 || Self::has_dialog(window, cx)
                 || self
                     .focused_terminal(window, cx)
@@ -3837,7 +3850,8 @@ impl Render for Shell {
                 || self.usage_open
                 || self.session_picker.is_some()
                 || self.park_sheet.is_some()
-                || self.new_work_sheet.is_some();
+                || self.new_work_sheet.is_some()
+            || self.settings_sheet.is_some();
             content.sync_covers(window, cx);
         });
         self.ensure_work_sidebars(window, cx);
@@ -4037,6 +4051,7 @@ impl Render for Shell {
             .children(self.session_picker.clone())
             .children(self.park_sheet.clone())
             .children(self.new_work_sheet.clone())
+            .children(self.settings_sheet.clone())
             .children(self.task_switcher.clone())
             .when(self.plans_open, |view| view.child(self.plans_viewer(cx)))
             .into_any_element()
@@ -4191,6 +4206,8 @@ impl Shell {
         self.picker_subscription = None;
         self.park_sheet = None;
         self.park_subscription = None;
+        self.settings_sheet = None;
+        self.settings_subscription = None;
         let owner = self.owner.read(cx);
         let saved = owner
             .iced_catalog()
