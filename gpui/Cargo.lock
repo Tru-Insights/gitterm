@@ -2852,6 +2852,7 @@ dependencies = [
  "shell-words",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "toml 0.8.23",
 ]
 
