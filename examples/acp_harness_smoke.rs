@@ -233,6 +233,7 @@ async fn main() {
         "acp-smoke",
         task_commands,
         gitterm::browser_control::html_preview_runner(),
+        env!("CARGO_PKG_VERSION"),
     )
     .expect("reserve task MCP endpoint");
     tokio::spawn(task_server.run());

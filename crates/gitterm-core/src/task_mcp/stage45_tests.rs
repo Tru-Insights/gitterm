@@ -7,12 +7,12 @@ use serde_json::json;
 #[tokio::test]
 async fn stage45_task_tools_wire_and_batch_order() {
     let rows: Vec<Value> = serde_json::from_str(include_str!(
-        "../../tests/fixtures/stage45/tasks/tools.wire.json"
+        "../../../../tests/fixtures/stage45/tasks/tools.wire.json"
     ))
     .unwrap();
     for row in rows {
         let (commands, mut receiver) = command_channel();
-        let tool = TaskMcpTools::new(commands, refused_html_preview());
+        let tool = TaskMcpTools::new(commands, refused_html_preview(), TEST_SERVER_VERSION);
         let expected = row.clone();
         let bridge = tokio::spawn(async move {
             let envelope = receiver.recv().await.unwrap();
@@ -70,7 +70,7 @@ async fn stage45_task_tools_wire_and_batch_order() {
     }
 
     let (commands, mut receiver) = command_channel();
-    let tool = TaskMcpTools::new(commands, refused_html_preview());
+    let tool = TaskMcpTools::new(commands, refused_html_preview(), TEST_SERVER_VERSION);
     let bridge = tokio::spawn(async move {
         let first = receiver.recv().await.unwrap();
         assert!(receiver.try_recv().is_err(), "batch waits for each reply");
@@ -145,7 +145,7 @@ async fn stage45_mcp_dispatch_order_caller_ack_and_errors() {
     drop(receiver);
     trace.push(json!({"point":"bridge closed","error":dispatch_operation(&commands,TaskControlOperation::PlanLimits,None).await.unwrap_err()}));
     let (sender, mut requests) = command_channel();
-    let tools = TaskMcpTools::new(sender, refused_html_preview());
+    let tools = TaskMcpTools::new(sender, refused_html_preview(), TEST_SERVER_VERSION);
     let (parts, _) = Request::builder()
         .uri("/mcp")
         .body(())
@@ -157,7 +157,7 @@ async fn stage45_mcp_dispatch_order_caller_ack_and_errors() {
     trace.push(json!({"point":"missing caller","is_error":result.is_error,"forwarded":requests.try_recv().is_ok(),"content":serde_json::to_value(result.content).unwrap()}));
     trace.push(json!({"point":"timeout configuration","seconds":COMMAND_TIMEOUT.as_secs()}));
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/stage45/tasks/mcp.trace.json");
+        .join("../../tests/fixtures/stage45/tasks/mcp.trace.json");
     let expected: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     let actual = json!(trace);
     assert_eq!(actual, expected);

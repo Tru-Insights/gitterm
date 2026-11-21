@@ -40,6 +40,8 @@ pub mod workers;
 #[cfg(feature = "runtime")]
 pub mod gh_identity;
 #[cfg(feature = "runtime")]
+pub mod task_mcp;
+#[cfg(feature = "runtime")]
 pub mod task_worktree;
 
 pub mod chat_facts;

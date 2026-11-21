@@ -21344,6 +21344,7 @@ impl App {
             config::instance_id(),
             task_commands,
             gitterm::browser_control::html_preview_runner(),
+            env!("CARGO_PKG_VERSION"),
         ) {
             Ok((connection, server)) => {
                 eprintln!("GitTerm V6 task MCP reserved at {}", connection.endpoint());

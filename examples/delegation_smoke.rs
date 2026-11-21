@@ -143,6 +143,7 @@ async fn smoke(workdir: &Path) -> Result<(), String> {
         "delegation-smoke",
         commands,
         gitterm::browser_control::html_preview_runner(),
+        env!("CARGO_PKG_VERSION"),
     )
     .map_err(|error| error.to_string())?;
     tokio::spawn(server.run());
