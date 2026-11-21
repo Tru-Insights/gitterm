@@ -215,6 +215,7 @@ fn headless(fixture: &Path) -> App {
         chat_index: Arc::default(),
         workspace_overviews: HashMap::new(),
         workspace_overview_summary_generation: 0,
+        workspace_repo_joins_generation: 0,
         workspace_overview_presentations: HashMap::new(),
         work_documents: HashMap::new(),
         work_document_copies_open: None,
@@ -259,6 +260,7 @@ fn headless(fixture: &Path) -> App {
         codex_exec_polling: false,
         codex_exec_has_runs: false,
         chat_overview_cache: ChatOverviewCache::default(),
+        task_attention_cache: TaskAttentionCache::default(),
         chat_overview_idle_expanded: false,
         roster_reveal_held: HashMap::new(),
         chat_preview: None,
@@ -1204,3 +1206,144 @@ fn status_file_order_and_hash_traces() {
 
 #[path = "stage45/mod.rs"]
 mod stage45;
+
+#[test]
+fn repo_joins_read_off_thread_apply_only_when_latest() {
+    if isolated("repo_joins_read_off_thread_apply_only_when_latest") {
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(fixture.path());
+    let uid = app.workspaces[0].uid;
+    let joined = fixture.path().join("joined");
+    let removed = fixture.path().join("removed");
+    std::fs::create_dir(&joined).unwrap();
+    std::fs::create_dir(&removed).unwrap();
+    let listed = |app: &App| -> Vec<PathBuf> {
+        app.workspaces[0]
+            .repos
+            .iter()
+            .filter_map(|id| app.repos.get(*id))
+            .map(|repo| repo.dir.clone())
+            .collect()
+    };
+    let before = listed(&app);
+    let _ = app.sync_workspace_repos();
+    let stale = app.workspace_repo_joins_generation;
+    let _ = app.sync_workspace_repos();
+    let latest = app.workspace_repo_joins_generation;
+    let _ = app.update_event(Event::WorkspaceRepoJoinsRead(
+        stale,
+        Ok(vec![(uid, vec![joined.clone()])]),
+    ));
+    assert_eq!(listed(&app), before, "a superseded read must not apply");
+    // A repo removed by hand while the read ran stays out.
+    app.workspaces[0].repos_removed.push(removed.clone());
+    let _ = app.update_event(Event::WorkspaceRepoJoinsRead(
+        latest,
+        Ok(vec![(uid, vec![removed, joined.clone()])]),
+    ));
+    let mut expected = before.clone();
+    expected.push(joined);
+    assert_eq!(listed(&app), expected);
+    assert_eq!(app.workspaces[0].joined_note.len(), 1);
+    let _ = app.update_event(Event::WorkspaceRepoJoinsRead(
+        latest,
+        Err("fixture failure".into()),
+    ));
+    assert_eq!(listed(&app), expected);
+}
+
+#[test]
+fn task_and_tab_changes_reach_the_next_attention_items() {
+    if isolated("task_and_tab_changes_reach_the_next_attention_items") {
+        return;
+    }
+    use gitterm::tasks::{GitBase, RepositoryIdentity, TaskAttentionReason};
+    let fixture = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(fixture.path());
+    let mut store = TaskStore::load(fixture.path().join("tasks.json")).unwrap();
+    let mut task = TaskRecord::new_draft(
+        NewTaskRecord {
+            task_id: "T1".into(),
+            title: "First title".into(),
+            objective: "Implement a change".into(),
+            workspace: TaskWorkspaceIdentity {
+                name: "beta".into(),
+                location: WorkspaceLocationIdentity::Local {
+                    directory: PathBuf::from("/fixture/beta/sub"),
+                },
+            },
+            repository: RepositoryIdentity {
+                common_dir: fixture.path().join(".git"),
+                remote_url: None,
+            },
+            issue: None,
+            base: GitBase {
+                reference: "v6".into(),
+                commit: "0123456789abcdef".into(),
+            },
+            branch: "task/T1".into(),
+            executor: ExecutorTarget::Local,
+            harness: None,
+            stopping_boundary: StoppingBoundary::ImplementUntilTestsPass,
+        },
+        "2026-01-01T00:00:00Z",
+    );
+    task.attention.reason = Some(TaskAttentionReason::RequiresInput);
+    task.attention.since = Some("2026-01-01T00:00:00Z".into());
+    store.insert(task.clone()).unwrap();
+    *app.task_host.store_mut() = Some(store);
+    let task_row = |app: &App| {
+        app.attention_items()
+            .into_iter()
+            .find(|item| item.target == AttentionTarget::Task("T1".into()))
+            .map(|item| {
+                (
+                    item.title,
+                    item.workspace_idx,
+                    item.waiting > Duration::ZERO,
+                )
+            })
+    };
+    assert_eq!(task_row(&app), Some(("First title".into(), Some(1), true)));
+
+    // A task store write shows up in the next read.
+    task.title = "Second title".into();
+    app.task_host
+        .store_mut()
+        .as_mut()
+        .unwrap()
+        .replace(task.clone())
+        .unwrap();
+    assert_eq!(task_row(&app), Some(("Second title".into(), Some(1), true)));
+
+    // A workspace that starts owning chats stops taking tasks by folder.
+    app.workspaces[1].chats = vec!["owned-chat".into()];
+    assert_eq!(task_row(&app), Some(("Second title".into(), None, true)));
+    app.workspaces[1].chats.clear();
+    // Moving a workspace moves the row's index with it.
+    app.workspaces.swap(0, 1);
+    assert_eq!(task_row(&app), Some(("Second title".into(), Some(0), true)));
+
+    // A session tab surfacing live attention replaces the task row.
+    let tab = &mut app.workspaces[2].tabs[0];
+    tab.task_id = Some("T1".into());
+    tab.attention = Some(TabAttention::new(AttentionReason::HumanInputRequired));
+    let tab_id = tab.id;
+    assert_eq!(task_row(&app), None);
+    assert!(app
+        .attention_items()
+        .iter()
+        .any(|item| item.target == AttentionTarget::Tab(tab_id)));
+    app.workspaces[2].tabs[0].attention = None;
+    assert!(task_row(&app).is_some());
+
+    // A reloaded store is read again even with no write in between.
+    task.attention.reason = None;
+    let reloaded = fixture.path().join("reloaded.json");
+    let mut other = TaskStore::load(&reloaded).unwrap();
+    other.insert(task).unwrap();
+    *app.task_host.store_mut() = Some(TaskStore::load(&reloaded).unwrap());
+    assert_eq!(task_row(&app), None);
+}

@@ -4243,6 +4243,53 @@ type ChatOverviewCache =
 type ChatDigestCache =
     std::cell::RefCell<HashMap<usize, (u64, Instant, std::rc::Rc<chat_summary::ChatDigest>)>>;
 
+/// The attention list's task rows (TRU-274), built for the task store
+/// revision and workspace layout they were read with. A cell because
+/// `view` takes `&self`; building walks every task and canonicalizes each
+/// attention task's directory, too slow for every frame.
+type TaskAttentionCache = std::cell::RefCell<Option<TaskAttentionRows>>;
+
+struct TaskAttentionRows {
+    revision: u64,
+    /// Per open workspace, what its task-row ownership reads: local, owns
+    /// chats, folder.
+    workspaces: Vec<(bool, bool, PathBuf)>,
+    rows: Vec<TaskAttentionRow>,
+}
+
+impl TaskAttentionRows {
+    fn workspace_key(ws: &Workspace) -> (bool, bool, &Path) {
+        (
+            matches!(ws.location, WorkspaceLocation::Local { .. }),
+            ws.owns_chats(),
+            ws.dir.as_path(),
+        )
+    }
+
+    fn built_for(&self, revision: u64, workspaces: &[Workspace]) -> bool {
+        self.revision == revision
+            && self.workspaces.len() == workspaces.len()
+            && self
+                .workspaces
+                .iter()
+                .zip(workspaces)
+                .all(|((local, owns, dir), ws)| {
+                    (*local, *owns, dir.as_path()) == Self::workspace_key(ws)
+                })
+    }
+}
+
+/// A task's attention row without its age, which moves every frame.
+struct TaskAttentionRow {
+    task_id: String,
+    workspace_idx: Option<usize>,
+    title: String,
+    priority: u8,
+    icon: &'static str,
+    label: &'static str,
+    raised_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Least time between two overview snapshot builds. A streaming chat
 /// changes the key on every delta; the menu poll redraws every
 /// `MENU_POLL_INTERVAL_MS`, so the overview trails by well under a second.
@@ -7351,6 +7398,9 @@ pub enum Event {
     /// A background refresh finished: workspace dir, generation, result.
     WorkspaceOverviewRefreshed(OverviewKey, u64, Box<overview::RefreshOutcome>),
     WorkspaceOverviewSummaryBuilt(OverviewKey, u64, Box<Result<overview::WorkSummary, String>>),
+    /// The repos open work workspaces' chats joined, read off the UI
+    /// thread, with the read's generation.
+    WorkspaceRepoJoinsRead(u64, Result<Vec<(u64, Vec<PathBuf>)>, String>),
     /// Open a coordinator's conversation in the main area; the sidebar
     /// stays on the overview.
     WorkspaceOverviewOpenChat(String),
@@ -7820,6 +7870,8 @@ struct App {
     workspace_overviews: HashMap<OverviewKey, WorkspaceOverviewState>,
     /// Survives overview removal so a recreated owner cannot accept an old job.
     workspace_overview_summary_generation: u64,
+    /// Bumped per repo-join read; only the latest read's result applies.
+    workspace_repo_joins_generation: u64,
     /// Fold and row disclosure state belongs to a workspace, even when its
     /// overview summary is shared with another folder-scoped workspace.
     workspace_overview_presentations: HashMap<u64, WorkspaceOverviewPresentation>,
@@ -7927,6 +7979,7 @@ struct App {
     /// in `view` on first need and rebuilt only when the key changes, so a
     /// frame costs a cheap key, not a walk of every conversation.
     chat_overview_cache: ChatOverviewCache,
+    task_attention_cache: TaskAttentionCache,
     /// The overview's "Idle but open" section is unfolded (folded by
     /// default; per app run).
     chat_overview_idle_expanded: bool,
@@ -9331,75 +9384,114 @@ fn sync_task_sessions_from_chat_index(
     }
 }
 
+/// [`RepoJoinPlan`] read in place; the app reads it off the UI thread.
+#[cfg(test)]
 fn workspace_repo_joins(
     chat_index: &[chats::ChatIndexEntry],
     workspaces: &[Workspace],
     repos: &RepoRegistry,
     task_store: Option<&TaskStore>,
 ) -> Vec<(u64, Vec<PathBuf>)> {
-    let task_worktrees = task_store
-        .map(|store| {
-            store
-                .tasks()
-                .iter()
-                .filter_map(|task| task.worktree.path.clone())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let canonical = |dir: &Path| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    let mut joins: Vec<(u64, Vec<PathBuf>)> = Vec::new();
-    for ws in workspaces {
-        if !ws.is_work() || !matches!(ws.location, WorkspaceLocation::Local { .. }) {
-            continue;
-        }
-        let work = if ws.owns_chats() {
-            overview::chats_under(chat_index, &ws.chats)
-        } else {
-            overview::work_chats(chat_index, &ws.dir)
-        };
-        let workers: Vec<PathBuf> = work
+    RepoJoinPlan::new(workspaces, repos, task_store).joins(chat_index)
+}
+
+/// What [`workspace_repo_joins`] reads, owned so its git and filesystem
+/// work (a `git rev-parse` per candidate worktree) runs off the UI thread.
+struct RepoJoinPlan {
+    workspaces: Vec<RepoJoinWorkspace>,
+    tasks: Vec<TaskRecord>,
+    delegations: Vec<gitterm::tasks::Delegation>,
+}
+
+/// An open local work workspace as the join reads it.
+struct RepoJoinWorkspace {
+    uid: u64,
+    chats: Vec<String>,
+    dir: PathBuf,
+    listed: Vec<PathBuf>,
+    removed: Vec<PathBuf>,
+}
+
+impl RepoJoinPlan {
+    fn new(workspaces: &[Workspace], repos: &RepoRegistry, task_store: Option<&TaskStore>) -> Self {
+        let workspaces = workspaces
             .iter()
-            .filter_map(|entry| entry.facts.as_ref())
-            .flat_map(|facts| facts.children.iter())
-            .filter(|child| child.kind == chat_facts::ChildKind::Worker)
-            .filter_map(|child| child.task_id.as_deref())
-            .filter_map(|task_id| task_store?.get(task_id))
-            .filter_map(|task| task_main_checkout(&task.repository.common_dir))
+            .filter(|ws| ws.is_work() && matches!(ws.location, WorkspaceLocation::Local { .. }))
+            .map(|ws| RepoJoinWorkspace {
+                uid: ws.uid,
+                chats: ws.chats.clone(),
+                dir: ws.dir.clone(),
+                listed: ws
+                    .repos
+                    .iter()
+                    .filter_map(|id| repos.get(*id))
+                    .map(|repo| repo.dir.clone())
+                    .collect(),
+                removed: ws.repos_removed.clone(),
+            })
             .collect();
-        let delegated = task_store.map_or_else(Vec::new, |store| {
-            gitterm::workspace_repos::delegation_targets(&work, store.delegations(), store.tasks())
-        });
-        // A linked worktree (an agent-made one too) joins as its main
-        // checkout (TRU-191); a checkout since deleted does not join.
-        let candidates: Vec<PathBuf> = gitterm::workspace_repos::fold_worktrees(
-            gitterm::workspace_repos::auto_repo_candidates(
-                &work,
-                &workers,
-                &task_worktrees,
-                &delegated,
-            )
-            .into_iter()
-            .filter(|dir| dir.is_dir()),
-        );
-        let listed: Vec<PathBuf> = ws
-            .repos
-            .iter()
-            .filter_map(|id| repos.get(*id))
-            .map(|repo| canonical(&repo.dir))
-            .collect();
-        let removed: Vec<PathBuf> = ws.repos_removed.iter().map(|d| canonical(d)).collect();
-        let (_, joined) = gitterm::workspace_repos::derive_repo_list(
-            &canonical(&ws.dir),
-            &listed,
-            &candidates,
-            &[],
-            &removed,
-        );
-        if !joined.is_empty() {
-            joins.push((ws.uid, joined));
+        Self {
+            workspaces,
+            tasks: task_store.map_or_else(Vec::new, |store| store.tasks().to_vec()),
+            delegations: task_store.map_or_else(Vec::new, |store| store.delegations().to_vec()),
         }
     }
-    joins
+
+    /// Blocking: canonicalizes and runs git per candidate.
+    fn joins(&self, chat_index: &[chats::ChatIndexEntry]) -> Vec<(u64, Vec<PathBuf>)> {
+        let task_worktrees: Vec<PathBuf> = self
+            .tasks
+            .iter()
+            .filter_map(|task| task.worktree.path.clone())
+            .collect();
+        let task = |task_id: &str| self.tasks.iter().find(|task| task.task_id == task_id);
+        let canonical =
+            |dir: &Path| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let mut joins: Vec<(u64, Vec<PathBuf>)> = Vec::new();
+        for ws in &self.workspaces {
+            let work = if !ws.chats.is_empty() {
+                overview::chats_under(chat_index, &ws.chats)
+            } else {
+                overview::work_chats(chat_index, &ws.dir)
+            };
+            let workers: Vec<PathBuf> = work
+                .iter()
+                .filter_map(|entry| entry.facts.as_ref())
+                .flat_map(|facts| facts.children.iter())
+                .filter(|child| child.kind == chat_facts::ChildKind::Worker)
+                .filter_map(|child| child.task_id.as_deref())
+                .filter_map(task)
+                .filter_map(|task| task_main_checkout(&task.repository.common_dir))
+                .collect();
+            let delegated =
+                gitterm::workspace_repos::delegation_targets(&work, &self.delegations, &self.tasks);
+            // A linked worktree (an agent-made one too) joins as its main
+            // checkout (TRU-191); a checkout since deleted does not join.
+            let candidates: Vec<PathBuf> = gitterm::workspace_repos::fold_worktrees(
+                gitterm::workspace_repos::auto_repo_candidates(
+                    &work,
+                    &workers,
+                    &task_worktrees,
+                    &delegated,
+                )
+                .into_iter()
+                .filter(|dir| dir.is_dir()),
+            );
+            let listed: Vec<PathBuf> = ws.listed.iter().map(|dir| canonical(dir)).collect();
+            let removed: Vec<PathBuf> = ws.removed.iter().map(|d| canonical(d)).collect();
+            let (_, joined) = gitterm::workspace_repos::derive_repo_list(
+                &canonical(&ws.dir),
+                &listed,
+                &candidates,
+                &[],
+                &removed,
+            );
+            if !joined.is_empty() {
+                joins.push((ws.uid, joined));
+            }
+        }
+        joins
+    }
 }
 
 /// An owned snapshot for the summary's CPU work; the index itself is shared.
@@ -15569,15 +15661,56 @@ impl App {
     /// in first-touch order, minus those removed by hand. Runs when the
     /// chat index lands; a folder-scoped workspace lists only its home
     /// and what was added by hand.
-    fn sync_workspace_repos(&mut self) {
-        let joins = workspace_repo_joins(
-            &self.chat_index,
+    fn sync_workspace_repos(&mut self) -> Task<Event> {
+        self.workspace_repo_joins_generation += 1;
+        let generation = self.workspace_repo_joins_generation;
+        let plan = RepoJoinPlan::new(
             &self.workspaces,
             &self.repos,
             self.task_host.store().as_ref(),
         );
+        let chat_index = Arc::clone(&self.chat_index);
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || plan.joins(&chat_index))
+                    .await
+                    .map_err(|error| format!("workspace repo joins task failed: {error}"))
+            },
+            move |result| Event::WorkspaceRepoJoinsRead(generation, result),
+        )
+    }
+
+    /// Applies joins read off the UI thread. A newer read supersedes this
+    /// one; a repo listed or removed by hand meanwhile is left as it is.
+    fn apply_workspace_repo_joins(
+        &mut self,
+        generation: u64,
+        result: Result<Vec<(u64, Vec<PathBuf>)>, String>,
+    ) {
+        if generation != self.workspace_repo_joins_generation {
+            return;
+        }
+        let joins = match result {
+            Ok(joins) => joins,
+            Err(error) => {
+                eprintln!("[workspace] {error}");
+                return;
+            }
+        };
         for (uid, dirs) in joins {
             for dir in dirs {
+                let settled = self.workspace_index_by_uid(uid).is_some_and(|idx| {
+                    let ws = &self.workspaces[idx];
+                    ws.repos_removed.contains(&dir)
+                        || ws
+                            .repos
+                            .iter()
+                            .filter_map(|id| self.repos.get(*id))
+                            .any(|repo| repo.dir == dir)
+                });
+                if settled {
+                    continue;
+                }
                 let Some(id) = self.add_repo_to_workspace(uid, dir.clone()) else {
                     continue;
                 };
@@ -21449,6 +21582,7 @@ impl App {
             chat_index: Arc::default(),
             workspace_overviews: HashMap::new(),
             workspace_overview_summary_generation: 0,
+            workspace_repo_joins_generation: 0,
             workspace_overview_presentations: HashMap::new(),
             work_documents: HashMap::new(),
             work_document_copies_open: None,
@@ -21495,6 +21629,7 @@ impl App {
             codex_exec_polling: false,
             codex_exec_has_runs: false,
             chat_overview_cache: ChatOverviewCache::default(),
+            task_attention_cache: TaskAttentionCache::default(),
             chat_overview_idle_expanded: false,
             roster_reveal_held: HashMap::new(),
             chat_preview: None,
@@ -23357,30 +23492,53 @@ fi
         // tab row above is the more precise entry for the same thing.
         if let Some(store) = self.task_host.store().as_ref() {
             let tabbed_task_ids = self.task_ids_with_tab_attention();
-            for task in store.tasks() {
-                if task.lifecycle == TaskLifecycle::Archived
-                    || tabbed_task_ids.contains(task.task_id.as_str())
-                {
+            let mut cache = self.task_attention_cache.borrow_mut();
+            if !cache
+                .as_ref()
+                .is_some_and(|rows| rows.built_for(store.revision(), &self.workspaces))
+            {
+                *cache = Some(self.task_attention_rows(store));
+            }
+            for row in cache.iter().flat_map(|rows| &rows.rows) {
+                if tabbed_task_ids.contains(row.task_id.as_str()) {
                     continue;
                 }
-                let Some(reason) = task.attention.reason else {
-                    continue;
-                };
+                let waiting = row
+                    .raised_at
+                    .and_then(|raised| now_utc.signed_duration_since(raised).to_std().ok())
+                    .unwrap_or_default();
+                items.push(AttentionItem {
+                    target: AttentionTarget::Task(row.task_id.clone()),
+                    workspace_idx: row.workspace_idx,
+                    title: row.title.clone(),
+                    priority: row.priority,
+                    icon: row.icon,
+                    label: row.label,
+                    waiting,
+                });
+            }
+        }
+        sort_attention_items(&mut items);
+        items
+    }
+
+    /// [`TaskAttentionRows`] for `store` and the open workspaces.
+    fn task_attention_rows(&self, store: &TaskStore) -> TaskAttentionRows {
+        let rows = store
+            .tasks()
+            .iter()
+            .filter(|task| task.lifecycle != TaskLifecycle::Archived)
+            .filter_map(|task| {
+                let reason = task.attention.reason?;
                 let (priority, icon, label) = task_attention_presentation(reason);
                 // Age from when the reason was raised, not `updated_at` —
                 // that bumps on every progress write and would walk the row
                 // around the list while the agent works (TRU-133). Records
                 // written before `since` existed fall back to `updated_at`.
                 let raised_at = task.attention.since.as_deref().unwrap_or(&task.updated_at);
-                let waiting = chrono::DateTime::parse_from_rfc3339(raised_at)
+                let raised_at = chrono::DateTime::parse_from_rfc3339(raised_at)
                     .ok()
-                    .and_then(|raised| {
-                        now_utc
-                            .signed_duration_since(raised.with_timezone(&chrono::Utc))
-                            .to_std()
-                            .ok()
-                    })
-                    .unwrap_or_default();
+                    .map(|raised| raised.with_timezone(&chrono::Utc));
                 let title = match &task.issue {
                     Some(issue) => format!("{} {}", issue.key, task.title),
                     None => task.title.clone(),
@@ -23391,19 +23549,29 @@ fi
                     }
                     WorkspaceLocationIdentity::RemoteAgent { .. } => None,
                 };
-                items.push(AttentionItem {
-                    target: AttentionTarget::Task(task.task_id.clone()),
+                Some(TaskAttentionRow {
+                    task_id: task.task_id.clone(),
                     workspace_idx,
                     title,
                     priority,
                     icon,
                     label,
-                    waiting,
-                });
-            }
+                    raised_at,
+                })
+            })
+            .collect();
+        TaskAttentionRows {
+            revision: store.revision(),
+            workspaces: self
+                .workspaces
+                .iter()
+                .map(|ws| {
+                    let (local, owns, dir) = TaskAttentionRows::workspace_key(ws);
+                    (local, owns, dir.to_path_buf())
+                })
+                .collect(),
+            rows,
         }
-        sort_attention_items(&mut items);
-        items
     }
 
     /// Every open tab across the local workspaces that the Chats panel's
@@ -30851,10 +31019,10 @@ fi
                     freeze_time!("chat_index_park_note", {
                         self.refill_park_note();
                     });
-                    // Work workspaces list the repos their chats touched (TRU-180).
-                    freeze_time!("chat_index_repo_joins", {
-                        self.sync_workspace_repos();
-                    });
+                    // Work workspaces list the repos their chats touched
+                    // (TRU-180), read off the UI thread (TRU-274).
+                    let repo_joins =
+                        freeze_time!("chat_index_repo_joins", { self.sync_workspace_repos() });
                     // PR homes read the index's facts (TRU-173).
                     freeze_time!("chat_index_pr_homes", {
                         self.prs.homes_built = None;
@@ -30901,7 +31069,7 @@ fi
                         offers
                     });
                     let rank = freeze_time!("chat_index_rank", { self.request_chat_rank() });
-                    Task::batch([rank, overview_summary, Task::batch(offers)])
+                    Task::batch([rank, overview_summary, repo_joins, Task::batch(offers)])
                 });
             }
             Event::ChatsQueryChanged(query) => {
@@ -31133,6 +31301,9 @@ fi
                 self.work_document_copies_open = (self.work_document_copies_open.as_deref()
                     != Some(key.as_str()))
                 .then_some(key);
+            }
+            Event::WorkspaceRepoJoinsRead(generation, result) => {
+                self.apply_workspace_repo_joins(generation, result);
             }
             Event::WorkspaceOverviewSummaryBuilt(key, generation, result) => match *result {
                 Ok(summary) => {

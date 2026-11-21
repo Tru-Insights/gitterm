@@ -529,11 +529,50 @@ fn scan_issue_keys(text: &str, whole_token: bool) -> Vec<String> {
     keys
 }
 
-/// Issue keys in a branch or folder name, which are usually lowercase
-/// (`tracey/tru-166-chat-facts`, `blobfs-prj-102`); returned uppercase.
-/// Names are hyphen-joined words, so a key may sit between separators here.
+/// The issue key a branch or folder name carries, which is usually
+/// lowercase (`tracey/tru-166-chat-facts`, `blobfs-prj-102`); returned
+/// uppercase. Names are hyphen-joined words, so a key may sit between
+/// separators here. Only the first key counts: words after it read like
+/// keys too (`tru-274-stage-5-pr-17`). A UUID (a task branch's id) is
+/// skipped, since its hex groups can (`e5f6-4504`).
 pub fn issue_keys_in_name(name: &str) -> Vec<String> {
-    scan_issue_keys(&name.to_ascii_uppercase(), false)
+    let mut upper = name.to_ascii_uppercase().into_bytes();
+    blank_uuids(&mut upper);
+    let upper = String::from_utf8(upper).expect("blanking ASCII keeps UTF-8");
+    scan_issue_keys(&upper, false).into_iter().take(1).collect()
+}
+
+/// Overwrites each standalone UUID (`8-4-4-4-12` hex digits) with `/`.
+fn blank_uuids(bytes: &mut [u8]) {
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    let uuid_len = |at: &[u8]| -> Option<usize> {
+        let mut len = 0;
+        for (index, group) in GROUPS.iter().enumerate() {
+            if index > 0 {
+                if at.get(len) != Some(&b'-') {
+                    return None;
+                }
+                len += 1;
+            }
+            let hex = at.get(len..len + group)?;
+            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
+            len += group;
+        }
+        (!at.get(len).is_some_and(u8::is_ascii_alphanumeric)).then_some(len)
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        if i == 0 || !bytes[i - 1].is_ascii_alphanumeric() {
+            if let Some(len) = uuid_len(&bytes[i..]) {
+                bytes[i..i + len].fill(b'/');
+                i += len;
+                continue;
+            }
+        }
+        i += 1;
+    }
 }
 
 /// Length of a key starting at `bytes[0]`, if one does, with nothing
@@ -715,6 +754,32 @@ fn root_of(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_give_their_first_issue_key_and_never_a_uuid_piece() {
+        for (name, keys) in [
+            ("TRU-274-tru-274-stage-5-pr-17-delegation", vec!["TRU-274"]),
+            (
+                "task/0d59b300-9d11-4504-836a-6fb46ceb69d3-tru-274-task-host-h4b",
+                vec!["TRU-274"],
+            ),
+            // UUID groups that read like keys (`E5F6-4504`, `AB12CDEF-1234`).
+            (
+                "task/0d59b300-e5f6-4504-836a-6fb46ceb69d3-tru-274-task-host-h4b",
+                vec!["TRU-274"],
+            ),
+            (
+                "task/ab12cdef-1234-4504-836a-6fb46ceb69d3-tru-274-task-host-h4b",
+                vec!["TRU-274"],
+            ),
+            ("task/ab12cdef-1234-4504-836a-6fb46ceb69d3", vec![]),
+            ("tru-143/chips", vec!["TRU-143"]),
+            ("pr/TRU-293", vec!["TRU-293"]),
+            ("pr/task-host-h4b", vec![]),
+        ] {
+            assert_eq!(issue_keys_in_name(name), keys, "{name}");
+        }
+    }
     #[test]
     fn facts_read_errors_and_legacy_shape_stay_distinct() {
         let temp = tempfile::tempdir().unwrap();

@@ -404,6 +404,38 @@ fn load_root_prs(
     prs
 }
 
+/// What resolving roots needs, built once per PR-homes rebuild.
+struct RootResolver {
+    /// Index chat id to its root; the first entry for an id wins, as a
+    /// front-to-back search of the index would.
+    index_roots: HashMap<String, String>,
+    links: Vec<chat_facts::ChildLink>,
+    branches: Vec<(TaskPrOrigin, TaskBranch)>,
+}
+
+impl RootResolver {
+    /// [`App::root_chat_of`] over the inputs read once.
+    fn root_of(&self, chat: &str) -> String {
+        match self.index_roots.get(chat) {
+            Some(root) => root.clone(),
+            None => root_through_links(&self.links, chat),
+        }
+    }
+}
+
+/// Follows `chat`'s parents through `links` to the top, stopping at a cycle.
+fn root_through_links(links: &[chat_facts::ChildLink], chat: &str) -> String {
+    let mut current = chat.to_string();
+    let mut seen: HashSet<String> = HashSet::from([current.clone()]);
+    while let Some(link) = links.iter().find(|link| link.child.session_id == current) {
+        if !seen.insert(link.parent.clone()) {
+            break;
+        }
+        current = link.parent.clone();
+    }
+    current
+}
+
 /// Facts, live tabs and cached task branches share one PR identity set.
 fn collect_root_prs(
     index: &[chats::ChatIndexEntry],
@@ -855,30 +887,48 @@ impl App {
         if let Some(entry) = self.chat_index.iter().find(|entry| entry.id == chat) {
             return entry.root_id.clone().unwrap_or_else(|| chat.to_string());
         }
-        let links = self.chat_child_links();
-        let mut current = chat.to_string();
-        let mut seen: HashSet<String> = HashSet::from([current.clone()]);
-        while let Some(link) = links.iter().find(|link| link.child.session_id == current) {
-            if !seen.insert(link.parent.clone()) {
-                break;
-            }
-            current = link.parent.clone();
-        }
-        current
+        root_through_links(&self.chat_child_links(), chat)
     }
 
     /// The PRs root `root`'s chats recorded: indexed and saved facts, what
     /// live tabs saw since, plus delegated tasks' cached branch PRs.
     fn root_fact_prs(&self, root: &str) -> Vec<PrRef> {
-        let branches = self
-            .task_host
-            .store()
-            .as_ref()
-            .map(|store| task_branches(store, chrono::Utc::now(), &self.chat_uid_to_chat()))
-            .unwrap_or_default();
-        collect_root_prs(&self.chat_index, root, &self.prs, &branches, |chat| {
-            self.root_chat_of(chat)
-        })
+        self.root_fact_prs_in(&self.root_resolver(), root)
+    }
+
+    fn root_fact_prs_in(&self, resolver: &RootResolver, root: &str) -> Vec<PrRef> {
+        collect_root_prs(
+            &self.chat_index,
+            root,
+            &self.prs,
+            &resolver.branches,
+            |chat| resolver.root_of(chat),
+        )
+    }
+
+    /// Tab and delegation parents, their child links and the recent task
+    /// branches, read once for a whole rebuild rather than per root and per
+    /// chat (each read walks every delegation).
+    fn root_resolver(&self) -> RootResolver {
+        let mut index_roots: HashMap<String, String> = HashMap::new();
+        for entry in self.chat_index.iter() {
+            index_roots
+                .entry(entry.id.clone())
+                .or_insert_with(|| entry.root_id.clone().unwrap_or_else(|| entry.id.clone()));
+        }
+        let uid_to_chat = self.chat_uid_to_chat();
+        let (links, branches) = match self.task_host.store() {
+            Some(store) => (
+                chat_facts::store_links(store.delegations(), store.tasks(), &uid_to_chat),
+                task_branches(store, chrono::Utc::now(), &uid_to_chat),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        RootResolver {
+            index_roots,
+            links,
+            branches,
+        }
     }
 
     fn rebuild_pr_homes(&mut self) {
@@ -911,15 +961,21 @@ impl App {
             }
         }
         let dir = chat_facts::facts_dir(&config::global_config_dir());
-        let links = self.chat_child_links();
+        let resolver = self.root_resolver();
         self.prs.saved_root_prs.clear();
         for (_, roots) in &mut homes {
             for root in roots {
-                let saved = load_root_prs(&dir, &self.chat_index, &links, &root.root, |message| {
-                    eprintln!("{message}");
-                });
+                let saved = load_root_prs(
+                    &dir,
+                    &self.chat_index,
+                    &resolver.links,
+                    &root.root,
+                    |message| {
+                        eprintln!("{message}");
+                    },
+                );
                 self.prs.saved_root_prs.insert(root.root.clone(), saved);
-                root.facts = self.root_fact_prs(&root.root);
+                root.facts = self.root_fact_prs_in(&resolver, &root.root);
             }
         }
         // A root a tab here hosts, with a plan or PRs the index does not
@@ -942,11 +998,11 @@ impl App {
                 .iter()
                 .filter_map(|tab| tab.chat_session_id.as_deref())
             {
-                let root = self.root_chat_of(chat);
+                let root = resolver.root_of(chat);
                 if listed.contains(&root) || added.contains(&root) {
                     continue;
                 }
-                let facts = self.root_fact_prs(&root);
+                let facts = self.root_fact_prs_in(&resolver, &root);
                 if facts.is_empty() && !self.prs.plans.contains_key(&root) {
                     continue;
                 }
@@ -3004,6 +3060,347 @@ mod tests {
             .contains("no GitTerm tab"));
         assert!(app.prs.plans.is_empty());
         assert!(!merge_plan::plans_dir(dir.path()).exists());
+    }
+
+    /// The rebuild before TRU-274 read links and task branches per root and
+    /// per chat. Kept here only to prove the once-per-rebuild path matches.
+    fn legacy_root_chat_of(app: &App, chat: &str) -> String {
+        if let Some(entry) = app.chat_index.iter().find(|entry| entry.id == chat) {
+            return entry.root_id.clone().unwrap_or_else(|| chat.to_string());
+        }
+        let links = app.chat_child_links();
+        let mut current = chat.to_string();
+        let mut seen: HashSet<String> = HashSet::from([current.clone()]);
+        while let Some(link) = links.iter().find(|link| link.child.session_id == current) {
+            if !seen.insert(link.parent.clone()) {
+                break;
+            }
+            current = link.parent.clone();
+        }
+        current
+    }
+
+    fn legacy_root_fact_prs(app: &App, root: &str) -> Vec<PrRef> {
+        let branches = app
+            .task_host
+            .store()
+            .as_ref()
+            .map(|store| task_branches(store, chrono::Utc::now(), &app.chat_uid_to_chat()))
+            .unwrap_or_default();
+        collect_root_prs(&app.chat_index, root, &app.prs, &branches, |chat| {
+            legacy_root_chat_of(app, chat)
+        })
+    }
+
+    fn legacy_rebuild_pr_homes(app: &mut App) {
+        let mut homes: Vec<(PrHome, Vec<RootPrs>)> = Vec::new();
+        let roots_of = |app: &App, owned: &[String], dir: &Path| -> Vec<RootPrs> {
+            app.pr_roots_of(owned, dir)
+                .into_iter()
+                .map(|(root, title)| RootPrs {
+                    facts: Vec::new(),
+                    root,
+                    title,
+                })
+                .collect()
+        };
+        for ws in &app.workspaces {
+            if matches!(ws.location, WorkspaceLocation::Local { .. }) {
+                homes.push((PrHome::Open(ws.uid), roots_of(app, &ws.chats, &ws.dir)));
+            }
+        }
+        let dir = chat_facts::facts_dir(&config::global_config_dir());
+        let links = app.chat_child_links();
+        app.prs.saved_root_prs.clear();
+        for (_, roots) in &mut homes {
+            for root in roots {
+                let saved = load_root_prs(&dir, &app.chat_index, &links, &root.root, |message| {
+                    panic!("{message}")
+                });
+                app.prs.saved_root_prs.insert(root.root.clone(), saved);
+                root.facts = legacy_root_fact_prs(app, &root.root);
+            }
+        }
+        let listed: HashSet<String> = homes
+            .iter()
+            .flat_map(|(_, roots)| roots.iter().map(|root| root.root.clone()))
+            .collect();
+        let mut added: HashSet<String> = HashSet::new();
+        for (home, roots) in homes.iter_mut() {
+            let PrHome::Open(uid) = home else {
+                continue;
+            };
+            let Some(ws) = app.workspaces.iter().find(|ws| ws.uid == *uid) else {
+                continue;
+            };
+            for chat in ws
+                .tabs
+                .iter()
+                .filter_map(|tab| tab.chat_session_id.as_deref())
+            {
+                let root = legacy_root_chat_of(app, chat);
+                if listed.contains(&root) || added.contains(&root) {
+                    continue;
+                }
+                let facts = legacy_root_fact_prs(app, &root);
+                if facts.is_empty() && !app.prs.plans.contains_key(&root) {
+                    continue;
+                }
+                added.insert(root.clone());
+                let title = format!("chat {}", root.chars().take(8).collect::<String>());
+                roots.push(RootPrs { root, title, facts });
+            }
+        }
+        app.prs.homes = homes;
+    }
+
+    fn fixture_index_entry(
+        dir: &Path,
+        id: &str,
+        root: Option<&str>,
+        prs: Vec<PrRef>,
+    ) -> chats::ChatIndexEntry {
+        chats::ChatIndexEntry {
+            id: id.into(),
+            backend: chats::ChatBackend::Claude,
+            path: dir.join(format!("{id}.jsonl")),
+            cwd: dir.into(),
+            repo_root: None,
+            is_worktree: false,
+            branch: None,
+            title: id.into(),
+            latest: None,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            size: 0,
+            dead_cwd: false,
+            facts: Some(chat_facts::ChatFacts {
+                prs,
+                ..Default::default()
+            }),
+            root_id: root.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn rebuilt_pr_homes_match_the_per_root_rebuild() {
+        const NAME: &str = "work_prs::tests::rebuilt_pr_homes_match_the_per_root_rebuild";
+        if std::env::var_os("GT_TRU274_HOMES_CHILD").is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env(config::CONFIG_DIR_ENV, dir.path())
+                .env("GT_TRU274_HOMES_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use gitterm::tasks::{
+            Delegation, DelegationChild, DelegationKind, DelegationParent, GitBase,
+            HarnessConversationBackend, HarnessConversationRef, NewDelegation, RepositoryIdentity,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = crate::baseline_tests::app_with_tabs(dir.path());
+        let now = chrono::Utc::now();
+        let mut store = TaskStore::load(dir.path().join("tasks.json")).unwrap();
+        // (task, parent tab uid, parent chat if recorded, child conversation, age in days)
+        let delegations = [
+            ("A1", "uid-root-a", Some("root-a"), Some("worker-a1"), 1),
+            ("A2", "uid-worker-a1", None, Some("worker-a2"), 2),
+            ("B1", "uid-root-b", Some("root-b"), Some("worker-b1"), 3),
+            ("B2", "uid-worker-b1", None, None, 4),
+            ("C1", "uid-loose", None, Some("worker-c1"), 5),
+            ("old", "uid-root-a", Some("root-a"), Some("worker-old"), 30),
+            // A reused task opens a second ownership window.
+            (
+                "A1",
+                "uid-root-b",
+                Some("root-b"),
+                Some("worker-a1-again"),
+                0,
+            ),
+        ];
+        for (index, (task, uid, chat, conversation, age)) in delegations.into_iter().enumerate() {
+            let at = (now - chrono::Duration::days(age) - chrono::Duration::minutes(index as i64))
+                .to_rfc3339();
+            if store.get(task).is_none() {
+                store
+                    .insert(TaskRecord::new_draft(
+                        NewTaskRecord {
+                            task_id: task.into(),
+                            title: "Worker task".into(),
+                            objective: "Implement a change".into(),
+                            workspace: TaskWorkspaceIdentity {
+                                name: "alpha".into(),
+                                location: WorkspaceLocationIdentity::Local {
+                                    directory: dir.path().to_path_buf(),
+                                },
+                            },
+                            repository: RepositoryIdentity {
+                                common_dir: dir.path().join(".git"),
+                                remote_url: Some("git@github.com:acme/api.git".into()),
+                            },
+                            issue: None,
+                            base: GitBase {
+                                reference: "v6".into(),
+                                commit: "0123456789abcdef".into(),
+                            },
+                            branch: format!("task/{task}"),
+                            executor: ExecutorTarget::Local,
+                            harness: None,
+                            stopping_boundary: StoppingBoundary::ImplementUntilTestsPass,
+                        },
+                        &at,
+                    ))
+                    .unwrap();
+            }
+            store
+                .insert_delegation(Delegation::new_requested(
+                    NewDelegation {
+                        kind: DelegationKind::Implement,
+                        parent: DelegationParent {
+                            session_uid: uid.into(),
+                            chat_session_id: chat.map(str::to_string),
+                            workspace: "alpha".into(),
+                            cwd: dir.path().to_path_buf(),
+                        },
+                        child: DelegationChild::TaskSession {
+                            task_id: task.into(),
+                            task_session_id: None,
+                            conversation: conversation.map(|session_id| HarnessConversationRef {
+                                backend: HarnessConversationBackend::Claude,
+                                session_id: session_id.into(),
+                            }),
+                            preset_name: Some("Codex".into()),
+                            model: None,
+                            role: None,
+                        },
+                        brief: "Implement a change".into(),
+                        target: None,
+                        previous: None,
+                        options: Default::default(),
+                    },
+                    &at,
+                ))
+                .unwrap();
+        }
+        *app.task_host.store_mut() = Some(store);
+        // Tabs host workers whose parent uids only a tab can resolve.
+        let tabs: [(usize, &str, &str); 4] = [
+            (0, "uid-worker-a1", "worker-a1"),
+            (0, "uid-worker-b1", "worker-b1"),
+            (1, "uid-loose", "loose-chat"),
+            (2, "uid-unlisted", "worker-c1"),
+        ];
+        for (ws, uid, chat) in tabs {
+            let id = 100 + app.workspaces[ws].tabs.len() + ws * 10;
+            let mut tab = TabState::new(id, app.workspaces[ws].dir.clone());
+            tab.session_uid = uid.into();
+            tab.chat_session_id = Some(chat.into());
+            app.workspaces[ws].tabs.push(tab);
+        }
+        app.workspaces[0].chats = vec!["root-a".into(), "root-b".into()];
+        app.workspaces[1].chats = vec!["root-saved".into()];
+        // Only some chats are indexed; the rest resolve through links.
+        Arc::make_mut(&mut app.chat_index).extend([
+            fixture_index_entry(dir.path(), "root-a", None, vec![task_pr(1)]),
+            fixture_index_entry(dir.path(), "worker-a2", Some("root-a"), vec![task_pr(2)]),
+            fixture_index_entry(dir.path(), "worker-a2", Some("root-b"), vec![task_pr(3)]),
+        ]);
+        let facts = chat_facts::facts_dir(&config::global_config_dir());
+        save_pr_facts(
+            &facts,
+            chats::ChatBackend::Claude,
+            "root-saved",
+            chat_facts::ChatFacts {
+                prs: vec![task_pr(4)],
+                children: vec![chat_facts::ChatChild {
+                    session_id: "saved-child".into(),
+                    kind: chat_facts::ChildKind::Worker,
+                    delegation_id: None,
+                    task_id: None,
+                    title: None,
+                }],
+                ..Default::default()
+            },
+        );
+        save_pr_facts(
+            &facts,
+            chats::ChatBackend::Claude,
+            "saved-child",
+            chat_facts::ChatFacts {
+                prs: vec![task_pr(5)],
+                ..Default::default()
+            },
+        );
+        for (chat, numbers) in [
+            ("worker-a1", vec![6, 1]),
+            ("worker-b1", vec![7]),
+            ("loose-chat", vec![8]),
+            ("worker-c1", vec![9]),
+            ("worker-a1-again", vec![10]),
+        ] {
+            app.prs
+                .live_prs
+                .insert(chat.into(), numbers.into_iter().map(task_pr).collect());
+        }
+        let branch_pr = |number: u64, days_ago: i64| pr_watch::BranchPr {
+            pr: task_pr(number),
+            created_at: now - chrono::Duration::days(days_ago) + chrono::Duration::hours(1),
+        };
+        for (task, found) in [
+            ("A1", vec![branch_pr(11, 1), branch_pr(12, 0)]),
+            ("A2", vec![branch_pr(13, 2)]),
+            ("B2", vec![branch_pr(14, 4)]),
+            ("C1", vec![branch_pr(15, 5)]),
+            ("old", vec![branch_pr(16, 30)]),
+        ] {
+            app.prs.task_branch_prs.insert(
+                TaskBranch {
+                    repo: "acme/api".into(),
+                    branch: format!("task/{task}"),
+                },
+                found,
+            );
+        }
+
+        legacy_rebuild_pr_homes(&mut app);
+        let legacy_homes = std::mem::take(&mut app.prs.homes);
+        let legacy_saved = std::mem::take(&mut app.prs.saved_root_prs);
+        app.rebuild_pr_homes();
+        assert_eq!(app.prs.homes, legacy_homes);
+        assert_eq!(app.prs.saved_root_prs, legacy_saved);
+        for chat in [
+            "worker-a1",
+            "worker-a2",
+            "worker-b1",
+            "worker-c1",
+            "loose-chat",
+            "unknown",
+        ] {
+            assert_eq!(app.root_chat_of(chat), legacy_root_chat_of(&app, chat));
+            assert_eq!(app.root_fact_prs(chat), legacy_root_fact_prs(&app, chat));
+        }
+        // The fixture reaches every source: index, saved, live, branch PRs
+        // and a root only a tab names.
+        let roots: Vec<(&str, usize)> = app
+            .prs
+            .homes
+            .iter()
+            .flat_map(|(_, roots)| roots.iter())
+            .map(|root| (root.root.as_str(), root.facts.len()))
+            .collect();
+        assert!(roots.len() >= 4, "{roots:?}");
+        assert!(roots.iter().all(|(_, facts)| *facts > 0), "{roots:?}");
+        assert!(
+            roots.iter().any(|(root, _)| *root == "loose-chat"),
+            "{roots:?}"
+        );
     }
 
     fn task_pr(number: u64) -> PrRef {

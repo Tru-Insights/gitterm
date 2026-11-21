@@ -229,11 +229,10 @@ pub fn parse_issue(json: &str) -> Result<IssueInfo, String> {
 
 /// A failed `issue view` that means "this workspace has no such issue":
 /// the CLI prints `... not found ...` (its NotFoundError and the API's
-/// "Entity not found").
+/// "Entity not found") or the API's "Could not find referenced Issue.".
 pub fn is_not_found(stderr: &str) -> bool {
-    strip_ansi(stderr)
-        .to_ascii_lowercase()
-        .contains("not found")
+    let stderr = strip_ansi(stderr).to_ascii_lowercase();
+    stderr.contains("not found") || stderr.contains("could not find referenced issue")
 }
 
 /// The Work page's Issues groups, in display order (TRU-243).
@@ -778,6 +777,7 @@ globex      Globex Corp Pat Example <pat@example.com>\n";
     fn not_found_is_read_from_stderr() {
         assert!(is_not_found("\n Issue not found: ABC-12\n"));
         assert!(is_not_found("\u{1b}[31mEntity not found\u{1b}[39m"));
+        assert!(is_not_found("Could not find referenced Issue."));
         assert!(!is_not_found("Authentication failed"));
     }
 
