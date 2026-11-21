@@ -3059,7 +3059,7 @@ pub(crate) fn start_preview_host(
     let (sender, receiver) = gitterm_core::task_commands::runtime::command_channel();
     let config = HostConfig {
         roots,
-        iced_tasks: gitterm_core::tasks::TaskStore::path_for_config_root(iced_config),
+        iced_config: iced_config.to_path_buf(),
         ingress: Ingress::Channel(sender, receiver),
     };
     let owner = cx.update(|cx| TaskHostOwner::start(config, cx)).unwrap();
