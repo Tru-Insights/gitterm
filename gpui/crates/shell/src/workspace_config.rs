@@ -278,7 +278,7 @@ pub(crate) fn iced_layout_key(w: &gitterm_core::workspace_config::WorkspaceConfi
     crate::layout::workspace_layout_key(Path::new(&identity))
 }
 
-fn iced_config_dir() -> PathBuf {
+pub(crate) fn iced_config_dir() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     gitterm_core::config_paths::iced_config_dir(
         std::env::var_os(gitterm_core::config_paths::CONFIG_DIR_ENV),
