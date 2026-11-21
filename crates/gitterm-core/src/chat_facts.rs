@@ -807,8 +807,8 @@ pub fn root_prs<'a>(
 
 /// A stand-in for the transcript index, for a host that has none: one entry
 /// per facts file in `dir`, by id (a file's time is not its transcript's, so
-/// it cannot give the index's order), then one per `links` parent without a
-/// file, since a chat GitTerm's records name has a transcript. Only `id`,
+/// it cannot give the index's order), then one per `links` parent or child
+/// without a file, since a chat GitTerm's records name has a transcript. Only `id`,
 /// `facts` and (for files) `backend` and `path` are real.
 /// Run [`resolve_tree`] on it before reading roots. Unreadable files are
 /// logged and left out.
@@ -871,13 +871,13 @@ pub fn saved_facts_index(
     }
     entries.sort_by(|a, b| (&a.id, a.backend.label()).cmp(&(&b.id, b.backend.label())));
     for link in links {
-        if !entries.iter().any(|entry| entry.id == link.parent) {
-            // Links carry no parent backend; nothing that reads roots uses it.
-            entries.push(stand_in(
-                link.parent.clone(),
-                ChatBackend::Claude,
-                PathBuf::new(),
-            ));
+        // Parents and children both get an entry, so a chat resolves the same
+        // way whether or not it has a facts file. Links carry no backend;
+        // nothing that reads roots uses it.
+        for id in [&link.parent, &link.child.session_id] {
+            if !entries.iter().any(|entry| &entry.id == id) {
+                entries.push(stand_in(id.clone(), ChatBackend::Claude, PathBuf::new()));
+            }
         }
     }
     entries
@@ -1088,7 +1088,7 @@ mod tests {
         assert!(logged.is_empty(), "{logged:?}");
         let mut ids: Vec<_> = index.iter().map(|entry| entry.id.as_str()).collect();
         ids.sort_unstable();
-        assert_eq!(ids, ["boss", "coord", "worker"]);
+        assert_eq!(ids, ["boss", "coord", "lone", "worker"]);
         resolve_tree(&mut index, &links);
         let unused = || -> Vec<ChildLink> { panic!("indexed chats need no links") };
         assert_eq!(root_chat_of(&index, "worker", unused), "boss");
@@ -1105,5 +1105,33 @@ mod tests {
         let again = root_prs(&index, "boss", [&first_one, &extra, &extra]);
         assert_eq!(again.len(), 3);
         assert_eq!(again.last(), Some(&extra));
+    }
+
+    /// A store-link child with no facts file roots through its facts-file
+    /// parent, as it would with an empty facts file.
+    #[test]
+    fn stand_in_index_roots_store_only_leaf_through_facts_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = facts_path(temp.path(), ChatBackend::Claude, "coord").unwrap();
+        std::fs::write(path, r#"{"children": []}"#).unwrap();
+        let link = |parent: &str, child: &str| ChildLink {
+            parent: parent.into(),
+            child: serde_json::from_value(
+                serde_json::json!({"session_id": child, "kind": "worker"}),
+            )
+            .unwrap(),
+        };
+        let boss_path = facts_path(temp.path(), ChatBackend::Claude, "boss").unwrap();
+        std::fs::write(
+            boss_path,
+            r#"{"children": [{"session_id": "coord", "kind": "worker"}]}"#,
+        )
+        .unwrap();
+        let links = vec![link("coord", "leaf")];
+        let mut index = saved_facts_index(temp.path(), &links, |_| {});
+        resolve_tree(&mut index, &links);
+        let unused = || -> Vec<ChildLink> { panic!("indexed chats need no links") };
+        assert_eq!(root_chat_of(&index, "coord", unused), "boss");
+        assert_eq!(root_chat_of(&index, "leaf", unused), "boss");
     }
 }
