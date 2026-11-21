@@ -9,9 +9,12 @@
 //! PR read on each render, so tests assert on what is drawn.
 
 use gitterm_core::{
-    merge_plan::{MergeMethod, PrKey, PrState, RowStatus},
-    prs::{self, ChecksState, PrAction, ReviewDecision, WatchedPr},
-    work::summary,
+    merge_plan::{MergeMethod, PrState, RowStatus},
+    prs::{ChecksState, ReviewDecision, WatchedPr},
+    work::{
+        pr_actions::{ActionKind, PrActionConfirm},
+        summary,
+    },
 };
 use gpui::{
     Anchor, Context, FocusHandle, Window, anchored, deferred, div, point, prelude::*, px, rgb, rgba,
@@ -25,66 +28,6 @@ use crate::{
     theme::{Palette, UI_FONT_SIZE},
     work_sidebar::WorkSidebar,
 };
-
-/// Which row action the panel confirms (Iced `ActionKind`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Kind {
-    Approve,
-    Merge,
-    /// Mark a draft ready for review.
-    Ready,
-}
-
-/// Open panel state (Iced `PrActionConfirm`, minus `running`: nothing runs).
-pub(crate) struct PrConfirm {
-    pub key: PrKey,
-    pub kind: Kind,
-    pub method: MergeMethod,
-    /// The plan named the method.
-    method_from_plan: bool,
-    /// The mapped gh account; `None` for gh's active account.
-    account: Option<String>,
-    /// The preview notice after the verb button, in Iced's error slot.
-    pub error: Option<String>,
-    pub focus: FocusHandle,
-}
-
-impl PrConfirm {
-    pub fn new(
-        key: PrKey,
-        kind: Kind,
-        plan_method: Option<MergeMethod>,
-        account: Option<String>,
-        focus: FocusHandle,
-    ) -> Self {
-        Self {
-            key,
-            kind,
-            method: plan_method.unwrap_or_default(),
-            method_from_plan: plan_method.is_some(),
-            account,
-            error: None,
-            focus,
-        }
-    }
-
-    fn action(&self) -> PrAction {
-        match self.kind {
-            Kind::Approve => PrAction::Approve,
-            Kind::Merge => PrAction::Merge(self.method),
-            Kind::Ready => PrAction::Ready,
-        }
-    }
-
-    pub fn verb(&self) -> &'static str {
-        self.action().verb()
-    }
-
-    /// Iced disables the verb button for an account that is not a login.
-    pub fn account_ok(&self) -> bool {
-        self.account.as_deref().is_none_or(prs::valid_login)
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Tone {
@@ -132,31 +75,19 @@ pub(crate) struct Model {
 }
 
 impl Model {
+    /// `active_login` is gh's active login when one has been read.
     pub fn build(
-        confirm: &PrConfirm,
+        confirm: &PrActionConfirm,
         watched: Option<&WatchedPr>,
         plan_status: Option<&RowStatus>,
+        active_login: Option<&str>,
     ) -> Self {
         let action = confirm.action();
         let key = &confirm.key;
-        let owner = key.owner().to_string();
-        let (account_line, account_tone) = match &confirm.account {
-            Some(user) if prs::valid_login(user) => (
-                format!("Runs as {user} (github_accounts maps {owner} to it)"),
-                Tone::Secondary,
-            ),
-            Some(user) => (
-                format!(
-                    "github_accounts maps {owner} to {user:?}, which is not a GitHub login; fix github-accounts.json"
-                ),
-                Tone::Danger,
-            ),
-            // Iced names gh's active login here when it has read one; the
-            // preview never runs gh.
-            None => (
-                format!("Runs as gh's active account: github_accounts has no entry for {owner}"),
-                Tone::Secondary,
-            ),
+        let account_tone = if confirm.account_ok() {
+            Tone::Secondary
+        } else {
+            Tone::Danger
         };
         Self {
             heading: format!("{} {}", action.verb(), key.label()),
@@ -165,29 +96,21 @@ impl Model {
                 .map(|core| summary::shorten(&core.title, 90)),
             live: live_line(watched),
             plan_note: plan_status.and_then(plan_note),
-            account_line,
+            account_line: confirm.account_line(active_login),
             account_tone,
-            methods: (confirm.kind == Kind::Merge).then(|| {
+            methods: (confirm.kind == ActionKind::Merge).then(|| {
                 (
                     MergeMethod::ALL
                         .map(|method| (method, method == confirm.method))
                         .to_vec(),
-                    if confirm.method_from_plan {
-                        "(the plan's)"
-                    } else {
-                        "(default; the plan names none)"
-                    },
+                    confirm.method_hint(),
                 )
             }),
-            command: prs::action_command_line(action, key, confirm.account.as_deref()),
+            command: confirm.command_line(),
             error: confirm.error.as_deref().map(|e| summary::shorten(e, 400)),
-            close_label: if confirm.error.is_some() {
-                "Close"
-            } else {
-                "Cancel"
-            },
+            close_label: confirm.close_label(),
             run_label: action.verb(),
-            run_enabled: confirm.account_ok(),
+            run_enabled: confirm.run_enabled(),
         }
     }
 }

@@ -834,7 +834,7 @@ fn w19a_w20_plan_merge_and_hold_controls_match_iced_placement_and_only_notice(
     click_control(&sidebar, cx, "Next change", merge.as_str());
     sidebar.read_with(cx, |s, _| {
         let confirm = s.confirm.as_ref().expect("Merge opens the panel");
-        assert_eq!(confirm.kind, Kind::Merge);
+        assert_eq!(confirm.kind, ActionKind::Merge);
         assert_eq!(confirm.key.number, 1);
     });
     sidebar.update(cx, |s, cx| s.confirm_close(cx));
