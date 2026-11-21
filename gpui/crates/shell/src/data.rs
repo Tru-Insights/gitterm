@@ -458,15 +458,15 @@ impl IcedWorkData {
         id: u64,
         saved: &gitterm_core::workspace_config::WorkspaceConfig,
         focus: gitterm_core::work::summary::Focus,
-        previous: &[gitterm_core::chats::ChatIndexEntry],
+        previous: Option<&Self>,
         mut publish: impl FnMut(&Self),
     ) -> anyhow::Result<Self> {
         #[cfg(test)]
         let home: Option<std::path::PathBuf> = None;
         #[cfg(not(test))]
         let home = dirs::home_dir();
-        // Retain the last indexed snapshot while saved facts publish ahead of
-        // the slow full harness read, which replaces that snapshot.
+        // Retain indexed chats and repo presentation while partial facts publish
+        // ahead of the slow full read, which replaces the snapshot.
         if home.is_some() {
             Self::read_with_progress(
                 config,
@@ -498,9 +498,9 @@ impl IcedWorkData {
         saved: &gitterm_core::workspace_config::WorkspaceConfig,
         focus: gitterm_core::work::summary::Focus,
     ) -> anyhow::Result<Self> {
-        Self::read_with_progress(config, home, id, saved, focus, &[], true, |_| {})
+        Self::read_with_progress(config, home, id, saved, focus, None, true, |_| {})
     }
-    // Keep the prior index explicit alongside the read inputs and progress sink.
+    // Keep the prior snapshot explicit alongside the read inputs and progress sink.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_with_progress(
         config: &std::path::Path,
@@ -508,7 +508,7 @@ impl IcedWorkData {
         id: u64,
         saved: &gitterm_core::workspace_config::WorkspaceConfig,
         focus: gitterm_core::work::summary::Focus,
-        previous: &[gitterm_core::chats::ChatIndexEntry],
+        previous: Option<&Self>,
         measure_branches: bool,
         mut publish: impl FnMut(&Self),
     ) -> anyhow::Result<Self> {
@@ -605,7 +605,9 @@ impl IcedWorkData {
         let mut errors = vec![];
         let mut entries = if local {
             home.map(|home| crate::workspace_config::read_iced_chat_index(config, home))
-                .unwrap_or_else(|| previous.to_vec())
+                .unwrap_or_else(|| {
+                    previous.map_or_else(Vec::new, |data| data.indexed_chats.clone())
+                })
         } else {
             vec![]
         };
@@ -958,7 +960,7 @@ impl IcedWorkData {
             data.documents.documents.len(),
             started.elapsed()
         );
-        publish(&data);
+        data.publish_partial(previous, &mut publish);
         if local && measure_branches {
             // Iced only lists checkouts owned by the focused work: facts edits,
             // its child task worktrees, and issue-key matches. A shared repo's
@@ -1016,7 +1018,7 @@ impl IcedWorkData {
                     }
                 })
                 .collect();
-            publish(&data);
+            data.publish_partial(previous, &mut publish);
             for branch in &mut data.branches {
                 *branch = git.branch(branch.owned.clone());
             }
@@ -1027,7 +1029,29 @@ impl IcedWorkData {
             data.branches.len(),
             started.elapsed()
         );
+        if !measure_branches {
+            data.retain_repos(previous);
+        }
         Ok(data)
+    }
+
+    fn retain_repos(&mut self, previous: Option<&Self>) {
+        if let Some(previous) = previous.filter(|previous| {
+            previous.facts.id == self.facts.id && previous.facts.dir == self.facts.dir
+        }) {
+            // A partial harness/status read cannot remove a repo or its facts.
+            // The completed read is authoritative, including removals.
+            self.facts.repos = previous.facts.repos.clone();
+            self.facts.running_by_repo = previous.facts.running_by_repo.clone();
+            self.summary.repos = previous.summary.repos.clone();
+            self.branches = previous.branches.clone();
+        }
+    }
+
+    fn publish_partial(&self, previous: Option<&Self>, publish: &mut impl FnMut(&Self)) {
+        let mut partial = self.clone();
+        partial.retain_repos(previous);
+        publish(&partial);
     }
 
     pub fn apply(&self, state: &mut gitterm_core::work::state::State) {
@@ -1376,6 +1400,110 @@ mod work_index_tests {
     };
 
     #[test]
+    fn partial_publications_retain_four_repos_and_facts_until_the_full_read() {
+        use gitterm_core::work::summary::{RepoTouched, merge_repo_groups};
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let config = root.path().join("catalog");
+        let repos: Vec<_> = ["home", "api", "tools", "server"]
+            .map(|name| root.path().join(name))
+            .into_iter()
+            .collect();
+        std::fs::create_dir_all(&config).unwrap();
+        for repo in &repos {
+            std::fs::create_dir_all(repo).unwrap();
+        }
+        let write_catalog = |repos: &[std::path::PathBuf]| {
+            std::fs::write(
+                config.join("workspaces.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "active_workspace": 0,
+                    "workspaces": [{"name": "Fixture", "abbrev": "F", "color": "blue",
+                        "dir": repos[0], "repos": repos, "tabs": []}],
+                    "repos": []
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        write_catalog(&repos);
+        let catalog = crate::workspace_config::IcedCatalog::read(&config).unwrap();
+        let saved = &catalog.workspaces[0];
+        let mut first =
+            IcedWorkData::read_with_home(&config, None, 1, saved, Focus::Latest).unwrap();
+        assert_eq!(first.facts.repos.len(), 4);
+        // The last completed read's measured facts must survive an incomplete read.
+        first.summary.repos = vec![RepoTouched {
+            dir: repos[3].clone(),
+            edits: 7,
+        }];
+        first.facts.running_by_repo.insert(repos[3].clone(), 2);
+        first.branches.push(crate::work_sidebar::tests::branch(
+            repos[3].to_str().unwrap(),
+            "feature",
+            false,
+        ));
+        write_catalog(&repos[..3]);
+        let mut publications = 0;
+        let mut assert_retained = |data: &IcedWorkData| {
+            publications += 1;
+            assert_eq!(data.facts.repos.len(), 4);
+            assert_eq!(data.summary.repos, first.summary.repos);
+            assert_eq!(data.facts.running_by_repo, first.facts.running_by_repo);
+            let listed = data
+                .facts
+                .repos
+                .iter()
+                .map(|repo| repo.dir.clone())
+                .collect::<Vec<_>>();
+            let groups = merge_repo_groups(
+                &listed,
+                &data.facts.removed,
+                &data.summary.repos,
+                &data.branches,
+            );
+            assert_eq!(groups.len(), 4);
+            assert_eq!(groups[3].edits, Some(7));
+            assert_eq!(groups[3].rows.len(), 1);
+            assert_eq!(groups[3].rows[0].status, first.branches[0].status);
+            let mut state = State::default();
+            data.apply(&mut state);
+            assert_eq!(state.pane(1).unwrap().summary.repos, first.summary.repos);
+            assert_eq!(state.pane(1).unwrap().branches.len(), 1);
+        };
+        let partial = IcedWorkData::read_with_progress(
+            &config,
+            None,
+            1,
+            saved,
+            Focus::Latest,
+            Some(&first),
+            false,
+            &mut assert_retained,
+        )
+        .unwrap();
+        assert_retained(&partial);
+        let full = IcedWorkData::read_with_progress(
+            &config,
+            None,
+            1,
+            saved,
+            Focus::Latest,
+            Some(&partial),
+            true,
+            &mut assert_retained,
+        )
+        .unwrap();
+        assert_eq!(
+            publications, 4,
+            "saved facts, partial result, overview, ownership"
+        );
+        assert_eq!(full.facts.repos.len(), 3);
+        assert!(full.summary.repos.is_empty());
+        assert!(full.facts.running_by_repo.is_empty());
+        assert!(full.branches.is_empty());
+    }
+
+    #[test]
     fn partial_publish_retains_indexed_titles_and_full_read_replaces_the_snapshot() {
         let root = tempfile::tempdir_in("/private/tmp").unwrap();
         let config = root.path().join("catalog");
@@ -1445,7 +1573,7 @@ mod work_index_tests {
             1,
             saved,
             Focus::Latest,
-            &first.indexed_chats,
+            Some(&first),
             false,
             |data| {
                 publications += 1;
@@ -1471,7 +1599,7 @@ mod work_index_tests {
             1,
             saved,
             Focus::Latest,
-            &partial.indexed_chats,
+            Some(&partial),
             true,
             |data| {
                 data.apply(&mut state);

@@ -448,11 +448,18 @@ fn file_navigation_edit_and_escape_use_existing_file_open_route(cx: &mut TestApp
         },
         cx,
     );
+    let before = cx.read(|cx| shell.read(cx).content.read(cx).selected.clone());
     dispatch(EditFile, cx);
+    // Iced's edit launches $EDITOR; the preview only reports it (no viewer opens).
     cx.read(|cx| {
-        assert_eq!(
+        assert_eq!(shell.read(cx).content.read(cx).selected, before);
+        assert_ne!(
             shell.read(cx).content.read(cx).selected,
             Some(content_pane_id(workspace, &work.join("file.txt")))
+        );
+        assert_eq!(
+            shell.read(cx).owner.read(cx).error.as_deref(),
+            Some("Open in editor · not available in preview")
         )
     });
     cx.simulate_keystrokes("escape");

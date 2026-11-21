@@ -47,8 +47,70 @@ pub struct Input {
     pub branch: String,
     pub pulse_bright: bool,
     pub mic: Option<News>,
-    pub worktree_follow: Option<News>,
+    pub worktree_follow: Option<WorktreeFollow>,
 }
+/// Derived checkout facts are supplied by the owning chat; never infer them
+/// from a saved tab's startup directory or the last checkout it touched.
+#[derive(Clone, Debug)]
+pub struct WorktreeFollow {
+    pub following: bool,
+    pub path: std::path::PathBuf,
+    pub label: Option<String>,
+    pub branch: Option<String>,
+}
+impl WorktreeFollow {
+    pub fn text(&self, workspace_branch: &str) -> String {
+        let label = self
+            .label
+            .clone()
+            .unwrap_or_else(|| self.path.display().to_string());
+        if self.following {
+            format!(
+                "⎇ {} · worktree {label}",
+                self.branch.as_deref().unwrap_or("detached")
+            )
+        } else {
+            format!("⎇ {workspace_branch} · workspace root · follow worktree {label}")
+        }
+    }
+}
+
+pub(crate) fn attention(
+    task: Option<&gitterm_core::tasks::TaskAttention>,
+    workers: &[gitterm_core::tasks::Delegation],
+    session_uid: Option<&str>,
+) -> Option<AttentionKind> {
+    use gitterm_core::tasks::{DelegationStatus, TaskAttentionReason};
+    let task = task.and_then(|task| match task.reason {
+        Some(TaskAttentionReason::RequiresInput | TaskAttentionReason::RemoteUnavailable) => {
+            Some(AttentionKind::NeedsYou)
+        }
+        Some(TaskAttentionReason::ExecutionFailed) => Some(AttentionKind::Failed),
+        Some(TaskAttentionReason::CompletedUnread | TaskAttentionReason::ReadyForReview) => {
+            Some(AttentionKind::Review)
+        }
+        None if task.unread => Some(AttentionKind::Review),
+        _ => None,
+    });
+    workers
+        .iter()
+        .filter(|worker| {
+            worker.dismissed_at.is_none() && Some(worker.parent.session_uid.as_str()) == session_uid
+        })
+        .filter_map(|worker| match worker.status {
+            DelegationStatus::Blocked => Some(AttentionKind::NeedsYou),
+            DelegationStatus::Failed { .. } => Some(AttentionKind::Failed),
+            DelegationStatus::Completed => Some(AttentionKind::Review),
+            _ => None,
+        })
+        .chain(task)
+        .min_by_key(|kind| match kind {
+            AttentionKind::NeedsYou => 0,
+            AttentionKind::Failed => 1,
+            AttentionKind::Review => 2,
+        })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     SelectSession(SessionId),
@@ -395,9 +457,9 @@ pub fn render(input: &Input, c: Colors, emit: Handler<Outcome>) -> gpui::Statefu
         metadata = metadata.child(
             control(
                 "pstrip-worktree",
-                follow.label.clone(),
-                "Toggle worktree follow",
-                follow.color,
+                follow.text(&input.branch),
+                follow.text(&input.branch),
+                if follow.following { c.blue } else { c.muted },
                 c,
                 Outcome::ToggleWorktreeFollow,
                 emit,
@@ -534,6 +596,63 @@ mod tests {
         assert_eq!(s.icon(false, false, c), ("✦ ", c.peach));
     }
     #[test]
+    fn worktree_follow_text_matches_following_root_and_detached_states() {
+        let mut follow = WorktreeFollow {
+            following: true,
+            path: "/tmp/worktree".into(),
+            label: Some("parity".into()),
+            branch: Some("feature".into()),
+        };
+        assert_eq!(follow.text("v6"), "⎇ feature · worktree parity");
+        follow.following = false;
+        assert_eq!(
+            follow.text("v6"),
+            "⎇ v6 · workspace root · follow worktree parity"
+        );
+        follow.following = true;
+        follow.branch = None;
+        follow.label = None;
+        assert_eq!(follow.text("v6"), "⎇ detached · worktree /tmp/worktree");
+    }
+
+    #[test]
+    fn durable_task_attention_matches_iced_tab_states() {
+        use gitterm_core::tasks::{TaskAttention, TaskAttentionReason as R};
+        for (reason, expected) in [
+            (R::RequiresInput, Some(AttentionKind::NeedsYou)),
+            (R::RemoteUnavailable, Some(AttentionKind::NeedsYou)),
+            (R::ExecutionFailed, Some(AttentionKind::Failed)),
+            (R::CompletedUnread, Some(AttentionKind::Review)),
+            (R::ReadyForReview, Some(AttentionKind::Review)),
+            (R::Interrupted, None),
+        ] {
+            assert_eq!(
+                attention(
+                    Some(&TaskAttention {
+                        reason: Some(reason),
+                        ..Default::default()
+                    }),
+                    &[],
+                    None
+                ),
+                expected
+            );
+        }
+        assert_eq!(attention(None, &[], None), None);
+        assert_eq!(
+            attention(
+                Some(&TaskAttention {
+                    unread: true,
+                    ..Default::default()
+                }),
+                &[],
+                None
+            ),
+            Some(AttentionKind::Review)
+        );
+    }
+
+    #[test]
     fn add_labels_are_context_aware_and_last_workspace_is_protected() {
         let mut i = input();
         assert_eq!(i.add_label(), "+ Session");
@@ -664,9 +783,11 @@ mod tests {
                 title: "Parity".into(),
             });
             view.input.visible_workspace_count = 1;
-            view.input.worktree_follow = Some(News {
-                label: "⎇ v6 · worktree parity".into(),
-                color: 0x89b4fa,
+            view.input.worktree_follow = Some(WorktreeFollow {
+                following: true,
+                path: "/tmp/parity".into(),
+                label: Some("parity".into()),
+                branch: Some("v6".into()),
             });
             cx.notify();
         });

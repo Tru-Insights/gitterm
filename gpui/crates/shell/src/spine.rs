@@ -179,6 +179,67 @@ impl Input {
             .collect()
     }
 }
+/// Durable task attention uses Iced's reason/age presentation without opening
+/// a store or discovering a process. The caller resolves workspace identity.
+pub(crate) fn task_rows<'a>(
+    workspace: WorkspaceId,
+    tasks: impl Iterator<Item = &'a gitterm_core::tasks::TaskRecord>,
+    now: std::time::SystemTime,
+) -> Vec<AttentionRow> {
+    use gitterm_core::tasks::{TaskAttentionReason as R, TaskLifecycle};
+    use objc2_foundation::{NSISO8601DateFormatOptions as O, NSISO8601DateFormatter, NSString};
+    // Foundation is already a shell dependency; keep the formatter local to
+    // this projection instead of introducing another date dependency or cache.
+    let formatter = NSISO8601DateFormatter::new();
+    tasks
+        .filter(|task| task.lifecycle != TaskLifecycle::Archived)
+        .filter_map(|task| {
+            let (priority, icon, label) = match task.attention.reason? {
+                R::RequiresInput => (0, "●", "Input or approval needed"),
+                R::RemoteUnavailable => (0, "●", "Remote unavailable"),
+                R::ExecutionFailed => (1, "!", "Task failed"),
+                R::Interrupted => (2, "○", "Interrupted · resume"),
+                R::CompletedUnread | R::ReadyForReview => (3, "✓", "Ready to review"),
+            };
+            let raised = task.attention.since.as_deref().unwrap_or(&task.updated_at);
+            let options = O::WithInternetDateTime
+                | if raised.contains('.') {
+                    O::WithFractionalSeconds
+                } else {
+                    O::empty()
+                };
+            formatter.setFormatOptions(options);
+            // Iced also gives malformed/future timestamps age zero; saved records
+            // predating `since` use updated_at above.
+            let waiting = formatter
+                .dateFromString(&NSString::from_str(raised))
+                .and_then(|date| {
+                    now.duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .and_then(|now| {
+                            Duration::try_from_secs_f64(
+                                now.as_secs_f64() - date.timeIntervalSince1970(),
+                            )
+                            .ok()
+                        })
+                })
+                .unwrap_or_default();
+            Some(AttentionRow {
+                workspace,
+                target: Target::Task(task.task_id.clone()),
+                title: task.issue.as_ref().map_or_else(
+                    || task.title.clone(),
+                    |issue| format!("{} {}", issue.key, task.title),
+                ),
+                priority,
+                icon: icon.into(),
+                label: label.into(),
+                waiting,
+            })
+        })
+        .collect()
+}
+
 pub fn age(waiting: Duration) -> String {
     let secs = waiting.as_secs();
     match secs {
@@ -440,6 +501,78 @@ mod tests {
             assert_eq!(dot.color, color);
         }
     }
+    #[test]
+    fn idle_active_urgency_and_pulse_states_match_iced_dot_geometry() {
+        let mut i = input();
+        let c = Colors::new(true);
+        i.attention.clear();
+        let dots = i.dots(c);
+        assert_eq!(
+            (dots[0].width, dots[0].height, dots[0].color),
+            (4., 18., c.workspace(i.workspaces[1].color))
+        );
+        assert_eq!(
+            (dots[1].width, dots[1].height, dots[1].color),
+            (4., 4., c.surface2)
+        );
+        i.attention = vec![row(1, Target::Tab(11), 0, 1)];
+        i.pulse_bright = true;
+        let dot = i.dots(c).remove(1);
+        assert_eq!((dot.width, dot.height, dot.color), (6., 6., c.peach));
+        i.active = Some(WorkspaceId(1));
+        let dot = i.dots(c).remove(1);
+        assert_eq!((dot.width, dot.height, dot.color), (4., 18., c.peach));
+    }
+
+    #[test]
+    fn durable_task_rows_keep_iced_reason_age_and_identity() {
+        use gitterm_core::tasks::{TaskAttentionReason as R, TaskLifecycle};
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/stage45/tasks/old.tasks.json"
+        ))
+        .unwrap();
+        let mut task: gitterm_core::tasks::TaskRecord =
+            serde_json::from_value(fixture["tasks"][0].clone()).unwrap();
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_120);
+        task.attention.since = Some("2023-11-14T22:13:20.000+00:00".into());
+        task.lifecycle = TaskLifecycle::Ready;
+        for (reason, priority, icon, label) in [
+            (R::RequiresInput, 0, "●", "Input or approval needed"),
+            (R::RemoteUnavailable, 0, "●", "Remote unavailable"),
+            (R::ExecutionFailed, 1, "!", "Task failed"),
+            (R::Interrupted, 2, "○", "Interrupted · resume"),
+            (R::CompletedUnread, 3, "✓", "Ready to review"),
+            (R::ReadyForReview, 3, "✓", "Ready to review"),
+        ] {
+            task.attention.reason = Some(reason);
+            let rows = task_rows(WorkspaceId(2), std::iter::once(&task), now);
+            let row = &rows[0];
+            assert_eq!(
+                (row.priority, row.icon.as_str(), row.label.as_str()),
+                (priority, icon, label)
+            );
+            assert_eq!(row.waiting, Duration::from_secs(120));
+            assert_eq!(row.workspace, WorkspaceId(2));
+            assert_eq!(row.target, Target::Task(task.task_id.clone()));
+        }
+        task.attention.since = None;
+        task.updated_at = "2023-11-14T22:13:20Z".into();
+        assert_eq!(
+            task_rows(WorkspaceId(2), std::iter::once(&task), now)[0].waiting,
+            Duration::from_secs(120)
+        );
+        task.attention.since = Some("invalid".into());
+        assert_eq!(
+            task_rows(WorkspaceId(2), std::iter::once(&task), now)[0].waiting,
+            Duration::ZERO
+        );
+        task.lifecycle = TaskLifecycle::Archived;
+        assert!(task_rows(WorkspaceId(2), std::iter::once(&task), now).is_empty());
+        task.lifecycle = TaskLifecycle::Ready;
+        task.attention.reason = None;
+        assert!(task_rows(WorkspaceId(2), std::iter::once(&task), now).is_empty());
+    }
+
     #[test]
     fn tooltip_age_boundaries_match_iced() {
         for (secs, expected) in [
