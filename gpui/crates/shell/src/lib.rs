@@ -62,6 +62,9 @@ pub mod session_strip;
 mod sessions;
 pub mod settings;
 pub mod spine;
+mod task_host;
+#[cfg(test)]
+mod task_host_tests;
 pub mod task_switcher;
 pub mod tasks;
 mod theme;
@@ -4263,8 +4266,17 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
         &title_workspace,
         SidebarMode::Work,
     );
+    let task_host = (!sample).then(|| task_host::HostConfig::production(preview.roots.clone()));
     gpui_kit::application().run(move |cx| {
         preview.release_on_quit(cx);
+        // Before the window's workspace owner, so the host's quit callback
+        // runs ahead of its chat drains.
+        if let Some(config) = task_host {
+            match task_host::TaskHostOwner::start(config, cx) {
+                Ok(owner) => cx.set_global(task_host::GpuiTaskHost(owner)),
+                Err(error) => eprintln!("GitTerm GPUI runs without a task host: {error:#}"),
+            }
+        }
         gpui_kit::init(cx);
         theme::apply_settings(&settings, None, cx);
         install_app_menus(cx);

@@ -1009,6 +1009,7 @@ mod tests {
             config: json!({"mcpServers": {}}),
             allowed_tools: Vec::new(),
             env: vec![("SYNTHETIC_TOKEN".into(), value.into())],
+            public_env: Vec::new(),
         });
         let env: std::collections::BTreeMap<_, _> =
             child_environment(inherited, "/child/path".into(), &servers)
@@ -1487,6 +1488,7 @@ for line in sys.stdin:
             }),
             allowed_tools: allowed.iter().map(|tool| tool.to_string()).collect(),
             env: vec![(token_env.to_string(), SECRET.to_string())],
+            public_env: Vec::new(),
         }
     }
 

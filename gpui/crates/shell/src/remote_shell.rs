@@ -366,7 +366,7 @@ impl Shell {
             .into_iter()
             .find(|machine| machine.key == key)
             .map_or_else(|| remote_id.to_string(), |machine| machine.name);
-        let panel = cx.new(|cx| PhonePanel::new(machine_name, window, cx));
+        let panel = cx.new(|cx| PhonePanel::new(remote_id.to_string(), machine_name, window, cx));
         let subscription = cx.subscribe_in(
             &panel,
             window,

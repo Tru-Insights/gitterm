@@ -9,7 +9,8 @@ use std::{
     rc::Rc,
 };
 
-use crate::pr_confirm::{self, Kind, PrConfirm};
+use crate::pr_confirm;
+use gitterm_core::work::pr_actions::{self, ActionKind, PrActionConfirm, RowGate};
 use gitterm_core::{
     chat_facts::ChildKind,
     chats,
@@ -176,7 +177,7 @@ enum Action {
     Preview(String),
     /// Iced `Pr(ActionOpen)`: Approve, Merge and Ready for review open a
     /// confirmation panel first.
-    Confirm(gitterm_core::merge_plan::PrKey, crate::pr_confirm::Kind),
+    Confirm(gitterm_core::merge_plan::PrKey, ActionKind),
     /// Iced's disabled Approve/Merge (checks gate, draft): a click does nothing.
     Inert,
 }
@@ -217,6 +218,9 @@ struct Row {
     indent: bool,
     editor: Option<PathBuf>,
     chat: bool,
+    /// Index into `badges` of the one fact that may shrink and ellipsize so
+    /// the row's title keeps its width (a chat's fan-out line).
+    shrinking_badge: Option<usize>,
 }
 
 impl Row {
@@ -262,7 +266,12 @@ pub struct WorkSidebar {
     /// The checkout whose review is shown, as Iced's `open_review_checkout`.
     review_checkout: Option<PathBuf>,
     agent_line: Option<String>,
-    confirm: Option<crate::pr_confirm::PrConfirm>,
+    confirm: Option<PrActionConfirm>,
+    /// The open panel's focus, for Escape.
+    confirm_focus: Option<gpui::FocusHandle>,
+    /// gh's active login, as Iced reads it from a PR poll (`gh api user`).
+    /// The preview never polls or runs gh, so nothing sets it yet.
+    active_login: Option<String>,
 }
 
 impl WorkSidebar {
@@ -313,6 +322,8 @@ impl WorkSidebar {
             review_checkout: None,
             agent_line: None,
             confirm: None,
+            confirm_focus: None,
+            active_login: None,
         }
     }
 
@@ -828,22 +839,12 @@ impl WorkSidebar {
                 let plan_row = ordered.iter().find(|row| row.entry.key() == pr.key);
                 let next = plan_row
                     .is_some_and(|row| row.status == gitterm_core::merge_plan::RowStatus::Next);
-                let draft = pr.snapshot.state() == Some(PrState::Draft);
-                let gated = |name: &str| {
-                    if draft {
-                        format!("{name} (draft)")
-                    } else if pr.snapshot.state() == Some(PrState::Open)
-                        && let Some(reason) = pr.checks_gate().reason()
-                    {
-                        format!("{name} ({reason})")
-                    } else {
-                        name.into()
-                    }
-                };
+                let gate = RowGate::of(Some(pr));
+                let draft = gate.draft;
+                let gated = |name: &str| gate.label(name);
                 // Iced enables Approve and Merge only for an open PR whose
                 // checks pass; otherwise the label names why and a click is inert.
-                let can_act = pr.snapshot.state() == Some(PrState::Open)
-                    && pr.checks_gate().reason().is_none();
+                let can_act = gate.can_act();
                 let confirm = |kind| {
                     if can_act {
                         Action::Confirm(pr.key.clone(), kind)
@@ -852,7 +853,7 @@ impl WorkSidebar {
                     }
                 };
                 if next {
-                    row.control(gated("Merge"), confirm(Kind::Merge));
+                    row.control(gated("Merge"), confirm(ActionKind::Merge));
                 }
                 let fold = Fold::Pr(pr.key.id());
                 row.expanded = self.open.contains(&fold);
@@ -928,23 +929,24 @@ impl WorkSidebar {
                         detail.control("×", Action::Preview("×".into()));
                         row.detail_rows.push(detail);
                     }
-                    let account = gitterm_core::prs::account_for(pr.key.owner(), &self.pr_accounts);
-                    let own = gitterm_core::prs::is_own_pr(
-                        core.map(|core| core.author.as_str()),
-                        account.as_deref(),
+                    let own = pr_actions::own_pr(
+                        &pr.key,
+                        Some(pr),
+                        &self.pr_accounts,
+                        self.active_login.as_deref(),
                     );
                     let mut controls =
                         vec![("Review".to_string(), Action::Preview("Review".to_string()))];
                     if !own {
-                        controls.push((gated("Approve"), confirm(Kind::Approve)));
+                        controls.push((gated("Approve"), confirm(ActionKind::Approve)));
                     }
                     if !next {
-                        controls.push((gated("Merge"), confirm(Kind::Merge)));
+                        controls.push((gated("Merge"), confirm(ActionKind::Merge)));
                     }
                     if draft {
                         controls.push((
                             "Ready for review".into(),
-                            Action::Confirm(pr.key.clone(), Kind::Ready),
+                            Action::Confirm(pr.key.clone(), ActionKind::Ready),
                         ));
                     }
                     for (label, action) in controls {
@@ -1467,6 +1469,7 @@ impl WorkSidebar {
             ));
         }
         if let Some(fan_out) = &chat.fan_out {
+            row.shrinking_badge = Some(row.badges.len());
             row.badges.push(summary::shorten(fan_out, 28));
         }
         row.badges.push(chats::format_age(chat.active));
@@ -1595,19 +1598,19 @@ impl WorkSidebar {
     fn open_confirm(
         &mut self,
         key: gitterm_core::merge_plan::PrKey,
-        kind: Kind,
+        kind: ActionKind,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let method = self
-            .pr_plans
-            .values()
-            .find_map(|plan| plan.entry(&key))
-            .and_then(|entry| entry.method);
-        let account = gitterm_core::prs::account_for(key.owner(), &self.pr_accounts);
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        self.confirm = Some(PrConfirm::new(key, kind, method, account, focus));
+        self.confirm = Some(PrActionConfirm::open(
+            key,
+            kind,
+            self.pr_plans.values(),
+            &self.pr_accounts,
+        ));
+        self.confirm_focus = Some(focus);
         cx.notify();
     }
 
@@ -1618,32 +1621,35 @@ impl WorkSidebar {
         cx: &mut Context<Self>,
     ) {
         if let Some(confirm) = self.confirm.as_mut() {
-            confirm.method = method;
-            confirm.error = None;
+            confirm.choose_method(method);
             cx.notify();
         }
     }
 
     /// Iced `ActionClose`: no other effect.
     pub(crate) fn confirm_close(&mut self, cx: &mut Context<Self>) {
-        self.confirm = None;
+        if pr_actions::close_action(&mut self.confirm) {
+            self.confirm_focus = None;
+        }
         cx.notify();
     }
 
     /// Iced `ActionRun` would run `gh`; the preview reports it instead, in
     /// the panel's error slot and the shell's notice.
+    /// shortcut: the shell has no `ServiceContext` yet, so the notice text is
+    /// the preview's own; ask `ServiceContext::pr_action` once it has one.
     pub(crate) fn confirm_run(&mut self, cx: &mut Context<Self>) {
-        let Some(confirm) = self.confirm.as_mut().filter(|c| c.account_ok()) else {
+        let Some(confirm) = self.confirm.as_mut().filter(|c| c.run_enabled()) else {
             return;
         };
-        let message = format!("{} · not available in preview", confirm.verb());
+        let message = format!("{} · not available in preview", confirm.action().verb());
         confirm.error = Some(message.clone());
         self.notice(message, cx);
     }
 
     /// The panel's live inputs: the PR's latest read and where its plan
     /// stands on it (Iced `view_pr_action_confirm`).
-    fn confirm_model(&self, confirm: &PrConfirm) -> pr_confirm::Model {
+    fn confirm_model(&self, confirm: &PrActionConfirm) -> pr_confirm::Model {
         let id = confirm.key.id();
         let group = self
             .pull_requests
@@ -1662,7 +1668,12 @@ impl WorkSidebar {
                 .find(|row| row.entry.key().id() == id)
                 .map(|row| row.status)
         });
-        pr_confirm::Model::build(confirm, watched, status.as_ref())
+        pr_confirm::Model::build(
+            confirm,
+            watched,
+            status.as_ref(),
+            self.active_login.as_deref(),
+        )
     }
 
     fn run_command_outcome(repo: PathBuf, value: &str) -> WorkSidebarOutcome {
@@ -1877,8 +1888,16 @@ impl Render for WorkSidebar {
                     .overflow_hidden();
             }
             if row.chat {
+                // Wraps by word like Iced's Fill title. A `flex_1` title has a
+                // basis of zero, so the fixed facts took the whole row and it
+                // wrapped one letter per line. Start from the full row instead
+                // and give way to the facts only down to half of it; the
+                // fan-out line (shrink factor 2) gives way before the title.
                 label = label
-                    .flex_1()
+                    .flex_grow(1.)
+                    .flex_shrink(1.)
+                    .flex_basis(gpui::relative(1.))
+                    .min_w(gpui::relative(0.5))
                     .font_family(".SystemUIFont")
                     .text_size(px(12.))
                     .whitespace_normal();
@@ -1906,7 +1925,13 @@ impl Render for WorkSidebar {
                 // Iced shortens, then lets the branch name wrap in a fill slot.
                 label = label.font_family("Menlo").flex_1().whitespace_normal();
             }
-            let mut line = div().w_full().min_w_0().flex().items_center().gap(px(6.));
+            let mut line = div()
+                .debug_selector(|| format!("work-line-{index}"))
+                .w_full()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(6.));
             if let Some((number, chars)) = row.pr_number {
                 line = line.child(
                     self.button(
@@ -1970,6 +1995,7 @@ impl Render for WorkSidebar {
                         .flex_1(),
                 );
             }
+            let shrinking_badge = row.shrinking_badge;
             for (badge_index, badge) in row.badges.into_iter().enumerate() {
                 let color = if matches!(
                     badge.as_str(),
@@ -1985,10 +2011,22 @@ impl Render for WorkSidebar {
                 } else {
                     rgb(p.muted).into()
                 };
+                let shrinks = shrinking_badge == Some(badge_index);
                 line = line.child(
                     div()
                         .debug_selector(|| format!("work-badge-{index}-{badge_index}"))
-                        .flex_shrink_0()
+                        .map(|badge| {
+                            if shrinks {
+                                badge
+                                    .flex_shrink(2.)
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                            } else {
+                                badge.flex_shrink_0()
+                            }
+                        })
                         .font_family("Menlo")
                         .text_size(px(10.))
                         .text_color(color)
@@ -2184,10 +2222,10 @@ impl Render for WorkSidebar {
                 body.child(block)
             };
         }
-        if let Some(confirm) = &self.confirm {
+        if let (Some(confirm), Some(focus)) = (&self.confirm, &self.confirm_focus) {
             body = body.child(pr_confirm::view(
                 self.confirm_model(confirm),
-                &confirm.focus,
+                focus,
                 window,
                 cx,
             ));

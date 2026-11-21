@@ -1636,6 +1636,21 @@ macro_rules! freeze_time {
     }};
 }
 
+/// `freeze_time!` that logs every duration: a stall can be the sum of many
+/// short steps (TRU-274, worker start).
+macro_rules! freeze_span {
+    ($label:expr, $block:block) => {{
+        let _start = std::time::Instant::now();
+        let result = $block;
+        freeze_debug!(
+            "{} took {:.1}ms",
+            $label,
+            _start.elapsed().as_secs_f64() * 1000.0
+        );
+        result
+    }};
+}
+
 // Menu item IDs stored globally for event matching
 static MENU_IDS: OnceLock<MenuIds> = OnceLock::new();
 
@@ -8688,6 +8703,9 @@ fn remote_session_definitions_from_config(
 }
 
 use gitterm_core::remote::config::push_remote_agent_config;
+use gitterm_core::remote::phone_panel::{
+    self, scope_label as phone_scope_label, PhoneCall, PhoneRequest,
+};
 
 /// Insert or update an agent by id. Updates touch only the fields the
 /// connect form edits; hand-maintained `shell_command` / `session_commands`
@@ -9148,49 +9166,45 @@ fn remote_connect_form_done(form: &RemoteConnectForm, remote_id: &str, connected
 }
 
 /// The "Pair a phone" panel (TRU-151) for one remote agent: a pairing QR
-/// code and the phones already paired, with Revoke.
-#[derive(Debug, Clone)]
-struct PhonePanel {
-    remote_id: String,
-    machine_name: String,
-    /// Shown in the paired-phones list.
-    device_name: String,
-    /// "Allow sending and approving": the next pairing gets act scope.
-    /// Off by default; a phone already paired keeps its scope.
-    allow_act: bool,
-    pairing: Option<PhonePairingView>,
-    /// `None` while loading.
-    phones: Option<Vec<PairedPhoneInfo>>,
-    /// A pairing or revoke is in flight.
-    busy: bool,
-    error: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct PhonePairingView {
-    url: String,
-    /// The same pairing, typed into the phone's home-screen app
-    /// (`XXXX-XXXX`). Empty from an agent that predates short codes.
-    short_code: String,
-    /// The scope the agent granted ("view" or "act").
-    scope: String,
-    expires_unix_secs: u64,
-    qr: iced::widget::image::Handle,
-}
-
-/// How the pairing panel names a phone scope from the agent.
-fn phone_scope_label(scope: &str) -> String {
-    match scope {
-        "view" => "view only".to_string(),
-        "act" => "can send and approve".to_string(),
-        other => other.to_string(),
-    }
-}
+/// code and the phones already paired, with Revoke. Its state and rules are
+/// in core; Iced draws it, draws the QR and runs the agent calls.
+type PhonePanel = phone_panel::PhonePanel<iced::widget::image::Handle>;
 
 /// Pixels per QR module in the pairing panel, and the quiet zone around
 /// the code (modules) that scanners need.
 const PHONE_QR_SCALE: usize = 6;
 const PHONE_QR_QUIET: usize = 4;
+
+/// Run one phone panel call against the remote's agent; the answer comes
+/// back as the event the panel applies.
+async fn run_phone_call(call: PhoneCall<RemoteAgentClientConfig>) -> Event {
+    let PhoneCall {
+        remote_id,
+        request,
+        client,
+    } = call;
+    let backend = RemoteAgentBackend::new(client);
+    match request {
+        PhoneRequest::List => {
+            let result = backend.list_phones().await.map_err(|err| err.to_string());
+            Event::PhonesLoaded(remote_id, result)
+        }
+        PhoneRequest::Create { device_name, scope } => {
+            let result = backend
+                .create_phone_pairing(device_name, scope.to_string())
+                .await
+                .map_err(|err| err.to_string());
+            Event::PhonePairingCreated(remote_id, result)
+        }
+        PhoneRequest::Revoke { id } => {
+            let result = backend
+                .revoke_phone(id)
+                .await
+                .map_err(|err| err.to_string());
+            Event::PhoneRevoked(remote_id, result)
+        }
+    }
+}
 
 /// The pairing URL as a QR image (black on white, quiet zone included).
 fn phone_pairing_qr(url: &str) -> Result<iced::widget::image::Handle, String> {
@@ -11255,46 +11269,20 @@ impl App {
         )
     }
 
-    /// Load the phone panel's paired phones from its agent.
-    fn load_paired_phones(&mut self) -> Task<Event> {
-        let Some(panel) = self.phone_panel.as_ref() else {
+    /// Run a panel rule that may start an agent call, with this app's
+    /// client lookup, and start the call it returns.
+    fn phone_panel_call(
+        &mut self,
+        rule: impl FnOnce(&mut PhonePanel, &Self) -> Option<PhoneCall<RemoteAgentClientConfig>>,
+    ) -> Task<Event> {
+        let Some(mut panel) = self.phone_panel.take() else {
             return Task::none();
         };
-        let remote_id = panel.remote_id.clone();
-        let client = match self.remote_chat_client(&remote_id) {
-            Ok(client) => client,
-            Err(error) => {
-                if let Some(panel) = self.phone_panel.as_mut() {
-                    panel.error = Some(error);
-                    panel.phones = Some(Vec::new());
-                }
-                return Task::none();
-            }
-        };
-        Task::perform(
-            async move {
-                let result = RemoteAgentBackend::new(client)
-                    .list_phones()
-                    .await
-                    .map_err(|err| err.to_string());
-                (remote_id, result)
-            },
-            |(remote_id, result)| Event::PhonesLoaded(remote_id, result),
-        )
-    }
-
-    /// The phone panel's agent client, or the panel shows why there is none.
-    fn phone_panel_client(&mut self) -> Option<(String, RemoteAgentClientConfig)> {
-        let remote_id = self.phone_panel.as_ref()?.remote_id.clone();
-        match self.remote_chat_client(&remote_id) {
-            Ok(client) => Some((remote_id, client)),
-            Err(error) => {
-                if let Some(panel) = self.phone_panel.as_mut() {
-                    panel.error = Some(error);
-                }
-                None
-            }
-        }
+        let call = rule(&mut panel, self);
+        self.phone_panel = Some(panel);
+        call.map_or_else(Task::none, |call| {
+            Task::perform(run_phone_call(call), |event| event)
+        })
     }
 
     /// Whether a remote's agent owns its Claude chats (TRU-152): they
@@ -12811,34 +12799,32 @@ impl App {
         &mut self,
         mutation: TaskMutation,
     ) -> Result<TaskMutationAction, String> {
+        let facts = self.mutation_facts(&mutation);
+        self.task_host
+            .reduce_mutation(
+                TaskMutationCommand {
+                    reply: None,
+                    mutation,
+                },
+                &facts,
+            )
+            .action
+    }
+
+    /// The facts `reduce_task_mutation` hands the reducer for `mutation`.
+    fn mutation_facts(&self, mutation: &TaskMutation) -> TaskMutationFacts {
         let mut facts = self.task_mutation_facts();
-        if matches!(
-            &mutation,
-            TaskMutation::BeginWorkerPreparation { .. }
-                | TaskMutation::CheckWorkerPreparation { .. }
-                | TaskMutation::BindWorkerPreparation { .. }
-                | TaskMutation::WorkerPrepared { .. }
-                | TaskMutation::WorkerPreparationSaved { .. }
-                | TaskMutation::ReuseWorkerCheckout { .. }
-                | TaskMutation::WorkerCheckoutReuseSaved { .. }
-        ) {
-            facts.callers = self
-                .workspaces
-                .iter()
-                .flat_map(|ws| &ws.tabs)
-                .filter_map(|tab| self.worker_authority_caller(&tab.session_uid).ok())
-                .collect();
-        }
+        facts.callers = self.worker_mutation_callers(mutation);
         if let TaskMutation::PreparationCompleted {
             cleanup_path: Some(path),
             ..
-        } = &mutation
+        } = mutation
         {
             if path.exists() {
                 facts.existing_paths.push(path.clone());
             }
         }
-        let destination = match &mutation {
+        let destination = match mutation {
             TaskMutation::CheckWorkerDestination { expected } => Some(expected.path.clone()),
             TaskMutation::CheckWorkerCheckout { path, .. } => Some(path.clone()),
             TaskMutation::ReuseWorkerCheckout { replacement, .. } => {
@@ -12850,18 +12836,15 @@ impl App {
             } => Some(prepared.path.clone()),
             _ => None,
         };
-        if matches!(
-            &mutation,
-            TaskMutation::WorkerPreparationSaved { .. }
-                | TaskMutation::WorkerCheckoutReuseSaved { .. }
-        ) {
-            if let Some(store) = self.task_host.store() {
-                facts.checkouts = store
-                    .tasks()
-                    .iter()
-                    .filter_map(|task| task.worktree.path.as_ref())
-                    .filter_map(|path| worker_checkout_fact(path).ok())
-                    .collect();
+        if let TaskMutation::WorkerPreparationSaved { id, .. }
+        | TaskMutation::WorkerCheckoutReuseSaved { id, .. } = mutation
+        {
+            // A save re-checks only its own task's checkout, which must be
+            // the target task's path; any other task's checkout is never read.
+            if let Some((_, Some(path))) = self.task_host.pending_worker_subject(*id) {
+                facts.checkouts = freeze_span!("worker facts: checkouts", {
+                    worker_checkout_fact(path).ok().into_iter().collect()
+                });
             }
         }
         if let Some(path) = destination {
@@ -12872,15 +12855,34 @@ impl App {
                 facts.checkouts.push(checkout);
             }
         }
-        self.task_host
-            .reduce_mutation(
-                TaskMutationCommand {
-                    reply: None,
-                    mutation,
-                },
-                &facts,
-            )
-            .action
+        facts
+    }
+
+    /// The caller a worker mutation's reducer reads: the tab it names, or
+    /// the one its preparation captured. The reducer finds it by session
+    /// UID, and every tab's resolution is keyed on its UID, so another
+    /// tab's caller is never read. Resolving every open tab stalled the UI
+    /// thread at worker start (TRU-274).
+    fn worker_mutation_callers(&self, mutation: &TaskMutation) -> Vec<WorkerCaller> {
+        let uid = match mutation {
+            TaskMutation::BeginWorkerPreparation { caller } => Some(caller.as_str()),
+            TaskMutation::CheckWorkerPreparation { id }
+            | TaskMutation::BindWorkerPreparation { id, .. }
+            | TaskMutation::WorkerPrepared { id, .. }
+            | TaskMutation::WorkerPreparationSaved { id, .. }
+            | TaskMutation::ReuseWorkerCheckout { id, .. }
+            | TaskMutation::WorkerCheckoutReuseSaved { id, .. } => self
+                .task_host
+                .pending_worker_subject(*id)
+                .map(|(uid, _)| uid),
+            _ => None,
+        };
+        let Some(uid) = uid else {
+            return Vec::new();
+        };
+        freeze_span!("worker facts: caller", {
+            self.worker_authority_caller(uid).ok().into_iter().collect()
+        })
     }
 
     fn worker_authority_caller(&self, uid: &str) -> Result<WorkerCaller, String> {
@@ -12937,6 +12939,37 @@ impl App {
         })
     }
 
+    /// The facts a worker's `WorkerPrepared` completion is reduced with;
+    /// `resolved` is the destination the preparation was asked to create.
+    fn worker_completion_facts(
+        &self,
+        completion: &TaskMutation,
+        resolved: Option<&Path>,
+    ) -> TaskMutationFacts {
+        let mut facts = self.task_mutation_facts();
+        facts.callers = self.worker_mutation_callers(completion);
+        facts.existing_paths = resolved
+            .iter()
+            .filter(|path| path.exists())
+            .filter_map(|path| std::fs::canonicalize(path).ok())
+            .collect();
+        if let Some(path) = resolved {
+            if let Ok(path) = normalized_worker_path(path) {
+                facts.preparation_paths.push(path);
+            }
+        }
+        if let TaskMutation::WorkerPrepared {
+            result: Ok(prepared),
+            ..
+        } = completion
+        {
+            if let Ok(checkout) = worker_checkout_fact(&prepared.path) {
+                facts.checkouts.push(checkout);
+            }
+        }
+        facts
+    }
+
     fn cancel_worker_preparation(&mut self, id: WorkerPreparationId) {
         let _ = self.reduce_task_mutation(TaskMutation::CancelWorkerPreparation { id });
     }
@@ -12949,38 +12982,18 @@ impl App {
         let worker = pending.worker.clone().expect("worker completion");
         let reply = pending.control_reply.clone().expect("worker reply");
         let id = worker.authority;
-        let mut facts = self.task_mutation_facts();
-        facts.callers = self
-            .workspaces
-            .iter()
-            .flat_map(|ws| &ws.tabs)
-            .filter_map(|tab| self.worker_authority_caller(&tab.session_uid).ok())
-            .collect();
-        facts.existing_paths = pending
-            .resolved_worktree_path
-            .iter()
-            .filter(|path| path.exists())
-            .filter_map(|path| std::fs::canonicalize(path).ok())
-            .collect();
-        if let Some(path) = &pending.resolved_worktree_path {
-            if let Ok(path) = normalized_worker_path(path) {
-                facts.preparation_paths.push(path);
-            }
-        }
-        if let Ok(prepared) = &result {
-            if let Ok(checkout) = worker_checkout_fact(&prepared.path) {
-                facts.checkouts.push(checkout);
-            }
-        }
+        let mutation = TaskMutation::WorkerPrepared {
+            id,
+            result: result.map(Into::into),
+        };
+        let facts =
+            self.worker_completion_facts(&mutation, pending.resolved_worktree_path.as_deref());
         let effect = self
             .task_host
             .reduce_mutation(
                 TaskMutationCommand {
                     reply: Some(reply.id()),
-                    mutation: TaskMutation::WorkerPrepared {
-                        id,
-                        result: result.map(Into::into),
-                    },
+                    mutation,
                 },
                 &facts,
             )
@@ -12995,13 +13008,14 @@ impl App {
                     .as_mut()
                     .ok_or("The task store became unavailable".to_string())
                     .and_then(|store| {
-                        store
-                            .complete_worktree_preparation(
+                        freeze_span!("task store: complete worker preparation", {
+                            store.complete_worktree_preparation(
                                 &task_id,
                                 prepared,
                                 &chrono::Utc::now().to_rfc3339(),
                             )
-                            .map_err(|error| error.to_string())
+                        })
+                        .map_err(|error| error.to_string())
                     });
                 if let Err(error) = &saved {
                     self.task_store_error = Some(error.clone());
@@ -13017,12 +13031,14 @@ impl App {
                 cleanup_path,
             } => {
                 if let Some(store) = self.task_host.store_mut().as_mut() {
-                    if let Err(store_error) = store.fail_worktree_preparation(
-                        &task_id,
-                        error.clone(),
-                        cleanup_path,
-                        &chrono::Utc::now().to_rfc3339(),
-                    ) {
+                    if let Err(store_error) = freeze_span!("task store: fail worker preparation", {
+                        store.fail_worktree_preparation(
+                            &task_id,
+                            error.clone(),
+                            cleanup_path,
+                            &chrono::Utc::now().to_rfc3339(),
+                        )
+                    }) {
                         self.task_store_error = Some(store_error.to_string());
                     }
                 }
@@ -13047,12 +13063,15 @@ impl App {
         else {
             unreachable!("metadata effect")
         };
-        self.task_host
+        let store = self
+            .task_host
             .store_mut()
             .as_mut()
-            .ok_or("GitTerm's task store became unavailable")?
-            .insert(*record)
-            .map_err(|error| error.to_string())
+            .ok_or("GitTerm's task store became unavailable")?;
+        freeze_span!("task store: insert preparing task", {
+            store.insert(*record)
+        })
+        .map_err(|error| error.to_string())
     }
 
     fn archive_task(&mut self, task_id: &str, timestamp: &str) -> Result<(), String> {
@@ -14356,13 +14375,15 @@ impl App {
         let workspace_idx =
             self.ensure_local_workspace_for_chat(directory, Some(directory), &task.workspace.name);
         let workspace_name = self.workspaces[workspace_idx].name.clone();
-        let mut tab = self.create_tab_with_session_uid(
-            worktree_path.clone(),
-            command,
-            Some(&workspace_name),
-            None,
-            true,
-        );
+        let mut tab = freeze_span!("task launch: create_tab_with_session_uid", {
+            self.create_tab_with_session_uid(
+                worktree_path.clone(),
+                command,
+                Some(&workspace_name),
+                None,
+                true,
+            )
+        });
         if tab.terminal().is_none() {
             self.task_host.abandon_launch(ticket);
             return Err(self.task_ui_error.take().unwrap_or_else(|| {
@@ -14422,17 +14443,20 @@ impl App {
         });
         // The host saves the session and attaches the worker before the tab
         // is published; on failure it drops the tab, stopping the terminal.
-        let tab = self.task_host.publish_launch(
-            ticket,
-            LaunchedSession {
-                label: child_label.clone(),
-                harness: harness.clone(),
-                conversation,
-                objective_delivery,
-                timestamp,
-            },
-            tab,
-        )?;
+        // The host's session save and worker attach are store writes.
+        let tab = freeze_span!("task store: publish launch (session + worker attach)", {
+            self.task_host.publish_launch(
+                ticket,
+                LaunchedSession {
+                    label: child_label.clone(),
+                    harness: harness.clone(),
+                    conversation,
+                    objective_delivery,
+                    timestamp,
+                },
+                tab,
+            )
+        })?;
         self.workspaces[workspace_idx].tabs.push(tab);
         let tab_idx = self.workspaces[workspace_idx].tabs.len() - 1;
         if focus {
@@ -19663,9 +19687,10 @@ impl App {
                         .as_mut()
                         .ok_or("GitTerm's task store is unavailable".to_string())
                         .and_then(|store| {
-                            store
-                                .replace(*replacement)
-                                .map_err(|error| error.to_string())
+                            freeze_span!("task store: reuse worker checkout", {
+                                store.replace(*replacement)
+                            })
+                            .map_err(|error| error.to_string())
                         });
                     self.reduce_task_mutation(TaskMutation::WorkerCheckoutReuseSaved {
                         id: authority,
@@ -19746,9 +19771,10 @@ impl App {
                         .as_mut()
                         .ok_or("GitTerm's task store is unavailable".to_string())
                         .and_then(|store| {
-                            store
-                                .complete_worktree_preparation(&task_id, prepared, &timestamp)
-                                .map_err(|error| error.to_string())
+                            freeze_span!("task store: complete adopted worker checkout", {
+                                store.complete_worktree_preparation(&task_id, prepared, &timestamp)
+                            })
+                            .map_err(|error| error.to_string())
                         });
                     self.reduce_task_mutation(TaskMutation::WorkerPreparationSaved {
                         id: authority,
@@ -19881,9 +19907,10 @@ impl App {
         let delegation = gitterm::tasks::Delegation::new_requested(new, now);
         let delegation_id = delegation.delegation_id.clone();
         let inserted = match self.task_host.store_mut().as_mut() {
-            Some(store) => store
-                .insert_delegation(delegation)
-                .map_err(|error| error.to_string()),
+            Some(store) => freeze_span!("task store: insert worker delegation", {
+                store.insert_delegation(delegation)
+            })
+            .map_err(|error| error.to_string()),
             None => Err("GitTerm's task store is unavailable".to_string()),
         };
         if let Err(error) = inserted {
@@ -32588,17 +32615,10 @@ fi
                     .remote_agent_config_by_id(&remote_id)
                     .map(|agent| agent.name.clone())
                     .unwrap_or_else(|| remote_id.clone());
-                self.phone_panel = Some(PhonePanel {
-                    remote_id,
-                    machine_name,
-                    device_name: "iPhone".to_string(),
-                    allow_act: false,
-                    pairing: None,
-                    phones: None,
-                    busy: false,
-                    error: None,
-                });
-                return Task::batch([self.load_paired_phones(), self.apply_webview_surfaces()]);
+                self.phone_panel = Some(PhonePanel::open(remote_id, machine_name));
+                let list =
+                    self.phone_panel_call(|panel, app| panel.list(|id| app.remote_chat_client(id)));
+                return Task::batch([list, self.apply_webview_surfaces()]);
             }
             Event::PhonePanelClose => {
                 self.phone_panel = None;
@@ -32606,132 +32626,38 @@ fi
             }
             Event::PhoneDeviceNameChanged(value) => {
                 if let Some(panel) = self.phone_panel.as_mut() {
-                    panel.device_name = value;
+                    panel.set_device_name(value);
                 }
             }
             Event::PhoneAllowActToggled(allow) => {
                 if let Some(panel) = self.phone_panel.as_mut() {
-                    panel.allow_act = allow;
+                    panel.set_allow_act(allow);
                 }
             }
             Event::PhonePairingCreate => {
-                let Some(panel) = self.phone_panel.as_mut() else {
-                    return Task::none();
-                };
-                if panel.busy {
-                    return Task::none();
-                }
-                let device_name = panel.device_name.trim().to_string();
-                if device_name.is_empty() {
-                    panel.error = Some("Name the phone first.".to_string());
-                    return Task::none();
-                }
-                let scope = if panel.allow_act { "act" } else { "view" };
-                let Some((remote_id, client)) = self.phone_panel_client() else {
-                    return Task::none();
-                };
-                if let Some(panel) = self.phone_panel.as_mut() {
-                    panel.busy = true;
-                    panel.error = None;
-                }
-                return Task::perform(
-                    async move {
-                        let result = RemoteAgentBackend::new(client)
-                            .create_phone_pairing(device_name, scope.to_string())
-                            .await
-                            .map_err(|err| err.to_string());
-                        (remote_id, result)
-                    },
-                    |(remote_id, result)| Event::PhonePairingCreated(remote_id, result),
-                );
+                return self
+                    .phone_panel_call(|panel, app| panel.create(|id| app.remote_chat_client(id)));
             }
             Event::PhoneShortCodeEdited(_) => {}
             Event::PhonePairingCreated(remote_id, result) => {
-                let Some(panel) = self
-                    .phone_panel
-                    .as_mut()
-                    .filter(|panel| panel.remote_id == remote_id)
-                else {
-                    return Task::none();
-                };
-                panel.busy = false;
-                let view = result.and_then(|pairing| {
-                    phone_pairing_qr(&pairing.pairing_url).map(|qr| PhonePairingView {
-                        url: pairing.pairing_url,
-                        short_code: pairing.short_code,
-                        scope: pairing.scope,
-                        expires_unix_secs: pairing.expires_unix_secs,
-                        qr,
-                    })
-                });
-                match view {
-                    Ok(view) => {
-                        panel.pairing = Some(view);
-                        panel.error = None;
-                    }
-                    Err(error) => {
-                        eprintln!("[phone] pairing on {remote_id} failed: {error}");
-                        panel.error = Some(format!("Could not create a pairing: {error}"));
-                    }
+                if let Some(panel) = self.phone_panel.as_mut() {
+                    panel.pairing_created(&remote_id, result, phone_pairing_qr);
                 }
             }
             Event::PhonesLoaded(remote_id, result) => {
-                let Some(panel) = self
-                    .phone_panel
-                    .as_mut()
-                    .filter(|panel| panel.remote_id == remote_id)
-                else {
-                    return Task::none();
-                };
-                match result {
-                    Ok(phones) => panel.phones = Some(phones),
-                    Err(error) => {
-                        eprintln!("[phone] listing phones on {remote_id} failed: {error}");
-                        panel.phones = Some(Vec::new());
-                        panel.error = Some(format!("Could not list paired phones: {error}"));
-                    }
+                if let Some(panel) = self.phone_panel.as_mut() {
+                    panel.phones_loaded(&remote_id, result);
                 }
             }
             Event::PhoneRevoke(id) => {
-                let Some((remote_id, client)) = self.phone_panel_client() else {
-                    return Task::none();
-                };
-                if let Some(panel) = self.phone_panel.as_mut() {
-                    panel.busy = true;
-                    panel.error = None;
-                }
-                return Task::perform(
-                    async move {
-                        let result = RemoteAgentBackend::new(client)
-                            .revoke_phone(id)
-                            .await
-                            .map_err(|err| err.to_string());
-                        (remote_id, result)
-                    },
-                    |(remote_id, result)| Event::PhoneRevoked(remote_id, result),
-                );
+                return self.phone_panel_call(|panel, app| {
+                    panel.revoke(id, |id| app.remote_chat_client(id))
+                });
             }
             Event::PhoneRevoked(remote_id, result) => {
-                let Some(panel) = self
-                    .phone_panel
-                    .as_mut()
-                    .filter(|panel| panel.remote_id == remote_id)
-                else {
-                    return Task::none();
-                };
-                panel.busy = false;
-                match result {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        panel.error =
-                            Some("That phone was no longer paired with the agent.".to_string());
-                    }
-                    Err(error) => {
-                        eprintln!("[phone] revoking a phone on {remote_id} failed: {error}");
-                        panel.error = Some(format!("Could not revoke: {error}"));
-                    }
-                }
-                return self.load_paired_phones();
+                return self.phone_panel_call(|panel, app| {
+                    panel.revoked(&remote_id, result, |id| app.remote_chat_client(id))
+                });
             }
             Event::RemoteWorkspaceBrowse(remote_id) => {
                 return self.open_folder_picker(FolderPickerPurpose::NewWorkspace, Some(remote_id));
@@ -34545,11 +34471,7 @@ fi
                     selection: accent,
                 },
             );
-        let create_label = if panel.pairing.is_some() {
-            "New code"
-        } else {
-            "Show pairing code"
-        };
+        let create_label = panel.create_label();
         let name_row = row![
             column![
                 text("Phone name").size(11).color(text_secondary),
@@ -56168,6 +56090,10 @@ mod tests {
 #[cfg(test)]
 #[path = "baseline_tests.rs"]
 mod baseline_tests;
+
+#[cfg(test)]
+#[path = "phone_panel_tests.rs"]
+mod phone_panel_tests;
 
 #[cfg(test)]
 #[path = "../tests/iced-chat/c10.rs"]

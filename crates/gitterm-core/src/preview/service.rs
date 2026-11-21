@@ -163,6 +163,20 @@ pub fn classify_pr_action(action: crate::prs::PrAction) -> Class {
     }
 }
 
+/// A phone panel call to a remote agent (`remote::phone_panel::PhoneCall`).
+/// Create and revoke grant or withdraw a phone's access in the agent's
+/// registry on another machine, which no fixture root can contain, so they
+/// are Outside rather than Write (local state) or Process (local children).
+/// List reads that registry with the desktop token and writes nothing.
+pub fn classify_phone_request(request: &crate::remote::phone_panel::PhoneRequest) -> Class {
+    use crate::remote::phone_panel::{PhoneRequest as R, CREATE_LABEL};
+    match request {
+        R::List => class("Paired phones", Access::Read),
+        R::Create { .. } => class(CREATE_LABEL, Access::Outside),
+        R::Revoke { .. } => class("Revoke", Access::Outside),
+    }
+}
+
 /// Labels are the MCP tool names, so the notice reads "<tool> · not available in preview".
 #[cfg(feature = "runtime")]
 pub fn classify_operation(operation: &crate::task_mcp::TaskControlOperation) -> Class {
@@ -461,6 +475,10 @@ impl ServiceContext {
 
     pub fn pr_action(&self, run: &crate::work::pr_actions::RunPrAction) -> Result<(), Denied> {
         self.authorize(classify_pr_action(run.action), None)
+    }
+
+    pub fn phone<C>(&self, call: &crate::remote::phone_panel::PhoneCall<C>) -> Result<(), Denied> {
+        self.authorize(classify_phone_request(&call.request), None)
     }
 
     /// `tool` is the browser MCP tool name, used as the notice label.

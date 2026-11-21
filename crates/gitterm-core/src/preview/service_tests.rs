@@ -658,6 +658,49 @@ fn every_pr_action_run_is_outside_and_denied_in_preview() {
     assert!(production.pr_action(&run).is_ok());
 }
 
+#[test]
+fn phone_create_and_revoke_are_outside_and_denied_in_preview() {
+    use crate::remote::phone_panel::{PhoneCall, PhoneRequest};
+    let f = fixture();
+    let context = ServiceContext::preview(f.preview.clone()).unwrap();
+    let create = PhoneRequest::Create {
+        device_name: "iPhone".into(),
+        scope: "act",
+    };
+    let revoke = PhoneRequest::Revoke { id: "p1".into() };
+    assert_preview(
+        &context,
+        &[
+            (
+                classify_phone_request(&create),
+                "Show pairing code",
+                Access::Outside,
+            ),
+            (classify_phone_request(&revoke), "Revoke", Access::Outside),
+            (
+                classify_phone_request(&PhoneRequest::List),
+                "Paired phones",
+                Access::Read,
+            ),
+        ],
+    );
+    let call = |request| PhoneCall {
+        remote_id: "fixture".to_string(),
+        request,
+        client: (),
+    };
+    // The same notice the GPUI preview panel shows for its create button.
+    assert_eq!(
+        context.phone(&call(create.clone())).unwrap_err().notice(),
+        "Show pairing code · not available in preview"
+    );
+    assert!(context.phone(&call(PhoneRequest::List)).is_ok());
+    let production = ServiceContext::production(f.dir.path(), "fixture").unwrap();
+    for request in [create, revoke, PhoneRequest::List] {
+        assert!(production.phone(&call(request)).is_ok());
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn context_only_comes_from_a_validated_root_and_rejects_real_v6_roots() {

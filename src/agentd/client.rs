@@ -15,29 +15,8 @@ pub use gitterm_core::remote::client::{
 use std::time::Duration;
 use tonic::Request;
 
-/// A one-time phone pairing from `CreatePhonePairing` (TRU-151).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PhonePairing {
-    /// Open on the phone; the code is in its fragment.
-    pub pairing_url: String,
-    pub expires_unix_secs: u64,
-    /// The scope the phone gets ("view" or "act").
-    pub scope: String,
-    /// The same pairing, typed into the phone's home-screen app
-    /// (`XXXX-XXXX`). Empty from an agent that predates short codes.
-    pub short_code: String,
-}
-
-/// A phone paired with an agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PairedPhoneInfo {
-    pub id: String,
-    pub name: String,
-    pub scope: String,
-    pub created_unix_secs: u64,
-    /// 0: not used since pairing.
-    pub last_seen_unix_secs: u64,
-}
+/// The panel DTOs live in core so every frontend can draw them (TRU-151).
+pub use gitterm_core::remote::phone_panel::{PairedPhoneInfo, PhonePairing};
 
 #[derive(Debug, Clone)]
 pub struct RemoteAgentBackend {
