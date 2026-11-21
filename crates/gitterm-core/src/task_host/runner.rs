@@ -11,7 +11,9 @@ use super::TaskHost;
 use crate::delegation_state::{Authority, Caller, Effect, Intent, RequestId, State};
 use crate::plan_limits::PolicyEvaluation;
 use crate::preview::service::RunnerEffect;
+use crate::tasks::Delegation;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 /// Capacity and policy facts for one admission or checked start.
 #[derive(Clone, Copy)]
@@ -40,23 +42,40 @@ impl TaskHost {
     /// [`Self::delegation_start_checked`]; a `StartRejected` is final.
     /// `callers` maps a parent tab's session uid to its current identity,
     /// for the requested runs not yet running.
+    ///
+    /// Each delegation's own targets ([`delegation_targets`]) must pass the
+    /// gate; one that does not stays queued, untouched, and the others are
+    /// admitted as before.
     pub fn admit_delegations(
         &mut self,
         capacity: RunnerCapacity<'_>,
         callers: &HashMap<String, Caller>,
     ) -> Vec<Effect> {
-        if self
-            .services
-            .runner(RunnerEffect::QueuePromotion, None)
-            .is_err()
-        {
-            return Vec::new();
-        }
         let Some(store) = self.authority.store().as_ref() else {
             return Vec::new();
         };
+        let all = store.delegations();
+        let allowed = |delegation: &Delegation| {
+            delegation_targets(delegation).iter().all(|target| {
+                self.services
+                    .runner(RunnerEffect::QueuePromotion, Some(target))
+                    .is_ok()
+            })
+        };
+        // Production allows every target, so it keeps reducing the stored
+        // slice itself.
+        let filtered: Vec<Delegation>;
+        let delegations = if all.iter().all(allowed) {
+            all
+        } else {
+            filtered = all.iter().filter(|d| allowed(d)).cloned().collect();
+            &filtered
+        };
+        if delegations.is_empty() {
+            return Vec::new();
+        }
         self.delegations.reduce(Intent::Admit {
-            delegations: store.delegations(),
+            delegations,
             running: capacity.running,
             callers,
             max_concurrent: capacity.max_concurrent,
@@ -108,4 +127,18 @@ impl TaskHost {
         let delegation = self.authority.store().as_ref()?.delegation(id)?;
         Some(self.delegations.reduce(intent_for(delegation)))
     }
+}
+
+/// Where a queued headless run would act: its explicit checkout, else the
+/// requesting tab's checkout, plus every extra writable folder.
+fn delegation_targets(delegation: &Delegation) -> Vec<PathBuf> {
+    let checkout = delegation
+        .options
+        .checkout
+        .as_ref()
+        .unwrap_or(&delegation.parent.cwd);
+    std::iter::once(checkout)
+        .chain(&delegation.options.add_dirs)
+        .cloned()
+        .collect()
 }

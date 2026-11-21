@@ -3,6 +3,7 @@ use crate::preview::{Preview, ProtectedRoots};
 use crate::task_commands::runtime::{command_channel, PendingReply};
 use crate::task_commands::TaskProjection;
 use crate::task_mcp::TaskControlOperation as Op;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 fn req<T: serde::de::DeserializeOwned>(value: Value) -> T {
@@ -518,4 +519,350 @@ fn preview_host_never_delivers_automatically() {
     let dir = tempfile::tempdir().unwrap();
     let mut host = delivery_host(&dir, production(&dir), &["a"]);
     assert_eq!(host.deliver_finished(&chat(false), true).tabs, [7]);
+}
+
+/// A fixture-launch host over `dir`: its one fixture holds `repo/`, and the
+/// store has a task `inside` (worktree `repo/`) and a task `outside`
+/// (worktree a real checkout outside the temp dir). Returns the fixture's
+/// `repo/` and the outside checkout.
+fn target_host(dir: &tempfile::TempDir, fixture_mode: bool) -> (TaskHost, PathBuf, PathBuf) {
+    use crate::delegation_test_support::test_task;
+    let root = dir.path().join("fixture");
+    std::fs::create_dir_all(root.join("repo")).unwrap();
+    std::fs::write(root.join(crate::preview::service::FIXTURE_MARKER), b"").unwrap();
+    let repo = std::fs::canonicalize(root.join("repo")).unwrap();
+    let outside = std::env::current_dir().unwrap();
+    let services = if fixture_mode {
+        let protected = ProtectedRoots::new(&dir.path().join("host"), []).unwrap();
+        let preview = Preview::validate(&dir.path().join("preview"), protected).unwrap();
+        ServiceContext::fixture_launch(Arc::new(preview), [root]).unwrap()
+    } else {
+        production(dir)
+    };
+    let mut store = TaskStore::load(dir.path().join("tasks.json")).unwrap();
+    store.insert(test_task("inside", &repo)).unwrap();
+    store.insert(test_task("outside", &outside)).unwrap();
+    let (commands, _receiver) = command_channel();
+    (
+        TaskHost::new(Some(store), services, commands),
+        repo,
+        outside,
+    )
+}
+
+/// The notice when the gate denied `operation`, else `None` (dispatched).
+fn denial(
+    host: &TaskHost,
+    operation: TaskControlOperation,
+    caller_task: Option<&str>,
+) -> Option<String> {
+    let label = crate::preview::service::classify_operation(&operation).label;
+    let (sender, mut receiver) = command_channel();
+    let pending = sender.enqueue(operation, Some("caller".into())).unwrap();
+    let effect = host.dispatch_with_caller_task(receiver.try_recv().unwrap(), caller_task);
+    if effect.is_some() {
+        return None;
+    }
+    let notice = wait(pending).unwrap_err();
+    assert_eq!(notice, format!("{label} · not available in preview"));
+    Some(notice)
+}
+
+fn delegate(value: Value) -> TaskControlOperation {
+    let mut request = json!({"title": "t", "objective": "o"});
+    request
+        .as_object_mut()
+        .unwrap()
+        .extend(value.as_object().unwrap().clone());
+    Op::DelegateTask(req(request))
+}
+
+#[test]
+fn fixture_write_allowed_only_for_resolved_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host, repo, outside) = target_host(&dir, true);
+    let path = |p: &Path| p.display().to_string();
+    let allowed = [
+        (Op::LaunchSession(req(json!({"task_id": "inside"}))), None),
+        (
+            Op::UpdateHandoff(req(json!({"task_id": "inside", "summary": "s"}))),
+            None,
+        ),
+        (
+            Op::Create(req(json!({
+                "title": "t", "objective": "o", "repository_path": path(&repo)
+            }))),
+            None,
+        ),
+        (
+            Op::RequestReview(req(
+                json!({"target": "uncommitted", "checkout": path(&repo)}),
+            )),
+            None,
+        ),
+        // No checkout: the caller's task worktree.
+        (
+            Op::RequestConsult(req(json!({"brief": "b"}))),
+            Some("inside"),
+        ),
+        (delegate(json!({})), Some("inside")),
+    ];
+    for (operation, caller_task) in allowed {
+        assert_eq!(
+            denial(&host, operation.clone(), caller_task),
+            None,
+            "{operation:?}"
+        );
+    }
+    let denied = [
+        (Op::LaunchSession(req(json!({"task_id": "outside"}))), None),
+        // Unknown task: unresolved, so denied.
+        (Op::LaunchSession(req(json!({"task_id": "absent"}))), None),
+        (
+            Op::UpdateHandoff(req(json!({"task_id": "outside", "summary": "s"}))),
+            None,
+        ),
+        (
+            Op::Create(req(json!({
+                "title": "t", "objective": "o", "repository_path": path(&outside)
+            }))),
+            None,
+        ),
+        (
+            Op::RequestReview(req(
+                json!({"target": "uncommitted", "checkout": path(&outside)}),
+            )),
+            Some("inside"),
+        ),
+        // The caller's task is unknown, or its worktree is outside.
+        (Op::RequestConsult(req(json!({"brief": "b"}))), None),
+        (
+            Op::RequestConsult(req(json!({"brief": "b"}))),
+            Some("outside"),
+        ),
+        (delegate(json!({})), None),
+        // No checkout at all.
+        (Op::MergePlanSet(req(json!({"entries": []}))), None),
+    ];
+    for (operation, caller_task) in denied {
+        assert!(
+            denial(&host, operation.clone(), caller_task).is_some(),
+            "{operation:?}"
+        );
+    }
+    // Plain dispatch knows no caller task.
+    let (effect, _pending) = dispatch(
+        &host,
+        Op::RequestConsult(req(json!({"brief": "b"}))),
+        Some("c"),
+    );
+    assert!(effect.is_none());
+    // Reads are not target-checked.
+    let (effect, _pending) = dispatch(&host, Op::Get(req(json!({"task_id": "outside"}))), None);
+    assert!(matches!(effect, Some(HostEffect::Read { .. })));
+}
+
+#[test]
+fn fixture_checkout_with_outside_repo_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host, repo, outside) = target_host(&dir, true);
+    let (repo_text, outside_text) = (repo.display().to_string(), outside.display().to_string());
+    assert_eq!(
+        denial(&host, delegate(json!({"checkout": repo_text})), None),
+        None
+    );
+    assert_eq!(
+        denial(&host, delegate(json!({"repo": repo_text})), None),
+        None
+    );
+    // Every named target is checked, even a pair the request handler refuses.
+    assert!(denial(
+        &host,
+        delegate(json!({"checkout": repo_text, "repo": outside_text})),
+        Some("inside")
+    )
+    .is_some());
+    // A checkout in the fixture that is a worktree of a repository outside it.
+    let worktree = repo.parent().unwrap().join("wt");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join(".git"), format!("gitdir: {outside_text}\n")).unwrap();
+    let worktree_text = worktree.display().to_string();
+    assert!(denial(&host, delegate(json!({"checkout": worktree_text})), None).is_some());
+    assert!(denial(
+        &host,
+        Op::RequestReview(req(
+            json!({"target": "uncommitted", "checkout": worktree_text})
+        )),
+        None
+    )
+    .is_some());
+}
+
+#[test]
+fn fixture_add_dir_outside_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host, repo, outside) = target_host(&dir, true);
+    let inside_dir = repo.join("docs").display().to_string();
+    let repo_text = repo.display().to_string();
+    assert_eq!(
+        denial(
+            &host,
+            delegate(json!({"checkout": repo_text, "add_dirs": [inside_dir]})),
+            None
+        ),
+        None
+    );
+    assert!(denial(
+        &host,
+        delegate(json!({
+            "checkout": repo_text,
+            "add_dirs": [inside_dir, outside.display().to_string()]
+        })),
+        None
+    )
+    .is_some());
+    // add_dirs alone do not stand in for the checkout the worker runs in.
+    assert!(denial(&host, delegate(json!({"add_dirs": [inside_dir]})), None).is_some());
+}
+
+/// Two queued consults, `in` (checkout in the fixture) and `out` (checkout
+/// outside), stored with the caller [`queue_caller`] admission expects.
+fn queue_delegations(host: &mut TaskHost, repo: &Path, outside: &Path) {
+    use crate::delegation_state::{Authority, Intent};
+    let caller = queue_caller(repo);
+    for (id, checkout) in [("in", repo), ("out", outside)] {
+        let new = crate::delegations::consult_delegation(
+            &req(json!({"brief": format!("Inspect {id}")})),
+            &caller.tab,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut delegation = Delegation::new_requested(new, "t0");
+        delegation.delegation_id = id.into();
+        delegation.options.checkout = Some(checkout.to_path_buf());
+        host.store_mut()
+            .as_mut()
+            .unwrap()
+            .insert_delegation(delegation)
+            .unwrap();
+        host.delegations_mut().reduce(Intent::Stored {
+            id: id.into(),
+            caller: caller.clone(),
+            authority: Authority {
+                checkout: checkout.to_path_buf(),
+                repository: crate::tasks::RepositoryIdentity {
+                    common_dir: checkout.join(".git"),
+                    remote_url: None,
+                },
+                workdir: checkout.to_path_buf(),
+                roots: vec![Some(checkout.to_path_buf())],
+            },
+        });
+    }
+}
+
+fn queue_caller(repo: &Path) -> crate::delegation_state::Caller {
+    let tab = crate::delegations::CallerTab {
+        session_uid: "caller".into(),
+        chat_session_id: None,
+        workspace: "fixture".into(),
+        cwd: repo.to_path_buf(),
+        remote: false,
+        home: repo.to_path_buf(),
+        repos: vec![],
+    };
+    crate::delegation_state::Caller {
+        target: crate::session::Target {
+            tab_id: 1,
+            session_uid: tab.session_uid.clone(),
+            task_id: None,
+            task_session_id: None,
+        },
+        workspace_uid: 1,
+        local_root: Some(repo.to_path_buf()),
+        tab,
+    }
+}
+
+/// The ids admission starts checking, and those it rejects.
+fn admit(host: &mut TaskHost, repo: &Path) -> (Vec<String>, Vec<String>) {
+    use crate::delegation_state::Effect;
+    let policy =
+        crate::plan_limits::evaluate_policy(&crate::plan_limits::PlanLimitsFile::default(), 0);
+    let running = std::collections::HashSet::new();
+    let capacity = RunnerCapacity {
+        running: &running,
+        max_concurrent: 4,
+        policy: &policy,
+        running_workers: 0,
+    };
+    let callers = std::collections::HashMap::from([("caller".to_string(), queue_caller(repo))]);
+    let (mut started, mut rejected) = (Vec::new(), Vec::new());
+    for effect in host.admit_delegations(capacity, &callers) {
+        match effect {
+            Effect::CheckStart { id, .. } => started.push(id),
+            Effect::StartRejected { id, .. } => rejected.push(id),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    (started, rejected)
+}
+
+#[test]
+fn mixed_allowed_and_denied_headless_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut host, repo, outside) = target_host(&dir, true);
+    queue_delegations(&mut host, &repo, &outside);
+    assert_eq!(admit(&mut host, &repo), (vec!["in".into()], vec![]));
+    // The denied run stays queued, untouched, and is never admitted.
+    let store = host.store().as_ref().unwrap();
+    assert_eq!(
+        store.delegation("out").unwrap().status,
+        DelegationStatus::Requested
+    );
+    assert_eq!(admit(&mut host, &repo), (vec![], vec![]));
+}
+
+#[test]
+fn production_dispatch_and_admission_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut host, repo, outside) = target_host(&dir, false);
+    let outside_text = outside.display().to_string();
+    for (operation, caller_task) in [
+        (Op::LaunchSession(req(json!({"task_id": "outside"}))), None),
+        (Op::LaunchSession(req(json!({"task_id": "absent"}))), None),
+        (
+            Op::Create(req(json!({
+                "title": "t", "objective": "o", "repository_path": outside_text
+            }))),
+            None,
+        ),
+        (Op::RequestConsult(req(json!({"brief": "b"}))), None),
+        (
+            Op::RequestReview(req(
+                json!({"target": "uncommitted", "checkout": outside_text}),
+            )),
+            Some("outside"),
+        ),
+        (
+            delegate(json!({"repo": outside_text, "add_dirs": [outside_text]})),
+            None,
+        ),
+        (delegate(json!({})), None),
+        (Op::MergePlanSet(req(json!({"entries": []}))), None),
+    ] {
+        assert_eq!(
+            denial(&host, operation.clone(), caller_task),
+            None,
+            "{operation:?}"
+        );
+    }
+    queue_delegations(&mut host, &repo, &outside);
+    let (mut started, rejected) = admit(&mut host, &repo);
+    started.sort();
+    assert_eq!(
+        (started, rejected),
+        (vec!["in".into(), "out".into()], vec![])
+    );
 }

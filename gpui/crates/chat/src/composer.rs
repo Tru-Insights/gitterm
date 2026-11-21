@@ -68,6 +68,8 @@ pub const NOT_IN_PREVIEW: &str = "not available in preview";
 #[derive(Debug, Default)]
 pub struct ComposerState {
     pub queue: Vec<QueuedRow>,
+    /// Queued prompts the harness's exit left unsent (Iced's `dropQueued`).
+    exited_unsent: std::collections::HashSet<String>,
     pub pending_request: bool,
     pub streaming: bool,
     pub status: String,
@@ -106,14 +108,20 @@ pub struct ComposerState {
 pub const GUIDELINES_TOOLTIP: &str = "GitTerm adds its change guidelines to this agent's system prompt (workspace settings switch them off)";
 
 impl ComposerState {
-    pub fn withdraw_tooltip(&self) -> String {
-        let harness = match self.backend {
+    /// Iced's `harnessName()`.
+    fn harness_name(&self) -> &'static str {
+        match self.backend {
             Some(gitterm_core::chat::types::AgentBackend::Claude) => "Claude",
             Some(gitterm_core::chat::types::AgentBackend::Pi) => "the agent",
             Some(gitterm_core::chat::types::AgentBackend::Acp(agent)) => agent.label(),
             None => "the agent",
-        };
-        format!("Withdraw this message ({harness} keeps working)")
+        }
+    }
+    pub fn withdraw_tooltip(&self) -> String {
+        format!(
+            "Withdraw this message ({} keeps working)",
+            self.harness_name()
+        )
     }
 
     /// Iced's `queuedText()`.
@@ -133,6 +141,9 @@ impl ComposerState {
             _ if row.withdraw_pending => ("Withdrawing…".into(), Some(false)),
             PromptStatus::Pending | PromptStatus::Queued => {
                 (self.queued_text(), Some(!read_only && row.withdrawable()))
+            }
+            PromptStatus::Unsent if self.exited_unsent.contains(id) => {
+                (format!("Not sent: {} exited before reading it", self.harness_name()), None)
             }
             PromptStatus::Unsent => ("Not sent".into(), None),
             PromptStatus::Uncertain => ("Delivery uncertain: the agent may have read this message. Check the conversation before sending it again.".into(), None),
@@ -477,6 +488,13 @@ impl ComposerState {
             .checkout
             .as_ref()
             .map(|path| path.display().to_string());
+        // Core marks the exit's queue Unsent; a prompt refused earlier keeps plain "Not sent".
+        let waiting: Vec<_> = self
+            .queue
+            .iter()
+            .filter(|row| matches!(row.status, PromptStatus::Pending | PromptStatus::Queued))
+            .map(|row| row.id.clone())
+            .collect();
         self.queue = state
             .queued_prompts
             .iter()
@@ -487,6 +505,13 @@ impl ComposerState {
                 withdraw_pending: queued.withdraw_pending,
             })
             .collect();
+        if effects.is_some_and(|effects| effects.process_exited) {
+            self.exited_unsent.extend(waiting.into_iter().filter(|id| {
+                self.queue
+                    .iter()
+                    .any(|row| &row.id == id && row.status == PromptStatus::Unsent)
+            }));
+        }
         self.commands_ready = ready.is_some();
         self.commands = state
             .conversation

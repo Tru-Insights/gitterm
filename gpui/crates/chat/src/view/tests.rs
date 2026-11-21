@@ -3420,6 +3420,92 @@ fn read_only_withdraw_inert(cx: &mut TestAppContext) {
     assert_eq!(queued.intents.borrow().len(), sent);
 }
 
+fn queued_row(chat: &Entity<ChatView>, cx: &mut VisualTestContext) -> (usize, RowKind) {
+    chat.read_with(cx, |view, _| {
+        let index = view
+            .model
+            .rows
+            .iter()
+            .position(|row| row.prompt_id.as_deref() == Some("synthetic-message"))
+            .expect("queued row");
+        (index, view.model.rows[index].kind)
+    })
+}
+
+#[gpui::test]
+fn withdrawn_bubble_removed(cx: &mut TestAppContext) {
+    let (chat, cx, mut queued) = queued_chat(cx);
+    click(cx, "withdraw-synthetic-message");
+    draw(cx);
+    queued.run(
+        ChatIntent::Withdraw {
+            message_id: "synthetic-message".into(),
+        },
+        &chat,
+        cx,
+    );
+    // Iced keeps the bubble, "Withdrawing…", until the withdrawal is confirmed.
+    assert_eq!(queued_row(&chat, cx).1, RowKind::User);
+    assert!(cx.debug_bounds("transcript-row-0").is_some());
+    queued.lifecycle(MessageState::Cancelled, &chat, cx);
+    assert_eq!(queued_row(&chat, cx).1, RowKind::Withdrawn);
+    assert!(cx.debug_bounds("transcript-row-0").is_none());
+    assert!(cx.debug_bounds("withdraw-synthetic-message").is_none());
+    // A rebuild from the conversation drops it too.
+    let rebuilt = ChatModel::from_conversation(&queued.adapter.state().conversation);
+    assert!(
+        rebuilt.rows.iter().all(|row| row.kind != RowKind::User
+            || row.prompt_id.as_deref() != Some("synthetic-message"))
+    );
+}
+
+#[gpui::test]
+fn withdrawn_message_not_in_find(cx: &mut TestAppContext) {
+    let (chat, cx, mut queued) = queued_chat(cx);
+    chat.update_in(cx, |view, window, cx| {
+        view.open_find(&Find, window, cx);
+        view.change_find("later".into(), window, cx);
+    });
+    draw(cx);
+    let index = queued_row(&chat, cx).0;
+    chat.read_with(cx, |view, _| {
+        assert_eq!(
+            view.find
+                .matches
+                .iter()
+                .map(|found| found.row)
+                .collect::<Vec<_>>(),
+            [index]
+        );
+    });
+    queued.run(
+        ChatIntent::Withdraw {
+            message_id: "synthetic-message".into(),
+        },
+        &chat,
+        cx,
+    );
+    queued.lifecycle(MessageState::Cancelled, &chat, cx);
+    // An open find drops the match, and a fresh search does not find it.
+    chat.read_with(cx, |view, _| assert!(view.find.matches.is_empty()));
+    chat.update_in(cx, |view, window, cx| {
+        view.change_find("late".into(), window, cx);
+        view.change_find("later".into(), window, cx);
+    });
+    chat.read_with(cx, |view, _| assert!(view.find.matches.is_empty()));
+}
+
+#[gpui::test]
+fn unsent_after_exit_shows_iced_text(cx: &mut TestAppContext) {
+    let (chat, cx, mut queued) = queued_chat(cx);
+    queued.receive(HarnessEvent::ProcessExited { code: Some(1) }, &chat, cx);
+    let tag = bubble_tag(&chat, cx).expect("unsent tag on the bubble");
+    assert_eq!(tag.label, "Not sent: Claude exited before reading it");
+    assert_eq!(tag.withdraw, None);
+    // The bubble stays, so the text can be sent again.
+    assert_eq!(queued_row(&chat, cx).1, RowKind::User);
+}
+
 #[gpui::test]
 fn c05_slash_row_names_the_command_and_tooltips_its_description(cx: &mut TestAppContext) {
     let (chat, cx) = setup(

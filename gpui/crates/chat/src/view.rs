@@ -1948,7 +1948,7 @@ impl Render for RowView {
             .visual
             .clone()
             .filter(|visual| !visual.read(cx).expanded);
-        if self.hidden_by_turn || self.hidden_by_work {
+        if self.hidden_by_turn || self.hidden_by_work || self.row.kind == RowKind::Withdrawn {
             return div().h(px(0.)).mb(px(0.)).into_any_element();
         }
         if self.hidden_by_run && self.work_summary.is_none() {
