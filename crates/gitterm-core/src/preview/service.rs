@@ -27,6 +27,14 @@ pub const SCRUBBED_ENV_PREFIX: &str = "GITTERM_";
 
 /// A disposable fixture root carries this regular file.
 pub const FIXTURE_MARKER: &str = ".gitterm-fixture-root";
+/// Provider and browser-control homes a preview or fixture child must not
+/// share with production: they are removed and the provider homes are
+/// pinned under the preview state root.
+pub const PROVIDER_HOME_ENV: [(&str, &str); 2] = [
+    ("CODEX_HOME", "provider-homes/codex"),
+    ("CLAUDE_CONFIG_DIR", "provider-homes/claude"),
+];
+pub const SCRUBBED_PREVIEW_ENV_PREFIXES: [&str; 1] = ["AGENT_BROWSER_"];
 
 /// The same wording the preview UI uses for a disabled action.
 pub fn preview_notice(label: &str) -> String {
@@ -195,7 +203,9 @@ pub fn classify_task_action(action: &TaskMutationAction) -> Class {
     use TaskMutationAction as A;
     match action {
         A::None => class("Task", Access::Read),
-        A::InspectCleanup { .. } => class("Inspect worktree", Access::Read),
+        // `git status` without --no-optional-locks can rewrite the checkout's
+        // index, so inspection is a write until that path is proven read-only.
+        A::InspectCleanup { .. } => class("Inspect worktree", Access::Write),
         A::ConfirmPublish { .. } => class("Publish", Access::Read),
         A::WorkerAuthorityChecked { .. } => class("Check worker", Access::Read),
         A::PrepareTask(_) => class("Create task", Access::Write),
@@ -355,11 +365,20 @@ impl ServiceContext {
         &self,
         inherited: impl IntoIterator<Item = (OsString, OsString)>,
     ) -> Vec<(OsString, OsString)> {
+        let preview = self.is_preview();
         let mut env: Vec<_> = inherited
             .into_iter()
-            .filter(|(name, _)| !is_scrubbed(name))
+            .filter(|(name, _)| !(is_scrubbed(name) || (preview && is_preview_scrubbed(name))))
             .collect();
         env.push((CONFIG_DIR_ENV.into(), self.root.clone().into_os_string()));
+        if preview {
+            // shortcut: HOME itself is still inherited (shells and git need it);
+            // tools that write under ~ outside these homes are not isolated yet.
+            // Revisit when H5b wires real preview children.
+            for (name, dir) in PROVIDER_HOME_ENV {
+                env.push((name.into(), self.root.join(dir).into_os_string()));
+            }
+        }
         env
     }
 
@@ -426,6 +445,15 @@ impl ServiceContext {
     }
 }
 
+fn is_preview_scrubbed(name: &OsStr) -> bool {
+    name.to_str().is_none_or(|name| {
+        PROVIDER_HOME_ENV.iter().any(|(env, _)| name == *env)
+            || SCRUBBED_PREVIEW_ENV_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+    })
+}
+
 pub fn is_scrubbed(name: &OsStr) -> bool {
     name.to_str()
         .is_none_or(|name| name.starts_with(SCRUBBED_ENV_PREFIX))
@@ -437,6 +465,13 @@ fn preview_instance_id() -> String {
 
 /// The resolved path decides, so a link inside the temp dir to a real
 /// checkout is refused.
+///
+/// shortcut: only the checkout path is resolved. A fixture whose `.git` file
+/// or `commondir` points into protected state (e.g. `--separate-git-dir`)
+/// is not detected, and the preview root is not re-resolved when child env
+/// is exported, so a later swap of the root for a link is not caught there.
+/// Both need a deliberately crafted setup (Codex review 9f9354eb F3/F4);
+/// validate Git admin dirs and re-check the root when H5b wires hosting.
 fn fixture_root(preview: &Preview, temp: &Path, path: &Path) -> io::Result<PathBuf> {
     let actual = preview.protected().check(path)?;
     if actual == temp || !actual.starts_with(temp) || !fs::symlink_metadata(&actual)?.is_dir() {

@@ -335,7 +335,7 @@ fn every_task_action_and_session_effect_is_classified() {
                 pull_request_url: None,
             },
             "Inspect worktree",
-            Access::Read,
+            Access::Write,
         ),
         (
             A::ConfirmPublish {
@@ -694,6 +694,31 @@ fn child_env_scrubs_production_service_env_and_pins_the_config_dir() {
         assert!(is_scrubbed(OsStr::new(name)));
     }
     assert!(!is_scrubbed(OsStr::new("HOME")));
+}
+
+#[test]
+fn preview_child_env_pins_provider_homes_and_drops_browser_control_env() {
+    let f = fixture();
+    let context = ServiceContext::preview(f.preview.clone()).unwrap();
+    let inherited = [
+        ("CODEX_HOME", "/real/codex"),
+        ("CLAUDE_CONFIG_DIR", "/real/claude"),
+        ("AGENT_BROWSER_HOME", "/real/browser"),
+        ("HOME", "/Users/someone"),
+    ]
+    .map(|(name, value)| (OsString::from(name), OsString::from(value)));
+    let env = context.child_env(inherited);
+    assert!(env
+        .iter()
+        .all(|(_, value)| !value.to_string_lossy().starts_with("/real/")));
+    assert!(env.iter().all(|(key, _)| key != "AGENT_BROWSER_HOME"));
+    for (name, dir) in PROVIDER_HOME_ENV {
+        let values: Vec<_> = env.iter().filter(|(key, _)| key == name).collect();
+        assert_eq!(values.len(), 1, "{name}");
+        assert_eq!(values[0].1, f.preview.root().join(dir).as_os_str());
+    }
+    // HOME stays (shells and git need it); see the shortcut note in child_env.
+    assert!(env.contains(&("HOME".into(), "/Users/someone".into())));
 }
 
 #[cfg(unix)]
