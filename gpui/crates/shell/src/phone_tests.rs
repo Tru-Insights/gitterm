@@ -7,23 +7,25 @@ use crate::{
     remote_shell_tests::{Fixture, bar, click, draw, fixture, snapshot},
     workspace_bar,
 };
+use gitterm_core::remote::phone_panel::{CREATE_LABEL, RECREATE_LABEL};
 use gpui::{TestAppContext, VisualTestContext};
 
-fn fixture_phones() -> Vec<PairedPhone> {
-    vec![PairedPhone {
+fn fixture_phones() -> Vec<PairedPhoneInfo> {
+    vec![PairedPhoneInfo {
         id: "p1".into(),
         name: "Fixture phone".into(),
-        scope: "view only".into(),
-        seen: "never used".into(),
+        scope: "view".into(),
+        created_unix_secs: 1,
+        last_seen_unix_secs: 0,
     }]
 }
 
-fn fixture_pairing(short_code: &str) -> Pairing {
-    Pairing {
-        url: "http://fixture.invalid/pair?t=abc".into(),
+fn fixture_pairing(short_code: &str) -> PhonePairing {
+    PhonePairing {
+        pairing_url: "http://fixture.invalid/pair?t=abc".into(),
         short_code: short_code.into(),
-        scope: "view only".into(),
-        expires: "10:42".into(),
+        scope: "view".into(),
+        expires_unix_secs: 1_000,
     }
 }
 
@@ -89,7 +91,7 @@ fn the_pair_a_phone_menu_entry_opens_the_panel(cx: &mut TestAppContext) {
     // The entry opens the panel instead of reporting a preview notice.
     assert_eq!(shell_notice(&f, cx), None);
     let opened = panel(&f, cx);
-    cx.read(|cx| assert_eq!(opened.read(cx).machine_name, "Mini"));
+    cx.read(|cx| assert_eq!(opened.read(cx).panel.machine_name, "Mini"));
     assert_untouched(&f, &before);
 }
 
@@ -101,10 +103,10 @@ fn labels_and_defaults_match_iced(cx: &mut TestAppContext) {
     assert_eq!(RECREATE_LABEL, "New code");
     assert_eq!(ALLOW_ACT_LABEL, "Allow sending and approving");
     assert_eq!(REVOKE_LABEL, "Revoke");
-    assert_eq!(DEFAULT_PHONE_NAME, "iPhone");
+    assert_eq!(DEFAULT_DEVICE_NAME, "iPhone");
     cx.read(|cx| {
         let panel = panel.read(cx);
-        assert_eq!(panel.machine_name, "Mini");
+        assert_eq!(panel.panel.machine_name, "Mini");
         assert_eq!(panel.device_name(cx), "iPhone");
         assert!(!panel.allow_act());
         assert_eq!(panel.create_label(), "Show pairing code");
@@ -126,7 +128,7 @@ fn labels_and_defaults_match_iced(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("phone-pairing-url").is_none());
 
     panel.update(cx, |panel, cx| {
-        panel.set_pairing(Some(fixture_pairing("ABCD-1234")), cx)
+        panel.pairing_created("mini", Ok(fixture_pairing("ABCD-1234")), cx)
     });
     draw(cx);
     cx.read(|cx| assert_eq!(panel.read(cx).create_label(), "New code"));
@@ -135,13 +137,15 @@ fn labels_and_defaults_match_iced(cx: &mut TestAppContext) {
 
     // An agent that predates short codes: the row is absent, the rest stays.
     panel.update(cx, |panel, cx| {
-        panel.set_pairing(Some(fixture_pairing("")), cx)
+        panel.pairing_created("mini", Ok(fixture_pairing("")), cx)
     });
     draw(cx);
     assert!(cx.debug_bounds("phone-short-code").is_none());
     assert!(cx.debug_bounds("phone-pairing-url").is_some());
 
-    panel.update(cx, |panel, cx| panel.set_phones(Some(fixture_phones()), cx));
+    panel.update(cx, |panel, cx| {
+        panel.phones_loaded("mini", Ok(fixture_phones()), cx)
+    });
     draw(cx);
     assert!(cx.debug_bounds("phone-revoke-p1").is_some());
     assert!(cx.debug_bounds("phone-list-unavailable").is_none());
@@ -174,7 +178,9 @@ fn create_enter_and_revoke_only_show_the_preview_notice(cx: &mut TestAppContext)
     let (f, cx) = fixture(cx);
     let before = snapshot(&f.iced());
     let panel = open(&f, cx);
-    panel.update(cx, |panel, cx| panel.set_phones(Some(fixture_phones()), cx));
+    panel.update(cx, |panel, cx| {
+        panel.phones_loaded("mini", Ok(fixture_phones()), cx)
+    });
     draw(cx);
     let both = |label: &str, cx: &mut VisualTestContext| {
         let expected = format!("{label} · not available in preview");
@@ -203,7 +209,7 @@ fn create_enter_and_revoke_only_show_the_preview_notice(cx: &mut TestAppContext)
     });
 
     panel.update(cx, |panel, cx| {
-        panel.set_pairing(Some(fixture_pairing("ABCD-1234")), cx)
+        panel.pairing_created("mini", Ok(fixture_pairing("ABCD-1234")), cx)
     });
     draw(cx);
     click("phone-create", cx);
@@ -213,8 +219,8 @@ fn create_enter_and_revoke_only_show_the_preview_notice(cx: &mut TestAppContext)
     both("Revoke", cx);
     // Nothing was granted or revoked: the pairing and the list are as given.
     cx.read(|cx| {
-        assert!(panel.read(cx).pairing.is_some());
-        assert_eq!(panel.read(cx).phones, Some(fixture_phones()));
+        assert!(panel.read(cx).panel.pairing.is_some());
+        assert_eq!(panel.read(cx).panel.phones, Some(fixture_phones()));
     });
     assert!(panel_is_open(&f, cx));
     assert_untouched(&f, &before);
@@ -225,7 +231,7 @@ fn busy_disables_every_write_control(cx: &mut TestAppContext) {
     let (f, cx) = fixture(cx);
     let panel = open(&f, cx);
     panel.update(cx, |panel, cx| {
-        panel.set_phones(Some(fixture_phones()), cx);
+        panel.phones_loaded("mini", Ok(fixture_phones()), cx);
         panel.set_busy(true, cx);
     });
     draw(cx);
