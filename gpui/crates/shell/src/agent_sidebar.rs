@@ -43,6 +43,12 @@ impl AgentSidebar {
         }
     }
 
+    /// Iced reads the active tab's repo (`Tab::fetch_claude_config` uses
+    /// `self.repo_path`), so the pane follows the active session.
+    pub fn set_dir(&mut self, dir: PathBuf) {
+        self.dir = dir;
+    }
+
     /// Iced re-reads on entering the Agent view and on returning to Work.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.home = cx.try_global::<AgentHome>().map(|home| home.0.clone());
@@ -281,6 +287,17 @@ impl crate::Shell {
         self.sync_agent_line(workspace, cx);
     }
 
+    /// The active session's repo, as Iced's tab `repo_path`; the workspace
+    /// folder when the session has none.
+    fn active_repo_dir(&self, workspace: crate::WorkspaceId, cx: &App) -> Option<PathBuf> {
+        let state = self
+            .workspaces
+            .iter()
+            .find(|w| w.workspace.id == workspace)?;
+        let tab = state.active_session.and_then(|id| self.session_tab(id, cx));
+        tab_repo_dir(tab).or_else(|| self.data.terminal_cwd(workspace, cx))
+    }
+
     fn sync_agent_line(&self, workspace: crate::WorkspaceId, cx: &mut Context<Self>) {
         let line = self
             .agent_sidebars
@@ -298,8 +315,14 @@ impl crate::Shell {
         agent: bool,
         cx: &mut Context<Self>,
     ) {
+        let dir = self.active_repo_dir(workspace, cx);
         if let Some(pane) = self.agent_sidebars.get(&workspace) {
-            pane.update(cx, |pane, cx| pane.reload(cx));
+            pane.update(cx, |pane, cx| {
+                if let Some(dir) = dir {
+                    pane.set_dir(dir);
+                }
+                pane.reload(cx)
+            });
         }
         self.sync_agent_line(workspace, cx);
         if let Some(state) = self
@@ -344,4 +367,22 @@ impl crate::Shell {
             .get(&workspace)
             .and_then(|pane| pane.read(cx).file_root(path))
     }
+}
+
+/// A tab's repo as Iced's `repo_path`: its repo dir, else its launch dir.
+fn tab_repo_dir(
+    tab: Option<&gitterm_core::workspace_config::WorkspaceTabConfig>,
+) -> Option<PathBuf> {
+    tab.map(|tab| PathBuf::from(tab.repo_dir.as_deref().unwrap_or(&tab.dir)))
+}
+
+#[cfg(test)]
+#[test]
+fn the_agent_pane_reads_the_active_tabs_repo_like_iced() {
+    let mut tab: gitterm_core::workspace_config::WorkspaceTabConfig =
+        serde_json::from_value(serde_json::json!({"dir": "/ws"})).unwrap();
+    assert_eq!(tab_repo_dir(Some(&tab)), Some(PathBuf::from("/ws")));
+    tab.repo_dir = Some("/ws/repo".into());
+    assert_eq!(tab_repo_dir(Some(&tab)), Some(PathBuf::from("/ws/repo")));
+    assert_eq!(tab_repo_dir(None), None);
 }
