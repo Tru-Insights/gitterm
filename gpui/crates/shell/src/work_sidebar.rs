@@ -119,9 +119,11 @@ pub enum WorkSidebarOutcome {
     OpenUrl {
         url: String,
     },
-    /// Iced opens this in its authenticated Page viewer, not the OS browser.
-    OpenPrViewer {
+    /// A PR or issue in the embedded Page, in its owner's or workspace's login
+    /// store (Iced `Pr(OpenInViewer)`, `Issue(Open)`), not the OS browser.
+    OpenPage {
         url: String,
+        store: gitterm_core::page_store::PageStore,
     },
 }
 
@@ -756,8 +758,12 @@ impl WorkSidebar {
                         .unwrap_or_else(|| pr.key.label()),
                 );
                 row.pr_number = Some((pr.key.number, number_chars));
-                row.pr_link = Some(Action::Emit(WorkSidebarOutcome::OpenPrViewer {
+                row.pr_link = Some(Action::Emit(WorkSidebarOutcome::OpenPage {
                     url: pr.key.url(),
+                    store: gitterm_core::page_store::PageStore::github(
+                        pr.key.owner(),
+                        &self.pr_accounts,
+                    ),
                 }));
                 let plan_row = ordered.iter().find(|row| row.entry.key() == pr.key);
                 let next = plan_row
@@ -919,8 +925,17 @@ impl WorkSidebar {
                     });
                     row.badges
                         .extend(issue.and_then(|issue| issue.state.clone()));
-                    if let Some(url) = issue.and_then(|issue| issue.url.clone()) {
-                        row.action = Some(Action::Emit(WorkSidebarOutcome::OpenUrl { url }));
+                    if let Some(issue) = issue
+                        && let Some(url) = issue.url.clone()
+                    {
+                        let workspace = issue
+                            .workspace
+                            .clone()
+                            .or_else(|| gitterm_core::issues::workspace_from_issue_url(&url));
+                        let store =
+                            gitterm_core::page_store::PageStore::linear(workspace.as_deref());
+                        row.action =
+                            Some(Action::Emit(WorkSidebarOutcome::OpenPage { url, store }));
                     }
                     rows.push(row);
                 }
