@@ -73,6 +73,11 @@ fn aggregate_result_draws_bounded_lines_limits_and_authoritative_marks(cx: &mut 
                 .any(|notice| notice.contains("truncated"))
         );
         assert_eq!(view.render_lines(0..10).len(), 10);
+        for mut row in view.render_lines(0..3) {
+            let style = row.text_style().clone();
+            assert_eq!(style.font_family.as_deref(), Some("Menlo"));
+            assert_eq!(style.font_size, Some(px(12.).into()));
+        }
         assert!(
             view.selected_file().unwrap().shown_lines()
                 <= gitterm_core::review::budget::FILE_LINE_CAP

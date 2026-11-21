@@ -263,6 +263,12 @@ impl ContentWindow {
             .get(id)
             .map(|entry| (entry.root.clone(), entry.relative.clone()))
     }
+    /// Whether the workspace's viewer cover currently shows this pane.
+    pub(crate) fn is_visiting(&self, workspace: crate::WorkspaceId, pane: &str) -> bool {
+        self.visits
+            .get(&workspace)
+            .is_some_and(|visit| visit.pane == pane)
+    }
     pub fn close(&mut self, id: &str) {
         self.visits.retain(|_, visit| visit.pane != id);
         if let Some(mut entry) = self.entries.remove(id) {

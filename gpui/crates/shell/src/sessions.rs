@@ -257,6 +257,20 @@ impl crate::Shell {
             self.work_sidebars.insert(id, sidebar);
         }
     }
+    /// Mark the branch row whose review is open; clear it once another viewer
+    /// replaces it or the review closes.
+    pub(crate) fn sync_review_selection(&mut self, cx: &mut gpui::Context<Self>) {
+        for (id, sidebar) in &self.work_sidebars {
+            let open = self.branch_reviews.get(id).filter(|checkout| {
+                self.content.read(cx).is_visiting(
+                    *id,
+                    &format!("{}-branch-review", crate::content_pane_id(*id, checkout)),
+                )
+            });
+            let open = open.cloned();
+            sidebar.update(cx, |sidebar, cx| sidebar.set_review_checkout(open, cx));
+        }
+    }
     pub(crate) fn work_outcome(
         &mut self,
         outcome: &crate::work_sidebar::WorkSidebarOutcome,
@@ -284,6 +298,9 @@ impl crate::Shell {
                 cx.notify();
             }
             O::OpenReview { checkout, vs_base } => {
+                if let Some(active) = self.active_workspace(cx) {
+                    self.branch_reviews.insert(active, checkout.clone());
+                }
                 self.open_work_review(checkout.clone(), *vs_base, window, cx);
             }
             O::OpenFind => {

@@ -155,6 +155,9 @@ pub struct Shell {
     bar_menu: Option<workspace_bar::Menu>,
     work_sidebars: HashMap<WorkspaceId, Entity<work_sidebar::WorkSidebar>>,
     work_subscriptions: HashMap<WorkspaceId, Subscription>,
+    /// The branch checkout last opened in review per workspace; the sidebar
+    /// marks it only while that review is still the visible viewer.
+    branch_reviews: HashMap<WorkspaceId, std::path::PathBuf>,
     #[cfg(test)]
     dock_fixture: bool,
 }
@@ -405,6 +408,7 @@ impl Shell {
             bar_menu: None,
             work_sidebars: HashMap::new(),
             work_subscriptions: HashMap::new(),
+            branch_reviews: HashMap::new(),
             #[cfg(test)]
             dock_fixture: false,
         };
@@ -3837,6 +3841,7 @@ impl Render for Shell {
             content.sync_covers(window, cx);
         });
         self.ensure_work_sidebars(window, cx);
+        self.sync_review_selection(cx);
         self.ensure_rosters(window, cx);
         for (id, sidebar) in &self.work_sidebars {
             if !self.run_sidebar_subscriptions.contains_key(id) {

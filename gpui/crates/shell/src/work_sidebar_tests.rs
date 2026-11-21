@@ -994,7 +994,10 @@ fn expanded_repo_disclosure_stays_inside_default_sidebar_and_collapses(
             let run = cx
                 .debug_bounds(Box::leak(format!("work-run-{index}").into_boxed_str()))
                 .unwrap();
-            assert!(run.size.height > px(20.), "constrained command text wraps");
+            assert!(
+                run.right() <= disclosure.left(),
+                "command truncates, never overlaps"
+            );
         }
         click_sidebar(cx, selector);
         assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
@@ -2523,4 +2526,101 @@ fn repo_running_subtitle_includes_live_chat_and_avoids_counted_task_twice() {
         rows.iter().find(|row| row.label == "api").unwrap().details,
         ["7 edits · 1 branch · 1 PR · 3 running"]
     );
+}
+
+#[gpui::test]
+fn open_review_checkout_marks_only_its_branch_row_selected(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let mut fixture = fixture(false);
+    fixture.open.insert(Fold::Repo("/repos/api".into()));
+    let (sidebar, cx) = cx.add_window_view(|_, _| fixture);
+    cx.simulate_resize(gpui::size(px(640.), px(1200.)));
+    draw_sidebar(cx);
+    let index = sidebar.read_with(cx, |s, _| {
+        s.rows().iter().position(|r| r.label == "tru-274").unwrap()
+    });
+    let selected: &'static str = Box::leak(format!("work-selected-{index}").into_boxed_str());
+    assert!(cx.debug_bounds(selected).is_none());
+    let count = |cx: &mut gpui::VisualTestContext| {
+        (0..40)
+            .filter(|i| {
+                cx.debug_bounds(Box::leak(format!("work-selected-{i}").into_boxed_str()))
+                    .is_some()
+            })
+            .count()
+    };
+    let others = count(cx);
+    sidebar.update(cx, |s, cx| {
+        s.set_review_checkout(Some("/repos/api-tru-274".into()), cx)
+    });
+    draw_sidebar(cx);
+    assert!(cx.debug_bounds(selected).is_some());
+    assert_eq!(
+        count(cx),
+        others + 1,
+        "only the open review's branch is added"
+    );
+    sidebar.update(cx, |s, cx| s.set_review_checkout(None, cx));
+    draw_sidebar(cx);
+    assert!(cx.debug_bounds(selected).is_none());
+}
+
+#[gpui::test]
+fn expanded_repo_row_slots_stay_on_one_line_with_muted_editor(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let repo = PathBuf::from("/repos/gitterm-v2");
+    let fold = Fold::Repo(repo.clone());
+    let (sidebar, cx) = cx.add_window_view(|_, _| {
+        let mut sidebar = fixture(false);
+        sidebar.workspace.repos[0].dir = repo.clone();
+        sidebar.workspace.repos[0].run_command = Some("cargo run --example preview".into());
+        sidebar.open.insert(fold.clone());
+        sidebar
+    });
+    let index = sidebar.read_with(cx, |s, _| {
+        s.rows()
+            .iter()
+            .position(|r| r.label == "gitterm-v2")
+            .unwrap()
+    });
+    let heights = |cx: &mut gpui::VisualTestContext, width: f32| {
+        cx.simulate_resize(gpui::size(px(width), px(900.)));
+        draw_sidebar(cx);
+        ["work-name-", "work-run-", "work-control-"].map(|prefix| {
+            let selector = if prefix == "work-control-" {
+                format!("{prefix}{index}-0")
+            } else {
+                format!("{prefix}{index}")
+            };
+            cx.debug_bounds(Box::leak(selector.into_boxed_str()))
+                .unwrap()
+                .size
+                .height
+        })
+    };
+    let one_line = heights(cx, 2400.);
+    let default = heights(cx, crate::layout::RegionLayout::default().sidebar_width);
+    assert_eq!(
+        default, one_line,
+        "name, run command and Open in editor never wrap"
+    );
+    let disclosure = cx
+        .debug_bounds(Box::leak(format!("work-fold-{index}-▾").into_boxed_str()))
+        .unwrap();
+    let bounds = cx.debug_bounds("work-sidebar").unwrap();
+    assert!(disclosure.right() <= bounds.right());
+    let p = crate::theme::Palette::for_mode(true);
+    let editor = Action::Emit(WorkSidebarOutcome::OpenEditor { dir: repo.clone() });
+    assert_eq!(control_color(&editor, true, &p), p.muted);
+    assert_eq!(control_color(&editor, false, &p), p.blue);
+    sidebar.read_with(cx, |s, _| {
+        let row = s
+            .rows()
+            .into_iter()
+            .find(|r| r.label == "gitterm-v2")
+            .unwrap();
+        assert!(row.controls.iter().any(|c| c.label == "Open in editor"));
+    });
 }
