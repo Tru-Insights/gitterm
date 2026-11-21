@@ -265,3 +265,68 @@ fn launch_zsh_startup_waits_past_a_login_file_vared_editor() {
     wait(|| backend.take_events().title.as_deref() == Some("AFTER_LOGIN_EDITOR"));
     assert_eq!(std::fs::read_to_string(marker).unwrap(), "once\n");
 }
+
+/// Runs `zsh` interactively (login or not) over the generated integration files and
+/// returns the integration dir plus the ZDOTDIR the shell saw after startup.
+fn run_zsh_startup(login: bool) -> Option<(PathBuf, String)> {
+    if !std::path::Path::new("/bin/zsh").exists() {
+        eprintln!("skipping: zsh not installed");
+        return None;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let user_rc = home.path().join("rc");
+    std::fs::create_dir(&user_rc).unwrap();
+    std::fs::write(user_rc.join(".zshrc"), "").unwrap();
+    let launch = TerminalLaunch {
+        env: HashMap::from([
+            ("HOME".into(), Some(home.path().to_string_lossy().into())),
+            ("ZDOTDIR".into(), Some(user_rc.to_string_lossy().into())),
+        ]),
+        program: "/bin/zsh".into(),
+        startup_command: Some("true".into()),
+        ..Default::default()
+    };
+    let (settings, dir) = launch.prepare().unwrap();
+    let dir = dir.unwrap();
+    let integration = dir.path().to_path_buf();
+    let out = home.path().join("out");
+    let mut cmd = std::process::Command::new("/bin/zsh");
+    cmd.arg("-i");
+    if login {
+        cmd.arg("-l");
+    }
+    cmd.env_clear().envs(&settings.env);
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(stdin, "print -r -- $ZDOTDIR > '{}'; exit", out.display()).unwrap();
+    }
+    assert!(child.wait().unwrap().success());
+    let seen = std::fs::read_to_string(out).unwrap().trim().to_string();
+    assert_eq!(seen, user_rc.to_string_lossy());
+    Some((integration, seen))
+}
+
+#[test]
+fn integration_dir_removed_after_shell_start() {
+    for login in [false, true] {
+        if let Some((integration, _)) = run_zsh_startup(login) {
+            assert!(
+                !integration.exists(),
+                "integration dir left behind (login={login})"
+            );
+        }
+    }
+}
+
+#[test]
+fn user_zdotdir_still_restored() {
+    // run_zsh_startup asserts the shell saw the user's ZDOTDIR after startup.
+    for login in [false, true] {
+        run_zsh_startup(login);
+    }
+}

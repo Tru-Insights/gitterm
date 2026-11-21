@@ -1629,7 +1629,7 @@ impl Shell {
             .find(|w| Some(w.workspace.id) == self.active_workspace(cx));
         let colors = workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark());
         let mut workspaces = self.chrome_workspaces(cx);
-        let facts = self.saved_facts.snapshot();
+        let facts = self.connected_facts(self.saved_facts.snapshot(), colors);
         for workspace in &mut workspaces {
             let count = facts
                 .attention_counts
@@ -1803,6 +1803,7 @@ impl Shell {
                     Ok(facts) => {
                         shell.saved_facts.replace(facts);
                         shell.saved_facts_error = None;
+                        shell.connect_remotes(cx);
                     }
                     Err(error) => {
                         let path = source.join("workspaces.json");

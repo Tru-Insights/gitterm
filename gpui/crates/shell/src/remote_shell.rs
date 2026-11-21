@@ -1,6 +1,7 @@
 //! Shell hookup for remote machines, read-only: the in-app folder picker,
-//! the connection form, legacy remote-session Refresh and "Show {machine}
-//! chats". Mirrors Iced's handlers; nothing here writes Iced's config.
+//! the connection form, legacy remote-session Refresh, "Show {machine}
+//! chats", each configured agent's connection state and the phone panel's
+//! list. Mirrors Iced's handlers; nothing here writes Iced's config.
 
 use std::{
     cell::RefCell,
@@ -12,8 +13,10 @@ use std::{
 
 use gitterm_core::{
     folder_picker as rules,
+    preview::service::{ServiceContext, classify_phone_request, preview_notice},
     remote::{
         config::{RemoteAgentConfig, WorkspaceLocationConfig},
+        phone_panel::{PhoneCall, PhoneRequest},
         ssh_sessions::{
             RemoteHostConfig, RemoteSessionEntry, claude_session_name, codex_session_name,
             session_status,
@@ -36,8 +39,22 @@ use crate::{
     phone::{PhonePanel, PhonePanelOutcome},
     remote_client::RemoteClient,
     theme::Palette,
+    workspace_bar::{self, News, SavedFacts},
     workspace_sheet::FolderPickerPurpose,
 };
+
+/// Iced's `PHONE_CAPABILITY` (src/agentd/server.rs): the agent serves the
+/// phone web app, so its machine menu offers "Pair a phone…".
+const PHONE_CAPABILITY: &str = "phone";
+
+/// A configured agent's connection, as Iced's `RemoteAgentConnectionStatus`
+/// shows it on the bar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Connection {
+    Connecting,
+    Connected { capabilities: Vec<String> },
+    Unreachable,
+}
 
 /// Iced's machine-wide legacy remote-session facts.
 #[derive(Default)]
@@ -58,6 +75,8 @@ pub(crate) struct RemoteState {
     pub phone: Option<(Entity<PhonePanel>, Subscription)>,
     pub sessions: RemoteSessions,
     pub remotes: Vec<RemoteAgentConfig>,
+    /// One handshake per configured agent id this session.
+    pub connections: HashMap<String, Connection>,
 }
 
 impl Default for RemoteState {
@@ -75,6 +94,7 @@ impl Default for RemoteState {
             phone: None,
             sessions: RemoteSessions::default(),
             remotes: vec![],
+            connections: HashMap::new(),
         }
     }
 }
@@ -348,8 +368,85 @@ impl Shell {
         cx.notify();
     }
 
-    /// "Pair a phone…" (machine key): Iced's panel, read-only. It lists no
-    /// paired phones (they come from a live agent) and grants nothing.
+    /// Handshake each configured agent not yet asked, off the UI thread, as
+    /// Iced connects its remotes: the bar shows the answer and the machine
+    /// menu offers "Pair a phone…" when the agent serves phones. Same client
+    /// and token lookup as the folder picker's handshake.
+    ///
+    /// shortcut: a failed handshake is not retried (the menu's Reconnect… is
+    /// a preview notice) and an edited endpoint keeps the first answer; retry
+    /// when the preview gets Reconnect.
+    pub(crate) fn connect_remotes(&mut self, cx: &mut Context<Self>) {
+        let remotes: Vec<_> = self
+            .remote
+            .remotes
+            .iter()
+            .filter(|remote| !self.remote.connections.contains_key(&remote.id))
+            .cloned()
+            .collect();
+        for remote in remotes {
+            self.remote
+                .connections
+                .insert(remote.id.clone(), Connection::Connecting);
+            let client = self.remote.client.clone();
+            cx.spawn(async move |shell, cx| {
+                let id = remote.id.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { client.handshake(&remote) })
+                    .await;
+                let connection = match result {
+                    Ok(handshake) => Connection::Connected {
+                        capabilities: handshake.capabilities,
+                    },
+                    Err(error) => {
+                        eprintln!("[remote] handshake with {id} failed: {error}");
+                        Connection::Unreachable
+                    }
+                };
+                _ = shell.update(cx, |shell, cx| {
+                    shell.remote.connections.insert(id, connection);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// The saved facts with each configured agent's connection applied:
+    /// Iced's bar word and colour, and `serves_phones` from the handshake.
+    pub(crate) fn connected_facts(
+        &self,
+        mut facts: SavedFacts,
+        colors: workspace_bar::Colors,
+    ) -> SavedFacts {
+        for machine in &mut facts.repo_machines {
+            let Some(connection) = machine
+                .key
+                .strip_prefix("agent:")
+                .and_then(|id| self.remote.connections.get(id))
+            else {
+                continue;
+            };
+            let (label, color) = match connection {
+                Connection::Connecting => ("connecting", colors.yellow),
+                Connection::Connected { .. } => ("connected", colors.green),
+                Connection::Unreachable => ("unreachable", colors.red),
+            };
+            machine.status = Some(News {
+                label: label.into(),
+                color,
+            });
+            machine.connected = matches!(connection, Connection::Connected { .. });
+            machine.serves_phones = matches!(connection, Connection::Connected { capabilities }
+                if capabilities.iter().any(|c| c == PHONE_CAPABILITY));
+        }
+        facts.machines = workspace_bar::machine_news(&facts.repo_machines);
+        facts
+    }
+
+    /// "Pair a phone…" (machine key): Iced's panel. It lists the paired
+    /// phones as it opens; pairing and revoking are refused by the gate.
     pub(crate) fn open_phone_panel(
         &mut self,
         key: &str,
@@ -380,12 +477,107 @@ impl Shell {
                     );
                     cx.notify();
                 }
-                PhonePanelOutcome::Unavailable(label) => shell.chrome_unavailable(label, cx),
+                PhonePanelOutcome::Create => {
+                    shell.phone_panel_call(|panel, resolve| panel.create(resolve), cx)
+                }
+                PhonePanelOutcome::Revoke(id) => {
+                    let id = id.clone();
+                    shell.phone_panel_call(|panel, resolve| panel.revoke(id, resolve), cx)
+                }
             },
         );
         self.remote.phone = Some((panel, subscription));
         self.cover_sheet(true, window, cx);
+        // Iced lists the phones as the panel opens.
+        self.phone_panel_call(|panel, resolve| panel.list(resolve), cx);
         cx.notify();
+    }
+
+    /// Run a panel rule with Iced's client lookup (the configured remote,
+    /// re-read), then ask the preview gate before running the call it starts.
+    fn phone_panel_call(
+        &mut self,
+        rule: impl FnOnce(
+            &mut gitterm_core::remote::phone_panel::PhonePanel<()>,
+            &dyn Fn(&str) -> Result<RemoteAgentConfig, String>,
+        ) -> Option<PhoneCall<RemoteAgentConfig>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.phone_panel().cloned() else {
+            return;
+        };
+        let remotes = self.reload_remotes(cx);
+        // Iced's `remote_chat_client` text.
+        let resolve = |id: &str| {
+            remotes
+                .iter()
+                .find(|remote| remote.id == id)
+                .cloned()
+                .ok_or_else(|| {
+                    format!("No remote agent named {id} is configured in remote-agents.json.")
+                })
+        };
+        let call = panel.update(cx, |panel, cx| {
+            let call = rule(&mut panel.panel, &resolve);
+            cx.notify();
+            call
+        });
+        let Some(call) = call else {
+            return;
+        };
+        if let Err(notice) = self.phone_gate(&call, cx) {
+            panel.update(cx, |panel, cx| panel.refused(notice.clone(), cx));
+            self.owner.update(cx, |owner, cx| {
+                owner.error = Some(notice);
+                cx.notify();
+            });
+            return;
+        }
+        let PhoneCall {
+            remote_id,
+            request,
+            client: remote,
+        } = call;
+        if request != PhoneRequest::List {
+            // Only a production context passes a write, and this shell
+            // builds a preview one; it has no client to grant or revoke with.
+            let notice = preview_notice(classify_phone_request(&request).label);
+            panel.update(cx, |panel, cx| panel.refused(notice, cx));
+            return;
+        }
+        let client = self.remote.client.clone();
+        cx.spawn(async move |shell, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.list_phones(&remote) })
+                .await;
+            _ = shell.update(cx, |shell, cx| {
+                if let Some(panel) = shell.phone_panel().cloned() {
+                    panel.update(cx, |panel, cx| panel.phones_loaded(&remote_id, result, cx));
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// `ServiceContext::phone(&call)` on this shell's preview roots; the
+    /// notice when it refuses, or when there are no roots to decide on.
+    fn phone_gate(
+        &self,
+        call: &PhoneCall<RemoteAgentConfig>,
+        cx: &Context<Self>,
+    ) -> Result<(), String> {
+        let refused = || preview_notice(classify_phone_request(&call.request).label);
+        let Some(preview) = self.owner.read(cx).preview() else {
+            return Err(refused());
+        };
+        let services = ServiceContext::preview(preview).map_err(|error| {
+            eprintln!("[phone] preview services: {error}");
+            refused()
+        })?;
+        services
+            .phone(call)
+            .map_err(|denied| denied.notice().to_string())
     }
 
     /// "Show {machine} chats": Everywhere, only that machine's section open.
