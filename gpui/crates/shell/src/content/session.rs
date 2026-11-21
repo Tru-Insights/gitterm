@@ -17,7 +17,141 @@ pub(super) struct ViewerVisit {
     session: Option<SessionId>,
 }
 
+fn page_pane_id(workspace: WorkspaceId) -> String {
+    format!("workspace-{}-page", workspace.0)
+}
+
 impl Shell {
+    /// Iced `open_page_in_store`: show a PR or issue in the workspace's
+    /// embedded Page, in GPUI's own copy of the selected login store.
+    pub(crate) fn open_page(
+        &mut self,
+        url: String,
+        store: gitterm_core::page_store::PageStore,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = gitterm_core::page_store::browser_url(&url) {
+            eprintln!("[page] open refused: {error}");
+            return;
+        }
+        let Some(workspace) = self.active_workspace(cx) else {
+            return;
+        };
+        let session = self
+            .content
+            .read(cx)
+            .visits
+            .get(&workspace)
+            .map(|visit| visit.session);
+        let id = page_pane_id(workspace);
+        let (content, data) = (self.content.clone(), self.data.clone());
+        let state = self
+            .workspaces
+            .iter_mut()
+            .find(|state| state.workspace.id == workspace)
+            .unwrap();
+        let session = session.unwrap_or(state.active_session);
+        let pane = state
+            .panes
+            .entry(id.clone())
+            .or_insert_with(|| {
+                let pane = cx.new(|cx| {
+                    Pane::new(
+                        id.clone(),
+                        "Page".into(),
+                        PaneKind::Content(content),
+                        workspace,
+                        data,
+                        window,
+                        cx,
+                    )
+                });
+                self.registry
+                    .borrow_mut()
+                    .insert(id.clone(), pane.downgrade());
+                pane
+            })
+            .clone();
+        let origin = super::Origin {
+            workspace: workspace.0,
+            pane: pane.entity_id().as_u64(),
+            source: url.clone().into(),
+        };
+        self.selected_files.remove(&workspace);
+        self.content.update(cx, |content, cx| {
+            content.open_page(id.clone(), url, store, origin, window, cx);
+            content.select(Some(id.clone()));
+            content.visits.insert(
+                workspace,
+                ViewerVisit {
+                    pane: id.clone(),
+                    session,
+                },
+            );
+            cx.notify();
+        });
+        self.show_workspace_pane(workspace, &id, window, cx);
+    }
+
+    /// Iced `view_page_header`: URL, login store, `Open in browser`, `×`.
+    fn page_header(
+        &self,
+        url: String,
+        store: String,
+        workspace: WorkspaceId,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let muted = gpui_component::Theme::global(cx).muted_foreground;
+        div()
+            .h(px(40.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .child(
+                div()
+                    .debug_selector(|| "page-url".into())
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(gitterm_core::work::summary::shorten(&url, 100)),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "page-store".into())
+                    .text_xs()
+                    .text_color(muted)
+                    .child(store),
+            )
+            .child(
+                Button::new("page-open-browser")
+                    .debug_selector(|| "page-open-browser".into())
+                    .ghost()
+                    .label("Open in browser")
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        if gitterm_core::page_store::browser_url(&url).is_ok() {
+                            cx.open_url(&url);
+                        }
+                    })),
+            )
+            .child(
+                Button::new("page-close")
+                    .debug_selector(|| "page-close".into())
+                    .ghost()
+                    .label("×")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.close_file_viewer(workspace, window, cx)
+                    })),
+            )
+            .into_any_element()
+    }
+
     pub(crate) fn open_work_review(
         &mut self,
         checkout: std::path::PathBuf,
@@ -304,6 +438,12 @@ impl Shell {
         let is_review = review.is_some();
         let local_source = self.local && self.data.terminal_cwd(workspace, cx).is_some();
         let source = visit.and_then(|visit| self.content.read(cx).source(&visit.pane));
+        let page = visit.and_then(|visit| {
+            let content = self.content.read(cx);
+            content
+                .page(&visit.pane)
+                .map(|(url, store)| (url.to_owned(), store.label()))
+        });
         let rendered = source
             .as_ref()
             .is_some_and(|(_, path)| super::actions::is_rendered(path));
@@ -364,7 +504,9 @@ impl Shell {
                     cx.stop_propagation();
                 }
             }))
-            .child(
+            .child(if let Some((url, store)) = page {
+                self.page_header(url, store, workspace, cx)
+            } else {
                 div()
                     .h(px(40.))
                     .flex_shrink_0()
@@ -440,8 +582,9 @@ impl Shell {
                                 this.selected_files.remove(&workspace);
                                 this.close_file_viewer(workspace, window, cx)
                             })),
-                    ),
-            )
+                    )
+                    .into_any_element()
+            })
             .child(div().flex_1().min_h_0().child(pane.clone()))
     }
 }

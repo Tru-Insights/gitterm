@@ -528,3 +528,46 @@ fn rendered_document_preserves_controls_selection_and_scroll_content() {
         assert!(html.html().contains(control), "missing {control}");
     }
 }
+
+#[test]
+fn page_links_keep_known_services_embedded_and_send_others_out() {
+    use super::host::{DocumentNavigation as N, page_navigation};
+    for url in [
+        "https://github.com/example/gitterm/pull/1",
+        "https://linear.app/sample-a/issue/SAMPLE-1/x",
+        "https://accounts.google.com/signin",
+    ] {
+        assert_eq!(page_navigation(Some(url), false, true), N::Allow, "{url}");
+        assert_eq!(
+            page_navigation(Some(url), true, false),
+            N::External,
+            "{url}"
+        );
+    }
+    for url in [
+        "https://example.com/",
+        "http://github.com/x",
+        "https://github.com:8443/x",
+        "https://user@github.com/x",
+    ] {
+        assert_eq!(
+            page_navigation(Some(url), false, true),
+            N::External,
+            "{url}"
+        );
+    }
+    assert_eq!(
+        page_navigation(Some("https://example.com/frame"), false, false),
+        N::Allow
+    );
+    for url in [Some("file:///etc/hosts"), Some("about:blank"), None] {
+        assert_eq!(page_navigation(url, false, true), N::Cancel, "{url:?}");
+    }
+    assert_eq!(
+        super::host::uuid_string([
+            0xa9, 0x0d, 0x78, 0xb9, 0x36, 0xe7, 0x7e, 0x9f, 0x1e, 0xe4, 0x3b, 0x89, 0xd3, 0xf8,
+            0xa9, 0x35,
+        ]),
+        "a90d78b9-36e7-7e9f-1ee4-3b89d3f8a935"
+    );
+}
