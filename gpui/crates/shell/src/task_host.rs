@@ -355,7 +355,6 @@ impl TaskHostOwner {
         }))
     }
 
-    #[cfg(test)]
     pub(crate) fn host(&self) -> &TaskHost {
         &self.host
     }
