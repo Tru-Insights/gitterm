@@ -12,6 +12,7 @@ mod stores;
 mod task_authority;
 mod usage;
 mod work;
+mod worker_facts;
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/stage45");
 fn fixture(name: &str) -> String {
