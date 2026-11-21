@@ -40,7 +40,7 @@ fn entry(id: &str, title: &str, now: SystemTime) -> ChatIndexEntry {
     }
 }
 
-fn branch(repo: &str, name: &str, gone: bool) -> BranchStatus {
+pub(crate) fn branch(repo: &str, name: &str, gone: bool) -> BranchStatus {
     BranchStatus {
         owned: OwnedBranch {
             repo: repo.into(),
@@ -946,6 +946,62 @@ fn repo_name_and_disclosure_toggle_but_only_run_emits_command(cx: &mut gpui::Tes
 }
 
 #[gpui::test]
+fn expanded_repo_disclosure_stays_inside_default_sidebar_and_collapses(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let repo = PathBuf::from("/repos/api");
+    let fold = Fold::Repo(repo.clone());
+    let (sidebar, cx) = cx.add_window_view(|_, _| {
+        let mut sidebar = fixture(false);
+        sidebar.workspace.repos[0].dir = repo.clone();
+        sidebar
+    });
+    cx.simulate_resize(gpui::size(
+        px(crate::layout::RegionLayout::default().sidebar_width),
+        px(900.),
+    ));
+    for command in [Some("cargo run --example preview".to_string()), None] {
+        let has_command = command.is_some();
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.workspace.repos[0].run_command = command;
+            sidebar.open.insert(fold.clone());
+            cx.notify();
+        });
+        draw_sidebar(cx);
+        let index = sidebar.read_with(cx, |sidebar, _| {
+            let rows = sidebar.rows();
+            let index = rows.iter().position(|row| row.label == "api").unwrap();
+            assert_eq!(rows[index].controls.len(), 3, "editor, run edit, remove");
+            assert!(rows[index].age.is_some());
+            index
+        });
+        let selector: &'static str = Box::leak(format!("work-fold-{index}-▾").into_boxed_str());
+        let disclosure = cx.debug_bounds(selector).unwrap();
+        let sidebar_bounds = cx.debug_bounds("work-sidebar").unwrap();
+        assert_eq!(disclosure.size.width, px(24.));
+        assert!(disclosure.left() >= sidebar_bounds.left());
+        assert!(disclosure.right() <= sidebar_bounds.right());
+        assert_eq!(disclosure.right(), sidebar_bounds.right() - px(12.));
+        let editor = cx
+            .debug_bounds(Box::leak(
+                format!("work-control-{index}-0").into_boxed_str(),
+            ))
+            .unwrap();
+        assert!(editor.right() <= disclosure.left());
+        if has_command {
+            let run = cx
+                .debug_bounds(Box::leak(format!("work-run-{index}").into_boxed_str()))
+                .unwrap();
+            assert!(run.size.height > px(20.), "constrained command text wraps");
+        }
+        click_sidebar(cx, selector);
+        assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
+    }
+}
+
+#[gpui::test]
 fn pr_body_and_disclosure_keep_iced_toggle_targets(cx: &mut gpui::TestAppContext) {
     use gitterm_core::{merge_plan::PrKey, prs::WatchedPr};
     cx.background_executor.allow_parking();
@@ -1451,7 +1507,7 @@ impl IcedFixture {
             1,
             &self.workspace,
             Focus::Latest,
-            &[],
+            None,
             |_| {},
         )
         .unwrap()
@@ -1588,7 +1644,7 @@ fn missing_and_malformed_task_stores_are_read_only_and_errors_are_visible() {
         1,
         &fixture.workspace,
         Focus::Latest,
-        &[],
+        None,
         |_| {},
     );
     assert!(result.err().unwrap().to_string().contains("task store"));
@@ -1993,11 +2049,11 @@ fn folder_work_includes_historical_chats_and_missing_index_omits_unknown_chats()
 // Install the production read-only projection before a headless host's first draw.
 pub(crate) fn h8_install(sidebar: &mut WorkSidebar, data: crate::data::IcedWorkData) {
     data.apply(&mut sidebar.state.borrow_mut());
+    sidebar.previous_data = Some(data.clone());
     sidebar.workspace = data.facts;
     sidebar.tasks = data.tasks;
     sidebar.workers = data.workers;
     sidebar.repo_recency = data.repo_recency;
-    sidebar.indexed_chats = data.indexed_chats;
     sidebar.loaded_at = Some(Instant::now());
 }
 
@@ -2114,7 +2170,7 @@ fn realistic_catalog_partial_index_publishes_repos_chats_docs_before_branch_chec
         4,
         saved,
         Focus::Latest,
-        &[],
+        None,
         true,
         |data| {
             publications += 1;

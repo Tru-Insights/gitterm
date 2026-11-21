@@ -238,7 +238,7 @@ pub struct WorkSidebar {
     repo_recency: Vec<(PathBuf, std::time::SystemTime)>,
     source: Option<IcedWorkSource>,
     pull_requests: Vec<PullRequestGroup>,
-    indexed_chats: Vec<gitterm_core::chats::ChatIndexEntry>,
+    previous_data: Option<crate::data::IcedWorkData>,
     pr_plans: HashMap<String, gitterm_core::merge_plan::MergePlan>,
     pr_accounts: BTreeMap<String, String>,
     issues: gitterm_core::issues::IssueTitlesFile,
@@ -265,7 +265,7 @@ impl WorkSidebar {
             repo_recency: vec![],
             source: None,
             pull_requests: vec![],
-            indexed_chats: vec![],
+            previous_data: None,
             pr_plans: HashMap::new(),
             pr_accounts: BTreeMap::new(),
             issues: Default::default(),
@@ -347,7 +347,8 @@ impl WorkSidebar {
             .iter()
             .filter_map(|t| t.chat_session_id.clone())
             .collect();
-        self.workspace.repos = saved
+        if self.previous_data.is_none() {
+            self.workspace.repos = saved
             .repos
             .iter()
             .filter(|_| self.workspace.local)
@@ -361,8 +362,9 @@ impl WorkSidebar {
                     .and_then(|r| r.run_command.clone()),
             })
             .collect();
+        }
         let config = source.config.clone();
-        let previous = self.indexed_chats.clone();
+        let previous = self.previous_data.clone();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let job = cx.background_executor().spawn(async move {
             let plans = gitterm_core::merge_plan::load_plans(&gitterm_core::merge_plan::plans_dir(
@@ -374,7 +376,7 @@ impl WorkSidebar {
                 id,
                 &saved,
                 focus,
-                &previous,
+                previous.as_ref(),
                 |data| {
                     _ = sender.send((Ok(data.clone()), plans.clone(), accounts.clone()));
                 },
@@ -390,6 +392,7 @@ impl WorkSidebar {
                     this.loaded_at = Some(std::time::Instant::now());
                     match result {
                         Ok(data) => {
+                            this.previous_data = Some(data.clone());
                             this.pr_plans = plans;
                             this.pr_accounts = accounts;
                             data.apply(&mut this.state.borrow_mut());
@@ -399,7 +402,6 @@ impl WorkSidebar {
                             this.running_task_ids = data.running_task_ids;
                             this.repo_recency = data.repo_recency;
                             this.pull_requests = data.pull_requests;
-                            this.indexed_chats = data.indexed_chats;
                             this.issues = data.issues;
                             this.collapsed_issue_groups = data.collapsed_issue_groups;
                             this.error = None;
@@ -1489,7 +1491,7 @@ impl WorkSidebar {
         }
     }
 
-    fn button(&self, id: String, control: Control, cx: &Context<Self>) -> Button {
+    fn button(&self, id: String, control: Control, wrap: bool, cx: &Context<Self>) -> Button {
         let p = crate::theme::Palette::current(cx);
         let run = matches!(
             control.action,
@@ -1549,7 +1551,18 @@ impl WorkSidebar {
                     cx,
                 );
             }))
-            .label(control.label)
+            .map(|button| {
+                if wrap {
+                    button
+                        .flex_shrink_1()
+                        .min_w_0()
+                        .h_auto()
+                        .accessibility_label(control.label.clone())
+                        .child(div().min_w_0().whitespace_normal().child(control.label))
+                } else {
+                    button.label(control.label)
+                }
+            })
     }
 }
 
@@ -1656,7 +1669,10 @@ impl Render for WorkSidebar {
                 label = label.text_color(rgb(if row.small { p.subtext0 } else { p.muted }));
             }
             if repo {
-                label = label.font_family("Menlo").text_size(px(12.));
+                label = label
+                    .font_family("Menlo")
+                    .text_size(px(12.))
+                    .whitespace_normal();
             }
             if row.heading || repo {
                 label = label.font_weight(gpui::FontWeight::BOLD);
@@ -1673,6 +1689,7 @@ impl Render for WorkSidebar {
                             label: format!("#{number}"),
                             action: row.pr_link.take().expect("PR number has viewer action"),
                         },
+                        false,
                         cx,
                     )
                     .debug_selector(|| format!("work-pr-number-{index}"))
@@ -1695,7 +1712,8 @@ impl Render for WorkSidebar {
                         .h_auto()
                         .px(px(2.))
                         .py_0()
-                        .flex_shrink_0()
+                        .flex_shrink_1()
+                        .min_w_0()
                         .text_color(rgb(p.text))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.dispatch(action.clone(), window, cx);
@@ -1706,7 +1724,7 @@ impl Render for WorkSidebar {
                 line = line.child(label);
             }
             if let Some(run) = row.run {
-                line = line.child(self.button(format!("work-run-{index}"), run, cx));
+                line = line.child(self.button(format!("work-run-{index}"), run, repo, cx));
             }
             if row.editor.is_some()
                 && let Some((_, input)) = &self.editing
@@ -1773,6 +1791,7 @@ impl Render for WorkSidebar {
                 line = line.child(self.button(
                     format!("work-control-{index}-{control_index}"),
                     control,
+                    repo,
                     cx,
                 ));
             }
@@ -1784,6 +1803,16 @@ impl Render for WorkSidebar {
                         .text_color(rgb(p.muted))
                         .child(age),
                 );
+            }
+            if repo {
+                // Iced constrains wrapping content to a fill slot beside the disclosure.
+                line = div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().flex_1().min_w_0().overflow_hidden().child(line));
             }
             if let Some(fold) = row.fold {
                 let label = if fold == Fold::Focus {
@@ -1798,6 +1827,7 @@ impl Render for WorkSidebar {
                             label: label.into(),
                             action: Action::Toggle(fold),
                         },
+                        false,
                         cx,
                     )
                     .when(repo || pr, |button| {
@@ -1864,6 +1894,7 @@ impl Render for WorkSidebar {
                     line = line.child(self.button(
                         format!("work-inline-{index}-{detail_index}-{control_index}"),
                         control,
+                        false,
                         cx,
                     ));
                 }
@@ -1874,6 +1905,7 @@ impl Render for WorkSidebar {
                 actions = actions.child(self.button(
                     format!("work-detail-{index}-{control_index}"),
                     control,
+                    false,
                     cx,
                 ));
             }
