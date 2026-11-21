@@ -157,11 +157,7 @@ fn running_plan_limit_workers(
 
 impl App {
     pub(super) fn plan_limit_running_workers(&self, provider: Provider) -> usize {
-        running_plan_limit_workers(
-            &self.workspaces,
-            provider,
-            self.task_authority.store().as_ref(),
-        )
+        running_plan_limit_workers(&self.workspaces, provider, self.task_host.store().as_ref())
     }
 
     pub(super) fn plan_limits_routing(&self) -> plan_limits::RoutingReport {

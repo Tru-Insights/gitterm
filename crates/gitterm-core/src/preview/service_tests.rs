@@ -803,6 +803,14 @@ fn production_is_a_distinct_constructor_that_allows_everything() {
     let f = fixture();
     let real = f.dir.path().join("host/.config/gitterm-v6");
     assert!(ServiceContext::production(Path::new("relative"), "1").is_err());
+    // Iced accepts an absolute override containing `..`; production starts there too.
+    let dotted = f.dir.path().join("host/.config/x/../gitterm-v6");
+    assert_eq!(
+        ServiceContext::production(&dotted, "1")
+            .unwrap()
+            .state_root(),
+        dotted
+    );
     let production = ServiceContext::production(&real, "123").unwrap();
     assert!(!production.is_preview());
     assert_eq!(production.state_root(), real);

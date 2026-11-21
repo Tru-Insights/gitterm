@@ -552,7 +552,7 @@ fn chat_receiver_survives_task_attachment_and_existing_tab_resume() {
         .agent_session()
         .unwrap()
         .runtime_stamp(attached);
-    let store = app.task_authority.store_mut().as_mut().unwrap();
+    let store = app.task_host.store_mut().as_mut().unwrap();
     let mut saved = store
         .get("fixture-task")
         .unwrap()

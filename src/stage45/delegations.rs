@@ -32,7 +32,7 @@ fn review_consult_admission_cancel_and_late_completion() {
         .unwrap();
         let mut delegation = gitterm::tasks::Delegation::new_requested(new, "t0");
         delegation.delegation_id = id.into();
-        app.task_authority
+        app.task_host
             .store_mut()
             .as_mut()
             .unwrap()
@@ -63,7 +63,7 @@ fn review_consult_admission_cancel_and_late_completion() {
             "fixture failure".into(),
         )),
     );
-    let store = app.task_authority.store().as_ref().unwrap();
+    let store = app.task_host.store().as_ref().unwrap();
     let first = store.delegation("first").unwrap();
     let second = store.delegation("second").unwrap();
     golden(
@@ -79,7 +79,8 @@ fn review_consult_admission_cancel_and_late_completion() {
 
 fn delegation_app(dir: &Path) -> App {
     let mut app = app_with_tabs(dir);
-    app.task_authority = Some(TaskStore::load(dir.join("tasks.json")).unwrap()).into();
+    app.task_host
+        .replace_store(Some(TaskStore::load(dir.join("tasks.json")).unwrap()));
     app.review_config.max_concurrent_reviews = 1;
     app.workspaces[0].dir = dir.into();
     app.workspaces[0].location = WorkspaceLocation::Local { root: dir.into() };
@@ -149,7 +150,7 @@ fn checked_request_replies_only_after_insert_and_refuses_a_restored_caller() {
         if stale {
             assert!(result.unwrap_err().contains("calling GitTerm tab changed"));
             assert!(app
-                .task_authority
+                .task_host
                 .store()
                 .as_ref()
                 .unwrap()
@@ -195,7 +196,7 @@ fn failed_started_terminal_and_cancellation_saves_never_restart_a_paid_attempt()
         .unwrap();
         let mut d = gitterm::tasks::Delegation::new_requested(new, "t0");
         d.delegation_id = "attempt".into();
-        app.task_authority
+        app.task_host
             .store_mut()
             .as_mut()
             .unwrap()
@@ -237,7 +238,7 @@ fn failed_started_terminal_and_cancellation_saves_never_restart_a_paid_attempt()
         assert!(app.delegation_runs.is_empty());
         assert!(!app.delegation_state.busy());
         assert_eq!(
-            app.task_authority
+            app.task_host
                 .store()
                 .as_ref()
                 .unwrap()
@@ -274,7 +275,7 @@ fn fixture_authority(caller: &gitterm::delegations::CallerTab) -> delegation_sta
 }
 fn complete_checks(app: &mut App) {
     let ids: Vec<_> = app
-        .task_authority
+        .task_host
         .store()
         .as_ref()
         .into_iter()
@@ -284,7 +285,7 @@ fn complete_checks(app: &mut App) {
     for id in ids {
         if let Some(check) = app.delegation_state.pending_start(&id) {
             let d = app
-                .task_authority
+                .task_host
                 .store()
                 .as_ref()
                 .unwrap()
@@ -332,7 +333,7 @@ fn missing_unrelated_repo_is_optional_and_queued_checks_do_not_read_the_filesyst
     assert!(authority.roots.iter().any(Option::is_none));
     let mut d = gitterm::tasks::Delegation::new_requested(new, "t0");
     d.delegation_id = "preflight".into();
-    app.task_authority
+    app.task_host
         .store_mut()
         .as_mut()
         .unwrap()
@@ -354,7 +355,7 @@ fn missing_unrelated_repo_is_optional_and_queued_checks_do_not_read_the_filesyst
     let _unpolled = app.delegation_start_checked("preflight".into(), check, Ok(authority));
     assert!(app.delegation_runs.is_empty());
     assert!(matches!(
-        app.task_authority
+        app.task_host
             .store()
             .as_ref()
             .unwrap()
