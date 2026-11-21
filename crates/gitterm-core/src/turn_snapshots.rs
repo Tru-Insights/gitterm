@@ -1128,9 +1128,9 @@ impl Recorder {
             return;
         }
         let dirs = match self.checkouts().await {
-            Ok(dirs) => dirs,
+            Ok(dirs) => existing_checkouts(dirs),
             Err(e) => {
-                eprintln!("[turns] {e}");
+                log_turns(e);
                 return;
             }
         };
@@ -1143,7 +1143,7 @@ impl Recorder {
                             number = number.max(turn.number.saturating_add(1));
                         }
                     }
-                    Err(e) => eprintln!("[turns] {e}"),
+                    Err(e) => log_turns(e),
                 }
             }
         }
@@ -1163,7 +1163,7 @@ impl Recorder {
                     self.starts.insert(dir, snapshot);
                 }
                 Ok(None) => {}
-                Err(e) => eprintln!("[turns] {e}"),
+                Err(e) => log_turns(e),
             }
         }
         self.publish_starts().await;
@@ -1201,16 +1201,17 @@ impl Recorder {
             let dirs = match self.checkouts().await {
                 Ok(dirs) => dirs,
                 Err(e) => {
-                    eprintln!("[turns] {e}");
+                    log_turns(e);
                     self.starts.keys().cloned().collect()
                 }
             };
+            let dirs = existing_checkouts(dirs);
             for dir in dirs {
                 if !self.starts.contains_key(&dir) {
-                    eprintln!(
-                        "[turns] {}: checkout discovered after turn start; no baseline",
+                    log_turns(format!(
+                        "{}: checkout discovered after turn start; no baseline",
                         dir.display()
-                    );
+                    ));
                 }
                 match CapturedSnapshot::capture(
                     &self.root,
@@ -1224,7 +1225,7 @@ impl Recorder {
                         self.ends.insert(dir, snapshot);
                     }
                     Ok(None) => {}
-                    Err(e) => eprintln!("[turns] {e}"),
+                    Err(e) => log_turns(e),
                 }
             }
         }
@@ -1257,6 +1258,25 @@ impl Recorder {
             self.close().await;
         }
     }
+}
+
+/// A deleted checkout stays in the facts (cleanup reads them) but has
+/// nothing to capture: trying would only fail and log, twice a turn.
+fn existing_checkouts(mut dirs: BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+    dirs.retain(|dir| dir.is_dir());
+    dirs
+}
+
+/// A recorder run-log line; tests read the lines their thread logged.
+fn log_turns(message: impl std::fmt::Display) {
+    #[cfg(test)]
+    TURNS_LOG.with(|log| log.borrow_mut().push(message.to_string()));
+    eprintln!("[turns] {message}");
+}
+
+#[cfg(test)]
+thread_local! {
+    static TURNS_LOG: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Sweep all persisted checkout facts too: closed tabs may no longer be loaded.
@@ -2282,6 +2302,55 @@ mod tests {
         big.set_len(MAX_BYTES + 1).unwrap();
         assert!(snapshot(&test_root(), d).await.unwrap().is_none());
         assert!(refs(&test_root(), d, PREFIX).await.unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn a_removed_checkout_is_neither_captured_nor_logged() {
+        let live = repo();
+        let removed = repo();
+        let removed_dir = removed.path().to_path_buf();
+        drop(removed);
+        assert!(!removed_dir.exists());
+        let facts_dir = tempfile::tempdir().unwrap();
+        let touch = |dir: &Path| crate::chat_facts::CheckoutTouch {
+            repo: dir.into(),
+            dir: dir.into(),
+            branch: None,
+            edits: 1,
+            last: String::new(),
+        };
+        let facts = crate::chat_facts::ChatFacts {
+            checkouts: vec![touch(live.path()), touch(&removed_dir)],
+            ..Default::default()
+        };
+        let facts_path = facts_dir.path().join("claude-removed-checkout-chat.json");
+        let written = serde_json::to_vec(&facts).unwrap();
+        std::fs::write(&facts_path, &written).unwrap();
+        TURNS_LOG.with(|log| log.borrow_mut().clear());
+        let mut recorder = test_recorder(
+            live.path().into(),
+            Some("removed-checkout-chat".into()),
+            Some(facts_dir.path().into()),
+        );
+        recorder.begin().await;
+        assert_eq!(
+            recorder.starts.keys().collect::<Vec<_>>(),
+            vec![&live.path().to_path_buf()]
+        );
+        assert!(!recorder.known.contains(&removed_dir));
+        recorder.capture_end().await;
+        assert_eq!(
+            recorder.ends.keys().collect::<Vec<_>>(),
+            vec![&live.path().to_path_buf()]
+        );
+        recorder.finish().await;
+        let removed_text = removed_dir.display().to_string();
+        let logged = TURNS_LOG.with(|log| log.borrow().clone());
+        assert!(
+            logged.iter().all(|line| !line.contains(&removed_text)),
+            "{logged:?}"
+        );
+        // The facts keep the removed checkout for cleanup to read.
+        assert_eq!(std::fs::read(&facts_path).unwrap(), written);
     }
     #[tokio::test]
     async fn recorder_brackets_turns_and_resumes_numbering() {
