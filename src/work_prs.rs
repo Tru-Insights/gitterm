@@ -283,40 +283,27 @@ fn collect_root_prs(
     branches: &[(TaskPrOrigin, TaskBranch)],
     root_of: impl Fn(&str) -> String,
 ) -> Vec<PrRef> {
-    let mut found = Vec::new();
-    let mut seen = HashSet::new();
-    let mut push = |pr: &PrRef| {
-        if seen.insert(pr.key().id()) {
-            found.push(pr.clone());
-        }
-    };
-    for entry in overview::chats_under(index, &[root.to_string()]) {
-        for pr in entry.facts.iter().flat_map(|facts| &facts.prs) {
-            push(pr);
-        }
-    }
-    for pr in prs.saved_root_prs.get(root).into_iter().flatten() {
-        push(pr);
-    }
-    for (chat, live) in &prs.live_prs {
-        if chat == root || root_of(chat) == root {
-            for pr in live {
-                push(pr);
-            }
-        }
-    }
-    for (parent, branch) in branches {
-        if root_of(&parent.chat) == root {
-            for found in prs.task_branch_prs.get(branch).into_iter().flatten() {
-                if found.created_at >= parent.started_at
-                    && parent.before.is_none_or(|before| found.created_at < before)
-                {
-                    push(&found.pr);
-                }
-            }
-        }
-    }
-    found
+    let saved = prs.saved_root_prs.get(root).into_iter().flatten();
+    let live = prs
+        .live_prs
+        .iter()
+        .filter(|(chat, _)| *chat == root || root_of(chat) == root)
+        .flat_map(|(_, live)| live);
+    let task_branches = branches
+        .iter()
+        .filter(|(parent, _)| root_of(&parent.chat) == root)
+        .flat_map(|(parent, branch)| {
+            prs.task_branch_prs
+                .get(branch)
+                .into_iter()
+                .flatten()
+                .filter(move |found| {
+                    found.created_at >= parent.started_at
+                        && parent.before.is_none_or(|before| found.created_at < before)
+                })
+                .map(|found| &found.pr)
+        });
+    chat_facts::root_prs(index, root, saved.chain(live).chain(task_branches))
 }
 
 /// Splits `keys` into the open ones (state unknown counts as open) and the
@@ -708,10 +695,7 @@ impl App {
     /// The root `chat` folds under: its index root, else its parent chain
     /// through delegations and tasks, else itself.
     pub(super) fn root_chat_of(&self, chat: &str) -> String {
-        if let Some(entry) = self.chat_index.iter().find(|entry| entry.id == chat) {
-            return entry.root_id.clone().unwrap_or_else(|| chat.to_string());
-        }
-        root_through_links(&self.chat_child_links(), chat)
+        chat_facts::root_chat_of(&self.chat_index, chat, || self.chat_child_links())
     }
 
     /// The PRs root `root`'s chats recorded: indexed and saved facts, what

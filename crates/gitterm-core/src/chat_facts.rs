@@ -774,6 +774,115 @@ pub fn root_through_links(links: &[ChildLink], chat: &str) -> String {
     current
 }
 
+/// The root `chat` folds under: its root in `index` (as [`resolve_tree`] set
+/// it, so facts-file children count), else its parent chain through
+/// `links`, else itself. `links` is only built when the index lacks `chat`.
+pub fn root_chat_of(
+    index: &[ChatIndexEntry],
+    chat: &str,
+    links: impl FnOnce() -> Vec<ChildLink>,
+) -> String {
+    match index.iter().find(|entry| entry.id == chat) {
+        Some(entry) => entry.root_id.clone().unwrap_or_else(|| chat.to_string()),
+        None => root_through_links(&links(), chat),
+    }
+}
+
+/// `root`'s PRs: the facts PRs of the indexed chats under it, then `more`,
+/// each PR once (by [`PrKey::id`]), at its first occurrence.
+pub fn root_prs<'a>(
+    index: &'a [ChatIndexEntry],
+    root: &str,
+    more: impl IntoIterator<Item = &'a PrRef>,
+) -> Vec<PrRef> {
+    let mut seen = HashSet::new();
+    crate::work::summary::chats_under(index, &[root.to_string()])
+        .into_iter()
+        .flat_map(|entry| entry.facts.iter().flat_map(|facts| &facts.prs))
+        .chain(more)
+        .filter(|pr| seen.insert(pr.key().id()))
+        .cloned()
+        .collect()
+}
+
+/// A stand-in for the transcript index, for a host that has none: one entry
+/// per facts file in `dir`, by id (a file's time is not its transcript's, so
+/// it cannot give the index's order), then one per `links` parent without a
+/// file, since a chat GitTerm's records name has a transcript. Only `id`,
+/// `facts` and (for files) `backend` and `path` are real.
+/// Run [`resolve_tree`] on it before reading roots. Unreadable files are
+/// logged and left out.
+pub fn saved_facts_index(
+    dir: &Path,
+    links: &[ChildLink],
+    mut log: impl FnMut(&str),
+) -> Vec<ChatIndexEntry> {
+    let stand_in = |id: String, backend: ChatBackend, path: PathBuf| ChatIndexEntry {
+        id,
+        backend,
+        path,
+        cwd: PathBuf::new(),
+        repo_root: None,
+        is_worktree: false,
+        branch: None,
+        title: String::new(),
+        latest: None,
+        mtime: std::time::SystemTime::UNIX_EPOCH,
+        size: 0,
+        dead_cwd: false,
+        root_id: None,
+        facts: None,
+    };
+    let mut entries = Vec::new();
+    match std::fs::read_dir(dir) {
+        Ok(read) => {
+            for file in read.flatten() {
+                let Ok(name) = file.file_name().into_string() else {
+                    continue;
+                };
+                let parsed = ChatBackend::ALL.into_iter().find_map(|backend| {
+                    let id = name
+                        .strip_prefix(backend.label())?
+                        .strip_prefix('-')?
+                        .strip_suffix(".json")?;
+                    (facts_file_name(backend, id).as_deref() == Ok(name.as_str()))
+                        .then(|| (backend, id.to_string()))
+                });
+                let Some((backend, id)) = parsed else {
+                    continue;
+                };
+                let path = file.path();
+                match load_facts(&path) {
+                    Ok(Some(facts)) => {
+                        let mut entry = stand_in(id, backend, path);
+                        entry.facts = Some(facts);
+                        entries.push(entry);
+                    }
+                    Ok(None) => {}
+                    Err(error) => log(&format!("[chat-facts] {error}")),
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => log(&format!(
+            "[chat-facts] cannot list {}: {error}",
+            dir.display()
+        )),
+    }
+    entries.sort_by(|a, b| (&a.id, a.backend.label()).cmp(&(&b.id, b.backend.label())));
+    for link in links {
+        if !entries.iter().any(|entry| entry.id == link.parent) {
+            // Links carry no parent backend; nothing that reads roots uses it.
+            entries.push(stand_in(
+                link.parent.clone(),
+                ChatBackend::Claude,
+                PathBuf::new(),
+            ));
+        }
+    }
+    entries
+}
+
 /// The children `links` name for one parent chat.
 pub fn links_for_parent(links: &[ChildLink], parent: &str) -> Vec<ChatChild> {
     links
@@ -941,5 +1050,60 @@ mod tests {
             facts_path(temp.path(), ChatBackend::Claude, "../escape").unwrap_err(),
             "session id \"../escape\" is not a safe facts file name"
         );
+    }
+
+    /// A host without a transcript index resolves roots through facts-file
+    /// children and store links as Iced does, and counts each PR once.
+    #[test]
+    fn saved_facts_index_resolves_facts_only_ancestry_and_dedups_prs() {
+        let temp = tempfile::tempdir().unwrap();
+        let write = |backend, id: &str, facts: serde_json::Value| {
+            let path = facts_path(temp.path(), backend, id).unwrap();
+            std::fs::write(path, serde_json::to_vec(&facts).unwrap()).unwrap();
+        };
+        let pr = |n: u64| serde_json::json!({"repo": "acme/api", "number": n, "url": "u"});
+        // coord names worker only in its facts file; the store links boss
+        // (no facts file) to coord and to lone (no facts file either).
+        write(
+            ChatBackend::Claude,
+            "coord",
+            serde_json::json!({"children": [{"session_id": "worker", "kind": "worker"}], "prs": [pr(1)]}),
+        );
+        write(
+            ChatBackend::Codex,
+            "worker",
+            serde_json::json!({"prs": [{"repo": "ACME/api", "number": 1, "url": "w"}, pr(2)]}),
+        );
+        std::fs::write(temp.path().join("notes.txt"), "not facts").unwrap();
+        let link = |parent: &str, child: &str| ChildLink {
+            parent: parent.into(),
+            child: serde_json::from_value(
+                serde_json::json!({"session_id": child, "kind": "worker"}),
+            )
+            .unwrap(),
+        };
+        let links = vec![link("boss", "coord"), link("boss", "lone")];
+        let mut logged = Vec::new();
+        let mut index = saved_facts_index(temp.path(), &links, |m| logged.push(m.to_string()));
+        assert!(logged.is_empty(), "{logged:?}");
+        let mut ids: Vec<_> = index.iter().map(|entry| entry.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["boss", "coord", "worker"]);
+        resolve_tree(&mut index, &links);
+        let unused = || -> Vec<ChildLink> { panic!("indexed chats need no links") };
+        assert_eq!(root_chat_of(&index, "worker", unused), "boss");
+        assert_eq!(root_chat_of(&index, "boss", unused), "boss");
+        assert_eq!(root_chat_of(&index, "lone", || links.clone()), "boss");
+        assert_eq!(root_chat_of(&index, "stranger", Vec::new), "stranger");
+        let found = root_prs(&index, "boss", &[]);
+        let mut numbers: Vec<_> = found.iter().map(|pr| pr.number).collect();
+        numbers.sort_unstable();
+        assert_eq!(numbers, [1, 2], "{found:?}");
+        // The first occurrence wins: index facts before `more`.
+        let extra: PrRef = serde_json::from_value(pr(3)).unwrap();
+        let first_one = found.iter().find(|pr| pr.number == 1).unwrap().clone();
+        let again = root_prs(&index, "boss", [&first_one, &extra, &extra]);
+        assert_eq!(again.len(), 3);
+        assert_eq!(again.last(), Some(&extra));
     }
 }

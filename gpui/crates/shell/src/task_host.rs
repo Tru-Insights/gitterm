@@ -459,8 +459,9 @@ impl TaskHostOwner {
     }
 
     /// Iced's `merge_plan_get`: the plan of the caller's root chat (caller
-    /// pane, its conversation, then the conversation's root through the
-    /// store's links), with live PR state and the root's unplanned PRs.
+    /// pane, its conversation, then the conversation's root through saved
+    /// facts and the store's links), with live PR state and the root's
+    /// unplanned PRs.
     // shortcut: the plan, watch and facts files are read on the UI thread per
     // call; move them to the background executor if a call shows up in frames.
     fn merge_plan_get(&self, caller: Option<&str>, cx: &App) -> Result<serde_json::Value, String> {
@@ -690,8 +691,10 @@ fn open_sessions(
 }
 
 /// Iced's `merge_plan_value` for the root of `conversation`, from Iced's
-/// files. Iced also adds PRs its live tabs saw and its cached task-branch
-/// lookups; the preview has neither (no PR scan of GPUI turns, no `gh`), so
+/// files. Roots and PRs follow Iced's rules over a stand-in index built from
+/// the saved facts files (the preview has no transcript index). Iced also
+/// adds PRs its live tabs saw and its cached task-branch lookups; the
+/// preview has neither (no PR scan of GPUI turns, no `gh`), so
 /// `unplanned_prs` holds the root's saved chat facts PRs only.
 pub(crate) fn merge_plan_for(
     iced_config: &Path,
@@ -699,16 +702,15 @@ pub(crate) fn merge_plan_for(
     conversation: &str,
 ) -> serde_json::Value {
     use gitterm_core::{chat_facts, merge_plan, prs};
-    let root = chat_facts::root_through_links(links, conversation);
+    let log = |message: &str| eprintln!("{message}");
+    let dir = chat_facts::facts_dir(iced_config);
+    let mut index = chat_facts::saved_facts_index(&dir, links, log);
+    chat_facts::resolve_tree(&mut index, links);
+    let root = chat_facts::root_chat_of(&index, conversation, || links.to_vec());
     let plans = merge_plan::load_plans(&merge_plan::plans_dir(iced_config));
     let watch = prs::WatchFile::load(&prs::WatchFile::path_in(iced_config));
-    let found = chat_facts::load_root_prs(
-        &chat_facts::facts_dir(iced_config),
-        &[],
-        links,
-        &root,
-        |message| eprintln!("{message}"),
-    );
+    let saved = chat_facts::load_root_prs(&dir, &index, links, &root, log);
+    let found = chat_facts::root_prs(&index, &root, &saved);
     prs::merge_plan_value(&root, plans.get(&root), &watch, found)
 }
 

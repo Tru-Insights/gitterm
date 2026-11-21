@@ -1150,3 +1150,42 @@ fn merge_plan_scoped_to_root_chat(cx: &mut TestAppContext) {
     assert_eq!(get(&worker_a, cx), expected_a);
     assert_eq!(get(&root_b, cx), expected_b);
 }
+
+/// A worker whose parent names it only in a saved facts file (no store
+/// link) resolves to that parent's root, as Iced's index ancestry does, and
+/// a PR both chats saved is listed once, at its first occurrence.
+#[test]
+fn merge_plan_root_through_facts_only_link_and_prs_once() {
+    use gitterm_core::{chat_facts, chats::ChatBackend};
+    use serde_json::json;
+    let iced = tempfile::tempdir().unwrap();
+    let facts_dir = chat_facts::facts_dir(iced.path());
+    std::fs::create_dir_all(&facts_dir).unwrap();
+    let pr = |n: u64| json!({"repo": "acme/api", "number": n, "url": format!("https://github.com/acme/api/pull/{n}")});
+    let write = |backend, chat: &str, facts: serde_json::Value| {
+        std::fs::write(
+            chat_facts::facts_path(&facts_dir, backend, chat).unwrap(),
+            serde_json::to_vec(&facts).unwrap(),
+        )
+        .unwrap();
+    };
+    write(
+        ChatBackend::Claude,
+        "coord",
+        json!({"children": [{"session_id": "worker", "kind": "worker"}], "prs": [pr(7)]}),
+    );
+    write(ChatBackend::Codex, "worker", json!({"prs": [pr(7), pr(8)]}));
+    let unplanned = |n: u64| {
+        json!({"pr": format!("acme/api#{n}"), "repo": "acme/api", "number": n,
+               "url": format!("https://github.com/acme/api/pull/{n}"), "live": null})
+    };
+    for caller in ["worker", "coord"] {
+        let value = crate::task_host::merge_plan_for(iced.path(), &[], caller);
+        assert_eq!(value["root_chat_id"], json!("coord"), "{caller}: {value}");
+        assert_eq!(
+            value["unplanned_prs"],
+            json!([unplanned(7), unplanned(8)]),
+            "{caller}: {value}"
+        );
+    }
+}
