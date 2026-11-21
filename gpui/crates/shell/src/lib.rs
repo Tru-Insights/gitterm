@@ -467,8 +467,10 @@ impl Shell {
                     .panes
                     .iter()
                     .filter(|(id, pane)| {
-                        matches!(pane.read(cx).content, pane::PaneContent::Content(_))
-                            && content_pane_visible(state, id, cx)
+                        matches!(
+                            pane.read(cx).content,
+                            pane::PaneContent::Content(_) | pane::PaneContent::Review(_)
+                        ) && content_pane_visible(state, id, cx)
                     })
                     .map(|(id, _)| id.clone())
             })
@@ -1333,12 +1335,6 @@ fn build_workspace(
                 session.title.clone(),
                 if let Some(text) = data.imported_session(workspace.id, session.id, cx) {
                     PaneKind::IcedSession(text)
-                } else if imported {
-                    // Saved preview panes are inventory, never permission to start a shell.
-                    PaneKind::IcedSession(
-                        "Restored terminal · idle. Use + for a terminal or ▶ to run a command."
-                            .into(),
-                    )
                 } else if let Some(terminals) = &store.terminals {
                     let cwd = terminals
                         .iter()
@@ -1349,6 +1345,7 @@ fn build_workspace(
                     if stopped {
                         PaneKind::StoppedTerminal(cwd, true)
                     } else {
+                        // Like Iced, restore a plain shell now, without a saved run command.
                         PaneKind::CenterTerminal(cwd)
                     }
                 } else {
@@ -1360,15 +1357,6 @@ fn build_workspace(
                 cx,
             )
         });
-        if imported
-            && data
-                .imported_session(workspace.id, session.id, cx)
-                .is_none()
-        {
-            pane.update(cx, |pane, _| {
-                pane.session = Some(sessions::fresh_target());
-            });
-        }
         panes.insert(id, pane);
     }
     for (name, title, kind) in [
@@ -2906,7 +2894,7 @@ impl Shell {
         &mut self,
         workspace: WorkspaceId,
         action: &pane::git_view::GitAction,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         use pane::git_view::GitAction as A;
@@ -2922,16 +2910,7 @@ impl Shell {
                 }
                 self.sync_git_visibility(true, cx);
             }
-            A::EditFile(path) => self.open_file_viewer(
-                &FileOpen {
-                    workspace,
-                    path: path.clone(),
-                    changed: None,
-                    from_files: true,
-                },
-                window,
-                cx,
-            ),
+            A::EditFile(_) => self.editor_preview_notice(cx),
             A::OpenWorktree(_) | A::AdoptWorktree(_) | A::RemoveWorktree(_) => {
                 self.owner.update(cx, |owner, cx| {
                     owner.error = Some("Worktree actions are not available in preview".into());
@@ -3296,16 +3275,8 @@ impl Shell {
             .on_action(cx.listener(|this, a: &FileSelectByIndex, w, cx| {
                 this.select_file(&a.selection, w, cx)
             }))
-            .on_action(cx.listener(|this, _: &EditFile, w, cx| {
-                if let Some(mut file) = this
-                    .active_workspace(cx)
-                    .and_then(|id| this.selected_files.get(&id))
-                    .cloned()
-                {
-                    file.changed = None;
-                    file.from_files = true;
-                    this.open_file_viewer(&file, w, cx);
-                }
+            .on_action(cx.listener(|this, _: &EditFile, _, cx| {
+                this.editor_preview_notice(cx);
             }))
             .on_action(cx.listener(|this, _: &AgentFindOpen, w, cx| {
                 let focused = this.focused_chat(w, cx);

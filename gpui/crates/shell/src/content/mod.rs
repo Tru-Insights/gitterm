@@ -3,7 +3,9 @@
 //! `window` owns the shell's surfaces, off-thread preparation, native result
 //! draining, deadlines, selection and window-relative pane geometry. Component
 //! popup/dialog state and native pickers cover the selected surface before paint.
-//! There are no IPC handlers, URL loading or Page identity/store capabilities.
+//! There are no IPC handlers or Page identity/store capabilities. Document links
+//! follow the Iced Viewer network/navigation policy.
+mod actions;
 pub mod host;
 pub mod overlay;
 mod session;
@@ -33,10 +35,7 @@ impl Document {
         if let Some(html) = load.webview_content {
             return Ok(Self { html });
         }
-        if relative
-            .extension()
-            .is_some_and(|e| matches!(e.to_str(), Some("md" | "html" | "htm" | "excalidraw")))
-        {
+        if actions::is_rendered(relative) {
             return Err(format!(
                 "Cannot preview {}: {}",
                 relative.display(),
@@ -96,5 +95,7 @@ impl Document {
     }
 }
 
+#[cfg(test)]
+mod interactions;
 #[cfg(test)]
 mod tests;
