@@ -29,8 +29,8 @@ impl TaskHost {
         &self.delegations
     }
 
-    /// Transitional seam for intake and delivery (H4c), like
-    /// [`Self::store_mut`].
+    /// Transitional seam for intake and run progress, like
+    /// [`Self::store_mut`]. Delivery goes through [`super::delivery`].
     pub fn delegations_mut(&mut self) -> &mut State {
         &mut self.delegations
     }

@@ -320,3 +320,202 @@ fn preview_host_never_promotes_queued_work() {
         .admit_delegations(capacity, &Default::default())
         .is_empty());
 }
+
+/// A host with a store at `dir/tasks.json` holding finished consults `ids`
+/// requested by the chat [`chat`] returns.
+fn delivery_host(dir: &tempfile::TempDir, services: ServiceContext, ids: &[&str]) -> TaskHost {
+    let mut store = TaskStore::load(dir.path().join("tasks.json")).unwrap();
+    let caller = crate::delegations::CallerTab {
+        session_uid: "chat-uid".into(),
+        chat_session_id: None,
+        workspace: "fixture".into(),
+        cwd: "/fixture/repo".into(),
+        remote: false,
+        home: "/fixture/repo".into(),
+        repos: vec![],
+    };
+    for id in ids {
+        let new = crate::delegations::consult_delegation(
+            &req(json!({"brief": format!("Inspect {id}")})),
+            &caller,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut delegation = Delegation::new_requested(new, "t0");
+        delegation.delegation_id = id.to_string();
+        store.insert_delegation(delegation).unwrap();
+        store
+            .complete_delegation(
+                id,
+                crate::tasks::DelegationResult {
+                    handoff: Some(crate::tasks::TaskHandoff {
+                        summary: format!("Result {id}"),
+                        decisions: vec![],
+                        next_steps: vec![],
+                        blockers: vec![],
+                        updated_by_session_id: None,
+                        updated_at: "t1".into(),
+                    }),
+                    findings: None,
+                    reviewed: None,
+                },
+                "t1",
+            )
+            .unwrap();
+    }
+    let (commands, _receiver) = command_channel();
+    TaskHost::new(Some(store), services, commands)
+}
+
+fn chat(streaming: bool) -> Vec<DeliveryChat> {
+    vec![DeliveryChat {
+        tab_id: 7,
+        session_uid: "chat-uid".into(),
+        chat_session_id: None,
+        remote: false,
+        streaming,
+    }]
+}
+
+fn submissions(effects: Vec<DeliveryEffect>) -> Vec<Submission> {
+    effects
+        .into_iter()
+        .filter_map(|effect| match effect {
+            DeliveryEffect::Submit(submission) => Some(submission),
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_delivered(host: &TaskHost, id: &str) -> bool {
+    host.store()
+        .as_ref()
+        .unwrap()
+        .delegation(id)
+        .unwrap()
+        .is_delivered()
+}
+
+#[test]
+fn delivery_reserves_each_submission_until_its_identity_stamped_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut host = delivery_host(&dir, production(&dir), &["a"]);
+    let tick = host.deliver_finished(&chat(false), true);
+    assert_eq!(tick.tabs, [7]);
+    let out = submissions(host.flush_delivery(&chat(false), 7, true));
+    assert_eq!(out.len(), 1);
+    let first = out[0].clone();
+    assert_eq!(first.batch.delegation_ids, ["a"]);
+    assert!(host.delivery_pending(7, first.delivery));
+    // A flush, a tick and a manual send while it is out submit nothing.
+    assert!(submissions(host.flush_delivery(&chat(false), 7, true)).is_empty());
+    assert!(host.deliver_finished(&chat(false), true).tabs == [7]);
+    assert!(submissions(host.flush_delivery(&chat(false), 7, true)).is_empty());
+    assert!(host
+        .send_delegation(&chat(false), 7, "a", &[], true)
+        .is_empty());
+    assert!(!host.delivery_held(7, "a"));
+
+    // Rejected: undelivered, and the next flush retries under a new stamp.
+    assert_eq!(
+        host.delivery_completed(7, first.delivery, DeliveryCompletion::Rejected),
+        DeliveryReceipt::NotSubmitted
+    );
+    assert!(!is_delivered(&host, "a"));
+    let second = submissions(host.flush_delivery(&chat(false), 7, true))
+        .pop()
+        .unwrap();
+    assert_ne!(second.delivery, first.delivery);
+    // The first stamp is stale now, even reporting acceptance.
+    assert_eq!(
+        host.delivery_completed(7, first.delivery, DeliveryCompletion::Accepted),
+        DeliveryReceipt::Stale
+    );
+    assert!(!is_delivered(&host, "a"));
+    assert!(host.delivery_pending(7, second.delivery));
+    assert_eq!(
+        host.delivery_completed(7, second.delivery, DeliveryCompletion::Accepted),
+        DeliveryReceipt::Saved
+    );
+    let saved = TaskStore::load(dir.path().join("tasks.json")).unwrap();
+    assert!(saved.delegation("a").unwrap().is_delivered());
+    assert_eq!(
+        host.delivery_completed(7, second.delivery, DeliveryCompletion::Accepted),
+        DeliveryReceipt::Stale
+    );
+    assert!(submissions(host.flush_delivery(&chat(false), 7, true)).is_empty());
+    assert!(matches!(
+        host.send_delegation(&chat(false), 7, "a", &[], true)
+            .as_slice(),
+        [DeliveryEffect::AlreadyDelivered]
+    ));
+}
+
+#[test]
+fn delivery_receipt_save_failure_is_kept_and_saved_by_a_later_tick() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut host = delivery_host(&dir, production(&dir), &["a"]);
+    let submission = submissions(host.flush_delivery(&chat(false), 7, true))
+        .pop()
+        .unwrap();
+    let path = dir.path().join("tasks.json");
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let receipt = host.delivery_completed(7, submission.delivery, DeliveryCompletion::Accepted);
+    assert!(
+        matches!(&receipt, DeliveryReceipt::SaveFailed(error) if error.contains("tasks.json")),
+        "{receipt:?}"
+    );
+    assert!(is_delivered(&host, "a"));
+    let tick = host.deliver_finished(&chat(false), true);
+    assert!(tick.receipt_error.is_some());
+    // The receipt is in memory: nothing is submitted again.
+    for tab_id in tick.tabs {
+        assert!(submissions(host.flush_delivery(&chat(false), tab_id, true)).is_empty());
+    }
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    assert!(host
+        .deliver_finished(&chat(false), true)
+        .receipt_error
+        .is_none());
+    let saved = TaskStore::load(&path).unwrap();
+    assert!(saved.delegation("a").unwrap().is_delivered());
+}
+
+#[test]
+fn delivery_holds_while_busy_and_waits_for_a_closed_chat() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut host = delivery_host(&dir, production(&dir), &["a", "b"]);
+    assert!(submissions(host.flush_delivery(&chat(true), 7, true)).is_empty());
+    assert!(host.delivery_held(7, "a") && host.delivery_held(7, "b"));
+    let out = submissions(host.flush_delivery(&chat(false), 7, true));
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].batch.delegation_ids, ["a", "b"]);
+    // The requesting chat is closed: its results wait, one entry each.
+    let dir = tempfile::tempdir().unwrap();
+    let mut host = delivery_host(&dir, production(&dir), &["c"]);
+    let tick = host.deliver_finished(&[], true);
+    assert_eq!(tick.waiting, ["chat-uid"]);
+    assert!(tick.tabs.is_empty());
+    assert_eq!(
+        host.chat_delegation(&[], 7, "c").unwrap_err(),
+        "delegation c belongs to another tab"
+    );
+}
+
+/// Only automatic delivery is gated here; a manual send's gate is H5b's.
+#[test]
+fn preview_host_never_delivers_automatically() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut host = delivery_host(&dir, preview(&dir), &["a"]);
+    let tick = host.deliver_finished(&chat(false), true);
+    assert!(tick.tabs.is_empty() && tick.waiting.is_empty());
+    assert!(submissions(host.flush_delivery(&chat(false), 7, true)).is_empty());
+    assert!(!host.delivery_held(7, "a"));
+    let dir = tempfile::tempdir().unwrap();
+    let mut host = delivery_host(&dir, production(&dir), &["a"]);
+    assert_eq!(host.deliver_finished(&chat(false), true).tabs, [7]);
+}

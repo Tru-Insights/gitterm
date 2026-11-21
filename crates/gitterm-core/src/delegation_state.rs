@@ -106,6 +106,13 @@ pub enum Intent<'a> {
         streaming: bool,
         automatic: bool,
     },
+    /// The frontend's report of a `Deliver`. Applied only while `delivery`
+    /// is still the chat's reservation.
+    Submitted {
+        tab_id: usize,
+        delivery: RequestId,
+        accepted: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -143,10 +150,15 @@ pub enum Effect {
     },
     Refresh(String),
     Flush(usize),
+    /// Reserved: no flush submits these results again until `Submitted`
+    /// reports `delivery`.
     Deliver {
         tab_id: usize,
+        delivery: RequestId,
         batch: SendBatch,
     },
+    /// An accepted submission: write these results' receipts.
+    RecordDelivery(Vec<String>),
     Rejected(String),
     AlreadyDelivered,
 }
@@ -169,6 +181,8 @@ pub struct State {
     settled: HashSet<String>,
     activity: HashMap<String, String>,
     held: HashMap<usize, Vec<HeldSend>>,
+    // The one submission per chat that is out with the frontend.
+    submitting: HashMap<usize, (RequestId, Vec<String>)>,
 }
 
 impl State {
@@ -189,6 +203,15 @@ impl State {
     }
     pub fn held_tabs(&self) -> impl Iterator<Item = usize> + '_ {
         self.held.keys().copied()
+    }
+    /// The submission chat `tab_id` has out, if any.
+    pub fn submitting(&self, tab_id: usize) -> Option<RequestId> {
+        self.submitting.get(&tab_id).map(|(delivery, _)| *delivery)
+    }
+    fn reserved_for_delivery(&self, id: &str) -> bool {
+        self.submitting
+            .values()
+            .any(|(_, ids)| ids.iter().any(|reserved| reserved == id))
     }
 
     pub fn reduce(&mut self, intent: Intent<'_>) -> Vec<Effect> {
@@ -424,6 +447,10 @@ impl State {
                 finding_ids,
                 streaming,
             } => {
+                // Already out with the frontend: like a held send, wait.
+                if self.reserved_for_delivery(&delegation.delegation_id) {
+                    return Vec::new();
+                }
                 let message = match delegations::compose_send_message(delegation, finding_ids) {
                     Ok(message) => message,
                     Err(error) => return vec![Effect::Rejected(error)],
@@ -462,6 +489,15 @@ impl State {
                     self.held.remove(&tab_id);
                     return Vec::new();
                 }
+                // Results out with the frontend are neither queued again
+                // nor resubmitted before their completion.
+                let delegations: Vec<&Delegation> = delegations
+                    .iter()
+                    .copied()
+                    .filter(|d| !self.reserved_for_delivery(&d.delegation_id))
+                    .collect();
+                let delegations = delegations.as_slice();
+                let reserved = self.submitting.contains_key(&tab_id);
                 let held = self.held.entry(tab_id).or_default();
                 let mut ids: HashSet<_> =
                     held.iter().map(|send| send.delegation_id.clone()).collect();
@@ -479,12 +515,35 @@ impl State {
                     effects.push(Effect::Rejected(error));
                 }
                 ids.extend(held.iter().map(|send| send.delegation_id.clone()));
-                let next = delegations::next_held_send(held, streaming);
+                let next = delegations::next_held_send(held, streaming || reserved);
                 effects.extend(ids.into_iter().map(Effect::Refresh));
                 if let Some(batch) = next {
-                    effects.push(Effect::Deliver { tab_id, batch });
+                    self.next_request += 1;
+                    let delivery = RequestId(self.next_request);
+                    self.submitting
+                        .insert(tab_id, (delivery, batch.delegation_ids.clone()));
+                    effects.push(Effect::Deliver {
+                        tab_id,
+                        delivery,
+                        batch,
+                    });
                 }
                 effects
+            }
+            Intent::Submitted {
+                tab_id,
+                delivery,
+                accepted,
+            } => {
+                if self.submitting(tab_id) != Some(delivery) {
+                    return Vec::new();
+                }
+                let (_, ids) = self.submitting.remove(&tab_id).unwrap();
+                if accepted {
+                    vec![Effect::RecordDelivery(ids)]
+                } else {
+                    ids.into_iter().map(Effect::Refresh).collect()
+                }
             }
         }
     }

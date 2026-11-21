@@ -19,9 +19,10 @@
 //! launches, owns the launch queue and publishes a session only after it is
 //! saved ([`launch`]); it owns the delegation lifecycle state and admits
 //! headless Codex runs ([`runner`]). The frontend still builds commands,
-//! starts terminals and spawns runs. Delegation delivery (H4c) stays with the
-//! frontend, which reaches the store and the lifecycle state only through
-//! this owner.
+//! starts terminals and spawns runs. Delivering finished results into the
+//! requesting chat is decided here as well (H4c, [`delivery`]): the host
+//! holds, reserves and records each submission, and the frontend writes the
+//! prompt into its chat and reports the outcome.
 use crate::content::html_render::HtmlRenderRequest;
 use crate::delegations;
 use crate::preview::service::ServiceContext;
@@ -43,8 +44,13 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio_stream::Stream;
 
+mod delivery;
 mod launch;
 mod runner;
+pub use delivery::{
+    DeliveryChat, DeliveryCompletion, DeliveryEffect, DeliveryReceipt, DeliveryTick, Dismissal,
+    Submission,
+};
 pub use launch::{
     cancel_queued_worker_launch, launch_provider, update_queued_task_request, AwaitingWorker,
     LaunchAdmission, LaunchPolicy, LaunchRequest, LaunchTicket, LaunchedSession, Promotion,
