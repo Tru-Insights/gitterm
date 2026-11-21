@@ -38,6 +38,20 @@ pub struct SlashCommand {
     pub description: String,
     pub argument_hint: String,
 }
+impl SlashCommand {
+    /// Iced's row name: `/name` plus the argument hint when there is one.
+    pub fn label(&self) -> String {
+        if self.argument_hint.is_empty() {
+            format!("/{}", self.name)
+        } else {
+            format!("/{} {}", self.name, self.argument_hint)
+        }
+    }
+    /// Iced's row `title`; a command without a description has none.
+    pub fn tooltip(&self) -> Option<&str> {
+        Some(self.description.as_str()).filter(|text| !text.is_empty())
+    }
+}
 
 /// One entry of Iced's checkout menu: a label, its detail line and the directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -673,6 +687,7 @@ mod ui {
                     let id = row.id.clone();
                     div().flex().gap(px(8.)).child(div().flex_1().child(format!("{} · {} · {}", row.id, row.label(), row.text)))
                         .child(Button::new(gpui::SharedString::from(format!("withdraw-{}", row.id)))
+                            .debug_selector({ let id = row.id.clone(); move || format!("withdraw-{id}") })
                             .label("×").tooltip(self.withdraw_tooltip()).accessibility_label("Withdraw this message").disabled(disabled || !row.withdrawable())
                             .on_click(cx.listener(move |view, _, _, cx| view.withdraw(id.clone(), cx))))
                 })))
@@ -696,16 +711,20 @@ mod ui {
                             .children(matches.into_iter().enumerate().map(|(index, command)| {
                                 let name = command.name.clone();
                                 let selector = format!("slash-{name}");
-                                Button::new(gpui::SharedString::from(format!("slash-{name}")))
-                                    .debug_selector(move || selector.clone())
-                                    .tooltip(command.description.clone())
+                                let row = Button::new(gpui::SharedString::from(format!("slash-{name}")))
+                                    .debug_selector(move || selector.clone());
+                                let row = match command.tooltip() {
+                                    Some(tip) => row.tooltip(tip.to_string()),
+                                    None => row,
+                                };
+                                row
                                     .px(px(8.)).py(px(5.)).cursor_pointer()
                                     .w_full().h_auto().justify_start()
                                     .bg(rgb(if index == selected { palette.border } else { palette.block }))
                                     .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| { window.prevent_default(); cx.stop_propagation(); })
                                     .on_click(cx.listener(move |view, _, window, cx| view.select_slash(&name, window, cx)))
                                     .child(div().flex().flex_col().items_start()
-                                        .child(div().child(format!("/{} {}", command.name, command.argument_hint)))
+                                        .child(div().child(command.label()))
                                         .child(div().text_size(px(appearance.size(12.))).text_color(rgb(palette.muted)).child(command.description.clone())))
                             }))
                     })
@@ -734,7 +753,7 @@ mod ui {
                             .child(div().font_family("Menlo").text_size(px(appearance.size(12.))).child(label))
                             .disabled(match id {
                                 "review" => !matches!(self.backend, Some(gitterm_core::chat::types::AgentBackend::Claude)),
-                                "checkout" => disabled || self.checkout_locked.is_some(),
+                                "checkout" => disabled,
                                 _ => disabled || crate::pickers::Picker::from_chip(id).is_none_or(|picker| self.catalog.options(picker).is_empty()),
                             })
                             .on_click(cx.listener(move |view, _, window, cx| {
@@ -762,8 +781,8 @@ mod ui {
                         .absolute().bottom(gpui::relative(1.)).left_0().w(px(380.)).max_h(px(360.)).overflow_y_scroll()
                         .flex().flex_col().p(px(6.)).bg(rgb(palette.block)).border_1().border_color(rgb(palette.strong)).rounded(px(6.))
                         .on_click(|_, _, cx| cx.stop_propagation())
-                        .child(div().text_color(rgb(palette.muted)).child("Run this chat in"))
-                        .children(self.checkout_choices.iter().enumerate().map(|(index, choice)| {
+                        .children(self.checkout_locked.is_none().then(|| div().text_color(rgb(palette.muted)).child("Run this chat in")))
+                        .children(self.checkout_choices.iter().filter(|_| self.checkout_locked.is_none()).enumerate().map(|(index, choice)| {
                             let (path, label) = (choice.path.clone(), choice.label.clone());
                             let current = self.checkout_path.as_deref() == Some(choice.path.as_str());
                             Button::new(gpui::SharedString::from(format!("checkout-option-{index}")))
@@ -777,6 +796,16 @@ mod ui {
                                     .child(format!("{} {}", if current { "✓" } else { " " }, choice.label))
                                     .children((!choice.detail.is_empty()).then(|| div().text_color(rgb(palette.muted)).child(choice.detail.clone()))))
                         }))
+                        .child(Button::new("checkout-open-editor")
+                            .debug_selector(|| "checkout-open-editor".into())
+                            .w_full().h_auto().justify_start()
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_checkout_in_editor(window, cx);
+                                cx.stop_propagation();
+                            }))
+                            .child(div().flex().flex_col().items_start()
+                                .child("  Open in editor")
+                                .child(div().text_color(rgb(palette.muted)).child("Open this checkout folder"))))
                 }))
                 .children(self.picker.filter(|picker| !disabled && *picker != crate::pickers::Picker::Checkout).map(|picker| {
                     let options = self.catalog.options(picker);

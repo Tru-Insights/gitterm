@@ -5,6 +5,8 @@ use gpui::App;
 use std::{path::PathBuf, rc::Rc, sync::Arc};
 
 pub type SaveMarks = Arc<dyn Fn(Vec<u8>) -> Result<(), String> + Send + Sync>;
+/// Opens a worktree file in the shell.
+pub type OpenFile = Rc<dyn Fn(PathBuf, &mut App)>;
 
 #[derive(Clone, Default)]
 pub struct ReviewHost {
@@ -19,5 +21,5 @@ pub struct ReviewHost {
     /// The chat whose turns Turns lists.
     pub active_chat: Option<String>,
     /// Opens a worktree file the way the shell opens a file from the file tree.
-    pub open_file: Option<Rc<dyn Fn(PathBuf, &mut App)>>,
+    pub open_file: Option<OpenFile>,
 }

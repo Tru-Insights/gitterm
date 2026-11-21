@@ -843,7 +843,10 @@ impl Input {
     }
     /// The outcome a repo-menu action emits; None is a preview notice.
     fn repo_action_outcome(machine: &Machine, label: &str) -> Option<Outcome> {
-        if label == "Open a repo…" {
+        if label == "New workspace…" && machine.key == workspace::LOCAL_GROUP {
+            // The bar `+` opens the same sheet.
+            Some(Outcome::NewWork)
+        } else if label == "Open a repo…" {
             Some(Outcome::OpenFolder)
         } else if label == format!("Show {} chats", machine.name) {
             Some(Outcome::ShowMachineChats(machine.key.clone()))
@@ -1734,6 +1737,10 @@ pub(crate) mod tests {
                 "Show this Mac chats"
             ]
         );
+        assert!(matches!(
+            Input::repo_action_outcome(&machines[0], "New workspace…"),
+            Some(Outcome::NewWork)
+        ));
         i.repos_on_bar = true;
         assert_eq!(
             i.repo_actions(&machines[0], true)[3],

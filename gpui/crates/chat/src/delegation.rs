@@ -77,6 +77,16 @@ impl DelegationCard {
             )
         }
     }
+    /// The card's fold summary: marker, kind · model, target, state.
+    pub fn fold_label(&self, open: bool, now_ms: u64) -> String {
+        format!(
+            "{} {} · {} · {}",
+            if open { "▾" } else { "▸" },
+            self.header(),
+            self.target(),
+            self.state_text(now_ms)
+        )
+    }
     pub fn target(&self) -> String {
         if self.is_worker() {
             let title = self

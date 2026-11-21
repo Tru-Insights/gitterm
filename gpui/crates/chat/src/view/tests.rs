@@ -3124,6 +3124,8 @@ fn c10_checkout_picker_lists_iced_entries_previews_a_choice_and_locks_once_start
     });
     assert!(cx.debug_bounds("checkout-picker").is_some());
     assert!(cx.debug_bounds("checkout-option-0").is_some());
+    // C11: Open in editor follows the choices while the checkout is unlocked.
+    assert!(cx.debug_bounds("checkout-open-editor").is_some());
     // The current checkout does nothing, as in Iced.
     click(cx, "checkout-option-0");
     draw(cx);
@@ -3159,10 +3161,136 @@ fn c10_checkout_picker_lists_iced_entries_previews_a_choice_and_locks_once_start
             "/repo\nSet when the chat started; start a new chat to change it"
         );
     });
+    // C11: the locked chip still opens a menu, with only Open in editor.
     click(cx, "composer-checkout");
     draw(cx);
+    assert!(cx.debug_bounds("checkout-picker").is_some());
+    assert!(cx.debug_bounds("checkout-option-0").is_none());
+    assert!(cx.debug_bounds("checkout-open-editor").is_some());
+    assert_eq!(asked.get(), 2, "a locked menu asks for no choices");
+    click(cx, "checkout-open-editor");
+    draw(cx);
+    chat.read_with(cx, |view, _| {
+        assert_eq!(
+            view.composer_state.notice.as_deref(),
+            Some("Open in editor · not available in preview")
+        );
+        assert_eq!(view.composer_state.picker, None);
+    });
     assert!(cx.debug_bounds("checkout-picker").is_none());
-    assert_eq!(asked.get(), 2);
     // No chip or picker interaction reaches the host's session seam.
     assert!(intents.borrow().is_empty());
+}
+
+#[gpui::test]
+fn h11_delegation_fold_shows_kind_model_target_state_marker_and_toggles(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    let card = crate::delegation::tests::with_findings();
+    // The kind-title tooltip and the one-line summary, closed and open.
+    assert_eq!(card.header(), "Codex review · test-model");
+    assert_eq!(
+        card.fold_label(true, 0),
+        "▾ Codex review · test-model · vs v6 (+ uncommitted) · focus: edge cases · 1 finding (1 P1)"
+    );
+    assert!(card.fold_label(false, 0).starts_with("▸ Codex review"));
+    install_card(card, &chat, cx);
+    let open = |chat: &Entity<ChatView>, cx: &mut VisualTestContext| {
+        chat.read_with(cx, |view, cx| {
+            view.row_views[0].as_ref().unwrap().read(cx).open
+        })
+    };
+    assert!(open(&chat, cx));
+    click_selector("delegation-fold-0".into(), cx);
+    assert!(!open(&chat, cx));
+    click_selector("delegation-fold-0".into(), cx);
+    assert!(open(&chat, cx));
+}
+
+#[gpui::test]
+fn c04_queued_withdraw_is_a_times_button_with_the_harness_tooltip(cx: &mut TestAppContext) {
+    use crate::composer::QueuedRow;
+    use gitterm_core::chat::state::PromptStatus;
+    let (chat, cx) = setup(vec![], cx);
+    let intents = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captured = intents.clone();
+    chat.update_in(cx, |view, _, cx| {
+        view.set_read_only(None, cx);
+        view.set_intent_callback(
+            Rc::new(move |intent, _| {
+                captured.borrow_mut().push(intent);
+                written()
+            }),
+            cx,
+        );
+        view.composer_state.backend = Some(gitterm_core::chat::types::AgentBackend::Claude);
+        view.composer_state.queue = vec![QueuedRow {
+            id: "m1".into(),
+            text: "later".into(),
+            status: PromptStatus::Queued,
+            withdraw_pending: false,
+        }];
+        assert_eq!(
+            view.composer_state.withdraw_tooltip(),
+            "Withdraw this message (Claude keeps working)"
+        );
+    });
+    draw(cx);
+    click(cx, "withdraw-m1");
+    draw(cx);
+    assert_eq!(
+        *intents.borrow(),
+        [ChatIntent::Withdraw {
+            message_id: "m1".into()
+        }]
+    );
+    // Preview gating: a read-only chat sends nothing.
+    chat.update_in(cx, |view, _, cx| {
+        view.set_read_only(Some("preview".into()), cx)
+    });
+    draw(cx);
+    click(cx, "withdraw-m1");
+    assert_eq!(intents.borrow().len(), 1);
+}
+
+#[gpui::test]
+fn c05_slash_row_names_the_command_and_tooltips_its_description(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(
+        vec![Record {
+            at_ms: None,
+            entry: Entry::Harness(HarnessEvent::Ready {
+                session_id: None,
+                permission_mode: None,
+                models: vec![],
+                modes: vec![],
+                commands: vec![
+                    serde_json::json!({"name":"review","description":"Review changes","argumentHint":"[focus]"}),
+                    serde_json::json!({"name":"clear"}),
+                ],
+            }),
+        }],
+        cx,
+    );
+    chat.read_with(cx, |view, _| {
+        let matches = view.composer_state.slash_matches("/");
+        assert_eq!(matches[0].label(), "/review [focus]");
+        assert_eq!(matches[0].tooltip(), Some("Review changes"));
+        assert_eq!(matches[1].label(), "/clear");
+        assert_eq!(matches[1].tooltip(), None, "no description, no title");
+    });
+    chat.update_in(cx, |view, window, cx| {
+        view.set_read_only(None, cx);
+        view.set_intent_callback(Rc::new(|_, _| written()), cx);
+        view.composer.update(cx, |input, cx| {
+            input.set_value("/re", window, cx);
+            input.set_selected_range(3..3, cx);
+            input.focus(window, cx);
+        });
+    });
+    draw(cx);
+    click(cx, "slash-review");
+    draw(cx);
+    assert_eq!(
+        chat.read_with(cx, |view, cx| view.composer.read(cx).value().to_string()),
+        "/review "
+    );
 }
