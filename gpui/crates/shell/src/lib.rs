@@ -422,8 +422,8 @@ impl Shell {
             work_sidebars: HashMap::new(),
             work_subscriptions: HashMap::new(),
             branch_reviews: HashMap::new(),
-            #[cfg(test)]
             sidebar_width,
+            #[cfg(test)]
             dock_fixture: false,
         };
         shell.selected_task = shell
