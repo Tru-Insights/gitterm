@@ -285,14 +285,11 @@ fn cmd_t_escape_activate_overview_and_context_back_are_separate(cx: &mut TestApp
 }
 
 #[gpui::test]
-fn new_work_shortcuts_follow_chat_recency_on_both_entry_paths(cx: &mut TestAppContext) {
+fn new_work_button_follows_chat_recency(cx: &mut TestAppContext) {
     let (fixture, shell, cx) = fixture(cx, false);
-    for keyboard in [false, true] {
-        if keyboard {
-            key(cx, "alt-shift-t");
-        } else {
-            click(cx, "pstrip-new-work");
-        }
+    // ⌥⇧T is Iced's folder picker now (TRU-274), so only the button opens the sheet.
+    for _ in 0..2 {
+        click(cx, "pstrip-new-work");
         cx.read(|cx| {
             let s = shell.read(cx);
             let recent = &s.new_work_sheet.as_ref().unwrap().read(cx).draft().recent;

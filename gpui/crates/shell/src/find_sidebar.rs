@@ -2038,8 +2038,18 @@ impl FindPreview {
             }
         }
         if self.facts.open(id).is_some_and(|s| s.marker == "●") {
+            // Iced's ChatOverviewGo jumps to the waiting session's tab; this
+            // button shows only while that session is open here.
+            let target = id.clone();
             out = out.child("WAITING ON YOU").child("waiting for you").child(
-                self.unavailable_button("find-summary-prompt".into(), "Go to prompt".into(), cx),
+                Button::new("find-summary-prompt")
+                    .debug_selector(|| "find-summary-prompt".into())
+                    .label("Go to prompt")
+                    .outline()
+                    .xsmall()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(FindOutcome::Open { id: target.clone() })
+                    })),
             );
         }
         if let Some(full) = &preview.summary.reply {
@@ -2543,6 +2553,10 @@ impl crate::Shell {
     }
 
     fn refresh_find(&self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        // No workspace (the empty content's Open Folder) has no Find views.
+        if self.active_workspace(cx).is_none() {
+            return;
+        }
         let facts = self.find_facts(cx);
         let owner = self.find_owner(cx);
         let regions = &self.active(cx).store.regions;

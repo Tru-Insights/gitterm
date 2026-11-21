@@ -141,10 +141,11 @@ fn indexed_shortcuts_sidebar_console_sheets_and_escape_reach_host(cx: &mut TestA
     draw(cx);
     cx.read(|cx| assert!(shell.read(cx).active(cx).store.regions.bottom_opened));
     dispatch(OpenFolder, cx);
-    cx.read(|cx| assert!(shell.read(cx).new_work_sheet.is_some()));
-    cx.simulate_keystrokes("escape");
+    cx.read(|cx| assert!(shell.read(cx).folder_picker().is_some()));
+    let bounds = cx.debug_bounds("folder-picker-cancel").unwrap();
+    cx.simulate_click(bounds.center(), gpui::Modifiers::none());
     draw(cx);
-    cx.read(|cx| assert!(shell.read(cx).new_work_sheet.is_none()));
+    cx.read(|cx| assert!(shell.read(cx).folder_picker().is_none()));
     cx.simulate_keystrokes("cmd-shift-w");
     draw(cx);
     cx.read(|cx| assert!(shell.read(cx).park_sheet.is_some()));

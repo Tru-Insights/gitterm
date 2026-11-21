@@ -1004,8 +1004,14 @@ fn n12_and_n13d_workspace_and_waiting_actions_are_notice_only(cx: &mut TestAppCo
     }
     assert_eq!(
         *events.borrow(),
-        ["Go to Owner", "Add to workspace…", "Go to prompt"]
-            .map(|s| FindOutcome::Unavailable(s.into()))
+        [
+            FindOutcome::Unavailable("Go to Owner".into()),
+            FindOutcome::Unavailable("Add to workspace…".into()),
+            // N13d: Iced navigates to the waiting session.
+            FindOutcome::Open {
+                id: ChatRef::local("first")
+            },
+        ]
     );
     assert_eq!(
         retained.borrow().selected("tab").unwrap().chat,

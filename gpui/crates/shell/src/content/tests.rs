@@ -491,6 +491,20 @@ fn document_links_follow_viewer_network_and_external_window_policy() {
         assert_eq!(document_navigation(&pending, Some(url), false), N::Allow);
         assert_eq!(document_navigation(&pending, Some(url), true), N::External);
     }
+    // Same-frame links have no policy in Iced's Viewer.
+    for url in [
+        "file:///tmp/local.txt",
+        "javascript:alert(1)",
+        "custom:action",
+        "mailto:fixture@example.test",
+    ] {
+        assert_eq!(
+            document_navigation(&pending, Some(url), false),
+            N::Allow,
+            "{url}"
+        );
+    }
+    // Popups open only http(s) in the browser.
     for url in [
         "file:///tmp/local.txt",
         "javascript:alert(1)",
@@ -499,13 +513,11 @@ fn document_links_follow_viewer_network_and_external_window_policy() {
         "https:",
         "not a URL",
     ] {
-        for popup in [false, true] {
-            assert_eq!(
-                document_navigation(&pending, Some(url), popup),
-                N::Cancel,
-                "{url}"
-            );
-        }
+        assert_eq!(
+            document_navigation(&pending, Some(url), true),
+            N::Cancel,
+            "{url}"
+        );
     }
     assert_eq!(document_navigation(&pending, None, false), N::Cancel);
 }

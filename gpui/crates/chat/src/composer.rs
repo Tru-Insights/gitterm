@@ -297,9 +297,8 @@ impl ComposerState {
                 value.strip_suffix("[1m]").unwrap_or(value)
             }
         });
-        self.model = base_model.map_or_else(
-            || "Model".into(),
-            |value| {
+        let model_label = |value: &str| -> String {
+            {
                 let info =
                     ready.and_then(|(models, _)| models.iter().find(|info| info["value"] == value));
                 if self.is_acp() && value == "default" {
@@ -328,11 +327,25 @@ impl ComposerState {
                         .unwrap_or(value)
                         .into()
                 }
-            },
-        );
-        self.mode = acknowledged.mode.as_deref().map_or_else(
-            || "Mode".into(),
-            |value| {
+            }
+        };
+        // Iced's chips read `current → requested…` while one change is pending.
+        use gitterm_core::chat::types::SettingChange as Change;
+        let pending = state.pending_change();
+        let pending_model = match pending {
+            Some(Change::Model(value)) => Some(model_label(if self.is_acp() {
+                value
+            } else {
+                value.strip_suffix("[1m]").unwrap_or(value)
+            })),
+            _ => None,
+        };
+        self.model = base_model.map_or_else(|| "Model".into(), model_label);
+        if let Some(requested) = pending_model {
+            self.model = format!("{} → {requested}…", self.model);
+        }
+        let mode_label = |value: &str| -> String {
+            {
                 ready
                     .and_then(|(_, modes)| modes.iter().find(|info| info["value"] == value))
                     .and_then(|info| info["displayName"].as_str())
@@ -346,25 +359,33 @@ impl ComposerState {
                         other => other,
                     })
                     .into()
-            },
-        );
+            }
+        };
+        self.mode = acknowledged.mode.as_deref().map_or_else(|| "Mode".into(), mode_label);
+        if let Some(Change::Mode(requested)) = pending {
+            self.mode = format!("{} → {}…", self.mode, mode_label(requested));
+        }
         self.effort = acknowledged.effort.as_ref().map_or_else(
             || "Effort".into(),
             |effort| {
-                let label = crate::pickers::effort_name(effort.effort.as_deref());
+                let mut label = crate::pickers::effort_name(effort.effort.as_deref()).to_string();
+                let supported = self.catalog.efforts.iter().any(|row| {
+                    matches!(row.change, Change::Effort(_))
+                });
+                if supported && let Some(Change::Effort(requested)) = pending {
+                    label.push_str(&format!(
+                        " → {}…",
+                        crate::pickers::effort_name(requested.as_deref())
+                    ));
+                }
                 let context = if confirmed_model.is_some_and(|value| value.ends_with("[1m]")) {
                     "1M"
                 } else {
                     "200k"
                 };
                 if self.is_acp() {
-                    label.into()
-                } else if self.catalog.efforts.iter().any(|row| {
-                    matches!(
-                        row.change,
-                        gitterm_core::chat::types::SettingChange::Effort(_)
-                    )
-                }) {
+                    label
+                } else if supported {
                     format!("{label} · {context}")
                 } else {
                     context.into()
