@@ -380,3 +380,73 @@ fn sample_folders_also_navigate_without_an_inline_tree(cx: &mut TestAppContext) 
     click(cx, "files-parent");
     assert!(names(&view, cx).contains(&"src".into()));
 }
+
+#[gpui::test]
+fn mounted_files_pane_keeps_iced_insets_in_roots_and_directory(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::theme::apply(true, None, cx);
+    });
+    let root = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    fs::create_dir_all(repo.join("folder")).unwrap();
+    fs::write(repo.join("file.txt"), "file").unwrap();
+    let mut model = WorkspaceStatus::default();
+    let workspace = model.add(root.path().to_owned(), Instant::now());
+    let mut store = WorkspaceStore::new(config.path());
+    store.iced = Some(crate::workspace_config::IcedCatalog {
+        workspaces: vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "Fixture", "abbrev": "F", "color": "blue",
+                "dir": root.path(), "chats": ["owned"], "repos": [repo], "tabs": []
+            }))
+            .unwrap(),
+        ],
+        ..Default::default()
+    });
+    let owner = cx.new(|cx| WorkspaceOwner::new(model, Some(store), cx));
+    owner.update(cx, |owner, cx| {
+        owner.dispatch(Intent::Activate(workspace), Instant::now(), cx)
+    });
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        crate::pane::Pane::new(
+            "files-pane-fixture".into(),
+            "Files".into(),
+            crate::pane::PaneKind::Files,
+            workspace,
+            Rc::new(LocalData(owner.clone())),
+            window,
+            cx,
+        )
+    });
+    draw(cx);
+    assert_eq!(
+        cx.debug_bounds("files-root-icon-0").unwrap().origin.x,
+        px(16.)
+    );
+    click(cx, "files-root-0");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        draw(cx);
+        if cx.debug_bounds("files-name-1").is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "mounted directory did not load");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for ix in 0..2 {
+        assert_eq!(bounds(cx, &format!("files-icon-{ix}")).origin.x, px(16.));
+        assert_eq!(bounds(cx, &format!("files-name-{ix}")).origin.x, px(44.));
+    }
+    assert_eq!(
+        cx.debug_bounds("files-all-folders-label").unwrap().origin.x,
+        px(12.)
+    );
+    click(cx, "files-all-folders");
+    assert_eq!(
+        cx.debug_bounds("files-root-icon-0").unwrap().origin.x,
+        px(16.)
+    );
+}
