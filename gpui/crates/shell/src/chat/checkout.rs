@@ -1,6 +1,7 @@
 //! Iced's checkout menu entries (`checkout_choices_for`): the workspace's own
 //! checkout, then each prepared, unarchived task worktree of that workspace.
 //! Read-only: it loads the task file and never writes it.
+use gitterm_core::chat::checkout;
 use gitterm_core::tasks::{
     TaskLifecycle, TaskRecord, TaskStore, TaskWorktreeState, WorkspaceLocationIdentity,
 };
@@ -10,52 +11,32 @@ use std::{
     rc::Rc,
 };
 
-const CURRENT_CHECKOUT_LABEL: &str = "Current checkout";
-
-fn dir_name(path: &Path) -> String {
-    path.file_name().map_or_else(
-        || path.display().to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    )
-}
-
+/// Iced's rules, from core (canonical path comparison, as the Iced app).
 pub(super) fn choices(workspace_dir: &Path, tasks: &[TaskRecord]) -> Vec<CheckoutChoice> {
-    let mut choices = vec![CheckoutChoice {
-        label: CURRENT_CHECKOUT_LABEL.into(),
-        detail: workspace_dir.display().to_string(),
-        path: workspace_dir.display().to_string(),
-    }];
-    for task in tasks {
-        let (WorkspaceLocationIdentity::Local { directory }, Some(worktree)) =
-            (&task.workspace.location, task.worktree.path.as_deref())
-        else {
-            continue;
-        };
-        if task.worktree.state != TaskWorktreeState::Ready
-            || task.lifecycle == TaskLifecycle::Archived
-            || directory != workspace_dir
-        {
-            continue;
-        }
-        let path = worktree.display().to_string();
-        if choices.iter().any(|choice| choice.path == path) {
-            continue;
-        }
-        choices.push(CheckoutChoice {
-            label: dir_name(worktree),
-            detail: task.title.clone(),
-            path,
-        });
-    }
-    choices
+    let tasks = tasks.iter().map(|task| checkout::TaskWorktreeInfo {
+        title: &task.title,
+        workspace_dir: match &task.workspace.location {
+            WorkspaceLocationIdentity::Local { directory } => Some(directory.as_path()),
+            WorkspaceLocationIdentity::RemoteAgent { .. } => None,
+        },
+        worktree: task.worktree.path.as_deref(),
+        ready: task.worktree.state == TaskWorktreeState::Ready,
+        archived: task.lifecycle == TaskLifecycle::Archived,
+    });
+    checkout::checkout_choices(workspace_dir, tasks, checkout::paths_equal)
+        .into_iter()
+        .map(|choice| CheckoutChoice {
+            label: choice.label,
+            detail: choice.detail,
+            path: choice.path.display().to_string(),
+        })
+        .collect()
 }
 
 /// `config` is the Iced config root the owner resolved; without one (samples,
 /// tests) only the workspace's own checkout is offered.
 pub(super) fn source(workspace_dir: PathBuf, config: Option<PathBuf>) -> CheckoutSource {
     Rc::new(move || {
-        // shortcut: paths compare literally; Iced canonicalises. Upgrade if a
-        // symlinked workspace directory hides its task worktrees.
         let tasks = config.as_deref().map_or_else(Vec::new, |root| {
             let path = TaskStore::path_for_config_root(root);
             match TaskStore::load(&path) {
