@@ -1,18 +1,14 @@
 //! Iced's "Pair a phone" panel (TRU-151). The preview is read-only on Iced's
-//! data: typing and the checkbox are local, while every control that would
-//! grant a pairing or revoke a phone shows a notice and calls nothing.
+//! data: typing and the checkbox are local, the paired phones are listed
+//! from the agent, and every control that would grant a pairing or revoke a
+//! phone is refused by the preview gate with a notice and calls nothing.
 //!
 //! The state and rules are core's `remote::phone_panel` (Iced's too); this
-//! file draws them. Paired phones and an issued pairing only ever come from a
-//! live agent, which this preview never contacts, so the shell passes neither;
-//! `phones_loaded` and `pairing_created` take a read-only source if one
-//! appears. The pairing QR image
-//! is not drawn (no QR dependency, and no pairing to draw it for).
+//! file draws them, and the shell (`remote_shell.rs`) runs each call the
+//! rules start. The pairing QR image is not drawn (no QR dependency, and the
+//! preview never issues a pairing to draw it for).
 
-use std::{
-    cell::Cell,
-    time::{Duration, UNIX_EPOCH},
-};
+use std::time::{Duration, UNIX_EPOCH};
 
 use gitterm_core::{
     chats,
@@ -44,33 +40,17 @@ pub const EXPLANATION: &str = "Scan the code with the phone's camera; the phone 
      it can also message them, answer their prompts and stop a turn. \
      To change what a phone may do, revoke it and pair it again.";
 pub const SHORT_CODE_HINT: &str = "Using the home-screen app? Open it and type this code.";
-pub const PAIRED_PHONES_UNAVAILABLE: &str = "Paired phones are not listed in preview.";
+/// Iced's texts while the list loads and when it is empty.
+pub const LOADING: &str = "Loading…";
+pub const NO_PHONES: &str = "None yet.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PhonePanelOutcome {
     Close,
-    /// A write control was used; the shell reports it as unavailable.
-    Unavailable(String),
-}
-
-pub fn unavailable_notice(label: &str) -> String {
-    format!("{label} · not available in preview")
-}
-
-/// The preview has no agent client, so a write rule's lookup always says
-/// the control is unavailable; `declined` records that it was asked.
-///
-/// shortcut: the shell has no `ServiceContext` yet, so the notice text is
-/// the preview's own; take it from `ServiceContext::phone(&call)` once it has
-/// one and a client to build the call with.
-fn no_client<'a>(
-    label: &'a str,
-    declined: &'a Cell<bool>,
-) -> impl FnOnce(&str) -> Result<(), String> + 'a {
-    move |_| {
-        declined.set(true);
-        Err(unavailable_notice(label))
-    }
+    /// Show pairing code / New code, or Enter in the name field; the device
+    /// name is already copied into the rules.
+    Create,
+    Revoke(String),
 }
 
 /// `HH:MM` on this Mac's clock, as Iced's `local_clock_time`.
@@ -142,7 +122,7 @@ impl PhonePanel {
         self.panel.create_label()
     }
 
-    /// The answer to a list call, from a read-only source if one appears.
+    /// The answer to a list call.
     pub fn phones_loaded(
         &mut self,
         remote_id: &str,
@@ -170,13 +150,20 @@ impl PhonePanel {
         cx.notify();
     }
 
+    /// A call the preview gate refused: nothing is in flight, and the
+    /// notice shows where Iced shows a call's error. A refused list shows
+    /// the empty list, as Iced's failed list does, not "Loading…".
+    pub fn refused(&mut self, notice: String, cx: &mut Context<Self>) {
+        self.panel.busy = false;
+        self.panel.error = Some(notice);
+        self.panel.phones.get_or_insert_with(Vec::new);
+        cx.notify();
+    }
+
     /// Show pairing code / New code, and Enter in the name field.
     pub fn create(&mut self, cx: &mut Context<Self>) {
-        let label = self.panel.create_label();
-        let declined = Cell::new(false);
         self.panel.set_device_name(self.device_name(cx));
-        let _ = self.panel.create(no_client(label, &declined));
-        self.finish(label, declined.get(), cx);
+        cx.emit(PhonePanelOutcome::Create);
     }
 
     pub fn revoke(&mut self, id: String, cx: &mut Context<Self>) {
@@ -184,18 +171,7 @@ impl PhonePanel {
         if self.panel.busy {
             return;
         }
-        let declined = Cell::new(false);
-        let _ = self.panel.revoke(id, no_client(REVOKE_LABEL, &declined));
-        self.finish(REVOKE_LABEL, declined.get(), cx);
-    }
-
-    /// Only a refused lookup is the preview's "unavailable"; a refused name
-    /// shows its own notice and the shell hears nothing.
-    fn finish(&mut self, label: &str, declined: bool, cx: &mut Context<Self>) {
-        if declined {
-            cx.emit(PhonePanelOutcome::Unavailable(label.to_string()));
-        }
-        cx.notify();
+        cx.emit(PhonePanelOutcome::Revoke(id));
     }
 }
 
@@ -327,12 +303,15 @@ impl Render for PhonePanel {
         match &self.panel.phones {
             None => {
                 card = card.child(
-                    text(PAIRED_PHONES_UNAVAILABLE.into(), 11., p.muted)
-                        .debug_selector(|| "phone-list-unavailable".into()),
+                    text(LOADING.into(), 11., p.muted)
+                        .debug_selector(|| "phone-list-loading".into()),
                 )
             }
             Some(phones) if phones.is_empty() => {
-                card = card.child(text("None yet.".into(), 11., p.muted));
+                card = card.child(
+                    text(NO_PHONES.into(), 11., p.muted)
+                        .debug_selector(|| "phone-list-empty".into()),
+                );
             }
             Some(phones) => {
                 for phone in phones {
