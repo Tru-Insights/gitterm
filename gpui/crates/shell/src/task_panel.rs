@@ -13,14 +13,14 @@ use gitterm_core::{
     preview::service::{ServiceContext, classify_task_action},
     session::{self, Target},
     task_commands::{
-        TaskCreate, TaskCreateOrigin, TaskMutation, TaskMutationAction, TaskMutationCommand,
-        TaskMutationFacts, TaskPublish,
+        SessionLaunch, TaskCreate, TaskCreateOrigin, TaskLaunchOrigin, TaskMutation,
+        TaskMutationAction, TaskMutationCommand, TaskMutationFacts, TaskPublish,
     },
     task_host::TaskHost,
     task_worktree::{pr_base_branch, suggested_task_branch, suggested_task_worktree_path},
     tasks::{
-        StoppingBoundary, TaskLifecycle, TaskRecord, TaskStore, TaskWorktreeState,
-        WorkspaceLocationIdentity,
+        HarnessKind, StoppingBoundary, TaskCreatorKind, TaskLifecycle, TaskRecord, TaskStore,
+        TaskWorktreeState, VerificationState, WorkspaceLocationIdentity,
     },
 };
 use gpui::{
@@ -51,6 +51,42 @@ fn fresh_task_id() -> String {
 
 /// Iced's `CUSTOM_TASK_BASE`.
 const CUSTOM_BASE: &str = "Custom ref…";
+
+/// Iced `task_base_choices`: `develop`, `main`, the current branch, the
+/// rest by name, then `HEAD` and `Custom ref…`; with the preferred base.
+pub(crate) fn base_choices(branches: &[(String, bool)]) -> (Vec<String>, String) {
+    let current = branches
+        .iter()
+        .find(|(_, current)| *current)
+        .map(|(name, _)| name.as_str());
+    let has = |name: &str| branches.iter().any(|(branch, _)| branch == name);
+    let preferred = if has("develop") {
+        "develop"
+    } else if has("main") {
+        "main"
+    } else {
+        current.unwrap_or("HEAD")
+    };
+    let mut choices: Vec<String> = ["develop", "main"]
+        .into_iter()
+        .filter(|name| has(name))
+        .map(str::to_owned)
+        .collect();
+    if let Some(current) = current
+        && !choices.iter().any(|choice| choice == current)
+    {
+        choices.push(current.to_owned());
+    }
+    let mut remaining: Vec<String> = branches
+        .iter()
+        .map(|(name, _)| name.clone())
+        .filter(|name| !choices.contains(name))
+        .collect();
+    remaining.sort_by_key(|name| name.to_lowercase());
+    choices.extend(remaining);
+    choices.extend(["HEAD".to_owned(), CUSTOM_BASE.to_owned()]);
+    (choices, preferred.to_owned())
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum RailFilter {
@@ -100,15 +136,23 @@ pub(crate) struct Inputs {
     pub general_sessions: usize,
     /// Iced's `sidebar_panel_width() <= 160`.
     pub compact: bool,
-    /// The open task sessions in this workspace, first per task first
+    /// The open task sessions in every workspace, in workspace then tab order
     /// (Iced `first_open_task_tab`).
     pub open_sessions: Vec<Target>,
+    /// Each open session's tab title, by `session_uid`.
+    pub titles: std::collections::HashMap<String, String>,
 }
 impl Inputs {
     fn open_session(&self, task_id: &str) -> Option<&Target> {
         self.open_sessions
             .iter()
             .find(|target| target.task_id.as_deref() == Some(task_id))
+    }
+    /// Iced `task_tab_indices`: the task's open sessions, in tab order.
+    fn task_sessions<'a>(&'a self, task_id: &'a str) -> impl Iterator<Item = &'a Target> + 'a {
+        self.open_sessions
+            .iter()
+            .filter(move |target| target.task_id.as_deref() == Some(task_id))
     }
 }
 
@@ -216,24 +260,50 @@ pub(crate) fn row_archivable(task: &TaskRecord, compact: bool) -> bool {
     !compact && task.lifecycle != TaskLifecycle::Archived && !task.lifecycle.is_active()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Verb {
+    /// `▸ Start with {agent} ▾`, or `+ Continue ▾` once a session is open;
+    /// enabled while a session can be added.
+    Start {
+        continuing: bool,
+        enabled: bool,
+    },
+    Resume,
+    /// `Go to session` for the first open session that has an id.
+    GoToSession(String),
     ReviewChanges,
     PushBranch,
     OpenDraftPr,
     Stop,
     CancelQueue,
-    Archive { enabled: bool },
+    Archive {
+        enabled: bool,
+    },
 }
 
-/// Iced `view_task_detail`'s state verbs in its order (T03/T04 verbs are
-/// not mounted here). Publishing is never busy in the preview.
-pub(crate) fn verbs(task: &TaskRecord, open_session: bool) -> Vec<Verb> {
-    let mut verbs = vec![];
-    if task.worktree.state == TaskWorktreeState::Ready
+/// Iced `view_task_detail`'s state verbs in its order. Publishing is never
+/// busy in the preview.
+pub(crate) fn verbs(task: &TaskRecord, inputs: &Inputs) -> Vec<Verb> {
+    let first = inputs.open_session(&task.task_id);
+    let can_add_session = task.worktree.state == TaskWorktreeState::Ready
         && task.worktree.path.is_some()
-        && task.lifecycle != TaskLifecycle::Archived
+        && task.lifecycle != TaskLifecycle::Archived;
+    let mut verbs = vec![Verb::Start {
+        continuing: first.is_some(),
+        enabled: can_add_session,
+    }];
+    if can_add_session
+        && matches!(
+            task.lifecycle,
+            TaskLifecycle::Stopped | TaskLifecycle::Interrupted
+        )
     {
+        verbs.push(Verb::Resume);
+    }
+    if let Some(session) = first.and_then(|target| target.task_session_id.clone()) {
+        verbs.push(Verb::GoToSession(session));
+    }
+    if can_add_session {
         verbs.push(Verb::ReviewChanges);
         if matches!(
             task.workspace.location,
@@ -245,7 +315,7 @@ pub(crate) fn verbs(task: &TaskRecord, open_session: bool) -> Vec<Verb> {
             }
         }
     }
-    if task.lifecycle.is_active() && open_session {
+    if task.lifecycle.is_active() && first.is_some() {
         verbs.push(Verb::Stop);
     }
     if task.lifecycle == TaskLifecycle::Queued {
@@ -255,6 +325,174 @@ pub(crate) fn verbs(task: &TaskRecord, open_session: bool) -> Vec<Verb> {
         enabled: !task.lifecycle.is_active() && task.lifecycle != TaskLifecycle::Archived,
     });
     verbs
+}
+
+/// Iced `friendly_timestamp`.
+fn friendly_timestamp(rfc3339: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .ok()
+        .map(|stamp| {
+            let local = stamp.with_timezone(&chrono::Local);
+            if local.date_naive() == chrono::Local::now().date_naive() {
+                format!("today {}", local.format("%H:%M"))
+            } else {
+                local.format("%b %-d %H:%M").to_string()
+            }
+        })
+        .unwrap_or_else(|| rfc3339.to_owned())
+}
+
+/// Iced `TASK_PROGRESS_STALE_SECS`.
+const PROGRESS_STALE_SECS: i64 = 120;
+
+/// Iced `view_task_detail`'s detail rows. The preview captures no live
+/// progress and probes no PR, so stored values decide; `WAITING ON` names
+/// tasks with a working session, which the preview never hosts.
+pub(crate) fn detail_rows(task: &TaskRecord, inputs: &Inputs) -> Vec<(&'static str, String)> {
+    let mut rows = vec![("STATE", state_line(task, inputs))];
+    let delivery = &task.delivery;
+    if let (Some(url), Some(number)) = (&delivery.pr_url, delivery.pr_number) {
+        rows.push(("DELIVERY", format!("PR #{number} · {url}")));
+    } else if let Some(commit) = &delivery.commit_sha {
+        let short: String = commit.chars().take(10).collect();
+        rows.push(("DELIVERY", format!("{short} · no PR")));
+    }
+    let worktree = task.worktree.path.as_ref().map_or_else(
+        || "Not prepared".to_owned(),
+        |path| match task.worktree.state {
+            TaskWorktreeState::Missing => format!("{} (missing)", path.display()),
+            _ => path.display().to_string(),
+        },
+    );
+    let creator = match &task.created_by {
+        None => "Created manually".to_owned(),
+        Some(creator) => {
+            let when = friendly_timestamp(&creator.created_at);
+            match creator.kind {
+                TaskCreatorKind::Manual => format!("Created manually · {when}"),
+                TaskCreatorKind::Coordinator => creator.harness_label.as_ref().map_or_else(
+                    || format!("Coordinator session · {when}"),
+                    |harness| format!("{harness} coordinator · {when}"),
+                ),
+            }
+        }
+    };
+    rows.extend([
+        (
+            "ISSUE",
+            task.issue
+                .as_ref()
+                .map_or_else(|| "None".to_owned(), |issue| format!("{} ↗", issue.key)),
+        ),
+        (
+            "BASE",
+            format!(
+                "{} @ {}",
+                task.base.reference,
+                task.base.commit.chars().take(10).collect::<String>()
+            ),
+        ),
+        ("BRANCH", task.branch.clone()),
+        ("WORKTREE", worktree),
+        ("CREATED BY", creator),
+        (
+            "STOP WHEN",
+            boundary_label(task.stopping_boundary).to_owned(),
+        ),
+    ]);
+    if let Some(error) = &task.last_error {
+        rows.push(("LAST ERROR", error.clone()));
+    }
+    if let Some(harness) = &task.harness {
+        rows.push((
+            "LAST AGENT",
+            match &harness.kind {
+                HarnessKind::TerminalPreset { preset_name } => preset_name.clone(),
+                HarnessKind::NativeClaude => "Native Claude".to_owned(),
+                HarnessKind::NativePi => "Native Pi".to_owned(),
+            },
+        ));
+    }
+    if task.lifecycle.is_active() {
+        let progress = task.progress.as_ref();
+        let phase = progress
+            .and_then(|progress| progress.phase.clone())
+            .unwrap_or_else(|| {
+                match task.lifecycle {
+                    TaskLifecycle::Preparing => "Preparing",
+                    TaskLifecycle::Queued => "Queued",
+                    TaskLifecycle::Running => "Working",
+                    TaskLifecycle::WaitingForInput => "Waiting for input",
+                    _ => "Active",
+                }
+                .to_owned()
+            });
+        let latest = progress
+            .and_then(|progress| progress.last_update_line.clone())
+            .unwrap_or_else(|| friendly_timestamp(&task.updated_at));
+        let now = chrono::Utc::now();
+        let since = |raw: &str| {
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .ok()
+                .map(|stamp| now.signed_duration_since(stamp.with_timezone(&chrono::Utc)))
+        };
+        let activity = match progress
+            .and_then(|progress| progress.last_activity_at.as_deref())
+            .and_then(since)
+        {
+            Some(elapsed) => {
+                let secs = elapsed.num_seconds().max(0);
+                let friendly =
+                    friendly_timestamp(&(now - chrono::Duration::seconds(secs)).to_rfc3339());
+                if secs >= PROGRESS_STALE_SECS {
+                    format!("no activity since {friendly}")
+                } else {
+                    friendly
+                }
+            }
+            None => "Not observed yet".to_owned(),
+        };
+        rows.extend([
+            ("PHASE", phase),
+            ("LATEST UPDATE", latest),
+            ("LAST ACTIVITY", activity),
+        ]);
+        if let Some(elapsed) = task
+            .attempts
+            .iter()
+            .rev()
+            .find(|attempt| attempt.state.is_active())
+            .and_then(|attempt| since(&attempt.started_at))
+        {
+            rows.push(("ELAPSED", format!("{}m", elapsed.num_minutes().max(0))));
+        }
+        rows.push((
+            "CHANGED FILES",
+            if task.changes.checked_at.is_some() {
+                format!(
+                    "{} changed · {} staged",
+                    task.changes.changed, task.changes.staged
+                )
+            } else {
+                "Not checked yet".to_owned()
+            },
+        ));
+        let verification = match task.verification.state {
+            VerificationState::Unknown => "Unknown",
+            VerificationState::NotRun => "Not run",
+            VerificationState::Running => "Running",
+            VerificationState::Passed => "Passed",
+            VerificationState::Failed => "Failed",
+        };
+        rows.push((
+            "VERIFICATION",
+            match &task.verification.command {
+                Some(command) => format!("{verification} · {command}"),
+                None => verification.to_owned(),
+            },
+        ));
+    }
+    rows
 }
 
 /// Iced shows `Delete worktree…` under TASK SETTINGS whenever a path is recorded.
@@ -306,6 +544,13 @@ pub(crate) enum Write {
     DeleteConfirm,
     CreateSubmit,
     StopAndClose,
+    /// The task picker's choice (Iced `TaskChildLaunchPreset` / `Terminal`).
+    Launch {
+        task_id: String,
+        preset: Option<usize>,
+    },
+    /// Iced `TaskResume` with a recorded conversation.
+    Resume(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -314,6 +559,33 @@ pub(crate) enum TaskPanelOutcome {
     Back,
     Review(PathBuf),
     Notice(String),
+    /// Iced `TaskChildAdd`: the task's session picker.
+    Pick(String),
+    /// Iced `TaskFocusSession`.
+    FocusSession(String),
+}
+
+/// Iced `TaskResume` resumes the newest recorded conversation.
+fn latest_conversation(task: &TaskRecord) -> Option<&str> {
+    task.sessions.iter().rev().find_map(|session| {
+        session
+            .conversation
+            .as_ref()
+            .map(|conversation| conversation.session_id.as_str())
+    })
+}
+
+fn launch(task_id: &str, preset_index: Option<usize>) -> TaskMutationAction {
+    TaskMutationAction::LaunchSession {
+        request: SessionLaunch {
+            task_id: task_id.to_owned(),
+            // The preview has no agent presets (`picker_inputs`).
+            preset_name: None,
+            origin: TaskLaunchOrigin::User,
+            user_model_choice: false,
+        },
+        preset_index,
+    }
 }
 
 pub(crate) struct CreateForm {
@@ -326,9 +598,14 @@ pub(crate) struct CreateForm {
     pub base: Entity<SelectState<Vec<String>>>,
     pub custom_base: Entity<InputState>,
     pub base_custom: bool,
+    /// Iced `base_touched`: a picked base survives the branch list loading.
+    pub base_touched: bool,
+    /// Iced's `Refreshing local branches…` until the read returns.
+    pub branches_loading: bool,
     pub stopping_boundary: StoppingBoundary,
     pub error: Option<String>,
     _subscriptions: Vec<Subscription>,
+    _branches: gpui::Task<()>,
 }
 
 pub(crate) enum Modal {
@@ -431,7 +708,7 @@ impl TaskPanel {
         let objective = input("What should the agent accomplish?", cx);
         let issue = input("TRU-105 (optional)", cx);
         let custom_base = input("branch, tag, remote ref, or SHA", cx);
-        // Iced's choices before local branches load; the preview reads none.
+        // Iced's choices before local branches load.
         let base = cx.new(|cx| {
             SelectState::new(
                 vec!["HEAD".to_owned(), CUSTOM_BASE.to_owned()],
@@ -465,11 +742,24 @@ impl TaskPanel {
                 let SelectEvent::Confirm(choice) = event;
                 if let Some(Modal::Create(form)) = &mut this.modal {
                     form.base_custom = choice.as_deref() == Some(CUSTOM_BASE);
+                    form.base_touched = true;
                     form.error = None;
                 }
                 cx.notify();
             }),
         );
+        // Iced reads the repository's local branches (a git read) when the
+        // form opens; until then the choices are `HEAD` and `Custom ref…`.
+        let read = dir.clone();
+        let branches = cx.spawn_in(window, async move |panel, cx| {
+            let branches = cx
+                .background_executor()
+                .spawn(async move { crate::pane::git_view::local_branches(&read) })
+                .await;
+            _ = panel.update_in(cx, |panel, window, cx| {
+                panel.branches_loaded(branches, window, cx)
+            });
+        });
         self.modal = Some(Modal::Create(Box::new(CreateForm {
             task_id: fresh_task_id(),
             workspace_name: inputs.workspace_name.clone(),
@@ -480,10 +770,56 @@ impl TaskPanel {
             base,
             custom_base,
             base_custom: false,
+            base_touched: false,
+            branches_loading: true,
             stopping_boundary: StoppingBoundary::ImplementUntilTestsPass,
             error: None,
             _subscriptions: subscriptions,
+            _branches: branches,
         })));
+        cx.notify();
+    }
+
+    /// Iced's worktree-snapshot arm for the open form: a repository's
+    /// branches replace the choices (keeping a picked base, or moving it to
+    /// `Custom ref…` when gone); a failed read keeps `HEAD` / `Custom ref…`.
+    fn branches_loaded(
+        &mut self,
+        branches: Result<Vec<(String, bool)>, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(Modal::Create(form)) = &mut self.modal else {
+            return;
+        };
+        form.branches_loading = false;
+        let (choices, preferred) = match branches {
+            Ok(branches) => base_choices(&branches),
+            Err(_) => (
+                vec!["HEAD".to_owned(), CUSTOM_BASE.to_owned()],
+                "HEAD".to_owned(),
+            ),
+        };
+        let picked = form.base.read(cx).selected_value().cloned();
+        let select = if !form.base_touched {
+            form.base_custom = false;
+            Some(preferred)
+        } else if !form.base_custom
+            && !picked
+                .as_ref()
+                .is_some_and(|picked| choices.contains(picked))
+        {
+            form.base_custom = true;
+            Some(CUSTOM_BASE.to_owned())
+        } else {
+            None
+        };
+        form.base.update(cx, |base, cx| {
+            base.set_items(choices, window, cx);
+            if let Some(select) = &select {
+                base.set_selected_value(select, window, cx);
+            }
+        });
         cx.notify();
     }
 
@@ -630,6 +966,27 @@ impl TaskPanel {
                 )),
                 _ => None,
             },
+            Write::Launch { task_id, preset } => {
+                store.get(task_id).map(|_| launch(task_id, *preset))
+            }
+            // Iced `resume_task_conversation`'s worktree checks, then the
+            // resume launch (its session-record refresh is a write too).
+            Write::Resume(task_id) => match store.get(task_id) {
+                Some(task) if latest_conversation(task).is_some() => match &task.worktree.path {
+                    None => {
+                        return Err(format!("Task {} has no prepared worktree", task.title));
+                    }
+                    Some(path) if !path.is_dir() => {
+                        return Err(format!(
+                            "Task {} worktree is gone at {}",
+                            task.title,
+                            path.display()
+                        ));
+                    }
+                    Some(_) => Some(launch(task_id, None)),
+                },
+                _ => None,
+            },
         })
     }
 
@@ -639,6 +996,16 @@ impl TaskPanel {
     pub(crate) fn write(&mut self, write: Write, inputs: &Inputs, cx: &mut Context<Self>) {
         if write == Write::CreateSubmit {
             self.submit_create(cx);
+            return;
+        }
+        // Without a recorded conversation Iced's Resume opens the picker.
+        if let Write::Resume(task_id) = &write
+            && host(cx)
+                .and_then(|host| host.store().as_ref())
+                .and_then(|store| store.get(task_id))
+                .is_some_and(|task| latest_conversation(task).is_none())
+        {
+            cx.emit(TaskPanelOutcome::Pick(task_id.clone()));
             return;
         }
         let Some(host) = host(cx) else {
@@ -1055,16 +1422,39 @@ pub(crate) fn overview_view(
             .into_any_element();
     };
     let inputs = std::rc::Rc::new(inputs);
-    let open_session = inputs.open_session(&task.task_id).is_some();
     let mut row = div().flex().flex_wrap().gap(px(10.));
-    for verb in verbs(&task, open_session) {
+    for verb in verbs(&task, &inputs) {
         let (writer, inputs, id) = (panel.clone(), inputs.clone(), task.task_id.clone());
         let write = move |write: Write| {
             move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
                 writer.update(cx, |panel, cx| panel.write(write.clone(), &inputs, cx))
             }
         };
+        let emit = |outcome: TaskPanelOutcome| {
+            let panel = panel.clone();
+            move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+                panel.update(cx, |_, cx| cx.emit(outcome.clone()))
+            }
+        };
         row = row.child(match verb {
+            Verb::Start {
+                continuing,
+                enabled,
+            } => ghost(
+                "task-start",
+                if continuing {
+                    "+ Continue ▾".to_owned()
+                } else {
+                    // Iced names its first agent preset; the preview has none.
+                    "▸ Start with agent ▾".to_owned()
+                },
+            )
+            .text_color(rgb(p.blue))
+            .disabled(!enabled)
+            .on_click(emit(TaskPanelOutcome::Pick(id))),
+            Verb::Resume => ghost("task-resume", "▸ Resume").on_click(write(Write::Resume(id))),
+            Verb::GoToSession(session) => ghost("task-go-to-session", "Go to session")
+                .on_click(emit(TaskPanelOutcome::FocusSession(session))),
             Verb::ReviewChanges => {
                 let review = task.worktree.path.clone();
                 let panel = panel.clone();
@@ -1097,15 +1487,131 @@ pub(crate) fn overview_view(
                 .on_click(write(Write::Archive(id))),
         });
     }
+    let value_row = |label: &'static str, value: String| {
+        div()
+            .flex()
+            .gap(px(12.))
+            .child(
+                div()
+                    .w(px(130.))
+                    .flex_none()
+                    .text_size(px(11.))
+                    .text_color(muted(&p))
+                    .child(label),
+            )
+            .child(div().text_color(rgb(p.subtext0)).child(value))
+    };
+    let mut details = div()
+        .id("task-details")
+        .debug_selector(|| "task-details".into())
+        .flex()
+        .flex_col()
+        .gap(px(9.));
+    for (label, value) in detail_rows(&task, &inputs) {
+        details = details.child(value_row(label, value));
+    }
+    let handoff = match &task.handoff {
+        Some(handoff) => {
+            let list = |items: &[String]| {
+                if items.is_empty() {
+                    "none".to_owned()
+                } else {
+                    items.join(" · ")
+                }
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(7.))
+                .child(
+                    div()
+                        .text_color(rgb(p.subtext0))
+                        .child(handoff.summary.clone()),
+                )
+                .child(value_row("DECISIONS", list(&handoff.decisions)))
+                .child(value_row("NEXT STEPS", list(&handoff.next_steps)))
+                .child(value_row("BLOCKERS", list(&handoff.blockers)))
+        }
+        None => div()
+            .text_size(px(11.))
+            .text_color(muted(&p))
+            .child("No durable handoff recorded yet."),
+    };
+    let mut sessions = div()
+        .id("task-sessions")
+        .debug_selector(|| "task-sessions".into())
+        .flex()
+        .flex_col()
+        .gap(px(5.));
+    let mut session_count = 0;
+    for (index, target) in inputs.task_sessions(&task.task_id).enumerate() {
+        session_count += 1;
+        let short = target
+            .task_session_id
+            .as_deref()
+            .map_or_else(|| "legacy".to_owned(), |id| id.chars().take(8).collect());
+        let title = inputs
+            .titles
+            .get(&target.session_uid)
+            .cloned()
+            .unwrap_or_default();
+        let focus = target.task_session_id.clone();
+        let panel = panel.clone();
+        sessions = sessions.child(
+            div()
+                .id(("task-session", index))
+                .debug_selector(move || format!("task-session-{index}"))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(9.))
+                .py(px(6.))
+                .rounded(px(6.))
+                .when(focus.is_some(), |row| {
+                    row.hover(|row| row.bg(rgb(p.overlay)))
+                })
+                .child(div().flex_1().child(title))
+                .child(div().text_size(px(10.)).text_color(muted(&p)).child(short))
+                .on_click(move |_, _, cx| {
+                    if let Some(session) = focus.clone() {
+                        panel.update(cx, |_, cx| cx.emit(TaskPanelOutcome::FocusSession(session)));
+                    }
+                }),
+        );
+    }
+    if session_count == 0 {
+        sessions = sessions.child(
+            div()
+                .text_size(px(11.))
+                .text_color(muted(&p))
+                .child("No sessions yet. Add an agent or terminal to begin."),
+        );
+    }
+    let section = |label: &'static str| div().text_size(px(10.)).text_color(muted(&p)).child(label);
     let mut page = page
-        .child(div().text_size(px(20.)).child(task.title.clone()))
         .child(
             div()
-                .text_color(rgb(p.subtext0))
-                .child(task.objective.clone()),
+                .flex()
+                .flex_col()
+                .gap(px(14.))
+                .p(px(24.))
+                .bg(rgb(p.surface))
+                .border_1()
+                .border_color(rgb(p.border))
+                .rounded(px(8.))
+                .child(div().text_size(px(20.)).child(task.title.clone()))
+                .child(
+                    div()
+                        .text_color(rgb(p.subtext0))
+                        .child(task.objective.clone()),
+                )
+                .child(details)
+                .child(row),
         )
-        .child(state_line(&task, &inputs))
-        .child(row);
+        .child(section("LATEST HANDOFF"))
+        .child(handoff)
+        .child(section("SESSIONS"))
+        .child(sessions);
     if let Some(notice) = &panel.read(cx).notice {
         page = page.child(
             div()
@@ -1377,6 +1883,13 @@ fn create_form(
                 .debug_selector(|| "task-create-custom-base".into())
                 .child(Input::new(&form.custom_base).small()),
         );
+    } else if form.branches_loading {
+        base = base.child(
+            div()
+                .text_size(px(9.))
+                .text_color(muted(p))
+                .child("Refreshing local branches…"),
+        );
     }
     let mut boundaries = div().flex().gap(px(6.));
     for boundary in [
@@ -1513,6 +2026,10 @@ impl crate::Shell {
                         owner.error = Some(notice.clone());
                         cx.notify();
                     }),
+                    TaskPanelOutcome::Pick(task) => shell.open_task_picker(task, window, cx),
+                    TaskPanelOutcome::FocusSession(session) => {
+                        shell.focus_task_session(session, window, cx)
+                    }
                 }
             },
         );
@@ -1572,6 +2089,89 @@ impl crate::Shell {
             .is_some_and(|panel| panel.read(cx).modal_open())
     }
 
+    /// Iced `TaskChildAdd`: the session picker over the task. Iced also
+    /// copies the task's handoff prompt; the preview does not.
+    pub(crate) fn open_task_picker(
+        &mut self,
+        task_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task) = host(cx)
+            .and_then(|host| host.store().as_ref())
+            .and_then(|store| store.get(task_id))
+        else {
+            return;
+        };
+        let inputs = self.task_inputs(cx);
+        let context = crate::session_picker::TaskContext::from_task(
+            task,
+            inputs.task_sessions(task_id).count(),
+            false,
+        );
+        self.open_picker(Some(context), window, cx);
+    }
+
+    /// The task picker's choice is a launch: it stops at the preview notice.
+    pub(crate) fn launch_task_child(
+        &mut self,
+        task_id: &str,
+        preset: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let inputs = self.task_inputs(cx);
+        let panel = self.ensure_task_panel(window, cx);
+        panel.update(cx, |panel, cx| {
+            panel.write(
+                Write::Launch {
+                    task_id: task_id.to_owned(),
+                    preset,
+                },
+                &inputs,
+                cx,
+            )
+        });
+    }
+
+    /// Iced `TaskFocusSession`: the open tab carrying that task session, in
+    /// any workspace.
+    pub(crate) fn focus_task_session(
+        &mut self,
+        session: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let found = self.workspaces.iter().find_map(|state| {
+            state.sessions.iter().find_map(|tab| {
+                let pane = state.panes.get(&crate::session_pane_id(tab.id))?;
+                (pane.read(cx).session.as_ref()?.task_session_id.as_deref() == Some(session))
+                    .then_some((state.workspace.id, tab.id))
+            })
+        });
+        match found {
+            Some((workspace, id)) => {
+                if self.active_workspace(cx) != Some(workspace) {
+                    self.select_workspace_id(workspace, window, cx);
+                }
+                self.select_host_session(workspace, id, window, cx);
+                cx.notify();
+            }
+            None => {
+                let notice = format!(
+                    "Task session {} is no longer open",
+                    session.chars().take(8).collect::<String>()
+                );
+                if let Some(panel) = &self.task_panel {
+                    panel.update(cx, |panel, cx| {
+                        panel.notice = Some(notice);
+                        cx.notify();
+                    });
+                }
+            }
+        }
+    }
+
     /// Iced sets the host tab's sidebar to Tasks on entering the Overview.
     pub(crate) fn show_task_rail(&mut self, cx: &mut Context<Self>) {
         self.update_regions(
@@ -1588,16 +2188,22 @@ impl crate::Shell {
             return Inputs::default();
         };
         let state = self.active(cx);
-        let targets: Vec<Target> = state
-            .sessions
+        let mut titles = std::collections::HashMap::new();
+        // Iced `task_session_count` / `first_open_task_tab` / `task_state_copy`
+        // search every workspace: a task's sessions can live outside this one.
+        let targets: Vec<Target> = self
+            .workspaces
             .iter()
-            .filter_map(|session| {
-                state
+            .flat_map(|other| other.sessions.iter().map(move |session| (other, session)))
+            .filter_map(|(other, session)| {
+                let target = other
                     .panes
                     .get(&crate::session_pane_id(session.id))?
                     .read(cx)
                     .session
-                    .clone()
+                    .clone()?;
+                titles.insert(target.session_uid.clone(), session.title.clone());
+                Some(target)
             })
             .collect();
         use gitterm_core::remote::config::WorkspaceLocationConfig;
@@ -1637,6 +2243,7 @@ impl crate::Shell {
                 .into_iter()
                 .filter(|target| target.task_id.is_some())
                 .collect(),
+            titles,
         }
     }
 }

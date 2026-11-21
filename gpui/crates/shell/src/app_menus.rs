@@ -592,6 +592,92 @@ shortcuts![
     ("ctrl-enter", SubmitReview, Some("NativeChat && IcedReview")),
 ];
 
+/// Iced's menu bar is muda's NSMenu: AppKit resolves its key equivalents
+/// before winit sees the key, and Iced's menu poll (`CheckMenu`) dispatches
+/// with no modal check. So every item of `menus()` and its accelerator still
+/// runs behind any Iced modal; every other key reaches Iced's `KeyPressed`,
+/// which a modal consumes except for its own keys.
+pub const NATIVE_MENU_ACTIONS: &[&str] = &[
+    "About",
+    "Hide",
+    "HideOthers",
+    "ShowAll",
+    "Quit",
+    "Minimize",
+    "Maximize",
+    "Fullscreen",
+    "IncreaseTerminalFont",
+    "DecreaseTerminalFont",
+    "ClearTerminal",
+    "IncreaseUiFont",
+    "DecreaseUiFont",
+    "IncreaseChatFont",
+    "DecreaseChatFont",
+    "SetChatWidth",
+    "ToggleTheme",
+    "ToggleTerminalLogMirroring",
+    "OpenPlansViewer",
+];
+
+/// A shell surface that consumes background commands while it is open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Modal {
+    TaskSwitcher,
+    Usage,
+    /// A `gpui_component` dialog: the shortcuts help or a confirmation.
+    Dialog,
+    Task,
+    SessionPicker,
+    Park,
+    NewWork,
+    Settings,
+    Phone,
+    Plans,
+}
+
+impl Modal {
+    pub const ALL: [Modal; 10] = [
+        Modal::TaskSwitcher,
+        Modal::Usage,
+        Modal::Dialog,
+        Modal::Task,
+        Modal::SessionPicker,
+        Modal::Park,
+        Modal::NewWork,
+        Modal::Settings,
+        Modal::Phone,
+        Modal::Plans,
+    ];
+
+    /// The keys Iced's `KeyPressed` hands to this modal (Escape for all).
+    fn own(self) -> &'static [&'static str] {
+        match self {
+            // Escape, ⌘T, ↑/↓, and the query field's Enter.
+            Modal::TaskSwitcher => &[
+                "TaskSwitcherOpen",
+                "TaskSwitcherClose",
+                "TaskSwitcherNext",
+                "TaskSwitcherPrevious",
+                "TaskSwitcherActivateFirst",
+            ],
+            // Escape, ⌘⇧U, ⌘⇧O and Ctrl+1-9.
+            Modal::Usage => &["UsageViewToggle", "ChatsOverviewOpen", "WorkspaceSelect"],
+            // Escape or ⌥/ closes the help.
+            Modal::Dialog => &["ToggleHelp"],
+            // Enter parks.
+            Modal::Park => &["ParkSubmit"],
+            _ => &[],
+        }
+    }
+
+    /// Whether the action named `name` (namespaced or not) still runs
+    /// while this modal is open.
+    pub fn allows(self, name: &str) -> bool {
+        let name = name.strip_prefix("gitterm_iced::").unwrap_or(name);
+        name == "Escape" || NATIVE_MENU_ACTIONS.contains(&name) || self.own().contains(&name)
+    }
+}
+
 /// Actions without a host adapter remain unregistered, so GPUI's native menu
 /// validation disables their menu items.
 /// Mirroring has a preview-notice adapter; dictation remains out of scope.
