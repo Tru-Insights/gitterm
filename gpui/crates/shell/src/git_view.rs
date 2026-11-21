@@ -759,6 +759,29 @@ fn git(root: &std::path::Path, args: &[&str]) -> Result<String, String> {
     }
     String::from_utf8(output.stdout).map_err(|error| format!("{what}: {error}"))
 }
+/// Local branch names, each with whether it is checked out here: the
+/// `refs/heads` read Iced's worktree snapshot feeds the task base picker.
+pub(crate) fn local_branches(root: &std::path::Path) -> Result<Vec<(String, bool)>, String> {
+    let output = git(
+        root,
+        &[
+            "--no-optional-locks",
+            "for-each-ref",
+            "refs/heads",
+            "--format=%(refname:short)%00%(HEAD)",
+        ],
+    )?;
+    output
+        .lines()
+        .map(|record| match record.split_once('\0') {
+            Some((name, marker)) => Ok((name.to_owned(), marker == "*")),
+            None => Err(format!(
+                "Read branches in {}: invalid ref record",
+                root.display()
+            )),
+        })
+        .collect()
+}
 fn collect(root: PathBuf) -> Snapshot {
     let mut snapshot = Snapshot {
         root: root.clone(),
