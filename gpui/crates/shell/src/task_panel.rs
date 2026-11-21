@@ -12,12 +12,15 @@ use crate::{task_host::GpuiTaskHost, theme::Palette};
 use gitterm_core::{
     preview::service::{ServiceContext, classify_task_action},
     session::{self, Target},
-    task_commands::{TaskCreate, TaskCreateOrigin, TaskMutationAction, TaskPublish},
+    task_commands::{
+        TaskCreate, TaskCreateOrigin, TaskMutation, TaskMutationAction, TaskMutationCommand,
+        TaskMutationFacts, TaskPublish,
+    },
     task_host::TaskHost,
     task_worktree::{pr_base_branch, suggested_task_branch, suggested_task_worktree_path},
     tasks::{
         StoppingBoundary, TaskLifecycle, TaskRecord, TaskStore, TaskWorktreeState,
-        WorkspaceLocationIdentity, validate_task_objective, validate_task_title,
+        WorkspaceLocationIdentity,
     },
 };
 use gpui::{
@@ -57,12 +60,42 @@ pub(crate) enum RailFilter {
     Archived,
 }
 
+/// The workspace side of Iced's `task_belongs_to_workspace`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Location {
+    /// No saved location (a legacy remote workspace): no task matches.
+    #[default]
+    None,
+    Local {
+        dir: PathBuf,
+        root: PathBuf,
+    },
+    Remote {
+        remote_id: String,
+        root: String,
+    },
+}
+impl Location {
+    pub(crate) fn local(dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        Self::Local {
+            root: dir.clone(),
+            dir,
+        }
+    }
+    fn dir(&self) -> Option<&Path> {
+        match self {
+            Self::Local { dir, .. } => Some(dir),
+            _ => None,
+        }
+    }
+}
+
 /// What the shell knows that the store does not, read at each render.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Inputs {
     pub workspace_name: String,
-    /// The local workspace directory; `None` for a remote workspace.
-    pub dir: Option<PathBuf>,
+    pub location: Location,
     pub selected: Option<String>,
     pub general_sessions: usize,
     /// Iced's `sidebar_panel_width() <= 160`.
@@ -79,6 +112,17 @@ impl Inputs {
     }
 }
 
+/// Iced `task_state_copy`: the open task sessions decide a Ready task's copy.
+pub(crate) fn state_line(task: &TaskRecord, inputs: &Inputs) -> String {
+    let open: Vec<_> = inputs
+        .open_sessions
+        .iter()
+        .filter(|target| target.task_id.as_deref() == Some(task.task_id.as_str()))
+        .filter_map(|target| target.task_session_id.as_deref())
+        .collect();
+    crate::task_switcher::state_copy(task, &open, false)
+}
+
 /// The preview host's store and services; `None` when the host did not start.
 pub(crate) fn host(cx: &App) -> Option<&TaskHost> {
     cx.try_global::<GpuiTaskHost>()
@@ -91,9 +135,19 @@ fn same_dir(a: &Path, b: &Path) -> bool {
             == b.canonicalize().unwrap_or_else(|_| b.to_owned())
 }
 
-fn in_workspace(task: &TaskRecord, dir: Option<&Path>) -> bool {
-    match (&task.workspace.location, dir) {
-        (WorkspaceLocationIdentity::Local { directory }, Some(dir)) => same_dir(directory, dir),
+/// Iced `task_belongs_to_workspace`.
+pub(crate) fn in_workspace(task: &TaskRecord, location: &Location) -> bool {
+    match (&task.workspace.location, location) {
+        (WorkspaceLocationIdentity::Local { directory }, Location::Local { dir, root }) => {
+            same_dir(directory, root) || same_dir(directory, dir)
+        }
+        (
+            WorkspaceLocationIdentity::RemoteAgent {
+                remote_id: task_remote,
+                root: task_root,
+            },
+            Location::Remote { remote_id, root },
+        ) => task_remote == remote_id && task_root == root,
         _ => false,
     }
 }
@@ -111,11 +165,11 @@ pub(crate) struct Rail<'a> {
     pub rows: Vec<&'a TaskRecord>,
 }
 
-pub(crate) fn rail<'a>(store: &'a TaskStore, dir: Option<&Path>, filter: RailFilter) -> Rail<'a> {
+pub(crate) fn rail<'a>(store: &'a TaskStore, location: &Location, filter: RailFilter) -> Rail<'a> {
     let tasks: Vec<_> = store
         .tasks()
         .iter()
-        .filter(|task| in_workspace(task, dir))
+        .filter(|task| in_workspace(task, location))
         .collect();
     let live = |task: &&TaskRecord| task.lifecycle != TaskLifecycle::Archived;
     let mut rows: Vec<_> = tasks
@@ -364,7 +418,7 @@ impl TaskPanel {
             cx.notify();
             return;
         }
-        let Some(dir) = inputs.dir.clone() else {
+        let Some(dir) = inputs.location.dir().map(Path::to_owned) else {
             self.notice =
                 Some("Local task creation is available only from a workspace on this Mac".into());
             cx.notify();
@@ -491,7 +545,6 @@ impl TaskPanel {
         write: &Write,
         store: &TaskStore,
         inputs: &Inputs,
-        cx: &App,
     ) -> Result<Option<TaskMutationAction>, String> {
         let archive = |tasks: Vec<&TaskRecord>| {
             tasks.first().map(|task| TaskMutationAction::ArchiveTask {
@@ -519,10 +572,8 @@ impl TaskPanel {
             })
         };
         Ok(match write {
-            Write::ArchiveFailed => archive(rail(store, inputs.dir.as_deref(), self.filter).failed),
-            Write::ArchiveFinished => {
-                archive(rail(store, inputs.dir.as_deref(), self.filter).finished)
-            }
+            Write::ArchiveFailed => archive(rail(store, &inputs.location, self.filter).failed),
+            Write::ArchiveFinished => archive(rail(store, &inputs.location, self.filter).finished),
             Write::Archive(task_id) => {
                 store.get(task_id).map(|_| TaskMutationAction::ArchiveTask {
                     task_id: task_id.clone(),
@@ -571,38 +622,8 @@ impl TaskPanel {
                 },
                 _ => None,
             },
-            Write::CreateSubmit => match &self.modal {
-                Some(Modal::Create(form)) => {
-                    // Iced validates the form through the core reducer first.
-                    let read =
-                        |input: &Entity<InputState>| input.read(cx).value().trim().to_owned();
-                    let title = read(&form.title);
-                    let objective = read(&form.objective);
-                    validate_task_title(&title).map_err(|_| "Title is required".to_owned())?;
-                    validate_task_objective(&objective)
-                        .map_err(|_| "Objective is required".to_owned())?;
-                    let base = if form.base_custom {
-                        read(&form.custom_base)
-                    } else {
-                        form.base
-                            .read(cx)
-                            .selected_value()
-                            .cloned()
-                            .unwrap_or_else(|| "HEAD".into())
-                    };
-                    Some(TaskMutationAction::PrepareTask(TaskCreate {
-                        title,
-                        objective,
-                        repository_path: form.repository_path.clone(),
-                        workspace_name: Some(form.workspace_name.clone()),
-                        issue_key: Some(read(&form.issue)),
-                        base_reference: Some(base),
-                        stopping_boundary: form.stopping_boundary,
-                        origin: TaskCreateOrigin::Form,
-                    }))
-                }
-                _ => None,
-            },
+            // Decided by the core reducer in `write`.
+            Write::CreateSubmit => None,
             Write::StopAndClose => match &self.modal {
                 Some(Modal::StopAndClose { target, .. }) => Some(TaskMutationAction::Session(
                     session::Effect::Close(target.clone()),
@@ -616,6 +637,10 @@ impl TaskPanel {
     /// (the no-issue publish confirmation) opens its modal; anything else
     /// shows the context's notice and changes nothing.
     pub(crate) fn write(&mut self, write: Write, inputs: &Inputs, cx: &mut Context<Self>) {
+        if write == Write::CreateSubmit {
+            self.submit_create(cx);
+            return;
+        }
         let Some(host) = host(cx) else {
             self.show_notice("The task store is unavailable".into(), cx);
             return;
@@ -624,7 +649,7 @@ impl TaskPanel {
             self.show_notice("The task store is unavailable".into(), cx);
             return;
         };
-        let action = match self.action(&write, store, inputs, cx) {
+        let action = match self.action(&write, store, inputs) {
             Ok(Some(action)) => action,
             Ok(None) => return,
             Err(error) => {
@@ -648,6 +673,76 @@ impl TaskPanel {
         }
         let notice = refuse(host.services(), &action);
         self.show_notice(notice, cx);
+    }
+
+    /// Iced `TaskCreateSubmit`: the form's raw values, as Iced sends them.
+    fn create_input(&self, cx: &App) -> Option<TaskCreate> {
+        let Some(Modal::Create(form)) = &self.modal else {
+            return None;
+        };
+        let read = |input: &Entity<InputState>| input.read(cx).value().to_string();
+        // Iced clears the base when Custom ref… is picked; the field holds it.
+        let base = if form.base_custom {
+            read(&form.custom_base)
+        } else {
+            form.base
+                .read(cx)
+                .selected_value()
+                .cloned()
+                .unwrap_or_default()
+        };
+        Some(TaskCreate {
+            title: read(&form.title),
+            objective: read(&form.objective),
+            repository_path: form.repository_path.clone(),
+            workspace_name: Some(form.workspace_name.clone()),
+            issue_key: Some(read(&form.issue)),
+            base_reference: Some(base),
+            stopping_boundary: form.stopping_boundary,
+            origin: TaskCreateOrigin::Form,
+        })
+    }
+
+    /// Iced runs the form through the shared `TaskMutation::Create` reducer;
+    /// its error stays in the form. The normalized preparation then meets
+    /// the service check.
+    fn submit_create(&mut self, cx: &mut Context<Self>) {
+        let Some(input) = self.create_input(cx) else {
+            return;
+        };
+        let Some(owner) = cx.try_global::<GpuiTaskHost>().map(|host| host.0.clone()) else {
+            self.show_notice("The task store is unavailable".into(), cx);
+            return;
+        };
+        if owner.read(cx).host().store().is_none() {
+            self.show_notice("The task store is unavailable".into(), cx);
+            return;
+        }
+        // Create reads no facts; Iced's facts concern sessions and paths.
+        let decided = owner.update(cx, |owner, _| {
+            owner
+                .host_mut()
+                .reduce_mutation(
+                    TaskMutationCommand {
+                        reply: None,
+                        mutation: TaskMutation::Create(input),
+                    },
+                    &TaskMutationFacts::default(),
+                )
+                .action
+        });
+        match decided {
+            Ok(action) => {
+                let notice = refuse(owner.read(cx).host().services(), &action);
+                self.show_notice(notice, cx);
+            }
+            Err(error) => {
+                if let Some(Modal::Create(form)) = &mut self.modal {
+                    form.error = Some(error);
+                }
+                cx.notify();
+            }
+        }
     }
 }
 
@@ -673,7 +768,7 @@ pub(crate) fn rail_view(panel: &Entity<TaskPanel>, inputs: Inputs, cx: &App) -> 
     let state = panel.read(cx);
     let filter = state.filter;
     let store = host(cx).and_then(|host| host.store().as_ref());
-    let model = store.map(|store| rail(store, inputs.dir.as_deref(), filter));
+    let model = store.map(|store| rail(store, &inputs.location, filter));
     let inputs = std::rc::Rc::new(inputs);
     let mut content = div()
         .id("task-rail")
@@ -865,7 +960,7 @@ pub(crate) fn rail_view(panel: &Entity<TaskPanel>, inputs: Inputs, cx: &App) -> 
                 div().text_size(px(9.)).text_color(muted(&p)).child("local")
             });
         }
-        let state_line = crate::task_switcher::state_copy(task, &[], false);
+        let state_line = state_line(task, &inputs);
         let id = task.task_id.clone();
         let select = panel.clone();
         let row = div()
@@ -1009,7 +1104,7 @@ pub(crate) fn overview_view(
                 .text_color(rgb(p.subtext0))
                 .child(task.objective.clone()),
         )
-        .child(crate::task_switcher::state_copy(&task, &[], false))
+        .child(state_line(&task, &inputs))
         .child(row);
     if let Some(notice) = &panel.read(cx).notice {
         page = page.child(
@@ -1403,7 +1498,7 @@ impl crate::Shell {
             window,
             |shell, _, outcome: &TaskPanelOutcome, window, cx| {
                 match outcome {
-                    TaskPanelOutcome::Select(task) => shell.activate_task(task, window, cx),
+                    TaskPanelOutcome::Select(task) => shell.activate_rail_task(task, window, cx),
                     // Iced `TaskContextBack` keeps the rail as the host tab's sidebar.
                     TaskPanelOutcome::Back => {
                         shell.general_context(false, window, cx);
@@ -1429,6 +1524,46 @@ impl crate::Shell {
         }
         self.task_panel = Some(panel.clone());
         panel
+    }
+
+    /// A rail row, archived ones included: the rail lists the active
+    /// workspace's tasks from the host's snapshot, so the selection resolves
+    /// there too (the Work sidebar's list leaves archived tasks out).
+    pub(crate) fn activate_rail_task(
+        &mut self,
+        task: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.active_workspace(cx) else {
+            return;
+        };
+        let location = self.task_inputs(cx).location;
+        let listed = host(cx)
+            .and_then(|host| host.store().as_ref())
+            .and_then(|store| store.get(task))
+            .is_some_and(|record| in_workspace(record, &location));
+        if listed {
+            self.activate_task_in(workspace, task, window, cx);
+        }
+    }
+
+    /// Iced closes the open task modal on Escape; focus returns to the shell.
+    pub(crate) fn dismiss_task_modal(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(panel) = self
+            .task_panel
+            .clone()
+            .filter(|_| self.task_panel_modal_open(cx))
+        else {
+            return false;
+        };
+        panel.update(cx, |panel, cx| panel.dismiss(cx));
+        self.focus.focus(window, cx);
+        true
     }
 
     pub(crate) fn task_panel_modal_open(&self, cx: &App) -> bool {
@@ -1465,9 +1600,32 @@ impl crate::Shell {
                     .clone()
             })
             .collect();
+        use gitterm_core::remote::config::WorkspaceLocationConfig;
+        let saved = self
+            .owner
+            .read(cx)
+            .iced_workspace(workspace)
+            .and_then(|saved| saved.location.as_ref());
+        let location = match (saved, self.data.terminal_cwd(workspace, cx)) {
+            (
+                Some(WorkspaceLocationConfig::RemoteAgent {
+                    remote_id, root, ..
+                }),
+                _,
+            ) => Location::Remote {
+                remote_id: remote_id.clone(),
+                root: root.clone(),
+            },
+            (Some(WorkspaceLocationConfig::Local { root }), Some(dir)) => Location::Local {
+                dir,
+                root: root.into(),
+            },
+            (_, Some(dir)) => Location::local(dir),
+            (_, None) => Location::None,
+        };
         Inputs {
             workspace_name: state.workspace.name.clone(),
-            dir: self.data.terminal_cwd(workspace, cx),
+            location,
             selected: self.selected_task.clone(),
             general_sessions: state
                 .sessions

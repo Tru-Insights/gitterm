@@ -114,7 +114,7 @@ fn target(task_id: &str) -> Target {
 fn inputs(open: &[&str]) -> Inputs {
     Inputs {
         workspace_name: "Fixture".into(),
-        dir: Some(DIR.into()),
+        location: Location::local(DIR),
         selected: None,
         general_sessions: 1,
         compact: false,
@@ -218,12 +218,12 @@ fn task_rows_from_host_snapshot(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let store = host(cx).unwrap().store().as_ref().unwrap();
         assert_eq!(store.path(), fixture.copy());
-        let model = rail(store, Some(Path::new(DIR)), RailFilter::All);
+        let model = rail(store, &Location::local(DIR), RailFilter::All);
         let mut ids: Vec<_> = model.rows.iter().map(|t| t.task_id.as_str()).collect();
         ids.sort();
         assert_eq!(ids, ["seeded-a", "seeded-b"]);
         assert!(
-            rail(store, Some(Path::new("/elsewhere")), RailFilter::All)
+            rail(store, &Location::local("/elsewhere"), RailFilter::All)
                 .rows
                 .is_empty()
         );
@@ -432,12 +432,12 @@ fn task_filter_chips_match_iced(cx: &mut TestAppContext) {
     let (panel, _, cx, _) = surfaces(cx, inputs(&[]));
     cx.update(|_, cx| {
         let store = host(cx).unwrap().store().as_ref().unwrap();
-        let all = rail(store, Some(Path::new(DIR)), RailFilter::All);
+        let all = rail(store, &Location::local(DIR), RailFilter::All);
         assert_eq!((all.active, all.needs_you), (2, 1));
         assert_eq!(all.rows[0].task_id, "input", "attention sorts first");
-        let needs = rail(store, Some(Path::new(DIR)), RailFilter::NeedsYou);
+        let needs = rail(store, &Location::local(DIR), RailFilter::NeedsYou);
         assert_eq!(needs.rows.len(), 1);
-        let archived = rail(store, Some(Path::new(DIR)), RailFilter::Archived);
+        let archived = rail(store, &Location::local(DIR), RailFilter::Archived);
         assert_eq!(archived.rows[0].task_id, "archived");
         assert!(all.failed.is_empty() && all.finished.is_empty());
     });
@@ -530,4 +530,272 @@ fn task_controls_hidden_disabled_like_iced() {
         state(false).reduce(close),
         session::Effect::Close(_)
     ));
+}
+
+/// The h7 shell over an isolated Iced fixture, its preview task host seeded
+/// with `tasks` (given the shell workspace's directory).
+fn shell_with_tasks(
+    cx: &mut TestAppContext,
+    tasks: impl FnOnce(&Path) -> Vec<TaskRecord>,
+) -> (
+    Fixture,
+    tempfile::TempDir,
+    Entity<crate::Shell>,
+    Entity<TaskPanel>,
+    &mut VisualTestContext,
+) {
+    let (root, shell, cx) = crate::h7_tests::fixture(cx);
+    let fixture = Fixture::new();
+    fixture.write_iced(tasks(&root.path().join("work")));
+    fixture.start(cx);
+    let panel =
+        cx.update(|window, cx| shell.update(cx, |shell, cx| shell.ensure_task_panel(window, cx)));
+    draw(cx);
+    (fixture, root, shell, panel, cx)
+}
+
+fn in_dir(mut task: TaskRecord, dir: &Path) -> TaskRecord {
+    task.workspace.location = WorkspaceLocationIdentity::Local {
+        directory: dir.to_owned(),
+    };
+    task
+}
+
+fn run_tabs(shell: &Entity<crate::Shell>, cx: &mut VisualTestContext) -> usize {
+    cx.read(|cx| shell.read(cx).bottom.read(cx).input.tabs.len())
+}
+
+/// F1: Iced consumes background commands while a task prompt is up.
+#[gpui::test]
+fn task_modal_blocks_background_shortcuts(cx: &mut TestAppContext) {
+    let (_fixture, _root, shell, panel, cx) = shell_with_tasks(cx, |_| vec![]);
+    panel.update(cx, |panel, cx| {
+        panel.open_stop_and_close(target("running"), cx)
+    });
+    draw(cx);
+    cx.update(|window, cx| {
+        let context = shell.update(cx, |shell, cx| shell.menu_context(window, cx));
+        assert!(!context.contains("IcedMain"), "{context}");
+    });
+    cx.simulate_keystrokes("cmd-shift-r");
+    draw(cx);
+    assert_eq!(run_tabs(&shell, cx), 0, "the run shortcut reached run_repo");
+    // Dismissed, the same chord runs again (it is the modal that blocks it).
+    panel.update(cx, |panel, cx| panel.dismiss(cx));
+    draw(cx);
+    cx.update(|window, cx| {
+        let context = shell.update(cx, |shell, cx| shell.menu_context(window, cx));
+        assert!(context.contains("IcedMain"), "{context}");
+    });
+    cx.simulate_keystrokes("cmd-shift-r");
+    draw(cx);
+    assert_eq!(run_tabs(&shell, cx), 1);
+}
+
+/// F2: an archived row selects its task, from the host snapshot.
+#[gpui::test]
+fn archived_rail_row_selects_task(cx: &mut TestAppContext) {
+    let (_fixture, _root, shell, _panel, cx) = shell_with_tasks(cx, |work| {
+        let mut archived = in_dir(task("archived", TaskLifecycle::Archived), work);
+        archived.archived_at = Some("2026-01-02T00:00:00Z".into());
+        vec![archived]
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.activate_rail_task("archived", window, cx)
+        })
+    });
+    draw(cx);
+    cx.read(|cx| assert_eq!(shell.read(cx).selected_task.as_deref(), Some("archived")));
+    // A task outside the workspace's rail is not selected.
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.activate_rail_task("absent", window, cx)
+        })
+    });
+    cx.read(|cx| assert_eq!(shell.read(cx).selected_task.as_deref(), Some("archived")));
+}
+
+/// F3: a remote workspace's tasks match on remote id and root, as Iced.
+#[test]
+fn remote_workspace_rail_matches_remote_and_root() {
+    let remote = |id: &str, remote_id: &str, root: &str| {
+        let mut task = task(id, TaskLifecycle::Ready);
+        task.workspace.location = WorkspaceLocationIdentity::RemoteAgent {
+            remote_id: remote_id.into(),
+            root: root.into(),
+        };
+        task
+    };
+    let location = Location::Remote {
+        remote_id: "agent-1".into(),
+        root: "/srv/repo".into(),
+    };
+    assert!(in_workspace(
+        &remote("a", "agent-1", "/srv/repo"),
+        &location
+    ));
+    assert!(!in_workspace(
+        &remote("b", "agent-2", "/srv/repo"),
+        &location
+    ));
+    assert!(!in_workspace(
+        &remote("c", "agent-1", "/srv/other"),
+        &location
+    ));
+    assert!(!in_workspace(
+        &task("local", TaskLifecycle::Ready),
+        &location
+    ));
+    // A local workspace matches its root as well as its directory.
+    let local = Location::Local {
+        dir: "/tmp/elsewhere".into(),
+        root: DIR.into(),
+    };
+    assert!(in_workspace(&task("local", TaskLifecycle::Ready), &local));
+    assert!(!in_workspace(&remote("a", "agent-1", "/srv/repo"), &local));
+}
+
+/// F4: Escape closes each task modal before background navigation and
+/// gives focus back to the shell.
+#[gpui::test]
+fn escape_dismisses_task_modals(cx: &mut TestAppContext) {
+    let (_fixture, root, shell, panel, cx) = shell_with_tasks(cx, |work| {
+        vec![with_worktree(
+            in_dir(task("ready", TaskLifecycle::Ready), work),
+            work.to_owned(),
+        )]
+    });
+    let shell_focus = cx.read(|cx| shell.read(cx).focus.clone());
+    let work = root.path().join("work");
+    let open = Inputs {
+        location: Location::local(&work),
+        ..inputs(&[])
+    };
+    type Open<'a> = &'a dyn Fn(&mut TaskPanel, &mut Window, &mut Context<TaskPanel>);
+    let opens: [Open; 4] = [
+        &|panel, window, cx| panel.open_create(&open, window, cx),
+        &|panel, _, cx| panel.open_stop_and_close(target("ready"), cx),
+        &|panel, _, cx| panel.open_delete("ready", &open, cx),
+        &|panel, _, cx| {
+            panel.modal = Some(Modal::Publish {
+                task_id: "ready".into(),
+                action: TaskPublish::PushBranch,
+                error: None,
+            });
+            cx.notify();
+        },
+    ];
+    for (index, open_modal) in opens.iter().enumerate() {
+        panel.update_in(cx, |panel, window, cx| open_modal(panel, window, cx));
+        draw(cx);
+        assert!(
+            panel.read_with(cx, |panel, _| panel.modal_open()),
+            "modal {index}"
+        );
+        cx.simulate_keystrokes("escape");
+        draw(cx);
+        assert!(
+            !panel.read_with(cx, |panel, _| panel.modal_open()),
+            "modal {index}"
+        );
+        cx.update(|window, _| assert!(shell_focus.is_focused(window), "modal {index}"));
+    }
+}
+
+/// F5: the create form goes through the core reducer's validation.
+#[gpui::test]
+fn create_uses_core_validation(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    fixture.write_iced(vec![]);
+    let _owner = fixture.start(cx);
+    let open = inputs(&[]);
+    let (panel, _, cx, _) = surfaces(cx, open.clone());
+    let form_error = |cx: &mut VisualTestContext| {
+        panel.read_with(cx, |panel, _| match &panel.modal {
+            Some(Modal::Create(form)) => form.error.clone(),
+            _ => None,
+        })
+    };
+    let fill = |issue: &str, custom_base: Option<&str>, cx: &mut VisualTestContext| {
+        panel.update_in(cx, |panel, window, cx| {
+            let Some(Modal::Create(form)) = &mut panel.modal else {
+                panic!("create form should be open")
+            };
+            form.base_custom = custom_base.is_some();
+            let fields = [
+                (form.title.clone(), "Outcome"),
+                (form.objective.clone(), "Do the work"),
+                (form.issue.clone(), issue),
+                (form.custom_base.clone(), custom_base.unwrap_or_default()),
+            ];
+            for (field, value) in fields {
+                field.update(cx, |input, cx| input.set_value(value, window, cx));
+            }
+        });
+    };
+    panel.update_in(cx, |panel, window, cx| panel.open_create(&open, window, cx));
+    fill("", Some("  "), cx);
+    click("task-create-submit", cx);
+    assert_eq!(
+        form_error(cx).as_deref(),
+        Some("Base reference is required")
+    );
+    assert!(
+        notice(&panel, cx).is_none(),
+        "no preview notice before validation"
+    );
+    fill("tru-105", None, cx);
+    click("task-create-submit", cx);
+    assert_eq!(
+        form_error(cx).as_deref(),
+        Some("Linear issue must look like TRU-105")
+    );
+    assert!(notice(&panel, cx).is_none());
+    fill("TRU-105", Some(" origin/main "), cx);
+    click("task-create-submit", cx);
+    assert_eq!(
+        notice(&panel, cx).as_deref(),
+        Some("Create task · not available in preview")
+    );
+}
+
+/// F6: a Ready task with an open session reads Iced's session copy.
+#[test]
+fn rail_state_label_reads_open_sessions() {
+    use gitterm_core::tasks::{ObjectiveDeliveryState, TaskSessionRecord};
+    let mut ready = task("ready", TaskLifecycle::Ready);
+    let session = |delivery| TaskSessionRecord {
+        task_session_id: "session-ready".into(),
+        label: "Claude".into(),
+        harness: None,
+        conversation: None,
+        objective_delivery: delivery,
+        launch_identity: None,
+        created_at: ready.created_at.clone(),
+        updated_at: ready.created_at.clone(),
+    };
+    assert_eq!(
+        state_line(&ready, &inputs(&["ready"])),
+        "Ready · not started"
+    );
+    for (delivery, expected) in [
+        (
+            ObjectiveDeliveryState::NotDelivered,
+            "Session open · no brief",
+        ),
+        (ObjectiveDeliveryState::Delivered, "Session open · briefed"),
+        (
+            ObjectiveDeliveryState::Unknown,
+            "Session open · delivery unknown",
+        ),
+    ] {
+        ready.sessions = vec![session(delivery)];
+        assert_eq!(state_line(&ready, &inputs(&["ready"])), expected);
+        // Another task's open session does not count.
+        assert_eq!(
+            state_line(&ready, &inputs(&["other"])),
+            "Ready · not started"
+        );
+    }
 }

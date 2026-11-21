@@ -3129,6 +3129,7 @@ impl Shell {
             || self.park_sheet.is_some()
             || self.new_work_sheet.is_some()
             || self.settings_sheet.is_some()
+            || self.task_panel_modal_open(cx)
             || Self::has_dialog(window, cx);
         if !modal {
             context.push_str(" IcedMain");
@@ -3779,6 +3780,9 @@ impl Shell {
             cx.propagate();
             return;
         }
+        if self.dismiss_task_modal(window, cx) {
+            return;
+        }
         if self.bar_menu.take().is_some() {
             cx.notify();
             return;
@@ -3862,6 +3866,7 @@ impl Shell {
             && self.settings_sheet.is_none()
             && !Self::has_dialog(window, cx)
             && self.bar_menu.is_none()
+            && !self.task_panel_modal_open(cx)
             && self.focused_chat(window, cx).is_some()
         {
             return;
@@ -4571,9 +4576,18 @@ impl Shell {
                         .is_some_and(|s| s.read(cx).tasks().iter().any(|t| t.task_id == task))
             })
             .map(|w| w.workspace.id);
-        let Some(workspace) = workspace else {
-            return;
-        };
+        if let Some(workspace) = workspace {
+            self.activate_task_in(workspace, task, window, cx);
+        }
+    }
+
+    fn activate_task_in(
+        &mut self,
+        workspace: WorkspaceId,
+        task: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let mru = self.context_mru.clone();
         if self.active_workspace(cx) != Some(workspace) {
             self.select_workspace_id(workspace, window, cx);

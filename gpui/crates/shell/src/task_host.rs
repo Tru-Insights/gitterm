@@ -369,7 +369,6 @@ impl TaskHostOwner {
     pub(crate) fn host(&self) -> &TaskHost {
         &self.host
     }
-    #[cfg(test)]
     pub(crate) fn host_mut(&mut self) -> &mut TaskHost {
         &mut self.host
     }
