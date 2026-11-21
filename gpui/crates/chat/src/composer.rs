@@ -177,15 +177,13 @@ impl ComposerState {
     }
     /// Iced sets the Send title only while it can queue a message.
     pub fn send_tooltip(&self, blocked: bool) -> Option<String> {
-        (self.streaming && !blocked).then(|| {
-            match self.backend {
-                Some(gitterm_core::chat::types::AgentBackend::Acp(agent)) => format!(
-                    "{} is working: the message is queued and sent when this turn ends",
-                    agent.label()
-                ),
-                _ => "Claude is working: the message is queued and Claude reads it at its next step"
-                    .to_string(),
-            }
+        (self.streaming && !blocked).then(|| match self.backend {
+            Some(gitterm_core::chat::types::AgentBackend::Acp(agent)) => format!(
+                "{} is working: the message is queued and sent when this turn ends",
+                agent.label()
+            ),
+            _ => "Claude is working: the message is queued and Claude reads it at its next step"
+                .to_string(),
         })
     }
     fn is_acp(&self) -> bool {
@@ -220,12 +218,10 @@ impl ComposerState {
         }
         self.confirmed = state.acknowledged.clone();
         if (was_pending && self.pending_setting.is_none())
-            || self
-                .picker
-                .is_some_and(|picker| {
-                    picker != crate::pickers::Picker::Checkout
-                        && self.catalog.options(picker).is_empty()
-                })
+            || self.picker.is_some_and(|picker| {
+                picker != crate::pickers::Picker::Checkout
+                    && self.catalog.options(picker).is_empty()
+            })
             || effects.is_some_and(|effects| {
                 !effects.notices.is_empty() || effects.settings_changed.is_some()
             })
@@ -412,7 +408,10 @@ impl ComposerState {
                     .into()
             }
         };
-        self.mode = acknowledged.mode.as_deref().map_or_else(|| "Mode".into(), mode_label);
+        self.mode = acknowledged
+            .mode
+            .as_deref()
+            .map_or_else(|| "Mode".into(), mode_label);
         if let Some(Change::Mode(requested)) = pending {
             self.mode = format!("{} → {}…", self.mode, mode_label(requested));
         }
@@ -420,9 +419,11 @@ impl ComposerState {
             || "Effort".into(),
             |effort| {
                 let mut label = crate::pickers::effort_name(effort.effort.as_deref()).to_string();
-                let supported = self.catalog.efforts.iter().any(|row| {
-                    matches!(row.change, Change::Effort(_))
-                });
+                let supported = self
+                    .catalog
+                    .efforts
+                    .iter()
+                    .any(|row| matches!(row.change, Change::Effort(_)));
                 if supported && let Some(Change::Effort(requested)) = pending {
                     label.push_str(&format!(
                         " → {}…",
@@ -448,10 +449,8 @@ impl ComposerState {
         self.checkout = "Current checkout".into();
         self.checkout_locked = (state.session_id.is_some()
             || state.conversation.iter().any(|event| {
-                matches!(
-                    event,
-                    AgentEvent::Harness(HarnessEvent::TurnStarted { .. })
-                ) || matches!(event, AgentEvent::Other(value) if value["type"] == "user_prompt")
+                matches!(event, AgentEvent::Harness(HarnessEvent::TurnStarted { .. }))
+                    || matches!(event, AgentEvent::Other(value) if value["type"] == "user_prompt")
             }))
         .then(|| CHECKOUT_LOCKED_REASON.to_string());
         self.model_tooltip = format!("Model: {}", confirmed_model.unwrap_or_default());
