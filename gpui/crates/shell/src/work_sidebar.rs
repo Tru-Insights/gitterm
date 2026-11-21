@@ -4,7 +4,7 @@
 //! that mutate Iced state or launch a tool report the preview limitation.
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
     rc::Rc,
 };
@@ -119,6 +119,10 @@ pub enum WorkSidebarOutcome {
     OpenUrl {
         url: String,
     },
+    /// Iced opens this in its authenticated Page viewer, not the OS browser.
+    OpenPrViewer {
+        url: String,
+    },
 }
 
 impl WorkSidebarOutcome {
@@ -162,6 +166,7 @@ enum Action {
     Toggle(Fold),
     Edit(PathBuf),
     DismissAuto,
+    Preview(String),
 }
 
 #[derive(Clone, Debug)]
@@ -182,6 +187,7 @@ struct Row {
     label: String,
     small: bool,
     pr_number: Option<(u64, usize)>,
+    pr_link: Option<Action>,
     repo_prefix: Option<String>,
     badges: Vec<String>,
     age: Option<String>,
@@ -190,6 +196,7 @@ struct Row {
     run: Option<Control>,
     controls: Vec<Control>,
     detail_controls: Vec<Control>,
+    detail_rows: Vec<Row>,
     fold: Option<Fold>,
     expanded: bool,
     selected: bool,
@@ -231,6 +238,9 @@ pub struct WorkSidebar {
     repo_recency: Vec<(PathBuf, std::time::SystemTime)>,
     source: Option<IcedWorkSource>,
     pull_requests: Vec<PullRequestGroup>,
+    indexed_chats: Vec<gitterm_core::chats::ChatIndexEntry>,
+    pr_plans: HashMap<String, gitterm_core::merge_plan::MergePlan>,
+    pr_accounts: BTreeMap<String, String>,
     issues: gitterm_core::issues::IssueTitlesFile,
     collapsed_issue_groups: Vec<gitterm_core::issues::IssueGroup>,
     loading: bool,
@@ -255,6 +265,9 @@ impl WorkSidebar {
             repo_recency: vec![],
             source: None,
             pull_requests: vec![],
+            indexed_chats: vec![],
+            pr_plans: HashMap::new(),
+            pr_accounts: BTreeMap::new(),
             issues: Default::default(),
             collapsed_issue_groups: vec![],
             loading: false,
@@ -349,16 +362,27 @@ impl WorkSidebar {
             })
             .collect();
         let config = source.config.clone();
+        let previous = self.indexed_chats.clone();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let job = cx.background_executor().spawn(async move {
-            let result =
-                crate::data::IcedWorkData::read(&source.config, id, &saved, focus, |data| {
-                    _ = sender.send(Ok(data.clone()));
-                });
-            _ = sender.send(result);
+            let plans = gitterm_core::merge_plan::load_plans(&gitterm_core::merge_plan::plans_dir(
+                &source.config,
+            ));
+            let accounts = read_pr_accounts(&source.config);
+            let result = crate::data::IcedWorkData::read(
+                &source.config,
+                id,
+                &saved,
+                focus,
+                &previous,
+                |data| {
+                    _ = sender.send((Ok(data.clone()), plans.clone(), accounts.clone()));
+                },
+            );
+            _ = sender.send((result, plans, accounts));
         });
         cx.spawn(async move |view, cx| {
-            while let Some(result) = receiver.recv().await {
+            while let Some((result, plans, accounts)) = receiver.recv().await {
                 let updated = view.update(cx, |this, cx| {
                     if this.focus != requested_focus {
                         return false;
@@ -366,6 +390,8 @@ impl WorkSidebar {
                     this.loaded_at = Some(std::time::Instant::now());
                     match result {
                         Ok(data) => {
+                            this.pr_plans = plans;
+                            this.pr_accounts = accounts;
                             data.apply(&mut this.state.borrow_mut());
                             this.workspace = data.facts;
                             this.tasks = data.tasks;
@@ -373,6 +399,7 @@ impl WorkSidebar {
                             this.running_task_ids = data.running_task_ids;
                             this.repo_recency = data.repo_recency;
                             this.pull_requests = data.pull_requests;
+                            this.indexed_chats = data.indexed_chats;
                             this.issues = data.issues;
                             this.collapsed_issue_groups = data.collapsed_issue_groups;
                             this.error = None;
@@ -412,38 +439,44 @@ impl WorkSidebar {
             _ => None,
         });
         if let Some(error) = error {
-            self.error = Some(error.clone());
-            if let Some(source) = &self.source {
-                _ = source.owner.update(cx, |owner, cx| {
-                    owner.error = Some(error);
-                    cx.notify();
-                });
+            self.notice(error, cx);
+            return;
+        }
+        match &outcome {
+            WorkSidebarOutcome::Refresh { .. } => self.load(true, cx),
+            WorkSidebarOutcome::Focus { focus, .. } => {
+                self.open.remove(&Fold::Focus);
+                self.focus = focus.clone();
+                // The shell's focus outcome also invalidates its reducer.
+                // Complete a new read after that notification has returned.
+                self.loaded_at = None;
             }
-        } else {
-            match &outcome {
-                WorkSidebarOutcome::Refresh { .. } => self.load(true, cx),
-                WorkSidebarOutcome::Focus { focus, .. } => {
-                    self.focus = focus.clone();
-                    // The shell's focus outcome also invalidates its reducer.
-                    // Complete a new read after that notification has returned.
-                    self.loaded_at = None;
-                }
-                WorkSidebarOutcome::OpenUrl { url }
-                    if url.starts_with("https://") || url.starts_with("http://") =>
-                {
-                    cx.open_url(url)
-                }
-                WorkSidebarOutcome::OpenDocument { workspace, path } => {
-                    if let Some(source) = &self.source {
-                        _ = source.owner.update(cx, |owner, cx| {
-                            owner.open_file(crate::data::WorkspaceId(*workspace), path.clone(), cx)
-                        });
-                    }
-                }
-                _ => {}
+            WorkSidebarOutcome::OpenUrl { url }
+                if url.starts_with("https://") || url.starts_with("http://") =>
+            {
+                cx.open_url(url)
             }
+            WorkSidebarOutcome::OpenDocument { workspace, path } => {
+                if let Some(source) = &self.source {
+                    _ = source.owner.update(cx, |owner, cx| {
+                        owner.open_file(crate::data::WorkspaceId(*workspace), path.clone(), cx)
+                    });
+                }
+            }
+            _ => {}
         }
         cx.emit(outcome);
+    }
+
+    fn notice(&mut self, message: String, cx: &mut Context<Self>) {
+        self.error = Some(message.clone());
+        if let Some(source) = &self.source {
+            _ = source.owner.update(cx, |owner, cx| {
+                owner.error = Some(message);
+                cx.notify();
+            });
+        }
+        cx.notify();
     }
 
     /// Call after the host reduces Work intents or changes workspace facts.
@@ -462,6 +495,7 @@ impl WorkSidebar {
         let pane = state.pane(self.workspace.id);
         let mut title = Row::text(&self.workspace.name);
         title.heading = true;
+        title.control("✎", Action::Preview("✎".into()));
         title.control(
             "↻",
             Action::Emit(WorkSidebarOutcome::Refresh {
@@ -482,6 +516,17 @@ impl WorkSidebar {
             return rows;
         };
         let summary = &pane.summary;
+        if !summary.has_facts {
+            let mut row = Row::text(format!(
+                "No chat facts for this workspace yet ({} chats). Chat tabs record what they touch as they run; for older chats, run Index older chats.",
+                summary.chat_count
+            ));
+            row.detail_controls.push(Control {
+                label: "Index older chats".into(),
+                action: Action::Preview("Index older chats".into()),
+            });
+            rows.push(row);
+        }
         if summary.owned {
             let roots = if self.workspace.owned_chats.is_empty() {
                 summary.coordinators.len()
@@ -501,8 +546,10 @@ impl WorkSidebar {
                 "Focus: {}",
                 summary::shorten(&summary.focus_label(), 46)
             ));
-            focus.fold = Some(Fold::Focus);
             focus.expanded = self.open.contains(&Fold::Focus);
+            focus
+                .label
+                .push_str(if focus.expanded { " ▴" } else { " ▾" });
             focus.action = Some(Action::Toggle(Fold::Focus));
             rows.push(focus);
             if self.open.contains(&Fold::Focus) {
@@ -640,6 +687,16 @@ impl WorkSidebar {
             .unwrap_or(0);
         rows.push(heading);
         for (group, prs) in groups {
+            let briefs = group
+                .prs
+                .iter()
+                .filter_map(|pr| pr.brief().map(|b| (pr.key.id(), b)))
+                .collect();
+            let ordered = self
+                .pr_plans
+                .get(&group.root)
+                .map(|plan| gitterm_core::merge_plan::order_plan(plan, &briefs))
+                .unwrap_or_default();
             let done = prs.iter().filter(|pr| pr.done()).count();
             let done_fold = Fold::Done(group.root.clone());
             let done_open = self.open.contains(&done_fold);
@@ -683,6 +740,28 @@ impl WorkSidebar {
                         .unwrap_or_else(|| pr.key.label()),
                 );
                 row.pr_number = Some((pr.key.number, number_chars));
+                row.pr_link = Some(Action::Emit(WorkSidebarOutcome::OpenPrViewer {
+                    url: pr.key.url(),
+                }));
+                let plan_row = ordered.iter().find(|row| row.entry.key() == pr.key);
+                let next = plan_row
+                    .is_some_and(|row| row.status == gitterm_core::merge_plan::RowStatus::Next);
+                let draft = pr.snapshot.state() == Some(PrState::Draft);
+                let gated = |name: &str| {
+                    if draft {
+                        format!("{name} (draft)")
+                    } else if pr.snapshot.state() == Some(PrState::Open)
+                        && let Some(reason) = pr.checks_gate().reason()
+                    {
+                        format!("{name} ({reason})")
+                    } else {
+                        name.into()
+                    }
+                };
+                if next {
+                    let label = gated("Merge");
+                    row.control(label.clone(), Action::Preview(label));
+                }
                 let fold = Fold::Pr(pr.key.id());
                 row.expanded = self.open.contains(&fold);
                 row.fold = Some(fold.clone());
@@ -727,6 +806,57 @@ impl WorkSidebar {
                         }
                     }
                     row.details.push(meta.join(" · "));
+                    if let Some(plan_row) = plan_row {
+                        use gitterm_core::merge_plan::RowStatus;
+                        match &plan_row.status {
+                            RowStatus::Held(hold) => {
+                                let mut detail = Row::text(format!("hold: {hold}"));
+                                detail.control("clear hold", Action::Preview("clear hold".into()));
+                                row.detail_rows.push(detail);
+                            }
+                            RowStatus::Blocked(waits) => row.details.push(format!(
+                                "waits for {}{}",
+                                waits.join(", "),
+                                if plan_row.stacked { " (stacked)" } else { "" }
+                            )),
+                            RowStatus::Unordered(reason) => {
+                                row.details.push(format!("unordered: {reason}"))
+                            }
+                            _ => {}
+                        }
+                        row.details.extend(plan_row.entry.note.clone());
+                    }
+                    for news in pr.open_news() {
+                        let mut detail =
+                            Row::text(format!("● {}", summary::shorten(&news.text, 70)));
+                        detail.age = summary::parse_stamp(&news.at).map(summary::age_label);
+                        if news.told {
+                            detail.badges.push("sent to chat ✓".into());
+                        }
+                        detail.control("×", Action::Preview("×".into()));
+                        row.detail_rows.push(detail);
+                    }
+                    let account = gitterm_core::prs::account_for(pr.key.owner(), &self.pr_accounts);
+                    let own = gitterm_core::prs::is_own_pr(
+                        core.map(|core| core.author.as_str()),
+                        account.as_deref(),
+                    );
+                    let mut labels = vec!["Review".to_string()];
+                    if !own {
+                        labels.push(gated("Approve"));
+                    }
+                    if !next {
+                        labels.push(gated("Merge"));
+                    }
+                    if draft {
+                        labels.push("Ready for review".into());
+                    }
+                    for label in labels {
+                        row.detail_controls.push(Control {
+                            action: Action::Preview(label.clone()),
+                            label,
+                        });
+                    }
                     row.detail_controls.push(Control {
                         label: "Open in browser".into(),
                         action: Action::Emit(WorkSidebarOutcome::OpenUrl { url: pr.key.url() }),
@@ -892,9 +1022,10 @@ impl WorkSidebar {
             if doc.copies.len() > 1 && (expanded || copies_open || doc.differ) {
                 row.control(
                     format!(
-                        "{} copies{}",
+                        "{} copies{} {}",
                         doc.copies.len(),
-                        if doc.differ { " differ" } else { "" }
+                        if doc.differ { " differ" } else { "" },
+                        marker(copies_open)
                     ),
                     Action::Toggle(copies),
                 );
@@ -1212,17 +1343,14 @@ impl WorkSidebar {
         row.fold = Some(fold);
         row.expanded = expanded;
         row.selected = focused;
-        row.action = Some(Action::Emit(if owning {
-            WorkSidebarOutcome::OpenChat {
-                workspace: self.workspace.id,
-                chat: chat.id.clone(),
-            }
+        row.action = Some(if owning {
+            Action::Preview(row.label.clone())
         } else {
-            WorkSidebarOutcome::Focus {
+            Action::Emit(WorkSidebarOutcome::Focus {
                 workspace: self.workspace.id,
                 focus: Focus::Coordinator(chat.id.clone()),
-            }
-        }));
+            })
+        });
         if self.workspace.open_chats.contains(&chat.id) {
             row.badges.push("open".into());
         }
@@ -1306,17 +1434,18 @@ impl WorkSidebar {
                 }
                 None
             }
-            Action::DismissAuto => {
-                self.dismissed_auto = self.workspace.auto_added.clone();
-                Some(WorkSidebarOutcome::DismissAutoRepos {
-                    workspace: self.workspace.id,
-                })
-            }
-            Action::Edit(_) => None,
+            Action::DismissAuto => Some(WorkSidebarOutcome::DismissAutoRepos {
+                workspace: self.workspace.id,
+            }),
+            Action::Edit(_) | Action::Preview(_) => None,
         }
     }
 
     fn dispatch(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        if let Action::Preview(label) = action {
+            self.notice(format!("{label} · not available in preview"), cx);
+            return;
+        }
         if let Action::Edit(dir) = action {
             let Some(repo) = self
                 .workspace
@@ -1376,6 +1505,7 @@ impl WorkSidebar {
         let tooltip = match control.label.as_str() {
             "↗" => "Open chat",
             "×" => "Remove or dismiss",
+            "✎" if matches!(control.action, Action::Preview(_)) => "Rename workspace",
             "✎" => "Edit run command",
             "▸" => "Expand",
             "▾" => "Collapse",
@@ -1383,6 +1513,7 @@ impl WorkSidebar {
             _ => &control.label,
         }
         .to_string();
+        let preview_label = control.label.clone();
         Button::new(id.clone())
             .debug_selector(move || id.clone())
             .ghost()
@@ -1396,7 +1527,27 @@ impl WorkSidebar {
             .tooltip(tooltip)
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
-                this.dispatch(control.action.clone(), window, cx);
+                let preview = match &control.action {
+                    Action::Edit(_) | Action::DismissAuto => true,
+                    Action::Emit(outcome) => {
+                        outcome.preview_error().is_some()
+                            || matches!(
+                                outcome,
+                                WorkSidebarOutcome::OpenChat { .. }
+                                    | WorkSidebarOutcome::GoToChatOwner { .. }
+                            )
+                    }
+                    _ => false,
+                };
+                this.dispatch(
+                    if preview {
+                        Action::Preview(preview_label.clone())
+                    } else {
+                        control.action.clone()
+                    },
+                    window,
+                    cx,
+                );
             }))
             .label(control.label)
     }
@@ -1404,6 +1555,21 @@ impl WorkSidebar {
 
 fn marker(expanded: bool) -> &'static str {
     if expanded { "▾" } else { "▸" }
+}
+
+fn read_pr_accounts(config: &std::path::Path) -> BTreeMap<String, String> {
+    let path = config.join("github-accounts.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            eprintln!("Read {}: {error}", path.display());
+            BTreeMap::new()
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+        Err(error) => {
+            eprintln!("Read {}: {error}", path.display());
+            BTreeMap::new()
+        }
+    }
 }
 
 impl EventEmitter<WorkSidebarOutcome> for WorkSidebar {}
@@ -1501,14 +1667,22 @@ impl Render for WorkSidebar {
             let mut line = div().w_full().min_w_0().flex().items_center().gap(px(6.));
             if let Some((number, chars)) = row.pr_number {
                 line = line.child(
-                    div()
-                        .debug_selector(|| format!("work-pr-number-{index}"))
-                        .w(px(chars as f32 * 12. * 0.61))
-                        .text_size(px(12.))
-                        .flex_shrink_0()
-                        .font_family("Menlo")
-                        .text_color(rgb(p.muted))
-                        .child(format!("#{number}")),
+                    self.button(
+                        format!("work-pr-number-{index}"),
+                        Control {
+                            label: format!("#{number}"),
+                            action: row.pr_link.take().expect("PR number has viewer action"),
+                        },
+                        cx,
+                    )
+                    .debug_selector(|| format!("work-pr-number-{index}"))
+                    .p_0()
+                    .h_auto()
+                    .w(px(chars as f32 * 12. * 0.61))
+                    .text_size(px(12.))
+                    .flex_shrink_0()
+                    .font_family("Menlo")
+                    .text_color(rgb(p.muted)),
                 );
             }
             if repo {
@@ -1665,13 +1839,45 @@ impl Render for WorkSidebar {
                 }
                 block = block.child(detail);
             }
+            for (detail_index, detail) in row.detail_rows.into_iter().enumerate() {
+                let mut line = div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_size(px(10.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .child(detail.label),
+                    );
+                if let Some(age) = detail.age {
+                    line = line.child(age);
+                }
+                for badge in detail.badges {
+                    line = line.child(badge);
+                }
+                for (control_index, control) in detail.controls.into_iter().enumerate() {
+                    line = line.child(self.button(
+                        format!("work-inline-{index}-{detail_index}-{control_index}"),
+                        control,
+                        cx,
+                    ));
+                }
+                block = block.child(line);
+            }
+            let mut actions = div().flex().flex_wrap().gap_1();
             for (control_index, control) in row.detail_controls.into_iter().enumerate() {
-                block = block.child(div().flex().child(self.button(
+                actions = actions.child(self.button(
                     format!("work-detail-{index}-{control_index}"),
                     control,
                     cx,
-                )));
+                ));
             }
+            block = block.child(actions);
             body = if let Some(action) = row.action {
                 body.child(
                     Button::new(format!("work-row-{index}"))

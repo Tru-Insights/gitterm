@@ -5,21 +5,20 @@
 //! `FindPreview` in the centre while that owner has a selection. Subscribe to
 //! `FindOutcome` on both. Reduce `outcome.intent(state, owner)` and execute core
 //! effects asynchronously, returning their exact index/preview stamps. Open
-//! focuses the existing conversation; Resume maps Session/Chat/RecreateDirectory
-//! to Iced's ResumeChatAsTab/ResumeChatAsChat/ResumeChatRecreateDir behavior.
-//! Revalidate ownership, reachability and cwd at action time in the host. On
+//! focuses an existing conversation. Process/workspace controls emit Unavailable
+//! and the host shows its existing notice without performing the operation. On
 //! workspace changes update Filter.machine/workspace_root; refresh both entities
 //! after reductions or host-fact changes. Closing returns to the host's overview.
 
-use std::{cell::RefCell, collections::HashSet, rc::Rc};
+use std::{cell::RefCell, collections::HashSet, path::PathBuf, rc::Rc};
 
 use gitterm_core::{
     chats::{self, ChatBackend, ChatIndexEntry, ChatRef, ChatScope},
-    find::state::{Intent, Machine, State},
+    find::state::{Intent as CoreIntent, Machine},
 };
 use gpui::{Entity, EventEmitter, Subscription, Window, div, prelude::*, px, rgb};
 use gpui_component::{
-    Sizable,
+    Disableable, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
 };
@@ -46,6 +45,8 @@ pub enum FindOutcome {
     ClosePreview,
     Open { id: ChatRef },
     Resume { id: ChatRef, mode: ResumeMode },
+    Unavailable(String),
+    OpenFile(PathBuf),
 }
 
 impl FindOutcome {
@@ -67,10 +68,164 @@ impl FindOutcome {
                 });
             }
             Self::ClosePreview => return Some(Intent::ClosePreview(owner.into())),
-            Self::Open { .. } | Self::Resume { .. } => return None,
+            Self::Open { .. } | Self::Resume { .. } | Self::Unavailable(_) | Self::OpenFile(_) => {
+                return None;
+            }
         }
         Some(Intent::SetFilter(filter))
     }
+}
+
+/// Tail and summary share the reducer's source/selection generation guard.
+pub type State = gitterm_core::find::state::State<PreviewData>;
+type Intent = CoreIntent<PreviewData>;
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PreviewData {
+    tail: chats::ChatPreview,
+    summary: Summary,
+}
+
+impl std::ops::Deref for PreviewData {
+    type Target = chats::ChatPreview;
+    fn deref(&self) -> &Self::Target {
+        &self.tail
+    }
+}
+
+impl From<chats::ChatPreview> for PreviewData {
+    fn from(tail: chats::ChatPreview) -> Self {
+        let summary = Summary::from_messages(&tail.messages);
+        Self { tail, summary }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Summary {
+    ask: Option<String>,
+    reply: Option<String>,
+    files: Vec<String>,
+}
+
+impl Summary {
+    fn from_messages(messages: &[chats::ChatPreviewMessage]) -> Self {
+        Self {
+            ask: messages
+                .iter()
+                .rev()
+                .find(|m| m.is_user && human_request(&m.text))
+                .map(|m| m.text.trim().to_string()),
+            reply: messages
+                .iter()
+                .rev()
+                .find(|m| !m.is_user)
+                .map(|m| m.text.clone()),
+            files: vec![],
+        }
+    }
+}
+
+fn human_request(text: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty()
+        && !text.starts_with('<')
+        && !text.starts_with("[Request interrupted")
+        && !text.starts_with("This session is being continued from a previous conversation")
+        && !gitterm_core::delegations::is_delivery_message(text)
+}
+
+// Same clipping limits as Iced's chat_summary::clip_lines.
+fn clip_lines(text: &str, limit: usize) -> (String, bool) {
+    let mut cut = false;
+    let mut shown = vec![];
+    for (i, line) in text.lines().enumerate() {
+        if i == limit {
+            cut = true;
+            break;
+        }
+        if line.chars().count() > 200 {
+            cut = true;
+            shown.push(format!("{}…", line.chars().take(199).collect::<String>()));
+        } else {
+            shown.push(line.to_string());
+        }
+    }
+    (shown.join("\n"), cut)
+}
+
+fn load_preview_data(path: &std::path::Path, backend: ChatBackend) -> Result<PreviewData, String> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path).map_err(|e| format!("Read {}: {e}", path.display()))?;
+    let mut data = PreviewData::from(gitterm_core::find::load_preview(path, backend));
+    if backend != ChatBackend::Claude {
+        return Ok(data);
+    }
+    let lines = BufReader::new(file).lines();
+    let mut calls = vec![];
+    let mut failed = HashSet::new();
+    for line in lines {
+        let line = line.map_err(|e| format!("Read {}: {e}", path.display()))?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let content = value.pointer("/message/content");
+        if value["isMeta"] != true && value["isSidechain"] != true {
+            let text = content
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    content
+                        .and_then(|v| v.as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter(|b| b["type"] == "text")
+                        .filter_map(|b| b["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                });
+            if !text.trim().is_empty() {
+                if value["type"] == "user" && human_request(&text) {
+                    data.summary.ask = Some(text.trim().to_string());
+                }
+                if value["type"] == "assistant" {
+                    data.summary.reply = Some(text.trim().to_string());
+                }
+            }
+        }
+        if let Some(blocks) = content.and_then(|v| v.as_array()) {
+            for block in blocks {
+                if block["type"] == "tool_result"
+                    && block["is_error"] == true
+                    && let Some(id) = block["tool_use_id"].as_str()
+                {
+                    failed.insert(id.to_string());
+                }
+                if block["type"] == "tool_use"
+                    && matches!(
+                        block["name"].as_str(),
+                        Some("Edit" | "MultiEdit" | "Write" | "NotebookEdit")
+                    )
+                    && let Some(path) = block
+                        .pointer("/input/file_path")
+                        .or_else(|| block.pointer("/input/notebook_path"))
+                        .and_then(|v| v.as_str())
+                {
+                    calls.push((
+                        block["id"].as_str().unwrap_or_default().to_string(),
+                        path.to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    data.summary.files = calls
+        .into_iter()
+        .rev()
+        .filter(|(id, path)| !failed.contains(id) && seen.insert(path.clone()))
+        .map(|(_, path)| path)
+        .collect();
+    Ok(data)
 }
 
 /// In display order: local machine, then configured remotes (including offline
@@ -102,6 +257,18 @@ pub struct FindFacts {
     pub open_sessions: Vec<OpenSession>,
     /// Running remote native chats with no local tab. Resume joins the process.
     pub running_remote: Vec<ChatRef>,
+    pub workspaces: Vec<WorkspaceFacts>,
+    /// Iced only offers Relevant with a configured ranking client.
+    pub relevance_available: bool,
+    pub relevance_down: bool,
+    pub local_files_openable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceFacts {
+    pub name: String,
+    pub chats: Vec<String>,
+    pub open: bool,
 }
 
 impl FindFacts {
@@ -245,7 +412,18 @@ fn chat_row(
     }
 }
 
+#[cfg(test)]
 fn rows(state: &State, owner: &str, facts: &FindFacts, folds: &Disclosures) -> Vec<Row> {
+    rows_ordered(state, owner, facts, folds, None)
+}
+
+fn rows_ordered(
+    state: &State,
+    owner: &str,
+    facts: &FindFacts,
+    folds: &Disclosures,
+    rank: Option<&[String]>,
+) -> Vec<Row> {
     let filter = state.filter();
     let everywhere = filter.scope == ChatScope::Everywhere;
     let searching = !filter.query.is_empty();
@@ -259,11 +437,16 @@ fn rows(state: &State, owner: &str, facts: &FindFacts, folds: &Disclosures) -> V
     };
     let mut rows = vec![];
     for machine in machines {
-        let entries: Vec<_> = visible
+        let mut entries: Vec<_> = visible
             .iter()
             .filter(|(m, _)| *m == machine)
             .map(|(_, e)| *e)
             .collect();
+        if machine.is_none()
+            && let Some(rank) = rank
+        {
+            entries.sort_by_key(|e| rank.iter().position(|id| id == &e.id).unwrap_or(usize::MAX));
+        }
         let expanded = !everywhere || searching || folds.machines.contains(&machine);
         rows.push(Row::Machine {
             id: machine.clone(),
@@ -301,7 +484,12 @@ fn rows(state: &State, owner: &str, facts: &FindFacts, folds: &Disclosures) -> V
         let mut groups: Vec<(&std::path::Path, Vec<_>)> = vec![];
         for row in &folded {
             let root = row.root.group_root();
-            if let Some((_, group)) = groups.iter_mut().find(|(key, _)| *key == root) {
+            let existing = if machine.is_none() && rank.is_some() {
+                groups.last_mut().filter(|(key, _)| *key == root)
+            } else {
+                groups.iter_mut().find(|(key, _)| *key == root)
+            };
+            if let Some((_, group)) = existing {
                 group.push(row);
             } else {
                 groups.push((root, vec![row]));
@@ -404,6 +592,58 @@ fn scopes(state: &State, facts: &FindFacts) -> Vec<Control> {
     .collect()
 }
 
+fn widen_suggestions(state: &State, facts: &FindFacts) -> Vec<Control> {
+    let filter = state.filter();
+    if filter.query.is_empty() || filter.scope == ChatScope::Everywhere {
+        return vec![];
+    }
+    let query = filter.query.to_lowercase();
+    let count = |machine: &Machine, workspace: bool| {
+        state.index(machine).map_or(0, |index| {
+            gitterm_core::find::filter_chat_entries(
+                &index.entries,
+                if workspace {
+                    filter.workspace_root.as_deref()
+                } else {
+                    None
+                },
+                filter.backend,
+                &query,
+            )
+            .len()
+        })
+    };
+    let mut controls = vec![];
+    if filter.scope == ChatScope::Workspace {
+        let n = count(&filter.machine, false).saturating_sub(count(&filter.machine, true));
+        if n > 0 {
+            controls.push(Control {
+                label: format!(
+                    "{n} match{} elsewhere on this machine",
+                    if n == 1 { "" } else { "es" }
+                ),
+                outcome: FindOutcome::SetScope(ChatScope::Machine),
+            });
+        }
+    }
+    let n: usize = facts
+        .machines
+        .iter()
+        .filter(|m| m.id != filter.machine)
+        .map(|m| count(&m.id, false))
+        .sum();
+    if n > 0 {
+        controls.push(Control {
+            label: format!(
+                "{n} match{} on other machines",
+                if n == 1 { "" } else { "es" }
+            ),
+            outcome: FindOutcome::SetScope(ChatScope::Everywhere),
+        });
+    }
+    controls
+}
+
 fn backends() -> Vec<Control> {
     std::iter::once(Control {
         label: "All".into(),
@@ -416,6 +656,234 @@ fn backends() -> Vec<Control> {
     .collect()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RankKey {
+    filter: gitterm_core::find::state::Filter,
+    sources: Vec<(String, std::time::SystemTime, u64)>,
+}
+
+fn rank_key(state: &State) -> Option<RankKey> {
+    let filter = state.filter();
+    if filter.machine.is_some() && filter.scope != ChatScope::Everywhere {
+        return None;
+    }
+    let mut sources = state
+        .filtered_entries()
+        .into_iter()
+        .filter(|(m, _)| m.is_none())
+        .map(|(_, e)| (e.id.clone(), e.mtime, e.size))
+        .collect::<Vec<_>>();
+    sources.sort_by(|a, b| a.0.cmp(&b.0));
+    Some(RankKey {
+        filter: filter.clone(),
+        sources,
+    })
+}
+
+#[derive(Default)]
+struct Relevance {
+    in_flight: bool,
+    result: Option<(RankKey, Vec<String>, bool)>,
+    error: Option<String>,
+    down: bool,
+}
+
+fn ranking_key() -> Option<String> {
+    // Tests inject facts/results and never use the developer's credentials.
+    #[cfg(test)]
+    {
+        None
+    }
+    #[cfg(not(test))]
+    {
+        std::env::var("TYPESAFE_API_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+    }
+}
+
+fn ranked_probabilities(
+    value: &serde_json::Value,
+    count: usize,
+) -> Result<(Vec<f64>, f64, bool), String> {
+    let answer = value
+        .pointer("/answers/relevant")
+        .ok_or("TypeSafe: missing relevance answer")?;
+    if answer["type"] != "choice" {
+        return Err("TypeSafe: not a choice answer".into());
+    }
+    let offered = |id: &str| id == "none" || (0..count).any(|n| id == format!("c{n}"));
+    let choice = answer["choice"]
+        .as_str()
+        .filter(|id| offered(id))
+        .ok_or("TypeSafe: invalid choice")?;
+    let confidence = answer["confidence"]
+        .as_f64()
+        .filter(|n| n.is_finite() && (0.0..=1.0).contains(n))
+        .ok_or("TypeSafe: invalid confidence")?;
+    let probabilities = answer["probabilities"]
+        .as_object()
+        .ok_or("TypeSafe: missing probabilities")?;
+    if probabilities.iter().any(|(id, p)| {
+        !offered(id)
+            || p.as_f64()
+                .is_none_or(|p| !p.is_finite() || !(0.0..=1.0).contains(&p))
+    }) {
+        return Err("TypeSafe: invalid probability".into());
+    }
+    Ok((
+        (0..count)
+            .map(|i| {
+                probabilities
+                    .get(&format!("c{i}"))
+                    .and_then(|p| p.as_f64())
+                    .unwrap_or(0.)
+            })
+            .collect(),
+        confidence,
+        choice == "none",
+    ))
+}
+
+async fn rank_chats(
+    client: std::sync::Arc<dyn gpui::http_client::HttpClient>,
+    key: String,
+    filter: gitterm_core::find::state::Filter,
+    entries: Vec<ChatIndexEntry>,
+) -> Result<(Vec<String>, bool), (String, bool)> {
+    use gpui::http_client::{HttpRequestExt, Inner, Request, http::HeaderValue};
+    let clip = |text: &str, limit: usize| {
+        if text.chars().count() > limit {
+            format!("{}…", text.chars().take(limit - 1).collect::<String>())
+        } else {
+            text.to_string()
+        }
+    };
+    let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut state = format!(
+        "A developer in a terminal workspace wants to pick up an earlier AI coding conversation.\nWorkspace: {}",
+        filter
+            .workspace_root
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    );
+    if !filter.query.trim().is_empty() {
+        state.push_str(&format!(
+            "\nSearching the conversations for: {}",
+            clip(&one_line(&filter.query), 600)
+        ));
+    }
+    let mut scored = vec![];
+    let mut batches = vec![];
+    for (batch_index, batch) in entries.chunks(254).enumerate() {
+        let mut criteria = serde_json::Map::new();
+        for (i, entry) in batch.iter().enumerate() {
+            let mut label = format!(
+                "{} | {}",
+                clip(&one_line(&entry.title), 90),
+                entry.cwd.display()
+            );
+            if let Some(branch) = &entry.branch {
+                label.push_str(&format!(" @ {branch}"));
+            }
+            let age = chats::format_age(entry.mtime);
+            label.push_str(&format!(
+                " | {}",
+                if age == "now" {
+                    "active now".into()
+                } else {
+                    format!("{age} ago")
+                }
+            ));
+            if let Ok(preview) =
+                gitterm_core::find::load_snippet_preview(&entry.path, entry.backend)
+            {
+                let mut snippet = vec![];
+                if let Some(ask) = preview.messages.iter().rev().find(|m| m.is_user) {
+                    snippet.push(format!("asked: {}", clip(&one_line(&ask.text), 90)));
+                }
+                if let Some(reply) = preview.messages.iter().rev().find(|m| !m.is_user) {
+                    snippet.push(format!("reply: {}", clip(&one_line(&reply.text), 60)));
+                }
+                if !snippet.is_empty() {
+                    label.push_str(&format!(" | {}", snippet.join(" / ")));
+                }
+            }
+            criteria.insert(format!("c{i}"), clip(&label, 300).into());
+        }
+        criteria.insert(
+            "none".into(),
+            "None of these conversations is about the current work".into(),
+        );
+        let body = serde_json::json!({"state": state, "model": "jev-latest", "questions": {"relevant": {"type":"choice", "instructions":"Which earlier conversation is most relevant to what the developer is doing now (the workspace, branch, search text and current request in the state)? Prefer a conversation about the same task or topic; the same directory or branch alone is weaker evidence than the same subject. Choose \"none\" if no conversation is about this work.", "criteria": criteria}}});
+        let mut authorization = HeaderValue::from_str(&format!("Bearer {key}"))
+            .map_err(|_| ("TypeSafe: invalid key header".into(), true))?;
+        authorization.set_sensitive(true);
+        let request = Request::post("https://api.typesafe.ai/v1/systemone")
+            .timeout(std::time::Duration::from_secs(15))
+            .header("Content-Type", "application/json")
+            .header("Authorization", authorization)
+            .body(body.to_string().into())
+            .map_err(|_| ("TypeSafe: invalid ranking request".into(), false))?;
+        let response = client
+            .send(request)
+            .await
+            .map_err(|_| ("TypeSafe is unreachable".into(), true))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err((
+                format!("TypeSafe: HTTP {}", status.as_u16()),
+                matches!(status.as_u16(), 401 | 403),
+            ));
+        }
+        let bytes = match response.into_body().0 {
+            Inner::Empty => vec![],
+            Inner::Bytes(bytes) => bytes.into_inner().to_vec(),
+            Inner::AsyncReader(mut reader) => {
+                let mut bytes = vec![];
+                loop {
+                    let mut chunk = [0; 8192];
+                    let n = std::future::poll_fn(|cx| reader.as_mut().poll_read(cx, &mut chunk))
+                        .await
+                        .map_err(|_| ("TypeSafe: response read failed".into(), true))?;
+                    if n == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if bytes.len() > 1024 * 1024 {
+                        return Err(("TypeSafe: response too large".into(), false));
+                    }
+                }
+                bytes
+            }
+        };
+        let value = serde_json::from_slice(&bytes)
+            .map_err(|_| ("TypeSafe: invalid response JSON".into(), false))?;
+        let (probabilities, confidence, none) =
+            ranked_probabilities(&value, batch.len()).map_err(|e| (e, false))?;
+        scored.extend(
+            probabilities
+                .into_iter()
+                .enumerate()
+                .map(|(i, p)| (batch_index * 254 + i, p)),
+        );
+        batches.push((confidence, none));
+    }
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let confident = scored
+        .first()
+        .and_then(|(i, _)| batches.get(i / 254))
+        .is_some_and(|(confidence, none)| !none && *confidence >= 0.5);
+    Ok((
+        scored
+            .into_iter()
+            .map(|(i, _)| entries[i].id.clone())
+            .collect(),
+        confident,
+    ))
+}
+
 pub struct FindSidebar {
     state: Rc<RefCell<State>>,
     owner: String,
@@ -423,6 +891,9 @@ pub struct FindSidebar {
     folds: Disclosures,
     query: Entity<InputState>,
     _subscription: Subscription,
+    relevant: bool,
+    relevance: Relevance,
+    active: bool,
 }
 
 impl EventEmitter<FindOutcome> for FindSidebar {}
@@ -453,6 +924,9 @@ impl FindSidebar {
             owner,
             facts,
             folds: Disclosures::default(),
+            relevant: false,
+            relevance: Relevance::default(),
+            active: true,
             query,
             _subscription: subscription,
         }
@@ -465,7 +939,63 @@ impl FindSidebar {
             self.query
                 .update(cx, |input, cx| input.set_value(query, window, cx));
         }
+        self.request_rank(cx);
         cx.notify();
+    }
+
+    fn request_rank(&mut self, cx: &mut Context<Self>) {
+        if !self.active || !self.relevant || self.relevance.down || self.relevance.in_flight {
+            return;
+        }
+        let state = self.state.borrow();
+        let Some(stamp) = rank_key(&state) else {
+            return;
+        };
+        if stamp.sources.is_empty()
+            || self
+                .relevance
+                .result
+                .as_ref()
+                .is_some_and(|(key, _, _)| *key == stamp)
+        {
+            return;
+        }
+        let Some(key) = ranking_key() else {
+            return;
+        };
+        let entries = state
+            .filtered_entries()
+            .into_iter()
+            .filter(|(m, _)| m.is_none())
+            .map(|(_, e)| e.clone())
+            .collect::<Vec<_>>();
+        drop(state);
+        self.relevance.in_flight = true;
+        self.relevance.error = None;
+        let client = cx.http_client();
+        cx.spawn(async move |view, cx| {
+            let filter = stamp.filter.clone();
+            let result = cx
+                .background_executor()
+                .spawn(rank_chats(client, key, filter, entries))
+                .await;
+            _ = view.update(cx, |this, cx| {
+                this.relevance.in_flight = false;
+                match result {
+                    Ok((order, confident)) => {
+                        this.relevance.result = Some((stamp, order, confident))
+                    }
+                    Err((message, down)) => {
+                        this.relevance.result = Some((stamp, vec![], false));
+                        this.relevance.error = Some(message);
+                        this.relevance.down = down;
+                    }
+                }
+                this.request_rank(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn control(
@@ -564,6 +1094,18 @@ impl Render for FindSidebar {
         let font_small = theme::font_sizes(cx).ui - 1.;
         let secondary = font_small - 1.;
         let state = self.state.borrow();
+        let current_rank_key = rank_key(&state);
+        let rank = self
+            .relevance
+            .result
+            .as_ref()
+            .filter(|(key, _, confident)| {
+                self.relevant
+                    && !self.relevance.down
+                    && *confident
+                    && Some(key) == current_rank_key.as_ref()
+            })
+            .map(|(_, order, _)| order.as_slice());
         let mut scope = div().flex().gap(px(2.));
         for (i, control) in scopes(&state, &self.facts).into_iter().enumerate() {
             let active = control.outcome == FindOutcome::SetScope(state.filter().scope);
@@ -667,7 +1209,7 @@ impl Render for FindSidebar {
                 }
             }
         }
-        for (i, row) in rows(&state, &self.owner, &self.facts, &self.folds)
+        for (i, row) in rows_ordered(&state, &self.owner, &self.facts, &self.folds, rank)
             .into_iter()
             .enumerate()
         {
@@ -857,6 +1399,52 @@ impl Render for FindSidebar {
                 }
             }
         }
+        if (state.filter().scope == ChatScope::Everywhere || state.filter().machine.is_none())
+            && state
+                .index(&None)
+                .is_some_and(|index| !index.entries.is_empty())
+        {
+            list = list.child(self.control(
+                "find-backfill".into(),
+                Control {
+                    label: "Index older chats".into(),
+                    outcome: FindOutcome::Unavailable("Index older chats".into()),
+                },
+                false,
+                cx,
+            ));
+        }
+        for (i, control) in widen_suggestions(&state, &self.facts)
+            .into_iter()
+            .enumerate()
+        {
+            list = list.child(self.control(format!("find-widen-{i}"), control, false, cx));
+        }
+        let mut search = div()
+            .flex()
+            .gap_1()
+            .child(Input::new(&self.query).small().text_size(px(font_small)));
+        if self.facts.relevance_available {
+            search = search.child(
+                Button::new("find-relevant")
+                    .debug_selector(|| "find-relevant".into())
+                    .label("Relevant")
+                    .outline()
+                    .xsmall()
+                    .disabled(self.facts.relevance_down || self.relevance.down)
+                    .when(self.relevant && !self.facts.relevance_down, |b| {
+                        b.bg(rgb(p.surface))
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.relevant = !this.relevant;
+                        if !this.relevant {
+                            this.relevance.error = None;
+                        }
+                        this.request_rank(cx);
+                        cx.notify();
+                    })),
+            );
+        }
         div()
             .id("find-sidebar")
             .debug_selector(|| "find-sidebar".into())
@@ -871,14 +1459,30 @@ impl Render for FindSidebar {
             .font_family(theme::LABEL_FONT)
             .line_height(gpui::relative(theme::LABEL_LINE_HEIGHT))
             .text_size(px(font_small))
-            .child(
-                div()
-                    .px_2()
-                    .py(px(6.))
-                    .child(Input::new(&self.query).small().text_size(px(font_small))),
-            )
+            .child(div().px_2().py(px(6.)).child(search))
             .child(div().px_2().child(scope))
             .child(div().px_2().py(px(2.)).child(backend))
+            .when(self.relevant, |panel| {
+                let note = if let Some(error) = &self.relevance.error {
+                    Some(format!("{error} · showing recent"))
+                } else if current_rank_key.is_none() {
+                    Some("relevance order covers this Mac's chats only".into())
+                } else if self.relevance.in_flight {
+                    Some("ranking by relevance…".into())
+                } else if self
+                    .relevance
+                    .result
+                    .as_ref()
+                    .is_some_and(|(key, _, confident)| {
+                        Some(key) == current_rank_key.as_ref() && !confident
+                    })
+                {
+                    Some("not confident, showing recent".into())
+                } else {
+                    None
+                };
+                panel.children(note.map(|note| div().px_2().child(note)))
+            })
             .child(list)
     }
 }
@@ -970,6 +1574,10 @@ pub struct FindPreview {
     owner: String,
     facts: FindFacts,
     raw_expanded: bool,
+    idle_expanded: bool,
+    ask_expanded: bool,
+    reply_expanded: bool,
+    file_overlay: bool,
 }
 
 impl EventEmitter<FindOutcome> for FindPreview {}
@@ -981,12 +1589,347 @@ impl FindPreview {
             owner,
             facts,
             raw_expanded: false,
+            idle_expanded: false,
+            ask_expanded: false,
+            reply_expanded: false,
+            file_overlay: false,
         }
     }
 
     pub fn refresh(&mut self, facts: FindFacts, cx: &mut Context<Self>) {
         self.facts = facts;
         cx.notify();
+    }
+}
+
+impl FindPreview {
+    fn unavailable_button(&self, id: String, label: String, cx: &Context<Self>) -> Button {
+        let selector = id.clone();
+        Button::new(id)
+            .debug_selector(move || selector.clone())
+            .label(label.clone())
+            .outline()
+            .xsmall()
+            .on_click(
+                cx.listener(move |_, _, _, cx| cx.emit(FindOutcome::Unavailable(label.clone()))),
+            )
+    }
+
+    fn workspace_actions(&self, entry: &ChatIndexEntry, cx: &Context<Self>) -> gpui::Div {
+        let root = entry.root_id.as_ref().unwrap_or(&entry.id);
+        let owner = self
+            .facts
+            .workspaces
+            .iter()
+            .find(|w| w.chats.contains(root));
+        let mut line = div().flex().flex_wrap().gap_2();
+        if let Some(owner) = owner {
+            let name = if owner.name.chars().count() > 30 {
+                format!("{}…", owner.name.chars().take(29).collect::<String>())
+            } else {
+                owner.name.clone()
+            };
+            line =
+                line.child(format!("in workspace {}", owner.name))
+                    .child(self.unavailable_button(
+                        "find-workspace-owner".into(),
+                        format!("Go to {name}"),
+                        cx,
+                    ));
+        } else if entry.root_id.is_none() {
+            line = line.child(self.unavailable_button(
+                "find-workspace-make".into(),
+                "Make workspace".into(),
+                cx,
+            ));
+        }
+        if self
+            .facts
+            .workspaces
+            .iter()
+            .any(|w| w.open && !w.chats.contains(root))
+        {
+            line = line.child(
+                self.unavailable_button(
+                    "find-workspace-add".into(),
+                    if entry.root_id.is_some() {
+                        "Add its coordinator to workspace…"
+                    } else {
+                        "Add to workspace…"
+                    }
+                    .into(),
+                    cx,
+                ),
+            );
+        }
+        line
+    }
+
+    fn overview(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let p = Palette::current(cx);
+        let class = |s: &&OpenSession| match s.marker.as_str() {
+            "●" => 0,
+            "▶" => 1,
+            _ => 2,
+        };
+        let counts = [0, 1, 2].map(|n| {
+            self.facts
+                .open_sessions
+                .iter()
+                .filter(|s| class(s) == n)
+                .count()
+        });
+        let mut summary = vec![];
+        if counts[0] > 0 {
+            summary.push(format!("{} need you", counts[0]));
+        }
+        if counts[1] > 0 {
+            summary.push(format!("{} working", counts[1]));
+        }
+        summary.push(format!("{} open", self.facts.open_sessions.len()));
+        let mut body = div()
+            .id("find-overview")
+            .debug_selector(|| "find-overview".into())
+            .size_full()
+            .overflow_y_scroll()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().text_size(px(16.)).child("Overview"))
+            .child(summary.join(" · "));
+        for machine in &self.facts.machines {
+            body = body.child(
+                div()
+                    .text_color(rgb(p.muted))
+                    .child(format!("{} {}", machine.name, machine.status)),
+            );
+        }
+        if self.facts.open_sessions.is_empty() && self.facts.running_remote.is_empty() {
+            return body.child(div().p_4().child("Nothing open or running")).child("Chats, CLI sessions and Codex delegations show up here while they are open or running, on this Mac and connected machines. Pick a conversation on the left to preview it.");
+        }
+        for (group, label) in ["NEEDS YOU", "WORKING NOW", "IDLE BUT OPEN"]
+            .into_iter()
+            .enumerate()
+        {
+            if counts[group] == 0 {
+                continue;
+            }
+            if group == 2 {
+                body = body.child(
+                    Button::new("find-overview-idle")
+                        .debug_selector(|| "find-overview-idle".into())
+                        .label(format!(
+                            "{} {label} {}",
+                            if self.idle_expanded { "▾" } else { "▸" },
+                            counts[group]
+                        ))
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.idle_expanded = !this.idle_expanded;
+                            cx.notify();
+                        })),
+                );
+                if !self.idle_expanded {
+                    continue;
+                }
+            } else {
+                body = body.child(format!("{label} {}", counts[group]));
+            }
+            for (i, session) in self
+                .facts
+                .open_sessions
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| class(s) == group)
+            {
+                let id = session.id.clone();
+                let state = match group {
+                    0 => "waiting for you",
+                    1 => "Working",
+                    _ => "idle",
+                };
+                let indexed = entry(&self.state.borrow(), &id).cloned();
+                let mut lines = div()
+                    .w_full()
+                    .text_left()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(format!("{} {}", session.marker, session.title))
+                    .child(
+                        div().text_color(rgb(p.muted)).child(
+                            indexed
+                                .as_ref()
+                                .map(|entry| {
+                                    let mut place = vec![
+                                        self.facts.machine_name(&id.remote_id),
+                                        entry.group_name(),
+                                    ];
+                                    if let Some(branch) = &entry.branch {
+                                        place.push(branch.clone());
+                                    }
+                                    place.push(entry.backend.label().into());
+                                    place.join(" · ")
+                                })
+                                .unwrap_or_else(|| {
+                                    format!(
+                                        "{} · {} · {}",
+                                        self.facts.machine_name(&id.remote_id),
+                                        session.workspace,
+                                        session.detail
+                                    )
+                                }),
+                        ),
+                    )
+                    .child(state);
+                if let Some(entry) = indexed {
+                    if let Some(latest) = entry.latest {
+                        lines = lines.child(latest);
+                    }
+                    lines = lines.child(format!("{} ago", chats::format_age(entry.mtime)));
+                }
+                body = body.child(
+                    Button::new(format!("find-overview-row-{i}"))
+                        .debug_selector(move || format!("find-overview-row-{i}"))
+                        .ghost()
+                        .h_auto()
+                        .w_full()
+                        .child(lines)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(FindOutcome::Open { id: id.clone() })
+                        })),
+                );
+            }
+        }
+        for (i, id) in self.facts.running_remote.iter().enumerate() {
+            let state = self.state.borrow();
+            let indexed = entry(&state, id);
+            let title = indexed
+                .map(|e| e.title.clone())
+                .unwrap_or_else(|| id.id.clone());
+            let disabled = indexed.is_none();
+            let id = id.clone();
+            body = body.child(
+                Button::new(format!("find-overview-remote-{i}"))
+                    .debug_selector(move || format!("find-overview-remote-{i}"))
+                    .label(format!(
+                        "▶ {} · {}",
+                        title,
+                        self.facts.machine_name(&id.remote_id)
+                    ))
+                    .disabled(disabled)
+                    .ghost()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(FindOutcome::Select { id: id.clone() })
+                    })),
+            );
+        }
+        body
+    }
+
+    fn summary(
+        &self,
+        entry: &ChatIndexEntry,
+        id: &ChatRef,
+        preview: Option<&PreviewData>,
+        cx: &Context<Self>,
+    ) -> gpui::Div {
+        let mut out = div().flex().flex_col().gap_3();
+        let Some(preview) = preview else {
+            return out.child("reading the conversation…");
+        };
+        if let Some(session) = self.facts.open(id)
+            && session.marker == "▶"
+        {
+            out = out.child("DOING NOW").child(session.detail.clone());
+        }
+        if let Some(full) = &preview.summary.ask {
+            let (clipped, cut) = clip_lines(full, 4);
+            out = out.child("ASKED FOR").child(
+                div()
+                    .debug_selector(|| "find-summary-ask-text".into())
+                    .child(if self.ask_expanded {
+                        full.clone()
+                    } else {
+                        clipped
+                    }),
+            );
+            if cut {
+                out = out.child(
+                    Button::new("find-summary-ask")
+                        .debug_selector(|| "find-summary-ask".into())
+                        .label(if self.ask_expanded { "less" } else { "more" })
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.ask_expanded = !this.ask_expanded;
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+        if !preview.summary.files.is_empty() {
+            out = out.child(format!("FILES TOUCHED {}", preview.summary.files.len()));
+            for (i, path) in preview.summary.files.iter().take(8).enumerate() {
+                let full = entry.cwd.join(path);
+                let shown = full
+                    .strip_prefix(&entry.cwd)
+                    .ok()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| path.clone());
+                if id.remote_id.is_none() && self.facts.local_files_openable {
+                    out = out.child(
+                        Button::new(format!("find-summary-file-{i}"))
+                            .debug_selector(move || format!("find-summary-file-{i}"))
+                            .label(shown)
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(FindOutcome::OpenFile(full.clone()))
+                            })),
+                    );
+                } else {
+                    out = out.child(shown);
+                }
+            }
+            if preview.summary.files.len() > 8 {
+                out = out.child(format!("+{} more", preview.summary.files.len() - 8));
+            }
+        }
+        if self.facts.open(id).is_some_and(|s| s.marker == "●") {
+            out = out.child("WAITING ON YOU").child("waiting for you").child(
+                self.unavailable_button("find-summary-prompt".into(), "Go to prompt".into(), cx),
+            );
+        }
+        if let Some(full) = &preview.summary.reply {
+            let (clipped, cut) = clip_lines(full, 16);
+            out = out.child("LATEST REPLY").child(
+                div()
+                    .debug_selector(|| "find-summary-reply-text".into())
+                    .child(if self.reply_expanded {
+                        full.clone()
+                    } else {
+                        clipped
+                    }),
+            );
+            if cut {
+                out = out.child(
+                    Button::new("find-summary-reply")
+                        .debug_selector(|| "find-summary-reply".into())
+                        .label(if self.reply_expanded { "less" } else { "more" })
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.reply_expanded = !this.reply_expanded;
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+        out
     }
 }
 
@@ -1004,7 +1947,7 @@ impl Render for FindPreview {
             .text_color(rgb(p.text))
             .text_size(px(12.));
         let Some(selection) = state.selected(&self.owner) else {
-            return pane;
+            return pane.child(self.overview(cx));
         };
         let close = Button::new("find-close-preview")
             .debug_selector(|| "find-close-preview".into())
@@ -1024,10 +1967,16 @@ impl Render for FindPreview {
             controls = controls.child(
                 Button::new(format!("find-preview-action-{i}"))
                     .debug_selector(move || format!("find-preview-action-{i}"))
-                    .label(control.label)
+                    .label(control.label.clone())
                     .outline()
                     .small()
-                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(control.outcome.clone()))),
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(if matches!(control.outcome, FindOutcome::Resume { .. }) {
+                            FindOutcome::Unavailable(control.label.clone())
+                        } else {
+                            control.outcome.clone()
+                        });
+                    })),
             );
         }
         let mut place = vec![
@@ -1058,6 +2007,13 @@ impl Render for FindPreview {
                             .child(div().text_color(backend_color(entry.backend, cx)).child(
                                 format!("● {} · {}", entry.backend.label(), place.join(" · ")),
                             ))
+                            .children(self.facts.open(&selection.chat).map(|session| {
+                                div().child(match session.marker.as_str() {
+                                    "●" => "waiting for you",
+                                    "▶" => "working",
+                                    _ => "idle",
+                                })
+                            }))
                             .child(div().text_color(rgb(p.muted)).child(format!(
                                 "{} · {} ago{count}",
                                 chats::format_size(entry.size),
@@ -1073,7 +2029,10 @@ impl Render for FindPreview {
                                 }
                             ))
                             .child(controls)
-                            .child(div().text_color(rgb(p.muted)).child(note)),
+                            .child(div().text_color(rgb(p.muted)).child(note))
+                            .when(selection.chat.remote_id.is_none(), |header| {
+                                header.child(self.workspace_actions(entry, cx))
+                            }),
                     )
                     .child(close),
             );
@@ -1087,6 +2046,7 @@ impl Render for FindPreview {
             .flex()
             .flex_col()
             .gap_3();
+        body = body.child(self.summary(entry, &selection.chat, preview, cx));
         body = body.child(
             Button::new("find-preview-conversation")
                 .debug_selector(|| "find-preview-conversation".into())
@@ -1303,6 +2263,10 @@ impl crate::Shell {
             }],
             open_sessions: sessions.into_iter().map(|(_, session)| session).collect(),
             running_remote: vec![],
+            workspaces: self.owner.read(cx).iced_catalog().map(|catalog| catalog.workspaces.iter().filter(|w| w.location.as_ref().is_none_or(|l| matches!(l, gitterm_core::remote::config::WorkspaceLocationConfig::Local { .. }))).map(|w| WorkspaceFacts { name: w.name.clone(), chats: w.chats.clone(), open: w.active }).collect()).unwrap_or_else(|| self.workspaces.iter().map(|w| WorkspaceFacts { name: w.workspace.name.clone(), chats: vec![], open: true }).collect()),
+            relevance_available: ranking_key().is_some(),
+            relevance_down: false,
+            local_files_openable: self.active_agent_tab(cx),
         }
     }
 
@@ -1385,7 +2349,22 @@ impl crate::Shell {
             self.refresh_find(window, cx);
         }
         let regions = &self.active(cx).store.regions;
-        if regions.sidebar_mode == crate::SidebarMode::Find && !regions.sidebar_collapsed {
+        let find_open =
+            regions.sidebar_mode == crate::SidebarMode::Find && !regions.sidebar_collapsed;
+        for (id, views) in &self.find_views {
+            views.sidebar.update(cx, |sidebar, cx| {
+                let active = find_open && *id == owner;
+                if active && !sidebar.active {
+                    sidebar.relevance.down = false;
+                    if sidebar.relevance.error.take().is_some() {
+                        sidebar.relevance.result = None;
+                    }
+                }
+                sidebar.active = active;
+                sidebar.request_rank(cx);
+            });
+        }
+        if find_open {
             self.reduce_find(
                 Intent::LoadIndex {
                     machine: None,
@@ -1400,10 +2379,22 @@ impl crate::Shell {
 
     fn refresh_find(&self, window: &mut Window, cx: &mut gpui::Context<Self>) {
         let facts = self.find_facts(cx);
-        for views in self.find_views.values() {
-            views
-                .sidebar
-                .update(cx, |sidebar, cx| sidebar.refresh(facts.clone(), window, cx));
+        let owner = self.find_owner(cx);
+        let regions = &self.active(cx).store.regions;
+        let find_open =
+            regions.sidebar_mode == crate::SidebarMode::Find && !regions.sidebar_collapsed;
+        for (id, views) in &self.find_views {
+            views.sidebar.update(cx, |sidebar, cx| {
+                let active = find_open && *id == owner;
+                if active && !sidebar.active {
+                    sidebar.relevance.down = false;
+                    if sidebar.relevance.error.take().is_some() {
+                        sidebar.relevance.result = None;
+                    }
+                }
+                sidebar.active = active;
+                sidebar.refresh(facts.clone(), window, cx);
+            });
             views
                 .preview
                 .update(cx, |preview, cx| preview.refresh(facts.clone(), cx));
@@ -1458,12 +2449,7 @@ impl crate::Shell {
                                 if source.chat.remote_id.is_some() {
                                     return Err("Remote previews not available in preview".into());
                                 }
-                                std::fs::File::open(&source.path)
-                                    .map_err(|e| format!("Read {}: {e}", source.path.display()))?;
-                                Ok(gitterm_core::find::load_preview(
-                                    &source.path,
-                                    source.backend,
-                                ))
+                                load_preview_data(&source.path, source.backend)
                             })
                             .await;
                         _ = shell.update_in(cx, |shell, window, cx| {
@@ -1486,8 +2472,44 @@ impl crate::Shell {
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        if let FindOutcome::Unavailable(label) = outcome {
+            self.owner.update(cx, |owner, cx| {
+                owner.error = Some(format!("{label} · not available in preview"));
+                cx.notify();
+            });
+            return;
+        }
+        if let FindOutcome::OpenFile(path) = outcome {
+            if let Some(views) = self.find_views.get(owner) {
+                views
+                    .preview
+                    .update(cx, |preview, _| preview.file_overlay = true);
+            }
+            if let Some(workspace) = self.active_workspace(cx) {
+                self.open_file_viewer(
+                    &crate::FileOpen {
+                        workspace,
+                        path: path.clone(),
+                        changed: None,
+                        from_files: true,
+                    },
+                    window,
+                    cx,
+                );
+            }
+            return;
+        }
         let intent = outcome.intent(&self.find_state.borrow(), owner);
         if let Some(intent) = intent {
+            if matches!(
+                outcome,
+                FindOutcome::Select { .. } | FindOutcome::ClosePreview
+            ) && let Some(views) = self.find_views.get(owner)
+            {
+                views
+                    .preview
+                    .update(cx, |preview, _| preview.file_overlay = false);
+            }
             self.reduce_find(intent, window, cx);
             cx.notify();
             return;
@@ -1527,14 +2549,30 @@ impl crate::Shell {
         }
     }
 
+    pub(crate) fn find_preview_file_overlay(&self, cx: &gpui::App) -> bool {
+        self.find_views
+            .get(&self.find_owner(cx))
+            .is_some_and(|views| views.preview.read(cx).file_overlay)
+    }
+
     pub(crate) fn find_content(&self, cx: &gpui::Context<Self>) -> gpui::Stateful<gpui::Div> {
         let owner = self.find_owner(cx);
-        if self.find_state.borrow().selected(&owner).is_some()
+        let regions = &self.active(cx).store.regions;
+        if regions.sidebar_mode == crate::SidebarMode::Find
+            && !regions.sidebar_collapsed
+            && self.content.read(cx).selected.is_none()
             && let Some(views) = self.find_views.get(&owner)
         {
+            let selected = self.find_state.borrow().selected(&owner).is_some();
             return div()
                 .id("find-centre")
-                .debug_selector(|| "find-centre".into())
+                .debug_selector(move || {
+                    if selected {
+                        "find-centre".into()
+                    } else {
+                        "session-content".into()
+                    }
+                })
                 .flex_1()
                 .min_w_0()
                 .h_full()
