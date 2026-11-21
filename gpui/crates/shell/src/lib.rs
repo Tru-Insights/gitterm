@@ -153,6 +153,9 @@ pub struct Shell {
     resize: Option<(bool, f32, f32)>,
     task_switcher: Option<Entity<task_switcher::TaskSwitcher>>,
     task_panel: Option<Entity<task_panel::TaskPanel>>,
+    /// Background actions the modal guard refused, for the guard's tests.
+    #[cfg(test)]
+    blocked_actions: Vec<&'static str>,
     task_switcher_subscription: Option<Subscription>,
     task_switcher_return_focus: Option<FocusHandle>,
     task_last_session: HashMap<String, SessionId>,
@@ -421,6 +424,8 @@ impl Shell {
             resize: None,
             task_switcher: None,
             task_panel: None,
+            #[cfg(test)]
+            blocked_actions: vec![],
             task_switcher_subscription: None,
             task_switcher_return_focus: None,
             task_last_session: HashMap::new(),
@@ -3134,13 +3139,7 @@ impl Shell {
         }
         let chat_pane = self.focused_chat(window, cx);
         let chat = chat_pane.is_some();
-        let modal = self.plans_open
-            || self.session_picker.is_some()
-            || self.park_sheet.is_some()
-            || self.new_work_sheet.is_some()
-            || self.settings_sheet.is_some()
-            || self.task_panel_modal_open(cx)
-            || Self::has_dialog(window, cx);
+        let modal = self.shell_modal(window, cx).is_some();
         if !modal {
             context.push_str(" IcedMain");
         }
@@ -3200,110 +3199,173 @@ impl Shell {
         }
         context
     }
+    /// The open shell modal, topmost first. While one is open, Iced consumes
+    /// every background command except `app_menus::Modal::allows`.
+    fn shell_modal(&self, window: &mut Window, cx: &mut App) -> Option<app_menus::Modal> {
+        use app_menus::Modal;
+        [
+            (self.task_switcher.is_some(), Modal::TaskSwitcher),
+            (self.usage_open, Modal::Usage),
+            (Self::has_dialog(window, cx), Modal::Dialog),
+            (self.task_panel_modal_open(cx), Modal::Task),
+            (self.session_picker.is_some(), Modal::SessionPicker),
+            (self.park_sheet.is_some(), Modal::Park),
+            (self.new_work_sheet.is_some(), Modal::NewWork),
+            (self.settings_sheet.is_some(), Modal::Settings),
+            (self.phone_panel().is_some(), Modal::Phone),
+            (self.plans_open, Modal::Plans),
+        ]
+        .into_iter()
+        .find_map(|(open, modal)| open.then_some(modal))
+    }
+    /// Every shell action handler, behind the modal guard. GPUI dispatches a
+    /// key's bound action before raw-key capture, and context-free bindings
+    /// (and menu items) match behind a modal, so the guard sits on the
+    /// handlers. A refused action is consumed, never passed to a PTY.
+    fn background<A: gpui::Action>(
+        cx: &mut Context<Self>,
+        handler: impl Fn(&mut Self, &A, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl Fn(&A, &mut Window, &mut App) + 'static {
+        cx.listener(move |shell, action: &A, window, cx| {
+            if shell
+                .shell_modal(window, cx)
+                .is_some_and(|modal| !modal.allows(action.name()))
+            {
+                #[cfg(test)]
+                shell.blocked_actions.push(action.name());
+                return;
+            }
+            handler(shell, action, window, cx)
+        })
+    }
     fn menu_root(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         use app_menus::*;
         div()
             .track_focus(&self.focus)
             .key_context(self.menu_context(window, cx).as_str())
             .capture_key_down(cx.listener(Self::guard_app_shortcut))
-            .on_action(cx.listener(|_, _: &Minimize, w, _| w.minimize_window()))
-            .on_action(cx.listener(|_, _: &Maximize, w, _| w.zoom_window()))
-            .on_action(cx.listener(|_, _: &Fullscreen, w, _| w.toggle_fullscreen()))
-            .on_action(
-                cx.listener(|this, a: &SetChatWidth, _, cx| this.set_chat_width(a.width, cx)),
-            )
-            .on_action(cx.listener(|this, _: &OpenPlansViewer, w, cx| this.toggle_plans(w, cx)))
-            .on_action(cx.listener(|this, _: &ChatsOverviewOpen, w, cx| {
-                if this.active_workspace(cx).is_none() {
-                    return;
-                }
-                if this.usage_open {
-                    this.toggle_usage(w, cx);
-                }
-                if this.plans_open {
-                    this.toggle_plans(w, cx);
-                }
-                this.find_state.borrow_mut().reduce(
-                    gitterm_core::find::state::Intent::ClosePreview(this.find_owner(cx)),
-                );
-                this.update_regions(
-                    |r| {
-                        r.sidebar_mode = SidebarMode::Find;
-                        r.sidebar_collapsed = false;
-                    },
-                    cx,
-                );
-                this.ensure_find_views(w, cx);
-                this.focus.focus(w, cx);
+            // Iced's key handler closes a modal on Escape before any page-local
+            // Escape (the composer's slash menu, an input, find or review).
+            .capture_action(cx.listener(Self::modal_escape::<gpui_component::input::Escape>))
+            .capture_action(cx.listener(Self::modal_escape::<CloseSlash>))
+            .capture_action(cx.listener(Self::modal_escape::<CloseFind>))
+            .capture_action(cx.listener(Self::modal_escape::<CloseReview>))
+            .on_action(Self::background(cx, |_, _: &Minimize, w, _| {
+                w.minimize_window()
             }))
-            .on_action(cx.listener(|this, _: &DebugSpawnAgentTab, _, cx| {
-                this.preview_unavailable("Debug agent tab", cx)
+            .on_action(Self::background(cx, |_, _: &Maximize, w, _| {
+                w.zoom_window()
             }))
-            .on_action(cx.listener(|this, _: &LaunchAgentPreset, _, cx| {
-                this.preview_unavailable("Launch agent preset", cx)
+            .on_action(Self::background(cx, |_, _: &Fullscreen, w, _| {
+                w.toggle_fullscreen()
             }))
-            .on_action(cx.listener(|this, _: &TaskChildLaunchPreset, _, cx| {
-                this.preview_unavailable("Launch task child preset", cx)
+            .on_action(Self::background(cx, |this, a: &SetChatWidth, _, cx| {
+                this.set_chat_width(a.width, cx)
             }))
-            .on_action(cx.listener(|this, _: &ParkSubmit, _, cx| {
+            .on_action(Self::background(cx, |this, _: &OpenPlansViewer, w, cx| {
+                this.toggle_plans(w, cx)
+            }))
+            .on_action(Self::background(
+                cx,
+                |this, _: &ChatsOverviewOpen, w, cx| {
+                    if this.active_workspace(cx).is_none() {
+                        return;
+                    }
+                    if this.usage_open {
+                        this.toggle_usage(w, cx);
+                    }
+                    if this.plans_open {
+                        this.toggle_plans(w, cx);
+                    }
+                    this.find_state.borrow_mut().reduce(
+                        gitterm_core::find::state::Intent::ClosePreview(this.find_owner(cx)),
+                    );
+                    this.update_regions(
+                        |r| {
+                            r.sidebar_mode = SidebarMode::Find;
+                            r.sidebar_collapsed = false;
+                        },
+                        cx,
+                    );
+                    this.ensure_find_views(w, cx);
+                    this.focus.focus(w, cx);
+                },
+            ))
+            .on_action(Self::background(
+                cx,
+                |this, _: &DebugSpawnAgentTab, _, cx| {
+                    this.preview_unavailable("Debug agent tab", cx)
+                },
+            ))
+            .on_action(Self::background(
+                cx,
+                |this, _: &LaunchAgentPreset, _, cx| {
+                    this.preview_unavailable("Launch agent preset", cx)
+                },
+            ))
+            .on_action(Self::background(
+                cx,
+                |this, _: &TaskChildLaunchPreset, _, cx| {
+                    this.preview_unavailable("Launch task child preset", cx)
+                },
+            ))
+            .on_action(Self::background(cx, |this, _: &ParkSubmit, _, cx| {
                 if let Some(sheet) = &this.park_sheet {
                     sheet.update(cx, |sheet, cx| sheet.submit(cx));
                 }
             }))
-            .on_action(cx.listener(|_, _: &CycleMode, w, cx| {
+            .on_action(Self::background(cx, |_, _: &CycleMode, w, cx| {
                 Self::chat_action("native_chat::CycleMode", w, cx)
             }))
-            .on_action(cx.listener(|_, _: &SubmitReview, w, cx| {
+            .on_action(Self::background(cx, |_, _: &SubmitReview, w, cx| {
                 Self::chat_action("native_chat::SubmitReview", w, cx)
             }))
-            .on_action(cx.listener(|_, _: &CloseReview, w, cx| {
+            .on_action(Self::background(cx, |_, _: &CloseReview, w, cx| {
                 // The page closes review before find; preserve the host's
                 // chat-find marker until the next Escape closes find itself.
                 Self::chat_action("native_chat::CloseFind", w, cx)
             }))
-            .on_action(cx.listener(|_, _: &SubmitPrompt, w, cx| {
+            .on_action(Self::background(cx, |_, _: &SubmitPrompt, w, cx| {
                 Self::chat_action("native_chat::SubmitPrompt", w, cx)
             }))
-            .on_action(
-                cx.listener(|_, _: &Newline, w, cx| {
-                    Self::chat_action("native_chat::Newline", w, cx)
-                }),
-            )
-            .on_action(cx.listener(|_, _: &SlashNext, w, cx| {
+            .on_action(Self::background(cx, |_, _: &Newline, w, cx| {
+                Self::chat_action("native_chat::Newline", w, cx)
+            }))
+            .on_action(Self::background(cx, |_, _: &SlashNext, w, cx| {
                 Self::chat_action("native_chat::SlashNext", w, cx)
             }))
-            .on_action(cx.listener(|_, _: &SlashPrevious, w, cx| {
+            .on_action(Self::background(cx, |_, _: &SlashPrevious, w, cx| {
                 Self::chat_action("native_chat::SlashPrevious", w, cx)
             }))
-            .on_action(cx.listener(|_, _: &FillSlash, w, cx| {
+            .on_action(Self::background(cx, |_, _: &FillSlash, w, cx| {
                 Self::chat_action("native_chat::FillSlash", w, cx)
             }))
-            .on_action(cx.listener(|_, _: &SubmitSlash, w, cx| {
+            .on_action(Self::background(cx, |_, _: &SubmitSlash, w, cx| {
                 Self::chat_action("native_chat::SubmitSlash", w, cx)
             }))
-            .on_action(cx.listener(|_, _: &CloseSlash, w, cx| {
+            .on_action(Self::background(cx, |_, _: &CloseSlash, w, cx| {
                 Self::chat_action("native_chat::CloseSlash", w, cx)
             }))
-            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+            .on_action(Self::background(cx, |this, _: &ToggleSidebar, _, cx| {
                 this.update_regions(|r| r.sidebar_collapsed = !r.sidebar_collapsed, cx);
             }))
-            .on_action(
-                cx.listener(|this, _: &ConsoleToggle, w, cx| this.open_bottom_terminal(w, cx)),
-            )
-            .on_action(
-                cx.listener(|this, a: &WorkspaceSelect, w, cx| {
-                    this.select_workspace(a.index, w, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, a: &TabSelect, w, cx| this.select_session(a.index, w, cx)),
-            )
-            .on_action(cx.listener(|this, _: &WorkspaceClose, w, cx| this.open_park_sheet(w, cx)))
-            .on_action(cx.listener(|this, _: &OpenFolder, w, cx| {
+            .on_action(Self::background(cx, |this, _: &ConsoleToggle, w, cx| {
+                this.open_bottom_terminal(w, cx)
+            }))
+            .on_action(Self::background(cx, |this, a: &WorkspaceSelect, w, cx| {
+                this.select_workspace(a.index, w, cx)
+            }))
+            .on_action(Self::background(cx, |this, a: &TabSelect, w, cx| {
+                this.select_session(a.index, w, cx)
+            }))
+            .on_action(Self::background(cx, |this, _: &WorkspaceClose, w, cx| {
+                this.open_park_sheet(w, cx)
+            }))
+            .on_action(Self::background(cx, |this, _: &OpenFolder, w, cx| {
                 // Iced's ⌥⇧T / ⌘O: the in-app folder picker, not the new-work sheet.
                 this.bar_outcome(workspace_bar::Outcome::OpenFolder, w, cx)
             }))
-            .on_action(cx.listener(|this, _: &ToggleHelp, w, cx| {
+            .on_action(Self::background(cx, |this, _: &ToggleHelp, w, cx| {
                 use gpui_component::WindowExt;
                 if Self::has_dialog(w, cx) {
                     w.close_dialog(cx);
@@ -3313,28 +3375,30 @@ impl Shell {
                 this.content
                     .update(cx, |content, cx| content.sync_covers(w, cx));
             }))
-            .on_action(
-                cx.listener(|this, _: &IncreaseUiFont, _, cx| this.resize_font(true, 1., cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &DecreaseUiFont, _, cx| this.resize_font(true, -1., cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &IncreaseChatFont, _, cx| this.resize_chat_font(1., cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &DecreaseChatFont, _, cx| this.resize_chat_font(-1., cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &IncreaseTerminalFont, _, cx| {
-                    this.resize_content_font(1., cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &DecreaseTerminalFont, _, cx| {
-                this.resize_content_font(-1., cx)
+            .on_action(Self::background(cx, |this, _: &IncreaseUiFont, _, cx| {
+                this.resize_font(true, 1., cx)
             }))
-            .on_action(cx.listener(|this, _: &UsageViewToggle, w, cx| this.toggle_usage(w, cx)))
-            .on_action(cx.listener(|this, _: &RunRepoCommand, w, cx| {
+            .on_action(Self::background(cx, |this, _: &DecreaseUiFont, _, cx| {
+                this.resize_font(true, -1., cx)
+            }))
+            .on_action(Self::background(cx, |this, _: &IncreaseChatFont, _, cx| {
+                this.resize_chat_font(1., cx)
+            }))
+            .on_action(Self::background(cx, |this, _: &DecreaseChatFont, _, cx| {
+                this.resize_chat_font(-1., cx)
+            }))
+            .on_action(Self::background(
+                cx,
+                |this, _: &IncreaseTerminalFont, _, cx| this.resize_content_font(1., cx),
+            ))
+            .on_action(Self::background(
+                cx,
+                |this, _: &DecreaseTerminalFont, _, cx| this.resize_content_font(-1., cx),
+            ))
+            .on_action(Self::background(cx, |this, _: &UsageViewToggle, w, cx| {
+                this.toggle_usage(w, cx)
+            }))
+            .on_action(Self::background(cx, |this, _: &RunRepoCommand, w, cx| {
                 if let Some(saved) = this
                     .active_workspace(cx)
                     .and_then(|id| this.owner.read(cx).iced_workspace(id))
@@ -3343,16 +3407,22 @@ impl Shell {
                     this.run_repo(repo, w, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &ToggleTheme, _, cx| {
+            .on_action(Self::background(cx, |this, _: &ToggleTheme, _, cx| {
                 this.chrome_unavailable("Toggle Light/Dark Theme", cx);
             }))
-            .on_action(cx.listener(|this, _: &ToggleTerminalLogMirroring, _, cx| {
-                this.chrome_unavailable("Toggle Terminal Log Mirroring", cx);
-            }))
-            .on_action(cx.listener(|this, action: &PreviewUnavailable, _, cx| {
-                this.chrome_unavailable(&action.label, cx);
-            }))
-            .on_action(cx.listener(|this, _: &ClearTerminal, _, cx| {
+            .on_action(Self::background(
+                cx,
+                |this, _: &ToggleTerminalLogMirroring, _, cx| {
+                    this.chrome_unavailable("Toggle Terminal Log Mirroring", cx);
+                },
+            ))
+            .on_action(Self::background(
+                cx,
+                |this, action: &PreviewUnavailable, _, cx| {
+                    this.chrome_unavailable(&action.label, cx);
+                },
+            ))
+            .on_action(Self::background(cx, |this, _: &ClearTerminal, _, cx| {
                 // Iced writes to the active main tab, never the bottom panel.
                 if let Some(view) = this.active_main_terminal(cx) {
                     view.update(cx, |v, _| {
@@ -3361,7 +3431,7 @@ impl Shell {
                     });
                 }
             }))
-            .on_action(cx.listener(|this, _: &ToggleSearch, w, cx| {
+            .on_action(Self::background(cx, |this, _: &ToggleSearch, w, cx| {
                 if let Some(view) = this.focused_terminal(w, cx) {
                     if view.read(cx).is_find_open() {
                         view.update(cx, |v, cx| v.close_find(w, cx));
@@ -3371,43 +3441,56 @@ impl Shell {
                 }
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &SearchNext, w, cx| {
+            .on_action(Self::background(cx, |this, _: &SearchNext, w, cx| {
                 if let Some(view) = this.focused_terminal(w, cx) {
                     view.update(cx, |v, cx| {
                         v.navigate_find(false, cx);
                     });
                 }
             }))
-            .on_action(
-                cx.listener(|this, _: &TaskSwitcherOpen, w, cx| this.open_task_switcher(w, cx)),
-            )
-            .on_action(cx.listener(|this, _: &TaskSwitcherClose, _, cx| {
-                this.switcher_command(task_switcher::Command::Close, cx)
+            .on_action(Self::background(cx, |this, _: &TaskSwitcherOpen, w, cx| {
+                this.open_task_switcher(w, cx)
             }))
-            .on_action(cx.listener(|this, _: &TaskSwitcherNext, _, cx| {
+            .on_action(Self::background(
+                cx,
+                |this, _: &TaskSwitcherClose, _, cx| {
+                    this.switcher_command(task_switcher::Command::Close, cx)
+                },
+            ))
+            .on_action(Self::background(cx, |this, _: &TaskSwitcherNext, _, cx| {
                 this.switcher_command(task_switcher::Command::Next, cx)
             }))
-            .on_action(cx.listener(|this, _: &TaskSwitcherPrevious, _, cx| {
-                this.switcher_command(task_switcher::Command::Previous, cx)
+            .on_action(Self::background(
+                cx,
+                |this, _: &TaskSwitcherPrevious, _, cx| {
+                    this.switcher_command(task_switcher::Command::Previous, cx)
+                },
+            ))
+            .on_action(Self::background(
+                cx,
+                |this, _: &TaskSwitcherActivateFirst, _, cx| {
+                    this.switcher_command(task_switcher::Command::Activate, cx)
+                },
+            ))
+            .on_action(Self::background(cx, |this, _: &TaskContextBack, w, cx| {
+                this.general_context(false, w, cx)
             }))
-            .on_action(cx.listener(|this, _: &TaskSwitcherActivateFirst, _, cx| {
-                this.switcher_command(task_switcher::Command::Activate, cx)
+            .on_action(Self::background(cx, |this, _: &TaskOverview, w, cx| {
+                this.general_context(true, w, cx)
             }))
-            .on_action(
-                cx.listener(|this, _: &TaskContextBack, w, cx| this.general_context(false, w, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &TaskOverview, w, cx| this.general_context(true, w, cx)),
-            )
-            .on_action(cx.listener(|this, _: &AttentionJumpNext, w, cx| this.attention_jump(w, cx)))
-            .on_action(cx.listener(Self::escape))
-            .on_action(cx.listener(|this, a: &FileSelectByIndex, w, cx| {
-                this.select_file(&a.selection, w, cx)
-            }))
-            .on_action(cx.listener(|this, _: &EditFile, _, cx| {
+            .on_action(Self::background(
+                cx,
+                |this, _: &AttentionJumpNext, w, cx| this.attention_jump(w, cx),
+            ))
+            .on_action(Self::background(cx, Self::escape))
+            .on_action(Self::background(
+                cx,
+                |this, a: &FileSelectByIndex, w, cx| this.select_file(&a.selection, w, cx),
+            ))
+            .on_action(Self::background(cx, |this, _: &EditFile, _, cx| {
                 this.editor_preview_notice(cx);
             }))
-            .on_action(cx.listener(|this, _: &AgentFindOpen, w, cx| {
+            .on_action(Self::background(cx, |this, _: &AgentFindOpen, w, cx| {
                 let focused = this.focused_chat(w, cx);
                 let pane = focused
                     .and_then(|id| {
@@ -3425,7 +3508,7 @@ impl Shell {
                     cx.notify();
                 }
             }))
-            .on_action(cx.listener(|_, _: &Copy, w, cx| {
+            .on_action(Self::background(cx, |_, _: &Copy, w, cx| {
                 use gpui_component::WindowExt;
                 if w.has_focused_input(cx) {
                     w.dispatch_action(Box::new(gpui_component::input::Copy), cx);
@@ -3433,44 +3516,47 @@ impl Shell {
                     Self::chat_action("native_chat::CopyPlain", w, cx);
                 }
             }))
-            .on_action(cx.listener(|_, _: &CopyMarkdown, w, cx| {
+            .on_action(Self::background(cx, |_, _: &CopyMarkdown, w, cx| {
                 Self::chat_action("native_chat::CopyMarkdown", w, cx)
             }))
-            .on_action(cx.listener(|_, _: &FindNext, w, cx| {
+            .on_action(Self::background(cx, |_, _: &FindNext, w, cx| {
                 Self::chat_action("native_chat::NextMatch", w, cx)
             }))
-            .on_action(cx.listener(|_, _: &FindPrevious, w, cx| {
+            .on_action(Self::background(cx, |_, _: &FindPrevious, w, cx| {
                 Self::chat_action("native_chat::PreviousMatch", w, cx)
             }))
-            .on_action(cx.listener(|this, _: &CloseFind, w, cx| {
+            .on_action(Self::background(cx, |this, _: &CloseFind, w, cx| {
                 if let Some(pane) = this.focused_chat(w, cx) {
                     this.chat_find.remove(&pane);
                 }
                 Self::chat_action("native_chat::CloseFind", w, cx);
                 cx.notify();
             }))
-            .on_action(cx.listener(|_, _: &Cut, w, cx| {
+            .on_action(Self::background(cx, |_, _: &Cut, w, cx| {
                 w.dispatch_action(Box::new(gpui_component::input::Cut), cx)
             }))
-            .on_action(cx.listener(|_, _: &Paste, w, cx| {
+            .on_action(Self::background(cx, |_, _: &Paste, w, cx| {
                 w.dispatch_action(Box::new(gpui_component::input::Paste), cx)
             }))
-            .on_action(cx.listener(|_, _: &SelectAll, w, cx| {
+            .on_action(Self::background(cx, |_, _: &SelectAll, w, cx| {
                 w.dispatch_action(Box::new(gpui_component::input::SelectAll), cx)
             }))
-            .on_action(cx.listener(|_, _: &Undo, w, cx| {
+            .on_action(Self::background(cx, |_, _: &Undo, w, cx| {
                 w.dispatch_action(Box::new(gpui_component::input::Undo), cx)
             }))
-            .on_action(cx.listener(|_, _: &Redo, w, cx| {
+            .on_action(Self::background(cx, |_, _: &Redo, w, cx| {
                 w.dispatch_action(Box::new(gpui_component::input::Redo), cx)
             }))
-            .on_action(cx.listener(|this, _: &NewTerminal, w, cx| this.new_terminal(w, cx)))
-            .on_action(
-                cx.listener(|this, _: &ToggleBottomPanel, w, cx| this.open_bottom_terminal(w, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &NewClaudeChat, w, cx| this.new_claude_chat(None, w, cx)),
-            )
+            .on_action(Self::background(cx, |this, _: &NewTerminal, w, cx| {
+                this.new_terminal(w, cx)
+            }))
+            .on_action(Self::background(
+                cx,
+                |this, _: &ToggleBottomPanel, w, cx| this.open_bottom_terminal(w, cx),
+            ))
+            .on_action(Self::background(cx, |this, _: &NewClaudeChat, w, cx| {
+                this.new_claude_chat(None, w, cx)
+            }))
     }
     fn chat_action(name: &str, window: &mut Window, cx: &mut App) {
         // The chat action types are private. Use GPUI's registered action contract
@@ -3853,6 +3939,21 @@ impl Shell {
         } else {
             self.focus.focus(window, cx);
         }
+    }
+    /// Capture phase: while a modal is open, a child's Escape action runs
+    /// the shell's Escape first. Where that defers to the modal itself (a
+    /// sheet or dialog), the child action continues as before.
+    fn modal_escape<A: gpui::Action>(
+        &mut self,
+        _: &A,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shell_modal(window, cx).is_none() {
+            return;
+        }
+        cx.stop_propagation();
+        self.escape(&app_menus::Escape, window, cx);
     }
     fn guard_app_shortcut(
         &mut self,
