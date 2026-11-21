@@ -253,7 +253,7 @@ fn worker_start_facts_gathering_benchmark() {
 }
 
 const STEPS: [&str; 5] = ["begin", "check", "bind", "prepared", "saved"];
-const CASES: [&str; 8] = [
+const CASES: &[&str] = &[
     "matching caller",
     "missing caller",
     "foreign caller",
@@ -261,6 +261,8 @@ const CASES: [&str; 8] = [
     "changed caller checkout",
     "stale worktree",
     "moved path",
+    // Symlink creation is Unix-only here; Windows needs privileges.
+    #[cfg(unix)]
     "symlinked path",
 ];
 
@@ -367,6 +369,7 @@ fn perturb(pair: &mut Pair, case: &str) {
         "moved path" => {
             std::fs::rename(&pair.resolved, pair.resolved.with_extension("moved")).unwrap()
         }
+        #[cfg(unix)]
         "symlinked path" => {
             let moved = pair.resolved.with_extension("moved");
             std::fs::rename(&pair.resolved, &moved).unwrap();
@@ -416,7 +419,7 @@ fn targeted_worker_facts_reduce_exactly_as_the_full_gather() {
     ) {
         return;
     }
-    for case in CASES {
+    for case in CASES.iter().copied() {
         for perturb_at in STEPS {
             let mut pair = pair();
             let mut outcomes = Vec::new();
@@ -515,6 +518,112 @@ fn targeted_worker_facts_reduce_exactly_as_the_full_gather() {
             };
             assert!(
                 outcomes[step].contains(needle),
+                "{case} (changed before {perturb_at}): {outcomes:?}"
+            );
+        }
+    }
+}
+
+const REUSE_STEPS: [&str; 3] = ["begin", "reuse", "saved"];
+
+/// The same comparison for reusing an existing checkout: begin, reuse (the
+/// reducer reads the replacement's checkout), then the reuse save (the
+/// reducer reads the checkout of the `Reusing` subject, which the targeted
+/// gather finds from the reducer's pending state).
+#[test]
+fn targeted_worker_facts_reduce_exactly_as_the_full_gather_on_checkout_reuse() {
+    if isolated(
+        "targeted_worker_facts_reduce_exactly_as_the_full_gather_on_checkout_reuse",
+        "worker_facts",
+    ) {
+        return;
+    }
+    for case in CASES.iter().copied() {
+        for perturb_at in REUSE_STEPS {
+            let mut pair = pair();
+            // Reuse the existing checkout of "other-0" instead of preparing one.
+            pair.resolved = pair.resolved.with_file_name("other-0");
+            let mut replacement = pair
+                .app
+                .task_host
+                .store()
+                .as_ref()
+                .unwrap()
+                .get("other-0")
+                .unwrap()
+                .clone();
+            replacement.title = "Replacement work".into();
+            replacement.updated_at = "2000-01-02T00:00:00Z".into();
+            let mut outcomes = Vec::new();
+            let mut captured = None;
+            for step in REUSE_STEPS {
+                if step == perturb_at {
+                    perturb(&mut pair, case);
+                }
+                let id = match (step, captured) {
+                    ("begin", _) => None,
+                    (_, Some(id)) => Some(id),
+                    (_, None) => break,
+                };
+                let uid = pair.uid.clone();
+                let (new, old, action) = match step {
+                    "begin" => reduce_both(
+                        &mut pair,
+                        || TaskMutation::BeginWorkerPreparation {
+                            caller: uid.clone(),
+                        },
+                        false,
+                    ),
+                    "reuse" => reduce_both(
+                        &mut pair,
+                        || TaskMutation::ReuseWorkerCheckout {
+                            id: id.unwrap(),
+                            replacement: Box::new(replacement.clone()),
+                        },
+                        false,
+                    ),
+                    _ => reduce_both(
+                        &mut pair,
+                        || TaskMutation::WorkerCheckoutReuseSaved {
+                            id: id.unwrap(),
+                            result: Ok(()),
+                        },
+                        false,
+                    ),
+                };
+                assert_eq!(new, old, "{case} (changed before {perturb_at}), {step}");
+                match action {
+                    Ok(TaskMutationAction::WorkerAuthorityChecked { id }) => captured = Some(id),
+                    // Both sides save the same reuse, as the app would.
+                    Ok(TaskMutationAction::PersistWorkerCheckoutReuse { replacement, .. }) => {
+                        for store in [pair.app.task_host.store_mut(), pair.full.store_mut()] {
+                            store
+                                .as_mut()
+                                .unwrap()
+                                .replace(*replacement.clone())
+                                .unwrap();
+                        }
+                    }
+                    _ => {}
+                }
+                outcomes.push(new);
+            }
+            // The matrix must reach the launch and each refusal. A save whose
+            // `Reusing` subject returned no checkout would refuse the
+            // matching cases, so this fails if the targeted gather misses it.
+            let at = REUSE_STEPS.iter().position(|s| *s == perturb_at).unwrap();
+            let caller_case = case.contains("caller");
+            let (step, needle) = match case {
+                "matching caller" | "duplicate caller" => (2, "Ok(StartWorker"),
+                "missing caller" if at == 0 => {
+                    (0, "The calling GitTerm tab is no longer available")
+                }
+                _ if caller_case && at == 0 => (2, "Ok(StartWorker"),
+                _ if caller_case => (at, "caller, session, workspace authority"),
+                _ => (at.max(1), "checkout"),
+            };
+            assert!(
+                outcomes.len() > step && outcomes[step].contains(needle),
                 "{case} (changed before {perturb_at}): {outcomes:?}"
             );
         }
