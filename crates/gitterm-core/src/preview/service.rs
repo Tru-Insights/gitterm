@@ -9,7 +9,7 @@
 //!
 //! The mode is fixed by the constructor. Nothing here reads an environment
 //! variable to choose it, so no inherited value can widen a preview context.
-use super::{absolute, refuse, Effect as ProcessEffect, Preview};
+use super::{refuse, Effect as ProcessEffect, Preview};
 use crate::config_paths::CONFIG_DIR_ENV;
 use crate::session;
 use crate::task_commands::TaskMutationAction;
@@ -331,7 +331,14 @@ impl ServiceContext {
     /// today (its MCP server keeps its own namespace); GPUI only at cutover,
     /// when Iced no longer runs.
     pub fn production(root: &Path, instance_id: impl Into<String>) -> io::Result<Self> {
-        absolute(root)?;
+        // Only absoluteness: Iced's config accepts an absolute override that
+        // contains `..`, and production must start wherever Iced does.
+        if !root.is_absolute() {
+            return Err(refuse(format!(
+                "production root must be absolute: {}",
+                root.display()
+            )));
+        }
         Ok(Self {
             mode: Mode::Production,
             root: root.to_path_buf(),
