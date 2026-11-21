@@ -128,18 +128,30 @@ impl crate::Shell {
 }
 
 impl crate::Shell {
-    fn picker_inputs(&self) -> crate::session_picker::PickerInputs {
+    fn picker_inputs(
+        &self,
+        task: Option<crate::session_picker::TaskContext>,
+    ) -> crate::session_picker::PickerInputs {
         crate::session_picker::PickerInputs {
             chat: gitterm_core::settings::ChatDefaults::default().new_chat_selection(),
             local_workspace: self.local,
-            // TODO(TRU-274 P-src): project the settings/ACP/task catalogs here.
+            // TODO(TRU-274 P-src): project the settings/ACP catalogs here.
             acp_chats: vec![],
             presets: vec![],
-            task: None,
+            task,
         }
     }
     pub(crate) fn open_session_picker(
         &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.open_picker(None, window, cx)
+    }
+    /// The session picker, over a task when `task` is set (Iced `TaskChildAdd`).
+    pub(crate) fn open_picker(
+        &mut self,
+        task: Option<crate::session_picker::TaskContext>,
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
@@ -151,7 +163,7 @@ impl crate::Shell {
         {
             return;
         }
-        let inputs = self.picker_inputs();
+        let inputs = self.picker_inputs(task);
         let previous_focus = window.focused(cx).unwrap_or_else(|| self.focus.clone());
         let opening_workspace = self.active_workspace(cx);
         let picker = cx.new(|cx| crate::session_picker::SessionPicker::new(inputs.clone(), cx));
@@ -200,6 +212,7 @@ impl crate::Shell {
         match outcome {
             O::NewChat if self.local => self.new_claude_chat(None, window, cx),
             O::Terminal if self.local => self.new_terminal(window, cx),
+            O::Continue { task_id, preset } => self.launch_task_child(task_id, *preset, window, cx),
             _ => {
                 self.owner.update(cx, |owner, cx| {
                     owner.error = Some(format!("{label} · unavailable in preview"));

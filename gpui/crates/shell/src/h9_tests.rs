@@ -367,3 +367,266 @@ fn retained_preview_history_changes_width_without_rebuilding(cx: &mut TestAppCon
         assert_eq!(current.entity_id(), preview.entity_id());
     });
 }
+
+/// Every app_menus action: each key binding's, each menu item's, and the
+/// bar's preview notice (dispatched by the workspace bar, not a key).
+fn every_menu_action() -> Vec<Box<dyn gpui::Action>> {
+    fn items(menu: &gpui::Menu, into: &mut Vec<Box<dyn gpui::Action>>) {
+        for item in &menu.items {
+            match item {
+                gpui::MenuItem::Action { action, .. } => into.push(action.boxed_clone()),
+                gpui::MenuItem::Submenu(menu) => items(menu, into),
+                _ => {}
+            }
+        }
+    }
+    let mut actions: Vec<Box<dyn gpui::Action>> = key_bindings()
+        .iter()
+        .map(|binding| binding.action().boxed_clone())
+        .collect();
+    for menu in menus() {
+        items(&menu, &mut actions);
+    }
+    actions.push(Box::new(PreviewUnavailable {
+        label: "fixture".into(),
+    }));
+    let mut seen = std::collections::HashSet::new();
+    actions.retain(|action| seen.insert(action.name()));
+    actions
+}
+
+/// What Iced allows behind a modal is exactly its menu bar plus the
+/// modal's own keys.
+#[test]
+fn modal_allowances_are_iceds_menu_bar_and_own_keys() {
+    let mut menu = std::collections::BTreeSet::new();
+    fn names(menu: &gpui::Menu, into: &mut std::collections::BTreeSet<&'static str>) {
+        for item in &menu.items {
+            match item {
+                gpui::MenuItem::Action { action, .. } => {
+                    into.insert(action.name().trim_start_matches("gitterm_iced::"));
+                }
+                gpui::MenuItem::Submenu(menu) => names(menu, into),
+                _ => {}
+            }
+        }
+    }
+    for item in menus() {
+        names(&item, &mut menu);
+    }
+    assert_eq!(
+        menu,
+        NATIVE_MENU_ACTIONS.iter().copied().collect(),
+        "the allowed set is the Iced menu bar"
+    );
+    for modal in Modal::ALL {
+        assert!(modal.allows("gitterm_iced::Escape"), "{modal:?}");
+        for blocked in [
+            "RunRepoCommand",
+            "ToggleSidebar",
+            "SubmitPrompt",
+            "CloseSlash",
+        ] {
+            assert!(!modal.allows(blocked), "{modal:?} {blocked}");
+        }
+    }
+    assert!(Modal::Usage.allows("WorkspaceSelect"));
+    assert!(!Modal::Task.allows("WorkspaceSelect"));
+    assert!(Modal::Dialog.allows("ToggleHelp"));
+    assert!(!Modal::Plans.allows("ToggleHelp"));
+    assert!(Modal::Park.allows("ParkSubmit"));
+    assert!(Modal::TaskSwitcher.allows("TaskSwitcherNext"));
+}
+
+fn open_modal(shell: &Entity<Shell>, modal: Modal, cx: &mut VisualTestContext) {
+    cx.update(|window, cx| match modal {
+        Modal::TaskSwitcher => shell.update(cx, |s, cx| s.open_task_switcher(window, cx)),
+        Modal::Usage => shell.update(cx, |s, cx| s.toggle_usage(window, cx)),
+        Modal::Dialog => dialogs::shortcuts(window, cx),
+        Modal::Task => shell.update(cx, |s, cx| {
+            let panel = s.ensure_task_panel(window, cx);
+            panel.update(cx, |panel, cx| {
+                panel.open_stop_and_close(
+                    gitterm_core::session::Target {
+                        tab_id: 1,
+                        session_uid: "fixture".into(),
+                        task_id: Some("fixture".into()),
+                        task_session_id: None,
+                    },
+                    cx,
+                )
+            });
+        }),
+        Modal::SessionPicker => shell.update(cx, |s, cx| s.open_session_picker(window, cx)),
+        Modal::Park => shell.update(cx, |s, cx| s.open_park_sheet(window, cx)),
+        Modal::NewWork => shell.update(cx, |s, cx| s.open_new_work_sheet(window, cx)),
+        Modal::Settings => shell.update(cx, |s, cx| {
+            let id = s.active_workspace(cx).unwrap();
+            s.open_settings_sheet(id, window, cx)
+        }),
+        Modal::Phone => shell.update(cx, |s, cx| s.open_phone_panel("agent:fixture", window, cx)),
+        Modal::Plans => shell.update(cx, |s, cx| s.toggle_plans(window, cx)),
+    });
+    draw(cx);
+}
+
+fn open(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> Option<Modal> {
+    cx.update(|window, cx| shell.update(cx, |s, cx| s.shell_modal(window, cx)))
+}
+
+/// While each kind of modal is open, every app_menus action except Iced's
+/// menu bar and the modal's own keys is consumed before its handler runs.
+#[gpui::test]
+fn every_modal_consumes_background_actions(cx: &mut TestAppContext) {
+    // The workspace fixture opens every sheet; dialogs need the sample's Root.
+    let (root, shell, cx) = h7_tests::fixture(cx);
+    shell.update(cx, |shell, _| {
+        shell.usage_home = Some(root.path().to_owned())
+    });
+    let modals = Modal::ALL
+        .into_iter()
+        .filter(|modal| *modal != Modal::Dialog);
+    consume_behind(&shell, modals, cx);
+}
+
+#[gpui::test]
+fn a_dialog_consumes_background_actions(cx: &mut TestAppContext) {
+    let (_root, shell, cx) = h6_tests::sample(cx);
+    consume_behind(&shell, [Modal::Dialog], cx);
+}
+
+fn consume_behind(
+    shell: &Entity<Shell>,
+    modals: impl IntoIterator<Item = Modal>,
+    cx: &mut VisualTestContext,
+) {
+    let shell = shell.clone();
+    let actions = every_menu_action();
+    assert!(actions.len() > 60, "{}", actions.len());
+    for modal in modals {
+        open_modal(&shell, modal, cx);
+        assert_eq!(open(&shell, cx), Some(modal));
+        let sessions = cx.read(|cx| shell.read(cx).active(cx).sessions.len());
+        for action in &actions {
+            // Unregistered actions (dictation) have no handler to reach.
+            let short = action.name().trim_start_matches("gitterm_iced::");
+            if modal.allows(action.name()) || MISSING_HOST_ACTIONS.contains(&short) {
+                continue;
+            }
+            let name = action.name();
+            // From the modal's focus, as a key or menu item would arrive:
+            // either the guard refuses it or no shell handler is on the path.
+            shell.update(cx, |shell, _| shell.blocked_actions.clear());
+            cx.update(|window, cx| window.dispatch_action(action.boxed_clone(), cx));
+            draw(cx);
+            cx.read(|cx| {
+                let blocked = &shell.read(cx).blocked_actions;
+                assert!(
+                    blocked.is_empty() || blocked == &[name],
+                    "{modal:?}: {blocked:?}"
+                )
+            });
+            // From the shell root, through every shell handler.
+            shell.update(cx, |shell, _| shell.blocked_actions.clear());
+            cx.update(|window, cx| {
+                let focus = shell.read(cx).focus.clone();
+                focus.dispatch_action(&**action, window, cx)
+            });
+            draw(cx);
+            // A child's Escape-bound action runs the shell's Escape first
+            // (`modal_escape`): it closes the modal, or the modal keeps its
+            // own Escape and the action is refused.
+            if ["CloseSlash", "CloseFind", "CloseReview"].contains(&short)
+                && open(&shell, cx).is_none()
+            {
+                open_modal(&shell, modal, cx);
+                continue;
+            }
+            cx.read(|cx| {
+                assert_eq!(
+                    shell.read(cx).blocked_actions,
+                    [name],
+                    "{modal:?}: {name} reached its handler"
+                )
+            });
+            assert_eq!(open(&shell, cx), Some(modal), "{modal:?}: {name}");
+        }
+        assert_eq!(
+            cx.read(|cx| shell.read(cx).active(cx).sessions.len()),
+            sessions
+        );
+        cx.simulate_keystrokes("escape");
+        draw(cx);
+        assert_eq!(open(&shell, cx), None, "Escape closes {modal:?}");
+    }
+    // With no modal, the same actions reach their handlers again.
+    shell.update(cx, |shell, _| shell.blocked_actions.clear());
+    dispatch(ToggleSidebar, cx);
+    cx.read(|cx| assert!(shell.read(cx).blocked_actions.is_empty()));
+}
+
+/// Iced closes a task modal on Escape before the composer's slash menu
+/// sees it, and the shell takes focus back.
+#[gpui::test]
+fn escape_closes_task_modal_over_an_open_slash_menu(cx: &mut TestAppContext) {
+    use gitterm_gpui_chat::{
+        ChatView,
+        events::{Entry, HarnessEvent, Record},
+    };
+    let (_root, shell, cx) = h6_tests::sample(cx);
+    dispatch(TabSelect { index: 0 }, cx);
+    let chat = cx.update(|window, cx| {
+        cx.new(|cx| {
+            let mut chat = ChatView::new(
+                vec![Record {
+                    at_ms: None,
+                    entry: Entry::Harness(HarnessEvent::Ready {
+                        session_id: None,
+                        permission_mode: Some("default".into()),
+                        models: vec![],
+                        modes: vec![],
+                        commands: vec![serde_json::json!({"name":"clear"})],
+                    }),
+                }],
+                window,
+                cx,
+            );
+            chat.set_read_only(None, cx);
+            chat.set_intent_callback(
+                Rc::new(|_, _| gitterm_gpui_chat::adapter::Receipt::rejected("synthetic")),
+                cx,
+            );
+            chat
+        })
+    });
+    cx.update(|_, cx| {
+        let state = shell.read(cx).active(cx);
+        let pane = state.panes[&session_pane_id(state.active_session.unwrap())].clone();
+        pane.update(cx, |pane, cx| {
+            pane.content = pane::PaneContent::Chat(chat.clone());
+            cx.notify();
+        });
+    });
+    draw(cx);
+    let bounds = cx.debug_bounds("composer-input").unwrap();
+    cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+    draw(cx);
+    let shell_focus = cx.read(|cx| shell.read(cx).focus.clone());
+    for slash in [true, false] {
+        cx.simulate_input(if slash { "/" } else { "x" });
+        draw(cx);
+        if slash {
+            assert_key_action("escape", CloseSlash, cx);
+        }
+        open_modal(&shell, Modal::Task, cx);
+        cx.simulate_keystrokes("escape");
+        draw(cx);
+        assert_eq!(open(&shell, cx), None, "slash menu open: {slash}");
+        cx.update(|window, _| assert!(shell_focus.is_focused(window), "slash: {slash}"));
+        // Back in the composer for the next round.
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        draw(cx);
+        cx.simulate_keystrokes("cmd-a backspace");
+        draw(cx);
+    }
+}
