@@ -1629,7 +1629,7 @@ pub fn merge_plan_value(
 ) -> Value {
     use crate::merge_plan::{self, RowStatus};
     let live = |key: &PrKey| pr_live_value(watch.prs.get(&key.id()));
-    let briefs: HashMap<String, PrBrief> = watch
+    let briefs: std::collections::HashMap<String, PrBrief> = watch
         .prs
         .iter()
         .filter_map(|(id, watched)| Some((id.clone(), watched.brief()?)))

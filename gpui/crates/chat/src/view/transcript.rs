@@ -99,6 +99,13 @@ impl ChatView {
             TranscriptAction::PreviewOnly { label } => {
                 self.set_status_error(crate::interactions::preview_notice(&label), cx)
             }
+            TranscriptAction::Dismiss(request) => {
+                let notice = match &self.dismiss_gate {
+                    Some(gate) => gate(&request, cx),
+                    None => crate::interactions::preview_notice(&request.label),
+                };
+                self.set_status_error(notice, cx)
+            }
             TranscriptAction::OpenFile { path, review } => {
                 cx.emit(roster::RosterOutcome::OpenFile { path, review })
             }

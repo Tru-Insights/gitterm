@@ -439,6 +439,7 @@ impl WorkSidebar {
             .collect();
         }
         let config = source.config.clone();
+        let tasks = crate::data::TaskSource::resolve(&source.config, cx);
         let previous = self.previous_data.clone();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let job = cx.background_executor().spawn(async move {
@@ -448,6 +449,7 @@ impl WorkSidebar {
             let accounts = read_pr_accounts(&source.config);
             let result = crate::data::IcedWorkData::read(
                 &source.config,
+                &tasks,
                 id,
                 &saved,
                 focus,
