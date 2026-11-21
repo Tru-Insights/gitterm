@@ -379,7 +379,7 @@ impl crate::Shell {
     ) {
         use crate::workspace_bar::Outcome as O;
         match outcome {
-            O::SelectWorkspace(id) => self.select_workspace_id(id, window, cx),
+            O::SelectWorkspace(id) => self.pick_workspace_id(id, window, cx),
             O::NewWork => self.open_new_work_sheet(window, cx),
             O::ToggleTerminal if self.active_workspace(cx).is_some() => {
                 self.open_bottom_terminal(window, cx)
@@ -401,7 +401,7 @@ impl crate::Shell {
     ) {
         use crate::spine::Outcome as O;
         match outcome {
-            O::SelectWorkspace(id) => self.select_workspace_id(id, window, cx),
+            O::SelectWorkspace(id) => self.pick_workspace_id(id, window, cx),
             O::Jump { workspace, target } => {
                 self.select_workspace_id(workspace, window, cx);
                 if self.active_workspace(cx) == Some(workspace) {

@@ -29,6 +29,8 @@ mod h8_tests;
 #[cfg(test)]
 mod h9_tests;
 #[cfg(test)]
+mod h10_tests;
+#[cfg(test)]
 mod hookup_tests;
 mod layout;
 mod owner;
@@ -727,7 +729,7 @@ impl Shell {
             .get(index)
             .map(|&i| self.workspaces[i].workspace.id)
         {
-            self.select_workspace_id(id, window, cx);
+            self.pick_workspace_id(id, window, cx);
         }
     }
     fn select_workspace_id(
@@ -3411,6 +3413,18 @@ impl Shell {
             cx.notify();
         });
         cx.notify();
+    }
+    /// Iced: choosing a workspace from the bar or Ctrl+digit closes Usage.
+    pub(crate) fn pick_workspace_id(
+        &mut self,
+        id: WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.usage_open {
+            self.toggle_usage(window, cx);
+        }
+        self.select_workspace_id(id, window, cx);
     }
     fn toggle_usage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.usage_open {
