@@ -9,8 +9,6 @@ use crate::browser_control::{
     BrowserViewport, BrowserWaitCondition,
 };
 use crate::browser_engine::{BrowserEngine, BrowserEngineKind};
-use crate::harness::acp::AcpMcpServer;
-use crate::harness::claude::ClaudeMcpServer;
 use axum::{
     body::Body,
     extract::State,
@@ -20,6 +18,8 @@ use axum::{
     Router,
 };
 use base64::Engine;
+use gitterm_core::harness::acp::AcpMcpServer;
+use gitterm_core::harness::claude::ClaudeMcpServer;
 use gitterm_core::task_commands::mcp_protocol::{
     caller_endpoint, caller_from_query, TASK_MCP_CALLER_QUERY,
 };
@@ -286,6 +286,8 @@ pub struct BrowserMcpServer {
     token: String,
     cancellation: CancellationToken,
     engine: BrowserEngine,
+    /// The host app's version, reported as the MCP server version.
+    version: &'static str,
 }
 
 /// Reserve an endpoint from the V6-only loopback range synchronously so
@@ -294,6 +296,7 @@ pub struct BrowserMcpServer {
 pub fn prepare(
     v6_global_config_dir: impl AsRef<Path>,
     instance_id: &str,
+    version: &'static str,
 ) -> std::io::Result<(BrowserMcpConnection, BrowserMcpServer)> {
     let listener = bind_v6_loopback_listener(instance_id)?;
     listener.set_nonblocking(true)?;
@@ -320,6 +323,7 @@ pub fn prepare(
             token,
             cancellation,
             engine,
+            version,
         },
     ))
 }
@@ -351,7 +355,7 @@ impl BrowserMcpServer {
         let listener = tokio::net::TcpListener::from_std(self.listener).map_err(|error| {
             format!("failed to activate the GitTerm V6 browser MCP listener: {error}")
         })?;
-        let tools = BrowserMcpTools::new(self.engine);
+        let tools = BrowserMcpTools::new(self.engine, self.version);
         let mcp_service: StreamableHttpService<BrowserMcpTools, LocalSessionManager> =
             StreamableHttpService::new(
                 move || Ok::<_, std::io::Error>(tools.clone()),
@@ -402,6 +406,7 @@ async fn authenticate(
 #[derive(Clone)]
 struct BrowserMcpTools {
     engine: BrowserEngine,
+    version: &'static str,
     agent_operation_lock: Arc<Mutex<()>>,
     /// The tools this engine offers: the common set, plus the
     /// agent-browser-only tools when that engine runs (TRU-177).
@@ -409,7 +414,7 @@ struct BrowserMcpTools {
 }
 
 impl BrowserMcpTools {
-    fn new(engine: BrowserEngine) -> Self {
+    fn new(engine: BrowserEngine, version: &'static str) -> Self {
         let tool_router = match engine.kind() {
             Some(BrowserEngineKind::AgentBrowser) => {
                 Self::tool_router() + Self::agent_browser_tool_router()
@@ -418,6 +423,7 @@ impl BrowserMcpTools {
         };
         Self {
             engine,
+            version,
             agent_operation_lock: Arc::new(Mutex::new(())),
             tool_router,
         }
@@ -1341,10 +1347,7 @@ const SERVER_INSTRUCTIONS: &str = "These are the GitTerm browser tools, the brow
 impl ServerHandler for BrowserMcpTools {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(
-                "gitterm-v6-browser",
-                env!("CARGO_PKG_VERSION"),
-            ))
+            .with_server_info(Implementation::new("gitterm-v6-browser", self.version))
             .with_instructions(SERVER_INSTRUCTIONS)
     }
 }
@@ -1428,6 +1431,8 @@ mod tests {
     };
     use tempfile::tempdir;
 
+    const TEST_VERSION: &str = "9.9.9-test";
+
     fn successful_structured_content<T: Serialize>(value: T) -> serde_json::Value {
         let result = structured_value(value);
         assert_eq!(result.is_error, Some(false));
@@ -1468,9 +1473,21 @@ mod tests {
     }
 
     #[test]
+    fn server_info_reports_the_host_version_passed_in() {
+        let temp = tempdir().unwrap();
+        let tools = BrowserMcpTools::new(
+            BrowserEngine::GitTerm(BrowserControlService::new(temp.path())),
+            TEST_VERSION,
+        );
+        let info = tools.get_info();
+        assert_eq!(info.server_info.name, "gitterm-v6-browser");
+        assert_eq!(info.server_info.version, TEST_VERSION);
+    }
+
+    #[test]
     fn connection_uses_v6_loopback_range_and_memory_only_token_environment() {
         let temp = tempdir().unwrap();
-        let (connection, _server) = prepare(temp.path(), "connection-test").unwrap();
+        let (connection, _server) = prepare(temp.path(), "connection-test", TEST_VERSION).unwrap();
         assert!(connection.endpoint().starts_with("http://127.0.0.1:"));
         assert!(connection.endpoint().ends_with("/mcp"));
         let port = connection
@@ -1541,7 +1558,7 @@ mod tests {
     async fn a_call_without_a_caller_is_refused_before_the_browser() {
         let temp = tempdir().unwrap();
         let browser = BrowserControlService::new(temp.path());
-        let tools = BrowserMcpTools::new(BrowserEngine::GitTerm(browser.clone()));
+        let tools = BrowserMcpTools::new(BrowserEngine::GitTerm(browser.clone()), TEST_VERSION);
         for uri in ["/mcp", "/mcp?caller=", "/mcp?other=1"] {
             let result = tools.browser_targets(Extension(request_parts(uri))).await;
             assert_eq!(error_text(&result), missing_browser_caller_error(), "{uri}");
@@ -1567,7 +1584,7 @@ mod tests {
         browser
             .insert_test_target("chat-b", "primary", "tab-b")
             .await;
-        let tools = BrowserMcpTools::new(BrowserEngine::GitTerm(browser));
+        let tools = BrowserMcpTools::new(BrowserEngine::GitTerm(browser), TEST_VERSION);
         let chat_a = || Extension(request_parts("/mcp?caller=chat-a"));
         let chat_b = || Extension(request_parts("/mcp?caller=chat-b"));
 
@@ -1602,7 +1619,7 @@ mod tests {
         browser
             .insert_test_target("chat-a", "design", "tab-1")
             .await;
-        let tools = BrowserMcpTools::new(BrowserEngine::GitTerm(browser));
+        let tools = BrowserMcpTools::new(BrowserEngine::GitTerm(browser), TEST_VERSION);
         let chat_a = || Extension(request_parts("/mcp?caller=chat-a"));
         let chat_b = || Extension(request_parts("/mcp?caller=chat-b"));
         let design = || {
@@ -1647,9 +1664,10 @@ mod tests {
     #[test]
     fn tool_surface_marks_inspection_tools_read_only() {
         let temp = tempdir().unwrap();
-        let _tools = BrowserMcpTools::new(BrowserEngine::GitTerm(BrowserControlService::new(
-            temp.path(),
-        )));
+        let _tools = BrowserMcpTools::new(
+            BrowserEngine::GitTerm(BrowserControlService::new(temp.path())),
+            TEST_VERSION,
+        );
         let routes = BrowserMcpTools::tool_router();
         let listed = routes.list_all();
         let find = |name: &str| routes.get(name).unwrap_or_else(|| panic!("missing {name}"));
@@ -1704,7 +1722,9 @@ mod tests {
     fn only_the_agent_browser_engine_lists_its_tools_and_the_list_stays_small() {
         let temp = tempdir().unwrap();
         let listed = |engine: BrowserEngine| {
-            let mut tools = BrowserMcpTools::new(engine).tool_router.list_all();
+            let mut tools = BrowserMcpTools::new(engine, TEST_VERSION)
+                .tool_router
+                .list_all();
             tools.sort_by(|left, right| left.name.cmp(&right.name));
             tools
         };
@@ -1859,7 +1879,7 @@ mod tests {
     async fn mcp_tools_publish_agent_operation_activity() {
         let temp = tempdir().unwrap();
         let browser = BrowserControlService::new(temp.path());
-        let tools = BrowserMcpTools::new(BrowserEngine::GitTerm(browser.clone()));
+        let tools = BrowserMcpTools::new(BrowserEngine::GitTerm(browser.clone()), TEST_VERSION);
 
         let result = tools
             .browser_status(Extension(request_parts("/mcp?caller=chat-a")))
@@ -1875,7 +1895,7 @@ mod tests {
     #[tokio::test]
     async fn endpoint_requires_bearer_token_and_serves_the_tool_contract() {
         let temp = tempdir().unwrap();
-        let (connection, server) = prepare(temp.path(), "endpoint-test").unwrap();
+        let (connection, server) = prepare(temp.path(), "endpoint-test", TEST_VERSION).unwrap();
         let endpoint = connection.endpoint().to_string();
         let token = connection.token.clone();
         let server_task = tokio::spawn(server.run());

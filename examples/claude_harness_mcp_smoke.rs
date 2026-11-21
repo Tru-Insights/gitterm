@@ -78,7 +78,8 @@ async fn main() {
 
     let browser_dir = workdir.with_extension("browser");
     let (browser, browser_server) =
-        browser_mcp::prepare(&browser_dir, "mcp-smoke").expect("reserve browser MCP endpoint");
+        browser_mcp::prepare(&browser_dir, "mcp-smoke", env!("CARGO_PKG_VERSION"))
+            .expect("reserve browser MCP endpoint");
     tokio::spawn(browser_server.run());
     println!(
         "task MCP {} / browser MCP {}",

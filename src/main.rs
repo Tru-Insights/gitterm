@@ -21199,23 +21199,26 @@ impl App {
             },
             None => Vec::new(),
         };
-        let (browser_mcp, browser_mcp_server, browser_error) =
-            match browser_mcp::prepare(config::global_config_dir(), config::instance_id()) {
-                Ok((connection, server)) => {
-                    eprintln!(
-                        "GitTerm V6 browser MCP reserved at {}",
-                        connection.endpoint()
-                    );
-                    (Some(connection), Some(server), None)
-                }
-                Err(error) => {
-                    let message = format!(
-                        "failed to reserve the GitTerm V6 browser MCP loopback endpoint: {error}"
-                    );
-                    eprintln!("GitTerm V6 browser controls are unavailable: {message}");
-                    (None, None, Some(message))
-                }
-            };
+        let (browser_mcp, browser_mcp_server, browser_error) = match browser_mcp::prepare(
+            config::global_config_dir(),
+            config::instance_id(),
+            env!("CARGO_PKG_VERSION"),
+        ) {
+            Ok((connection, server)) => {
+                eprintln!(
+                    "GitTerm V6 browser MCP reserved at {}",
+                    connection.endpoint()
+                );
+                (Some(connection), Some(server), None)
+            }
+            Err(error) => {
+                let message = format!(
+                    "failed to reserve the GitTerm V6 browser MCP loopback endpoint: {error}"
+                );
+                eprintln!("GitTerm V6 browser controls are unavailable: {message}");
+                (None, None, Some(message))
+            }
+        };
         let (task_mcp, task_mcp_server) = match task_mcp::prepare(
             config::instance_id(),
             task_commands,

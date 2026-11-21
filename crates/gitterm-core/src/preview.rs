@@ -7,6 +7,9 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+/// Per-operation authority for the shared task host's services.
+pub mod service;
+
 fn refuse(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message.into())
 }

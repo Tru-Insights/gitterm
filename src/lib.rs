@@ -1,8 +1,6 @@
-pub mod agent_browser;
+// The managed browser lives in `gitterm-browser`; these keep the root paths.
+pub use gitterm_browser::{agent_browser, browser_control, browser_engine, browser_mcp};
 pub mod agentd;
-pub mod browser_control;
-pub mod browser_engine;
-pub mod browser_mcp;
 pub mod chat_facts;
 pub mod chat_page;
 pub mod chats;
