@@ -9,6 +9,7 @@ use crate::content::html_render::{HtmlPreviewRequest, HtmlRenderRequest};
 use crate::delegation_request as input;
 use crate::harness::acp::AcpMcpServer;
 use crate::harness::claude::ClaudeMcpServer;
+use crate::loopback::ListenerBind;
 use axum::{
     body::Body,
     extract::State,
@@ -536,9 +537,6 @@ pub fn prepare(
     server_version: &'static str,
 ) -> io::Result<(TaskMcpConnection, TaskMcpServer)> {
     let listener = bind_v6_loopback_listener(instance_id)?;
-    listener.set_nonblocking(true)?;
-    let port = listener.local_addr()?.port();
-    let endpoint = format!("http://127.0.0.1:{port}/mcp");
     // An external test driver that launches this instance may pre-share the
     // bearer secret through the app's own environment; whoever sets that env
     // already controls the process. Otherwise the token is random and lives
@@ -550,6 +548,40 @@ pub fn prepare(
         }
         _ => format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
     };
+    prepare_listener(listener, token, commands, html_preview, server_version)
+}
+
+/// [`prepare`] on a bind and bearer token the host chose (a preview host:
+/// an OS-assigned loopback port and its namespace token). The V6 port band
+/// and `GITTERM_TASK_MCP_TOKEN` are not consulted.
+pub fn prepare_on(
+    bind: ListenerBind,
+    token: String,
+    commands: TaskControlSender,
+    html_preview: HtmlPreviewRunner,
+    server_version: &'static str,
+) -> io::Result<(TaskMcpConnection, TaskMcpServer)> {
+    if token.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "task MCP bearer token must not be empty",
+        ));
+    }
+    let listener = bind.bind()?;
+    prepare_listener(listener, token, commands, html_preview, server_version)
+}
+
+fn prepare_listener(
+    listener: std::net::TcpListener,
+    token: String,
+    commands: TaskControlSender,
+    html_preview: HtmlPreviewRunner,
+    server_version: &'static str,
+) -> io::Result<(TaskMcpConnection, TaskMcpServer)> {
+    listener.set_nonblocking(true)?;
+    // A V4 loopback address prints as 127.0.0.1:port; a V6 one as [::1]:port.
+    let address = listener.local_addr()?;
+    let endpoint = format!("http://{address}/mcp");
     let cancellation = CancellationToken::new();
     Ok((
         TaskMcpConnection {
@@ -1360,6 +1392,125 @@ mod tests {
             server.allowed_tools.join(",")
         )));
         assert_eq!(server.env, environment.to_vec());
+    }
+
+    const OPERATOR_TOKEN: &str = "operator-token-from-the-environment";
+    /// Set only in the child test process `run_with_operator_token` starts.
+    const OPERATOR_CHILD_ENV: &str = "GITTERM_TEST_TASK_MCP_OPERATOR_CHILD";
+
+    fn port_of(connection: &TaskMcpConnection) -> u16 {
+        connection
+            .endpoint()
+            .trim_start_matches("http://127.0.0.1:")
+            .trim_end_matches("/mcp")
+            .parse()
+            .unwrap()
+    }
+
+    /// Runs the ignored test `name` in a child test process with the
+    /// operator token env set, so no test in this process ever sees it.
+    fn run_with_operator_token(name: &str) {
+        let (_, module) = module_path!().split_once("::").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                format!("{module}::{name}").as_str(),
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(TASK_MCP_TOKEN_ENV, OPERATOR_TOKEN)
+            .env(OPERATOR_CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains(" 1 passed;"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The production wrapper still honours the operator token override.
+    #[test]
+    fn production_prepare_uses_operator_token_env() {
+        run_with_operator_token("production_prepare_uses_operator_token_env_child");
+    }
+
+    #[test]
+    #[ignore = "run by production_prepare_uses_operator_token_env with the env set"]
+    fn production_prepare_uses_operator_token_env_child() {
+        if std::env::var_os(OPERATOR_CHILD_ENV).is_none() {
+            return;
+        }
+        let (commands, _requests) = command_channel();
+        let (connection, server) = prepare(
+            "operator-token-test",
+            commands,
+            refused_html_preview(),
+            TEST_SERVER_VERSION,
+        )
+        .unwrap();
+        assert_eq!(connection.token, OPERATOR_TOKEN);
+        assert_eq!(server.token, OPERATOR_TOKEN);
+        assert!((TASK_MCP_BASE_PORT..36_030).contains(&port_of(&connection)));
+    }
+
+    /// A preview task server listens on an OS-assigned loopback port with the
+    /// preview namespace's token, even when the operator token env is set.
+    #[test]
+    fn preview_endpoint_uses_namespace_token_ignores_env() {
+        run_with_operator_token("preview_endpoint_uses_namespace_token_ignores_env_child");
+    }
+
+    #[test]
+    #[ignore = "run by preview_endpoint_uses_namespace_token_ignores_env with the env set"]
+    fn preview_endpoint_uses_namespace_token_ignores_env_child() {
+        if std::env::var_os(OPERATOR_CHILD_ENV).is_none() {
+            return;
+        }
+        assert_eq!(std::env::var(TASK_MCP_TOKEN_ENV).unwrap(), OPERATOR_TOKEN);
+        let dir = tempfile::tempdir().unwrap();
+        let protected = crate::preview::ProtectedRoots::new(&dir.path().join("host"), []).unwrap();
+        let preview = Arc::new(
+            crate::preview::Preview::validate(&dir.path().join("preview"), protected).unwrap(),
+        );
+        let services = crate::preview::service::ServiceContext::preview(preview).unwrap();
+        let namespace_token = services.task_mcp().token().to_string();
+        assert_ne!(namespace_token, OPERATOR_TOKEN);
+
+        let (commands, _requests) = command_channel();
+        let (connection, server) = prepare_on(
+            ListenerBind::LoopbackEphemeral,
+            namespace_token.clone(),
+            commands,
+            refused_html_preview(),
+            TEST_SERVER_VERSION,
+        )
+        .unwrap();
+        assert_eq!(connection.token, namespace_token);
+        assert_eq!(server.token, namespace_token);
+        assert_eq!(connection.terminal_environment(None)[1].1, namespace_token);
+        let port = port_of(&connection);
+        assert!(!crate::loopback::V6_PORT_BANDS.contains(&port), "{port}");
+        assert_eq!(
+            server.listener.local_addr().unwrap().ip(),
+            Ipv4Addr::LOCALHOST
+        );
+    }
+
+    #[test]
+    fn explicit_prepare_refuses_an_empty_token() {
+        let (commands, _requests) = command_channel();
+        let error = prepare_on(
+            ListenerBind::LoopbackEphemeral,
+            String::new(),
+            commands,
+            refused_html_preview(),
+            TEST_SERVER_VERSION,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     /// The MCP server version is the host app's, passed in, not this crate's.

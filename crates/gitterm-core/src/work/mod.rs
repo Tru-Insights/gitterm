@@ -1,6 +1,7 @@
 //! Work rules and read-only services shared by frontends.
 
 pub mod documents;
+pub mod pr_actions;
 pub mod summary;
 
 pub mod state;

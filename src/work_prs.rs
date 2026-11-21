@@ -33,7 +33,9 @@ use super::*;
 use gitterm::merge_plan::{
     self, MergeMethod, MergePlan, OrderedRow, PrBrief, PrKey, PrRef, PrState, RowStatus,
 };
-use gitterm::pr_watch::{self, NewsItem, NewsKind, PrAction, WatchedPr};
+#[cfg(test)]
+use gitterm::pr_watch::PrAction;
+use gitterm::pr_watch::{self, NewsItem, NewsKind, WatchedPr};
 use gitterm::task_mcp::MergePlanSetRequest;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -107,39 +109,7 @@ pub struct RootPrs {
     pub facts: Vec<PrRef>,
 }
 
-/// The Approve / Merge confirmation.
-#[derive(Debug, Clone)]
-pub struct PrActionConfirm {
-    pub key: PrKey,
-    pub kind: ActionKind,
-    pub method: MergeMethod,
-    /// The plan named the method.
-    pub method_from_plan: bool,
-    /// The mapped gh account; `None` for gh's active account.
-    pub account: Option<String>,
-    pub running: bool,
-    /// Why the last run failed; a run that succeeds closes the sheet.
-    pub error: Option<String>,
-}
-
-impl PrActionConfirm {
-    fn action(&self) -> PrAction {
-        match self.kind {
-            ActionKind::Approve => PrAction::Approve,
-            ActionKind::Merge => PrAction::Merge(self.method),
-            ActionKind::Ready => PrAction::Ready,
-        }
-    }
-}
-
-/// Which row action the confirmation runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActionKind {
-    Approve,
-    Merge,
-    /// Mark a draft ready for review.
-    Ready,
-}
+pub use gitterm_core::work::pr_actions::{self, ActionKind, PrActionConfirm};
 
 /// A plan write finished: restore `previous` on failure, answer the tool.
 #[derive(Debug, Clone)]
@@ -809,22 +779,7 @@ impl PrsState {
     /// success and keeps the error on failure; returns whether it closed.
     pub fn action_done(&mut self, key: &PrKey, result: Result<String, String>) -> bool {
         self.request_immediate_refresh(key.id(), Instant::now());
-        if !self.action.as_ref().is_some_and(|c| c.key == *key) {
-            return false;
-        }
-        match result {
-            Ok(_) => {
-                self.action = None;
-                true
-            }
-            Err(error) => {
-                if let Some(confirm) = self.action.as_mut() {
-                    confirm.running = false;
-                    confirm.error = Some(error);
-                }
-                false
-            }
-        }
+        pr_actions::finish_action(&mut self.action, key, result)
     }
 
     /// Plans and the watch file from the config dir (small reads).
@@ -1055,15 +1010,12 @@ impl App {
     /// The PR's author is the gh account Approve would run as (the mapped
     /// one, else the active one). Unknown either way: not own.
     fn is_own_pr(&self, key: &PrKey, watched: Option<&WatchedPr>) -> bool {
-        let author = watched
-            .and_then(|w| w.snapshot.core.as_ref())
-            .map(|core| core.author.as_str());
-        let account = pr_watch::account_for(key.owner(), &self.github_accounts);
-        let login = match &account {
-            Some(user) => Some(user.as_str()),
-            None => self.prs.logins.get(&None).map(String::as_str),
-        };
-        pr_watch::is_own_pr(author, login)
+        pr_actions::own_pr(
+            key,
+            watched,
+            &self.github_accounts,
+            self.prs.logins.get(&None).map(String::as_str),
+        )
     }
 
     fn watched(&self, key: &PrKey) -> Option<&WatchedPr> {
@@ -1554,18 +1506,16 @@ impl App {
             }
             PrEvent::PlanWritten(write) => self.merge_plan_written(*write),
             PrEvent::ClearHold(root, key) => {
-                if self.prs.plan_writes.contains(&root) {
-                    return Task::none();
-                }
-                let Some(plan) = self.prs.plans.get_mut(&root) else {
+                let Some((previous, plan)) = pr_actions::clear_hold(
+                    &mut self.prs.plans,
+                    &self.prs.plan_writes,
+                    &root,
+                    &key,
+                    &chat_facts::now_stamp(),
+                ) else {
                     return Task::none();
                 };
-                let previous = plan.clone();
-                if !plan.clear_hold(&key, &chat_facts::now_stamp()) {
-                    return Task::none();
-                }
                 eprintln!("[merge-plan] {root}: hold on {} cleared", key.label());
-                let plan = plan.clone();
                 return self.write_merge_plan(plan, Some(previous), None, Vec::new());
             }
             PrEvent::Review(key) => return self.review_pr(key),
@@ -1588,67 +1538,32 @@ impl App {
                 };
             }
             PrEvent::ActionOpen(key, kind) => {
-                let entry = self
-                    .prs
-                    .plans
-                    .values()
-                    .find_map(|plan| plan.entry(&key).cloned());
-                let method = entry.as_ref().and_then(|entry| entry.method);
-                self.prs.action = Some(PrActionConfirm {
-                    account: pr_watch::account_for(key.owner(), &self.github_accounts),
+                self.prs.action = Some(PrActionConfirm::open(
                     key,
                     kind,
-                    method: method.unwrap_or_default(),
-                    method_from_plan: method.is_some(),
-                    running: false,
-                    error: None,
-                });
+                    self.prs.plans.values(),
+                    &self.github_accounts,
+                ));
                 self.prs.ready_open = false;
                 return self.apply_webview_surfaces();
             }
             PrEvent::ActionMethod(method) => {
                 if let Some(confirm) = self.prs.action.as_mut() {
-                    if !confirm.running {
-                        confirm.method = method;
-                        confirm.error = None;
-                    }
+                    confirm.choose_method(method);
                 }
             }
             PrEvent::ActionRun => {
-                let Some(confirm) = self.prs.action.as_ref() else {
-                    return Task::none();
-                };
-                if confirm.running {
-                    return Task::none();
-                }
-                // Merge re-checks the latest read: the checks may have
-                // turned pending or failing since the sheet opened.
-                let reason = if confirm.kind != ActionKind::Merge {
-                    None
-                } else {
-                    self.watched(&confirm.key)
-                        .map(WatchedPr::checks_gate)
-                        .unwrap_or(pr_watch::ChecksGate::Running)
-                        .reason()
-                };
                 let Some(confirm) = self.prs.action.as_mut() else {
                     return Task::none();
                 };
-                if let Some(reason) = reason {
-                    confirm.error = Some(format!("Not merged: {reason}"));
+                let latest = self.prs.watch.prs.get(&confirm.key.id());
+                let Some(run) = confirm.run(latest) else {
                     return Task::none();
-                }
-                confirm.running = true;
-                confirm.error = None;
-                let action = confirm.action();
-                let key = confirm.key.clone();
-                let account = confirm.account.clone();
-                eprintln!(
-                    "[pr-watch] user ran: {}",
-                    pr_watch::action_command_line(action, &key, account.as_deref())
-                );
+                };
+                eprintln!("[pr-watch] user ran: {}", run.command_line());
+                let key = run.key.clone();
                 return Task::perform(
-                    pr_watch::run_action(action, key.clone(), account),
+                    pr_watch::run_action(run.action, run.key, run.account),
                     move |result| Event::Pr(PrEvent::ActionDone(key.clone(), result)),
                 );
             }
@@ -1667,15 +1582,13 @@ impl App {
                 return refresh;
             }
             PrEvent::ActionClose => {
-                if self.prs.action.as_ref().is_some_and(|c| c.running) {
+                if !pr_actions::close_action(&mut self.prs.action) {
                     return Task::none();
                 }
-                self.prs.action = None;
                 return self.apply_webview_surfaces();
             }
             PrEvent::NewsDismiss(pr, news) => {
-                if let Some(item) = self.news_item_mut(&pr, &news) {
-                    item.dismissed = true;
+                if pr_actions::dismiss_news(&mut self.prs.watch, &pr, &news) {
                     return self.save_pr_watch();
                 }
             }
@@ -1732,32 +1645,18 @@ impl App {
     /// the PR's head branch in its repo, else the PR in the browser. Resets
     /// the row's new-comment count.
     fn review_pr(&mut self, key: PrKey) -> Task<Event> {
-        let save = match self.prs.watch.prs.get_mut(&key.id()) {
-            Some(watched) if watched.unseen_comments > 0 => {
-                watched.unseen_comments = 0;
-                self.save_pr_watch()
-            }
-            _ => Task::none(),
+        let save = if pr_actions::take_unseen_comments(&mut self.prs.watch, &key) {
+            self.save_pr_watch()
+        } else {
+            Task::none()
         };
-        let head = self
-            .watched(&key)
-            .and_then(|watched| watched.snapshot.core.as_ref())
-            .map(|core| core.head_ref.clone())
-            .filter(|head| !head.is_empty());
-        let candidates: Vec<(PathBuf, PathBuf)> = match (head, self.overview_key()) {
-            (Some(head), Some(overview_key)) => self
+        let candidates = match self.overview_key() {
+            Some(overview_key) => self
                 .workspace_overviews
                 .get(&overview_key)
-                .map(|state| {
-                    state
-                        .branches
-                        .iter()
-                        .filter(|row| !row.owned.gone && row.owned.branch.as_deref() == Some(&head))
-                        .map(|row| (row.owned.repo.clone(), row.owned.checkout.clone()))
-                        .collect()
-                })
+                .map(|state| pr_actions::review_candidates(self.watched(&key), &state.branches))
                 .unwrap_or_default(),
-            _ => Vec::new(),
+            None => Vec::new(),
         };
         if candidates.is_empty() {
             self.open_pr_in_browser(&key);
@@ -1767,18 +1666,16 @@ impl App {
         let resolve = Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    candidates.into_iter().find_map(|(repo_dir, checkout)| {
-                        match gitterm::gh_identity::repository_slug_for(&repo_dir) {
-                            Ok(slug) if slug.full_name().eq_ignore_ascii_case(&repo) => {
-                                Some(checkout)
-                            }
-                            Ok(_) => None,
-                            Err(error) => {
-                                eprintln!("[pr-watch] review: {error}");
-                                None
-                            }
-                        }
-                    })
+                    pr_actions::review_checkout(
+                        candidates,
+                        &repo,
+                        |repo_dir| {
+                            gitterm::gh_identity::repository_slug_for(repo_dir)
+                                .map(|slug| slug.full_name())
+                                .map_err(|error| error.to_string())
+                        },
+                        |error| eprintln!("[pr-watch] review: {error}"),
+                    )
                 })
                 .await
                 .unwrap_or_else(|error| {
@@ -2201,25 +2098,14 @@ impl App {
         let expanded = self.overview_row_open(&row_key);
         let is_next = row.is_some_and(|row| row.status == RowStatus::Next);
         let parts = pr_row_parts(is_next, expanded);
-        let draft = watched
-            .and_then(WatchedPr::brief)
-            .is_some_and(|brief| brief.state == merge_plan::PrState::Draft);
+        // Approve and Merge wait for the checks of the latest read; a draft
+        // can't be approved or merged until it is marked ready.
+        let gate = pr_actions::RowGate::of(watched);
+        let draft = gate.draft;
         let core = watched.and_then(|w| w.snapshot.core.as_ref());
-        let open = watched
-            .and_then(WatchedPr::brief)
-            .is_some_and(|brief| brief.state == merge_plan::PrState::Open);
-        // Approve and Merge wait for the checks of the latest read.
-        let reason = watched
-            .map(WatchedPr::checks_gate)
-            .unwrap_or(pr_watch::ChecksGate::Running)
-            .reason();
-        // A draft can't be approved or merged until it is marked ready.
-        let gated = |name: &str| match reason {
-            _ if draft => format!("{name} (draft)"),
-            Some(reason) if open => format!("{name} ({reason})"),
-            _ => name.to_string(),
-        };
-        let merge_event = (open && reason.is_none())
+        let gated = |name: &str| gate.label(name);
+        let merge_event = gate
+            .can_act()
             .then(|| Event::Pr(PrEvent::ActionOpen(key.clone(), ActionKind::Merge)));
         let action = |label: String, event: Option<Event>| {
             button(text(label).size(10).color(theme.text_primary()))
@@ -2383,7 +2269,7 @@ impl App {
             if !self.is_own_pr(key, watched) {
                 actions = actions.push(action(
                     gated("Approve"),
-                    (open && reason.is_none())
+                    gate.can_act()
                         .then(|| Event::Pr(PrEvent::ActionOpen(key.clone(), ActionKind::Approve))),
                 ));
             }
@@ -2864,24 +2750,8 @@ impl App {
                 card = card.push(text(note).size(font_small - 1.0).color(color));
             }
         }
-        let owner = key.owner().to_string();
-        let account_line = match &confirm.account {
-            Some(user) if pr_watch::valid_login(user) => {
-                format!("Runs as {user} (github_accounts maps {owner} to it)")
-            }
-            Some(user) => format!(
-                "github_accounts maps {owner} to {user:?}, which is not a GitHub login; fix github-accounts.json"
-            ),
-            None => match self.prs.logins.get(&None) {
-                Some(login) => format!(
-                    "Runs as gh's active account ({login}): github_accounts has no entry for {owner}"
-                ),
-                None => format!(
-                    "Runs as gh's active account: github_accounts has no entry for {owner}"
-                ),
-            },
-        };
-        let account_ok = confirm.account.as_deref().is_none_or(pr_watch::valid_login);
+        let account_line = confirm.account_line(self.prs.logins.get(&None).map(String::as_str));
+        let account_ok = confirm.account_ok();
         card = card.push(text(account_line).size(font_small).color(if account_ok {
             theme.text_secondary()
         } else {
@@ -2904,23 +2774,19 @@ impl App {
                 ))
                 .style(self.ghost_button_style())
                 .padding([2, 8]);
-                if !confirm.running {
+                if confirm.can_close() {
                     b = b.on_press(Event::Pr(PrEvent::ActionMethod(method)));
                 }
                 methods = methods.push(b);
             }
             methods = methods.push(
-                text(if confirm.method_from_plan {
-                    "(the plan's)"
-                } else {
-                    "(default; the plan names none)"
-                })
-                .size(10)
-                .color(theme.text_muted()),
+                text(confirm.method_hint())
+                    .size(10)
+                    .color(theme.text_muted()),
             );
             card = card.push(methods);
         }
-        let command = pr_watch::action_command_line(action, key, confirm.account.as_deref());
+        let command = confirm.command_line();
         let code_bg = theme.bg_crust();
         card = card.push(
             container(
@@ -2953,17 +2819,16 @@ impl App {
                     .color(theme.text_muted()),
             );
         }
-        let failed = confirm.error.is_some();
-        let mut close = button(text(if failed { "Close" } else { "Cancel" }).size(font_small))
+        let mut close = button(text(confirm.close_label()).size(font_small))
             .style(self.secondary_button_style())
             .padding([6, 12]);
-        if !confirm.running {
+        if confirm.can_close() {
             close = close.on_press(Event::Pr(PrEvent::ActionClose));
         }
         let mut run = button(text(action.verb()).size(font_small))
             .style(self.primary_button_style())
             .padding([6, 12]);
-        if !confirm.running && account_ok {
+        if confirm.run_enabled() {
             run = run.on_press(Event::Pr(PrEvent::ActionRun));
         }
         card = card.push(
@@ -4440,5 +4305,431 @@ mod tests {
         assert!(confirm.running);
         assert!(confirm.error.is_none());
         assert!(prs.due_now.contains(&other.id()));
+    }
+
+    // TRU-274 characterization of the PR action arms, through `update_prs`.
+    // Nothing here runs gh: `ActionRun`'s task is dropped unrun, and the
+    // wrong-account check refuses before a process starts.
+
+    const ACTION_REPO: &str = "example-org/example-repo";
+
+    fn action_key() -> PrKey {
+        PrKey::new(ACTION_REPO, 7)
+    }
+
+    fn action_app(dir: &Path) -> App {
+        crate::baseline_tests::app_with_tabs(dir)
+    }
+
+    fn plan_with(root: &str, entry: serde_json::Value) -> MergePlan {
+        MergePlan {
+            root_chat_id: root.to_string(),
+            source: None,
+            updated_at: "2026-11-01T00:00:00Z".to_string(),
+            entries: vec![serde_json::from_value(entry).unwrap()],
+        }
+    }
+
+    fn watched_with(state: merge_plan::PrState, checks: &[pr_watch::CheckOutcome]) -> WatchedPr {
+        let mut watched = WatchedPr::new(action_key());
+        watched.snapshot.core = Some(pr_watch::PullCore {
+            state: Some(state),
+            author: "someone-else".to_string(),
+            head_ref: "feature/x".to_string(),
+            ..pr_watch::PullCore::default()
+        });
+        watched.snapshot.check_runs = checks
+            .iter()
+            .enumerate()
+            .map(|(n, outcome)| pr_watch::CheckItem {
+                name: format!("check-{n}"),
+                outcome: *outcome,
+            })
+            .collect();
+        watched
+    }
+
+    fn confirm_of(app: &App) -> &PrActionConfirm {
+        app.prs.action.as_ref().expect("confirmation open")
+    }
+
+    #[test]
+    fn action_open_takes_the_plans_method_and_the_mapped_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = action_app(dir.path());
+        app.prs.ready_open = true;
+        app.prs.plans.insert(
+            "root-a".into(),
+            plan_with(
+                "root-a",
+                serde_json::json!({"repo": ACTION_REPO, "number": 7, "method": "squash"}),
+            ),
+        );
+        app.github_accounts
+            .insert(" Example-Org ".into(), " example-dev ".into());
+        let _ = app.update_prs(PrEvent::ActionOpen(action_key(), ActionKind::Merge));
+        let confirm = confirm_of(&app);
+        assert_eq!(confirm.key, action_key());
+        assert_eq!(confirm.kind, ActionKind::Merge);
+        assert_eq!(confirm.method, MergeMethod::Squash);
+        assert!(confirm.method_from_plan);
+        assert_eq!(confirm.account.as_deref(), Some("example-dev"));
+        assert!(!confirm.running);
+        assert!(confirm.error.is_none());
+        assert!(!app.prs.ready_open);
+
+        // No plan entry, no mapping: merge by default and gh's active account.
+        let mut app = action_app(dir.path());
+        let _ = app.update_prs(PrEvent::ActionOpen(action_key(), ActionKind::Approve));
+        let confirm = confirm_of(&app);
+        assert_eq!(confirm.kind, ActionKind::Approve);
+        assert_eq!(confirm.method, MergeMethod::Merge);
+        assert!(!confirm.method_from_plan);
+        assert_eq!(confirm.account, None);
+
+        // A plan entry without a method is the default, not the plan's.
+        let mut app = action_app(dir.path());
+        app.prs.plans.insert(
+            "root-a".into(),
+            plan_with(
+                "root-a",
+                serde_json::json!({"repo": ACTION_REPO, "number": 7}),
+            ),
+        );
+        let _ = app.update_prs(PrEvent::ActionOpen(action_key(), ActionKind::Merge));
+        assert_eq!(confirm_of(&app).method, MergeMethod::Merge);
+        assert!(!confirm_of(&app).method_from_plan);
+    }
+
+    #[test]
+    fn action_method_changes_only_an_idle_confirmation_and_clears_its_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = action_app(dir.path());
+        let _ = app.update_prs(PrEvent::ActionOpen(action_key(), ActionKind::Merge));
+        app.prs.action.as_mut().unwrap().error = Some("Not merged: checks running".into());
+        let _ = app.update_prs(PrEvent::ActionMethod(MergeMethod::Rebase));
+        assert_eq!(confirm_of(&app).method, MergeMethod::Rebase);
+        assert!(confirm_of(&app).error.is_none());
+
+        app.prs.action.as_mut().unwrap().running = true;
+        let _ = app.update_prs(PrEvent::ActionMethod(MergeMethod::Squash));
+        assert_eq!(confirm_of(&app).method, MergeMethod::Rebase);
+
+        // With no confirmation open it does nothing.
+        app.prs.action = None;
+        let _ = app.update_prs(PrEvent::ActionMethod(MergeMethod::Squash));
+        assert!(app.prs.action.is_none());
+    }
+
+    #[test]
+    fn action_run_rechecks_merge_against_the_latest_read() {
+        use pr_watch::CheckOutcome::{Fail, Pass, Pending};
+        let dir = tempfile::tempdir().unwrap();
+        for (watched, error) in [
+            (None, Some("Not merged: checks running")),
+            (
+                Some(watched_with(merge_plan::PrState::Open, &[Pass, Pending])),
+                Some("Not merged: checks running"),
+            ),
+            (
+                Some(watched_with(merge_plan::PrState::Open, &[Pass, Fail])),
+                Some("Not merged: checks failed"),
+            ),
+            (Some(watched_with(merge_plan::PrState::Open, &[Pass])), None),
+            // No checks at all counts as passed.
+            (Some(watched_with(merge_plan::PrState::Open, &[])), None),
+        ] {
+            let mut app = action_app(dir.path());
+            if let Some(watched) = watched {
+                app.prs.watch.prs.insert(action_key().id(), watched);
+            }
+            let _ = app.update_prs(PrEvent::ActionOpen(action_key(), ActionKind::Merge));
+            let _ = app.update_prs(PrEvent::ActionRun);
+            let confirm = confirm_of(&app);
+            assert_eq!(confirm.error.as_deref(), error);
+            assert_eq!(confirm.running, error.is_none());
+        }
+        // Approve and Ready run whatever the checks say.
+        for kind in [ActionKind::Approve, ActionKind::Ready] {
+            let mut app = action_app(dir.path());
+            let _ = app.update_prs(PrEvent::ActionOpen(action_key(), kind));
+            let _ = app.update_prs(PrEvent::ActionRun);
+            assert!(confirm_of(&app).running);
+            assert!(confirm_of(&app).error.is_none());
+        }
+    }
+
+    #[test]
+    fn action_run_is_ignored_while_running_and_without_a_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = action_app(dir.path());
+        let _ = app.update_prs(PrEvent::ActionRun);
+        assert!(app.prs.action.is_none());
+        let _ = app.update_prs(PrEvent::ActionOpen(action_key(), ActionKind::Merge));
+        {
+            let confirm = app.prs.action.as_mut().unwrap();
+            confirm.running = true;
+        }
+        let _ = app.update_prs(PrEvent::ActionRun);
+        // A running merge is not re-gated: no "Not merged" error appears.
+        assert!(confirm_of(&app).running);
+        assert!(confirm_of(&app).error.is_none());
+    }
+
+    #[test]
+    fn the_confirmed_action_is_the_gh_argv_and_command_line() {
+        let key = action_key();
+        let confirm = |kind, method, account: Option<&str>| PrActionConfirm {
+            key: key.clone(),
+            kind,
+            method,
+            method_from_plan: false,
+            account: account.map(str::to_owned),
+            running: false,
+            error: None,
+        };
+        let cases = [
+            (
+                confirm(ActionKind::Approve, MergeMethod::Squash, None),
+                "pr review 7 --repo example-org/example-repo --approve",
+            ),
+            (
+                confirm(ActionKind::Merge, MergeMethod::Merge, None),
+                "pr merge 7 --repo example-org/example-repo --merge",
+            ),
+            (
+                confirm(ActionKind::Merge, MergeMethod::Squash, None),
+                "pr merge 7 --repo example-org/example-repo --squash",
+            ),
+            (
+                confirm(ActionKind::Merge, MergeMethod::Rebase, None),
+                "pr merge 7 --repo example-org/example-repo --rebase",
+            ),
+            (
+                confirm(ActionKind::Ready, MergeMethod::Rebase, None),
+                "pr ready 7 --repo example-org/example-repo",
+            ),
+        ];
+        for (confirm, argv) in &cases {
+            let action = confirm.action();
+            assert_eq!(pr_watch::action_args(action, &key).join(" "), *argv);
+            assert_eq!(
+                pr_watch::action_command_line(action, &key, None),
+                format!("gh {argv}")
+            );
+        }
+        let mapped = confirm(ActionKind::Merge, MergeMethod::Squash, Some("example-dev"));
+        assert_eq!(
+            pr_watch::action_command_line(mapped.action(), &key, mapped.account.as_deref()),
+            "GH_TOKEN=\"$(gh auth token --user example-dev)\" \
+             gh pr merge 7 --repo example-org/example-repo --squash"
+        );
+        assert_eq!(
+            [ActionKind::Approve, ActionKind::Merge, ActionKind::Ready].map(|kind| confirm(
+                kind,
+                MergeMethod::Merge,
+                None
+            )
+            .action()
+            .verb()),
+            ["Approve", "Merge", "Ready for review"]
+        );
+    }
+
+    #[test]
+    fn a_mapped_account_that_is_not_a_login_is_refused_before_gh_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = action_app(dir.path());
+        app.github_accounts
+            .insert("example-org".into(), "not a login".into());
+        let _ = app.update_prs(PrEvent::ActionOpen(action_key(), ActionKind::Approve));
+        let account = confirm_of(&app).account.clone();
+        assert_eq!(account.as_deref(), Some("not a login"));
+        // The view disables Run for it ...
+        assert!(!account.as_deref().is_none_or(pr_watch::valid_login));
+        // ... and the run itself refuses it without starting a process.
+        let error = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(pr_watch::run_action(
+                PrAction::Approve,
+                action_key(),
+                account,
+            ))
+            .unwrap_err();
+        assert_eq!(error, "\"not a login\" is not a GitHub login");
+        for login in ["example-dev", "a1-b2"] {
+            assert!(pr_watch::valid_login(login));
+        }
+        for login in ["", "has space", "semi;colon", &"x".repeat(40)] {
+            assert!(!pr_watch::valid_login(login));
+        }
+    }
+
+    #[test]
+    fn a_failed_run_keeps_the_sheet_for_retry_and_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = action_app(dir.path());
+        app.prs.watch.prs.insert(
+            action_key().id(),
+            watched_with(merge_plan::PrState::Open, &[]),
+        );
+        let _ = app.update_prs(PrEvent::ActionOpen(action_key(), ActionKind::Merge));
+        let _ = app.update_prs(PrEvent::ActionRun);
+        // Close is refused while gh runs.
+        let _ = app.update_prs(PrEvent::ActionClose);
+        assert!(confirm_of(&app).running);
+        let _ = app.update_prs(PrEvent::ActionDone(
+            action_key(),
+            Err("gh pr merge failed: not mergeable".into()),
+        ));
+        assert!(!confirm_of(&app).running);
+        assert_eq!(
+            confirm_of(&app).error.as_deref(),
+            Some("gh pr merge failed: not mergeable")
+        );
+        assert!(app.prs.due_now.contains(&action_key().id()));
+        // Retry clears the error and runs again.
+        let _ = app.update_prs(PrEvent::ActionRun);
+        assert!(confirm_of(&app).running);
+        assert!(confirm_of(&app).error.is_none());
+        let _ = app.update_prs(PrEvent::ActionDone(action_key(), Err("again".into())));
+        let _ = app.update_prs(PrEvent::ActionClose);
+        assert!(app.prs.action.is_none());
+        // Closing with nothing open stays closed.
+        let _ = app.update_prs(PrEvent::ActionClose);
+        assert!(app.prs.action.is_none());
+        // Success closes the sheet.
+        let _ = app.update_prs(PrEvent::ActionOpen(action_key(), ActionKind::Merge));
+        let _ = app.update_prs(PrEvent::ActionRun);
+        let _ = app.update_prs(PrEvent::ActionDone(action_key(), Ok("merged".into())));
+        assert!(app.prs.action.is_none());
+    }
+
+    #[test]
+    fn own_pr_is_judged_by_the_account_the_action_runs_as() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = action_app(dir.path());
+        let mut watched = watched_with(merge_plan::PrState::Open, &[]);
+        watched.snapshot.core.as_mut().unwrap().author = "Example-Dev".into();
+        let key = action_key();
+        // Neither a mapping nor a read login: not own.
+        assert!(!app.is_own_pr(&key, Some(&watched)));
+        app.prs.logins.insert(None, "example-dev".into());
+        assert!(app.is_own_pr(&key, Some(&watched)));
+        // The mapping wins over the active login.
+        app.github_accounts
+            .insert("example-org".into(), "other-dev".into());
+        assert!(!app.is_own_pr(&key, Some(&watched)));
+        watched.snapshot.core.as_mut().unwrap().author = "other-dev".into();
+        assert!(app.is_own_pr(&key, Some(&watched)));
+        // No read: unknown author, not own.
+        assert!(!app.is_own_pr(&key, None));
+    }
+
+    #[test]
+    fn clear_hold_writes_the_plan_unless_a_write_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = || {
+            plan_with(
+                "root-a",
+                serde_json::json!({"repo": ACTION_REPO, "number": 7, "hold": "until prod"}),
+            )
+        };
+        let mut app = action_app(dir.path());
+        app.prs.plans.insert("root-a".into(), held());
+        app.prs.plan_writes.insert("root-a".into());
+        let _ = app.update_prs(PrEvent::ClearHold("root-a".into(), action_key()));
+        assert_eq!(app.prs.plans["root-a"], held());
+
+        let mut app = action_app(dir.path());
+        app.prs.plans.insert("root-a".into(), held());
+        app.prs.plan_errors.insert("root-a".into(), "old".into());
+        // An unknown root or an unheld PR changes nothing.
+        let _ = app.update_prs(PrEvent::ClearHold("root-b".into(), action_key()));
+        let _ = app.update_prs(PrEvent::ClearHold(
+            "root-a".into(),
+            PrKey::new(ACTION_REPO, 8),
+        ));
+        assert!(app.prs.plan_writes.is_empty());
+        let _ = app.update_prs(PrEvent::ClearHold("root-a".into(), action_key()));
+        let plan = &app.prs.plans["root-a"];
+        assert_eq!(plan.entries[0].hold, None);
+        assert_ne!(plan.updated_at, held().updated_at);
+        assert!(app.prs.plan_writes.contains("root-a"));
+        assert!(!app.prs.plan_errors.contains_key("root-a"));
+    }
+
+    #[test]
+    fn news_dismiss_marks_the_item_and_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = action_app(dir.path());
+        let mut watched = WatchedPr::new(action_key());
+        watched.news.push(NewsItem {
+            key: "checks_failed:a1".into(),
+            kind: NewsKind::ChecksFailed,
+            text: "checks failed: test".into(),
+            at: "2026-11-01T12:00:00Z".into(),
+            dismissed: false,
+            told: false,
+            approvals_only: false,
+        });
+        app.prs.watch.prs.insert(action_key().id(), watched);
+        // A save in flight makes the next save observable as `save_again`.
+        app.prs.save_in_flight = true;
+        let _ = app.update_prs(PrEvent::NewsDismiss(action_key().id(), "other".into()));
+        assert!(!app.prs.save_again);
+        let _ = app.update_prs(PrEvent::NewsDismiss(
+            action_key().id(),
+            "checks_failed:a1".into(),
+        ));
+        assert!(app.prs.watch.prs[&action_key().id()].news[0].dismissed);
+        assert!(app.prs.save_again);
+    }
+
+    #[test]
+    fn review_resets_unseen_comments_and_saves_only_when_there_were_some() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = action_app(dir.path());
+        // A checkout of the head branch, so Review resolves it rather than
+        // opening the browser.
+        let overview_key = app.overview_key().expect("local workspace");
+        app.workspace_overviews.insert(
+            overview_key,
+            WorkspaceOverviewState {
+                branches: vec![overview::BranchStatus {
+                    owned: overview::OwnedBranch {
+                        repo: dir.path().to_path_buf(),
+                        checkout: dir.path().to_path_buf(),
+                        branch: Some("feature/x".into()),
+                        is_main: false,
+                        ownership: overview::Ownership::Task,
+                        owner: String::new(),
+                        last: None,
+                        edits: 0,
+                        task: None,
+                        gone: false,
+                    },
+                    base: None,
+                    status: None,
+                    vs_base: None,
+                    error: None,
+                    stamp: overview::GitdirStamp::default(),
+                    checked_at: std::time::SystemTime::UNIX_EPOCH,
+                }],
+                ..WorkspaceOverviewState::default()
+            },
+        );
+        let mut watched = watched_with(merge_plan::PrState::Open, &[]);
+        watched.unseen_comments = 3;
+        app.prs.watch.prs.insert(action_key().id(), watched);
+        app.prs.save_in_flight = true;
+        let _ = app.update_prs(PrEvent::Review(action_key()));
+        assert_eq!(app.prs.watch.prs[&action_key().id()].unseen_comments, 0);
+        assert!(app.prs.save_again);
+        app.prs.save_again = false;
+        let _ = app.update_prs(PrEvent::Review(action_key()));
+        assert!(!app.prs.save_again);
     }
 }

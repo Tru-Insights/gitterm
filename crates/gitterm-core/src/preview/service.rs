@@ -152,6 +152,17 @@ pub fn classify_process(effect: ProcessEffect) -> Class {
     }
 }
 
+/// A Work PR action's `gh` run (`work::pr_actions::RunPrAction`) writes to
+/// GitHub, outside any fixture target. The label is the confirmation's verb.
+pub fn classify_pr_action(action: crate::prs::PrAction) -> Class {
+    use crate::prs::PrAction as A;
+    match action {
+        A::Approve => class("Approve", Access::Outside),
+        A::Merge(_) => class("Merge", Access::Outside),
+        A::Ready => class("Ready for review", Access::Outside),
+    }
+}
+
 /// Labels are the MCP tool names, so the notice reads "<tool> · not available in preview".
 #[cfg(feature = "runtime")]
 pub fn classify_operation(operation: &crate::task_mcp::TaskControlOperation) -> Class {
@@ -446,6 +457,10 @@ impl ServiceContext {
 
     pub fn runner(&self, effect: RunnerEffect, target: Option<&Path>) -> Result<(), Denied> {
         self.authorize(classify_runner(effect), target)
+    }
+
+    pub fn pr_action(&self, run: &crate::work::pr_actions::RunPrAction) -> Result<(), Denied> {
+        self.authorize(classify_pr_action(run.action), None)
     }
 
     /// `tool` is the browser MCP tool name, used as the notice label.
