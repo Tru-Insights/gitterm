@@ -40,6 +40,23 @@ impl TaskAuthority {
         }
     }
 
+    /// What a pending worker's next mutation reads from the host's facts:
+    /// the session UID of the caller it captured and, while a save is
+    /// pending, the checkout that save re-checks. The reducer looks up no
+    /// other caller or checkout, so a host gathers only these (TRU-274).
+    pub fn pending_worker_subject(
+        &self,
+        id: WorkerPreparationId,
+    ) -> Option<(&str, Option<&std::path::Path>)> {
+        let pending = self.pending_workers.get(&id)?;
+        let checkout = match &pending.stage {
+            PreparationStage::Saving { expected, .. } => Some(expected.path.as_path()),
+            PreparationStage::Reusing { expected } => expected.worktree.path.as_deref(),
+            PreparationStage::Captured | PreparationStage::Bound { .. } => None,
+        };
+        Some((pending.caller.target.session_uid.as_str(), checkout))
+    }
+
     fn task(&self, id: &str) -> Result<&TaskRecord, String> {
         self.store
             .as_ref()

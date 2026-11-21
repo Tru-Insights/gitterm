@@ -325,12 +325,15 @@ impl ChatPane {
                 .map(|source| source.config.clone()),
         );
         view.update(cx, |view, cx| view.set_checkout_source(source, cx));
+        // The caller is this pane's target, fixed here before the gate and
+        // launch run; nothing later can re-attribute the chat's task calls.
+        let task_mcp = task_mcp_server(&controller.target.session_uid, cx);
         let launch = (|| -> Result<_> {
             let program = claude_program()?;
             let provider = Arc::new(Provider::new(preview, &program)?);
             provider.prepare()?;
             let command = provider.sign_in_command();
-            let (runtime, events) = provider.start(saved.cwd.clone()).with_context(|| {
+            let (runtime, events) = provider.start(saved.cwd.clone(), task_mcp).with_context(|| {
                 format!(
                     "Sign in once with a personal Pro/Max account in the isolated root:\n{command}"
                 )
@@ -808,6 +811,27 @@ impl Render for ChatPane {
             .flex_col()
             .child(div().flex_1().min_h_0().child(self.view.clone()))
     }
+}
+/// The running preview task host's server for a chat attributed to `caller`.
+/// Only the task server: the browser descriptor waits for the browser
+/// server-side preview gate (H5b B7). Without a host the chat launches with
+/// no MCP server, and the first such launch says why.
+fn task_mcp_server(
+    caller: &str,
+    cx: &gpui::App,
+) -> Option<gitterm_core::harness::claude::ClaudeMcpServer> {
+    let server = cx
+        .try_global::<crate::task_host::GpuiTaskHost>()
+        .and_then(|host| host.0.read(cx).claude_mcp_server(caller));
+    if server.is_none() {
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            eprintln!(
+                "Claude preview chats launch without task tools: the preview task host is not running (see its startup error)"
+            )
+        });
+    }
+    server
 }
 fn claude_program() -> Result<PathBuf> {
     find_claude(
