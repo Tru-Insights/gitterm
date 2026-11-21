@@ -322,11 +322,7 @@ impl Render for FilesView {
                 div().flex().flex_shrink_0().p(px(4.)).child(
                     file_button("files-all-folders")
                         .debug_selector(|| "files-all-folders".into())
-                        .border_1()
-                        .border_color(rgb(p.overlay0))
-                        .rounded(px(6.))
-                        .px(px(7.))
-                        .py(px(3.))
+                        .aria_label("← All folders")
                         .hover(move |row| row.bg(rgb(p.overlay)))
                         .text_size(px(font - 1.))
                         .text_color(rgb(p.blue))
