@@ -10,6 +10,8 @@ struct Fixture {
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let protected = ProtectedRoots::new(&dir.path().join("host"), []).unwrap();
+    // A child's environment is only built over a root that exists.
+    fs::create_dir_all(dir.path().join("preview")).unwrap();
     let preview =
         Arc::new(Preview::validate(&dir.path().join("preview"), protected.clone()).unwrap());
     Fixture {
@@ -754,7 +756,7 @@ fn child_env_scrubs_production_service_env_and_pins_the_config_dir() {
         .iter()
         .map(|name| (OsString::from(name), OsString::from("production-secret")))
         .chain([("PATH".into(), "/usr/bin".into())]);
-    let env = context.child_env(inherited);
+    let env = context.child_env(inherited).unwrap();
     assert!(env.iter().all(|(_, value)| value != "production-secret"));
     for name in production.iter().filter(|name| **name != CONFIG_DIR_ENV) {
         assert!(env.iter().all(|(key, _)| key != name), "{name}");
@@ -788,7 +790,7 @@ fn preview_child_env_pins_provider_homes_and_drops_browser_control_env() {
         ("HOME", "/Users/someone"),
     ]
     .map(|(name, value)| (OsString::from(name), OsString::from(value)));
-    let env = context.child_env(inherited);
+    let env = context.child_env(inherited).unwrap();
     assert!(env
         .iter()
         .all(|(_, value)| !value.to_string_lossy().starts_with("/real/")));
@@ -921,4 +923,342 @@ fn production_is_a_distinct_constructor_that_allows_everything() {
     assert_ne!(preview.task_mcp().token(), other.task_mcp().token());
     assert_ne!(preview.task_mcp().token(), production.task_mcp().token());
     assert!(!format!("{preview:?}").contains(preview.task_mcp().token()));
+}
+
+/// The least Git accepts as a Git dir; a common dir needs `objects` and
+/// `refs` too.
+fn git_dir_skeleton(dir: &Path) {
+    fs::create_dir_all(dir.join("objects")).unwrap();
+    fs::create_dir_all(dir.join("refs")).unwrap();
+    fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+}
+
+/// A linked-worktree layout: `checkout/.git` is a `gitdir:` file naming
+/// `git_dir`, whose `commondir` (when given) names the shared repository.
+fn worktree_layout(checkout: &Path, git_dir: &Path, commondir: Option<&str>) {
+    fs::create_dir_all(checkout).unwrap();
+    git_dir_skeleton(git_dir);
+    fs::write(
+        checkout.join(".git"),
+        format!("gitdir: {}\n", git_dir.display()),
+    )
+    .unwrap();
+    if let Some(common) = commondir {
+        fs::write(git_dir.join("commondir"), format!("{common}\n")).unwrap();
+    }
+}
+
+const WORKER_DENIED: &str = "Worker · not available in preview";
+
+#[test]
+fn fixture_gitdir_file_into_protected_root_refused() {
+    let f = fixture();
+    let protected = f.dir.path().join("host/.config/gitterm-v6/worktrees/admin");
+    // The fixture root itself is a worktree whose admin dir is protected state.
+    let root = fixture_repo(f.dir.path(), "fixture");
+    worktree_layout(&root, &protected, None);
+    assert!(ServiceContext::fixture_launch(f.preview.clone(), [root]).is_err());
+
+    // A checkout inside an accepted fixture, redirected into protected state
+    // after the context was built: the decision repeats the check.
+    let good = fixture_repo(f.dir.path(), "good");
+    let context = ServiceContext::fixture_launch(f.preview.clone(), [good.clone()]).unwrap();
+    let checkout = good.join("repo");
+    assert!(context
+        .process(ProcessEffect::Worker, Some(&checkout))
+        .is_ok());
+    worktree_layout(&checkout, &protected, None);
+    for target in [checkout.clone(), checkout.join("src/missing.rs")] {
+        assert_eq!(
+            context
+                .process(ProcessEffect::Worker, Some(&target))
+                .unwrap_err()
+                .notice(),
+            WORKER_DENIED,
+            "{}",
+            target.display()
+        );
+    }
+    // The same layout with its admin dir inside the fixture is allowed.
+    worktree_layout(&checkout, &good.join("admin/worktrees/repo"), None);
+    assert!(context
+        .process(ProcessEffect::Worker, Some(&checkout))
+        .is_ok());
+    // A malformed `.git` file is refused, not ignored.
+    fs::write(checkout.join(".git"), b"not a pointer").unwrap();
+    assert!(context
+        .process(ProcessEffect::Worker, Some(&checkout))
+        .is_err());
+}
+
+#[test]
+fn fixture_commondir_outside_temp_refused() {
+    let f = fixture();
+    // A real checkout outside the temp dir.
+    let outside = std::env::current_dir().unwrap();
+    let temp = fs::canonicalize(std::env::temp_dir()).unwrap();
+    assert!(!fs::canonicalize(&outside).unwrap().starts_with(&temp));
+    let outside_text = outside.display().to_string();
+    for commondir in [
+        outside_text.as_str(),
+        // Relative, as Git writes it, but climbing out of the fixture.
+        "../../../..",
+        // Names nothing: refused rather than treated as absent.
+        "../missing",
+    ] {
+        let root = fixture_repo(f.dir.path(), "fixture");
+        worktree_layout(&root, &root.join("common/worktrees/wt"), Some(commondir));
+        assert!(
+            ServiceContext::fixture_launch(f.preview.clone(), [root.clone()]).is_err(),
+            "{commondir}"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Git's own layout (relative commondir inside the fixture) is accepted,
+    // as a root and as a target.
+    let root = fixture_repo(f.dir.path(), "fixture");
+    git_dir_skeleton(&root.join("common"));
+    worktree_layout(&root, &root.join("common/worktrees/wt"), Some("../.."));
+    let context = ServiceContext::fixture_launch(f.preview.clone(), [root.clone()]).unwrap();
+    let checkout = root.join("repo");
+    worktree_layout(
+        &checkout,
+        &root.join("common/worktrees/repo"),
+        Some("../.."),
+    );
+    assert!(context
+        .process(ProcessEffect::Worker, Some(&checkout))
+        .is_ok());
+    // The checkout's commondir now points at the real checkout.
+    fs::write(
+        root.join("common/worktrees/repo/commondir"),
+        format!("{outside_text}\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        context
+            .process(ProcessEffect::Worker, Some(&checkout))
+            .unwrap_err()
+            .notice(),
+        WORKER_DENIED
+    );
+}
+
+/// Git from the test, clear of the caller's repository and config.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let mut command = std::process::Command::new("git");
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_none_or(|name| name.starts_with("GIT_")) {
+            command.env_remove(name);
+        }
+    }
+    let output = command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {output:?}");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// A real repository beside the fixture (outside it, inside the temp dir).
+fn outside_repo(dir: &Path) -> PathBuf {
+    let outside = dir.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    git(&outside, &["init", "-q", "-b", "main"]);
+    git(&outside, &["commit", "-q", "--allow-empty", "-m", "x"]);
+    fs::canonicalize(outside).unwrap()
+}
+
+#[test]
+fn fixture_gitdir_with_embedded_newline_refused() {
+    let f = fixture();
+    let outside = outside_repo(f.dir.path());
+    let outside_head = fs::read(outside.join(".git/HEAD")).unwrap();
+    let root = fixture_repo(f.dir.path(), "fixture");
+    let context = ServiceContext::fixture_launch(f.preview.clone(), [root.clone()]).unwrap();
+    let root = fs::canonicalize(root).unwrap();
+    let wt = root.join("wt");
+    fs::create_dir_all(&wt).unwrap();
+    fs::create_dir_all(root.join("admin")).unwrap();
+    fs::create_dir_all(root.join("admin\n")).unwrap();
+    // The first line names `admin`, inside the fixture; Git reads the whole
+    // file and lands in the outside repository.
+    let admin = root.join("admin");
+    fs::write(
+        wt.join(".git"),
+        format!("gitdir: {}\n/../../outside/.git\n", admin.display()),
+    )
+    .unwrap();
+    // The layout is a real escape: Git (only reading) resolves it outside.
+    let resolved = git(&wt, &["rev-parse", "--absolute-git-dir"]);
+    assert_eq!(Path::new(resolved.trim_end()), outside.join(".git"));
+    for target in [wt.clone(), wt.join("src/missing.rs")] {
+        assert_eq!(
+            context
+                .process(ProcessEffect::Worker, Some(&target))
+                .unwrap_err()
+                .notice(),
+            WORKER_DENIED
+        );
+    }
+    assert!(ServiceContext::fixture_launch(f.preview.clone(), [wt.clone()]).is_err());
+
+    // Any other control character in a `.git` file or `commondir` is refused
+    // too, a CRLF ending included.
+    git_dir_skeleton(&admin);
+    for text in [
+        format!("gitdir: {}\r\n", admin.display()),
+        format!("gitdir: {}\0\n", admin.display()),
+        format!("gitdir: {}\n\n", admin.display()),
+    ] {
+        fs::write(wt.join(".git"), text.as_bytes()).unwrap();
+        assert!(
+            context.process(ProcessEffect::Worker, Some(&wt)).is_err(),
+            "{text:?}"
+        );
+    }
+    fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+    assert!(context.process(ProcessEffect::Worker, Some(&wt)).is_ok());
+    fs::write(admin.join("commondir"), ".\n/../../../outside/.git\n").unwrap();
+    assert!(context.process(ProcessEffect::Worker, Some(&wt)).is_err());
+
+    // Deciding never wrote through the fixture path.
+    assert_eq!(fs::read(outside.join(".git/HEAD")).unwrap(), outside_head);
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_admin_dirs_resolved_by_git() {
+    use std::os::unix::fs::symlink;
+    let f = fixture();
+    let outside = outside_repo(f.dir.path());
+    let root = fixture_repo(f.dir.path(), "fixture");
+    let context = ServiceContext::fixture_launch(f.preview.clone(), [root.clone()]).unwrap();
+    let root = fs::canonicalize(root).unwrap();
+    let worker = |target: &Path| context.process(ProcessEffect::Worker, Some(target));
+
+    // Git's own layout, a repository and a linked worktree, is allowed.
+    let repo = root.join("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "x"]);
+    git(&repo, &["worktree", "add", "-q", "../wt", "-b", "wt"]);
+    assert!(worker(&repo.join("src")).is_ok());
+    assert!(worker(&root.join("wt")).is_ok());
+
+    // Git keeps a trailing space that a trimming parser drops: `link `
+    // names the outside repository, `link` an admin dir inside.
+    let checkout = root.join("spaced");
+    fs::create_dir_all(&checkout).unwrap();
+    git_dir_skeleton(&root.join("link"));
+    symlink(outside.join(".git"), root.join("link ")).unwrap();
+    fs::write(
+        checkout.join(".git"),
+        format!("gitdir: {} \n", root.join("link").display()),
+    )
+    .unwrap();
+    assert!(worker(&checkout).is_err());
+
+    // A Git dir with no `.git` at all: its own `commondir` names the outside
+    // repository, so Git writes refs there.
+    let bare = root.join("bare");
+    fs::create_dir_all(&bare).unwrap();
+    fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(
+        bare.join("commondir"),
+        format!("{}\n", outside.join(".git").display()),
+    )
+    .unwrap();
+    let common = git(&bare, &["rev-parse", "--git-common-dir"]);
+    assert_eq!(Path::new(common.trim_end()), outside.join(".git"));
+    assert!(worker(&bare).is_err());
+    assert!(worker(&bare.join("refs/heads")).is_err());
+    // The same Git dir sharing a common dir inside the fixture is allowed.
+    fs::write(bare.join("commondir"), "../repo/.git\n").unwrap();
+    assert!(worker(&bare).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn child_env_refuses_swapped_root() {
+    use std::os::unix::fs::symlink;
+    let f = fixture();
+    let preview = ServiceContext::preview(f.preview.clone()).unwrap();
+    let fixture =
+        ServiceContext::fixture_launch(f.preview.clone(), [fixture_repo(f.dir.path(), "fixture")])
+            .unwrap();
+    let production = ServiceContext::production(f.preview.root(), "1").unwrap();
+    for context in [&preview, &fixture, &production] {
+        assert!(context.child_env([]).is_ok());
+    }
+    // Moved away: nothing is at the root any more.
+    let moved = f.dir.path().join("moved");
+    fs::rename(f.preview.root(), &moved).unwrap();
+    assert!(preview.child_env([]).is_err());
+    assert!(fixture.child_env([]).is_err());
+    // Replaced by a link, even to the directory it was.
+    symlink(&moved, f.preview.root()).unwrap();
+    assert!(preview.child_env([]).is_err());
+    assert!(fixture.child_env([]).is_err());
+    // Production pins whatever root it was given, as before.
+    assert!(production.child_env([]).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn path_swapped_after_prep_refused() {
+    use std::os::unix::fs::symlink;
+    let f = fixture();
+    let root = fixture_repo(f.dir.path(), "fixture");
+    let context = ServiceContext::fixture_launch(f.preview.clone(), [root.clone()]).unwrap();
+    let worker = classify_process(ProcessEffect::Worker);
+    let checkout = root.join("repo");
+    let other = root.join("other");
+    fs::create_dir_all(&other).unwrap();
+    let outside = std::env::current_dir().unwrap();
+
+    let granted = context
+        .authorize_targets(worker, &[checkout.clone(), root.join("notes")])
+        .unwrap();
+    assert_eq!(context.recheck(&granted), Ok(()));
+    // Swapped for a link to another folder of the same fixture: still
+    // allowed on its own, but no longer the folder that was authorized.
+    fs::rename(&checkout, root.join("prepared")).unwrap();
+    symlink(&other, &checkout).unwrap();
+    assert!(context.authorize(worker, Some(&checkout)).is_ok());
+    assert_eq!(
+        context.recheck(&granted).unwrap_err().notice(),
+        WORKER_DENIED
+    );
+    // Swapped for a link out of the fixture.
+    fs::remove_file(&checkout).unwrap();
+    symlink(&outside, &checkout).unwrap();
+    assert!(context.recheck(&granted).is_err());
+    // Put back, then its admin dir redirected out of the fixture.
+    fs::remove_file(&checkout).unwrap();
+    fs::rename(root.join("prepared"), &checkout).unwrap();
+    assert_eq!(context.recheck(&granted), Ok(()));
+    fs::write(
+        checkout.join(".git"),
+        format!("gitdir: {}\n", outside.display()),
+    )
+    .unwrap();
+    assert!(context.recheck(&granted).is_err());
+
+    // One denied target denies the set; no target is denied for a write.
+    assert!(context
+        .authorize_targets(worker, &[other.clone(), outside.clone()])
+        .is_err());
+    assert!(context.authorize_targets(worker, &[]).is_err());
+    // Production authorizes and rechecks anything, with no filesystem check.
+    let production = ServiceContext::production(f.preview.root(), "1").unwrap();
+    let granted = production
+        .authorize_targets(worker, std::slice::from_ref(&outside))
+        .unwrap();
+    assert_eq!(production.recheck(&granted), Ok(()));
 }
