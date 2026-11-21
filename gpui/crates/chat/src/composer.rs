@@ -39,6 +39,22 @@ pub struct SlashCommand {
     pub argument_hint: String,
 }
 
+/// One entry of Iced's checkout menu: a label, its detail line and the directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutChoice {
+    pub label: String,
+    pub detail: String,
+    pub path: String,
+}
+/// Source of the menu entries, asked again each time the menu opens.
+pub type CheckoutSource = std::rc::Rc<dyn Fn() -> Vec<CheckoutChoice>>;
+
+pub const MODE_TOOLTIP: &str = "Permission mode (Shift+Tab in the message box cycles)";
+pub const REVIEW_TOOLTIP: &str =
+    "Ask a Claude subagent or Codex to review this checkout, or consult them";
+pub const CHECKOUT_LOCKED_REASON: &str = "Set when the chat started; start a new chat to change it";
+pub const NOT_IN_PREVIEW: &str = "not available in preview";
+
 #[derive(Debug, Default)]
 pub struct ComposerState {
     pub queue: Vec<QueuedRow>,
@@ -57,6 +73,19 @@ pub struct ComposerState {
     pub picker: Option<crate::pickers::Picker>,
     pub pending_setting: Option<gitterm_core::chat::types::SettingChange>,
     pub backend: Option<gitterm_core::chat::types::AgentBackend>,
+    /// Picks made before the session was ready. They show as the chip value at
+    /// once and are sent when it starts, as Iced applies a pre-start choice.
+    pub prestart: Vec<gitterm_core::chat::types::SettingChange>,
+    /// One picker change is in flight; the next waits for its acknowledgement.
+    pub(crate) prestart_sent: bool,
+    pub(crate) confirmed: gitterm_core::chat::state::AcknowledgedSettings,
+    pub model_tooltip: String,
+    pub effort_tooltip: String,
+    /// Why the checkout can no longer change; `None` until the chat has started.
+    pub checkout_locked: Option<String>,
+    pub checkout_choices: Vec<CheckoutChoice>,
+    /// Preview shows a pick that Iced would persist as `<label> · not available in preview`.
+    pub checkout_notice: Option<String>,
     started_at_ms: Option<u64>,
     ended_at_ms: Option<u64>,
     output_tokens: Option<u64>,
@@ -77,6 +106,37 @@ impl ComposerState {
         format!("Withdraw this message ({harness} keeps working)")
     }
 
+    /// Iced's `title` for a chip; the checkout one adds its lock reason below the path.
+    pub fn chip_tooltip(&self, id: &str, read_only: Option<&str>) -> Option<String> {
+        match id {
+            "review" => Some(REVIEW_TOOLTIP.into()),
+            "model" => Some(self.model_tooltip.clone()),
+            "effort" => Some(self.effort_tooltip.clone()),
+            "mode" => Some(MODE_TOOLTIP.into()),
+            "checkout" => Some(format!(
+                "{}\n{}",
+                self.checkout_path.as_deref().unwrap_or_default(),
+                read_only
+                    .map(str::to_owned)
+                    .or_else(|| self.checkout_locked.clone())
+                    .unwrap_or_else(|| "Where this chat runs".into())
+            )),
+            _ => None,
+        }
+    }
+    /// Iced sets the Send title only while it can queue a message.
+    pub fn send_tooltip(&self, blocked: bool) -> Option<String> {
+        (self.streaming && !blocked).then(|| {
+            match self.backend {
+                Some(gitterm_core::chat::types::AgentBackend::Acp(agent)) => format!(
+                    "{} is working: the message is queued and sent when this turn ends",
+                    agent.label()
+                ),
+                _ => "Claude is working: the message is queued and Claude reads it at its next step"
+                    .to_string(),
+            }
+        })
+    }
     fn is_acp(&self) -> bool {
         matches!(
             self.backend,
@@ -85,12 +145,36 @@ impl ComposerState {
     }
     pub fn project(&mut self, state: &State, effects: Option<&EventEffects>) {
         let was_pending = self.pending_setting.is_some();
-        self.catalog = crate::pickers::Catalog::project(state, self.is_acp());
+        let mut acknowledged = state.acknowledged.clone();
+        for change in &self.prestart {
+            use gitterm_core::chat::types::SettingChange as C;
+            match change {
+                C::Model(value) => acknowledged.model = Some(value.clone()),
+                C::Mode(value) => acknowledged.mode = Some(value.clone()),
+                C::Effort(value) => {
+                    acknowledged.effort = Some(gitterm_core::chat::state::ConfirmedEffort {
+                        effort: value.clone(),
+                        applied: None,
+                    })
+                }
+            }
+        }
+        self.catalog = crate::pickers::Catalog::project_with(state, &acknowledged, self.is_acp());
         self.pending_setting = state.pending_change().cloned();
+        if was_pending && self.pending_setting.is_none() && self.prestart_sent {
+            self.prestart_sent = false;
+            if !self.prestart.is_empty() {
+                self.prestart.remove(0);
+            }
+        }
+        self.confirmed = state.acknowledged.clone();
         if (was_pending && self.pending_setting.is_none())
             || self
                 .picker
-                .is_some_and(|picker| self.catalog.options(picker).is_empty())
+                .is_some_and(|picker| {
+                    picker != crate::pickers::Picker::Checkout
+                        && self.catalog.options(picker).is_empty()
+                })
             || effects.is_some_and(|effects| {
                 !effects.notices.is_empty() || effects.settings_changed.is_some()
             })
@@ -205,7 +289,7 @@ impl ComposerState {
                 }
                 _ => None,
             });
-        let confirmed_model = state.acknowledged.model.as_deref();
+        let confirmed_model = acknowledged.model.as_deref();
         let base_model = confirmed_model.map(|value| {
             if self.is_acp() {
                 value
@@ -246,7 +330,7 @@ impl ComposerState {
                 }
             },
         );
-        self.mode = state.acknowledged.mode.as_deref().map_or_else(
+        self.mode = acknowledged.mode.as_deref().map_or_else(
             || "Mode".into(),
             |value| {
                 ready
@@ -264,7 +348,7 @@ impl ComposerState {
                     .into()
             },
         );
-        self.effort = state.acknowledged.effort.as_ref().map_or_else(
+        self.effort = acknowledged.effort.as_ref().map_or_else(
             || "Effort".into(),
             |effort| {
                 let label = crate::pickers::effort_name(effort.effort.as_deref());
@@ -290,6 +374,44 @@ impl ComposerState {
         // The reducer owns the acknowledged path; the host's current-checkout
         // label is stable even when its absolute path changes.
         self.checkout = "Current checkout".into();
+        self.checkout_locked = (state.session_id.is_some()
+            || state.conversation.iter().any(|event| {
+                matches!(
+                    event,
+                    AgentEvent::Harness(HarnessEvent::TurnStarted { .. })
+                ) || matches!(event, AgentEvent::Other(value) if value["type"] == "user_prompt")
+            }))
+        .then(|| CHECKOUT_LOCKED_REASON.to_string());
+        self.model_tooltip = format!("Model: {}", confirmed_model.unwrap_or_default());
+        let effort_supported = self.catalog.efforts.iter().any(|row| {
+            matches!(
+                row.change,
+                gitterm_core::chat::types::SettingChange::Effort(_)
+            )
+        });
+        self.effort_tooltip = {
+            let mut text = if !effort_supported {
+                "This model has no effort setting".to_string()
+            } else {
+                let mut text = "Effort".to_string();
+                if let Some(effort) = &acknowledged.effort
+                    && effort.effort.is_none()
+                    && let Some(applied) = &effort.applied
+                {
+                    text.push_str(&format!(" (auto runs at {applied})"));
+                }
+                text
+            };
+            if !self.is_acp() {
+                let context = if confirmed_model.is_some_and(|value| value.ends_with("[1m]")) {
+                    "1M"
+                } else {
+                    "200k"
+                };
+                text.push_str(&format!(" · context window {context}"));
+            }
+            text
+        };
         self.checkout_path = state
             .checkout
             .as_ref()
@@ -351,7 +473,12 @@ impl ComposerState {
             ("model", self.model.clone()),
             ("effort", self.effort.clone()),
             ("mode", self.mode.clone()),
-            ("checkout", self.checkout.clone()),
+            (
+                "checkout",
+                self.checkout_notice
+                    .clone()
+                    .unwrap_or_else(|| self.checkout.clone()),
+            ),
             ("guidelines", "guidelines".into()),
         ]
     }
@@ -564,10 +691,11 @@ mod ui {
                 }).flatten())
                 .child(div().flex().items_center().gap(px(6.))
                     .child(div().flex_1())
-                    .child(Button::new("send").debug_selector(|| "composer-send".into())
+                    .child({ let send = Button::new("send").debug_selector(|| "composer-send".into())
                         .child(div().text_size(px(appearance.size(13.))).child("Send")).px(px(14.)).py(px(5.)).h_auto().bg(rgb(palette.accent)).text_color(rgb(palette.base))
                         .disabled(send_blocked)
-                        .on_click(cx.listener(|view, _, window, cx| view.send(window, cx))))
+                        .on_click(cx.listener(|view, _, window, cx| view.send(window, cx)));
+                        match self.send_tooltip(disabled || self.pending_request) { Some(tip) => send.tooltip(tip), None => send } })
                     .child(Button::new("stop").child(div().text_size(px(appearance.size(13.))).child("Stop")).px(px(14.)).py(px(5.)).h_auto().bg(rgb(palette.err)).text_color(rgb(palette.base))
                         .disabled(disabled || !self.streaming)
                         .on_click(cx.listener(|view, _, _, cx| view.stop(cx)))))
@@ -583,7 +711,11 @@ mod ui {
                         let mut chip = Button::new(gpui::SharedString::from(format!("composer-{id}")))
                             .debug_selector(move || format!("composer-{id}"))
                             .child(div().font_family("Menlo").text_size(px(appearance.size(12.))).child(label))
-                            .disabled(if id == "review" { !matches!(self.backend, Some(gitterm_core::chat::types::AgentBackend::Claude)) } else { disabled || !self.commands_ready || crate::pickers::Picker::from_chip(id).is_none_or(|picker| self.catalog.options(picker).is_empty()) })
+                            .disabled(match id {
+                                "review" => !matches!(self.backend, Some(gitterm_core::chat::types::AgentBackend::Claude)),
+                                "checkout" => disabled || self.checkout_locked.is_some(),
+                                _ => disabled || crate::pickers::Picker::from_chip(id).is_none_or(|picker| self.catalog.options(picker).is_empty()),
+                            })
                             .on_click(cx.listener(move |view, _, window, cx| {
                                 if id == "review" { view.toggle_review(window, cx); }
                                 else if let Some(picker) = crate::pickers::Picker::from_chip(id) { view.toggle_picker(picker, window, cx); }
@@ -600,11 +732,32 @@ mod ui {
                         if let Some(icon) = icon {
                             chip = chip.icon(gpui_component::Icon::default().data(icon).size(px(12.)));
                         }
-                        if id == "checkout" && let Some(path) = &self.checkout_path { chip = chip.tooltip(path.clone()); }
+                        if let Some(tip) = self.chip_tooltip(id, unavailable.as_deref()) { chip = chip.tooltip(tip); }
                         chip.into_any_element()
                     }))
                     .children(review.open.then(|| review.render(self.streaming || self.pending_request, appearance, cx))))
-                .children(self.picker.filter(|_| !disabled).map(|picker| {
+                .children(self.picker.filter(|picker| !disabled && *picker == crate::pickers::Picker::Checkout).map(|_| {
+                    div().id("checkout-picker").debug_selector(|| "checkout-picker".into())
+                        .absolute().bottom(gpui::relative(1.)).left_0().w(px(380.)).max_h(px(360.)).overflow_y_scroll()
+                        .flex().flex_col().p(px(6.)).bg(rgb(palette.block)).border_1().border_color(rgb(palette.strong)).rounded(px(6.))
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .child(div().text_color(rgb(palette.muted)).child("Run this chat in"))
+                        .children(self.checkout_choices.iter().enumerate().map(|(index, choice)| {
+                            let (path, label) = (choice.path.clone(), choice.label.clone());
+                            let current = self.checkout_path.as_deref() == Some(choice.path.as_str());
+                            Button::new(gpui::SharedString::from(format!("checkout-option-{index}")))
+                                .debug_selector(move || format!("checkout-option-{index}"))
+                                .w_full().h_auto().justify_start()
+                                .on_click(cx.listener(move |view, _, window, cx| {
+                                    view.choose_checkout(&path, &label, window, cx);
+                                    cx.stop_propagation();
+                                }))
+                                .child(div().flex().flex_col().items_start()
+                                    .child(format!("{} {}", if current { "✓" } else { " " }, choice.label))
+                                    .children((!choice.detail.is_empty()).then(|| div().text_color(rgb(palette.muted)).child(choice.detail.clone()))))
+                        }))
+                }))
+                .children(self.picker.filter(|picker| !disabled && *picker != crate::pickers::Picker::Checkout).map(|picker| {
                     let options = self.catalog.options(picker);
                     div().id("setting-picker").debug_selector(|| "setting-picker".into())
                         .absolute().bottom(gpui::relative(1.)).left_0().w(px(380.)).max_h(px(360.)).overflow_y_scroll()
@@ -622,7 +775,7 @@ mod ui {
                                         cx.stop_propagation();
                                     }))
                                     .child(div().flex().flex_col().items_start()
-                                        .child(format!("{} {}", if row.selected { "✓" } else { " " }, row.label))
+                                        .child(format!("{} {}", if row.selected { "✓" } else if self.pending_setting.as_ref() == Some(&row.change) { "…" } else { " " }, row.label))
                                         .children((!row.description.is_empty()).then(|| div().text_color(rgb(palette.muted)).child(row.description.clone())))))
                         }))
                 }))
