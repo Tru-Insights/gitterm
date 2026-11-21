@@ -365,3 +365,146 @@ fn missing_unrelated_repo_is_optional_and_queued_checks_do_not_read_the_filesyst
         gitterm::tasks::DelegationStatus::Failed { .. }
     ));
 }
+
+fn pending_start(app: &App, id: &str) -> Option<delegation_state::RequestId> {
+    app.delegation_state.pending_start(id)
+}
+
+fn store_consult(app: &mut App, id: &str) {
+    let caller = app.delegation_caller_for_tab(10).unwrap();
+    let identity = app.delegation_identity(&caller.session_uid).unwrap();
+    app.delegation_state.reduce(DelegationIntent::Stored {
+        id: id.into(),
+        caller: identity,
+        authority: fixture_authority(&caller),
+    });
+    let new = gitterm::delegations::consult_delegation(
+        &task_mcp::ConsultDelegationRequest {
+            brief: "Inspect the parser".into(),
+            ..Default::default()
+        },
+        &caller,
+        None,
+        None,
+    )
+    .unwrap();
+    let mut delegation = gitterm::tasks::Delegation::new_requested(new, "t0");
+    delegation.delegation_id = id.into();
+    app.task_host
+        .store_mut()
+        .as_mut()
+        .unwrap()
+        .insert_delegation(delegation)
+        .unwrap();
+}
+
+/// A fresh Codex reading `step` seconds after the previous one.
+fn codex_reading(app: &mut App, step: i64, weekly: f64, five_hour: f64) {
+    use gitterm::plan_limits::{LimitWindow, PlanLimits, Provider};
+    let now = chrono::Utc::now().timestamp() + step;
+    assert!(app.plan_limits.finish_codex_read(Some(Box::new(PlanLimits {
+        provider: Provider::Codex,
+        observed_at: now,
+        local: Some(true),
+        windows: vec![
+            LimitWindow {
+                label: "5h".into(),
+                used_percent: Some(five_hour),
+                resets_at: Some(now + 3 * 3600),
+            },
+            LimitWindow {
+                label: "7d".into(),
+                used_percent: Some(weekly),
+                resets_at: Some(now + 86_400),
+            },
+        ],
+        alerts: vec![],
+        plan_type: None,
+        credits: None,
+    }))));
+}
+
+fn delegation_status(app: &App, id: &str) -> gitterm::tasks::DelegationStatus {
+    app.task_host
+        .store()
+        .as_ref()
+        .unwrap()
+        .delegation(id)
+        .unwrap()
+        .status
+        .clone()
+}
+
+#[test]
+fn queued_start_rechecks_policy_trust_and_batch_capacity() {
+    use gitterm::tasks::DelegationStatus;
+    if isolated(
+        "queued_start_rechecks_policy_trust_and_batch_capacity",
+        "delegations",
+    ) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let _trace = Trace::start();
+    let mut app = delegation_app(dir.path());
+    app.review_config.max_concurrent_reviews = 2;
+    for id in ["a", "b", "c", "d"] {
+        store_consult(&mut app, id);
+    }
+    // Batch capacity: two slots, so admission reserves a and b only, and
+    // both checks returning in one batch start both.
+    let _unpolled = app.start_queued_delegations();
+    assert!(pending_start(&app, "a").is_some() && pending_start(&app, "b").is_some());
+    assert!(pending_start(&app, "c").is_none() && pending_start(&app, "d").is_none());
+    complete_checks(&mut app);
+    assert!(app.delegation_runs.contains_key("a") && app.delegation_runs.contains_key("b"));
+    let _unpolled = app.start_queued_delegations();
+    assert!(pending_start(&app, "c").is_none() && pending_start(&app, "d").is_none());
+
+    // Policy: a and b finish and free both slots; c and d are admitted, then
+    // a burst hold arrives before their checks return. The batch shares one
+    // running count: c sees d reserved (parallel) and is refused, d then runs
+    // alone (serial).
+    for id in ["a", "b"] {
+        let _unpolled = app.finish_delegation(
+            id,
+            Err(gitterm::delegations::RunFailure::Failed("fixture".into())),
+        );
+    }
+    assert!(pending_start(&app, "c").is_some() && pending_start(&app, "d").is_some());
+    codex_reading(&mut app, 0, 10.0, 85.0);
+    complete_checks(&mut app);
+    assert!(!app.delegation_runs.contains_key("c"));
+    assert!(app.delegation_runs.contains_key("d"));
+    assert_eq!(delegation_status(&app, "c"), DelegationStatus::Requested);
+    assert!(pending_start(&app, "c").is_none());
+
+    // A weekly hold refuses a re-admitted c at its check, without failing it.
+    codex_reading(&mut app, 1, 10.0, 10.0);
+    let _unpolled = app.start_queued_delegations();
+    assert!(pending_start(&app, "c").is_some());
+    codex_reading(&mut app, 2, 99.0, 10.0);
+    complete_checks(&mut app);
+    assert!(!app.delegation_runs.contains_key("c"));
+    assert_eq!(delegation_status(&app, "c"), DelegationStatus::Requested);
+
+    // Trust: the hold lifts, c is admitted again, but its checkout changed
+    // while it was checked. The paid attempt fails and is never retried.
+    codex_reading(&mut app, 3, 10.0, 10.0);
+    let _unpolled = app.start_queued_delegations();
+    let check = pending_start(&app, "c").expect("c is re-admitted");
+    let caller = app.delegation_caller_for_tab(10).unwrap();
+    let mut moved = fixture_authority(&caller);
+    moved.checkout = dir.path().join("elsewhere");
+    let _unpolled = app.delegation_start_checked("c".into(), check, Ok(moved));
+    assert!(!app.delegation_runs.contains_key("c"));
+    match delegation_status(&app, "c") {
+        DelegationStatus::Failed { message } => {
+            assert!(message.contains("checkout changed"), "{message}")
+        }
+        other => panic!("c is {other:?}"),
+    }
+    let _unpolled = app.start_queued_delegations();
+    assert!(pending_start(&app, "c").is_none());
+    assert!(!app.delegation_runs.contains_key("c"));
+}
