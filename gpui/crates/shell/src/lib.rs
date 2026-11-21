@@ -1194,12 +1194,14 @@ fn subscribe_dock(state: &WorkspaceDock, cx: &mut Context<Shell>) -> Subscriptio
         let removed: Vec<_> = state
             .panes
             .iter()
-            .filter(|(_, pane)| {
+            .filter(|(id, pane)| {
                 matches!(pane.read(cx).content, pane::PaneContent::Content(_))
                     && dock
                         .read(cx)
                         .panel(PanelId::from(pane.entity_id()))
                         .is_none()
+                    // Iced keeps a closed Page hidden, not destroyed.
+                    && this.content.read(cx).page(id).is_none()
             })
             .map(|(id, _)| id.clone())
             .collect();

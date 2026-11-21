@@ -78,9 +78,14 @@ impl Shell {
             pane: pane.entity_id().as_u64(),
             source: url.clone().into(),
         };
+        let routes = self
+            .work_sidebars
+            .get(&workspace)
+            .map(|sidebar| sidebar.read(cx).page_routes())
+            .unwrap_or_default();
         self.selected_files.remove(&workspace);
         self.content.update(cx, |content, cx| {
-            content.open_page(id.clone(), url, store, origin, window, cx);
+            content.open_page(id.clone(), url, store, routes, origin, window, cx);
             content.select(Some(id.clone()));
             content.visits.insert(
                 workspace,

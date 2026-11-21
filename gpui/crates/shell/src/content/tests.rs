@@ -530,39 +530,48 @@ fn rendered_document_preserves_controls_selection_and_scroll_content() {
 }
 
 #[test]
-fn page_links_keep_known_services_embedded_and_send_others_out() {
-    use super::host::{DocumentNavigation as N, page_navigation};
-    for url in [
-        "https://github.com/example/gitterm/pull/1",
-        "https://linear.app/sample-a/issue/SAMPLE-1/x",
-        "https://accounts.google.com/signin",
-    ] {
-        assert_eq!(page_navigation(Some(url), false, true), N::Allow, "{url}");
-        assert_eq!(
-            page_navigation(Some(url), true, false),
-            N::External,
-            "{url}"
-        );
-    }
-    for url in [
-        "https://example.com/",
-        "http://github.com/x",
-        "https://github.com:8443/x",
-        "https://user@github.com/x",
-    ] {
-        assert_eq!(
-            page_navigation(Some(url), false, true),
-            N::External,
-            "{url}"
-        );
-    }
-    assert_eq!(
-        page_navigation(Some("https://example.com/frame"), false, false),
-        N::Allow
-    );
+fn page_policy_wraps_the_shared_decision_like_iced_wry_handlers() {
+    use super::host::{PagePolicy, PageRequest as R};
+    use gitterm_core::{page_navigation::PageNavigationContext, page_store::PageStore};
+    let origin = "https://github.com/example/gitterm/pull/1";
+    let mut policy = PagePolicy::new(PageNavigationContext {
+        url: origin.into(),
+        store: PageStore::GitHub("sample-login".into()),
+        github_accounts: [("example".to_string(), "sample-login".to_string())].into(),
+        linear_workspaces: ["sample-a".to_string()].into(),
+    });
+    // Popups open in the browser and embedded frames load in place, whatever
+    // the decision table says; only HTTP(S) is ever loaded or opened.
+    assert!(!policy.decide(Some(origin), true, false));
+    assert!(policy.decide(Some("https://example.com/frame"), false, false));
     for url in [Some("file:///etc/hosts"), Some("about:blank"), None] {
-        assert_eq!(page_navigation(url, false, true), N::Cancel, "{url:?}");
+        for (popup, main) in [(false, true), (true, false), (false, false)] {
+            assert!(!policy.decide(url, popup, main), "{url:?}");
+        }
     }
+    assert_eq!(policy.drain(), vec![R::External(origin.into())]);
+    // Main-frame navigations follow the shared decision.
+    let next = "https://github.com/example/gitterm/pull/2";
+    assert!(policy.decide(Some(next), false, true));
+    assert_eq!(
+        policy.context.url, next,
+        "the next redirect leaves this page"
+    );
+    let foreign = "https://example.com/";
+    assert!(!policy.decide(Some(foreign), false, true));
+    let issue = "https://linear.app/sample-a/issue/SAMPLE-1/x";
+    assert!(!policy.decide(Some(issue), false, true));
+    assert!(!policy.decide(Some("javascript:alert(1)"), false, true));
+    assert_eq!(
+        policy.drain(),
+        vec![
+            R::Navigated(next.into()),
+            R::External(foreign.into()),
+            R::Reopen(issue.into(), PageStore::Linear("sample-a".into())),
+        ]
+    );
+    assert_eq!(policy.context.url, next);
+    assert!(policy.drain().is_empty());
     assert_eq!(
         super::host::uuid_string([
             0xa9, 0x0d, 0x78, 0xb9, 0x36, 0xe7, 0x7e, 0x9f, 0x1e, 0xe4, 0x3b, 0x89, 0xd3, 0xf8,
