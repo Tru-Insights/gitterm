@@ -440,8 +440,14 @@ fn opening_a_review_file_asks_the_host_to_open_its_worktree_path(cx: &mut TestAp
     let (view, cx) = open_view(cx, repo.path(), host);
     view.update_in(cx, |view, _, cx| {
         view.selected = Some("hello.rs".into());
-        view.open_selected_file(cx);
-        assert!(view.error.is_none());
+        cx.notify();
     });
+    cx.run_until_parked();
+    // Iced's per-file Open button (not the title) opens the worktree file.
+    let open = cx
+        .debug_bounds("aggregate-open")
+        .expect("Open button is shown for a worktree file");
+    cx.simulate_click(open.center(), gpui::Modifiers::none());
+    view.read_with(cx, |view, _| assert!(view.error.is_none()));
     assert_eq!(*opened.borrow(), [repo.path().join("hello.rs")]);
 }

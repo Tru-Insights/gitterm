@@ -10,7 +10,8 @@ use gitterm_core::{
 };
 use gpui::{
     Context, InteractiveElement, IntoElement, ListHorizontalSizingBehavior, ParentElement, Render,
-    StatefulInteractiveElement, Styled, Window, div, px, rgb, uniform_list,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px, rgb,
+    uniform_list,
 };
 use gpui_component::{
     Disableable, Selectable, Sizable,
@@ -590,20 +591,25 @@ impl Render for AggregateView {
                     .flex()
                     .items_center()
                     .gap_3()
-                    .child({
-                        let name = div()
-                            .id("aggregate-open")
+                    .child(
+                        div()
                             .flex_1()
                             .font_family(MONO_FONT)
                             .text_size(px(12.5))
-                            .child(format!("{title}  +{} −{}", file.additions, file.deletions));
-                        // Iced's Open button's outcome, on the file's own title.
-                        if can_open {
-                            name.cursor_pointer()
-                                .on_click(cx.listener(|view, _, _, cx| view.open_selected_file(cx)))
-                        } else {
-                            name
-                        }
+                            .child(format!("{title}  +{} −{}", file.additions, file.deletions)),
+                    )
+                    // Iced's per-file Open button, before Viewed (review_pane.rs render_file).
+                    .when(can_open, |row| {
+                        row.child(
+                            div().debug_selector(|| "aggregate-open".into()).child(
+                                Button::new("aggregate-open")
+                                    .small()
+                                    .label("Open")
+                                    .on_click(
+                                        cx.listener(|view, _, _, cx| view.open_selected_file(cx)),
+                                    ),
+                            ),
+                        )
                     })
                     .child(
                         Button::new("aggregate-viewed")
