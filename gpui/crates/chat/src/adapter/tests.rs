@@ -808,11 +808,13 @@ fn exit_projects_core_unsent_versus_uncertain_without_resend() {
                 PromptStatus::Unsent
             }
         );
-        assert!(
-            composer.queue[0]
-                .label()
-                .contains(if written { "Uncertain" } else { "Unsent" })
-        );
+        let tag = composer.queued_tag("synthetic-message", false).unwrap();
+        assert!(tag.label.starts_with(if written {
+            "Delivery uncertain"
+        } else {
+            "Not sent"
+        }));
+        assert_eq!(tag.withdraw, None);
         assert_eq!(composer.queue[0].text, "synthetic draft");
         assert!(!composer.queue[0].withdrawable());
     }

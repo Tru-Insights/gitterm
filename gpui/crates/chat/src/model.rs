@@ -59,6 +59,8 @@ pub struct Row {
     pub tool: Option<Tool>,
     pub decision: Option<DecisionState>,
     pub request: Option<Request>,
+    /// The prompt's message id, so its bubble can show the queued state (C04).
+    pub prompt_id: Option<String>,
 }
 impl Row {
     pub fn collapsible(&self) -> bool {
@@ -324,6 +326,7 @@ impl ChatModel {
             tool: None,
             decision: None,
             request: None,
+            prompt_id: None,
         });
         self.next_id += 1;
         index
@@ -701,6 +704,7 @@ impl ChatModel {
                 }
                 if let Some(id) = id {
                     self.prompts.insert(id.clone(), index);
+                    self.rows[index].prompt_id = Some(id.clone());
                 }
                 changed.push(index);
             }
