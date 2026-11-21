@@ -10,6 +10,7 @@ pub mod bottom_panel;
 mod center_tests;
 mod chat;
 pub mod connect_form;
+pub mod phone;
 pub mod content;
 #[cfg(test)]
 mod content_shell_tests;
@@ -3768,6 +3769,7 @@ impl Shell {
             || self.park_sheet.is_some()
             || self.new_work_sheet.is_some()
             || self.settings_sheet.is_some()
+            || self.phone_panel().is_some()
             || Self::has_dialog(window, cx)
         {
             cx.propagate();
@@ -3879,6 +3881,7 @@ impl Shell {
                 || self.park_sheet.is_some()
                 || self.new_work_sheet.is_some()
             || self.settings_sheet.is_some()
+                || self.phone_panel().is_some()
                 || Self::has_dialog(window, cx)
                 || self
                     .focused_terminal(window, cx)
@@ -3977,7 +3980,8 @@ impl Render for Shell {
                 || self.session_picker.is_some()
                 || self.park_sheet.is_some()
                 || self.new_work_sheet.is_some()
-            || self.settings_sheet.is_some();
+            || self.settings_sheet.is_some()
+                || self.phone_panel().is_some();
             content.sync_covers(window, cx);
         });
         self.ensure_work_sidebars(window, cx);

@@ -20,12 +20,12 @@ use std::{
 };
 
 #[derive(Default)]
-struct FakeRemote {
+pub(crate) struct FakeRemote {
     calls: Mutex<Vec<String>>,
 }
 
 impl FakeRemote {
-    fn calls(&self) -> Vec<String> {
+    pub(crate) fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
     fn record(&self, call: String) {
@@ -113,13 +113,13 @@ impl RemoteClient for FakeRemote {
     }
 }
 
-fn draw(cx: &mut VisualTestContext) {
+pub(crate) fn draw(cx: &mut VisualTestContext) {
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
     cx.run_until_parked();
 }
 
-fn click(selector: &str, cx: &mut VisualTestContext) {
+pub(crate) fn click(selector: &str, cx: &mut VisualTestContext) {
     let selector: &'static str = selector.to_owned().leak();
     draw(cx);
     let bounds = cx
@@ -130,7 +130,7 @@ fn click(selector: &str, cx: &mut VisualTestContext) {
 }
 
 /// Every file under the Iced fixture dir, for byte-identical checks.
-fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+pub(crate) fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     let mut files: Vec<_> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -143,14 +143,14 @@ fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     files
 }
 
-struct Fixture {
-    root: tempfile::TempDir,
-    shell: Entity<Shell>,
-    fake: Arc<FakeRemote>,
+pub(crate) struct Fixture {
+    pub(crate) root: tempfile::TempDir,
+    pub(crate) shell: Entity<Shell>,
+    pub(crate) fake: Arc<FakeRemote>,
 }
 
 impl Fixture {
-    fn iced(&self) -> PathBuf {
+    pub(crate) fn iced(&self) -> PathBuf {
         self.root.path().join("iced")
     }
     fn local(&self) -> PathBuf {
@@ -158,7 +158,7 @@ impl Fixture {
     }
 }
 
-fn fixture(cx: &mut TestAppContext) -> (Fixture, &mut VisualTestContext) {
+pub(crate) fn fixture(cx: &mut TestAppContext) -> (Fixture, &mut VisualTestContext) {
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     cx.update(install_app_menus);
@@ -225,7 +225,7 @@ fn notice(f: &Fixture, cx: &mut VisualTestContext) -> Option<String> {
     cx.read(|cx| f.shell.read(cx).owner.read(cx).error.clone())
 }
 
-fn bar(f: &Fixture, outcome: workspace_bar::Outcome, cx: &mut VisualTestContext) {
+pub(crate) fn bar(f: &Fixture, outcome: workspace_bar::Outcome, cx: &mut VisualTestContext) {
     f.shell.update_in(cx, |shell, window, cx| {
         shell.bar_outcome(outcome, window, cx)
     });

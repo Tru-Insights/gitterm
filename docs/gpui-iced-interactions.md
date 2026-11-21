@@ -39,7 +39,7 @@ Each row is a control or a repeated control family whose instances share behavio
 
 ## Verdict counts
 
-Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this refresh the map showed 143 MATCH and 193 DIFF; it now shows 209 MATCH, 83 PREVIEW and 44 DIFF (336 rows; counts taken from the row verdicts) after the TRU-274 small-parity pass and the PR confirmation panel (D23, D23b).
+Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this refresh the map showed 143 MATCH and 193 DIFF; it now shows 211 MATCH, 87 PREVIEW and 38 DIFF (336 rows; counts taken from the row verdicts) after the TRU-274 small-parity pass, the GPUI phone pairing panel (PR 26c: A12g, T12–T12e) and the PR confirmation panel (PR 22b: D23, D23b).
 
 | Section | MATCH | PREVIEW | DIFF |
 | --- | ---: | ---: | ---: |
@@ -53,10 +53,10 @@ Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this
 | Bottom panel and terminal find | 16 | 1 | 0 |
 | Workspace bar, menus, settings | 12 | 23 | 1 |
 | Sheets and dialogs | 27 | 9 | 0 |
-| Task detail and other dialogs | 4 | 7 | 31 |
+| Task detail and other dialogs | 6 | 11 | 25 |
 | Usage page | 8 | 2 | 0 |
 | Native menus and shortcuts | 23 | 4 | 2 |
-| **Total** | **209** | **83** | **44** |
+| **Total** | **211** | **87** | **38** |
 
 `PREVIEW` means a deliberate preview limit (write/launch control shows "not available in preview"), kept until cutover.
 
@@ -332,7 +332,7 @@ Sources: [Iced bar](../src/main.rs#L37831), [repos/more menus](../src/main.rs#L3
 | A12d repos zone **W (UI)** | `Keep repos in this menu only` / `Show repos on the bar too` | Absent | I row H/status; G native selection hints | Click | `ToggleReposZone` | — | **PREVIEW** entry present, preview control (workspace_bar.rs:767). |
 | A12e machine chats **R** | `Show {machine} chats` | Same | I row H/status; G native selection hints | Click | `ShowMachineChats` → scoped Find | `ShowMachineChats(key)` → Find, Everywhere, only that machine open; remote index via `RemoteClient::list_chats` | **MATCH** machine-to-Find shortcut. |
 | A12f reconnect **W/X** | Disconnected machine: `Reconnect…` | Absent | I row H/status; G native selection hints | Click | `MachineReconnect` → connection workflow | — | **PREVIEW** `Reconnect…` present, preview control (workspace_bar.rs:778). |
-| A12g phone pairing **W/X** | Eligible machine: `Pair a phone…` | Absent | I row H/status; G native selection hints | Click | `PhonePanelOpen` | — | **PREVIEW** `Pair a phone…` present, preview control (workspace_bar.rs:781). |
+| A12g phone pairing **W/X** | Eligible machine: `Pair a phone…` | Absent | I row H/status; G native selection hints | Click | `PhonePanelOpen` | — | **PREVIEW** `Pair a phone…` opens the panel (`Outcome::PairPhone`, remote_shell.rs `open_phone_panel`). Offered only when `Machine.serves_phones`, which GPUI never sets (it makes no handshake), so the entry does not appear in the app yet. |
 | A12h remote workspace **P/W** | `+ {remote workspace}` | Absent | I row H/status; G native selection hints | Click | `RemoteWorkspaceOpen` → remote workspace/session | — | **PREVIEW** `+ {remote workspace}` present, preview control (workspace_bar.rs:1180-1190). |
 | A13 new workspace | `+`, T `New workspace` | Same | Delayed hint; native T | Click | `NewWorkOpen` | Mounted override → `open_recent_work_sheet` | **MATCH** sheet entry; creation itself differs (D08). |
 | A14 browser **P/X** | Browser outline; running/focus, stopped/error/open, busy disabled, driving highlight | Muted browser outline, always supplied Open; no driving state | I stateful hint; G `Browser` | Click when enabled | `BrowserOpen` / `BrowserFocus` | `Browser(Open)` → unavailable | **PREVIEW** `Browser` → "Browser" preview notice (sessions.rs:~385); state always idle (lib.rs:1676). |
@@ -427,12 +427,12 @@ These are part of the navigation reached from Work, session-strip task context a
 | T11 connection fields | Name / Endpoint / secure Token inputs | Same inputs, token masked; draft only | I inputs/H; G inputs | Type; Enter connects | `RemoteConnectNameChanged/EndpointChanged/TokenChanged` → draft; Submit on Enter | Input draft; Enter → T11a | **MATCH** local draft. |
 | T11a connect **W/X** | `Connect`; connecting/error/connected status text | `Connect` → status `Connect · not available in preview` | I inputs/H; G button | Click/Enter | `RemoteConnectSubmit` → save connection/token reference and connect | Notice only; nothing saved | **PREVIEW** `Connect · not available in preview`, saves nothing (connect_form.rs:18). |
 | T11b cancel connection | `Close` (button label in Iced) | `Close`; Esc | I inputs/H; G button | Click/Esc | `RemoteConnectClose` | `ConnectFormOutcome::Close` | **MATCH** closes the form; the picker beneath stays. |
-| T12 phone name | `Phone name`, placeholder `iPhone` | Absent | I H/disabled busy; — | Type; Enter creates pairing | `PhoneDeviceNameChanged`; Enter → `PhonePairingCreate` | — | **DIFF** phone pairing UI absent (workspace_bar.rs:78). |
-| T12a create pairing **W/X** | `Show pairing code` / `New code`; disabled busy | Absent | I H/disabled busy; — | Click or Enter in name | `PhonePairingCreate` → pairing grant | — | **DIFF** phone pairing absent. |
-| T12b pairing scope | Checkbox `Allow sending and approving`; disabled busy | Absent | I H/disabled busy; — | Toggle | `PhoneAllowActToggled` → requested pairing scope | — | **DIFF** phone pairing absent. |
-| T12c short code | Short-code text input; no row if server omits it | Absent | I H/disabled busy; — | Select/copy; input event | `PhoneShortCodeEdited` → no durable edit to issued code | — | **DIFF** phone pairing absent. |
-| T12d revoke phone **W/X** | `Revoke` per paired phone; disabled busy | Absent | I H/disabled busy; — | Click | `PhoneRevoke(id)` → revoke access | — | **DIFF** phone revoke absent. |
-| T12e close phone panel | `Close` | Absent | I H/disabled busy; — | Click | `PhonePanelClose` | — | **DIFF** phone panel absent. |
+| T12 phone name | `Phone name`, placeholder `iPhone` | Absent | I H/disabled busy; — | Type; Enter creates pairing | `PhoneDeviceNameChanged`; Enter → `PhonePairingCreate` | — | **PREVIEW** field, label, placeholder and `iPhone` default match (phone.rs); typing is local; Enter shows "Show pairing code · not available in preview" (no name-empty check). |
+| T12a create pairing **W/X** | `Show pairing code` / `New code`; disabled busy | Absent | I H/disabled busy; — | Click or Enter in name | `PhonePairingCreate` → pairing grant | — | **PREVIEW** label flips to `New code` once a pairing is set; click shows the preview notice, no grant. Busy disables it. |
+| T12b pairing scope | Checkbox `Allow sending and approving`; disabled busy | Absent | I H/disabled busy; — | Toggle | `PhoneAllowActToggled` → requested pairing scope | — | **MATCH** checkbox toggles local state only (default off); busy disables it. |
+| T12c short code | Short-code text input; no row if server omits it | Absent | I H/disabled busy; — | Select/copy; input event | `PhoneShortCodeEdited` → no durable edit to issued code | — | **PREVIEW** monospace row (absent when the code is empty) shows only once a pairing is supplied, which preview never does; it is plain text, not a selectable input, and the QR image is not drawn. |
+| T12d revoke phone **W/X** | `Revoke` per paired phone; disabled busy | Absent | I H/disabled busy; — | Click | `PhoneRevoke(id)` → revoke access | — | **PREVIEW** `Revoke` per row shows the preview notice, no revoke; busy disables it. GPUI has no read-only source for paired phones (they come from a live agent), so the panel shows "Paired phones are not listed in preview." and no rows. |
+| T12e close phone panel | `Close` | Absent | I H/disabled busy; — | Click | `PhonePanelClose` | — | **MATCH** `Close` and Esc close it, also while busy. |
 | T13 browser evidence close | `Close`, dim backdrop; screenshots/metadata are read-only | Absent (no More menu/browser action) | I button H; — | Click Close/backdrop | `BrowserEvidenceClose` → dismiss comparison | — | **DIFF** no evidence viewer (lib.rs:1681). |
 | T14 remote session attach **P/W** | Per remote session `Shell`; `Codex` / `Claude` only if corresponding command exists | Absent from mounted remote UI | I H/—; — | Click chosen attachment | `AttachRemoteSession`, `AttachRemoteCodexSession`, `AttachRemoteClaudeSession` → attach appropriate terminal/agent | — | **PREVIEW** `Shell`/`Codex`/`Claude` → preview notice (remote_shell.rs:576-590). |
 | T15 remote refresh **R** | Remote content: `Refresh` | Legacy remote workspace home: `Refresh` | I H/—; G button | Click | `RefreshRemoteSessions` → reload remote session facts | `RemoteClient::list_sessions` (core `ssh_sessions`) → session status | **MATCH** read-only refresh. |
@@ -525,8 +525,7 @@ Refreshed 2026-11-21 against `7c3b587` (after PRs #280–#310). Only rows still 
 17. T08–T08b — worktree delete opener and confirmation absent.
 18. T09–T09f — task create form is a fixture only.
 19. T10 / T10a — Stop and close / Keep open absent.
-20. T12–T12e — phone pairing and revocation absent.
-21. T13 — browser evidence viewer absent.
+20. T13 — browser evidence viewer absent.
 
 ## Verification boundary
 
