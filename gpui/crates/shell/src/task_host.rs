@@ -366,11 +366,9 @@ impl TaskHostOwner {
             .map(|servers| servers.task_mcp.claude_mcp_server(Some(caller)))
     }
 
-    #[cfg(test)]
     pub(crate) fn host(&self) -> &TaskHost {
         &self.host
     }
-    #[cfg(test)]
     pub(crate) fn host_mut(&mut self) -> &mut TaskHost {
         &mut self.host
     }

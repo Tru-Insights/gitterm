@@ -3,7 +3,10 @@ pub mod roster;
 
 use crate::events::*;
 use serde_json::Value;
-use std::{collections::HashMap, ops::Range};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowKind {
@@ -17,6 +20,9 @@ pub enum RowKind {
     Delegation,
     Error,
     Status,
+    /// A queued prompt whose withdrawal was confirmed. Iced removes its bubble;
+    /// the slot stays so row indices remain stable, but nothing reads it as a prompt.
+    Withdrawn,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -159,6 +165,8 @@ pub struct ChatModel {
     requests: HashMap<(Vec<String>, String), usize>,
     request_owner: Vec<String>,
     prompts: HashMap<String, usize>,
+    /// Prompts a withdrawal can no longer remove: started, or dropped by an exit.
+    settled_prompts: HashSet<String>,
     workers: HashMap<String, usize>,
     turn_start: HashMap<String, u64>,
     turn_end: HashMap<String, u64>,
@@ -710,6 +718,16 @@ impl ChatModel {
             }
             HarnessEvent::MessageLifecycle { id, state } => {
                 if let Some(&index) = self.prompts.get(id) {
+                    match state {
+                        MessageState::Started | MessageState::Completed => {
+                            self.settled_prompts.insert(id.clone());
+                        }
+                        // Iced's queuedLifecycle: a confirmed withdrawal removes the bubble.
+                        MessageState::Cancelled if !self.settled_prompts.contains(id) => {
+                            self.rows[index].kind = RowKind::Withdrawn;
+                        }
+                        _ => {}
+                    }
                     if self.rows[index].delivery.is_none() {
                         self.rows[index].title = format!("You · {state:?}");
                     }
@@ -746,6 +764,7 @@ impl ChatModel {
                 }
                 self.requests.retain(|(owner, _), _| !owner.starts_with(&self.request_owner));
                 self.prompts.clear();
+                self.settled_prompts.clear();
                 self.workers.clear();
                 self.turn_start.clear();
                 self.turn_row_start.clear();
@@ -769,6 +788,8 @@ impl ChatModel {
                 ));
             }
             HarnessEvent::ProcessExited { code: exit } => {
+                // Core leaves an exit's queue unsent; a late cancel cannot withdraw it.
+                self.settled_prompts.extend(self.prompts.keys().cloned());
                 changed.push(self.push(
                     RowKind::Status,
                     scope,

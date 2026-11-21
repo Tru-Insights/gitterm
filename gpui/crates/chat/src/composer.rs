@@ -68,6 +68,8 @@ pub const NOT_IN_PREVIEW: &str = "not available in preview";
 #[derive(Debug, Default)]
 pub struct ComposerState {
     pub queue: Vec<QueuedRow>,
+    /// Queued prompts the harness's exit left unsent (Iced's `dropQueued`).
+    exited_unsent: std::collections::HashSet<String>,
     pub pending_request: bool,
     pub streaming: bool,
     pub status: String,
@@ -106,14 +108,20 @@ pub struct ComposerState {
 pub const GUIDELINES_TOOLTIP: &str = "GitTerm adds its change guidelines to this agent's system prompt (workspace settings switch them off)";
 
 impl ComposerState {
-    pub fn withdraw_tooltip(&self) -> String {
-        let harness = match self.backend {
+    /// Iced's `harnessName()`.
+    fn harness_name(&self) -> &'static str {
+        match self.backend {
             Some(gitterm_core::chat::types::AgentBackend::Claude) => "Claude",
             Some(gitterm_core::chat::types::AgentBackend::Pi) => "the agent",
             Some(gitterm_core::chat::types::AgentBackend::Acp(agent)) => agent.label(),
             None => "the agent",
-        };
-        format!("Withdraw this message ({harness} keeps working)")
+        }
+    }
+    pub fn withdraw_tooltip(&self) -> String {
+        format!(
+            "Withdraw this message ({} keeps working)",
+            self.harness_name()
+        )
     }
 
     /// Iced's `queuedText()`.
@@ -133,6 +141,9 @@ impl ComposerState {
             _ if row.withdraw_pending => ("Withdrawing…".into(), Some(false)),
             PromptStatus::Pending | PromptStatus::Queued => {
                 (self.queued_text(), Some(!read_only && row.withdrawable()))
+            }
+            PromptStatus::Unsent if self.exited_unsent.contains(id) => {
+                (format!("Not sent: {} exited before reading it", self.harness_name()), None)
             }
             PromptStatus::Unsent => ("Not sent".into(), None),
             PromptStatus::Uncertain => ("Delivery uncertain: the agent may have read this message. Check the conversation before sending it again.".into(), None),
@@ -166,15 +177,13 @@ impl ComposerState {
     }
     /// Iced sets the Send title only while it can queue a message.
     pub fn send_tooltip(&self, blocked: bool) -> Option<String> {
-        (self.streaming && !blocked).then(|| {
-            match self.backend {
-                Some(gitterm_core::chat::types::AgentBackend::Acp(agent)) => format!(
-                    "{} is working: the message is queued and sent when this turn ends",
-                    agent.label()
-                ),
-                _ => "Claude is working: the message is queued and Claude reads it at its next step"
-                    .to_string(),
-            }
+        (self.streaming && !blocked).then(|| match self.backend {
+            Some(gitterm_core::chat::types::AgentBackend::Acp(agent)) => format!(
+                "{} is working: the message is queued and sent when this turn ends",
+                agent.label()
+            ),
+            _ => "Claude is working: the message is queued and Claude reads it at its next step"
+                .to_string(),
         })
     }
     fn is_acp(&self) -> bool {
@@ -209,12 +218,10 @@ impl ComposerState {
         }
         self.confirmed = state.acknowledged.clone();
         if (was_pending && self.pending_setting.is_none())
-            || self
-                .picker
-                .is_some_and(|picker| {
-                    picker != crate::pickers::Picker::Checkout
-                        && self.catalog.options(picker).is_empty()
-                })
+            || self.picker.is_some_and(|picker| {
+                picker != crate::pickers::Picker::Checkout
+                    && self.catalog.options(picker).is_empty()
+            })
             || effects.is_some_and(|effects| {
                 !effects.notices.is_empty() || effects.settings_changed.is_some()
             })
@@ -401,7 +408,10 @@ impl ComposerState {
                     .into()
             }
         };
-        self.mode = acknowledged.mode.as_deref().map_or_else(|| "Mode".into(), mode_label);
+        self.mode = acknowledged
+            .mode
+            .as_deref()
+            .map_or_else(|| "Mode".into(), mode_label);
         if let Some(Change::Mode(requested)) = pending {
             self.mode = format!("{} → {}…", self.mode, mode_label(requested));
         }
@@ -409,9 +419,11 @@ impl ComposerState {
             || "Effort".into(),
             |effort| {
                 let mut label = crate::pickers::effort_name(effort.effort.as_deref()).to_string();
-                let supported = self.catalog.efforts.iter().any(|row| {
-                    matches!(row.change, Change::Effort(_))
-                });
+                let supported = self
+                    .catalog
+                    .efforts
+                    .iter()
+                    .any(|row| matches!(row.change, Change::Effort(_)));
                 if supported && let Some(Change::Effort(requested)) = pending {
                     label.push_str(&format!(
                         " → {}…",
@@ -437,10 +449,8 @@ impl ComposerState {
         self.checkout = "Current checkout".into();
         self.checkout_locked = (state.session_id.is_some()
             || state.conversation.iter().any(|event| {
-                matches!(
-                    event,
-                    AgentEvent::Harness(HarnessEvent::TurnStarted { .. })
-                ) || matches!(event, AgentEvent::Other(value) if value["type"] == "user_prompt")
+                matches!(event, AgentEvent::Harness(HarnessEvent::TurnStarted { .. }))
+                    || matches!(event, AgentEvent::Other(value) if value["type"] == "user_prompt")
             }))
         .then(|| CHECKOUT_LOCKED_REASON.to_string());
         self.model_tooltip = format!("Model: {}", confirmed_model.unwrap_or_default());
@@ -477,6 +487,13 @@ impl ComposerState {
             .checkout
             .as_ref()
             .map(|path| path.display().to_string());
+        // Core marks the exit's queue Unsent; a prompt refused earlier keeps plain "Not sent".
+        let waiting: Vec<_> = self
+            .queue
+            .iter()
+            .filter(|row| matches!(row.status, PromptStatus::Pending | PromptStatus::Queued))
+            .map(|row| row.id.clone())
+            .collect();
         self.queue = state
             .queued_prompts
             .iter()
@@ -487,6 +504,13 @@ impl ComposerState {
                 withdraw_pending: queued.withdraw_pending,
             })
             .collect();
+        if effects.is_some_and(|effects| effects.process_exited) {
+            self.exited_unsent.extend(waiting.into_iter().filter(|id| {
+                self.queue
+                    .iter()
+                    .any(|row| &row.id == id && row.status == PromptStatus::Unsent)
+            }));
+        }
         self.commands_ready = ready.is_some();
         self.commands = state
             .conversation
