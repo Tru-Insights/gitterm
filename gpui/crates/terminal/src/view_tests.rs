@@ -909,6 +909,22 @@ fn iced_find_input_submit_count_buttons_shortcuts_and_close_without_process(
     draw(cx);
     cx.simulate_keystrokes("cmd-f");
     draw(cx);
+    cx.update(|window, cx| {
+        use gpui::Focusable as _;
+        let view = entity.read(cx);
+        assert!(
+            !view.focus_handle.is_focused(window),
+            "focus is in the input"
+        );
+        assert!(
+            view.find_input
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        );
+    });
     cx.simulate_input("[x]");
     cx.simulate_keystrokes("left backspace");
     cx.simulate_input("."); // Edit in the middle: this must be a real editable field.
@@ -966,9 +982,8 @@ fn iced_find_input_submit_count_buttons_shortcuts_and_close_without_process(
     cx.simulate_keystrokes("cmd-g");
     draw(cx);
     cx.read(|cx| assert_eq!(entity.read(cx).find_count_text(), "2/2"));
-    // The terminal must not add a previous-match binding for the host's debug chord.
     cx.simulate_keystrokes("cmd-shift-g");
-    cx.read(|cx| assert_eq!(entity.read(cx).find_count_text(), "2/2"));
+    cx.read(|cx| assert_eq!(entity.read(cx).find_count_text(), "1/2"));
     cx.simulate_keystrokes("enter");
     wait(|| {
         entity.update(cx, |view, cx| {
