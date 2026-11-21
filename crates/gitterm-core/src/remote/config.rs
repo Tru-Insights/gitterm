@@ -37,3 +37,71 @@ pub enum WorkspaceLocationConfig {
         root: String,
     },
 }
+
+/// `remote-agents.json` in the desktop config dir: the user-maintained list
+/// of remote agents. Hosts read it; only Iced's connect form writes it.
+pub const REMOTE_AGENTS_FILE: &str = "remote-agents.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RemoteAgentsFile {
+    #[serde(default)]
+    pub remote_agents: Vec<RemoteAgentConfig>,
+}
+
+/// Add `agent` unless one with its id is already known: the first source
+/// read wins (remote-agents.json before workspaces.json's copy).
+pub fn push_remote_agent_config(
+    definitions: &mut Vec<RemoteAgentConfig>,
+    agent: RemoteAgentConfig,
+) {
+    if !definitions.iter().any(|existing| existing.id == agent.id) {
+        definitions.push(agent);
+    }
+}
+
+/// The configured remotes in the order Iced builds them at startup:
+/// remote-agents.json, then those saved in workspaces.json.
+pub fn configured_remote_agents(
+    remote_agents_file: Option<RemoteAgentsFile>,
+    workspaces_file: &[RemoteAgentConfig],
+) -> Vec<RemoteAgentConfig> {
+    let mut agents = Vec::new();
+    for agent in remote_agents_file
+        .into_iter()
+        .flat_map(|file| file.remote_agents)
+        .chain(workspaces_file.iter().cloned())
+    {
+        push_remote_agent_config(&mut agents, agent);
+    }
+    agents
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent(id: &str, name: &str) -> RemoteAgentConfig {
+        RemoteAgentConfig {
+            id: id.into(),
+            name: name.into(),
+            endpoint: format!("http://{id}:7777"),
+            auth: RemoteAgentAuthConfig::Token {
+                token_ref: format!("env:{id}"),
+            },
+            shell_command: None,
+            session_commands: Default::default(),
+        }
+    }
+
+    #[test]
+    fn remote_agents_file_wins_and_workspaces_copies_append_in_order() {
+        let file = RemoteAgentsFile {
+            remote_agents: vec![agent("a", "From file"), agent("b", "B")],
+        };
+        let saved = [agent("a", "Stale copy"), agent("c", "C")];
+        let agents = configured_remote_agents(Some(file), &saved);
+        let names: Vec<_> = agents.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["From file", "B", "C"]);
+        assert_eq!(configured_remote_agents(None, &saved).len(), 2);
+    }
+}

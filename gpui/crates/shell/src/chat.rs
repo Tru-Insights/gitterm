@@ -499,6 +499,10 @@ impl ChatPane {
             gitterm_core::chat::types::AgentSessionState::Streaming
         )
     }
+    /// The provider chat id Iced keys its turn snapshots by.
+    pub(crate) fn chat_session_id(&self) -> Option<String> {
+        self.saved.session_id.clone()
+    }
     pub(crate) fn matches_chat(&self, id: &str) -> bool {
         self.saved.uid == id || self.saved.session_id.as_deref() == Some(id)
     }

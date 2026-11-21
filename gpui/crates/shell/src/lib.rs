@@ -9,6 +9,7 @@ pub mod bottom_panel;
 #[cfg(test)]
 mod center_tests;
 mod chat;
+pub mod connect_form;
 pub mod content;
 #[cfg(test)]
 mod content_shell_tests;
@@ -17,6 +18,7 @@ mod dialogs;
 pub mod files;
 mod files_view;
 pub mod find_sidebar;
+pub mod folder_picker;
 #[cfg(test)]
 mod h2_tests;
 #[cfg(test)]
@@ -46,6 +48,10 @@ pub mod preview;
 #[cfg(test)]
 mod region_tests;
 pub mod remote;
+pub mod remote_client;
+mod remote_shell;
+#[cfg(test)]
+mod remote_shell_tests;
 mod review_reload;
 pub mod session_picker;
 pub mod session_strip;
@@ -172,6 +178,8 @@ pub struct Shell {
     /// setting. Read once from Iced's settings (read-only); a drag changes it
     /// for the session and is never written back to Iced.
     sidebar_width: f32,
+    /// Remote machines, read-only: picker, connect form, sessions.
+    remote: remote_shell::RemoteState,
     #[cfg(test)]
     dock_fixture: bool,
 }
@@ -430,9 +438,11 @@ impl Shell {
             agent_subscriptions: HashMap::new(),
             branch_reviews: HashMap::new(),
             sidebar_width,
+            remote: Default::default(),
             #[cfg(test)]
             dock_fixture: false,
         };
+        shell.reload_remotes(cx);
         shell.selected_task = shell
             .active_workspace(cx)
             .and_then(|_| shell.active(cx).active_session)
@@ -583,7 +593,13 @@ impl Shell {
         // Use the event's workspace even if selection changed before delivery.
         self.show_workspace_pane(event.workspace, &id, window, cx);
     }
-    fn pick_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The OS folder picker (Iced's "Use macOS dialog…").
+    pub(crate) fn pick_folder(
+        &mut self,
+        prompt: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.content.update(cx, |content, cx| {
             content.picker = true;
             content.sync_covers(window, cx);
@@ -593,23 +609,39 @@ impl Shell {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Add workspace folder".into()),
+            prompt: Some(prompt.to_owned().into()),
         });
         cx.spawn_in(window, async move |this, cx| {
-            let result = match response.await {
-                Ok(Ok(Some(paths))) => {
-                    cx.background_executor()
-                        .spawn(async move {
-                            paths
-                                .first()
-                                .map(|path| workspace_config::local_folder(path))
-                                .transpose()
-                        })
-                        .await
-                }
+            let picked = match response.await {
+                Ok(Ok(Some(paths))) => Ok(paths.first().cloned()),
                 Ok(Ok(None)) => Ok(None),
                 Ok(Err(error)) => Err(error),
                 Err(error) => Err(error.into()),
+            };
+            _ = this.update_in(cx, |this, window, cx| {
+                this.finish_folder_pick(picked, sheet, window, cx)
+            });
+        })
+        .detach();
+    }
+    /// A folder chosen on this Mac (OS picker or in-app picker): back to the
+    /// New workspace sheet that asked for it, else added as a local folder.
+    pub(crate) fn finish_folder_pick(
+        &mut self,
+        picked: Result<Option<std::path::PathBuf>>,
+        sheet: Option<Entity<workspace_sheet::WorkspaceSheet>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let result = match picked {
+                Ok(Some(path)) => {
+                    cx.background_executor()
+                        .spawn(async move { workspace_config::local_folder(&path).map(Some) })
+                        .await
+                }
+                Ok(None) => Ok(None),
+                Err(error) => Err(error),
             };
             _ = this.update_in(cx, |this, window, cx| {
                 this.cover_sheet(this.new_work_sheet.is_some(), window, cx);
@@ -2247,6 +2279,9 @@ impl Shell {
                 .child(state.dock.clone());
         }
         if state.active_session.is_none() {
+            if let Some(home) = self.remote_session_home(cx) {
+                return home;
+            }
             return div()
                 .id("session-content")
                 .debug_selector(|| "session-content".into())
@@ -3945,6 +3980,7 @@ impl Render for Shell {
                         .child(self.workspace_bar(cx)),
                 )
                 .children(self.new_work_sheet.clone())
+                .children(self.remote_overlays())
                 .into_any_element();
         }
         let state = self.active(cx);
@@ -4079,6 +4115,7 @@ impl Render for Shell {
             .children(self.settings_sheet.clone())
             .children(self.task_switcher.clone())
             .when(self.plans_open, |view| view.child(self.plans_viewer(cx)))
+            .children(self.remote_overlays())
             .child(content::visual::reconciler(self.content.clone()))
             .into_any_element()
     }
