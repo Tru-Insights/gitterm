@@ -12814,24 +12814,7 @@ impl App {
     /// The facts `reduce_task_mutation` hands the reducer for `mutation`.
     fn mutation_facts(&self, mutation: &TaskMutation) -> TaskMutationFacts {
         let mut facts = self.task_mutation_facts();
-        if matches!(
-            mutation,
-            TaskMutation::BeginWorkerPreparation { .. }
-                | TaskMutation::CheckWorkerPreparation { .. }
-                | TaskMutation::BindWorkerPreparation { .. }
-                | TaskMutation::WorkerPrepared { .. }
-                | TaskMutation::WorkerPreparationSaved { .. }
-                | TaskMutation::ReuseWorkerCheckout { .. }
-                | TaskMutation::WorkerCheckoutReuseSaved { .. }
-        ) {
-            facts.callers = freeze_span!("worker facts: callers", {
-                self.workspaces
-                    .iter()
-                    .flat_map(|ws| &ws.tabs)
-                    .filter_map(|tab| self.worker_authority_caller(&tab.session_uid).ok())
-                    .collect()
-            });
-        }
+        facts.callers = self.worker_mutation_callers(mutation);
         if let TaskMutation::PreparationCompleted {
             cleanup_path: Some(path),
             ..
@@ -12853,19 +12836,14 @@ impl App {
             } => Some(prepared.path.clone()),
             _ => None,
         };
-        if matches!(
-            mutation,
-            TaskMutation::WorkerPreparationSaved { .. }
-                | TaskMutation::WorkerCheckoutReuseSaved { .. }
-        ) {
-            if let Some(store) = self.task_host.store() {
+        if let TaskMutation::WorkerPreparationSaved { id, .. }
+        | TaskMutation::WorkerCheckoutReuseSaved { id, .. } = mutation
+        {
+            // A save re-checks only its own task's checkout, which must be
+            // the target task's path; any other task's checkout is never read.
+            if let Some((_, Some(path))) = self.task_host.pending_worker_subject(*id) {
                 facts.checkouts = freeze_span!("worker facts: checkouts", {
-                    store
-                        .tasks()
-                        .iter()
-                        .filter_map(|task| task.worktree.path.as_ref())
-                        .filter_map(|path| worker_checkout_fact(path).ok())
-                        .collect()
+                    worker_checkout_fact(path).ok().into_iter().collect()
                 });
             }
         }
@@ -12878,6 +12856,33 @@ impl App {
             }
         }
         facts
+    }
+
+    /// The caller a worker mutation's reducer reads: the tab it names, or
+    /// the one its preparation captured. The reducer finds it by session
+    /// UID, and every tab's resolution is keyed on its UID, so another
+    /// tab's caller is never read. Resolving every open tab stalled the UI
+    /// thread at worker start (TRU-274).
+    fn worker_mutation_callers(&self, mutation: &TaskMutation) -> Vec<WorkerCaller> {
+        let uid = match mutation {
+            TaskMutation::BeginWorkerPreparation { caller } => Some(caller.as_str()),
+            TaskMutation::CheckWorkerPreparation { id }
+            | TaskMutation::BindWorkerPreparation { id, .. }
+            | TaskMutation::WorkerPrepared { id, .. }
+            | TaskMutation::WorkerPreparationSaved { id, .. }
+            | TaskMutation::ReuseWorkerCheckout { id, .. }
+            | TaskMutation::WorkerCheckoutReuseSaved { id, .. } => self
+                .task_host
+                .pending_worker_subject(*id)
+                .map(|(uid, _)| uid),
+            _ => None,
+        };
+        let Some(uid) = uid else {
+            return Vec::new();
+        };
+        freeze_span!("worker facts: caller", {
+            self.worker_authority_caller(uid).ok().into_iter().collect()
+        })
     }
 
     fn worker_authority_caller(&self, uid: &str) -> Result<WorkerCaller, String> {
@@ -12942,13 +12947,7 @@ impl App {
         resolved: Option<&Path>,
     ) -> TaskMutationFacts {
         let mut facts = self.task_mutation_facts();
-        facts.callers = freeze_span!("worker completion facts: callers", {
-            self.workspaces
-                .iter()
-                .flat_map(|ws| &ws.tabs)
-                .filter_map(|tab| self.worker_authority_caller(&tab.session_uid).ok())
-                .collect()
-        });
+        facts.callers = self.worker_mutation_callers(completion);
         facts.existing_paths = resolved
             .iter()
             .filter(|path| path.exists())

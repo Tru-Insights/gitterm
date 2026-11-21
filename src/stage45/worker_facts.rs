@@ -1,8 +1,12 @@
 //! TRU-274: starting a worker gathers its authority facts on Iced's UI
 //! thread. A store of real Git worktrees and a window of real checkout
-//! tabs, timed through the same fact gathering a worker launch runs.
-use super::task_authority::{fixture_worker_checkout, pending_worker_fixture};
+//! tabs, timed through the same fact gathering a worker launch runs, and
+//! the targeted gather checked against the full one it replaced.
+use super::task_authority::{
+    fixture_worker_checkout, fixture_worker_source, pending_worker_fixture,
+};
 use super::*;
+use gitterm::tasks::state::TaskAuthority;
 use std::time::Duration;
 
 const WORKTREES: usize = 40;
@@ -24,6 +28,72 @@ fn timed<T>(mut run: impl FnMut() -> T) -> (Duration, T) {
 
 fn ms(duration: Duration) -> String {
     format!("{:.2}ms", duration.as_secs_f64() * 1000.0)
+}
+
+/// The gather before TRU-274: a caller for every open tab.
+fn full_callers(app: &App) -> Vec<WorkerCaller> {
+    app.workspaces
+        .iter()
+        .flat_map(|ws| &ws.tabs)
+        .filter_map(|tab| app.worker_authority_caller(&tab.session_uid).ok())
+        .collect()
+}
+
+/// The gather before TRU-274: a checkout fact for every task's worktree.
+fn full_checkouts(app: &App) -> Vec<WorkerCheckout> {
+    app.task_host
+        .store()
+        .as_ref()
+        .map(|store| {
+            store
+                .tasks()
+                .iter()
+                .filter_map(|task| task.worktree.path.as_ref())
+                .filter_map(|path| worker_checkout_fact(path).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn is_worker_mutation(mutation: &TaskMutation) -> bool {
+    matches!(
+        mutation,
+        TaskMutation::BeginWorkerPreparation { .. }
+            | TaskMutation::CheckWorkerPreparation { .. }
+            | TaskMutation::BindWorkerPreparation { .. }
+            | TaskMutation::WorkerPrepared { .. }
+            | TaskMutation::WorkerPreparationSaved { .. }
+            | TaskMutation::ReuseWorkerCheckout { .. }
+            | TaskMutation::WorkerCheckoutReuseSaved { .. }
+    )
+}
+
+/// `reduce_task_mutation`'s facts as they were gathered before TRU-274.
+fn full_mutation_facts(app: &App, mutation: &TaskMutation) -> TaskMutationFacts {
+    let mut facts = app.mutation_facts(mutation);
+    if is_worker_mutation(mutation) {
+        facts.callers = full_callers(app);
+    }
+    if matches!(
+        mutation,
+        TaskMutation::WorkerPreparationSaved { .. } | TaskMutation::WorkerCheckoutReuseSaved { .. }
+    ) && app.task_host.store().is_some()
+    {
+        // Saves have no destination of their own; the old gather was all of it.
+        facts.checkouts = full_checkouts(app);
+    }
+    facts
+}
+
+/// The completion facts as they were gathered before TRU-274.
+fn full_completion_facts(
+    app: &App,
+    completion: &TaskMutation,
+    resolved: Option<&Path>,
+) -> TaskMutationFacts {
+    let mut facts = app.worker_completion_facts(completion, resolved);
+    facts.callers = full_callers(app);
+    facts
 }
 
 /// `WORKTREES` Ready tasks, each in its own worktree of the caller's
@@ -90,10 +160,12 @@ fn worker_start_facts_gathering_benchmark() {
         id,
         result: Ok(prepared.clone().into()),
     };
-    let (completion_time, facts) = timed(|| {
-        app.worker_completion_facts(&completion, pending.resolved_worktree_path.as_deref())
-    });
-    assert!(facts.callers.contains(&caller));
+    let resolved = pending.resolved_worktree_path.as_deref();
+    let (completion_before, full) = timed(|| full_completion_facts(&app, &completion, resolved));
+    assert_eq!(full.callers.len(), TABS, "every checkout tab resolves");
+    let (completion_after, facts) = timed(|| app.worker_completion_facts(&completion, resolved));
+    assert_eq!(facts.callers, vec![caller.clone()]);
+    assert_eq!(facts.checkouts, full.checkouts);
     let effect = app
         .task_host
         .reduce_mutation(
@@ -122,11 +194,21 @@ fn worker_start_facts_gathering_benchmark() {
 
     // WorkerPreparationSaved, reduced with reduce_task_mutation's facts.
     let saved = TaskMutation::WorkerPreparationSaved { id, result: Ok(()) };
-    let (saved_time, facts) = timed(|| app.mutation_facts(&saved));
-    assert!(facts.callers.contains(&caller));
-    assert!(facts.checkouts.iter().any(|checkout| {
-        checkout.path == prepared.path && checkout.repository == prepared.repository
-    }));
+    let (saved_before, full) = timed(|| full_mutation_facts(&app, &saved));
+    assert_eq!(
+        full.checkouts.len(),
+        WORKTREES + 1,
+        "every task worktree resolves"
+    );
+    let (saved_after, facts) = timed(|| app.mutation_facts(&saved));
+    assert_eq!(facts.callers, vec![caller.clone()]);
+    assert_eq!(
+        facts.checkouts,
+        vec![WorkerCheckout {
+            path: prepared.path.clone(),
+            repository: prepared.repository.clone(),
+        }]
+    );
     let effect = app.reduce_task_mutation(saved).unwrap();
     assert!(
         matches!(&effect, TaskMutationAction::StartWorker { task_id: started, .. } if started == &task_id),
@@ -155,15 +237,286 @@ fn worker_start_facts_gathering_benchmark() {
 
     println!(
         "[TRU-274 benchmark] {WORKTREES} worktrees, {TABS} tabs, {tasks} tasks, median of {RUNS}:\n\
-         completion facts (WorkerPrepared): {}\n\
-         saved facts (WorkerPreparationSaved): {}\n\
+         completion facts (WorkerPrepared): before {} after {}\n\
+         saved facts (WorkerPreparationSaved): before {} after {}\n\
          store complete_worktree_preparation: {}\n\
          start_delegated_worker (delegation insert + failure status): {}\n\
          store replace (one whole-store rewrite): {}",
-        ms(completion_time),
-        ms(saved_time),
+        ms(completion_before),
+        ms(completion_after),
+        ms(saved_before),
+        ms(saved_after),
         ms(complete_write),
         ms(start_writes),
         ms(replace_write),
     );
+}
+
+const STEPS: [&str; 5] = ["begin", "check", "bind", "prepared", "saved"];
+const CASES: [&str; 8] = [
+    "matching caller",
+    "missing caller",
+    "foreign caller",
+    "duplicate caller",
+    "changed caller checkout",
+    "stale worktree",
+    "moved path",
+    "symlinked path",
+];
+
+/// One worker preparation, reduced twice from the same store: by the Iced
+/// app with the targeted gather, and by a second authority with the full
+/// gather the app made before TRU-274.
+struct Pair {
+    _dir: tempfile::TempDir,
+    app: App,
+    full: TaskAuthority,
+    uid: String,
+    task_id: String,
+    expected: CompletedWorktreePreparation,
+    resolved: PathBuf,
+}
+
+fn pair() -> Pair {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let mut app = app_with_tabs(&root);
+    add_task(&mut app, &root, &root);
+    let source = root.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    fixture_worker_source(&source);
+    app.workspaces[0].dir = source.clone();
+    app.workspaces[0].location = WorkspaceLocation::Local {
+        root: source.clone(),
+    };
+    app.workspaces[0].tabs[0].repo_path = source.clone();
+    let uid = app.workspaces[0].tabs[0].session_uid.clone();
+    let repository = app
+        .worker_authority_caller(&uid)
+        .unwrap()
+        .repository
+        .unwrap();
+    let store = app.task_host.store_mut().as_mut().unwrap();
+    let mut target = store.get("fixture-task").unwrap().clone();
+    target.repository = repository.clone();
+    for index in 0..3 {
+        let name = format!("other-{index}");
+        let path = root.join(&name);
+        fixture_worker_checkout(&source, &path, &name);
+        let mut task = target.clone();
+        task.task_id = name.clone();
+        task.branch = name;
+        task.worktree.path = Some(path.clone());
+        store.insert(task).unwrap();
+        app.workspaces[0]
+            .tabs
+            .push(TabState::new(2000 + index, path));
+    }
+    target.task_id = "target".into();
+    target.branch = "prepared".into();
+    target.lifecycle = TaskLifecycle::Preparing;
+    target.worktree = TaskWorktree {
+        state: TaskWorktreeState::Preparing,
+        path: None,
+    };
+    store.insert(target.clone()).unwrap();
+    let resolved = root.join("prepared");
+    fixture_worker_checkout(&source, &resolved, "prepared");
+    let tasks = root.join("tasks.json");
+    let copy = root.join("tasks-full.json");
+    std::fs::copy(&tasks, &copy).unwrap();
+    app.task_host
+        .replace_store(Some(TaskStore::load(&tasks).unwrap()));
+    let full = TaskAuthority::from(Some(TaskStore::load(&copy).unwrap()));
+    Pair {
+        _dir: dir,
+        app,
+        full,
+        uid,
+        task_id: target.task_id,
+        expected: CompletedWorktreePreparation {
+            repository,
+            base: target.base,
+            branch: target.branch,
+            path: resolved.clone(),
+        },
+        resolved,
+    }
+}
+
+fn perturb(pair: &mut Pair, case: &str) {
+    let tabs = &mut pair.app.workspaces[0].tabs;
+    match case {
+        "matching caller" => {}
+        "missing caller" => {
+            tabs.remove(0);
+        }
+        "foreign caller" => {
+            // Another open tab, in another checkout, now carries the
+            // captured caller's UID.
+            tabs.remove(0);
+            tabs[0].session_uid = pair.uid.clone();
+        }
+        "duplicate caller" => {
+            tabs[1].session_uid = pair.uid.clone();
+        }
+        "changed caller checkout" => {
+            tabs[0].repo_path = tabs[1].repo_path.clone();
+        }
+        "stale worktree" => std::fs::remove_file(pair.resolved.join(".git")).unwrap(),
+        "moved path" => {
+            std::fs::rename(&pair.resolved, pair.resolved.with_extension("moved")).unwrap()
+        }
+        "symlinked path" => {
+            let moved = pair.resolved.with_extension("moved");
+            std::fs::rename(&pair.resolved, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &pair.resolved).unwrap();
+        }
+        _ => unreachable!("{case}"),
+    }
+}
+
+/// Reduces one mutation on both sides and returns each outcome, Debug-printed
+/// so error texts and every effect field are compared.
+fn reduce_both(
+    pair: &mut Pair,
+    mutation: impl Fn() -> TaskMutation,
+    completion: bool,
+) -> (String, String, Result<TaskMutationAction, String>) {
+    let resolved = Some(pair.resolved.as_path());
+    let (targeted, full) = if completion {
+        (
+            pair.app.worker_completion_facts(&mutation(), resolved),
+            full_completion_facts(&pair.app, &mutation(), resolved),
+        )
+    } else {
+        (
+            pair.app.mutation_facts(&mutation()),
+            full_mutation_facts(&pair.app, &mutation()),
+        )
+    };
+    let command = || TaskMutationCommand {
+        reply: None,
+        mutation: mutation(),
+    };
+    let new = pair
+        .app
+        .task_host
+        .reduce_mutation(command(), &targeted)
+        .action;
+    let old = pair.full.reduce_mutation(command(), &full).action;
+    (format!("{new:?}"), format!("{old:?}"), new)
+}
+
+#[test]
+fn targeted_worker_facts_reduce_exactly_as_the_full_gather() {
+    if isolated(
+        "targeted_worker_facts_reduce_exactly_as_the_full_gather",
+        "worker_facts",
+    ) {
+        return;
+    }
+    for case in CASES {
+        for perturb_at in STEPS {
+            let mut pair = pair();
+            let mut outcomes = Vec::new();
+            let mut captured = None;
+            for step in STEPS {
+                if step == perturb_at {
+                    perturb(&mut pair, case);
+                }
+                let id = match (step, captured) {
+                    ("begin", _) => None,
+                    (_, Some(id)) => Some(id),
+                    // Nothing was captured: no later step has an operation.
+                    (_, None) => break,
+                };
+                let id = || id.unwrap();
+                let (uid, task_id, expected) = (
+                    pair.uid.clone(),
+                    pair.task_id.clone(),
+                    pair.expected.clone(),
+                );
+                let (new, old, action) = match step {
+                    "begin" => reduce_both(
+                        &mut pair,
+                        || TaskMutation::BeginWorkerPreparation {
+                            caller: uid.clone(),
+                        },
+                        false,
+                    ),
+                    "check" => reduce_both(
+                        &mut pair,
+                        || TaskMutation::CheckWorkerPreparation { id: id() },
+                        false,
+                    ),
+                    "bind" => reduce_both(
+                        &mut pair,
+                        || TaskMutation::BindWorkerPreparation {
+                            id: id(),
+                            task_id: task_id.clone(),
+                            expected: expected.clone(),
+                        },
+                        false,
+                    ),
+                    "prepared" => reduce_both(
+                        &mut pair,
+                        || TaskMutation::WorkerPrepared {
+                            id: id(),
+                            result: Ok(expected.clone()),
+                        },
+                        true,
+                    ),
+                    _ => reduce_both(
+                        &mut pair,
+                        || TaskMutation::WorkerPreparationSaved {
+                            id: id(),
+                            result: Ok(()),
+                        },
+                        false,
+                    ),
+                };
+                assert_eq!(new, old, "{case} (changed before {perturb_at}), {step}");
+                match action {
+                    Ok(TaskMutationAction::WorkerAuthorityChecked { id }) => captured = Some(id),
+                    // Both sides save the same preparation, as the app would.
+                    Ok(TaskMutationAction::PersistWorkerPreparation {
+                        task_id, prepared, ..
+                    }) => {
+                        for store in [pair.app.task_host.store_mut(), pair.full.store_mut()] {
+                            store
+                                .as_mut()
+                                .unwrap()
+                                .complete_worktree_preparation(
+                                    &task_id,
+                                    prepared.clone(),
+                                    "2000-01-02T00:00:00Z",
+                                )
+                                .unwrap();
+                        }
+                    }
+                    _ => {}
+                }
+                outcomes.push(new);
+            }
+            // The matrix must reach both the launch and each refusal.
+            let at = STEPS.iter().position(|step| *step == perturb_at).unwrap();
+            let caller_case = case.contains("caller");
+            let (step, needle) = match case {
+                "matching caller" | "duplicate caller" => (4, "Ok(StartWorker"),
+                "missing caller" if at == 0 => {
+                    (0, "The calling GitTerm tab is no longer available")
+                }
+                // A caller already changed when captured is the caller.
+                _ if caller_case && at == 0 => (4, "Ok(StartWorker"),
+                _ if caller_case => (at, "caller, session, workspace authority"),
+                // A destination changed before completion fails there.
+                _ => (at.max(3), "destination checkout"),
+            };
+            assert!(
+                outcomes[step].contains(needle),
+                "{case} (changed before {perturb_at}): {outcomes:?}"
+            );
+        }
+    }
 }

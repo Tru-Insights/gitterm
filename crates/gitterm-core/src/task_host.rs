@@ -191,6 +191,14 @@ impl TaskHost {
         self.authority.reduce_mutation(command, facts)
     }
 
+    /// See [`TaskAuthority::pending_worker_subject`].
+    pub fn pending_worker_subject(
+        &self,
+        id: crate::task_commands::WorkerPreparationId,
+    ) -> Option<(&str, Option<&std::path::Path>)> {
+        self.authority.pending_worker_subject(id)
+    }
+
     /// Stops ingress and resolves every pending reply, even ones whose
     /// tickets are still held by deferred work.
     pub fn shutdown(&self) {
