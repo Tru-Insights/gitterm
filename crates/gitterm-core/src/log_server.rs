@@ -164,8 +164,17 @@ pub async fn start_server_on(state: ServerState, bind: ListenerBind) -> std::io:
     let shutdown = state.shutdown.clone();
     let bound_port = state.bound_port.clone();
     let listener = bind.bind()?;
+    let local = listener.local_addr()?;
+    // base_url() advertises http://localhost:<port>, which reaches only
+    // 127.0.0.1; another loopback address would publish a dead link.
+    if local.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("the log server serves only 127.0.0.1, not {local}"),
+        ));
+    }
     listener.set_nonblocking(true)?;
-    let port = listener.local_addr()?.port();
+    let port = local.port();
     let incoming = TcpListenerStream::new(tokio::net::TcpListener::from_std(listener)?);
     let server =
         warp::serve(routes(state)).serve_incoming_with_graceful_shutdown(incoming, async move {
@@ -579,6 +588,20 @@ mod tests {
         let state = ServerState::new();
         let bind = ListenerBind::Addr(std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
         assert!(start_server_on(state.clone(), bind).await.is_err());
+        assert_eq!(state.base_url(), None);
+    }
+
+    /// base_url() says localhost, so a bind that localhost cannot reach is
+    /// refused rather than advertised.
+    #[tokio::test]
+    async fn explicit_bind_other_than_ipv4_localhost_is_refused() {
+        let state = ServerState::new();
+        let bind = ListenerBind::Addr(std::net::SocketAddr::from((
+            std::net::Ipv6Addr::LOCALHOST,
+            0,
+        )));
+        let error = start_server_on(state.clone(), bind).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(state.base_url(), None);
     }
 
