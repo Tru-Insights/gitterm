@@ -1,6 +1,9 @@
 #![cfg(target_os = "macos")]
 extern crate gpui_kit as gpui;
 
+mod agent_sidebar;
+#[cfg(test)]
+mod agent_tests;
 pub mod app_menus;
 pub mod bottom_panel;
 #[cfg(test)]
@@ -155,6 +158,8 @@ pub struct Shell {
     bar_menu: Option<workspace_bar::Menu>,
     work_sidebars: HashMap<WorkspaceId, Entity<work_sidebar::WorkSidebar>>,
     work_subscriptions: HashMap<WorkspaceId, Subscription>,
+    agent_sidebars: HashMap<WorkspaceId, Entity<agent_sidebar::AgentSidebar>>,
+    agent_subscriptions: HashMap<WorkspaceId, Subscription>,
     /// The branch checkout last opened in review per workspace; the sidebar
     /// marks it only while that review is still the visible viewer.
     branch_reviews: HashMap<WorkspaceId, std::path::PathBuf>,
@@ -408,6 +413,8 @@ impl Shell {
             bar_menu: None,
             work_sidebars: HashMap::new(),
             work_subscriptions: HashMap::new(),
+            agent_sidebars: HashMap::new(),
+            agent_subscriptions: HashMap::new(),
             branch_reviews: HashMap::new(),
             #[cfg(test)]
             dock_fixture: false,
@@ -2035,7 +2042,8 @@ impl Shell {
             .when(regions.sidebar_collapsed, |row| row.flex_col());
         for (mode, title, icon) in Self::SIDEBAR_MODES {
             let selected = regions.sidebar_mode == mode
-                || (mode == SidebarMode::Work && regions.sidebar_mode == SidebarMode::Git);
+                || (mode == SidebarMode::Work
+                    && matches!(regions.sidebar_mode, SidebarMode::Git | SidebarMode::Agent));
             modes = modes.child(
                 div()
                     .when(!regions.sidebar_collapsed, |s| s.flex_1().border_b_2())
@@ -2103,6 +2111,9 @@ impl Shell {
         }
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Git {
             sidebar = self.git_sidebar(sidebar, cx);
+        }
+        if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Agent {
+            sidebar = sidebar.children(self.agent_sidebars.get(&state.workspace.id).cloned());
         }
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Work {
             sidebar = sidebar.child(
@@ -4039,6 +4050,7 @@ impl Render for Shell {
             .children(self.new_work_sheet.clone())
             .children(self.task_switcher.clone())
             .when(self.plans_open, |view| view.child(self.plans_viewer(cx)))
+            .child(content::visual::reconciler(self.content.clone()))
             .into_any_element()
     }
 }
@@ -4143,6 +4155,11 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
                         )
                         .expect("create sample shell")
                     } else {
+                        content::visual::install(cx);
+                        // Read-only: the Agent pane lists the agent's config.
+                        if let Some(home) = dirs::home_dir() {
+                            cx.set_global(agent_sidebar::AgentHome(home.join(".claude")));
+                        }
                         let owner = cx.new(|cx| WorkspaceOwner::new(model, Some(store), cx));
                         if let Some(save) = startup_save {
                             owner.update(cx, |owner, cx| owner.watch_save(save, cx));
@@ -4173,6 +4190,7 @@ fn window_title(app_name: &str, workspace: &str, sidebar_mode: SidebarMode) -> S
         SidebarMode::Files => "Files",
         SidebarMode::Find => "Find",
         SidebarMode::Git => "Git",
+        SidebarMode::Agent => "Agent",
     };
     format!("{app_name} - {workspace} - {mode}")
 }

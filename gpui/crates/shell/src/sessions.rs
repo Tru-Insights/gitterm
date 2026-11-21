@@ -210,6 +210,7 @@ impl crate::Shell {
     ) {
         use gitterm_core::work::state::{Inputs, Intent, Source};
         use gpui::AppContext as _;
+        let mut created = vec![];
         for workspace in &self.workspaces {
             let id = workspace.workspace.id;
             if self.work_sidebars.contains_key(&id) {
@@ -227,6 +228,7 @@ impl crate::Shell {
                     focus: Default::default(),
                     documents: None,
                 }));
+            created.push((id, dir.clone()));
             let facts = crate::work_sidebar::WorkspaceFacts {
                 id: id.0,
                 name: workspace.workspace.name.clone(),
@@ -255,6 +257,9 @@ impl crate::Shell {
                 ),
             );
             self.work_sidebars.insert(id, sidebar);
+        }
+        for (id, dir) in created {
+            self.ensure_agent_sidebar(id, dir, window, cx);
         }
     }
     /// Mark the branch row whose review is open; clear it once another viewer
@@ -314,6 +319,9 @@ impl crate::Shell {
                     state.store.regions.sidebar_collapsed = false;
                 }
                 cx.notify();
+            }
+            O::OpenAgentConfig { workspace } => {
+                self.show_agent_sidebar(crate::WorkspaceId(*workspace), true, cx)
             }
             O::OpenPrViewer { .. } => {
                 self.owner.update(cx, |owner, cx| {

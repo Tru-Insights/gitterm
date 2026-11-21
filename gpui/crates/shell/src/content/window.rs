@@ -291,6 +291,10 @@ impl ContentWindow {
             self.selected = id;
         }
     }
+    /// A menu, dialog, picker or drag is over native content.
+    pub fn covered(&self) -> bool {
+        self.covered.iter().any(|covered| *covered)
+    }
     pub fn sync_covers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let modal = self.picker
             || (window.root::<Root>().flatten().is_some()

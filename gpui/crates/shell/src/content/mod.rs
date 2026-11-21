@@ -9,6 +9,7 @@ pub(crate) mod actions;
 pub mod host;
 pub mod overlay;
 mod session;
+pub(crate) mod visual;
 pub(crate) mod window;
 
 use std::path::{Path, PathBuf};

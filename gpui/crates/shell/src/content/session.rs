@@ -159,6 +159,8 @@ impl Shell {
             });
             return;
         }
+        // Agent configuration files live in the agent's home config folder.
+        let agent_root = self.agent_file_root(event.workspace, &event.path, cx);
         let Some(state) = self
             .workspaces
             .iter_mut()
@@ -184,6 +186,7 @@ impl Shell {
                     .max_by_key(|root| root.components().count())
             })
             .or_else(|| self.data.terminal_cwd(event.workspace, cx));
+        let root = agent_root.or(root);
         let Some(root) = root else {
             return;
         };

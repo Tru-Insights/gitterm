@@ -2915,20 +2915,8 @@ pub(crate) struct SyntaxHighlightLine {
     segments: Vec<SyntaxHighlightSegment>,
 }
 
-// Claude config scope
-#[derive(Debug, Clone, PartialEq)]
-enum ConfigScope {
-    User,
-    Project,
-}
-
 // Claude config item (skill, plugin, server, hook, or setting)
-#[derive(Debug, Clone)]
-struct ClaudeConfigItem {
-    name: String,
-    file_path: PathBuf,
-    scope: ConfigScope,
-}
+use gitterm_core::agent_config::AgentConfigItem as ClaudeConfigItem;
 
 // Claude sidebar config tree
 #[derive(Debug, Clone, Default)]
@@ -5947,173 +5935,13 @@ impl TabState {
 
     fn fetch_claude_config(&mut self) {
         let home = dirs::home_dir().unwrap_or_default();
-        let claude_home = home.join(".claude");
-        let workspace_dir = &self.repo_path;
-
-        self.claude_config.skills.clear();
-        self.claude_config.plugins.clear();
-        self.claude_config.mcp_servers.clear();
-        self.claude_config.hooks.clear();
-        self.claude_config.settings.clear();
-
-        // --- Skills ---
-        // User global skills
-        let user_commands_dir = claude_home.join("commands");
-        let mut skill_names: HashSet<String> = HashSet::new();
-
-        // Project skills first (they override user skills with same name)
-        let project_commands_dir = workspace_dir.join(".claude").join("commands");
-        if let Ok(entries) = std::fs::read_dir(&project_commands_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                    let name = path
-                        .file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
-                    skill_names.insert(name.clone());
-                    self.claude_config.skills.push(ClaudeConfigItem {
-                        name,
-                        file_path: path,
-                        scope: ConfigScope::Project,
-                    });
-                }
-            }
-        }
-
-        if let Ok(entries) = std::fs::read_dir(&user_commands_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                    let name = path
-                        .file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
-                    if !skill_names.contains(&name) {
-                        self.claude_config.skills.push(ClaudeConfigItem {
-                            name,
-                            file_path: path,
-                            scope: ConfigScope::User,
-                        });
-                    }
-                }
-            }
-        }
-        self.claude_config
-            .skills
-            .sort_by_key(|a| a.name.to_lowercase());
-
-        // --- Read settings.json ---
-        let settings_path = claude_home.join("settings.json");
-        let settings_json: Option<serde_json::Value> = std::fs::read_to_string(&settings_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok());
-
-        // --- Plugins ---
-        if let Some(ref settings) = settings_json {
-            if let Some(plugins) = settings.get("enabledPlugins").and_then(|v| v.as_object()) {
-                for key in plugins.keys() {
-                    self.claude_config.plugins.push(ClaudeConfigItem {
-                        name: key.clone(),
-                        file_path: settings_path.clone(),
-                        scope: ConfigScope::User,
-                    });
-                }
-            }
-        }
-        self.claude_config
-            .plugins
-            .sort_by_key(|a| a.name.to_lowercase());
-
-        // --- MCP Servers ---
-        // Project .mcp.json
-        let project_mcp = workspace_dir.join(".mcp.json");
-        if let Ok(content) = std::fs::read_to_string(&project_mcp) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(servers) = json.get("mcpServers").and_then(|v| v.as_object()) {
-                    for key in servers.keys() {
-                        self.claude_config.mcp_servers.push(ClaudeConfigItem {
-                            name: key.clone(),
-                            file_path: project_mcp.clone(),
-                            scope: ConfigScope::Project,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Global ~/.claude/.mcp.json
-        let global_mcp = claude_home.join(".mcp.json");
-        if let Ok(content) = std::fs::read_to_string(&global_mcp) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(servers) = json.get("mcpServers").and_then(|v| v.as_object()) {
-                    for key in servers.keys() {
-                        self.claude_config.mcp_servers.push(ClaudeConfigItem {
-                            name: key.clone(),
-                            file_path: global_mcp.clone(),
-                            scope: ConfigScope::User,
-                        });
-                    }
-                }
-            }
-        }
-        self.claude_config
-            .mcp_servers
-            .sort_by_key(|a| a.name.to_lowercase());
-
-        // --- Hooks ---
-        if let Some(ref settings) = settings_json {
-            if let Some(hooks) = settings.get("hooks").and_then(|v| v.as_object()) {
-                for key in hooks.keys() {
-                    self.claude_config.hooks.push(ClaudeConfigItem {
-                        name: key.clone(),
-                        file_path: settings_path.clone(),
-                        scope: ConfigScope::User,
-                    });
-                }
-            }
-        }
-        self.claude_config
-            .hooks
-            .sort_by_key(|a| a.name.to_lowercase());
-
-        // --- Settings ---
-        // User settings (top-level keys, excluding plugins/hooks which have their own sections)
-        if let Some(ref settings) = settings_json {
-            if let Some(obj) = settings.as_object() {
-                let excluded = ["enabledPlugins", "hooks"];
-                for key in obj.keys() {
-                    if !excluded.contains(&key.as_str()) {
-                        self.claude_config.settings.push(ClaudeConfigItem {
-                            name: key.clone(),
-                            file_path: settings_path.clone(),
-                            scope: ConfigScope::User,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Project settings
-        let project_settings_path = workspace_dir.join(".claude").join("settings.local.json");
-        if let Ok(content) = std::fs::read_to_string(&project_settings_path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(obj) = json.as_object() {
-                    for key in obj.keys() {
-                        self.claude_config.settings.push(ClaudeConfigItem {
-                            name: key.clone(),
-                            file_path: project_settings_path.clone(),
-                            scope: ConfigScope::Project,
-                        });
-                    }
-                }
-            }
-        }
-        self.claude_config
-            .settings
-            .sort_by_key(|a| a.name.to_lowercase());
+        let loaded =
+            gitterm_core::agent_config::AgentConfig::load(&home.join(".claude"), &self.repo_path);
+        self.claude_config.skills = loaded.skills;
+        self.claude_config.plugins = loaded.plugins;
+        self.claude_config.mcp_servers = loaded.mcp_servers;
+        self.claude_config.hooks = loaded.hooks;
+        self.claude_config.settings = loaded.settings;
     }
 
     #[allow(dead_code)]
@@ -46695,10 +46523,7 @@ fi
         let hover_bg = theme.surface0();
 
         // Scope badge text
-        let scope_str = match item.scope {
-            ConfigScope::User => "USR",
-            ConfigScope::Project => "PRJ",
-        };
+        let scope_str = item.scope.badge();
 
         let scope_bg = iced::Color {
             a: 0.12,
