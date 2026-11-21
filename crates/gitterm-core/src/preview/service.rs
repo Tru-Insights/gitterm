@@ -618,24 +618,31 @@ fn fixture_target(preview: &Preview, fixtures: &[PathBuf], target: &Path) -> io:
     Ok(actual)
 }
 
-/// `checkout/.git`, when present, and the `commondir` it names must resolve
-/// inside `fixture` and outside every protected root.
+/// When `checkout` holds a `.git` or is itself a Git dir (it holds `HEAD`),
+/// the admin dir and common dir Git uses from there must resolve inside
+/// `fixture` and outside every protected root. Git itself names them: it
+/// reads a `.git` file and `commondir` differently from a line parser (it
+/// keeps embedded newlines and trailing spaces), and a Git dir needs no
+/// `.git` at all to carry a `commondir` of its own.
 fn check_git_admin(preview: &Preview, fixture: &Path, checkout: &Path) -> io::Result<()> {
     let dot_git = checkout.join(".git");
-    let metadata = match fs::metadata(&dot_git) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+    let has_dot_git = exists_no_follow(&dot_git)?;
+    if !has_dot_git && !exists_no_follow(&checkout.join("HEAD"))? {
+        return Ok(());
+    }
+    if has_dot_git {
+        match fs::metadata(&dot_git) {
+            Ok(metadata) if metadata.is_file() => check_pointer_text(&dot_git)?,
+            Ok(_) => {}
             // A dangling `.git` link is refused, not mistaken for absence.
-            return match fs::symlink_metadata(&dot_git) {
-                Ok(_) => Err(refuse(format!("dangling git link: {}", dot_git.display()))),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(error),
-            };
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(refuse(format!("dangling git link: {}", dot_git.display())));
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
-    };
-    // Git writes a relative `commondir` (`../..`), which the protected check
-    // refuses as traversal; the OS resolves it, and a missing one is refused.
+    }
+    // Git prints a relative common dir (`.git`, `../..`), which the
+    // protected check refuses as traversal; the OS resolves it.
     let inside = |path: &Path| -> io::Result<PathBuf> {
         let actual = preview.protected().check(&fs::canonicalize(path)?)?;
         if !actual.starts_with(fixture) {
@@ -646,46 +653,77 @@ fn check_git_admin(preview: &Preview, fixture: &Path, checkout: &Path) -> io::Re
         }
         Ok(actual)
     };
-    let git_dir = if metadata.is_file() {
-        let pointer = git_pointer(&dot_git, "gitdir:")?;
-        inside(&checkout.join(pointer))?
-    } else {
-        inside(&dot_git)?
-    };
+    let (git_dir, common_dir) = git_admin_dirs(checkout)?;
+    let git_dir = inside(&git_dir)?;
     let commondir = git_dir.join("commondir");
-    match fs::read_to_string(&commondir) {
-        Ok(contents) => {
-            let common = contents.trim_end_matches(['\n', '\r']);
-            if common.is_empty() {
-                return Err(refuse(format!("empty commondir: {}", commondir.display())));
-            }
-            inside(&git_dir.join(common))?;
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if fs::symlink_metadata(&commondir).is_ok() {
-                return Err(refuse(format!(
-                    "dangling commondir link: {}",
-                    commondir.display()
-                )));
-            }
-        }
-        Err(error) => return Err(error),
+    if exists_no_follow(&commondir)? {
+        // A dangling link fails here rather than reading as absent.
+        check_pointer_text(&commondir)?;
+    }
+    inside(&common_dir)?;
+    Ok(())
+}
+
+fn exists_no_follow(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// A `.git` file or `commondir` holds one line: any control character other
+/// than its trailing newline (an embedded `\n`, a `\r`, a NUL) is refused
+/// before Git is asked, because Git and a reader of lines disagree on it.
+fn check_pointer_text(file: &Path) -> io::Result<()> {
+    let bytes = fs::read(file)?;
+    let body = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    if body.is_empty() || body.iter().any(u8::is_ascii_control) {
+        return Err(refuse(format!(
+            "git pointer is not one plain line: {}",
+            file.display()
+        )));
     }
     Ok(())
 }
 
-/// The path a `.git` file names after `prefix`. A relative path is relative
-/// to the file's directory; the caller joins it, which keeps absolute ones.
-fn git_pointer(file: &Path, prefix: &str) -> io::Result<PathBuf> {
-    let contents = fs::read_to_string(file)?;
-    contents
-        .lines()
-        .next()
-        .and_then(|line| line.strip_prefix(prefix))
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| refuse(format!("not a gitdir file: {}", file.display())))
+/// The admin dir and common dir Git uses from `checkout`, as Git resolves
+/// them (`rev-parse`, which only reads). A Git failure is a refusal. The
+/// caller's `GIT_*` variables are cleared so the files on disk decide.
+fn git_admin_dirs(checkout: &Path) -> io::Result<(PathBuf, PathBuf)> {
+    let mut command = std::process::Command::new("git");
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_none_or(|name| name.starts_with("GIT_")) {
+            command.env_remove(name);
+        }
+    }
+    let output = command
+        .arg("-C")
+        .arg(checkout)
+        .args(["rev-parse", "--absolute-git-dir", "--git-common-dir"])
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    let failed = |why: &str| {
+        refuse(format!(
+            "git cannot name the admin dir of {}: {why}",
+            checkout.display()
+        ))
+    };
+    if !output.status.success() {
+        return Err(failed(String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    // One path per line, so a path holding a newline shows as extra lines.
+    let stdout = std::str::from_utf8(&output.stdout).map_err(|_| failed("non-UTF-8 path"))?;
+    match stdout
+        .strip_suffix('\n')
+        .map(|text| text.split('\n').collect::<Vec<_>>())
+        .as_deref()
+    {
+        Some([git_dir, common_dir]) if !git_dir.is_empty() && !common_dir.is_empty() => {
+            Ok((checkout.join(git_dir), checkout.join(common_dir)))
+        }
+        _ => Err(failed("unexpected rev-parse output")),
+    }
 }
 
 #[cfg(test)]
