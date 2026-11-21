@@ -71,6 +71,10 @@ pub(crate) fn branch(repo: &str, name: &str, gone: bool) -> BranchStatus {
 }
 
 fn fixture(owned: bool) -> WorkSidebar {
+    fixture_with_branch(owned, "tru-274")
+}
+
+fn fixture_with_branch(owned: bool, first_branch: &str) -> WorkSidebar {
     let now = Instant::now();
     let wall_time = SystemTime::now();
     let entries = vec![
@@ -123,7 +127,7 @@ fn fixture(owned: bool) -> WorkSidebar {
         result: RefreshOutcome {
             mode: RefreshMode::Full,
             branches: vec![
-                branch("/repos/api", "tru-274", false),
+                branch("/repos/api", first_branch, false),
                 branch("/repos/api", "old-branch", true),
                 branch("/repos/infra", "infra-fix", false),
                 branch("/repos/hidden", "hidden-fix", false),
@@ -2693,7 +2697,7 @@ fn open_review_checkout_marks_only_its_branch_row_selected(cx: &mut gpui::TestAp
 }
 
 #[gpui::test]
-fn expanded_repo_row_slots_stay_on_one_line_with_muted_editor(cx: &mut gpui::TestAppContext) {
+fn expanded_repo_row_name_and_run_never_shrink_but_actions_wrap(cx: &mut gpui::TestAppContext) {
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let repo = PathBuf::from("/repos/gitterm-v2");
@@ -2711,27 +2715,23 @@ fn expanded_repo_row_slots_stay_on_one_line_with_muted_editor(cx: &mut gpui::Tes
             .position(|r| r.label == "gitterm-v2")
             .unwrap()
     });
-    let heights = |cx: &mut gpui::VisualTestContext, width: f32| {
+    let measure = |cx: &mut gpui::VisualTestContext, width: f32| {
         cx.simulate_resize(gpui::size(px(width), px(900.)));
         draw_sidebar(cx);
-        ["work-name-", "work-run-", "work-control-"].map(|prefix| {
-            let selector = if prefix == "work-control-" {
-                format!("{prefix}{index}-0")
-            } else {
-                format!("{prefix}{index}")
-            };
+        let bounds = |cx: &mut gpui::VisualTestContext, selector: String| {
             cx.debug_bounds(Box::leak(selector.into_boxed_str()))
-                .unwrap()
-                .size
-                .height
-        })
+                .unwrap_or_else(|| panic!("missing bounds at {width}pt"))
+        };
+        (
+            bounds(cx, format!("work-name-{index}")).size,
+            bounds(cx, format!("work-run-{index}")).size,
+        )
     };
-    let one_line = heights(cx, 2400.);
-    let default = heights(cx, crate::layout::RegionLayout::default().sidebar_width);
-    assert_eq!(
-        default, one_line,
-        "name, run command and Open in editor never wrap"
-    );
+    let (name_wide, run_wide) = measure(cx, 2400.);
+    let (name, run) = measure(cx, 300.);
+    assert_eq!(name, name_wide, "repo name keeps its full width and height");
+    assert_eq!(run, run_wide, "run command keeps its full width and height");
+    assert_eq!(name.height, run.height, "one line each");
     let disclosure = cx
         .debug_bounds(Box::leak(format!("work-fold-{index}-▾").into_boxed_str()))
         .unwrap();
@@ -2749,4 +2749,59 @@ fn expanded_repo_row_slots_stay_on_one_line_with_muted_editor(cx: &mut gpui::Tes
             .unwrap();
         assert!(row.controls.iter().any(|c| c.label == "Open in editor"));
     });
+}
+
+#[gpui::test]
+fn long_branch_title_is_shortened_at_iced_limit_then_wraps(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let long = "task/02bf8131-5c35-4939-b33f-bf01dae8aa5c-extra-long-name";
+    let (sidebar, cx) = cx.add_window_view(|_, _| {
+        let mut sidebar = fixture_with_branch(false, long);
+        sidebar.open.insert(Fold::Repo("/repos/api".into()));
+        sidebar
+    });
+    cx.simulate_resize(gpui::size(px(300.), px(900.)));
+    draw_sidebar(cx);
+    let (index, label) = sidebar.read_with(cx, |s, _| {
+        let rows = s.rows();
+        let index = rows
+            .iter()
+            .position(|r| r.label.starts_with("task/02bf"))
+            .unwrap();
+        (index, rows[index].label.clone())
+    });
+    assert_eq!(label.chars().count(), 40);
+    assert!(label.ends_with('\u{2026}'));
+    let title = cx
+        .debug_bounds(Box::leak(format!("work-label-{index}").into_boxed_str()))
+        .unwrap();
+    assert!(title.size.height > px(20.), "branch title wraps: {title:?}");
+}
+
+#[gpui::test]
+fn repo_age_text_wraps_when_the_actions_slot_is_squeezed(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let repo = PathBuf::from("/repos/api");
+    let (sidebar, cx) = cx.add_window_view(|_, _| {
+        let mut sidebar = fixture(false);
+        sidebar.workspace.repos[0].dir = repo.clone();
+        sidebar.workspace.repos[0].run_command = Some("cargo run --example preview".into());
+        sidebar.open.insert(Fold::Repo(repo.clone()));
+        sidebar
+    });
+    let index = sidebar.read_with(cx, |s, _| {
+        s.rows().iter().position(|r| r.label == "api").unwrap()
+    });
+    let age = |cx: &mut gpui::VisualTestContext, width: f32| {
+        cx.simulate_resize(gpui::size(px(width), px(900.)));
+        draw_sidebar(cx);
+        cx.debug_bounds(Box::leak(format!("work-age-{index}").into_boxed_str()))
+            .unwrap()
+            .size
+    };
+    let wide = age(cx, 2400.);
+    let narrow = age(cx, 300.);
+    assert!(narrow.height >= wide.height, "age may wrap to more lines");
 }
