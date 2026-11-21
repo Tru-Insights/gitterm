@@ -13,9 +13,9 @@ use gitterm_core::session;
 use gitterm_core::task_commands::{
     HandoffUpdate, SessionLaunch, TaskCreate, TaskCreateOrigin, TaskLaunchOrigin, TaskMutation,
     TaskMutationAction, TaskMutationCommand, TaskMutationFacts, TaskPreset, TaskProjection,
-    TaskPublish, TaskRead, TaskReadCommand, WorkerCaller, WorkerCheckout, WorkerPreparationId,
+    TaskPublish, WorkerCaller, WorkerCheckout, WorkerPreparationId,
 };
-use gitterm_core::tasks::state::TaskAuthority;
+use gitterm_core::task_host::{HostEffect, TaskHost};
 use iced::advanced::graphics::core::Element;
 use iced::keyboard::{self, key, Key, Modifiers};
 use iced::widget::{
@@ -84,9 +84,11 @@ use gitterm::harness::{
     HarnessCommand, HarnessEvent, ImageAttachment, RuntimeDecision, TurnStatus, UserPrompt,
 };
 use gitterm::review_pane;
+#[cfg(test)]
+use gitterm::task_mcp::TaskControlOperation;
 use gitterm::task_mcp::{
-    self, CreateTaskRequest as McpCreateTaskRequest, TaskControlEnvelope, TaskControlOperation,
-    TaskControlReply, TaskMcpConnection, TaskStoppingBoundary,
+    self, CreateTaskRequest as McpCreateTaskRequest, TaskControlEnvelope, TaskControlReply,
+    TaskMcpConnection, TaskStoppingBoundary,
 };
 use gitterm::task_worktree::{
     discover_task_delivery, inspect_task_cleanup, open_task_draft_pr, prepare_task_worktree,
@@ -348,11 +350,27 @@ fn init_task_control_channel() -> task_mcp::TaskControlSender {
 }
 
 fn task_control_stream() -> impl iced::futures::Stream<Item = Event> + Send + 'static {
-    iced::futures::stream::unfold(task_mcp::take_command_receiver(), |receiver| async move {
-        let mut receiver = receiver?;
-        let envelope = receiver.recv().await?;
-        Some((Event::TaskControlRequested(envelope), Some(receiver)))
-    })
+    use iced::futures::StreamExt;
+    gitterm_core::task_host::command_stream().map(Event::TaskControlRequested)
+}
+
+/// Iced's composition of the shared task host: the real V6 root, so the
+/// service gate allows every operation, on the process command ingress.
+fn production_task_host(
+    store: Option<TaskStore>,
+    commands: task_mcp::TaskControlSender,
+) -> TaskHost {
+    let root = std::path::absolute(config::global_config_dir())
+        .expect("GitTerm V6 needs an absolute config directory for its task host");
+    let services =
+        gitterm_core::preview::service::ServiceContext::production(&root, config::instance_id())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "GitTerm V6 task host services at {}: {error}",
+                    root.display()
+                )
+            });
+    TaskHost::new(store, services, commands)
 }
 
 // Stable process-owner subscription: taking the receiver never restarts status jobs.
@@ -7668,7 +7686,7 @@ struct App {
     selection: SelectionState,
     next_tab_id: usize,
     // Durable task registry and cross-workspace Tasks UI state.
-    task_authority: TaskAuthority,
+    task_host: TaskHost,
     missing_task_worktrees_logged: HashSet<String>,
     /// Review… button defaults (config `review`, TRU-142).
     review_config: config::ReviewConfig,
@@ -9596,7 +9614,7 @@ impl Drop for App {
     fn drop(&mut self) {
         self.status_jobs.runtime.close();
         if self.task_mcp.is_some() {
-            task_mcp::close_commands();
+            self.task_host.shutdown();
         }
     }
 }
@@ -11549,7 +11567,7 @@ impl App {
         let task_worktree = tab
             .task_id
             .as_deref()
-            .and_then(|id| self.task_authority.store().as_ref()?.get(id))
+            .and_then(|id| self.task_host.store().as_ref()?.get(id))
             .and_then(|task| task.worktree.path.clone());
         let label = tab::checkout_label(
             &tab.repo_path,
@@ -11586,7 +11604,7 @@ impl App {
     /// workspace's prepared task worktrees.
     fn checkout_choices_for(&self, workspace_dir: &Path) -> Vec<tab::CheckoutChoice> {
         let tasks = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .map_or(&[][..], TaskStore::tasks);
@@ -11789,7 +11807,7 @@ impl App {
     /// the active tab as usual.
     fn task_context_worktree_root(&self) -> Option<PathBuf> {
         let task_id = self.active_task_context_id()?;
-        let task = self.task_authority.store().as_ref()?.get(task_id)?;
+        let task = self.task_host.store().as_ref()?.get(task_id)?;
         let workspace = self.active_workspace()?;
         let WorkspaceLocationIdentity::Local { directory } = &task.workspace.location else {
             return None;
@@ -11918,7 +11936,7 @@ impl App {
     /// The task (if any) whose registered worktree is `path`. Archived tasks
     /// still count — their worktree is managed until it is cleaned up.
     fn worktree_task(&self, path: &Path) -> Option<&TaskRecord> {
-        self.task_authority
+        self.task_host
             .store()
             .as_ref()?
             .tasks()
@@ -11981,7 +11999,7 @@ impl App {
         if anchored.is_empty() {
             return;
         }
-        if let Some(store) = self.task_authority.store_mut().as_mut() {
+        if let Some(store) = self.task_host.store_mut().as_mut() {
             for session in anchored {
                 if let Err(error) = store.upsert_session(task_id, session, &timestamp) {
                     self.task_ui_error = Some(error.to_string());
@@ -11997,7 +12015,7 @@ impl App {
     /// repository workspace, never peer workspaces in the bottom bar. Follow
     /// any worktree ancestry back to that logical workspace.
     fn canonical_task_workspace_directory(&self, directory: &Path) -> PathBuf {
-        let Some(store) = self.task_authority.store().as_ref() else {
+        let Some(store) = self.task_host.store().as_ref() else {
             return directory.to_path_buf();
         };
         let mut canonical = directory.to_path_buf();
@@ -12146,7 +12164,7 @@ impl App {
         // A late PTY/title/exit observation from a final worker cannot
         // replace its persisted handoff outcome or resurrect its lifecycle.
         let final_session = |tab: &TabState| {
-            self.task_authority.store().as_ref().is_some_and(|store| {
+            self.task_host.store().as_ref().is_some_and(|store| {
                 store.worker_session_is_final(task_id, tab.task_session_id.as_deref())
             })
         };
@@ -12172,7 +12190,7 @@ impl App {
             (None, Some((state, detail))) => (state, detail),
             (None, None) => return,
         };
-        let Some(store) = self.task_authority.store_mut().as_mut() else {
+        let Some(store) = self.task_host.store_mut().as_mut() else {
             return;
         };
         if let Err(error) =
@@ -12189,7 +12207,7 @@ impl App {
     /// every Tick for whichever task context is active — merely seeing the
     /// rail never acknowledges anything.
     fn acknowledge_task_attention(&mut self, task_id: &str) {
-        let Some(store) = self.task_authority.store_mut().as_mut() else {
+        let Some(store) = self.task_host.store_mut().as_mut() else {
             return;
         };
         if store.get(task_id).is_none() {
@@ -12460,7 +12478,7 @@ impl App {
     /// granularity and the store no-ops on identical snapshots, so output
     /// spam costs at most one write per minute.
     fn flush_task_progress(&mut self) {
-        let Some(store) = self.task_authority.store().as_ref() else {
+        let Some(store) = self.task_host.store().as_ref() else {
             return;
         };
         let mut activity: HashMap<String, Instant> = HashMap::new();
@@ -12519,7 +12537,7 @@ impl App {
             return;
         }
         let timestamp = now.to_rfc3339();
-        let Some(store) = self.task_authority.store_mut().as_mut() else {
+        let Some(store) = self.task_host.store_mut().as_mut() else {
             return;
         };
         for (task_id, progress, changes) in updates {
@@ -12609,7 +12627,7 @@ impl App {
             needs_attention: false,
             score: 0,
         }];
-        if let (Some(store), Some(workspace)) = (self.task_authority.store().as_ref(), workspace) {
+        if let (Some(store), Some(workspace)) = (self.task_host.store().as_ref(), workspace) {
             entries.extend(
                 store
                     .tasks()
@@ -12729,7 +12747,7 @@ impl App {
             concurrency_limit: self.max_concurrent_local_tasks,
             ..Default::default()
         };
-        if let Some(store) = self.task_authority.store() {
+        if let Some(store) = self.task_host.store() {
             facts.directories = store
                 .tasks()
                 .iter()
@@ -12789,7 +12807,7 @@ impl App {
             TaskMutation::WorkerPreparationSaved { .. }
                 | TaskMutation::WorkerCheckoutReuseSaved { .. }
         ) {
-            if let Some(store) = self.task_authority.store() {
+            if let Some(store) = self.task_host.store() {
                 facts.checkouts = store
                     .tasks()
                     .iter()
@@ -12806,7 +12824,7 @@ impl App {
                 facts.checkouts.push(checkout);
             }
         }
-        self.task_authority
+        self.task_host
             .reduce_mutation(
                 TaskMutationCommand {
                     reply: None,
@@ -12907,7 +12925,7 @@ impl App {
             }
         }
         let effect = self
-            .task_authority
+            .task_host
             .reduce_mutation(
                 TaskMutationCommand {
                     reply: Some(reply.id()),
@@ -12924,7 +12942,7 @@ impl App {
                 task_id, prepared, ..
             } => {
                 let saved = self
-                    .task_authority
+                    .task_host
                     .store_mut()
                     .as_mut()
                     .ok_or("The task store became unavailable".to_string())
@@ -12950,7 +12968,7 @@ impl App {
                 error,
                 cleanup_path,
             } => {
-                if let Some(store) = self.task_authority.store_mut().as_mut() {
+                if let Some(store) = self.task_host.store_mut().as_mut() {
                     if let Err(store_error) = store.fail_worktree_preparation(
                         &task_id,
                         error.clone(),
@@ -12981,7 +12999,7 @@ impl App {
         else {
             unreachable!("metadata effect")
         };
-        self.task_authority
+        self.task_host
             .store_mut()
             .as_mut()
             .ok_or("GitTerm's task store became unavailable")?
@@ -12993,7 +13011,7 @@ impl App {
         let effect = self.reduce_task_mutation(TaskMutation::Close {
             task_id: task_id.into(),
         });
-        let effect = effect.map_err(|error| match self.task_authority.store().as_ref() {
+        let effect = effect.map_err(|error| match self.task_host.store().as_ref() {
             None => "GitTerm's task store is unavailable".into(),
             Some(store) if store.get(task_id).is_none() => format!(
                 "failed to archive task store {}: task {task_id} does not exist",
@@ -13007,7 +13025,7 @@ impl App {
         let TaskMutationAction::ArchiveTask { task_id } = effect else {
             unreachable!("archive effect")
         };
-        self.task_authority
+        self.task_host
             .store_mut()
             .as_mut()
             .ok_or("GitTerm's task store is unavailable")?
@@ -13015,13 +13033,210 @@ impl App {
             .map_err(|error| error.to_string())
     }
 
+    /// Runs what the task host handed back for one command, with Iced's
+    /// live state. Each arm answers its reply exactly as before the host.
+    fn execute_host_effect(&mut self, effect: HostEffect) -> Task<Event> {
+        match effect {
+            HostEffect::PlanLimits { reply } => {
+                reply.send(self.plan_limits_snapshot());
+            }
+            HostEffect::HtmlRender {
+                reply,
+                caller,
+                request,
+            } => {
+                if !gitterm::html_render::NATIVE_HTML_SUPPORTED {
+                    reply.send(Err("html_render currently requires GitTerm for macOS; this platform lacks the required native subframe navigation guard".into()));
+                    return Task::none();
+                }
+                let caller = caller.as_deref();
+                let chat = self
+                    .workspaces
+                    .iter()
+                    .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
+                    .flat_map(|ws| &ws.tabs)
+                    .find(|tab| {
+                        Some(tab.session_uid.as_str()) == caller
+                            && tab
+                                .agent_session()
+                                .is_some_and(|session| session.backend().is_native())
+                    });
+                let result = request.validate().and_then(|()| {
+                    chat.ok_or_else(|| {
+                        "html_render requires an open local native Claude or ACP chat tab (Pi does not restore conversation history)".to_string()
+                    })?;
+                    // An additive result carried in the conversation works
+                    // even when a harness does not report the raw tool input.
+                    serde_json::to_value(gitterm::html_render::HtmlRenderResult {
+                        html_render: request,
+                    })
+                    .map_err(|error| format!("cannot encode visual reply: {error}"))
+                });
+                reply.send(result);
+            }
+            HostEffect::Read { reply, effect } => {
+                reply.send(self.task_read_requested(effect));
+            }
+            HostEffect::Create {
+                reply,
+                caller,
+                request,
+            } => {
+                let pending = match self.pending_task_from_control(request, reply.clone(), caller) {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        reply.send(Err(error));
+                        return Task::none();
+                    }
+                };
+                let worktree_request = pending.request.clone();
+                return Task::perform(resolve_task_preparation(worktree_request), move |result| {
+                    Event::TaskMetadataResolved(pending, result.map_err(|error| error.to_string()))
+                });
+            }
+            HostEffect::LaunchSession { reply, launch } => {
+                let decision =
+                    self.reduce_task_mutation(TaskMutation::LaunchSession(launch.clone()));
+                let preset_idx = match decision {
+                    Ok(TaskMutationAction::LaunchSession { preset_index, .. }) => preset_index,
+                    Ok(TaskMutationAction::QueueSession { preset_index, .. }) => Some(preset_index),
+                    Err(error) => {
+                        reply.send(Err(error));
+                        return Task::none();
+                    }
+                    _ => unreachable!("launch effect"),
+                };
+                match self.try_launch_task_child(
+                    &launch.task_id,
+                    preset_idx,
+                    false,
+                    launch.origin,
+                    launch.user_model_choice,
+                ) {
+                    Ok(TaskChildLaunch::Started(task, session)) => {
+                        let mut session = session;
+                        if launch.user_model_choice {
+                            session["cost_note"] = serde_json::json!("Explicit user model choice overrides plan limits; this may consume remaining allowance or credits.");
+                        }
+                        reply.send(Ok(session));
+                        return task;
+                    }
+                    Ok(TaskChildLaunch::Queued { position }) => {
+                        reply.send(Ok(serde_json::json!({
+                            "task_id": launch.task_id,
+                            "queued": true,
+                            "queue_position": position,
+                            "cost_note": launch.user_model_choice.then_some("Explicit user model choice overrides plan limits; this may consume remaining allowance or credits."),
+                            "detail": "Concurrency or plan limits deferred this launch; it starts automatically when capacity permits.",
+                        })));
+                    }
+                    Err(error) => reply.send(Err(error)),
+                }
+            }
+            HostEffect::UpdateHandoff {
+                reply,
+                caller,
+                request,
+            } => {
+                let result = self.update_handoff_requested(request, caller.as_deref());
+                reply.send(result);
+            }
+            HostEffect::DelegateTask {
+                reply,
+                caller,
+                request,
+            } => {
+                return self.delegate_task_requested(request, caller, reply);
+            }
+            HostEffect::TurnEnded {
+                reply,
+                task_id,
+                session_id,
+            } => {
+                let mut updated = false;
+                for workspace in &mut self.workspaces {
+                    for tab in &mut workspace.tabs {
+                        if tab.task_id.as_deref() == Some(task_id.as_str())
+                            && tab.task_session_id.as_deref() == Some(session_id.as_str())
+                        {
+                            tab.task_live_state = Some(TaskSessionLiveState::AwaitingInput);
+                            tab.set_attention(AttentionReason::HumanInputRequired);
+                            updated = true;
+                        }
+                    }
+                }
+                if updated {
+                    self.apply_task_session_signal(&task_id, None);
+                    self.mark_log_server_dirty();
+                }
+                reply.send(Ok(serde_json::json!({
+                    "task_id": task_id,
+                    "session_id": session_id,
+                    "waiting_for_input": updated,
+                })));
+            }
+            HostEffect::RequestReview {
+                reply,
+                caller,
+                request,
+            } => {
+                let new = self
+                    .delegation_caller_for_tool(caller.as_deref(), "review_request")
+                    .and_then(|caller| {
+                        gitterm::delegations::review_delegation(
+                            &request,
+                            &caller,
+                            self.review_config.codex_model.as_deref(),
+                            None,
+                        )
+                    });
+                return self.request_delegation(new, DelegationOrigin::Mcp(reply));
+            }
+            HostEffect::RequestConsult {
+                reply,
+                caller,
+                request,
+            } => {
+                let new = self
+                    .delegation_caller_for_tool(caller.as_deref(), "consult_request")
+                    .and_then(|caller| {
+                        gitterm::delegations::consult_delegation(
+                            &request,
+                            &caller,
+                            self.review_config.codex_model.as_deref(),
+                            None,
+                        )
+                    });
+                return self.request_delegation(new, DelegationOrigin::Mcp(reply));
+            }
+            HostEffect::DelegationRecord {
+                reply,
+                delegation,
+                mut record,
+            } => {
+                if let Some(worker) = self.worker_info(&delegation) {
+                    record["worker"] = worker;
+                }
+                reply.send(Ok(record));
+            }
+            HostEffect::MergePlanSet {
+                reply,
+                caller,
+                request,
+            } => {
+                return self.merge_plan_set(caller.as_deref(), request, reply);
+            }
+            HostEffect::MergePlanGet { reply, caller } => {
+                reply.send(self.merge_plan_get(caller.as_deref()));
+            }
+        }
+        Task::none()
+    }
+
     fn task_read_requested(
         &self,
-        query: TaskRead,
-        reply: gitterm_core::task_commands::ReplyId,
+        effect: gitterm_core::task_commands::TaskReadEffect,
     ) -> Result<serde_json::Value, String> {
-        let effect = self.task_authority.reduce(TaskReadCommand { reply, query });
-        debug_assert_eq!(effect.reply, reply);
         match effect.projection? {
             TaskProjection::List(tasks) => {
                 let tasks = tasks
@@ -13075,7 +13290,7 @@ impl App {
     /// Startup probes read harness files off the UI thread even when Chats
     /// is hidden. Prompt stability ignores cursor/spinner PTY redraws.
     fn poll_task_watchdogs(&mut self) -> Task<Event> {
-        let Some(store) = self.task_authority.store().as_ref() else {
+        let Some(store) = self.task_host.store().as_ref() else {
             return Task::none();
         };
         let mut probes = Vec::new();
@@ -13165,7 +13380,7 @@ impl App {
             return;
         };
         let Some(mut session) = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .and_then(|store| store.get(task_id))
@@ -13185,7 +13400,7 @@ impl App {
                 session.objective_delivery = ObjectiveDeliveryState::Delivered;
                 session.conversation = Some(conversation.clone());
                 session.updated_at = now.to_rfc3339();
-                if let Some(store) = self.task_authority.store_mut().as_mut() {
+                if let Some(store) = self.task_host.store_mut().as_mut() {
                     if let Err(error) = store.upsert_session(task_id, session, &now.to_rfc3339()) {
                         eprintln!("[tasks] confirm startup {task_id}/{session_id}: {error}");
                         self.task_store_error = Some(error.to_string());
@@ -13230,7 +13445,7 @@ impl App {
             return;
         }
         // A late probe must not overwrite a worker's already final report.
-        let Some(store) = self.task_authority.store_mut().as_mut() else {
+        let Some(store) = self.task_host.store_mut().as_mut() else {
             return;
         };
         if !store.open_worker_delegations(task_id).iter().any(|d| d.status.is_active() && matches!(&d.child,
@@ -13273,14 +13488,14 @@ impl App {
         sync_task_sessions_from_chat_index(
             &self.chat_index,
             &self.workspaces,
-            self.task_authority.store_mut(),
+            self.task_host.store_mut(),
             &mut self.task_store_error,
         );
     }
 
     fn resume_task_conversation(&mut self, task_id: &str, chat_id: &str) -> Task<Event> {
         let Some(task) = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .and_then(|store| store.get(task_id))
@@ -13309,7 +13524,7 @@ impl App {
         };
         if let Some((ws, idx)) = self.find_chat_tab(&chats::ChatRef::local(chat_id)) {
             let tab = &self.workspaces[ws].tabs[idx];
-            if self.task_authority.store().as_ref().is_some_and(|store| {
+            if self.task_host.store().as_ref().is_some_and(|store| {
                 store.worker_session_is_final(task_id, tab.task_session_id.as_deref())
             }) {
                 self.task_ui_error = Some("This finished worker is closing. Reopen its conversation after its tab closes.".into());
@@ -13328,7 +13543,7 @@ impl App {
             session.conversation = None;
             let timestamp = chrono::Utc::now().to_rfc3339();
             session.updated_at = timestamp.clone();
-            if let Some(store) = self.task_authority.store_mut().as_mut() {
+            if let Some(store) = self.task_host.store_mut().as_mut() {
                 if let Err(error) = store.upsert_session(task_id, session, &timestamp) {
                     self.task_ui_error = Some(error.to_string());
                     return Task::none();
@@ -13373,7 +13588,7 @@ impl App {
             }
         }
         let timestamp = chrono::Utc::now().to_rfc3339();
-        if let Some(store) = self.task_authority.store_mut().as_mut() {
+        if let Some(store) = self.task_host.store_mut().as_mut() {
             renew_final_worker_session(store, task_id, &mut session, &timestamp);
             if let Err(error) = store.upsert_session(task_id, session.clone(), &timestamp) {
                 self.task_ui_error = Some(error.to_string());
@@ -13531,7 +13746,7 @@ impl App {
 
     fn enter_task_context(&mut self, task_id: &str) -> Task<Event> {
         let Some(task) = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .and_then(|store| store.get(task_id))
@@ -13606,7 +13821,7 @@ impl App {
 
     fn record_task_ui_error(&mut self, task_id: &str, detail: String) {
         self.task_ui_error = Some(detail.clone());
-        if let Some(store) = self.task_authority.store_mut().as_mut() {
+        if let Some(store) = self.task_host.store_mut().as_mut() {
             if let Err(error) =
                 store.record_resumable_error(task_id, detail, &chrono::Utc::now().to_rfc3339())
             {
@@ -13648,7 +13863,7 @@ impl App {
     /// and reclaims one (without re-queuing) when its agent resumes — the
     /// cap can therefore be briefly exceeded after an answer (TRU-129).
     fn local_slot_holders(&self) -> Vec<&TaskRecord> {
-        self.task_authority
+        self.task_host
             .store()
             .as_ref()
             .map(|store| local_slot_holders(store, &self.workspaces))
@@ -13664,7 +13879,7 @@ impl App {
     /// workspace env var; None lets delivery probe logged-in accounts for one
     /// with access to the repository.
     fn task_gh_account(&self, task_id: &str) -> Option<String> {
-        let task = self.task_authority.store().as_ref()?.get(task_id)?;
+        let task = self.task_host.store().as_ref()?.get(task_id)?;
         self.workspaces
             .iter()
             .find(|workspace| self.task_belongs_to_workspace(task, workspace))
@@ -13686,7 +13901,7 @@ impl App {
     /// Discovery only reads state — publishing stays behind explicit actions.
     fn probe_task_delivery(&mut self, task_id: &str) -> Task<Event> {
         let Some(task) = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .and_then(|store| store.get(task_id))
@@ -13709,7 +13924,7 @@ impl App {
             // raise "No such file or directory" at the user — note the state
             // on the record and leave the last known delivery in place.
             let timestamp = chrono::Utc::now().to_rfc3339();
-            if let Some(store) = self.task_authority.store_mut().as_mut() {
+            if let Some(store) = self.task_host.store_mut().as_mut() {
                 if let Err(error) = store.mark_worktree_missing(task_id, &timestamp) {
                     self.task_ui_error = Some(error.to_string());
                 }
@@ -13847,7 +14062,7 @@ impl App {
             // The queue only holds launches for tasks still marked Queued —
             // anything cancelled, archived, or started by hand just drops out.
             let still_queued = self
-                .task_authority
+                .task_host
                 .store()
                 .as_ref()
                 .and_then(|store| store.get(&entry.task_id))
@@ -13868,7 +14083,7 @@ impl App {
                     // A queued launch that can no longer start (worktree gone,
                     // preset removed) must not sit "Queued" forever.
                     let timestamp = chrono::Utc::now().to_rfc3339();
-                    if let Some(store) = self.task_authority.store_mut().as_mut() {
+                    if let Some(store) = self.task_host.store_mut().as_mut() {
                         if let Err(store_error) = store.record_lifecycle_signal(
                             &entry.task_id,
                             TaskLifecycle::Failed,
@@ -13922,7 +14137,7 @@ impl App {
         user_model_choice: bool,
     ) -> Result<TaskChildLaunch, String> {
         let Some(task) = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .and_then(|store| store.get(task_id))
@@ -14059,7 +14274,7 @@ impl App {
         facts.policy_reason = self.plan_limits_routing().reason;
         facts.slot_holders = holders.iter().cloned().collect();
         let decision = self
-            .task_authority
+            .task_host
             .reduce_mutation(
                 TaskMutationCommand {
                     reply: None,
@@ -14082,7 +14297,7 @@ impl App {
                     });
                 }
                 let store = self
-                    .task_authority
+                    .task_host
                     .store_mut()
                     .as_mut()
                     .ok_or("GitTerm's task store became unavailable")?;
@@ -14243,7 +14458,7 @@ impl App {
             updated_at: timestamp.clone(),
         };
         let store = self
-            .task_authority
+            .task_host
             .store_mut()
             .as_mut()
             .ok_or_else(|| "GitTerm's task store became unavailable".to_string())?;
@@ -14293,7 +14508,7 @@ impl App {
             "workspace": workspace_name,
             "worktree_path": task.worktree.path,
             "preset_name": preset_idx.map(|index| self.agent_presets[index].name.clone()),
-            "conversation_id": self.task_authority.store().as_ref()
+            "conversation_id": self.task_host.store().as_ref()
                 .and_then(|store| store.get(task_id))
                 .and_then(|task| task.sessions.iter().find(|item| item.task_session_id == session_id))
                 .and_then(|item| item.conversation.as_ref())
@@ -14479,7 +14694,7 @@ impl App {
     /// the task so the bottom bar remains a workspace/machine navigator.
     fn reconcile_managed_task_workspaces(&mut self) -> usize {
         let worktrees = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .map(|store| {
@@ -15496,7 +15711,7 @@ impl App {
             &self.chat_index,
             &self.workspaces,
             &self.repos,
-            self.task_authority.store().as_ref(),
+            self.task_host.store().as_ref(),
         );
         for (uid, dirs) in joins {
             for dir in dirs {
@@ -16172,7 +16387,7 @@ impl App {
             .flat_map(|ws| ws.tabs.iter())
             .filter_map(|tab| Some((tab.session_uid.clone(), tab.chat_session_id.clone()?)))
             .collect();
-        if let Some(store) = self.task_authority.store().as_ref() {
+        if let Some(store) = self.task_host.store().as_ref() {
             for delegation in store.delegations() {
                 if let Some(chat) = &delegation.parent.chat_session_id {
                     uid_to_chat
@@ -16185,7 +16400,7 @@ impl App {
     }
 
     fn chat_child_links(&self) -> Vec<chat_facts::ChildLink> {
-        let Some(store) = self.task_authority.store().as_ref() else {
+        let Some(store) = self.task_host.store().as_ref() else {
             return Vec::new();
         };
         let uid_to_chat = self.chat_uid_to_chat();
@@ -16193,7 +16408,7 @@ impl App {
     }
 
     fn poll_worker_prs(&mut self) -> Task<Event> {
-        let Some(store) = self.task_authority.store().as_ref() else {
+        let Some(store) = self.task_host.store().as_ref() else {
             return Task::none();
         };
         let uid_to_chat = self.chat_uid_to_chat();
@@ -16794,7 +17009,7 @@ impl App {
 
     /// Every task's worktree folder: never a repo of a workspace.
     fn task_worktree_dirs(&self) -> Vec<PathBuf> {
-        self.task_authority
+        self.task_host
             .store()
             .as_ref()
             .map(|store| {
@@ -17040,7 +17255,7 @@ impl App {
         rebuild_workspace_overview(
             &self.chat_index,
             &self.workspaces,
-            self.task_authority.store().as_ref(),
+            self.task_host.store().as_ref(),
             &self.overview_focus_picks,
             &mut self.workspace_overviews,
             &mut self.workspace_overview_summary_generation,
@@ -18595,7 +18810,7 @@ impl App {
 
     /// Newest first, including results requested before Resume as Chat.
     fn delegations_for_tab(&self, tab_id: usize) -> Vec<&gitterm::tasks::Delegation> {
-        self.task_authority
+        self.task_host
             .store()
             .as_ref()
             .map(|store| {
@@ -18712,7 +18927,7 @@ impl App {
                 return Task::none();
             }
         };
-        if self.task_authority.store().is_none() {
+        if self.task_host.store().is_none() {
             Self::report_delegation_error(&origin, "GitTerm's task store is unavailable".into());
             return Task::none();
         }
@@ -18803,7 +19018,7 @@ impl App {
         }
         let delegation_id = delegation.delegation_id.clone();
         let session_uid = delegation.parent.session_uid.clone();
-        let Some(store) = self.task_authority.store_mut().as_mut() else {
+        let Some(store) = self.task_host.store_mut().as_mut() else {
             Self::report_delegation_error(&origin, "GitTerm's task store is unavailable".into());
             return Task::none();
         };
@@ -18825,7 +19040,7 @@ impl App {
                 "status": "requested",
                 "routing": self.plan_limits_routing(),
                 "provider": "codex",
-                "cost_note": self.task_authority.store().as_ref().and_then(|store| store.delegation(&delegation_id)).filter(|delegation| delegation.options.user_model_choice).map(|_| "Explicit user model choice overrides plan limits; this may consume remaining allowance or credits."),
+                "cost_note": self.task_host.store().as_ref().and_then(|store| store.delegation(&delegation_id)).filter(|delegation| delegation.options.user_model_choice).map(|_| "Explicit user model choice overrides plan limits; this may consume remaining allowance or credits."),
                 "queued": queued,
                 "detail": if queued {
                     "Queued until plan limits and concurrency permit a Codex run. Do not wait or poll: the result appears as a card in the requesting chat tab, and delegation_get reads it."
@@ -18861,7 +19076,7 @@ impl App {
     /// Starts queued Codex runs while slots are free
     /// (`review.max_concurrent_reviews`).
     fn admit_delegations(&mut self) -> Vec<DelegationEffect> {
-        let Some(store) = self.task_authority.store().as_ref() else {
+        let Some(store) = self.task_host.store().as_ref() else {
             return Vec::new();
         };
         let running: HashSet<String> = self.delegation_runs.keys().cloned().collect();
@@ -18929,7 +19144,7 @@ impl App {
         check: delegation_state::RequestId,
         result: Result<delegation_state::Authority, String>,
     ) -> Task<Event> {
-        let Some(store) = self.task_authority.store().as_ref() else {
+        let Some(store) = self.task_host.store().as_ref() else {
             return Task::none();
         };
         let Some(delegation) = store.delegation(&id) else {
@@ -18971,7 +19186,7 @@ impl App {
 
     fn start_delegation_run(&mut self, id: &str) -> Task<Event> {
         let Some(delegation) = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .and_then(|store| store.delegation(id))
@@ -19013,7 +19228,7 @@ impl App {
         event: gitterm::codex_runner::CodexRunEvent,
     ) {
         let Some(delegation) = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .and_then(|store| store.delegation(delegation_id))
@@ -19026,7 +19241,7 @@ impl App {
         for effect in effects {
             match effect {
                 DelegationEffect::RecordStarted { id, thread_id } => {
-                    if let Some(store) = self.task_authority.store_mut().as_mut() {
+                    if let Some(store) = self.task_host.store_mut().as_mut() {
                         if let Err(error) = store.mark_delegation_started(
                             &id,
                             &thread_id,
@@ -19053,7 +19268,7 @@ impl App {
         >,
     ) -> Task<Event> {
         self.delegation_runs.remove(delegation_id);
-        let Some(store) = self.task_authority.store().as_ref() else {
+        let Some(store) = self.task_host.store().as_ref() else {
             eprintln!("[delegation] {delegation_id} finished but the task store is unavailable");
             return Task::none();
         };
@@ -19084,7 +19299,7 @@ impl App {
         >,
     ) -> Task<Event> {
         let now = chrono::Utc::now().to_rfc3339();
-        let Some(store) = self.task_authority.store_mut().as_mut() else {
+        let Some(store) = self.task_host.store_mut().as_mut() else {
             eprintln!("[delegation] {delegation_id} finished but the task store is unavailable");
             return Task::none();
         };
@@ -19181,7 +19396,7 @@ impl App {
         task_id: &str,
         preset_name: &str,
     ) -> Option<(String, Option<String>, gitterm::tasks::DelegationRunOptions)> {
-        let store = self.task_authority.store().as_ref()?;
+        let store = self.task_host.store().as_ref()?;
         store
             .open_worker_delegations(task_id)
             .into_iter()
@@ -19470,7 +19685,7 @@ impl App {
                         unreachable!("reuse effect")
                     };
                     let saved = self
-                        .task_authority
+                        .task_host
                         .store_mut()
                         .as_mut()
                         .ok_or("GitTerm's task store is unavailable".to_string())
@@ -19553,7 +19768,7 @@ impl App {
                         unreachable!("adoption effect")
                     };
                     let saved = self
-                        .task_authority
+                        .task_host
                         .store_mut()
                         .as_mut()
                         .ok_or("GitTerm's task store is unavailable".to_string())
@@ -19595,7 +19810,7 @@ impl App {
     /// was relaunched, close its tab (as Stop and close does, which ends the
     /// harness), and fail the delegation as stopped at the time limit.
     fn worker_time_limit_reached(&mut self, delegation_id: &str, session_id: &str) -> Task<Event> {
-        let Some(store) = self.task_authority.store().as_ref() else {
+        let Some(store) = self.task_host.store().as_ref() else {
             eprintln!("[delegation] {delegation_id}: time limit reached, but the task store is unavailable");
             return Task::none();
         };
@@ -19622,7 +19837,7 @@ impl App {
         let message = gitterm::delegations::time_limit_message(minutes, place.as_deref(), true);
         eprintln!("[delegation] {delegation_id}: {message}");
         let now = chrono::Utc::now().to_rfc3339();
-        if let Some(store) = self.task_authority.store_mut().as_mut() {
+        if let Some(store) = self.task_host.store_mut().as_mut() {
             if let Err(error) = store.stop_delegation_at_time_limit(delegation_id, message, &now) {
                 eprintln!("[delegation] {delegation_id}: {error}");
             }
@@ -19664,7 +19879,7 @@ impl App {
         debug_assert_eq!(caller.target.session_uid, worker.caller.session_uid);
         let task_id = task_id.as_str();
         let Some(task) = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .and_then(|store| store.get(task_id))
@@ -19692,7 +19907,7 @@ impl App {
         let now = chrono::Utc::now().to_rfc3339();
         let delegation = gitterm::tasks::Delegation::new_requested(new, now);
         let delegation_id = delegation.delegation_id.clone();
-        let inserted = match self.task_authority.store_mut().as_mut() {
+        let inserted = match self.task_host.store_mut().as_mut() {
             Some(store) => store
                 .insert_delegation(delegation)
                 .map_err(|error| error.to_string()),
@@ -19722,7 +19937,7 @@ impl App {
             Err(error) => {
                 let message = format!("the worker could not start: {error}");
                 eprintln!("[delegation] {delegation_id}: {message}");
-                if let Some(store) = self.task_authority.store_mut().as_mut() {
+                if let Some(store) = self.task_host.store_mut().as_mut() {
                     if let Err(store_error) = store.set_delegation_status(
                         &delegation_id,
                         gitterm::tasks::DelegationStatus::Failed {
@@ -19801,7 +20016,7 @@ impl App {
             unreachable!("handoff must persist")
         };
         let store = self
-            .task_authority
+            .task_host
             .store_mut()
             .as_mut()
             .ok_or("GitTerm's task store is unavailable")?;
@@ -19837,7 +20052,7 @@ impl App {
         // A progress line (or any new handoff) shows on the worker cards.
         self.push_worker_cards(&request.task_id);
         let task = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .and_then(|store| store.get(&request.task_id))
@@ -19893,7 +20108,7 @@ impl App {
         } else {
             TaskLifecycle::WaitingForInput
         };
-        if let Some(store) = self.task_authority.store_mut().as_mut() {
+        if let Some(store) = self.task_host.store_mut().as_mut() {
             if let Err(error) = store.record_lifecycle_signal(
                 task_id,
                 lifecycle,
@@ -19904,7 +20119,7 @@ impl App {
             }
         }
         let parent = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .and_then(|store| store.delegation(delegation_id))
@@ -19934,7 +20149,7 @@ impl App {
     }
 
     fn persist_worker_launch_identities(&mut self) {
-        let Some(store) = self.task_authority.store_mut().as_mut() else {
+        let Some(store) = self.task_host.store_mut().as_mut() else {
             return;
         };
         for tab in self.workspaces.iter_mut().flat_map(|ws| &mut ws.tabs) {
@@ -19947,7 +20162,7 @@ impl App {
     /// Called after durable results have been delivered or queued.
     /// Keep the terminal alive during TERM's grace period, then remove its tab.
     fn close_final_workers(&mut self) -> Task<Event> {
-        let Some(store) = self.task_authority.store().as_ref() else {
+        let Some(store) = self.task_host.store().as_ref() else {
             return Task::none();
         };
         let ready: HashSet<_> = store
@@ -20019,7 +20234,7 @@ impl App {
                     && tab.task_live_state.is_some()
             });
             if !live {
-                if let Some(store) = self.task_authority.store_mut().as_mut() {
+                if let Some(store) = self.task_host.store_mut().as_mut() {
                     if let Err(error) = store.record_lifecycle_signal(
                         &task_id,
                         state,
@@ -20050,7 +20265,7 @@ impl App {
     /// Pushes the cards of every worker delegation on `task_id`, after its
     /// sessions' live state or handoff changed.
     fn push_worker_cards(&self, task_id: &str) {
-        let Some(store) = self.task_authority.store().as_ref() else {
+        let Some(store) = self.task_host.store().as_ref() else {
             return;
         };
         let ids: Vec<String> = store
@@ -20083,7 +20298,7 @@ impl App {
             return None;
         };
         let task = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .and_then(|store| store.get(task_id));
@@ -20108,7 +20323,7 @@ impl App {
     /// Updates (or creates) the delegation's card on its parent's chat page.
     fn push_delegation_card(&self, delegation_id: &str) {
         let Some(delegation) = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .and_then(|store| store.delegation(delegation_id))
@@ -20247,13 +20462,13 @@ impl App {
     /// Collect every finished outcome at the same moment. Idle chats flush
     /// now; busy chats keep the existing held queue until their turn ends.
     fn auto_deliver_delegations(&mut self) -> Task<Event> {
-        if let Some(store) = self.task_authority.store_mut().as_mut() {
+        if let Some(store) = self.task_host.store_mut().as_mut() {
             if let Err(error) = store.retry_delivery_acknowledgements() {
                 eprintln!("[delegation] retry delivery acknowledgements: {error}");
             }
         }
         let parents: Vec<_> = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .map(|store| {
@@ -20341,7 +20556,7 @@ impl App {
         delegation_id: &str,
     ) -> Result<&gitterm::tasks::Delegation, String> {
         let delegation = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?
@@ -20759,7 +20974,7 @@ impl App {
             for tab_config in &ws_config.tabs {
                 if !workspace_is_remote_agent
                     && !restore_task_tab(
-                        self.task_authority.store().as_ref(),
+                        self.task_host.store().as_ref(),
                         tab_config,
                         &mut self.missing_task_worktrees_logged,
                     )
@@ -20868,7 +21083,7 @@ impl App {
                 });
                 if startup_command.is_some() {
                     let conversation = tab_config.task_id.as_ref().and_then(|task_id| {
-                        let task = self.task_authority.store().as_ref()?.get(task_id)?;
+                        let task = self.task_host.store().as_ref()?.get(task_id)?;
                         let own_session = task.sessions.iter().find(|session| {
                             Some(&session.task_session_id) == tab_config.task_session_id.as_ref()
                         });
@@ -21083,6 +21298,7 @@ impl App {
             refused: settings_refused,
         } = Config::load();
         let task_commands = init_task_control_channel();
+        let host_commands = task_commands.clone();
         let task_store_path = TaskStore::path_for_config_root(&config::global_config_dir());
         let (mut task_store, mut task_store_error) = match load_task_store_for_startup(
             task_store_path,
@@ -21267,7 +21483,7 @@ impl App {
             bottom_repo_picker_open: false,
             selection: SelectionState::default(),
             next_tab_id: 0,
-            task_authority: task_store.into(),
+            task_host: production_task_host(task_store, host_commands),
             missing_task_worktrees_logged: HashSet::new(),
             review_config: config.review.clone(),
             model_policy: config.policy.clone(),
@@ -23319,7 +23535,7 @@ fi
         // Tasks with durable attention join the rows unless one of their
         // open session tabs is already surfacing live attention — then the
         // tab row above is the more precise entry for the same thing.
-        if let Some(store) = self.task_authority.store().as_ref() {
+        if let Some(store) = self.task_host.store().as_ref() {
             let tabbed_task_ids = self.task_ids_with_tab_attention();
             for task in store.tasks() {
                 if task.lifecycle == TaskLifecycle::Archived
@@ -23719,7 +23935,7 @@ fi
                 }
             }
         }
-        if let Some(store) = self.task_authority.store().as_ref() {
+        if let Some(store) = self.task_host.store().as_ref() {
             for delegation in store.delegations() {
                 delegation.delegation_id.hash(&mut hasher);
                 delegation.status.label().hash(&mut hasher);
@@ -23753,14 +23969,14 @@ fi
         };
         let now = std::time::SystemTime::now();
         let delegations: &[gitterm::tasks::Delegation] = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .map(TaskStore::delegations)
             .unwrap_or(&[]);
         let task_title = |delegation: &gitterm::tasks::Delegation| match &delegation.child {
             gitterm::tasks::DelegationChild::TaskSession { task_id, .. } => self
-                .task_authority
+                .task_host
                 .store()
                 .as_ref()
                 .and_then(|store| store.get(task_id))
@@ -24034,7 +24250,7 @@ fi
             });
         }
         // A task whose tab already raised attention is that tab's news.
-        if let Some(store) = self.task_authority.store().as_ref() {
+        if let Some(store) = self.task_host.store().as_ref() {
             let tabbed = self.task_ids_with_tab_attention();
             for task in store.tasks() {
                 if task.lifecycle == TaskLifecycle::Archived
@@ -24066,7 +24282,7 @@ fi
                     .find(|tab| tab.id == *tab_id)
                     .map(|tab| self.tab_display_title(tab).to_string()),
                 AttentionTarget::Task(task_id) => self
-                    .task_authority
+                    .task_host
                     .store()
                     .as_ref()
                     .and_then(|store| store.get(task_id))
@@ -24305,7 +24521,7 @@ fi
             }),
         ];
 
-        if let Some(store) = self.task_authority.store() {
+        if let Some(store) = self.task_host.store() {
             subs.extend(worker_time_limit_subscriptions(store, &self.workspaces));
         }
 
@@ -24534,7 +24750,7 @@ fi
         self.record_task_session_focus();
         match event {
             Event::TaskMcpStopped(result) => {
-                task_mcp::close_commands();
+                self.task_host.shutdown();
                 let error = match result {
                     Ok(()) => {
                         "GitTerm V6 task MCP server stopped before application shutdown".to_string()
@@ -24544,281 +24760,12 @@ fi
                 eprintln!("{error}");
                 self.task_mcp = None;
             }
-            Event::TaskControlRequested(envelope) => match envelope.operation {
-                TaskControlOperation::PlanLimits => {
-                    envelope.reply.send(self.plan_limits_snapshot());
-                }
-                TaskControlOperation::HtmlRender(request) => {
-                    if !gitterm::html_render::NATIVE_HTML_SUPPORTED {
-                        envelope.reply.send(Err("html_render currently requires GitTerm for macOS; this platform lacks the required native subframe navigation guard".into()));
-                        return Task::none();
-                    }
-                    let caller = envelope.caller.as_deref();
-                    let chat = self
-                        .workspaces
-                        .iter()
-                        .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
-                        .flat_map(|ws| &ws.tabs)
-                        .find(|tab| {
-                            Some(tab.session_uid.as_str()) == caller
-                                && tab
-                                    .agent_session()
-                                    .is_some_and(|session| session.backend().is_native())
-                        });
-                    let result = request.validate().and_then(|()| {
-                        chat.ok_or_else(|| {
-                            "html_render requires an open local native Claude or ACP chat tab (Pi does not restore conversation history)".to_string()
-                        })?;
-                        // An additive result carried in the conversation works
-                        // even when a harness does not report the raw tool input.
-                        serde_json::to_value(gitterm::html_render::HtmlRenderResult {
-                            html_render: request,
-                        })
-                        .map_err(|error| format!("cannot encode visual reply: {error}"))
-                    });
-                    envelope.reply.send(result);
-                }
-                TaskControlOperation::List(request) => {
-                    let result = self.task_read_requested(
-                        TaskRead::List {
-                            include_archived: request.include_archived,
-                        },
-                        envelope.reply.id(),
-                    );
-                    envelope.reply.send(result);
-                }
-                TaskControlOperation::Get(request) => {
-                    let result = self.task_read_requested(
-                        TaskRead::Get {
-                            task_id: request.task_id,
-                        },
-                        envelope.reply.id(),
-                    );
-                    envelope.reply.send(result);
-                }
-                TaskControlOperation::Create(request) => {
-                    let pending = match self.pending_task_from_control(
-                        request,
-                        envelope.reply.clone(),
-                        envelope.caller.clone(),
-                    ) {
-                        Ok(pending) => pending,
-                        Err(error) => {
-                            envelope.reply.send(Err(error));
-                            return Task::none();
-                        }
-                    };
-                    let worktree_request = pending.request.clone();
-                    return Task::perform(
-                        resolve_task_preparation(worktree_request),
-                        move |result| {
-                            Event::TaskMetadataResolved(
-                                pending,
-                                result.map_err(|error| error.to_string()),
-                            )
-                        },
-                    );
-                }
-                TaskControlOperation::LaunchSession(request) => {
-                    let decision =
-                        self.reduce_task_mutation(TaskMutation::LaunchSession(SessionLaunch {
-                            task_id: request.task_id.clone(),
-                            preset_name: request.preset_name.clone(),
-                            origin: TaskLaunchOrigin::Agent,
-                            user_model_choice: request.user_model_choice,
-                        }));
-                    let preset_idx = match decision {
-                        Ok(TaskMutationAction::LaunchSession { preset_index, .. }) => preset_index,
-                        Ok(TaskMutationAction::QueueSession { preset_index, .. }) => {
-                            Some(preset_index)
-                        }
-                        Err(error) => {
-                            envelope.reply.send(Err(error));
-                            return Task::none();
-                        }
-                        _ => unreachable!("launch effect"),
-                    };
-                    match self.try_launch_task_child(
-                        &request.task_id,
-                        preset_idx,
-                        false,
-                        TaskLaunchOrigin::Agent,
-                        request.user_model_choice,
-                    ) {
-                        Ok(TaskChildLaunch::Started(task, session)) => {
-                            let mut session = session;
-                            if request.user_model_choice {
-                                session["cost_note"] = serde_json::json!("Explicit user model choice overrides plan limits; this may consume remaining allowance or credits.");
-                            }
-                            envelope.reply.send(Ok(session));
-                            return task;
-                        }
-                        Ok(TaskChildLaunch::Queued { position }) => {
-                            envelope.reply.send(Ok(serde_json::json!({
-                                "task_id": request.task_id,
-                                "queued": true,
-                                "queue_position": position,
-                                "cost_note": request.user_model_choice.then_some("Explicit user model choice overrides plan limits; this may consume remaining allowance or credits."),
-                                "detail": "Concurrency or plan limits deferred this launch; it starts automatically when capacity permits.",
-                            })));
-                        }
-                        Err(error) => envelope.reply.send(Err(error)),
-                    }
-                }
-                TaskControlOperation::UpdateHandoff(request) => {
-                    let result = self.update_handoff_requested(request, envelope.caller.as_deref());
-                    envelope.reply.send(result);
-                }
-                TaskControlOperation::DelegateTask(request) => {
-                    return self.delegate_task_requested(
-                        request,
-                        envelope.caller.clone(),
-                        envelope.reply,
-                    );
-                }
-                TaskControlOperation::SessionEvent(request) => {
-                    // Only turn completion carries a lifecycle edge today;
-                    // other notify types are acknowledged and dropped.
-                    if request.event_type != "agent-turn-complete" {
-                        envelope.reply.send(Ok(serde_json::json!({
-                            "ignored": request.event_type,
-                        })));
-                        return Task::none();
-                    }
-                    // A worker that reported done goes idle at its prompt;
-                    // that turn end is not a request for input (S6).
-                    let reported_done = self.task_authority.store().as_ref().is_some_and(|store| {
-                        store.delegations().iter().any(|delegation| {
-                            delegation.status == gitterm::tasks::DelegationStatus::Completed
-                                && matches!(
-                                    &delegation.child,
-                                    gitterm::tasks::DelegationChild::TaskSession {
-                                        task_session_id: Some(session),
-                                        ..
-                                    } if *session == request.session_id
-                                )
-                        })
-                    });
-                    if reported_done {
-                        envelope.reply.send(Ok(serde_json::json!({
-                            "task_id": request.task_id,
-                            "session_id": request.session_id,
-                            "waiting_for_input": false,
-                            "ignored": "the worker reported done",
-                        })));
-                        return Task::none();
-                    }
-                    let mut updated = false;
-                    for workspace in &mut self.workspaces {
-                        for tab in &mut workspace.tabs {
-                            if tab.task_id.as_deref() == Some(request.task_id.as_str())
-                                && tab.task_session_id.as_deref()
-                                    == Some(request.session_id.as_str())
-                            {
-                                tab.task_live_state = Some(TaskSessionLiveState::AwaitingInput);
-                                tab.set_attention(AttentionReason::HumanInputRequired);
-                                updated = true;
-                            }
-                        }
-                    }
-                    if updated {
-                        self.apply_task_session_signal(&request.task_id, None);
-                        self.mark_log_server_dirty();
-                    }
-                    envelope.reply.send(Ok(serde_json::json!({
-                        "task_id": request.task_id,
-                        "session_id": request.session_id,
-                        "waiting_for_input": updated,
-                    })));
-                }
-                TaskControlOperation::RequestReview(request) => {
-                    let new = self
-                        .delegation_caller_for_tool(envelope.caller.as_deref(), "review_request")
-                        .and_then(|caller| {
-                            gitterm::delegations::review_delegation(
-                                &request,
-                                &caller,
-                                self.review_config.codex_model.as_deref(),
-                                None,
-                            )
-                        });
-                    return self.request_delegation(new, DelegationOrigin::Mcp(envelope.reply));
-                }
-                TaskControlOperation::RequestConsult(request) => {
-                    let new = self
-                        .delegation_caller_for_tool(envelope.caller.as_deref(), "consult_request")
-                        .and_then(|caller| {
-                            gitterm::delegations::consult_delegation(
-                                &request,
-                                &caller,
-                                self.review_config.codex_model.as_deref(),
-                                None,
-                            )
-                        });
-                    return self.request_delegation(new, DelegationOrigin::Mcp(envelope.reply));
-                }
-                TaskControlOperation::GetDelegation(request) => {
-                    let result = envelope
-                        .caller
-                        .as_deref()
-                        .ok_or_else(|| task_mcp::missing_caller_error("delegation_get"))
-                        .and_then(|_| {
-                            self.task_authority
-                                .store()
-                                .as_ref()
-                                .ok_or_else(|| "GitTerm's task store is unavailable".to_string())
-                        })
-                        .and_then(|store| {
-                            store
-                                .delegation(request.delegation_id.trim())
-                                .ok_or_else(|| {
-                                    format!(
-                                        "delegation {} does not exist",
-                                        request.delegation_id.trim()
-                                    )
-                                })
-                        })
-                        .and_then(|delegation| {
-                            let mut record = gitterm::delegations::delegation_record(
-                                delegation,
-                                &config::global_config_dir(),
-                            )?;
-                            if let Some(worker) = self.worker_info(delegation) {
-                                record["worker"] = worker;
-                            }
-                            Ok(record)
-                        });
-                    envelope.reply.send(result);
-                }
-                TaskControlOperation::ListDelegations(request) => {
-                    let result = envelope
-                        .caller
-                        .as_deref()
-                        .ok_or_else(|| task_mcp::missing_caller_error("delegation_list"))
-                        .and_then(|caller| {
-                            let store =
-                                self.task_authority.store().as_ref().ok_or_else(|| {
-                                    "GitTerm's task store is unavailable".to_string()
-                                })?;
-                            gitterm::delegations::delegation_list(
-                                &store.delegations_for_parent(caller),
-                                request.status.as_deref(),
-                            )
-                        });
-                    envelope.reply.send(result);
-                }
-                TaskControlOperation::MergePlanSet(request) => {
-                    return self.merge_plan_set(
-                        envelope.caller.as_deref(),
-                        request,
-                        envelope.reply,
-                    );
-                }
-                TaskControlOperation::MergePlanGet => {
-                    let result = self.merge_plan_get(envelope.caller.as_deref());
-                    envelope.reply.send(result);
-                }
-            },
+            Event::TaskControlRequested(envelope) => {
+                let Some(effect) = self.task_host.dispatch(envelope) else {
+                    return Task::none();
+                };
+                return self.execute_host_effect(effect);
+            }
             Event::BrowserMcpStopped(result) => {
                 let error = match result {
                     Ok(()) => "GitTerm V6 browser MCP server stopped before application shutdown"
@@ -25035,7 +24982,7 @@ fi
                         .flat_map(|ws| &ws.tabs)
                         .find(|tab| tab.id == tab_id)
                         .is_some_and(|tab| {
-                            !worker_accepts_input(tab, self.task_authority.store().as_ref())
+                            !worker_accepts_input(tab, self.task_host.store().as_ref())
                         })
                 {
                     return Task::none();
@@ -25116,7 +25063,7 @@ fi
                         // next report. Input makes it live immediately, before
                         // any delayed harness title/notify event arrives.
                         let resumed_blocked = tab.task_id.as_deref().is_some_and(|task| {
-                            self.task_authority.store().as_ref().is_some_and(|store| store.open_worker_delegations(task).iter().any(|d| {
+                            self.task_host.store().as_ref().is_some_and(|store| store.open_worker_delegations(task).iter().any(|d| {
                                 d.status == gitterm::tasks::DelegationStatus::Blocked
                                     && matches!(&d.child, gitterm::tasks::DelegationChild::TaskSession { task_session_id, .. } if task_session_id == &tab.task_session_id)
                             }))
@@ -25136,7 +25083,7 @@ fi
                         // observed live state is never overridden here.
                         if tab.task_live_state.is_none() {
                             let interrupted = tab.task_id.as_deref().is_some_and(|task_id| {
-                                self.task_authority
+                                self.task_host
                                     .store()
                                     .as_ref()
                                     .and_then(|store| store.get(task_id))
@@ -26415,7 +26362,7 @@ fi
                 }
                 if let Some(batch) = delivery {
                     let recorded = self
-                        .task_authority
+                        .task_host
                         .store_mut()
                         .as_mut()
                         .ok_or_else(|| "GitTerm's task store is unavailable".to_string())
@@ -26757,7 +26704,7 @@ fi
                 let task_base = tab
                     .task_id
                     .as_deref()
-                    .and_then(|id| self.task_authority.store().as_ref()?.get(id))
+                    .and_then(|id| self.task_host.store().as_ref()?.get(id))
                     .map(|task| task.base.reference.clone());
                 return Task::perform(
                     async move {
@@ -27015,7 +26962,7 @@ fi
                     }
                 }
                 let now = chrono::Utc::now().to_rfc3339();
-                let result = match self.task_authority.store_mut().as_mut() {
+                let result = match self.task_host.store_mut().as_mut() {
                     Some(store) => {
                         let cancelled = if active {
                             store.cancel_delegation(&delegation_id, &now)
@@ -28951,7 +28898,7 @@ fi
             }
             Event::TaskCreateOpen => {
                 self.task_ui_error = None;
-                if self.task_authority.store().is_none() {
+                if self.task_host.store().is_none() {
                     self.task_ui_error = Some(
                         self.task_store_error
                             .clone()
@@ -29282,7 +29229,7 @@ fi
                 });
                 match effect {
                     Ok(TaskMutationAction::PersistPreparation { prepared, .. }) => {
-                        let persisted = self.task_authority.store_mut().as_mut().map(|store| {
+                        let persisted = self.task_host.store_mut().as_mut().map(|store| {
                             store.complete_worktree_preparation(
                                 &pending.task_id,
                                 prepared,
@@ -29293,7 +29240,7 @@ fi
                             Some(Ok(())) => {
                                 if let Some(reply) = &pending.control_reply {
                                     let result = self
-                                        .task_authority
+                                        .task_host
                                         .store()
                                         .as_ref()
                                         .and_then(|store| store.get(&pending.task_id))
@@ -29332,7 +29279,7 @@ fi
                         cleanup_path,
                         ..
                     }) => {
-                        let persisted = self.task_authority.store_mut().as_mut().map(|store| {
+                        let persisted = self.task_host.store_mut().as_mut().map(|store| {
                             store.fail_worktree_preparation(
                                 &pending.task_id,
                                 error.clone(),
@@ -29442,7 +29389,7 @@ fi
             }
             Event::TaskChildAdd(task_id) => {
                 let handoff = self
-                    .task_authority
+                    .task_host
                     .store()
                     .as_ref()
                     .and_then(|store| store.get(&task_id))
@@ -29521,7 +29468,7 @@ fi
                 // that lands back inside the worktree session with context.
                 // Without one, fall through to the Continue picker.
                 let conversation = self
-                    .task_authority
+                    .task_host
                     .store()
                     .as_ref()
                     .and_then(|store| store.get(&task_id))
@@ -29582,7 +29529,7 @@ fi
                         Ok(TaskMutationAction::PersistDelivery { delivery, .. }) => delivery,
                         _ => return Task::none(),
                     };
-                    let Some(store) = self.task_authority.store_mut().as_mut() else {
+                    let Some(store) = self.task_host.store_mut().as_mut() else {
                         return Task::none();
                     };
                     let timestamp = chrono::Utc::now().to_rfc3339();
@@ -29619,7 +29566,7 @@ fi
                 self.task_launch_queue
                     .retain(|entry| entry.task_id != task_id);
                 let timestamp = chrono::Utc::now().to_rfc3339();
-                match self.task_authority.store_mut().as_mut() {
+                match self.task_host.store_mut().as_mut() {
                     Some(store) => {
                         if let Err(error) = store.record_lifecycle_signal(
                             &task_id,
@@ -29657,19 +29604,17 @@ fi
             Event::TaskArchiveAllFailed => {
                 // Scoped to the active workspace — the button acknowledges the
                 // failures the user is looking at, not failures everywhere.
-                let failed_ids: Vec<String> = match (
-                    self.task_authority.store().as_ref(),
-                    self.active_workspace(),
-                ) {
-                    (Some(store), Some(workspace)) => store
-                        .tasks()
-                        .iter()
-                        .filter(|task| task.lifecycle == TaskLifecycle::Failed)
-                        .filter(|task| self.task_belongs_to_workspace(task, workspace))
-                        .map(|task| task.task_id.clone())
-                        .collect(),
-                    _ => Vec::new(),
-                };
+                let failed_ids: Vec<String> =
+                    match (self.task_host.store().as_ref(), self.active_workspace()) {
+                        (Some(store), Some(workspace)) => store
+                            .tasks()
+                            .iter()
+                            .filter(|task| task.lifecycle == TaskLifecycle::Failed)
+                            .filter(|task| self.task_belongs_to_workspace(task, workspace))
+                            .map(|task| task.task_id.clone())
+                            .collect(),
+                        _ => Vec::new(),
+                    };
                 if !failed_ids.is_empty() {
                     let timestamp = chrono::Utc::now().to_rfc3339();
                     let focused = self.active_task_context_id().map(str::to_string);
@@ -29696,10 +29641,7 @@ fi
                 }
             }
             Event::TaskArchiveFinished => {
-                let task_ids = match (
-                    self.task_authority.store().as_ref(),
-                    self.active_workspace(),
-                ) {
+                let task_ids = match (self.task_host.store().as_ref(), self.active_workspace()) {
                     (Some(store), Some(workspace)) => {
                         finished_task_ids_for_workspace(store, |task| {
                             self.task_belongs_to_workspace(task, workspace)
@@ -29858,7 +29800,7 @@ fi
                     // clear_worktree resets only the worktree record — the
                     // task's sessions and conversation references survive so
                     // transcripts stay auditable after cleanup.
-                    let updated = match self.task_authority.store_mut().as_mut() {
+                    let updated = match self.task_host.store_mut().as_mut() {
                         Some(store) => store
                             .clear_worktree(&task_id, &timestamp)
                             .map_err(|error| error.to_string()),
@@ -29896,7 +29838,7 @@ fi
                 }
             },
             Event::WorktreeAdopt(path) => {
-                if self.task_authority.store().is_none() {
+                if self.task_host.store().is_none() {
                     self.task_ui_error = Some("The task store is unavailable".to_string());
                     return Task::none();
                 }
@@ -30000,7 +29942,7 @@ fi
                     state: TaskWorktreeState::Preparing,
                     path: None,
                 };
-                let Some(store) = self.task_authority.store_mut().as_mut() else {
+                let Some(store) = self.task_host.store_mut().as_mut() else {
                     let op = self.unmanaged_worktree_ops.entry(path).or_default();
                     op.busy = false;
                     op.error = Some("The task store is unavailable".to_string());
@@ -30992,7 +30934,7 @@ fi
                     self.workspaces_dirty = false;
                     self.next_workspace_save_at = None;
                 }
-                task_mcp::close_commands();
+                self.task_host.shutdown();
                 // Signal the log server to shut down
                 self.log_server_state.shutdown.notify_one();
                 // Clean up instance-specific configuration
@@ -31101,7 +31043,7 @@ fi
                             .filter(|_| self.workspace_overview_visible());
                         match reload_workspace_overviews(
                             &self.workspaces,
-                            self.task_authority.store().as_ref(),
+                            self.task_host.store().as_ref(),
                             &self.overview_focus_picks,
                             &mut self.workspace_overviews,
                             &mut self.workspace_overview_summary_generation,
@@ -31846,7 +31788,7 @@ fi
                 // workspace tab there. Task session tabs (task_id set) still
                 // heal normally — their repo_path is the worktree by design.
                 let snapshot_root_is_task_worktree =
-                    self.task_authority.store().as_ref().is_some_and(|store| {
+                    self.task_host.store().as_ref().is_some_and(|store| {
                         store.tasks().iter().any(|task| {
                             task.worktree
                                 .path
@@ -32460,7 +32402,7 @@ fi
                         .selected_task_id
                         .as_deref()
                         .and_then(|task_id| {
-                            self.task_authority
+                            self.task_host
                                 .store()
                                 .as_ref()
                                 .and_then(|store| store.get(task_id))
@@ -33301,7 +33243,7 @@ fi
                         .any(|tab| tab.task_id.as_deref() == Some(task_id))
                 };
                 let candidates = self
-                    .task_authority
+                    .task_host
                     .store()
                     .as_ref()
                     .map(|store| {
@@ -35697,7 +35639,7 @@ fi
         let mut items = Column::new().spacing(0).width(Length::Fixed(260.0));
         if let Some(task_id) = task_context_id.as_deref() {
             let task_title = self
-                .task_authority
+                .task_host
                 .store()
                 .as_ref()
                 .and_then(|store| store.get(task_id))
@@ -38949,7 +38891,7 @@ fi
             let surface0 = theme.surface0();
             let mono = iced::Font::with_name("Menlo");
             let task = self
-                .task_authority
+                .task_host
                 .store()
                 .as_ref()
                 .and_then(|store| store.get(task_id));
@@ -39049,7 +38991,7 @@ fi
             // over a restored shell title or legacy branch-like repo name.
             let task_session_label = task_context_id.as_deref().and_then(|task_id| {
                 let session_id = tab.task_session_id.as_deref()?;
-                self.task_authority
+                self.task_host
                     .store()
                     .as_ref()?
                     .get(task_id)?
@@ -39269,7 +39211,7 @@ fi
         let branch = task_context_id
             .as_deref()
             .and_then(|task_id| {
-                self.task_authority
+                self.task_host
                     .store()
                     .as_ref()
                     .and_then(|store| store.get(task_id))
@@ -40584,7 +40526,7 @@ fi
                 }
             }
             let running_tasks: HashSet<String> = self
-                .task_authority
+                .task_host
                 .store()
                 .as_ref()
                 .into_iter()
@@ -41442,7 +41384,7 @@ fi
         });
         let general_selected = self.active_task_context_id().is_none();
         let repo_tasks = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .map(|store| {
@@ -41471,7 +41413,7 @@ fi
             .iter()
             .filter(|task| task.lifecycle == TaskLifecycle::Failed)
             .count();
-        let finished_count = match (self.task_authority.store().as_ref(), workspace) {
+        let finished_count = match (self.task_host.store().as_ref(), workspace) {
             (Some(store), Some(workspace)) => finished_task_ids_for_workspace(store, |task| {
                 self.task_belongs_to_workspace(task, workspace)
             })
@@ -41987,7 +41929,7 @@ fi
         let border = theme.border();
 
         let selected = self.active_task_context_id().and_then(|task_id| {
-            self.task_authority
+            self.task_host
                 .store()
                 .as_ref()
                 .and_then(|store| store.get(task_id))
@@ -42239,7 +42181,7 @@ fi
                         text(if open {
                             "Open"
                         } else if worktree_ready {
-                            if self.task_authority.store().as_ref().is_some_and(|store| {
+                            if self.task_host.store().as_ref().is_some_and(|store| {
                                 store.worker_session_is_final(
                                     &task.task_id,
                                     Some(&session.task_session_id),
@@ -42760,7 +42702,7 @@ fi
             .task_tab_close_prompt
             .as_ref()
             .and_then(|prompt| {
-                self.task_authority.store().as_ref().and_then(|store| {
+                self.task_host.store().as_ref().and_then(|store| {
                     prompt
                         .target
                         .task_id
@@ -42837,7 +42779,7 @@ fi
             return container(iced::widget::Space::new()).into();
         };
         let task_title = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .and_then(|store| store.get(&prompt.task_id))
@@ -43004,7 +42946,7 @@ fi
             return container(iced::widget::Space::new()).into();
         };
         let task_title = self
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .and_then(|store| store.get(&prompt.task_id))

@@ -326,8 +326,10 @@ impl ServiceContext {
         })
     }
 
-    /// Cutover only, when Iced no longer runs: the real V6 root with every
-    /// operation and effect allowed. Deliberately no protected-root check.
+    /// The real V6 root with every operation and effect allowed.
+    /// Deliberately no protected-root check. Iced's task host gate uses it
+    /// today (its MCP server keeps its own namespace); GPUI only at cutover,
+    /// when Iced no longer runs.
     pub fn production(root: &Path, instance_id: impl Into<String>) -> io::Result<Self> {
         absolute(root)?;
         Ok(Self {

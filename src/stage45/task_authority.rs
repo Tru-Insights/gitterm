@@ -47,7 +47,9 @@ fn iced_read_results_preserve_store_order_live_facts_errors_and_schema() {
         .unwrap_err(),
         "GitTerm's task store is unavailable"
     );
-    app.task_authority = Some(TaskStore::load(dir.path().join("tasks.json")).unwrap()).into();
+    app.task_host.replace_store(Some(
+        TaskStore::load(dir.path().join("tasks.json")).unwrap(),
+    ));
     assert_eq!(
         control(
             &mut app,
@@ -61,7 +63,7 @@ fn iced_read_results_preserve_store_order_live_facts_errors_and_schema() {
     );
     add_task(&mut app, dir.path(), dir.path());
     let mut archived = app
-        .task_authority
+        .task_host
         .store()
         .as_ref()
         .unwrap()
@@ -71,7 +73,7 @@ fn iced_read_results_preserve_store_order_live_facts_errors_and_schema() {
     archived.task_id = "archived".into();
     archived.archived_at = Some("t3".into());
     archived.lifecycle = TaskLifecycle::Archived;
-    app.task_authority
+    app.task_host
         .store_mut()
         .as_mut()
         .unwrap()
@@ -84,7 +86,7 @@ fn iced_read_results_preserve_store_order_live_facts_errors_and_schema() {
         tab.status.repo_name = label.into();
     }
     let mut expected = serde_json::to_value(
-        app.task_authority
+        app.task_host
             .store()
             .as_ref()
             .unwrap()
@@ -300,7 +302,7 @@ fn pending_worker_fixture_at(
         options: Default::default(),
     });
     let base = app
-        .task_authority
+        .task_host
         .store()
         .as_ref()
         .unwrap()
@@ -393,7 +395,7 @@ fn iced_stale_worker_completion_refuses_writes_and_launch_end_to_end() {
                         .unwrap();
                 }
                 "target" => {
-                    let store = app.task_authority.store_mut().as_mut().unwrap();
+                    let store = app.task_host.store_mut().as_mut().unwrap();
                     let mut task = store.get(&pending.task_id).unwrap().clone();
                     task.branch = "replaced".into();
                     store.replace(task).unwrap();
@@ -416,7 +418,7 @@ fn iced_stale_worker_completion_refuses_writes_and_launch_end_to_end() {
                 "{stale}/{success}"
             );
             assert!(app
-                .task_authority
+                .task_host
                 .store()
                 .as_ref()
                 .unwrap()
@@ -460,7 +462,7 @@ fn iced_worker_completion_observes_actual_save_and_consumes_duplicates() {
         };
         let _effect = app.update_event(Event::TaskWorktreePrepared(pending.clone(), result));
         let error = iced::futures::executor::block_on(response).unwrap_err();
-        let store = app.task_authority.store().as_ref().unwrap();
+        let store = app.task_host.store().as_ref().unwrap();
         let task = store.get(&pending.task_id).unwrap();
         match outcome {
             "saved" => {
@@ -533,7 +535,7 @@ fn typed_handoff_session_does_not_grant_worker_completion_authority() {
     let session: TaskSessionRecord = serde_json::from_str(&fixture("tasks/session.json")).unwrap();
     let delegation: gitterm::tasks::Delegation =
         serde_json::from_str(&fixture("tasks/delegation.json")).unwrap();
-    let store = app.task_authority.store_mut().as_mut().unwrap();
+    let store = app.task_host.store_mut().as_mut().unwrap();
     store.upsert_session("fixture-task", session, "t1").unwrap();
     store.insert_delegation(delegation).unwrap();
     let before = std::fs::read(dir.path().join("tasks.json")).unwrap();
@@ -585,7 +587,7 @@ fn iced_create_is_deferred_and_only_acknowledges_saved_preparation() {
             .unwrap();
         assert_pending(&mut response);
         let record = app
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .unwrap()
@@ -609,7 +611,7 @@ fn iced_create_is_deferred_and_only_acknowledges_saved_preparation() {
         let deferred = app.update_event(Event::TaskMetadataResolved(pending.clone(), Ok(resolved)));
         assert_pending(&mut response);
         assert_eq!(
-            app.task_authority
+            app.task_host
                 .store()
                 .as_ref()
                 .unwrap()
@@ -633,7 +635,7 @@ fn iced_create_is_deferred_and_only_acknowledges_saved_preparation() {
         if fail_save {
             assert!(result.unwrap_err().contains("atomically write"));
             assert_eq!(
-                app.task_authority
+                app.task_host
                     .store()
                     .as_ref()
                     .unwrap()
@@ -702,7 +704,7 @@ fn iced_mutation_refusals_do_not_change_the_store() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_tabs(dir.path());
     add_task(&mut app, dir.path(), dir.path());
-    let store = app.task_authority.store_mut().as_mut().unwrap();
+    let store = app.task_host.store_mut().as_mut().unwrap();
     let mut task = store.get("fixture-task").unwrap().clone();
     task.worktree = TaskWorktree {
         state: TaskWorktreeState::Unprepared,
@@ -756,7 +758,7 @@ fn iced_close_archive_states_match_the_shared_fixture() {
         let mut app = app_with_tabs(dir.path());
         add_task(&mut app, dir.path(), dir.path());
         let lifecycle: TaskLifecycle = serde_json::from_value(case["state"].clone()).unwrap();
-        let store = app.task_authority.store_mut().as_mut().unwrap();
+        let store = app.task_host.store_mut().as_mut().unwrap();
         if lifecycle != TaskLifecycle::Draft {
             store
                 .begin_worktree_preparation("fixture-task", "t1")
@@ -807,7 +809,7 @@ fn iced_cleanup_confirmation_blocks_risky_removal_and_preserves_history_when_rec
     let mut app = app_with_tabs(dir.path());
     add_task(&mut app, dir.path(), dir.path());
     let session: TaskSessionRecord = serde_json::from_str(&fixture("tasks/session.json")).unwrap();
-    app.task_authority
+    app.task_host
         .store_mut()
         .as_mut()
         .unwrap()
@@ -898,7 +900,7 @@ fn iced_existing_checkout_reuse_preserves_outcomes_and_refuses_before_writes() {
         fixture_worker_checkout(&app.workspaces[0].tabs[0].repo_path, &checkout, "reuse");
         let checkout = std::fs::canonicalize(checkout).unwrap();
         let mut record = app
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .unwrap()
@@ -919,7 +921,7 @@ fn iced_existing_checkout_reuse_preserves_outcomes_and_refuses_before_writes() {
         }
         record.last_error = Some("retained diagnostic".into());
         record.attention.unread = true;
-        app.task_authority
+        app.task_host
             .store_mut()
             .as_mut()
             .unwrap()
@@ -958,7 +960,7 @@ fn iced_existing_checkout_reuse_preserves_outcomes_and_refuses_before_writes() {
         let _effect =
             app.delegate_task_in_checkout(targets, checkout, receiver.try_recv().unwrap().reply);
         let error = iced::futures::executor::block_on(response).unwrap_err();
-        let store = app.task_authority.store().as_ref().unwrap();
+        let store = app.task_host.store().as_ref().unwrap();
         let saved = store.get("reuse-task").unwrap();
         assert_eq!(saved.lifecycle, record.lifecycle);
         assert_eq!(saved.attention, record.attention);
@@ -1015,7 +1017,7 @@ fn iced_prepared_destination_replacement_is_refused_before_save() {
             before
         );
         assert!(app
-            .task_authority
+            .task_host
             .store()
             .as_ref()
             .unwrap()
@@ -1061,7 +1063,7 @@ fn iced_symlink_destination_normalization_preserves_authority_and_detects_retarg
                 before
             );
             assert!(app
-                .task_authority
+                .task_host
                 .store()
                 .as_ref()
                 .unwrap()
@@ -1073,7 +1075,7 @@ fn iced_symlink_destination_normalization_preserves_authority_and_detects_retarg
                 "{error}"
             );
             assert_eq!(
-                app.task_authority
+                app.task_host
                     .store()
                     .as_ref()
                     .unwrap()
@@ -1157,12 +1159,7 @@ fn iced_non_repository_caller_can_delegate_to_a_listed_checkout() {
         "{error}"
     );
     assert_eq!(
-        app.task_authority
-            .store()
-            .as_ref()
-            .unwrap()
-            .delegations()
-            .len(),
+        app.task_host.store().as_ref().unwrap().delegations().len(),
         1
     );
 }
@@ -1235,7 +1232,7 @@ fn iced_git_workdir_redirection_after_target_resolution_refuses_all_writes() {
     );
     assert!(worker_checkout_fact(&target).is_err());
     let before = std::fs::read(dir.path().join("tasks.json")).unwrap();
-    let count = app.task_authority.store().as_ref().unwrap().tasks().len();
+    let count = app.task_host.store().as_ref().unwrap().tasks().len();
     let (sender, mut receiver) = command_channel();
     let response = sender.enqueue((), None).unwrap();
     let _effect = app.update_event(Event::DelegateTaskTargetsChecked(
@@ -1250,12 +1247,9 @@ fn iced_git_workdir_redirection_after_target_resolution_refuses_all_writes() {
         std::fs::read(dir.path().join("tasks.json")).unwrap(),
         before
     );
-    assert_eq!(
-        app.task_authority.store().as_ref().unwrap().tasks().len(),
-        count
-    );
+    assert_eq!(app.task_host.store().as_ref().unwrap().tasks().len(), count);
     assert!(app
-        .task_authority
+        .task_host
         .store()
         .as_ref()
         .unwrap()
@@ -1304,7 +1298,7 @@ fn iced_delegation_reads_need_a_caller_scope_to_the_parent_and_write_nothing() {
     }
     add_task(&mut app, dir.path(), dir.path());
     let delegation = fixture_delegation("requested");
-    app.task_authority
+    app.task_host
         .store_mut()
         .as_mut()
         .unwrap()
@@ -1318,7 +1312,7 @@ fn iced_delegation_reads_need_a_caller_scope_to_the_parent_and_write_nothing() {
     // Any caller can read a delegation by id; the worker card is added for a
     // task-session child even when its tab is closed.
     let task = app
-        .task_authority
+        .task_host
         .store()
         .as_ref()
         .unwrap()
@@ -1387,7 +1381,7 @@ fn iced_turn_complete_marks_only_its_session_unless_the_worker_reported_done() {
         json!({"task_id":"fixture-task","session_id":"unknown","waiting_for_input":false})
     );
     // A worker that reported done is idle at its prompt, not awaiting input.
-    let store = app.task_authority.store_mut().as_mut().unwrap();
+    let store = app.task_host.store_mut().as_mut().unwrap();
     store
         .insert_delegation(fixture_delegation("requested"))
         .unwrap();

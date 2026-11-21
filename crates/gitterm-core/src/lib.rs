@@ -42,6 +42,8 @@ pub mod gh_identity;
 #[cfg(feature = "runtime")]
 pub mod log_server;
 #[cfg(feature = "runtime")]
+pub mod task_host;
+#[cfg(feature = "runtime")]
 pub mod task_mcp;
 #[cfg(feature = "runtime")]
 pub mod task_worktree;
