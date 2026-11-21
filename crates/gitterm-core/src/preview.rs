@@ -199,7 +199,7 @@ impl Preview {
         }
         Ok(actual)
     }
-    /// Shell layout/catalog only. Imported history and provider state have no writer.
+    /// Shell layout/catalog and the native review's viewed marks only. Imported history and provider state have no writer.
     #[cfg(test)]
     fn replace_layout(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         self.replace_layout_checked(path, bytes, || Ok(()))
@@ -215,6 +215,8 @@ impl Preview {
             .and_then(|n| n.to_str())
             .is_some_and(|name| {
                 name == "local-workspaces.json"
+                    // The native review's own viewed marks (never Iced's file).
+                    || name == crate::review::viewed::VIEWED_FILE
                     || name
                         .strip_prefix("layout-")
                         .and_then(|n| n.strip_suffix(".json"))
@@ -560,6 +562,12 @@ mod tests {
             .is_err());
         p.replace_layout(&p.layout().join("layout-1.json"), b"good")
             .unwrap();
+        // The native review's marks file is writable; another name is not.
+        p.replace_layout(&p.layout().join("review-viewed.json"), b"{}")
+            .unwrap();
+        assert!(p
+            .replace_layout(&p.layout().join("review-other.json"), b"bad")
+            .is_err());
         fs::write(p.root().join(".gitterm-protected"), "sentinel").unwrap();
         assert!(p
             .replace_layout(&p.layout().join("layout-1.json"), b"bad")

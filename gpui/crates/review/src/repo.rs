@@ -84,12 +84,33 @@ pub async fn aggregate_target(root: PathBuf) -> Result<(ReviewTarget, Vec<BaseCh
 
 /// Preserve the effect's stamp verbatim. Only State decides whether it still applies.
 pub async fn collect_aggregate(stamp: CollectStamp) -> Intent {
-    let result = gitterm_core::review::collect::load_review_source_with_snapshots(
-        stamp.target.clone(),
-        stamp.source.clone(),
-        async { Err("turn review requires a host-provided snapshot source".into()) },
-    )
-    .await;
+    collect_aggregate_with(stamp, None).await
+}
+
+/// `roots` is the host's read-only turn snapshot source; without it turn
+/// sources fail loudly and every other source is unaffected.
+pub async fn collect_aggregate_with(
+    stamp: CollectStamp,
+    roots: Option<gitterm_core::turn_snapshots::SnapshotRoots>,
+) -> Intent {
+    let result = match roots {
+        Some(roots) => {
+            gitterm_core::review::collect::load_review_source(
+                stamp.target.clone(),
+                stamp.source.clone(),
+                &roots,
+            )
+            .await
+        }
+        None => {
+            gitterm_core::review::collect::load_review_source_with_snapshots(
+                stamp.target.clone(),
+                stamp.source.clone(),
+                async { Err("turn review requires a host-provided snapshot source".into()) },
+            )
+            .await
+        }
+    };
     Intent::CollectFinished {
         stamp,
         result: Box::new(result),
