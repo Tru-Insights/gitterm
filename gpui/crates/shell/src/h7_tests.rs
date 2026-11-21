@@ -423,7 +423,8 @@ fn saved_run_inventory_and_workspace_switches_never_start_a_terminal(cx: &mut Te
 }
 
 #[gpui::test]
-fn work_run_outcome_is_an_unavailable_notice_and_cannot_launch(cx: &mut TestAppContext) {
+fn work_repo_row_run_launches_like_iced_without_a_notice(cx: &mut TestAppContext) {
+    // Owner decision 2026-11-20: the sidebar ▶ runs, exactly like Iced's RunRepoCommand.
     let (root, shell, cx) = fixture(cx);
     let sidebar = cx.read(|cx| shell.read(cx).work_sidebars[&WorkspaceId(1)].clone());
     sidebar.update(cx, |_, cx| {
@@ -431,20 +432,22 @@ fn work_run_outcome_is_an_unavailable_notice_and_cannot_launch(cx: &mut TestAppC
             repo: root.path().join("work"),
         })
     });
-    draw(cx);
+    wait_file(&root.path().join("work/h7-run.txt"), "x", cx);
     cx.read(|cx| {
         let shell = shell.read(cx);
-        assert!(shell.run_tabs.is_empty());
-        assert!(shell.bottom.read(cx).input.tabs.is_empty());
-        assert_eq!(
-            shell.owner.read(cx).error.as_deref(),
-            Some("Run command · unavailable in preview")
-        );
+        assert_eq!(shell.bottom.read(cx).input.tabs.len(), 1);
+        assert_eq!(shell.owner.read(cx).error, None);
     });
+    // Preview notices (from controls still unavailable) sit below the session strip.
+    let owner = cx.read(|cx| shell.read(cx).owner.clone());
+    owner.update(cx, |owner, cx| {
+        owner.error = Some("Open in editor · not available in preview".into());
+        cx.notify();
+    });
+    draw(cx);
     let notice = cx.debug_bounds("preview-notice").unwrap();
     let strip = cx.debug_bounds("pstrip-session-strip").unwrap();
     assert!(notice.origin.y > strip.bottom());
-    assert!(!root.path().join("work/h7-run.txt").exists());
 }
 
 #[gpui::test]

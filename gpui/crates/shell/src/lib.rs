@@ -3659,16 +3659,13 @@ impl Render for Shell {
                         if let work_sidebar::WorkSidebarOutcome::OpenTask { task } = outcome {
                             shell.activate_task(task, window, cx);
                         }
-                        if matches!(
-                            outcome,
-                            work_sidebar::WorkSidebarOutcome::RunRepoCommand { .. }
-                        ) {
-                            // Work emits unavailable outcomes too. They are not launch requests;
-                            // only the explicit bottom-panel/menu Run controls may launch.
-                            shell.owner.update(cx, |owner, cx| {
-                                owner.error = Some("Run command · unavailable in preview".into());
-                                cx.notify();
-                            });
+                        // The repo row's ▶ is an explicit Run, as in Iced (RunRepoCommand).
+                        if let work_sidebar::WorkSidebarOutcome::RunRepoCommand { repo } = outcome {
+                            shell.run_repo(
+                                gitterm_core::workspace_config::RepoKey::local(repo),
+                                window,
+                                cx,
+                            );
                         }
                     },
                 );
