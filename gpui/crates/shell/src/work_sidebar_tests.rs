@@ -1649,6 +1649,7 @@ impl IcedFixture {
     fn load(&self) -> crate::data::IcedWorkData {
         crate::data::IcedWorkData::read(
             &self.config,
+            &crate::data::TaskSource::iced(&self.config),
             1,
             &self.workspace,
             Focus::Latest,
@@ -1786,6 +1787,7 @@ fn missing_and_malformed_task_stores_are_read_only_and_errors_are_visible() {
     let before = tree_snapshot(fixture.root.path());
     let result = crate::data::IcedWorkData::read(
         &fixture.config,
+        &crate::data::TaskSource::iced(&fixture.config),
         1,
         &fixture.workspace,
         Focus::Latest,
@@ -2311,6 +2313,7 @@ fn realistic_catalog_partial_index_publishes_repos_chats_docs_before_branch_chec
     let mut publications = 0;
     let result = crate::data::IcedWorkData::read_with_progress(
         &fixture.config,
+        &crate::data::TaskSource::iced(&fixture.config),
         Some(&home),
         4,
         saved,
@@ -3039,4 +3042,274 @@ fn repo_age_text_wraps_when_the_actions_slot_is_squeezed(cx: &mut gpui::TestAppC
     let wide = age(cx, 2400.);
     let narrow = age(cx, 300.);
     assert!(narrow.height >= wide.height, "age may wrap to more lines");
+}
+
+/// H5b B8b: a preview task host on a preview root under `base`, seeded from
+/// the Iced stand-in at `iced_config`, installed as the app's host.
+pub(crate) fn start_preview_host(
+    base: &std::path::Path,
+    iced_config: &std::path::Path,
+    cx: &mut gpui::TestAppContext,
+) -> gpui::Entity<crate::task_host::TaskHostOwner> {
+    use crate::task_host::{GpuiTaskHost, HostConfig, Ingress, TaskHostOwner};
+    use gitterm_core::preview::{Preview, ProtectedRoots};
+    let protected =
+        ProtectedRoots::new(&base.join("fixture-home"), [iced_config.to_path_buf()]).unwrap();
+    let roots = std::sync::Arc::new(Preview::validate(&base.join("preview"), protected).unwrap());
+    let (sender, receiver) = gitterm_core::task_commands::runtime::command_channel();
+    let config = HostConfig {
+        roots,
+        iced_tasks: gitterm_core::tasks::TaskStore::path_for_config_root(iced_config),
+        ingress: Ingress::Channel(sender, receiver),
+    };
+    let owner = cx.update(|cx| TaskHostOwner::start(config, cx)).unwrap();
+    cx.update(|cx| cx.set_global(GpuiTaskHost(owner.clone())));
+    owner
+}
+
+/// Stops the host inside the test: ingress closes and the pump exits on the
+/// test scheduler, so the servers' teardown wakes nothing on it.
+pub(crate) fn stop_preview_host(
+    owner: &gpui::Entity<crate::task_host::TaskHostOwner>,
+    cx: &mut gpui::TestAppContext,
+) {
+    owner.update(cx, |owner, _| owner.host().shutdown());
+    cx.run_until_parked();
+    owner.update(cx, |owner, _| owner.shutdown());
+}
+
+/// What the Work pane, workspace bar and chat rosters show from one task source.
+#[derive(Debug, PartialEq)]
+struct PaneRows {
+    work_tasks: Vec<(String, String)>,
+    work_workers: Vec<String>,
+    running: Vec<String>,
+    attention: Vec<(crate::WorkspaceId, usize)>,
+    roster_tasks: Vec<String>,
+    cards: Vec<gitterm_gpui_chat::delegation::DelegationCard>,
+}
+impl IcedFixture {
+    fn base(&self) -> PathBuf {
+        self.root.path().canonicalize().unwrap()
+    }
+    fn rows(&self, tasks: &crate::data::TaskSource) -> PaneRows {
+        let work = crate::data::IcedWorkData::read(
+            &self.config,
+            tasks,
+            1,
+            &self.workspace,
+            Focus::Latest,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let catalog = crate::workspace_config::IcedCatalog::read(&self.config).unwrap();
+        let bar = crate::workspace_bar::SavedFacts::read_from(
+            &self.config,
+            &catalog.workspaces,
+            &Default::default(),
+            crate::workspace_bar::Colors::new(true),
+            tasks,
+        )
+        .unwrap();
+        let roster = crate::data::RosterFacts::read(&self.config, tasks).unwrap();
+        let projection = crate::chat::RosterProjection::new(&roster.tasks, &roster.workers, |w| {
+            roster.worker_tab(&w.delegation_id, None)
+        });
+        let mut running: Vec<_> = work.running_task_ids.into_iter().collect();
+        running.sort();
+        let mut attention: Vec<_> = bar.attention_counts.into_iter().collect();
+        attention.sort();
+        PaneRows {
+            work_tasks: work
+                .tasks
+                .iter()
+                .map(|t| (t.task_id.clone(), t.title.clone()))
+                .collect(),
+            work_workers: work
+                .workers
+                .iter()
+                .map(|w| w.delegation_id.clone())
+                .collect(),
+            running,
+            attention,
+            roster_tasks: roster.tasks.iter().map(|t| t.title.clone()).collect(),
+            cards: projection.cards,
+        }
+    }
+    /// Replaces Iced's store with one that differs from the seeded copy: the
+    /// first task is renamed and every worker is gone. A later mtime, so the
+    /// host's next poll would see it.
+    fn diverge_iced(&self) {
+        use gitterm_core::tasks::TaskStoreDocument;
+        let path = self.config.join("tasks.json");
+        let mut document: TaskStoreDocument =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        document.tasks[0].title = "Renamed in Iced".into();
+        document.delegations.clear();
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(10))
+            .unwrap();
+    }
+}
+
+#[gpui::test]
+fn work_find_counts_match_host(cx: &mut gpui::TestAppContext) {
+    let fixture = IcedFixture::new();
+    let iced = crate::data::TaskSource::iced(&fixture.config);
+    let before = fixture.rows(&iced);
+    let owner = start_preview_host(&fixture.base(), &fixture.config, cx);
+    let host = cx.update(|cx| crate::data::TaskSource::resolve(&fixture.config, cx));
+    let seeded = owner.read_with(cx, |owner, _| {
+        owner.host().store().as_ref().unwrap().path().to_owned()
+    });
+    assert_eq!(host, crate::data::TaskSource::Host(seeded));
+    let rows = fixture.rows(&host);
+    assert_eq!(rows, before, "same rows, order and counts as Iced's file");
+    assert_eq!(
+        rows.work_tasks,
+        [("task-1".to_string(), "Fixture task".to_string())]
+    );
+    assert_eq!(rows.work_workers, ["worker-1"]);
+    assert_eq!(rows.cards.len(), 1);
+    stop_preview_host(&owner, cx);
+}
+
+#[gpui::test]
+fn delegation_cards_from_host_store(cx: &mut gpui::TestAppContext) {
+    let fixture = IcedFixture::new();
+    let owner = start_preview_host(&fixture.base(), &fixture.config, cx);
+    fixture.diverge_iced();
+    let host = cx.update(|cx| crate::data::TaskSource::resolve(&fixture.config, cx));
+    let cards = fixture.rows(&host).cards;
+    let stored = owner.read_with(cx, |owner, _| {
+        owner
+            .host()
+            .store()
+            .as_ref()
+            .unwrap()
+            .delegations()
+            .to_vec()
+    });
+    assert_eq!(
+        cards.iter().map(|c| &c.delegation).collect::<Vec<_>>(),
+        stored.iter().collect::<Vec<_>>(),
+        "cards come from the host's store, not Iced's emptied file"
+    );
+    assert_eq!(cards[0].delegation.delegation_id, "worker-1");
+    assert!(cards[0].worker.is_some(), "the worker card keeps its task");
+    assert!(
+        fixture
+            .rows(&crate::data::TaskSource::iced(&fixture.config))
+            .cards
+            .is_empty()
+    );
+    stop_preview_host(&owner, cx);
+}
+
+#[gpui::test]
+fn panes_fall_back_to_iced_file_when_host_down(cx: &mut gpui::TestAppContext) {
+    use std::sync::atomic::AtomicBool;
+    let fixture = IcedFixture::new();
+    let iced = crate::data::TaskSource::iced(&fixture.config);
+    assert_eq!(
+        cx.update(|cx| crate::data::TaskSource::resolve(&fixture.config, cx)),
+        iced
+    );
+    let logged = AtomicBool::new(false);
+    let mut lines = vec![];
+    for _ in 0..3 {
+        let source =
+            crate::data::TaskSource::choose(None, &fixture.config, &logged, |line: &str| {
+                lines.push(line.to_owned())
+            });
+        assert_eq!(source, iced);
+    }
+    assert_eq!(lines.len(), 1, "one line while the host is down: {lines:?}");
+    assert!(lines[0].contains("task host is not running"));
+    let before = tree_snapshot(fixture.root.path());
+    let rows = fixture.rows(&iced);
+    assert_eq!(rows.work_workers, ["worker-1"]);
+    assert_eq!(rows.cards.len(), 1);
+    assert_eq!(
+        tree_snapshot(fixture.root.path()),
+        before,
+        "the fallback only reads Iced's file"
+    );
+}
+
+#[gpui::test]
+fn no_shell_reader_loads_iced_tasks_json_when_host_up(cx: &mut gpui::TestAppContext) {
+    let fixture = IcedFixture::new();
+    let owner = start_preview_host(&fixture.base(), &fixture.config, cx);
+    let seeded = fixture.rows(&crate::data::TaskSource::iced(&fixture.config));
+    fixture.diverge_iced();
+    let host = cx.update(|cx| crate::data::TaskSource::resolve(&fixture.config, cx));
+    let shown = fixture.rows(&host);
+    assert_eq!(shown, seeded, "every pane shows the seeded store");
+    assert_eq!(shown.roster_tasks[0], "Fixture task");
+    // Once the host re-seeds, the panes follow it.
+    let reseed = owner.update(cx, |owner, cx| owner.refresh_seed(cx));
+    assert_eq!(reseed, crate::task_host::Reseed::Reseeded);
+    let shown = fixture.rows(&host);
+    assert_eq!(shown.roster_tasks[0], "Renamed in Iced");
+    assert!(shown.cards.is_empty());
+    stop_preview_host(&owner, cx);
+}
+
+#[gpui::test]
+fn delegation_dismiss_and_stop_go_through_service_context_without_writes(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gitterm_gpui_chat::interactions::{DismissRequest, preview_notice};
+    let fixture = IcedFixture::new();
+    let owner = start_preview_host(&fixture.base(), &fixture.config, cx);
+    let requests = [
+        ("Dismiss", false),
+        ("Cancel", true),
+        ("Stop tracking", true),
+    ]
+    .map(|(label, active)| DismissRequest {
+        id: "worker-1".into(),
+        label: label.into(),
+        active,
+    });
+    let before = tree_snapshot(fixture.root.path());
+    for request in &requests {
+        let notice = cx.update(|cx| {
+            crate::chat::dismiss_notice(
+                crate::task_panel::host(cx).map(|host| host.services()),
+                request,
+            )
+        });
+        assert_eq!(notice, preview_notice(&request.label));
+        assert_eq!(
+            crate::chat::dismiss_notice(None, request),
+            preview_notice(&request.label)
+        );
+    }
+    assert_eq!(
+        tree_snapshot(fixture.root.path()),
+        before,
+        "nothing written"
+    );
+    owner.read_with(cx, |owner, _| {
+        assert_eq!(
+            owner.host().store().as_ref().unwrap().delegations()[0].dismissed_at,
+            None
+        )
+    });
+    // The decision is the context's: one that allows the effects says so.
+    let allowing =
+        gitterm_core::preview::service::ServiceContext::production(&fixture.base(), "fixture")
+            .unwrap();
+    assert_eq!(
+        crate::chat::dismiss_notice(Some(&allowing), &requests[0]),
+        "Dismiss · not wired in the GPUI preview"
+    );
+    stop_preview_host(&owner, cx);
 }

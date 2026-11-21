@@ -159,6 +159,7 @@ pub struct ChatView {
     /// re-project the chips at once. Dropped once the session is ready.
     shadow: Option<gitterm_core::chat::state::State>,
     checkout_source: Option<crate::composer::CheckoutSource>,
+    dismiss_gate: Option<crate::interactions::DismissGate>,
     callback: Option<IntentCallback>,
     images: Vec<gitterm_core::chat::types::ImageAttachment>,
     image_previews: Vec<Option<Arc<gpui::Image>>>,
@@ -292,6 +293,7 @@ impl ChatView {
             fixture_composer,
             shadow: None,
             checkout_source: None,
+            dismiss_gate: None,
             callback: None,
             images: vec![],
             image_previews: vec![],
@@ -568,6 +570,15 @@ impl ChatView {
         self.checkout_source = Some(source);
         cx.notify();
     }
+    /// The host's gate for delegation card dismissals.
+    pub fn set_dismiss_gate(
+        &mut self,
+        gate: crate::interactions::DismissGate,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_gate = Some(gate);
+        cx.notify();
+    }
     fn reproject(&mut self) {
         let state = self.shadow.as_ref().unwrap_or(&self.fixture_composer);
         self.composer_state.project(state, None);
@@ -667,7 +678,7 @@ impl ChatView {
             if self.composer_state.checkout_locked.is_none()
                 && let Some(source) = &self.checkout_source
             {
-                self.composer_state.checkout_choices = source();
+                self.composer_state.checkout_choices = source(cx);
             }
         } else if !self.settings_enabled() || self.composer_state.catalog.options(picker).is_empty()
         {
