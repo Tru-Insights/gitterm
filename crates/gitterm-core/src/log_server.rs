@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio_stream::wrappers::TcpListenerStream;
 use warp::Filter;
 
 use crate::file_page::html_escape;
+use crate::loopback::ListenerBind;
 
 const LOG_SERVER_BASE_PORT: u16 = 33_030;
 const LOG_SERVER_PORTS_PER_INSTANCE: u16 = 10;
@@ -87,11 +89,12 @@ fn find_available_port(instance_id: &str) -> Option<u16> {
         .and_then(|listener| listener.local_addr().ok().map(|addr| addr.port()))
 }
 
-/// Start the HTTP log server with graceful shutdown. `instance_id` is the
-/// host process's instance identity; it selects the port range.
-pub async fn start_server(state: ServerState, instance_id: &str) {
-    let shutdown = state.shutdown.clone();
-    let bound_port = state.bound_port.clone();
+/// The log server's pages: the tab index, terminal and file snapshots, and
+/// the plans/docs viewer routes.
+fn routes(
+    state: ServerState,
+) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone + Send + Sync + 'static
+{
     let plans_state = state.clone();
     let state_filter = warp::any().map(move || state.clone());
 
@@ -110,13 +113,21 @@ pub async fn start_server(state: ServerState, instance_id: &str) {
         .and(state_filter.clone())
         .and_then(handle_file);
 
-    let routes = index
+    index
         .or(tab)
         .or(file)
         .or(crate::plans::routes(crate::plans::DocumentRoots {
             plans_dir: plans_state.plans_dir.clone(),
             docs_dir: plans_state.docs_dir.clone(),
-        }));
+        }))
+}
+
+/// Start the HTTP log server with graceful shutdown. `instance_id` is the
+/// host process's instance identity; it selects the port range.
+pub async fn start_server(state: ServerState, instance_id: &str) {
+    let shutdown = state.shutdown.clone();
+    let bound_port = state.bound_port.clone();
+    let routes = routes(state);
 
     let Some(port) = find_available_port(instance_id) else {
         eprintln!("Log server disabled: unable to bind any localhost port");
@@ -142,6 +153,44 @@ pub async fn start_server(state: ServerState, instance_id: &str) {
         *p = None;
     }
     println!("Log server shut down");
+}
+
+/// [`start_server`] on a bind the host chose (a preview host: an
+/// OS-assigned loopback port) instead of the V6 band, with no OS-assigned
+/// fallback. Like [`start_server`] it has no authentication. Serves until
+/// `state.shutdown` is notified; a bind failure is returned and leaves
+/// `bound_port` empty.
+pub async fn start_server_on(state: ServerState, bind: ListenerBind) -> std::io::Result<()> {
+    let shutdown = state.shutdown.clone();
+    let bound_port = state.bound_port.clone();
+    let listener = bind.bind()?;
+    let local = listener.local_addr()?;
+    // base_url() advertises http://localhost:<port>, which reaches only
+    // 127.0.0.1; another loopback address would publish a dead link.
+    if local.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("the log server serves only 127.0.0.1, not {local}"),
+        ));
+    }
+    listener.set_nonblocking(true)?;
+    let port = local.port();
+    let incoming = TcpListenerStream::new(tokio::net::TcpListener::from_std(listener)?);
+    let server =
+        warp::serve(routes(state)).serve_incoming_with_graceful_shutdown(incoming, async move {
+            shutdown.notified().await;
+        });
+
+    if let Ok(mut p) = bound_port.lock() {
+        *p = Some(port);
+    }
+    println!("Log server started at http://localhost:{}", port);
+    server.await;
+    if let Ok(mut p) = bound_port.lock() {
+        *p = None;
+    }
+    println!("Log server shut down");
+    Ok(())
 }
 
 /// Handler for index page - lists all tabs
@@ -487,6 +536,73 @@ mod tests {
         let v5_last = 23_030 + (99 * 10) + 9;
         assert!(v6_first > v5_last);
         assert_eq!(v6_last, 34_029);
+    }
+
+    /// The explicit variant serves the same pages, unauthenticated, on the
+    /// bind it was given, records the port while running and clears it on
+    /// shutdown.
+    #[tokio::test]
+    async fn explicit_bind_serves_pages_and_shuts_down() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let state = ServerState::new();
+        let server = tokio::spawn(start_server_on(
+            state.clone(),
+            ListenerBind::LoopbackEphemeral,
+        ));
+        let port = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(port) = *state.bound_port.lock().unwrap() {
+                    break port;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("log server never bound");
+        assert!(!crate::loopback::V6_PORT_BANDS.contains(&port), "{port}");
+
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("GitTerm V6 Log Viewer"));
+
+        state.shutdown.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("log server did not shut down")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.base_url(), None);
+    }
+
+    #[tokio::test]
+    async fn explicit_bind_failure_is_returned() {
+        let state = ServerState::new();
+        let bind = ListenerBind::Addr(std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+        assert!(start_server_on(state.clone(), bind).await.is_err());
+        assert_eq!(state.base_url(), None);
+    }
+
+    /// base_url() says localhost, so a bind that localhost cannot reach is
+    /// refused rather than advertised.
+    #[tokio::test]
+    async fn explicit_bind_other_than_ipv4_localhost_is_refused() {
+        let state = ServerState::new();
+        let bind = ListenerBind::Addr(std::net::SocketAddr::from((
+            std::net::Ipv6Addr::LOCALHOST,
+            0,
+        )));
+        let error = start_server_on(state.clone(), bind).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(state.base_url(), None);
     }
 
     // === html_escape ===

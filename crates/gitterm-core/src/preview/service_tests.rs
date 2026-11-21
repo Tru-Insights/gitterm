@@ -625,6 +625,37 @@ fn runner_process_and_browser_effects_are_classified() {
     }
 }
 
+#[test]
+fn every_pr_action_run_is_outside_and_denied_in_preview() {
+    use crate::merge_plan::{MergeMethod, PrKey};
+    use crate::prs::PrAction;
+    use crate::work::pr_actions::RunPrAction;
+    let f = fixture();
+    let context = ServiceContext::preview(f.preview.clone()).unwrap();
+    let mut actions = vec![
+        (PrAction::Approve, "Approve"),
+        (PrAction::Ready, "Ready for review"),
+    ];
+    actions.extend(MergeMethod::ALL.map(|method| (PrAction::Merge(method), "Merge")));
+    let classes: Vec<_> = actions
+        .iter()
+        .map(|(action, label)| (classify_pr_action(*action), *label, Access::Outside))
+        .collect();
+    assert_preview(&context, &classes);
+    let run = RunPrAction {
+        action: PrAction::Merge(MergeMethod::Squash),
+        key: PrKey::new("example-org/example-repo", 7),
+        account: None,
+    };
+    // The same notice the GPUI preview panel shows for its verb button.
+    assert_eq!(
+        context.pr_action(&run).unwrap_err().notice(),
+        "Merge · not available in preview"
+    );
+    let production = ServiceContext::production(f.dir.path(), "fixture").unwrap();
+    assert!(production.pr_action(&run).is_ok());
+}
+
 #[cfg(unix)]
 #[test]
 fn context_only_comes_from_a_validated_root_and_rejects_real_v6_roots() {

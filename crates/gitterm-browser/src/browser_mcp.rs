@@ -20,6 +20,7 @@ use axum::{
 use base64::Engine;
 use gitterm_core::harness::acp::AcpMcpServer;
 use gitterm_core::harness::claude::ClaudeMcpServer;
+use gitterm_core::loopback::ListenerBind;
 use gitterm_core::task_commands::mcp_protocol::{
     caller_endpoint, caller_from_query, TASK_MCP_CALLER_QUERY,
 };
@@ -301,12 +302,32 @@ pub fn prepare(
     version: &'static str,
 ) -> std::io::Result<(BrowserMcpConnection, BrowserMcpServer)> {
     let listener = bind_v6_loopback_listener(instance_id)?;
+    prepare_listener(v6_global_config_dir.as_ref(), listener, version)
+}
+
+/// [`prepare`] on a bind the host chose (a preview host: an OS-assigned
+/// loopback port) instead of the V6 band. The server still generates its
+/// own bearer token.
+pub fn prepare_on(
+    v6_global_config_dir: impl AsRef<Path>,
+    bind: ListenerBind,
+    version: &'static str,
+) -> std::io::Result<(BrowserMcpConnection, BrowserMcpServer)> {
+    let listener = bind.bind()?;
+    prepare_listener(v6_global_config_dir.as_ref(), listener, version)
+}
+
+fn prepare_listener(
+    shared_config_dir: &Path,
+    listener: std::net::TcpListener,
+    version: &'static str,
+) -> std::io::Result<(BrowserMcpConnection, BrowserMcpServer)> {
     listener.set_nonblocking(true)?;
-    let port = listener.local_addr()?.port();
-    let endpoint = format!("http://127.0.0.1:{port}/mcp");
+    // A V4 loopback address prints as 127.0.0.1:port; a V6 one as [::1]:port.
+    let address = listener.local_addr()?;
+    let endpoint = format!("http://{address}/mcp");
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let cancellation = CancellationToken::new();
-    let shared_config_dir = v6_global_config_dir.as_ref();
     let browser = BrowserControlService::new(shared_config_dir);
     // The engine choice is the shared config's browser.json (TRU-177),
     // read once: the tool list an agent sees depends on it.
@@ -1484,6 +1505,88 @@ mod tests {
         let info = tools.get_info();
         assert_eq!(info.server_info.name, "gitterm-v6-browser");
         assert_eq!(info.server_info.version, TEST_VERSION);
+    }
+
+    fn endpoint_port(endpoint: &str) -> u16 {
+        endpoint
+            .trim_start_matches("http://127.0.0.1:")
+            .trim_end_matches("/mcp")
+            .parse()
+            .unwrap()
+    }
+
+    /// A preview host's task MCP, browser MCP and log server all listen on
+    /// OS-assigned 127.0.0.1 ports, none inside a V6 production band.
+    #[tokio::test]
+    async fn preview_bind_outside_v6_bands() {
+        use gitterm_core::loopback::V6_PORT_BANDS;
+        use gitterm_core::preview::{service::ServiceContext, Preview, ProtectedRoots};
+
+        let dir = tempdir().unwrap();
+        let protected = ProtectedRoots::new(&dir.path().join("host"), []).unwrap();
+        let preview = Arc::new(Preview::validate(&dir.path().join("preview"), protected).unwrap());
+        let services = ServiceContext::preview(preview).unwrap();
+
+        let (commands, _requests) = gitterm_core::task_commands::runtime::command_channel();
+        let refused: gitterm_core::task_mcp::HtmlPreviewRunner =
+            Arc::new(|_| Box::pin(async { Err("not wired in this test".to_string()) }));
+        let (task, _task_server) = gitterm_core::task_mcp::prepare_on(
+            ListenerBind::LoopbackEphemeral,
+            services.task_mcp().token().to_string(),
+            commands,
+            refused,
+            TEST_VERSION,
+        )
+        .unwrap();
+        let (browser, browser_server) = prepare_on(
+            services.state_root(),
+            ListenerBind::LoopbackEphemeral,
+            TEST_VERSION,
+        )
+        .unwrap();
+        // The browser keeps its own token, not the task namespace's.
+        assert_eq!(browser.token.len(), 64);
+        assert_eq!(browser_server.token, browser.token);
+        assert_ne!(browser.token, services.task_mcp().token());
+
+        let log = gitterm_core::log_server::ServerState::new();
+        let log_task = tokio::spawn(gitterm_core::log_server::start_server_on(
+            log.clone(),
+            ListenerBind::LoopbackEphemeral,
+        ));
+        let log_url = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(url) = log.base_url() {
+                    break url;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("log server never bound");
+        let log_port: u16 = log_url
+            .trim_start_matches("http://localhost:")
+            .parse()
+            .unwrap();
+
+        for (name, port) in [
+            ("task MCP", endpoint_port(task.endpoint())),
+            ("browser MCP", endpoint_port(browser.endpoint())),
+            ("log server", log_port),
+        ] {
+            assert!(!V6_PORT_BANDS.contains(&port), "{name} bound {port}");
+        }
+        assert_eq!(
+            browser_server.listener.local_addr().unwrap().ip(),
+            std::net::Ipv4Addr::LOCALHOST
+        );
+
+        log.shutdown.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), log_task)
+            .await
+            .expect("log server did not shut down")
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
