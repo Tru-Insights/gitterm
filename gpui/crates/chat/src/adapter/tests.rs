@@ -895,6 +895,13 @@ fn setting_selection_uses_core_commands_and_waits_for_ack_or_typed_rejection() {
         view.project(adapter.state(), None);
         assert_eq!(adapter.state().acknowledged, before);
         assert_eq!(view.pending_setting, Some(change.clone()));
+        // Iced's chip reads `current → requested…` while the change is pending.
+        let chip = match &change {
+            SettingChange::Model(_) => &view.model,
+            SettingChange::Effort(_) => &view.effort,
+            SettingChange::Mode(_) => &view.mode,
+        };
+        assert!(chip.contains(" → ") && chip.contains('…'), "{chip}");
         view.picker = Some(Picker::Model);
         let rejected = adapter
             .receive(
@@ -910,6 +917,11 @@ fn setting_selection_uses_core_commands_and_waits_for_ack_or_typed_rejection() {
         view.project(adapter.state(), rejected.event.as_ref());
         assert_eq!(adapter.state().acknowledged, before);
         assert!(view.pending_setting.is_none());
+        assert!(
+            ![&view.model, &view.effort, &view.mode]
+                .iter()
+                .any(|chip| chip.contains('→'))
+        );
         assert!(view.picker.is_none());
         let error = adapter
             .receive(

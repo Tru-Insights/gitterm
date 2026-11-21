@@ -31,14 +31,26 @@ const ALTERNATIVE: &str = "Park keeps its tabs to come back to; Close removes it
 const STOP_DESCRIPTION: &str = "It leaves the bar and keeps its tabs. Its terminals and chats stop; Resume from ⏸ parked brings them back.";
 const RUN_DESCRIPTION: &str = "It leaves the bar and keeps its tabs. Its terminals and chats keep running; it comes back to the bar when a chat needs you, finishes or fails.";
 const WORKING_WARNING: &str = "● a chat is still working; parking stops it";
+const READY_DESCRIPTION: &str = "The next PR of each merge plan, and what changed on the work's PRs. GitTerm only watches; you approve and merge from the workspace overview.";
 const LIST_DESCRIPTION: &str = "Resume brings a workspace back with its tabs. Done takes it off this list; its chats stay in Chats.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    Close { target: park::Target },
-    Park { note: String, keep_running: bool },
-    Resume { id: park::Key },
-    Done { id: park::Key },
+    Close {
+        target: park::Target,
+    },
+    Park {
+        note: String,
+        keep_running: bool,
+    },
+    Resume {
+        id: park::Key,
+    },
+    Done {
+        id: park::Key,
+    },
+    /// Ready list: `Open` (live work) or `Resume` (parked work) of a group.
+    ReadyGo(ReadyHome),
     Cancel,
 }
 
@@ -59,7 +71,44 @@ impl Outcome {
             }),
             Self::Resume { id } => Some(park::Intent::Resume(id.clone())),
             Self::Done { id } => Some(park::Intent::Done(id.clone())),
-            Self::Cancel => None,
+            Self::ReadyGo(_) | Self::Cancel => None,
+        }
+    }
+}
+
+/// Where a Ready group's button goes: an open workspace or a parked entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadyHome {
+    Open(crate::data::WorkspaceId),
+    Parked(park::Key),
+}
+#[derive(Clone, Debug)]
+pub struct ReadyNext {
+    pub number: u64,
+    pub repo: String,
+    pub title: String,
+}
+#[derive(Clone, Debug)]
+pub struct ReadyNews {
+    pub number: u64,
+    pub label: String,
+    pub text: String,
+    pub color: u32,
+}
+/// One home of Iced's Ready list, supplied in Iced order.
+#[derive(Clone, Debug)]
+pub struct ReadyGroup {
+    pub name: String,
+    pub home: ReadyHome,
+    pub next: Vec<ReadyNext>,
+    pub news: Vec<ReadyNews>,
+}
+impl ReadyGroup {
+    /// Iced: `Open` for live work, `Resume` for parked work.
+    pub fn button_label(&self) -> &'static str {
+        match self.home {
+            ReadyHome::Open(_) => "Open",
+            ReadyHome::Parked(_) => "Resume",
         }
     }
 }
@@ -329,6 +378,7 @@ impl ParkedRow {
 enum Content {
     Workspace(WorkspaceSheet),
     Parked(Vec<ParkedRow>),
+    Ready(Vec<ReadyGroup>),
 }
 
 /// Mount as a full-size overlay. The backdrop deliberately does not dismiss on
@@ -405,6 +455,17 @@ impl ParkSheet {
             _subscriptions: vec![],
         }
     }
+    pub fn ready(groups: Vec<ReadyGroup>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
+        Self {
+            content: Content::Ready(groups),
+            input: None,
+            focus,
+            completed: false,
+            _subscriptions: vec![],
+        }
+    }
     /// Host calls when an asynchronously refreshed, correctly scoped index lands.
     pub fn refill(
         &mut self,
@@ -423,6 +484,20 @@ impl ParkSheet {
             }
         }
         cx.notify();
+    }
+    #[cfg(test)]
+    pub(crate) fn ready_groups(&self) -> Option<&[ReadyGroup]> {
+        match &self.content {
+            Content::Ready(groups) => Some(groups),
+            _ => None,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn parked_rows(&self) -> Option<&[ParkedRow]> {
+        match &self.content {
+            Content::Parked(rows) => Some(rows),
+            _ => None,
+        }
     }
     pub fn set_rows(&mut self, rows: Vec<ParkedRow>, cx: &mut Context<Self>) {
         if let Content::Parked(current) = &mut self.content {
@@ -443,9 +518,80 @@ impl ParkSheet {
     fn activate(&mut self, action: SheetAction, cx: &mut Context<Self>) {
         let outcome = match &self.content {
             Content::Workspace(model) => model.activate(action),
-            Content::Parked(_) => Some(Outcome::Cancel),
+            Content::Parked(_) | Content::Ready(_) => Some(Outcome::Cancel),
         };
         self.emit(outcome, cx);
+    }
+    fn ready_group(
+        &self,
+        index: usize,
+        group: &ReadyGroup,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let go = Outcome::ReadyGo(group.home.clone());
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap(px(3.))
+            .py(px(6.))
+            .px_2()
+            .rounded(px(6.))
+            .bg(cx.theme().background)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_family("Menlo")
+                            .child(group.name.clone()),
+                    )
+                    .child(
+                        Button::new(("ready-go", index))
+                            .small()
+                            .ghost()
+                            .label(group.button_label())
+                            .debug_selector(move || format!("ready-go-{index}"))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.emit(Some(go.clone()), cx)),
+                            ),
+                    ),
+            );
+        for next in &group.next {
+            card = card.child(
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .text_xs()
+                    .child(div().text_color(muted).child(format!("#{}", next.number)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(cx.theme().primary)
+                            .child(format!("next: {}", next.title)),
+                    )
+                    .child(div().text_color(muted).child(next.repo.clone())),
+            );
+        }
+        for news in &group.news {
+            card = card.child(
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .text_xs()
+                    .child(div().text_color(muted).child(format!("#{}", news.number)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(gpui::rgb(news.color))
+                            .child(news.text.clone()),
+                    ),
+            );
+        }
+        card
     }
     fn row(&self, index: usize, row: &ParkedRow, cx: &mut Context<Self>) -> impl IntoElement {
         let mut head = div()
@@ -590,6 +736,47 @@ impl Render for ParkSheet {
                 }
                 card = card.child(buttons);
             }
+            Content::Ready(groups) => {
+                let mut list = div()
+                    .id("ready-rows")
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .max_h(px(460.))
+                    .overflow_y_scroll();
+                if groups.is_empty() {
+                    list = list.child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Nothing to merge and no news."),
+                    );
+                }
+                for (index, group) in groups.iter().enumerate() {
+                    list = list.child(self.ready_group(index, group, cx));
+                }
+                card = card
+                    .w(px(568.))
+                    .child("Ready to merge")
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(READY_DESCRIPTION),
+                    )
+                    .child(list)
+                    .child(
+                        div().flex().justify_end().child(
+                            Button::new("close-ready-list")
+                                .small()
+                                .label("Close")
+                                .debug_selector(|| "ready-close".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.activate(SheetAction::Cancel, cx)
+                                })),
+                        ),
+                    );
+            }
             Content::Parked(rows) => {
                 let mut list = div()
                     .id("parked-rows")
@@ -624,6 +811,7 @@ impl Render for ParkSheet {
                             Button::new("close-parked-list")
                                 .small()
                                 .label("Close")
+                                .debug_selector(|| "parked-close".into())
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.activate(SheetAction::Cancel, cx)
                                 })),
@@ -645,7 +833,9 @@ impl Render for ParkSheet {
                 let key = event.keystroke.key.as_str();
                 let outcome = match &this.content {
                     Content::Workspace(model) => model.key(key),
-                    Content::Parked(_) if key == "escape" => Some(Outcome::Cancel),
+                    Content::Parked(_) | Content::Ready(_) if key == "escape" => {
+                        Some(Outcome::Cancel)
+                    }
                     _ => None,
                 };
                 if outcome.is_some() {
