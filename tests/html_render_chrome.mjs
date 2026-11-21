@@ -57,7 +57,7 @@ try {
   page = page.replace('</body>', () => '<script>window.__testMode="chrome"; window.__gittermCanRenderHtml=true; window.__nativeCalls=[]; window.ipc={postMessage:()=>{}}; window.__gittermNativePost=(s)=>window.__nativeCalls.push(JSON.parse(s));</script><script>' + '</script></body>');
   const frame = (await call('Page.getFrameTree')).frameTree.frame.id;
   await call('Page.setDocumentContent', { frameId: frame, html: page });
-  assert.equal(await evaluate(await readFile('assets/html_guard_probe.js','utf8')), true, 'native frame-guard preflight');
+  assert.equal(await evaluate(await readFile('crates/gitterm-browser/assets/html_guard_probe.js','utf8')), true, 'native frame-guard preflight');
   await call('Runtime.evaluate', { expression: (await readFile('tests/html_render_ui.js', 'utf8')).replaceAll('127.0.0.1:1', address), awaitPromise: false });
   for (let i = 0; i < 100 && !await evaluate('!!window.__awaitTrustedClick || !!window.__testResult'); i++) await delay(100);
   if (await evaluate('!!window.__awaitTrustedClick')) {
@@ -80,7 +80,7 @@ try {
   await evaluate('window.__gittermCanRenderHtml=false;window.__gittermNativePost=()=>{};window.__resetConversation();window.__appendEvent({kind:"harness",event:{type:"item_started",data:{id:"unsupported",kind:{name:"html_render",input:{}}}}});window.__appendEvent({kind:"harness",event:{type:"item_completed",data:{id:"unsupported",output:JSON.stringify({html_render:{html:"<p>inert</p>",height:100}}),is_error:false}}});');
   assert.equal(await evaluate('document.querySelectorAll(".html-render iframe").length'),0,'unsupported native platform replay is inert');
   await call('Page.removeScriptToEvaluateOnNewDocument', {identifier:guardScript.identifier});
-  assert.equal(await evaluate(await readFile('assets/html_guard_probe.js','utf8')), false, 'preflight fails without native initialization');
+  assert.equal(await evaluate(await readFile('crates/gitterm-browser/assets/html_guard_probe.js','utf8')), false, 'preflight fails without native initialization');
   await evaluate(`window.__unguardedRan=false;addEventListener('message',e=>{if(e.data==='unguarded-code-ran')window.__unguardedRan=true;});window.unguarded=GitTermHtml.create('<script>parent.postMessage("unguarded-code-ran","*")<\\/script>',100,'dark');document.body.appendChild(unguarded.frame);`);
   await delay(200);
   assert.equal(await evaluate('unguarded.state.guardError'),true,'missing guard is observable');
