@@ -25,7 +25,6 @@ use gitterm::harness::transcript::TranscriptEntry;
 use gitterm::harness::HarnessSession;
 #[cfg(test)]
 use gitterm::harness::{HarnessEvent, UserPrompt};
-use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
