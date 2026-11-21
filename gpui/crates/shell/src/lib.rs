@@ -44,6 +44,7 @@ mod pane;
 mod page_tests;
 mod park;
 pub mod park_sheet;
+mod pr_confirm;
 pub mod preview;
 #[cfg(test)]
 mod region_tests;
