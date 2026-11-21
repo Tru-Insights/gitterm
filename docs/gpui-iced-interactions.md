@@ -39,7 +39,7 @@ Each row is a control or a repeated control family whose instances share behavio
 
 ## Verdict counts
 
-Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this refresh the map showed 143 MATCH and 193 DIFF; it now shows 207 MATCH, 84 PREVIEW and 45 DIFF (336 rows; counts taken from the row verdicts) after the TRU-274 small-parity pass.
+Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this refresh the map showed 143 MATCH and 193 DIFF; it now shows 209 MATCH, 83 PREVIEW and 44 DIFF (336 rows; counts taken from the row verdicts) after the TRU-274 small-parity pass and the PR confirmation panel (D23, D23b).
 
 | Section | MATCH | PREVIEW | DIFF |
 | --- | ---: | ---: | ---: |
@@ -52,11 +52,11 @@ Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this
 | Composer and Review / Consult | 20 | 1 | 4 |
 | Bottom panel and terminal find | 16 | 1 | 0 |
 | Workspace bar, menus, settings | 12 | 23 | 1 |
-| Sheets and dialogs | 25 | 10 | 1 |
+| Sheets and dialogs | 27 | 9 | 0 |
 | Task detail and other dialogs | 4 | 7 | 31 |
 | Usage page | 8 | 2 | 0 |
 | Native menus and shortcuts | 23 | 4 | 2 |
-| **Total** | **207** | **84** | **45** |
+| **Total** | **209** | **83** | **44** |
 
 `PREVIEW` means a deliberate preview limit (write/launch control shows "not available in preview"), kept until cutover.
 
@@ -128,9 +128,9 @@ Sources: [Iced Work](../src/main.rs#L40753), [coordinator/branch rows](../src/ma
 | W16 chat open **P/W** | Expanded `↗` | Same | H/—; N/— | Click | `WorkspaceOverviewOpenChat` → focus existing or open/resume local chat/terminal | `OpenChat` → existing session only, otherwise preview error | **PREVIEW** `OpenChat` on a chat that is not open shows the preview notice (work_sidebar.rs:484-490, 1618); an open chat is selected (sessions.rs:322). |
 | W17 PR number **X/R** | `#n` separate clickable viewer link | Same `#n` link | I button H; G button H | Click | `Pr(OpenInViewer)` → PR viewer | `OpenPage {url, store}` → embedded Page in the owner's GitHub login store | **MATCH** PR number opens the embedded Page (GPUI's own copy of the store). |
 | W18 PR Review **R/W/X** | `Review` in expanded row | Absent | H/—; — | Click | `Pr(Review)` → reset unseen-comment count, resolve checkout/review VsBase; external PR fallback | — | **PREVIEW** `Review` is a preview action (work_sidebar.rs:911). |
-| W19 PR Approve **W/X** | `Approve` + blocking reason when gated; omitted for own PR | Absent | I enabled button H; — | Click opens confirmation; confirm runs | `Pr(ActionOpen(Approve))` → confirmation → `ActionRun` | — | **PREVIEW** `Approve` mounted (hidden for own PR), preview action (work_sidebar.rs:913). |
-| W19a PR Merge **W/X** | `Merge` + blocking reason; next-PR title may itself be the merge button | No Merge action; title folds row | I enabled button H; — | Click opens confirmation; confirm runs | `Pr(ActionOpen(Merge))` → confirmation → `ActionRun` | — | **PREVIEW** `Merge` mounted, preview action (work_sidebar.rs:829, 916); title still folds. |
-| W19b PR Ready **W/X** | Draft only: `Ready for review` | Absent | I enabled button H; — | Click opens confirmation; confirm runs | `Pr(ActionOpen(Ready))` → confirmation → `ActionRun` | — | **PREVIEW** `Ready for review` mounted for drafts, preview action (work_sidebar.rs:919). |
+| W19 PR Approve **W/X** | `Approve` + blocking reason when gated; omitted for own PR | Absent | I enabled button H; — | Click opens confirmation; confirm runs | `Pr(ActionOpen(Approve))` → confirmation → `ActionRun` | — | **PREVIEW** Click opens the Iced confirmation panel (pr_confirm.rs; `Approve` hidden for own PR); gated `Approve (reason)` is inert like Iced's disabled button; the execute step is the preview limit (D23a); test `approve_merge_and_ready_open_iceds_panel_with_its_labels`. |
+| W19a PR Merge **W/X** | `Merge` + blocking reason; next-PR title may itself be the merge button | No Merge action; title folds row | I enabled button H; — | Click opens confirmation; confirm runs | `Pr(ActionOpen(Merge))` → confirmation → `ActionRun` | — | **PREVIEW** Click opens the Iced confirmation panel (pr_confirm.rs), from the title line for the plan's next PR or the detail row otherwise; gated `Merge (reason)` is inert; title still folds; execute is the preview limit (D23a). |
+| W19b PR Ready **W/X** | Draft only: `Ready for review` | Absent | I enabled button H; — | Click opens confirmation; confirm runs | `Pr(ActionOpen(Ready))` → confirmation → `ActionRun` | — | **PREVIEW** Click opens the Iced confirmation panel (pr_confirm.rs) for drafts; execute is the preview limit (D23a). |
 | W20 PR clear hold **W** | `clear hold` on held row | Badge counts only | H/—; — | Click | `Pr(ClearHold)` → clear durable hold | No corresponding controls | **PREVIEW** `clear hold` is a preview action (work_sidebar.rs:881). |
 | W20a PR dismiss news **W** | News `×`; delivered notice `sent to chat ✓` is informational | Badge counts only | H/—; — | Click × | `Pr(NewsDismiss)` → persist dismissal | No corresponding controls | **PREVIEW** news `×` is a preview action (work_sidebar.rs:895). |
 | W21 PR external open **X** | Expanded `Open in browser` | Same | H/—; N/— | Click | `Pr(OpenInBrowser)` → external URL | `OpenUrl` → `cx.open_url` for HTTP(S) | **MATCH** opens PR externally. |
@@ -374,9 +374,9 @@ Sources: [Iced new work](../src/main.rs#L36426), [picker](../src/main.rs#L36020)
 | D20 switcher query | `SWITCH CONTEXT`, search input; no-match state | Same | Input focus; native | `⌘T` opens/closes; type | `TaskSwitcherQueryChanged` | Query change → model filtering | **MATCH** name filtering, reset highlight. |
 | D21 switcher row | General workspace + task rows, `CURRENT`, attention/unread facts | Same projection/sort rules | Selected/H; selected/H | Click; ↑↓ clamp, Enter highlighted | `TaskSwitcherSelect` / `ActivateFirst` | `Activate`/`ContextBack` → mounted task/general navigation | **MATCH** switcher selection; task launch is separate. |
 | D22 switcher backdrop | Dim outside card | Same | — | Outside click/Esc/`⌘T` | `TaskSwitcherClose` | `Outcome::Close`, prior focus restored | **MATCH** dismiss without context change. |
-| D23 PR merge method | `merge`, `squash`, `rebase`; selected accent; disabled running | Absent | H/disabled; — | Click method | `Pr(ActionMethod)` → draft method | — | **PREVIEW** no merge-method panel; PR actions are preview notices (work_sidebar.rs:895-925). |
-| D23a PR execute **W/X** | Action verb (Approve/Merge/Ready), disabled running or wrong account | Absent | H/disabled; — | Click | `Pr(ActionRun)` → guarded operation | — | **PREVIEW** no execute button; PR actions are preview notices (work_sidebar.rs:910-925). |
-| D23b PR cancel | `Cancel` / `Close` after failure; disabled running | Absent | H/disabled; — | Click | `Pr(ActionClose)` → dismiss without execution | — | **DIFF** no PR confirmation panel, so no Cancel/Close. |
+| D23 PR merge method | `merge`, `squash`, `rebase`; selected accent; disabled running | Absent | H/disabled; — | Click method | `Pr(ActionMethod)` → draft method | — | **MATCH** `merge` / `squash` / `rebase` with the selected one accented, default the plan's method else merge, local only (pr_confirm.rs); test `merge_method_defaults_like_iced_and_is_selectable_locally`. No running state: nothing runs. |
+| D23a PR execute **W/X** | Action verb (Approve/Merge/Ready), disabled running or wrong account | Absent | H/disabled; — | Click | `Pr(ActionRun)` → guarded operation | — | **PREVIEW** verb button drawn like Iced, disabled for an account that is not a login; click shows `{verb} · not available in preview` in the panel's error slot (button becomes `Close`, as after a failed Iced run) and the shell notice; no gh call; test `execute_shows_the_preview_notice_and_changes_nothing`. |
+| D23b PR cancel | `Cancel` / `Close` after failure; disabled running | Absent | H/disabled; — | Click | `Pr(ActionClose)` → dismiss without execution | — | **MATCH** `Cancel` (`Close` after the notice) and Escape close the panel with no other effect; test `cancel_and_escape_close_the_panel_with_no_other_effect`. |
 | D24 folder machine **R** | Local machine and configured remote chips; omitted for NewWork purpose | Same chips from Iced's remote-agents.json + workspaces.json (read-only); omitted for NewWork | I row/input H; G row H | Click chip | `FolderPickerMachine` → list chosen machine | `FolderPicker::select_machine` → local `read_dir` or `RemoteClient::list_dir` (core agent client) | **MATCH** remote listing is a read. |
 | D24a connect machine **W/X** | `Connect a machine…` | Same chip | I row/input H; G row H | Click | `RemoteConnectOpen` → connection form | `ConnectMachine` → connection form (T11) | **MATCH** opens the form; connecting is a preview notice (T11a). |
 | D24b folder path **R** | `/path/to/folder or ~/folder` input | Same input | I row/input H; G input | Type; Enter lists path | `FolderPickerPathChanged` / `FolderPickerPathSubmit` | Input Change / Enter → core `folder_picker::typed_path`, list | **MATCH** same validation and inline error. |
@@ -515,19 +515,18 @@ Refreshed 2026-11-21 against `7c3b587` (after PRs #280–#310). Only rows still 
 
 **Workspace bar, sheets and menus**
 11. A12b — `New workspace…` is a preview control.
-12. D23b — no PR confirmation panel, so no Cancel/Close.
-13. M08 — attention jump reads mounted GPUI facts only, not live Iced urgency.
-14. M11 — dictation (`SttToggle`) has no handler or mic state.
+12. M08 — attention jump reads mounted GPUI facts only, not live Iced urgency.
+13. M11 — dictation (`SttToggle`) has no handler or mic state.
 
 **Task detail (not mounted)**
-15. T01–T01d — new-task, filter chips and archive controls absent.
-16. T05–T06c — Review changes, Push branch, Open draft PR, publish confirmation absent.
-17. T07 / T07a — Stop and Cancel queue absent.
-18. T08–T08b — worktree delete opener and confirmation absent.
-19. T09–T09f — task create form is a fixture only.
-20. T10 / T10a — Stop and close / Keep open absent.
-21. T12–T12e — phone pairing and revocation absent.
-22. T13 — browser evidence viewer absent.
+14. T01–T01d — new-task, filter chips and archive controls absent.
+15. T05–T06c — Review changes, Push branch, Open draft PR, publish confirmation absent.
+16. T07 / T07a — Stop and Cancel queue absent.
+17. T08–T08b — worktree delete opener and confirmation absent.
+18. T09–T09f — task create form is a fixture only.
+19. T10 / T10a — Stop and close / Keep open absent.
+20. T12–T12e — phone pairing and revocation absent.
+21. T13 — browser evidence viewer absent.
 
 ## Verification boundary
 
