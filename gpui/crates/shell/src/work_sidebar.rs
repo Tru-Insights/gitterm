@@ -1904,6 +1904,9 @@ impl Render for WorkSidebar {
                 .overflow_hidden()
                 .items_center()
                 .gap(px(6.));
+            // The repo row's × sits beside the disclosure, outside the clipped
+            // actions slot, so a narrow sidebar never hides it (TRU-274).
+            let mut remove = None;
             for (control_index, control) in row.controls.into_iter().enumerate() {
                 if matches!(
                     control.action,
@@ -1925,8 +1928,14 @@ impl Render for WorkSidebar {
                 } else {
                     format!("work-control-{index}-{control_index}")
                 };
+                let is_remove = matches!(
+                    control.action,
+                    Action::Emit(WorkSidebarOutcome::RemoveRepo { .. })
+                );
                 let button = self.button(id, control, repo, cx);
-                if repo {
+                if repo && is_remove {
+                    remove = Some(button);
+                } else if repo {
                     actions = actions.child(button);
                 } else {
                     line = line.child(button);
@@ -1951,7 +1960,8 @@ impl Render for WorkSidebar {
                     .flex()
                     .items_center()
                     .gap(px(6.))
-                    .child(div().flex_1().min_w_0().overflow_hidden().child(line));
+                    .child(div().flex_1().min_w_0().overflow_hidden().child(line))
+                    .children(remove);
             }
             if let Some(fold) = row.fold {
                 let label = if fold == Fold::Focus {

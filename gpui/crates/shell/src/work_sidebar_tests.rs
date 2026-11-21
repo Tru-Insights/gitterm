@@ -2905,17 +2905,34 @@ fn at_310pt_expanded_repo_actions_keep_one_line_and_age_wraps_by_word(
     let edit = format!("work-control-{index}-1");
     let wide_open = size(cx, 2400., open.clone()).size;
     let wide_edit = size(cx, 2400., edit.clone()).size;
-    let narrow_open = size(cx, 310., open).size;
-    let narrow_edit = size(cx, 310., edit).size;
+    let narrow_open = size(cx, 300., open).size;
+    let narrow_edit = size(cx, 300., edit).size;
     assert_eq!(narrow_open, wide_open, "Open in editor stays intrinsic");
     assert_eq!(narrow_edit, wide_edit, "edit stays intrinsic");
-    let age = size(cx, 310., format!("work-age-{index}")).size;
+    // The age gives way first: wrapped or dropped to nothing.
+    let age = size(cx, 300., format!("work-age-{index}")).size;
     assert!(age.height <= px(26.), "age at most two lines: {age:?}");
+    let remove = cx
+        .debug_bounds(Box::leak(
+            format!("work-control-{index}-2").into_boxed_str(),
+        ))
+        .expect("× is always rendered");
     let disclosure = cx
         .debug_bounds(Box::leak(format!("work-fold-{index}-▾").into_boxed_str()))
         .unwrap();
+    let actions = cx
+        .debug_bounds(Box::leak(format!("work-actions-{index}").into_boxed_str()))
+        .unwrap();
     let bounds = cx.debug_bounds("work-sidebar").unwrap();
+    assert!(remove.left() >= bounds.left() && remove.right() <= bounds.right());
     assert!(disclosure.right() <= bounds.right());
+    // Name and run command keep their width, so the clipped actions slot may
+    // be pushed wholly past the wrapper's edge; it never overlaps ×.
+    assert!(
+        actions.right() <= remove.left() || actions.left() >= remove.right(),
+        "× clear of actions: {actions:?} vs {remove:?}"
+    );
+    assert!(remove.right() <= disclosure.left(), "× clear of disclosure");
 }
 
 #[gpui::test]
