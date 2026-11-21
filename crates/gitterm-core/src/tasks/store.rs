@@ -52,8 +52,17 @@ pub struct TaskStore {
     // An accepted prompt must not be resent just because its receipt could not
     // be written. Any successful store commit also persists these receipts.
     delivery_ack_pending: bool,
+    /// See [`TaskStore::revision`].
+    revision: u64,
     #[cfg(test)]
     write_count: std::cell::Cell<usize>,
+}
+
+/// Process-wide, so a reloaded store never repeats an earlier store's value.
+static NEXT_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_revision() -> u64 {
+    NEXT_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl TaskStore {
@@ -70,6 +79,7 @@ impl TaskStore {
                     path,
                     document: TaskStoreDocument::default(),
                     delivery_ack_pending: false,
+                    revision: next_revision(),
                     #[cfg(test)]
                     write_count: std::cell::Cell::new(0),
                 });
@@ -86,6 +96,7 @@ impl TaskStore {
             path,
             document,
             delivery_ack_pending: false,
+            revision: next_revision(),
             #[cfg(test)]
             write_count: std::cell::Cell::new(0),
         })
@@ -93,6 +104,13 @@ impl TaskStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Changes whenever the document does (load or commit), and differs
+    /// between stores, so a reader can key what it derives from the tasks
+    /// on it instead of rescanning them.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn tasks(&self) -> &[TaskRecord] {
@@ -1291,6 +1309,7 @@ impl TaskStore {
         validate_document(&candidate)
             .map_err(|detail| TaskStoreError::new("validate", &self.path, detail))?;
         self.document = candidate;
+        self.revision = next_revision();
         self.delivery_ack_pending = true;
         self.retry_delivery_acknowledgements()
     }
@@ -1427,6 +1446,7 @@ impl TaskStore {
             replace_file_atomically(temporary, destination)
         })?;
         self.document = candidate;
+        self.revision = next_revision();
         self.delivery_ack_pending = false;
         Ok(())
     }

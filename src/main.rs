@@ -4243,6 +4243,53 @@ type ChatOverviewCache =
 type ChatDigestCache =
     std::cell::RefCell<HashMap<usize, (u64, Instant, std::rc::Rc<chat_summary::ChatDigest>)>>;
 
+/// The attention list's task rows (TRU-274), built for the task store
+/// revision and workspace layout they were read with. A cell because
+/// `view` takes `&self`; building walks every task and canonicalizes each
+/// attention task's directory, too slow for every frame.
+type TaskAttentionCache = std::cell::RefCell<Option<TaskAttentionRows>>;
+
+struct TaskAttentionRows {
+    revision: u64,
+    /// Per open workspace, what its task-row ownership reads: local, owns
+    /// chats, folder.
+    workspaces: Vec<(bool, bool, PathBuf)>,
+    rows: Vec<TaskAttentionRow>,
+}
+
+impl TaskAttentionRows {
+    fn workspace_key(ws: &Workspace) -> (bool, bool, &Path) {
+        (
+            matches!(ws.location, WorkspaceLocation::Local { .. }),
+            ws.owns_chats(),
+            ws.dir.as_path(),
+        )
+    }
+
+    fn built_for(&self, revision: u64, workspaces: &[Workspace]) -> bool {
+        self.revision == revision
+            && self.workspaces.len() == workspaces.len()
+            && self
+                .workspaces
+                .iter()
+                .zip(workspaces)
+                .all(|((local, owns, dir), ws)| {
+                    (*local, *owns, dir.as_path()) == Self::workspace_key(ws)
+                })
+    }
+}
+
+/// A task's attention row without its age, which moves every frame.
+struct TaskAttentionRow {
+    task_id: String,
+    workspace_idx: Option<usize>,
+    title: String,
+    priority: u8,
+    icon: &'static str,
+    label: &'static str,
+    raised_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Least time between two overview snapshot builds. A streaming chat
 /// changes the key on every delta; the menu poll redraws every
 /// `MENU_POLL_INTERVAL_MS`, so the overview trails by well under a second.
@@ -7932,6 +7979,7 @@ struct App {
     /// in `view` on first need and rebuilt only when the key changes, so a
     /// frame costs a cheap key, not a walk of every conversation.
     chat_overview_cache: ChatOverviewCache,
+    task_attention_cache: TaskAttentionCache,
     /// The overview's "Idle but open" section is unfolded (folded by
     /// default; per app run).
     chat_overview_idle_expanded: bool,
@@ -21581,6 +21629,7 @@ impl App {
             codex_exec_polling: false,
             codex_exec_has_runs: false,
             chat_overview_cache: ChatOverviewCache::default(),
+            task_attention_cache: TaskAttentionCache::default(),
             chat_overview_idle_expanded: false,
             roster_reveal_held: HashMap::new(),
             chat_preview: None,
@@ -23443,30 +23492,53 @@ fi
         // tab row above is the more precise entry for the same thing.
         if let Some(store) = self.task_host.store().as_ref() {
             let tabbed_task_ids = self.task_ids_with_tab_attention();
-            for task in store.tasks() {
-                if task.lifecycle == TaskLifecycle::Archived
-                    || tabbed_task_ids.contains(task.task_id.as_str())
-                {
+            let mut cache = self.task_attention_cache.borrow_mut();
+            if !cache
+                .as_ref()
+                .is_some_and(|rows| rows.built_for(store.revision(), &self.workspaces))
+            {
+                *cache = Some(self.task_attention_rows(store));
+            }
+            for row in cache.iter().flat_map(|rows| &rows.rows) {
+                if tabbed_task_ids.contains(row.task_id.as_str()) {
                     continue;
                 }
-                let Some(reason) = task.attention.reason else {
-                    continue;
-                };
+                let waiting = row
+                    .raised_at
+                    .and_then(|raised| now_utc.signed_duration_since(raised).to_std().ok())
+                    .unwrap_or_default();
+                items.push(AttentionItem {
+                    target: AttentionTarget::Task(row.task_id.clone()),
+                    workspace_idx: row.workspace_idx,
+                    title: row.title.clone(),
+                    priority: row.priority,
+                    icon: row.icon,
+                    label: row.label,
+                    waiting,
+                });
+            }
+        }
+        sort_attention_items(&mut items);
+        items
+    }
+
+    /// [`TaskAttentionRows`] for `store` and the open workspaces.
+    fn task_attention_rows(&self, store: &TaskStore) -> TaskAttentionRows {
+        let rows = store
+            .tasks()
+            .iter()
+            .filter(|task| task.lifecycle != TaskLifecycle::Archived)
+            .filter_map(|task| {
+                let reason = task.attention.reason?;
                 let (priority, icon, label) = task_attention_presentation(reason);
                 // Age from when the reason was raised, not `updated_at` —
                 // that bumps on every progress write and would walk the row
                 // around the list while the agent works (TRU-133). Records
                 // written before `since` existed fall back to `updated_at`.
                 let raised_at = task.attention.since.as_deref().unwrap_or(&task.updated_at);
-                let waiting = chrono::DateTime::parse_from_rfc3339(raised_at)
+                let raised_at = chrono::DateTime::parse_from_rfc3339(raised_at)
                     .ok()
-                    .and_then(|raised| {
-                        now_utc
-                            .signed_duration_since(raised.with_timezone(&chrono::Utc))
-                            .to_std()
-                            .ok()
-                    })
-                    .unwrap_or_default();
+                    .map(|raised| raised.with_timezone(&chrono::Utc));
                 let title = match &task.issue {
                     Some(issue) => format!("{} {}", issue.key, task.title),
                     None => task.title.clone(),
@@ -23477,19 +23549,29 @@ fi
                     }
                     WorkspaceLocationIdentity::RemoteAgent { .. } => None,
                 };
-                items.push(AttentionItem {
-                    target: AttentionTarget::Task(task.task_id.clone()),
+                Some(TaskAttentionRow {
+                    task_id: task.task_id.clone(),
                     workspace_idx,
                     title,
                     priority,
                     icon,
                     label,
-                    waiting,
-                });
-            }
+                    raised_at,
+                })
+            })
+            .collect();
+        TaskAttentionRows {
+            revision: store.revision(),
+            workspaces: self
+                .workspaces
+                .iter()
+                .map(|ws| {
+                    let (local, owns, dir) = TaskAttentionRows::workspace_key(ws);
+                    (local, owns, dir.to_path_buf())
+                })
+                .collect(),
+            rows,
         }
-        sort_attention_items(&mut items);
-        items
     }
 
     /// Every open tab across the local workspaces that the Chats panel's
