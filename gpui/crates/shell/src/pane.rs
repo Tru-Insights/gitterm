@@ -373,16 +373,11 @@ impl Render for Pane {
                 .size_full()
                 .min_h_0()
                 .children(self.git.clone()),
-            PaneContent::Files => {
-                let folder = self
-                    .data
-                    .terminal_cwd(self.workspace, cx)
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| self.data.status(self.workspace, cx).repository);
-                body.overflow_hidden()
-                    .child(folder)
-                    .child(div().flex_1().min_h_0().children(self.files.clone()))
-            }
+            PaneContent::Files => div()
+                .id("files-left-view")
+                .size_full()
+                .min_h_0()
+                .children(self.files.clone()),
         }
     }
 }

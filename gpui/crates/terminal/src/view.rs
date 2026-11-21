@@ -7,7 +7,12 @@ use crate::render::TerminalRenderer;
 use crate::{Action, JobState, SearchResults, ServiceError, ServiceJob, SessionState};
 use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::TermMode;
-use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
+use gpui_kit::component::{
+    Disableable, Sizable,
+    button::Button,
+    input::{Input, InputEvent, InputState},
+    menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
+};
 use gpui_kit::{Edges, ElementInputHandler, EntityInputHandler, UTF16Selection, *};
 use std::sync::Arc;
 use std::time::Duration;
@@ -112,6 +117,12 @@ pub struct TerminalView {
 
     find_open: bool,
     find_query: String,
+    find_input: Option<Entity<InputState>>,
+    find_subscription: Option<Subscription>,
+    find_focus_pending: bool,
+    find_executed_query: Option<String>,
+    find_count: usize,
+    find_index: usize,
     find_job: Option<(String, ServiceJob<SearchResults>)>,
     find_revision: Option<u64>,
     find_status: String,
@@ -219,6 +230,12 @@ impl TerminalView {
             pending_copy: false,
             find_open: false,
             find_query: String::new(),
+            find_input: None,
+            find_subscription: None,
+            find_focus_pending: false,
+            find_executed_query: None,
+            find_count: 0,
+            find_index: 0,
             find_job: None,
             find_revision: None,
             find_status: String::new(),
@@ -252,22 +269,190 @@ impl TerminalView {
 
     pub fn open_find(&mut self, cx: &mut Context<Self>) {
         self.find_open = true;
-        self.find_revision = None;
-        self.backend.clear_find();
+        self.find_focus_pending = true;
         self.ime_text.clear();
         self.ime_marked_range = None;
-        self.find_retry = std::time::Instant::now();
         cx.notify();
     }
 
     pub fn set_find_query(&mut self, query: String, cx: &mut Context<Self>) {
+        // Iced edits the draft without replacing the last executed results.
         self.find_query = query;
+        cx.notify();
+    }
+
+    fn execute_find(&mut self, cx: &mut Context<Self>) {
+        self.find_executed_query = Some(self.find_query.clone());
         self.find_revision = None;
+        self.find_job = None;
+        self.find_count = 0;
+        self.find_index = 0;
         self.backend.clear_find();
         self.find_status = "Busy".into();
         self.find_retry = std::time::Instant::now();
         self.poll_services(cx);
         cx.notify();
+    }
+
+    pub fn navigate_find(&mut self, previous: bool, cx: &mut Context<Self>) {
+        if self.find_count > 0 && self.backend.next_find(previous) {
+            self.find_index = if previous {
+                (self.find_index + self.find_count - 1) % self.find_count
+            } else {
+                (self.find_index + 1) % self.find_count
+            };
+            cx.notify();
+        }
+    }
+
+    pub fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find_open = false;
+        self.find_focus_pending = false;
+        self.find_query.clear();
+        self.find_executed_query = None;
+        self.find_job = None;
+        self.find_revision = None;
+        self.find_count = 0;
+        self.find_index = 0;
+        self.find_status.clear();
+        self.backend.clear_find();
+        self.ime_text.clear();
+        self.ime_marked_range = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn find_count_text(&self) -> String {
+        if self.find_status.starts_with("Search failed:") {
+            self.find_status.clone()
+        } else if self.find_count > 0 {
+            format!("{}/{}", self.find_index + 1, self.find_count)
+        } else if self.find_query.is_empty() {
+            String::new()
+        } else {
+            "No matches".into()
+        }
+    }
+
+    fn prepare_find_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.find_open {
+            return;
+        }
+        let input = self
+            .find_input
+            .get_or_insert_with(|| {
+                cx.new(|cx| InputState::new(window, cx).placeholder("Search..."))
+            })
+            .clone();
+        if self.find_subscription.is_none() {
+            self.find_subscription =
+                Some(cx.subscribe(&input, |this, input, event, cx| match event {
+                    InputEvent::Change => {
+                        this.set_find_query(input.read(cx).value().to_string(), cx)
+                    }
+                    InputEvent::PressEnter { .. } => this.execute_find(cx),
+                    _ => {}
+                }));
+        }
+        if input.read(cx).value().as_str() != self.find_query {
+            input.update(cx, |input, cx| {
+                input.set_value(self.find_query.clone(), window, cx)
+            });
+        }
+        if self.find_focus_pending {
+            input.update(cx, |input, cx| input.focus(window, cx));
+            self.find_focus_pending = false;
+        }
+    }
+
+    fn capture_find_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.to_lowercase();
+        if self.find_open && key == "escape" {
+            self.close_find(window, cx);
+        } else if event.keystroke.modifiers.platform && key == "f" {
+            if self.find_open {
+                self.close_find(window, cx);
+            } else {
+                self.open_find(cx);
+            }
+        } else if self.find_open
+            && event.keystroke.modifiers.platform
+            && key == "g"
+            && !event.keystroke.modifiers.shift
+        {
+            self.navigate_find(false, cx);
+        } else {
+            return;
+        }
+        cx.stop_propagation();
+    }
+
+    fn find_bar(&self, cx: &Context<Self>) -> AnyElement {
+        let enabled = self.find_count > 0;
+        let navigation = |id: &'static str, label: &'static str, previous| {
+            div().id(id).debug_selector(move || id.into()).child(
+                Button::new(id)
+                    .small()
+                    .label(label)
+                    .disabled(!enabled)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.navigate_find(previous, cx);
+                    })),
+            )
+        };
+        div()
+            .id("terminal-find")
+            .debug_selector(|| "terminal-find".into())
+            .flex()
+            .flex_none()
+            .items_center()
+            .w_full()
+            .gap(px(8.))
+            .p(px(8.))
+            .bg(self.config.colors.background())
+            .text_color(self.config.colors.foreground())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .w(px(200.))
+                    .child(Input::new(self.find_input.as_ref().unwrap())),
+            )
+            .child(
+                div()
+                    .id("terminal-find-count")
+                    .child(self.find_count_text()),
+            )
+            .child(navigation("terminal-find-prev", "<", true))
+            .child(navigation("terminal-find-next", ">", false))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .child("Esc: close  Cmd+G: next  Cmd+Shift+G: prev"),
+            )
+            .child(
+                div()
+                    .id("terminal-find-close")
+                    .debug_selector(|| "terminal-find-close".into())
+                    .role(Role::Button)
+                    .aria_label("Close search")
+                    .px(px(8.))
+                    .py(px(4.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgba(0xffffff18)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_find(window, cx);
+                    }))
+                    .child("x"),
+            )
+            .into_any_element()
     }
 
     fn poll_services(&mut self, cx: &mut Context<Self>) {
@@ -282,15 +467,18 @@ impl TerminalView {
         if let Some((query, job)) = &self.find_job
             && let JobState::Ready(result) = job.poll()
         {
-            let current = self.find_open && *query == self.find_query;
+            let current = self.find_open && self.find_executed_query.as_ref() == Some(query);
             self.find_job = None;
             if current {
                 match result {
                     Ok(results) if results.revision == self.backend.revision() => {
                         self.find_revision = Some(results.revision);
-                        self.find_status = format!("{} matches", results.matches.len());
+                        self.find_count = results.matches.len();
+                        self.find_index = 0;
+                        self.find_status.clear();
                         if !self.backend.set_find_results(results) {
                             self.find_revision = None;
+                            self.find_count = 0;
                             self.find_status = "Busy".into();
                         }
                     }
@@ -305,15 +493,20 @@ impl TerminalView {
                 cx.notify();
             }
         }
-        if self.find_open && self.find_revision != Some(self.backend.revision()) {
-            let changed = self.find_revision.is_some() || self.find_status != "Busy";
+        if self.find_open && self.find_executed_query.is_some() && self.find_revision.is_none() {
+            let changed = self.find_status != "Busy";
             self.backend.clear_find();
             self.find_revision = None;
             self.find_status = "Busy".into();
             if self.find_job.is_none() && std::time::Instant::now() >= self.find_retry {
                 self.find_retry = std::time::Instant::now() + Duration::from_millis(100);
-                match self.backend.search_job(self.find_query.clone()) {
-                    Ok(job) => self.find_job = Some((self.find_query.clone(), job)),
+                match self
+                    .backend
+                    .search_job(self.find_executed_query.clone().unwrap())
+                {
+                    Ok(job) => {
+                        self.find_job = Some((self.find_executed_query.clone().unwrap(), job))
+                    }
                     Err(ServiceError::Busy) => {}
                     Err(error) => self.find_status = format!("Search failed: {error:?}"),
                 }
@@ -439,47 +632,8 @@ impl TerminalView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, _cx: &mut Context<Self>) {
-        let key = event.keystroke.key.to_lowercase();
-        if event.keystroke.modifiers.platform && key == "f" {
-            self.open_find(_cx);
-            _cx.stop_propagation();
-            return;
-        }
-        if event.keystroke.modifiers.platform && key == "g" {
-            self.backend.next_find(event.keystroke.modifiers.shift);
-            _cx.notify();
-            _cx.stop_propagation();
-            return;
-        }
         if self.find_open {
-            match key.as_str() {
-                "escape" => {
-                    self.find_open = false;
-                    self.backend.clear_find();
-                    self.ime_text.clear();
-                    self.ime_marked_range = None;
-                    _window.focus(&self.focus_handle, _cx);
-                }
-                "backspace" => {
-                    let mut query = self.find_query.clone();
-                    query.pop();
-                    self.set_find_query(query, _cx);
-                }
-                "enter" => {
-                    self.backend.next_find(event.keystroke.modifiers.shift);
-                }
-                "v" if event.keystroke.modifiers.platform => {
-                    if let Ok(mut clipboard) = crate::clipboard::Clipboard::new()
-                        && let Ok(text) = clipboard.get_text()
-                    {
-                        self.set_find_query(format!("{}{}", self.find_query, text), _cx);
-                    }
-                }
-                // Printable keys arrive through EntityInputHandler, preserving IME.
-                _ => return,
-            }
-            _cx.stop_propagation();
-            _cx.notify();
+            // Input owns editing/submit; the capture handler owns search shortcuts.
             return;
         }
         if let Some(ref handler) = self.key_handler
@@ -919,7 +1073,7 @@ impl EntityInputHandler for TerminalView {
         self.ime_marked_range = None;
         self.ime_text.clear();
         if self.find_open {
-            self.set_find_query(format!("{}{}", self.find_query, text), cx);
+            // The editable Input owns text, selection, clipboard and IME.
             return;
         }
         if !text.is_empty() {
@@ -985,6 +1139,7 @@ impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.process_events(window, cx);
         self.poll_services(cx);
+        self.prepare_find_input(window, cx);
 
         if self.backend.sync() && self.pending_copy {
             self.copy_selection();
@@ -1013,6 +1168,8 @@ impl Render for TerminalView {
         div()
             .size_full()
             .relative()
+            .flex()
+            .flex_col()
             .cursor(if link_hovered {
                 CursorStyle::PointingHand
             } else {
@@ -1023,6 +1180,7 @@ impl Render for TerminalView {
             .key_context(CONTEXT)
             .on_action(cx.listener(Self::on_action_send_tab))
             .on_action(cx.listener(Self::on_action_send_backtab))
+            .capture_key_down(cx.listener(Self::capture_find_key))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -1045,6 +1203,7 @@ impl Render for TerminalView {
                     Self::build_context_menu(view.clone(), has_selection, menu, window, cx)
                 }
             })
+            .children(self.find_open.then(|| self.find_bar(cx)))
             .child(
                 canvas(
                     move |bounds, _window, _cx| bounds,
@@ -1113,22 +1272,10 @@ impl Render for TerminalView {
                         );
                     },
                 )
-                .size_full(),
+                .w_full()
+                .flex_1()
+                .min_h_0(),
             )
-            .children(self.find_open.then(|| {
-                div()
-                    .absolute()
-                    .top_0()
-                    .right_0()
-                    .px_2()
-                    .py_1()
-                    .bg(self.config.colors.background())
-                    .text_color(self.config.colors.foreground())
-                    .child(format!(
-                        "Find: {}{}▏  {}  (Esc closes)",
-                        self.find_query, self.ime_text, self.find_status
-                    ))
-            }))
             .children(status.map(|message| {
                 div()
                     .absolute()
