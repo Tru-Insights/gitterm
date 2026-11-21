@@ -943,6 +943,18 @@ impl<T: RegisteredTarget> BrowserTargetRegistry<T> {
     }
 }
 
+/// Whether a caller's first page operation may open its default target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefaultTarget {
+    /// Open (or adopt Chrome's launch page as) the caller's default tab on
+    /// first use, as Iced always has.
+    OpenOnFirstUse,
+    /// Never: a caller with no target is answered as having none, so no read
+    /// creates a tab or marks a page. The GPUI preview, which may adopt a
+    /// Chrome already running on its profile but must not change it.
+    Never,
+}
+
 /// Owns one visible Chrome process and its dedicated GitTerm V6 profile.
 ///
 /// Dropping the controller terminates the child process. Chrome is launched
@@ -960,6 +972,7 @@ pub struct BrowserController {
     /// The blank page Chrome opened when this controller launched it; the
     /// first caller's default target adopts it instead of opening another.
     launch_blank_target: Option<String>,
+    default_target: DefaultTarget,
     last_exit: Option<String>,
     stderr_log: Arc<Mutex<Vec<u8>>>,
     stderr_task: Option<JoinHandle<()>>,
@@ -967,14 +980,18 @@ pub struct BrowserController {
 
 impl BrowserController {
     pub fn new(v6_global_config_dir: impl AsRef<Path>) -> Self {
-        Self::with_profile_dir(browser_profile_dir(v6_global_config_dir.as_ref()))
+        Self::with_profile_dir(
+            browser_profile_dir(v6_global_config_dir.as_ref()),
+            DefaultTarget::OpenOnFirstUse,
+        )
     }
 
     /// A controller on a profile the host chose (a preview context's
     /// `browser_profile_dir`), not `<config dir>/browser-profile`.
-    pub fn with_profile_dir(profile_dir: PathBuf) -> Self {
+    pub fn with_profile_dir(profile_dir: PathBuf, default_target: DefaultTarget) -> Self {
         Self {
             profile_dir,
+            default_target,
             child: None,
             endpoint: None,
             registry: BrowserTargetRegistry::default(),
@@ -1691,7 +1708,9 @@ impl BrowserController {
     }
 
     /// The caller's own targets. A caller with none gets its default
-    /// target opened, as on its first page operation.
+    /// target opened, as on its first page operation, unless this
+    /// controller never opens one ([`DefaultTarget::Never`]): then the list
+    /// is empty.
     pub async fn targets(&mut self, owner: &str) -> Result<Vec<BrowserTargetInfo>> {
         let default_key = self
             .registry
@@ -1699,7 +1718,7 @@ impl BrowserController {
         let endpoint = self.running_endpoint()?;
         let mut live_targets = list_page_targets(endpoint.port).await?;
         self.registry.retain_live(&live_targets);
-        if !self.registry.owns_any(owner) {
+        if !self.registry.owns_any(owner) && self.default_target == DefaultTarget::OpenOnFirstUse {
             self.page_session_for(&default_key).await?;
             live_targets = list_page_targets(endpoint.port).await?;
         }
@@ -1953,15 +1972,19 @@ impl BrowserController {
     }
 
     /// The DevTools session of one owner's target, attached on first use.
-    /// Only the owner's default target is opened on demand; any other name
-    /// the owner has not opened (including every other owner's target) is
-    /// reported as not found before Chrome is consulted.
+    /// Only the owner's default target is opened on demand, and only when
+    /// this controller opens one ([`DefaultTarget::OpenOnFirstUse`]); any
+    /// other name the owner has not opened (including every other owner's
+    /// target) is reported as not found before Chrome is consulted.
     async fn page_session_for(&mut self, key: &TargetKey) -> Result<&CdpSession> {
         let mapped_target_id = self
             .registry
             .get(key)
             .map(|target| target.target_id.clone());
-        if mapped_target_id.is_none() && key.name != DEFAULT_BROWSER_TARGET_NAME {
+        if mapped_target_id.is_none()
+            && (key.name != DEFAULT_BROWSER_TARGET_NAME
+                || self.default_target == DefaultTarget::Never)
+        {
             return Err(browser_target_not_found(&key.name));
         }
         let endpoint = self.running_endpoint()?;
@@ -2155,8 +2178,11 @@ impl BrowserControlService {
     }
 
     /// See [`BrowserController::with_profile_dir`].
-    pub fn with_profile_dir(profile_dir: PathBuf) -> Self {
-        Self::from_controller(BrowserController::with_profile_dir(profile_dir))
+    pub fn with_profile_dir(profile_dir: PathBuf, default_target: DefaultTarget) -> Self {
+        Self::from_controller(BrowserController::with_profile_dir(
+            profile_dir,
+            default_target,
+        ))
     }
 
     fn from_controller(controller: BrowserController) -> Self {

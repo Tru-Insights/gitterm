@@ -6,7 +6,7 @@ use crate::agent_browser::{
 use crate::browser_control::{
     BrowserCaptureMode, BrowserControlError, BrowserControlService, BrowserKey,
     BrowserLaunchOptions, BrowserLocator, BrowserNodeSelector, BrowserOperation, BrowserSnapshot,
-    BrowserViewport, BrowserWaitCondition,
+    BrowserViewport, BrowserWaitCondition, DefaultTarget,
 };
 use crate::browser_engine::{BrowserEngine, BrowserEngineKind};
 use axum::{
@@ -367,14 +367,22 @@ pub fn prepare(
 /// `services` in the server's dispatch, so a client that ignores
 /// `--allowedTools` is refused too. A preview context always runs the
 /// GitTerm engine: the agent-browser engine starts its own binary and writes
-/// its state dir even for reads.
+/// its state dir even for reads. Its reads never open a default tab
+/// ([`DefaultTarget::Never`]): `browser_status` may adopt a Chrome already
+/// running on the preview profile, and a read must not change that Chrome.
 pub fn prepare_scoped(
     services: Arc<ServiceContext>,
     bind: ListenerBind,
     version: &'static str,
 ) -> std::io::Result<(BrowserMcpConnection, BrowserMcpServer)> {
     let listener = bind.bind()?;
-    let browser = BrowserControlService::with_profile_dir(services.browser_profile_dir()?);
+    let default_target = if services.is_preview() {
+        DefaultTarget::Never
+    } else {
+        DefaultTarget::OpenOnFirstUse
+    };
+    let browser =
+        BrowserControlService::with_profile_dir(services.browser_profile_dir()?, default_target);
     let engine = if services.is_preview() {
         BrowserEngine::GitTerm(browser.clone())
     } else {
@@ -2480,6 +2488,132 @@ mod tests {
         assert_eq!(connection.engine().kind(), Some(BrowserEngineKind::Gitterm));
         // Building the server created nothing in the root.
         assert!(!profile.exists());
+    }
+
+    /// Arguments that get each Read tool past its own validation to the
+    /// browser, so a call reaches `page_session_for` when it would.
+    fn read_arguments(tool: &str) -> serde_json::Value {
+        let locator = serde_json::json!({"kind": "css", "selector": "body"});
+        match tool {
+            "browser_capture" => serde_json::json!({"label": "before"}),
+            "browser_wait_for" => serde_json::json!({
+                "condition": {"kind": "loading_state", "state": "complete"},
+                "timeout_ms": 50,
+            }),
+            "browser_target_diagnostics" => serde_json::json!({
+                "target": crate::browser_control::DEFAULT_BROWSER_TARGET_NAME,
+            }),
+            "browser_node_inspect" => {
+                serde_json::json!({"selector": {"kind": "locator", "locator": locator}})
+            }
+            _ => serde_json::json!({}),
+        }
+    }
+
+    /// Chrome already runs on the preview profile and `browser_status`
+    /// adopts it. No Read then opens the chat's default tab, attaches to a
+    /// page or installs the title script: a page read answers that the
+    /// target does not exist, and `browser_targets` lists none.
+    #[tokio::test]
+    async fn preview_read_tools_never_create_targets_or_scripts() {
+        let dir = tempdir().unwrap();
+        let services = preview_services(dir.path());
+        let devtools = fake_chrome_in(&services.browser_profile_dir().unwrap()).await;
+        let (connection, server) = prepare_scoped(
+            services.clone(),
+            ListenerBind::LoopbackEphemeral,
+            TEST_VERSION,
+        )
+        .unwrap();
+        let (client, server_task) = serve_and_connect(&connection, server, "chat-a").await;
+
+        let status = call(&client, "browser_status", serde_json::json!({})).await;
+        assert_eq!(status.structured_content.unwrap()["state"], "running");
+        let not_found = crate::browser_control::browser_target_not_found(
+            crate::browser_control::DEFAULT_BROWSER_TARGET_NAME,
+        )
+        .to_string();
+        let mut page_reads = 0;
+        for (tool, access) in BROWSER_TOOL_ACCESS {
+            if access != BrowserAccess::Read || tool == "browser_status" {
+                continue;
+            }
+            // Agent-browser only: the GitTerm engine the preview runs does
+            // not route them, so the client cannot reach them at all.
+            if matches!(tool, "browser_snapshot_refs" | "browser_diff") {
+                assert!(
+                    !BrowserMcpTools::tool_router().has_route(tool),
+                    "{tool} is routed"
+                );
+                continue;
+            }
+            let result = call(&client, tool, read_arguments(tool)).await;
+            match tool {
+                "browser_targets" => {
+                    assert_eq!(result.is_error, Some(false), "{result:?}");
+                    assert_eq!(
+                        result.structured_content.unwrap()["result"],
+                        serde_json::json!([])
+                    );
+                }
+                _ => {
+                    assert_eq!(error_text(&result), not_found, "{tool}");
+                    page_reads += 1;
+                }
+            }
+        }
+        // snapshot, capture, wait_for, console, network, target_diagnostics,
+        // dom_outline, node_inspect.
+        assert_eq!(page_reads, 8);
+        // No CDP command at all: no Target.createTarget, no page session,
+        // no Page.addScriptToEvaluateOnNewDocument.
+        assert!(
+            devtools.calls.lock().unwrap().is_empty(),
+            "{:?}",
+            devtools.calls.lock().unwrap()
+        );
+        assert!(devtools.created_target_params.lock().unwrap().is_empty());
+        assert_eq!(*devtools.pages.lock().unwrap(), ["tab-user"]);
+
+        client.cancel().await.unwrap();
+        drop(connection);
+        server_task.await.unwrap().unwrap();
+    }
+
+    /// Iced (no context) keeps opening the chat's default tab on its first
+    /// read and marking it with the owner title script, as before the gate.
+    #[tokio::test]
+    async fn iced_first_read_still_opens_the_default_tab() {
+        let temp = tempdir().unwrap();
+        let devtools = fake_chrome_in(&temp.path().join("browser-profile")).await;
+        let (connection, server) = prepare(temp.path(), "iced-default", TEST_VERSION).unwrap();
+        let (client, server_task) = serve_and_connect(&connection, server, "chat-a").await;
+
+        let status = call(&client, "browser_status", serde_json::json!({})).await;
+        assert_eq!(status.structured_content.unwrap()["state"], "running");
+        let listed = call(&client, "browser_targets", serde_json::json!({})).await;
+        assert_eq!(listed.is_error, Some(false), "{listed:?}");
+        let listed = listed.structured_content.unwrap();
+        let listed = listed["result"].as_array().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["targetId"], "created-page");
+        let calls = devtools.calls.lock().unwrap().clone();
+        assert!(
+            calls.contains(&"Target.createTarget".to_string()),
+            "{calls:?}"
+        );
+        assert!(
+            calls.contains(&"Page.addScriptToEvaluateOnNewDocument".to_string()),
+            "{calls:?}"
+        );
+        assert_eq!(
+            *devtools.pages.lock().unwrap(),
+            ["tab-user", "created-page"]
+        );
+
+        client.cancel().await.unwrap();
+        drop(connection);
+        server_task.await.unwrap().unwrap();
     }
 
     /// Iced's server (`prepare`) has no context: every tool passes the gate
