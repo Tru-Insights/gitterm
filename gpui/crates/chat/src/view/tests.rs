@@ -729,13 +729,13 @@ fn completed_before_written_reconciles_submitted_draft_and_preserves_new_edits(
             assert!(!view.submission_blocked());
             assert_eq!(
                 view.composer.read(cx).value().as_str(),
+                // Send already emptied the box (Iced); only a newer edit remains.
                 match edit {
-                    0 => "",
                     1 => "newer draft",
-                    _ => "submitted draft",
+                    _ => "",
                 }
             );
-            assert_eq!(view.images, if edit == 1 { images } else { vec![] });
+            assert_eq!(view.images, vec![]);
             assert!(view.submitted_draft.is_none());
         });
         assert!(
@@ -2818,4 +2818,351 @@ fn h12_delivered_findings_are_checked_and_disabled(cx: &mut TestAppContext) {
         cx.debug_bounds("delegation-action-0-Send to Claude")
             .is_none()
     );
+}
+
+fn ready_event(models: Vec<serde_json::Value>) -> HarnessEvent {
+    HarnessEvent::Ready {
+        session_id: None,
+        permission_mode: Some("default".into()),
+        models,
+        modes: vec![],
+        commands: vec![],
+    }
+}
+fn launch_config_records() -> Vec<Record> {
+    [
+        HarnessEvent::ModelChanged("opus".into()),
+        HarnessEvent::PermissionModeChanged("default".into()),
+        HarnessEvent::EffortChanged {
+            effort: None,
+            applied: None,
+        },
+    ]
+    .into_iter()
+    .map(|event| Record {
+        at_ms: None,
+        entry: Entry::Harness(event),
+    })
+    .collect()
+}
+fn click(cx: &mut VisualTestContext, selector: &'static str) {
+    let center = cx.debug_bounds(selector).expect(selector).center();
+    cx.simulate_click(center, gpui::Modifiers::none());
+}
+fn written() -> Receipt {
+    let mut receipt = Receipt::rejected("synthetic");
+    receipt.state = ReceiptState::Written;
+    receipt
+}
+
+#[gpui::test]
+fn c06_c08_choice_before_ready_is_shown_held_and_sent_when_the_session_starts(
+    cx: &mut TestAppContext,
+) {
+    use crate::pickers::Picker;
+    use gitterm_core::chat::types::SettingChange;
+    let (chat, cx) = setup(launch_config_records(), cx);
+    cx.simulate_resize(size(px(1200.), px(900.)));
+    let intents = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captured = intents.clone();
+    chat.update_in(cx, |view, _, cx| {
+        view.set_intent_callback(
+            Rc::new(move |intent, _| {
+                captured.borrow_mut().push(intent);
+                written()
+            }),
+            cx,
+        );
+        view.set_read_only(None, cx);
+    });
+    draw(cx);
+    chat.read_with(cx, |view, _| assert!(!view.composer_state.commands_ready));
+    // The model chip opens before the session is ready and shows Iced's hint.
+    click(cx, "composer-model");
+    draw(cx);
+    chat.read_with(cx, |view, _| {
+        assert_eq!(view.composer_state.picker, Some(Picker::Model));
+        assert_eq!(
+            view.composer_state.catalog.models[0].section,
+            "Model · full list after the session starts"
+        );
+    });
+    let labels = chat.read_with(cx, |view, _| {
+        view.composer_state
+            .catalog
+            .models
+            .iter()
+            .map(|row| row.label.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(labels, ["Default", "Opus", "Sonnet", "Haiku", "Fable"]);
+    click(cx, "setting-option-2");
+    draw(cx);
+    // Nothing is sent yet; the chip shows the choice at once.
+    assert!(intents.borrow().is_empty());
+    chat.read_with(cx, |view, _| {
+        assert_eq!(view.composer_state.model, "sonnet");
+        assert_eq!(
+            view.composer_state.prestart,
+            [SettingChange::Model("sonnet".into())]
+        );
+    });
+    // The mode chip works the same way; one picker change is sent at a time.
+    click(cx, "composer-mode");
+    draw(cx);
+    click(cx, "setting-option-2");
+    draw(cx);
+    chat.read_with(cx, |view, _| {
+        assert_eq!(view.composer_state.mode, "Plan mode")
+    });
+    assert!(intents.borrow().is_empty());
+    chat.update(cx, |view, cx| {
+        view.append_event(
+            ready_event(vec![
+                serde_json::json!({"value":"opus","displayName":"Opus","supportsEffort":true}),
+                serde_json::json!({"value":"sonnet","displayName":"Sonnet","supportsEffort":true}),
+            ]),
+            cx,
+        )
+    });
+    draw(cx);
+    assert_eq!(
+        *intents.borrow(),
+        [ChatIntent::ChangeSetting {
+            change: SettingChange::Model("sonnet".into())
+        }]
+    );
+    chat.read_with(cx, |view, _| {
+        assert_eq!(view.composer_state.prestart.len(), 2, "mode waits its turn")
+    });
+}
+
+#[gpui::test]
+fn c06_c08_rejected_prestart_choice_is_dropped_with_a_notice(cx: &mut TestAppContext) {
+    use gitterm_core::chat::types::SettingChange;
+    let (chat, cx) = setup(launch_config_records(), cx);
+    chat.update_in(cx, |view, window, cx| {
+        view.set_intent_callback(Rc::new(|_, _| Receipt::rejected("provider said no")), cx);
+        view.set_read_only(None, cx);
+        view.choose_setting(SettingChange::Model("haiku".into()), window, cx);
+        view.append_event(ready_event(vec![]), cx);
+    });
+    draw(cx);
+    chat.read_with(cx, |view, _| {
+        assert!(view.composer_state.prestart.is_empty());
+        assert_eq!(view.composer_state.model, "opus");
+        assert_eq!(
+            view.composer_state.notice.as_deref(),
+            Some("provider said no")
+        );
+    });
+}
+
+#[gpui::test]
+fn c02_draft_is_empty_right_after_send_and_a_rejection_puts_it_back(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    let intents = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captured = intents.clone();
+    chat.update_in(cx, |view, window, cx| {
+        view.set_intent_callback(
+            Rc::new(move |intent, _| {
+                captured.borrow_mut().push(intent);
+                let mut receipt = Receipt::rejected("synthetic");
+                receipt.state = ReceiptState::ChannelAccepted;
+                receipt
+            }),
+            cx,
+        );
+        view.set_read_only(None, cx);
+        view.composer
+            .update(cx, |input, cx| input.set_value("hello", window, cx));
+        view.send(window, cx);
+        // Before any write or terminal receipt, as Iced empties the box on post.
+        assert_eq!(view.composer.read(cx).value().as_str(), "");
+        let mut receipt = view.submission.clone().unwrap();
+        receipt.state = ReceiptState::Rejected("closed".into());
+        view.update_receipt(receipt, window, cx);
+        assert_eq!(view.composer.read(cx).value().as_str(), "hello");
+    });
+    assert_eq!(intents.borrow().len(), 1);
+}
+
+#[gpui::test]
+fn c02_send_explains_the_queue_only_while_a_turn_runs(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    chat.update(cx, |view, _| {
+        let state = &mut view.composer_state;
+        assert_eq!(state.send_tooltip(false), None);
+        state.streaming = true;
+        assert_eq!(
+            state.send_tooltip(false).as_deref(),
+            Some("Claude is working: the message is queued and Claude reads it at its next step")
+        );
+        assert_eq!(state.send_tooltip(true), None, "disabled Send has no title");
+        state.backend = Some(gitterm_core::chat::types::AgentBackend::Acp(
+            gitterm_core::chat::types::AcpAgent::OpenCode,
+        ));
+        assert_eq!(
+            state.send_tooltip(false).as_deref(),
+            Some("OpenCode is working: the message is queued and sent when this turn ends")
+        );
+    });
+}
+
+#[gpui::test]
+fn c06_c07_c08_c14_chip_tooltips_are_iced_titles(cx: &mut TestAppContext) {
+    let mut records = launch_config_records();
+    records.push(Record {
+        at_ms: None,
+        entry: Entry::Harness(HarnessEvent::EffortChanged {
+            effort: None,
+            applied: Some("high".into()),
+        }),
+    });
+    records.push(Record {
+        at_ms: None,
+        entry: Entry::Harness(ready_event(vec![
+            serde_json::json!({"value":"opus","supportsEffort":true}),
+            serde_json::json!({"value":"opus[1m]","supportsEffort":true}),
+            serde_json::json!({"value":"haiku"}),
+        ])),
+    });
+    let (chat, cx) = setup(records, cx);
+    chat.update(cx, |view, _| {
+        let state = &mut view.composer_state;
+        assert_eq!(state.chip_tooltip("model", None).unwrap(), "Model: opus");
+        assert_eq!(
+            state.chip_tooltip("effort", None).unwrap(),
+            "Effort (auto runs at high) · context window 200k"
+        );
+        assert_eq!(
+            state.chip_tooltip("mode", None).unwrap(),
+            "Permission mode (Shift+Tab in the message box cycles)"
+        );
+        assert_eq!(
+            state.chip_tooltip("review", None).unwrap(),
+            "Ask a Claude subagent or Codex to review this checkout, or consult them"
+        );
+        assert_eq!(state.chip_tooltip("guidelines", None), None);
+    });
+    // A model without effort levels, and a 1M window.
+    chat.update(cx, |view, cx| {
+        view.append_event(HarnessEvent::ModelChanged("haiku".into()), cx);
+        assert_eq!(
+            view.composer_state.chip_tooltip("effort", None).unwrap(),
+            "This model has no effort setting · context window 200k"
+        );
+        view.append_event(HarnessEvent::ModelChanged("opus[1m]".into()), cx);
+        assert_eq!(
+            view.composer_state.chip_tooltip("model", None).unwrap(),
+            "Model: opus[1m]"
+        );
+        assert!(
+            view.composer_state
+                .chip_tooltip("effort", None)
+                .unwrap()
+                .ends_with(" · context window 1M")
+        );
+    });
+}
+
+#[gpui::test]
+fn c10_checkout_picker_lists_iced_entries_previews_a_choice_and_locks_once_started(
+    cx: &mut TestAppContext,
+) {
+    use crate::composer::CheckoutChoice;
+    use crate::pickers::Picker;
+    let (chat, cx) = setup(launch_config_records(), cx);
+    cx.simulate_resize(size(px(1200.), px(900.)));
+    let intents = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captured = intents.clone();
+    let asked = Rc::new(std::cell::Cell::new(0));
+    let counted = asked.clone();
+    chat.update_in(cx, |view, _, cx| {
+        view.fixture_composer.checkout = Some("/repo".into());
+        view.reproject();
+        view.set_preview(cx);
+        view.set_intent_callback(
+            Rc::new(move |intent, _| {
+                captured.borrow_mut().push(intent);
+                written()
+            }),
+            cx,
+        );
+        view.set_checkout_source(
+            Rc::new(move || {
+                counted.set(counted.get() + 1);
+                vec![
+                    CheckoutChoice {
+                        label: "Current checkout".into(),
+                        detail: "/repo".into(),
+                        path: "/repo".into(),
+                    },
+                    CheckoutChoice {
+                        label: "tru-143-chips".into(),
+                        detail: "Add chips".into(),
+                        path: "/wt/tru-143-chips".into(),
+                    },
+                ]
+            }),
+            cx,
+        );
+        view.set_read_only(None, cx);
+    });
+    draw(cx);
+    chat.read_with(cx, |view, _| {
+        assert_eq!(
+            view.composer_state.chip_tooltip("checkout", None).unwrap(),
+            "/repo\nWhere this chat runs"
+        );
+    });
+    click(cx, "composer-checkout");
+    draw(cx);
+    assert_eq!(asked.get(), 1, "choices are asked for each time it opens");
+    chat.read_with(cx, |view, _| {
+        assert_eq!(view.composer_state.picker, Some(Picker::Checkout))
+    });
+    assert!(cx.debug_bounds("checkout-picker").is_some());
+    assert!(cx.debug_bounds("checkout-option-0").is_some());
+    // The current checkout does nothing, as in Iced.
+    click(cx, "checkout-option-0");
+    draw(cx);
+    chat.read_with(cx, |view, _| {
+        assert_eq!(view.composer_state.chips()[4].1, "Current checkout")
+    });
+    click(cx, "composer-checkout");
+    draw(cx);
+    click(cx, "checkout-option-1");
+    draw(cx);
+    chat.read_with(cx, |view, _| {
+        assert_eq!(
+            view.composer_state.chips()[4].1,
+            "tru-143-chips · not available in preview"
+        );
+        assert_eq!(view.composer_state.checkout_path.as_deref(), Some("/repo"));
+    });
+    assert!(cx.debug_bounds("checkout-picker").is_none());
+    // Once the chat has started the chip is locked with Iced's reason.
+    chat.update(cx, |view, cx| {
+        view.append_event(
+            HarnessEvent::TurnStarted {
+                session_id: Some("s".into()),
+                model: None,
+            },
+            cx,
+        )
+    });
+    draw(cx);
+    chat.read_with(cx, |view, _| {
+        assert_eq!(
+            view.composer_state.chip_tooltip("checkout", None).unwrap(),
+            "/repo\nSet when the chat started; start a new chat to change it"
+        );
+    });
+    click(cx, "composer-checkout");
+    draw(cx);
+    assert!(cx.debug_bounds("checkout-picker").is_none());
+    assert_eq!(asked.get(), 2);
+    // No chip or picker interaction reaches the host's session seam.
+    assert!(intents.borrow().is_empty());
 }

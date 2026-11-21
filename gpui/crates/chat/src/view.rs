@@ -155,6 +155,10 @@ pub struct ChatView {
     activity_tick: Option<Task<()>>,
     /// Raw fixture ingress only; live projection is always supplied by the owner.
     fixture_composer: gitterm_core::chat::state::State,
+    /// The live state seen before the session was ready, so a pre-start pick can
+    /// re-project the chips at once. Dropped once the session is ready.
+    shadow: Option<gitterm_core::chat::state::State>,
+    checkout_source: Option<crate::composer::CheckoutSource>,
     callback: Option<IntentCallback>,
     images: Vec<gitterm_core::chat::types::ImageAttachment>,
     image_previews: Vec<Option<Arc<gpui::Image>>>,
@@ -286,6 +290,8 @@ impl ChatView {
             roster_hidden: HashSet::new(),
             activity_tick: None,
             fixture_composer,
+            shadow: None,
+            checkout_source: None,
             callback: None,
             images: vec![],
             image_previews: vec![],
@@ -546,10 +552,88 @@ impl ChatView {
         }
         cx.notify();
     }
+    /// Picks made before the session is ready are held and sent when it starts.
     fn settings_enabled(&self) -> bool {
-        self.read_only_reason.is_none()
-            && self.callback.is_some()
-            && self.composer_state.commands_ready
+        self.read_only_reason.is_none() && self.callback.is_some()
+    }
+    /// The host's source for the checkout menu, asked again whenever it opens.
+    pub fn set_checkout_source(
+        &mut self,
+        source: crate::composer::CheckoutSource,
+        cx: &mut Context<Self>,
+    ) {
+        self.checkout_source = Some(source);
+        cx.notify();
+    }
+    fn reproject(&mut self) {
+        let state = self.shadow.as_ref().unwrap_or(&self.fixture_composer);
+        self.composer_state.project(state, None);
+    }
+    /// Send the next pre-start pick once the session is ready. Deferred, because
+    /// the host may be mid-update when it presents the ready state.
+    fn schedule_prestart(&mut self, cx: &mut Context<Self>) {
+        if self.composer_state.commands_ready
+            && !self.composer_state.prestart.is_empty()
+            && !self.composer_state.prestart_sent
+            && self.composer_state.pending_setting.is_none()
+        {
+            cx.spawn(async move |this, cx| {
+                _ = this.update(cx, |this, cx| this.send_prestart(cx));
+            })
+            .detach();
+        }
+    }
+    fn send_prestart(&mut self, cx: &mut Context<Self>) {
+        use gitterm_core::chat::types::SettingChange as C;
+        let state = &mut self.composer_state;
+        if !state.commands_ready
+            || state.prestart_sent
+            || state.pending_setting.is_some()
+            || self.read_only_reason.is_some()
+        {
+            return;
+        }
+        let confirmed = state.confirmed.clone();
+        state.prestart.retain(|change| match change {
+            C::Model(value) => confirmed.model.as_ref() != Some(value),
+            C::Mode(value) => confirmed.mode.as_ref() != Some(value),
+            C::Effort(value) => confirmed.effort.as_ref().map(|e| &e.effort) != Some(value),
+        });
+        let (Some(change), Some(callback)) =
+            (state.prestart.first().cloned(), self.callback.clone())
+        else {
+            return;
+        };
+        state.prestart_sent = true;
+        let receipt = callback(ChatIntent::ChangeSetting { change }, cx);
+        self.control_receipt = Some(receipt.clone());
+        if let ReceiptState::Rejected(reason) | ReceiptState::Uncertain(reason) = receipt.state {
+            let state = &mut self.composer_state;
+            state.prestart.remove(0);
+            state.prestart_sent = false;
+            state.notice = Some(reason);
+            self.reproject();
+        }
+        cx.notify();
+    }
+    pub(crate) fn choose_checkout(
+        &mut self,
+        path: &str,
+        label: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer_state.picker = None;
+        // Iced's set_checkout rewrites the tab and workspace files; the preview
+        // may not, so the choice is shown but not applied.
+        if self.composer_state.checkout_locked.is_none()
+            && self.composer_state.checkout_path.as_deref() != Some(path)
+        {
+            self.composer_state.checkout_notice =
+                Some(format!("{label} · {}", crate::composer::NOT_IN_PREVIEW));
+        }
+        self.focus_composer(window, cx);
+        cx.notify();
     }
     pub(crate) fn close_picker(&mut self, cx: &mut Context<Self>) {
         self.composer_state.picker = None;
@@ -561,7 +645,16 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.settings_enabled() || self.composer_state.catalog.options(picker).is_empty() {
+        if picker == crate::pickers::Picker::Checkout {
+            if self.read_only_reason.is_some() || self.composer_state.checkout_locked.is_some() {
+                return;
+            }
+            if let Some(source) = &self.checkout_source {
+                self.composer_state.checkout_choices = source();
+            }
+        } else if !self.settings_enabled()
+            || self.composer_state.catalog.options(picker).is_empty()
+        {
             return;
         }
         self.focus_composer(window, cx);
@@ -589,7 +682,14 @@ impl ChatView {
                 .chain(&self.composer_state.catalog.efforts)
                 .chain(&self.composer_state.catalog.modes)
                 .any(|row| row.change == change && row.selected);
-            if !selected && let Some(callback) = &self.callback {
+            if !selected && !self.composer_state.commands_ready {
+                let state = &mut self.composer_state;
+                state
+                    .prestart
+                    .retain(|held| std::mem::discriminant(held) != std::mem::discriminant(&change));
+                state.prestart.push(change);
+                self.reproject();
+            } else if !selected && let Some(callback) = &self.callback {
                 let receipt = callback(ChatIntent::ChangeSetting { change }, cx);
                 self.control_receipt = Some(receipt.clone());
                 if let ReceiptState::Rejected(reason) | ReceiptState::Uncertain(reason) =
@@ -711,6 +811,12 @@ impl ChatView {
                 cx,
             );
             self.submission = Some(receipt.clone());
+            // Iced empties the box and attachments as it posts the message; a
+            // rejected or uncertain receipt puts the draft back (below).
+            self.composer
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.images.clear();
+            self.image_previews.clear();
             self.update_receipt(receipt, window, cx);
         }
         cx.notify();
@@ -739,6 +845,26 @@ impl ChatView {
                 .update(cx, |input, cx| input.set_value("", window, cx));
             self.images.clear();
             self.image_previews.clear();
+        }
+        if self
+            .submission
+            .as_ref()
+            .is_some_and(|old| old.accepts_update(&receipt))
+            && matches!(
+                receipt.state,
+                ReceiptState::Rejected(_) | ReceiptState::Uncertain(_)
+            )
+            && let Some(draft) = self.submitted_draft.take()
+        {
+            // Newer edits win; only what the user has not retyped comes back.
+            if self.composer.read(cx).value().is_empty() {
+                self.composer
+                    .update(cx, |input, cx| input.set_value(draft.text, window, cx));
+            }
+            if self.images.is_empty() {
+                self.image_previews = vec![None; draft.images.len()];
+                self.images = draft.images;
+            }
         }
         self.sync_receipt(&receipt, cx);
     }
@@ -795,6 +921,15 @@ impl ChatView {
         }
         self.projection_runtime = Some(source.clone());
         self.composer_state.project(state, update.event.as_ref());
+        self.shadow = (!self.composer_state.commands_ready).then(|| {
+            let mut shadow = gitterm_core::chat::state::State::default();
+            shadow.conversation = state.conversation.clone();
+            shadow.session_id = state.session_id.clone();
+            shadow.acknowledged = state.acknowledged.clone();
+            shadow.checkout = state.checkout.clone();
+            shadow
+        });
+        self.schedule_prestart(cx);
         self.sync_activity_tick(cx);
         match update.presentation {
             Some(Presentation::Replay) => {
@@ -1235,6 +1370,7 @@ impl ChatView {
                     _ => None,
                 },
             );
+            self.schedule_prestart(cx);
         }
         let following = self.scroller.read(cx).is_following_tail();
         let count = self.model.rows.len();

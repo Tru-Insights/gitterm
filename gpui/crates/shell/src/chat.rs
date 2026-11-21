@@ -1,6 +1,7 @@
 //! Native preview composition. The shared workspace owner retains these entities;
 //! docking/hiding never installs another runtime receiver.
 mod auth;
+mod checkout;
 mod fence;
 mod lease;
 mod managed;
@@ -318,6 +319,12 @@ impl ChatPane {
         let review_subscription = Self::handle_review(&view, saved.cwd.clone(), window, cx);
         let callback = Self::intent_callback(cx.weak_entity());
         view.update(cx, |view, cx| view.set_intent_callback(callback, cx));
+        let source = checkout::source(
+            saved.cwd.clone(),
+            cx.try_global::<crate::work_sidebar::IcedWorkSource>()
+                .map(|source| source.config.clone()),
+        );
+        view.update(cx, |view, cx| view.set_checkout_source(source, cx));
         let launch = (|| -> Result<_> {
             let program = claude_program()?;
             let provider = Arc::new(Provider::new(preview, &program)?);

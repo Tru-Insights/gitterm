@@ -10,6 +10,8 @@ pub enum Picker {
     Model,
     Effort,
     Mode,
+    /// The checkout menu; its entries come from the host, not the catalog.
+    Checkout,
 }
 impl Picker {
     pub fn from_chip(id: &str) -> Option<Self> {
@@ -17,6 +19,7 @@ impl Picker {
             "model" => Some(Self::Model),
             "effort" => Some(Self::Effort),
             "mode" => Some(Self::Mode),
+            "checkout" => Some(Self::Checkout),
             _ => None,
         }
     }
@@ -67,6 +70,7 @@ impl Catalog {
             Picker::Model => &self.models,
             Picker::Effort => &self.efforts,
             Picker::Mode => &self.modes,
+            Picker::Checkout => &[],
         }
     }
     pub fn offers(&self, change: &SettingChange) -> bool {
@@ -77,6 +81,14 @@ impl Catalog {
             .any(|row| !row.disabled && &row.change == change)
     }
     pub fn project(state: &State, acp: bool) -> Self {
+        Self::project_with(state, &state.acknowledged, acp)
+    }
+    /// `acknowledged` may carry pre-start choices over the reducer's values.
+    pub fn project_with(
+        state: &State,
+        acknowledged: &gitterm_core::chat::state::AcknowledgedSettings,
+        acp: bool,
+    ) -> Self {
         let ready = state
             .conversation
             .iter()
@@ -100,7 +112,7 @@ impl Catalog {
             ].into();
         }
         models.retain(|m| m["value"].is_string());
-        if let Some(current) = state.acknowledged.model.as_deref() {
+        if let Some(current) = acknowledged.model.as_deref() {
             if !models.iter().any(|m| m["value"] == current) {
                 models.insert(0, json!({"value":current, "displayName":current}));
             }
@@ -115,7 +127,11 @@ impl Catalog {
                     continue;
                 }
                 catalog.models.push(OptionRow {
-                    section: "Model",
+                    section: if listed {
+                        "Model"
+                    } else {
+                        "Model · full list after the session starts"
+                    },
                     label: info["displayName"].as_str().unwrap_or(value).into(),
                     description: info["description"].as_str().unwrap_or_default().into(),
                     change: SettingChange::Model(if wide {
@@ -133,8 +149,7 @@ impl Catalog {
             } else {
                 !acp
             };
-            let effort = state
-                .acknowledged
+            let effort = acknowledged
                 .effort
                 .as_ref()
                 .and_then(|e| e.effort.as_deref());
@@ -191,7 +206,7 @@ impl Catalog {
                 }
             }
         }
-        if let Some(current) = state.acknowledged.mode.as_deref() {
+        if let Some(current) = acknowledged.mode.as_deref() {
             let mut modes = if acp {
                 ready.map(|(_, modes)| modes.clone()).unwrap_or_default()
             } else {
