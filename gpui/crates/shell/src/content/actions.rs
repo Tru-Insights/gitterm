@@ -47,7 +47,13 @@ fn open_platform(path: &Path, cx: &App) -> Result<(), String> {
 /// The page Iced opens in the browser, written to a temp file: the rendered
 /// HTML for markdown/HTML/Excalidraw, the content server's `/file/{id}` page
 /// for anything else. The `gitterm-gpui-` prefix never collides with Iced's.
-pub(super) fn browser_page(root: &Path, relative: &Path, dark: bool) -> Result<PathBuf, String> {
+/// As in Iced: rendered content missing opens the file itself; an empty raw
+/// file opens nothing (`Ok(None)`).
+pub(super) fn browser_page(
+    root: &Path,
+    relative: &Path,
+    dark: bool,
+) -> Result<Option<PathBuf>, String> {
     let path = root.join(relative);
     let load = gitterm_core::content::collect_contained_file_load(0, root, relative, dark)
         .map_err(|e| format!("Open {} in browser: {e}", path.display()))?;
@@ -56,16 +62,13 @@ pub(super) fn browser_page(root: &Path, relative: &Path, dark: bool) -> Result<P
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "preview".to_string());
     let (html, suffix) = if is_rendered(relative) {
-        let html = load
-            .webview_content
-            .ok_or_else(|| format!("Open {} in browser: no rendered content", path.display()))?;
+        let Some(html) = load.webview_content else {
+            return Ok(Some(path));
+        };
         (html, "preview")
     } else {
         if load.file_content.is_empty() {
-            return Err(format!(
-                "Open {} in browser: no text content",
-                path.display()
-            ));
+            return Ok(None);
         }
         let html =
             gitterm_core::file_page::file_page_html(&path.to_string_lossy(), &load.file_content);
@@ -73,7 +76,7 @@ pub(super) fn browser_page(root: &Path, relative: &Path, dark: bool) -> Result<P
     };
     let temp = std::env::temp_dir().join(format!("gitterm-gpui-{stem}_{suffix}.html"));
     std::fs::write(&temp, html).map_err(|e| format!("Write {}: {e}", temp.display()))?;
-    Ok(temp)
+    Ok(Some(temp))
 }
 
 fn full_text(root: &Path, relative: &Path) -> Result<String, String> {
@@ -117,7 +120,9 @@ impl Shell {
                 .spawn(async move { browser_page(&root, &relative, dark) })
                 .await;
             _ = this.update(cx, |this, cx| {
-                if let Err(error) = result.and_then(|page| open_file(&page, cx)) {
+                if let Err(error) =
+                    result.and_then(|page| page.map_or(Ok(()), |page| open_file(&page, cx)))
+                {
                     this.viewer_error(error, cx);
                 }
             });
@@ -156,13 +161,17 @@ mod tests {
         std::fs::write(outside.path().join("outside"), "private fixture").unwrap();
         std::os::unix::fs::symlink(outside.path().join("outside"), root.path().join("link"))
             .unwrap();
-        assert!(full_text(root.path(), Path::new("link"))
-            .unwrap_err()
-            .contains("outside viewer root"));
+        assert!(
+            full_text(root.path(), Path::new("link"))
+                .unwrap_err()
+                .contains("outside viewer root")
+        );
         std::fs::write(root.path().join("binary"), [0xff]).unwrap();
         assert!(full_text(root.path(), Path::new("binary")).is_err());
-        assert!(full_text(root.path(), Path::new("missing"))
-            .unwrap_err()
-            .contains("missing"));
+        assert!(
+            full_text(root.path(), Path::new("missing"))
+                .unwrap_err()
+                .contains("missing")
+        );
     }
 }

@@ -1,10 +1,10 @@
 //! Viewer cover/return bridge. Session entities and selection survive the visit.
-use crate::{data::SessionId, pane, FileOpen, Pane, PaneKind, Shell, WorkspaceId};
+use crate::{FileOpen, Pane, PaneKind, Shell, WorkspaceId, data::SessionId, pane};
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
+    Disableable,
     button::{Button, ButtonVariants},
     dock::PanelId,
-    Disableable,
 };
 use std::collections::HashMap;
 
