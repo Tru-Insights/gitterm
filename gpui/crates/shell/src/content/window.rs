@@ -1,18 +1,22 @@
 //! Window-owned local content surfaces. The dock owns identities, never native visibility.
 use super::{
     Document, Origin,
-    host::{LocalWebKitHost, NavigationResult, SnapshotResult, SurfaceHost},
+    host::{
+        LocalWebKitHost, NavigationResult, PagePolicy, PageRequest, SnapshotResult, SurfaceHost,
+    },
     overlay::*,
 };
-use gitterm_core::page_store::PageStore;
+use gitterm_core::{page_navigation::PageNavigationContext, page_store::PageStore};
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, IntoElement as _, ParentElement as _,
     Styled as _, Subscription, Task, WeakFocusHandle, Window, canvas, div, img,
 };
 use gpui_component::{Root, WindowExt};
 use std::{
-    collections::HashMap,
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
+    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -26,23 +30,27 @@ pub(crate) fn supported(path: &Path) -> bool {
 struct WindowHost {
     native: Option<LocalWebKitHost>,
     navigation: Vec<NavigationResult>,
+    /// A remote Page's link policy, shared with its WebKit delegate.
+    page: Option<Rc<RefCell<PagePolicy>>>,
 }
 impl WindowHost {
-    /// `page` selects a remote Page's login store; `None` is a local document.
-    fn new(window: &Window, page: Option<&PageStore>) -> Result<Self, String> {
+    /// `page` is a remote Page's policy (its store is fixed); `None` is a local document.
+    fn new(window: &Window, page: Option<Rc<RefCell<PagePolicy>>>) -> Result<Self, String> {
         #[cfg(test)]
         {
-            let _ = (window, page);
+            let _ = window;
             Ok(Self {
                 native: None,
                 navigation: vec![],
+                page,
             })
         }
         #[cfg(not(test))]
         {
             Ok(Self {
-                native: Some(LocalWebKitHost::new(window, page)?),
+                native: Some(LocalWebKitHost::new(window, page.clone())?),
                 navigation: vec![],
+                page,
             })
         }
     }
@@ -94,8 +102,22 @@ impl SurfaceHost for WindowHost {
     }
 }
 enum Source {
-    Local { root: PathBuf, relative: PathBuf },
-    Page { url: String, store: PageStore },
+    Local {
+        root: PathBuf,
+        relative: PathBuf,
+    },
+    Page {
+        url: String,
+        store: PageStore,
+        origin: Origin,
+    },
+}
+/// What a Page's links need to pick a store: GitHub owner -> login, and the
+/// Linear workspaces known from cached issues (Iced `page_navigation_context`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PageRoutes {
+    pub github_accounts: BTreeMap<String, String>,
+    pub linear_workspaces: BTreeSet<String>,
 }
 struct Entry {
     source: Source,
@@ -137,7 +159,7 @@ impl ContentWindow {
                             return;
                         }
                         this.sync_covers(window, cx);
-                        let mut changed = false;
+                        let mut changed = this.pump_page_requests(window, cx);
                         for entry in this.entries.values_mut() {
                             let before = entry.viewer.state();
                             if let Some(host) = &mut entry.viewer.host_mut().native {
@@ -211,6 +233,7 @@ impl ContentWindow {
                 let mut viewer = RetainedViewer::new(WindowHost {
                     native: None,
                     navigation: vec![],
+                    page: None,
                 });
                 let ticket = viewer.begin_content(Origin {
                     workspace,
@@ -269,30 +292,49 @@ impl ContentWindow {
     }
     /// Load `url` in the Page entry `id`. The same store reuses its surface;
     /// another store rebuilds it, since a WebKit view's store is fixed.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_page(
         &mut self,
         id: String,
         url: String,
         store: PageStore,
+        routes: PageRoutes,
         origin: Origin,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let reuse = matches!(
-            self.entries.get(&id),
-            Some(Entry { source: Source::Page { store: current, .. }, .. }) if *current == store
-        );
+        let context = PageNavigationContext {
+            url: url.clone(),
+            store: store.clone(),
+            github_accounts: routes.github_accounts,
+            linear_workspaces: routes.linear_workspaces,
+        };
+        let reused = match self.entries.get(&id) {
+            Some(Entry {
+                source: Source::Page { store: current, .. },
+                viewer,
+                ..
+            }) if *current == store => viewer.host().page.clone(),
+            _ => None,
+        };
         let mut failed = None;
-        if !reuse {
+        if let Some(policy) = reused {
+            // A fresh origin and routes; effects of the page being left are stale.
+            let mut policy = policy.borrow_mut();
+            policy.context = context;
+            policy.drain();
+        } else {
             if let Some(mut old) = self.entries.remove(&id) {
                 old.viewer.clear();
             }
-            let host = WindowHost::new(window, Some(&store)).unwrap_or_else(|error| {
+            let policy = Rc::new(RefCell::new(PagePolicy::new(context)));
+            let host = WindowHost::new(window, Some(policy.clone())).unwrap_or_else(|error| {
                 // Keep a normal failed entry so host failure remains inline.
                 failed = Some(error);
                 WindowHost {
                     native: None,
                     navigation: vec![],
+                    page: Some(policy),
                 }
             });
             self.entries.insert(
@@ -301,6 +343,7 @@ impl ContentWindow {
                     source: Source::Page {
                         url: url.clone(),
                         store: store.clone(),
+                        origin: origin.clone(),
                     },
                     viewer: RetainedViewer::new(host),
                     covers: [None; 3],
@@ -312,11 +355,90 @@ impl ContentWindow {
             Some(error) => Err(error),
             None => Document::page(&url),
         };
-        entry.source = Source::Page { url, store };
+        entry.source = Source::Page {
+            url,
+            store,
+            origin: origin.clone(),
+        };
         let ticket = entry.viewer.begin_content(origin);
         entry.viewer.complete_content(&ticket, document);
         cx.notify();
         self.apply_covers(window, cx);
+    }
+    /// Apply what Page navigations queued: browser opens, the URL a Page now
+    /// shows, and reopens in another store. A Page that is no longer visited
+    /// drops its reopen, as Iced drops a stale Page generation.
+    fn pump_page_requests(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let mut changed = false;
+        let mut reopen = Vec::new();
+        for (id, entry) in &mut self.entries {
+            let Some(policy) = entry.viewer.host_mut().page.clone() else {
+                continue;
+            };
+            let requests = policy.borrow_mut().drain();
+            for request in requests {
+                match request {
+                    PageRequest::External(url) => cx.open_url(&url),
+                    PageRequest::Navigated(next) => {
+                        if let Source::Page { url, .. } = &mut entry.source
+                            && *url != next
+                        {
+                            *url = next;
+                            changed = true;
+                        }
+                    }
+                    PageRequest::Reopen(url, store) => {
+                        let visited = self.visits.values().any(|visit| visit.pane == *id);
+                        if let Source::Page { origin, .. } = &entry.source
+                            && visited
+                        {
+                            let routes = {
+                                let policy = policy.borrow();
+                                PageRoutes {
+                                    github_accounts: policy.context.github_accounts.clone(),
+                                    linear_workspaces: policy.context.linear_workspaces.clone(),
+                                }
+                            };
+                            let origin = Origin {
+                                source: url.clone().into(),
+                                ..origin.clone()
+                            };
+                            reopen.push((id.clone(), url, store, routes, origin));
+                        }
+                    }
+                }
+            }
+        }
+        for (id, url, store, routes, origin) in reopen {
+            self.open_page(id, url, store, routes, origin, window, cx);
+            changed = true;
+        }
+        changed
+    }
+    /// Run a Page navigation through the entry's policy as its WebKit delegate
+    /// would, then apply the effects. Returns whether WebKit would load it.
+    #[cfg(test)]
+    pub(crate) fn simulate_page_navigation(
+        &mut self,
+        id: &str,
+        url: &str,
+        new_window: bool,
+        main_frame: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let policy = self.entries[id].viewer.host().page.clone().expect("a Page");
+        let allowed = policy
+            .borrow_mut()
+            .decide(Some(url), new_window, main_frame);
+        self.pump_page_requests(window, cx);
+        allowed
+    }
+    /// The policy behind entry `id`, to tell reuse from rebuild; holding it
+    /// keeps its address from being reused.
+    #[cfg(test)]
+    pub(crate) fn page_policy(&self, id: &str) -> Option<Rc<RefCell<PagePolicy>>> {
+        self.entries.get(id)?.viewer.host().page.clone()
     }
     pub(super) fn source(&self, id: &str) -> Option<(PathBuf, PathBuf)> {
         match &self.entries.get(id)?.source {
@@ -327,7 +449,7 @@ impl ContentWindow {
     /// The URL and login store a Page entry was asked to show.
     pub(crate) fn page(&self, id: &str) -> Option<(&str, &PageStore)> {
         match &self.entries.get(id)?.source {
-            Source::Page { url, store } => Some((url, store)),
+            Source::Page { url, store, .. } => Some((url, store)),
             Source::Local { .. } => None,
         }
     }

@@ -29,6 +29,14 @@ impl PageStore {
             .unwrap_or(Self::Default)
     }
 
+    /// Normalize GitHub login casing because logins are case-insensitive.
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::GitHub(login) => Self::GitHub(login.to_ascii_lowercase()),
+            store => store,
+        }
+    }
+
     pub fn label(&self) -> String {
         match self {
             Self::Default => "default login".to_string(),

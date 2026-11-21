@@ -2750,3 +2750,38 @@ fn expanded_repo_row_slots_stay_on_one_line_with_muted_editor(cx: &mut gpui::Tes
         assert!(row.controls.iter().any(|c| c.label == "Open in editor"));
     });
 }
+
+#[test]
+fn page_routes_carry_mapped_owners_and_cached_issue_workspaces() {
+    use gitterm_core::issues::CachedIssue;
+    let mut sidebar = fixture(true);
+    sidebar.pr_accounts = BTreeMap::from([("example".into(), "Sample-Login".into())]);
+    let issue = |url: Option<&str>, workspace: Option<&str>| CachedIssue {
+        url: url.map(str::to_owned),
+        workspace: workspace.map(str::to_owned),
+        ..Default::default()
+    };
+    for (key, cached) in [
+        // Iced prefers the cached workspace over the URL's.
+        (
+            "SAMPLE-1",
+            issue(
+                Some("https://linear.app/sample-a/issue/SAMPLE-1/x"),
+                Some("sample-b"),
+            ),
+        ),
+        (
+            "SAMPLE-2",
+            issue(Some("https://linear.app/sample-c/issue/SAMPLE-2/y"), None),
+        ),
+        ("SAMPLE-3", issue(Some("https://example.com/issue/3"), None)),
+    ] {
+        sidebar.issues.issues.insert(key.into(), cached);
+    }
+    let routes = sidebar.page_routes();
+    assert_eq!(routes.github_accounts, sidebar.pr_accounts);
+    assert_eq!(
+        routes.linear_workspaces,
+        ["sample-b".to_string(), "sample-c".to_string()].into()
+    );
+}

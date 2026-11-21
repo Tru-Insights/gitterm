@@ -146,6 +146,9 @@ impl<H: SurfaceHost> RetainedViewer<H> {
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
+    pub fn host(&self) -> &H {
+        &self.host
+    }
     pub fn host_mut(&mut self) -> &mut H {
         &mut self.host
     }

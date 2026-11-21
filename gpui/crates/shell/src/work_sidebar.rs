@@ -254,6 +254,26 @@ pub struct WorkSidebar {
 }
 
 impl WorkSidebar {
+    /// Iced `page_navigation_context`'s routes: mapped GitHub owners, and the
+    /// Linear workspaces of cached issues.
+    pub(crate) fn page_routes(&self) -> crate::content::window::PageRoutes {
+        crate::content::window::PageRoutes {
+            github_accounts: self.pr_accounts.clone(),
+            linear_workspaces: self
+                .issues
+                .issues
+                .values()
+                .filter_map(|issue| {
+                    issue.workspace.clone().or_else(|| {
+                        issue
+                            .url
+                            .as_deref()
+                            .and_then(gitterm_core::issues::workspace_from_issue_url)
+                    })
+                })
+                .collect(),
+        }
+    }
     pub fn new(workspace: WorkspaceFacts, state: Rc<RefCell<State>>) -> Self {
         Self {
             workspace,

@@ -24,6 +24,11 @@ use objc2_web_kit::{
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+use gitterm_core::{
+    page_navigation::{PageNavigationContext, PageNavigationDecision, page_navigation_decision},
+    page_store::PageStore,
+};
+
 use super::{
     Document,
     overlay::{Geometry, LoadTicket, Snapshot, SnapshotTicket},
@@ -47,8 +52,8 @@ pub type NavigationResult = (LoadTicket, Result<(), String>);
 #[derive(Default)]
 struct NavigationState {
     injection: Cell<bool>,
-    /// A remote Page: navigation follows `page_navigation`, not the local policy.
-    page: Cell<bool>,
+    /// A remote Page: navigation follows its `PagePolicy`, not the local policy.
+    page: Option<Rc<RefCell<PagePolicy>>>,
     /// The Page URL just requested; its own first navigation always loads.
     page_request: RefCell<Option<String>>,
     pending: RefCell<Option<(Retained<WKNavigation>, LoadTicket)>>,
@@ -88,7 +93,7 @@ define_class!(
             // window or persistent Page surface is created for local documents.
             let target: Option<Retained<NSObject>> = unsafe { msg_send![action, targetFrame] };
             let url = url.as_ref().map(|url| url.to_string());
-            let policy = if self.ivars().page.get() {
+            let policy = if let Some(page) = &self.ivars().page {
                 // SAFETY: targetFrame is a WKFrameInfo, which answers isMainFrame.
                 let main_frame = target
                     .as_ref()
@@ -96,11 +101,21 @@ define_class!(
                 let requested = main_frame
                     .then(|| self.ivars().page_request.borrow_mut().take())
                     .flatten();
-                if requested.is_some() && requested == url {
-                    DocumentNavigation::Allow
+                let allowed = if requested.is_some() && requested == url {
+                    true
+                } else if let Ok(mut page) = page.try_borrow_mut() {
+                    page.decide(url.as_deref(), target.is_none(), main_frame)
                 } else {
-                    page_navigation(url.as_deref(), target.is_none(), main_frame)
-                }
+                    // An unavailable policy fails closed, as Iced's does.
+                    eprintln!("[page] navigation policy busy; cancelled");
+                    false
+                };
+                // The policy queued any browser open or reopen itself.
+                return decision.call((if allowed {
+                    WKNavigationActionPolicy::Allow
+                } else {
+                    WKNavigationActionPolicy::Cancel
+                },));
             } else {
                 document_navigation(&self.ivars().injection, url.as_deref(), target.is_none())
             };
@@ -200,51 +215,75 @@ pub(super) fn document_navigation(
     }
 }
 
-/// Page link policy, after Iced's: GitHub, Linear and their sign-in providers
-/// stay in the Page's login store; other web links open in the browser.
-/// shortcut: a link to another owner's or workspace's store stays in this
-/// store (Iced reopens the Page in that store); port Iced's Reopen when needed.
-pub(super) fn page_navigation(
-    url: Option<&str>,
-    new_window: bool,
-    main_frame: bool,
-) -> DocumentNavigation {
-    let Some(parsed) = url.and_then(|url| gitterm_core::page_store::browser_url(url).ok()) else {
-        return DocumentNavigation::Cancel;
-    };
-    if new_window {
-        return DocumentNavigation::External;
+/// What an embedded Page's navigation asks its window to do afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageRequest {
+    /// An allowed main-frame navigation: the Page now shows this URL.
+    Navigated(String),
+    /// Open this HTTP(S) URL in the default browser.
+    External(String),
+    /// Open this URL in the Page with that store (Iced `open_page_in_store`).
+    Reopen(String, PageStore),
+}
+
+/// A Page's link policy: Iced's wry handlers around the shared
+/// `page_navigation_decision`. Popups open in the browser; main-frame
+/// navigations follow the decision; embedded frames load in place.
+#[derive(Debug)]
+pub struct PagePolicy {
+    pub context: PageNavigationContext,
+    requests: Vec<PageRequest>,
+}
+
+impl PagePolicy {
+    pub fn new(context: PageNavigationContext) -> Self {
+        Self {
+            context,
+            requests: Vec::new(),
+        }
     }
-    // Embedded frames of an allowed page load in place.
-    if !main_frame {
-        return DocumentNavigation::Allow;
+
+    /// Whether WebKit may load `url`; queues the other effects for the window.
+    pub fn decide(&mut self, url: Option<&str>, new_window: bool, main_frame: bool) -> bool {
+        let Some(url) = url.filter(|url| gitterm_core::page_store::browser_url(url).is_ok()) else {
+            return false;
+        };
+        if new_window {
+            self.requests.push(PageRequest::External(url.to_owned()));
+            return false;
+        }
+        if !main_frame {
+            return true;
+        }
+        match page_navigation_decision(url, &self.context) {
+            PageNavigationDecision::Allow => {
+                // Redirects are decided against the page they leave.
+                self.context.url = url.to_owned();
+                self.requests.push(PageRequest::Navigated(url.to_owned()));
+                true
+            }
+            PageNavigationDecision::Reopen(store) => {
+                self.requests
+                    .push(PageRequest::Reopen(url.to_owned(), store));
+                false
+            }
+            PageNavigationDecision::External => {
+                self.requests.push(PageRequest::External(url.to_owned()));
+                false
+            }
+            PageNavigationDecision::Cancel => false,
+        }
     }
-    let service = matches!(
-        parsed.host_str(),
-        Some(
-            "github.com"
-                | "linear.app"
-                | "accounts.google.com"
-                | "appleid.apple.com"
-                | "idmsa.apple.com"
-        )
-    );
-    if parsed.scheme() == "https"
-        && parsed.username().is_empty()
-        && parsed.password().is_none()
-        && parsed.port().is_none()
-        && service
-    {
-        DocumentNavigation::Allow
-    } else {
-        DocumentNavigation::External
+
+    pub fn drain(&mut self) -> Vec<PageRequest> {
+        std::mem::take(&mut self.requests)
     }
 }
 
 /// The WebKit store a Page uses: GPUI's own default store, or the persistent
 /// store with Iced's identifier for that login, held in GPUI's app data.
 fn page_data_store(
-    store: &gitterm_core::page_store::PageStore,
+    store: &PageStore,
     mtm: MainThreadMarker,
 ) -> Result<Retained<WKWebsiteDataStore>, String> {
     let unavailable = || format!("Page {} · not available in preview", store.label());
@@ -290,13 +329,10 @@ pub struct LocalWebKitHost {
 }
 
 impl LocalWebKitHost {
-    pub fn new(
-        window: &Window,
-        page: Option<&gitterm_core::page_store::PageStore>,
-    ) -> Result<Self, String> {
+    pub fn new(window: &Window, page: Option<Rc<RefCell<PagePolicy>>>) -> Result<Self, String> {
         let mtm = MainThreadMarker::new().ok_or("WebKit host requires the main thread")?;
-        let store = match page {
-            Some(store) => page_data_store(store, mtm)?,
+        let store = match &page {
+            Some(policy) => page_data_store(&policy.borrow().context.store, mtm)?,
             None => unsafe { WKWebsiteDataStore::nonPersistentDataStore(mtm) },
         };
         let handle = HasWindowHandle::window_handle(window)
@@ -310,7 +346,7 @@ impl LocalWebKitHost {
             .ok_or("Missing native parent view")?;
         let navigation: Retained<LocalNavigation> = unsafe {
             let allocated = LocalNavigation::alloc(mtm).set_ivars(NavigationState {
-                page: Cell::new(page.is_some()),
+                page,
                 ..NavigationState::default()
             });
             msg_send![super(allocated), init]
