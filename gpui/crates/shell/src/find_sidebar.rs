@@ -1007,6 +1007,30 @@ impl FindSidebar {
     ) -> impl IntoElement {
         let p = Palette::current(cx);
         let selector = id.clone();
+        if id == "find-backfill" || id.starts_with("find-widen-") {
+            return row_button(id, cx)
+                .debug_selector({
+                    let selector = selector.clone();
+                    move || selector.clone()
+                })
+                .aria_label(control.label.clone())
+                .px(px(8.))
+                .py(px(3.))
+                .text_size(px(theme::font_sizes(cx).ui - 2.))
+                .child(
+                    div()
+                        .debug_selector({
+                            let selector = selector.clone();
+                            move || format!("{selector}-label")
+                        })
+                        .child(control.label),
+                )
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(control.outcome.clone());
+                }))
+                .into_any_element();
+        }
         let backend = matches!(control.outcome, FindOutcome::SetBackend(_));
         let mut content = div()
             .flex()
@@ -1043,6 +1067,7 @@ impl FindSidebar {
                 cx.stop_propagation();
                 cx.emit(control.outcome.clone());
             }))
+            .into_any_element()
     }
 }
 
@@ -1063,29 +1088,40 @@ fn open_lines(session: &OpenSession) -> (String, String) {
     (truncate(&session.title, 48), truncate(&detail, 72))
 }
 
-// A Button label is a centred, single-line control with a fixed height. Use
-// full-width content and intrinsic height for headers and multi-line rows.
-fn header(id: String, parts: Vec<String>, cx: &gpui::App) -> Button {
+// Plain clickable rows keep content at the Iced inset; Button centres its child.
+fn row_button(id: impl Into<gpui::ElementId>, cx: &gpui::App) -> gpui::Stateful<gpui::Div> {
     let p = Palette::current(cx);
-    Button::new(id)
-        .accessibility_label(parts.join(" "))
-        .ghost()
-        .h_auto()
-        .line_height(gpui::relative(theme::LABEL_LINE_HEIGHT))
+    div()
+        .id(id)
+        .role(gpui::Role::Button)
         .w_full()
+        .flex_shrink_0()
+        .flex()
+        .items_start()
+        .text_left()
+        .line_height(gpui::relative(theme::LABEL_LINE_HEIGHT))
+        .cursor_pointer()
+        .hover(move |row| row.bg(rgb(p.overlay)))
+}
+
+fn header(id: String, parts: Vec<String>, cx: &gpui::App) -> gpui::Stateful<gpui::Div> {
+    let p = Palette::current(cx);
+    let selector = id.clone();
+    row_button(id, cx)
+        .aria_label(parts.join(" "))
         .px(px(6.))
         .py(px(6.))
-        .child(
+        .items_center()
+        .gap(px(8.))
+        .text_size(px(10.))
+        .text_color(rgb(p.subtext0))
+        .children(parts.into_iter().enumerate().map(move |(i, part)| {
+            let selector = selector.clone();
             div()
-                .w_full()
-                .text_left()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .text_size(px(10.))
-                .text_color(rgb(p.subtext0))
-                .children(parts.into_iter().map(|part| div().child(part))),
-        )
+                .debug_selector(move || format!("{selector}-part-{i}"))
+                .when(i == 2, |part| part.text_color(rgb(p.muted)))
+                .child(part)
+        }))
 }
 
 impl Render for FindSidebar {
@@ -1153,13 +1189,9 @@ impl Render for FindSidebar {
                     let (title, detail) = open_lines(session);
                     let id = session.id.clone();
                     list = list.child(
-                        Button::new(format!("find-open-{i}"))
-                            .accessibility_label(format!("{title}, {detail}"))
+                        row_button(format!("find-open-{i}"), cx)
+                            .aria_label(format!("{title}, {detail}"))
                             .debug_selector(move || format!("find-open-{i}"))
-                            .ghost()
-                            .h_auto()
-                            .line_height(gpui::relative(theme::LABEL_LINE_HEIGHT))
-                            .w_full()
                             .px(px(8.))
                             .py(px(4.))
                             .when(session.selected, |b| b.bg(rgb(p.surface)))
@@ -1174,6 +1206,7 @@ impl Render for FindSidebar {
                                     .text_size(px(font_small))
                                     .child(
                                         div()
+                                            .debug_selector(move || format!("find-open-icon-{i}"))
                                             .flex_shrink_0()
                                             .child(session.marker.trim_end().to_string()),
                                     )
@@ -1353,12 +1386,9 @@ impl Render for FindSidebar {
                                 .child(detail),
                         );
                     }
-                    let content = Button::new(format!("find-chat-{i}"))
-                        .accessibility_label(accessible_title)
+                    let content = row_button(format!("find-chat-{i}"), cx)
+                        .aria_label(accessible_title)
                         .debug_selector(move || format!("find-chat-{i}"))
-                        .ghost()
-                        .h_auto()
-                        .line_height(gpui::relative(theme::LABEL_LINE_HEIGHT))
                         .flex_1()
                         .min_w_0()
                         .px(px(8.))
@@ -1602,6 +1632,28 @@ impl FindPreview {
     }
 }
 
+fn overview_place(
+    facts: &FindFacts,
+    session: &OpenSession,
+    indexed: Option<&ChatIndexEntry>,
+) -> String {
+    let mut parts = vec![facts.machine_name(&session.id.remote_id)];
+    if let Some(entry) = indexed {
+        parts.push(entry.group_name());
+        if let Some(branch) = &entry.branch {
+            parts.push(branch.clone());
+        }
+        parts.push(entry.backend.label().into());
+    } else {
+        parts.extend([session.workspace.clone(), session.detail.clone()]);
+    }
+    parts
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 impl FindPreview {
     fn unavailable_button(&self, id: String, label: String, cx: &Context<Self>) -> Button {
         let selector = id.clone();
@@ -1667,6 +1719,8 @@ impl FindPreview {
 
     fn overview(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
         let p = Palette::current(cx);
+        let font = theme::font_sizes(cx).ui;
+        let small = font - 1.;
         let class = |s: &&OpenSession| match s.marker.as_str() {
             "●" => 0,
             "▶" => 1,
@@ -1692,12 +1746,13 @@ impl FindPreview {
             .debug_selector(|| "find-overview".into())
             .size_full()
             .overflow_y_scroll()
-            .p_4()
+            .px(px(18.))
+            .py(px(14.))
             .flex()
             .flex_col()
-            .gap_2()
-            .child(div().text_size(px(16.)).child("Overview"))
-            .child(summary.join(" · "));
+            .gap(px(2.))
+            .child(div().text_size(px(font + 2.)).child("Overview"))
+            .child(div().text_color(rgb(p.subtext0)).child(summary.join(" · ")));
         for machine in &self.facts.machines {
             body = body.child(
                 div()
@@ -1717,25 +1772,45 @@ impl FindPreview {
             }
             if group == 2 {
                 body = body.child(
-                    Button::new("find-overview-idle")
-                        .debug_selector(|| "find-overview-idle".into())
-                        .label(format!(
-                            "{} {label} {}",
-                            if self.idle_expanded { "▾" } else { "▸" },
-                            counts[group]
-                        ))
-                        .ghost()
-                        .xsmall()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.idle_expanded = !this.idle_expanded;
-                            cx.notify();
-                        })),
+                    header(
+                        "find-overview-idle".into(),
+                        vec![
+                            if self.idle_expanded { "▾" } else { "▸" }.into(),
+                            label.into(),
+                            counts[group].to_string(),
+                        ],
+                        cx,
+                    )
+                    .debug_selector(|| "find-overview-idle".into())
+                    .aria_expanded(self.idle_expanded)
+                    .pt(px(10.))
+                    .pb(px(4.))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.idle_expanded = !this.idle_expanded;
+                        cx.notify();
+                    })),
                 );
                 if !self.idle_expanded {
                     continue;
                 }
             } else {
-                body = body.child(format!("{label} {}", counts[group]));
+                body = body.child(
+                    div()
+                        .flex_shrink_0()
+                        .flex()
+                        .gap(px(8.))
+                        .pt(px(14.))
+                        .pb(px(4.))
+                        .px(px(6.))
+                        .text_size(px(10.))
+                        .text_color(rgb(p.subtext0))
+                        .child(label)
+                        .child(
+                            div()
+                                .text_color(rgb(p.muted))
+                                .child(counts[group].to_string()),
+                        ),
+                );
             }
             for (i, session) in self
                 .facts
@@ -1745,58 +1820,80 @@ impl FindPreview {
                 .filter(|(_, s)| class(s) == group)
             {
                 let id = session.id.clone();
-                let state = match group {
-                    0 => "waiting for you",
-                    1 => "Working",
-                    _ => "idle",
-                };
                 let indexed = entry(&self.state.borrow(), &id).cloned();
+                let place = overview_place(&self.facts, session, indexed.as_ref());
+                let color = match group {
+                    0 => p.peach,
+                    1 => p.green,
+                    _ => p.muted,
+                };
+                // shortcut: OpenSession exposes no elapsed/cost or gist facts;
+                // show indexed activity age until the host supplies those facts.
+                let right = indexed
+                    .as_ref()
+                    .map(|entry| format!("{} ago", chats::format_age(entry.mtime)))
+                    .unwrap_or_default();
+                let detail = match group {
+                    0 => Some("waiting for you".to_string()),
+                    1 => Some("Working".to_string()),
+                    _ => indexed.as_ref().and_then(|entry| entry.latest.clone()),
+                };
                 let mut lines = div()
-                    .w_full()
-                    .text_left()
+                    .flex_1()
+                    .min_w_0()
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .child(format!("{} {}", session.marker, session.title))
+                    .gap(px(1.))
                     .child(
-                        div().text_color(rgb(p.muted)).child(
-                            indexed
-                                .as_ref()
-                                .map(|entry| {
-                                    let mut place = vec![
-                                        self.facts.machine_name(&id.remote_id),
-                                        entry.group_name(),
-                                    ];
-                                    if let Some(branch) = &entry.branch {
-                                        place.push(branch.clone());
-                                    }
-                                    place.push(entry.backend.label().into());
-                                    place.join(" · ")
-                                })
-                                .unwrap_or_else(|| {
-                                    format!(
-                                        "{} · {} · {}",
-                                        self.facts.machine_name(&id.remote_id),
-                                        session.workspace,
-                                        session.detail
-                                    )
-                                }),
-                        ),
+                        div()
+                            .debug_selector(move || format!("find-overview-title-{i}"))
+                            .text_size(px(small))
+                            .child(session.title.clone()),
                     )
-                    .child(state);
-                if let Some(entry) = indexed {
-                    if let Some(latest) = entry.latest {
-                        lines = lines.child(latest);
-                    }
-                    lines = lines.child(format!("{} ago", chats::format_age(entry.mtime)));
+                    .child(
+                        div()
+                            .debug_selector(move || format!("find-overview-meta-{i}"))
+                            .text_size(px(small - 1.))
+                            .text_color(rgb(p.muted))
+                            .child(place),
+                    );
+                if let Some(detail) = detail {
+                    lines = lines.child(
+                        div()
+                            .debug_selector(move || format!("find-overview-detail-{i}"))
+                            .text_size(px(small))
+                            .text_color(rgb(match group {
+                                0 => p.peach,
+                                1 => p.subtext0,
+                                _ => p.muted,
+                            }))
+                            .child(detail),
+                    );
                 }
                 body = body.child(
-                    Button::new(format!("find-overview-row-{i}"))
+                    row_button(format!("find-overview-row-{i}"), cx)
                         .debug_selector(move || format!("find-overview-row-{i}"))
-                        .ghost()
-                        .h_auto()
-                        .w_full()
+                        .aria_label(session.title.clone())
+                        .px(px(10.))
+                        .py(px(5.))
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .debug_selector(move || format!("find-overview-icon-{i}"))
+                                .flex_shrink_0()
+                                .text_size(px(small))
+                                .text_color(rgb(color))
+                                .child(session.marker.clone()),
+                        )
                         .child(lines)
+                        .child(
+                            div()
+                                .debug_selector(move || format!("find-overview-right-{i}"))
+                                .flex_shrink_0()
+                                .text_size(px(small - 1.))
+                                .text_color(rgb(p.subtext0))
+                                .child(right),
+                        )
                         .on_click(cx.listener(move |_, _, _, cx| {
                             cx.emit(FindOutcome::Open { id: id.clone() })
                         })),
@@ -1812,17 +1909,36 @@ impl FindPreview {
             let disabled = indexed.is_none();
             let id = id.clone();
             body = body.child(
-                Button::new(format!("find-overview-remote-{i}"))
+                row_button(format!("find-overview-remote-{i}"), cx)
                     .debug_selector(move || format!("find-overview-remote-{i}"))
-                    .label(format!(
+                    .aria_label(format!(
                         "▶ {} · {}",
                         title,
                         self.facts.machine_name(&id.remote_id)
                     ))
-                    .disabled(disabled)
-                    .ghost()
+                    .px(px(10.))
+                    .py(px(5.))
+                    .gap(px(8.))
+                    .when(disabled, |row| row.cursor_default().opacity(0.5))
+                    .child(
+                        div()
+                            .debug_selector(move || format!("find-overview-remote-icon-{i}"))
+                            .text_color(rgb(p.green))
+                            .child("▶"),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(move || format!("find-overview-remote-title-{i}"))
+                            .child(format!(
+                                "{} · {}",
+                                title,
+                                self.facts.machine_name(&id.remote_id)
+                            )),
+                    )
                     .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.emit(FindOutcome::Select { id: id.clone() })
+                        if !disabled {
+                            cx.emit(FindOutcome::Select { id: id.clone() })
+                        }
                     })),
             );
         }
@@ -1858,11 +1974,16 @@ impl FindPreview {
             );
             if cut {
                 out = out.child(
-                    Button::new("find-summary-ask")
+                    row_button("find-summary-ask", cx)
                         .debug_selector(|| "find-summary-ask".into())
-                        .label(if self.ask_expanded { "less" } else { "more" })
-                        .ghost()
-                        .xsmall()
+                        .aria_label(if self.ask_expanded { "less" } else { "more" })
+                        .px(px(6.))
+                        .py(px(2.))
+                        .child(
+                            div()
+                                .debug_selector(|| "find-summary-ask-label".into())
+                                .child(if self.ask_expanded { "less" } else { "more" }),
+                        )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.ask_expanded = !this.ask_expanded;
                             cx.notify();
@@ -1882,11 +2003,16 @@ impl FindPreview {
                     .unwrap_or_else(|| path.clone());
                 if id.remote_id.is_none() && self.facts.local_files_openable {
                     out = out.child(
-                        Button::new(format!("find-summary-file-{i}"))
+                        row_button(format!("find-summary-file-{i}"), cx)
                             .debug_selector(move || format!("find-summary-file-{i}"))
-                            .label(shown)
-                            .ghost()
-                            .xsmall()
+                            .aria_label(shown.clone())
+                            .px(px(6.))
+                            .py(px(2.))
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("find-summary-file-label-{i}"))
+                                    .child(shown),
+                            )
                             .on_click(cx.listener(move |_, _, _, cx| {
                                 cx.emit(FindOutcome::OpenFile(full.clone()))
                             })),
@@ -1917,11 +2043,16 @@ impl FindPreview {
             );
             if cut {
                 out = out.child(
-                    Button::new("find-summary-reply")
+                    row_button("find-summary-reply", cx)
                         .debug_selector(|| "find-summary-reply".into())
-                        .label(if self.reply_expanded { "less" } else { "more" })
-                        .ghost()
-                        .xsmall()
+                        .aria_label(if self.reply_expanded { "less" } else { "more" })
+                        .px(px(6.))
+                        .py(px(2.))
+                        .child(
+                            div()
+                                .debug_selector(|| "find-summary-reply-label".into())
+                                .child(if self.reply_expanded { "less" } else { "more" }),
+                        )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.reply_expanded = !this.reply_expanded;
                             cx.notify();
@@ -1945,7 +2076,9 @@ impl Render for FindPreview {
             .flex_col()
             .bg(rgb(p.base))
             .text_color(rgb(p.text))
-            .text_size(px(12.));
+            .font_family(theme::LABEL_FONT)
+            .line_height(gpui::relative(theme::LABEL_LINE_HEIGHT))
+            .text_size(px(theme::font_sizes(cx).ui - 1.));
         let Some(selection) = state.selected(&self.owner) else {
             return pane.child(self.overview(cx));
         };
@@ -2048,21 +2181,22 @@ impl Render for FindPreview {
             .gap_3();
         body = body.child(self.summary(entry, &selection.chat, preview, cx));
         body = body.child(
-            Button::new("find-preview-conversation")
-                .debug_selector(|| "find-preview-conversation".into())
-                .label(format!(
-                    "{} CONVERSATION {}",
-                    if self.raw_expanded { "▾" } else { "▸" },
+            header(
+                "find-preview-conversation".into(),
+                vec![
+                    if self.raw_expanded { "▾" } else { "▸" }.into(),
+                    "CONVERSATION".into(),
                     preview
                         .map(|p| format!("last {}", p.messages.len()))
-                        .unwrap_or_default()
-                ))
-                .ghost()
-                .xsmall()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.raw_expanded = !this.raw_expanded;
-                    cx.notify();
-                })),
+                        .unwrap_or_default(),
+                ],
+                cx,
+            )
+            .debug_selector(|| "find-preview-conversation".into())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.raw_expanded = !this.raw_expanded;
+                cx.notify();
+            })),
         );
         if let Some(error) = state.preview_error(&self.owner) {
             body = body.child(div().text_color(rgb(p.red)).child(error.to_string()));
