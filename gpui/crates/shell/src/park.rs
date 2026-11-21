@@ -519,7 +519,7 @@ impl Shell {
     }
     pub(crate) fn open_park_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use gpui::AppContext as _;
-        if self.park_sheet.is_some() {
+        if self.park_sheet.is_some() || self.settings_sheet.is_some() {
             return;
         }
         let Some(model) = self.workspace_sheet(cx) else {

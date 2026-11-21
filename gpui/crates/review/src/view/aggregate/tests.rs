@@ -189,3 +189,22 @@ fn base_selection_then_collection_replaces_the_native_file_projection(cx: &mut T
         assert!(!view.render_lines(0..10).is_empty());
     });
 }
+
+#[test]
+fn aggregate_file_names_follow_iced_viewed_and_stale_styles() {
+    use gpui::Styled as _;
+    let style = |state| {
+        let mut name = super::file_name("a.rs".into(), state);
+        let text = &name.style().text;
+        (text.color, text.strikethrough.is_some())
+    };
+    assert_eq!(style(ViewedState::Unviewed), (None, false));
+    assert_eq!(
+        style(ViewedState::Viewed),
+        (Some(gpui::rgb(0x9399b2).into()), true)
+    );
+    assert_eq!(
+        style(ViewedState::ChangedSinceViewed),
+        (Some(gpui::rgb(0xf9e2af).into()), false)
+    );
+}
