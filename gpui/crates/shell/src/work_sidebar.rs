@@ -9,6 +9,7 @@ use std::{
     rc::Rc,
 };
 
+use crate::pr_confirm::{self, Kind, PrConfirm};
 use gitterm_core::{
     chat_facts::ChildKind,
     chats,
@@ -173,6 +174,11 @@ enum Action {
     Edit(PathBuf),
     DismissAuto,
     Preview(String),
+    /// Iced `Pr(ActionOpen)`: Approve, Merge and Ready for review open a
+    /// confirmation panel first.
+    Confirm(gitterm_core::merge_plan::PrKey, crate::pr_confirm::Kind),
+    /// Iced's disabled Approve/Merge (checks gate, draft): a click does nothing.
+    Inert,
 }
 
 #[derive(Clone, Debug)]
@@ -256,6 +262,7 @@ pub struct WorkSidebar {
     /// The checkout whose review is shown, as Iced's `open_review_checkout`.
     review_checkout: Option<PathBuf>,
     agent_line: Option<String>,
+    confirm: Option<crate::pr_confirm::PrConfirm>,
 }
 
 impl WorkSidebar {
@@ -305,6 +312,7 @@ impl WorkSidebar {
             error: None,
             review_checkout: None,
             agent_line: None,
+            confirm: None,
         }
     }
 
@@ -832,9 +840,19 @@ impl WorkSidebar {
                         name.into()
                     }
                 };
+                // Iced enables Approve and Merge only for an open PR whose
+                // checks pass; otherwise the label names why and a click is inert.
+                let can_act = pr.snapshot.state() == Some(PrState::Open)
+                    && pr.checks_gate().reason().is_none();
+                let confirm = |kind| {
+                    if can_act {
+                        Action::Confirm(pr.key.clone(), kind)
+                    } else {
+                        Action::Inert
+                    }
+                };
                 if next {
-                    let label = gated("Merge");
-                    row.control(label.clone(), Action::Preview(label));
+                    row.control(gated("Merge"), confirm(Kind::Merge));
                 }
                 let fold = Fold::Pr(pr.key.id());
                 row.expanded = self.open.contains(&fold);
@@ -915,21 +933,22 @@ impl WorkSidebar {
                         core.map(|core| core.author.as_str()),
                         account.as_deref(),
                     );
-                    let mut labels = vec!["Review".to_string()];
+                    let mut controls =
+                        vec![("Review".to_string(), Action::Preview("Review".to_string()))];
                     if !own {
-                        labels.push(gated("Approve"));
+                        controls.push((gated("Approve"), confirm(Kind::Approve)));
                     }
                     if !next {
-                        labels.push(gated("Merge"));
+                        controls.push((gated("Merge"), confirm(Kind::Merge)));
                     }
                     if draft {
-                        labels.push("Ready for review".into());
+                        controls.push((
+                            "Ready for review".into(),
+                            Action::Confirm(pr.key.clone(), Kind::Ready),
+                        ));
                     }
-                    for label in labels {
-                        row.detail_controls.push(Control {
-                            action: Action::Preview(label.clone()),
-                            label,
-                        });
+                    for (label, action) in controls {
+                        row.detail_controls.push(Control { label, action });
                     }
                     row.detail_controls.push(Control {
                         label: "Open in browser".into(),
@@ -1524,13 +1543,17 @@ impl WorkSidebar {
             Action::DismissAuto => Some(WorkSidebarOutcome::DismissAutoRepos {
                 workspace: self.workspace.id,
             }),
-            Action::Edit(_) | Action::Preview(_) => None,
+            Action::Edit(_) | Action::Preview(_) | Action::Confirm(..) | Action::Inert => None,
         }
     }
 
     fn dispatch(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
         if let Action::Preview(label) = action {
             self.notice(format!("{label} · not available in preview"), cx);
+            return;
+        }
+        if let Action::Confirm(key, kind) = action {
+            self.open_confirm(key, kind, window, cx);
             return;
         }
         if let Action::Edit(dir) = action {
@@ -1566,6 +1589,80 @@ impl WorkSidebar {
             self.emit(outcome, cx);
         }
         cx.notify();
+    }
+
+    /// Iced `ActionOpen`: the method defaults to the plan's, else merge.
+    fn open_confirm(
+        &mut self,
+        key: gitterm_core::merge_plan::PrKey,
+        kind: Kind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let method = self
+            .pr_plans
+            .values()
+            .find_map(|plan| plan.entry(&key))
+            .and_then(|entry| entry.method);
+        let account = gitterm_core::prs::account_for(key.owner(), &self.pr_accounts);
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
+        self.confirm = Some(PrConfirm::new(key, kind, method, account, focus));
+        cx.notify();
+    }
+
+    /// Iced `ActionMethod`: local to the open panel.
+    pub(crate) fn confirm_method(
+        &mut self,
+        method: gitterm_core::merge_plan::MergeMethod,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(confirm) = self.confirm.as_mut() {
+            confirm.method = method;
+            confirm.error = None;
+            cx.notify();
+        }
+    }
+
+    /// Iced `ActionClose`: no other effect.
+    pub(crate) fn confirm_close(&mut self, cx: &mut Context<Self>) {
+        self.confirm = None;
+        cx.notify();
+    }
+
+    /// Iced `ActionRun` would run `gh`; the preview reports it instead, in
+    /// the panel's error slot and the shell's notice.
+    pub(crate) fn confirm_run(&mut self, cx: &mut Context<Self>) {
+        let Some(confirm) = self.confirm.as_mut().filter(|c| c.account_ok()) else {
+            return;
+        };
+        let message = format!("{} · not available in preview", confirm.verb());
+        confirm.error = Some(message.clone());
+        self.notice(message, cx);
+    }
+
+    /// The panel's live inputs: the PR's latest read and where its plan
+    /// stands on it (Iced `view_pr_action_confirm`).
+    fn confirm_model(&self, confirm: &PrConfirm) -> pr_confirm::Model {
+        let id = confirm.key.id();
+        let group = self
+            .pull_requests
+            .iter()
+            .find(|group| group.prs.iter().any(|pr| pr.key.id() == id));
+        let watched = group.and_then(|group| group.prs.iter().find(|pr| pr.key.id() == id));
+        let status = group.and_then(|group| {
+            let briefs = group
+                .prs
+                .iter()
+                .filter_map(|pr| pr.brief().map(|b| (pr.key.id(), b)))
+                .collect();
+            let plan = self.pr_plans.get(&group.root)?;
+            gitterm_core::merge_plan::order_plan(plan, &briefs)
+                .into_iter()
+                .find(|row| row.entry.key().id() == id)
+                .map(|row| row.status)
+        });
+        pr_confirm::Model::build(confirm, watched, status.as_ref())
     }
 
     fn run_command_outcome(repo: PathBuf, value: &str) -> WorkSidebarOutcome {
@@ -1687,6 +1784,7 @@ fn control_color(action: &Action, repo_row: bool, p: &crate::theme::Palette) -> 
         Action::Emit(WorkSidebarOutcome::RunRepoCommand { .. }) => p.green,
         Action::Edit(_)
         | Action::Toggle(_)
+        | Action::Inert
         | Action::Emit(WorkSidebarOutcome::RemoveRepo { .. }) => p.muted,
         // Iced draws the repo row's Open in editor in text_muted.
         Action::Emit(WorkSidebarOutcome::OpenEditor { .. }) if repo_row => p.muted,
@@ -1716,7 +1814,7 @@ fn read_pr_accounts(config: &std::path::Path) -> BTreeMap<String, String> {
 impl EventEmitter<WorkSidebarOutcome> for WorkSidebar {}
 
 impl Render for WorkSidebar {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.load(false, cx);
         self.running_chats = self
             .source
@@ -2086,10 +2184,21 @@ impl Render for WorkSidebar {
                 body.child(block)
             };
         }
+        if let Some(confirm) = &self.confirm {
+            body = body.child(pr_confirm::view(
+                self.confirm_model(confirm),
+                &confirm.focus,
+                window,
+                cx,
+            ));
+        }
         body
     }
 }
 
+#[cfg(test)]
+#[path = "pr_confirm_tests.rs"]
+mod pr_confirm_tests;
 #[cfg(test)]
 #[path = "work_sidebar_tests.rs"]
 pub(crate) mod tests;

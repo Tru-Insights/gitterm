@@ -70,7 +70,7 @@ pub(crate) fn branch(repo: &str, name: &str, gone: bool) -> BranchStatus {
     }
 }
 
-fn fixture(owned: bool) -> WorkSidebar {
+pub(super) fn fixture(owned: bool) -> WorkSidebar {
     fixture_with_branch(owned, "tru-274")
 }
 
@@ -277,13 +277,13 @@ fn chat_title_column_never_overlaps_right_aligned_metadata(cx: &mut gpui::TestAp
     );
 }
 
-fn draw_sidebar(cx: &mut gpui::VisualTestContext) {
+pub(super) fn draw_sidebar(cx: &mut gpui::VisualTestContext) {
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
     cx.run_until_parked();
 }
 
-fn click_sidebar(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+pub(super) fn click_sidebar(cx: &mut gpui::VisualTestContext, selector: &'static str) {
     let bounds = cx
         .debug_bounds(selector)
         .unwrap_or_else(|| panic!("missing {selector}"));
@@ -291,7 +291,7 @@ fn click_sidebar(cx: &mut gpui::VisualTestContext, selector: &'static str) {
     draw_sidebar(cx);
 }
 
-fn subscribe_outcomes(
+pub(super) fn subscribe_outcomes(
     sidebar: &Entity<WorkSidebar>,
     cx: &mut gpui::VisualTestContext,
 ) -> Rc<RefCell<Vec<WorkSidebarOutcome>>> {
@@ -527,7 +527,7 @@ fn click_row(sidebar: &Entity<WorkSidebar>, cx: &mut gpui::VisualTestContext, la
     );
 }
 
-fn click_control(
+pub(super) fn click_control(
     sidebar: &Entity<WorkSidebar>,
     cx: &mut gpui::VisualTestContext,
     row_label: &str,
@@ -708,9 +708,6 @@ fn preview_write_controls_only_show_the_exact_clicked_label(cx: &mut gpui::TestA
         ("✦ Ship parity", "↗"),
         ("✦ Ship parity", "⊞ Make workspace"),
         ("Draft change", "Review"),
-        ("Draft change", "Approve (draft)"),
-        ("Draft change", "Merge (draft)"),
-        ("Draft change", "Ready for review"),
         ("Draft change", "×"),
     ] {
         click_control(&sidebar, cx, row, label);
@@ -728,6 +725,15 @@ fn preview_write_controls_only_show_the_exact_clicked_label(cx: &mut gpui::TestA
             "{label} must not emit a process/write/navigation outcome"
         );
         assert_eq!(tree_snapshot(root.path()), before);
+    }
+    // Iced's disabled Approve and Merge do nothing: no panel, no notice.
+    let notice = sidebar.read_with(cx, |s, _| s.error.clone());
+    for label in ["Approve (draft)", "Merge (draft)"] {
+        click_control(&sidebar, cx, "Draft change", label);
+        sidebar.read_with(cx, |s, _| {
+            assert!(s.confirm.is_none(), "{label} is disabled");
+            assert_eq!(s.error, notice);
+        });
     }
     sidebar.update(cx, |s, cx| {
         s.workspace
@@ -818,16 +824,21 @@ fn w19a_w20_plan_merge_and_hold_controls_match_iced_placement_and_only_notice(
     let events = subscribe_outcomes(&sidebar, cx);
     cx.simulate_resize(gpui::size(px(800.), px(1500.)));
     draw_sidebar(cx);
-    for (row, label) in [
-        ("Next change", merge.as_str()),
-        ("Held change", "clear hold"),
-    ] {
-        click_control(&sidebar, cx, row, label);
-        assert_eq!(
-            sidebar.read_with(cx, |s, _| s.error.clone()).as_deref(),
-            Some(format!("{label} · not available in preview").as_str())
-        );
-    }
+    click_control(&sidebar, cx, "Held change", "clear hold");
+    assert_eq!(
+        sidebar.read_with(cx, |s, _| s.error.clone()).as_deref(),
+        Some("clear hold · not available in preview")
+    );
+    // The next PR's title-line Merge opens the confirmation (Iced
+    // `ActionOpen`) instead of a notice.
+    click_control(&sidebar, cx, "Next change", merge.as_str());
+    sidebar.read_with(cx, |s, _| {
+        let confirm = s.confirm.as_ref().expect("Merge opens the panel");
+        assert_eq!(confirm.kind, Kind::Merge);
+        assert_eq!(confirm.key.number, 1);
+    });
+    sidebar.update(cx, |s, cx| s.confirm_close(cx));
+    let notice = sidebar.read_with(cx, |s, _| s.error.clone());
     for (outcome, reason) in [
         (gitterm_core::prs::CheckOutcome::Pending, "checks running"),
         (gitterm_core::prs::CheckOutcome::Fail, "checks failed"),
@@ -843,10 +854,10 @@ fn w19a_w20_plan_merge_and_hold_controls_match_iced_placement_and_only_notice(
         for action in ["Approve", "Merge"] {
             let label = format!("{action} ({reason})");
             click_control(&sidebar, cx, "Held change", &label);
-            assert_eq!(
-                sidebar.read_with(cx, |s, _| s.error.clone()).as_deref(),
-                Some(format!("{label} · not available in preview").as_str())
-            );
+            sidebar.read_with(cx, |s, _| {
+                assert!(s.confirm.is_none(), "{label} is disabled");
+                assert_eq!(s.error, notice);
+            });
         }
     }
     assert!(
@@ -1648,7 +1659,7 @@ impl IcedFixture {
     }
 }
 
-fn tree_snapshot(
+pub(super) fn tree_snapshot(
     root: &std::path::Path,
 ) -> std::collections::BTreeMap<PathBuf, (Option<Vec<u8>>, SystemTime)> {
     let mut snapshot = std::collections::BTreeMap::new();
