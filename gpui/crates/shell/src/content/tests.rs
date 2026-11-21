@@ -9,7 +9,7 @@ use super::{
 };
 
 #[test]
-fn native_navigation_accepts_only_one_host_injected_blank_document() {
+fn injection_grant_accepts_only_one_host_injected_blank_document() {
     let pending = std::cell::Cell::new(true);
     assert!(allow_injected_document(&pending, Some("about:blank")));
     assert!(!allow_injected_document(&pending, Some("about:blank")));
@@ -469,4 +469,62 @@ fn general_text_viewer_uses_core_text_and_escapes_html() {
     std::fs::write(root.path().join("empty"), "").unwrap();
     assert!(Document::local_file(root.path(), Path::new("empty"), false).is_ok());
     assert!(Document::local_file(root.path(), Path::new("missing.txt"), false).is_err());
+}
+
+#[test]
+fn document_links_follow_viewer_network_and_external_window_policy() {
+    use super::host::{DocumentNavigation as N, document_navigation};
+    let pending = std::cell::Cell::new(true);
+    assert_eq!(
+        document_navigation(&pending, Some("about:blank"), false),
+        N::Allow
+    );
+    assert_eq!(
+        document_navigation(&pending, Some("about:blank#section"), false),
+        N::Allow
+    );
+    for url in [
+        "http://example.test/path?q=value",
+        "https://example.test/#anchor",
+        "HTTPS://example.test/",
+    ] {
+        assert_eq!(document_navigation(&pending, Some(url), false), N::Allow);
+        assert_eq!(document_navigation(&pending, Some(url), true), N::External);
+    }
+    for url in [
+        "file:///tmp/local.txt",
+        "javascript:alert(1)",
+        "custom:action",
+        "mailto:fixture@example.test",
+        "https:",
+        "not a URL",
+    ] {
+        for popup in [false, true] {
+            assert_eq!(
+                document_navigation(&pending, Some(url), popup),
+                N::Cancel,
+                "{url}"
+            );
+        }
+    }
+    assert_eq!(document_navigation(&pending, None, false), N::Cancel);
+}
+
+#[test]
+fn rendered_document_preserves_controls_selection_and_scroll_content() {
+    let html = Document::local_file(
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        Path::new("src/content/fixtures/viewer.html"),
+        true,
+    )
+    .unwrap();
+    for control in [
+        "<input",
+        "<textarea",
+        "<button",
+        "overflow:auto",
+        "user-select:text",
+    ] {
+        assert!(html.html().contains(control), "missing {control}");
+    }
 }

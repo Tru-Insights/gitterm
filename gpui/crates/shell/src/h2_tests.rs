@@ -315,15 +315,20 @@ fn sheet_folder_picker_returns_selection_and_cancel_without_creating_work(cx: &m
 #[gpui::test]
 fn missing_host_controls_keep_iced_controls_and_report_unavailable(cx: &mut TestAppContext) {
     let (_root, shell, cx) = fixture(cx);
-    for (selector, label) in [
-        ("pstrip-browser", "Browser"),
-        ("pstrip-settings", "Settings"),
-    ] {
+    // Iced labels; the preview reports them (I6, interaction map A02/A14).
+    for selector in ["pstrip-browser", "pstrip-settings"] {
         click(cx, selector);
         cx.read(|cx| {
-            assert_eq!(
-                shell.read(cx).owner.read(cx).error,
-                Some(format!("{label} · unavailable in preview"))
+            let error = shell
+                .read(cx)
+                .owner
+                .read(cx)
+                .error
+                .clone()
+                .unwrap_or_default();
+            assert!(
+                error.ends_with(" · not available in preview"),
+                "{selector}: {error}"
             )
         });
     }
@@ -484,7 +489,8 @@ fn catalog_bar_renders_repos_folder_badge_plus_and_real_counts_read_only(cx: &mu
             .all(|pair| pair[0].right() <= pair[1].left())
     );
     assert!(cx.debug_bounds("pstrip-attention-1").is_some());
-    assert!(cx.debug_bounds("pstrip-more").is_none());
+    // Iced's ⋯ more menu (A18) is rendered.
+    assert!(cx.debug_bounds("pstrip-more").is_some());
     click(cx, "pstrip-repos");
     assert!(cx.debug_bounds("pstrip-repos-list").is_some());
     click(cx, "pstrip-repo-1");

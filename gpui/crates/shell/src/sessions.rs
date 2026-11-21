@@ -283,6 +283,9 @@ impl crate::Shell {
                 }
                 cx.notify();
             }
+            O::OpenReview { checkout, vs_base } => {
+                self.open_work_review(checkout.clone(), *vs_base, window, cx);
+            }
             O::OpenFind => {
                 if let Some(active) = self.active_workspace(cx)
                     && let Some(state) = self
@@ -302,7 +305,6 @@ impl crate::Shell {
                 });
             }
             // Write/launch controls stop at the sidebar's preview notice.
-            // Branch review still needs a checkout/source-aware review API.
             _ => {}
         }
     }

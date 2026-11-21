@@ -104,6 +104,14 @@ fn aggregate_result_draws_bounded_lines_limits_and_authoritative_marks(cx: &mut 
         );
         assert!(view.model.state().pane().unwrap().error.is_none());
         assert_eq!(view.selected.as_deref(), Some("large.txt"));
+        view.navigate_to(false, cx);
+        assert_eq!(view.selected.as_deref(), Some("hello.rs"));
+        view.navigate(true, cx);
+        assert_eq!(view.selected.as_deref(), Some("hello.rs"));
+        view.navigate_to(true, cx);
+        assert_eq!(view.selected.as_deref(), Some("large.txt"));
+        view.navigate(false, cx);
+        assert_eq!(view.selected.as_deref(), Some("large.txt"));
     });
     draw(cx);
 }
