@@ -1,11 +1,15 @@
 //! Codex trust decisions over fixed fixtures. The root workspace runs this
 //! file with its pinned toml 0.8.2; the GPUI shell includes the same file
 //! (`gpui/crates/shell/tests/codex_trust.rs`) under GPUI's resolved toml 0.8.x.
-//! The expected outcomes are exact, so both passing means identical results.
+//! The expected outcomes are exact. Where the two parsers are known to
+//! differ, the expectation is pinned per resolved toml version (read from
+//! the building workspace's Cargo.lock), and an unreviewed version fails.
 //! Mirrors the trust tests in `workers.rs` (`reliability_tests`).
+#[cfg(unix)]
+use gitterm_core::workers::with_codex_trust;
 use gitterm_core::workers::{
     claude_task_trust, codex_task_trust, codex_trust_value, trust_main_repository,
-    validate_codex_trust_command, validate_codex_trust_home, with_codex_trust,
+    validate_codex_trust_command, validate_codex_trust_home,
 };
 use std::path::{Path, PathBuf};
 
@@ -104,16 +108,19 @@ fn worktree_trust_resolves_main_and_denies_aliases() {
         codex_task_trust("codex", &checkout, std::slice::from_ref(&root), &config).unwrap(),
         Some(codex_trust_value(&root).unwrap())
     );
-    let alias = temp.path().join("alias");
-    std::os::unix::fs::symlink(&root, &alias).unwrap();
-    std::fs::write(
-        &config,
-        format!("[projects.{}]\ntrust_level='untrusted'\n", key(&alias)),
-    )
-    .unwrap();
-    assert!(codex_task_trust("codex", &checkout, &[root], &config)
-        .unwrap_err()
-        .contains("explicitly untrusted"));
+    #[cfg(unix)]
+    {
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        std::fs::write(
+            &config,
+            format!("[projects.{}]\ntrust_level='untrusted'\n", key(&alias)),
+        )
+        .unwrap();
+        assert!(codex_task_trust("codex", &checkout, &[root], &config)
+            .unwrap_err()
+            .contains("explicitly untrusted"));
+    }
 }
 
 #[test]
@@ -131,14 +138,21 @@ fn forged_worktree_pointer_without_reciprocal_registration_gets_no_trust() {
     let claude_config = temp.path().join("claude.json");
     std::fs::write(&claude_config, "{}").unwrap();
     assert!(claude_task_trust(&forged, std::slice::from_ref(&root), &claude_config).is_err());
-    let original_config = std::fs::read(&claude_config).unwrap();
-    let symlinked = temp.path().join("symlinked-forgery");
-    std::fs::create_dir(&symlinked).unwrap();
-    std::os::unix::fs::symlink(linked.join(".git"), symlinked.join(".git")).unwrap();
-    assert!(trust_main_repository(&symlinked).is_err());
-    assert!(codex_task_trust("codex", &symlinked, std::slice::from_ref(&root), &config).is_err());
-    assert!(claude_task_trust(&symlinked, std::slice::from_ref(&root), &claude_config).is_err());
-    assert_eq!(std::fs::read(&claude_config).unwrap(), original_config);
+    #[cfg(unix)]
+    {
+        let original_config = std::fs::read(&claude_config).unwrap();
+        let symlinked = temp.path().join("symlinked-forgery");
+        std::fs::create_dir(&symlinked).unwrap();
+        std::os::unix::fs::symlink(linked.join(".git"), symlinked.join(".git")).unwrap();
+        assert!(trust_main_repository(&symlinked).is_err());
+        assert!(
+            codex_task_trust("codex", &symlinked, std::slice::from_ref(&root), &config).is_err()
+        );
+        assert!(
+            claude_task_trust(&symlinked, std::slice::from_ref(&root), &claude_config).is_err()
+        );
+        assert_eq!(std::fs::read(&claude_config).unwrap(), original_config);
+    }
 }
 
 #[test]
@@ -195,6 +209,8 @@ fn malformed_private_config_does_not_expose_source_text() {
     assert!(!error.contains(secret), "private config source leaked");
 }
 
+// `with_codex_trust` quotes for a POSIX worker shell and refuses elsewhere.
+#[cfg(unix)]
 #[test]
 fn inline_path_and_shell_quoting_preserve_special_characters() {
     let path = Path::new("/tmp/sample.repo space \"quote\" ' $value");
@@ -211,10 +227,78 @@ fn inline_path_and_shell_quoting_preserve_special_characters() {
     );
 }
 
+/// The toml parsers whose divergences below have been reviewed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Toml {
+    /// Root workspace (exact pin): toml_edit 0.20.2, toml_datetime 0.6.3.
+    V0_8_2,
+    /// GPUI workspace: toml_edit 0.22.27, toml_datetime 0.6.11.
+    V0_8_23,
+}
+
+/// The toml version gitterm-core links in the workspace building this test,
+/// from that workspace's Cargo.lock (the first one above this crate's
+/// manifest: the root's for gitterm-core, gpui's for the GPUI shell).
+fn resolved_toml() -> Toml {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let lock = manifest
+        .ancestors()
+        .map(|dir| dir.join("Cargo.lock"))
+        .find(|lock| lock.is_file())
+        .expect("no Cargo.lock above the test crate");
+    let text = std::fs::read_to_string(&lock).unwrap();
+    let lock: toml::Value = toml::from_str(&text).unwrap();
+    let packages = lock["package"].as_array().unwrap();
+    let named = |name: &'static str| {
+        packages
+            .iter()
+            .filter(move |package| package["name"].as_str() == Some(name))
+    };
+    let core = named("gitterm-core")
+        .next()
+        .expect("gitterm-core is not in the lockfile");
+    let dependency = core["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|dependency| dependency.as_str())
+        .find(|dependency| *dependency == "toml" || dependency.starts_with("toml "))
+        .expect("gitterm-core does not depend on toml in the lockfile");
+    // A lockfile names the version only when several are present.
+    let version = match dependency.strip_prefix("toml ") {
+        Some(version) => version.to_string(),
+        None => {
+            let mut versions = named("toml").map(|package| package["version"].as_str().unwrap());
+            let version = versions.next().unwrap().to_string();
+            assert!(versions.next().is_none(), "ambiguous toml in the lockfile");
+            version
+        }
+    };
+    match version.as_str() {
+        "0.8.2" => Toml::V0_8_2,
+        "0.8.23" => Toml::V0_8_23,
+        other => panic!(
+            "toml {other} is unreviewed: diff its parser against 0.8.2 and pin the \
+             divergence cases in trust_matrix_outcomes_are_exact for it"
+        ),
+    }
+}
+
 /// Exact outcomes, including TOML error byte offsets, for config shapes the
 /// parser could treat differently between patch versions.
 #[test]
 fn trust_matrix_outcomes_are_exact() {
+    let toml = resolved_toml();
+    let per_version = |v0_8_2: &str, v0_8_23: &str| match toml {
+        Toml::V0_8_2 => v0_8_2.to_string(),
+        Toml::V0_8_23 => v0_8_23.to_string(),
+    };
+    let invalid_at = |byte: usize| {
+        format!(
+            "err: parse Codex trust list {}: invalid TOML at byte {byte}",
+            Path::new("<tmp>").join("config.toml").display()
+        )
+    };
     let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let (root, repository) = committed(&base.join("main"));
@@ -225,19 +309,49 @@ fn trust_matrix_outcomes_are_exact() {
     let r = key(&root);
     let o = key(&outside);
     let b = key(&base);
-    let escaped = r.replacen('/', "\\u002F", 1);
+    // The final `m` of `…main"` as a \u escape: present on every platform.
+    let escaped = format!("{}\\u006Dain\"", r.strip_suffix("main\"").unwrap());
     let literal = format!("'{}'", root.to_str().unwrap());
-    let untrusted = "err: Refusing Codex worker: repository <tmp>/main is explicitly untrusted in <tmp>/config.toml. Change its trust_level there before launching";
-    let invalid_level = "err: invalid project trust_level in <tmp>/config.toml";
-    let not_table = "err: projects in <tmp>/config.toml must be a table";
+    let tmp = Path::new("<tmp>");
+    let config_shown = tmp.join("config.toml");
+    let untrusted = format!(
+        "err: Refusing Codex worker: repository {} is explicitly untrusted in {}. Change its trust_level there before launching",
+        tmp.join("main").display(),
+        config_shown.display()
+    );
+    let untrusted = untrusted.as_str();
+    let invalid_level = format!(
+        "err: invalid project trust_level in {}",
+        config_shown.display()
+    );
+    let invalid_level = invalid_level.as_str();
+    let not_table = format!(
+        "err: projects in {} must be a table",
+        config_shown.display()
+    );
+    let not_table = not_table.as_str();
     let duplicate = format!(
         "[projects.{r}]\ntrust_level=\"trusted\"\n[projects.{r}]\ntrust_level=\"untrusted\"\n"
     );
     // The second header, wherever the temp path puts it.
-    let duplicate_error = format!(
-        "err: parse Codex trust list <tmp>/config.toml: invalid TOML at byte {}",
-        duplicate.rfind("[projects.").unwrap()
-    );
+    let duplicate_error = invalid_at(duplicate.rfind("[projects.").unwrap());
+    // Divergences between the two parsers, one case per class found by
+    // diffing toml_edit 0.20.2 / toml_datetime 0.6.3 against 0.22.27 / 0.6.11
+    // and parsing an edge-case corpus with both.
+    // 1. Calendar dates: 0.8.23 checks the day against the month's length
+    //    (leap years, 30-day months); 0.8.2 accepts any day 01-31.
+    let calendar_date = per_version("trusted", &invalid_at(19));
+    // 2. Leap second: 0.8.2 refuses second 60 when building the value;
+    //    0.8.23 accepts it (RFC 3339).
+    let leap_second = per_version(&invalid_at(2), "trusted");
+    // 3. Nesting depth: 0.8.23 refuses at 80 levels (arrays, inline tables,
+    //    dotted keys and headers); 0.8.2 at 128.
+    let nesting = format!("a={}{}\n", "[".repeat(80), "]".repeat(80));
+    let nesting_error = per_version("trusted", &invalid_at(81));
+    // 4. Error position: an array left open by a trailing comment is
+    //    reported at the comment's end by 0.8.2, at the value by 0.8.23.
+    let open_array = per_version(&invalid_at(8), &invalid_at(3));
+    let (invalid_9, invalid_17, invalid_4) = (invalid_at(9), invalid_at(17), invalid_at(4));
     let cases: Vec<(&str, Option<Vec<u8>>, &str)> = vec![
         ("missing file", None, "trusted"),
         ("empty", Some(b"".to_vec()), "trusted"),
@@ -328,17 +442,17 @@ fn trust_matrix_outcomes_are_exact() {
         (
             "unclosed table header",
             Some(b"[projects\n".to_vec()),
-            "err: parse Codex trust list <tmp>/config.toml: invalid TOML at byte 9",
+            &invalid_9,
         ),
         (
             "unterminated string",
             Some(b"api_key = \"secret\n".to_vec()),
-            "err: parse Codex trust list <tmp>/config.toml: invalid TOML at byte 17",
+            &invalid_17,
         ),
         (
             "duplicate key",
             Some(b"a=1\na=2\n".to_vec()),
-            "err: parse Codex trust list <tmp>/config.toml: invalid TOML at byte 4",
+            &invalid_4,
         ),
         (
             "duplicate table",
@@ -349,6 +463,18 @@ fn trust_matrix_outcomes_are_exact() {
             "byte order mark",
             Some(b"\xEF\xBB\xBFapproval_policy='on-request'\n".to_vec()),
             "trusted",
+        ),
+        (
+            "day past the month's end",
+            Some(b"updated_at=2023-02-29".to_vec()),
+            &calendar_date,
+        ),
+        ("leap second", Some(b"t=00:00:60\n".to_vec()), &leap_second),
+        ("80 nested arrays", Some(nesting.clone().into_bytes()), &nesting_error),
+        (
+            "array open after a trailing comment",
+            Some(b"a=[1 # c".to_vec()),
+            &open_array,
         ),
     ];
     let value = codex_trust_value(&root).unwrap();

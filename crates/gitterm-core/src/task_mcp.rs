@@ -478,6 +478,8 @@ impl TaskMcpConnection {
             config: claude_mcp_config(&caller_endpoint(&self.endpoint, caller)),
             allowed_tools: vec![CLAUDE_ALLOWED_TOOLS.to_string()],
             env: self.terminal_environment(caller).into(),
+            // The caller URL is in `config` too; the token is not.
+            public_env: vec![TASK_MCP_URL_ENV.to_string()],
         }
     }
 

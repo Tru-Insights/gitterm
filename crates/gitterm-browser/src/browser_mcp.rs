@@ -115,6 +115,8 @@ impl BrowserMcpConnection {
             config: claude_mcp_config(&caller_endpoint(&self.endpoint, caller)),
             allowed_tools: claude_allowed_tools(),
             env: self.terminal_environment(caller).into(),
+            // The caller URL is in `config` too; the token is not.
+            public_env: vec![BROWSER_MCP_URL_ENV.to_string()],
         }
     }
 
@@ -1538,6 +1540,75 @@ mod tests {
             codex.contains(&format!("'mcp_servers.gitterm_browser.url={caller_url}'")),
             "{codex}"
         );
+    }
+
+    /// A preview chat launched with the real task and browser descriptors:
+    /// both caller URLs (public) reach argv, neither token does, and a token
+    /// that leaks into any server's config is refused without being echoed.
+    #[test]
+    fn preview_tools_accepts_the_real_task_and_browser_descriptors() {
+        use gitterm_core::harness::claude::{ClaudeSessionConfig, LaunchFlags};
+        use gitterm_core::task_mcp;
+
+        let temp = tempdir().unwrap();
+        let (mut browser, _browser_server) =
+            prepare(temp.path(), "preview-descriptors", TEST_VERSION).unwrap();
+        browser.token = "fake-browser-token-0123456789abcdef".into();
+        let (commands, _requests) = gitterm_core::task_commands::runtime::command_channel();
+        let refused: task_mcp::HtmlPreviewRunner =
+            std::sync::Arc::new(|_| Box::pin(async { Err("not wired in this test".into()) }));
+        let (tasks, _task_server) =
+            task_mcp::prepare("preview-descriptors", commands, refused, TEST_VERSION).unwrap();
+        let caller = "7d1c2a4e-0b3f-4e8a-9c55-2f1e6d7a8b90";
+        let servers = vec![
+            tasks.claude_mcp_server(Some(caller)),
+            browser.claude_mcp_server(Some(caller)),
+        ];
+        let tokens: Vec<String> = [
+            tasks.terminal_environment(Some(caller)),
+            browser.terminal_environment(Some(caller)),
+        ]
+        .iter()
+        .map(|environment| environment[1].1.clone())
+        .collect();
+        let mut config = ClaudeSessionConfig {
+            cwd: temp.path().to_path_buf(),
+            snapshot_facts_dir: None,
+            model: None,
+            permission_mode: "default".into(),
+            effort: None,
+            resume: None,
+            wire_log_dir: None,
+            mcp_servers: servers.clone(),
+            chrome: false,
+            guidelines_file: None,
+            guidelines_content: None,
+        };
+        let args = LaunchFlags::PreviewTools.args(&config).unwrap();
+        for server in &servers {
+            let url = &server.env[0].1;
+            assert!(url.contains(caller), "{url}");
+            assert!(args.iter().any(|arg| arg.contains(url.as_str())));
+        }
+        for token in &tokens {
+            assert!(args.iter().all(|arg| !arg.contains(token.as_str())));
+        }
+
+        // Either token, written literally into the other server's config.
+        for (target, token) in [(0, &tokens[1]), (1, &tokens[0])] {
+            let mut leaked = servers.clone();
+            let name = if target == 0 {
+                "gitterm_tasks"
+            } else {
+                "gitterm_browser"
+            };
+            leaked[target].config["mcpServers"][name]["headers"]["Authorization"] =
+                serde_json::json!(format!("Bearer {token}"));
+            config.mcp_servers = leaked;
+            let error = LaunchFlags::PreviewTools.args(&config).unwrap_err();
+            assert!(error.contains("appears literally"), "{error}");
+            assert!(!error.contains(token.as_str()), "token echoed in the error");
+        }
     }
 
     fn request_parts(uri: &str) -> Parts {
