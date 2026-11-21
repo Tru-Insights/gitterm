@@ -57,7 +57,8 @@ pub struct CheckoutChoice {
     pub path: String,
 }
 /// Source of the menu entries, asked again each time the menu opens.
-pub type CheckoutSource = std::rc::Rc<dyn Fn() -> Vec<CheckoutChoice>>;
+#[cfg(target_os = "macos")]
+pub type CheckoutSource = std::rc::Rc<dyn Fn(&gpui::App) -> Vec<CheckoutChoice>>;
 
 pub const MODE_TOOLTIP: &str = "Permission mode (Shift+Tab in the message box cycles)";
 pub const REVIEW_TOOLTIP: &str =

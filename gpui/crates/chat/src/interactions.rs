@@ -4,11 +4,35 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptAction {
-    OpenFile { path: PathBuf, review: bool },
-    OpenWorker { id: String },
-    PreviewOnly { label: String },
-    Withdraw { message_id: String },
+    OpenFile {
+        path: PathBuf,
+        review: bool,
+    },
+    OpenWorker {
+        id: String,
+    },
+    PreviewOnly {
+        label: String,
+    },
+    /// A delegation card's Dismiss, Cancel or Stop tracking.
+    Dismiss(DismissRequest),
+    Withdraw {
+        message_id: String,
+    },
 }
+
+/// Iced `delegation_dismiss` for one card: `active` is the delegation's
+/// `status.is_active()`, which makes the dismissal a cancel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DismissRequest {
+    pub id: String,
+    pub label: String,
+    pub active: bool,
+}
+/// The host's answer to a [`DismissRequest`]: the notice to show. Without a
+/// gate the view shows the preview notice itself.
+#[cfg(target_os = "macos")]
+pub type DismissGate = std::rc::Rc<dyn Fn(&DismissRequest, &gpui::App) -> String>;
 
 pub fn preview_notice(label: &str) -> String {
     format!("{label} · not available in preview")

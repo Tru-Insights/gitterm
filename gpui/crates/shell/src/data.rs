@@ -33,9 +33,14 @@ impl RosterFacts {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn read_from(source: &std::path::Path) -> anyhow::Result<Self> {
-        use gitterm_core::tasks::TaskStore;
-        let store = TaskStore::load(TaskStore::path_for_config_root(source))?;
+        Self::read(source, &TaskSource::iced(source))
+    }
+    /// `source` is Iced's config root, for its tabs; tasks and workers come
+    /// from `tasks`.
+    pub(crate) fn read(source: &std::path::Path, tasks: &TaskSource) -> anyhow::Result<Self> {
+        let store = tasks.load()?;
         let catalog = crate::workspace_config::IcedCatalog::read(source)?;
         Ok(Self {
             tasks: store.tasks().to_vec(),
@@ -53,6 +58,60 @@ impl RosterFacts {
         })
     }
 }
+/// Where the panes read tasks and delegations (H5b B8b): the preview task
+/// host's store when the host runs, else Iced's `tasks.json`, read-only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TaskSource {
+    /// The host store's own file under the preview root. B4 seeds it from
+    /// Iced's file (re-seeded every 2 s, replaced only by an atomic rename of
+    /// a validated copy) and loads the host's store from it, so loading it
+    /// reads the host's snapshot. A path, not a clone: `TaskStore` is not
+    /// `Clone` and the readers run on the background executor.
+    Host(std::path::PathBuf),
+    /// Iced's own file: only when the host did not start.
+    Iced(std::path::PathBuf),
+}
+impl TaskSource {
+    /// Resolve on the GPUI thread, then load where the reader runs.
+    /// `iced_config` is Iced's config root, used only when the host is down.
+    pub(crate) fn resolve(iced_config: &std::path::Path, cx: &App) -> Self {
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        Self::choose(crate::task_panel::host(cx), iced_config, &LOGGED, |line| {
+            eprintln!("{line}")
+        })
+    }
+    pub(crate) fn choose(
+        host: Option<&gitterm_core::task_host::TaskHost>,
+        iced_config: &std::path::Path,
+        logged: &std::sync::atomic::AtomicBool,
+        log: impl FnOnce(&str),
+    ) -> Self {
+        match host.and_then(|host| host.store().as_ref()) {
+            Some(store) => Self::Host(store.path().to_owned()),
+            None => {
+                if !logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log(
+                        "GPUI panes read Iced's tasks.json directly: the preview task host is not running (see its startup error)",
+                    );
+                }
+                Self::iced(iced_config)
+            }
+        }
+    }
+    pub(crate) fn iced(iced_config: &std::path::Path) -> Self {
+        Self::Iced(gitterm_core::tasks::TaskStore::path_for_config_root(
+            iced_config,
+        ))
+    }
+    pub(crate) fn load(
+        &self,
+    ) -> Result<gitterm_core::tasks::TaskStore, gitterm_core::tasks::TaskStoreError> {
+        match self {
+            Self::Host(path) | Self::Iced(path) => gitterm_core::tasks::TaskStore::load(path),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WorkspaceId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -455,6 +514,7 @@ pub(crate) struct IcedWorkData {
 impl IcedWorkData {
     pub fn read(
         config: &std::path::Path,
+        tasks: &TaskSource,
         id: u64,
         saved: &gitterm_core::workspace_config::WorkspaceConfig,
         focus: gitterm_core::work::summary::Focus,
@@ -470,6 +530,7 @@ impl IcedWorkData {
         if home.is_some() {
             Self::read_with_progress(
                 config,
+                tasks,
                 None,
                 id,
                 saved,
@@ -481,6 +542,7 @@ impl IcedWorkData {
         }
         Self::read_with_progress(
             config,
+            tasks,
             home.as_deref(),
             id,
             saved,
@@ -498,12 +560,23 @@ impl IcedWorkData {
         saved: &gitterm_core::workspace_config::WorkspaceConfig,
         focus: gitterm_core::work::summary::Focus,
     ) -> anyhow::Result<Self> {
-        Self::read_with_progress(config, home, id, saved, focus, None, true, |_| {})
+        Self::read_with_progress(
+            config,
+            &TaskSource::iced(config),
+            home,
+            id,
+            saved,
+            focus,
+            None,
+            true,
+            |_| {},
+        )
     }
     // Keep the prior snapshot explicit alongside the read inputs and progress sink.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_with_progress(
         config: &std::path::Path,
+        task_source: &TaskSource,
         home: Option<&std::path::Path>,
         id: u64,
         saved: &gitterm_core::workspace_config::WorkspaceConfig,
@@ -563,7 +636,7 @@ impl IcedWorkData {
             running_by_repo: HashMap::new(),
             selected_checkout: None,
         };
-        let store = TaskStore::load(TaskStore::path_for_config_root(config))?;
+        let store = task_source.load()?;
         let equal = |a: &Path, b: &Path| {
             a.canonicalize().unwrap_or_else(|_| a.to_owned())
                 == b.canonicalize().unwrap_or_else(|_| b.to_owned())
@@ -1471,6 +1544,7 @@ mod work_index_tests {
         };
         let partial = IcedWorkData::read_with_progress(
             &config,
+            &super::TaskSource::iced(&config),
             None,
             1,
             saved,
@@ -1483,6 +1557,7 @@ mod work_index_tests {
         assert_retained(&partial);
         let full = IcedWorkData::read_with_progress(
             &config,
+            &super::TaskSource::iced(&config),
             None,
             1,
             saved,
@@ -1568,6 +1643,7 @@ mod work_index_tests {
         let mut publications = 0;
         let partial = IcedWorkData::read_with_progress(
             &config,
+            &super::TaskSource::iced(&config),
             None,
             1,
             saved,
@@ -1594,6 +1670,7 @@ mod work_index_tests {
         .unwrap();
         let full = IcedWorkData::read_with_progress(
             &config,
+            &super::TaskSource::iced(&config),
             Some(&home),
             1,
             saved,
