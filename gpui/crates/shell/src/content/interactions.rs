@@ -71,6 +71,8 @@ fn open(shell: &Entity<Shell>, path: PathBuf, cx: &mut VisualTestContext) {
 #[gpui::test]
 fn copy_all_and_browser_buttons_use_full_file_and_test_platform(cx: &mut TestAppContext) {
     let (folder, config, shell, cx) = fixture(cx);
+    let out = tempfile::tempdir().unwrap();
+    super::actions::TEST_OUT_DIR.with(|dir| *dir.borrow_mut() = Some(out.path().to_path_buf()));
     let text = format!("{}\nTHE END\n", "whole file & <text>\n".repeat(70000));
     let raw = folder.path().join("whole file.txt");
     std::fs::write(&raw, &text).unwrap();
@@ -112,7 +114,7 @@ fn copy_all_and_browser_buttons_use_full_file_and_test_platform(cx: &mut TestApp
         } else {
             "file"
         };
-        let expected = std::env::temp_dir().join(format!(
+        let expected = out.path().join(format!(
             "gitterm-gpui-{}_{suffix}.html",
             path.file_stem().unwrap().to_string_lossy()
         ));

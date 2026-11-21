@@ -44,6 +44,22 @@ fn open_platform(path: &Path, cx: &App) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests redirect the browser page into their own temp dir.
+    pub(crate) static TEST_OUT_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Where the browser page is written: the temp dir (tests: their own dir).
+fn browser_out_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = TEST_OUT_DIR.with(|dir| dir.borrow().clone()) {
+        return dir;
+    }
+    std::env::temp_dir()
+}
+
 /// The page Iced opens in the browser, written to a temp file: the rendered
 /// HTML for markdown/HTML/Excalidraw, the content server's `/file/{id}` page
 /// for anything else. The `gitterm-gpui-` prefix never collides with Iced's.
@@ -53,6 +69,7 @@ pub(super) fn browser_page(
     root: &Path,
     relative: &Path,
     dark: bool,
+    out_dir: &Path,
 ) -> Result<Option<PathBuf>, String> {
     let path = root.join(relative);
     let load = gitterm_core::content::collect_contained_file_load(0, root, relative, dark)
@@ -74,7 +91,7 @@ pub(super) fn browser_page(
             gitterm_core::file_page::file_page_html(&path.to_string_lossy(), &load.file_content);
         (html, "file")
     };
-    let temp = std::env::temp_dir().join(format!("gitterm-gpui-{stem}_{suffix}.html"));
+    let temp = out_dir.join(format!("gitterm-gpui-{stem}_{suffix}.html"));
     std::fs::write(&temp, html).map_err(|e| format!("Write {}: {e}", temp.display()))?;
     Ok(Some(temp))
 }
@@ -114,10 +131,11 @@ impl Shell {
         dark: bool,
         cx: &mut Context<Self>,
     ) {
+        let out_dir = browser_out_dir();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { browser_page(&root, &relative, dark) })
+                .spawn(async move { browser_page(&root, &relative, dark, &out_dir) })
                 .await;
             _ = this.update(cx, |this, cx| {
                 if let Err(error) =

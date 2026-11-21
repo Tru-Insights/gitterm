@@ -35,8 +35,8 @@ fn open_viewer(shell: &Entity<Shell>, path: PathBuf, cx: &mut VisualTestContext)
     });
     draw(cx);
 }
-fn opened(name: &str, cx: &mut VisualTestContext) -> PathBuf {
-    let expected = std::env::temp_dir().join(name);
+fn opened(out: &std::path::Path, name: &str, cx: &mut VisualTestContext) -> PathBuf {
+    let expected = out.join(name);
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
     loop {
         draw(cx);
@@ -56,20 +56,23 @@ fn opened(name: &str, cx: &mut VisualTestContext) -> PathBuf {
 fn viewer_headers_show_the_esc_hint_and_browser_opens_what_iced_opens(cx: &mut TestAppContext) {
     let (root, shell, cx) = super::h7_tests::fixture(cx);
     let work = root.path().join("work");
+    let out = tempfile::tempdir().unwrap();
+    crate::content::actions::TEST_OUT_DIR
+        .with(|dir| *dir.borrow_mut() = Some(out.path().to_path_buf()));
     std::fs::write(work.join("h10guide.md"), "# Ten heading").unwrap();
     std::fs::write(work.join("h10raw.txt"), "alpha <b>\nbeta").unwrap();
 
     open_viewer(&shell, work.join("h10guide.md"), cx);
     assert!(cx.debug_bounds("viewer-esc-hint").is_some(), "rendered");
     click("viewer-open-browser", cx);
-    let page = opened("gitterm-gpui-h10guide_preview.html", cx);
+    let page = opened(out.path(), "gitterm-gpui-h10guide_preview.html", cx);
     let html = std::fs::read_to_string(&page).unwrap();
     assert!(html.contains("Ten heading"), "{html}");
 
     open_viewer(&shell, work.join("h10raw.txt"), cx);
     assert!(cx.debug_bounds("viewer-esc-hint").is_some(), "raw");
     click("viewer-open-browser", cx);
-    let page = opened("gitterm-gpui-h10raw_file.html", cx);
+    let page = opened(out.path(), "gitterm-gpui-h10raw_file.html", cx);
     let html = std::fs::read_to_string(&page).unwrap();
     assert!(html.contains("GitTerm V6 File Viewer"));
     assert!(html.contains("alpha &lt;b&gt;"), "{html}");

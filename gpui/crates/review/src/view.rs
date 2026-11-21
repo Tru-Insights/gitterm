@@ -4,9 +4,9 @@ use crate::{
 };
 use gitterm_core::status::GitStatusSnapshot;
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled, TitlebarOptions,
-    Window, WindowBounds, WindowOptions, actions, div, px, rgb, size,
+    App, AppContext, Bounds, Context, Div, Entity, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, px, rgb, size,
 };
 use gpui_component::{
     Root, Sizable,
@@ -366,6 +366,7 @@ impl Render for ReviewView {
                     file.status,
                     file.title()
                 );
+                let prefix = format!("{} {}", if file.viewed { "✓" } else { "○" }, file.status);
                 sidebar = sidebar.child(
                     ListItem::new(("review-file", index))
                         .w_full()
@@ -374,7 +375,10 @@ impl Render for ReviewView {
                             div()
                                 .font_family(aggregate::MONO_FONT)
                                 .text_size(px(12.))
-                                .child(label),
+                                .flex()
+                                .gap_1()
+                                .child(prefix)
+                                .child(file_name(file.title(), file.viewed)),
                         )
                         .selected(self.model.selected == Some(index))
                         .on_click(
@@ -462,3 +466,14 @@ impl Render for ReviewView {
 
 #[cfg(test)]
 mod tests;
+
+/// A changed-files row's name. Viewed files are muted and struck through in the
+/// muted colour, as in Iced's `.tf.viewed .nm`.
+pub(crate) fn file_name(name: impl Into<SharedString>, viewed: bool) -> Div {
+    let name = div().child(name.into());
+    if !viewed {
+        return name;
+    }
+    // The strike takes the text colour (no explicit colour), so it is muted too.
+    name.text_color(rgb(0x9399b2)).line_through()
+}
