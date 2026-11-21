@@ -1,4 +1,5 @@
-//! Local WebKit host with Viewer link navigation. No Wry, IPC or persistent store.
+//! WebKit host: local Viewer documents in a nonpersistent store, or a remote
+//! Page in GPUI's own login store. No Wry or IPC.
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
@@ -14,7 +15,8 @@ use objc2::{
 };
 use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSImage, NSView};
 use objc2_foundation::{
-    NSDictionary, NSError, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
+    NSDictionary, NSError, NSObject, NSObjectProtocol, NSOperatingSystemVersion, NSPoint,
+    NSProcessInfo, NSRect, NSSize, NSString, NSURL, NSURLRequest, NSUUID,
 };
 use objc2_web_kit::{
     WKNavigation, WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate,
@@ -45,6 +47,10 @@ pub type NavigationResult = (LoadTicket, Result<(), String>);
 #[derive(Default)]
 struct NavigationState {
     injection: Cell<bool>,
+    /// A remote Page: navigation follows `page_navigation`, not the local policy.
+    page: Cell<bool>,
+    /// The Page URL just requested; its own first navigation always loads.
+    page_request: RefCell<Option<String>>,
     pending: RefCell<Option<(Retained<WKNavigation>, LoadTicket)>>,
     results: RefCell<VecDeque<NavigationResult>>,
     external: RefCell<Vec<String>>,
@@ -82,8 +88,22 @@ define_class!(
             // window or persistent Page surface is created for local documents.
             let target: Option<Retained<NSObject>> = unsafe { msg_send![action, targetFrame] };
             let url = url.as_ref().map(|url| url.to_string());
-            let policy =
-                document_navigation(&self.ivars().injection, url.as_deref(), target.is_none());
+            let policy = if self.ivars().page.get() {
+                // SAFETY: targetFrame is a WKFrameInfo, which answers isMainFrame.
+                let main_frame = target
+                    .as_ref()
+                    .is_some_and(|frame| unsafe { msg_send![&**frame, isMainFrame] });
+                let requested = main_frame
+                    .then(|| self.ivars().page_request.borrow_mut().take())
+                    .flatten();
+                if requested.is_some() && requested == url {
+                    DocumentNavigation::Allow
+                } else {
+                    page_navigation(url.as_deref(), target.is_none(), main_frame)
+                }
+            } else {
+                document_navigation(&self.ivars().injection, url.as_deref(), target.is_none())
+            };
             if policy == DocumentNavigation::External
                 && let Some(url) = url
             {
@@ -180,7 +200,86 @@ pub(super) fn document_navigation(
     }
 }
 
-/// One hidden-on-construction child view with an immutable nonpersistent store.
+/// Page link policy, after Iced's: GitHub, Linear and their sign-in providers
+/// stay in the Page's login store; other web links open in the browser.
+/// shortcut: a link to another owner's or workspace's store stays in this
+/// store (Iced reopens the Page in that store); port Iced's Reopen when needed.
+pub(super) fn page_navigation(
+    url: Option<&str>,
+    new_window: bool,
+    main_frame: bool,
+) -> DocumentNavigation {
+    let Some(parsed) = url.and_then(|url| gitterm_core::page_store::browser_url(url).ok()) else {
+        return DocumentNavigation::Cancel;
+    };
+    if new_window {
+        return DocumentNavigation::External;
+    }
+    // Embedded frames of an allowed page load in place.
+    if !main_frame {
+        return DocumentNavigation::Allow;
+    }
+    let service = matches!(
+        parsed.host_str(),
+        Some(
+            "github.com"
+                | "linear.app"
+                | "accounts.google.com"
+                | "appleid.apple.com"
+                | "idmsa.apple.com"
+        )
+    );
+    if parsed.scheme() == "https"
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.port().is_none()
+        && service
+    {
+        DocumentNavigation::Allow
+    } else {
+        DocumentNavigation::External
+    }
+}
+
+/// The WebKit store a Page uses: GPUI's own default store, or the persistent
+/// store with Iced's identifier for that login, held in GPUI's app data.
+fn page_data_store(
+    store: &gitterm_core::page_store::PageStore,
+    mtm: MainThreadMarker,
+) -> Result<Retained<WKWebsiteDataStore>, String> {
+    let unavailable = || format!("Page {} · not available in preview", store.label());
+    let Some(bytes) = store.identifier() else {
+        return Ok(unsafe { WKWebsiteDataStore::defaultDataStore(mtm) });
+    };
+    // dataStoreForIdentifier: is macOS 14+.
+    let version = NSOperatingSystemVersion {
+        majorVersion: 14,
+        minorVersion: 0,
+        patchVersion: 0,
+    };
+    if !NSProcessInfo::processInfo().isOperatingSystemAtLeastVersion(version) {
+        return Err(unavailable());
+    }
+    let identifier =
+        NSUUID::from_string(&NSString::from_str(&uuid_string(bytes))).ok_or_else(unavailable)?;
+    Ok(unsafe { WKWebsiteDataStore::dataStoreForIdentifier(&identifier, mtm) })
+}
+
+/// RFC 4122 text form, so NSUUID parses the bytes without a raw-pointer init.
+pub(super) fn uuid_string(bytes: [u8; 16]) -> String {
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
+/// One hidden-on-construction child view with an immutable store: nonpersistent
+/// for local documents, the Page's login store for a remote Page.
 /// Drop before its GPUI window. PR9 drains results on the UI thread and feeds
 /// them to `complete_snapshot`, then notifies the pane; callbacks never show it.
 pub struct LocalWebKitHost {
@@ -191,8 +290,15 @@ pub struct LocalWebKitHost {
 }
 
 impl LocalWebKitHost {
-    pub fn new(window: &Window) -> Result<Self, String> {
+    pub fn new(
+        window: &Window,
+        page: Option<&gitterm_core::page_store::PageStore>,
+    ) -> Result<Self, String> {
         let mtm = MainThreadMarker::new().ok_or("WebKit host requires the main thread")?;
+        let store = match page {
+            Some(store) => page_data_store(store, mtm)?,
+            None => unsafe { WKWebsiteDataStore::nonPersistentDataStore(mtm) },
+        };
         let handle = HasWindowHandle::window_handle(window)
             .map_err(|e| format!("Cannot get native window: {e}"))?;
         let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
@@ -203,14 +309,17 @@ impl LocalWebKitHost {
         let parent = unsafe { Retained::retain(handle.ns_view.as_ptr().cast::<NSView>()) }
             .ok_or("Missing native parent view")?;
         let navigation: Retained<LocalNavigation> = unsafe {
-            let allocated = LocalNavigation::alloc(mtm).set_ivars(NavigationState::default());
+            let allocated = LocalNavigation::alloc(mtm).set_ivars(NavigationState {
+                page: Cell::new(page.is_some()),
+                ..NavigationState::default()
+            });
             msg_send![super(allocated), init]
         };
         // SAFETY: configuration and all native view operations stay on the main
-        // thread. No user scripts/message handlers or persistent data are added.
+        // thread. No user scripts/message handlers are added; only a Page persists data.
         let view = unsafe {
             let configuration = WKWebViewConfiguration::new(mtm);
-            configuration.setWebsiteDataStore(&WKWebsiteDataStore::nonPersistentDataStore(mtm));
+            configuration.setWebsiteDataStore(&store);
             let view = WKWebView::initWithFrame_configuration(
                 WKWebView::alloc(mtm),
                 NSRect::ZERO,
@@ -253,12 +362,23 @@ impl SurfaceHost for LocalWebKitHost {
         self.navigation.ivars().pending.borrow_mut().take();
         self.navigation.ivars().external.borrow_mut().clear();
         // SAFETY: main-thread WebKit instance, owned string, no filesystem base
-        // URL or read-access grant. Store stays ephemeral across replacements.
+        // URL or read-access grant. The store never changes across replacements.
         let navigation = unsafe {
             self.view.stopLoading();
-            self.navigation.ivars().injection.set(true);
-            self.view
-                .loadHTMLString_baseURL(&NSString::from_str(document.html()), None)
+            if let Some(url) = document.page_url() {
+                self.navigation.ivars().injection.set(false);
+                let request = NSURL::URLWithString(&NSString::from_str(url))
+                    .ok_or("WebKit refused the Page URL")?;
+                // Record WebKit's own spelling, which the policy callback reports.
+                *self.navigation.ivars().page_request.borrow_mut() =
+                    request.absoluteString().map(|url| url.to_string());
+                let url = request;
+                self.view.loadRequest(&NSURLRequest::requestWithURL(&url))
+            } else {
+                self.navigation.ivars().injection.set(true);
+                self.view
+                    .loadHTMLString_baseURL(&NSString::from_str(document.html()), None)
+            }
         }
         .ok_or("WebKit refused retained HTML")?;
         *self.navigation.ivars().pending.borrow_mut() = Some((navigation, ticket));

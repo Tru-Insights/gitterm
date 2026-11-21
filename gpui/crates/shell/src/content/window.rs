@@ -4,6 +4,7 @@ use super::{
     host::{LocalWebKitHost, NavigationResult, SnapshotResult, SurfaceHost},
     overlay::*,
 };
+use gitterm_core::page_store::PageStore;
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, IntoElement as _, ParentElement as _,
     Styled as _, Subscription, Task, WeakFocusHandle, Window, canvas, div, img,
@@ -27,10 +28,11 @@ struct WindowHost {
     navigation: Vec<NavigationResult>,
 }
 impl WindowHost {
-    fn new(window: &Window) -> Result<Self, String> {
+    /// `page` selects a remote Page's login store; `None` is a local document.
+    fn new(window: &Window, page: Option<&PageStore>) -> Result<Self, String> {
         #[cfg(test)]
         {
-            let _ = window;
+            let _ = (window, page);
             Ok(Self {
                 native: None,
                 navigation: vec![],
@@ -39,7 +41,7 @@ impl WindowHost {
         #[cfg(not(test))]
         {
             Ok(Self {
-                native: Some(LocalWebKitHost::new(window)?),
+                native: Some(LocalWebKitHost::new(window, page)?),
                 navigation: vec![],
             })
         }
@@ -91,9 +93,12 @@ impl SurfaceHost for WindowHost {
             .unwrap_or(Ok(()))
     }
 }
+enum Source {
+    Local { root: PathBuf, relative: PathBuf },
+    Page { url: String, store: PageStore },
+}
 struct Entry {
-    root: PathBuf,
-    relative: PathBuf,
+    source: Source,
     viewer: RetainedViewer<WindowHost>,
     covers: [Option<CoverId>; 3],
 }
@@ -199,7 +204,7 @@ impl ContentWindow {
         if self.entries.contains_key(&id) {
             return;
         }
-        let host = match WindowHost::new(window) {
+        let host = match WindowHost::new(window, None) {
             Ok(host) => host,
             Err(error) => {
                 // Keep a normal failed entry so host failure remains inline.
@@ -216,8 +221,10 @@ impl ContentWindow {
                 self.entries.insert(
                     id,
                     Entry {
-                        root: root.clone(),
-                        relative: relative.clone(),
+                        source: Source::Local {
+                            root: root.clone(),
+                            relative: relative.clone(),
+                        },
                         viewer,
                         covers: [None; 3],
                     },
@@ -235,8 +242,10 @@ impl ContentWindow {
         self.entries.insert(
             id.clone(),
             Entry {
-                root: root.clone(),
-                relative: relative.clone(),
+                source: Source::Local {
+                    root: root.clone(),
+                    relative: relative.clone(),
+                },
                 viewer,
                 covers: [None; 3],
             },
@@ -258,10 +267,69 @@ impl ContentWindow {
         // Newly opened entries also inherit covers that predate their creation.
         self.apply_covers(window, cx);
     }
+    /// Load `url` in the Page entry `id`. The same store reuses its surface;
+    /// another store rebuilds it, since a WebKit view's store is fixed.
+    pub(crate) fn open_page(
+        &mut self,
+        id: String,
+        url: String,
+        store: PageStore,
+        origin: Origin,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let reuse = matches!(
+            self.entries.get(&id),
+            Some(Entry { source: Source::Page { store: current, .. }, .. }) if *current == store
+        );
+        let mut failed = None;
+        if !reuse {
+            if let Some(mut old) = self.entries.remove(&id) {
+                old.viewer.clear();
+            }
+            let host = WindowHost::new(window, Some(&store)).unwrap_or_else(|error| {
+                // Keep a normal failed entry so host failure remains inline.
+                failed = Some(error);
+                WindowHost {
+                    native: None,
+                    navigation: vec![],
+                }
+            });
+            self.entries.insert(
+                id.clone(),
+                Entry {
+                    source: Source::Page {
+                        url: url.clone(),
+                        store: store.clone(),
+                    },
+                    viewer: RetainedViewer::new(host),
+                    covers: [None; 3],
+                },
+            );
+        }
+        let entry = self.entries.get_mut(&id).expect("Page entry inserted");
+        let document = match failed {
+            Some(error) => Err(error),
+            None => Document::page(&url),
+        };
+        entry.source = Source::Page { url, store };
+        let ticket = entry.viewer.begin_content(origin);
+        entry.viewer.complete_content(&ticket, document);
+        cx.notify();
+        self.apply_covers(window, cx);
+    }
     pub(super) fn source(&self, id: &str) -> Option<(PathBuf, PathBuf)> {
-        self.entries
-            .get(id)
-            .map(|entry| (entry.root.clone(), entry.relative.clone()))
+        match &self.entries.get(id)?.source {
+            Source::Local { root, relative } => Some((root.clone(), relative.clone())),
+            Source::Page { .. } => None,
+        }
+    }
+    /// The URL and login store a Page entry was asked to show.
+    pub(crate) fn page(&self, id: &str) -> Option<(&str, &PageStore)> {
+        match &self.entries.get(id)?.source {
+            Source::Page { url, store } => Some((url, store)),
+            Source::Local { .. } => None,
+        }
     }
     /// Whether the workspace's viewer cover currently shows this pane.
     pub(crate) fn is_visiting(&self, workspace: crate::WorkspaceId, pane: &str) -> bool {

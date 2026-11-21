@@ -132,6 +132,7 @@ impl crate::Shell {
         if self.active_workspace(cx).is_none()
             || self.park_sheet.is_some()
             || self.new_work_sheet.is_some()
+            || self.settings_sheet.is_some()
         {
             return;
         }
@@ -323,12 +324,7 @@ impl crate::Shell {
             O::OpenAgentConfig { workspace } => {
                 self.show_agent_sidebar(crate::WorkspaceId(*workspace), true, cx)
             }
-            O::OpenPrViewer { .. } => {
-                self.owner.update(cx, |owner, cx| {
-                    owner.error = Some("PR viewer · not available in preview".into());
-                    cx.notify();
-                });
-            }
+            O::OpenPage { url, store } => self.open_page(url.clone(), store.clone(), window, cx),
             // Write/launch controls stop at the sidebar's preview notice.
             _ => {}
         }
@@ -392,7 +388,7 @@ impl crate::Shell {
             O::ToggleTerminal if self.active_workspace(cx).is_some() => {
                 self.open_bottom_terminal(window, cx)
             }
-            O::OpenSettings(_) => self.unavailable("Settings", cx),
+            O::OpenSettings(id) => self.open_settings_sheet(id, window, cx),
             O::OpenReposMenu => self.unavailable("Repos ▾", cx),
             O::OpenReady => self.unavailable("Ready", cx),
             O::OpenParked => self.unavailable("Parked", cx),
@@ -477,6 +473,8 @@ impl crate::Shell {
         self.picker_subscription = None;
         self.park_sheet = None;
         self.park_subscription = None;
+        self.settings_sheet = None;
+        self.settings_subscription = None;
         let owner = self.owner.read(cx);
         let saved = owner
             .iced_catalog()

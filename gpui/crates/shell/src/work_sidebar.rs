@@ -119,9 +119,11 @@ pub enum WorkSidebarOutcome {
     OpenUrl {
         url: String,
     },
-    /// Iced opens this in its authenticated Page viewer, not the OS browser.
-    OpenPrViewer {
+    /// A PR or issue in the embedded Page, in its owner's or workspace's login
+    /// store (Iced `Pr(OpenInViewer)`, `Issue(Open)`), not the OS browser.
+    OpenPage {
         url: String,
+        store: gitterm_core::page_store::PageStore,
     },
     /// The skills · MCPs · hooks line opens the Agent sidebar.
     OpenAgentConfig {
@@ -781,8 +783,12 @@ impl WorkSidebar {
                         .unwrap_or_else(|| pr.key.label()),
                 );
                 row.pr_number = Some((pr.key.number, number_chars));
-                row.pr_link = Some(Action::Emit(WorkSidebarOutcome::OpenPrViewer {
+                row.pr_link = Some(Action::Emit(WorkSidebarOutcome::OpenPage {
                     url: pr.key.url(),
+                    store: gitterm_core::page_store::PageStore::github(
+                        pr.key.owner(),
+                        &self.pr_accounts,
+                    ),
                 }));
                 let plan_row = ordered.iter().find(|row| row.entry.key() == pr.key);
                 let next = plan_row
@@ -944,8 +950,17 @@ impl WorkSidebar {
                     });
                     row.badges
                         .extend(issue.and_then(|issue| issue.state.clone()));
-                    if let Some(url) = issue.and_then(|issue| issue.url.clone()) {
-                        row.action = Some(Action::Emit(WorkSidebarOutcome::OpenUrl { url }));
+                    if let Some(issue) = issue
+                        && let Some(url) = issue.url.clone()
+                    {
+                        let workspace = issue
+                            .workspace
+                            .clone()
+                            .or_else(|| gitterm_core::issues::workspace_from_issue_url(&url));
+                        let store =
+                            gitterm_core::page_store::PageStore::linear(workspace.as_deref());
+                        row.action =
+                            Some(Action::Emit(WorkSidebarOutcome::OpenPage { url, store }));
                     }
                     rows.push(row);
                 }
@@ -1567,6 +1582,9 @@ impl WorkSidebar {
             .flex_shrink_0()
             .text_size(px(10.))
             .when(mono, |button| button.font_family("Menlo"))
+            .when(repo_row && !mono, |button| {
+                button.font_family(".SystemUIFont")
+            })
             .text_color(rgb(color))
             .tooltip(tooltip)
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -1595,19 +1613,21 @@ impl WorkSidebar {
             }))
             .map(|button| {
                 if repo_row {
-                    // Repo-row slots stay on one line; only the command may
-                    // truncate, after the name, when the sidebar is too narrow.
+                    // Like Iced, the run command keeps its full width and the
+                    // action slots give way, wrapping their text.
                     button
                         .h_auto()
-                        .whitespace_nowrap()
                         .accessibility_label(control.label.clone())
-                        .when(run, |button| button.flex_shrink_1().min_w_0())
+                        .map(|button| {
+                            if run {
+                                button.whitespace_nowrap()
+                            } else {
+                                button.flex_shrink_1().min_w_0().whitespace_normal()
+                            }
+                        })
                         .child(
                             div()
-                                .min_w_0()
-                                .whitespace_nowrap()
-                                .overflow_hidden()
-                                .text_ellipsis()
+                                .when(run, |d| d.whitespace_nowrap())
                                 .child(control.label),
                         )
                 } else {
@@ -1615,6 +1635,17 @@ impl WorkSidebar {
                 }
             })
     }
+}
+
+fn age_label(index: usize, age: String, repo: bool, p: &crate::theme::Palette) -> gpui::Div {
+    div()
+        .debug_selector(move || format!("work-age-{index}"))
+        .font_family("Menlo")
+        .text_size(px(10.))
+        .text_color(rgb(p.muted))
+        // Iced's age text wraps ("14s" / "ago") when the slot is squeezed.
+        .when(repo, |d| d.flex_shrink_1().min_w_0().whitespace_normal())
+        .child(age)
 }
 
 fn control_color(action: &Action, repo_row: bool, p: &crate::theme::Palette) -> u32 {
@@ -1732,19 +1763,18 @@ impl Render for WorkSidebar {
                 label = label.text_color(rgb(if row.small { p.subtext0 } else { p.muted }));
             }
             if repo {
-                // One line like Iced's Shrink name slot; a narrow sidebar truncates it.
+                // Iced's name slot never shrinks, wraps or ellipsizes.
                 label = label
                     .font_family("Menlo")
                     .text_size(px(12.))
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .text_ellipsis();
+                    .whitespace_nowrap();
             }
             if row.heading || repo {
                 label = label.font_weight(gpui::FontWeight::BOLD);
             }
             if row.indent {
-                label = label.font_family("Menlo");
+                // Iced shortens, then lets the branch name wrap in a fill slot.
+                label = label.font_family("Menlo").flex_1().whitespace_normal();
             }
             let mut line = div().w_full().min_w_0().flex().items_center().gap(px(6.));
             if let Some((number, chars)) = row.pr_number {
@@ -1778,8 +1808,7 @@ impl Render for WorkSidebar {
                         .h_auto()
                         .px(px(2.))
                         .py_0()
-                        .flex_shrink_1()
-                        .min_w_0()
+                        .flex_shrink_0()
                         .text_color(rgb(p.text))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.dispatch(action.clone(), window, cx);
@@ -1840,19 +1869,27 @@ impl Render for WorkSidebar {
                 line = line.child(div().flex_1());
             }
             let mut age = row.age;
+            // Repo rows group the controls and age in one shrinking slot, like
+            // Iced's `actions_slot`; other rows append them to the line.
+            let mut actions = div()
+                .debug_selector(|| format!("work-actions-{index}"))
+                .min_w_0()
+                .flex()
+                .flex_shrink_1()
+                .items_center()
+                .gap(px(6.));
             for (control_index, control) in row.controls.into_iter().enumerate() {
                 if matches!(
                     control.action,
                     Action::Emit(WorkSidebarOutcome::RemoveRepo { .. })
                 ) && let Some(age) = age.take()
                 {
-                    line = line.child(
-                        div()
-                            .font_family("Menlo")
-                            .text_size(px(10.))
-                            .text_color(rgb(p.muted))
-                            .child(age),
-                    );
+                    let age = age_label(index, age, repo, &p);
+                    if repo {
+                        actions = actions.child(age);
+                    } else {
+                        line = line.child(age);
+                    }
                 }
                 let id = if matches!(
                     control.action,
@@ -1862,16 +1899,23 @@ impl Render for WorkSidebar {
                 } else {
                     format!("work-control-{index}-{control_index}")
                 };
-                line = line.child(self.button(id, control, repo, cx));
+                let button = self.button(id, control, repo, cx);
+                if repo {
+                    actions = actions.child(button);
+                } else {
+                    line = line.child(button);
+                }
             }
             if let Some(age) = age {
-                line = line.child(
-                    div()
-                        .font_family("Menlo")
-                        .text_size(px(10.))
-                        .text_color(rgb(p.muted))
-                        .child(age),
-                );
+                let age = age_label(index, age, repo, &p);
+                if repo {
+                    actions = actions.child(age);
+                } else {
+                    line = line.child(age);
+                }
+            }
+            if repo {
+                line = line.child(actions);
             }
             if repo {
                 // Iced constrains wrapping content to a fill slot beside the disclosure.

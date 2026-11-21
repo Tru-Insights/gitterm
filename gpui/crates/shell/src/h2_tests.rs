@@ -316,7 +316,7 @@ fn sheet_folder_picker_returns_selection_and_cancel_without_creating_work(cx: &m
 fn missing_host_controls_keep_iced_controls_and_report_unavailable(cx: &mut TestAppContext) {
     let (_root, shell, cx) = fixture(cx);
     // Iced labels; the preview reports them (I6, interaction map A02/A14).
-    for selector in ["pstrip-browser", "pstrip-settings"] {
+    for selector in ["pstrip-browser"] {
         click(cx, selector);
         cx.read(|cx| {
             let error = shell
@@ -332,6 +332,12 @@ fn missing_host_controls_keep_iced_controls_and_report_unavailable(cx: &mut Test
             )
         });
     }
+    // The gear now opens the settings sheet (A02); it closes with Escape.
+    click(cx, "pstrip-settings");
+    cx.read(|cx| assert!(shell.read(cx).settings_sheet.is_some()));
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    cx.read(|cx| assert!(shell.read(cx).settings_sheet.is_none()));
     click(cx, "pstrip-usage");
     cx.read(|cx| assert!(shell.read(cx).usage_open));
     click(cx, "pstrip-usage");

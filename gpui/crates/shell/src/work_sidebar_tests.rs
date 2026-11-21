@@ -71,6 +71,10 @@ pub(crate) fn branch(repo: &str, name: &str, gone: bool) -> BranchStatus {
 }
 
 fn fixture(owned: bool) -> WorkSidebar {
+    fixture_with_branch(owned, "tru-274")
+}
+
+fn fixture_with_branch(owned: bool, first_branch: &str) -> WorkSidebar {
     let now = Instant::now();
     let wall_time = SystemTime::now();
     let entries = vec![
@@ -123,7 +127,7 @@ fn fixture(owned: bool) -> WorkSidebar {
         result: RefreshOutcome {
             mode: RefreshMode::Full,
             branches: vec![
-                branch("/repos/api", "tru-274", false),
+                branch("/repos/api", first_branch, false),
                 branch("/repos/api", "old-branch", true),
                 branch("/repos/infra", "infra-fix", false),
                 branch("/repos/hidden", "hidden-fix", false),
@@ -1005,6 +1009,130 @@ fn expanded_repo_disclosure_stays_inside_default_sidebar_and_collapses(
 }
 
 #[gpui::test]
+fn pr_number_click_requests_the_pr_page_in_the_pr_store(cx: &mut gpui::TestAppContext) {
+    use gitterm_core::{merge_plan::PrKey, prs::WatchedPr};
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let mut sidebar = fixture(true);
+    sidebar.pull_requests = vec![PullRequestGroup {
+        root: "root".into(),
+        title: "Owning chat".into(),
+        prs: vec![WatchedPr::new(PrKey::new("example/gitterm", 42))],
+    }];
+    sidebar.pr_accounts = BTreeMap::from([("example".into(), "Sample-Login".into())]);
+    let (sidebar, cx) = cx.add_window_view(|_, _| sidebar);
+    let shell = cx.update(|window, cx| {
+        cx.new(|cx| {
+            let mut model = crate::WorkspaceStatus::default();
+            model.add(root.path().to_path_buf(), Instant::now());
+            let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, None, cx));
+            crate::Shell::with_owner(
+                Rc::new(crate::data::LocalData(owner.clone())),
+                owner,
+                config.path(),
+                true,
+                window,
+                cx,
+            )
+            .unwrap()
+        })
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |_, cx| {
+            cx.subscribe_in(
+                &sidebar,
+                window,
+                |shell, _, outcome: &WorkSidebarOutcome, window, cx| {
+                    shell.work_outcome(outcome, window, cx)
+                },
+            )
+            .detach();
+        })
+    });
+    cx.simulate_resize(gpui::size(px(640.), px(900.)));
+    draw_sidebar(cx);
+    click_sidebar(cx, "work-pr-number-2");
+    assert_eq!(
+        crate::page_tests::page(&shell, cx),
+        Some((
+            "https://github.com/example/gitterm/pull/42".into(),
+            gitterm_core::page_store::PageStore::GitHub("sample-login".into())
+        ))
+    );
+    assert!(
+        cx.opened_url().is_none(),
+        "the PR opens embedded, not externally"
+    );
+}
+
+#[test]
+fn issue_rows_with_a_url_open_the_page_in_the_workspace_store() {
+    use gitterm_core::{issues::CachedIssue, page_store::PageStore};
+    let mut sidebar = fixture(true);
+    let issue = |url: Option<&str>, workspace: Option<&str>| CachedIssue {
+        title: Some("Sample issue".into()),
+        url: url.map(str::to_owned),
+        workspace: workspace.map(str::to_owned),
+        ..Default::default()
+    };
+    for (key, cached) in [
+        (
+            "SAMPLE-1",
+            issue(
+                Some("https://linear.app/sample-a/issue/SAMPLE-1/x"),
+                Some("sample-b"),
+            ),
+        ),
+        (
+            "SAMPLE-2",
+            issue(Some("https://linear.app/sample-a/issue/SAMPLE-2/y"), None),
+        ),
+        ("SAMPLE-3", issue(Some("https://example.com/issue/3"), None)),
+        ("SAMPLE-4", issue(None, Some("sample-b"))),
+    ] {
+        sidebar.issues.issues.insert(key.into(), cached);
+    }
+    let keys: Vec<String> = (1..=4).map(|n| format!("SAMPLE-{n}")).collect();
+    let mut rows = vec![];
+    sidebar.issue_rows(&keys, &mut rows);
+    let action = |key: &str| {
+        rows.iter()
+            .find(|row| row.label.starts_with(key))
+            .unwrap_or_else(|| panic!("missing {key}"))
+            .action
+            .clone()
+    };
+    let page = |url: &str, store| {
+        Some(Action::Emit(WorkSidebarOutcome::OpenPage {
+            url: url.into(),
+            store,
+        }))
+    };
+    // The resolving workspace wins; older caches fall back to the URL's workspace.
+    assert_eq!(
+        action("SAMPLE-1"),
+        page(
+            "https://linear.app/sample-a/issue/SAMPLE-1/x",
+            PageStore::Linear("sample-b".into())
+        )
+    );
+    assert_eq!(
+        action("SAMPLE-2"),
+        page(
+            "https://linear.app/sample-a/issue/SAMPLE-2/y",
+            PageStore::Linear("sample-a".into())
+        )
+    );
+    assert_eq!(
+        action("SAMPLE-3"),
+        page("https://example.com/issue/3", PageStore::Default)
+    );
+    assert_eq!(action("SAMPLE-4"), None, "unknown URL stays text");
+}
+
+#[gpui::test]
 fn pr_body_and_disclosure_keep_iced_toggle_targets(cx: &mut gpui::TestAppContext) {
     use gitterm_core::{merge_plan::PrKey, prs::WatchedPr};
     cx.background_executor.allow_parking();
@@ -1017,6 +1145,7 @@ fn pr_body_and_disclosure_keep_iced_toggle_targets(cx: &mut gpui::TestAppContext
         title: "Owning chat".into(),
         prs: vec![WatchedPr::new(PrKey::new("example/gitterm", 42))],
     }];
+    sidebar.pr_accounts = BTreeMap::from([("Example".into(), "Sample-Login".into())]);
     let (sidebar, cx) = cx.add_window_view(|_, _| sidebar);
     cx.simulate_resize(gpui::size(px(640.), px(900.)));
     draw_sidebar(cx);
@@ -1027,8 +1156,9 @@ fn pr_body_and_disclosure_keep_iced_toggle_targets(cx: &mut gpui::TestAppContext
     assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
     assert_eq!(
         *events.borrow(),
-        [WorkSidebarOutcome::OpenPrViewer {
-            url: "https://github.com/example/gitterm/pull/42".into()
+        [WorkSidebarOutcome::OpenPage {
+            url: "https://github.com/example/gitterm/pull/42".into(),
+            store: gitterm_core::page_store::PageStore::GitHub("sample-login".into()),
         }]
     );
     assert!(
@@ -2567,7 +2697,7 @@ fn open_review_checkout_marks_only_its_branch_row_selected(cx: &mut gpui::TestAp
 }
 
 #[gpui::test]
-fn expanded_repo_row_slots_stay_on_one_line_with_muted_editor(cx: &mut gpui::TestAppContext) {
+fn expanded_repo_row_name_and_run_never_shrink_but_actions_wrap(cx: &mut gpui::TestAppContext) {
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let repo = PathBuf::from("/repos/gitterm-v2");
@@ -2585,27 +2715,23 @@ fn expanded_repo_row_slots_stay_on_one_line_with_muted_editor(cx: &mut gpui::Tes
             .position(|r| r.label == "gitterm-v2")
             .unwrap()
     });
-    let heights = |cx: &mut gpui::VisualTestContext, width: f32| {
+    let measure = |cx: &mut gpui::VisualTestContext, width: f32| {
         cx.simulate_resize(gpui::size(px(width), px(900.)));
         draw_sidebar(cx);
-        ["work-name-", "work-run-", "work-control-"].map(|prefix| {
-            let selector = if prefix == "work-control-" {
-                format!("{prefix}{index}-0")
-            } else {
-                format!("{prefix}{index}")
-            };
+        let bounds = |cx: &mut gpui::VisualTestContext, selector: String| {
             cx.debug_bounds(Box::leak(selector.into_boxed_str()))
-                .unwrap()
-                .size
-                .height
-        })
+                .unwrap_or_else(|| panic!("missing bounds at {width}pt"))
+        };
+        (
+            bounds(cx, format!("work-name-{index}")).size,
+            bounds(cx, format!("work-run-{index}")).size,
+        )
     };
-    let one_line = heights(cx, 2400.);
-    let default = heights(cx, crate::layout::RegionLayout::default().sidebar_width);
-    assert_eq!(
-        default, one_line,
-        "name, run command and Open in editor never wrap"
-    );
+    let (name_wide, run_wide) = measure(cx, 2400.);
+    let (name, run) = measure(cx, 300.);
+    assert_eq!(name, name_wide, "repo name keeps its full width and height");
+    assert_eq!(run, run_wide, "run command keeps its full width and height");
+    assert_eq!(name.height, run.height, "one line each");
     let disclosure = cx
         .debug_bounds(Box::leak(format!("work-fold-{index}-▾").into_boxed_str()))
         .unwrap();
@@ -2623,4 +2749,59 @@ fn expanded_repo_row_slots_stay_on_one_line_with_muted_editor(cx: &mut gpui::Tes
             .unwrap();
         assert!(row.controls.iter().any(|c| c.label == "Open in editor"));
     });
+}
+
+#[gpui::test]
+fn long_branch_title_is_shortened_at_iced_limit_then_wraps(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let long = "task/02bf8131-5c35-4939-b33f-bf01dae8aa5c-extra-long-name";
+    let (sidebar, cx) = cx.add_window_view(|_, _| {
+        let mut sidebar = fixture_with_branch(false, long);
+        sidebar.open.insert(Fold::Repo("/repos/api".into()));
+        sidebar
+    });
+    cx.simulate_resize(gpui::size(px(300.), px(900.)));
+    draw_sidebar(cx);
+    let (index, label) = sidebar.read_with(cx, |s, _| {
+        let rows = s.rows();
+        let index = rows
+            .iter()
+            .position(|r| r.label.starts_with("task/02bf"))
+            .unwrap();
+        (index, rows[index].label.clone())
+    });
+    assert_eq!(label.chars().count(), 40);
+    assert!(label.ends_with('\u{2026}'));
+    let title = cx
+        .debug_bounds(Box::leak(format!("work-label-{index}").into_boxed_str()))
+        .unwrap();
+    assert!(title.size.height > px(20.), "branch title wraps: {title:?}");
+}
+
+#[gpui::test]
+fn repo_age_text_wraps_when_the_actions_slot_is_squeezed(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let repo = PathBuf::from("/repos/api");
+    let (sidebar, cx) = cx.add_window_view(|_, _| {
+        let mut sidebar = fixture(false);
+        sidebar.workspace.repos[0].dir = repo.clone();
+        sidebar.workspace.repos[0].run_command = Some("cargo run --example preview".into());
+        sidebar.open.insert(Fold::Repo(repo.clone()));
+        sidebar
+    });
+    let index = sidebar.read_with(cx, |s, _| {
+        s.rows().iter().position(|r| r.label == "api").unwrap()
+    });
+    let age = |cx: &mut gpui::VisualTestContext, width: f32| {
+        cx.simulate_resize(gpui::size(px(width), px(900.)));
+        draw_sidebar(cx);
+        cx.debug_bounds(Box::leak(format!("work-age-{index}").into_boxed_str()))
+            .unwrap()
+            .size
+    };
+    let wide = age(cx, 2400.);
+    let narrow = age(cx, 300.);
+    assert!(narrow.height >= wide.height, "age may wrap to more lines");
 }
