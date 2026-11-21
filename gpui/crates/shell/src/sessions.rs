@@ -286,6 +286,9 @@ impl crate::Shell {
                 }
                 cx.notify();
             }
+            O::OpenReview { checkout, vs_base } => {
+                self.open_work_review(checkout.clone(), *vs_base, window, cx);
+            }
             // TODO(TRU-274 Work actions slice): wire repo editing, run/review/editor,
             // ownership, refresh/index and Find after the owner exposes those paths.
             _ => {}
