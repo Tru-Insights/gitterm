@@ -2261,6 +2261,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitterm-browser"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.9",
+ "base64 0.22.1",
+ "dirs",
+ "futures-util",
+ "gitterm-core",
+ "hyper 0.14.32",
+ "image",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "gitterm-core"
 version = "0.1.0"
 dependencies = [
@@ -2302,6 +2325,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "git2",
+ "gitterm-browser",
  "gitterm-core",
  "hyper 0.14.32",
  "iced",

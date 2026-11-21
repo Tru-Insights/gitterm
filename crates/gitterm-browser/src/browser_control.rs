@@ -3635,7 +3635,7 @@ fn chrome_launch_args(profile_dir: &Path) -> Vec<String> {
 /// Visual replies use the same low-level Chrome/CDP adapter, but never the
 /// interactive browser's process, profile, targets, or credentials.
 /// `preview_html` as the task MCP server's injected HTML-preview runner.
-pub fn html_preview_runner() -> crate::task_mcp::HtmlPreviewRunner {
+pub fn html_preview_runner() -> gitterm_core::task_mcp::HtmlPreviewRunner {
     std::sync::Arc::new(|request| {
         Box::pin(async move {
             preview_html(request)
@@ -3645,7 +3645,9 @@ pub fn html_preview_runner() -> crate::task_mcp::HtmlPreviewRunner {
     })
 }
 
-pub async fn preview_html(request: crate::html_render::HtmlPreviewRequest) -> Result<Value> {
+pub async fn preview_html(
+    request: gitterm_core::content::html_render::HtmlPreviewRequest,
+) -> Result<Value> {
     request.validate().map_err(BrowserControlError::new)?;
     static PREVIEWS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
     let permit = PREVIEWS
@@ -3662,7 +3664,9 @@ pub async fn preview_html(request: crate::html_render::HtmlPreviewRequest) -> Re
     .map_err(|error| BrowserControlError::new(format!("HTML preview worker failed: {error}")))?
 }
 
-async fn run_html_preview(request: crate::html_render::HtmlPreviewRequest) -> Result<Value> {
+async fn run_html_preview(
+    request: gitterm_core::content::html_render::HtmlPreviewRequest,
+) -> Result<Value> {
     let profile = env::temp_dir().join(format!("gitterm-v6-html-preview-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&profile).map_err(|error| {
         BrowserControlError::new(format!(
@@ -3723,7 +3727,7 @@ async fn run_html_preview(request: crate::html_render::HtmlPreviewRequest) -> Re
 
 async fn capture_html_preview(
     profile: &Path,
-    request: &crate::html_render::HtmlPreviewRequest,
+    request: &gitterm_core::content::html_render::HtmlPreviewRequest,
 ) -> Result<Value> {
     let deadline = Instant::now() + DEFAULT_STARTUP_TIMEOUT;
     let endpoint = loop {
@@ -3756,10 +3760,12 @@ async fn capture_html_preview(
     session
         .command(
             "Page.addScriptToEvaluateOnNewDocument",
-            json!({"source": crate::html_render::FRAME_GUARD_JS}),
+            json!({"source": gitterm_core::content::html_render::FRAME_GUARD_JS}),
         )
         .await?;
-    let width = request.width.unwrap_or(crate::html_render::DEFAULT_WIDTH);
+    let width = request
+        .width
+        .unwrap_or(gitterm_core::content::html_render::DEFAULT_WIDTH);
     session
         .command(
             "Emulation.setDeviceMetricsOverride",
@@ -3768,7 +3774,7 @@ async fn capture_html_preview(
         .await?;
     let wrapper = format!(
         "<!doctype html><html><body style='margin:0'><script>{}</script></body></html>",
-        crate::html_render::RENDER_JS
+        gitterm_core::content::html_render::RENDER_JS
     );
     let document = session.command("Page.getFrameTree", json!({})).await?;
     let frame_id = document
@@ -3785,7 +3791,10 @@ async fn capture_html_preview(
     // apply it there as well, before creating any untrusted document.
     evaluate_by_value::<Value>(
         &session,
-        &format!("{}; true", crate::html_render::FRAME_GUARD_JS),
+        &format!(
+            "{}; true",
+            gitterm_core::content::html_render::FRAME_GUARD_JS
+        ),
         "preview frame guard",
     )
     .await?;
@@ -3802,8 +3811,8 @@ async fn capture_html_preview(
         BrowserControlError::new(format!("cannot encode preview HTML: {error}"))
     })?;
     let theme = match request.theme.unwrap_or_default() {
-        crate::html_render::HtmlTheme::Dark => "dark",
-        crate::html_render::HtmlTheme::Light => "light",
+        gitterm_core::content::html_render::HtmlTheme::Dark => "dark",
+        gitterm_core::content::html_render::HtmlTheme::Light => "light",
     };
     let source = format!("window.preview = GitTermHtml.create({html},100,'{theme}'); document.body.appendChild(preview.frame); true");
     evaluate_by_value::<bool>(&session, &source, "HTML preview creation").await?;
@@ -3841,7 +3850,10 @@ async fn capture_html_preview(
         .get("contentHeight")
         .and_then(Value::as_u64)
         .ok_or_else(|| BrowserControlError::new("HTML preview omitted contentHeight"))?;
-    let captured = height.clamp(100, u64::from(crate::html_render::MAX_HEIGHT));
+    let captured = height.clamp(
+        100,
+        u64::from(gitterm_core::content::html_render::MAX_HEIGHT),
+    );
     session
         .command(
             "Emulation.setDeviceMetricsOverride",
@@ -5027,7 +5039,7 @@ mod tests {
                 .collect::<HashSet<_>>()
         };
         let before = profiles();
-        let request = crate::html_render::HtmlPreviewRequest {
+        let request = gitterm_core::content::html_render::HtmlPreviewRequest {
             html: r#"<body><div style="height:4300px">A tall visual</div><script>
                 console.log('RTC', typeof RTCPeerConnection, typeof webkitRTCPeerConnection);
                 console.log('THEME',getComputedStyle(document.documentElement).getPropertyValue('--bg'));
@@ -5037,7 +5049,7 @@ mod tests {
                 document.body.append(child);
                 console.warn('preview warning');
             </script></body>"#.into(),
-            width: Some(390), theme: Some(crate::html_render::HtmlTheme::Light),
+            width: Some(390), theme: Some(gitterm_core::content::html_render::HtmlTheme::Light),
         };
         let value = preview_html(request).await.unwrap();
         assert_eq!(value["width"], 390);
@@ -5055,7 +5067,7 @@ mod tests {
         assert_eq!((image.width(), image.height()), (390, 4000));
         std::fs::write(env::temp_dir().join("gitterm-v6-html-preview.png"), bytes).unwrap();
         assert_eq!(profiles(), before);
-        let failure = preview_html(crate::html_render::HtmlPreviewRequest {
+        let failure = preview_html(gitterm_core::content::html_render::HtmlPreviewRequest {
             html: "<script>while(true){}</script>".into(),
             width: None,
             theme: None,

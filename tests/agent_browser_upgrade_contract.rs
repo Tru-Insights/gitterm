@@ -415,7 +415,8 @@ async fn agent_browser_engine_honours_the_front_door_contract() {
     let index = format!("http://127.0.0.1:{site_port}/index.html");
     let other = format!("http://127.0.0.1:{site_port}/other.html");
 
-    let (connection, server) = browser_mcp::prepare(config.path(), "contract").unwrap();
+    let (connection, server) =
+        browser_mcp::prepare(config.path(), "contract", env!("CARGO_PKG_VERSION")).unwrap();
     let server = tokio::spawn(server.run());
     let a = client_for(&connection, "chat-a").await;
     let b = client_for(&connection, "chat-b").await;
@@ -544,8 +545,12 @@ async fn agent_browser_engine_honours_the_front_door_contract() {
             .join("browser-profile/DevToolsActivePort"),
     )
     .unwrap();
-    let (gitterm_connection, gitterm_server) =
-        browser_mcp::prepare(gitterm_config.path(), "contract-gitterm").unwrap();
+    let (gitterm_connection, gitterm_server) = browser_mcp::prepare(
+        gitterm_config.path(),
+        "contract-gitterm",
+        env!("CARGO_PKG_VERSION"),
+    )
+    .unwrap();
     let gitterm_server = tokio::spawn(gitterm_server.run());
     let g = client_for(&gitterm_connection, "chat-g").await;
     assert_eq!(
