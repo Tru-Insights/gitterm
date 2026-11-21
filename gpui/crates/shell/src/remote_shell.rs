@@ -33,6 +33,7 @@ use crate::{
     Shell,
     connect_form::{ConnectForm, ConnectFormOutcome},
     folder_picker::{FolderPicker, FolderPickerOutcome, Machine, PickerFacts},
+    phone::{PhonePanel, PhonePanelOutcome},
     remote_client::RemoteClient,
     theme::Palette,
     workspace_sheet::FolderPickerPurpose,
@@ -54,6 +55,7 @@ pub(crate) struct RemoteState {
     /// Focus to return to when the picker closes.
     pub picker_return_focus: Option<gpui::FocusHandle>,
     pub connect: Option<(Entity<ConnectForm>, Subscription)>,
+    pub phone: Option<(Entity<PhonePanel>, Subscription)>,
     pub sessions: RemoteSessions,
     pub remotes: Vec<RemoteAgentConfig>,
 }
@@ -70,6 +72,7 @@ impl Default for RemoteState {
             picker: None,
             picker_return_focus: None,
             connect: None,
+            phone: None,
             sessions: RemoteSessions::default(),
             remotes: vec![],
         }
@@ -96,6 +99,10 @@ impl Shell {
 
     pub(crate) fn connect_form(&self) -> Option<&Entity<ConnectForm>> {
         self.remote.connect.as_ref().map(|(form, _)| form)
+    }
+
+    pub(crate) fn phone_panel(&self) -> Option<&Entity<PhonePanel>> {
+        self.remote.phone.as_ref().map(|(panel, _)| panel)
     }
 
     /// Iced's configured remotes as last read.
@@ -337,6 +344,46 @@ impl Shell {
             },
         );
         self.remote.connect = Some((form, subscription));
+        self.cover_sheet(true, window, cx);
+        cx.notify();
+    }
+
+    /// "Pair a phone…" (machine key): Iced's panel, read-only. It lists no
+    /// paired phones (they come from a live agent) and grants nothing.
+    pub(crate) fn open_phone_panel(
+        &mut self,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.bar_menu = None;
+        let remote_id = key.strip_prefix("agent:").unwrap_or(key);
+        // Iced names the machine from its config, else by its id.
+        let machine_name = self
+            .saved_facts
+            .snapshot()
+            .repo_machines
+            .into_iter()
+            .find(|machine| machine.key == key)
+            .map_or_else(|| remote_id.to_string(), |machine| machine.name);
+        let panel = cx.new(|cx| PhonePanel::new(machine_name, window, cx));
+        let subscription = cx.subscribe_in(
+            &panel,
+            window,
+            |shell, _, outcome: &PhonePanelOutcome, window, cx| match outcome {
+                PhonePanelOutcome::Close => {
+                    shell.remote.phone = None;
+                    shell.cover_sheet(
+                        shell.new_work_sheet.is_some() || shell.folder_picker().is_some(),
+                        window,
+                        cx,
+                    );
+                    cx.notify();
+                }
+                PhonePanelOutcome::Unavailable(label) => shell.chrome_unavailable(label, cx),
+            },
+        );
+        self.remote.phone = Some((panel, subscription));
         self.cover_sheet(true, window, cx);
         cx.notify();
     }
@@ -603,6 +650,7 @@ impl Shell {
             .map(|p| p.clone().into())
             .into_iter()
             .chain(self.connect_form().map(|f| f.clone().into()))
+            .chain(self.phone_panel().map(|p| p.clone().into()))
             .collect()
     }
 }
