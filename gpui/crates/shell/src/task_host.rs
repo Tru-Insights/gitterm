@@ -14,17 +14,13 @@
 use anyhow::{Context as _, Result};
 use gitterm_browser::browser_mcp::BrowserMcpConnection;
 use gitterm_core::{
-    content::html_render::HtmlPreviewRequest,
     loopback::ListenerBind,
     preview::{
         Preview,
         service::{ServiceContext, classify_operation, preview_notice},
     },
     task_host::{HostEffect, OpenSession, TaskHost},
-    task_mcp::{
-        HtmlPreviewFuture, HtmlPreviewRunner, TaskControlEnvelope, TaskControlReceiver,
-        TaskControlSender, TaskMcpConnection,
-    },
+    task_mcp::{TaskControlEnvelope, TaskControlReceiver, TaskControlSender, TaskMcpConnection},
     tasks::TaskStore,
 };
 use gpui::{App, AppContext, Context, Entity, Global, Subscription, Task};
@@ -273,14 +269,19 @@ impl TaskHostOwner {
             ListenerBind::LoopbackEphemeral,
             services.task_mcp().token().to_string(),
             sender.clone(),
-            refused_html_preview(),
+            // The preview context denies RunnerEffect::HtmlPreview: no Chrome.
+            gitterm_browser::browser_control::html_preview_runner_in(&services),
             SERVER_VERSION,
         )
         .context("bind preview task MCP")?;
+        // The browser server gates every call on its own preview context
+        // over the same roots, so its state root and profile are the host's.
+        let browser_services =
+            Arc::new(ServiceContext::preview(roots.clone()).context("preview browser services")?);
         let (browser, browser_server) = {
             let _entered = runtime.enter();
-            gitterm_browser::browser_mcp::prepare_on(
-                services.state_root(),
+            gitterm_browser::browser_mcp::prepare_scoped(
+                browser_services,
                 ListenerBind::LoopbackEphemeral,
                 SERVER_VERSION,
             )
@@ -366,15 +367,19 @@ impl TaskHostOwner {
         }))
     }
 
-    /// The task server for one native Claude chat, attributed to `caller`
-    /// (the chat's `session_uid`); `None` once the servers have shut down.
-    pub(crate) fn claude_mcp_server(
+    /// The task and browser servers for one native Claude chat, attributed
+    /// to `caller` (the chat's `session_uid`); none once the servers have
+    /// shut down.
+    pub(crate) fn claude_mcp_servers(
         &self,
         caller: &str,
-    ) -> Option<gitterm_core::harness::claude::ClaudeMcpServer> {
-        self.servers
-            .as_ref()
-            .map(|servers| servers.task_mcp.claude_mcp_server(Some(caller)))
+    ) -> Vec<gitterm_core::harness::claude::ClaudeMcpServer> {
+        self.servers.as_ref().map_or_else(Vec::new, |servers| {
+            vec![
+                servers.task_mcp.claude_mcp_server(Some(caller)),
+                servers.browser.claude_mcp_server(Some(caller)),
+            ]
+        })
     }
 
     pub(crate) fn host(&self) -> &TaskHost {
@@ -712,11 +717,4 @@ pub(crate) fn merge_plan_for(
     let saved = chat_facts::load_root_prs(&dir, &index, links, &root, log);
     let found = chat_facts::root_prs(&index, &root, &saved);
     prs::merge_plan_value(&root, plans.get(&root), &watch, found)
-}
-
-/// B7 gates html_preview; until then the preview runner starts nothing.
-fn refused_html_preview() -> HtmlPreviewRunner {
-    Arc::new(|_: HtmlPreviewRequest| -> HtmlPreviewFuture {
-        Box::pin(std::future::ready(Err(preview_notice("html_preview"))))
-    })
 }

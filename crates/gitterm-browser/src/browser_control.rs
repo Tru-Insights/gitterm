@@ -967,8 +967,14 @@ pub struct BrowserController {
 
 impl BrowserController {
     pub fn new(v6_global_config_dir: impl AsRef<Path>) -> Self {
+        Self::with_profile_dir(browser_profile_dir(v6_global_config_dir.as_ref()))
+    }
+
+    /// A controller on a profile the host chose (a preview context's
+    /// `browser_profile_dir`), not `<config dir>/browser-profile`.
+    pub fn with_profile_dir(profile_dir: PathBuf) -> Self {
         Self {
-            profile_dir: browser_profile_dir(v6_global_config_dir.as_ref()),
+            profile_dir,
             child: None,
             endpoint: None,
             registry: BrowserTargetRegistry::default(),
@@ -2145,10 +2151,19 @@ pub struct BrowserControlService {
 
 impl BrowserControlService {
     pub fn new(v6_global_config_dir: impl AsRef<Path>) -> Self {
+        Self::from_controller(BrowserController::new(v6_global_config_dir))
+    }
+
+    /// See [`BrowserController::with_profile_dir`].
+    pub fn with_profile_dir(profile_dir: PathBuf) -> Self {
+        Self::from_controller(BrowserController::with_profile_dir(profile_dir))
+    }
+
+    fn from_controller(controller: BrowserController) -> Self {
         let (telemetry_revision, _) = watch::channel(0);
         Self {
             id: NEXT_BROWSER_CONTROL_SERVICE_ID.fetch_add(1, Ordering::Relaxed),
-            controller: Arc::new(Mutex::new(BrowserController::new(v6_global_config_dir))),
+            controller: Arc::new(Mutex::new(controller)),
             telemetry: Arc::new(Mutex::new(BrowserTelemetryState::default())),
             telemetry_revision,
         }
@@ -3643,6 +3658,35 @@ pub fn html_preview_runner() -> gitterm_core::task_mcp::HtmlPreviewRunner {
                 .map_err(|error| error.to_string())
         })
     })
+}
+
+/// [`html_preview_runner`] behind `services`' `RunnerEffect::HtmlPreview`
+/// check: a context that denies it (the preview) gets a runner that answers
+/// the notice and never starts headless Chrome.
+pub fn html_preview_runner_in(
+    services: &gitterm_core::preview::service::ServiceContext,
+) -> gitterm_core::task_mcp::HtmlPreviewRunner {
+    gate_html_preview(services, html_preview_runner())
+}
+
+/// `runner` when `services` allows the html_preview runner, else a refusal
+/// carrying the notice. The mode is fixed when a context is built, so one
+/// decision here holds for every later call.
+pub fn gate_html_preview(
+    services: &gitterm_core::preview::service::ServiceContext,
+    runner: gitterm_core::task_mcp::HtmlPreviewRunner,
+) -> gitterm_core::task_mcp::HtmlPreviewRunner {
+    use gitterm_core::preview::service::RunnerEffect;
+    match services.runner(RunnerEffect::HtmlPreview, None) {
+        Ok(()) => runner,
+        Err(denied) => {
+            let notice = denied.notice().to_string();
+            std::sync::Arc::new(move |_| {
+                let notice = notice.clone();
+                Box::pin(async move { Err(notice) })
+            })
+        }
+    }
 }
 
 pub async fn preview_html(
