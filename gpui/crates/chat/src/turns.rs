@@ -142,6 +142,63 @@ mod tests {
     }
 
     #[test]
+    fn turn_grouping_ignores_withdrawn() {
+        let echo = |id: &str| Record {
+            at_ms: None,
+            entry: Entry::Harness(HarnessEvent::UserMessageEcho {
+                id: Some(id.into()),
+                text: id.into(),
+                image_count: 0,
+                delivery: None,
+            }),
+        };
+        let lifecycle = |id: &str, state| Record {
+            at_ms: None,
+            entry: Entry::Harness(HarnessEvent::MessageLifecycle {
+                id: id.into(),
+                state,
+            }),
+        };
+        let records = [
+            Record {
+                at_ms: None,
+                entry: Entry::UserPrompt("first".into()),
+            },
+            Record {
+                at_ms: None,
+                entry: Entry::Harness(HarnessEvent::TextDelta("reply".into())),
+            },
+            echo("withdrawn"),
+            lifecycle("withdrawn", crate::events::MessageState::Cancelled),
+            Record {
+                at_ms: None,
+                entry: Entry::Harness(HarnessEvent::TextDelta("more".into())),
+            },
+            // Started, a stale cancel cannot withdraw it (core and Iced agree).
+            echo("sent"),
+            lifecycle("sent", crate::events::MessageState::Started),
+            lifecycle("sent", crate::events::MessageState::Cancelled),
+        ];
+        let model = ChatModel::from_records(&records);
+        assert_eq!(model.rows[2].kind, RowKind::Withdrawn);
+        let turns = group(&model.rows);
+        assert_eq!(
+            turns,
+            [
+                Turn {
+                    user_row: 0,
+                    end: 4
+                },
+                Turn {
+                    user_row: 4,
+                    end: 5
+                }
+            ]
+        );
+        assert!(turns[0].contains(2) && turns[0].contains(3));
+    }
+
+    #[test]
     fn folded_turn_membership_excludes_user_and_next_turn() {
         let records = [
             Record {
