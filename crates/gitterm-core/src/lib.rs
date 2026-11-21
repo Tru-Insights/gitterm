@@ -28,6 +28,7 @@ pub mod tasks;
 pub mod worker_process;
 
 pub mod content;
+pub mod file_page;
 pub mod plans;
 
 #[cfg(feature = "runtime")]

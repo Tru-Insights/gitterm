@@ -1,10 +1,10 @@
 //! Viewer cover/return bridge. Session entities and selection survive the visit.
-use crate::{FileOpen, Pane, PaneKind, Shell, WorkspaceId, data::SessionId, pane};
+use crate::{data::SessionId, pane, FileOpen, Pane, PaneKind, Shell, WorkspaceId};
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
-    Disableable,
     button::{Button, ButtonVariants},
     dock::PanelId,
+    Disableable,
 };
 use std::collections::HashMap;
 
@@ -367,7 +367,7 @@ impl Shell {
                     .child(div().flex_1().child(title))
                     .when(is_review, |header| header.child(DIFF_HINT))
                     .when_some(source, |header, (root, relative)| {
-                        let browser_path = root.join(&relative);
+                        let (browser_root, browser_relative) = (root.clone(), relative.clone());
                         header
                             .child(
                                 Button::new("viewer-open-editor")
@@ -406,12 +406,22 @@ impl Shell {
                                         "Open in Browser"
                                     })
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        if let Err(error) =
-                                            super::actions::open_file(&browser_path, cx)
-                                        {
-                                            this.viewer_error(error, cx);
-                                        }
+                                        let dark = gpui_component::Theme::global(cx).mode.is_dark();
+                                        this.open_viewer_in_browser(
+                                            browser_root.clone(),
+                                            browser_relative.clone(),
+                                            dark,
+                                            cx,
+                                        );
                                     })),
+                            )
+                            .child(
+                                div()
+                                    .debug_selector(|| "viewer-esc-hint".into())
+                                    .text_xs()
+                                    .text_color(gpui_component::Theme::global(cx).muted_foreground)
+                                    .px_2()
+                                    .child("Esc: close"),
                             )
                     })
                     .child(
