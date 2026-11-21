@@ -2813,11 +2813,29 @@ fn overview_task_belongs_to_repo(repo_dir: &Path, common_dir: &Path) -> bool {
 
 fn overview_repo_header<'a>(
     content: Element<'a, Event, Theme, iced::Renderer>,
+    remove: Option<Element<'a, Event, Theme, iced::Renderer>>,
     disclosure: Element<'a, Event, Theme, iced::Renderer>,
 ) -> Row<'a, Event, Theme, iced::Renderer> {
-    row![overview_row_content(content), disclosure]
+    let mut header = Row::new().push(overview_row_content(content));
+    if let Some(remove) = remove {
+        header = header.push(remove);
+    }
+    header
+        .push(disclosure)
         .spacing(6)
         .align_y(iced::Alignment::Center)
+}
+
+fn overview_repo_remove_button<'a>(
+    label: iced::widget::Text<'a, Theme, iced::Renderer>,
+    style: impl Fn(&Theme, button::Status) -> button::Style + 'a,
+    event: Event,
+) -> Element<'a, Event, Theme, iced::Renderer> {
+    button(label)
+        .style(style)
+        .padding([0, 4])
+        .on_press(event)
+        .into()
 }
 
 fn overview_repo_facts(facts: &str, branches: usize, with_pr: usize, running: usize) -> String {
@@ -40618,7 +40636,32 @@ fi
                 || hideable.is_some()
                 || !rows.is_empty()
                 || !gone.is_empty();
-            let mut actions_slot = Row::new().spacing(2).align_y(iced::Alignment::Center);
+            // The remove / hide × is a fixed sibling beside the disclosure, not
+            // part of the shrinking actions slot, so a narrow sidebar never
+            // clips it (TRU-274): the age and Open in editor give way first.
+            let remove_event = if expanded {
+                removable
+                    .map(|repo| Event::WorkspaceRepoRemove(uid, repo.id))
+                    .or_else(|| {
+                        hideable
+                            .clone()
+                            .map(|dir| Event::WorkspaceRepoHide(uid, dir))
+                    })
+            } else {
+                None
+            };
+            let remove_slot: Option<Element<'a, Event, Theme, iced::Renderer>> =
+                remove_event.map(|event| {
+                    overview_repo_remove_button(
+                        text("\u{00D7}").size(font_small).color(text_muted),
+                        self.flat_button_style(),
+                        event,
+                    )
+                });
+            let mut actions_slot = Row::new()
+                .spacing(2)
+                .align_y(iced::Alignment::Center)
+                .clip(true);
             if expanded {
                 if local_repo.is_some() {
                     let editor_name = editor::display_name(&self.editor);
@@ -40655,22 +40698,6 @@ fi
                             .size(10)
                             .color(text_muted)
                             .font(mono),
-                    );
-                }
-                if let Some(repo) = removable {
-                    actions_slot = actions_slot.push(
-                        button(text("\u{00D7}").size(font_small).color(text_muted))
-                            .style(self.flat_button_style())
-                            .padding([0, 4])
-                            .on_press(Event::WorkspaceRepoRemove(uid, repo.id)),
-                    );
-                }
-                if let Some(dir) = hideable.clone() {
-                    actions_slot = actions_slot.push(
-                        button(text("\u{00D7}").size(font_small).color(text_muted))
-                            .style(self.flat_button_style())
-                            .padding([0, 4])
-                            .on_press(Event::WorkspaceRepoHide(uid, dir)),
                     );
                 }
             }
@@ -40744,7 +40771,7 @@ fi
             } else {
                 iced::widget::Space::new().into()
             };
-            let head = overview_repo_header(head_content.into(), disclosure);
+            let head = overview_repo_header(head_content.into(), remove_slot, disclosure);
             let mut column = overview_repo_details(head.into(), facts_line.into());
             column = column.push(overview_repo_branch_slots(
                 rows.iter()
@@ -51120,8 +51147,27 @@ mod tests {
             Length::Fixed(OVERVIEW_DISCLOSURE_WIDTH)
         );
         let header: Element<'_, Event, Theme, iced::Renderer> =
-            overview_repo_header(text("api").into(), disclosure).into();
+            overview_repo_header(text("api").into(), None, disclosure).into();
         assert_eq!(header.as_widget().children().len(), 2);
+    }
+
+    #[test]
+    fn repo_header_keeps_remove_as_a_fixed_sibling_of_the_fill_content() {
+        let remove = overview_repo_remove_button(
+            text("\u{00D7}"),
+            |_, _| button::Style::default(),
+            Event::WorkspaceRepoHide(1, PathBuf::from("/work/api")),
+        );
+        let disclosure = overview_disclosure_button(
+            true,
+            iced::Color::BLACK,
+            |_, _| button::Style::default(),
+            Event::OverviewRowToggle(overview::RowKey::Repo(PathBuf::from("/work/api"))),
+        );
+        let header: Element<'_, Event, Theme, iced::Renderer> =
+            overview_repo_header(text("api").into(), Some(remove), disclosure).into();
+        // content (Fill) + remove + disclosure: only the content gives way.
+        assert_eq!(header.as_widget().children().len(), 3);
     }
 
     #[test]
