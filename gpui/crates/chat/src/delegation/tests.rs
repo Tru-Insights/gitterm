@@ -98,7 +98,10 @@ fn h14_h15_h16_h16a_h16b_iced_control_states_and_order() {
             expected
         );
         assert!(controls.iter().all(|c| c.label == "Open worker tab"
-            || matches!(&c.action,TranscriptAction::PreviewOnly {label} if label==&c.label)));
+            || matches!(&c.action,TranscriptAction::PreviewOnly {label} if label==&c.label)
+            || matches!(&c.action,TranscriptAction::Dismiss(request) if request.label==c.label
+                && request.id=="review-1"
+                && request.active==card.delegation.status.is_active())));
     }
     let mut card = card("review", "completed");
     card.held = true;

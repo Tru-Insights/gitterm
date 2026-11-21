@@ -1757,13 +1757,20 @@ impl Shell {
                 .collect()
         };
         let colors = workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark());
+        let tasks = data::TaskSource::resolve(&source, cx);
         cx.spawn(async move |shell, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     (
-                        workspace_bar::SavedFacts::read_from(&source, &workspaces, &roots, colors),
-                        data::RosterFacts::read_from(&source),
+                        workspace_bar::SavedFacts::read_from(
+                            &source,
+                            &workspaces,
+                            &roots,
+                            colors,
+                            &tasks,
+                        ),
+                        data::RosterFacts::read(&source, &tasks),
                     )
                 })
                 .await;

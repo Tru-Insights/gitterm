@@ -52,9 +52,10 @@ impl SavedFacts {
         workspaces: &[gitterm_core::workspace_config::WorkspaceConfig],
         roots: &std::collections::HashMap<WorkspaceId, Vec<String>>,
         colors: Colors,
+        tasks: &crate::data::TaskSource,
     ) -> anyhow::Result<Self> {
         use anyhow::Context as _;
-        use gitterm_core::{chat_facts, chats::ChatBackend, merge_plan, prs, tasks::TaskStore};
+        use gitterm_core::{chat_facts, chats::ChatBackend, merge_plan, prs};
         use std::collections::{HashMap, HashSet};
         let path = source.join("workspaces.json");
         let file: gitterm_core::workspace_config::WorkspacesFile = serde_json::from_slice(
@@ -65,8 +66,7 @@ impl SavedFacts {
         let watch = prs::WatchFile::load(&watch_path);
         let plans_dir = merge_plan::plans_dir(source);
         let plans = merge_plan::load_plans(&plans_dir);
-        let tasks =
-            TaskStore::load(TaskStore::path_for_config_root(source)).map_err(anyhow::Error::msg)?;
+        let tasks = tasks.load().map_err(anyhow::Error::msg)?;
         let briefs: HashMap<_, _> = watch
             .prs
             .iter()

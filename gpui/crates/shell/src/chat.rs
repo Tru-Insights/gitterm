@@ -316,6 +316,7 @@ impl ChatPane {
             view
         });
         let roster_subscription = Self::forward_roster(&view, cx);
+        view.update(cx, |view, cx| view.set_dismiss_gate(dismiss_gate(), cx));
         let review_subscription = Self::handle_review(&view, saved.cwd.clone(), window, cx);
         let callback = Self::intent_callback(cx.weak_entity());
         view.update(cx, |view, cx| view.set_intent_callback(callback, cx));
@@ -478,6 +479,7 @@ impl ChatPane {
             view
         });
         let roster_subscription = Self::forward_roster(&view, cx);
+        view.update(cx, |view, cx| view.set_dismiss_gate(dismiss_gate(), cx));
         let review_subscription = Self::handle_review(&view, saved.cwd.clone(), window, cx);
         Self {
             controller,
@@ -813,6 +815,45 @@ impl Render for ChatPane {
             .child(div().flex_1().min_h_0().child(self.view.clone()))
     }
 }
+fn dismiss_gate() -> gitterm_gpui_chat::interactions::DismissGate {
+    Rc::new(|request, cx| {
+        dismiss_notice(
+            crate::task_panel::host(cx).map(|host| host.services()),
+            request,
+        )
+    })
+}
+
+/// Iced `delegation_dismiss` runs `Intent::Dismiss`: abort a live run, then
+/// persist the dismissal. The host's `ServiceContext` decides each effect;
+/// the preview denies both, so nothing is stopped or written. The notice
+/// keeps the button's label, as before. Without a host it is the same notice.
+// shortcut: an allowed effect is reported, not run; B9–B11 add the executor.
+pub(crate) fn dismiss_notice(
+    services: Option<&gitterm_core::preview::service::ServiceContext>,
+    request: &gitterm_gpui_chat::interactions::DismissRequest,
+) -> String {
+    use gitterm_core::delegation_state::Effect;
+    use gitterm_gpui_chat::interactions::preview_notice;
+    let Some(services) = services else {
+        return preview_notice(&request.label);
+    };
+    let abort = request.active.then(|| Effect::Abort(request.id.clone()));
+    let persist = Effect::PersistDismiss {
+        id: request.id.clone(),
+        cancel: request.active,
+    };
+    if abort
+        .iter()
+        .chain([&persist])
+        .any(|effect| services.delegation_effect(effect, None).is_err())
+    {
+        preview_notice(&request.label)
+    } else {
+        format!("{} · not wired in the GPUI preview", request.label)
+    }
+}
+
 /// The running preview task host's task and browser servers for a chat
 /// attributed to `caller`. Both gate every call server-side. Without a host
 /// the chat launches with no MCP server, and the first such launch says why.
