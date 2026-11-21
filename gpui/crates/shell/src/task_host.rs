@@ -6,6 +6,11 @@
 //! and log servers bind OS-assigned loopback ports, and the owner is the only
 //! receiver of the task command ingress. Nothing here launches, attaches,
 //! notifies or delivers: imported running or queued records stay inert.
+//!
+//! Reads answer in Iced's shapes from what the preview reads: the seeded
+//! store, the GPUI chat panes, and Iced's settings, plan-limits, merge-plan,
+//! PR-watch and chat-facts files (only read). Every write, launch and run
+//! answers the preview notice.
 use anyhow::{Context as _, Result};
 use gitterm_browser::browser_mcp::BrowserMcpConnection;
 use gitterm_core::{
@@ -15,7 +20,7 @@ use gitterm_core::{
         Preview,
         service::{ServiceContext, classify_operation, preview_notice},
     },
-    task_host::{HostEffect, TaskHost},
+    task_host::{HostEffect, OpenSession, TaskHost},
     task_mcp::{
         HtmlPreviewFuture, HtmlPreviewRunner, TaskControlEnvelope, TaskControlReceiver,
         TaskControlSender, TaskMcpConnection,
@@ -81,15 +86,16 @@ impl Ingress {
 
 pub(crate) struct HostConfig {
     pub roots: Arc<Preview>,
-    /// Iced's `tasks.json`, found the way `data.rs` reads it. Only read.
-    pub iced_tasks: PathBuf,
+    /// Iced's config dir, found the way `data.rs` reads it. Its `tasks.json`
+    /// is seeded from; it and the files the reads use are only read.
+    pub iced_config: PathBuf,
     pub ingress: Ingress,
 }
 impl HostConfig {
     pub(crate) fn production(roots: Arc<Preview>) -> Self {
         Self {
             roots,
-            iced_tasks: TaskStore::path_for_config_root(&crate::workspace_config::iced_config_dir()),
+            iced_config: crate::workspace_config::iced_config_dir(),
             ingress: Ingress::Process,
         }
     }
@@ -229,6 +235,9 @@ struct Servers {
 pub(crate) struct TaskHostOwner {
     host: TaskHost,
     roots: Arc<Preview>,
+    /// Iced's config dir; never written.
+    iced_config: PathBuf,
+    /// Iced's `tasks.json` in it.
     source: PathBuf,
     stamp: Stamp,
     /// The latest seed problem, shown until a seed succeeds.
@@ -247,9 +256,10 @@ impl TaskHostOwner {
     pub(crate) fn start(config: HostConfig, cx: &mut App) -> Result<Entity<Self>> {
         let HostConfig {
             roots,
-            iced_tasks,
+            iced_config,
             ingress,
         } = config;
+        let iced_tasks = TaskStore::path_for_config_root(&iced_config);
         let lock = HostLock::acquire(&roots)?;
         let (store, stamp) = seed_copy(&roots, &iced_tasks)?;
         let services = ServiceContext::preview(roots.clone()).context("preview task services")?;
@@ -337,6 +347,7 @@ impl TaskHostOwner {
             Self {
                 host,
                 roots,
+                iced_config,
                 source: iced_tasks,
                 stamp,
                 notice: None,
@@ -390,32 +401,91 @@ impl TaskHostOwner {
             .map(|servers| servers.browser.endpoint().to_string())
     }
 
-    /// The one executor for host effects. B4 answers every effect with the
-    /// preview notice except the task read, which returns the authority's
-    /// projection. B5 fills in the read arms (open sessions, presets, plan
-    /// limits, html_render, delegation_get, merge_plan_get); B9–B11 the
-    /// fixture-mode write and process arms.
-    fn execute(&mut self, envelope: TaskControlEnvelope, _cx: &mut Context<Self>) {
+    fn execute(&mut self, envelope: TaskControlEnvelope, cx: &mut Context<Self>) {
         let label = classify_operation(&envelope.operation).label;
-        let notice = || Err(preview_notice(label));
-        let Some(effect) = self.host.dispatch(envelope) else {
-            return;
-        };
+        if let Some(effect) = self.host.dispatch(envelope) {
+            self.execute_effect(effect, label, cx);
+        }
+    }
+
+    /// The one executor for host effects; `label` is the operation's. Reads
+    /// answer as Iced's arms do. Writes, launches and runs are denied by the
+    /// preview gate before dispatch; their arms answer the same notice and do
+    /// nothing else: no store write, no process, no network. B9–B11 fill in
+    /// the fixture-mode write and process arms.
+    pub(crate) fn execute_effect(
+        &mut self,
+        effect: HostEffect,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) {
         match effect {
-            HostEffect::Read { reply, effect } => reply.send(read_projection(effect)),
-            HostEffect::PlanLimits { reply }
-            | HostEffect::HtmlRender { reply, .. }
-            | HostEffect::Create { reply, .. }
+            HostEffect::PlanLimits { reply } => reply.send(plan_limits(&self.iced_config)),
+            HostEffect::HtmlRender {
+                reply,
+                caller,
+                request,
+            } => reply.send(html_render(request, caller.as_deref(), &open_chats(cx))),
+            HostEffect::Read { reply, effect } => {
+                let source = cx.try_global::<crate::work_sidebar::IcedWorkSource>();
+                let workspaces = source.map_or(&[][..], |source| &source.workspaces[..]);
+                let presets: Vec<String> =
+                    crate::workspace_config::load_iced_settings_from(&self.iced_config)
+                        .agent_presets
+                        .iter()
+                        .map(|preset| preset.name.clone())
+                        .collect();
+                reply.send(read_projection(
+                    effect,
+                    &open_chats(cx),
+                    workspaces,
+                    &presets,
+                ));
+            }
+            // Iced adds the live worker card; the preview runs no workers.
+            HostEffect::DelegationRecord { reply, record, .. } => reply.send(Ok(record)),
+            HostEffect::MergePlanGet { reply, caller } => {
+                reply.send(self.merge_plan_get(caller.as_deref(), cx));
+            }
+            HostEffect::Create { reply, .. }
             | HostEffect::LaunchSession { reply, .. }
             | HostEffect::UpdateHandoff { reply, .. }
             | HostEffect::DelegateTask { reply, .. }
             | HostEffect::TurnEnded { reply, .. }
             | HostEffect::RequestReview { reply, .. }
             | HostEffect::RequestConsult { reply, .. }
-            | HostEffect::DelegationRecord { reply, .. }
-            | HostEffect::MergePlanSet { reply, .. }
-            | HostEffect::MergePlanGet { reply, .. } => reply.send(notice()),
+            | HostEffect::MergePlanSet { reply, .. } => reply.send(Err(preview_notice(label))),
         }
+    }
+
+    /// Iced's `merge_plan_get`: the plan of the caller's root chat (caller
+    /// pane, its conversation, then the conversation's root through saved
+    /// facts and the store's links), with live PR state and the root's
+    /// unplanned PRs.
+    // shortcut: the plan, watch and facts files are read on the UI thread per
+    // call; move them to the background executor if a call shows up in frames.
+    fn merge_plan_get(&self, caller: Option<&str>, cx: &App) -> Result<serde_json::Value, String> {
+        const TOOL: &str = "merge_plan_get";
+        let caller =
+            caller.ok_or_else(|| gitterm_core::task_mcp::missing_plan_caller_error(TOOL))?;
+        let chat = open_chats(cx)
+            .into_iter()
+            .find(|chat| chat.session_uid == caller)
+            .ok_or_else(|| {
+                format!("{TOOL}: no GitTerm tab on this Mac has session {caller}; merge plans are for this Mac's chats")
+            })?;
+        let conversation = chat.conversation.ok_or_else(|| {
+            format!(
+                "{TOOL}: this tab has no conversation id yet; call it again after your first reply"
+            )
+        })?;
+        let workspaces = cx
+            .try_global::<crate::work_sidebar::IcedWorkSource>()
+            .map_or(&[][..], |source| &source.workspaces[..]);
+        let links = self.host.store().as_ref().map_or_else(Vec::new, |store| {
+            crate::data::iced_chat_links(workspaces, store)
+        });
+        Ok(merge_plan_for(&self.iced_config, &links, &conversation))
     }
 
     /// Re-seeds when Iced's file changed and the host owns no in-flight work.
@@ -496,23 +566,152 @@ impl TaskHostOwner {
     }
 }
 
-/// B4's task read: the authority's records as stored. B5 adds open sessions
-/// and presets (Iced's `task_control_value` shape).
-fn read_projection(
+/// One GPUI chat pane, as the read arms see it.
+#[derive(Clone, Debug)]
+pub(crate) struct OpenChat {
+    /// The task MCP caller: the pane's target `session_uid`.
+    pub session_uid: String,
+    /// The provider conversation id, once the first reply named it.
+    pub conversation: Option<String>,
+    pub task_id: Option<String>,
+    pub task_session_id: Option<String>,
+    pub cwd: PathBuf,
+}
+
+/// The workspace owner's open chat panes; none before the window exists.
+fn open_chats(cx: &App) -> Vec<OpenChat> {
+    let Some(owner) = cx
+        .try_global::<crate::work_sidebar::IcedWorkSource>()
+        .and_then(|source| source.owner.upgrade())
+    else {
+        return Vec::new();
+    };
+    owner
+        .read(cx)
+        .chats
+        .values()
+        .map(|pane| {
+            let pane = pane.read(cx);
+            let target = pane.target();
+            OpenChat {
+                session_uid: target.session_uid,
+                conversation: pane.chat_session_id(),
+                task_id: target.task_id,
+                task_session_id: target.task_session_id,
+                cwd: pane.cwd().to_path_buf(),
+            }
+        })
+        .collect()
+}
+
+/// Iced's `plan_limits` arm on Iced's plan-limits file, read as Usage reads it.
+pub(crate) fn plan_limits(iced_config: &Path) -> Result<serde_json::Value, String> {
+    use gitterm_core::plan_limits::{PlanLimitsFile, evaluate_policy};
+    let file = PlanLimitsFile::load(&PlanLimitsFile::path_in(iced_config));
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64);
+    serde_json::to_value(evaluate_policy(&file, now).report)
+        .map_err(|error| format!("cannot encode plan_limits result: {error}"))
+}
+
+/// Iced's `html_render` arm: a valid request from an open GPUI chat (every
+/// GPUI chat is a native Claude chat).
+pub(crate) fn html_render(
+    request: gitterm_core::content::html_render::HtmlRenderRequest,
+    caller: Option<&str>,
+    chats: &[OpenChat],
+) -> Result<serde_json::Value, String> {
+    if !gitterm_core::content::html_render::NATIVE_HTML_SUPPORTED {
+        return Err("html_render currently requires GitTerm for macOS; this platform lacks the required native subframe navigation guard".into());
+    }
+    request.validate()?;
+    if !chats
+        .iter()
+        .any(|chat| Some(chat.session_uid.as_str()) == caller)
+    {
+        return Err("html_render requires an open local native Claude or ACP chat tab (Pi does not restore conversation history)".into());
+    }
+    serde_json::to_value(gitterm_core::chat::html_render::HtmlRenderResult {
+        html_render: request,
+    })
+    .map_err(|error| format!("cannot encode visual reply: {error}"))
+}
+
+/// The task read in Iced's shape: each task with the GPUI chats bound to it
+/// as `open_sessions`, and Iced's preset names on a list.
+pub(crate) fn read_projection(
     effect: gitterm_core::task_commands::TaskReadEffect,
+    chats: &[OpenChat],
+    workspaces: &[gitterm_core::workspace_config::WorkspaceConfig],
+    presets: &[String],
 ) -> Result<serde_json::Value, String> {
     use gitterm_core::task_commands::TaskProjection;
     let value = |task: &gitterm_core::tasks::TaskRecord| {
-        serde_json::to_value(task)
-            .map_err(|error| format!("could not serialize task {}: {error}", task.task_id))
+        gitterm_core::task_host::task_control_value(task, &open_sessions(task, chats, workspaces))
     };
     match effect.projection? {
         TaskProjection::List(tasks) => Ok(serde_json::json!({
             "tasks": tasks.iter().map(value).collect::<Result<Vec<_>, _>>()?,
-            "available_presets": [],
+            "available_presets": presets,
         })),
         TaskProjection::Get(task) => value(&task),
     }
+}
+
+/// Iced lists the task's tabs; the preview's are its chat panes. Preview
+/// panes start without a task (`sessions::fresh_target`), so this is empty
+/// until GPUI opens task sessions.
+fn open_sessions(
+    task: &gitterm_core::tasks::TaskRecord,
+    chats: &[OpenChat],
+    workspaces: &[gitterm_core::workspace_config::WorkspaceConfig],
+) -> Vec<OpenSession> {
+    chats
+        .iter()
+        .filter(|chat| chat.task_id.as_deref() == Some(task.task_id.as_str()))
+        .map(|chat| OpenSession {
+            session_id: chat.task_session_id.clone(),
+            label: chat.cwd.file_name().map_or_else(
+                || chat.cwd.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            ),
+            workspace: workspaces
+                .iter()
+                .find(|workspace| chat.cwd.starts_with(&workspace.dir))
+                .map_or_else(
+                    || chat.cwd.display().to_string(),
+                    |workspace| workspace.name.clone(),
+                ),
+            // shortcut: the active pane lives on the Shell, which the host
+            // cannot read; report it when B8 gives the host pane state.
+            is_active: false,
+        })
+        .collect()
+}
+
+/// Iced's `merge_plan_value` for the root of `conversation`, from Iced's
+/// files. Roots and PRs follow Iced's rules over a stand-in index built from
+/// the saved facts files (the preview has no transcript index). Iced also
+/// adds PRs its live tabs saw and its cached task-branch lookups; the
+/// preview has neither (no PR scan of GPUI turns, no `gh`), so
+/// `unplanned_prs` holds the root's saved chat facts PRs only.
+pub(crate) fn merge_plan_for(
+    iced_config: &Path,
+    links: &[gitterm_core::chat_facts::ChildLink],
+    conversation: &str,
+) -> serde_json::Value {
+    use gitterm_core::{chat_facts, merge_plan, prs};
+    let log = |message: &str| eprintln!("{message}");
+    let dir = chat_facts::facts_dir(iced_config);
+    let mut index = chat_facts::saved_facts_index(&dir, links, log);
+    chat_facts::resolve_tree(&mut index, links);
+    let root = chat_facts::root_chat_of(&index, conversation, || links.to_vec());
+    let plans = merge_plan::load_plans(&merge_plan::plans_dir(iced_config));
+    let watch = prs::WatchFile::load(&prs::WatchFile::path_in(iced_config));
+    let saved = chat_facts::load_root_prs(&dir, &index, links, &root, log);
+    let found = chat_facts::root_prs(&index, &root, &saved);
+    prs::merge_plan_value(&root, plans.get(&root), &watch, found)
 }
 
 /// B7 gates html_preview; until then the preview runner starts nothing.

@@ -153,10 +153,16 @@ fn scan_one(
         mark_scanned(&marker)?;
         return Ok(None);
     }
-    let conversation = scan
-        .conversation
-        .as_ref()
-        .ok_or("task session has no recorded conversation id")?;
+    // Scans run only for finished delegations, so a missing conversation id
+    // never appears later: skip once instead of retrying every launch.
+    let Some(conversation) = scan.conversation.as_ref() else {
+        eprintln!(
+            "[worker-prs] delegation {}: task session has no recorded conversation id",
+            scan.delegation_id
+        );
+        mark_scanned(&marker)?;
+        return Ok(None);
+    };
     let transcript = crate::chats::task_conversation_path_under(home, conversation)?;
     let prs = scan_transcript(&transcript, conversation.backend)
         .map_err(|error| format!("cannot read {}: {error}", transcript.display()))?;
@@ -1157,5 +1163,24 @@ GH_TOKEN="$(gh auth token --user example-user)" gh pr create --draft --base deve
         assert!(!facts_dir(&config).exists());
         let due = Scans::default().take_due(&[worker], &[], &HashMap::new(), now());
         assert!(run(due, &config, temp.path()).is_empty());
+    }
+
+    #[test]
+    fn missing_conversation_is_marked_scanned_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        let path = parent(&config);
+        let before = std::fs::read(&path).unwrap();
+        let scan = Scan {
+            delegation_id: "deleg-1".into(),
+            parent: Some("parent-chat".into()),
+            conversation: None,
+        };
+        let marker = config.join("worker-pr-scans").join("deleg-1");
+        assert_eq!(scan_one(&scan, &config, temp.path()), Ok(None));
+        assert!(marker.exists());
+        // Second scan stops at the marker; home has no transcript to read.
+        assert_eq!(scan_one(&scan, &config, temp.path()), Ok(None));
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
 }

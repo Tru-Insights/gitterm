@@ -866,3 +866,122 @@ fn production_dispatch_and_admission_unchanged() {
         (vec!["in".into(), "out".into()], vec![])
     );
 }
+
+/// Iced's `task_control_value` before it moved here, kept verbatim over a
+/// stand-in for its tabs: the core fn must answer the same JSON.
+#[test]
+fn task_control_value_matches_iced() {
+    struct Tab {
+        id: u64,
+        task_id: Option<String>,
+        task_session_id: Option<String>,
+        repo_name: String,
+    }
+    struct Workspace {
+        name: String,
+        tabs: Vec<Tab>,
+        active_tab: usize,
+    }
+    let tab = |id, task: Option<&str>, session: Option<&str>, repo: &str| Tab {
+        id,
+        task_id: task.map(str::to_string),
+        task_session_id: session.map(str::to_string),
+        repo_name: repo.into(),
+    };
+    let workspaces = [
+        Workspace {
+            name: "First".into(),
+            tabs: vec![
+                tab(1, Some("t1"), Some("s1"), "api"),
+                tab(2, None, None, "other"),
+            ],
+            active_tab: 0,
+        },
+        Workspace {
+            name: "Second".into(),
+            tabs: vec![
+                tab(3, Some("t1"), None, "web"),
+                tab(4, Some("t2"), Some("s4"), "api"),
+            ],
+            active_tab: 0,
+        },
+    ];
+    let active_workspace_index = 1;
+    let old = |task: &TaskRecord| -> Result<Value, String> {
+        let mut value = serde_json::to_value(task)
+            .map_err(|error| format!("could not serialize task {}: {error}", task.task_id))?;
+        let sessions = workspaces
+            .iter()
+            .enumerate()
+            .flat_map(|(workspace_idx, workspace)| {
+                workspace
+                    .tabs
+                    .iter()
+                    .filter(|tab| tab.task_id.as_deref() == Some(task.task_id.as_str()))
+                    .map(move |tab| {
+                        serde_json::json!({
+                            "session_id": tab.task_session_id,
+                            "label": tab.repo_name,
+                            "workspace": workspace.name,
+                            "is_active": workspace_idx == active_workspace_index
+                                && workspace.active_tab < workspace.tabs.len()
+                                && workspace.tabs[workspace.active_tab].id == tab.id,
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        value
+            .as_object_mut()
+            .ok_or_else(|| format!("task {} did not serialize as an object", task.task_id))?
+            .insert(
+                "open_sessions".to_string(),
+                serde_json::Value::Array(sessions),
+            );
+        Ok(value)
+    };
+    // The new call site, as Iced's main.rs now builds it.
+    let new = |task: &TaskRecord| {
+        let sessions: Vec<OpenSession> = workspaces
+            .iter()
+            .enumerate()
+            .flat_map(|(workspace_idx, workspace)| {
+                workspace
+                    .tabs
+                    .iter()
+                    .filter(|tab| tab.task_id.as_deref() == Some(task.task_id.as_str()))
+                    .map(move |tab| OpenSession {
+                        session_id: tab.task_session_id.clone(),
+                        label: tab.repo_name.clone(),
+                        workspace: workspace.name.clone(),
+                        is_active: workspace_idx == active_workspace_index
+                            && workspace.active_tab < workspace.tabs.len()
+                            && workspace.tabs[workspace.active_tab].id == tab.id,
+                    })
+            })
+            .collect();
+        task_control_value(task, &sessions)
+    };
+    for id in ["t1", "t2", "t3"] {
+        let task = crate::delegation_test_support::test_task(id, Path::new("/repo/wt"));
+        let expected = old(&task).unwrap();
+        assert_eq!(new(&task).unwrap(), expected, "{id}");
+        // Byte-identical too, not only equal as maps.
+        assert_eq!(
+            serde_json::to_string(&new(&task).unwrap()).unwrap(),
+            serde_json::to_string(&expected).unwrap()
+        );
+    }
+    let sessions = old(&crate::delegation_test_support::test_task(
+        "t1",
+        Path::new("/w"),
+    ))
+    .unwrap()["open_sessions"]
+        .clone();
+    assert_eq!(
+        sessions,
+        json!([
+            {"session_id": "s1", "label": "api", "workspace": "First", "is_active": false},
+            {"session_id": null, "label": "web", "workspace": "Second", "is_active": true},
+        ])
+    );
+}

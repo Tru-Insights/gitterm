@@ -37,7 +37,8 @@ use crate::task_mcp::{
     TaskControlSender, TaskSessionEventRequest, UpdateTaskHandoffRequest,
 };
 use crate::tasks::state::TaskAuthority;
-use crate::tasks::{Delegation, DelegationChild, DelegationStatus, TaskStore};
+use crate::tasks::{Delegation, DelegationChild, DelegationStatus, TaskRecord, TaskStore};
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::future::Future;
 use std::path::PathBuf;
@@ -133,6 +134,34 @@ pub enum HostEffect {
         reply: TaskControlReply,
         caller: Option<String>,
     },
+}
+
+/// One open session of a task, as `task_get` and `task_list` report it in
+/// `open_sessions`: the frontend's tab or pane bound to the task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OpenSession {
+    pub session_id: Option<String>,
+    pub label: String,
+    pub workspace: String,
+    pub is_active: bool,
+}
+
+/// A task as the task tools answer it: the stored record plus the
+/// frontend's `open_sessions` for it.
+pub fn task_control_value(task: &TaskRecord, sessions: &[OpenSession]) -> Result<Value, String> {
+    let mut value = serde_json::to_value(task)
+        .map_err(|error| format!("could not serialize task {}: {error}", task.task_id))?;
+    let sessions = serde_json::to_value(sessions).map_err(|error| {
+        format!(
+            "could not serialize task {} sessions: {error}",
+            task.task_id
+        )
+    })?;
+    value
+        .as_object_mut()
+        .ok_or_else(|| format!("task {} did not serialize as an object", task.task_id))?
+        .insert("open_sessions".to_string(), sessions);
+    Ok(value)
 }
 
 pub struct TaskHost {

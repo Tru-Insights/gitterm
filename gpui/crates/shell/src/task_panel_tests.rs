@@ -55,7 +55,7 @@ impl Fixture {
         let (sender, receiver) = command_channel();
         let config = HostConfig {
             roots: self.roots.clone(),
-            iced_tasks: self.source(),
+            iced_config: self.iced.clone(),
             ingress: Ingress::Channel(sender, receiver),
         };
         let owner = cx.update(|cx| TaskHostOwner::start(config, cx)).unwrap();
