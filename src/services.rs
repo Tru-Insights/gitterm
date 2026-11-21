@@ -2,7 +2,7 @@ use crate::{
     add_word_diffs_to_lines, build_syntax_highlight_lines, DiffLine, DiffLineType, DiffSnapshot,
     FileEntry, FileLoadSnapshot, FileSyntaxSnapshot, FileVersionSignature, GitBranchEntry,
     GitStatusSnapshot, GitWorktreeEntry, GitWorktreesSnapshot, RemoteHostConfig,
-    RemoteSessionEntry, RemoteSessionsSnapshot, TabState,
+    RemoteSessionsSnapshot, TabState,
 };
 use std::path::PathBuf;
 use std::time::Instant;
@@ -208,72 +208,7 @@ pub(crate) fn collect_git_worktrees(tab_id: usize, repo_path: PathBuf) -> GitWor
 
 pub(crate) fn collect_remote_sessions(host: RemoteHostConfig) -> RemoteSessionsSnapshot {
     let started = Instant::now();
-    let mut snapshot = RemoteSessionsSnapshot {
-        host_name: host.name.clone(),
-        sessions: Vec::new(),
-        error: None,
-    };
-
-    let remote_command = format!(
-        "{} list-sessions -F '#{{session_name}}\t#{{session_windows}}\t#{{session_attached}}' 2>/dev/null || true",
-        host.tmux_path
-    );
-    let output = match std::process::Command::new("ssh")
-        .arg("-i")
-        .arg(&host.identity_file)
-        .args([
-            "-o",
-            "IdentitiesOnly=yes",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=10",
-        ])
-        .arg(&host.ssh_target)
-        .arg(remote_command)
-        .output()
-    {
-        Ok(output) => output,
-        Err(e) => {
-            snapshot.error = Some(format!("Failed to run ssh: {}", e));
-            return snapshot;
-        }
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        snapshot.error = if stderr.is_empty() {
-            Some(format!("ssh exited with status {}", output.status))
-        } else {
-            Some(stderr)
-        };
-        return snapshot;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let mut parts = line.split('\t');
-        let name = parts.next().unwrap_or("").trim().to_string();
-        if name.is_empty() {
-            continue;
-        }
-        let windows = parts
-            .next()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0);
-        let attached = parts
-            .next()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0);
-        snapshot.sessions.push(RemoteSessionEntry {
-            name,
-            windows,
-            attached,
-        });
-    }
-
-    snapshot.sessions.sort_by(|a, b| a.name.cmp(&b.name));
-
+    let snapshot = gitterm_core::remote::ssh_sessions::collect_remote_sessions(&host);
     let elapsed = started.elapsed();
     perf_log!(
         "remote_sessions host={} sessions={} took={}ms",
@@ -281,7 +216,6 @@ pub(crate) fn collect_remote_sessions(host: RemoteHostConfig) -> RemoteSessionsS
         snapshot.sessions.len(),
         elapsed.as_millis()
     );
-
     snapshot
 }
 

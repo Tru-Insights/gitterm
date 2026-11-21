@@ -1824,11 +1824,8 @@ pub struct RemoteSessionsFile {
     pub remote_sessions: Vec<RemoteSessionConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct RemoteAgentsFile {
-    #[serde(default = "default_remote_agents")]
-    pub remote_agents: Vec<RemoteAgentConfig>,
-}
+/// Shared with the GPUI preview, which reads it through the same type.
+pub use gitterm_core::remote::config::RemoteAgentsFile;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteSessionConfig {
@@ -2244,12 +2241,19 @@ impl RemoteSessionsFile {
     }
 }
 
-impl RemoteAgentsFile {
-    pub fn file_path() -> PathBuf {
-        global_config_dir().join("remote-agents.json")
+/// Iced's read/write of the shared `RemoteAgentsFile` in its config dir.
+pub trait RemoteAgentsFileStore: Sized {
+    fn file_path() -> PathBuf;
+    fn load() -> Option<Self>;
+    fn save(&self);
+}
+
+impl RemoteAgentsFileStore for RemoteAgentsFile {
+    fn file_path() -> PathBuf {
+        global_config_dir().join(gitterm_core::remote::config::REMOTE_AGENTS_FILE)
     }
 
-    pub fn load() -> Option<Self> {
+    fn load() -> Option<Self> {
         let path = Self::file_path();
         if path.exists() {
             let contents = std::fs::read_to_string(&path).ok()?;
@@ -2259,7 +2263,7 @@ impl RemoteAgentsFile {
         }
     }
 
-    pub fn save(&self) {
+    fn save(&self) {
         let path = Self::file_path();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);

@@ -285,7 +285,10 @@ fn sheet_folder_picker_returns_selection_and_cancel_without_creating_work(cx: &m
     click(cx, "pstrip-new-work");
     cx.simulate_input("Draft work");
     draw(cx);
+    // Add repo… opens the in-app picker (D24); its macOS dialog is the OS picker.
     click(cx, "workspace-sheet-add-repo");
+    assert!(cx.debug_bounds("folder-picker").is_some());
+    click(cx, "folder-picker-native");
     cx.simulate_path_prompt_response(|options| {
         assert!(options.directories && !options.files && !options.multiple);
         Some(vec![repo.clone()])
@@ -300,8 +303,7 @@ fn sheet_folder_picker_returns_selection_and_cancel_without_creating_work(cx: &m
         assert_eq!(s.workspaces.len(), 2);
     });
     click(cx, "workspace-sheet-add-repo");
-    cx.simulate_path_prompt_response(|_| None);
-    draw(cx);
+    click(cx, "folder-picker-cancel");
     cx.read(|cx| {
         let s = shell.read(cx);
         let sheet = s.new_work_sheet.as_ref().unwrap().read(cx);

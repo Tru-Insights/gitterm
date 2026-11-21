@@ -285,5 +285,39 @@ impl<P> State<P> {
     }
 }
 
+/// A remote machine's chat-index state as the Chats/Find machine header
+/// names it. This Mac has no status: its index is always local.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteIndexStatus {
+    Syncing,
+    Unreachable,
+    UnreachableCached,
+    Connected,
+    NotSynced,
+}
+
+impl RemoteIndexStatus {
+    /// From the index (loading, failed, has entries), or None before a sync.
+    pub fn of(index: Option<(bool, bool, bool)>) -> Self {
+        match index {
+            Some((true, _, _)) => Self::Syncing,
+            Some((false, true, false)) => Self::Unreachable,
+            Some((false, true, true)) => Self::UnreachableCached,
+            Some((false, false, _)) => Self::Connected,
+            None => Self::NotSynced,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Syncing => "⟳ syncing",
+            Self::Unreachable => "○ unreachable",
+            Self::UnreachableCached => "○ unreachable · cached index",
+            Self::Connected => "● connected",
+            Self::NotSynced => "○ not yet synced",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

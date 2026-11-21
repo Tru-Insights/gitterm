@@ -134,8 +134,9 @@ use work_prs::PrEvent;
 // Start with just config for now to avoid conflicts
 use config::{
     AgentPreset, BottomTerminalConfig, Config, ParkedInfo, QuickCommand, RemoteAgentConfig,
-    RemoteAgentsFile, RemoteSessionConfig, RemoteSessionsFile, RepoConfig, RepoKey, WorkspaceColor,
-    WorkspaceConfig, WorkspaceLocationConfig, WorkspaceTabConfig, WorkspacesFile,
+    RemoteAgentsFile, RemoteAgentsFileStore, RemoteSessionConfig, RemoteSessionsFile, RepoConfig,
+    RepoKey, WorkspaceColor, WorkspaceConfig, WorkspaceLocationConfig, WorkspaceTabConfig,
+    WorkspacesFile,
 };
 use events::SidebarMode;
 use theme::AppTheme;
@@ -8597,14 +8598,7 @@ impl TerminalRedrawQueue {
     }
 }
 
-fn expand_home_path(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(path)
-}
+use gitterm_core::remote::token::expand_home_path;
 
 fn remote_session_definition_from_config(config: &RemoteSessionConfig) -> RemoteSessionDefinition {
     RemoteSessionDefinition {
@@ -8649,11 +8643,7 @@ fn remote_session_definitions_from_config(
         .collect()
 }
 
-fn push_remote_agent_config(definitions: &mut Vec<RemoteAgentConfig>, agent: RemoteAgentConfig) {
-    if !definitions.iter().any(|existing| existing.id == agent.id) {
-        definitions.push(agent);
-    }
-}
+use gitterm_core::remote::config::push_remote_agent_config;
 
 /// Insert or update an agent by id. Updates touch only the fields the
 /// connect form edits; hand-maintained `shell_command` / `session_commands`
@@ -8750,15 +8740,7 @@ struct RemoteChatState {
 }
 
 fn remote_agent_client_config(agent: RemoteAgentConfig) -> RemoteAgentClientConfig {
-    let token_ref = match agent.auth {
-        config::RemoteAgentAuthConfig::Token { token_ref } => token_ref,
-    };
-    RemoteAgentClientConfig {
-        remote_id: agent.id,
-        name: agent.name,
-        endpoint: agent.endpoint,
-        token_ref,
-    }
+    agent.into()
 }
 
 fn push_remote_session_definition(
@@ -8774,11 +8756,11 @@ fn push_remote_session_definition(
 }
 
 fn remote_codex_session_name(session: &RemoteSessionDefinition) -> String {
-    format!("{}-codex", session.session_name)
+    gitterm_core::remote::ssh_sessions::codex_session_name(&session.session_name)
 }
 
 fn remote_claude_session_name(session: &RemoteSessionDefinition) -> String {
-    format!("{}-claude", session.session_name)
+    gitterm_core::remote::ssh_sessions::claude_session_name(&session.session_name)
 }
 
 fn remote_workspace_name(session: &RemoteSessionDefinition) -> String {
@@ -8998,35 +8980,11 @@ struct FolderPicker {
     start_hint: Option<String>,
 }
 
-/// Where the folder picker opens on a machine: the folder last chosen
-/// there this session, else `hint`, else the machine's home, else "/".
-fn folder_picker_start_dir(
-    last_chosen: Option<&str>,
-    hint: Option<&str>,
-    home: Option<&str>,
-) -> String {
-    [last_chosen, hint, home]
-        .into_iter()
-        .flatten()
-        .find(|dir| !dir.is_empty())
-        .unwrap_or("/")
-        .to_string()
-}
-
-/// The deepest folder that holds every one of `repos`, if it is below
-/// `home` (a repo directly in home, or outside it, gives `None`).
-fn repos_common_parent_below_home(repos: &[PathBuf], home: &Path) -> Option<PathBuf> {
-    let mut parents = repos.iter().filter_map(|repo| repo.parent());
-    let mut common: PathBuf = parents.next()?.to_path_buf();
-    for parent in parents {
-        while !parent.starts_with(&common) {
-            if !common.pop() {
-                return None;
-            }
-        }
-    }
-    (common.starts_with(home) && common != home).then_some(common)
-}
+use gitterm_core::folder_picker::{
+    recents as folder_picker_recents, repos_common_parent_below_home,
+    start_dir as folder_picker_start_dir, tilde as folder_picker_tilde,
+    typed_path as folder_picker_typed_path,
+};
 
 fn parked_snapshot_chats(
     workspaces: &[Workspace],
@@ -9124,71 +9082,6 @@ fn chat_facts_line(facts: &chat_facts::ChatFacts) -> Option<String> {
     .flatten()
     .collect();
     (!parts.is_empty()).then(|| parts.join(" · "))
-}
-
-/// The picker's "Recent" list for one machine: distinct repo roots from
-/// its chat index, most recent first, then its open workspaces' dirs; at
-/// most `max`. Chats whose directory is gone are skipped.
-fn folder_picker_recents(
-    entries: &[chats::ChatIndexEntry],
-    open_dirs: &[PathBuf],
-    max: usize,
-) -> Vec<PathBuf> {
-    let mut live: Vec<&chats::ChatIndexEntry> =
-        entries.iter().filter(|entry| !entry.dead_cwd).collect();
-    live.sort_by_key(|entry| std::cmp::Reverse(entry.mtime));
-    let mut recents: Vec<PathBuf> = Vec::new();
-    let candidates = live
-        .iter()
-        .map(|entry| entry.group_root())
-        .chain(open_dirs.iter().map(PathBuf::as_path));
-    for dir in candidates {
-        if recents.len() >= max {
-            break;
-        }
-        if !recents.iter().any(|seen| seen == dir) {
-            recents.push(dir.to_path_buf());
-        }
-    }
-    recents
-}
-
-/// Resolve the picker's path field: trimmed, a leading "~" expanded to
-/// the machine's `home`, and absolute. The error is shown inline.
-fn folder_picker_typed_path(input: &str, home: Option<&str>) -> Result<String, String> {
-    let input = input.trim();
-    if input.is_empty() {
-        return Err("Type a folder path".to_string());
-    }
-    let resolved = if input == "~" || input.starts_with("~/") {
-        let Some(home) = home.filter(|home| !home.is_empty()) else {
-            return Err(
-                "This machine's home folder is not known; type an absolute path".to_string(),
-            );
-        };
-        format!("{}{}", home.trim_end_matches('/'), &input[1..])
-    } else {
-        input.to_string()
-    };
-    if !(resolved.starts_with('/') || Path::new(&resolved).is_absolute()) {
-        return Err(format!("{resolved} is not an absolute path"));
-    }
-    Ok(resolved)
-}
-
-/// A picker path for display, with the machine's home shown as "~".
-fn folder_picker_tilde(path: &str, home: Option<&str>) -> String {
-    let Some(home) = home
-        .map(|home| home.trim_end_matches('/'))
-        .filter(|home| !home.is_empty())
-    else {
-        return path.to_string();
-    };
-    match path.strip_prefix(home) {
-        Some("") => "~".to_string(),
-        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
-        _ => path.to_string(),
-    }
 }
 
 /// "Connect remote host" form — the in-app editor for adding an entry to
@@ -9302,13 +9195,9 @@ pub struct GitWorktreesSnapshot {
     error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct RemoteHostConfig {
-    name: String,
-    ssh_target: String,
-    identity_file: PathBuf,
-    tmux_path: String,
-}
+pub use gitterm_core::remote::ssh_sessions::{
+    RemoteHostConfig, RemoteSessionEntry, RemoteSessionsSnapshot,
+};
 
 #[derive(Debug, Clone)]
 pub struct RemoteSessionDefinition {
@@ -9319,20 +9208,6 @@ pub struct RemoteSessionDefinition {
     shell_command: String,
     codex_command: Option<String>,
     claude_command: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RemoteSessionEntry {
-    name: String,
-    windows: usize,
-    attached: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct RemoteSessionsSnapshot {
-    host_name: String,
-    sessions: Vec<RemoteSessionEntry>,
-    error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -11185,21 +11060,22 @@ impl App {
         let Some(remote_id) = remote_id else {
             return (String::new(), theme.text_muted());
         };
-        match self.remote_chat_indexes.get(remote_id) {
-            Some(state) if state.loading => ("⟳ syncing".to_string(), theme.yellow()),
-            Some(state) if state.error.is_some() => {
-                if state.entries.is_empty() {
-                    ("○ unreachable".to_string(), theme.text_muted())
-                } else {
-                    (
-                        "○ unreachable · cached index".to_string(),
-                        theme.text_muted(),
-                    )
-                }
-            }
-            Some(_) => ("● connected".to_string(), theme.green()),
-            None => ("○ not yet synced".to_string(), theme.text_muted()),
-        }
+        use gitterm_core::find::state::RemoteIndexStatus;
+        let status = RemoteIndexStatus::of(self.remote_chat_indexes.get(remote_id).map(|state| {
+            (
+                state.loading,
+                state.error.is_some(),
+                !state.entries.is_empty(),
+            )
+        }));
+        let color = match status {
+            RemoteIndexStatus::Syncing => theme.yellow(),
+            RemoteIndexStatus::Connected => theme.green(),
+            RemoteIndexStatus::Unreachable
+            | RemoteIndexStatus::UnreachableCached
+            | RemoteIndexStatus::NotSynced => theme.text_muted(),
+        };
+        (status.label().to_string(), color)
     }
 
     fn request_remote_chat_index(
@@ -43188,12 +43064,11 @@ fi
         let panel_bg = theme.bg_base();
         let border_color = theme.surface1();
 
-        let (status_label, status_color) = match runtime {
-            Some(entry) if entry.attached > 0 => {
-                (format!("attached {}", entry.attached), theme.accent())
-            }
-            Some(_) => ("running".to_string(), theme.success()),
-            None => ("not running".to_string(), theme.text_secondary()),
+        let status_label = gitterm_core::remote::ssh_sessions::session_status(runtime);
+        let status_color = match runtime {
+            Some(entry) if entry.attached > 0 => theme.accent(),
+            Some(_) => theme.success(),
+            None => theme.text_secondary(),
         };
         let status_bg = iced::Color {
             a: 0.16,
@@ -43248,11 +43123,10 @@ fi
         }
 
         if let Some(codex_command) = &session.codex_command {
-            let codex_status = match codex_runtime {
-                Some(entry) if entry.attached > 0 => format!("Codex attached {}", entry.attached),
-                Some(_) => "Codex running".to_string(),
-                None => "Codex not running".to_string(),
-            };
+            let codex_status = format!(
+                "Codex {}",
+                gitterm_core::remote::ssh_sessions::session_status(codex_runtime)
+            );
             detail = detail.push(
                 text(format!("{} - {}", codex_status, codex_command))
                     .size(10)
@@ -43261,13 +43135,10 @@ fi
         }
 
         if let Some(claude_command) = &session.claude_command {
-            let claude_status = match claude_runtime {
-                Some(entry) if entry.attached > 0 => {
-                    format!("Claude attached {}", entry.attached)
-                }
-                Some(_) => "Claude running".to_string(),
-                None => "Claude not running".to_string(),
-            };
+            let claude_status = format!(
+                "Claude {}",
+                gitterm_core::remote::ssh_sessions::session_status(claude_runtime)
+            );
             detail = detail.push(
                 text(format!("{} - {}", claude_status, claude_command))
                     .size(10)

@@ -32,8 +32,14 @@ use gpui_component::{
 
 use crate::theme::{Palette, UI_FONT_SIZE};
 
+/// Why the folder picker is open; decides what "Use this folder" does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FolderPickerPurpose {
+    /// A machine's "+" in the Repos menu.
+    NewWorkspace,
+    /// "Open a repo…".
+    OpenFolder,
+    /// This sheet's Add repo…: the folder comes back to the sheet.
     NewWork,
 }
 

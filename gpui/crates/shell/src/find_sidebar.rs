@@ -932,6 +932,18 @@ impl FindSidebar {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_machines(&self) -> &HashSet<Machine> {
+        &self.folds.machines
+    }
+
+    /// Iced's "Show {machine} chats": only that machine's section open.
+    pub fn show_only_machine(&mut self, machine: Machine, cx: &mut Context<Self>) {
+        self.folds.machines.clear();
+        self.folds.machines.insert(machine);
+        cx.notify();
+    }
+
     pub fn refresh(&mut self, facts: FindFacts, window: &mut Window, cx: &mut Context<Self>) {
         self.facts = facts;
         let query = self.state.borrow().filter().query.clone();
@@ -2388,13 +2400,29 @@ impl crate::Shell {
         // Stable sort preserves workspace/tab order among equal attention classes.
         sessions.sort_by_key(|(class, _)| *class);
         FindFacts {
-            machines: vec![MachineFacts {
+            machines: std::iter::once(MachineFacts {
                 id: None,
                 name: "This Mac".into(),
                 status: String::new(),
                 reachable: true,
                 claude_chat: false,
-            }],
+            })
+            .chain(self.configured_remotes().iter().map(|remote| {
+                let id = Some(remote.id.clone());
+                let state = self.find_state.borrow();
+                let index = state.index(&id).filter(|i| i.loaded_at.is_some() || state.loading_index(&id));
+                let status = gitterm_core::find::state::RemoteIndexStatus::of(index.map(|i| {
+                    (state.loading_index(&id), i.error.is_some(), !i.entries.is_empty())
+                }));
+                MachineFacts {
+                    reachable: status == gitterm_core::find::state::RemoteIndexStatus::Connected,
+                    id,
+                    name: remote.name.clone(),
+                    status: status.label().into(),
+                    claude_chat: false,
+                }
+            }))
+            .collect(),
             open_sessions: sessions.into_iter().map(|(_, session)| session).collect(),
             running_remote: vec![],
             workspaces: self.owner.read(cx).iced_catalog().map(|catalog| catalog.workspaces.iter().filter(|w| w.location.as_ref().is_none_or(|l| matches!(l, gitterm_core::remote::config::WorkspaceLocationConfig::Local { .. }))).map(|w| WorkspaceFacts { name: w.name.clone(), chats: w.chats.clone(), open: w.active }).collect()).unwrap_or_else(|| self.workspaces.iter().map(|w| WorkspaceFacts { name: w.workspace.name.clone(), chats: vec![], open: true }).collect()),
@@ -2508,6 +2536,9 @@ impl crate::Shell {
                 window,
                 cx,
             );
+            if self.find_state.borrow().filter().scope == ChatScope::Everywhere {
+                self.load_remote_indexes(window, cx);
+            }
         }
     }
 
@@ -2535,7 +2566,12 @@ impl crate::Shell {
         }
     }
 
-    fn reduce_find(&mut self, intent: Intent, window: &mut Window, cx: &mut gpui::Context<Self>) {
+    pub(crate) fn reduce_find(
+        &mut self,
+        intent: Intent,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
         use gitterm_core::find::state::Effect;
         let loading_index = matches!(&intent, Intent::LoadIndex { .. });
         let effects = self.find_state.borrow_mut().reduce(intent);
@@ -2545,6 +2581,9 @@ impl crate::Shell {
         }
         for effect in effects {
             match effect {
+                Effect::LoadIndex(stamp) if stamp.machine.is_some() => {
+                    self.load_remote_index(stamp, window, cx)
+                }
                 Effect::LoadIndex(stamp) => {
                     #[cfg(test)]
                     let home = self.find_home.clone();
@@ -2596,7 +2635,28 @@ impl crate::Shell {
             }
         }
         self.refresh_find(window, cx);
+        self.refresh_picker_recents(cx);
         cx.notify();
+    }
+
+    /// Sidebar mode Find, as the Chats overview opens it.
+    pub(crate) fn open_find_sidebar(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        if self.active_workspace(cx).is_none() {
+            return;
+        }
+        if self.usage_open {
+            self.toggle_usage(window, cx);
+        }
+        if self.plans_open {
+            self.toggle_plans(window, cx);
+        }
+        self.update_regions(
+            |r| {
+                r.sidebar_mode = crate::SidebarMode::Find;
+                r.sidebar_collapsed = false;
+            },
+            cx,
+        );
     }
 
     pub(crate) fn find_outcome(
