@@ -229,8 +229,12 @@ async fn main() {
 
     let (task_commands, mut task_requests) =
         gitterm_core::task_commands::runtime::command_channel();
-    let (task, task_server) =
-        task_mcp::prepare("acp-smoke", task_commands).expect("reserve task MCP endpoint");
+    let (task, task_server) = task_mcp::prepare(
+        "acp-smoke",
+        task_commands,
+        gitterm::browser_control::html_preview_runner(),
+    )
+    .expect("reserve task MCP endpoint");
     tokio::spawn(task_server.run());
     let task_lists = Arc::new(AtomicUsize::new(0));
     let attributed_lists = Arc::new(AtomicUsize::new(0));

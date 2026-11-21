@@ -93,49 +93,6 @@ fn supports_http_mcp(agent: AcpAgent, result: &Value) -> bool {
 // Session config
 // ---------------------------------------------------------------------------
 
-/// One HTTP MCP server handed to the agent in `session/new` / `session/load`.
-/// ACP carries header values literally, so the bearer token travels in the
-/// JSON-RPC frame on the child's stdin, never argv, logs or `Debug`.
-#[derive(Clone)]
-pub struct AcpMcpServer {
-    pub name: String,
-    pub url: String,
-    pub headers: Vec<(String, String)>,
-}
-
-impl std::fmt::Debug for AcpMcpServer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AcpMcpServer")
-            .field("name", &self.name)
-            .field("url", &self.url)
-            .field(
-                "headers",
-                &self
-                    .headers
-                    .iter()
-                    .map(|(name, _)| name)
-                    .collect::<Vec<_>>(),
-            )
-            .finish()
-    }
-}
-
-impl AcpMcpServer {
-    /// The ACP `McpServer` (http variant) for `agent`.
-    pub fn to_acp(&self, agent: AcpAgent) -> Value {
-        json!({
-            "type": "http",
-            "name": agent.mcp_server_name(&self.name),
-            "url": self.url,
-            "headers": self
-                .headers
-                .iter()
-                .map(|(name, value)| json!({"name": name, "value": value}))
-                .collect::<Vec<_>>(),
-        })
-    }
-}
-
 #[derive(Clone)]
 pub struct AcpSessionConfig {
     /// Local turn snapshots; None for remote/test processes.

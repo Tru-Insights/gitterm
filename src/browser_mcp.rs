@@ -11,7 +11,6 @@ use crate::browser_control::{
 use crate::browser_engine::{BrowserEngine, BrowserEngineKind};
 use crate::harness::acp::AcpMcpServer;
 use crate::harness::claude::ClaudeMcpServer;
-use crate::task_mcp::{caller_endpoint, caller_from_query, TASK_MCP_CALLER_QUERY};
 use axum::{
     body::Body,
     extract::State,
@@ -21,6 +20,9 @@ use axum::{
     Router,
 };
 use base64::Engine;
+use gitterm_core::task_commands::mcp_protocol::{
+    caller_endpoint, caller_from_query, TASK_MCP_CALLER_QUERY,
+};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, tool::Extension, wrapper::Parameters},
     model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
@@ -47,8 +49,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-pub const BROWSER_MCP_TOKEN_ENV: &str = "GITTERM_V6_BROWSER_MCP_TOKEN";
-pub const BROWSER_MCP_URL_ENV: &str = "GITTERM_V6_BROWSER_MCP_URL";
+pub use gitterm_core::task_commands::mcp_protocol::{BROWSER_MCP_TOKEN_ENV, BROWSER_MCP_URL_ENV};
 const BROWSER_MCP_BASE_PORT: u16 = 34_030;
 const BROWSER_MCP_PORTS_PER_INSTANCE: u16 = 10;
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 10_000;

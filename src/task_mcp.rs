@@ -31,9 +31,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    fmt, io,
+    fmt,
+    future::Future,
+    io,
     net::{Ipv4Addr, SocketAddrV4},
     path::PathBuf,
+    pin::Pin,
     sync::{Arc, OnceLock},
 };
 
@@ -42,11 +45,9 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-pub const TASK_MCP_TOKEN_ENV: &str = "GITTERM_V6_TASK_MCP_TOKEN";
-pub const TASK_MCP_URL_ENV: &str = "GITTERM_V6_TASK_MCP_URL";
-/// Query parameter on a tab's task MCP URL naming the calling tab's durable
-/// `session_uid`. The bearer token authenticates; this only attributes.
-pub const TASK_MCP_CALLER_QUERY: &str = "caller";
+pub use gitterm_core::task_commands::mcp_protocol::{
+    caller_endpoint, caller_from_query, TASK_MCP_CALLER_QUERY, TASK_MCP_TOKEN_ENV, TASK_MCP_URL_ENV,
+};
 const TASK_MCP_BASE_PORT: u16 = 35_030;
 const TASK_MCP_PORTS_PER_INSTANCE: u16 = 10;
 pub use gitterm_core::task_commands::runtime::{CommandReply as TaskControlReply, COMMAND_TIMEOUT};
@@ -358,27 +359,6 @@ pub enum TaskControlOperation {
     MergePlanGet,
 }
 
-/// The task MCP URL handed to one tab: the shared endpoint plus
-/// `?caller=<session_uid>`. Without a caller the bare endpoint is returned.
-pub fn caller_endpoint(endpoint: &str, caller: Option<&str>) -> String {
-    match caller.filter(|caller| !caller.is_empty()) {
-        Some(caller) => {
-            let encoded: String = url::form_urlencoded::byte_serialize(caller.as_bytes()).collect();
-            format!("{endpoint}?{TASK_MCP_CALLER_QUERY}={encoded}")
-        }
-        None => endpoint.to_string(),
-    }
-}
-
-/// The caller named by a request URI's `caller` query, if any. The browser
-/// MCP reads the same query (TRU-176).
-pub(crate) fn caller_from_query(query: Option<&str>) -> Option<String> {
-    url::form_urlencoded::parse(query?.as_bytes())
-        .find(|(key, _)| key == TASK_MCP_CALLER_QUERY)
-        .map(|(_, value)| value.into_owned())
-        .filter(|value| !value.is_empty())
-}
-
 pub struct TaskMcpConnection {
     endpoint: String,
     token: String,
@@ -447,16 +427,26 @@ impl Drop for TaskMcpConnection {
     }
 }
 
+/// What one `html_preview` run resolves to: the preview JSON (carrying its
+/// `png`) or the reason it failed.
+pub type HtmlPreviewFuture = Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>;
+/// Runs one validated `html_preview` request. The host supplies it when it
+/// prepares the server, so the task server does not depend on the browser
+/// controller.
+pub type HtmlPreviewRunner = Arc<dyn Fn(HtmlPreviewRequest) -> HtmlPreviewFuture + Send + Sync>;
+
 pub struct TaskMcpServer {
     listener: std::net::TcpListener,
     token: String,
     cancellation: CancellationToken,
     commands: TaskControlSender,
+    html_preview: HtmlPreviewRunner,
 }
 
 pub fn prepare(
     instance_id: &str,
     commands: TaskControlSender,
+    html_preview: HtmlPreviewRunner,
 ) -> io::Result<(TaskMcpConnection, TaskMcpServer)> {
     let listener = bind_v6_loopback_listener(instance_id)?;
     listener.set_nonblocking(true)?;
@@ -485,6 +475,7 @@ pub fn prepare(
             token,
             cancellation,
             commands,
+            html_preview,
         },
     ))
 }
@@ -519,7 +510,7 @@ impl TaskMcpServer {
         let notify_state = NotifyState {
             commands: self.commands.clone(),
         };
-        let tools = TaskMcpTools::new(self.commands);
+        let tools = TaskMcpTools::new(self.commands, self.html_preview);
         let mcp_service: StreamableHttpService<TaskMcpTools, LocalSessionManager> =
             StreamableHttpService::new(
                 move || Ok::<_, io::Error>(tools.clone()),
@@ -621,11 +612,15 @@ async fn dispatch_operation(
 #[derive(Clone)]
 struct TaskMcpTools {
     commands: TaskControlSender,
+    html_preview: HtmlPreviewRunner,
 }
 
 impl TaskMcpTools {
-    fn new(commands: TaskControlSender) -> Self {
-        Self { commands }
+    fn new(commands: TaskControlSender, html_preview: HtmlPreviewRunner) -> Self {
+        Self {
+            commands,
+            html_preview,
+        }
     }
 
     /// Bridge one operation, attributed to the caller named on the HTTP
@@ -728,7 +723,7 @@ impl TaskMcpTools {
         if let Err(error) = request.validate() {
             return tool_error(error);
         }
-        match crate::browser_control::preview_html(request).await {
+        match (self.html_preview)(request).await {
             Ok(mut value) => {
                 let Some(png) = value
                     .as_object_mut()
@@ -1196,46 +1191,6 @@ fn codex_config_overrides(endpoint: &str) -> [String; 4] {
     ]
 }
 
-/// One zsh wrapper composes both GitTerm-owned MCP servers. It is safe when
-/// either service is unavailable and never writes global Codex configuration.
-pub fn codex_zsh_integration() -> String {
-    format!(
-        r#"if [[ ( -n "${{{browser_url}:-}}" && -n "${{{browser_token}:-}}" ) || ( -n "${{{task_url}:-}}" && -n "${{{task_token}:-}}" ) ]]; then
-    codex() {{
-        local arg
-        for arg in "$@"; do
-            if [[ "$arg" == mcp_servers.gitterm_browser.url=* || "$arg" == mcp_servers.gitterm_tasks.url=* ]]; then
-                command codex "$@"
-                return
-            fi
-        done
-        local -a gitterm_mcp_args
-        if [[ -n "${{{browser_url}:-}}" && -n "${{{browser_token}:-}}" ]]; then
-            gitterm_mcp_args+=(
-                --config "mcp_servers.gitterm_browser.url=${{{browser_url}}}"
-                --config "mcp_servers.gitterm_browser.bearer_token_env_var={browser_token}"
-                --config "mcp_servers.gitterm_browser.default_tools_approval_mode=writes"
-                --config "mcp_servers.gitterm_browser.tool_timeout_sec=60"
-            )
-        fi
-        if [[ -n "${{{task_url}:-}}" && -n "${{{task_token}:-}}" ]]; then
-            gitterm_mcp_args+=(
-                --config "mcp_servers.gitterm_tasks.url=${{{task_url}}}"
-                --config "mcp_servers.gitterm_tasks.bearer_token_env_var={task_token}"
-                --config "mcp_servers.gitterm_tasks.default_tools_approval_mode=approve"
-                --config "mcp_servers.gitterm_tasks.tool_timeout_sec=300"
-            )
-        fi
-        command codex "${{gitterm_mcp_args[@]}}" "$@"
-    }}
-fi"#,
-        browser_url = crate::browser_mcp::BROWSER_MCP_URL_ENV,
-        browser_token = crate::browser_mcp::BROWSER_MCP_TOKEN_ENV,
-        task_url = TASK_MCP_URL_ENV,
-        task_token = TASK_MCP_TOKEN_ENV,
-    )
-}
-
 fn task_result(result: Result<Value, String>) -> CallToolResult {
     match result {
         Ok(value) => CallToolResult::structured(value),
@@ -1245,6 +1200,12 @@ fn task_result(result: Result<Value, String>) -> CallToolResult {
 
 fn tool_error(error: impl fmt::Display) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(error.to_string())])
+}
+
+/// Test servers never start Chrome: `html_preview` refuses.
+#[cfg(test)]
+fn refused_html_preview() -> HtmlPreviewRunner {
+    Arc::new(|_| Box::pin(async { Err("html_preview is not wired in this test".to_string()) }))
 }
 
 #[cfg(test)]
@@ -1263,7 +1224,8 @@ mod tests {
     #[test]
     fn connection_uses_v6_task_range_and_memory_only_token_environment() {
         let (commands, _requests) = command_channel();
-        let (connection, _server) = prepare("connection-test", commands).unwrap();
+        let (connection, _server) =
+            prepare("connection-test", commands, refused_html_preview()).unwrap();
         let port = connection
             .endpoint()
             .trim_start_matches("http://127.0.0.1:")
@@ -1379,7 +1341,7 @@ mod tests {
     #[tokio::test]
     async fn plan_limits_bridges_a_read_only_snapshot_with_its_output_shape() {
         let (commands, mut requests) = command_channel();
-        let tool = TaskMcpTools::new(commands);
+        let tool = TaskMcpTools::new(commands, refused_html_preview());
         let bridge = tokio::spawn(async move {
             let envelope = requests.recv().await.unwrap();
             assert!(matches!(
@@ -1418,16 +1380,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_integration_composes_browser_and_task_servers() {
+    fn codex_command_injection_targets_codex_only() {
         let configured = configure_codex_command("codex resume --last", "http://127.0.0.1:1/mcp");
         assert!(configured.contains("mcp_servers.gitterm_tasks.url="));
         assert!(configured.ends_with(" resume --last"));
         assert_eq!(configure_codex_command("claude", "unused"), "claude");
-        let integration = codex_zsh_integration();
-        assert!(integration.contains("mcp_servers.gitterm_browser.url="));
-        assert!(integration.contains("mcp_servers.gitterm_tasks.url="));
-        assert!(integration.contains("gitterm_mcp_args"));
-        assert!(!integration.contains("Bearer "));
     }
 
     #[test]
@@ -1466,7 +1423,8 @@ mod tests {
     #[test]
     fn every_injection_path_carries_the_caller_and_keeps_the_token_in_the_environment() {
         let (commands, _requests) = command_channel();
-        let (connection, _server) = prepare("caller-injection-test", commands).unwrap();
+        let (connection, _server) =
+            prepare("caller-injection-test", commands, refused_html_preview()).unwrap();
         let caller = "7d1c2a4e-0b3f-4e8a-9c55-2f1e6d7a8b90";
         let expected_url = format!("{}?caller={caller}", connection.endpoint());
         let token = connection.token.clone();
@@ -1587,7 +1545,8 @@ mod tests {
     #[tokio::test]
     async fn notify_route_requires_auth_and_bridges_session_events() {
         let (commands, mut requests) = command_channel();
-        let (connection, server) = prepare("notify-test", commands).unwrap();
+        let (connection, server) =
+            prepare("notify-test", commands, refused_html_preview()).unwrap();
         let url = format!(
             "{}?task_id=task-9&session_id=session-9",
             connection.notify_endpoint()
@@ -1642,7 +1601,8 @@ mod tests {
     #[tokio::test]
     async fn endpoint_requires_auth_and_forwards_commands_to_the_app_bridge() {
         let (commands, mut requests) = command_channel();
-        let (connection, server) = prepare("endpoint-test", commands).unwrap();
+        let (connection, server) =
+            prepare("endpoint-test", commands, refused_html_preview()).unwrap();
         let endpoint = connection.endpoint().to_string();
         let token = connection.token.clone();
         let server_task = tokio::spawn(server.run());
@@ -1724,7 +1684,8 @@ mod tests {
     #[tokio::test]
     async fn caller_query_reaches_the_bridged_envelope() {
         let (commands, mut requests) = command_channel();
-        let (connection, server) = prepare("caller-test", commands).unwrap();
+        let (connection, server) =
+            prepare("caller-test", commands, refused_html_preview()).unwrap();
         let endpoint = caller_endpoint(connection.endpoint(), Some("abc"));
         let token = connection.token.clone();
         let server_task = tokio::spawn(server.run());
@@ -1898,7 +1859,8 @@ mod tests {
     #[tokio::test]
     async fn delegation_tools_need_a_caller_return_ids_at_once_and_list_newest_first() {
         let (commands, requests) = command_channel();
-        let (connection, server) = prepare("delegation-test", commands).unwrap();
+        let (connection, server) =
+            prepare("delegation-test", commands, refused_html_preview()).unwrap();
         let token = connection.token.clone();
         let server_task = tokio::spawn(server.run());
         let store_dir = tempfile::tempdir().unwrap();
@@ -2214,7 +2176,8 @@ mod tests {
     #[tokio::test]
     async fn a_delegated_worker_reports_done_to_the_parent_delegation() {
         let (commands, requests) = command_channel();
-        let (connection, server) = prepare("worker-test", commands).unwrap();
+        let (connection, server) =
+            prepare("worker-test", commands, refused_html_preview()).unwrap();
         let token = connection.token.clone();
         let server_task = tokio::spawn(server.run());
         let store_dir = tempfile::tempdir().unwrap();

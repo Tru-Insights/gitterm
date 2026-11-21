@@ -12,7 +12,7 @@ async fn stage45_task_tools_wire_and_batch_order() {
     .unwrap();
     for row in rows {
         let (commands, mut receiver) = command_channel();
-        let tool = TaskMcpTools::new(commands);
+        let tool = TaskMcpTools::new(commands, refused_html_preview());
         let expected = row.clone();
         let bridge = tokio::spawn(async move {
             let envelope = receiver.recv().await.unwrap();
@@ -70,7 +70,7 @@ async fn stage45_task_tools_wire_and_batch_order() {
     }
 
     let (commands, mut receiver) = command_channel();
-    let tool = TaskMcpTools::new(commands);
+    let tool = TaskMcpTools::new(commands, refused_html_preview());
     let bridge = tokio::spawn(async move {
         let first = receiver.recv().await.unwrap();
         assert!(receiver.try_recv().is_err(), "batch waits for each reply");
@@ -145,7 +145,7 @@ async fn stage45_mcp_dispatch_order_caller_ack_and_errors() {
     drop(receiver);
     trace.push(json!({"point":"bridge closed","error":dispatch_operation(&commands,TaskControlOperation::PlanLimits,None).await.unwrap_err()}));
     let (sender, mut requests) = command_channel();
-    let tools = TaskMcpTools::new(sender);
+    let tools = TaskMcpTools::new(sender, refused_html_preview());
     let (parts, _) = Request::builder()
         .uri("/mcp")
         .body(())

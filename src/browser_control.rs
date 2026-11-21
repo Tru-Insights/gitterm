@@ -3634,6 +3634,17 @@ fn chrome_launch_args(profile_dir: &Path) -> Vec<String> {
 
 /// Visual replies use the same low-level Chrome/CDP adapter, but never the
 /// interactive browser's process, profile, targets, or credentials.
+/// `preview_html` as the task MCP server's injected HTML-preview runner.
+pub fn html_preview_runner() -> crate::task_mcp::HtmlPreviewRunner {
+    std::sync::Arc::new(|request| {
+        Box::pin(async move {
+            preview_html(request)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    })
+}
+
 pub async fn preview_html(request: crate::html_render::HtmlPreviewRequest) -> Result<Value> {
     request.validate().map_err(BrowserControlError::new)?;
     static PREVIEWS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);

@@ -21343,6 +21343,7 @@ impl App {
         let (task_mcp, task_mcp_server) = match task_mcp::prepare(
             config::instance_id(),
             task_commands,
+            gitterm::browser_control::html_preview_runner(),
         ) {
             Ok((connection, server)) => {
                 eprintln!("GitTerm V6 task MCP reserved at {}", connection.endpoint());
@@ -22207,7 +22208,8 @@ impl App {
                 .to_string_lossy()
                 .into_owned();
             let gitterm_zshrc = format!("{gitterm_dir}/.zshrc");
-            let codex_zsh_integration = task_mcp::codex_zsh_integration();
+            let codex_zsh_integration =
+                gitterm_core::task_commands::mcp_protocol::codex_zsh_integration();
 
             let _ = std::fs::create_dir_all(&gitterm_dir);
             let zshrc_content = format!(
