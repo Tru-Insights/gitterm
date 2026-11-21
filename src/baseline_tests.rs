@@ -215,6 +215,7 @@ fn headless(fixture: &Path) -> App {
         chat_index: Arc::default(),
         workspace_overviews: HashMap::new(),
         workspace_overview_summary_generation: 0,
+        workspace_repo_joins_generation: 0,
         workspace_overview_presentations: HashMap::new(),
         work_documents: HashMap::new(),
         work_document_copies_open: None,
@@ -1204,3 +1205,50 @@ fn status_file_order_and_hash_traces() {
 
 #[path = "stage45/mod.rs"]
 mod stage45;
+
+#[test]
+fn repo_joins_read_off_thread_apply_only_when_latest() {
+    if isolated("repo_joins_read_off_thread_apply_only_when_latest") {
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(fixture.path());
+    let uid = app.workspaces[0].uid;
+    let joined = fixture.path().join("joined");
+    let removed = fixture.path().join("removed");
+    std::fs::create_dir(&joined).unwrap();
+    std::fs::create_dir(&removed).unwrap();
+    let listed = |app: &App| -> Vec<PathBuf> {
+        app.workspaces[0]
+            .repos
+            .iter()
+            .filter_map(|id| app.repos.get(*id))
+            .map(|repo| repo.dir.clone())
+            .collect()
+    };
+    let before = listed(&app);
+    let _ = app.sync_workspace_repos();
+    let stale = app.workspace_repo_joins_generation;
+    let _ = app.sync_workspace_repos();
+    let latest = app.workspace_repo_joins_generation;
+    let _ = app.update_event(Event::WorkspaceRepoJoinsRead(
+        stale,
+        Ok(vec![(uid, vec![joined.clone()])]),
+    ));
+    assert_eq!(listed(&app), before, "a superseded read must not apply");
+    // A repo removed by hand while the read ran stays out.
+    app.workspaces[0].repos_removed.push(removed.clone());
+    let _ = app.update_event(Event::WorkspaceRepoJoinsRead(
+        latest,
+        Ok(vec![(uid, vec![removed, joined.clone()])]),
+    ));
+    let mut expected = before.clone();
+    expected.push(joined);
+    assert_eq!(listed(&app), expected);
+    assert_eq!(app.workspaces[0].joined_note.len(), 1);
+    let _ = app.update_event(Event::WorkspaceRepoJoinsRead(
+        latest,
+        Err("fixture failure".into()),
+    ));
+    assert_eq!(listed(&app), expected);
+}

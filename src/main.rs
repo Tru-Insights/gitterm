@@ -7351,6 +7351,9 @@ pub enum Event {
     /// A background refresh finished: workspace dir, generation, result.
     WorkspaceOverviewRefreshed(OverviewKey, u64, Box<overview::RefreshOutcome>),
     WorkspaceOverviewSummaryBuilt(OverviewKey, u64, Box<Result<overview::WorkSummary, String>>),
+    /// The repos open work workspaces' chats joined, read off the UI
+    /// thread, with the read's generation.
+    WorkspaceRepoJoinsRead(u64, Result<Vec<(u64, Vec<PathBuf>)>, String>),
     /// Open a coordinator's conversation in the main area; the sidebar
     /// stays on the overview.
     WorkspaceOverviewOpenChat(String),
@@ -7820,6 +7823,8 @@ struct App {
     workspace_overviews: HashMap<OverviewKey, WorkspaceOverviewState>,
     /// Survives overview removal so a recreated owner cannot accept an old job.
     workspace_overview_summary_generation: u64,
+    /// Bumped per repo-join read; only the latest read's result applies.
+    workspace_repo_joins_generation: u64,
     /// Fold and row disclosure state belongs to a workspace, even when its
     /// overview summary is shared with another folder-scoped workspace.
     workspace_overview_presentations: HashMap<u64, WorkspaceOverviewPresentation>,
@@ -9331,75 +9336,114 @@ fn sync_task_sessions_from_chat_index(
     }
 }
 
+/// [`RepoJoinPlan`] read in place; the app reads it off the UI thread.
+#[cfg(test)]
 fn workspace_repo_joins(
     chat_index: &[chats::ChatIndexEntry],
     workspaces: &[Workspace],
     repos: &RepoRegistry,
     task_store: Option<&TaskStore>,
 ) -> Vec<(u64, Vec<PathBuf>)> {
-    let task_worktrees = task_store
-        .map(|store| {
-            store
-                .tasks()
-                .iter()
-                .filter_map(|task| task.worktree.path.clone())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let canonical = |dir: &Path| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    let mut joins: Vec<(u64, Vec<PathBuf>)> = Vec::new();
-    for ws in workspaces {
-        if !ws.is_work() || !matches!(ws.location, WorkspaceLocation::Local { .. }) {
-            continue;
-        }
-        let work = if ws.owns_chats() {
-            overview::chats_under(chat_index, &ws.chats)
-        } else {
-            overview::work_chats(chat_index, &ws.dir)
-        };
-        let workers: Vec<PathBuf> = work
+    RepoJoinPlan::new(workspaces, repos, task_store).joins(chat_index)
+}
+
+/// What [`workspace_repo_joins`] reads, owned so its git and filesystem
+/// work (a `git rev-parse` per candidate worktree) runs off the UI thread.
+struct RepoJoinPlan {
+    workspaces: Vec<RepoJoinWorkspace>,
+    tasks: Vec<TaskRecord>,
+    delegations: Vec<gitterm::tasks::Delegation>,
+}
+
+/// An open local work workspace as the join reads it.
+struct RepoJoinWorkspace {
+    uid: u64,
+    chats: Vec<String>,
+    dir: PathBuf,
+    listed: Vec<PathBuf>,
+    removed: Vec<PathBuf>,
+}
+
+impl RepoJoinPlan {
+    fn new(workspaces: &[Workspace], repos: &RepoRegistry, task_store: Option<&TaskStore>) -> Self {
+        let workspaces = workspaces
             .iter()
-            .filter_map(|entry| entry.facts.as_ref())
-            .flat_map(|facts| facts.children.iter())
-            .filter(|child| child.kind == chat_facts::ChildKind::Worker)
-            .filter_map(|child| child.task_id.as_deref())
-            .filter_map(|task_id| task_store?.get(task_id))
-            .filter_map(|task| task_main_checkout(&task.repository.common_dir))
+            .filter(|ws| ws.is_work() && matches!(ws.location, WorkspaceLocation::Local { .. }))
+            .map(|ws| RepoJoinWorkspace {
+                uid: ws.uid,
+                chats: ws.chats.clone(),
+                dir: ws.dir.clone(),
+                listed: ws
+                    .repos
+                    .iter()
+                    .filter_map(|id| repos.get(*id))
+                    .map(|repo| repo.dir.clone())
+                    .collect(),
+                removed: ws.repos_removed.clone(),
+            })
             .collect();
-        let delegated = task_store.map_or_else(Vec::new, |store| {
-            gitterm::workspace_repos::delegation_targets(&work, store.delegations(), store.tasks())
-        });
-        // A linked worktree (an agent-made one too) joins as its main
-        // checkout (TRU-191); a checkout since deleted does not join.
-        let candidates: Vec<PathBuf> = gitterm::workspace_repos::fold_worktrees(
-            gitterm::workspace_repos::auto_repo_candidates(
-                &work,
-                &workers,
-                &task_worktrees,
-                &delegated,
-            )
-            .into_iter()
-            .filter(|dir| dir.is_dir()),
-        );
-        let listed: Vec<PathBuf> = ws
-            .repos
-            .iter()
-            .filter_map(|id| repos.get(*id))
-            .map(|repo| canonical(&repo.dir))
-            .collect();
-        let removed: Vec<PathBuf> = ws.repos_removed.iter().map(|d| canonical(d)).collect();
-        let (_, joined) = gitterm::workspace_repos::derive_repo_list(
-            &canonical(&ws.dir),
-            &listed,
-            &candidates,
-            &[],
-            &removed,
-        );
-        if !joined.is_empty() {
-            joins.push((ws.uid, joined));
+        Self {
+            workspaces,
+            tasks: task_store.map_or_else(Vec::new, |store| store.tasks().to_vec()),
+            delegations: task_store.map_or_else(Vec::new, |store| store.delegations().to_vec()),
         }
     }
-    joins
+
+    /// Blocking: canonicalizes and runs git per candidate.
+    fn joins(&self, chat_index: &[chats::ChatIndexEntry]) -> Vec<(u64, Vec<PathBuf>)> {
+        let task_worktrees: Vec<PathBuf> = self
+            .tasks
+            .iter()
+            .filter_map(|task| task.worktree.path.clone())
+            .collect();
+        let task = |task_id: &str| self.tasks.iter().find(|task| task.task_id == task_id);
+        let canonical =
+            |dir: &Path| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let mut joins: Vec<(u64, Vec<PathBuf>)> = Vec::new();
+        for ws in &self.workspaces {
+            let work = if !ws.chats.is_empty() {
+                overview::chats_under(chat_index, &ws.chats)
+            } else {
+                overview::work_chats(chat_index, &ws.dir)
+            };
+            let workers: Vec<PathBuf> = work
+                .iter()
+                .filter_map(|entry| entry.facts.as_ref())
+                .flat_map(|facts| facts.children.iter())
+                .filter(|child| child.kind == chat_facts::ChildKind::Worker)
+                .filter_map(|child| child.task_id.as_deref())
+                .filter_map(task)
+                .filter_map(|task| task_main_checkout(&task.repository.common_dir))
+                .collect();
+            let delegated =
+                gitterm::workspace_repos::delegation_targets(&work, &self.delegations, &self.tasks);
+            // A linked worktree (an agent-made one too) joins as its main
+            // checkout (TRU-191); a checkout since deleted does not join.
+            let candidates: Vec<PathBuf> = gitterm::workspace_repos::fold_worktrees(
+                gitterm::workspace_repos::auto_repo_candidates(
+                    &work,
+                    &workers,
+                    &task_worktrees,
+                    &delegated,
+                )
+                .into_iter()
+                .filter(|dir| dir.is_dir()),
+            );
+            let listed: Vec<PathBuf> = ws.listed.iter().map(|dir| canonical(dir)).collect();
+            let removed: Vec<PathBuf> = ws.removed.iter().map(|d| canonical(d)).collect();
+            let (_, joined) = gitterm::workspace_repos::derive_repo_list(
+                &canonical(&ws.dir),
+                &listed,
+                &candidates,
+                &[],
+                &removed,
+            );
+            if !joined.is_empty() {
+                joins.push((ws.uid, joined));
+            }
+        }
+        joins
+    }
 }
 
 /// An owned snapshot for the summary's CPU work; the index itself is shared.
@@ -15569,15 +15613,56 @@ impl App {
     /// in first-touch order, minus those removed by hand. Runs when the
     /// chat index lands; a folder-scoped workspace lists only its home
     /// and what was added by hand.
-    fn sync_workspace_repos(&mut self) {
-        let joins = workspace_repo_joins(
-            &self.chat_index,
+    fn sync_workspace_repos(&mut self) -> Task<Event> {
+        self.workspace_repo_joins_generation += 1;
+        let generation = self.workspace_repo_joins_generation;
+        let plan = RepoJoinPlan::new(
             &self.workspaces,
             &self.repos,
             self.task_host.store().as_ref(),
         );
+        let chat_index = Arc::clone(&self.chat_index);
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || plan.joins(&chat_index))
+                    .await
+                    .map_err(|error| format!("workspace repo joins task failed: {error}"))
+            },
+            move |result| Event::WorkspaceRepoJoinsRead(generation, result),
+        )
+    }
+
+    /// Applies joins read off the UI thread. A newer read supersedes this
+    /// one; a repo listed or removed by hand meanwhile is left as it is.
+    fn apply_workspace_repo_joins(
+        &mut self,
+        generation: u64,
+        result: Result<Vec<(u64, Vec<PathBuf>)>, String>,
+    ) {
+        if generation != self.workspace_repo_joins_generation {
+            return;
+        }
+        let joins = match result {
+            Ok(joins) => joins,
+            Err(error) => {
+                eprintln!("[workspace] {error}");
+                return;
+            }
+        };
         for (uid, dirs) in joins {
             for dir in dirs {
+                let settled = self.workspace_index_by_uid(uid).is_some_and(|idx| {
+                    let ws = &self.workspaces[idx];
+                    ws.repos_removed.contains(&dir)
+                        || ws
+                            .repos
+                            .iter()
+                            .filter_map(|id| self.repos.get(*id))
+                            .any(|repo| repo.dir == dir)
+                });
+                if settled {
+                    continue;
+                }
                 let Some(id) = self.add_repo_to_workspace(uid, dir.clone()) else {
                     continue;
                 };
@@ -21449,6 +21534,7 @@ impl App {
             chat_index: Arc::default(),
             workspace_overviews: HashMap::new(),
             workspace_overview_summary_generation: 0,
+            workspace_repo_joins_generation: 0,
             workspace_overview_presentations: HashMap::new(),
             work_documents: HashMap::new(),
             work_document_copies_open: None,
@@ -30851,10 +30937,10 @@ fi
                     freeze_time!("chat_index_park_note", {
                         self.refill_park_note();
                     });
-                    // Work workspaces list the repos their chats touched (TRU-180).
-                    freeze_time!("chat_index_repo_joins", {
-                        self.sync_workspace_repos();
-                    });
+                    // Work workspaces list the repos their chats touched
+                    // (TRU-180), read off the UI thread (TRU-274).
+                    let repo_joins =
+                        freeze_time!("chat_index_repo_joins", { self.sync_workspace_repos() });
                     // PR homes read the index's facts (TRU-173).
                     freeze_time!("chat_index_pr_homes", {
                         self.prs.homes_built = None;
@@ -30901,7 +30987,7 @@ fi
                         offers
                     });
                     let rank = freeze_time!("chat_index_rank", { self.request_chat_rank() });
-                    Task::batch([rank, overview_summary, Task::batch(offers)])
+                    Task::batch([rank, overview_summary, repo_joins, Task::batch(offers)])
                 });
             }
             Event::ChatsQueryChanged(query) => {
@@ -31133,6 +31219,9 @@ fi
                 self.work_document_copies_open = (self.work_document_copies_open.as_deref()
                     != Some(key.as_str()))
                 .then_some(key);
+            }
+            Event::WorkspaceRepoJoinsRead(generation, result) => {
+                self.apply_workspace_repo_joins(generation, result);
             }
             Event::WorkspaceOverviewSummaryBuilt(key, generation, result) => match *result {
                 Ok(summary) => {
