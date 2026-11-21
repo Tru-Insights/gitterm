@@ -1263,3 +1263,228 @@ fn iced_git_workdir_redirection_after_target_resolution_refuses_all_writes() {
         .is_empty());
     assert!(app.task_launch_queue.is_empty());
 }
+
+fn fixture_delegation(state: &str) -> gitterm::tasks::Delegation {
+    let mut value: Value = serde_json::from_str(&fixture("tasks/delegation.json")).unwrap();
+    value["status"] = json!({ "state": state });
+    serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn iced_delegation_reads_need_a_caller_scope_to_the_parent_and_write_nothing() {
+    if isolated(
+        "iced_delegation_reads_need_a_caller_scope_to_the_parent_and_write_nothing",
+        "task_authority",
+    ) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(dir.path());
+    let get = |id: &str| {
+        TaskControlOperation::GetDelegation(task_mcp::GetDelegationRequest {
+            delegation_id: id.into(),
+        })
+    };
+    let list =
+        || TaskControlOperation::ListDelegations(task_mcp::ListDelegationsRequest { status: None });
+    // The caller check comes before the store check.
+    assert_eq!(
+        control(&mut app, get("fixture-delegation"), None).unwrap_err(),
+        task_mcp::missing_caller_error("delegation_get")
+    );
+    assert_eq!(
+        control(&mut app, list(), None).unwrap_err(),
+        task_mcp::missing_caller_error("delegation_list")
+    );
+    for operation in [get("fixture-delegation"), list()] {
+        assert_eq!(
+            control(&mut app, operation, Some("fixture-caller")).unwrap_err(),
+            "GitTerm's task store is unavailable"
+        );
+    }
+    add_task(&mut app, dir.path(), dir.path());
+    let delegation = fixture_delegation("requested");
+    app.task_authority
+        .store_mut()
+        .as_mut()
+        .unwrap()
+        .insert_delegation(delegation.clone())
+        .unwrap();
+    let before = std::fs::read(dir.path().join("tasks.json")).unwrap();
+    assert_eq!(
+        control(&mut app, get(" absent "), Some("fixture-caller")).unwrap_err(),
+        "delegation absent does not exist"
+    );
+    // Any caller can read a delegation by id; the worker card is added for a
+    // task-session child even when its tab is closed.
+    let task = app
+        .task_authority
+        .store()
+        .as_ref()
+        .unwrap()
+        .get("fixture-task")
+        .cloned();
+    let mut expected =
+        gitterm::delegations::delegation_record(&delegation, &config::global_config_dir()).unwrap();
+    expected["worker"] = gitterm::delegations::worker_card_info(
+        &delegation,
+        task.as_ref(),
+        gitterm::delegations::WorkerTab::Closed,
+    );
+    assert_eq!(
+        control(&mut app, get(" fixture-delegation "), Some("someone-else")).unwrap(),
+        expected
+    );
+    // Listing is scoped to the caller's own delegations.
+    assert_eq!(
+        control(&mut app, list(), Some("fixture-caller")).unwrap(),
+        gitterm::delegations::delegation_list(&[&delegation], None).unwrap()
+    );
+    assert_eq!(
+        control(&mut app, list(), Some("someone-else")).unwrap(),
+        gitterm::delegations::delegation_list(&[], None).unwrap()
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("tasks.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn iced_turn_complete_marks_only_its_session_unless_the_worker_reported_done() {
+    if isolated(
+        "iced_turn_complete_marks_only_its_session_unless_the_worker_reported_done",
+        "task_authority",
+    ) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(dir.path());
+    add_task(&mut app, dir.path(), dir.path());
+    for (ws, session) in [(0, "first"), (1, "fixture-session")] {
+        let tab = &mut app.workspaces[ws].tabs[0];
+        tab.task_id = Some("fixture-task".into());
+        tab.task_session_id = Some(session.into());
+    }
+    let notify = |session: &str| {
+        TaskControlOperation::SessionEvent(task_mcp::TaskSessionEventRequest {
+            task_id: "fixture-task".into(),
+            session_id: session.into(),
+            event_type: "agent-turn-complete".into(),
+        })
+    };
+    assert_eq!(
+        control(&mut app, notify("first"), None).unwrap(),
+        json!({"task_id":"fixture-task","session_id":"first","waiting_for_input":true})
+    );
+    assert_eq!(
+        app.workspaces[0].tabs[0].task_live_state,
+        Some(TaskSessionLiveState::AwaitingInput)
+    );
+    assert_eq!(app.workspaces[1].tabs[0].task_live_state, None);
+    assert_eq!(
+        control(&mut app, notify("unknown"), None).unwrap(),
+        json!({"task_id":"fixture-task","session_id":"unknown","waiting_for_input":false})
+    );
+    // A worker that reported done is idle at its prompt, not awaiting input.
+    let store = app.task_authority.store_mut().as_mut().unwrap();
+    store
+        .insert_delegation(fixture_delegation("requested"))
+        .unwrap();
+    store
+        .set_delegation_status(
+            "fixture-delegation",
+            gitterm::tasks::DelegationStatus::Running,
+            "t2",
+        )
+        .unwrap();
+    store
+        .complete_delegation(
+            "fixture-delegation",
+            gitterm::tasks::DelegationResult {
+                handoff: Some(
+                    serde_json::from_value(json!({"summary":"Done","updated_at":"t3"})).unwrap(),
+                ),
+                ..Default::default()
+            },
+            "t3",
+        )
+        .unwrap();
+    assert_eq!(
+        control(&mut app, notify("fixture-session"), None).unwrap(),
+        json!({
+            "task_id":"fixture-task",
+            "session_id":"fixture-session",
+            "waiting_for_input":false,
+            "ignored":"the worker reported done",
+        })
+    );
+    assert_eq!(app.workspaces[1].tabs[0].task_live_state, None);
+}
+
+#[test]
+fn iced_merge_plan_tools_need_a_caller() {
+    if isolated("iced_merge_plan_tools_need_a_caller", "task_authority") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(dir.path());
+    assert_eq!(
+        control(&mut app, TaskControlOperation::MergePlanGet, None).unwrap_err(),
+        task_mcp::missing_plan_caller_error("merge_plan_get")
+    );
+    let set = TaskControlOperation::MergePlanSet(task_mcp::MergePlanSetRequest {
+        entries: Vec::new(),
+    });
+    assert_eq!(
+        control(&mut app, set, None).unwrap_err(),
+        task_mcp::missing_plan_caller_error("merge_plan_set")
+    );
+}
+
+#[test]
+fn iced_dispatch_answers_each_command_on_its_own_reply_in_admission_order() {
+    if isolated(
+        "iced_dispatch_answers_each_command_on_its_own_reply_in_admission_order",
+        "task_authority",
+    ) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(dir.path());
+    add_task(&mut app, dir.path(), dir.path());
+    let (sender, mut receiver) = command_channel();
+    let operations = [
+        read("missing"),
+        TaskControlOperation::SessionEvent(task_mcp::TaskSessionEventRequest {
+            task_id: "fixture-task".into(),
+            session_id: "first".into(),
+            event_type: "other".into(),
+        }),
+        read("fixture-task"),
+        TaskControlOperation::ListDelegations(task_mcp::ListDelegationsRequest { status: None }),
+    ];
+    let pending = operations
+        .into_iter()
+        .map(|operation| sender.enqueue(operation, None).unwrap())
+        .collect::<Vec<_>>();
+    // Admission is FIFO: each envelope is dispatched in the order it was sent.
+    for _ in 0..pending.len() {
+        let _effect = app.update_event(Event::TaskControlRequested(receiver.try_recv().unwrap()));
+    }
+    assert!(receiver.try_recv().is_err());
+    let results = pending
+        .into_iter()
+        .map(iced::futures::executor::block_on)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results[0].as_ref().unwrap_err(),
+        "Task missing is not available"
+    );
+    assert_eq!(results[1].as_ref().unwrap(), &json!({"ignored":"other"}));
+    assert_eq!(results[2].as_ref().unwrap()["task_id"], "fixture-task");
+    assert_eq!(
+        results[3].as_ref().unwrap_err(),
+        &task_mcp::missing_caller_error("delegation_list")
+    );
+}
