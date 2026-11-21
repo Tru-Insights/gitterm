@@ -15,11 +15,13 @@ fn review_consult_admission_cancel_and_late_completion() {
     let caller = app.delegation_caller_for_tab(10).unwrap();
     let identity = app.delegation_identity(&caller.session_uid).unwrap();
     for id in ["first", "second"] {
-        app.delegation_state.reduce(DelegationIntent::Stored {
-            id: id.into(),
-            caller: identity.clone(),
-            authority: fixture_authority(&caller),
-        });
+        app.task_host
+            .delegations_mut()
+            .reduce(DelegationIntent::Stored {
+                id: id.into(),
+                caller: identity.clone(),
+                authority: fixture_authority(&caller),
+            });
         let new = gitterm::delegations::consult_delegation(
             &task_mcp::ConsultDelegationRequest {
                 brief: "Inspect the parser".into(),
@@ -120,7 +122,8 @@ fn checked_request_replies_only_after_insert_and_refuses_a_restored_caller() {
         )
         .unwrap();
         let DelegationEffect::Check { request, new, .. } = app
-            .delegation_state
+            .task_host
+            .delegations_mut()
             .reduce(DelegationIntent::Request {
                 new: Box::new(new),
                 caller,
@@ -202,11 +205,13 @@ fn failed_started_terminal_and_cancellation_saves_never_restart_a_paid_attempt()
             .unwrap()
             .insert_delegation(d)
             .unwrap();
-        app.delegation_state.reduce(DelegationIntent::Stored {
-            id: "attempt".into(),
-            authority: fixture_authority(&caller.tab),
-            caller,
-        });
+        app.task_host
+            .delegations_mut()
+            .reduce(DelegationIntent::Stored {
+                id: "attempt".into(),
+                authority: fixture_authority(&caller.tab),
+                caller,
+            });
         let _unpolled = app.start_queued_delegations();
         complete_checks(&mut app);
         assert!(app.delegation_runs.contains_key("attempt"));
@@ -236,7 +241,7 @@ fn failed_started_terminal_and_cancellation_saves_never_restart_a_paid_attempt()
             );
         }
         assert!(app.delegation_runs.is_empty());
-        assert!(!app.delegation_state.busy());
+        assert!(!app.task_host.delegations().busy());
         assert_eq!(
             app.task_host
                 .store()
@@ -256,7 +261,7 @@ fn failed_started_terminal_and_cancellation_saves_never_restart_a_paid_attempt()
                 description: "late".into(),
             },
         );
-        assert!(app.delegation_state.activity("attempt").is_none());
+        assert!(app.task_host.delegations().activity("attempt").is_none());
     }
 }
 
@@ -283,7 +288,7 @@ fn complete_checks(app: &mut App) {
         .map(|d| d.delegation_id.clone())
         .collect();
     for id in ids {
-        if let Some(check) = app.delegation_state.pending_start(&id) {
+        if let Some(check) = app.task_host.delegations().pending_start(&id) {
             let d = app
                 .task_host
                 .store()
@@ -339,16 +344,25 @@ fn missing_unrelated_repo_is_optional_and_queued_checks_do_not_read_the_filesyst
         .unwrap()
         .insert_delegation(d)
         .unwrap();
-    app.delegation_state.reduce(DelegationIntent::Stored {
-        id: "preflight".into(),
-        caller,
-        authority: authority.clone(),
-    });
+    app.task_host
+        .delegations_mut()
+        .reduce(DelegationIntent::Stored {
+            id: "preflight".into(),
+            caller,
+            authority: authority.clone(),
+        });
     let _unpolled = app.start_queued_delegations();
-    let check = app.delegation_state.pending_start("preflight").unwrap();
+    let check = app
+        .task_host
+        .delegations()
+        .pending_start("preflight")
+        .unwrap();
     assert!(app.delegation_runs.is_empty());
     let _unpolled = app.start_queued_delegations();
-    assert_eq!(app.delegation_state.pending_start("preflight"), Some(check));
+    assert_eq!(
+        app.task_host.delegations().pending_start("preflight"),
+        Some(check)
+    );
     // The catalog-only identity remains readable with unavailable paths. A
     // changed incarnation while the worker checks paths is refused at return.
     app.workspaces[0].tabs[0].id = 11;
@@ -367,17 +381,19 @@ fn missing_unrelated_repo_is_optional_and_queued_checks_do_not_read_the_filesyst
 }
 
 fn pending_start(app: &App, id: &str) -> Option<delegation_state::RequestId> {
-    app.delegation_state.pending_start(id)
+    app.task_host.delegations().pending_start(id)
 }
 
 fn store_consult(app: &mut App, id: &str) {
     let caller = app.delegation_caller_for_tab(10).unwrap();
     let identity = app.delegation_identity(&caller.session_uid).unwrap();
-    app.delegation_state.reduce(DelegationIntent::Stored {
-        id: id.into(),
-        caller: identity,
-        authority: fixture_authority(&caller),
-    });
+    app.task_host
+        .delegations_mut()
+        .reduce(DelegationIntent::Stored {
+            id: id.into(),
+            caller: identity,
+            authority: fixture_authority(&caller),
+        });
     let new = gitterm::delegations::consult_delegation(
         &task_mcp::ConsultDelegationRequest {
             brief: "Inspect the parser".into(),

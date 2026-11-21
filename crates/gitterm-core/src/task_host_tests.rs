@@ -246,3 +246,77 @@ async fn command_stream_yields_in_admission_order_and_ends_with_ingress() {
     assert!(stream.next().await.is_none());
     assert!(commands(None).next().await.is_none());
 }
+
+/// Stands in for an unpublished terminal: records when it is dropped.
+struct Child(std::rc::Rc<std::cell::Cell<bool>>);
+impl Drop for Child {
+    fn drop(&mut self) {
+        self.0.set(true);
+    }
+}
+
+fn session() -> LaunchedSession {
+    LaunchedSession {
+        label: "Fake".into(),
+        harness: None,
+        conversation: None,
+        objective_delivery: Default::default(),
+        timestamp: "2000-01-01T00:00:00Z".into(),
+    }
+}
+
+fn ticket(task_id: &str) -> launch::LaunchTicket {
+    launch::LaunchTicket::for_test(task_id, Some("worker"))
+}
+
+#[test]
+fn failed_publish_drops_the_unpublished_child_and_saves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (commands, _receiver) = command_channel();
+    for store in [
+        None,
+        Some(TaskStore::load(dir.path().join("tasks.json")).unwrap()),
+    ] {
+        let with_store = store.is_some();
+        let mut host = TaskHost::new(store, production(&dir), commands.clone());
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let error = host
+            .publish_launch(ticket("absent"), session(), Child(dropped.clone()))
+            .err()
+            .unwrap();
+        assert!(dropped.get(), "{error}");
+        if with_store {
+            assert!(error.contains("task absent does not exist"), "{error}");
+            assert!(host.store().as_ref().unwrap().tasks().is_empty());
+        } else {
+            assert_eq!(error, "GitTerm's task store became unavailable");
+        }
+    }
+}
+
+#[test]
+fn preview_host_never_promotes_queued_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let (commands, _receiver) = command_channel();
+    let mut host = TaskHost::new(None, preview(&dir), commands);
+    host.restore_launch_queue(vec![QueuedTaskLaunch {
+        task_id: "t".into(),
+        preset_idx: Some(0),
+        origin: TaskLaunchOrigin::Agent,
+        user_model_choice: false,
+    }]);
+    assert!(matches!(host.next_queued_launch(0, 1), Promotion::Stop));
+    assert_eq!(host.launch_queue().len(), 1);
+    let policy =
+        crate::plan_limits::evaluate_policy(&crate::plan_limits::PlanLimitsFile::default(), 0);
+    let running = std::collections::HashSet::new();
+    let capacity = RunnerCapacity {
+        running: &running,
+        max_concurrent: 1,
+        policy: &policy,
+        running_workers: 0,
+    };
+    assert!(host
+        .admit_delegations(capacity, &Default::default())
+        .is_empty());
+}

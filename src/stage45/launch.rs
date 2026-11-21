@@ -184,7 +184,7 @@ fn mcp_launch(app: &mut App, user_model_choice: bool) -> Result<Value, String> {
 
 #[cfg(unix)]
 fn queued_launches(app: &App) -> Vec<QueuedTaskLaunch> {
-    app.task_launch_queue.clone()
+    app.task_host.launch_queue().to_vec()
 }
 
 #[cfg(unix)]

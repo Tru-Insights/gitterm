@@ -51,6 +51,21 @@ pub enum TaskLaunchOrigin {
     Agent,
 }
 
+impl TaskLaunchOrigin {
+    /// A user's own launch is never held by plan limits; an agent's is,
+    /// unless the user explicitly chose the model.
+    pub fn policy_blocked(
+        self,
+        evaluation: &crate::plan_limits::PolicyEvaluation,
+        provider: crate::plan_limits::Provider,
+        parallel: bool,
+        user_model_choice: bool,
+    ) -> bool {
+        matches!(self, Self::Agent)
+            && !evaluation.allows_start(provider, parallel, user_model_choice)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionLaunch {
     pub task_id: String,

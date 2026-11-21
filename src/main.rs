@@ -10,12 +10,19 @@ use gitterm_core::delegation_state::{
     self, Effect as DelegationEffect, Intent as DelegationIntent,
 };
 use gitterm_core::session;
+#[cfg(test)]
+use gitterm_core::task_commands::SessionLaunch;
 use gitterm_core::task_commands::{
-    HandoffUpdate, SessionLaunch, TaskCreate, TaskCreateOrigin, TaskLaunchOrigin, TaskMutation,
+    HandoffUpdate, TaskCreate, TaskCreateOrigin, TaskLaunchOrigin, TaskMutation,
     TaskMutationAction, TaskMutationCommand, TaskMutationFacts, TaskPreset, TaskProjection,
     TaskPublish, WorkerCaller, WorkerCheckout, WorkerPreparationId,
 };
-use gitterm_core::task_host::{HostEffect, TaskHost};
+#[cfg(test)]
+use gitterm_core::task_host::update_queued_task_request;
+use gitterm_core::task_host::{
+    cancel_queued_worker_launch, launch_provider, HostEffect, LaunchAdmission, LaunchPolicy,
+    LaunchRequest, LaunchedSession, Promotion, QueuedTaskLaunch, RunnerCapacity, TaskHost,
+};
 use iced::advanced::graphics::core::Element;
 use iced::keyboard::{self, key, Key, Modifiers};
 use iced::widget::{
@@ -5159,39 +5166,6 @@ struct TaskTabClosePrompt {
     target: session::Target,
 }
 
-trait TaskLaunchPolicy {
-    fn policy_blocked(
-        self,
-        evaluation: &gitterm::plan_limits::PolicyEvaluation,
-        provider: gitterm::plan_limits::Provider,
-        parallel: bool,
-        user_model_choice: bool,
-    ) -> bool;
-}
-
-impl TaskLaunchPolicy for TaskLaunchOrigin {
-    fn policy_blocked(
-        self,
-        evaluation: &gitterm::plan_limits::PolicyEvaluation,
-        provider: gitterm::plan_limits::Provider,
-        parallel: bool,
-        user_model_choice: bool,
-    ) -> bool {
-        matches!(self, Self::Agent)
-            && !evaluation.allows_start(provider, parallel, user_model_choice)
-    }
-}
-
-/// A dispatch the local concurrency limit deferred: the task sits in the
-/// store as `Queued`; this remembers which preset to start when a slot frees.
-#[derive(Debug, Clone)]
-struct QueuedTaskLaunch {
-    task_id: String,
-    preset_idx: Option<usize>,
-    origin: TaskLaunchOrigin,
-    user_model_choice: bool,
-}
-
 fn restored_task_preset_index(
     harness: Option<&HarnessSelection>,
     presets: &[AgentPreset],
@@ -5252,21 +5226,6 @@ fn restore_task_launch_queue(
         }
     }
     Ok(launches)
-}
-
-fn update_queued_task_request(
-    queue: &mut [QueuedTaskLaunch],
-    task_id: &str,
-    origin: TaskLaunchOrigin,
-    user_model_choice: bool,
-) -> Option<usize> {
-    let position = queue.iter().position(|entry| entry.task_id == task_id)?;
-    let entry = &mut queue[position];
-    if matches!(origin, TaskLaunchOrigin::User) {
-        entry.origin = TaskLaunchOrigin::User;
-    }
-    entry.user_model_choice |= user_model_choice;
-    Some(position)
 }
 
 /// Outcome of asking for a task child session: it started, or the local
@@ -7694,8 +7653,8 @@ struct App {
     model_policy: gitterm::workers::ModelPolicy,
     /// Codex delegation runs in flight, by delegation id. Aborting a handle
     /// drops the run, which kills its Codex process (TRU-142).
+    /// The lifecycle state of these runs lives in the task host.
     delegation_runs: HashMap<String, iced::task::Handle>,
-    delegation_state: delegation_state::State,
     worker_pr_scans: gitterm::worker_prs::Scans,
     delegation_waiting_counts: HashMap<String, usize>,
     /// New-chat model/effort defaults and the last selection (config
@@ -7725,11 +7684,6 @@ struct App {
     // cadence. Rendering reads this before the stored snapshot — it is
     // always at least as fresh.
     task_progress_pending: HashMap<String, PendingTaskProgress>,
-    // FIFO of task launches deferred by the local concurrency limit. The
-    // durable truth is the store's Queued lifecycle; this Vec carries the
-    // order and the chosen preset within a run, and is rebuilt from the
-    // store on startup.
-    task_launch_queue: Vec<QueuedTaskLaunch>,
     // Freshest delivery probe per task (worktree HEAD vs PR head). The store
     // keeps the durable facts; this carries the live comparison that says
     // whether the recorded PR is behind local work.
@@ -12740,7 +12694,8 @@ impl App {
                 .map(|task| task.task_id.clone())
                 .collect(),
             queue: self
-                .task_launch_queue
+                .task_host
+                .launch_queue()
                 .iter()
                 .map(|entry| entry.task_id.clone())
                 .collect(),
@@ -14042,7 +13997,8 @@ impl App {
 
     /// 1-based place in the launch queue, for "Queued · #N" copy.
     fn queued_task_position(&self, task_id: &str) -> Option<usize> {
-        self.task_launch_queue
+        self.task_host
+            .launch_queue()
             .iter()
             .position(|entry| entry.task_id == task_id)
             .map(|index| index + 1)
@@ -14053,23 +14009,16 @@ impl App {
     /// signal hot path.
     fn promote_queued_tasks(&mut self) -> Task<Event> {
         let mut started = Vec::new();
-        for _ in 0..self.task_launch_queue.len() {
-            let limit = self.max_concurrent_local_tasks.max(1);
-            if self.local_running_task_count() >= limit {
-                break;
-            }
-            let entry = self.task_launch_queue.remove(0);
-            // The queue only holds launches for tasks still marked Queued —
-            // anything cancelled, archived, or started by hand just drops out.
-            let still_queued = self
+        for _ in 0..self.task_host.launch_queue().len() {
+            let running = self.local_running_task_count();
+            let entry = match self
                 .task_host
-                .store()
-                .as_ref()
-                .and_then(|store| store.get(&entry.task_id))
-                .is_some_and(|task| task.lifecycle == TaskLifecycle::Queued);
-            if !still_queued {
-                continue;
-            }
+                .next_queued_launch(running, self.max_concurrent_local_tasks)
+            {
+                Promotion::Stop => break,
+                Promotion::Skip => continue,
+                Promotion::Start(entry) => entry,
+            };
             match self.try_launch_task_child(
                 &entry.task_id,
                 entry.preset_idx,
@@ -14080,21 +14029,7 @@ impl App {
                 Ok(TaskChildLaunch::Started(task, _session)) => started.push(task),
                 Ok(TaskChildLaunch::Queued { .. }) => continue,
                 Err(error) => {
-                    // A queued launch that can no longer start (worktree gone,
-                    // preset removed) must not sit "Queued" forever.
-                    let timestamp = chrono::Utc::now().to_rfc3339();
-                    if let Some(store) = self.task_host.store_mut().as_mut() {
-                        if let Err(store_error) = store.record_lifecycle_signal(
-                            &entry.task_id,
-                            TaskLifecycle::Failed,
-                            Some(error.clone()),
-                            &timestamp,
-                        ) {
-                            eprintln!(
-                                "GitTerm V6 dropped a queued-launch failure signal: {store_error}"
-                            );
-                        }
-                    }
+                    self.task_host.fail_queued_launch(&entry.task_id, &error);
                     self.record_task_ui_error(&entry.task_id, error);
                     self.push_worker_cards(&entry.task_id);
                 }
@@ -14186,14 +14121,17 @@ impl App {
         // delegation's preset: the model goes on the command, the brief ends
         // with Report back, and the session is attached after launch.
         let worker = if command.is_some() {
-            self.worker_awaiting_launch(task_id, &child_label)
+            self.task_host
+                .worker_awaiting_launch(task_id, &child_label, |session| {
+                    find_task_session_tab(&self.workspaces, session).is_some()
+                })
         } else {
             None
         };
-        let worker_model = worker.as_ref().and_then(|(_, model, _)| model.clone());
+        let worker_model = worker.as_ref().and_then(|worker| worker.model.clone());
         let worker_options = worker
             .as_ref()
-            .map(|(_, _, options)| options.clone())
+            .map(|worker| worker.options.clone())
             .unwrap_or_default();
         let (command, harness) = match (command, worker_model.as_deref()) {
             (Some(command), Some(model)) => (
@@ -14239,100 +14177,47 @@ impl App {
         let WorkspaceLocationIdentity::Local { directory } = &task.workspace.location else {
             return Err("Remote task sessions require the later remote-executor slice".to_string());
         };
-        // A delegation may have queued before its provider crossed a limit.
-        // UI launches are the user's own choice. MCP launches, including
-        // tasks without delegations, must pass policy unless explicitly overridden.
-        let policy_blocked = command.as_deref().is_some_and(|command| {
-            let provider = match gitterm::workers::provider_for_command(command) {
-                gitterm::workers::WorkerProvider::Claude => gitterm::plan_limits::Provider::Claude,
-                gitterm::workers::WorkerProvider::Codex => gitterm::plan_limits::Provider::Codex,
-                gitterm::workers::WorkerProvider::Other
-                | gitterm::workers::WorkerProvider::Antigravity => return false,
-            };
-            origin.policy_blocked(
-                &self.plan_limits.evaluation_for_launch(),
-                provider,
-                self.plan_limit_running_workers(provider) > 0
-                    || (provider == gitterm::plan_limits::Provider::Codex
-                        && (self.delegation_state.busy() || !self.delegation_runs.is_empty())),
-                worker_options.user_model_choice || user_model_choice,
-            )
-        });
-        let holders = self
+        let provider = command.as_deref().and_then(launch_provider);
+        let policy = LaunchPolicy {
+            evaluation: self.plan_limits.evaluation_for_launch(),
+            reason: self.plan_limits_routing().reason,
+            running_workers: provider
+                .map_or(0, |provider| self.plan_limit_running_workers(provider)),
+            codex_runs: self.delegation_runs.len(),
+        };
+        let mut facts = self.task_mutation_facts();
+        facts.slot_holders = self
             .local_slot_holders()
             .iter()
             .map(|task| task.task_id.clone())
-            .collect::<HashSet<_>>();
-        let request = SessionLaunch {
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let request = LaunchRequest {
             task_id: task_id.into(),
+            preset_idx,
             preset_name: preset_idx.map(|index| self.agent_presets[index].name.clone()),
             origin,
-            user_model_choice: worker_options.user_model_choice || user_model_choice,
+            user_model_choice,
+            worker,
+            provider,
+            harness: harness.clone(),
+            launched_agent,
+            worktree: worktree_path.clone(),
         };
-        let mut facts = self.task_mutation_facts();
-        facts.policy_blocked = policy_blocked;
-        facts.policy_reason = self.plan_limits_routing().reason;
-        facts.slot_holders = holders.iter().cloned().collect();
-        let decision = self
-            .task_host
-            .reduce_mutation(
-                TaskMutationCommand {
-                    reply: None,
-                    mutation: TaskMutation::LaunchSession(request),
-                },
-                &facts,
-            )
-            .action?;
-        match decision {
-            TaskMutationAction::QueueSession { position, .. } => {
-                // Admission is acknowledged only after the durable queue write.
-                if let Some(position) = update_queued_task_request(
-                    &mut self.task_launch_queue,
-                    task_id,
-                    origin,
-                    user_model_choice,
-                ) {
-                    return Ok(TaskChildLaunch::Queued {
-                        position: position + 1,
-                    });
-                }
-                let store = self
-                    .task_host
-                    .store_mut()
-                    .as_mut()
-                    .ok_or("GitTerm's task store became unavailable")?;
-                let timestamp = chrono::Utc::now().to_rfc3339();
-                if let Some(selection) = harness.clone() {
-                    store
-                        .record_requested_harness(task_id, selection, &timestamp)
-                        .map_err(|error| error.to_string())?;
-                }
-                store
-                    .record_lifecycle_signal(task_id, TaskLifecycle::Queued, None, &timestamp)
-                    .map_err(|error| error.to_string())?;
-                self.task_launch_queue.push(QueuedTaskLaunch {
-                    task_id: task_id.into(),
-                    preset_idx,
-                    origin,
-                    user_model_choice,
-                });
-                return Ok(TaskChildLaunch::Queued { position });
+        let ticket = match self.task_host.admit_launch(request, policy, facts)? {
+            LaunchAdmission::Queued { position } => {
+                return Ok(TaskChildLaunch::Queued { position })
             }
-            TaskMutationAction::LaunchSession { .. } => {
-                if launched_agent && !holders.contains(task_id) {
-                    self.task_launch_queue
-                        .retain(|entry| entry.task_id != task_id);
-                }
-            }
-            _ => unreachable!("launch effect"),
-        }
+            LaunchAdmission::Open(ticket) => ticket,
+        };
         let original_workspace_dir = self
             .active_workspace()
             .map(|workspace| workspace.dir.clone());
         let original_tab_idx = self
             .active_workspace()
             .map(|workspace| workspace.active_tab);
-        let session_id = uuid::Uuid::new_v4().to_string();
+        let session_id = ticket.session_id().to_string();
         let command = match command {
             Some(command) if conversation_backend == Some(HarnessConversationBackend::Codex) => {
                 Some(self.codex_task_notify_command(command, task_id, &session_id))
@@ -14347,13 +14232,7 @@ impl App {
         let pre_injection_command = command.clone();
         let (command, objective_delivery) = match command {
             Some(launch) if command_accepts_initial_prompt(&launch, conversation_backend) => {
-                match write_task_brief(
-                    &session_id,
-                    &task,
-                    worker
-                        .as_ref()
-                        .map(|(delegation_id, _, _)| delegation_id.as_str()),
-                ) {
+                match write_task_brief(&session_id, &task, ticket.worker()) {
                     Ok(brief_path) => (
                         Some(command_with_initial_prompt(&launch, &brief_path)),
                         if matches!(
@@ -14392,6 +14271,7 @@ impl App {
             true,
         );
         if tab.terminal().is_none() {
+            self.task_host.abandon_launch(ticket);
             return Err(self.task_ui_error.take().unwrap_or_else(|| {
                 format!(
                     "Prepared {}, but the agent terminal could not start",
@@ -14447,36 +14327,19 @@ impl App {
             backend: conversation_backend.unwrap_or(HarnessConversationBackend::Claude),
             session_id: chat_session_id,
         });
-        let task_session = TaskSessionRecord {
-            task_session_id: session_id.clone(),
-            label: child_label.clone(),
-            harness: harness.clone(),
-            conversation: conversation.clone(),
-            objective_delivery,
-            launch_identity: None,
-            created_at: timestamp.clone(),
-            updated_at: timestamp.clone(),
-        };
-        let store = self
-            .task_host
-            .store_mut()
-            .as_mut()
-            .ok_or_else(|| "GitTerm's task store became unavailable".to_string())?;
-        store
-            .upsert_session(task_id, task_session, &timestamp)
-            .map_err(|error| error.to_string())?;
-        if let Some((delegation_id, _, _)) = &worker {
-            // The worker is running; its report reaches the delegation.
-            if let Err(error) =
-                store.attach_worker_session(delegation_id, &session_id, conversation, &timestamp)
-            {
-                // `tab` has not entered the workspace yet. Dropping it stops
-                // the terminal instead of leaving an untracked timed worker.
-                return Err(format!(
-                    "worker session {session_id} could not attach to delegation {delegation_id}: {error}; stopping worker"
-                ));
-            }
-        }
+        // The host saves the session and attaches the worker before the tab
+        // is published; on failure it drops the tab, stopping the terminal.
+        let tab = self.task_host.publish_launch(
+            ticket,
+            LaunchedSession {
+                label: child_label.clone(),
+                harness: harness.clone(),
+                conversation,
+                objective_delivery,
+                timestamp,
+            },
+            tab,
+        )?;
         self.workspaces[workspace_idx].tabs.push(tab);
         let tab_idx = self.workspaces[workspace_idx].tabs.len() - 1;
         if focus {
@@ -18941,7 +18804,8 @@ impl App {
             }
         };
         let effect = self
-            .delegation_state
+            .task_host
+            .delegations_mut()
             .reduce(DelegationIntent::Request {
                 new: Box::new(new),
                 caller,
@@ -18988,7 +18852,8 @@ impl App {
     ) -> Task<Event> {
         let caller = self.delegation_identity(&new.parent.session_uid).ok();
         let effect = self
-            .delegation_state
+            .task_host
+            .delegations_mut()
             .reduce(DelegationIntent::Checked {
                 request,
                 new: Box::new(new),
@@ -19026,14 +18891,16 @@ impl App {
             Self::report_delegation_error(&origin, error.to_string());
             return Task::none();
         }
-        self.delegation_state.reduce(DelegationIntent::Stored {
-            id: delegation_id.clone(),
-            caller,
-            authority,
-        });
+        self.task_host
+            .delegations_mut()
+            .reduce(DelegationIntent::Stored {
+                id: delegation_id.clone(),
+                caller,
+                authority,
+            });
         self.anchor_delegation_card(&session_uid, &delegation_id);
         let start = self.start_queued_delegations();
-        let queued = !self.delegation_state.admitted(&delegation_id);
+        let queued = !self.task_host.delegations().admitted(&delegation_id);
         if let DelegationOrigin::Mcp(reply) = &origin {
             reply.send(Ok(serde_json::json!({
                 "delegation_id": delegation_id,
@@ -19074,34 +18941,38 @@ impl App {
     }
 
     /// Starts queued Codex runs while slots are free
-    /// (`review.max_concurrent_reviews`).
+    /// (`review.max_concurrent_reviews`); the host decides which.
     fn admit_delegations(&mut self) -> Vec<DelegationEffect> {
-        let Some(store) = self.task_host.store().as_ref() else {
-            return Vec::new();
-        };
         let running: HashSet<String> = self.delegation_runs.keys().cloned().collect();
-        let callers = store
-            .delegations()
-            .iter()
-            .filter(|d| {
-                d.codex_child().is_some()
-                    && d.status == gitterm::tasks::DelegationStatus::Requested
-                    && !running.contains(&d.delegation_id)
-            })
-            .filter_map(|d| {
-                self.delegation_identity(&d.parent.session_uid)
-                    .ok()
-                    .map(|caller| (d.parent.session_uid.clone(), caller))
-            })
-            .collect();
-        self.delegation_state.reduce(DelegationIntent::Admit {
-            delegations: store.delegations(),
+        let policy = self.plan_limits.evaluation_for_launch();
+        let capacity = RunnerCapacity {
             running: &running,
-            callers: &callers,
             max_concurrent: self.review_config.max_concurrent_reviews,
-            policy: &self.plan_limits.evaluation_for_launch(),
+            policy: &policy,
             running_workers: self.plan_limit_running_workers(gitterm::plan_limits::Provider::Codex),
-        })
+        };
+        let callers = self
+            .task_host
+            .store()
+            .as_ref()
+            .map(|store| {
+                store
+                    .delegations()
+                    .iter()
+                    .filter(|d| {
+                        d.codex_child().is_some()
+                            && d.status == gitterm::tasks::DelegationStatus::Requested
+                            && !running.contains(&d.delegation_id)
+                    })
+                    .filter_map(|d| {
+                        self.delegation_identity(&d.parent.session_uid)
+                            .ok()
+                            .map(|caller| (d.parent.session_uid.clone(), caller))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.task_host.admit_delegations(capacity, &callers)
     }
 
     fn start_queued_delegations(&mut self) -> Task<Event> {
@@ -19144,29 +19015,27 @@ impl App {
         check: delegation_state::RequestId,
         result: Result<delegation_state::Authority, String>,
     ) -> Task<Event> {
-        let Some(store) = self.task_host.store().as_ref() else {
+        let running: HashSet<String> = self.delegation_runs.keys().cloned().collect();
+        let policy = self.plan_limits.evaluation_for_launch();
+        let capacity = RunnerCapacity {
+            running: &running,
+            max_concurrent: self.review_config.max_concurrent_reviews,
+            policy: &policy,
+            running_workers: self.plan_limit_running_workers(gitterm::plan_limits::Provider::Codex),
+        };
+        let Some(parent) = self
+            .task_host
+            .store()
+            .as_ref()
+            .and_then(|store| store.delegation(&id))
+            .map(|delegation| delegation.parent.session_uid.clone())
+        else {
             return Task::none();
         };
-        let Some(delegation) = store.delegation(&id) else {
-            return Task::none();
-        };
-        let caller = self
-            .delegation_identity(&delegation.parent.session_uid)
-            .ok();
-        let running = self.delegation_runs.keys().cloned().collect();
-        let effects = self
-            .delegation_state
-            .reduce(DelegationIntent::StartChecked {
-                delegation,
-                check,
-                caller: caller.as_ref(),
-                result,
-                running: &running,
-                max_concurrent: self.review_config.max_concurrent_reviews,
-                policy: &self.plan_limits.evaluation_for_launch(),
-                running_workers: self
-                    .plan_limit_running_workers(gitterm::plan_limits::Provider::Codex),
-            });
+        let caller = self.delegation_identity(&parent).ok();
+        let effects =
+            self.task_host
+                .delegation_start_checked(&id, check, result, capacity, caller.as_ref());
         let mut tasks = Vec::new();
         for effect in effects {
             match effect {
@@ -19227,17 +19096,15 @@ impl App {
         delegation_id: &str,
         event: gitterm::codex_runner::CodexRunEvent,
     ) {
-        let Some(delegation) = self
+        let Some(effects) = self
             .task_host
-            .store()
-            .as_ref()
-            .and_then(|store| store.delegation(delegation_id))
+            .reduce_delegation(delegation_id, |delegation| DelegationIntent::Progress {
+                delegation,
+                event,
+            })
         else {
             return;
         };
-        let effects = self
-            .delegation_state
-            .reduce(DelegationIntent::Progress { delegation, event });
         for effect in effects {
             match effect {
                 DelegationEffect::RecordStarted { id, thread_id } => {
@@ -19268,18 +19135,20 @@ impl App {
         >,
     ) -> Task<Event> {
         self.delegation_runs.remove(delegation_id);
-        let Some(store) = self.task_host.store().as_ref() else {
+        if self.task_host.store().is_none() {
             eprintln!("[delegation] {delegation_id} finished but the task store is unavailable");
             return Task::none();
-        };
-        let Some(delegation) = store.delegation(delegation_id) else {
+        }
+        let Some(mut effects) = self
+            .task_host
+            .reduce_delegation(delegation_id, |delegation| DelegationIntent::Finished {
+                delegation,
+            })
+        else {
             eprintln!("[delegation] {delegation_id} finished but is not in the store");
             return Task::none();
         };
-        let effect = self
-            .delegation_state
-            .reduce(DelegationIntent::Finished { delegation })
-            .pop();
+        let effect = effects.pop();
         match effect {
             Some(DelegationEffect::RecordCompletion(id)) => {
                 self.record_delegation_outcome(&id, outcome)
@@ -19391,36 +19260,6 @@ impl App {
     /// options (TRU-212). Only a
     /// delegation whose session is not live qualifies — none attached yet
     /// (first or queued launch), or one whose tab is gone (a relaunch).
-    fn worker_awaiting_launch(
-        &self,
-        task_id: &str,
-        preset_name: &str,
-    ) -> Option<(String, Option<String>, gitterm::tasks::DelegationRunOptions)> {
-        let store = self.task_host.store().as_ref()?;
-        store
-            .open_worker_delegations(task_id)
-            .into_iter()
-            .find_map(|delegation| match &delegation.child {
-                gitterm::tasks::DelegationChild::TaskSession {
-                    preset_name: Some(preset),
-                    task_session_id,
-                    model,
-                    ..
-                } if preset == preset_name
-                    && task_session_id.as_deref().is_none_or(|session| {
-                        find_task_session_tab(&self.workspaces, session).is_none()
-                    }) =>
-                {
-                    Some((
-                        delegation.delegation_id.clone(),
-                        model.clone(),
-                        delegation.options.clone(),
-                    ))
-                }
-                _ => None,
-            })
-    }
-
     /// `delegate_task` (TRU-142 S6): resolve the worker, then create the
     /// task through the same path as `task_create`. The worker is launched
     /// in `start_delegated_worker` once the worktree is ready. A request
@@ -20171,7 +20010,7 @@ impl App {
             .filter(|d| {
                 let parent = self.delegation_chat_tab_id(&d.parent);
                 let held = parent
-                    .and_then(|id| self.delegation_state.held(id))
+                    .and_then(|id| self.task_host.delegations().held(id))
                     .is_some_and(|sends| {
                         sends
                             .iter()
@@ -20352,12 +20191,13 @@ impl App {
     ) -> Result<serde_json::Value, String> {
         let id = delegation.delegation_id.as_str();
         let held = self
-            .delegation_state
+            .task_host
+            .delegations()
             .held(tab_id)
             .is_some_and(|held| held.iter().any(|send| send.delegation_id == id));
         gitterm::delegations::card_payload(
             delegation,
-            self.delegation_state.activity(id),
+            self.task_host.delegations().activity(id),
             held,
             self.worker_info(delegation),
             &config::global_config_dir(),
@@ -20484,7 +20324,7 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
-        let mut tabs: HashSet<usize> = self.delegation_state.held_tabs().collect();
+        let mut tabs: HashSet<usize> = self.task_host.delegations().held_tabs().collect();
         let mut waiting = Vec::new();
         for parent in parents {
             match self.delegation_chat_tab_id(&parent) {
@@ -20523,13 +20363,16 @@ impl App {
             .collect();
         delegations.reverse();
         let records: Vec<_> = delegations.iter().collect();
-        let effects = self.delegation_state.reduce(DelegationIntent::Flush {
-            tab_id,
-            recipient_exists,
-            delegations: &records,
-            streaming,
-            automatic: self.delegations_config.auto_tell,
-        });
+        let effects = self
+            .task_host
+            .delegations_mut()
+            .reduce(DelegationIntent::Flush {
+                tab_id,
+                recipient_exists,
+                delegations: &records,
+                streaming,
+                automatic: self.delegations_config.auto_tell,
+            });
         let mut tasks = Vec::new();
         for effect in effects {
             match effect {
@@ -20567,33 +20410,6 @@ impl App {
         }
         Ok(delegation)
     }
-}
-
-fn cancel_queued_worker_launch(
-    store: &mut TaskStore,
-    queue: &mut Vec<QueuedTaskLaunch>,
-    delegation_id: &str,
-    timestamp: &str,
-) -> Result<(), TaskStoreError> {
-    let task_id = store
-        .delegation(delegation_id)
-        .filter(|d| d.status == gitterm::tasks::DelegationStatus::Cancelled)
-        .and_then(|d| match &d.child {
-            gitterm::tasks::DelegationChild::TaskSession {
-                task_id,
-                task_session_id: None,
-                ..
-            } => Some(task_id.clone()),
-            _ => None,
-        });
-    if let Some(task_id) = task_id {
-        let before = queue.len();
-        queue.retain(|launch| launch.task_id != task_id);
-        if queue.len() != before {
-            store.record_lifecycle_signal(&task_id, TaskLifecycle::Stopped, None, timestamp)?;
-        }
-    }
-    Ok(())
 }
 
 fn local_slot_holders<'a>(store: &'a TaskStore, workspaces: &[Workspace]) -> Vec<&'a TaskRecord> {
@@ -21483,12 +21299,17 @@ impl App {
             bottom_repo_picker_open: false,
             selection: SelectionState::default(),
             next_tab_id: 0,
-            task_host: production_task_host(task_store, host_commands),
+            task_host: {
+                // The queue's durable truth is the store's Queued lifecycle;
+                // the host carries order and preset within a run.
+                let mut host = production_task_host(task_store, host_commands);
+                host.restore_launch_queue(task_launch_queue);
+                host
+            },
             missing_task_worktrees_logged: HashSet::new(),
             review_config: config.review.clone(),
             model_policy: config.policy.clone(),
             delegation_runs: HashMap::new(),
-            delegation_state: delegation_state::State::default(),
             worker_pr_scans: gitterm::worker_prs::Scans::default(),
             delegation_waiting_counts: HashMap::new(),
             chat_config: config.chat.clone(),
@@ -21507,7 +21328,6 @@ impl App {
             task_context_mru: VecDeque::from([None]),
             task_last_session_tab: HashMap::new(),
             task_progress_pending: HashMap::new(),
-            task_launch_queue,
             task_delivery_probe: HashMap::new(),
             task_publish_busy: HashSet::new(),
             task_publish_prompt: None,
@@ -25388,7 +25208,7 @@ fi
 
                 // Start queued task launches whenever capacity has freed up
                 // (a session ending, the limit being raised, a task archived).
-                if !self.task_launch_queue.is_empty() {
+                if !self.task_host.launch_queue().is_empty() {
                     let promoted = self.promote_queued_tasks();
                     tasks.push(promoted);
                 }
@@ -26907,12 +26727,15 @@ fi
                         return Task::none();
                     }
                 };
-                let effects = self.delegation_state.reduce(DelegationIntent::ManualSend {
-                    tab_id,
-                    delegation: &delegation,
-                    finding_ids: &finding_ids,
-                    streaming,
-                });
+                let effects =
+                    self.task_host
+                        .delegations_mut()
+                        .reduce(DelegationIntent::ManualSend {
+                            tab_id,
+                            delegation: &delegation,
+                            finding_ids: &finding_ids,
+                            streaming,
+                        });
                 for effect in effects {
                     match effect {
                         DelegationEffect::Flush(tab_id) => {
@@ -26946,9 +26769,12 @@ fi
                         return Task::none();
                     }
                 };
-                let effects = self.delegation_state.reduce(DelegationIntent::Dismiss {
-                    delegation: &delegation,
-                });
+                let effects = self
+                    .task_host
+                    .delegations_mut()
+                    .reduce(DelegationIntent::Dismiss {
+                        delegation: &delegation,
+                    });
                 let mut active = false;
                 for effect in effects {
                     match effect {
@@ -26962,7 +26788,8 @@ fi
                     }
                 }
                 let now = chrono::Utc::now().to_rfc3339();
-                let result = match self.task_host.store_mut().as_mut() {
+                let (store, queue) = self.task_host.store_and_launch_queue_mut();
+                let result = match store.as_mut() {
                     Some(store) => {
                         let cancelled = if active {
                             store.cancel_delegation(&delegation_id, &now)
@@ -26971,12 +26798,7 @@ fi
                         };
                         cancelled
                             .and_then(|()| {
-                                cancel_queued_worker_launch(
-                                    store,
-                                    &mut self.task_launch_queue,
-                                    &delegation_id,
-                                    &now,
-                                )
+                                cancel_queued_worker_launch(store, queue, &delegation_id, &now)
                             })
                             .and_then(|()| store.dismiss_delegation(&delegation_id, &now))
                             .map_err(|error| error.to_string())
@@ -29563,7 +29385,8 @@ fi
                 return self.update(Event::TaskDeliveryDiscovered(task_id, result));
             }
             Event::TaskQueueCancel(task_id) => {
-                self.task_launch_queue
+                self.task_host
+                    .launch_queue_mut()
                     .retain(|entry| entry.task_id != task_id);
                 let timestamp = chrono::Utc::now().to_rfc3339();
                 match self.task_host.store_mut().as_mut() {
