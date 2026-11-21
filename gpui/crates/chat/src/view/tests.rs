@@ -263,8 +263,13 @@ fn collapse_diff_and_replay_preserve_find(cx: &mut TestAppContext) {
             .unwrap()
             .read(cx);
         assert!(row.open);
-        assert_eq!(row.diffs.len(), 2);
-        assert!(row.diff_error.is_none(), "{:?}", row.diff_error);
+        assert_eq!(row.row.edits().len(), 2);
+        assert!(
+            row.row
+                .edits()
+                .iter()
+                .all(|edit| !crate::interactions::edit_lines(edit).rows.is_empty())
+        );
         assert!(!row.text.read(cx).rendered_text().is_empty());
     });
     let matched_row = chat.read_with(cx, |view, _| view.find.active().unwrap().row);
@@ -303,7 +308,7 @@ fn collapse_diff_and_replay_preserve_find(cx: &mut TestAppContext) {
 }
 
 #[test]
-fn edit_fragments_parse_as_component_diffs_including_paths_and_empty_files() {
+fn edit_fragments_preserve_paths_and_empty_file_line_changes() {
     for edit in [
         EditDiff {
             path: "src/a.rs".into(),
@@ -321,11 +326,27 @@ fn edit_fragments_parse_as_component_diffs_including_paths_and_empty_files() {
             new: String::new(),
         },
     ] {
-        assert!(
-            DiffFile::parse(&edit_patch(&edit)).is_ok(),
-            "{}",
-            edit_patch(&edit)
-        );
+        let diff = crate::interactions::edit_lines(&edit);
+        let removed = diff
+            .rows
+            .iter()
+            .filter(|line| line.sign == '-')
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        let added = diff
+            .rows
+            .iter()
+            .filter(|line| line.sign == '+')
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(!edit.path.is_empty());
+        if edit.old.is_empty() {
+            assert!(removed.is_empty());
+        }
+        if edit.new.is_empty() {
+            assert!(added.is_empty());
+        }
+        assert!(!removed.is_empty() || !added.is_empty());
     }
 }
 
@@ -2240,4 +2261,547 @@ fn mid_turn_three_commands_use_run_wording_after_history_completion(cx: &mut Tes
         assert!(view.row_views[2].as_ref().unwrap().read(cx).hidden_by_run);
         assert!(!view.row_views[4].as_ref().unwrap().read(cx).hidden_by_run);
     });
+}
+
+fn install_card(
+    card: crate::delegation::DelegationCard,
+    chat: &Entity<ChatView>,
+    cx: &mut VisualTestContext,
+) {
+    chat.update_in(cx, |view, _, cx| {
+        view.set_delegations(vec![card.clone()], cx);
+        view.set_roster(
+            vec![roster::RosterEntry {
+                id: format!("dlg:{}", card.delegation.delegation_id),
+                name: "Codex".into(),
+                model: String::new(),
+                checkout: String::new(),
+                activity: String::new(),
+                state: roster::WorkerState::Done,
+                started_at_ms: 0,
+                ended_at_ms: Some(0),
+            }],
+            cx,
+        );
+    });
+    draw(cx);
+}
+fn click_selector(selector: String, cx: &mut VisualTestContext) {
+    let selector = Box::leak(selector.into_boxed_str());
+    let bounds = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("missing {selector}"));
+    cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+    draw(cx);
+}
+#[gpui::test]
+fn h12_h14_h15_h16_h16a_h16b_preview_buttons_only_notice(cx: &mut TestAppContext) {
+    use crate::delegation::tests::{card, with_findings};
+    let (chat, cx) = setup(vec![], cx);
+    cx.simulate_resize(size(px(1400.), px(1000.)));
+    let called = Rc::new(std::cell::Cell::new(0));
+    let captured = called.clone();
+    chat.update_in(cx, |view, _, cx| {
+        view.set_intent_callback(
+            Rc::new(move |_, _| {
+                captured.set(captured.get() + 1);
+                Receipt::rejected("unexpected")
+            }),
+            cx,
+        )
+    });
+    for (card, label) in [
+        (with_findings(), "Send to Claude"),
+        (card("review", "completed"), "Re-run"),
+        (card("review", "completed"), "Dismiss"),
+        (card("consult", "running"), "Cancel"),
+        (card("implement", "running"), "Stop tracking"),
+    ] {
+        install_card(card.clone(), &chat, cx);
+        let id = chat.read_with(cx, |view, _| view.model.rows[0].id);
+        click_selector(format!("delegation-action-{id}-{label}"), cx);
+        chat.read_with(cx, |view, _| {
+            assert_eq!(
+                view.composer_state.notice.as_deref(),
+                Some(crate::interactions::preview_notice(label).as_str())
+            );
+            assert_eq!(view.model.rows[0].delegation.as_ref(), Some(&card));
+            assert!(view.records.is_empty());
+        });
+    }
+    let card = with_findings();
+    install_card(card.clone(), &chat, cx);
+    click_selector("finding-select-0-F1".into(), cx);
+    chat.read_with(cx, |view, _| {
+        assert_eq!(
+            view.composer_state.notice.as_deref(),
+            Some("Handle empty input · not available in preview")
+        );
+        assert_eq!(view.model.rows[0].delegation.as_ref(), Some(&card));
+    });
+    assert_eq!(called.get(), 0, "no runtime commands or persistence path");
+}
+#[gpui::test]
+fn h13_h13a_card_navigation_emits_only_the_exact_file_or_worker(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    cx.simulate_resize(size(px(1400.), px(1000.)));
+    let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captured = events.clone();
+    let _subscription = cx.update(|_, cx| {
+        cx.subscribe(&chat, move |_, event: &roster::RosterOutcome, _| {
+            captured.borrow_mut().push(event.clone())
+        })
+    });
+    install_card(crate::delegation::tests::with_findings(), &chat, cx);
+    click_selector("finding-location-0-F1".into(), cx);
+    assert_eq!(
+        *events.borrow(),
+        [roster::RosterOutcome::OpenFile {
+            path: "src/lib.rs".into(),
+            review: false
+        }]
+    );
+    install_card(
+        crate::delegation::tests::card("implement", "running"),
+        &chat,
+        cx,
+    );
+    click_selector("delegation-action-0-Open worker tab".into(), cx);
+    assert_eq!(
+        events.borrow().last(),
+        Some(&roster::RosterOutcome::OpenWorker {
+            id: "review-1".into()
+        })
+    );
+}
+#[gpui::test]
+fn h24_roster_reveals_unfolds_flashes_card_without_worker_navigation(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    cx.simulate_resize(size(px(1400.), px(1000.)));
+    install_card(
+        crate::delegation::tests::card("implement", "running"),
+        &chat,
+        cx,
+    );
+    let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captured = events.clone();
+    let _subscription = cx.update(|_, cx| {
+        cx.subscribe(&chat, move |_, event: &roster::RosterOutcome, _| {
+            captured.borrow_mut().push(event.clone())
+        })
+    });
+    chat.update_in(cx, |view, window, cx| {
+        view.row(0, window, cx)
+            .update(cx, |row, _| row.open = false);
+    });
+    draw(cx);
+    click_selector("roster-dlg:review-1".into(), cx);
+    chat.read_with(cx, |view, cx| {
+        assert_eq!(view.flashed_row, Some(0));
+        assert!(view.row_views[0].as_ref().unwrap().read(cx).open);
+        assert!(!view.scroller.read(cx).is_following_tail());
+    });
+    assert!(
+        events
+            .borrow()
+            .iter()
+            .all(|event| matches!(event, roster::RosterOutcome::Open { .. }))
+    );
+    assert!(cx.debug_bounds("roster-dot-dlg:review-1").is_some());
+    assert!(cx.debug_bounds("chat-latest").is_some());
+    cx.executor().advance_clock(Duration::from_millis(901));
+    draw(cx);
+    assert_eq!(chat.read_with(cx, |view, _| view.flashed_row), None);
+}
+#[gpui::test]
+fn h03_show_earlier_restores_one_chunk_and_h04_latest_follows_and_trims(cx: &mut TestAppContext) {
+    let records = (0..250)
+        .map(|i| Record {
+            at_ms: None,
+            entry: Entry::UserPrompt(format!("prompt {i}")),
+        })
+        .collect();
+    let (chat, cx) = setup(records, cx);
+    draw(cx);
+    assert_eq!(chat.read_with(cx, |view, _| view.history_start), 100);
+    chat.update_in(cx, |view, _, cx| {
+        view.scroller.update(cx, |state, cx| {
+            state.scroll_to_item(99, cx);
+        });
+    });
+    draw(cx);
+    click_selector("show-earlier".into(), cx);
+    assert_eq!(chat.read_with(cx, |view, _| view.history_start), 50);
+    chat.update_in(cx, |view, _, cx| {
+        view.scroller.update(cx, |state, cx| {
+            state.scroll_to_item(100, cx);
+        });
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("chat-latest").is_some());
+    click_selector("chat-latest".into(), cx);
+    chat.read_with(cx, |view, cx| {
+        assert_eq!(view.history_start, 100);
+        assert!(view.scroller.read(cx).is_following_tail());
+    });
+}
+#[gpui::test]
+fn h06_markdown_callback_blocks_middle_click_and_unsafe_schemes(cx: &mut TestAppContext) {
+    use super::transcript::{link_allowed, open_link};
+    let (_, cx) = setup(vec![], cx);
+    let left = ClickEvent::Mouse(gpui::MouseClickEvent {
+        up: gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let middle = ClickEvent::Mouse(gpui::MouseClickEvent {
+        up: gpui::MouseUpEvent {
+            button: gpui::MouseButton::Middle,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    assert!(link_allowed("https://example.com", &left));
+    assert!(!link_allowed("https://example.com", &middle));
+    assert!(!link_allowed("file:///private/tmp/a", &left));
+    cx.update(|window, cx| {
+        open_link(&"file:///private/tmp/a".into(), &left, window, cx);
+        open_link(&"https://example.com".into(), &middle, window, cx);
+    });
+    assert!(cx.opened_url().is_none());
+    cx.update(|window, cx| open_link(&"HTTPS://example.com".into(), &left, window, cx));
+    assert_eq!(cx.opened_url().as_deref(), Some("HTTPS://example.com"));
+}
+#[gpui::test]
+fn h08_edit_show_all_expands_and_h09_review_routes_without_toggling_card(cx: &mut TestAppContext) {
+    let records = vec![Record {
+        at_ms: None,
+        entry: Entry::Harness(HarnessEvent::ItemStarted {
+            id: "edit".into(),
+            kind: ItemKind::ToolCall {
+                name: "Write".into(),
+                input: serde_json::json!({"file_path":"src/lib.rs","content":"line\n".repeat(60)}),
+            },
+        }),
+    }];
+    let (chat, cx) = setup(records, cx);
+    cx.simulate_resize(size(px(1400.), px(2000.)));
+    draw(cx);
+    click_selector("tool-run-0".into(), cx);
+    click_selector("row-fold".into(), cx);
+    chat.update_in(cx, |view, _, cx| {
+        view.scroller.update(cx, |state, cx| {
+            state.scroll_to_item(0, cx);
+        });
+    });
+    draw(cx);
+    click_selector("edit-more-0-0".into(), cx);
+    chat.read_with(cx, |view, cx| {
+        assert!(
+            view.row_views[0]
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .expanded_edits
+                .contains(&0)
+        )
+    });
+    let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captured = events.clone();
+    let _subscription = cx.update(|_, cx| {
+        cx.subscribe(&chat, move |_, event: &roster::RosterOutcome, _| {
+            captured.borrow_mut().push(event.clone())
+        })
+    });
+    // Review stays outside the edit's disclosure and stops propagation.
+    chat.update_in(cx, |view, window, cx| {
+        view.row(0, window, cx)
+            .update(cx, |row, _| row.open = false)
+    });
+    draw(cx);
+    click_selector("edit-review-0".into(), cx);
+    assert_eq!(
+        *events.borrow(),
+        [roster::RosterOutcome::OpenFile {
+            path: "src/lib.rs".into(),
+            review: true
+        }]
+    );
+    chat.read_with(cx, |view, cx| {
+        assert!(!view.row_views[0].as_ref().unwrap().read(cx).open)
+    });
+}
+#[gpui::test]
+fn h21_opening_empty_find_preserves_the_exact_retained_pixel_offset(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(
+        parse_fixture(include_str!("../../fixtures/long-5000.jsonl")).unwrap(),
+        cx,
+    );
+    draw(cx);
+    chat.update_in(cx, |view, _, cx| {
+        view.history_start = 0;
+        view.scroller.update(cx, |state, cx| {
+            state.remeasure(cx);
+            state.scroll_to_item(2500, cx);
+        });
+    });
+    draw(cx);
+    let x = cx.debug_bounds("native-chat").unwrap().center().x;
+    cx.simulate_event(gpui::ScrollEvent {
+        position: gpui::point(x, px(300.)),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-37.))),
+        ..Default::default()
+    });
+    draw(cx);
+    let (scroller, top) = chat.read_with(cx, |view, cx| {
+        (
+            view.scroller.clone(),
+            view.scroller.read(cx).logical_scroll_top(),
+        )
+    });
+    assert_ne!(top.offset_in_item, px(0.));
+    cx.simulate_keystrokes("cmd-f");
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        assert_ne!(view.scroller, scroller);
+        assert_eq!(view.scroller.read(cx).logical_scroll_top(), top);
+    });
+    chat.update_in(cx, |view, _, cx| {
+        view.jump(cx);
+        assert_eq!(view.history_start, 0, "find pauses history trimming");
+    });
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        assert_eq!(view.scroller.read(cx).logical_scroll_top(), top)
+    });
+}
+
+#[gpui::test]
+fn h26_imported_continue_here_is_inert_and_pending_disables_it(cx: &mut TestAppContext) {
+    let offer = crate::imported::ImportedOffer {
+        conversations: vec![crate::imported::ImportedConversation {
+            id: "imported-1".into(),
+            title: "Earlier work".into(),
+            origin: "terminal".into(),
+        }],
+        pending: false,
+    };
+    let (chat, cx) = setup(
+        vec![Record {
+            at_ms: None,
+            entry: Entry::ImportedOffer(offer.clone()),
+        }],
+        cx,
+    );
+    draw(cx);
+    click_selector("continue-here-imported-1".into(), cx);
+    chat.read_with(cx, |view, _| {
+        assert_eq!(
+            view.composer_state.notice.as_deref(),
+            Some("Continue here · not available in preview")
+        );
+        assert_eq!(view.imported_offer, offer);
+        assert!(view.model.rows.is_empty());
+        assert!(view.submission.is_none());
+    });
+    chat.update_in(cx, |view, _, cx| {
+        view.set_imported_offer(
+            crate::imported::ImportedOffer {
+                pending: true,
+                ..offer.clone()
+            },
+            cx,
+        );
+        view.composer_state.notice = None;
+    });
+    draw(cx);
+    click_selector("continue-here-imported-1".into(), cx);
+    assert!(chat.read_with(cx, |view, _| view.composer_state.notice.is_none()));
+}
+
+#[gpui::test]
+fn h02_tool_run_counts_and_completed_work_keep_reply_visible(cx: &mut TestAppContext) {
+    let records=parse_fixture(r#"{"at_ms":0,"entry":{"type":"harness","data":{"type":"turn_started","data":{"session_id":null,"model":null}}}}
+{"type":"item_started","data":{"id":"a","kind":{"type":"tool_call","name":"Read","input":{"file_path":"a.rs"}}}}
+{"type":"item_completed","data":{"id":"a","output":"one","is_error":false}}
+{"type":"item_started","data":{"id":"b","kind":{"type":"tool_call","name":"Read","input":{"file_path":"b.rs"}}}}
+{"type":"item_completed","data":{"id":"b","output":"two","is_error":false}}
+{"type":"text_delta","data":"Final reply stays visible"}
+{"at_ms":2000,"entry":{"type":"harness","data":{"type":"turn_completed","data":{"status":{"state":"completed"},"usage":{},"cost_usd":null,"rate_limit":null}}}}"#).unwrap();
+    let (chat, cx) = setup(records, cx);
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        let row = view.row_views[0].as_ref().unwrap().read(cx);
+        assert_eq!(row.work_summary.as_deref(), Some("Worked for 2.0s"));
+        assert_eq!(row.run_summary.as_deref(), Some("Read 2 files"));
+        assert_eq!(row.run_tooltip, "Read ×2");
+        assert!(!row.work_open);
+        assert!(
+            view.row_views[2]
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .row
+                .body
+                .contains("Final reply stays visible")
+        );
+    });
+    click_selector("work-fold-0".into(), cx);
+    click_selector("tool-run-0".into(), cx);
+    chat.read_with(cx, |view, cx| {
+        let row = view.row_views[0].as_ref().unwrap().read(cx);
+        assert!(row.work_open && row.run_open);
+    });
+}
+
+#[gpui::test]
+fn h03_history_counts_folded_tool_runs_as_one_block(cx: &mut TestAppContext) {
+    let records = (0..220)
+        .map(|index| Record {
+            at_ms: None,
+            entry: Entry::Harness(HarnessEvent::ItemStarted {
+                id: format!("tool-{index}"),
+                kind: ItemKind::ToolCall {
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command":"sample"}),
+                },
+            }),
+        })
+        .collect();
+    let (chat, cx) = setup(records, cx);
+    draw(cx);
+    chat.read_with(cx, |view, _| {
+        assert_eq!(view.history_start, 0);
+        assert_eq!(scroll::block_starts(&view.model), vec![0]);
+    });
+    assert!(cx.debug_bounds("show-earlier").is_none());
+}
+
+#[gpui::test]
+fn h11_dismissed_card_stays_in_transcript_and_closes_on_registry_refresh(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    let mut card = crate::delegation::tests::with_findings();
+    install_card(card.clone(), &chat, cx);
+    assert!(chat.read_with(cx, |view, cx| {
+        view.row_views[0].as_ref().unwrap().read(cx).open
+    }));
+    card.delegation.dismissed_at = Some("2026-11-20T01:00:00Z".into());
+    chat.update_in(cx, |view, _, cx| {
+        view.set_delegations(vec![card.clone()], cx);
+        view.set_roster(vec![], cx);
+    });
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        assert_eq!(view.model.rows.len(), 1);
+        assert!(!view.row_views[0].as_ref().unwrap().read(cx).open);
+        assert!(view.roster.is_empty());
+    });
+}
+
+#[gpui::test]
+fn h21_find_searches_findings_and_temporarily_expands_long_edits(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    install_card(crate::delegation::tests::with_findings(), &chat, cx);
+    chat.update_in(cx, |view, window, cx| {
+        view.open_find(&Find, window, cx);
+        view.change_find("Return early".into(), window, cx);
+    });
+    draw(cx);
+    assert_eq!(chat.read_with(cx, |view, _| view.find.matches.len()), 1);
+    chat.update_in(cx, |view, window, cx| {
+        view.close_find(&CloseFind, window, cx)
+    });
+    let content = (0..60).map(|i| format!("line {i}\n")).collect::<String>();
+    chat.update_in(cx, |view, window, cx| {
+        view.append_event(
+            HarnessEvent::ItemStarted {
+                id: "write".into(),
+                kind: ItemKind::ToolCall {
+                    name: "Write".into(),
+                    input: serde_json::json!({"file_path":"sample.rs","content":content}),
+                },
+            },
+            cx,
+        );
+        view.open_find(&Find, window, cx);
+        view.toggle_find_tools(window, cx);
+        view.change_find("line 59".into(), window, cx);
+    });
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        assert_eq!(view.find.active().unwrap().row, 1);
+        assert!(
+            view.row_views[1]
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .expanded_edits
+                .contains(&0)
+        );
+    });
+    chat.update_in(cx, |view, window, cx| {
+        view.close_find(&CloseFind, window, cx)
+    });
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        assert!(
+            !view.row_views[1]
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .expanded_edits
+                .contains(&0)
+        )
+    });
+}
+
+#[gpui::test]
+fn h08_expanded_edit_survives_row_eviction_without_changing_source(cx: &mut TestAppContext) {
+    let mut records = vec![Record {
+        at_ms: None,
+        entry: Entry::Harness(HarnessEvent::ItemStarted {
+            id: "edit".into(),
+            kind: ItemKind::ToolCall {
+                name: "Write".into(),
+                input: serde_json::json!({"file_path":"sample.rs","content":"line\n".repeat(60)}),
+            },
+        }),
+    }];
+    records.extend((0..110).map(|i| Record {
+        at_ms: None,
+        entry: Entry::UserPrompt(format!("prompt {i}")),
+    }));
+    let (chat, cx) = setup(records, cx);
+    chat.update_in(cx, |view, window, cx| {
+        let source = view.model.rows[0].body.clone();
+        view.row(0, window, cx)
+            .update(cx, |row, cx| row.expand_edit(0, cx));
+        for index in 1..view.model.rows.len() {
+            view.row(index, window, cx);
+        }
+        assert!(view.row_views[0].is_none());
+        let row = view.row(0, window, cx);
+        assert!(row.read(cx).expanded_edits.contains(&0));
+        assert_eq!(view.model.rows[0].body, source);
+    });
+}
+
+#[gpui::test]
+fn h12_delivered_findings_are_checked_and_disabled(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    let mut card = crate::delegation::tests::with_findings();
+    card.delegation.delivered = true;
+    install_card(card.clone(), &chat, cx);
+    click_selector("finding-select-0-F1".into(), cx);
+    chat.read_with(cx, |view, _| {
+        assert!(view.composer_state.notice.is_none());
+        assert_eq!(view.model.rows[0].delegation.as_ref(), Some(&card));
+    });
+    assert!(
+        cx.debug_bounds("delegation-action-0-Send to Claude")
+            .is_none()
+    );
 }

@@ -364,7 +364,7 @@ fn roster_periodic_read_finds_new_workers_and_preserves_local_dismissal(cx: &mut
 }
 
 #[gpui::test]
-fn roster_is_fed_from_worker_fixture_and_open_selects_its_session(cx: &mut TestAppContext) {
+fn roster_is_fed_from_worker_fixture_and_row_click_stays_in_place(cx: &mut TestAppContext) {
     let (fixture, shell, cx) = fixture(cx, true);
     assert!(cx.debug_bounds("roster-dlg:worker").is_some());
     cx.read(|cx| {
@@ -381,16 +381,18 @@ fn roster_is_fed_from_worker_fixture_and_open_selects_its_session(cx: &mut TestA
             gitterm_gpui_chat::model::roster::WorkerState::Waiting
         );
     });
+    let before = cx.read(|cx| {
+        let s = shell.read(cx);
+        (s.selected_task.clone(), s.active(cx).active_session)
+    });
     click(cx, "roster-dlg:worker");
+    // Iced's roster row reveals and flashes its transcript card
+    // (agent_chat.html revealRosterTarget); it never switches session or task.
     cx.read(|cx| {
         let s = shell.read(cx);
-        assert_eq!(s.selected_task.as_deref(), Some("open"));
         assert_eq!(
-            s.session_tab(s.active(cx).active_session.unwrap(), cx)
-                .unwrap()
-                .task_session_id
-                .as_deref(),
-            Some("child-two")
+            (s.selected_task.clone(), s.active(cx).active_session),
+            before
         );
         assert!(s.owner.read(cx).chats.is_empty());
         assert!(
@@ -399,7 +401,7 @@ fn roster_is_fed_from_worker_fixture_and_open_selects_its_session(cx: &mut TestA
                 .all(|w| w.store.terminals.as_ref().unwrap().is_empty())
         );
     });
-    cx.update(|window, cx| {
+    let message = cx.update(|window, cx| {
         shell.update(cx, |s, cx| {
             s.open_roster("dlg:missing", window, cx);
             let ordinary: Vec<_> = s
@@ -415,12 +417,21 @@ fn roster_is_fed_from_worker_fixture_and_open_selects_its_session(cx: &mut TestA
                 .unwrap()
                 .sessions
                 .retain(|t| ordinary.contains(&t.id));
-            s.open_roster("dlg:worker", window, cx);
+            s.open_worker_tab("dlg:worker", window, cx)
         })
     });
     draw(cx);
-    cx.read(|cx| assert_eq!(shell.read(cx).selected_task.as_deref(), Some("open")));
-    assert!(cx.debug_bounds("task-overview").is_some());
+    // H13a: with no open worker session Iced reports it closed/queued; it never
+    // opens the task overview or launches anything.
+    cx.read(|cx| {
+        let s = shell.read(cx);
+        assert_eq!(s.selected_task, before.0);
+    });
+    assert_eq!(
+        message.as_deref(),
+        Some("The worker's tab is closed. Open its task from the Tasks rail to resume it.")
+    );
+    assert!(cx.debug_bounds("task-overview").is_none());
     assert_eq!(snapshot(&fixture.source), fixture.before);
 }
 

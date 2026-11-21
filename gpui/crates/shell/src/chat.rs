@@ -4,7 +4,9 @@ mod auth;
 mod fence;
 mod lease;
 mod managed;
+mod navigation;
 mod provider;
+pub(crate) use navigation::{Navigation, navigation, worker_tab_target};
 #[cfg(test)]
 mod tests;
 use anyhow::{Context as _, Result};
@@ -218,6 +220,49 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[derive(Default)]
+pub(crate) struct RosterProjection {
+    pub rows: Vec<gitterm_gpui_chat::model::roster::RosterEntry>,
+    pub cards: Vec<gitterm_gpui_chat::delegation::DelegationCard>,
+}
+impl RosterProjection {
+    pub fn new(
+        tasks: &[gitterm_core::tasks::TaskRecord],
+        workers: &[gitterm_core::tasks::Delegation],
+        tab: impl Fn(&gitterm_core::tasks::Delegation) -> gitterm_core::delegations::WorkerTab,
+    ) -> Self {
+        let rows = crate::roster_entries(tasks, workers, &tab);
+        let mut workers: Vec<_> = workers.iter().collect();
+        workers.sort_by_key(|worker| {
+            std::cmp::Reverse(gitterm_core::work::summary::parse_stamp(&worker.created_at))
+        });
+        let cards = workers
+            .into_iter()
+            .map(|worker| {
+                let task = match &worker.child {
+                    gitterm_core::tasks::DelegationChild::TaskSession { task_id, .. } => {
+                        tasks.iter().find(|task| &task.task_id == task_id)
+                    }
+                    _ => None,
+                };
+                gitterm_gpui_chat::delegation::DelegationCard {
+                    delegation: worker.clone(),
+                    activity: None,
+                    held: false,
+                    worker: matches!(
+                        worker.child,
+                        gitterm_core::tasks::DelegationChild::TaskSession { .. }
+                    )
+                    .then(|| {
+                        gitterm_core::delegations::worker_card_info(worker, task, tab(worker))
+                    }),
+                }
+            })
+            .collect();
+        Self { rows, cards }
+    }
 }
 
 pub(crate) struct ChatPane {
@@ -434,14 +479,20 @@ impl ChatPane {
             _review_context_load: None,
         }
     }
-    pub(crate) fn set_roster(
-        &self,
-        rows: Vec<gitterm_gpui_chat::model::roster::RosterEntry>,
-        cx: &mut Context<Self>,
-    ) {
-        self.view.update(cx, |view, cx| view.set_roster(rows, cx));
+    pub(crate) fn set_roster(&self, projection: RosterProjection, cx: &mut Context<Self>) {
+        self.view.update(cx, |view, cx| {
+            view.set_delegations(projection.cards, cx);
+            view.set_roster(projection.rows, cx);
+        });
     }
 
+    pub(crate) fn cwd(&self) -> &std::path::Path {
+        &self.saved.cwd
+    }
+    pub(crate) fn show_notice(&self, notice: String, cx: &mut Context<Self>) {
+        self.view
+            .update(cx, |view, cx| view.set_status_error(notice, cx));
+    }
     pub(crate) fn is_working(&self) -> bool {
         matches!(
             self.controller.adapter.state().state,

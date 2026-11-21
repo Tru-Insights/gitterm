@@ -26,6 +26,8 @@ pub enum Entry {
         state: DecisionState,
         detail: String,
     },
+    /// Host-supplied V5 pickup choices; rendering does not resume them.
+    ImportedOffer(crate::imported::ImportedOffer),
     /// Delegations are app-owned, not harness-owned.
     DisplayDelegation {
         id: String,
@@ -80,6 +82,7 @@ pub fn parse_fixture(source: &str) -> Result<Vec<Record>, FixtureError> {
                         | "turn_timing"
                         | "display_decision"
                         | "display_delegation"
+                        | "imported_offer"
                 ) {
                     serde_json::from_value(value)?
                 } else {

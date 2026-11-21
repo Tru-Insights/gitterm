@@ -55,6 +55,28 @@ pub(super) fn group(rows: &[Row], completed: &[crate::model::CompletedTurn]) -> 
     runs
 }
 
+pub(super) fn tooltip(rows: &[Row]) -> String {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for tool in rows.iter().filter_map(|row| row.tool.as_ref()) {
+        if let Some((_, n)) = counts.iter_mut().find(|(name, _)| *name == tool.name) {
+            *n += 1;
+        } else {
+            counts.push((&tool.name, 1));
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(name, n)| {
+            if n > 1 {
+                format!("{name} ×{n}")
+            } else {
+                name.into()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn kind(tool: &Tool) -> &str {
     match tool.name.to_lowercase().as_str() {
         "bash" | "shell" | "run_shell_command" | "execute" | "exec" | "terminal" | "bashoutput"

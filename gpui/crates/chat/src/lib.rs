@@ -3,8 +3,11 @@ pub mod adapter;
 mod appearance;
 pub use appearance::{ChatAppearance, ChatPalette};
 pub mod composer;
+pub mod delegation;
 pub mod events;
+pub mod imported;
 pub mod intents;
+pub mod interactions;
 pub mod model;
 pub use intents::{ChatIntent, PermissionDecision, QuestionAnswer};
 
@@ -16,7 +19,7 @@ extern crate gpui_kit as gpui;
 #[cfg(target_os = "macos")]
 mod view;
 #[cfg(target_os = "macos")]
-pub use view::{ChatView, IntentCallback, init, run};
+pub use view::{ChatView, IntentCallback, TranscriptScrollerState, init, run};
 
 pub mod pickers;
 pub mod review;

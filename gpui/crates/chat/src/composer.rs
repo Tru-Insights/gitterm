@@ -64,7 +64,19 @@ pub struct ComposerState {
     pub(crate) slash_index: usize,
     pub(crate) slash_dismissed: bool,
 }
+pub const GUIDELINES_TOOLTIP: &str = "GitTerm adds its change guidelines to this agent's system prompt (workspace settings switch them off)";
+
 impl ComposerState {
+    pub fn withdraw_tooltip(&self) -> String {
+        let harness = match self.backend {
+            Some(gitterm_core::chat::types::AgentBackend::Claude) => "Claude",
+            Some(gitterm_core::chat::types::AgentBackend::Pi) => "the agent",
+            Some(gitterm_core::chat::types::AgentBackend::Acp(agent)) => agent.label(),
+            None => "the agent",
+        };
+        format!("Withdraw this message ({harness} keeps working)")
+    }
+
     fn is_acp(&self) -> bool {
         matches!(
             self.backend,
@@ -513,7 +525,7 @@ mod ui {
                     let id = row.id.clone();
                     div().flex().gap(px(8.)).child(div().flex_1().child(format!("{} · {} · {}", row.id, row.label(), row.text)))
                         .child(Button::new(gpui::SharedString::from(format!("withdraw-{}", row.id)))
-                            .label("Withdraw").disabled(disabled || !row.withdrawable())
+                            .label("×").tooltip(self.withdraw_tooltip()).accessibility_label("Withdraw this message").disabled(disabled || !row.withdrawable())
                             .on_click(cx.listener(move |view, _, _, cx| view.withdraw(id.clone(), cx))))
                 })))
                 .children(self.notice.iter().map(|notice| div().text_color(rgb(palette.err)).child(notice.clone())))
@@ -538,6 +550,7 @@ mod ui {
                                 let selector = format!("slash-{name}");
                                 Button::new(gpui::SharedString::from(format!("slash-{name}")))
                                     .debug_selector(move || selector.clone())
+                                    .tooltip(command.description.clone())
                                     .px(px(8.)).py(px(5.)).cursor_pointer()
                                     .w_full().h_auto().justify_start()
                                     .bg(rgb(if index == selected { palette.border } else { palette.block }))
@@ -561,6 +574,12 @@ mod ui {
                 .child(div().id("composer-chips").relative().flex().flex_wrap().gap(px(4.))
                     .font_family("Menlo").text_size(px(appearance.size(12.))).text_color(rgb(palette.muted))
                     .children(self.chips().into_iter().map(|(id, label)| {
+                        if id == "guidelines" {
+                            return div().id("composer-guidelines").debug_selector(|| "composer-guidelines".into())
+                                .px(px(8.)).py(px(4.)).cursor_default().child(label)
+                                .tooltip(|window, cx| gpui_component::tooltip::Tooltip::new(GUIDELINES_TOOLTIP).build(window, cx))
+                                .into_any_element();
+                        }
                         let mut chip = Button::new(gpui::SharedString::from(format!("composer-{id}")))
                             .debug_selector(move || format!("composer-{id}"))
                             .child(div().font_family("Menlo").text_size(px(appearance.size(12.))).child(label))
@@ -582,7 +601,7 @@ mod ui {
                             chip = chip.icon(gpui_component::Icon::default().data(icon).size(px(12.)));
                         }
                         if id == "checkout" && let Some(path) = &self.checkout_path { chip = chip.tooltip(path.clone()); }
-                        chip
+                        chip.into_any_element()
                     }))
                     .children(review.open.then(|| review.render(self.streaming || self.pending_request, appearance, cx))))
                 .children(self.picker.filter(|_| !disabled).map(|picker| {
