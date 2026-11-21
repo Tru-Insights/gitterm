@@ -63,6 +63,7 @@ mod sessions;
 pub mod settings;
 pub mod spine;
 mod task_host;
+mod task_panel;
 #[cfg(test)]
 mod task_host_tests;
 pub mod task_switcher;
@@ -151,6 +152,7 @@ pub struct Shell {
     _subscriptions: Vec<Subscription>,
     resize: Option<(bool, f32, f32)>,
     task_switcher: Option<Entity<task_switcher::TaskSwitcher>>,
+    task_panel: Option<Entity<task_panel::TaskPanel>>,
     task_switcher_subscription: Option<Subscription>,
     task_switcher_return_focus: Option<FocusHandle>,
     task_last_session: HashMap<String, SessionId>,
@@ -418,6 +420,7 @@ impl Shell {
             _subscriptions: subscriptions,
             resize: None,
             task_switcher: None,
+            task_panel: None,
             task_switcher_subscription: None,
             task_switcher_return_focus: None,
             task_last_session: HashMap::new(),
@@ -2176,6 +2179,13 @@ impl Shell {
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Git {
             sidebar = self.git_sidebar(sidebar, cx);
         }
+        if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Tasks {
+            sidebar = sidebar.children(
+                self.task_panel
+                    .as_ref()
+                    .map(|panel| task_panel::rail_view(panel, self.task_inputs(cx), cx)),
+            );
+        }
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Agent {
             sidebar = sidebar.children(self.agent_sidebars.get(&state.workspace.id).cloned());
         }
@@ -2259,27 +2269,18 @@ impl Shell {
     }
     fn session_content(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
         let state = self.active(cx);
-        if let Some(task) = self
-            .selected_task
-            .as_ref()
-            .and_then(|id| self.task_records(cx).into_iter().find(|t| &t.task_id == id))
+        if self.selected_task.is_some()
+            && let Some(panel) = &self.task_panel
             && state
                 .active_session
                 .and_then(|id| self.session_task(id, cx))
                 .is_none()
         {
             return div()
-                .id("task-overview")
-                .debug_selector(|| "task-overview".into())
+                .id("task-overview-host")
                 .flex_1()
                 .h_full()
-                .p_4()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(task.title.clone())
-                .child(task_switcher::state_copy(&task, &[], false))
-                .child(task.objective.clone());
+                .child(task_panel::overview_view(panel, self.task_inputs(cx), cx));
         }
         #[cfg(test)]
         if self.dock_fixture {
@@ -3128,6 +3129,7 @@ impl Shell {
             || self.park_sheet.is_some()
             || self.new_work_sheet.is_some()
             || self.settings_sheet.is_some()
+            || self.task_panel_modal_open(cx)
             || Self::has_dialog(window, cx);
         if !modal {
             context.push_str(" IcedMain");
@@ -3778,6 +3780,9 @@ impl Shell {
             cx.propagate();
             return;
         }
+        if self.dismiss_task_modal(window, cx) {
+            return;
+        }
         if self.bar_menu.take().is_some() {
             cx.notify();
             return;
@@ -3861,6 +3866,7 @@ impl Shell {
             && self.settings_sheet.is_none()
             && !Self::has_dialog(window, cx)
             && self.bar_menu.is_none()
+            && !self.task_panel_modal_open(cx)
             && self.focused_chat(window, cx).is_some()
         {
             return;
@@ -3948,6 +3954,7 @@ impl Focusable for Shell {
 }
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_task_panel(window, cx);
         if self.active_workspace(cx).is_some() {
             let state = self.active(cx);
             window.set_window_title(&window_title(
@@ -3984,7 +3991,8 @@ impl Render for Shell {
                 || self.park_sheet.is_some()
                 || self.new_work_sheet.is_some()
             || self.settings_sheet.is_some()
-                || self.phone_panel().is_some();
+                || self.phone_panel().is_some()
+                || self.task_panel_modal_open(cx);
             content.sync_covers(window, cx);
         });
         self.ensure_work_sidebars(window, cx);
@@ -4189,6 +4197,9 @@ impl Render for Shell {
             .children(self.new_work_sheet.clone())
             .children(self.settings_sheet.clone())
             .children(self.task_switcher.clone())
+            .children(self.task_panel.as_ref().and_then(|panel| {
+                task_panel::modal_view(panel, self.task_inputs(cx), cx)
+            }))
             .when(self.plans_open, |view| view.child(self.plans_viewer(cx)))
             .children(self.remote_overlays())
             .child(content::visual::reconciler(self.content.clone()))
@@ -4341,6 +4352,7 @@ fn window_title(app_name: &str, workspace: &str, sidebar_mode: SidebarMode) -> S
         SidebarMode::Find => "Find",
         SidebarMode::Git => "Git",
         SidebarMode::Agent => "Agent",
+        SidebarMode::Tasks => "Tasks",
     };
     format!("{app_name} - {workspace} - {mode}")
 }
@@ -4564,9 +4576,18 @@ impl Shell {
                         .is_some_and(|s| s.read(cx).tasks().iter().any(|t| t.task_id == task))
             })
             .map(|w| w.workspace.id);
-        let Some(workspace) = workspace else {
-            return;
-        };
+        if let Some(workspace) = workspace {
+            self.activate_task_in(workspace, task, window, cx);
+        }
+    }
+
+    fn activate_task_in(
+        &mut self,
+        workspace: WorkspaceId,
+        task: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let mru = self.context_mru.clone();
         if self.active_workspace(cx) != Some(workspace) {
             self.select_workspace_id(workspace, window, cx);
@@ -4594,6 +4615,7 @@ impl Shell {
             self.general_context(false, window, cx);
             self.selected_task = Some(task.into());
             self.remember_context(self.selected_task.clone());
+            self.show_task_rail(cx);
         }
         self.context_mru = mru;
         self.remember_context(Some(task.into()));
@@ -4631,6 +4653,7 @@ impl Shell {
         if overview {
             self.selected_task = task;
             self.context_mru = mru;
+            self.show_task_rail(cx);
         }
         self.remember_context(self.selected_task.clone());
         self.selected_files.remove(&workspace);

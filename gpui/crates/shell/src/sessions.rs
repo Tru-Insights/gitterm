@@ -80,6 +80,21 @@ impl crate::Shell {
         };
         let pane_id = crate::session_pane_id(id);
         let pane = &state.panes[&pane_id];
+        // Iced's running-task prompt (`TaskTabClose` → Stop and close / Keep open).
+        if crate::task_panel::close_needs_confirm(
+            pane.read(cx).session.as_ref().unwrap(),
+            requested,
+            state.sessions.len() <= 1,
+            cx,
+        ) {
+            let workspace = state.workspace.id;
+            self.show_workspace_pane(workspace, &pane_id, window, cx);
+            let panel = self.ensure_task_panel(window, cx);
+            panel.update(cx, |panel, cx| {
+                panel.open_stop_and_close(requested.clone(), cx)
+            });
+            return;
+        }
         if !can_close(
             pane.read(cx).session.as_ref().unwrap(),
             requested,
