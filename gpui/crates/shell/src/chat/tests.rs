@@ -499,7 +499,7 @@ assert not sys.stdin.read()
     independent_clone(&cwd);
     let (runtime, mut events) = provider
         .clone()
-        .fake_start(cwd.clone())
+        .fake_start(cwd.clone(), None)
         .await
         .unwrap()
         .unwrap();
@@ -630,7 +630,7 @@ assert not sys.stdin.read()
         "#!/bin/sh\nprintf '{\"authMethod\":\"none\",\"configDirectory\":\"%s\"}' \"$CLAUDE_CONFIG_DIR\"\nexit 1\n",
     );
     let unsigned = Arc::new(Provider::fixture(preview, &fake).unwrap());
-    assert!(unsigned.fake_start(cwd).await.unwrap().is_none());
+    assert!(unsigned.fake_start(cwd, None).await.unwrap().is_none());
 }
 
 #[test]
@@ -747,7 +747,7 @@ Path('reaped-marker').write_text('finished')
     let cwd = dir.path().join("checkout");
     independent_clone(&cwd);
     let (runtime, mut events) = executor
-        .block_on(provider.clone().fake_start(cwd.clone()))
+        .block_on(provider.clone().fake_start(cwd.clone(), None))
         .unwrap()
         .unwrap();
     executor.block_on(async {
@@ -951,7 +951,7 @@ async fn fake_process_rejected_and_partial_write_outcomes_reach_adapter() {
         if partial {
             std::fs::write(cwd.join("partial-mode"), b"").unwrap();
         }
-        let (runtime, mut events) = provider.fake_start(cwd).await.unwrap().unwrap();
+        let (runtime, mut events) = provider.fake_start(cwd, None).await.unwrap().unwrap();
         let mut controller = Controller::new();
         controller.runtime = Some(runtime);
         while !controller.ready {
@@ -1208,7 +1208,7 @@ assert not sys.stdin.read()
     let provider = Arc::new(Provider::fixture(preview, &fake).unwrap());
     let cwd = dir.path().join("checkout");
     independent_clone(&cwd);
-    let (runtime, mut events) = provider.fake_start(cwd).await.unwrap().unwrap();
+    let (runtime, mut events) = provider.fake_start(cwd, None).await.unwrap().unwrap();
     let mut controller = Controller::new();
     controller.runtime = Some(runtime);
     let source = controller.source.clone();
@@ -1314,4 +1314,259 @@ assert not sys.stdin.read()
         .completed()
         .await
         .unwrap();
+}
+
+/// H5b B6: a fake `claude` that passes the gate, records its argv and env at
+/// launch, answers initialize and exits when stdin closes.
+fn recorded_launch(
+    dir: &Path,
+    preview: Arc<Preview>,
+    task_mcp: Option<gitterm_core::harness::claude::ClaudeMcpServer>,
+) -> (Vec<String>, serde_json::Map<String, serde_json::Value>) {
+    let python = std::process::Command::new("python3")
+        .args(["-I", "-S", "-c", "import sys; print(sys.executable)"])
+        .output()
+        .unwrap();
+    assert!(python.status.success());
+    let fake = script(
+        dir,
+        "fake-recording-claude",
+        &format!(
+            r##"#!{}
+import json, sys, os
+from pathlib import Path
+if sys.argv[1:] == ['--help']:
+    print('  --restricted\n  --strict-mcp-config\n  --safe-mode\n  --permission-mode <mode> (choices: "manual")')
+    sys.exit(0)
+if sys.argv[1:] == ['auth', 'status', '--json']:
+    print(json.dumps({{'fixture_signed_in':True,'fixture_method':'fixture_personal','fixture_plan':'fixture_pro','fixture_root':os.environ['CLAUDE_CONFIG_DIR'],'fixture_provider':'fixture_first_party'}}))
+    sys.exit(0)
+if sys.argv[1:] == ['auth', 'status']:
+    print(json.dumps({{'authMethod':'claude.ai','configDirectory':os.environ['CLAUDE_CONFIG_DIR']}}))
+    sys.exit(0)
+Path('launch.json').write_text(json.dumps({{'env':dict(os.environ), 'args':sys.argv[1:]}}))
+init = json.loads(sys.stdin.readline())
+print(json.dumps({{'type':'control_response','response':{{'subtype':'success','request_id':init['request_id'],'response':{{'models':[]}}}}}}), flush=True)
+sys.stdin.read()
+"##,
+            String::from_utf8(python.stdout).unwrap().trim()
+        ),
+    );
+    let provider = Arc::new(Provider::fixture(preview, &fake).unwrap());
+    let cwd = dir.join("checkout");
+    independent_clone(&cwd);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (mut runtime, mut events) = provider
+                .fake_start(cwd.clone(), task_mcp)
+                .await
+                .unwrap()
+                .unwrap();
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                {
+                    RuntimeEvent::Harness(HarnessEvent::Ready { .. }) => break,
+                    RuntimeEvent::Harness(HarnessEvent::Error(error)) => {
+                        panic!("fake runtime: {error}")
+                    }
+                    RuntimeEvent::Harness(HarnessEvent::ProcessExited { .. }) => {
+                        panic!("fake claude exited before Ready")
+                    }
+                    _ => {}
+                }
+            }
+            runtime.send(HarnessCommand::Shutdown).unwrap();
+            runtime.completed().await.unwrap();
+        });
+    let launch: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cwd.join("launch.json")).unwrap()).unwrap();
+    let args = serde_json::from_value(launch["args"].clone()).unwrap();
+    let serde_json::Value::Object(env) = launch["env"].clone() else {
+        panic!("recorded env is not an object");
+    };
+    (args, env)
+}
+
+/// The fixed preview argv, with `mcp` between the base flags and the fence.
+fn preview_argv(mcp: &[String]) -> Vec<String> {
+    [
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--input-format",
+        "stream-json",
+        "--permission-prompt-tool",
+        "stdio",
+        "--include-partial-messages",
+        "--no-chrome",
+        "--permission-mode",
+        "default",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .chain(mcp.iter().cloned())
+    .chain(["--restricted", "--strict-mcp-config", "--safe-mode"].map(str::to_owned))
+    .collect()
+}
+
+/// A running preview task host on the fixture's preview root (Iced's store
+/// stands in under the protected production root and is absent).
+fn start_host(
+    cx: &mut gpui::TestAppContext,
+    dir: &Path,
+    preview: &Arc<Preview>,
+) -> gpui::Entity<crate::task_host::TaskHostOwner> {
+    let (sender, receiver) = gitterm_core::task_commands::runtime::command_channel();
+    let config = crate::task_host::HostConfig {
+        roots: preview.clone(),
+        iced_tasks: dir.join("production/tasks.json"),
+        ingress: crate::task_host::Ingress::Channel(sender, receiver),
+    };
+    let owner = cx
+        .update(|cx| crate::task_host::TaskHostOwner::start(config, cx))
+        .unwrap();
+    cx.update(|cx| cx.set_global(crate::task_host::GpuiTaskHost(owner.clone())));
+    owner
+}
+
+/// A chat launched against the running host, as `ChatPane::new` does it.
+struct HostedLaunch {
+    caller: String,
+    endpoint: String,
+    token: String,
+    args: Vec<String>,
+    env: serde_json::Map<String, serde_json::Value>,
+    fixed: std::collections::BTreeMap<String, String>,
+}
+fn hosted_launch(cx: &mut gpui::TestAppContext) -> HostedLaunch {
+    use gitterm_core::task_mcp::{TASK_MCP_TOKEN_ENV, TASK_MCP_URL_ENV};
+    cx.background_executor.allow_parking();
+    let (dir, preview) = fixture();
+    let owner = start_host(cx, dir.path(), &preview);
+    let endpoint = owner.read_with(cx, |owner, _| owner.task_endpoint().unwrap());
+    let caller = Controller::new().target.session_uid;
+    let server = cx.update(|cx| task_mcp_server(&caller, cx)).unwrap();
+    let token = server
+        .env
+        .iter()
+        .find(|(key, _)| key == TASK_MCP_TOKEN_ENV)
+        .map(|(_, value)| value.clone())
+        .unwrap();
+    assert!(!token.is_empty());
+    assert_eq!(server.public_env, [TASK_MCP_URL_ENV]);
+    let fixed = Provider::fixture(preview.clone(), Path::new("/fake/claude"))
+        .unwrap()
+        .spec
+        .environment()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.to_str().unwrap().to_owned(),
+                v.to_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let (args, env) = recorded_launch(dir.path(), preview, Some(server));
+    owner.update(cx, |owner, _| owner.shutdown());
+    HostedLaunch {
+        caller,
+        endpoint,
+        token,
+        args,
+        env,
+        fixed,
+    }
+}
+
+#[gpui::test]
+fn chat_argv_has_configs_not_token(cx: &mut gpui::TestAppContext) {
+    let launch = hosted_launch(cx);
+    let url = format!("{}?caller={}", launch.endpoint, launch.caller);
+    let config = serde_json::json!({"mcpServers": {"gitterm_tasks": {
+        "type": "http",
+        "url": url,
+        "headers": {"Authorization": "Bearer ${GITTERM_V6_TASK_MCP_TOKEN}"},
+    }}});
+    // Exactly one config and one allow entry are added; the fence, the
+    // default permission mode and every other flag stay as they were.
+    assert_eq!(
+        launch.args,
+        preview_argv(&[
+            format!("--mcp-config={config}"),
+            "--allowedTools=mcp__gitterm_tasks".into(),
+        ])
+    );
+    assert!(launch.args.iter().all(|arg| !arg.contains(&launch.token)));
+}
+
+#[gpui::test]
+fn chat_env_has_token_and_caller_url(cx: &mut gpui::TestAppContext) {
+    let launch = hosted_launch(cx);
+    assert_eq!(
+        launch.env["GITTERM_V6_TASK_MCP_TOKEN"],
+        launch.token.as_str()
+    );
+    assert_eq!(
+        launch.env["GITTERM_V6_TASK_MCP_URL"],
+        format!("{}?caller={}", launch.endpoint, launch.caller).as_str()
+    );
+    // The isolated HOME/config/temp environment is unchanged; the task MCP
+    // adds exactly its two keys. The child process itself may add
+    // LC_CTYPE (Python's locale coercion) and __CF_USER_TEXT_ENCODING
+    // (macOS CoreFoundation); neither comes from the launch.
+    for (key, value) in &launch.fixed {
+        assert_eq!(launch.env[key], value.as_str(), "{key}");
+    }
+    let mut added: Vec<_> = launch
+        .env
+        .keys()
+        .filter(|key| {
+            !launch.fixed.contains_key(*key)
+                && !["LC_CTYPE", "__CF_USER_TEXT_ENCODING"].contains(&key.as_str())
+        })
+        .collect();
+    added.sort();
+    assert_eq!(
+        added,
+        ["GITTERM_V6_TASK_MCP_TOKEN", "GITTERM_V6_TASK_MCP_URL"]
+    );
+}
+
+#[gpui::test]
+fn chat_caller_is_target_uid(cx: &mut gpui::TestAppContext) {
+    let launch = hosted_launch(cx);
+    let config = launch
+        .args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--mcp-config="))
+        .unwrap();
+    let config: serde_json::Value = serde_json::from_str(config).unwrap();
+    let url = config["mcpServers"]["gitterm_tasks"]["url"]
+        .as_str()
+        .unwrap();
+    for url in [url, launch.env["GITTERM_V6_TASK_MCP_URL"].as_str().unwrap()] {
+        let query = url.split_once('?').map(|(_, query)| query);
+        assert_eq!(
+            gitterm_core::task_mcp::caller_from_query(query).as_deref(),
+            Some(launch.caller.as_str())
+        );
+    }
+}
+
+#[gpui::test]
+fn chat_without_host_launches_without_mcp(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    let (dir, preview) = fixture();
+    let caller = Controller::new().target.session_uid;
+    let server = cx.update(|cx| task_mcp_server(&caller, cx));
+    assert!(server.is_none());
+    let (args, env) = recorded_launch(dir.path(), preview, server);
+    assert_eq!(args, preview_argv(&[]));
+    assert!(!env.keys().any(|key| key.starts_with("GITTERM_V6_TASK_MCP")));
 }
