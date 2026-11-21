@@ -16,20 +16,16 @@ impl QueuedRow {
         !self.withdraw_pending
             && matches!(self.status, PromptStatus::Pending | PromptStatus::Queued)
     }
-    pub fn label(&self) -> &'static str {
-        if self.withdraw_pending {
-            return "Withdrawal pending";
-        }
-        match self.status {
-            PromptStatus::Pending => "Sending to queue",
-            PromptStatus::Queued => "Queued",
-            PromptStatus::Started => "Started",
-            PromptStatus::Completed => "Completed",
-            PromptStatus::Cancelled => "Withdrawn",
-            PromptStatus::Unsent => "Unsent · retained, no automatic resend",
-            PromptStatus::Uncertain => "Uncertain · may have been sent, retry blocked",
-        }
-    }
+}
+
+/// Iced's `.queued-tag` inside a queued bubble: its line and its `×`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedTag {
+    pub id: String,
+    pub label: String,
+    /// `Some(enabled)` while the bubble shows the `×`.
+    pub withdraw: Option<bool>,
+    pub tooltip: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +114,36 @@ impl ComposerState {
             None => "the agent",
         };
         format!("Withdraw this message ({harness} keeps working)")
+    }
+
+    /// Iced's `queuedText()`.
+    fn queued_text(&self) -> String {
+        match self.backend {
+            Some(gitterm_core::chat::types::AgentBackend::Acp(agent)) => {
+                format!("Queued · sent when {} finishes this turn", agent.label())
+            }
+            _ => "Queued · Claude reads it at its next step".into(),
+        }
+    }
+    /// The tag Iced shows on a bubble while its message is queued; none once
+    /// it is delivered or withdrawn. Read-only leaves the `×` inert.
+    pub fn queued_tag(&self, id: &str, read_only: bool) -> Option<QueuedTag> {
+        let row = self.queue.iter().find(|row| row.id == id)?;
+        let (label, withdraw) = match row.status {
+            _ if row.withdraw_pending => ("Withdrawing…".into(), Some(false)),
+            PromptStatus::Pending | PromptStatus::Queued => {
+                (self.queued_text(), Some(!read_only && row.withdrawable()))
+            }
+            PromptStatus::Unsent => ("Not sent".into(), None),
+            PromptStatus::Uncertain => ("Delivery uncertain: the agent may have read this message. Check the conversation before sending it again.".into(), None),
+            PromptStatus::Started | PromptStatus::Completed | PromptStatus::Cancelled => return None,
+        };
+        Some(QueuedTag {
+            id: id.into(),
+            label,
+            withdraw,
+            tooltip: self.withdraw_tooltip(),
+        })
     }
 
     /// Iced's `title` for a chip; the checkout one adds its lock reason below the path.
@@ -683,14 +709,6 @@ mod ui {
                     view.attach_paths(paths.0.to_vec(), cx);
                     view.focus_composer(window, cx);
                 }))
-                .child(div().id("composer-queue").max_h(px(160.)).overflow_y_scroll().children(self.queue.iter().map(|row| {
-                    let id = row.id.clone();
-                    div().flex().gap(px(8.)).child(div().flex_1().child(format!("{} · {} · {}", row.id, row.label(), row.text)))
-                        .child(Button::new(gpui::SharedString::from(format!("withdraw-{}", row.id)))
-                            .debug_selector({ let id = row.id.clone(); move || format!("withdraw-{id}") })
-                            .label("×").tooltip(self.withdraw_tooltip()).accessibility_label("Withdraw this message").disabled(disabled || !row.withdrawable())
-                            .on_click(cx.listener(move |view, _, _, cx| view.withdraw(id.clone(), cx))))
-                })))
                 .children(self.notice.iter().map(|notice| div().text_color(rgb(palette.err)).child(notice.clone())))
                 .child(div().id("composer-input").debug_selector(|| "composer-input".into()).child(Textarea::new(input).disabled(disabled)
                     .on_paste(move |item, _, cx| owner.update(cx, |view, cx| view.paste_images(item, cx)).unwrap_or(false))

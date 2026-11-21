@@ -1,4 +1,4 @@
-//! Read-only transcript gestures and Iced's bounded edit presentation.
+//! Transcript gestures and Iced's bounded edit presentation.
 use crate::model::EditDiff;
 use std::path::PathBuf;
 
@@ -7,6 +7,7 @@ pub enum TranscriptAction {
     OpenFile { path: PathBuf, review: bool },
     OpenWorker { id: String },
     PreviewOnly { label: String },
+    Withdraw { message_id: String },
 }
 
 pub fn preview_notice(label: &str) -> String {

@@ -472,6 +472,7 @@ impl ChatView {
         for card in self.cards.values() {
             card.update(cx, |card, cx| card.set_callback(self.callback.clone(), cx));
         }
+        self.sync_queued(cx);
         cx.notify();
     }
     pub fn set_read_only(&mut self, reason: Option<String>, cx: &mut Context<Self>) {
@@ -491,6 +492,7 @@ impl ChatView {
                 });
             }
         }
+        self.sync_queued(cx);
         cx.notify();
     }
     /// Saved tab settings fill gaps in history; recorded acknowledgements win.
@@ -550,6 +552,7 @@ impl ChatView {
         if backend != gitterm_core::chat::types::AgentBackend::Claude {
             self.review.open = false;
         }
+        self.sync_queued(cx);
         cx.notify();
     }
     /// Picks made before the session is ready are held and sent when it starts.
@@ -1015,6 +1018,7 @@ impl ChatView {
             state.state,
             gitterm_core::chat::types::AgentSessionState::Streaming
         );
+        self.sync_queued(cx);
         cx.notify();
     }
     pub(crate) fn stop(&mut self, cx: &mut Context<Self>) {
@@ -1130,6 +1134,7 @@ impl ChatView {
         });
         let scroller = self.scroller.clone();
         let open = self.folded.get(&row.id).copied();
+        let queued = self.queued_tag(&row);
         let view = cx.new(|cx| {
             let mut view = RowView::new(row, index, scroller, cx);
             if let Some(open) = open {
@@ -1162,6 +1167,7 @@ impl ChatView {
             view.hidden_by_turn =
                 turn_collapsed && turn.as_ref().is_some_and(|turn| turn.contains(index));
             view.visual_expand = visual_expand;
+            view.queued = queued;
             view.sync_visual(cx);
             view
         });
@@ -1392,6 +1398,29 @@ impl ChatView {
         self.sync_activity_tick(cx);
         self.refresh_rows(count, following, changed, cx);
     }
+    fn queued_tag(&self, row: &Row) -> Option<crate::composer::QueuedTag> {
+        let id = row.prompt_id.as_deref()?;
+        self.composer_state.queued_tag(
+            id,
+            self.read_only_reason.is_some() || self.callback.is_none(),
+        )
+    }
+    /// The queue lives in core state; each live bubble follows its message.
+    pub(crate) fn sync_queued(&mut self, cx: &mut Context<Self>) {
+        for (index, view) in self.row_views.iter().enumerate() {
+            let Some(view) = view else { continue };
+            let tag = self.queued_tag(&self.model.rows[index]);
+            if view.read(cx).queued != tag {
+                view.update(cx, |view, cx| {
+                    view.queued = tag;
+                    cx.notify();
+                });
+                self.scroller.update(cx, |state, cx| {
+                    state.remeasure_items(index..index + 1, cx);
+                });
+            }
+        }
+    }
     fn refresh_rows(
         &mut self,
         count: usize,
@@ -1428,6 +1457,7 @@ impl ChatView {
             }
         }
         self.sync_runs(cx);
+        self.sync_queued(cx);
         if self.find_open && !self.find.query.is_empty() {
             self.find.refresh(&self.model, &changed);
             for index in 0..self.row_views.len() {
@@ -1742,6 +1772,8 @@ struct RowView {
     visual: Option<Entity<visual::VisualReply>>,
     visual_expand: visual::VisualExpand,
     visual_subscription: Option<Subscription>,
+    /// Iced's queued tag on this prompt's bubble (C04).
+    queued: Option<crate::composer::QueuedTag>,
 }
 impl RowView {
     fn new(
@@ -1801,6 +1833,7 @@ impl RowView {
             visual: None,
             visual_expand: Rc::new(|_, _| {}),
             visual_subscription: None,
+            queued: None,
         };
         view.update_edit_text(cx);
         view.prepare_sent_images(cx);
@@ -1857,6 +1890,42 @@ impl RowView {
             cx.notify();
         }));
         self.visual = Some(reply);
+    }
+    /// Iced's `.queued-tag`: the state line and, while queued, the `×`.
+    fn render_queued_tag(&self) -> Option<impl IntoElement> {
+        let tag = self.queued.as_ref()?;
+        let palette = self.appearance.palette();
+        let id = tag.id.clone();
+        let action = self.action.clone();
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .whitespace_normal()
+                .text_size(px(self.appearance.size(11.)))
+                .text_color(rgb(palette.muted))
+                .child(tag.label.clone())
+                .children(tag.withdraw.map(|enabled| {
+                    let selector = format!("withdraw-{id}");
+                    Button::new(("withdraw", self.row.id))
+                        .debug_selector(move || selector.clone())
+                        .xsmall()
+                        .label("×")
+                        .tooltip(tag.tooltip.clone())
+                        .accessibility_label("Withdraw this message")
+                        .disabled(!enabled)
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            action(
+                                crate::interactions::TranscriptAction::Withdraw {
+                                    message_id: id.clone(),
+                                },
+                                cx,
+                            );
+                        })
+                })),
+        )
     }
     fn toggle(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.open = !self.open;
@@ -1931,7 +2000,8 @@ impl Render for RowView {
             .when(self.row.delivery.is_some(), |content| {
                 content.pl(px(22.)).pr(px(10.)).pb(px(8.))
             })
-            .child(self.copyable_text(cx));
+            .child(self.copyable_text(cx))
+            .children(self.render_queued_tag());
         let header = div()
             .text_size(px(self.appearance.size(13.)))
             .text_color(rgb(color))
@@ -2016,6 +2086,12 @@ impl Render for RowView {
                         .border_1()
                         .border_color(rgb(palette.border))
                         .rounded(px(10.))
+                })
+                // Iced's `.user-msg.queued` / `.unsent`: dashed and muted.
+                .when_some(self.queued.as_ref(), |view, tag| {
+                    view.border_dashed()
+                        .text_color(rgb(palette.muted))
+                        .when(tag.withdraw.is_none(), |view| view.opacity(0.7))
                 })
                 .when(
                     matches!(

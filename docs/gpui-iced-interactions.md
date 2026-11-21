@@ -39,7 +39,7 @@ Each row is a control or a repeated control family whose instances share behavio
 
 ## Verdict counts
 
-Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this refresh the map showed 143 MATCH and 193 DIFF; it now shows 215 MATCH, 88 PREVIEW and 33 DIFF (336 rows; counts taken from the row verdicts) after the TRU-274 small-parity pass, the GPUI phone pairing panel (PR 26c: A12g, T12–T12e), the PR confirmation panel (PR 22b: D23, D23b) and the leftovers pass (H02, H11, C05, A12b now MATCH; C11 PREVIEW; C04 narrowed).
+Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this refresh the map showed 143 MATCH and 193 DIFF; it now shows 216 MATCH, 88 PREVIEW and 32 DIFF (336 rows; counts taken from the row verdicts) after the TRU-274 small-parity pass, the GPUI phone pairing panel (PR 26c: A12g, T12–T12e), the PR confirmation panel (PR 22b: D23, D23b) and the leftovers pass (H02, H11, C05, A12b now MATCH; C11 PREVIEW; C04 narrowed, then MATCH with the `×` on the queued bubble).
 
 | Section | MATCH | PREVIEW | DIFF |
 | --- | ---: | ---: | ---: |
@@ -48,15 +48,15 @@ Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this
 | Work sidebar | 23 | 17 | 0 |
 | Find sidebar and preview | 18 | 7 | 0 |
 | Content area and file viewer | 10 | 1 | 0 |
-| Chat transcript, cards, roster | 27 | 6 | 2 |
-| Composer and Review / Consult | 20 | 1 | 4 |
+| Chat transcript, cards, roster | 29 | 6 | 0 |
+| Composer and Review / Consult | 22 | 2 | 1 |
 | Bottom panel and terminal find | 16 | 1 | 0 |
-| Workspace bar, menus, settings | 12 | 23 | 1 |
+| Workspace bar, menus, settings | 13 | 23 | 0 |
 | Sheets and dialogs | 27 | 9 | 0 |
 | Task detail and other dialogs | 6 | 11 | 25 |
 | Usage page | 8 | 2 | 0 |
 | Native menus and shortcuts | 23 | 4 | 2 |
-| **Total** | **211** | **87** | **38** |
+| **Total** | **216** | **88** | **32** |
 
 `PREVIEW` means a deliberate preview limit (write/launch control shows "not available in preview"), kept until cutover.
 
@@ -254,7 +254,7 @@ Sources: [Iced composer](../assets/agent_chat.html#L2333), [slash/mode](../asset
 | C01 input | Multiline prompt, grows to 200px; typing stays possible pending request | Native Textarea, disabled when read-only/unavailable | Input focus; native | Type, paste text; Enter send, Shift+Enter newline; IME composition protected | Draft in `promptEl`; `submitPrompt` | Textarea draft; `send` | **MATCH** draft editing/submit keys; read-only guards explicit. |
 | C02 Send **P/W** | `Send`; disabled on read-only, pending request, busy non-steerable; empty click does nothing; busy steerable T explains queue | `Send`; disabled on empty draft/no images, pending request, image prep, IME/unresolved submission/read-only/no callback; box and images empty at once | I queue explanation T; G same text while a turn runs | Click or Enter unless slash consumes | `submit` IPC; clears draft/images immediately | `ChatIntent::Send`, receipt reconciliation preserves rejected/uncertain draft | **MATCH** queue T and immediate clear (TRU-274 `view/tests.rs`); GPUI also disables Send on an empty draft, and a rejected/uncertain receipt puts the unedited draft back (Iced loses it).
 | C03 Stop **P/W** | `Stop`, disabled idle/read-only | `Stop`, disabled idle/unavailable | Danger button H; native danger | Click | `stop` IPC → interrupt current turn | `ChatIntent::Stop` → adapter | **MATCH** stops turn without withdrawing queued draft. |
-| C04 queued withdraw **P/W** | Queued bubble `×`, T `Withdraw this message ({harness} keeps working)` | Composer queue row `×`, T `Withdraw this message ({harness} keeps working)`, state-gated, inert when read-only | I withdraw T (agent_chat.html:3949); G same (composer.rs:691) | Click | `withdraw {id}` IPC | `ChatIntent::Withdraw {message_id}` | **DIFF** `×`, tooltip and operation match (test `c04_queued_withdraw_is_a_times_button_with_the_harness_tooltip`); the control sits in the composer's queue strip as `{id} · {state} · {text}`, not inside the transcript bubble with `Queued · …` / `Withdrawing…` text (transcript rows carry no message id). |
+| C04 queued withdraw **P/W** | Queued bubble: dashed and muted, `Queued · {next step}` line and `×`; click shows `Withdrawing…` with `×` disabled; delivered removes the line and `×`; withdrawn removes the bubble | Same line and `×` on the queued transcript bubble (row carries the message id), `Withdrawing…` while pending, line and `×` gone once delivered or withdrawn; `×` inert when read-only; no composer queue strip | I withdraw T (agent_chat.html:3949); G same (`render_queued_tag`, view.rs:1895) | Click | `withdraw {id}` IPC | `ChatIntent::Withdraw {message_id}` | **MATCH** placement, tooltip, gating and operation (tests `queued_bubble_shows_withdraw`, `withdraw_from_bubble_removes_queued_message`, `delivered_message_has_no_withdraw`, `read_only_withdraw_inert`). A withdrawn bubble stays in the GPUI transcript without its line; Iced removes it. |
 | C05 slash row | `/name {argumentHint}`, selected row; description tooltip | `/name {argumentHint}` and description; per-command description tooltip (none when empty) | I H/T (agent_chat.html:2552); G same (`SlashCommand::tooltip`, composer.rs:717) | Click or Tab **fills only**; ↑↓ wrap; Enter runs no-arg, fills argument command; Esc dismisses | `fillSlash` / `slashKey` / `submitPrompt` | `select_slash` / `slash_key` → fill/send | **MATCH** gestures, label and tooltip; test `c05_slash_row_names_the_command_and_tooltips_its_description`. |
 | C06 model picker **P/W** | Model icon + label; pending `current → requested…`; `✓` current, `…` pending | Model icon + confirmed label (pre-start pick shown at once); catalog rows `✓` selected, `…` pending; hint `Model · full list after the session starts` before ready | I T `Model: {id}`; G same | Click chip/option, Esc/click-away | `set_model` IPC; usable configured values before session ready | `ChangeSetting(Model)`; chip enabled before ready, pick held then sent after Ready (Iced writes config before spawn) | **MATCH** pre-start pick, tooltip and option markers match; the chip reads `current → requested…` while a change is pending (composer.rs `project`; test adapter/tests.rs).
 | C07 effort/context picker **P/W** | Gauge + Auto/Low/Medium/High/X-High/Max as offered; `200k`/`1M` section for Claude; pending arrow | Same catalog concepts and offered levels; confirmed selected tick | I effort/applied-auto/context T; G same | Click chip/option; Esc/click-away | `set_effort` / `set_model` for context | `ChangeSetting` catalog choice; enabled before ready, sent after Ready | **MATCH** pre-start pick, tooltip and option markers match; the chip reads `current → requested…` while a change is pending (composer.rs `project`; test adapter/tests.rs).
@@ -504,21 +504,20 @@ Refreshed 2026-11-21 against `7c3b587` (after PRs #280–#310). Only rows still 
 4. S07 — worktree-follow control never renders (`worktree_follow: None`, lib.rs:1963).
 
 **Composer**
-5. C04 — queued withdraw: `×`, tooltip and operation match; the control is in the composer queue strip, not inside the transcript bubble.
-6. C10 — picker entries, lock rule and tooltip match; a pick shows `{label} · not available in preview` (preview limit).
+5. C10 — picker entries, lock rule and tooltip match; a pick shows `{label} · not available in preview` (preview limit).
 
 **Workspace bar, sheets and menus**
-7. M08 — attention jump reads mounted GPUI facts only, not live Iced urgency.
-8. M11 — dictation (`SttToggle`) has no handler or mic state.
+6. M08 — attention jump reads mounted GPUI facts only, not live Iced urgency.
+7. M11 — dictation (`SttToggle`) has no handler or mic state.
 
 **Task detail (not mounted)**
-9. T01–T01d — new-task, filter chips and archive controls absent.
-10. T05–T06c — Review changes, Push branch, Open draft PR, publish confirmation absent.
-11. T07 / T07a — Stop and Cancel queue absent.
-12. T08–T08b — worktree delete opener and confirmation absent.
-13. T09–T09f — task create form is a fixture only.
-14. T10 / T10a — Stop and close / Keep open absent.
-15. T13 — browser evidence viewer absent.
+8. T01–T01d — new-task, filter chips and archive controls absent.
+9. T05–T06c — Review changes, Push branch, Open draft PR, publish confirmation absent.
+10. T07 / T07a — Stop and Cancel queue absent.
+11. T08–T08b — worktree delete opener and confirmation absent.
+12. T09–T09f — task create form is a fixture only.
+13. T10 / T10a — Stop and close / Keep open absent.
+14. T13 — browser evidence viewer absent.
 
 ## Verification boundary
 

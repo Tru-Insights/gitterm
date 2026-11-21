@@ -105,6 +105,7 @@ impl ChatView {
             TranscriptAction::OpenWorker { id } => {
                 cx.emit(roster::RosterOutcome::OpenWorker { id })
             }
+            TranscriptAction::Withdraw { message_id } => self.withdraw(message_id, cx),
         }
     }
     pub(super) fn trim_history(&mut self, cx: &mut Context<Self>) {
