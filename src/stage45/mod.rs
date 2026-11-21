@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 
 mod app;
 mod delegations;
+mod delivery;
 mod launch;
 mod review;
 mod sessions;

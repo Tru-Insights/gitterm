@@ -340,9 +340,10 @@ impl TaskHost {
 
     /// Saves the session, then attaches the worker delegation to it, and
     /// only then returns `child` for the frontend to publish. On either
-    /// failure the host drops `child`, stopping the unpublished process.
-    /// shortcut: a failed attach keeps the session record it follows (as
-    /// before H4b); removing it would change saved state.
+    /// failure the host drops `child`, stopping the unpublished process. A
+    /// failed attach also puts the task back as it was before the session
+    /// was saved, so a failed start leaves nothing behind; if that save
+    /// fails too, the error says so.
     pub fn publish_launch<C>(
         &mut self,
         ticket: LaunchTicket,
@@ -357,6 +358,7 @@ impl TaskHost {
         let saved = (|| {
             let store = self.store_mut().as_mut().ok_or(STORE_GONE)?;
             let conversation = session.conversation.clone();
+            let before = store.get(&task_id).cloned();
             store
                 .upsert_session(
                     &task_id,
@@ -383,8 +385,18 @@ impl TaskHost {
                         &session.timestamp,
                     )
                     .map_err(|error| {
+                        let removed = match before {
+                            Some(task) => store.replace(task).map_err(|error| error.to_string()),
+                            None => Err(format!("task {task_id} was not stored before the launch")),
+                        };
+                        let removed = match removed {
+                            Ok(()) => String::new(),
+                            Err(error) => format!(
+                                "; its saved session record could not be removed: {error}"
+                            ),
+                        };
                         format!(
-                            "worker session {session_id} could not attach to delegation {delegation_id}: {error}; stopping worker"
+                            "worker session {session_id} could not attach to delegation {delegation_id}: {error}{removed}; stopping worker"
                         )
                     })?;
             }

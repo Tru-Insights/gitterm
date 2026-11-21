@@ -18,10 +18,11 @@ use gitterm_core::task_commands::{
     TaskPublish, WorkerCaller, WorkerCheckout, WorkerPreparationId,
 };
 #[cfg(test)]
-use gitterm_core::task_host::update_queued_task_request;
+use gitterm_core::task_host::{cancel_queued_worker_launch, update_queued_task_request};
 use gitterm_core::task_host::{
-    cancel_queued_worker_launch, launch_provider, HostEffect, LaunchAdmission, LaunchPolicy,
-    LaunchRequest, LaunchedSession, Promotion, QueuedTaskLaunch, RunnerCapacity, TaskHost,
+    launch_provider, DeliveryChat, DeliveryCompletion, DeliveryEffect, DeliveryReceipt, HostEffect,
+    LaunchAdmission, LaunchPolicy, LaunchRequest, LaunchedSession, Promotion, QueuedTaskLaunch,
+    RunnerCapacity, Submission, TaskHost,
 };
 use iced::advanced::graphics::core::Element;
 use iced::keyboard::{self, key, Key, Modifiers};
@@ -7186,7 +7187,7 @@ pub enum Event {
     /// User submitted a prompt (text plus any attached images) for the
     /// agent tab with this id.
     AgentSubmitPrompt(usize, UserPrompt),
-    AgentSubmitDelegations(usize, gitterm::delegations::SendBatch),
+    AgentSubmitDelegations(Submission),
     /// User clicked the stop button on the agent tab with this id.
     AgentStopRequested(usize),
     /// User answered a pending runtime request (Claude permission prompt
@@ -20142,13 +20143,8 @@ impl App {
             .iter()
             .filter(|d| {
                 let parent = self.delegation_chat_tab_id(&d.parent);
-                let held = parent
-                    .and_then(|id| self.task_host.delegations().held(id))
-                    .is_some_and(|sends| {
-                        sends
-                            .iter()
-                            .any(|send| send.delegation_id == d.delegation_id)
-                    });
+                let held =
+                    parent.is_some_and(|id| self.task_host.delivery_held(id, &d.delegation_id));
                 worker_delivery_allows_close(
                     d,
                     self.delegations_config.auto_tell,
@@ -20323,11 +20319,7 @@ impl App {
         delegation: &gitterm::tasks::Delegation,
     ) -> Result<serde_json::Value, String> {
         let id = delegation.delegation_id.as_str();
-        let held = self
-            .task_host
-            .delegations()
-            .held(tab_id)
-            .is_some_and(|held| held.iter().any(|send| send.delegation_id == id));
+        let held = self.task_host.delivery_held(tab_id, id);
         gitterm::delegations::card_payload(
             delegation,
             self.task_host.delegations().activity(id),
@@ -20399,79 +20391,72 @@ impl App {
         )
     }
 
+    /// Open chat tabs, as delivery resolves a result's requesting chat.
+    fn delivery_chats(&self) -> Vec<DeliveryChat> {
+        self.workspaces
+            .iter()
+            .flat_map(|ws| {
+                let remote = self.workspace_has_remote_identity(ws);
+                ws.tabs.iter().filter_map(move |t| {
+                    let session = t.agent_session()?;
+                    Some(DeliveryChat {
+                        tab_id: t.id,
+                        session_uid: t.session_uid.clone(),
+                        chat_session_id: t.chat_session_id.clone(),
+                        remote,
+                        streaming: matches!(session.state, tab::AgentSessionState::Streaming),
+                    })
+                })
+            })
+            .collect()
+    }
+
     /// Submit synchronously so the chat's streaming state is set before
-    /// another tick can dispatch. The submit handler acknowledges success.
-    fn deliver_delegations(
-        &mut self,
-        tab_id: usize,
-        batch: gitterm::delegations::SendBatch,
-    ) -> Task<Event> {
-        if batch
-            .delegation_ids
+    /// another tick can dispatch. The submit handler reports the outcome to
+    /// the host; a submission that never reached it was not submitted.
+    fn deliver_delegations(&mut self, submission: Submission) -> Task<Event> {
+        let (tab_id, delivery) = (submission.tab_id, submission.delivery);
+        let ids = submission.batch.delegation_ids.clone();
+        let task = if ids
             .iter()
             .any(|id| self.tab_delegation(tab_id, id).is_err())
         {
-            eprintln!(
-                "[delegation] {:?}: requesting chat identity changed before delivery",
-                batch.delegation_ids
-            );
-            return Task::none();
-        }
-        if !self
+            eprintln!("[delegation] {ids:?}: requesting chat identity changed before delivery");
+            Task::none()
+        } else if !self
             .workspaces
             .iter()
             .flat_map(|ws| &ws.tabs)
             .any(|tab| tab.id == tab_id && tab.agent_session().is_some())
         {
-            eprintln!(
-                "[delegation] {:?}: not sent: requesting chat tab {tab_id} is gone",
-                batch.delegation_ids
-            );
-            return Task::none();
+            eprintln!("[delegation] {ids:?}: not sent: requesting chat tab {tab_id} is gone");
+            Task::none()
+        } else {
+            self.update(Event::AgentSubmitDelegations(submission))
+        };
+        if self.task_host.delivery_pending(tab_id, delivery) {
+            self.task_host
+                .delivery_completed(tab_id, delivery, DeliveryCompletion::Rejected);
         }
-        self.update(Event::AgentSubmitDelegations(tab_id, batch))
+        task
     }
 
     /// Collect every finished outcome at the same moment. Idle chats flush
     /// now; busy chats keep the existing held queue until their turn ends.
     fn auto_deliver_delegations(&mut self) -> Task<Event> {
-        if let Some(store) = self.task_host.store_mut().as_mut() {
-            if let Err(error) = store.retry_delivery_acknowledgements() {
-                eprintln!("[delegation] retry delivery acknowledgements: {error}");
-            }
-        }
-        let parents: Vec<_> = self
+        let tick = self
             .task_host
-            .store()
-            .as_ref()
-            .map(|store| {
-                store
-                    .delegations()
-                    .iter()
-                    .filter(|d| {
-                        self.delegations_config.auto_tell
-                            && d.status.is_sendable()
-                            && !d.is_delivered()
-                    })
-                    .map(|d| d.parent.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut tabs: HashSet<usize> = self.task_host.delegations().held_tabs().collect();
-        let mut waiting = Vec::new();
-        for parent in parents {
-            match self.delegation_chat_tab_id(&parent) {
-                Some(tab_id) => {
-                    tabs.insert(tab_id);
-                }
-                None => waiting.push(parent.session_uid),
-            }
+            .deliver_finished(&self.delivery_chats(), self.delegations_config.auto_tell);
+        if let Some(error) = tick.receipt_error {
+            eprintln!("[delegation] retry delivery acknowledgements: {error}");
         }
-        for line in waiting_delegation_log_lines(&mut self.delegation_waiting_counts, waiting) {
+        for line in waiting_delegation_log_lines(&mut self.delegation_waiting_counts, tick.waiting)
+        {
             eprintln!("{line}");
         }
         Task::batch(
-            tabs.into_iter()
+            tick.tabs
+                .into_iter()
                 .map(|tab_id| self.flush_held_delegation(tab_id))
                 .collect::<Vec<_>>(),
         )
@@ -20480,45 +20465,43 @@ impl App {
     /// Both Tick and turn-end use this path, including results that finished
     /// since the last tick. There is at most one submitted prompt per chat.
     fn flush_held_delegation(&mut self, tab_id: usize) -> Task<Event> {
-        let recipient_exists = self
-            .workspaces
-            .iter()
-            .flat_map(|ws| &ws.tabs)
-            .any(|tab| tab.id == tab_id && tab.agent_session().is_some());
-        if !recipient_exists {
+        let chats = self.delivery_chats();
+        if !chats.iter().any(|chat| chat.tab_id == tab_id) {
             eprintln!("[delegation] not sent: requesting chat tab {tab_id} is gone");
         }
-        let streaming = self.chat_turn_running(tab_id);
-        let mut delegations: Vec<_> = self
-            .delegations_for_tab(tab_id)
-            .into_iter()
-            .cloned()
-            .collect();
-        delegations.reverse();
-        let records: Vec<_> = delegations.iter().collect();
-        let effects = self
-            .task_host
-            .delegations_mut()
-            .reduce(DelegationIntent::Flush {
-                tab_id,
-                recipient_exists,
-                delegations: &records,
-                streaming,
-                automatic: self.delegations_config.auto_tell,
-            });
+        let effects =
+            self.task_host
+                .flush_delivery(&chats, tab_id, self.delegations_config.auto_tell);
+        self.run_delivery_effects(tab_id, None, effects)
+    }
+
+    /// `send` names the card whose "Send to Claude" produced `effects`.
+    fn run_delivery_effects(
+        &mut self,
+        tab_id: usize,
+        send: Option<&str>,
+        effects: Vec<DeliveryEffect>,
+    ) -> Task<Event> {
         let mut tasks = Vec::new();
         for effect in effects {
             match effect {
-                DelegationEffect::Refresh(id) => self.push_delegation_card(&id),
+                DeliveryEffect::Refresh(id) => self.push_delegation_card(&id),
                 // Submission remains synchronous: busy state and receipts are
                 // updated before Tick or turn-end can flush another batch.
-                DelegationEffect::Deliver { tab_id, batch } => {
-                    tasks.push(self.deliver_delegations(tab_id, batch))
+                DeliveryEffect::Submit(submission) => {
+                    tasks.push(self.deliver_delegations(submission))
                 }
-                DelegationEffect::Rejected(error) => {
+                DeliveryEffect::NotQueued(error) => {
                     eprintln!("[delegation] chat {tab_id}: cannot queue result: {error}")
                 }
-                _ => unreachable!("delivery effect"),
+                DeliveryEffect::AlreadyDelivered => {
+                    agent_webview_note(tab_id, "That result was already sent to Claude.")
+                }
+                DeliveryEffect::NotSent(error) => {
+                    let id = send.unwrap_or_default();
+                    eprintln!("[delegation] send {id} on tab {tab_id}: {error}");
+                    agent_webview_note(tab_id, &format!("Not sent: {error}"))
+                }
             }
         }
         Task::batch(tasks)
@@ -20531,17 +20514,8 @@ impl App {
         tab_id: usize,
         delegation_id: &str,
     ) -> Result<&gitterm::tasks::Delegation, String> {
-        let delegation = self
-            .task_host
-            .store()
-            .as_ref()
-            .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?
-            .delegation(delegation_id)
-            .ok_or_else(|| format!("delegation {delegation_id} does not exist"))?;
-        if self.delegation_chat_tab_id(&delegation.parent) != Some(tab_id) {
-            return Err(format!("delegation {delegation_id} belongs to another tab"));
-        }
-        Ok(delegation)
+        self.task_host
+            .chat_delegation(&self.delivery_chats(), tab_id, delegation_id)
     }
 }
 
@@ -25892,9 +25866,11 @@ fi
             event @ (Event::AgentSubmitPrompt(..) | Event::AgentSubmitDelegations(..)) => {
                 let (tab_id, prompt, delivery) = match event {
                     Event::AgentSubmitPrompt(tab_id, prompt) => (tab_id, prompt, None),
-                    Event::AgentSubmitDelegations(tab_id, batch) => {
-                        (tab_id, batch.message.clone().into(), Some(batch))
-                    }
+                    Event::AgentSubmitDelegations(submission) => (
+                        submission.tab_id,
+                        submission.batch.message.clone().into(),
+                        Some(submission),
+                    ),
                     _ => unreachable!(),
                 };
                 if let Some(note) = self
@@ -26348,22 +26324,18 @@ fi
                         break 'outer_submit;
                     }
                 }
-                if let Some(batch) = delivery {
-                    let recorded = self
-                        .task_host
-                        .store_mut()
-                        .as_mut()
-                        .ok_or_else(|| "GitTerm's task store is unavailable".to_string())
-                        .and_then(|store| {
-                            batch
-                                .record_submission(
-                                    store,
-                                    submitted,
-                                    &chrono::Utc::now().to_rfc3339(),
-                                )
-                                .map_err(|error| error.to_string())
-                        });
-                    if let Err(error) = recorded {
+                if let Some(submission) = delivery {
+                    let completion = if submitted {
+                        DeliveryCompletion::Accepted
+                    } else {
+                        DeliveryCompletion::Rejected
+                    };
+                    let batch = &submission.batch;
+                    if let DeliveryReceipt::SaveFailed(error) = self.task_host.delivery_completed(
+                        submission.tab_id,
+                        submission.delivery,
+                        completion,
+                    ) {
                         eprintln!(
                             "[delegation] {:?}: delivery acknowledgement failed: {error}",
                             batch.delegation_ids
@@ -26880,47 +26852,14 @@ fi
                 return Task::none();
             }
             Event::DelegationSendRequested(tab_id, delegation_id, finding_ids) => {
-                let streaming = self
-                    .workspaces
-                    .iter()
-                    .flat_map(|ws| ws.tabs.iter())
-                    .find(|t| t.id == tab_id)
-                    .and_then(|t| t.agent_session())
-                    .is_some_and(|s| matches!(s.state, tab::AgentSessionState::Streaming));
-                let delegation = match self.tab_delegation(tab_id, &delegation_id).cloned() {
-                    Ok(delegation) => delegation,
-                    Err(error) => {
-                        eprintln!("[delegation] send {delegation_id} on tab {tab_id}: {error}");
-                        agent_webview_note(tab_id, &format!("Not sent: {error}"));
-                        return Task::none();
-                    }
-                };
-                let effects =
-                    self.task_host
-                        .delegations_mut()
-                        .reduce(DelegationIntent::ManualSend {
-                            tab_id,
-                            delegation: &delegation,
-                            finding_ids: &finding_ids,
-                            streaming,
-                        });
-                for effect in effects {
-                    match effect {
-                        DelegationEffect::Flush(tab_id) => {
-                            return self.flush_held_delegation(tab_id)
-                        }
-                        DelegationEffect::Refresh(id) => self.push_delegation_card(&id),
-                        DelegationEffect::AlreadyDelivered => {
-                            agent_webview_note(tab_id, "That result was already sent to Claude.")
-                        }
-                        DelegationEffect::Rejected(error) => {
-                            eprintln!("[delegation] send {delegation_id} on tab {tab_id}: {error}");
-                            agent_webview_note(tab_id, &format!("Not sent: {error}"))
-                        }
-                        _ => unreachable!("manual send effect"),
-                    }
-                }
-                return Task::none();
+                let effects = self.task_host.send_delegation(
+                    &self.delivery_chats(),
+                    tab_id,
+                    &delegation_id,
+                    &finding_ids,
+                    self.delegations_config.auto_tell,
+                );
+                return self.run_delivery_effects(tab_id, Some(&delegation_id), effects);
             }
             Event::DelegationRerunRequested(tab_id, delegation_id) => {
                 let new = self.tab_delegation(tab_id, &delegation_id).and_then(|d| {
@@ -26929,51 +26868,26 @@ fi
                 return self.request_delegation(new, DelegationOrigin::Page(tab_id));
             }
             Event::DelegationDismissRequested(tab_id, delegation_id) => {
-                let delegation = match self.tab_delegation(tab_id, &delegation_id).cloned() {
-                    Ok(delegation) => delegation,
+                let now = chrono::Utc::now().to_rfc3339();
+                let dismissal = match self.task_host.dismiss_delegation(
+                    &self.delivery_chats(),
+                    tab_id,
+                    &delegation_id,
+                    &now,
+                ) {
+                    Ok(dismissal) => dismissal,
                     Err(error) => {
                         eprintln!("[delegation] dismiss {delegation_id}: {error}");
                         agent_webview_note(tab_id, &format!("Not dismissed: {error}"));
                         return Task::none();
                     }
                 };
-                let effects = self
-                    .task_host
-                    .delegations_mut()
-                    .reduce(DelegationIntent::Dismiss {
-                        delegation: &delegation,
-                    });
-                let mut active = false;
-                for effect in effects {
-                    match effect {
-                        DelegationEffect::Abort(id) => {
-                            if let Some(handle) = self.delegation_runs.remove(&id) {
-                                handle.abort();
-                            }
-                        }
-                        DelegationEffect::PersistDismiss { cancel, .. } => active = cancel,
-                        _ => unreachable!("dismiss effect"),
+                for id in dismissal.abort {
+                    if let Some(handle) = self.delegation_runs.remove(&id) {
+                        handle.abort();
                     }
                 }
-                let now = chrono::Utc::now().to_rfc3339();
-                let (store, queue) = self.task_host.store_and_launch_queue_mut();
-                let result = match store.as_mut() {
-                    Some(store) => {
-                        let cancelled = if active {
-                            store.cancel_delegation(&delegation_id, &now)
-                        } else {
-                            Ok(())
-                        };
-                        cancelled
-                            .and_then(|()| {
-                                cancel_queued_worker_launch(store, queue, &delegation_id, &now)
-                            })
-                            .and_then(|()| store.dismiss_delegation(&delegation_id, &now))
-                            .map_err(|error| error.to_string())
-                    }
-                    None => Err("GitTerm's task store is unavailable".to_string()),
-                };
-                if let Err(error) = result {
+                if let Err(error) = dismissal.saved {
                     eprintln!("[delegation] dismiss {delegation_id}: {error}");
                     agent_webview_note(tab_id, &format!("Not dismissed: {error}"));
                 }

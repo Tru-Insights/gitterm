@@ -248,6 +248,14 @@ fn launch_save_or_attach_failure_stops_unpublished_child() {
             std::fs::create_dir(dir.path().join("tasks.json")).unwrap();
         }
         let before = worker_record(&app);
+        let before_task = app
+            .task_host
+            .store()
+            .as_ref()
+            .unwrap()
+            .get("fixture-task")
+            .unwrap()
+            .clone();
         let tabs = app.workspaces.iter().map(|ws| ws.tabs.len()).sum::<usize>();
         let error = if case == "mcp save" {
             mcp_launch(&mut app, false).unwrap_err()
@@ -287,11 +295,12 @@ fn launch_save_or_attach_failure_stops_unpublished_child() {
                     && error.ends_with("; stopping worker"),
                 "{error}"
             );
-            // Pinned as today: the session record written before the attach
-            // stays in the store (in memory and on disk) without a tab.
-            assert_eq!(task.sessions.len(), 1);
+            // The session record written before the attach is gone again,
+            // in memory and on disk: the task is as it was before.
+            assert!(task.sessions.is_empty());
+            assert_eq!(task, before_task);
             let saved = TaskStore::load(dir.path().join("tasks.json")).unwrap();
-            assert_eq!(saved.get("fixture-task").unwrap().sessions.len(), 1);
+            assert_eq!(saved.get("fixture-task").unwrap(), &before_task);
             assert_eq!(worker_session(saved.delegation("worker").unwrap()), None);
         } else {
             assert!(
