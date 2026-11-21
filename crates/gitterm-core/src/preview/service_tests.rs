@@ -202,9 +202,10 @@ fn every_delegation_effect_is_classified() {
     let E::Check { request, .. } = &check else {
         panic!("expected Check, got {check:?}")
     };
+    let request = *request;
     let insert = state
         .reduce(Intent::Checked {
-            request: *request,
+            request,
             new: new(),
             caller: Some(&caller),
             result: Ok(authority.clone()),
@@ -264,6 +265,11 @@ fn every_delegation_effect_is_classified() {
             "Dismiss delegation",
             Access::Write,
         ),
+        (
+            E::RecordDelivery(vec!["d".into()]),
+            "Save delivery",
+            Access::Write,
+        ),
         (check_start, "Start queued delegation", Access::Process),
         (E::Start("d".into()), "Start delegation", Access::Process),
         (E::Abort("d".into()), "Stop delegation", Access::Process),
@@ -271,6 +277,7 @@ fn every_delegation_effect_is_classified() {
         (
             E::Deliver {
                 tab_id: 1,
+                delivery: request,
                 batch: SendBatch {
                     delegation_ids: vec!["d".into()],
                     message: "m".into(),
@@ -287,7 +294,7 @@ fn every_delegation_effect_is_classified() {
         .map(|(effect, label, access)| (classify_delegation_effect(effect), *label, *access))
         .collect();
     assert_preview(&context, &classes);
-    assert!(context.delegation_effect(&effects[10].0, None).is_err());
+    assert!(context.delegation_effect(&effects[11].0, None).is_err());
 }
 
 #[cfg(feature = "runtime")]

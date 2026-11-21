@@ -370,37 +370,69 @@ fn flush(state: &mut State, d: &Delegation, busy: bool) -> Vec<Effect> {
         automatic: true,
     })
 }
+fn delivered(effects: &[Effect]) -> Vec<(RequestId, Vec<String>)> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Deliver {
+                delivery, batch, ..
+            } => Some((*delivery, batch.delegation_ids.clone())),
+            _ => None,
+        })
+        .collect()
+}
+fn submitted(state: &mut State, delivery: RequestId, accepted: bool) -> Vec<Effect> {
+    state.reduce(Intent::Submitted {
+        tab_id: 1,
+        delivery,
+        accepted,
+    })
+}
 #[test]
 fn delivery_is_held_until_turn_end_and_receipts_suppress_repeat_flushes() {
     let mut state = State::default();
     let mut d = completed();
-    assert!(!flush(&mut state, &d, true)
-        .iter()
-        .any(|e| matches!(e, Effect::Deliver { .. })));
+    assert!(delivered(&flush(&mut state, &d, true)).is_empty());
     assert_eq!(state.held(1).unwrap().len(), 1);
-    assert!(!flush(&mut state, &d, true)
-        .iter()
-        .any(|e| matches!(e, Effect::Deliver { .. })));
-    let effects = flush(&mut state, &d, false);
-    assert_eq!(
-        effects
-            .iter()
-            .filter(
-                |e| matches!(e, Effect::Deliver { batch, .. } if batch.delegation_ids == ["done"])
-            )
-            .count(),
-        1
-    );
-    // Host synchronously marks acceptance before another flush. The store
-    // retains in-memory receipts even when their disk save fails.
+    assert!(delivered(&flush(&mut state, &d, true)).is_empty());
+    let out = delivered(&flush(&mut state, &d, false));
+    assert_eq!(out.len(), 1);
+    let (first, ids) = out[0].clone();
+    assert_eq!(ids, ["done"]);
+    assert_eq!(state.submitting(1), Some(first));
+    // Reserved: a flush before the completion neither queues nor resubmits.
+    assert!(delivered(&flush(&mut state, &d, false)).is_empty());
+    assert!(state.held(1).unwrap().is_empty());
+    assert!(state
+        .reduce(Intent::ManualSend {
+            tab_id: 1,
+            delegation: &d,
+            finding_ids: &[],
+            streaming: false,
+        })
+        .is_empty());
+    // Accepted: the host records the receipt. The store keeps it in memory
+    // even when the disk save fails, so no later flush repeats it.
+    assert!(matches!(
+        submitted(&mut state, first, true).as_slice(),
+        [Effect::RecordDelivery(ids)] if ids == &["done"]
+    ));
+    assert_eq!(state.submitting(1), None);
+    assert!(submitted(&mut state, first, true).is_empty(), "stale");
     d.delivered = true;
-    assert!(!flush(&mut state, &d, false)
-        .iter()
-        .any(|e| matches!(e, Effect::Deliver { .. })));
+    assert!(delivered(&flush(&mut state, &d, false)).is_empty());
     d.delivered = false;
-    assert!(flush(&mut state, &d, false)
-        .iter()
-        .any(|e| matches!(e, Effect::Deliver { .. }))); // rejected submission retries
+    let (second, _) = delivered(&flush(&mut state, &d, false))[0].clone();
+    assert_ne!(second, first);
+    // A stale completion is ignored and keeps the reservation.
+    assert!(submitted(&mut state, first, false).is_empty());
+    assert_eq!(state.submitting(1), Some(second));
+    // Rejected: the result stays undelivered and the next flush retries.
+    assert!(matches!(
+        submitted(&mut state, second, false).as_slice(),
+        [Effect::Refresh(id)] if id == "done"
+    ));
+    assert_eq!(delivered(&flush(&mut state, &d, false)).len(), 1);
 }
 
 #[test]
