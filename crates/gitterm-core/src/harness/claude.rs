@@ -97,6 +97,11 @@ pub enum LaunchFlags {
     #[default]
     Standard,
     FreshPreview,
+    /// `FreshPreview` plus `mcp_servers` (with their `allowed_tools`); every
+    /// other restriction and flag is the same. A server's credential env
+    /// values (every key not in its `public_env`) must reach the child only
+    /// through env, as `${VAR}` in config.
+    PreviewTools,
 }
 impl LaunchFlags {
     pub fn args(self, config: &ClaudeSessionConfig) -> Result<Vec<String>, String> {
@@ -108,10 +113,13 @@ impl LaunchFlags {
         guidelines: Option<&Path>,
     ) -> Result<Vec<String>, String> {
         let mut args = config.args_with_guidelines_file(guidelines);
-        if self == Self::FreshPreview {
+        if self == Self::PreviewTools {
+            preview_env_stays_out_of_argv(&config.mcp_servers)?;
+        }
+        if matches!(self, Self::FreshPreview | Self::PreviewTools) {
             if config.resume.is_some()
                 || config.chrome
-                || !config.mcp_servers.is_empty()
+                || (self == Self::FreshPreview && !config.mcp_servers.is_empty())
                 || config.snapshot_facts_dir.is_some()
                 || config.wire_log_dir.is_some()
                 || guidelines.is_some()
@@ -128,6 +136,50 @@ impl LaunchFlags {
     }
 }
 
+/// Refuses a preview launch in which a credential, that is any server env
+/// value whose key is not in that server's `public_env`, appears literally
+/// in any server's `--mcp-config` or `--allowedTools`. Errors name the key,
+/// never the value.
+fn preview_env_stays_out_of_argv(servers: &[ClaudeMcpServer]) -> Result<(), String> {
+    let mut argv = Vec::new();
+    for server in servers {
+        if let Some(name) = server
+            .public_env
+            .iter()
+            .find(|name| !server.env.iter().any(|(key, _)| key == *name))
+        {
+            return Err(format!(
+                "preview MCP public env {name} is not in the server's env"
+            ));
+        }
+        argv.push(server.config.to_string());
+        argv.extend(server.allowed_tools.iter().cloned());
+    }
+    for server in servers {
+        for (name, value) in &server.env {
+            if server.public_env.contains(name) {
+                continue;
+            }
+            if value.is_empty() {
+                return Err(format!("preview MCP env {name} is empty"));
+            }
+            // The JSON-escaped form is what a literal looks like inside the
+            // serialized config.
+            let escaped = Value::String(value.clone()).to_string();
+            let escaped = &escaped[1..escaped.len() - 1];
+            if argv
+                .iter()
+                .any(|arg| arg.contains(value.as_str()) || arg.contains(escaped))
+            {
+                return Err(format!(
+                    "preview MCP env {name} appears literally in argv; reference it as ${{{name}}}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// One MCP server attached to a session through `--mcp-config`, mirroring
 /// what GitTerm injects into terminal-launched `claude` commands.
 #[derive(Clone)]
@@ -141,6 +193,11 @@ pub struct ClaudeMcpServer {
     /// Child environment the config's `${VAR}` references resolve from.
     /// Values may be secrets: they never reach argv, logs or `Debug`.
     pub env: Vec<(String, String)>,
+    /// Keys of `env` whose values are not credentials (a caller URL) and so
+    /// may also appear literally in `config`. Every other key is treated as
+    /// a credential: an unlisted value is refused from argv, not allowed
+    /// (`LaunchFlags::PreviewTools`).
+    pub public_env: Vec<String>,
 }
 
 impl std::fmt::Debug for ClaudeMcpServer {
@@ -152,6 +209,7 @@ impl std::fmt::Debug for ClaudeMcpServer {
                 "env",
                 &self.env.iter().map(|(key, _)| key).collect::<Vec<_>>(),
             )
+            .field("public_env", &self.public_env)
             .finish()
     }
 }
@@ -1151,6 +1209,146 @@ mod tests {
         config.resume = None;
         config.permission_mode = "bypassPermissions".into();
         assert!(LaunchFlags::FreshPreview.args(&config).is_err());
+    }
+
+    fn preview_config() -> ClaudeSessionConfig {
+        ClaudeSessionConfig {
+            cwd: PathBuf::from("/clone"),
+            snapshot_facts_dir: None,
+            model: None,
+            permission_mode: "default".into(),
+            effort: None,
+            resume: None,
+            wire_log_dir: None,
+            mcp_servers: vec![],
+            chrome: false,
+            guidelines_file: None,
+            guidelines_content: None,
+        }
+    }
+
+    const FIXTURE_URL: &str = "http://127.0.0.1:1/mcp?caller=fixture";
+
+    /// Shaped like the real descriptors: the caller URL is public and is in
+    /// the config literally, the token only as `${VAR}`.
+    fn task_server(token: &str) -> ClaudeMcpServer {
+        ClaudeMcpServer {
+            config: json!({"mcpServers": {"tasks": {
+                "type": "http",
+                "url": FIXTURE_URL,
+                "headers": {"Authorization": "Bearer ${FIXTURE_TASK_TOKEN}"},
+            }}}),
+            allowed_tools: vec!["mcp__tasks__task_get".into()],
+            env: vec![
+                ("FIXTURE_TASK_URL".into(), FIXTURE_URL.into()),
+                ("FIXTURE_TASK_TOKEN".into(), token.into()),
+            ],
+            public_env: vec!["FIXTURE_TASK_URL".into()],
+        }
+    }
+
+    #[test]
+    fn preview_tools_allows_only_mcp_servers() {
+        let mut config = preview_config();
+        let fresh = LaunchFlags::FreshPreview.args(&config).unwrap();
+        assert_eq!(LaunchFlags::PreviewTools.args(&config).unwrap(), fresh);
+        config.mcp_servers = vec![task_server("synthetic-token")];
+        let server = &config.mcp_servers[0];
+        let mut expected = fresh.clone();
+        let fence = expected.len() - 3;
+        expected.splice(
+            fence..fence,
+            [
+                format!("--mcp-config={}", server.config),
+                "--allowedTools=mcp__tasks__task_get".into(),
+            ],
+        );
+        let args = LaunchFlags::PreviewTools.args(&config).unwrap();
+        assert_eq!(args, expected);
+        assert!(args
+            .ends_with(&["--restricted", "--strict-mcp-config", "--safe-mode"].map(String::from)));
+        let refused: [fn(&mut ClaudeSessionConfig); 9] = [
+            |c| c.resume = Some("existing-id".into()),
+            |c| c.chrome = true,
+            |c| c.snapshot_facts_dir = Some("/facts".into()),
+            |c| c.wire_log_dir = Some("/wire".into()),
+            |c| c.guidelines_file = Some("/guidelines.md".into()),
+            |c| c.guidelines_content = Some("text".into()),
+            |c| c.model = Some("model".into()),
+            |c| c.effort = Some("high".into()),
+            |c| c.permission_mode = "bypassPermissions".into(),
+        ];
+        for (index, change) in refused.into_iter().enumerate() {
+            let mut changed = config.clone();
+            change(&mut changed);
+            assert!(
+                LaunchFlags::PreviewTools.args(&changed).is_err(),
+                "restriction {index} must stay"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_tools_keeps_tokens_out_of_argv() {
+        let token = "SYNTHETIC_TOKEN_MUST_NOT_APPEAR";
+        let mut config = preview_config();
+        config.mcp_servers = vec![task_server(token)];
+        let args = LaunchFlags::PreviewTools.args(&config).unwrap();
+        assert!(args.iter().all(|arg| !arg.contains(token)));
+        assert!(args
+            .iter()
+            .any(|arg| arg.contains("Bearer ${FIXTURE_TASK_TOKEN}")));
+        // A literal token, raw or JSON-escaped, in config or allowed tools is refused
+        // without echoing it.
+        for literal in [token, "tok\"en\\with-escapes"] {
+            let mut server = task_server(literal);
+            server.config["mcpServers"]["tasks"]["headers"]["Authorization"] =
+                json!(format!("Bearer {literal}"));
+            config.mcp_servers = vec![server];
+            let error = LaunchFlags::PreviewTools.args(&config).unwrap_err();
+            assert!(error.contains("${FIXTURE_TASK_TOKEN}"), "{error}");
+            assert!(!error.contains(literal), "token leaked into the error");
+        }
+        let mut server = task_server(token);
+        server.allowed_tools.push(format!("mcp__{token}"));
+        config.mcp_servers = vec![server];
+        assert!(LaunchFlags::PreviewTools.args(&config).is_err());
+        config.mcp_servers = vec![task_server("")];
+        assert!(LaunchFlags::PreviewTools.args(&config).is_err());
+
+        // A token leaked into another server's config is refused too.
+        let mut other = task_server("other-token");
+        other.config["mcpServers"]["tasks"]["headers"]["Authorization"] =
+            json!(format!("Bearer {token}"));
+        config.mcp_servers = vec![task_server(token), other];
+        let error = LaunchFlags::PreviewTools.args(&config).unwrap_err();
+        assert!(!error.contains(token), "token leaked into the error");
+    }
+
+    #[test]
+    fn preview_tools_lets_only_public_env_appear_in_argv() {
+        let mut config = preview_config();
+        config.mcp_servers = vec![task_server("synthetic-token")];
+        let args = LaunchFlags::PreviewTools.args(&config).unwrap();
+        assert!(args.iter().any(|arg| arg.contains(FIXTURE_URL)));
+        // Unmarked, the URL counts as a credential: fail closed.
+        config.mcp_servers[0].public_env.clear();
+        let error = LaunchFlags::PreviewTools.args(&config).unwrap_err();
+        assert!(error.contains("FIXTURE_TASK_URL"), "{error}");
+        // A public key must name an env entry.
+        config.mcp_servers[0].public_env = vec!["FIXTURE_TASK_URL".into(), "MISSING".into()];
+        let error = LaunchFlags::PreviewTools.args(&config).unwrap_err();
+        assert!(error.contains("MISSING"), "{error}");
+    }
+
+    #[test]
+    fn fresh_preview_still_rejects_servers() {
+        let mut config = preview_config();
+        config.mcp_servers = vec![task_server("synthetic-token")];
+        assert!(LaunchFlags::FreshPreview.args(&config).is_err());
+        config.mcp_servers[0].allowed_tools.clear();
+        assert!(LaunchFlags::FreshPreview.args(&config).is_err());
+        assert!(LaunchFlags::PreviewTools.args(&config).is_ok());
     }
 
     #[test]
