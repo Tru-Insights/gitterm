@@ -190,6 +190,7 @@ pub fn classify_delegation_effect(effect: &crate::delegation_state::Effect) -> C
         E::RecordStarted { .. } => class("Save delegation", Access::Write),
         E::RecordCompletion(_) => class("Save delegation", Access::Write),
         E::PersistDismiss { .. } => class("Dismiss delegation", Access::Write),
+        E::RecordDelivery(_) => class("Save delivery", Access::Write),
         // Only queue admission emits CheckStart: it is the promotion step.
         E::CheckStart { .. } => class("Start queued delegation", Access::Process),
         E::Start(_) => class("Start delegation", Access::Process),
