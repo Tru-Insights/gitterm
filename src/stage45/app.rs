@@ -97,9 +97,10 @@ fn task_launch_queue_and_store_before_handoff_ack() {
         (TaskLaunchOrigin::Agent, false),
         (TaskLaunchOrigin::User, true),
     ] {
+        let (store, queue) = app.task_host.store_and_launch_queue_mut();
         let position = queue_task_launch_if_full(
-            app.task_host.store_mut().as_mut().unwrap(),
-            &mut app.task_launch_queue,
+            store.as_mut().unwrap(),
+            queue,
             QueuedTaskLaunch {
                 task_id: "fixture-task".into(),
                 preset_idx: Some(0),
@@ -113,9 +114,9 @@ fn task_launch_queue_and_store_before_handoff_ack() {
         )
         .unwrap();
         let saved = TaskStore::load(dir.path().join("tasks.json")).unwrap();
-        rows.push(json!({"command":"queue launch", "position":position, "queue_len":app.task_launch_queue.len(),
+        rows.push(json!({"command":"queue launch", "position":position, "queue_len":app.task_host.launch_queue().len(),
             "lifecycle":saved.get("fixture-task").unwrap().lifecycle,
-            "origin":format!("{:?}", app.task_launch_queue[0].origin), "override":app.task_launch_queue[0].user_model_choice,
+            "origin":format!("{:?}", app.task_host.launch_queue()[0].origin), "override":app.task_host.launch_queue()[0].user_model_choice,
             "harness":saved.get("fixture-task").unwrap().harness}));
     }
     let result = app

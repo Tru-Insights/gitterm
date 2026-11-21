@@ -424,7 +424,7 @@ fn iced_stale_worker_completion_refuses_writes_and_launch_end_to_end() {
                 .unwrap()
                 .delegations()
                 .is_empty());
-            assert!(app.task_launch_queue.is_empty());
+            assert!(app.task_host.launch_queue().is_empty());
             assert_eq!(
                 app.workspaces.iter().map(|ws| ws.tabs.len()).sum::<usize>(),
                 tabs
@@ -986,7 +986,7 @@ fn iced_existing_checkout_reuse_preserves_outcomes_and_refuses_before_writes() {
             assert_eq!(saved.objective, "New objective");
             assert_eq!(store.delegations().len(), 1);
         }
-        assert!(app.task_launch_queue.is_empty());
+        assert!(app.task_host.launch_queue().is_empty());
     }
 }
 
@@ -1023,7 +1023,7 @@ fn iced_prepared_destination_replacement_is_refused_before_save() {
             .unwrap()
             .delegations()
             .is_empty());
-        assert!(app.task_launch_queue.is_empty());
+        assert!(app.task_host.launch_queue().is_empty());
     }
 }
 
@@ -1255,7 +1255,7 @@ fn iced_git_workdir_redirection_after_target_resolution_refuses_all_writes() {
         .unwrap()
         .delegations()
         .is_empty());
-    assert!(app.task_launch_queue.is_empty());
+    assert!(app.task_host.launch_queue().is_empty());
 }
 
 fn fixture_delegation(state: &str) -> gitterm::tasks::Delegation {

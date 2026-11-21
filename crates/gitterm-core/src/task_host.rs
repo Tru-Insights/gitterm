@@ -15,9 +15,13 @@
 //! accepted work. [`TaskHost::shutdown`] stops ingress and resolves pending
 //! replies.
 //!
-//! Not here yet: worker launch and the headless runner (H4b), and delegation
-//! delivery (H4c). Both stay with the frontend, which reaches the store only
-//! through this owner.
+//! Starting work is decided here too (H4b): the host admits task-session
+//! launches, owns the launch queue and publishes a session only after it is
+//! saved ([`launch`]); it owns the delegation lifecycle state and admits
+//! headless Codex runs ([`runner`]). The frontend still builds commands,
+//! starts terminals and spawns runs. Delegation delivery (H4c) stays with the
+//! frontend, which reaches the store and the lifecycle state only through
+//! this owner.
 use crate::content::html_render::HtmlRenderRequest;
 use crate::delegations;
 use crate::preview::service::ServiceContext;
@@ -38,6 +42,15 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio_stream::Stream;
+
+mod launch;
+mod runner;
+pub use launch::{
+    cancel_queued_worker_launch, launch_provider, update_queued_task_request, AwaitingWorker,
+    LaunchAdmission, LaunchPolicy, LaunchRequest, LaunchTicket, LaunchedSession, Promotion,
+    QueuedTaskLaunch,
+};
+pub use runner::RunnerCapacity;
 
 const STORE_UNAVAILABLE: &str = "GitTerm's task store is unavailable";
 
@@ -119,6 +132,8 @@ pub struct TaskHost {
     authority: TaskAuthority,
     services: ServiceContext,
     commands: TaskControlSender,
+    launch_queue: Vec<QueuedTaskLaunch>,
+    delegations: crate::delegation_state::State,
 }
 
 impl TaskHost {
@@ -133,6 +148,8 @@ impl TaskHost {
             authority: store.into(),
             services,
             commands,
+            launch_queue: Vec::new(),
+            delegations: Default::default(),
         }
     }
 
@@ -150,7 +167,8 @@ impl TaskHost {
     }
 
     /// A new authority for this store: pending worker preparations belonged
-    /// to the store being replaced and are dropped with it.
+    /// to the store being replaced and are dropped with it. The launch queue
+    /// and delegation state are kept, as before they moved here.
     pub fn replace_store(&mut self, store: Option<TaskStore>) {
         self.authority = store.into();
     }
