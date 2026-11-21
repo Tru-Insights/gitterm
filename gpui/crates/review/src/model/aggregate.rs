@@ -81,6 +81,46 @@ impl AggregateModel {
         })
     }
 
+    /// Same request Iced's Turns button sends; the reducer rejects it without a chat.
+    pub fn turns_intent(&self, active_chat: Option<String>) -> Option<Intent> {
+        let pane = self.state.pane()?;
+        Some(Intent::IpcRequest {
+            message: ReviewIpc::ShowTurns {
+                token: pane.token.clone(),
+            },
+            visible: true,
+            active_chat,
+            page: Self::page(),
+        })
+    }
+
+    pub fn turn_intent(&self, number: u64) -> Option<Intent> {
+        let pane = self.state.pane()?;
+        Some(Intent::IpcRequest {
+            message: ReviewIpc::SelectTurn {
+                token: pane.token.clone(),
+                number,
+            },
+            visible: true,
+            active_chat: None,
+            page: Self::page(),
+        })
+    }
+
+    /// Iced's per-file Open request: the reducer resolves the path and refuses deleted files.
+    pub fn open_file_intent(&self, path: &str) -> Option<Intent> {
+        let pane = self.state.pane()?;
+        Some(Intent::IpcRequest {
+            message: ReviewIpc::OpenFile {
+                token: pane.token.clone(),
+                path: path.into(),
+            },
+            visible: true,
+            active_chat: None,
+            page: Self::page(),
+        })
+    }
+
     pub fn commit_intent(&self, sha: String) -> Intent {
         let first = match self.state.pane().map(|pane| &pane.source) {
             Some(ReviewSource::Commits(Some(range))) if range.pending => Some(range.first.clone()),

@@ -281,6 +281,10 @@ impl WorkspaceOwner {
             }
         }
     }
+    /// The guarded preview writer, when this owner has one.
+    pub(crate) fn preview_writer(&self) -> Option<Arc<crate::preview::Writer>> {
+        self.store.as_ref()?.guard.clone()
+    }
     pub(crate) fn preview(&self) -> Option<Arc<gitterm_core::preview::Preview>> {
         self.store
             .as_ref()

@@ -6,7 +6,7 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     dock::PanelId,
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 pub(super) const DIFF_BACK_LABEL: &str = "Back to Terminal";
 pub(super) const DIFF_HINT: &str = "j/k: navigate Esc: back";
@@ -170,6 +170,7 @@ impl Shell {
         let Some(workspace) = self.active_workspace(cx) else {
             return;
         };
+        let host = self.review_host(workspace, cx);
         let state = self
             .workspaces
             .iter_mut()
@@ -221,6 +222,7 @@ impl Shell {
                 } else {
                     gitterm_core::review::model::ReviewSource::Uncommitted
                 },
+                host,
                 cx,
             )
         });
@@ -236,6 +238,67 @@ impl Shell {
             cx.notify();
         });
         self.show_workspace_pane(workspace, &id, window, cx);
+    }
+
+    /// What the native review borrows from the shell: Iced's config dir (marks and
+    /// turn snapshots, read-only), the preview root's writer for marks, the active
+    /// chat and the file-tree opener.
+    pub(crate) fn review_host(
+        &self,
+        workspace: WorkspaceId,
+        cx: &mut Context<Self>,
+    ) -> gitterm_gpui_review::ReviewHost {
+        let owner = self.owner.read(cx);
+        let iced = owner.iced_catalog().map(|catalog| catalog.source.clone());
+        let writer = owner.preview_writer();
+        let active_chat = self
+            .workspaces
+            .iter()
+            .find(|state| state.workspace.id == workspace)
+            .and_then(|state| {
+                state
+                    .panes
+                    .get(&crate::session_pane_id(state.active_session?))
+            })
+            .and_then(|pane| match &pane.read(cx).content {
+                pane::PaneContent::PreviewChat(chat) => chat.read(cx).chat_session_id(),
+                _ => None,
+            });
+        let preview_marks_dir = writer.as_ref().map(|writer| writer.preview().layout());
+        let save_marks = writer.zip(preview_marks_dir.clone()).map(|(writer, dir)| {
+            let path = dir.join(gitterm_core::review::viewed::VIEWED_FILE);
+            Arc::new(move |bytes: Vec<u8>| {
+                // Completion errors are reported by the writer's own thread.
+                writer
+                    .submit(path.clone(), bytes)
+                    .map(drop)
+                    .map_err(|error| format!("save viewed marks: {error:#}"))
+            }) as gitterm_gpui_review::SaveMarks
+        });
+        let events = self.owner.clone();
+        gitterm_gpui_review::ReviewHost {
+            snapshot_roots: iced.as_ref().and_then(|dir| {
+                gitterm_core::turn_snapshots::SnapshotRoots::new(
+                    dir.join("turn-snapshots"),
+                    std::env::temp_dir(),
+                )
+                .ok()
+            }),
+            iced_marks_dir: iced,
+            preview_marks_dir,
+            save_marks,
+            active_chat,
+            open_file: Some(std::rc::Rc::new(move |path, cx| {
+                events.update(cx, |_, cx| {
+                    cx.emit(FileOpen {
+                        workspace,
+                        path,
+                        changed: None,
+                        from_files: true,
+                    })
+                })
+            })),
+        }
     }
 
     pub fn open_file_viewer(
