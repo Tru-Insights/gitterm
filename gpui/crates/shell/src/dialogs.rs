@@ -354,7 +354,6 @@ mod interaction_tests {
             ("pstrip-repo-action-0-1", "Add a repo to acme-api…"),
             ("pstrip-repo-action-0-3", "Keep repos in this menu only"),
             ("pstrip-repo-action-1-1", "Reconnect…"),
-            ("pstrip-repo-action-1-2", "Pair a phone…"),
             ("pstrip-remote-workspace-0", "+ Fixture:repo"),
         ] {
             click(cx, "pstrip-repos");

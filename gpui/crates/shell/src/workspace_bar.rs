@@ -720,6 +720,8 @@ pub enum Outcome {
     OpenFolder,
     /// "Show {machine} chats" (machine key): Find, that machine only.
     ShowMachineChats(String),
+    /// "Pair a phone…" (machine key): the phone pairing panel.
+    PairPhone(String),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Item {
@@ -845,6 +847,8 @@ impl Input {
             Some(Outcome::OpenFolder)
         } else if label == format!("Show {} chats", machine.name) {
             Some(Outcome::ShowMachineChats(machine.key.clone()))
+        } else if label == "Pair a phone…" {
+            Some(Outcome::PairPhone(machine.key.clone()))
         } else {
             None
         }
