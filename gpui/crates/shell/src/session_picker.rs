@@ -534,7 +534,7 @@ impl Render for SessionPicker {
     }
 }
 
-fn preset_color(color: WorkspaceColor, dark: bool) -> u32 {
+pub(crate) fn preset_color(color: WorkspaceColor, dark: bool) -> u32 {
     // Same Catppuccin values as Iced's config::WorkspaceColor::color.
     let (mocha, latte) = match color {
         WorkspaceColor::Lavender => (0xb4befe, 0x7287fd),

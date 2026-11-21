@@ -183,6 +183,13 @@ impl Shell {
                     .filter(|root| event.path.starts_with(root))
                     .max_by_key(|root| root.components().count())
             })
+            // The shared guidelines file lives in Iced's config dir, not a
+            // workspace root; only that one file is opened from there.
+            .or_else(|| {
+                let source = &self.owner.read(cx).iced_catalog()?.source;
+                (event.path == gitterm_core::guidelines::guidelines_path(source))
+                    .then(|| source.clone())
+            })
             .or_else(|| self.data.terminal_cwd(event.workspace, cx));
         let Some(root) = root else {
             return;
