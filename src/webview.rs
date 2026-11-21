@@ -53,6 +53,27 @@ pub enum PageDataStore {
     Linear(String),
 }
 
+impl From<PageDataStore> for gitterm_core::page_store::PageStore {
+    fn from(store: PageDataStore) -> Self {
+        match store {
+            PageDataStore::Default => Self::Default,
+            PageDataStore::GitHub(login) => Self::GitHub(login),
+            PageDataStore::Linear(workspace) => Self::Linear(workspace),
+        }
+    }
+}
+
+impl From<gitterm_core::page_store::PageStore> for PageDataStore {
+    fn from(store: gitterm_core::page_store::PageStore) -> Self {
+        use gitterm_core::page_store::PageStore;
+        match store {
+            PageStore::Default => Self::Default,
+            PageStore::GitHub(login) => Self::GitHub(login),
+            PageStore::Linear(workspace) => Self::Linear(workspace),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageStoreAction {
     Navigate,

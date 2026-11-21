@@ -57,9 +57,13 @@ impl Default for RegionLayout {
         }
     }
 }
+/// Iced's sidebar panel clamp (the panel excludes the spine).
+pub fn clamp_sidebar(width: f32) -> f32 {
+    width.clamp(150., 600.)
+}
 impl RegionLayout {
     pub fn resize_sidebar(&mut self, width: f32) {
-        self.sidebar_width = width.clamp(150., 600.);
+        self.sidebar_width = clamp_sidebar(width);
     }
     pub fn sidebar_size(&self) -> f32 {
         if self.sidebar_collapsed {

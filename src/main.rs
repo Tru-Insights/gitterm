@@ -8228,124 +8228,20 @@ impl PageNavigationContext {
     }
 }
 
-fn github_sign_in_url(url: &url::Url) -> bool {
-    url.host_str() == Some("github.com")
-        && matches!(
-            url.path_segments().and_then(|mut segments| segments.next()),
-            Some("login" | "session" | "sessions")
-        )
-}
-
-fn page_sign_in_provider(url: &url::Url) -> bool {
-    matches!(
-        url.host_str(),
-        Some("accounts.google.com" | "appleid.apple.com" | "idmsa.apple.com")
-    )
-}
-
+/// The shared policy in `gitterm_core::page_navigation`, in this host's types.
 fn page_navigation_decision(url: &str, context: &PageNavigationContext) -> PageNavigationDecision {
-    use PageNavigationDecision::{Allow, Cancel, External, Reopen};
-    let Ok(destination) = webview::browser_url(url) else {
-        return Cancel;
+    use gitterm_core::page_navigation::PageNavigationDecision as Shared;
+    let shared = gitterm_core::page_navigation::PageNavigationContext {
+        url: context.url.clone(),
+        store: context.store.clone().into(),
+        github_accounts: context.github_accounts.clone(),
+        linear_workspaces: context.linear_workspaces.clone(),
     };
-    if destination.scheme() != "https"
-        || !destination.username().is_empty()
-        || destination.password().is_some()
-        || destination.port().is_some()
-    {
-        return External;
-    }
-    let origin = url::Url::parse(&context.url).ok();
-    let same_service = origin.as_ref().and_then(url::Url::host_str) == destination.host_str();
-    let segments: Vec<_> = destination.path_segments().into_iter().flatten().collect();
-    let first = segments.first().copied().unwrap_or_default();
-    // Encoded or empty identity prefixes are ambiguous; let the browser resolve them.
-    if destination.path() != "/" && (first.is_empty() || first.contains('%')) {
-        return External;
-    }
-    if let Some(origin) = origin.as_ref().filter(|origin| {
-        origin.scheme() == "https"
-            && origin.username().is_empty()
-            && origin.password().is_none()
-            && origin.port().is_none()
-    }) {
-        // Social sign-in redirects must keep GitHub's OAuth state in this store.
-        if (page_sign_in_provider(&destination)
-            && (github_sign_in_url(origin) || page_sign_in_provider(origin)))
-            || (page_sign_in_provider(origin) && github_sign_in_url(&destination))
-        {
-            return Allow;
-        }
-    }
-    let store = match destination.host_str() {
-        Some("github.com") => {
-            // Authentication and account-wide pages must retain the selected login.
-            if destination.path() == "/"
-                || matches!(
-                    first,
-                    "login" | "logout" | "session" | "sessions" | "settings"
-                )
-            {
-                if same_service {
-                    context.store.clone()
-                } else {
-                    webview::PageDataStore::Default
-                }
-            } else {
-                let current_owner = origin
-                    .as_ref()
-                    .filter(|url| url.host_str() == Some("github.com"))
-                    .and_then(|url| url.path_segments()?.next());
-                let canonical_pr = segments.get(2) == Some(&"pull")
-                    && segments
-                        .get(3)
-                        .is_some_and(|number| number.parse::<u64>().is_ok_and(|number| number > 0));
-                let mapped =
-                    gitterm::pr_watch::account_for(first, &context.github_accounts).is_some();
-                if !mapped && !canonical_pr && current_owner != Some(first) {
-                    return External;
-                }
-                github_page_store(first, &context.github_accounts)
-            }
-        }
-        Some("linear.app") => {
-            if destination.path() == "/"
-                || first == "login"
-                || destination.path() == "/oauth/authorize"
-            {
-                if same_service {
-                    context.store.clone()
-                } else {
-                    webview::PageDataStore::Default
-                }
-            } else if let Some(workspace) = gitterm::issue_titles::workspace_from_issue_url(url) {
-                linear_page_store(Some(&workspace))
-            } else {
-                let origin_workspace = origin
-                    .as_ref()
-                    .and_then(|url| gitterm::issue_titles::workspace_from_issue_url(url.as_str()));
-                let current_workspace = match &context.store {
-                    webview::PageDataStore::Linear(workspace) => Some(workspace.as_str()),
-                    _ => origin_workspace.as_deref(),
-                };
-                // Only known workspace prefixes select stores; a valid-looking
-                // slug alone cannot distinguish a workspace from a global route.
-                if context.linear_workspaces.contains(first)
-                    || (same_service && current_workspace == Some(first))
-                {
-                    linear_page_store(Some(first))
-                } else {
-                    return External;
-                }
-            }
-        }
-        _ => return External,
-    }
-    .normalized();
-    if store == context.store {
-        Allow
-    } else {
-        Reopen(store)
+    match gitterm_core::page_navigation::page_navigation_decision(url, &shared) {
+        Shared::Allow => PageNavigationDecision::Allow,
+        Shared::Reopen(store) => PageNavigationDecision::Reopen(store.into()),
+        Shared::External => PageNavigationDecision::External,
+        Shared::Cancel => PageNavigationDecision::Cancel,
     }
 }
 
