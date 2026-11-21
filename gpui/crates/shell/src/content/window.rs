@@ -92,6 +92,8 @@ impl SurfaceHost for WindowHost {
     }
 }
 struct Entry {
+    root: PathBuf,
+    relative: PathBuf,
     viewer: RetainedViewer<WindowHost>,
     covers: [Option<CoverId>; 3],
 }
@@ -133,6 +135,11 @@ impl ContentWindow {
                         let mut changed = false;
                         for entry in this.entries.values_mut() {
                             let before = entry.viewer.state();
+                            if let Some(host) = &mut entry.viewer.host_mut().native {
+                                for url in host.drain_external() {
+                                    cx.open_url(&url);
+                                }
+                            }
                             for (ticket, result) in entry.viewer.host_mut().navigation() {
                                 changed |= entry.viewer.complete_navigation(&ticket, result);
                             }
@@ -209,6 +216,8 @@ impl ContentWindow {
                 self.entries.insert(
                     id,
                     Entry {
+                        root: root.clone(),
+                        relative: relative.clone(),
                         viewer,
                         covers: [None; 3],
                     },
@@ -226,6 +235,8 @@ impl ContentWindow {
         self.entries.insert(
             id.clone(),
             Entry {
+                root: root.clone(),
+                relative: relative.clone(),
                 viewer,
                 covers: [None; 3],
             },
@@ -246,6 +257,11 @@ impl ContentWindow {
         .detach();
         // Newly opened entries also inherit covers that predate their creation.
         self.apply_covers(window, cx);
+    }
+    pub(super) fn source(&self, id: &str) -> Option<(PathBuf, PathBuf)> {
+        self.entries
+            .get(id)
+            .map(|entry| (entry.root.clone(), entry.relative.clone()))
     }
     pub fn close(&mut self, id: &str) {
         self.visits.retain(|_, visit| visit.pane != id);

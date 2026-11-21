@@ -465,8 +465,10 @@ impl Shell {
                     .panes
                     .iter()
                     .filter(|(id, pane)| {
-                        matches!(pane.read(cx).content, pane::PaneContent::Content(_))
-                            && content_pane_visible(state, id, cx)
+                        matches!(
+                            pane.read(cx).content,
+                            pane::PaneContent::Content(_) | pane::PaneContent::Review(_)
+                        ) && content_pane_visible(state, id, cx)
                     })
                     .map(|(id, _)| id.clone())
             })
@@ -2755,7 +2757,7 @@ impl Shell {
         &mut self,
         workspace: WorkspaceId,
         action: &pane::git_view::GitAction,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         use pane::git_view::GitAction as A;
@@ -2771,16 +2773,7 @@ impl Shell {
                 }
                 self.sync_git_visibility(true, cx);
             }
-            A::EditFile(path) => self.open_file_viewer(
-                &FileOpen {
-                    workspace,
-                    path: path.clone(),
-                    changed: None,
-                    from_files: true,
-                },
-                window,
-                cx,
-            ),
+            A::EditFile(_) => self.editor_preview_notice(cx),
             A::OpenWorktree(_) | A::AdoptWorktree(_) | A::RemoveWorktree(_) => {
                 self.owner.update(cx, |owner, cx| {
                     owner.error = Some("Worktree actions are not available in preview".into());
@@ -3139,16 +3132,8 @@ impl Shell {
             .on_action(cx.listener(|this, a: &FileSelectByIndex, w, cx| {
                 this.select_file(&a.selection, w, cx)
             }))
-            .on_action(cx.listener(|this, _: &EditFile, w, cx| {
-                if let Some(mut file) = this
-                    .active_workspace(cx)
-                    .and_then(|id| this.selected_files.get(&id))
-                    .cloned()
-                {
-                    file.changed = None;
-                    file.from_files = true;
-                    this.open_file_viewer(&file, w, cx);
-                }
+            .on_action(cx.listener(|this, _: &EditFile, _, cx| {
+                this.editor_preview_notice(cx);
             }))
             .on_action(cx.listener(|this, _: &AgentFindOpen, w, cx| {
                 let focused = this.focused_chat(w, cx);

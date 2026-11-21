@@ -200,8 +200,14 @@ fn git_mount_actions_file_cover_return_and_unavailable_worktrees(cx: &mut TestAp
         ))
     });
     draw(cx);
-    assert!(cx.debug_bounds("close-file-viewer").is_some());
-    click(cx, "close-file-viewer");
+    // Iced's edit launches $EDITOR; the preview only reports it (no viewer).
+    assert!(cx.debug_bounds("close-file-viewer").is_none());
+    cx.read(|cx| {
+        assert_eq!(
+            shell.read(cx).owner.read(cx).error.as_deref(),
+            Some("Open in editor · not available in preview")
+        )
+    });
     assert!(cx.debug_bounds("git-changes").is_some());
     for action in [
         pane::git_view::GitAction::OpenWorktree(root.path().join("MUST NOT CREATE")),

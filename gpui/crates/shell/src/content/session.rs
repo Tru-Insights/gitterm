@@ -2,10 +2,14 @@
 use crate::{FileOpen, Pane, PaneKind, Shell, WorkspaceId, data::SessionId, pane};
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
+    Disableable,
     button::{Button, ButtonVariants},
     dock::PanelId,
 };
 use std::collections::HashMap;
+
+pub(super) const DIFF_BACK_LABEL: &str = "Back to Terminal";
+pub(super) const DIFF_HINT: &str = "j/k: navigate Esc: back";
 
 #[derive(Clone)]
 pub(super) struct ViewerVisit {
@@ -14,6 +18,87 @@ pub(super) struct ViewerVisit {
 }
 
 impl Shell {
+    pub(crate) fn open_work_review(
+        &mut self,
+        checkout: std::path::PathBuf,
+        vs_base: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.local {
+            return;
+        }
+        let Some(workspace) = self.active_workspace(cx) else {
+            return;
+        };
+        let state = self
+            .workspaces
+            .iter_mut()
+            .find(|state| state.workspace.id == workspace)
+            .unwrap();
+        let session = self
+            .content
+            .read(cx)
+            .visits
+            .get(&workspace)
+            .map(|visit| visit.session)
+            .unwrap_or(state.active_session);
+        // Keep branch review separate from the workspace's status-driven review.
+        let id = format!(
+            "{}-branch-review",
+            crate::content_pane_id(workspace, &checkout)
+        );
+        let pane = state
+            .panes
+            .entry(id.clone())
+            .or_insert_with(|| {
+                let review = cx
+                    .new(|cx| gitterm_gpui_review::ReviewView::new(Default::default(), window, cx));
+                let pane = cx.new(|cx| {
+                    Pane::new(
+                        id.clone(),
+                        "Review".into(),
+                        PaneKind::Review(review),
+                        workspace,
+                        self.data.clone(),
+                        window,
+                        cx,
+                    )
+                });
+                self.registry
+                    .borrow_mut()
+                    .insert(id.clone(), pane.downgrade());
+                pane
+            })
+            .clone();
+        let pane::PaneContent::Review(review) = &pane.read(cx).content else {
+            unreachable!()
+        };
+        review.clone().update(cx, |view, cx| {
+            view.open_branch_review(
+                checkout,
+                if vs_base {
+                    gitterm_core::review::model::ReviewSource::VsBase
+                } else {
+                    gitterm_core::review::model::ReviewSource::Uncommitted
+                },
+                cx,
+            )
+        });
+        self.selected_files.remove(&workspace);
+        self.content.update(cx, |content, cx| {
+            content.visits.insert(
+                workspace,
+                ViewerVisit {
+                    pane: id.clone(),
+                    session,
+                },
+            );
+            cx.notify();
+        });
+        self.show_workspace_pane(workspace, &id, window, cx);
+    }
+
     pub fn open_file_viewer(
         &mut self,
         event: &FileOpen,
@@ -204,7 +289,18 @@ impl Shell {
             return self.session_content(cx);
         };
         let workspace = state.workspace.id;
-        let title = if matches!(pane.read(cx).content, pane::PaneContent::Review(_)) {
+        let review = if let pane::PaneContent::Review(view) = &pane.read(cx).content {
+            Some(view.clone())
+        } else {
+            None
+        };
+        let is_review = review.is_some();
+        let local_source = self.local && self.data.terminal_cwd(workspace, cx).is_some();
+        let source = visit.and_then(|visit| self.content.read(cx).source(&visit.pane));
+        let rendered = source
+            .as_ref()
+            .is_some_and(|(_, path)| super::actions::is_rendered(path));
+        let title = if is_review {
             "Review".to_owned()
         } else {
             pane.read(cx).title.clone()
@@ -224,7 +320,39 @@ impl Shell {
                 |view| view.track_focus(&pane.focus_handle(cx)),
             )
             .capture_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if is_review
+                    && !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.platform
+                    && !event.keystroke.modifiers.alt
+                {
+                    let key = event.keystroke.key.as_str();
+                    if let Some(review) = &review {
+                        match key {
+                            "j" | "k" => {
+                                review.update(cx, |view, cx| view.navigate(key == "k", window, cx))
+                            }
+                            "g" | "G" => review.update(cx, |view, cx| {
+                                view.navigate_to(
+                                    key == "G" || event.keystroke.modifiers.shift,
+                                    window,
+                                    cx,
+                                )
+                            }),
+                            "e" => this.editor_preview_notice(cx),
+                            _ => {
+                                if key != "escape" {
+                                    return;
+                                }
+                            }
+                        }
+                        if matches!(key, "j" | "k" | "g" | "G" | "e") {
+                            cx.stop_propagation();
+                            return;
+                        }
+                    }
+                }
                 if event.keystroke.key == "escape" {
+                    this.selected_files.remove(&workspace);
                     this.close_file_viewer(workspace, window, cx);
                     cx.stop_propagation();
                 }
@@ -237,12 +365,62 @@ impl Shell {
                     .items_center()
                     .px_2()
                     .child(div().flex_1().child(title))
+                    .when(is_review, |header| header.child(DIFF_HINT))
+                    .when_some(source, |header, (root, relative)| {
+                        let browser_path = root.join(&relative);
+                        header
+                            .child(
+                                Button::new("viewer-open-editor")
+                                    .debug_selector(|| "viewer-open-editor".into())
+                                    .ghost()
+                                    .label("Open in editor")
+                                    .disabled(!local_source)
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.editor_preview_notice(cx)
+                                        }),
+                                    ),
+                            )
+                            .when(!rendered, |header| {
+                                header.child(
+                                    Button::new("viewer-copy-all")
+                                        .debug_selector(|| "viewer-copy-all".into())
+                                        .ghost()
+                                        .label("Copy All")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.copy_viewer_file(
+                                                root.clone(),
+                                                relative.clone(),
+                                                cx,
+                                            );
+                                        })),
+                                )
+                            })
+                            .child(
+                                Button::new("viewer-open-browser")
+                                    .debug_selector(|| "viewer-open-browser".into())
+                                    .ghost()
+                                    .label(if rendered {
+                                        "View in Browser"
+                                    } else {
+                                        "Open in Browser"
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Err(error) =
+                                            super::actions::open_file(&browser_path, cx)
+                                        {
+                                            this.viewer_error(error, cx);
+                                        }
+                                    })),
+                            )
+                    })
                     .child(
                         Button::new("close-file-viewer")
                             .debug_selector(|| "close-file-viewer".into())
                             .ghost()
-                            .label("Close")
+                            .label(if is_review { DIFF_BACK_LABEL } else { "Close" })
                             .on_click(cx.listener(move |this, _, window, cx| {
+                                this.selected_files.remove(&workspace);
                                 this.close_file_viewer(workspace, window, cx)
                             })),
                     ),
