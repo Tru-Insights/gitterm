@@ -313,3 +313,52 @@ fn disabled_actions_and_direct_notices_do_not_open_the_panel(cx: &mut gpui::Test
     });
     assert!(events.borrow().is_empty());
 }
+
+#[gpui::test]
+fn gh_active_login_decides_own_pr_and_names_the_account(cx: &mut gpui::TestAppContext) {
+    let has_approve = |s: &WorkSidebar| {
+        s.rows()
+            .into_iter()
+            .find(|r| r.label == "Second change")
+            .unwrap()
+            .detail_controls
+            .iter()
+            .any(|c| c.label.starts_with("Approve"))
+    };
+    let (sidebar, cx, _) = open_panel(cx);
+    sidebar.update(cx, |s, cx| {
+        // No mapping: the author is compared with gh's active login.
+        s.pr_accounts.clear();
+        s.pull_requests[0].prs[1]
+            .snapshot
+            .core
+            .as_mut()
+            .unwrap()
+            .author = "example-dev".into();
+        cx.notify();
+    });
+    sidebar.read_with(cx, |s, _| assert!(has_approve(s), "no login read: not own"));
+    sidebar.update(cx, |s, cx| {
+        s.active_login = Some("Example-Dev".into());
+        cx.notify();
+    });
+    sidebar.read_with(cx, |s, _| {
+        assert!(!has_approve(s), "gh's active login owns it")
+    });
+    sidebar.update(cx, |s, cx| {
+        s.confirm_close(cx);
+        cx.notify();
+    });
+    click_control(&sidebar, cx, "Second change", "Merge");
+    assert_eq!(
+        model(&sidebar, cx).account_line,
+        "Runs as gh's active account (Example-Dev): github_accounts has no entry for example"
+    );
+    // A mapped account wins over the active login.
+    sidebar.update(cx, |s, cx| {
+        s.confirm_close(cx);
+        s.pr_accounts = [("example".to_string(), "someone-else".to_string())].into();
+        cx.notify();
+    });
+    sidebar.read_with(cx, |s, _| assert!(has_approve(s), "the mapping wins"));
+}
