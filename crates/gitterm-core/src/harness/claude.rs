@@ -97,6 +97,10 @@ pub enum LaunchFlags {
     #[default]
     Standard,
     FreshPreview,
+    /// `FreshPreview` plus `mcp_servers` (with their `allowed_tools`); every
+    /// other restriction and flag is the same. A server's env values (its
+    /// tokens) must reach the child only through env, as `${VAR}` in config.
+    PreviewTools,
 }
 impl LaunchFlags {
     pub fn args(self, config: &ClaudeSessionConfig) -> Result<Vec<String>, String> {
@@ -108,10 +112,31 @@ impl LaunchFlags {
         guidelines: Option<&Path>,
     ) -> Result<Vec<String>, String> {
         let mut args = config.args_with_guidelines_file(guidelines);
-        if self == Self::FreshPreview {
+        if self == Self::PreviewTools {
+            for server in &config.mcp_servers {
+                let config = server.config.to_string();
+                for (name, value) in &server.env {
+                    if value.is_empty() {
+                        return Err(format!("preview MCP env {name} is empty"));
+                    }
+                    // Values are never echoed: they may be credentials. The
+                    // JSON-escaped form is what a literal would look like in argv.
+                    let escaped = Value::String(value.clone()).to_string();
+                    if config.contains(value.as_str())
+                        || config.contains(&escaped[1..escaped.len() - 1])
+                        || server.allowed_tools.iter().any(|tool| tool.contains(value))
+                    {
+                        return Err(format!(
+                            "preview MCP env {name} appears literally in argv; reference it as ${{{name}}}"
+                        ));
+                    }
+                }
+            }
+        }
+        if matches!(self, Self::FreshPreview | Self::PreviewTools) {
             if config.resume.is_some()
                 || config.chrome
-                || !config.mcp_servers.is_empty()
+                || (self == Self::FreshPreview && !config.mcp_servers.is_empty())
                 || config.snapshot_facts_dir.is_some()
                 || config.wire_log_dir.is_some()
                 || guidelines.is_some()
@@ -1151,6 +1176,114 @@ mod tests {
         config.resume = None;
         config.permission_mode = "bypassPermissions".into();
         assert!(LaunchFlags::FreshPreview.args(&config).is_err());
+    }
+
+    fn preview_config() -> ClaudeSessionConfig {
+        ClaudeSessionConfig {
+            cwd: PathBuf::from("/clone"),
+            snapshot_facts_dir: None,
+            model: None,
+            permission_mode: "default".into(),
+            effort: None,
+            resume: None,
+            wire_log_dir: None,
+            mcp_servers: vec![],
+            chrome: false,
+            guidelines_file: None,
+            guidelines_content: None,
+        }
+    }
+
+    fn task_server(token: &str) -> ClaudeMcpServer {
+        ClaudeMcpServer {
+            config: json!({"mcpServers": {"tasks": {
+                "type": "http",
+                "url": "http://127.0.0.1:1/mcp",
+                "headers": {"Authorization": "Bearer ${FIXTURE_TASK_TOKEN}"},
+            }}}),
+            allowed_tools: vec!["mcp__tasks__task_get".into()],
+            env: vec![("FIXTURE_TASK_TOKEN".into(), token.into())],
+        }
+    }
+
+    #[test]
+    fn preview_tools_allows_only_mcp_servers() {
+        let mut config = preview_config();
+        let fresh = LaunchFlags::FreshPreview.args(&config).unwrap();
+        assert_eq!(LaunchFlags::PreviewTools.args(&config).unwrap(), fresh);
+        config.mcp_servers = vec![task_server("synthetic-token")];
+        let server = &config.mcp_servers[0];
+        let mut expected = fresh.clone();
+        let fence = expected.len() - 3;
+        expected.splice(
+            fence..fence,
+            [
+                format!("--mcp-config={}", server.config),
+                "--allowedTools=mcp__tasks__task_get".into(),
+            ],
+        );
+        let args = LaunchFlags::PreviewTools.args(&config).unwrap();
+        assert_eq!(args, expected);
+        assert!(args
+            .ends_with(&["--restricted", "--strict-mcp-config", "--safe-mode"].map(String::from)));
+        let refused: [fn(&mut ClaudeSessionConfig); 9] = [
+            |c| c.resume = Some("existing-id".into()),
+            |c| c.chrome = true,
+            |c| c.snapshot_facts_dir = Some("/facts".into()),
+            |c| c.wire_log_dir = Some("/wire".into()),
+            |c| c.guidelines_file = Some("/guidelines.md".into()),
+            |c| c.guidelines_content = Some("text".into()),
+            |c| c.model = Some("model".into()),
+            |c| c.effort = Some("high".into()),
+            |c| c.permission_mode = "bypassPermissions".into(),
+        ];
+        for (index, change) in refused.into_iter().enumerate() {
+            let mut changed = config.clone();
+            change(&mut changed);
+            assert!(
+                LaunchFlags::PreviewTools.args(&changed).is_err(),
+                "restriction {index} must stay"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_tools_keeps_tokens_out_of_argv() {
+        let token = "SYNTHETIC_TOKEN_MUST_NOT_APPEAR";
+        let mut config = preview_config();
+        config.mcp_servers = vec![task_server(token)];
+        let args = LaunchFlags::PreviewTools.args(&config).unwrap();
+        assert!(args.iter().all(|arg| !arg.contains(token)));
+        assert!(args
+            .iter()
+            .any(|arg| arg.contains("Bearer ${FIXTURE_TASK_TOKEN}")));
+        // A literal token, raw or JSON-escaped, in config or allowed tools is refused
+        // without echoing it.
+        for literal in [token, "tok\"en\\with-escapes"] {
+            let mut server = task_server(literal);
+            server.config["mcpServers"]["tasks"]["headers"]["Authorization"] =
+                json!(format!("Bearer {literal}"));
+            config.mcp_servers = vec![server];
+            let error = LaunchFlags::PreviewTools.args(&config).unwrap_err();
+            assert!(error.contains("${FIXTURE_TASK_TOKEN}"), "{error}");
+            assert!(!error.contains(literal), "token leaked into the error");
+        }
+        let mut server = task_server(token);
+        server.allowed_tools.push(format!("mcp__{token}"));
+        config.mcp_servers = vec![server];
+        assert!(LaunchFlags::PreviewTools.args(&config).is_err());
+        config.mcp_servers = vec![task_server("")];
+        assert!(LaunchFlags::PreviewTools.args(&config).is_err());
+    }
+
+    #[test]
+    fn fresh_preview_still_rejects_servers() {
+        let mut config = preview_config();
+        config.mcp_servers = vec![task_server("synthetic-token")];
+        assert!(LaunchFlags::FreshPreview.args(&config).is_err());
+        config.mcp_servers[0].allowed_tools.clear();
+        assert!(LaunchFlags::FreshPreview.args(&config).is_err());
+        assert!(LaunchFlags::PreviewTools.args(&config).is_ok());
     }
 
     #[test]
