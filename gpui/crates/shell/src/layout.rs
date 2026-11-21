@@ -26,6 +26,8 @@ pub enum SidebarMode {
     Git,
     /// Iced's agent configuration view, opened from Work.
     Agent,
+    /// Iced's task rail: not a header mode; entering a task Overview opens it.
+    Tasks,
 }
 
 /// Stored alongside the retained pane inventory in the existing layout file.

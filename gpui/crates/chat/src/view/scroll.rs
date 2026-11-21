@@ -169,7 +169,11 @@ pub(super) fn block_starts(model: &ChatModel) -> Vec<usize> {
     while index < model.rows.len() {
         starts.push(index);
         index = ends.get(&index).copied().unwrap_or(index + 1);
-        while index < model.rows.len() && !model.rows[index].scope.is_empty() {
+        // A withdrawn prompt is not a block of its own; it joins the one before.
+        while index < model.rows.len()
+            && (!model.rows[index].scope.is_empty()
+                || model.rows[index].kind == crate::model::RowKind::Withdrawn)
+        {
             index += 1;
         }
     }
