@@ -185,18 +185,21 @@ fn dispatch_as(
 /// A minimal streamable-HTTP MCP client over a plain socket.
 struct McpClient {
     address: String,
+    /// `/mcp`, with the caller query when the endpoint carries one.
+    path: String,
     token: String,
     session: Option<String>,
 }
 impl McpClient {
     fn connect(endpoint: &str, token: &str) -> Self {
-        let address = endpoint
+        let (address, path) = endpoint
             .strip_prefix("http://")
-            .and_then(|rest| rest.strip_suffix("/mcp"))
-            .unwrap()
-            .to_string();
+            .and_then(|rest| rest.split_once('/'))
+            .unwrap();
+        assert!(path == "mcp" || path.starts_with("mcp?"), "{endpoint}");
         let mut client = Self {
-            address,
+            address: address.into(),
+            path: format!("/{path}"),
             token: token.into(),
             session: None,
         };
@@ -242,7 +245,8 @@ impl McpClient {
             .unwrap_or_default();
         write!(
             stream,
-            "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n{session}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n{session}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            self.path,
             self.address,
             self.token,
             body.len()
@@ -274,6 +278,56 @@ fn dechunk(mut body: &str) -> String {
         body = &rest[size + 2..];
     }
     out
+}
+
+/// H5b B7: the host's browser server, reached as a chat reaches it (its
+/// descriptor's caller URL and token), serves reads and refuses launches in
+/// its dispatch; its profile is the preview root's.
+#[gpui::test]
+fn host_browser_serves_reads_and_refuses_launch(cx: &mut TestAppContext) {
+    use gitterm_core::{
+        preview::service::preview_notice,
+        task_commands::mcp_protocol::{BROWSER_MCP_TOKEN_ENV, BROWSER_MCP_URL_ENV},
+    };
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    fixture.write_iced(vec![], vec![]);
+    let (owner, _) = fixture.start(cx);
+    let servers = owner.read_with(cx, |owner, _| owner.claude_mcp_servers("chat-b7"));
+    assert_eq!(servers.len(), 2);
+    let env = |key: &str| {
+        servers[1]
+            .env
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+            .unwrap()
+    };
+    let client = McpClient::connect(&env(BROWSER_MCP_URL_ENV), &env(BROWSER_MCP_TOKEN_ENV));
+    let status = client.call("browser_status", serde_json::json!({}));
+    assert_ne!(status["isError"], true, "{status}");
+    assert_eq!(status["structuredContent"]["state"], "stopped", "{status}");
+    let profile = PathBuf::from(
+        status["structuredContent"]["profile_dir"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no profile_dir: {status}")),
+    );
+    assert_eq!(profile, fixture.roots.root().join("browser-profile"));
+    for tool in [
+        "browser_open",
+        "browser_navigate",
+        "browser_network_capture",
+    ] {
+        let result = client.call(tool, serde_json::json!({}));
+        assert_eq!(result["isError"], true, "{tool}: {result}");
+        assert_eq!(
+            result["content"][0]["text"],
+            preview_notice(tool).as_str(),
+            "{tool}"
+        );
+    }
+    assert!(!profile.exists(), "nothing created the profile");
+    owner.update(cx, |owner, _| owner.shutdown());
 }
 
 #[gpui::test]
