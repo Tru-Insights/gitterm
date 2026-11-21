@@ -61,7 +61,7 @@ impl TerminalLaunch {
             }
         }
     }
-    fn prepare(self) -> io::Result<(BackendSettings, Option<tempfile::TempDir>)> {
+    pub(crate) fn prepare(self) -> io::Result<(BackendSettings, Option<tempfile::TempDir>)> {
         let cwd = self
             .cwd
             .map(|path| {
@@ -206,7 +206,13 @@ add-zle-hook-widget line-init _gitterm_gpui_ready
 GITTERM_GPUI_USER_ZDOTDIR=${ZDOTDIR-}
 ZDOTDIR=$GITTERM_GPUI_INTEGRATION
 "#;
-                        let cleanup = "unset GITTERM_GPUI_HAS_ZDOTDIR GITTERM_GPUI_USER_ZDOTDIR GITTERM_GPUI_INTEGRATION\n";
+                        // zsh reads these files only at startup, and cleanup runs in the last
+                        // loader for each shell kind (.zshrc non-login, .zlogin login), so the
+                        // directory is not needed afterwards. Remove it here: the Rust
+                        // TempDir is only dropped when the session is, which may never happen.
+                        let cleanup = r#"[[ ${GITTERM_GPUI_INTEGRATION:t} == gitterm-gpui-shell-* ]] && command rm -rf -- "$GITTERM_GPUI_INTEGRATION"
+unset GITTERM_GPUI_HAS_ZDOTDIR GITTERM_GPUI_USER_ZDOTDIR GITTERM_GPUI_INTEGRATION
+"#;
                         match file {
                             ".zlogin" => script.push_str(cleanup),
                             ".zshrc" => script.push_str(&format!(
