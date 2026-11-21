@@ -390,9 +390,11 @@ impl DelegationCard {
                     ""
                 },
                 false,
-                TranscriptAction::PreviewOnly {
+                TranscriptAction::Dismiss(crate::interactions::DismissRequest {
+                    id: d.delegation_id.clone(),
                     label: label.into(),
-                },
+                    active: d.status.is_active(),
+                }),
             );
         }
         controls

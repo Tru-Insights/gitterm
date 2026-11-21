@@ -2332,6 +2332,44 @@ fn h12_h14_h15_h16_h16a_h16b_preview_buttons_only_notice(cx: &mut TestAppContext
     assert_eq!(called.get(), 0, "no runtime commands or persistence path");
 }
 #[gpui::test]
+fn delegation_dismiss_asks_the_host_gate(cx: &mut TestAppContext) {
+    use crate::delegation::tests::card;
+    use crate::interactions::DismissRequest;
+    let (chat, cx) = setup(vec![], cx);
+    cx.simulate_resize(size(px(1400.), px(1000.)));
+    let asked = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captured = asked.clone();
+    chat.update_in(cx, |view, _, cx| {
+        view.set_dismiss_gate(
+            Rc::new(move |request: &DismissRequest, _: &gpui::App| {
+                captured.borrow_mut().push(request.clone());
+                "host notice".into()
+            }),
+            cx,
+        )
+    });
+    for (card, label, active) in [
+        (card("review", "completed"), "Dismiss", false),
+        (card("consult", "running"), "Cancel", true),
+        (card("implement", "running"), "Stop tracking", true),
+    ] {
+        install_card(card, &chat, cx);
+        let id = chat.read_with(cx, |view, _| view.model.rows[0].id);
+        click_selector(format!("delegation-action-{id}-{label}"), cx);
+        chat.read_with(cx, |view, _| {
+            assert_eq!(view.composer_state.notice.as_deref(), Some("host notice"))
+        });
+        assert_eq!(
+            asked.borrow().last(),
+            Some(&DismissRequest {
+                id: "review-1".into(),
+                label: label.into(),
+                active,
+            })
+        );
+    }
+}
+#[gpui::test]
 fn h13_h13a_card_navigation_emits_only_the_exact_file_or_worker(cx: &mut TestAppContext) {
     let (chat, cx) = setup(vec![], cx);
     cx.simulate_resize(size(px(1400.), px(1000.)));
@@ -3090,7 +3128,7 @@ fn c10_checkout_picker_lists_iced_entries_previews_a_choice_and_locks_once_start
             cx,
         );
         view.set_checkout_source(
-            Rc::new(move || {
+            Rc::new(move |_| {
                 counted.set(counted.get() + 1);
                 vec![
                     CheckoutChoice {
