@@ -29,7 +29,7 @@ pub(super) struct AggregateView {
 }
 
 impl AggregateView {
-    pub(super) fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
+    pub(super) fn new(root: PathBuf, source: ReviewSource, cx: &mut Context<Self>) -> Self {
         let executor = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -50,7 +50,7 @@ impl AggregateView {
                     view.dispatch(
                         Intent::Open {
                             target,
-                            source: ReviewSource::Uncommitted,
+                            source,
                             hide_noise: false,
                             focus: None,
                             page: AggregateModel::page(),
@@ -145,6 +145,17 @@ impl AggregateView {
         {
             self.dispatch(intent, cx);
         }
+    }
+
+    pub(super) fn navigate_to(&mut self, last: bool, cx: &mut Context<Self>) {
+        let projection = self.model.projection();
+        self.selected = if last {
+            projection.files.last()
+        } else {
+            projection.files.first()
+        }
+        .map(|row| row.file.path.clone());
+        cx.notify();
     }
 
     pub(super) fn navigate(&mut self, previous: bool, cx: &mut Context<Self>) {

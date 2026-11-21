@@ -609,6 +609,22 @@ fn measured_rows_are_left_aligned_and_never_overlap(cx: &mut TestAppContext) {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         let bounds = |cx: &mut VisualTestContext, selector| cx.debug_bounds(selector).unwrap();
         let mut previous = bounds(cx, "find-open");
+        let disclosure = bounds(cx, "find-open-part-0");
+        assert_eq!(disclosure.left(), previous.left() + px(6.));
+        assert_eq!(disclosure.top(), previous.top() + px(6.));
+        for i in 0..3 {
+            let row = bounds(cx, Box::leak(format!("find-open-{i}").into_boxed_str()));
+            let icon = bounds(
+                cx,
+                Box::leak(format!("find-open-icon-{i}").into_boxed_str()),
+            );
+            assert_eq!(icon.left(), row.left() + px(8.));
+        }
+        let backfill = bounds(cx, "find-backfill");
+        assert_eq!(
+            bounds(cx, "find-backfill-label").left(),
+            backfill.left() + px(8.)
+        );
         for (row, title, detail) in [
             ("find-open-0", "find-open-title-0", "find-open-detail-0"),
             ("find-open-1", "find-open-title-1", "find-open-detail-1"),
@@ -669,7 +685,7 @@ fn measured_rows_are_left_aligned_and_never_overlap(cx: &mut TestAppContext) {
             assert!(meta.bottom() <= row.bottom());
             assert_eq!(title.left(), latest.left());
             assert_eq!(latest.left(), meta.left());
-            assert!(title.left() < row.left() + px(12.));
+            assert_eq!(title.left(), row.left() + px(8.));
         }
     }
 }
@@ -749,6 +765,32 @@ fn observe_preview(
     events
 }
 
+#[test]
+fn overview_facts_follow_iced_machine_repo_branch_harness_order() {
+    let (state, facts) = fixture();
+    let mut session = OpenSession {
+        id: ChatRef::local("first"),
+        title: "Title".into(),
+        workspace: "Work".into(),
+        marker: "✦".into(),
+        detail: "main".into(),
+        selected: false,
+    };
+    assert_eq!(
+        overview_place(&facts, &session, entry(&state, &session.id)),
+        "This Mac · api · main · claude"
+    );
+    session.id = ChatRef::new(Some("remote"), "same");
+    assert_eq!(
+        overview_place(&facts, &session, entry(&state, &session.id)),
+        "Build machine · repo · main · pi"
+    );
+    assert_eq!(
+        overview_place(&facts, &session, None),
+        "Build machine · Work · main"
+    );
+}
+
 #[gpui::test]
 fn n13_overview_groups_idle_fold_and_live_navigation(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
@@ -771,15 +813,71 @@ fn n13_overview_groups_idle_fold_and_live_navigation(cx: &mut TestAppContext) {
         root.view().clone().downcast::<FindPreview>().unwrap()
     });
     let events = observe_preview(&view, cx);
-    cx.simulate_resize(gpui::size(px(1000.), px(1200.)));
+    for width in [480., 1000.] {
+        cx.simulate_resize(gpui::size(px(width), px(1200.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = |cx: &mut VisualTestContext, selector| cx.debug_bounds(selector).unwrap();
+        let overview = bounds(cx, "find-overview");
+        let fold = bounds(cx, "find-overview-idle");
+        let arrow = bounds(cx, "find-overview-idle-part-0");
+        let label = bounds(cx, "find-overview-idle-part-1");
+        let count = bounds(cx, "find-overview-idle-part-2");
+        assert_eq!(fold.left(), overview.left() + px(18.));
+        assert_eq!(fold.right(), overview.right() - px(18.));
+        assert_eq!(arrow.left(), fold.left() + px(6.));
+        assert_eq!(arrow.top(), fold.top() + px(10.));
+        assert_eq!(label.left(), arrow.right() + px(8.));
+        assert_eq!(count.left(), label.right() + px(8.));
+        assert_eq!(fold.bottom(), arrow.bottom() + px(4.));
+        assert!(cx.debug_bounds("find-overview-row-2").is_none());
+        click("find-overview-idle", cx);
+        assert!(view.read_with(cx, |v, _| v.idle_expanded));
+        for i in 0..3 {
+            let row = bounds(
+                cx,
+                Box::leak(format!("find-overview-row-{i}").into_boxed_str()),
+            );
+            let icon = bounds(
+                cx,
+                Box::leak(format!("find-overview-icon-{i}").into_boxed_str()),
+            );
+            let title = bounds(
+                cx,
+                Box::leak(format!("find-overview-title-{i}").into_boxed_str()),
+            );
+            let meta = bounds(
+                cx,
+                Box::leak(format!("find-overview-meta-{i}").into_boxed_str()),
+            );
+            let detail = bounds(
+                cx,
+                Box::leak(format!("find-overview-detail-{i}").into_boxed_str()),
+            );
+            let right = bounds(
+                cx,
+                Box::leak(format!("find-overview-right-{i}").into_boxed_str()),
+            );
+            assert_eq!(row.left(), overview.left() + px(18.));
+            assert_eq!(icon.left(), row.left() + px(10.));
+            assert_eq!(title.left(), icon.right() + px(8.));
+            assert_eq!(right.right(), row.right() - px(10.));
+            assert_eq!(right.top(), title.top());
+            assert_eq!(title.top(), row.top() + px(5.));
+            assert_eq!(meta.top(), title.bottom() + px(1.));
+            assert_eq!(detail.top(), meta.bottom() + px(1.));
+            assert_eq!(meta.left(), title.left());
+            assert_eq!(detail.left(), title.left());
+            assert_eq!(row.bottom(), detail.bottom() + px(5.));
+            assert!(meta.right() + px(8.) <= right.left());
+        }
+        click("find-overview-idle", cx);
+        assert!(!view.read_with(cx, |v, _| v.idle_expanded));
+    }
     click("find-overview-row-0", cx);
     click("find-overview-row-1", cx);
-    assert!(cx.debug_bounds("find-overview-row-2").is_none());
     click("find-overview-idle", cx);
-    assert!(view.read_with(cx, |v, _| v.idle_expanded));
     click("find-overview-row-2", cx);
     click("find-overview-idle", cx);
-    assert!(!view.read_with(cx, |v, _| v.idle_expanded));
     assert_eq!(
         *events.borrow(),
         ["first", "second", "same"].map(|id| FindOutcome::Open {
@@ -831,7 +929,21 @@ fn n13b_summary_folds_match_iced_limits_and_files_emit_local_open(cx: &mut TestA
     assert!(view.read_with(cx, |v, _| v.reply_expanded));
     click("find-summary-reply", cx);
     assert!(!view.read_with(cx, |v, _| v.reply_expanded));
+    for (row, label) in [
+        ("find-summary-ask", "find-summary-ask-label"),
+        ("find-summary-reply", "find-summary-reply-label"),
+    ] {
+        let row = cx.debug_bounds(row).unwrap();
+        let label = cx.debug_bounds(label).unwrap();
+        assert_eq!(label.left(), row.left() + px(6.));
+    }
     click("find-summary-file-0", cx);
+    let file = cx.debug_bounds("find-summary-file-0").unwrap();
+    let label = cx.debug_bounds("find-summary-file-label-0").unwrap();
+    assert_eq!(label.left(), file.left() + px(6.));
+    let fold = cx.debug_bounds("find-preview-conversation").unwrap();
+    let arrow = cx.debug_bounds("find-preview-conversation-part-0").unwrap();
+    assert_eq!(arrow.left(), fold.left() + px(6.));
     assert_eq!(
         *events.borrow(),
         [FindOutcome::OpenFile("/work/api/src/main.rs".into())]
@@ -1261,6 +1373,11 @@ fn n13_non_targets_are_disabled_and_remote_changed_files_are_text(cx: &mut TestA
     });
     let events = observe_preview(&view, cx);
     click("find-overview-remote-0", cx);
+    let remote = cx.debug_bounds("find-overview-remote-0").unwrap();
+    let icon = cx.debug_bounds("find-overview-remote-icon-0").unwrap();
+    let title = cx.debug_bounds("find-overview-remote-title-0").unwrap();
+    assert_eq!(icon.left(), remote.left() + px(10.));
+    assert_eq!(title.left(), icon.right() + px(8.));
     assert!(events.borrow().is_empty());
     view.update(cx, |v, cx| {
         preview_state(

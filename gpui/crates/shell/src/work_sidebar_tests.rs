@@ -40,7 +40,7 @@ fn entry(id: &str, title: &str, now: SystemTime) -> ChatIndexEntry {
     }
 }
 
-fn branch(repo: &str, name: &str, gone: bool) -> BranchStatus {
+pub(crate) fn branch(repo: &str, name: &str, gone: bool) -> BranchStatus {
     BranchStatus {
         owned: OwnedBranch {
             repo: repo.into(),
@@ -201,7 +201,7 @@ fn fixture_row_order_labels_and_repo_facts_match_iced() {
             "tools",
             "api",
             "infra",
-            "Focus: Ship parity",
+            "Focus: Ship parity ▾",
             "Chats",
             "✦ Ship parity",
             "1 older ▸",
@@ -287,6 +287,577 @@ fn click_sidebar(cx: &mut gpui::VisualTestContext, selector: &'static str) {
     draw_sidebar(cx);
 }
 
+fn subscribe_outcomes(
+    sidebar: &Entity<WorkSidebar>,
+    cx: &mut gpui::VisualTestContext,
+) -> Rc<RefCell<Vec<WorkSidebarOutcome>>> {
+    let events = Rc::new(RefCell::new(vec![]));
+    let received = events.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(sidebar, move |_, event: &WorkSidebarOutcome, _| {
+            received.borrow_mut().push(event.clone());
+        })
+        .detach();
+    });
+    events
+}
+
+fn replace_entries(sidebar: &WorkSidebar, entries: Vec<ChatIndexEntry>) {
+    let mut state = sidebar.state.borrow_mut();
+    let (stamp, summary) = state
+        .reduce(Intent::IndexChanged {
+            visible: Some(7),
+            wall_time: SystemTime::now(),
+        })
+        .into_iter()
+        .find_map(|e| match e {
+            Effect::BuildSummary { stamp, plan } => Some((stamp, plan.build(&entries))),
+            _ => None,
+        })
+        .unwrap();
+    state.reduce(Intent::SummaryFinished {
+        stamp,
+        result: Box::new(Ok(summary)),
+        now: Instant::now(),
+        visible: false,
+    });
+}
+
+#[gpui::test]
+fn w30_more_in_find_switches_host_mode_preserving_filter_without_writes_or_sessions(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let fixture = fixture(false);
+    replace_entries(
+        &fixture,
+        (0..14)
+            .map(|i| entry(&format!("chat-{i}"), "Chat", SystemTime::now()))
+            .collect(),
+    );
+    let (sidebar, cx) = cx.add_window_view(|_, _| fixture);
+    let shell = cx.update(|window, cx| {
+        cx.new(|cx| {
+            let mut model = crate::WorkspaceStatus::default();
+            model.add(root.path().to_path_buf(), Instant::now());
+            let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, None, cx));
+            crate::Shell::with_owner(
+                Rc::new(crate::data::LocalData(owner.clone())),
+                owner,
+                config.path(),
+                true,
+                window,
+                cx,
+            )
+            .unwrap()
+        })
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell
+                .find_state
+                .borrow_mut()
+                .reduce(gitterm_core::find::state::Intent::SetFilter(
+                    gitterm_core::find::state::Filter {
+                        query: "keep query".into(),
+                        ..Default::default()
+                    },
+                ));
+            shell.workspaces[0].store.regions.sidebar_collapsed = true;
+            cx.subscribe_in(
+                &sidebar,
+                window,
+                |shell, _, outcome: &WorkSidebarOutcome, window, cx| {
+                    shell.work_outcome(outcome, window, cx)
+                },
+            )
+            .detach();
+        })
+    });
+    let events = subscribe_outcomes(&sidebar, cx);
+    let before = tree_snapshot(root.path());
+    let config_before = tree_snapshot(config.path());
+    let filter = shell.read_with(cx, |s, _| s.find_state.borrow().filter().clone());
+    cx.simulate_resize(gpui::size(px(640.), px(1600.)));
+    draw_sidebar(cx);
+    click_row(&sidebar, cx, "… 2 more in Find");
+    assert_eq!(*events.borrow(), [WorkSidebarOutcome::OpenFind]);
+    shell.read_with(cx, |s, cx| {
+        assert_eq!(
+            s.active(cx).store.regions.sidebar_mode,
+            crate::layout::SidebarMode::Find
+        );
+        assert!(!s.active(cx).store.regions.sidebar_collapsed);
+        assert_eq!(s.find_state.borrow().filter(), &filter);
+        assert!(s.workspaces.iter().all(|w| w.sessions.is_empty()));
+        assert!(s.owner.read(cx).chats.is_empty());
+    });
+    assert_eq!(tree_snapshot(root.path()), before);
+    assert_eq!(tree_snapshot(config.path()), config_before);
+}
+
+#[gpui::test]
+fn w27_document_copies_suffix_tracks_fold_without_opening_a_document(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gitterm_core::work::documents::{
+        CopySource, Document, DocumentCopy, ScanRequest, ScanResult,
+    };
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir().unwrap();
+    let fixture = fixture(false);
+    {
+        let mut state = fixture.state.borrow_mut();
+        state.reduce(Intent::SetInputs(Inputs {
+            workspace: 7,
+            source: Source::Folder("/work".into()),
+            tasks: vec![],
+            focus: Focus::Latest,
+            documents: Some(ScanRequest::default()),
+        }));
+        let stamp = state
+            .reduce(Intent::ScanDocuments(7))
+            .into_iter()
+            .find_map(|e| match e {
+                Effect::ScanDocuments { stamp, .. } => Some(stamp),
+                _ => None,
+            })
+            .unwrap();
+        state.reduce(Intent::DocumentsFinished {
+            stamp,
+            result: Ok(ScanResult {
+                documents: vec![Document {
+                    key: "doc".into(),
+                    title: "Decision".into(),
+                    rel: "docs/DECISIONS.md".into(),
+                    differ: true,
+                    copies: ["new.md", "old.md"]
+                        .into_iter()
+                        .map(|name| DocumentCopy {
+                            path: root.path().join(name),
+                            source: CopySource::WorkDocs,
+                            modified: SystemTime::now(),
+                        })
+                        .collect(),
+                }],
+                truncated: false,
+            }),
+            now: Instant::now(),
+        });
+    }
+    let before = tree_snapshot(root.path());
+    let (sidebar, cx) = cx.add_window_view(|_, _| fixture);
+    let events = subscribe_outcomes(&sidebar, cx);
+    cx.simulate_resize(gpui::size(px(640.), px(1300.)));
+    draw_sidebar(cx);
+    click_row(&sidebar, cx, "Documents");
+    click_control(&sidebar, cx, "Decision", "2 copies differ ▸");
+    assert!(sidebar.read_with(cx, |s, _| {
+        s.rows()
+            .iter()
+            .any(|r| r.controls.iter().any(|c| c.label == "2 copies differ ▾"))
+    }));
+    click_control(&sidebar, cx, "Decision", "2 copies differ ▾");
+    assert!(sidebar.read_with(cx, |s, _| {
+        s.rows()
+            .iter()
+            .any(|r| r.controls.iter().any(|c| c.label == "2 copies differ ▸"))
+    }));
+    assert!(
+        events.borrow().is_empty(),
+        "folds cannot launch a process or open a document"
+    );
+    assert_eq!(tree_snapshot(root.path()), before);
+}
+
+#[gpui::test]
+fn w03_and_w15_index_and_owned_chat_only_notice(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir().unwrap();
+    let fixture = fixture(true);
+    let mut chat = entry("recent", "Unindexed chat", SystemTime::now());
+    chat.facts = None;
+    replace_entries(&fixture, vec![chat]);
+    let (sidebar, cx) = cx.add_window_view(|_, _| fixture);
+    let events = subscribe_outcomes(&sidebar, cx);
+    let before = tree_snapshot(root.path());
+    cx.simulate_resize(gpui::size(px(640.), px(1300.)));
+    draw_sidebar(cx);
+    let label = sidebar.read_with(cx, |s, _| {
+        s.rows()
+            .into_iter()
+            .find(|r| r.label.starts_with("No chat facts"))
+            .unwrap()
+            .label
+    });
+    click_control(&sidebar, cx, &label, "Index older chats");
+    assert_eq!(
+        sidebar.read_with(cx, |s, _| s.error.clone()).as_deref(),
+        Some("Index older chats · not available in preview")
+    );
+    click_row(&sidebar, cx, "✦ Unindexed chat");
+    assert_eq!(
+        sidebar.read_with(cx, |s, _| s.error.clone()).as_deref(),
+        Some("✦ Unindexed chat · not available in preview")
+    );
+    assert!(events.borrow().is_empty());
+    assert_eq!(tree_snapshot(root.path()), before);
+}
+
+fn click_row(sidebar: &Entity<WorkSidebar>, cx: &mut gpui::VisualTestContext, label: &str) {
+    let index = sidebar.read_with(cx, |sidebar, _| {
+        sidebar
+            .rows()
+            .iter()
+            .position(|row| row.label == label)
+            .unwrap()
+    });
+    click_sidebar(
+        cx,
+        Box::leak(format!("work-label-{index}").into_boxed_str()),
+    );
+}
+
+fn click_control(
+    sidebar: &Entity<WorkSidebar>,
+    cx: &mut gpui::VisualTestContext,
+    row_label: &str,
+    label: &str,
+) {
+    let selector = sidebar.read_with(cx, |sidebar, _| {
+        let rows = sidebar.rows();
+        let (index, row) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, row)| row.label == row_label)
+            .unwrap();
+        if let Some(control) = row.controls.iter().position(|c| c.label == label) {
+            format!("work-control-{index}-{control}")
+        } else if let Some(control) = row.detail_controls.iter().position(|c| c.label == label) {
+            format!("work-detail-{index}-{control}")
+        } else {
+            let (detail, control) = row
+                .detail_rows
+                .iter()
+                .enumerate()
+                .find_map(|(i, row)| {
+                    row.controls
+                        .iter()
+                        .position(|c| c.label == label)
+                        .map(|c| (i, c))
+                })
+                .unwrap();
+            format!("work-inline-{index}-{detail}-{control}")
+        }
+    });
+    click_sidebar(cx, Box::leak(selector.into_boxed_str()));
+}
+
+#[gpui::test]
+fn w12_branch_body_emits_review_and_disclosure_only_folds(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir().unwrap();
+    let before = tree_snapshot(root.path());
+    let mut fixture = fixture(false);
+    fixture.open.insert(Fold::Repo("/repos/api".into()));
+    let (sidebar, cx) = cx.add_window_view(|_, _| fixture);
+    let events = subscribe_outcomes(&sidebar, cx);
+    cx.simulate_resize(gpui::size(px(640.), px(1200.)));
+    draw_sidebar(cx);
+    let index = sidebar.read_with(cx, |s, _| {
+        s.rows().iter().position(|r| r.label == "tru-274").unwrap()
+    });
+    click_sidebar(cx, Box::leak(format!("work-fold-{index}").into_boxed_str()));
+    assert!(
+        events.borrow().is_empty(),
+        "disclosure must never open review or launch"
+    );
+    assert!(sidebar.read_with(cx, |s, _| {
+        s.open.contains(&Fold::Branch("/repos/api-tru-274".into()))
+    }));
+    click_row(&sidebar, cx, "tru-274");
+    assert_eq!(
+        *events.borrow(),
+        [WorkSidebarOutcome::OpenReview {
+            checkout: "/repos/api-tru-274".into(),
+            vs_base: false
+        }]
+    );
+    let s = sidebar.read_with(cx, |s, _| {
+        let mut clean = branch("/repos/api", "clean", false);
+        clean.status.as_mut().unwrap().files = 0;
+        clean.base = Some(gitterm_core::git_facts::BaseChoice {
+            reference: "main".into(),
+            source: gitterm_core::git_facts::BaseSource::Local,
+            considered: 1,
+        });
+        s.branch_row(&clean).action
+    });
+    assert_eq!(
+        s,
+        Some(Action::Emit(WorkSidebarOutcome::OpenReview {
+            checkout: "/repos/api-clean".into(),
+            vs_base: true
+        }))
+    );
+    assert_eq!(tree_snapshot(root.path()), before);
+}
+
+#[gpui::test]
+fn w25_focus_menu_uses_iced_suffix_choices_and_closes_on_pick(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir().unwrap();
+    let before = tree_snapshot(root.path());
+    let (sidebar, cx) = cx.add_window_view(|_, _| fixture(false));
+    let events = subscribe_outcomes(&sidebar, cx);
+    cx.simulate_resize(gpui::size(px(640.), px(1200.)));
+    draw_sidebar(cx);
+    click_row(&sidebar, cx, "Focus: Ship parity ▾");
+    assert!(events.borrow().is_empty());
+    assert!(sidebar.read_with(cx, |s, _| {
+        s.rows().iter().any(|r| r.label == "Focus: Ship parity ▴")
+    }));
+    click_row(&sidebar, cx, "All recent work · 1 chats, last 7 days");
+    assert_eq!(
+        *events.borrow(),
+        [WorkSidebarOutcome::Focus {
+            workspace: 7,
+            focus: Focus::AllRecent
+        }]
+    );
+    assert!(!sidebar.read_with(cx, |s, _| s.open.contains(&Fold::Focus)));
+    click_row(&sidebar, cx, "Focus: Ship parity ▾");
+    click_row(&sidebar, cx, "Most recently active chat");
+    assert_eq!(
+        events.borrow().last(),
+        Some(&WorkSidebarOutcome::Focus {
+            workspace: 7,
+            focus: Focus::Latest
+        })
+    );
+    assert_eq!(tree_snapshot(root.path()), before);
+}
+
+#[gpui::test]
+fn preview_write_controls_only_show_the_exact_clicked_label(cx: &mut gpui::TestAppContext) {
+    use gitterm_core::{
+        merge_plan::{PrKey, PrState},
+        prs::{PullCore, WatchedPr},
+    };
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir().unwrap();
+    let before = tree_snapshot(root.path());
+    let mut fixture = fixture(false);
+    for dir in ["home", "tools", "api"] {
+        fixture
+            .open
+            .insert(Fold::Repo(format!("/repos/{dir}").into()));
+    }
+    fixture
+        .open
+        .insert(Fold::Branch("/repos/api-tru-274".into()));
+    fixture.open.insert(Fold::Chat("recent".into()));
+    let mut pr = WatchedPr::new(PrKey::new("example/gitterm", 42));
+    pr.snapshot.core = Some(PullCore {
+        title: "Draft change".into(),
+        state: Some(PrState::Draft),
+        ..Default::default()
+    });
+    pr.news.push(gitterm_core::prs::NewsItem {
+        key: "news".into(),
+        kind: gitterm_core::prs::NewsKind::ChecksFailed,
+        text: "checks failed".into(),
+        at: "2026-11-20T00:00:00Z".into(),
+        dismissed: false,
+        told: true,
+        approvals_only: false,
+    });
+    fixture.pull_requests.push(PullRequestGroup {
+        root: "root".into(),
+        title: "Chat".into(),
+        prs: vec![pr],
+    });
+    fixture.open.insert(Fold::Pr("example/gitterm#42".into()));
+    let (sidebar, cx) = cx.add_window_view(|_, _| fixture);
+    let events = subscribe_outcomes(&sidebar, cx);
+    cx.simulate_resize(gpui::size(px(800.), px(2000.)));
+    draw_sidebar(cx);
+    let folds = sidebar.read_with(cx, |s, _| s.open.clone());
+    for (row, label) in [
+        ("Parity", "✎"),
+        ("Repos", "+ Add repo…"),
+        ("tools added to this workspace's repos", "Undo"),
+        ("tools added to this workspace's repos", "×"),
+        ("tools", "×"),
+        ("home", "Open in editor"),
+        ("home", "✎"),
+        ("tools", "+ run command"),
+        ("tru-274", "Open in editor"),
+        ("✦ Ship parity", "↗"),
+        ("✦ Ship parity", "⊞ Make workspace"),
+        ("Draft change", "Review"),
+        ("Draft change", "Approve (draft)"),
+        ("Draft change", "Merge (draft)"),
+        ("Draft change", "Ready for review"),
+        ("Draft change", "×"),
+    ] {
+        click_control(&sidebar, cx, row, label);
+        sidebar.read_with(cx, |s, _| {
+            assert_eq!(
+                s.error.as_deref(),
+                Some(format!("{label} · not available in preview").as_str())
+            );
+            assert_eq!(s.open, folds);
+            assert!(s.editing.is_none());
+            assert!(s.dismissed_auto.is_empty());
+        });
+        assert!(
+            events.borrow().is_empty(),
+            "{label} must not emit a process/write/navigation outcome"
+        );
+        assert_eq!(tree_snapshot(root.path()), before);
+    }
+    sidebar.update(cx, |s, cx| {
+        s.workspace
+            .chat_owners
+            .insert("recent".into(), "Other work".into());
+        cx.notify();
+    });
+    draw_sidebar(cx);
+    click_control(&sidebar, cx, "✦ Ship parity", "→ Go to Other work");
+    assert!(events.borrow().is_empty());
+    assert_eq!(
+        sidebar.read_with(cx, |s, _| s.error.clone()).as_deref(),
+        Some("→ Go to Other work · not available in preview")
+    );
+    assert_eq!(tree_snapshot(root.path()), before);
+}
+
+#[gpui::test]
+fn w19a_w20_plan_merge_and_hold_controls_match_iced_placement_and_only_notice(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gitterm_core::{
+        merge_plan::{PrKey, PrState},
+        prs::{PullCore, WatchedPr},
+    };
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir().unwrap();
+    let mut fixture = fixture(true);
+    let mut own = WatchedPr::new(PrKey::new("example/gitterm", 1));
+    own.snapshot.core = Some(PullCore {
+        title: "Next change".into(),
+        author: "fixture".into(),
+        state: Some(PrState::Open),
+        ..Default::default()
+    });
+    let mut held = WatchedPr::new(PrKey::new("example/gitterm", 2));
+    held.snapshot.core = Some(PullCore {
+        title: "Held change".into(),
+        state: Some(PrState::Open),
+        ..Default::default()
+    });
+    std::fs::write(
+        root.path().join("github-accounts.json"),
+        r#"{"EXAMPLE":" fixture "}"#,
+    )
+    .unwrap();
+    fixture.pr_accounts = read_pr_accounts(root.path());
+    fixture.pr_plans.insert("root".into(), serde_json::from_value(serde_json::json!({"root_chat_id":"root", "entries":[{"repo":"example/gitterm","number":1,"step":1},{"repo":"example/gitterm","number":2,"step":2,"hold":"wait for release"}]})).unwrap());
+    fixture.pull_requests.push(PullRequestGroup {
+        root: "root".into(),
+        title: "Chat".into(),
+        prs: vec![own, held],
+    });
+    for number in [1, 2] {
+        fixture
+            .open
+            .insert(Fold::Pr(format!("example/gitterm#{number}")));
+    }
+    let next = fixture
+        .rows()
+        .into_iter()
+        .find(|r| r.label == "Next change")
+        .unwrap();
+    let merge = next
+        .controls
+        .iter()
+        .find(|c| c.label.starts_with("Merge"))
+        .unwrap()
+        .label
+        .clone();
+    assert_eq!(merge, "Merge");
+    assert!(
+        !next
+            .detail_controls
+            .iter()
+            .any(|c| c.label.starts_with("Approve") || c.label.starts_with("Merge")),
+        "own PR omits Approve; next Merge sits on the title line"
+    );
+    let held = fixture
+        .rows()
+        .into_iter()
+        .find(|r| r.label == "Held change")
+        .unwrap();
+    assert_eq!(held.detail_rows[0].label, "hold: wait for release");
+    let before = tree_snapshot(root.path());
+    let (sidebar, cx) = cx.add_window_view(|_, _| fixture);
+    let events = subscribe_outcomes(&sidebar, cx);
+    cx.simulate_resize(gpui::size(px(800.), px(1500.)));
+    draw_sidebar(cx);
+    for (row, label) in [
+        ("Next change", merge.as_str()),
+        ("Held change", "clear hold"),
+    ] {
+        click_control(&sidebar, cx, row, label);
+        assert_eq!(
+            sidebar.read_with(cx, |s, _| s.error.clone()).as_deref(),
+            Some(format!("{label} · not available in preview").as_str())
+        );
+    }
+    for (outcome, reason) in [
+        (gitterm_core::prs::CheckOutcome::Pending, "checks running"),
+        (gitterm_core::prs::CheckOutcome::Fail, "checks failed"),
+    ] {
+        sidebar.update(cx, |s, cx| {
+            s.pull_requests[0].prs[1].snapshot.check_runs = vec![gitterm_core::prs::CheckItem {
+                name: "test".into(),
+                outcome,
+            }];
+            cx.notify();
+        });
+        draw_sidebar(cx);
+        for action in ["Approve", "Merge"] {
+            let label = format!("{action} ({reason})");
+            click_control(&sidebar, cx, "Held change", &label);
+            assert_eq!(
+                sidebar.read_with(cx, |s, _| s.error.clone()).as_deref(),
+                Some(format!("{label} · not available in preview").as_str())
+            );
+        }
+    }
+    assert!(
+        events.borrow().is_empty(),
+        "no merge/hold process or write can reach the host"
+    );
+    assert_eq!(
+        sidebar
+            .read_with(cx, |s, _| s.pr_plans["root"].entries[1].hold.clone())
+            .as_deref(),
+        Some("wait for release")
+    );
+    assert_eq!(tree_snapshot(root.path()), before);
+}
+
 #[gpui::test]
 fn repo_name_and_disclosure_toggle_but_only_run_emits_command(cx: &mut gpui::TestAppContext) {
     cx.background_executor.allow_parking();
@@ -353,24 +924,81 @@ fn repo_name_and_disclosure_toggle_but_only_run_emits_command(cx: &mut gpui::Tes
     // moves the repo row to index 4 from here on.
     click_sidebar(cx, "work-control-3-0");
     assert!(sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
+    assert_eq!(events.borrow().len(), 2, "editor launch is notice-only");
     assert_eq!(
-        events.borrow().last(),
-        Some(&WorkSidebarOutcome::OpenEditor {
-            dir: "/repos/home".into(),
-        })
+        sidebar
+            .read_with(cx, |sidebar, _| sidebar.error.clone())
+            .as_deref(),
+        Some("Open in editor · not available in preview")
     );
     click_sidebar(cx, "work-control-4-1");
-    assert!(sidebar.read_with(cx, |sidebar, _| sidebar.editing.is_some()));
+    assert!(sidebar.read_with(cx, |sidebar, _| sidebar.editing.is_none()));
     assert!(sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
-    assert!(cx.debug_bounds("work-run-4").is_none());
+    assert!(cx.debug_bounds("work-run-4").is_some());
+    assert!(cx.debug_bounds("work-run-command-input").is_none());
     assert_eq!(
-        cx.debug_bounds("work-run-command-input")
-            .unwrap()
-            .size
-            .width,
-        px(160.)
+        sidebar
+            .read_with(cx, |sidebar, _| sidebar.error.clone())
+            .as_deref(),
+        Some("✎ · not available in preview")
     );
-    assert_eq!(events.borrow().len(), 3);
+    assert_eq!(events.borrow().len(), 2);
+}
+
+#[gpui::test]
+fn expanded_repo_disclosure_stays_inside_default_sidebar_and_collapses(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let repo = PathBuf::from("/repos/api");
+    let fold = Fold::Repo(repo.clone());
+    let (sidebar, cx) = cx.add_window_view(|_, _| {
+        let mut sidebar = fixture(false);
+        sidebar.workspace.repos[0].dir = repo.clone();
+        sidebar
+    });
+    cx.simulate_resize(gpui::size(
+        px(crate::layout::RegionLayout::default().sidebar_width),
+        px(900.),
+    ));
+    for command in [Some("cargo run --example preview".to_string()), None] {
+        let has_command = command.is_some();
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.workspace.repos[0].run_command = command;
+            sidebar.open.insert(fold.clone());
+            cx.notify();
+        });
+        draw_sidebar(cx);
+        let index = sidebar.read_with(cx, |sidebar, _| {
+            let rows = sidebar.rows();
+            let index = rows.iter().position(|row| row.label == "api").unwrap();
+            assert_eq!(rows[index].controls.len(), 3, "editor, run edit, remove");
+            assert!(rows[index].age.is_some());
+            index
+        });
+        let selector: &'static str = Box::leak(format!("work-fold-{index}-▾").into_boxed_str());
+        let disclosure = cx.debug_bounds(selector).unwrap();
+        let sidebar_bounds = cx.debug_bounds("work-sidebar").unwrap();
+        assert_eq!(disclosure.size.width, px(24.));
+        assert!(disclosure.left() >= sidebar_bounds.left());
+        assert!(disclosure.right() <= sidebar_bounds.right());
+        assert_eq!(disclosure.right(), sidebar_bounds.right() - px(12.));
+        let editor = cx
+            .debug_bounds(Box::leak(
+                format!("work-control-{index}-0").into_boxed_str(),
+            ))
+            .unwrap();
+        assert!(editor.right() <= disclosure.left());
+        if has_command {
+            let run = cx
+                .debug_bounds(Box::leak(format!("work-run-{index}").into_boxed_str()))
+                .unwrap();
+            assert!(run.size.height > px(20.), "constrained command text wraps");
+        }
+        click_sidebar(cx, selector);
+        assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
+    }
 }
 
 #[gpui::test]
@@ -378,6 +1006,8 @@ fn pr_body_and_disclosure_keep_iced_toggle_targets(cx: &mut gpui::TestAppContext
     use gitterm_core::{merge_plan::PrKey, prs::WatchedPr};
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
+    let root = tempfile::tempdir().unwrap();
+    let before = tree_snapshot(root.path());
     let mut sidebar = fixture(true);
     sidebar.pull_requests = vec![PullRequestGroup {
         root: "root".into(),
@@ -389,14 +1019,32 @@ fn pr_body_and_disclosure_keep_iced_toggle_targets(cx: &mut gpui::TestAppContext
     draw_sidebar(cx);
     let fold = Fold::Pr("example/gitterm#42".into());
     assert!(cx.debug_bounds("work-fold-2-▸").is_some());
-    // Iced view_pr_row wraps the title, number and facts in its toggle button.
+    let events = subscribe_outcomes(&sidebar, cx);
     click_sidebar(cx, "work-pr-number-2");
+    assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
+    assert_eq!(
+        *events.borrow(),
+        [WorkSidebarOutcome::OpenPrViewer {
+            url: "https://github.com/example/gitterm/pull/42".into()
+        }]
+    );
+    assert!(
+        cx.opened_url().is_none(),
+        "PR number requests the Page viewer, never an external process"
+    );
+    click_sidebar(cx, "work-label-2");
     assert!(sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
     assert!(cx.debug_bounds("work-fold-2-▾").is_some());
     click_sidebar(cx, "work-fold-2-▾");
     assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
     click_sidebar(cx, "work-fold-2-▸");
     assert!(sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
+    assert_eq!(
+        events.borrow().len(),
+        1,
+        "only the separate number link emits navigation"
+    );
+    assert_eq!(tree_snapshot(root.path()), before);
 }
 
 #[test]
@@ -478,10 +1126,11 @@ fn add_undo_and_dismiss_use_actual_row_controls() {
         Some(WorkSidebarOutcome::DismissAutoRepos { workspace: 7 })
     );
     assert!(
-        !sidebar
+        sidebar
             .rows()
             .iter()
-            .any(|row| row.label.contains("added to this workspace"))
+            .any(|row| row.label.contains("added to this workspace")),
+        "preview dismiss must preserve the notice"
     );
     sidebar.workspace.local = false;
     assert!(sidebar.rows()[1].controls.is_empty());
@@ -496,20 +1145,17 @@ fn owned_coordinators_open_and_folder_coordinators_focus_with_explicit_open() {
             .into_iter()
             .find(|row| row.label == "✦ Ship parity")
             .unwrap();
-        assert_eq!(
-            sidebar.activate(row.action.unwrap()),
-            Some(if owned {
-                WorkSidebarOutcome::OpenChat {
+        if owned {
+            assert_eq!(row.action, Some(Action::Preview(row.label.clone())));
+        } else {
+            assert_eq!(
+                sidebar.activate(row.action.unwrap()),
+                Some(WorkSidebarOutcome::Focus {
                     workspace: 7,
-                    chat: "recent".into(),
-                }
-            } else {
-                WorkSidebarOutcome::Focus {
-                    workspace: 7,
-                    focus: Focus::Coordinator("recent".into()),
-                }
-            })
-        );
+                    focus: Focus::Coordinator("recent".into())
+                })
+            );
+        }
         assert!(!row.controls.iter().any(|c| c.label == "↗"));
         sidebar.activate(Action::Toggle(Fold::Chat("recent".into())));
         let action = control(&sidebar, "✦ Ship parity", "↗");
@@ -856,8 +1502,15 @@ impl IcedFixture {
         }
     }
     fn load(&self) -> crate::data::IcedWorkData {
-        crate::data::IcedWorkData::read(&self.config, 1, &self.workspace, Focus::Latest, |_| {})
-            .unwrap()
+        crate::data::IcedWorkData::read(
+            &self.config,
+            1,
+            &self.workspace,
+            Focus::Latest,
+            None,
+            |_| {},
+        )
+        .unwrap()
     }
 }
 
@@ -882,8 +1535,27 @@ fn tree_snapshot(
 #[test]
 fn iced_work_fixture_has_real_rows_in_order_and_never_changes_source_bytes_or_mtimes() {
     let fixture = IcedFixture::new();
+    let home = fixture.root.path().join("harness-home");
+    indexed_transcript(
+        &home,
+        "root-chat",
+        std::path::Path::new(&fixture.workspace.dir),
+        "Fixture chat title",
+        "Fixture request",
+        "2026-11-20T12:00:00Z",
+    );
+    let load = || {
+        crate::data::IcedWorkData::read_with_home(
+            &fixture.config,
+            Some(&home),
+            1,
+            &fixture.workspace,
+            Focus::Latest,
+        )
+        .unwrap()
+    };
     let before = tree_snapshot(fixture.root.path());
-    let data = fixture.load();
+    let data = load();
     assert_eq!(data.tasks.len(), 1);
     assert_eq!(data.workers.len(), 1);
     assert_eq!(
@@ -954,7 +1626,7 @@ fn iced_work_fixture_has_real_rows_in_order_and_never_changes_source_bytes_or_mt
     );
     // A second load also must not acquire a lease, migrate a task, or write
     // status refresh metadata in the repositories or source config directory.
-    fixture.load();
+    load();
     assert_eq!(tree_snapshot(fixture.root.path()), before);
 }
 
@@ -972,6 +1644,7 @@ fn missing_and_malformed_task_stores_are_read_only_and_errors_are_visible() {
         1,
         &fixture.workspace,
         Focus::Latest,
+        None,
         |_| {},
     );
     assert!(result.err().unwrap().to_string().contains("task store"));
@@ -979,7 +1652,7 @@ fn missing_and_malformed_task_stores_are_read_only_and_errors_are_visible() {
 }
 
 #[gpui::test]
-fn write_outcomes_report_unavailable_and_still_emit_typed_events(cx: &mut gpui::TestAppContext) {
+fn write_outcomes_report_unavailable_without_emitting_events(cx: &mut gpui::TestAppContext) {
     let sidebar = cx.new(|_| fixture(false));
     let events = Rc::new(RefCell::new(Vec::new()));
     let received = events.clone();
@@ -1024,7 +1697,10 @@ fn write_outcomes_report_unavailable_and_still_emit_typed_events(cx: &mut gpui::
             );
         });
     }
-    assert_eq!(events.borrow().as_slice(), actions.as_slice());
+    assert!(
+        events.borrow().is_empty(),
+        "preview notices cannot reach host write subscribers"
+    );
     assert!(
         WorkSidebarOutcome::Refresh { workspace: 7 }
             .preview_error()
@@ -1266,7 +1942,7 @@ fn indexed_work_uses_iced_titles_latest_and_child_activity_in_iced_order_read_on
             (cwd, noon + Duration::from_secs(3600))
         ]
     );
-    // Without transcripts, task links must not change the previous fallback rows.
+    // Without transcripts or an earlier index, owned roots are omitted from Chats.
     let fallback = crate::data::IcedWorkData::read_with_home(
         &fixture.config,
         Some(&home.join("absent-index")),
@@ -1277,20 +1953,12 @@ fn indexed_work_uses_iced_titles_latest_and_child_activity_in_iced_order_read_on
     .unwrap();
     let mut state = State::default();
     fallback.apply(&mut state);
-    assert!(
-        state
-            .pane(1)
-            .unwrap()
-            .summary
-            .coordinators
-            .iter()
-            .all(|c| c.fan_out.is_none())
-    );
+    assert!(state.pane(1).unwrap().summary.coordinators.is_empty());
     assert_eq!(tree_snapshot(fixture.root.path()), before);
 }
 
 #[test]
-fn folder_work_includes_historical_chats_and_missing_index_preserves_fallback() {
+fn folder_work_includes_historical_chats_and_missing_index_omits_unknown_chats() {
     let fixture = IcedFixture::new();
     let home = fixture.root.path().join("harness-home");
     let missing = fixture.root.path().join("absent-home");
@@ -1305,9 +1973,14 @@ fn folder_work_includes_historical_chats_and_missing_index_preserves_fallback() 
     .unwrap();
     let state = Rc::new(RefCell::new(State::default()));
     fallback.apply(&mut state.borrow_mut());
-    assert_eq!(
-        state.borrow().pane(1).unwrap().summary.coordinators[0].title,
-        "root-chat"
+    assert!(
+        state
+            .borrow()
+            .pane(1)
+            .unwrap()
+            .summary
+            .coordinators
+            .is_empty()
     );
     assert!(fallback.repo_recency.is_empty());
     assert_eq!(tree_snapshot(fixture.root.path()), before);
@@ -1376,6 +2049,7 @@ fn folder_work_includes_historical_chats_and_missing_index_preserves_fallback() 
 // Install the production read-only projection before a headless host's first draw.
 pub(crate) fn h8_install(sidebar: &mut WorkSidebar, data: crate::data::IcedWorkData) {
     data.apply(&mut sidebar.state.borrow_mut());
+    sidebar.previous_data = Some(data.clone());
     sidebar.workspace = data.facts;
     sidebar.tasks = data.tasks;
     sidebar.workers = data.workers;
@@ -1496,6 +2170,7 @@ fn realistic_catalog_partial_index_publishes_repos_chats_docs_before_branch_chec
         4,
         saved,
         Focus::Latest,
+        None,
         true,
         |data| {
             publications += 1;
@@ -1538,7 +2213,7 @@ fn realistic_catalog_partial_index_publishes_repos_chats_docs_before_branch_chec
             );
             assert_eq!(
                 rows.iter().find(|row| row.label == "Chats").unwrap().badges,
-                ["7"]
+                ["1"]
             );
             assert_eq!(
                 rows.iter()

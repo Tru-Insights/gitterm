@@ -150,6 +150,23 @@ impl ReviewView {
         view.prepare(cx);
         view
     }
+    pub fn branch_review<'a>(&self, cx: &'a App) -> Option<&'a gitterm_core::review::state::Pane> {
+        self.aggregate.as_ref()?.read(cx).model.state().pane()
+    }
+    pub fn navigate_to(&mut self, last: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_aggregate
+            && let Some(aggregate) = &self.aggregate
+        {
+            aggregate.update(cx, |view, cx| view.navigate_to(last, cx));
+        } else if !self.model.files.is_empty() {
+            self.select(
+                if last { self.model.files.len() - 1 } else { 0 },
+                window,
+                cx,
+            );
+        }
+        self.focus.focus(window, cx);
+    }
     pub fn model(&self) -> &ReviewModel {
         &self.model
     }
@@ -251,7 +268,7 @@ impl ReviewView {
     fn previous(&mut self, _: &PreviousFile, window: &mut Window, cx: &mut Context<Self>) {
         self.navigate(true, window, cx);
     }
-    fn navigate(&mut self, previous: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn navigate(&mut self, previous: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.show_aggregate
             && let Some(aggregate) = &self.aggregate
         {
@@ -288,13 +305,14 @@ impl ReviewView {
             cx.notify();
         }
     }
-    pub fn open_branch_review(&mut self, cx: &mut Context<Self>) {
-        if self.aggregate.is_none() {
-            let Some(root) = self.repo_path.clone() else {
-                return;
-            };
-            self.aggregate = Some(cx.new(|cx| AggregateView::new(root, cx)));
-        }
+    pub fn open_branch_review(
+        &mut self,
+        checkout: PathBuf,
+        source: gitterm_core::review::model::ReviewSource,
+        cx: &mut Context<Self>,
+    ) {
+        // A new entity also isolates completions from a previously selected checkout.
+        self.aggregate = Some(cx.new(|cx| AggregateView::new(checkout, source, cx)));
         self.show_aggregate = true;
         cx.notify();
     }

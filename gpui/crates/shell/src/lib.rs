@@ -150,6 +150,7 @@ pub struct Shell {
     saved_facts_error: Option<workspace_bar::News>,
     saved_facts_catalog_key: Option<String>,
     saved_facts_generation: u64,
+    bar_menu: Option<workspace_bar::Menu>,
     work_sidebars: HashMap<WorkspaceId, Entity<work_sidebar::WorkSidebar>>,
     work_subscriptions: HashMap<WorkspaceId, Subscription>,
     #[cfg(test)]
@@ -399,6 +400,7 @@ impl Shell {
             saved_facts_error: None,
             saved_facts_catalog_key: None,
             saved_facts_generation: 0,
+            bar_menu: None,
             work_sidebars: HashMap::new(),
             work_subscriptions: HashMap::new(),
             #[cfg(test)]
@@ -465,8 +467,10 @@ impl Shell {
                     .panes
                     .iter()
                     .filter(|(id, pane)| {
-                        matches!(pane.read(cx).content, pane::PaneContent::Content(_))
-                            && content_pane_visible(state, id, cx)
+                        matches!(
+                            pane.read(cx).content,
+                            pane::PaneContent::Content(_) | pane::PaneContent::Review(_)
+                        ) && content_pane_visible(state, id, cx)
                     })
                     .map(|(id, _)| id.clone())
             })
@@ -1331,12 +1335,6 @@ fn build_workspace(
                 session.title.clone(),
                 if let Some(text) = data.imported_session(workspace.id, session.id, cx) {
                     PaneKind::IcedSession(text)
-                } else if imported {
-                    // Saved preview panes are inventory, never permission to start a shell.
-                    PaneKind::IcedSession(
-                        "Restored terminal · idle. Use + for a terminal or ▶ to run a command."
-                            .into(),
-                    )
                 } else if let Some(terminals) = &store.terminals {
                     let cwd = terminals
                         .iter()
@@ -1347,6 +1345,7 @@ fn build_workspace(
                     if stopped {
                         PaneKind::StoppedTerminal(cwd, true)
                     } else {
+                        // Like Iced, restore a plain shell now, without a saved run command.
                         PaneKind::CenterTerminal(cwd)
                     }
                 } else {
@@ -1358,15 +1357,6 @@ fn build_workspace(
                 cx,
             )
         });
-        if imported
-            && data
-                .imported_session(workspace.id, session.id, cx)
-                .is_none()
-        {
-            pane.update(cx, |pane, _| {
-                pane.session = Some(sessions::fresh_target());
-            });
-        }
         panes.insert(id, pane);
     }
     for (name, title, kind) in [
@@ -1596,8 +1586,10 @@ impl Shell {
             workspaces,
             active: self.active_workspace(cx),
             repos_on_bar: self.repos_on_bar(cx),
-            repos_open: false,
+            repos_open: self.bar_menu == Some(workspace_bar::Menu::Repos),
             machine_news,
+            repo_machines: facts.repo_machines.clone(),
+            remote_workspaces: facts.remote_workspaces.clone(),
             pulse_bright: false,
             ready_count: facts.ready,
             ready_news_count: facts.news_count,
@@ -1607,14 +1599,23 @@ impl Shell {
                 + hidden
                 + self.workspaces.iter().filter(|w| !w.on_bar()).count(),
             terminal_expanded: active.is_some_and(|w| w.store.regions.has_bottom(false)),
-            terminal_running: false,
+            terminal_running: active.is_some_and(|state| {
+                bottom_pane_ids(state, cx).iter().any(|id| {
+                    self.run_tabs.contains_key(id)
+                        && state
+                            .panes
+                            .get(id)
+                            .is_some_and(|pane| terminal_alive(pane.read(cx), cx))
+                })
+            }),
             browser: workspace_bar::Browser {
                 color: colors.muted,
                 driving: false,
-                hint: "Browser".into(),
+                hint: "Browser idle".into(),
                 action: Some(workspace_bar::BrowserAction::Open),
+                has_evidence: false,
             },
-            more_open: false,
+            more_open: self.bar_menu == Some(workspace_bar::Menu::More),
         }
     }
     fn refresh_saved_facts_if_catalog_changed(&mut self, cx: &mut Context<Self>) {
@@ -1731,7 +1732,30 @@ impl Shell {
             workspaces: self.chrome_workspaces(cx),
             active: self.active_workspace(cx),
             repos_on_bar: self.repos_on_bar(cx),
-            attention: vec![],
+            attention: self
+                .workspaces
+                .iter()
+                .flat_map(|state| {
+                    let root = self.data.terminal_cwd(state.workspace.id, cx);
+                    self.work_sidebars
+                        .get(&state.workspace.id)
+                        .map(|sidebar| {
+                            spine::task_rows(
+                                state.workspace.id,
+                                sidebar.read(cx).tasks().iter().filter(|task| {
+                                    match &task.workspace.location {
+                                        gitterm_core::tasks::WorkspaceLocationIdentity::Local {
+                                            directory,
+                                        } => root.as_ref() == Some(directory),
+                                        _ => false,
+                                    }
+                                }),
+                                std::time::SystemTime::now(),
+                            )
+                        })
+                        .unwrap_or_default()
+                })
+                .collect(),
             frontmost: self
                 .workspaces
                 .iter()
@@ -1740,7 +1764,25 @@ impl Shell {
                     w.active_session
                         .map(|s| (w.workspace.id, spine::Target::Tab(s.0)))
                 }),
-            running: vec![],
+            running: self
+                .workspaces
+                .iter()
+                .flat_map(|state| {
+                    state.sessions.iter().filter_map(|session| {
+                        state
+                            .panes
+                            .get(&session_pane_id(session.id))
+                            .and_then(|pane| match &pane.read(cx).content {
+                                pane::PaneContent::PreviewChat(view)
+                                    if view.read(cx).is_working() =>
+                                {
+                                    Some((state.workspace.id, spine::Target::Tab(session.id.0)))
+                                }
+                                _ => None,
+                            })
+                    })
+                })
+                .collect(),
             pulse_bright: false,
             usage_open: self.usage_open,
             usage_hint: "Usage".into(),
@@ -1777,6 +1819,34 @@ impl Shell {
                     let untitled = tab.is_some_and(|tab| {
                         tab.chat_session_id.as_deref() == Some(s.title.as_str())
                     });
+                    let sidebar = state
+                        .and_then(|state| self.work_sidebars.get(&state.workspace.id))
+                        .map(|sidebar| sidebar.read(cx));
+                    let tasks = sidebar
+                        .map(|sidebar| sidebar.tasks())
+                        .or_else(|| {
+                            self.roster_facts
+                                .as_ref()
+                                .map(|facts| facts.tasks.as_slice())
+                        })
+                        .unwrap_or_default();
+                    let workers = sidebar
+                        .map(|sidebar| sidebar.workers())
+                        .or_else(|| {
+                            self.roster_facts
+                                .as_ref()
+                                .map(|facts| facts.workers.as_slice())
+                        })
+                        .unwrap_or_default();
+                    let task = tab
+                        .and_then(|tab| tab.task_id.as_ref())
+                        .and_then(|id| tasks.iter().find(|task| &task.task_id == id));
+                    let running = state
+                        .and_then(|state| state.panes.get(&session_pane_id(s.id)))
+                        .is_some_and(|pane| {
+                            matches!(&pane.read(cx).content,
+                            pane::PaneContent::PreviewChat(view) if view.read(cx).is_working())
+                        });
                     session_strip::Session {
                         id: s.id,
                         kind: s.kind,
@@ -1789,9 +1859,22 @@ impl Shell {
                         },
                         chat_title: (s.kind == data::SessionKind::Chat && !untitled)
                             .then(|| s.title.clone()),
-                        task_session_label: None,
-                        attention: None,
-                        running: false,
+                        task_session_label: task.and_then(|task| {
+                            tab.and_then(|tab| tab.task_session_id.as_ref())
+                                .and_then(|id| {
+                                    task.sessions
+                                        .iter()
+                                        .find(|session| &session.task_session_id == id)
+                                })
+                                .map(|session| session.label.clone())
+                        }),
+                        attention: session_strip::attention(
+                            task.map(|task| &task.attention),
+                            workers,
+                            tab.and_then(|tab| tab.session_uid.as_deref()),
+                        ),
+                        running,
+                        // ChatPane does not yet expose its pending-request projection.
                         pending_requests: 0,
                     }
                 })
@@ -1821,29 +1904,58 @@ impl Shell {
             &self.spine_input(cx),
             workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark()),
             Rc::new(move |outcome, window, cx| {
-                _ = weak.update(cx, |shell, cx| {
-                    if matches!(outcome, spine::Outcome::ToggleUsage) {
-                        shell.toggle_usage(window, cx);
-                    } else {
-                        shell.spine_outcome(outcome, window, cx);
+                _ = weak.update(cx, |shell, cx| match outcome {
+                    spine::Outcome::ToggleUsage => shell.toggle_usage(window, cx),
+                    spine::Outcome::Jump {
+                        target: spine::Target::Task(task),
+                        ..
+                    } => {
+                        shell.activate_task(&task, window, cx);
                     }
+                    outcome => shell.spine_outcome(outcome, window, cx),
                 });
             }),
         )
         .w(px(layout::SPINE_WIDTH + 1.))
     }
+    fn chrome_unavailable(&self, label: &str, cx: &mut Context<Self>) {
+        self.owner.update(cx, |owner, cx| {
+            owner.error = Some(format!("{label} · not available in preview"));
+            cx.notify();
+        });
+    }
     fn workspace_bar(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
         let weak = cx.weak_entity();
+        let menu_owner = weak.clone();
         workspace_bar::render(
             &self.bar_input(cx),
             workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark()),
             Rc::new(move |outcome, window, cx| {
                 _ = weak.update(cx, |shell, cx| {
-                    if outcome == workspace_bar::Outcome::NewWork {
-                        shell.open_recent_work_sheet(window, cx);
-                    } else {
-                        shell.bar_outcome(outcome, window, cx);
+                    use workspace_bar::Outcome as O;
+                    match outcome {
+                        O::NewWork => shell.open_recent_work_sheet(window, cx),
+                        O::OpenSettings(_) => shell.chrome_unavailable("Workspace settings", cx),
+                        O::OpenReady => shell.chrome_unavailable("Ready", cx),
+                        O::OpenParked => shell.chrome_unavailable("Parked", cx),
+                        O::Browser(workspace_bar::BrowserAction::Open) => {
+                            shell.chrome_unavailable("Open browser", cx)
+                        }
+                        O::Browser(workspace_bar::BrowserAction::Focus) => {
+                            shell.chrome_unavailable("Focus browser", cx)
+                        }
+                        outcome => shell.bar_outcome(outcome, window, cx),
                     }
+                });
+            }),
+            Rc::new(move |change, _, cx| {
+                let _ = menu_owner.update(cx, |shell, cx| {
+                    if change.open {
+                        shell.bar_menu = Some(change.menu);
+                    } else if shell.bar_menu == Some(change.menu) {
+                        shell.bar_menu = None;
+                    }
+                    cx.notify();
                 });
             }),
         )
@@ -1860,6 +1972,12 @@ impl Shell {
                         shell.general_context(false, window, cx)
                     }
                     session_strip::Outcome::TaskOverview => shell.general_context(true, window, cx),
+                    session_strip::Outcome::ToggleWorktreeFollow => {
+                        let input = shell.strip_input(cx);
+                        if let Some(follow) = &input.worktree_follow {
+                            shell.chrome_unavailable(&follow.text(&input.branch), cx);
+                        }
+                    }
                     outcome => shell.strip_outcome(outcome, window, cx),
                 });
             }),
@@ -1883,6 +2001,14 @@ impl Shell {
         self.sync_git_visibility(true, cx);
         cx.notify();
     }
+    const SIDEBAR_MODES: [(SidebarMode, &'static str, &'static str); 3] = [
+        (SidebarMode::Work, "Work", "▦"),
+        (SidebarMode::Files, "Files", "📁"),
+        (SidebarMode::Find, "Find", "≋"),
+    ];
+    fn sidebar_chevron(collapsed: bool) -> &'static str {
+        if collapsed { "▶" } else { "◀" }
+    }
     fn sidebar(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
         let state = self.active(cx);
         let regions = &state.store.regions;
@@ -1901,18 +2027,14 @@ impl Shell {
             .flex()
             .items_center()
             .when(regions.sidebar_collapsed, |row| row.flex_col());
-        for (mode, title, icon) in [
-            (SidebarMode::Work, "Work", "W"),
-            (SidebarMode::Files, "Files", "F"),
-            (SidebarMode::Find, "Find", "⌕"),
-        ] {
+        for (mode, title, icon) in Self::SIDEBAR_MODES {
             let selected = regions.sidebar_mode == mode
                 || (mode == SidebarMode::Work && regions.sidebar_mode == SidebarMode::Git);
             modes = modes.child(
                 div()
-                    .flex_1()
+                    .when(!regions.sidebar_collapsed, |s| s.flex_1().border_b_2())
+                    .when(regions.sidebar_collapsed, |s| s.w_full().border_l_2())
                     .min_w_0()
-                    .border_b_2()
                     .border_color(if selected {
                         rgb(p.blue).into()
                     } else {
@@ -1927,12 +2049,13 @@ impl Shell {
                             } else {
                                 title
                             })
-                            .tooltip(title)
-                            .h(px(26.))
+                            .h(px(if regions.sidebar_collapsed { 40. } else { 26. }))
                             .w_full()
-                            .justify_start()
+                            .when(!regions.sidebar_collapsed, |s| {
+                                s.justify_start().px(px(10.))
+                            })
+                            .when(regions.sidebar_collapsed, |s| s.justify_center().px_0())
                             .rounded_none()
-                            .px(px(10.))
                             .text_size(px(12.))
                             .text_color(rgb(if selected { p.text } else { p.subtext0 }))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1947,26 +2070,28 @@ impl Shell {
                     ),
             );
         }
-        modes = modes.child(
-            Button::new("collapse-sidebar")
-                .debug_selector(|| "collapse-sidebar".into())
-                .ghost()
-                .label(if regions.sidebar_collapsed {
-                    "▸"
-                } else {
-                    "◂"
-                })
-                .tooltip(if regions.sidebar_collapsed {
-                    "Expand sidebar"
-                } else {
-                    "Collapse sidebar"
-                })
-                .h(px(28.))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.update_regions(|r| r.sidebar_collapsed = !r.sidebar_collapsed, cx)
-                })),
-        );
-        sidebar = sidebar.child(modes);
+        let collapse = Button::new("collapse-sidebar")
+            .debug_selector(|| "collapse-sidebar".into())
+            .ghost()
+            .label(Self::sidebar_chevron(regions.sidebar_collapsed))
+            .text_size(px(10.))
+            .text_color(rgb(p.subtext0))
+            .h(px(if regions.sidebar_collapsed { 30. } else { 28. }))
+            .when(regions.sidebar_collapsed, |s| s.w_full())
+            .when(!regions.sidebar_collapsed, |s| {
+                s.custom(
+                    gpui_component::button::ButtonCustomVariant::new(cx)
+                        .foreground(rgb(p.subtext0).into()),
+                )
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.update_regions(|r| r.sidebar_collapsed = !r.sidebar_collapsed, cx)
+            }));
+        if regions.sidebar_collapsed {
+            sidebar = sidebar.child(modes).child(div().flex_1()).child(collapse);
+        } else {
+            sidebar = sidebar.child(modes.child(collapse));
+        }
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Files {
             sidebar = self.files_sidebar(sidebar, cx);
         }
@@ -2769,7 +2894,7 @@ impl Shell {
         &mut self,
         workspace: WorkspaceId,
         action: &pane::git_view::GitAction,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         use pane::git_view::GitAction as A;
@@ -2785,16 +2910,7 @@ impl Shell {
                 }
                 self.sync_git_visibility(true, cx);
             }
-            A::EditFile(path) => self.open_file_viewer(
-                &FileOpen {
-                    workspace,
-                    path: path.clone(),
-                    changed: None,
-                    from_files: true,
-                },
-                window,
-                cx,
-            ),
+            A::EditFile(_) => self.editor_preview_notice(cx),
             A::OpenWorktree(_) | A::AdoptWorktree(_) | A::RemoveWorktree(_) => {
                 self.owner.update(cx, |owner, cx| {
                     owner.error = Some("Worktree actions are not available in preview".into());
@@ -3013,6 +3129,11 @@ impl Shell {
             .on_action(cx.listener(|_, _: &SubmitReview, w, cx| {
                 Self::chat_action("native_chat::SubmitReview", w, cx)
             }))
+            .on_action(cx.listener(|_, _: &CloseReview, w, cx| {
+                // The page closes review before find; preserve the host's
+                // chat-find marker until the next Escape closes find itself.
+                Self::chat_action("native_chat::CloseFind", w, cx)
+            }))
             .on_action(cx.listener(|_, _: &SubmitPrompt, w, cx| {
                 Self::chat_action("native_chat::SubmitPrompt", w, cx)
             }))
@@ -3094,13 +3215,14 @@ impl Shell {
                     this.run_repo(repo, w, cx);
                 }
             }))
-            .on_action(cx.listener(|_, _: &ToggleTheme, w, cx| {
-                theme::apply(
-                    !gpui_component::Theme::global(cx).mode.is_dark(),
-                    Some(w),
-                    cx,
-                );
-                cx.notify();
+            .on_action(cx.listener(|this, _: &ToggleTheme, _, cx| {
+                this.chrome_unavailable("Toggle Light/Dark Theme", cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTerminalLogMirroring, _, cx| {
+                this.chrome_unavailable("Toggle Terminal Log Mirroring", cx);
+            }))
+            .on_action(cx.listener(|this, action: &PreviewUnavailable, _, cx| {
+                this.chrome_unavailable(&action.label, cx);
             }))
             .on_action(cx.listener(|this, _: &ClearTerminal, w, cx| {
                 if let Some(view) = this.focused_terminal(w, cx) {
@@ -3153,16 +3275,8 @@ impl Shell {
             .on_action(cx.listener(|this, a: &FileSelectByIndex, w, cx| {
                 this.select_file(&a.selection, w, cx)
             }))
-            .on_action(cx.listener(|this, _: &EditFile, w, cx| {
-                if let Some(mut file) = this
-                    .active_workspace(cx)
-                    .and_then(|id| this.selected_files.get(&id))
-                    .cloned()
-                {
-                    file.changed = None;
-                    file.from_files = true;
-                    this.open_file_viewer(&file, w, cx);
-                }
+            .on_action(cx.listener(|this, _: &EditFile, _, cx| {
+                this.editor_preview_notice(cx);
             }))
             .on_action(cx.listener(|this, _: &AgentFindOpen, w, cx| {
                 let focused = this.focused_chat(w, cx);
@@ -3489,21 +3603,6 @@ impl Shell {
         cx.notify();
     }
     fn escape(&mut self, _: &app_menus::Escape, window: &mut Window, cx: &mut Context<Self>) {
-        if self.task_switcher.is_none()
-            && self.session_picker.is_none()
-            && self.park_sheet.is_none()
-            && self.new_work_sheet.is_none()
-            && !Self::has_dialog(window, cx)
-            && self
-                .bottom
-                .update(cx, |bottom, cx| bottom.dismiss_quick_picker(cx))
-        {
-            return;
-        }
-        if self.plans_open {
-            self.toggle_plans(window, cx);
-            return;
-        }
         if self.task_switcher.is_some() {
             self.task_switcher_outcome(&task_switcher::Outcome::Close, window, cx);
             return;
@@ -3516,11 +3615,29 @@ impl Shell {
             || self.park_sheet.is_some()
             || self.new_work_sheet.is_some()
             || Self::has_dialog(window, cx)
-            || self
-                .focused_terminal(window, cx)
-                .is_some_and(|v| v.read(cx).is_find_open())
         {
-            // The existing sheet/search raw-key handler consumes Escape once.
+            cx.propagate();
+            return;
+        }
+        if self.bar_menu.take().is_some() {
+            cx.notify();
+            return;
+        }
+        if self
+            .bottom
+            .update(cx, |bottom, cx| bottom.dismiss_quick_picker(cx))
+        {
+            return;
+        }
+        if self.plans_open {
+            self.toggle_plans(window, cx);
+            return;
+        }
+        if self
+            .focused_terminal(window, cx)
+            .is_some_and(|v| v.read(cx).is_find_open())
+        {
+            // Terminal search owns its Escape handler.
             cx.propagate();
         } else if self
             .focused_chat(window, cx)
@@ -3574,7 +3691,22 @@ impl Shell {
         if self.task_switcher.is_some() {
             return;
         }
+        // Page-local review, composer pickers and find consume Escape before
+        // the host's quick commands, viewers and navigation.
         if event.keystroke.key == "escape"
+            && !self.plans_open
+            && !self.usage_open
+            && self.session_picker.is_none()
+            && self.park_sheet.is_none()
+            && self.new_work_sheet.is_none()
+            && !Self::has_dialog(window, cx)
+            && self.bar_menu.is_none()
+            && self.focused_chat(window, cx).is_some()
+        {
+            return;
+        }
+        if event.keystroke.key == "escape"
+            && !self.usage_open
             && self.session_picker.is_none()
             && self.park_sheet.is_none()
             && self.new_work_sheet.is_none()

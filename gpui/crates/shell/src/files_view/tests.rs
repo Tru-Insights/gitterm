@@ -245,7 +245,22 @@ fn roots_back_and_directory_rows_have_iced_insets_and_heights(cx: &mut TestAppCo
     click(cx, "files-root-0");
     wait_for(&view, "file.txt", cx);
     let back = cx.debug_bounds("files-all-folders-label").unwrap();
+    let back_row = cx.debug_bounds("files-all-folders").unwrap();
     assert_eq!(back.origin.x - list.origin.x, px(12.));
+    assert_eq!(back.left(), back_row.left() + px(8.));
+    assert_eq!(back.top(), back_row.top() + px(4.));
+    assert_eq!(back_row.bottom(), back.bottom() + px(4.));
+    let has_border = cx.update(|window, _| {
+        let scaled = back_row.scale(window.scale_factor());
+        window
+            .painted_quads()
+            .iter()
+            .any(|quad| quad.bounds == scaled && quad.border_widths.any(|width| width.0 > 0.))
+    });
+    assert!(
+        !has_border,
+        "All folders must paint as a borderless ghost row"
+    );
     for ix in 0..2 {
         let icon = bounds(cx, &format!("files-icon-{ix}"));
         let name = bounds(cx, &format!("files-name-{ix}"));

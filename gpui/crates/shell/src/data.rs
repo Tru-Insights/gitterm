@@ -443,6 +443,7 @@ pub(crate) struct IcedWorkData {
     pub running_task_ids: std::collections::HashSet<String>,
     pub repo_recency: Vec<(std::path::PathBuf, std::time::SystemTime)>,
     pub pull_requests: Vec<crate::work_sidebar::PullRequestGroup>,
+    pub indexed_chats: Vec<gitterm_core::chats::ChatIndexEntry>,
     pub issues: gitterm_core::issues::IssueTitlesFile,
     pub collapsed_issue_groups: Vec<gitterm_core::issues::IssueGroup>,
     inputs: gitterm_core::work::state::Inputs,
@@ -457,18 +458,37 @@ impl IcedWorkData {
         id: u64,
         saved: &gitterm_core::workspace_config::WorkspaceConfig,
         focus: gitterm_core::work::summary::Focus,
+        previous: Option<&Self>,
         mut publish: impl FnMut(&Self),
     ) -> anyhow::Result<Self> {
         #[cfg(test)]
         let home: Option<std::path::PathBuf> = None;
         #[cfg(not(test))]
         let home = dirs::home_dir();
-        // Saved facts can populate Work independently of a slow full harness
-        // index. This is a fresh read, never a second persisted index/cache.
+        // Retain indexed chats and repo presentation while partial facts publish
+        // ahead of the slow full read, which replaces the snapshot.
         if home.is_some() {
-            Self::read_with_progress(config, None, id, saved, focus.clone(), false, &mut publish)?;
+            Self::read_with_progress(
+                config,
+                None,
+                id,
+                saved,
+                focus.clone(),
+                previous,
+                false,
+                &mut publish,
+            )?;
         }
-        Self::read_with_progress(config, home.as_deref(), id, saved, focus, true, publish)
+        Self::read_with_progress(
+            config,
+            home.as_deref(),
+            id,
+            saved,
+            focus,
+            previous,
+            true,
+            publish,
+        )
     }
     #[cfg(test)]
     pub(crate) fn read_with_home(
@@ -478,14 +498,17 @@ impl IcedWorkData {
         saved: &gitterm_core::workspace_config::WorkspaceConfig,
         focus: gitterm_core::work::summary::Focus,
     ) -> anyhow::Result<Self> {
-        Self::read_with_progress(config, home, id, saved, focus, true, |_| {})
+        Self::read_with_progress(config, home, id, saved, focus, None, true, |_| {})
     }
+    // Keep the prior snapshot explicit alongside the read inputs and progress sink.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_with_progress(
         config: &std::path::Path,
         home: Option<&std::path::Path>,
         id: u64,
         saved: &gitterm_core::workspace_config::WorkspaceConfig,
         focus: gitterm_core::work::summary::Focus,
+        previous: Option<&Self>,
         measure_branches: bool,
         mut publish: impl FnMut(&Self),
     ) -> anyhow::Result<Self> {
@@ -582,7 +605,9 @@ impl IcedWorkData {
         let mut errors = vec![];
         let mut entries = if local {
             home.map(|home| crate::workspace_config::read_iced_chat_index(config, home))
-                .unwrap_or_default()
+                .unwrap_or_else(|| {
+                    previous.map_or_else(Vec::new, |data| data.indexed_chats.clone())
+                })
         } else {
             vec![]
         };
@@ -601,7 +626,22 @@ impl IcedWorkData {
         } else {
             iced_chat_links(&catalog, &store)
         };
-        // A partial index must not erase owned chats whose transcript is absent.
+        gitterm_core::chat_facts::resolve_tree(&mut entries, &links);
+        let indexed_chats = entries.clone();
+        let infos: Vec<_> = store.tasks().iter().map(TaskInfo::from).collect();
+        let source = if saved.chats.is_empty() {
+            Source::Folder(saved.dir.clone().into())
+        } else {
+            Source::Owned(saved.chats.clone())
+        };
+        let summary = SummaryPlan {
+            source: source.clone(),
+            tasks: infos.clone(),
+            focus: focus.clone(),
+            now: SystemTime::now(),
+        }
+        .build(&entries);
+        // Saved facts supply repo/PR ownership without inventing Chats rows.
         {
             let mut pending: Vec<_> = saved
                 .chats
@@ -615,17 +655,6 @@ impl IcedWorkData {
                 if !seen.insert(chat.clone()) {
                     continue;
                 }
-                let fallback_path = match gitterm_core::chat_facts::facts_path(
-                    &gitterm_core::chat_facts::facts_dir(config),
-                    chats::ChatBackend::Claude,
-                    &chat,
-                ) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        errors.push(error);
-                        continue;
-                    }
-                };
                 let mut loaded = None;
                 for backend in chats::ChatBackend::ALL {
                     let path = match gitterm_core::chat_facts::facts_path(
@@ -648,18 +677,15 @@ impl IcedWorkData {
                         Err(error) => errors.push(error),
                     }
                 }
-                let (backend, path, chat_facts) = match loaded {
-                    Some((backend, path, facts)) => (backend, path, Some(facts)),
-                    None => (chats::ChatBackend::Claude, fallback_path, None),
+                let Some((backend, path, chat_facts)) = loaded else {
+                    continue;
                 };
-                if let Some(facts) = &chat_facts {
-                    pending.extend(facts.children.iter().map(|c| {
-                        (
-                            c.session_id.clone(),
-                            c.title.clone().unwrap_or_else(|| c.session_id.clone()),
-                        )
-                    }));
-                }
+                pending.extend(chat_facts.children.iter().map(|c| {
+                    (
+                        c.session_id.clone(),
+                        c.title.clone().unwrap_or_else(|| c.session_id.clone()),
+                    )
+                }));
                 if entries.iter().any(|entry| entry.id == chat) {
                     continue;
                 }
@@ -679,24 +705,11 @@ impl IcedWorkData {
                     size: 0,
                     dead_cwd: !Path::new(&saved.dir).exists(),
                     root_id: None,
-                    facts: chat_facts,
+                    facts: Some(chat_facts),
                 });
             }
         }
         gitterm_core::chat_facts::resolve_tree(&mut entries, &links);
-        let infos: Vec<_> = store.tasks().iter().map(TaskInfo::from).collect();
-        let source = if saved.chats.is_empty() {
-            Source::Folder(saved.dir.clone().into())
-        } else {
-            Source::Owned(saved.chats.clone())
-        };
-        let summary = SummaryPlan {
-            source: source.clone(),
-            tasks: infos.clone(),
-            focus: focus.clone(),
-            now: SystemTime::now(),
-        }
-        .build(&entries);
         let task_worktrees: Vec<PathBuf> = store
             .tasks()
             .iter()
@@ -870,7 +883,7 @@ impl IcedWorkData {
                 .chats
                 .iter()
                 .map(|id| {
-                    let title = entries
+                    let title = indexed_chats
                         .iter()
                         .find(|entry| entry.id == *id)
                         .map(|entry| entry.title.clone())
@@ -928,6 +941,7 @@ impl IcedWorkData {
                 .collect(),
             repo_recency,
             pull_requests,
+            indexed_chats,
             issues,
             collapsed_issue_groups: saved.collapsed_issue_groups.clone(),
             inputs,
@@ -946,7 +960,7 @@ impl IcedWorkData {
             data.documents.documents.len(),
             started.elapsed()
         );
-        publish(&data);
+        data.publish_partial(previous, &mut publish);
         if local && measure_branches {
             // Iced only lists checkouts owned by the focused work: facts edits,
             // its child task worktrees, and issue-key matches. A shared repo's
@@ -1004,7 +1018,7 @@ impl IcedWorkData {
                     }
                 })
                 .collect();
-            publish(&data);
+            data.publish_partial(previous, &mut publish);
             for branch in &mut data.branches {
                 *branch = git.branch(branch.owned.clone());
             }
@@ -1015,7 +1029,29 @@ impl IcedWorkData {
             data.branches.len(),
             started.elapsed()
         );
+        if !measure_branches {
+            data.retain_repos(previous);
+        }
         Ok(data)
+    }
+
+    fn retain_repos(&mut self, previous: Option<&Self>) {
+        if let Some(previous) = previous.filter(|previous| {
+            previous.facts.id == self.facts.id && previous.facts.dir == self.facts.dir
+        }) {
+            // A partial harness/status read cannot remove a repo or its facts.
+            // The completed read is authoritative, including removals.
+            self.facts.repos = previous.facts.repos.clone();
+            self.facts.running_by_repo = previous.facts.running_by_repo.clone();
+            self.summary.repos = previous.summary.repos.clone();
+            self.branches = previous.branches.clone();
+        }
+    }
+
+    fn publish_partial(&self, previous: Option<&Self>, publish: &mut impl FnMut(&Self)) {
+        let mut partial = self.clone();
+        partial.retain_repos(previous);
+        publish(&partial);
     }
 
     pub fn apply(&self, state: &mut gitterm_core::work::state::State) {
@@ -1351,5 +1387,232 @@ impl WorkGit {
             stamp: GitdirStamp::default(),
             checked_at: std::time::SystemTime::now(),
         }
+    }
+}
+
+#[cfg(test)]
+mod work_index_tests {
+    use super::IcedWorkData;
+    use gitterm_core::{
+        chat_facts::{self, ChatFacts, PrRef},
+        chats::ChatBackend,
+        work::{state::State, summary::Focus},
+    };
+
+    #[test]
+    fn partial_publications_retain_four_repos_and_facts_until_the_full_read() {
+        use gitterm_core::work::summary::{RepoTouched, merge_repo_groups};
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let config = root.path().join("catalog");
+        let repos: Vec<_> = ["home", "api", "tools", "server"]
+            .map(|name| root.path().join(name))
+            .into_iter()
+            .collect();
+        std::fs::create_dir_all(&config).unwrap();
+        for repo in &repos {
+            std::fs::create_dir_all(repo).unwrap();
+        }
+        let write_catalog = |repos: &[std::path::PathBuf]| {
+            std::fs::write(
+                config.join("workspaces.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "active_workspace": 0,
+                    "workspaces": [{"name": "Fixture", "abbrev": "F", "color": "blue",
+                        "dir": repos[0], "repos": repos, "tabs": []}],
+                    "repos": []
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        write_catalog(&repos);
+        let catalog = crate::workspace_config::IcedCatalog::read(&config).unwrap();
+        let saved = &catalog.workspaces[0];
+        let mut first =
+            IcedWorkData::read_with_home(&config, None, 1, saved, Focus::Latest).unwrap();
+        assert_eq!(first.facts.repos.len(), 4);
+        // The last completed read's measured facts must survive an incomplete read.
+        first.summary.repos = vec![RepoTouched {
+            dir: repos[3].clone(),
+            edits: 7,
+        }];
+        first.facts.running_by_repo.insert(repos[3].clone(), 2);
+        first.branches.push(crate::work_sidebar::tests::branch(
+            repos[3].to_str().unwrap(),
+            "feature",
+            false,
+        ));
+        write_catalog(&repos[..3]);
+        let mut publications = 0;
+        let mut assert_retained = |data: &IcedWorkData| {
+            publications += 1;
+            assert_eq!(data.facts.repos.len(), 4);
+            assert_eq!(data.summary.repos, first.summary.repos);
+            assert_eq!(data.facts.running_by_repo, first.facts.running_by_repo);
+            let listed = data
+                .facts
+                .repos
+                .iter()
+                .map(|repo| repo.dir.clone())
+                .collect::<Vec<_>>();
+            let groups = merge_repo_groups(
+                &listed,
+                &data.facts.removed,
+                &data.summary.repos,
+                &data.branches,
+            );
+            assert_eq!(groups.len(), 4);
+            assert_eq!(groups[3].edits, Some(7));
+            assert_eq!(groups[3].rows.len(), 1);
+            assert_eq!(groups[3].rows[0].status, first.branches[0].status);
+            let mut state = State::default();
+            data.apply(&mut state);
+            assert_eq!(state.pane(1).unwrap().summary.repos, first.summary.repos);
+            assert_eq!(state.pane(1).unwrap().branches.len(), 1);
+        };
+        let partial = IcedWorkData::read_with_progress(
+            &config,
+            None,
+            1,
+            saved,
+            Focus::Latest,
+            Some(&first),
+            false,
+            &mut assert_retained,
+        )
+        .unwrap();
+        assert_retained(&partial);
+        let full = IcedWorkData::read_with_progress(
+            &config,
+            None,
+            1,
+            saved,
+            Focus::Latest,
+            Some(&partial),
+            true,
+            &mut assert_retained,
+        )
+        .unwrap();
+        assert_eq!(
+            publications, 4,
+            "saved facts, partial result, overview, ownership"
+        );
+        assert_eq!(full.facts.repos.len(), 3);
+        assert!(full.summary.repos.is_empty());
+        assert!(full.facts.running_by_repo.is_empty());
+        assert!(full.branches.is_empty());
+    }
+
+    #[test]
+    fn partial_publish_retains_indexed_titles_and_full_read_replaces_the_snapshot() {
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let config = root.path().join("catalog");
+        let home = root.path().join("harness-home");
+        let cwd = root.path().join("work");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let owned = ["indexed-root-chat", "never-indexed-chat"];
+        std::fs::write(
+            config.join("workspaces.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "active_workspace": 0,
+                "workspaces": [{"name": "Fixture", "abbrev": "F", "color": "blue",
+                    "dir": cwd, "chats": owned, "tabs": []}],
+                "repos": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let facts_dir = chat_facts::facts_dir(&config);
+        std::fs::create_dir_all(&facts_dir).unwrap();
+        for (number, id) in owned.iter().enumerate() {
+            let facts = ChatFacts {
+                prs: vec![PrRef {
+                    repo: "example/project".into(),
+                    number: number as u64 + 1,
+                    url: format!("https://github.com/example/project/pull/{}", number + 1),
+                }],
+                ..Default::default()
+            };
+            std::fs::write(
+                chat_facts::facts_path(&facts_dir, ChatBackend::Claude, id).unwrap(),
+                serde_json::to_vec(&facts).unwrap(),
+            )
+            .unwrap();
+        }
+        let transcript = home.join(".claude/projects/fixture/indexed-root-chat.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            [
+                serde_json::json!({"type": "user", "cwd": cwd,
+                    "timestamp": "2026-11-20T12:00:00Z", "message": {"content": "Request"}}),
+                serde_json::json!({"type": "ai-title", "aiTitle": "Retained title"}),
+            ]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+        let catalog = crate::workspace_config::IcedCatalog::read(&config).unwrap();
+        let saved = &catalog.workspaces[0];
+        let first =
+            IcedWorkData::read_with_home(&config, Some(&home), 1, saved, Focus::Latest).unwrap();
+        let mut state = State::default();
+        first.apply(&mut state);
+        assert_eq!(state.pane(1).unwrap().summary.coordinators.len(), 1);
+        assert_eq!(first.indexed_chats.len(), 1);
+        assert_eq!(first.pull_requests[0].title, "Retained title");
+        assert_eq!(first.pull_requests[1].title, "never-in");
+        std::fs::remove_file(transcript).unwrap();
+        let mut publications = 0;
+        let partial = IcedWorkData::read_with_progress(
+            &config,
+            None,
+            1,
+            saved,
+            Focus::Latest,
+            Some(&first),
+            false,
+            |data| {
+                publications += 1;
+                data.apply(&mut state);
+                let chats = &state.pane(1).unwrap().summary.coordinators;
+                assert_eq!(chats.len(), 1);
+                assert_eq!(chats[0].id, "indexed-root-chat");
+                assert_eq!(chats[0].title, "Retained title");
+                assert_eq!(data.pull_requests[0].title, "Retained title");
+                assert_eq!(data.pull_requests[1].title, "never-in");
+            },
+        )
+        .unwrap();
+        assert_eq!(publications, 1);
+        assert_eq!(partial.indexed_chats.len(), 1);
+        std::fs::remove_file(
+            chat_facts::facts_path(&facts_dir, ChatBackend::Claude, owned[0]).unwrap(),
+        )
+        .unwrap();
+        let full = IcedWorkData::read_with_progress(
+            &config,
+            Some(&home),
+            1,
+            saved,
+            Focus::Latest,
+            Some(&partial),
+            true,
+            |data| {
+                data.apply(&mut state);
+                assert!(state.pane(1).unwrap().summary.coordinators.is_empty());
+                assert_eq!(data.pull_requests.len(), 1);
+                assert_eq!(data.pull_requests[0].root, "never-indexed-chat");
+            },
+        )
+        .unwrap();
+        full.apply(&mut state);
+        assert!(state.pane(1).unwrap().summary.coordinators.is_empty());
+        assert!(full.indexed_chats.is_empty());
+        assert_eq!(full.pull_requests.len(), 1);
+        assert_eq!(full.pull_requests[0].title, "never-in");
     }
 }

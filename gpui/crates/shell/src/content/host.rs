@@ -1,4 +1,4 @@
-//! Narrow local WebKit host. No Wry, IPC handlers, URL loader or persistent store.
+//! Local WebKit host with Viewer link navigation. No Wry, IPC or persistent store.
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
@@ -14,7 +14,7 @@ use objc2::{
 };
 use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSImage, NSView};
 use objc2_foundation::{
-    NSDictionary, NSError, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    NSDictionary, NSError, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
 };
 use objc2_web_kit::{
     WKNavigation, WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate,
@@ -47,6 +47,7 @@ struct NavigationState {
     injection: Cell<bool>,
     pending: RefCell<Option<(Retained<WKNavigation>, LoadTicket)>>,
     results: RefCell<VecDeque<NavigationResult>>,
+    external: RefCell<Vec<String>>,
 }
 
 impl NavigationState {
@@ -76,15 +77,19 @@ define_class!(
             action: &WKNavigationAction,
             decision: &DynBlock<dyn Fn(WKNavigationActionPolicy)>,
         ) {
-            // loadHTMLString has about:blank as its document URL. Local rendered
-            // content may fetch renderer assets but cannot navigate into Page,
-            // local files, custom schemes, or launch an external application.
             let url = unsafe { action.request().URL() }.and_then(|url| url.absoluteString());
-            let allow = allow_injected_document(
-                &self.ivars().injection,
-                url.as_ref().map(|url| url.to_string()).as_deref(),
-            );
-            decision.call((if allow {
+            // targetFrame is nil for target=_blank/window.open. No new native
+            // window or persistent Page surface is created for local documents.
+            let target: Option<Retained<NSObject>> = unsafe { msg_send![action, targetFrame] };
+            let url = url.as_ref().map(|url| url.to_string());
+            let policy =
+                document_navigation(&self.ivars().injection, url.as_deref(), target.is_none());
+            if policy == DocumentNavigation::External
+                && let Some(url) = url
+            {
+                self.ivars().external.borrow_mut().push(url);
+            }
+            decision.call((if policy == DocumentNavigation::Allow {
                 WKNavigationActionPolicy::Allow
             } else {
                 WKNavigationActionPolicy::Cancel
@@ -132,6 +137,47 @@ define_class!(
 
 pub(super) fn allow_injected_document(pending: &Cell<bool>, url: Option<&str>) -> bool {
     pending.replace(false) && url == Some("about:blank")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum DocumentNavigation {
+    Allow,
+    External,
+    Cancel,
+}
+
+pub(super) fn document_navigation(
+    pending: &Cell<bool>,
+    url: Option<&str>,
+    new_window: bool,
+) -> DocumentNavigation {
+    if allow_injected_document(pending, url) {
+        return DocumentNavigation::Allow;
+    }
+    let Some(url) = url else {
+        return DocumentNavigation::Cancel;
+    };
+    if !new_window && url.starts_with("about:blank#") {
+        return DocumentNavigation::Allow;
+    }
+    let parsed = NSURL::URLWithString(&NSString::from_str(url));
+    let network = parsed.as_ref().is_some_and(|url| {
+        url.scheme().is_some_and(|scheme| {
+            matches!(
+                scheme.to_string().to_ascii_lowercase().as_str(),
+                "http" | "https"
+            )
+        }) && url.host().is_some_and(|host| !host.is_empty())
+    });
+    if network {
+        if new_window {
+            DocumentNavigation::External
+        } else {
+            DocumentNavigation::Allow
+        }
+    } else {
+        DocumentNavigation::Cancel
+    }
 }
 
 /// One hidden-on-construction child view with an immutable nonpersistent store.
@@ -183,6 +229,10 @@ impl LocalWebKitHost {
         })
     }
 
+    pub fn drain_external(&mut self) -> Vec<String> {
+        std::mem::take(&mut *self.navigation.ivars().external.borrow_mut())
+    }
+
     pub fn drain_snapshots(&mut self) -> Vec<SnapshotResult> {
         self.results.borrow_mut().drain(..).collect()
     }
@@ -201,6 +251,7 @@ impl SurfaceHost for LocalWebKitHost {
     fn load(&mut self, ticket: LoadTicket, document: &Document) -> Result<(), String> {
         self.hide();
         self.navigation.ivars().pending.borrow_mut().take();
+        self.navigation.ivars().external.borrow_mut().clear();
         // SAFETY: main-thread WebKit instance, owned string, no filesystem base
         // URL or read-access grant. Store stays ephemeral across replacements.
         let navigation = unsafe {
@@ -251,6 +302,7 @@ impl SurfaceHost for LocalWebKitHost {
     fn clear(&mut self) {
         self.hide();
         self.navigation.ivars().pending.borrow_mut().take();
+        self.navigation.ivars().external.borrow_mut().clear();
         unsafe {
             self.view.stopLoading();
             self.navigation.ivars().injection.set(true);
