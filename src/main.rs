@@ -56170,6 +56170,10 @@ mod tests {
 mod baseline_tests;
 
 #[cfg(test)]
+#[path = "phone_panel_tests.rs"]
+mod phone_panel_tests;
+
+#[cfg(test)]
 #[path = "../tests/iced-chat/c10.rs"]
 mod iced_chat_c10;
 
