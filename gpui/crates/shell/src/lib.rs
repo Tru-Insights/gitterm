@@ -1333,12 +1333,6 @@ fn build_workspace(
                 session.title.clone(),
                 if let Some(text) = data.imported_session(workspace.id, session.id, cx) {
                     PaneKind::IcedSession(text)
-                } else if imported {
-                    // Saved preview panes are inventory, never permission to start a shell.
-                    PaneKind::IcedSession(
-                        "Restored terminal · idle. Use + for a terminal or ▶ to run a command."
-                            .into(),
-                    )
                 } else if let Some(terminals) = &store.terminals {
                     let cwd = terminals
                         .iter()
@@ -1349,6 +1343,7 @@ fn build_workspace(
                     if stopped {
                         PaneKind::StoppedTerminal(cwd, true)
                     } else {
+                        // Like Iced, restore a plain shell now, without a saved run command.
                         PaneKind::CenterTerminal(cwd)
                     }
                 } else {
@@ -1360,15 +1355,6 @@ fn build_workspace(
                 cx,
             )
         });
-        if imported
-            && data
-                .imported_session(workspace.id, session.id, cx)
-                .is_none()
-        {
-            pane.update(cx, |pane, _| {
-                pane.session = Some(sessions::fresh_target());
-            });
-        }
         panes.insert(id, pane);
     }
     for (name, title, kind) in [

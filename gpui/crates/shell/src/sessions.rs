@@ -268,9 +268,6 @@ impl crate::Shell {
             O::OpenChat { workspace, chat } => self.select_work_chat(*workspace, chat, window, cx),
             O::Focus { workspace, focus } => {
                 self.select_workspace_id(crate::WorkspaceId(*workspace), window, cx);
-                if let gitterm_core::work::summary::Focus::Coordinator(chat) = focus {
-                    self.select_work_chat(*workspace, chat, window, cx);
-                }
                 if let Some(dir) = self.data.terminal_cwd(crate::WorkspaceId(*workspace), cx) {
                     self.work_state.borrow_mut().reduce(
                         gitterm_core::work::state::Intent::SetInputs(
@@ -289,8 +286,25 @@ impl crate::Shell {
             O::OpenReview { checkout, vs_base } => {
                 self.open_work_review(checkout.clone(), *vs_base, window, cx);
             }
-            // TODO(TRU-274 Work actions slice): wire repo editing, run/review/editor,
-            // ownership, refresh/index and Find after the owner exposes those paths.
+            O::OpenFind => {
+                if let Some(active) = self.active_workspace(cx)
+                    && let Some(state) = self
+                        .workspaces
+                        .iter_mut()
+                        .find(|w| w.workspace.id == active)
+                {
+                    state.store.regions.sidebar_mode = crate::layout::SidebarMode::Find;
+                    state.store.regions.sidebar_collapsed = false;
+                }
+                cx.notify();
+            }
+            O::OpenPrViewer { .. } => {
+                self.owner.update(cx, |owner, cx| {
+                    owner.error = Some("PR viewer · not available in preview".into());
+                    cx.notify();
+                });
+            }
+            // Write/launch controls stop at the sidebar's preview notice.
             _ => {}
         }
     }
