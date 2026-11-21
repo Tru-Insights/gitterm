@@ -993,7 +993,8 @@ fn expanded_repo_disclosure_stays_inside_default_sidebar_and_collapses(
                 format!("work-control-{index}-0").into_boxed_str(),
             ))
             .unwrap();
-        assert!(editor.right() <= disclosure.left());
+        // Iced clips the actions slot at the disclosure; Open in editor stays one line.
+        assert!(editor.size.height <= px(24.), "{editor:?}");
         if has_command {
             let run = cx
                 .debug_bounds(Box::leak(format!("work-run-{index}").into_boxed_str()))
@@ -2812,6 +2813,109 @@ fn long_branch_title_is_shortened_at_iced_limit_then_wraps(cx: &mut gpui::TestAp
         .debug_bounds(Box::leak(format!("work-label-{index}").into_boxed_str()))
         .unwrap();
     assert!(title.size.height > px(20.), "branch title wraps: {title:?}");
+}
+
+#[gpui::test]
+fn at_310pt_branch_title_wraps_to_two_lines_across_the_row(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let long = "task/02bf8131-5c35-4939-b33f-bf01dae8aa5c-extra-long-name";
+    let (sidebar, cx) = cx.add_window_view(|_, _| {
+        let mut sidebar = fixture_with_branch(false, long);
+        sidebar.open.insert(Fold::Repo("/repos/api".into()));
+        sidebar
+    });
+    cx.simulate_resize(gpui::size(px(310.), px(900.)));
+    draw_sidebar(cx);
+    let index = sidebar.read_with(cx, |s, _| {
+        s.rows()
+            .iter()
+            .position(|r| r.label.starts_with("task/02bf"))
+            .unwrap()
+    });
+    let title = cx
+        .debug_bounds(Box::leak(format!("work-label-{index}").into_boxed_str()))
+        .unwrap();
+    let line = px(14.);
+    assert!(
+        title.size.height > line * 1.5 && title.size.height < line * 2.6,
+        "exactly two lines: {title:?}"
+    );
+    assert!(title.size.width > px(180.), "uses the row width: {title:?}");
+}
+
+#[gpui::test]
+fn at_310pt_long_chat_title_wraps_unclipped_left_of_the_facts(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let sidebar = fixture(false);
+    replace_entries(
+        &sidebar,
+        vec![entry(
+            "long",
+            "Revisiting GPUI sidebar parity and keep going on the remaining row layouts",
+            SystemTime::now(),
+        )],
+    );
+    let (sidebar, cx) = cx.add_window_view(|_, _| sidebar);
+    cx.simulate_resize(gpui::size(px(310.), px(900.)));
+    draw_sidebar(cx);
+    let index = sidebar.read_with(cx, |s, _| {
+        s.rows()
+            .iter()
+            .position(|r| r.label.starts_with("✦ Revisiting"))
+            .unwrap()
+    });
+    let title = cx
+        .debug_bounds(Box::leak(format!("work-label-{index}").into_boxed_str()))
+        .unwrap();
+    assert!(title.size.height > px(18.), "wraps over lines: {title:?}");
+    let sidebar_bounds = cx.debug_bounds("work-sidebar").unwrap();
+    assert!(title.right() <= sidebar_bounds.right());
+    let badge = cx
+        .debug_bounds(Box::leak(format!("work-badge-{index}-0").into_boxed_str()))
+        .unwrap();
+    assert!(title.right() <= badge.left(), "{title:?} vs {badge:?}");
+}
+
+#[gpui::test]
+fn at_310pt_expanded_repo_actions_keep_one_line_and_age_wraps_by_word(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let repo = PathBuf::from("/repos/api");
+    let (sidebar, cx) = cx.add_window_view(|_, _| {
+        let mut sidebar = fixture(false);
+        sidebar.workspace.repos[0].dir = repo.clone();
+        sidebar.workspace.repos[0].run_command = Some("cargo run --example preview".into());
+        sidebar.open.insert(Fold::Repo(repo.clone()));
+        sidebar
+    });
+    let index = sidebar.read_with(cx, |s, _| {
+        s.rows().iter().position(|r| r.label == "api").unwrap()
+    });
+    let size = |cx: &mut gpui::VisualTestContext, width: f32, id: String| {
+        cx.simulate_resize(gpui::size(px(width), px(900.)));
+        draw_sidebar(cx);
+        cx.debug_bounds(Box::leak(id.into_boxed_str()))
+            .unwrap_or_else(|| panic!("missing bounds at {width}pt"))
+    };
+    let open = format!("work-control-{index}-0");
+    let edit = format!("work-control-{index}-1");
+    let wide_open = size(cx, 2400., open.clone()).size;
+    let wide_edit = size(cx, 2400., edit.clone()).size;
+    let narrow_open = size(cx, 310., open).size;
+    let narrow_edit = size(cx, 310., edit).size;
+    assert_eq!(narrow_open, wide_open, "Open in editor stays intrinsic");
+    assert_eq!(narrow_edit, wide_edit, "edit stays intrinsic");
+    let age = size(cx, 310., format!("work-age-{index}")).size;
+    assert!(age.height <= px(26.), "age at most two lines: {age:?}");
+    let disclosure = cx
+        .debug_bounds(Box::leak(format!("work-fold-{index}-▾").into_boxed_str()))
+        .unwrap();
+    let bounds = cx.debug_bounds("work-sidebar").unwrap();
+    assert!(disclosure.right() <= bounds.right());
 }
 
 #[gpui::test]
