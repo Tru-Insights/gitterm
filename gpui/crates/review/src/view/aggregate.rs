@@ -416,10 +416,20 @@ impl Render for AggregateView {
                 ViewedState::Unviewed => "○",
             };
             let label = format!("{mark} {} {}", row.file.status.letter(), row.file.path);
+            let name = file_name(row.file.path.clone(), row.viewed);
             sidebar = sidebar.child(
                 ListItem::new(("aggregate-file", index))
-                    .accessibility_label(label.clone())
-                    .child(div().font_family(MONO_FONT).text_size(px(12.)).child(label))
+                    .accessibility_label(label)
+                    .child(
+                        div()
+                            .debug_selector(move || format!("aggregate-file-name-{index}"))
+                            .font_family(MONO_FONT)
+                            .text_size(px(12.))
+                            .flex()
+                            .gap_1()
+                            .child(format!("{mark} {}", row.file.status.letter()))
+                            .child(name),
+                    )
                     .selected(self.selected.as_ref() == Some(&row.file.path))
                     .on_click(cx.listener(move |view, _, _, cx| {
                         view.selected = Some(path.clone());
@@ -520,5 +530,14 @@ impl Render for AggregateView {
             .flex_col()
             .child(top)
             .child(div().flex_1().min_h_0().flex().child(sidebar).child(body))
+    }
+}
+
+/// A changed file's name as Iced's `.tf.viewed .nm` (muted, struck through)
+/// and `.tf.stale .nm` (warn colour) style it.
+pub(crate) fn file_name(path: String, viewed: ViewedState) -> gpui::Div {
+    match viewed {
+        ViewedState::ChangedSinceViewed => div().text_color(rgb(0xf9e2af)).child(path),
+        viewed => super::file_name(path, matches!(viewed, ViewedState::Viewed)),
     }
 }

@@ -301,3 +301,24 @@ fn asynchronous_reload_keeps_marks_selection_and_rejects_stale_results(cx: &mut 
     });
     draw(cx);
 }
+
+#[gpui::test]
+fn viewed_file_name_is_muted_and_struck_through_until_unmarked(cx: &mut TestAppContext) {
+    let (view, cx) = setup(cx);
+    draw(cx);
+    let styled = |view: &Entity<ReviewView>, cx: &mut VisualTestContext| {
+        let viewed = view.read_with(cx, |v, _| v.model.files[0].viewed);
+        let mut name = file_name("name", viewed);
+        let text = &name.style().text;
+        (text.color, text.strikethrough.is_some())
+    };
+    assert_eq!(styled(&view, cx), (None, false));
+    view.update_in(cx, |v, window, cx| {
+        v.toggle_viewed(&ToggleViewed, window, cx)
+    });
+    assert_eq!(styled(&view, cx), (Some(gpui::rgb(0x9399b2).into()), true));
+    view.update_in(cx, |v, window, cx| {
+        v.toggle_viewed(&ToggleViewed, window, cx)
+    });
+    assert_eq!(styled(&view, cx), (None, false));
+}
