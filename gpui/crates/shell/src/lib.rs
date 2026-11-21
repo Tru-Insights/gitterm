@@ -141,7 +141,7 @@ pub struct Shell {
     park_subscription: Option<Subscription>,
     new_work_sheet: Option<Entity<workspace_sheet::WorkspaceSheet>>,
     new_work_subscription: Option<Subscription>,
-    find_state: Rc<RefCell<gitterm_core::find::state::State>>,
+    find_state: Rc<RefCell<find_sidebar::State>>,
     find_views: HashMap<String, find_sidebar::FindViews>,
     #[cfg(test)]
     find_home: Option<std::path::PathBuf>,
@@ -456,7 +456,10 @@ impl Shell {
         let mut visible: Vec<String> = self
             .workspaces
             .iter()
-            .filter(|w| !find_selected && Some(w.workspace.id) == self.active_workspace(cx))
+            .filter(|w| {
+                (!find_selected || self.find_preview_file_overlay(cx))
+                    && Some(w.workspace.id) == self.active_workspace(cx)
+            })
             .flat_map(|state| {
                 state
                     .panes
@@ -3538,7 +3541,26 @@ impl Shell {
             {
                 self.show_workspace_pane(workspace, &session_pane_id(session), window, cx);
             }
+            if self.active(cx).store.regions.sidebar_mode == SidebarMode::Find
+                && self
+                    .find_state
+                    .borrow()
+                    .selected(&self.find_owner(cx))
+                    .is_some()
+            {
+                self.focus.focus(window, cx);
+            }
             cx.notify();
+        } else if self.active_workspace(cx).is_some()
+            && self.active(cx).store.regions.sidebar_mode == SidebarMode::Find
+            && self
+                .find_state
+                .borrow()
+                .selected(&self.find_owner(cx))
+                .is_some()
+        {
+            let owner = self.find_owner(cx);
+            self.find_outcome(&owner, &find_sidebar::FindOutcome::ClosePreview, window, cx);
         } else {
             self.focus.focus(window, cx);
         }

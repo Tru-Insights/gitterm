@@ -90,6 +90,7 @@ fn fixture() -> (State, FindFacts) {
                     claude_chat: false,
                 },
             ],
+            local_files_openable: true,
             ..FindFacts::default()
         },
     )
@@ -299,7 +300,7 @@ fn select_is_machine_qualified_preview_is_stamp_guarded_and_close_is_owner_scope
     stale.generation += 1;
     state.reduce(Intent::PreviewFinished {
         stamp: stale,
-        result: Ok(ChatPreview::default()),
+        result: Ok(ChatPreview::default().into()),
     });
     assert!(state.preview("tab").is_none());
     state.reduce(Intent::PreviewFinished {
@@ -310,7 +311,8 @@ fn select_is_machine_qualified_preview_is_stamp_guarded_and_close_is_owner_scope
                 text: "Hello".into(),
             }],
             message_count: Some(9),
-        }),
+        }
+        .into()),
     });
     assert_eq!(state.preview("tab").unwrap().messages[0].text, "Hello");
     let intent = FindOutcome::ClosePreview
@@ -531,14 +533,8 @@ fn native_preview_buttons_emit_resume_and_close_and_raw_toggle_is_local(cx: &mut
     assert_eq!(
         *events.borrow(),
         [
-            FindOutcome::Resume {
-                id: ChatRef::local("first"),
-                mode: ResumeMode::Session
-            },
-            FindOutcome::Resume {
-                id: ChatRef::local("first"),
-                mode: ResumeMode::Chat
-            },
+            FindOutcome::Unavailable("Resume as Session".into()),
+            FindOutcome::Unavailable("Resume as Chat".into()),
             FindOutcome::ClosePreview
         ]
     );
@@ -725,4 +721,653 @@ fn fixture_text_and_order_match_iced_find_sidebar() {
             vec!["● Title second", "↳ Latest second", "3h | main"],
         ]
     );
+}
+
+fn preview_state(state: &mut State, id: ChatRef, data: PreviewData) {
+    let intent = FindOutcome::Select { id }.intent(state, "tab").unwrap();
+    let Effect::LoadPreview(stamp) = state.reduce(intent).remove(0) else {
+        panic!("preview load");
+    };
+    state.reduce(Intent::PreviewFinished {
+        stamp,
+        result: Ok(data),
+    });
+}
+
+fn observe_preview(
+    view: &Entity<FindPreview>,
+    cx: &mut VisualTestContext,
+) -> Rc<RefCell<Vec<FindOutcome>>> {
+    let events = Rc::new(RefCell::new(vec![]));
+    cx.update(|_, cx| {
+        let captured = events.clone();
+        cx.subscribe(view, move |_, outcome: &FindOutcome, _| {
+            captured.borrow_mut().push(outcome.clone())
+        })
+        .detach();
+    });
+    events
+}
+
+#[gpui::test]
+fn n13_overview_groups_idle_fold_and_live_navigation(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (state, mut facts) = fixture();
+    for (id, marker) in [("first", "●"), ("second", "▶"), ("same", "✦")] {
+        facts.open_sessions.push(OpenSession {
+            id: ChatRef::local(id),
+            title: format!("{id} title"),
+            workspace: "Work".into(),
+            marker: marker.into(),
+            detail: "main".into(),
+            selected: false,
+        });
+    }
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|_| FindPreview::new(Rc::new(RefCell::new(state)), "tab".into(), facts));
+        gpui_component::Root::new(view, window, cx)
+    });
+    let view = root.read_with(cx, |root, _| {
+        root.view().clone().downcast::<FindPreview>().unwrap()
+    });
+    let events = observe_preview(&view, cx);
+    cx.simulate_resize(gpui::size(px(1000.), px(1200.)));
+    click("find-overview-row-0", cx);
+    click("find-overview-row-1", cx);
+    assert!(cx.debug_bounds("find-overview-row-2").is_none());
+    click("find-overview-idle", cx);
+    assert!(view.read_with(cx, |v, _| v.idle_expanded));
+    click("find-overview-row-2", cx);
+    click("find-overview-idle", cx);
+    assert!(!view.read_with(cx, |v, _| v.idle_expanded));
+    assert_eq!(
+        *events.borrow(),
+        ["first", "second", "same"].map(|id| FindOutcome::Open {
+            id: ChatRef::local(id)
+        })
+    );
+}
+
+#[gpui::test]
+fn n13b_summary_folds_match_iced_limits_and_files_emit_local_open(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (mut state, facts) = fixture();
+    preview_state(
+        &mut state,
+        ChatRef::local("first"),
+        PreviewData {
+            tail: ChatPreview::default(),
+            summary: Summary {
+                ask: Some(
+                    (0..6)
+                        .map(|i| format!("ask {i}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                reply: Some(
+                    (0..18)
+                        .map(|i| format!("reply {i}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                files: vec!["src/main.rs".into()],
+            },
+        },
+    );
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|_| FindPreview::new(Rc::new(RefCell::new(state)), "tab".into(), facts));
+        gpui_component::Root::new(view, window, cx)
+    });
+    let view = root.read_with(cx, |root, _| {
+        root.view().clone().downcast::<FindPreview>().unwrap()
+    });
+    let events = observe_preview(&view, cx);
+    cx.simulate_resize(gpui::size(px(1000.), px(1800.)));
+    click("find-summary-ask", cx);
+    assert!(view.read_with(cx, |v, _| v.ask_expanded));
+    click("find-summary-ask", cx);
+    assert!(!view.read_with(cx, |v, _| v.ask_expanded));
+    click("find-summary-reply", cx);
+    assert!(view.read_with(cx, |v, _| v.reply_expanded));
+    click("find-summary-reply", cx);
+    assert!(!view.read_with(cx, |v, _| v.reply_expanded));
+    click("find-summary-file-0", cx);
+    assert_eq!(
+        *events.borrow(),
+        [FindOutcome::OpenFile("/work/api/src/main.rs".into())]
+    );
+    assert_eq!(clip_lines("one\ntwo\nthree", 2), ("one\ntwo".into(), true));
+    assert_eq!(
+        clip_lines(&"é".repeat(201), 4),
+        (format!("{}…", "é".repeat(199)), true)
+    );
+}
+
+#[gpui::test]
+fn n12_and_n13d_workspace_and_waiting_actions_are_notice_only(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (mut state, mut facts) = fixture();
+    facts.workspaces = vec![
+        WorkspaceFacts {
+            name: "Owner".into(),
+            chats: vec!["first".into()],
+            open: true,
+        },
+        WorkspaceFacts {
+            name: "Other".into(),
+            chats: vec![],
+            open: true,
+        },
+    ];
+    facts.open_sessions.push(OpenSession {
+        id: ChatRef::local("first"),
+        title: "Waiting".into(),
+        workspace: "Owner".into(),
+        marker: "●".into(),
+        detail: "main".into(),
+        selected: false,
+    });
+    preview_state(
+        &mut state,
+        ChatRef::local("first"),
+        ChatPreview::default().into(),
+    );
+    let state = Rc::new(RefCell::new(state));
+    let retained = state.clone();
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|_| FindPreview::new(state, "tab".into(), facts));
+        gpui_component::Root::new(view, window, cx)
+    });
+    let view = root.read_with(cx, |root, _| {
+        root.view().clone().downcast::<FindPreview>().unwrap()
+    });
+    let events = observe_preview(&view, cx);
+    cx.simulate_resize(gpui::size(px(1000.), px(1200.)));
+    for selector in [
+        "find-workspace-owner",
+        "find-workspace-add",
+        "find-summary-prompt",
+    ] {
+        click(selector, cx);
+    }
+    assert_eq!(
+        *events.borrow(),
+        ["Go to Owner", "Add to workspace…", "Go to prompt"]
+            .map(|s| FindOutcome::Unavailable(s.into()))
+    );
+    assert_eq!(
+        retained.borrow().selected("tab").unwrap().chat,
+        ChatRef::local("first")
+    );
+    assert!(!view.read_with(cx, |v, _| v.raw_expanded));
+    view.update(cx, |v, cx| {
+        v.facts.workspaces[0].chats.clear();
+        v.facts.open_sessions.clear();
+        cx.notify();
+    });
+    click("find-workspace-make", cx);
+    assert_eq!(
+        events.borrow().last(),
+        Some(&FindOutcome::Unavailable("Make workspace".into()))
+    );
+}
+
+#[gpui::test]
+fn n14_relevant_guard_and_n14a_widen_clicks_preserve_filters(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (mut state, mut facts) = fixture();
+    state.reduce(Intent::SetFilter(Filter {
+        query: "Title".into(),
+        scope: ChatScope::Workspace,
+        workspace_root: Some("/work".into()),
+        ..Filter::default()
+    }));
+    let suggestions = widen_suggestions(&state, &facts);
+    assert_eq!(
+        suggestions
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "1 match elsewhere on this machine",
+            "1 match on other machines"
+        ]
+    );
+    facts.relevance_available = true;
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| {
+            FindSidebar::new(
+                Rc::new(RefCell::new(state)),
+                "tab".into(),
+                facts,
+                window,
+                cx,
+            )
+        });
+        gpui_component::Root::new(view, window, cx)
+    });
+    let view = root.read_with(cx, |root, _| {
+        root.view().clone().downcast::<FindSidebar>().unwrap()
+    });
+    let events = Rc::new(RefCell::new(vec![]));
+    cx.update(|_, cx| {
+        let captured = events.clone();
+        cx.subscribe(&view, move |_, outcome: &FindOutcome, _| {
+            captured.borrow_mut().push(outcome.clone())
+        })
+        .detach();
+    });
+    cx.simulate_resize(gpui::size(px(600.), px(1800.)));
+    click("find-relevant", cx);
+    assert!(view.read_with(cx, |v, _| v.relevant));
+    click("find-relevant", cx);
+    assert!(!view.read_with(cx, |v, _| v.relevant));
+    view.update(cx, |v, cx| {
+        v.facts.relevance_down = true;
+        cx.notify();
+    });
+    click("find-relevant", cx);
+    assert!(!view.read_with(cx, |v, _| v.relevant));
+    for selector in ["find-widen-0", "find-widen-1", "find-backfill"] {
+        click(selector, cx);
+    }
+    assert_eq!(
+        *events.borrow(),
+        [
+            FindOutcome::SetScope(ChatScope::Machine),
+            FindOutcome::SetScope(ChatScope::Everywhere),
+            FindOutcome::Unavailable("Index older chats".into())
+        ]
+    );
+    view.update(cx, |v, cx| {
+        v.facts.relevance_available = false;
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("find-relevant").is_none());
+}
+
+fn draw_host(cx: &mut VisualTestContext) {
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn n16_escape_dismisses_file_before_preview_then_returns_to_overview(cx: &mut TestAppContext) {
+    let (root, shell, cx) = crate::h7_tests::fixture(cx);
+    cx.update(|window, cx| {
+        window.dispatch_action(Box::new(crate::app_menus::ChatsOverviewOpen), cx)
+    });
+    draw_host(cx);
+    let mut item = chat(
+        "preview",
+        root.path().join("work").to_str().unwrap(),
+        ChatBackend::Claude,
+    );
+    item.dead_cwd = false;
+    let owner = cx.read(|cx| shell.read(cx).find_owner(cx));
+    shell.update(cx, |shell, cx| {
+        shell
+            .find_state
+            .borrow_mut()
+            .reduce(Intent::SourceChanged(None));
+        load(&mut shell.find_state.borrow_mut(), None, vec![item]);
+        let mut state = shell.find_state.borrow_mut();
+        let intent = FindOutcome::Select {
+            id: ChatRef::local("preview"),
+        }
+        .intent(&state, &owner)
+        .unwrap();
+        let Effect::LoadPreview(stamp) = state.reduce(intent).remove(0) else {
+            panic!("load");
+        };
+        state.reduce(Intent::PreviewFinished {
+            stamp,
+            result: Ok(ChatPreview::default().into()),
+        });
+        cx.notify();
+    });
+    draw_host(cx);
+    assert!(cx.debug_bounds("find-centre").is_some());
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.find_outcome(
+                &owner,
+                &FindOutcome::OpenFile(root.path().join("work/file.txt")),
+                window,
+                cx,
+            )
+        })
+    });
+    draw_host(cx);
+    assert!(cx.debug_bounds("close-file-viewer").is_some());
+    cx.simulate_keystrokes("escape");
+    draw_host(cx);
+    assert!(cx.debug_bounds("close-file-viewer").is_none());
+    assert!(cx.read(|cx| {
+        shell
+            .read(cx)
+            .find_state
+            .borrow()
+            .selected(&owner)
+            .is_some()
+    }));
+    cx.simulate_keystrokes("escape");
+    draw_host(cx);
+    assert!(cx.read(|cx| {
+        shell
+            .read(cx)
+            .find_state
+            .borrow()
+            .selected(&owner)
+            .is_none()
+    }));
+    assert!(cx.debug_bounds("find-overview").is_some());
+}
+
+fn tree_snapshot(root: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut entries = vec![];
+    for entry in std::fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            entries.extend(tree_snapshot(&path));
+        } else {
+            entries.push((path.clone(), std::fs::read(path).unwrap()));
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
+#[gpui::test]
+fn pw_notices_do_not_write_or_create_a_process_or_session(cx: &mut TestAppContext) {
+    let (root, shell, cx) = crate::h7_tests::fixture(cx);
+    cx.update(|window, cx| {
+        window.dispatch_action(Box::new(crate::app_menus::ChatsOverviewOpen), cx)
+    });
+    draw_host(cx);
+    let before = tree_snapshot(root.path());
+    let sessions = cx.read(|cx| {
+        shell
+            .read(cx)
+            .workspaces
+            .iter()
+            .map(|w| w.sessions.len())
+            .sum::<usize>()
+    });
+    let owner = cx.read(|cx| shell.read(cx).find_owner(cx));
+    for label in [
+        "Resume as Session",
+        "Resume as Chat",
+        "Open Chat",
+        "Recreate directory & resume",
+        "Go to Owner",
+        "Make workspace",
+        "Add to workspace…",
+        "Add its coordinator to workspace…",
+        "Other",
+        "Go to prompt",
+        "Index older chats",
+    ] {
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.find_outcome(&owner, &FindOutcome::Unavailable(label.into()), window, cx)
+            })
+        });
+        draw_host(cx);
+        cx.read(|cx| {
+            let shell = shell.read(cx);
+            assert_eq!(
+                shell.owner.read(cx).error.as_deref(),
+                Some(format!("{label} · not available in preview").as_str())
+            );
+            assert_eq!(
+                shell
+                    .workspaces
+                    .iter()
+                    .map(|w| w.sessions.len())
+                    .sum::<usize>(),
+                sessions
+            );
+            assert!(
+                shell
+                    .workspaces
+                    .iter()
+                    .all(|w| w.panes.values().all(|p| p.read(cx).session.is_none()))
+            );
+        });
+    }
+    assert_eq!(tree_snapshot(root.path()), before);
+}
+
+#[test]
+fn summary_reads_whole_claude_transcript_and_excludes_failed_edits() {
+    let dir = tempfile::tempdir_in("/private/tmp").unwrap();
+    let path = dir.path().join("chat.jsonl");
+    let lines = [
+        serde_json::json!({"type":"user","message":{"content":"original request"}}),
+        serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"a","name":"Write","input":{"file_path":"old.rs"}}]}}),
+        serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"b","name":"Edit","input":{"file_path":"failed.rs"}}]}}),
+        serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b","is_error":true}]}}),
+        serde_json::json!({"type":"user","isMeta":true,"message":{"content":"ignore me"}}),
+        serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}),
+    ].map(|v| v.to_string()).join("\n");
+    std::fs::write(&path, &lines).unwrap();
+    let data = load_preview_data(&path, ChatBackend::Claude).unwrap();
+    assert_eq!(data.summary.ask.as_deref(), Some("original request"));
+    assert_eq!(data.summary.reply.as_deref(), Some("done"));
+    assert_eq!(data.summary.files, ["old.rs"]);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), lines);
+}
+
+#[test]
+fn n14_confidence_choice_and_source_guard_match_iced() {
+    let answer = |confidence, choice| serde_json::json!({"answers":{"relevant":{"type":"choice","choice":choice,"confidence":confidence,"probabilities":{"c0":0.1,"c1":0.8,"none":0.1}}}});
+    assert_eq!(
+        ranked_probabilities(&answer(0.9, "c1"), 2).unwrap(),
+        (vec![0.1, 0.8], 0.9, false)
+    );
+    assert!(ranked_probabilities(&answer(0.9, "c7"), 2).is_err());
+    assert!(ranked_probabilities(&answer(0.9, "c1"), 1).is_err());
+    let (mut state, _) = fixture();
+    let old = rank_key(&state).unwrap();
+    let mut filter = state.filter().clone();
+    filter.query = "first".into();
+    state.reduce(Intent::SetFilter(filter));
+    assert_ne!(rank_key(&state).as_ref(), Some(&old));
+}
+
+#[gpui::test]
+fn n14_toggle_restores_recency_and_confident_order_keeps_adjacent_repo_groups(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let (state, mut facts) = fixture();
+    facts.relevance_available = true;
+    let key = rank_key(&state).unwrap();
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| {
+            let mut sidebar = FindSidebar::new(
+                Rc::new(RefCell::new(state)),
+                "tab".into(),
+                facts,
+                window,
+                cx,
+            );
+            sidebar.relevance.result = Some((
+                key,
+                vec!["same".into(), "second".into(), "first".into()],
+                true,
+            ));
+            sidebar
+        });
+        gpui_component::Root::new(view, window, cx)
+    });
+    let view = root.read_with(cx, |root, _| {
+        root.view().clone().downcast::<FindSidebar>().unwrap()
+    });
+    let order = |view: &FindSidebar| {
+        let state = view.state.borrow();
+        let rank = view
+            .relevance
+            .result
+            .as_ref()
+            .filter(|(_, _, confident)| view.relevant && *confident)
+            .map(|(_, order, _)| order.as_slice());
+        chats(rows_ordered(&state, "tab", &view.facts, &view.folds, rank))
+            .into_iter()
+            .map(|r| r.id.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        view.read_with(cx, |v, _| order(v)),
+        ["first", "same", "second"]
+    );
+    click("find-relevant", cx);
+    assert_eq!(
+        view.read_with(cx, |v, _| order(v)),
+        ["same", "second", "first"]
+    );
+    click("find-relevant", cx);
+    assert_eq!(
+        view.read_with(cx, |v, _| order(v)),
+        ["first", "same", "second"]
+    );
+    view.update(cx, |v, cx| {
+        v.relevance.result.as_mut().unwrap().2 = false;
+        cx.notify();
+    });
+    click("find-relevant", cx);
+    assert_eq!(
+        view.read_with(cx, |v, _| order(v)),
+        ["first", "same", "second"]
+    );
+}
+
+#[gpui::test]
+fn n13_non_targets_are_disabled_and_remote_changed_files_are_text(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (state, mut facts) = fixture();
+    facts
+        .running_remote
+        .push(ChatRef::new(Some("remote"), "missing"));
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|_| FindPreview::new(Rc::new(RefCell::new(state)), "tab".into(), facts));
+        gpui_component::Root::new(view, window, cx)
+    });
+    let view = root.read_with(cx, |root, _| {
+        root.view().clone().downcast::<FindPreview>().unwrap()
+    });
+    let events = observe_preview(&view, cx);
+    click("find-overview-remote-0", cx);
+    assert!(events.borrow().is_empty());
+    view.update(cx, |v, cx| {
+        preview_state(
+            &mut v.state.borrow_mut(),
+            ChatRef::new(Some("remote"), "same"),
+            PreviewData {
+                tail: ChatPreview::default(),
+                summary: Summary {
+                    files: vec!["src/lib.rs".into()],
+                    ..Summary::default()
+                },
+            },
+        );
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("find-summary-file-0").is_none());
+}
+
+#[test]
+fn n14_fake_transport_uses_iced_contract_and_confidence_fallback() {
+    use gpui::http_client::{FakeHttpClient, Inner, Response};
+    for (confidence, choice, expected) in
+        [(0.9, "c1", true), (0.2, "c1", false), (0.9, "none", false)]
+    {
+        let client = FakeHttpClient::create(move |request| async move {
+            assert_eq!(
+                request.uri().to_string(),
+                "https://api.typesafe.ai/v1/systemone"
+            );
+            assert_eq!(request.method(), "POST");
+            assert!(request.headers()["Authorization"].is_sensitive());
+            let Inner::Bytes(body) = request.into_body().0 else {
+                panic!("request bytes");
+            };
+            let value: serde_json::Value = serde_json::from_slice(&body.into_inner()).unwrap();
+            assert_eq!(value["model"], "jev-latest");
+            assert_eq!(value["questions"]["relevant"]["type"], "choice");
+            assert_eq!(
+                value["questions"]["relevant"]["criteria"]["none"],
+                "None of these conversations is about the current work"
+            );
+            Ok(Response::builder().status(200).body(serde_json::json!({"answers":{"relevant":{"type":"choice","confidence":confidence,"choice":choice,"probabilities":{"c0":0.1,"c1":0.8,"none":0.1}}}}).to_string().into()).unwrap())
+        });
+        let result = gpui::block_on(rank_chats(
+            client,
+            "fixture-key".into(),
+            Filter::default(),
+            vec![
+                chat("first", "/fixture", ChatBackend::Claude),
+                chat("second", "/fixture", ChatBackend::Codex),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(result, (vec!["second".into(), "first".into()], expected));
+    }
+}
+
+#[gpui::test]
+fn n10_n11_and_n12b_child_controls_emit_exact_notice_labels(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (state, facts) = fixture();
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|_| FindPreview::new(Rc::new(RefCell::new(state)), "tab".into(), facts));
+        gpui_component::Root::new(view, window, cx)
+    });
+    let view = root.read_with(cx, |root, _| {
+        root.view().clone().downcast::<FindPreview>().unwrap()
+    });
+    let events = observe_preview(&view, cx);
+    cx.simulate_resize(gpui::size(px(1000.), px(1400.)));
+    for (remote, dead, child, label) in [
+        (false, true, false, "Recreate directory & resume"),
+        (true, false, false, "Open Chat"),
+        (false, false, true, "Resume as Session"),
+    ] {
+        view.update(cx, |v, cx| {
+            let machine = remote.then(|| "remote".to_string());
+            let mut item = chat("action", "/fixture", ChatBackend::Claude);
+            item.dead_cwd = dead;
+            item.root_id = child.then(|| "coordinator".to_string());
+            let id = ChatRef::new(machine.as_deref(), "action");
+            let mut state = v.state.borrow_mut();
+            state.reduce(Intent::SourceChanged(machine.clone()));
+            load(&mut state, machine, vec![item]);
+            preview_state(&mut state, id.clone(), ChatPreview::default().into());
+            v.facts.running_remote = if remote { vec![id] } else { vec![] };
+            v.facts.workspaces = vec![WorkspaceFacts {
+                name: "Target".into(),
+                chats: vec![],
+                open: true,
+            }];
+            cx.notify();
+        });
+        click("find-preview-action-0", cx);
+        assert_eq!(
+            events.borrow().last(),
+            Some(&FindOutcome::Unavailable(label.into()))
+        );
+        if child {
+            click("find-workspace-add", cx);
+            assert_eq!(
+                events.borrow().last(),
+                Some(&FindOutcome::Unavailable(
+                    "Add its coordinator to workspace…".into()
+                ))
+            );
+        }
+    }
 }
