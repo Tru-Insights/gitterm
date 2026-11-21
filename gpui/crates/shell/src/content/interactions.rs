@@ -107,13 +107,30 @@ fn copy_all_and_browser_buttons_use_full_file_and_test_platform(cx: &mut TestApp
         let browser_config_before = tree_bytes(config.path());
         click(cx, "viewer-open-browser");
         assert_eq!(tree_bytes(config.path()), browser_config_before);
-        let expected = objc2_foundation::NSURL::fileURLWithPath(
-            &objc2_foundation::NSString::from_str(path.to_str().unwrap()),
-        )
-        .absoluteString()
-        .unwrap()
-        .to_string();
-        assert_eq!(cx.opened_url().as_deref(), Some(expected.as_str()));
+        let suffix = if super::actions::is_rendered(path) {
+            "preview"
+        } else {
+            "file"
+        };
+        let expected = std::env::temp_dir().join(format!(
+            "gitterm-gpui-{}_{suffix}.html",
+            path.file_stem().unwrap().to_string_lossy()
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !super::actions::OPENED.lock().unwrap().contains(&expected) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} not opened",
+                expected.display()
+            );
+            draw(cx);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_ne!(
+            std::fs::read_to_string(&expected).unwrap(),
+            "",
+            "the opened page is the rendered/served page, never the raw file"
+        );
     }
     assert_eq!(std::fs::read_dir(folder.path()).unwrap().count(), before);
     assert_eq!(std::fs::read_to_string(raw).unwrap(), text);

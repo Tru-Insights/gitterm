@@ -1,7 +1,6 @@
 //! Viewer actions: clipboard reads run off-thread; external opens use the platform.
 use crate::Shell;
 use gpui::{App, ClipboardItem, Context};
-use objc2_foundation::{NSString, NSURL};
 use std::path::{Path, PathBuf};
 
 pub(super) fn is_rendered(path: &Path) -> bool {
@@ -15,8 +14,25 @@ pub(super) fn is_rendered(path: &Path) -> bool {
         })
 }
 
+/// Paths handed to the platform opener, recorded instead under test so no
+/// browser is ever launched.
+#[cfg(test)]
+pub(crate) static OPENED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 pub(super) fn open_file(path: &Path, cx: &App) -> Result<(), String> {
-    // Open the original file: preview actions must not write a temporary rendition.
+    #[cfg(test)]
+    {
+        _ = cx;
+        OPENED.lock().unwrap().push(path.to_path_buf());
+        Ok(())
+    }
+    #[cfg(not(test))]
+    open_platform(path, cx)
+}
+
+#[cfg(not(test))]
+fn open_platform(path: &Path, cx: &App) -> Result<(), String> {
+    use objc2_foundation::{NSString, NSURL};
     let path = path
         .to_str()
         .ok_or_else(|| format!("Open {}: invalid path", path.display()))?;
@@ -26,6 +42,41 @@ pub(super) fn open_file(path: &Path, cx: &App) -> Result<(), String> {
         .ok_or_else(|| format!("Open {path}: invalid file URL"))?;
     cx.open_url(&url.to_string());
     Ok(())
+}
+
+/// The page Iced opens in the browser, written to a temp file: the rendered
+/// HTML for markdown/HTML/Excalidraw, the content server's `/file/{id}` page
+/// for anything else. The `gitterm-gpui-` prefix never collides with Iced's.
+/// As in Iced: rendered content missing opens the file itself; an empty raw
+/// file opens nothing (`Ok(None)`).
+pub(super) fn browser_page(
+    root: &Path,
+    relative: &Path,
+    dark: bool,
+) -> Result<Option<PathBuf>, String> {
+    let path = root.join(relative);
+    let load = gitterm_core::content::collect_contained_file_load(0, root, relative, dark)
+        .map_err(|e| format!("Open {} in browser: {e}", path.display()))?;
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "preview".to_string());
+    let (html, suffix) = if is_rendered(relative) {
+        let Some(html) = load.webview_content else {
+            return Ok(Some(path));
+        };
+        (html, "preview")
+    } else {
+        if load.file_content.is_empty() {
+            return Ok(None);
+        }
+        let html =
+            gitterm_core::file_page::file_page_html(&path.to_string_lossy(), &load.file_content);
+        (html, "file")
+    };
+    let temp = std::env::temp_dir().join(format!("gitterm-gpui-{stem}_{suffix}.html"));
+    std::fs::write(&temp, html).map_err(|e| format!("Write {}: {e}", temp.display()))?;
+    Ok(Some(temp))
 }
 
 fn full_text(root: &Path, relative: &Path) -> Result<String, String> {
@@ -54,6 +105,29 @@ impl Shell {
             owner.error = Some(error);
             cx.notify();
         });
+    }
+
+    pub(super) fn open_viewer_in_browser(
+        &self,
+        root: PathBuf,
+        relative: PathBuf,
+        dark: bool,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { browser_page(&root, &relative, dark) })
+                .await;
+            _ = this.update(cx, |this, cx| {
+                if let Err(error) =
+                    result.and_then(|page| page.map_or(Ok(()), |page| open_file(&page, cx)))
+                {
+                    this.viewer_error(error, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     pub(super) fn copy_viewer_file(

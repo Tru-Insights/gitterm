@@ -5,7 +5,7 @@
 //! popup/dialog state and native pickers cover the selected surface before paint.
 //! There are no IPC handlers or Page identity/store capabilities. Document links
 //! follow the Iced Viewer network/navigation policy.
-mod actions;
+pub(crate) mod actions;
 pub mod host;
 pub mod overlay;
 mod session;
