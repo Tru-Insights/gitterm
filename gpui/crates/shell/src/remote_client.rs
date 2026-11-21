@@ -9,10 +9,15 @@ use anyhow::{Context as _, Result};
 use gitterm_core::{
     chats::ChatIndexEntry,
     remote::{
-        client::{RemoteAgentBackend, RemoteAgentClientConfig, RemoteAgentHandshake},
+        client::{
+            RemoteAgentBackend, RemoteAgentClientConfig, RemoteAgentClientError,
+            RemoteAgentHandshake, connect_channel,
+        },
         config::{
             REMOTE_AGENTS_FILE, RemoteAgentConfig, RemoteAgentsFile, configured_remote_agents,
         },
+        phone_panel::PairedPhoneInfo,
+        protocol::v6::{ListPhonesRequest, git_term_agent_client::GitTermAgentClient},
         source::{SourceDirListing, SourceHost, SourcePath, WorkspaceSource},
         ssh_sessions::{RemoteHostConfig, RemoteSessionsSnapshot},
     },
@@ -26,6 +31,9 @@ pub trait RemoteClient: Send + Sync {
     fn list_chats(&self, remote: &RemoteAgentConfig) -> Result<Vec<ChatIndexEntry>, String>;
     /// A legacy SSH host's tmux sessions (Iced's remote-content Refresh).
     fn list_sessions(&self, host: &RemoteHostConfig) -> RemoteSessionsSnapshot;
+    /// The phones paired with the agent (Iced's `list_phones`, capability
+    /// "phone"). Read only: pairing and revoking are not on this client.
+    fn list_phones(&self, remote: &RemoteAgentConfig) -> Result<Vec<PairedPhoneInfo>, String>;
 }
 
 /// The agent workspace id Iced's folder picker lists through.
@@ -87,6 +95,38 @@ impl RemoteClient for AgentClient {
     fn list_sessions(&self, host: &RemoteHostConfig) -> RemoteSessionsSnapshot {
         gitterm_core::remote::ssh_sessions::collect_remote_sessions(host)
     }
+    fn list_phones(&self, remote: &RemoteAgentConfig) -> Result<Vec<PairedPhoneInfo>, String> {
+        let backend = PreviewSourceHost::backend(remote.clone().into());
+        block_on(list_phones(&backend))?.map_err(|error| error.to_string())
+    }
+}
+
+/// Iced's `RemoteAgentBackend::list_phones` (src/agentd/client.rs), which
+/// is not in core: the same request, bearer token and error text.
+async fn list_phones(
+    backend: &RemoteAgentBackend,
+) -> Result<Vec<PairedPhoneInfo>, RemoteAgentClientError> {
+    let mut request = tonic::Request::new(ListPhonesRequest {});
+    backend.authorize(&mut request)?;
+    let channel = connect_channel(&backend.config().endpoint).await?;
+    let response = GitTermAgentClient::new(channel)
+        .list_phones(request)
+        .await
+        .map_err(|err| {
+            RemoteAgentClientError::new(format!("list_phones failed: {}", err.message()))
+        })?
+        .into_inner();
+    Ok(response
+        .phones
+        .into_iter()
+        .map(|phone| PairedPhoneInfo {
+            id: phone.id,
+            name: phone.name,
+            scope: phone.scope,
+            created_unix_secs: phone.created_unix_secs,
+            last_seen_unix_secs: phone.last_seen_unix_secs,
+        })
+        .collect())
 }
 
 /// Iced's configured remotes, read-only: remote-agents.json, then the copies
@@ -138,5 +178,8 @@ impl RemoteClient for Offline {
             sessions: vec![],
             error: Some("offline in tests".into()),
         }
+    }
+    fn list_phones(&self, _: &RemoteAgentConfig) -> Result<Vec<PairedPhoneInfo>, String> {
+        Err("offline in tests".into())
     }
 }

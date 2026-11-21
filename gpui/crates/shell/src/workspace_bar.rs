@@ -99,16 +99,7 @@ impl SavedFacts {
                 serves_phones: false,
             })
             .collect();
-        result.machines = result
-            .repo_machines
-            .iter()
-            .filter_map(|machine| {
-                machine.status.as_ref().map(|status| News {
-                    label: format!("{} {}", machine.name, status.label),
-                    color: status.color,
-                })
-            })
-            .collect();
+        result.machines = machine_news(&result.repo_machines);
         result.remote_workspaces = file
             .remote_sessions
             .iter()
@@ -341,6 +332,19 @@ fn iced_tab_attention_counts(
         }
     }
     counts
+}
+
+/// The bar's machine news: each machine with a status, by name and word.
+pub(crate) fn machine_news(machines: &[Machine]) -> Vec<News> {
+    machines
+        .iter()
+        .filter_map(|machine| {
+            machine.status.as_ref().map(|status| News {
+                label: format!("{} {}", machine.name, status.label),
+                color: status.color,
+            })
+        })
+        .collect()
 }
 
 #[derive(Default)]
