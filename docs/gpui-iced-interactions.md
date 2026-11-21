@@ -39,7 +39,7 @@ Each row is a control or a repeated control family whose instances share behavio
 
 ## Verdict counts
 
-Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this refresh the map showed 143 MATCH and 193 DIFF; it now shows 197 MATCH, 81 PREVIEW and 58 DIFF (336 rows).
+Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this refresh the map showed 143 MATCH and 193 DIFF; it now shows 198 MATCH, 80 PREVIEW and 58 DIFF (336 rows).
 
 | Section | MATCH | PREVIEW | DIFF |
 | --- | ---: | ---: | ---: |
@@ -48,7 +48,7 @@ Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this
 | Work sidebar | 23 | 17 | 0 |
 | Find sidebar and preview | 17 | 7 | 1 |
 | Content area and file viewer | 8 | 1 | 2 |
-| Chat transcript, cards, roster | 28 | 7 | 0 |
+| Chat transcript, cards, roster | 29 | 6 | 0 |
 | Composer and Review / Consult | 17 | 2 | 6 |
 | Bottom panel and terminal find | 16 | 1 | 0 |
 | Workspace bar, menus, settings | 11 | 21 | 4 |
@@ -56,7 +56,7 @@ Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this
 | Task detail and other dialogs | 4 | 7 | 31 |
 | Usage page | 7 | 2 | 1 |
 | Native menus and shortcuts | 22 | 3 | 4 |
-| **Total** | **197** | **81** | **58** |
+| **Total** | **198** | **80** | **58** |
 
 `PREVIEW` means a deliberate preview limit (write/launch control shows "not available in preview"), kept until cutover.
 
@@ -208,19 +208,19 @@ Sources: [Iced transcript and copy](../assets/agent_chat.html#L820), [edit cards
 | ID / control | I glyph/label and states | G glyph/label and states | Hover / tooltip I; G | Gesture / keyboard | I event → effect | G equivalent → effect | Parity |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | H01 thinking/tool fold | Native details marker closed/open; tool name/salient input, state color | `▸/▾ {title}` | I summary hover, input/path titles; G N, no equivalent title T | Click; I native summary keyboard activation | HTML details open state | `RowView::toggle` → expand/remeasure | **MATCH** reveal/collapse content; native summary versus button keyboard remains platform-dependent. |
-| H02 tool-run / completed-work fold | Group summary + `›/⌄`; `Worked for {duration}`; final reply stays visible | Same labels and `›/⌄` | I summary T lists tool counts; G N/no count tooltip | Click summary | Run/turn details toggle | `run_toggle` / `work_toggle` / turn visibility | **MATCH** run tooltip lists tool counts (chat/view.rs:1803, view/tool_runs.rs:58); test `h02_tool_run_counts_and_completed_work_keep_reply_visible`. |
-| H03 earlier history | `Show earlier…` when blocks trimmed | No earlier button; virtual scrolling exposes rows | I button H; — | Click vs scroll | `showEarlier(1)` inserts older 50-block chunk | `MessageScroller` virtual rows | **MATCH** `Show earlier · N blocks hidden` (view/scroll.rs:122, interactions.rs:29); test `h03_show_earlier_restores_one_chunk`. |
-| H04 latest | `↓ Latest` when not following | `New messages · Jump to latest` when not following | H/—; N/— | Click | Set follow, trim, scroll bottom | `jump` → tail-follow scroller | **MATCH** `↓ Latest` (view.rs:1469); test `h03_..._h04_latest_follows_and_trims`. |
+| H02 tool-run / completed-work fold | Group summary + `›/⌄`; `Worked for {duration}`; final reply stays visible | Same labels and `›/⌄` | I summary T lists tool counts; G N/no count tooltip | Click summary | Run/turn details toggle | `run_toggle` / `work_toggle` / turn visibility | **DIFF** grouping/folding preserved, summary tooltip missing. |
+| H03 earlier history | `Show earlier · {n} block(s) hidden` when blocks trimmed | Same label, first row of the trimmed list | H/—; N/— | Click | `showEarlier(1)` inserts older 50-block chunk | `show_earlier` restores one 50-block chunk (tool runs/work folds count once) | **MATCH** label, place and chunking. |
+| H04 latest | `↓ Latest` when not following | `↓ Latest` when not following | H/—; N/— | Click | Set follow, trim, scroll bottom | `jump` → tail-follow scroller, trims history | **MATCH** label and action. |
 | H05 code copy **C** | `Copy` → copied feedback then reset | `Copy` → copied feedback (1200ms) | Button H; native code action H | Click | `copyText` → clipboard fallback/IPC | `copied_payload` → clipboard, timer | **MATCH** copies exact code including whitespace. |
-| H06 Markdown link **X** | Rendered link; optional Markdown title | Rendered native text link | I link hover/title; G text component link styling | Click; G also middle-click | `open_url` IPC only for HTTP(S) | Default `gpui-base 0.9.1` `handle_link_click` → `cx.open_url(url)`; no scheme check there | **MATCH** HTTP(S) and left-click only (copy.rs:156, transcript.rs:5-21); test `h06_markdown_callback_blocks_middle_click_and_unsafe_schemes`. |
+| H06 Markdown link **X** | Rendered link; optional Markdown title | Rendered native text link | I link hover/title; G text component link styling | Click | `open_url` IPC only for HTTP(S) | `transcript::open_link` via `on_link_click`: HTTP(S) and left/keyboard click only | **MATCH** non-HTTP(S) and middle-click open nothing. |
 | H07 selected text **C** | Browser selection; native menu + Copy as Markdown | Native TextSelection; menu `Copy`, `Copy as Markdown` | Context menu state/disabled if no selection | Drag/double-click text selection; right-click; `⌘C`, `⌘⇧C` | Editing copy / `copy_markdown` IPC, context snapshot | `copy_selection`, `selection_menu`, clipboard | **MATCH** selection copy and Markdown snapshot paths; not a whole-reply copy button. |
-| H08 large edit / patch | Expand/truncation control in long edit output | Scrollable native Diff (fixed-height row content) | I button H; native diff hover | Click show-more vs scroll diff | Edit rendering expands lines | `make_diffs` / Diff view | **MATCH** `Show all N lines` expands (transcript.rs:242, 269); test `h08_edit_show_all_expands_and_h09_review_routes`. |
-| H09 edit Review link | `Review` on edit card; T `Open {path} in the review pane` | No matching row action | I H/T; — | Click, stop parent fold propagation | `open_review {path}` IPC → review pane | Patch is inline native Diff only | **MATCH** `Review` button with tooltip, opens review (view.rs:2004-2025, shell chat/navigation.rs:13); same test. |
+| H08 large edit / patch | `Show all {n} lines` over 40 rows | Same label and 40-row threshold; expands in place | I button H; — | Click | Edit rendering expands lines | `edit_lines` / `edit-more` | **MATCH** expansion survives row eviction. |
+| H09 edit Review link | `Review` on edit card; T `Open {path} in the review pane` | Same label and tooltip; click stops propagation (no fold toggle) | I H/T; — | Click, stop parent fold propagation | `open_review {path}` IPC → review pane | `TranscriptAction::OpenFile{review:true}` → shell review route | **MATCH**. |
 | H10 visual reply **X** | `Expand` ↔ `Close expanded view`; sandbox content may open HTTP(S) links | Same bar and labels; expanded covers the chat inset 8px | I button H; — | Click; Esc collapses | `GitTermHtml.create`, local expanded state, `open_url` | `VisualReply` + shell WKWebView (`content::visual`) running `GitTermHtml.create` with Iced's frame guard | **MATCH** in headless tests; native frame not run in this audit. |
-| H11 delegation fold | Kind/model/target/state, details marker; dismissed folds closed | Generic delegation/delivery `▸/▾`, body text | I kind title tooltip; G N | Click summary | HTML `details` | `RowView::toggle` | **MATCH** delegation fold with actionable body (transcript.rs:315-340); tests `h11_iced_delegation_header`, `h11_dismissed_card_stays`. |
-| H12 finding select | Checked/unchecked finding box; disabled after delivered | Absent | Checkbox H; — | Click/Space with checkbox focus | Update `card.selected` | — | **PREVIEW** finding checkbox mounted; click shows the preview notice (transcript.rs:366-385); test `h12_h14_..._preview_buttons_only_notice`. |
-| H13 finding location | `{file}:{line}` | Absent from transcript card | I path title; — | Click | `open_file` IPC → file viewer | — (roster has a different navigation action) | **MATCH** `finding-location` opens the file (transcript.rs:386-420, navigation.rs:13); test `h13_finding_location_preserves_file_and_line_range`. |
-| H13a worker open | `Open worker tab` | Absent from transcript card | I open/not-open worker T; — | Click | `delegation_open_worker` IPC → worker session | — (roster has a different navigation action) | **MATCH** `Open worker tab` with tooltip (delegation.rs:310-325); test `h13a_worker_open_is_a_navigation_request_even_when_closed`. |
+| H11 delegation fold | Kind/model/target/state, details marker; dismissed folds closed | Generic delegation/delivery `▸/▾`, body text | I kind title tooltip; G N | Click summary | HTML `details` | `RowView::toggle` | **DIFF** generic fold lacks the actionable delegation card body below. |
+| H12 finding select | Checked/unchecked finding box; disabled after delivered | Checkbox per finding, all checked by default, local selection set per card, disabled after delivered | Checkbox H; — | Click/Space with checkbox focus | Update `card.selected` | `RowView::selected_findings` | **MATCH** local only; Send to Claude stays preview-only (H14). |
+| H13 finding location | `{file}:{line}` | Same button, tooltip `Open {file} in the file viewer` | I path title; — | Click | `open_file` IPC → file viewer | `TranscriptAction::OpenFile{review:false}` → shell file open | **MATCH**. |
+| H13a worker open | `Open worker tab` | Same button on the transcript card (roster path reused) | I open/not-open worker T; — | Click | `delegation_open_worker` IPC → worker session | `TranscriptAction::OpenWorker` | **MATCH**. |
 | H14 Send to Claude **P/W** | `Send to Claude`; `Queued, sends when Claude finishes` disabled; `sent to chat ✓` after delivery | Absent | T explains queuing/report/selected findings | Click | `delegation_send` IPC with finding IDs → deliver/queue | — | **PREVIEW** `Send to Claude` and queued state mounted, preview only (delegation.rs:325-345); test `h14_h15_h16_h16a_h16b_iced_control_states_and_order`. |
 | H15 Re-run **P/W** | `Re-run`, non-worker and non-live only | Absent | H/—; — | Click | `delegation_rerun` → new run | — | **PREVIEW** `Re-run` preview only (delegation.rs:348-360). |
 | H16 cancel delegation **P/W** | Live consult/review: `Cancel` | Absent | H/—; — | Click | `delegation_dismiss` → cancel live consult/review | — | **PREVIEW** `Cancel` preview only (delegation.rs:365-385). |
