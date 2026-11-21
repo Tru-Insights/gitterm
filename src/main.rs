@@ -4,6 +4,7 @@ use git2::{DiffOptions, Repository};
 use gitterm::chats::{ChatBackendResume, ChatEntryResume};
 #[cfg(test)]
 use gitterm::task_worktree::DEFAULT_TASK_BASE;
+use gitterm::tasks::task_handoff_prompt;
 #[cfg(test)]
 use gitterm::tasks::TaskHandoff;
 use gitterm_core::delegation_state::{
@@ -4540,22 +4541,6 @@ fn task_base_choices(branches: &[GitBranchEntry]) -> (Vec<String>, String) {
     (choices, preferred.to_string())
 }
 
-fn task_lifecycle_label(lifecycle: TaskLifecycle) -> &'static str {
-    match lifecycle {
-        TaskLifecycle::Draft => "draft",
-        TaskLifecycle::Preparing => "preparing",
-        TaskLifecycle::Ready => "ready",
-        TaskLifecycle::Queued => "queued",
-        TaskLifecycle::Running => "running",
-        TaskLifecycle::WaitingForInput => "waiting",
-        TaskLifecycle::Completed => "completed",
-        TaskLifecycle::Failed => "failed",
-        TaskLifecycle::Stopped => "stopped",
-        TaskLifecycle::Interrupted => "interrupted",
-        TaskLifecycle::Archived => "archived",
-    }
-}
-
 fn stopping_boundary_label(boundary: StoppingBoundary) -> &'static str {
     match boundary {
         StoppingBoundary::PlanOnly => "Plan only",
@@ -4877,99 +4862,6 @@ fn preset_conversation_backend(preset: &AgentPreset) -> Option<HarnessConversati
         Some(HarnessConversationBackend::Pi)
     } else {
         None
-    }
-}
-
-/// The brief a task session starts with. `report_back` is the worker
-/// delegation this session carries out (TRU-142 S6): the brief then ends with
-/// the Report back section naming it.
-fn task_handoff_prompt(task: &TaskRecord, report_back: Option<&str>) -> String {
-    let bullet_list = |items: &[String]| {
-        if items.is_empty() {
-            "- none recorded".to_string()
-        } else {
-            items
-                .iter()
-                .map(|item| format!("- {item}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-    };
-    let issue = task
-        .issue
-        .as_ref()
-        .map(|issue| issue.key.as_str())
-        .unwrap_or("none");
-    let worktree = task
-        .worktree
-        .path
-        .as_ref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "not prepared".to_string());
-    let prior_sessions = task
-        .sessions
-        .iter()
-        .filter_map(|session| {
-            session.conversation.as_ref().map(|conversation| {
-                format!(
-                    "- {}: {} ({})",
-                    conversation_backend_label(conversation.backend),
-                    session.label,
-                    conversation.session_id
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    let prior_sessions = if prior_sessions.is_empty() {
-        "- none recorded".to_string()
-    } else {
-        prior_sessions.join("\n")
-    };
-    let last_error = task.last_error.as_deref().unwrap_or("none");
-    let durable_handoff = task.handoff.as_ref().map_or_else(
-        || "No prior handoff has been recorded.".to_string(),
-        |handoff| {
-            format!(
-                "Summary:\n{}\n\nDecisions:\n{}\n\nNext steps:\n{}\n\nBlockers:\n{}",
-                handoff.summary,
-                bullet_list(&handoff.decisions),
-                bullet_list(&handoff.next_steps),
-                bullet_list(&handoff.blockers),
-            )
-        },
-    );
-    let brief = format!(
-        "Continue GitTerm task {task_id}: {title}\n\n\
-Objective:\n{objective}\n\n\
-Task context:\n\
-- Issue: {issue}\n\
-- State: {state}\n\
-- Worktree: {worktree}\n\
-- Branch: {branch}\n\
-- Base: {base_ref} @ {base_commit}\n\
-- Stop when: {stopping_boundary}\n\
-- Last error: {last_error}\n\n\
-Latest durable handoff:\n{durable_handoff}\n\n\
-Prior harness conversations:\n{prior_sessions}\n\n\
-Work from the existing worktree. Inspect git status and the current diff before changing files. \
-Use GitTerm's task_get tool for task {task_id} when it is available. Preserve valid prior work, \
-surface conflicts or missing context explicitly, and use task_update_handoff to leave a concise durable \
-summary before stopping when that tool is available.",
-        task_id = task.task_id,
-        title = task.title,
-        objective = task.objective,
-        state = task_lifecycle_label(task.lifecycle),
-        branch = task.branch,
-        base_ref = task.base.reference,
-        base_commit = task.base.commit,
-        stopping_boundary = stopping_boundary_label(task.stopping_boundary),
-    );
-    match report_back {
-        Some(delegation_id) => format!(
-            "{brief}\n\n{}",
-            gitterm::delegations::report_back_section(delegation_id, &task.task_id)
-        ),
-        None => brief,
     }
 }
 

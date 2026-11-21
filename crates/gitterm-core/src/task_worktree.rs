@@ -1011,11 +1011,13 @@ pub fn inspect_cleanup(
         risks.push(CleanupRisk::WorktreeNotRegistered);
     }
 
+    // No optional locks: a plain `git status` may refresh and rewrite the
+    // index, and inspection must only read (the preview runs it).
     let dirty = if path_exists {
         !run_git(
             worktree_path,
             "inspect changes",
-            &["status", "--porcelain=v1"],
+            &["--no-optional-locks", "status", "--porcelain=v1"],
         )?
         .stdout
         .is_empty()
@@ -1896,6 +1898,69 @@ mod tests {
             url: "https://example.invalid/pull/1".to_string()
         }));
         assert!(!guarded.safe_to_remove());
+    }
+
+    /// Every file under `root` with its bytes and modification time.
+    fn snapshot(
+        root: &Path,
+    ) -> std::collections::BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)> {
+        let mut files = std::collections::BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                let meta = fs::symlink_metadata(&path).unwrap();
+                if meta.is_dir() {
+                    pending.push(path);
+                } else {
+                    files.insert(
+                        path.clone(),
+                        (fs::read(&path).unwrap(), meta.modified().unwrap()),
+                    );
+                }
+            }
+        }
+        files
+    }
+
+    /// The preview runs this inspection as a read (TRU-274 T08), so it must
+    /// write nothing: not the index a plain `git status` would refresh.
+    #[test]
+    fn inspection_spawns_only_read_git() {
+        let repository = TestRepository::new();
+        let request = repository.request("task-read", None, "Inspect read", "main");
+        let prepared = prepare_task_worktree_blocking(&request).unwrap();
+        fs::write(prepared.path.join("untracked.txt"), "change\n").unwrap();
+        // Same content, new mtime: the index's stat data is stale, which a
+        // plain `git status` refreshes by rewriting the index.
+        fs::File::options()
+            .write(true)
+            .open(prepared.path.join("README.md"))
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
+            )
+            .unwrap();
+        let git_dir = repository.path.join(".git");
+        let before = (snapshot(&git_dir), snapshot(&prepared.path));
+
+        let inspection = inspect_cleanup(
+            &repository.path,
+            &prepared.path,
+            &prepared.branch,
+            &prepared.base.commit,
+            &CleanupContext {
+                process_running: false,
+                pull_request_url: None,
+            },
+        )
+        .unwrap();
+        assert!(inspection.dirty);
+        assert_eq!(before, (snapshot(&git_dir), snapshot(&prepared.path)));
+
+        // The fixture would catch the write: a plain status rewrites the index.
+        git_ok(&prepared.path, &["status", "--porcelain=v1"]);
+        assert_ne!(before.0, snapshot(&git_dir));
     }
 
     #[test]
