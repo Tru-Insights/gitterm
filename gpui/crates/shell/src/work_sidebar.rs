@@ -269,9 +269,12 @@ pub struct WorkSidebar {
     confirm: Option<PrActionConfirm>,
     /// The open panel's focus, for Escape.
     confirm_focus: Option<gpui::FocusHandle>,
-    /// gh's active login, as Iced reads it from a PR poll (`gh api user`).
-    /// The preview never polls or runs gh, so nothing sets it yet.
+    /// gh's active login, as Iced reads it with each PR poll (`gh api user`,
+    /// core `prs::login_of`). A failed read keeps the last good value.
     active_login: Option<String>,
+    login_reading: bool,
+    /// The last read failure logged, so a repeating failure logs once.
+    login_error: Option<String>,
 }
 
 impl WorkSidebar {
@@ -324,6 +327,8 @@ impl WorkSidebar {
             confirm: None,
             confirm_focus: None,
             active_login: None,
+            login_reading: false,
+            login_error: None,
         }
     }
 
@@ -502,10 +507,68 @@ impl WorkSidebar {
                 if this.focus != requested_focus {
                     this.load(true, cx);
                 }
+                if this.needs_active_login() {
+                    this.read_active_login(cx);
+                }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Iced reads the login only inside a poll of PRs that no
+    /// `github_accounts` entry covers; those are the PRs that run as gh's
+    /// active account.
+    fn needs_active_login(&self) -> bool {
+        self.pull_requests.iter().any(|group| {
+            group.prs.iter().any(|pr| {
+                gitterm_core::prs::account_for(pr.key.owner(), &self.pr_accounts).is_none()
+            })
+        })
+    }
+
+    /// `gh api user` off the UI thread, once at a time.
+    fn read_active_login(&mut self, cx: &mut Context<Self>) {
+        if self.login_reading {
+            return;
+        }
+        self.login_reading = true;
+        let read = cx.background_executor().spawn(async {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("gh api user: {error}"))?
+                .block_on(gitterm_core::prs::login_of(None))
+        });
+        cx.spawn(async move |view, cx| {
+            let result = read.await;
+            _ = view.update(cx, |this, cx| {
+                this.login_reading = false;
+                _ = this.apply_login_read(result);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Success sets the login; failure keeps the last one, as Iced's poll
+    /// only inserts on success, and logs a given message once.
+    fn apply_login_read(&mut self, result: Result<String, String>) -> bool {
+        match result {
+            Ok(login) => {
+                self.active_login = Some(login);
+                self.login_error = None;
+                false
+            }
+            Err(error) => {
+                let new = self.login_error.as_ref() != Some(&error);
+                if new {
+                    eprintln!("[pr-watch] gh's active account: not read: {error}");
+                    self.login_error = Some(error);
+                }
+                new
+            }
+        }
     }
 
     fn emit(&mut self, outcome: WorkSidebarOutcome, cx: &mut Context<Self>) {
@@ -2242,3 +2305,6 @@ mod pr_confirm_tests;
 #[cfg(test)]
 #[path = "work_sidebar_tests.rs"]
 pub(crate) mod tests;
+#[cfg(test)]
+#[path = "work_sidebar_login_tests.rs"]
+mod work_sidebar_login_tests;
