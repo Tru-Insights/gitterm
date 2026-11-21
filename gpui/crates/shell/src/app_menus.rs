@@ -83,7 +83,8 @@ actions!(
         FillSlash,
         SubmitSlash,
         CloseSlash,
-        SubmitReview
+        SubmitReview,
+        CloseReview
     ]
 );
 
@@ -101,6 +102,13 @@ indexed_action!(WorkspaceSelect);
 indexed_action!(TabSelect);
 indexed_action!(LaunchAgentPreset);
 indexed_action!(TaskChildLaunchPreset);
+
+/// Preview chrome keeps owner actions visible without invoking their effects.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = gitterm_iced, no_json)]
+pub struct PreviewUnavailable {
+    pub label: String,
+}
 
 /// The Iced key handler computes a FileSelectByIndex target from current state.
 #[derive(Clone, PartialEq, Debug)]
@@ -557,7 +565,11 @@ shortcuts![
         FindPrevious,
         Some("NativeChat && IcedChatFind")
     ),
-    ("escape", CloseFind, Some("NativeChat && IcedChatFind")),
+    (
+        "escape",
+        CloseFind,
+        Some("(GitTermShell && IcedChatFind) > NativeChat")
+    ),
     ("down", SlashNext, Some("(NativeChat && IcedSlash) > Input")),
     (
         "up",
@@ -575,14 +587,15 @@ shortcuts![
         CloseSlash,
         Some("(NativeChat && IcedSlash) > Input")
     ),
+    ("escape", CloseReview, Some("NativeChat && IcedReview")),
     ("cmd-enter", SubmitReview, Some("NativeChat && IcedReview")),
     ("ctrl-enter", SubmitReview, Some("NativeChat && IcedReview")),
 ];
 
 /// Actions without a host adapter remain unregistered, so GPUI's native menu
 /// validation disables their menu items.
-/// Terminal log mirroring has no native backend, and dictation is out of scope.
-pub const MISSING_HOST_ACTIONS: &[&str] = &["ToggleTerminalLogMirroring", "SttToggle"];
+/// Mirroring has a preview-notice adapter; dictation remains out of scope.
+pub const MISSING_HOST_ACTIONS: &[&str] = &["SttToggle"];
 
 #[cfg(test)]
 mod tests {
@@ -935,6 +948,11 @@ mod tests {
                 "escape",
                 "slashMenuEl.classList.remove('visible')",
                 "CloseSlash",
+            ),
+            (
+                "escape",
+                "if (e.key === 'Escape') { closeReview(); promptEl.focus(); }",
+                "CloseReview",
             ),
             (
                 "cmd-enter",
