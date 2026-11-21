@@ -50,22 +50,30 @@ impl ChatView {
         // Source reconstructs selected formatting (bold, lists, fences, links),
         // rather than treating rendered byte offsets as offsets into Markdown.
         for row in self.row_views.iter().flatten() {
-            row.read(cx).text.clone().update(cx, |text, cx| {
-                text.set_selection_format(
-                    if markdown {
-                        SelectionFormat::Source
-                    } else {
-                        SelectionFormat::Plain
-                    },
-                    cx,
-                );
-            });
+            for state in
+                std::iter::once(row.read(cx).text.clone()).chain(row.read(cx).edit_text.clone())
+            {
+                state.update(cx, |text, cx| {
+                    text.set_selection_format(
+                        if markdown {
+                            SelectionFormat::Source
+                        } else {
+                            SelectionFormat::Plain
+                        },
+                        cx,
+                    );
+                });
+            }
         }
         let text = TextSelection::selected_text(window, cx);
         for row in self.row_views.iter().flatten() {
-            row.read(cx).text.clone().update(cx, |text, cx| {
-                text.set_selection_format(SelectionFormat::Plain, cx);
-            });
+            for state in
+                std::iter::once(row.read(cx).text.clone()).chain(row.read(cx).edit_text.clone())
+            {
+                state.update(cx, |text, cx| {
+                    text.set_selection_format(SelectionFormat::Plain, cx)
+                });
+            }
         }
         if markdown {
             text
@@ -144,7 +152,8 @@ impl RowView {
     pub(super) fn copyable_text(&self, cx: &mut Context<Self>) -> TextView {
         let owner = cx.entity().downgrade();
         let copied: HashSet<_> = self.copied.keys().copied().collect();
-        let view = TextView::new(&self.text)
+        let view = TextView::new(self.edit_text.as_ref().unwrap_or(&self.text))
+            .on_link_click(super::transcript::open_link)
             .font_family(".SystemUIFont")
             .text_size(px(
                 if self.row.kind == RowKind::Thinking || self.row.delivery.is_some() {

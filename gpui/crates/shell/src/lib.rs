@@ -4497,11 +4497,11 @@ impl Shell {
         workspace: WorkspaceId,
         view: &Entity<chat::ChatPane>,
         cx: &App,
-    ) -> Vec<gitterm_gpui_chat::model::roster::RosterEntry> {
+    ) -> chat::RosterProjection {
         let Some(facts) = &self.roster_facts else {
             // An imported chat waits for the first authoritative store read.
             if self.owner.read(cx).iced_catalog().is_some() {
-                return vec![];
+                return chat::RosterProjection::default();
             }
             // Sample/test hosts have no Iced catalog.
             return self
@@ -4509,7 +4509,7 @@ impl Shell {
                 .get(&workspace)
                 .map(|sidebar| {
                     let sidebar = sidebar.read(cx);
-                    roster_entries(sidebar.tasks(), sidebar.workers(), |worker| {
+                    chat::RosterProjection::new(sidebar.tasks(), sidebar.workers(), |worker| {
                         self.worker_tab(worker, cx)
                     })
                 })
@@ -4577,7 +4577,7 @@ impl Shell {
             })
             .cloned()
             .collect();
-        roster_entries(&facts.tasks, &workers, |worker| self.worker_tab(worker, cx))
+        chat::RosterProjection::new(&facts.tasks, &workers, |worker| self.worker_tab(worker, cx))
     }
 
     fn sync_rosters(&self, cx: &mut Context<Self>) {
@@ -4619,14 +4619,20 @@ impl Shell {
                     &view,
                     window,
                     |shell,
-                     _,
+                     view,
                      outcome: &gitterm_gpui_chat::model::roster::RosterOutcome,
                      window,
                      cx| {
-                        if let gitterm_gpui_chat::model::roster::RosterOutcome::Open { id } =
-                            outcome
-                        {
-                            shell.open_roster(id, window, cx);
+                        match chat::navigation(outcome) {
+                            Some(chat::Navigation::Worker(id)) => {
+                                if let Some(message) = shell.open_worker_tab(id, window, cx) {
+                                    view.update(cx, |pane, cx| pane.show_notice(message, cx));
+                                }
+                            }
+                            Some(chat::Navigation::File(path, review)) => {
+                                shell.open_chat_file(view, path, review, window, cx)
+                            }
+                            None => {}
                         }
                     },
                 );
@@ -4639,8 +4645,17 @@ impl Shell {
         }
     }
 
+    #[cfg(test)]
     fn open_roster(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        use gitterm_core::tasks::DelegationChild;
+        let _ = self.open_worker_tab(id, window, cx);
+    }
+
+    fn open_worker_tab(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
         let worker = self
             .roster_facts
             .iter()
@@ -4653,42 +4668,28 @@ impl Shell {
             .find(|w| w.delegation_id == id.trim_start_matches("dlg:"))
             .cloned();
         let Some(worker) = worker else {
-            return;
+            return Some(format!("delegation {id} has no worker tab"));
         };
-        let (task, session, conversation) = match &worker.child {
-            DelegationChild::TaskSession {
-                task_id,
-                task_session_id,
-                conversation,
-                ..
-            } => (
-                Some(task_id.as_str()),
-                task_session_id.as_deref(),
-                conversation.as_ref().map(|c| c.session_id.as_str()),
-            ),
-            DelegationChild::CodexReview { thread_id, .. }
-            | DelegationChild::CodexConsult { thread_id, .. } => (None, None, thread_id.as_deref()),
-            DelegationChild::ClaudeSubagent { .. } => (None, None, None),
-        };
-        let target = self.workspaces.iter().filter(|w| w.on_bar()).find_map(|w| {
-            w.sessions
+        let target = chat::worker_tab_target(&worker, |session| {
+            self.workspaces
                 .iter()
-                .find(|s| {
-                    self.session_tab(s.id, cx).is_some_and(|t| {
-                        session.is_some_and(|id| t.task_session_id.as_deref() == Some(id))
-                            || conversation
-                                .is_some_and(|id| t.chat_session_id.as_deref() == Some(id))
-                    })
+                .filter(|workspace| workspace.on_bar())
+                .find_map(|workspace| {
+                    workspace
+                        .sessions
+                        .iter()
+                        .find(|tab| {
+                            self.session_tab(tab.id, cx)
+                                .is_some_and(|tab| tab.task_session_id.as_deref() == Some(session))
+                        })
+                        .map(|tab| (workspace.workspace.id, tab.id))
                 })
-                .map(|s| (w.workspace.id, s.id))
         });
-        if let Some((workspace, session)) = target {
-            self.select_host_session(workspace, session, window, cx);
-        } else if let Some(task) = task {
-            self.activate_task(task, window, cx);
-        } else {
-            self.preview_unavailable("Open worker history", cx);
+        match target {
+            Ok((workspace, session)) => self.select_host_session(workspace, session, window, cx),
+            Err(message) => return Some(message),
         }
+        None
     }
 }
 

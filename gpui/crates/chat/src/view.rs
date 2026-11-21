@@ -5,7 +5,11 @@ mod copy;
 mod find;
 #[path = "review/ui.rs"]
 pub(crate) mod review_ui;
+mod scroll;
 mod tool_runs;
+mod transcript;
+pub use scroll::TranscriptScrollerState;
+use scroll::TranscriptScrollerState as MessageScrollerState;
 #[path = "turns.rs"]
 mod turns;
 use copy::CopyTarget;
@@ -29,13 +33,11 @@ use gpui_component::{
     Disableable, Root, Sizable, WindowExt,
     button::{Button, ButtonVariants},
     collapsible::Collapsible,
-    diff::{Diff, DiffFile, DiffState},
     input::{
         Enter as InputEnter, Escape as InputEscape, IndentInline, Input, InputEvent, InputState,
         MoveDown, MoveUp, TextareaState,
     },
     menu::{ContextMenuExt, PopupMenuItem},
-    message_scroller::{MessageScroller, MessageScrollerState},
     text::{RangeHighlight, SelectionFormat, TextView, TextViewMotion, TextViewState},
 };
 use std::{
@@ -68,6 +70,7 @@ actions!(
 );
 
 pub type IntentCallback = Rc<dyn Fn(ChatIntent, &mut App) -> Receipt>;
+type RowAction = Rc<dyn Fn(crate::interactions::TranscriptAction, &mut App)>;
 type TurnToggle = Rc<dyn Fn(u64, &mut App)>;
 
 pub fn run(records: Vec<Record>) {
@@ -134,6 +137,10 @@ pub struct ChatView {
     appearance: ChatAppearance,
     width: gitterm_core::settings::ChatWidth,
     records: Arc<Vec<Record>>,
+    history_start: usize,
+    imported_offer: crate::imported::ImportedOffer,
+    flashed_row: Option<u64>,
+    flash_timer: Option<Task<()>>,
     preview: bool,
     composer: Entity<TextareaState>,
     composer_state: crate::composer::ComposerState,
@@ -159,6 +166,7 @@ pub struct ChatView {
     cards: HashMap<u64, Entity<CardView>>,
     recent_rows: VecDeque<usize>,
     folded: HashMap<u64, bool>,
+    retained_edit_expansion: HashMap<u64, HashSet<usize>>,
     folded_turns: HashSet<u64>,
     open_runs: HashSet<u64>,
     open_work: HashSet<u64>,
@@ -248,6 +256,20 @@ impl ChatView {
         Self {
             appearance: ChatAppearance::default(),
             width: Default::default(),
+            imported_offer: records
+                .iter()
+                .rev()
+                .find_map(|record| {
+                    if let Entry::ImportedOffer(offer) = &record.entry {
+                        Some(offer.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default(),
+            history_start: scroll::initial_start(&model),
+            flashed_row: None,
+            flash_timer: None,
             records: Arc::new(records),
             preview: false,
             composer,
@@ -273,6 +295,7 @@ impl ChatView {
             cards: HashMap::new(),
             recent_rows: VecDeque::new(),
             folded: HashMap::new(),
+            retained_edit_expansion: HashMap::new(),
             folded_turns: HashSet::new(),
             open_runs: HashSet::new(),
             open_work: HashSet::new(),
@@ -343,28 +366,50 @@ impl ChatView {
     }
 
     /// Supply the chat's worker/task roster without giving the view runtime ownership.
-    // TODO: shell::chat::ChatPane should project its task/delegation registry here
-    // once the shared workspace owner exposes those workers to this pane.
     pub fn set_roster(&mut self, rows: Vec<roster::RosterEntry>, cx: &mut Context<Self>) {
         self.roster = rows;
         self.sync_activity_tick(cx);
         cx.notify();
     }
 
+    pub fn set_delegations(
+        &mut self,
+        cards: Vec<crate::delegation::DelegationCard>,
+        cx: &mut Context<Self>,
+    ) {
+        let count = self.model.rows.len();
+        let following = self.scroller.read(cx).is_following_tail();
+        let mut changed = Vec::new();
+        // Registry order is newest-first for the roster; new transcript cards
+        // arrive oldest-first when replay has no stored anchor for them.
+        for card in cards.into_iter().rev() {
+            changed.extend(self.model.upsert_delegation(card));
+        }
+        if !changed.is_empty() {
+            self.refresh_rows(count, following, changed, cx);
+        }
+    }
+
     pub(crate) fn roster_outcome(
         &mut self,
         outcome: roster::RosterOutcome,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let id = match &outcome {
             roster::RosterOutcome::Open { id } | roster::RosterOutcome::Dismiss { id } => id,
+            _ => return,
         };
         if !self.roster.iter().any(|row| &row.id == id) || self.roster_hidden.contains(id) {
             return;
         }
-        if let roster::RosterOutcome::Dismiss { id } = &outcome {
-            self.roster_hidden.insert(id.clone());
-            self.sync_activity_tick(cx);
+        match &outcome {
+            roster::RosterOutcome::Dismiss { id } => {
+                self.roster_hidden.insert(id.clone());
+                self.sync_activity_tick(cx);
+            }
+            roster::RosterOutcome::Open { id } => self.reveal_roster(id, window, cx),
+            _ => unreachable!(),
         }
         cx.emit(outcome);
         cx.notify();
@@ -773,9 +818,11 @@ impl ChatView {
                 self.row_views = vec![None; self.model.rows.len()];
                 self.recent_rows.clear();
                 self.folded.clear();
+                self.retained_edit_expansion.clear();
                 self.folded_turns.clear();
                 self.open_runs.clear();
                 self.open_work.clear();
+                self.history_start = scroll::initial_start(&self.model);
                 self.scroller
                     .update(cx, |scroller, cx| scroller.reset(self.model.rows.len(), cx));
                 self.reset_find(cx);
@@ -825,6 +872,7 @@ impl ChatView {
     }
     fn jump(&mut self, cx: &mut Context<Self>) {
         self.new_messages = false;
+        self.trim_history(cx);
         self.scroller
             .update(cx, |state, cx| state.scroll_to_end(cx));
         cx.notify();
@@ -846,7 +894,10 @@ impl ChatView {
             if let Some(old) = self.recent_rows.pop_front()
                 && let Some(view) = self.row_views[old].take()
             {
-                self.folded.insert(view.read(cx).row.id, view.read(cx).open);
+                let row = view.read(cx);
+                self.folded.insert(row.row.id, row.open);
+                self.retained_edit_expansion
+                    .insert(row.row.id, row.expanded_edits.clone());
             }
         }
         if let Some(view) = &self.row_views[index] {
@@ -863,6 +914,10 @@ impl ChatView {
         let hidden_by_run = run
             .as_ref()
             .is_some_and(|run| run.range.start != index && !run_open);
+        let run_tooltip = run
+            .as_ref()
+            .map(|run| tool_runs::tooltip(&self.model.rows[run.range.clone()]))
+            .unwrap_or_default();
         let run_summary = run
             .filter(|run| run.range.start == index)
             .map(|run| run.label);
@@ -906,6 +961,10 @@ impl ChatView {
                 view.sync_runs(cx);
             });
         });
+        let owner = cx.entity().downgrade();
+        let action: RowAction = Rc::new(move |action, cx| {
+            _ = owner.update(cx, |view, cx| view.transcript_action(action, cx));
+        });
         let scroller = self.scroller.clone();
         let open = self.folded.get(&row.id).copied();
         let view = cx.new(|cx| {
@@ -918,6 +977,14 @@ impl ChatView {
             {
                 view.open = true;
             }
+            view.expanded_edits = self
+                .retained_edit_expansion
+                .get(&view.row.id)
+                .cloned()
+                .unwrap_or_default();
+            view.action = action;
+            view.flashed = self.flashed_row == Some(view.row.id);
+            view.busy = self.composer_state.streaming;
             view.appearance = self.appearance;
             view.column_width = self.column_width().map(|width| width - 28.);
             view.work_toggle = work_toggle;
@@ -926,6 +993,7 @@ impl ChatView {
             view.hidden_by_work = hidden_by_work;
             view.run_toggle = run_toggle;
             view.run_summary = run_summary;
+            view.run_tooltip = run_tooltip;
             view.run_open = run_open;
             view.hidden_by_run = hidden_by_run;
             view.hidden_by_turn =
@@ -942,6 +1010,9 @@ impl ChatView {
         for (index, view) in self.row_views.iter().enumerate() {
             let Some(view) = view else { continue };
             let run = runs.iter().find(|run| run.range.contains(&index));
+            let tooltip = run
+                .map(|run| tool_runs::tooltip(&self.model.rows[run.range.clone()]))
+                .unwrap_or_default();
             let summary = run
                 .filter(|run| run.range.start == index)
                 .map(|run| run.label.clone());
@@ -964,6 +1035,7 @@ impl ChatView {
                     || view.work_open != work_open
                     || view.hidden_by_work != hidden_by_work
                     || view.run_summary != summary
+                    || view.run_tooltip != tooltip
                     || view.run_open != open
                     || view.hidden_by_run != hidden
                 {
@@ -971,6 +1043,7 @@ impl ChatView {
                     view.work_open = work_open;
                     view.hidden_by_work = hidden_by_work;
                     view.run_summary = summary;
+                    view.run_tooltip = tooltip;
                     view.run_open = open;
                     view.hidden_by_run = hidden;
                     view.scroller
@@ -1117,6 +1190,9 @@ impl ChatView {
     }
     /// Append a timestamped transcript/fixture entry using the same live path.
     pub fn append_record(&mut self, record: &Record, cx: &mut Context<Self>) {
+        if let Entry::ImportedOffer(offer) = &record.entry {
+            self.imported_offer = offer.clone();
+        }
         self.turn_running = running_after(&record.entry, self.turn_running);
         if let Entry::Harness(event) = &record.entry {
             let event = gitterm_core::chat::state::AgentEvent::Harness(event.clone());
@@ -1158,6 +1234,9 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) {
         self.row_views.resize(self.model.rows.len(), None);
+        if following && !self.find_open {
+            self.trim_history(cx);
+        }
         if !changed.is_empty() && !following {
             self.new_messages = true;
         }
@@ -1202,8 +1281,7 @@ impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.appearance.palette();
         let send_blocked = self.send_blocked(window, cx);
-        let owner = cx.entity().downgrade();
-        let copy_owner = owner.clone();
+        let copy_owner = cx.entity().downgrade();
         let composer_focused = self.composer.read(cx).focus_handle(cx).is_focused(window);
         let mut context = String::from("NativeChat");
         if self.review.open {
@@ -1356,37 +1434,19 @@ impl Render for ChatView {
                     .min_h_0()
                     .bg(rgb(palette.alt))
                     .rounded(px(8.))
-                    .child(
-                        MessageScroller::new(
-                            "messages",
-                            self.scroller.clone(),
-                            move |index, window, cx| {
-                                owner
-                                    .update(cx, |this, cx| this.row(index, window, cx))
-                                    .map(IntoElement::into_any_element)
-                                    .unwrap_or_else(|_| div().into_any_element())
-                            },
-                        )
-                        .jump_button(false)
-                        // Hidden rows must occupy no space, including the list's
-                        // default per-item padding. Visible rows own their margin.
-                        .with_row_style(StyleRefinement::default().pb(px(0.)))
-                        .with_content_style(StyleRefinement::default().px(px(14.)).py(px(12.))),
-                    )
+                    .child(self.messages(cx))
                     .context_menu(move |menu, window, cx| {
                         Self::selection_menu(copy_owner.clone(), menu, window, cx)
                     }),
             )
-            .when(
-                self.new_messages && !self.scroller.read(cx).is_following_tail(),
-                |view| {
-                    view.child(
-                        Button::new("new-messages")
-                            .label("New messages · Jump to latest")
-                            .on_click(cx.listener(|this, _, _, cx| this.jump(cx))),
-                    )
-                },
-            )
+            .when(!self.scroller.read(cx).is_following_tail(), |view| {
+                view.child(
+                    Button::new("new-messages")
+                        .label("↓ Latest")
+                        .debug_selector(|| "chat-latest".into())
+                        .on_click(cx.listener(|this, _, _, cx| this.jump(cx))),
+                )
+            })
             .child(
                 div()
                     .when_some(self.column_width(), |footer, width| footer.max_w(px(width)))
@@ -1405,6 +1465,7 @@ impl Render for ChatView {
                     .border_1()
                     .border_color(rgb(palette.border))
                     .rounded(px(10.))
+                    .child(self.render_imported_offer(cx))
                     .child(self.composer_state.render_activity(self.appearance))
                     .child(self.pending_panel(window, cx))
                     .children(
@@ -1460,6 +1521,11 @@ impl Render for ChatView {
 }
 
 struct RowView {
+    action: RowAction,
+    flashed: bool,
+    busy: bool,
+    expanded_edits: HashSet<usize>,
+    run_tooltip: String,
     work_summary: Option<String>,
     work_open: bool,
     hidden_by_work: bool,
@@ -1474,8 +1540,7 @@ struct RowView {
     preparing_sent_images: Option<Task<()>>,
     row: Row,
     text: Entity<TextViewState>,
-    diffs: Vec<Entity<DiffState>>,
-    diff_error: Option<String>,
+    edit_text: Option<Entity<TextViewState>>,
     open: bool,
     query: String,
     active: Option<usize>,
@@ -1506,8 +1571,16 @@ impl RowView {
             });
             cx.notify();
         });
-        let open = !row.collapsible();
+        let open = row.delegation.as_ref().map_or_else(
+            || !row.collapsible(),
+            |card| card.delegation.dismissed_at.is_none(),
+        );
         let mut view = Self {
+            action: Rc::new(|_, _| {}),
+            flashed: false,
+            busy: false,
+            expanded_edits: HashSet::new(),
+            run_tooltip: String::new(),
             work_summary: None,
             work_open: true,
             hidden_by_work: false,
@@ -1522,8 +1595,7 @@ impl RowView {
             preparing_sent_images: None,
             row,
             text,
-            diffs: vec![],
-            diff_error: None,
+            edit_text: None,
             open,
             query: String::new(),
             active: None,
@@ -1535,37 +1607,32 @@ impl RowView {
             _subscription: subscription,
             hidden_by_turn: false,
         };
-        view.make_diffs(cx);
+        view.update_edit_text(cx);
         view.prepare_sent_images(cx);
         view
     }
     fn set_row(&mut self, row: Row, cx: &mut Context<Self>) {
-        let edits_changed = self.row.edits() != row.edits();
         let images_changed = self.row.images != row.images;
         self.text
             .update(cx, |text, cx| text.set_text(&row.body, cx));
-        self.row = row;
-        if edits_changed {
-            self.make_diffs(cx);
+        if self
+            .row
+            .delegation
+            .as_ref()
+            .is_some_and(|card| card.delegation.dismissed_at.is_none())
+            && row
+                .delegation
+                .as_ref()
+                .is_some_and(|card| card.delegation.dismissed_at.is_some())
+        {
+            self.open = false;
         }
+        self.row = row;
+        self.update_edit_text(cx);
         if images_changed {
             self.prepare_sent_images(cx);
         }
         cx.notify();
-    }
-    fn make_diffs(&mut self, cx: &mut Context<Self>) {
-        self.diffs.clear();
-        self.diff_error = None;
-        for edit in self.row.edits() {
-            let patch = edit_patch(&edit);
-            match DiffFile::parse(&patch) {
-                Ok(files) => self.diffs.push(cx.new(|cx| DiffState::new(files, cx))),
-                Err(error) => {
-                    self.diff_error =
-                        Some(format!("Cannot display diff for {}: {error}", edit.path))
-                }
-            }
-        }
     }
     fn toggle(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.open = !self.open;
@@ -1619,16 +1686,7 @@ impl Render for RowView {
                     .border_l_2()
                     .border_color(rgb(palette.border))
             })
-            .children(
-                self.diff_error
-                    .clone()
-                    .map(|error| div().text_color(rgb(palette.err)).child(error)),
-            )
-            .children(
-                self.diffs
-                    .iter()
-                    .map(|diff| div().h(px(260.)).child(Diff::new(diff))),
-            )
+            .children(self.render_edits(cx))
             .children((!self.row.images.is_empty()).then(|| self.render_sent_images()))
             .when(self.row.delivery.is_some(), |content| {
                 content.pl(px(22.)).pr(px(10.)).pb(px(8.))
@@ -1655,6 +1713,7 @@ impl Render for RowView {
                 .cursor_pointer()
                 .text_size(px(self.appearance.size(12.5)))
                 .text_color(rgb(palette.muted))
+                .tooltip(self.run_tooltip.clone())
                 .child(div().min_w_0().text_ellipsis().child(label))
                 .child(if self.run_open { "⌄" } else { "›" })
                 .on_click(move |_, _, cx| toggle(id, cx))
@@ -1681,110 +1740,124 @@ impl Render for RowView {
                 .child(if self.work_open { "⌄" } else { "›" })
                 .on_click(move |_, _, cx| toggle(id, cx))
         });
-        let row = div()
-            .id(("row", self.row.id))
-            .debug_selector({
-                let id = self.row.id;
-                move || format!("transcript-row-{id}")
-            })
-            .group("chat-row")
-            .text_size(px(self.appearance.font_size))
-            .text_color(rgb(match self.row.kind {
-                RowKind::Thinking | RowKind::Status => palette.muted,
-                RowKind::Error => palette.err,
-                _ => palette.fg,
-            }))
-            .font_family(".SystemUIFont")
-            .w_full()
-            .mb(px(10.))
-            .when(!self.row.scope.is_empty(), |view| {
-                view.ml(px(18.))
-                    .border_l_2()
-                    .border_color(rgb(palette.border))
-            })
-            .when(self.row.delivery.is_some(), |view| {
-                let id = self.row.id;
-                view.debug_selector(move || format!("delivery-card-{id}"))
-                    .my(px(8.))
-            })
-            .when(self.row.kind == RowKind::User, |view| {
-                view.w_auto()
-                    .max_w(gpui::relative(0.85))
-                    .ml_auto()
-                    .mr_0()
-                    .bg(rgb(palette.block))
-                    .border_1()
-                    .border_color(rgb(palette.border))
-                    .rounded(px(10.))
-            })
-            .when(
-                matches!(
-                    self.row.kind,
-                    RowKind::Permission | RowKind::Question | RowKind::Delegation
-                ),
-                |view| {
-                    view.bg(rgb(palette.base))
+        let row =
+            div()
+                .id(("row", self.row.id))
+                .debug_selector({
+                    let id = self.row.id;
+                    move || format!("transcript-row-{id}")
+                })
+                .group("chat-row")
+                .text_size(px(self.appearance.font_size))
+                .text_color(rgb(match self.row.kind {
+                    RowKind::Thinking | RowKind::Status => palette.muted,
+                    RowKind::Error => palette.err,
+                    _ => palette.fg,
+                }))
+                .font_family(".SystemUIFont")
+                .w_full()
+                .mb(px(10.))
+                .when(!self.row.scope.is_empty(), |view| {
+                    view.ml(px(18.))
+                        .border_l_2()
+                        .border_color(rgb(palette.border))
+                })
+                .when(self.row.delivery.is_some(), |view| {
+                    let id = self.row.id;
+                    view.debug_selector(move || format!("delivery-card-{id}"))
+                        .my(px(8.))
+                })
+                .when(self.row.kind == RowKind::User, |view| {
+                    view.w_auto()
+                        .max_w(gpui::relative(0.85))
+                        .ml_auto()
+                        .mr_0()
+                        .bg(rgb(palette.block))
                         .border_1()
-                        .border_l_3()
-                        .border_color(rgb(color))
-                        .rounded(px(6.))
-                },
-            )
-            .when(self.row.delivery.is_some(), |row| {
-                row.relative().border_color(rgb(palette.border)).child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top_0()
-                        .bottom_0()
-                        .w(px(3.))
-                        .bg(rgb(palette.result)),
+                        .border_color(rgb(palette.border))
+                        .rounded(px(10.))
+                })
+                .when(
+                    matches!(
+                        self.row.kind,
+                        RowKind::Permission | RowKind::Question | RowKind::Delegation
+                    ),
+                    |view| {
+                        view.bg(rgb(palette.base))
+                            .border_1()
+                            .border_l_3()
+                            .border_color(rgb(color))
+                            .rounded(px(6.))
+                    },
                 )
-            })
-            .children(work_summary)
-            .when(show_work, |row| row.children(run_summary))
-            .when(show_card, |row| {
-                row.child(if self.row.collapsible() {
-                    div()
-                        .when(self.row.kind == RowKind::Tool, |card| {
-                            card.bg(rgb(palette.base))
-                                .border_1()
-                                .border_l_3()
-                                .border_color(rgb(color))
-                                .rounded(px(6.))
-                                .px(px(10.))
-                                .py(px(5.))
-                        })
-                        .child(
-                            Collapsible::new()
-                                .open(self.open)
-                                .child(
-                                    Button::new("fold")
-                                        .ghost()
-                                        .h_auto()
-                                        .w_full()
-                                        .p_0()
-                                        .justify_start()
-                                        .debug_selector(move || "row-fold".into())
-                                        .flex()
-                                        .justify_start()
-                                        .cursor_pointer()
-                                        .text_size(px(self.appearance.size(13.)))
-                                        .text_color(rgb(color))
-                                        .when(self.row.kind == RowKind::Thinking, |row| {
-                                            row.italic()
-                                        })
-                                        .when(self.row.delivery.is_none(), |header| {
-                                            header.child(format!(
-                                                "{} {}",
-                                                if self.open { "▾" } else { "▸" },
-                                                self.row.title
-                                            ))
-                                        })
-                                        .when_some(
-                                            self.row.delivery.as_ref(),
-                                            |header, delivery| {
-                                                header
+                .when(self.row.delivery.is_some(), |row| {
+                    row.relative().border_color(rgb(palette.border)).child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(px(3.))
+                            .bg(rgb(palette.result)),
+                    )
+                })
+                .when(self.flashed, |row| {
+                    row.bg(rgb(palette.border))
+                        .border_color(rgb(palette.accent))
+                })
+                .children(work_summary)
+                .when(show_work, |row| row.children(run_summary))
+                .when(show_card, |row| {
+                    row.child(if self.row.delegation.is_some() {
+                        self.render_delegation(cx).into_any_element()
+                    } else if self.row.collapsible() {
+                        div()
+                            .when(self.row.kind == RowKind::Tool, |card| {
+                                card.bg(rgb(palette.base))
+                                    .border_1()
+                                    .border_l_3()
+                                    .border_color(rgb(color))
+                                    .rounded(px(6.))
+                                    .px(px(10.))
+                                    .py(px(5.))
+                            })
+                            .child(
+                                Collapsible::new()
+                                    .open(self.open)
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.))
+                                            .child(
+                                                Button::new("fold")
+                                                    .ghost()
+                                                    .h_auto()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .p_0()
+                                                    .justify_start()
+                                                    .debug_selector(move || "row-fold".into())
+                                                    .flex()
+                                                    .justify_start()
+                                                    .cursor_pointer()
+                                                    .text_size(px(self.appearance.size(13.)))
+                                                    .text_color(rgb(color))
+                                                    .when(
+                                                        self.row.kind == RowKind::Thinking,
+                                                        |row| row.italic(),
+                                                    )
+                                                    .when(self.row.delivery.is_none(), |header| {
+                                                        header.child(format!(
+                                                            "{} {}",
+                                                            if self.open { "▾" } else { "▸" },
+                                                            self.row.title
+                                                        ))
+                                                    })
+                                                    .when_some(
+                                                        self.row.delivery.as_ref(),
+                                                        |header, delivery| {
+                                                            header
                                                     .px(px(10.))
                                                     .py(px(6.))
                                                     .gap(px(8.))
@@ -1831,24 +1904,51 @@ impl Render for RowView {
                                                             )
                                                         },
                                                     )
-                                            },
-                                        )
-                                        .on_click(cx.listener(Self::toggle)),
-                                )
-                                .content(content),
-                        )
-                        .into_any_element()
-                } else {
-                    div()
-                        .when(
-                            !matches!(self.row.kind, RowKind::Assistant | RowKind::User),
-                            |row| row.child(header),
-                        )
-                        .child(content)
-                        .into_any_element()
+                                                        },
+                                                    )
+                                                    .on_click(cx.listener(Self::toggle)),
+                                            )
+                                            .children(self.row.edits().first().map(|edit| {
+                                                let action = self.action.clone();
+                                                let path = std::path::PathBuf::from(&edit.path);
+                                                Button::new("edit-review")
+                                                    .ghost()
+                                                    .small()
+                                                    .label("Review")
+                                                    .debug_selector({
+                                                        let id = self.row.id;
+                                                        move || format!("edit-review-{id}")
+                                                    })
+                                                    .tooltip(format!(
+                                                        "Open {} in the review pane",
+                                                        edit.path
+                                                    ))
+                                                    .on_click(move |_, _, cx| {
+                                                        cx.stop_propagation();
+                                                        action(
+                                        crate::interactions::TranscriptAction::OpenFile {
+                                            path: path.clone(),
+                                            review: true,
+                                        },
+                                        cx,
+                                    );
+                                                    })
+                                            })),
+                                    )
+                                    .content(content),
+                            )
+                            .into_any_element()
+                    } else {
+                        div()
+                            .when(
+                                !matches!(self.row.kind, RowKind::Assistant | RowKind::User),
+                                |row| row.child(header),
+                            )
+                            .child(content)
+                            .into_any_element()
+                    })
                 })
-            })
-            .into_any_element();
+                .into_any_element();
         div()
             .w_full()
             .when_some(self.column_width, |row, width| row.max_w(px(width)))
@@ -1884,30 +1984,6 @@ fn running_after(entry: &Entry, previous: bool) -> bool {
         }
         _ => previous,
     }
-}
-
-/// Full replacement fragments, matching the HTML Edit/MultiEdit/Write preview.
-/// No filesystem read is needed, and no full-file context is invented.
-fn edit_patch(edit: &EditDiff) -> String {
-    let old_path = serde_json::to_string(&format!("a/{}", edit.path)).expect("string JSON");
-    let new_path = serde_json::to_string(&format!("b/{}", edit.path)).expect("string JSON");
-    let old: Vec<_> = edit.old.lines().collect();
-    let new: Vec<_> = edit.new.lines().collect();
-    let mut patch = format!(
-        "--- {old_path}\n+++ {new_path}\n@@ -{},{} +{},{} @@\n",
-        usize::from(!old.is_empty()),
-        old.len(),
-        usize::from(!new.is_empty()),
-        new.len()
-    );
-    for (prefix, lines) in [('-', old), ('+', new)] {
-        for line in lines {
-            patch.push(prefix);
-            patch.push_str(line);
-            patch.push('\n');
-        }
-    }
-    patch
 }
 
 #[cfg(test)]

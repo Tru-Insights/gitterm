@@ -259,3 +259,53 @@ fn completion_usage_lives_in_activity_with_iced_wording_and_no_missing_placehold
     view.project(&state, None);
     assert_eq!(view.status_at(1000), "Ready");
 }
+
+#[test]
+fn c04_withdraw_tooltip_keeps_the_current_harness_working() {
+    let mut composer = ComposerState::default();
+    assert_eq!(
+        composer.withdraw_tooltip(),
+        "Withdraw this message (the agent keeps working)"
+    );
+    composer.backend = Some(gitterm_core::chat::types::AgentBackend::Claude);
+    assert_eq!(
+        composer.withdraw_tooltip(),
+        "Withdraw this message (Claude keeps working)"
+    );
+    composer.backend = Some(gitterm_core::chat::types::AgentBackend::Pi);
+    assert_eq!(
+        composer.withdraw_tooltip(),
+        "Withdraw this message (the agent keeps working)"
+    );
+    composer.backend = Some(gitterm_core::chat::types::AgentBackend::Acp(
+        gitterm_core::chat::types::AcpAgent::OpenCode,
+    ));
+    assert_eq!(
+        composer.withdraw_tooltip(),
+        "Withdraw this message (OpenCode keeps working)"
+    );
+}
+
+#[test]
+fn c05_slash_keeps_full_iced_description_for_the_tooltip() {
+    let mut state = State::default();
+    state.conversation.push(AgentEvent::Harness(HarnessEvent::Ready {
+        session_id:None,permission_mode:None,models:vec![],modes:vec![],
+        commands:vec![json!({"name":"review","description":"Review changes\nwith context","argumentHint":"[focus]"})],
+    }));
+    let mut composer = ComposerState::default();
+    composer.project(&state, None);
+    assert_eq!(
+        composer.slash_matches("/rev")[0].description,
+        "Review changes\nwith context"
+    );
+}
+
+#[test]
+fn c19_guidelines_explains_the_system_prompt() {
+    assert_eq!(
+        GUIDELINES_TOOLTIP,
+        "GitTerm adds its change guidelines to this agent's system prompt (workspace settings switch them off)"
+    );
+    assert!(crate::pickers::Picker::from_chip("guidelines").is_none());
+}

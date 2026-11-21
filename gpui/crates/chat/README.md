@@ -48,9 +48,11 @@ The loader accepts any of these JSONL line formats:
 usage/time is labeled as unreported. Replay uses a fixed 35 ms event cadence
 and the component's 280 ms stream fade, respecting its reduced-motion policy.
 
-Two **fixture-only** `Entry` variants supply app-owned display context:
+App-owned `Entry` variants supply display context:
 `display_decision {request_id, state: answered|denied, detail}` and
-`display_delegation {id, title, state, body}`. These are not new harness events.
+`display_delegation {id, title, state, body}`, plus `imported_offer` with
+`conversations: [{id, title, origin}]` and an optional `pending` flag. These
+are not new harness events.
 A real `runtime_request_resolved` alone says only that a request ended; it
 never implies approval, denial, or an answer that was not recorded. Question
 answers can be shown as the existing question-text → joined-label map, through the app adapter; this crate does not encode a harness protocol. Permission suggestions and ACP options
@@ -83,9 +85,9 @@ not just the older migration-plan audit.
 | Markdown, tables, highlighted code / `:1003`, `:1090` | Done | Selectable component TextView with the `syntect` feature. Native table/code rendering. |
 | Thinking / `:1319` | Done | Independent collapsible rows, including empty/redacted blocks. |
 | Tool runs / `:1400`, `:1430` | Done | Stable-ID collapsible tool cards; input, streamed partial JSON, results and errors; running/done/error colors. |
-| Edit, MultiEdit, Write / `:1519`, `:1580` | Done | Component Diff per replacement fragment; multiple edits supported. Original/result text is still selectable/searchable. No filesystem reads or invented full-file context. |
-| Stream, replay, tail-follow / `:863`, `:945`, `:3501`, `:3731` | Done | Virtualized MessageScroller, model-stable IDs, retained folds, asynchronous remeasurement, Replay/Restart, stream fade, built-in jump-to-latest. Scroll-up suspends tail-follow. |
-| Earlier history, reconnect, reset / `:945`, `:3501`, `:3731` | Display-only | All fixture history is in the model; history replay, reset markers, disconnect/reconnect errors and gap notice render. Live transport, fetching older history and repairing gaps are later. |
+| Edit, MultiEdit, Write / `:1519`, `:1580` | Done | Iced line diffs per replacement fragment, with 3 context lines, a 400-line comparison cap, 40 initially displayed lines and Show all expansion. No filesystem reads or invented full-file context. |
+| Stream, replay, tail-follow / `:863`, `:945`, `:3501`, `:3731` | Done | Paged transcript over GPUI ListState, model-stable IDs, retained folds, asynchronous remeasurement, Replay/Restart, stream fade, explicit ↓ Latest control. Scroll-up suspends tail-follow. |
+| Earlier history, reconnect, reset / `:945`, `:3501`, `:3731` | Display-only | All recorded history stays in the model; Show earlier restores detached 50-block chunks. Reset markers, disconnect/reconnect errors and gap notices render. Repairing transport gaps remains separate. |
 | Find in current chat / TRU-256 | Done | Cmd+F input, Enter/Cmd+G next, Cmd+Shift+G previous, Escape close; full model search including folded/unmounted rows; highlights and reveal; query retained during replay. Case-insensitive Unicode ranges remain valid byte boundaries. |
 | Selection Cmd+C and right-click Copy | Done | Component plain-copy behavior retained, including outer-whitespace trimming; explicit context-menu handler uses the same policy. |
 | Selected text Copy as Markdown / TRU-270 | Done | Right-click menu and Cmd+Shift+C use native selection Source format, preserving Markdown tables and code fences with language. Normal copy remains plain. Menu payloads are captured on opening, like HTML `:4427`, before popup focus changes; selection copy shows Copied for 1.2 seconds. |
@@ -93,12 +95,35 @@ not just the older migration-plan audit.
 | Code block Copy / `:1090` | Done | Copies code text only; per-code-block Copied feedback for 1.2 seconds (HTML `:1841`). |
 | Question cards / `:3317` | Done | Single/multi choice, Other/free text, header and option descriptions, validated submit and dismiss. Answered/resolved cards are read-only. |
 | Permission cards / `:3254`, `:3279` | Done | Allow / Allow always / Deny intents. Always passes the exact offered localSettings suggestion or ACP option. No invented rule or backend effect. |
-| Workers / `:1671`, `:2668` | Display-only | Nested scope labels/indentation, worker lifecycle row, scoped child text/thinking/tools and usage. No worker roster/navigation commands. |
-| Delegations / `:3048`, `:3087` | Display-only | Collapsible fixture/app delivery cards and results; no delivery or task commands. |
+| Workers / `:1671`, `:2668` | Display-only | Nested scope labels/indentation, worker lifecycle rows and scoped child text/thinking/tools. Roster clicks reveal cards; explicit worker navigation focuses an existing session. |
+| Delegations / `:3048`, `:3087` | Display-only | Typed registry cards, findings and handoffs; dismissed cards remain folded in history. Preview mutation controls show notices without delivery or task commands. |
 | Turn status / `:784`, `:2668` | Done | Recorded input/output tokens, elapsed time, optional cost; completed/interrupted/failed and explicit errors. |
-| Review / `:2456`, `:2768` | Later | Review targets, findings, file opening, stale-head warnings, rerun/cancel/dismiss and held delivery require core/session integration. |
+| Review / `:2456`, `:2768` | Read-only / preview | Registry targets and findings render; locations open files and edit Review links open changed files in the workspace Review pane. Rerun/cancel/dismiss/delivery remain notice-only. |
 | Composer / `:1843`, `:1896` | Done | Per-view multiline draft; Enter sends, Shift+Enter inserts newline; visible read-only reason; Stop while a turn runs. Streaming Queue, withdraw by ID, slash completion and owner-fed status are provided by C11a below. Attachments, dictation and interactive model controls remain later. |
 | HTML results / `:784`, `:3048` | Later | Text/code stays native; interactive HTML preview belongs in a retained Viewer surface. |
+
+## I5 transcript interactions (TRU-274)
+
+History exposes the newest 150 top-level blocks and restores earlier history
+in 50-block chunks. Virtual layout stays an implementation detail: scrolling
+alone cannot reveal detached history. Tool runs and completed-work folds count
+as single blocks. `↓ Latest` resumes following and trims older blocks.
+Find searches the full model, preserves the exact opening pixel offset, and
+restores folds and temporary long-edit expansion when closed. Markdown links
+forward only HTTP(S) destinations on primary clicks or keyboard activation.
+
+The shell supplies typed registry cards through `set_delegations`, separately
+from the visible roster. Dismissed cards stay in the transcript, folded closed.
+Roster `Open` reveals, unfolds and flashes its matching card for 900 ms without
+host navigation. Explicit `OpenWorker` and `OpenFile` outcomes use the host's
+existing worker session, file viewer and Review routes. Closed or queued workers
+show Iced's notice; no task or process is started.
+
+Finding selection, Send to Claude, Re-run, Cancel, Dismiss, Stop tracking and
+Continue here are presentation-only controls: enabled clicks show
+`<label> · not available in preview`. A host can supply imported choices through
+`set_imported_offer`; this crate never discovers or resumes V5 conversations.
+Interactive HTML replies still require a retained sandboxed surface.
 
 ## Synthetic fixtures and verification
 

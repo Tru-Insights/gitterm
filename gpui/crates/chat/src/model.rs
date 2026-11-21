@@ -54,6 +54,8 @@ pub struct Row {
     pub body: String,
     pub images: Vec<gitterm_core::chat::types::ImageAttachment>,
     pub delivery: Option<gitterm_core::chat::types::DeliveryCard>,
+    pub delegation: Option<crate::delegation::DelegationCard>,
+    pub roster_id: Option<String>,
     pub tool: Option<Tool>,
     pub decision: Option<DecisionState>,
     pub request: Option<Request>,
@@ -70,10 +72,10 @@ impl Row {
             return vec![];
         };
         let input = &tool.input;
-        let path = input["file_path"]
-            .as_str()
-            .unwrap_or("(path not provided)")
-            .to_owned();
+        let Some(path) = input["file_path"].as_str().filter(|path| !path.is_empty()) else {
+            return vec![];
+        };
+        let path = path.to_owned();
         let edit = |value: &Value| -> Option<EditDiff> {
             Some(EditDiff {
                 path: path.clone(),
@@ -85,10 +87,9 @@ impl Row {
             "Edit" => edit(input).into_iter().collect(),
             "MultiEdit" => input["edits"]
                 .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(edit)
-                .collect(),
+                .filter(|edits| !edits.is_empty())
+                .and_then(|edits| edits.iter().map(edit).collect::<Option<Vec<_>>>())
+                .unwrap_or_default(),
             "Write" => input["content"]
                 .as_str()
                 .map(|new| EditDiff {
@@ -100,6 +101,40 @@ impl Row {
                 .collect(),
             _ => vec![],
         }
+    }
+    pub fn find_body(&self) -> String {
+        let edits = self.edits();
+        if !edits.is_empty() {
+            let mut text = edits
+                .iter()
+                .flat_map(|edit| {
+                    crate::interactions::edit_lines(edit)
+                        .rows
+                        .into_iter()
+                        .map(|line| line.text)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if let Some(output) = self.tool.as_ref().and_then(|tool| tool.output.as_ref()) {
+                text.push('\n');
+                text.push_str(output);
+            }
+            return text;
+        }
+        let mut text = plain_markdown(&self.body);
+        if let Some(findings) = self.delegation.as_ref().and_then(|card| card.findings()) {
+            for finding in &findings.findings {
+                text.push_str(&format!(
+                    "\n{:?} {} {}\n{}\n{}",
+                    finding.severity,
+                    finding.id,
+                    finding.title,
+                    crate::delegation::finding_location(finding).unwrap_or_default(),
+                    finding.body
+                ));
+            }
+        }
+        text
     }
     pub fn search_text(&self) -> String {
         format!("{}\n{}", self.title, plain_markdown(&self.body))
@@ -202,6 +237,40 @@ impl ChatModel {
                     delivery,
                 })
             }
+            AgentEvent::Other(value) if value["kind"] == "delegation" => {
+                return match serde_json::from_value::<crate::delegation::DelegationCard>(
+                    value.clone(),
+                ) {
+                    Ok(card) => self.upsert_delegation(card),
+                    Err(error) => vec![self.push(
+                        RowKind::Error,
+                        "",
+                        "Invalid delegation card".into(),
+                        error.to_string(),
+                    )],
+                };
+            }
+            AgentEvent::Other(value) if value["kind"] == "delegation_anchor" => {
+                let Some(id) = value["delegation_id"].as_str() else {
+                    return vec![];
+                };
+                let key = format!("dlg:{id}");
+                if self
+                    .rows
+                    .iter()
+                    .any(|row| row.roster_id.as_deref() == Some(&key))
+                {
+                    return vec![];
+                }
+                let index = self.push(
+                    RowKind::Delegation,
+                    "",
+                    "Codex · requested".into(),
+                    String::new(),
+                );
+                self.rows[index].roster_id = Some(key);
+                return vec![index];
+            }
             _ => return vec![],
         };
         let images = match event {
@@ -250,12 +319,36 @@ impl ChatModel {
             body,
             images: vec![],
             delivery: None,
+            delegation: None,
+            roster_id: None,
             tool: None,
             decision: None,
             request: None,
         });
         self.next_id += 1;
         index
+    }
+    pub fn upsert_delegation(&mut self, card: crate::delegation::DelegationCard) -> Vec<usize> {
+        let key = format!("dlg:{}", card.delegation.delegation_id);
+        let index = self
+            .rows
+            .iter()
+            .position(|row| row.roster_id.as_deref() == Some(&key))
+            .unwrap_or_else(|| self.push(RowKind::Delegation, "", String::new(), String::new()));
+        let row = &mut self.rows[index];
+        if row.delegation.as_ref() == Some(&card) {
+            return vec![];
+        }
+        row.title = format!(
+            "{} · {} · {}",
+            card.header(),
+            card.target(),
+            card.state_text(crate::composer::now_ms())
+        );
+        row.body = card.body();
+        row.roster_id = Some(key);
+        row.delegation = Some(card);
+        vec![index]
     }
     /// Returns changed row indexes so UI text state can update without scanning history.
     pub fn apply(&mut self, record: &Record) -> Vec<usize> {
@@ -267,6 +360,7 @@ impl ChatModel {
     }
     fn entry(&mut self, entry: &Entry, at: Option<u64>, scope: &str, changed: &mut Vec<usize>) {
         match entry {
+            Entry::ImportedOffer(_) => {}
             Entry::TurnTiming {
                 start_ms, end_ms, ..
             } => {
@@ -340,12 +434,14 @@ impl ChatModel {
                 state,
                 body,
             } => {
-                changed.push(self.push(
+                let index = self.push(
                     RowKind::Delegation,
                     scope,
                     format!("Delegation {id} · {title} · {state}"),
                     literal(body),
-                ));
+                );
+                self.rows[index].roster_id = Some(format!("dlg:{id}"));
+                changed.push(index);
             }
         }
     }
@@ -412,6 +508,7 @@ impl ChatModel {
                         format!("Worker {scope} · Running"),
                         literal(model.as_deref().unwrap_or("Model not reported")),
                     );
+                    self.rows[index].roster_id = Some(format!("sub:{scope}"));
                     self.workers.insert(scope.into(), index);
                     changed.push(index);
                 }
@@ -427,6 +524,7 @@ impl ChatModel {
                     format!("{name} · Running"),
                     String::new(),
                 );
+                self.rows[index].roster_id = Some(format!("sub:{id}"));
                 self.rows[index].tool = Some(Tool {
                     name: name.clone(),
                     input: input.clone(),

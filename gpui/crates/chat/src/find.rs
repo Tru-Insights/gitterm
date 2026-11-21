@@ -8,19 +8,21 @@ pub(super) struct TranscriptFind {
     pub matches: Vec<SearchMatch>,
     pub current: Option<usize>,
     include_tools: bool,
-    // MessageScroller exposes no setter for an intra-row offset. Retain the original
-    // list untouched while a temporary list handles find jumps, then restore it.
-    // shortcut: empty find opens at the saved top row, not its intra-row offset;
-    // use a snapshot API when MessageScroller offers one. Escape restores exactly.
+    // Retain the original list while find owns its jumps/folds; restore its
+    // exact pixel anchor and follow mode when the search closes.
     pub(super) saved_scroller: Option<Entity<MessageScrollerState>>,
     scroll_subscription: Option<Subscription>,
     opened: HashSet<u64>,
     opened_turns: HashSet<u64>,
     opened_runs: HashSet<u64>,
     opened_work: HashSet<u64>,
+    opened_edits: HashSet<(u64, usize)>,
 }
 // HTML searches content roots, excluding native headers and tool labels.
 fn body_ranges(row: &Row, text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    if !row.edits().is_empty() {
+        return find_ranges(text, query);
+    }
     let Some(tool) = &row.tool else {
         return find_ranges(text, query);
     };
@@ -63,7 +65,7 @@ impl TranscriptFind {
         if !self.searches(value) || self.query.is_empty() {
             return vec![];
         }
-        body_ranges(value, &plain_markdown(&value.body), &self.query)
+        body_ranges(value, &value.find_body(), &self.query)
             .into_iter()
             .enumerate()
             .map(|(occurrence, range)| SearchMatch {
@@ -183,6 +185,14 @@ impl ChatView {
                     self.find.opened.insert(view.row.id);
                     view.open = true;
                 }
+                for (index, edit) in view.row.edits().iter().enumerate() {
+                    if !find_ranges(&format!("{}\n{}", edit.old, edit.new), &self.find.query)
+                        .is_empty()
+                        && view.expanded_edits.insert(index)
+                    {
+                        self.find.opened_edits.insert((view.row.id, index));
+                    }
+                }
                 view.reveal_pending = true;
                 view.highlight_signature = None;
                 view.highlight(cx);
@@ -215,7 +225,7 @@ impl ChatView {
             self.find.saved_scroller = Some(self.scroller.clone());
             let temporary = cx.new(|cx| {
                 let mut state = MessageScrollerState::new(self.model.rows.len(), cx);
-                state.scroll_to_item(top.item_ix.min(self.model.rows.len().saturating_sub(1)), cx);
+                state.scroll_to_offset(top, cx);
                 state
             });
             self.find.scroll_subscription = Some(cx.observe(&temporary, |_, _, cx| cx.notify()));
@@ -261,6 +271,19 @@ impl ChatView {
             self.open_work.remove(&id);
         }
         self.sync_runs(cx);
+        for (id, index) in self.find.opened_edits.drain() {
+            if let Some(expanded) = self.retained_edit_expansion.get_mut(&id) {
+                expanded.remove(&index);
+            }
+            for view in self.row_views.iter().flatten() {
+                if view.read(cx).row.id == id {
+                    view.update(cx, |view, cx| {
+                        view.expanded_edits.remove(&index);
+                        cx.notify();
+                    });
+                }
+            }
+        }
         self.find.matches.clear();
         self.find.current = None;
         for index in 0..self.row_views.len() {
@@ -283,6 +306,9 @@ impl ChatView {
     pub(super) fn reset_find(&mut self, cx: &mut Context<Self>) {
         self.find.opened.clear();
         self.find.opened_turns.clear();
+        self.find.opened_runs.clear();
+        self.find.opened_work.clear();
+        self.find.opened_edits.clear();
         self.find.search(&self.model, self.find.query.clone());
         // Replay replaces the history. Reset both lists, retaining the original
         // entity and its scroll observer for when find closes.
@@ -305,45 +331,82 @@ impl ChatView {
             .text_size(px(self.appearance.size(12.)))
             .rounded(px(8.))
             .child(div().flex_1().child(Input::new(&self.find_input)))
-            .child(format!(
-                "{} of {}",
-                self.find.current.map_or(0, |index| index + 1),
-                self.find.matches.len()
-            ))
+            .child(if self.find.query.is_empty() {
+                String::new()
+            } else if self.find.matches.is_empty() {
+                "No matches".into()
+            } else {
+                format!(
+                    "{} of {}",
+                    self.find.current.map_or(0, |index| index + 1),
+                    self.find.matches.len()
+                )
+            })
             .child(
                 Button::new("previous")
                     .small()
-                    .label("Previous")
+                    .label("↑")
+                    .tooltip("Previous match (Shift+Enter)")
                     .disabled(self.find.matches.is_empty())
                     .on_click(cx.listener(|this, _, window, cx| this.navigate(true, window, cx))),
             )
             .child(
                 Button::new("next")
                     .small()
-                    .label("Next")
+                    .label("↓")
+                    .tooltip("Next match (Enter)")
                     .disabled(self.find.matches.is_empty())
                     .on_click(cx.listener(|this, _, window, cx| this.navigate(false, window, cx))),
             )
             .child(
                 Checkbox::new("find-tools")
-                    .label("Include tool output")
+                    .label("Tool output")
                     .checked(self.find.include_tools)
                     .on_click(
                         cx.listener(|this, _, window, cx| this.toggle_find_tools(window, cx)),
                     ),
             )
-            .child(Button::new("close-find").small().label("Close").on_click(
-                cx.listener(|this, _, window, cx| this.close_find(&CloseFind, window, cx)),
-            ))
+            .child(
+                Button::new("close-find")
+                    .small()
+                    .label("×")
+                    .tooltip("Close (Esc)")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.close_find(&CloseFind, window, cx)),
+                    ),
+            )
     }
 }
 
 impl RowView {
     pub(super) fn highlight(&mut self, cx: &mut Context<Self>) {
         let query = self.query.clone();
-        let active = self.active;
+        let display = self.edit_text.as_ref().unwrap_or(&self.text).clone();
+        let edit_matches = if self.edit_text.is_some() {
+            self.row
+                .edits()
+                .iter()
+                .map(|edit| {
+                    find_ranges(
+                        &crate::interactions::edit_lines(edit)
+                            .rows
+                            .into_iter()
+                            .map(|line| line.text)
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        &query,
+                    )
+                    .len()
+                })
+                .sum()
+        } else {
+            0
+        };
+        let active = self
+            .active
+            .and_then(|index| index.checked_sub(edit_matches));
         let reveal = self.reveal_pending;
-        let rendered = self.text.read(cx).rendered_text();
+        let rendered = display.read(cx).rendered_text();
         let mut signature = std::hash::DefaultHasher::new();
         (rendered.as_str(), &query, active).hash(&mut signature);
         let signature = signature.finish();
@@ -352,9 +415,24 @@ impl RowView {
             return;
         }
         self.highlight_signature = Some(signature);
-        let revealed = self.text.update(cx, |text, cx| {
+        let revealed = display.update(cx, |text, cx| {
             let rendered = text.rendered_text();
-            let ranges = body_ranges(&self.row, rendered.as_str(), &query);
+            let ranges = if self.edit_text.is_some() {
+                self.row
+                    .tool
+                    .as_ref()
+                    .and_then(|tool| tool.output.as_deref())
+                    .and_then(|output| rendered.as_str().find(output).map(|start| (start, output)))
+                    .map(|(start, output)| {
+                        find_ranges(output, &query)
+                            .into_iter()
+                            .map(|range| start + range.start..start + range.end)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                body_ranges(&self.row, rendered.as_str(), &query)
+            };
             let available = active.is_none() || active.is_some_and(|index| index < ranges.len());
             let mut highlights: Vec<_> = ranges
                 .iter()

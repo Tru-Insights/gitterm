@@ -79,11 +79,23 @@ pub fn rows(input: &[RosterEntry], now_ms: u64) -> Vec<RosterRow> {
         .collect()
 }
 
-/// Navigation belongs to the host; dismissal only hides this chat's roster row.
+/// Open reveals a card locally. Only explicit worker/file actions navigate the host;
+/// dismissal hides this chat's roster row without changing the worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RosterOutcome {
-    Open { id: String },
-    Dismiss { id: String },
+    Open {
+        id: String,
+    },
+    OpenWorker {
+        id: String,
+    },
+    OpenFile {
+        path: std::path::PathBuf,
+        review: bool,
+    },
+    Dismiss {
+        id: String,
+    },
 }
 
 #[cfg(target_os = "macos")]
@@ -141,9 +153,27 @@ pub(crate) fn render(
                         .cursor_pointer()
                         .rounded(px(4.))
                         .hover(|style| style.bg(rgb(palette.border)))
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            view.roster_outcome(RosterOutcome::Open { id: id.clone() }, cx)
+                        .on_click(cx.listener(move |view, _, window, cx| {
+                            view.roster_outcome(RosterOutcome::Open { id: id.clone() }, window, cx)
                         }))
+                        .child(
+                            div()
+                                .id(gpui::SharedString::from(format!("roster-dot-{}", row.id)))
+                                .debug_selector({
+                                    let id = row.id.clone();
+                                    move || format!("roster-dot-{id}")
+                                })
+                                .size(px(7.))
+                                .rounded_full()
+                                .flex_shrink_0()
+                                .bg(rgb(match row.state {
+                                    WorkerState::Running => palette.accent,
+                                    WorkerState::Queued => palette.muted,
+                                    WorkerState::Waiting => palette.warn,
+                                    WorkerState::Done => palette.result,
+                                    WorkerState::Failed => palette.err,
+                                })),
+                        )
                         .child(
                             div()
                                 .flex_shrink_0()
@@ -168,10 +198,11 @@ pub(crate) fn render(
                             .bg(gpui::rgba(0))
                             .border_0()
                             .on_click(cx.listener(
-                                move |view, _, _, cx| {
+                                move |view, _, window, cx| {
                                     cx.stop_propagation();
                                     view.roster_outcome(
                                         RosterOutcome::Dismiss { id: row.id.clone() },
+                                        window,
                                         cx,
                                     );
                                 },
