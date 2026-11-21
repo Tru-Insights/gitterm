@@ -2329,16 +2329,6 @@ fn h12_h14_h15_h16_h16a_h16b_preview_buttons_only_notice(cx: &mut TestAppContext
             assert!(view.records.is_empty());
         });
     }
-    let card = with_findings();
-    install_card(card.clone(), &chat, cx);
-    click_selector("finding-select-0-F1".into(), cx);
-    chat.read_with(cx, |view, _| {
-        assert_eq!(
-            view.composer_state.notice.as_deref(),
-            Some("Handle empty input · not available in preview")
-        );
-        assert_eq!(view.model.rows[0].delegation.as_ref(), Some(&card));
-    });
     assert_eq!(called.get(), 0, "no runtime commands or persistence path");
 }
 #[gpui::test]
@@ -2789,6 +2779,30 @@ fn h08_expanded_edit_survives_row_eviction_without_changing_source(cx: &mut Test
     });
 }
 
+#[gpui::test]
+fn h12_finding_checkbox_toggles_local_selection_only(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    cx.simulate_resize(size(px(1400.), px(1000.)));
+    let card = crate::delegation::tests::with_findings();
+    install_card(card.clone(), &chat, cx);
+    let selected = |chat: &Entity<ChatView>, cx: &mut gpui::VisualTestContext| {
+        chat.read_with(cx, |view, cx| {
+            view.row_views[0]
+                .as_ref()
+                .map(|row| row.read(cx).selected_findings.clone())
+        })
+    };
+    click_selector("finding-select-0-F1".into(), cx);
+    let after = selected(&chat, cx).flatten().expect("selection state");
+    assert!(!after.contains("F1"), "first click unchecks F1");
+    click_selector("finding-select-0-F1".into(), cx);
+    let after = selected(&chat, cx).flatten().expect("selection state");
+    assert!(after.contains("F1"), "second click re-checks F1");
+    chat.read_with(cx, |view, _| {
+        assert!(view.composer_state.notice.is_none());
+        assert_eq!(view.model.rows[0].delegation.as_ref(), Some(&card));
+    });
+}
 #[gpui::test]
 fn h12_delivered_findings_are_checked_and_disabled(cx: &mut TestAppContext) {
     let (chat, cx) = setup(vec![], cx);
