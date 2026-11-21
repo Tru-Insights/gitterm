@@ -218,6 +218,9 @@ struct Row {
     indent: bool,
     editor: Option<PathBuf>,
     chat: bool,
+    /// Index into `badges` of the one fact that may shrink and ellipsize so
+    /// the row's title keeps its width (a chat's fan-out line).
+    shrinking_badge: Option<usize>,
 }
 
 impl Row {
@@ -1466,6 +1469,7 @@ impl WorkSidebar {
             ));
         }
         if let Some(fan_out) = &chat.fan_out {
+            row.shrinking_badge = Some(row.badges.len());
             row.badges.push(summary::shorten(fan_out, 28));
         }
         row.badges.push(chats::format_age(chat.active));
@@ -1884,8 +1888,16 @@ impl Render for WorkSidebar {
                     .overflow_hidden();
             }
             if row.chat {
+                // Wraps by word like Iced's Fill title. A `flex_1` title has a
+                // basis of zero, so the fixed facts took the whole row and it
+                // wrapped one letter per line. Start from the full row instead
+                // and give way to the facts only down to half of it; the
+                // fan-out line (shrink factor 2) gives way before the title.
                 label = label
-                    .flex_1()
+                    .flex_grow(1.)
+                    .flex_shrink(1.)
+                    .flex_basis(gpui::relative(1.))
+                    .min_w(gpui::relative(0.5))
                     .font_family(".SystemUIFont")
                     .text_size(px(12.))
                     .whitespace_normal();
@@ -1913,7 +1925,13 @@ impl Render for WorkSidebar {
                 // Iced shortens, then lets the branch name wrap in a fill slot.
                 label = label.font_family("Menlo").flex_1().whitespace_normal();
             }
-            let mut line = div().w_full().min_w_0().flex().items_center().gap(px(6.));
+            let mut line = div()
+                .debug_selector(|| format!("work-line-{index}"))
+                .w_full()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(6.));
             if let Some((number, chars)) = row.pr_number {
                 line = line.child(
                     self.button(
@@ -1977,6 +1995,7 @@ impl Render for WorkSidebar {
                         .flex_1(),
                 );
             }
+            let shrinking_badge = row.shrinking_badge;
             for (badge_index, badge) in row.badges.into_iter().enumerate() {
                 let color = if matches!(
                     badge.as_str(),
@@ -1992,10 +2011,22 @@ impl Render for WorkSidebar {
                 } else {
                     rgb(p.muted).into()
                 };
+                let shrinks = shrinking_badge == Some(badge_index);
                 line = line.child(
                     div()
                         .debug_selector(|| format!("work-badge-{index}-{badge_index}"))
-                        .flex_shrink_0()
+                        .map(|badge| {
+                            if shrinks {
+                                badge
+                                    .flex_shrink(2.)
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                            } else {
+                                badge.flex_shrink_0()
+                            }
+                        })
                         .font_family("Menlo")
                         .text_size(px(10.))
                         .text_color(color)

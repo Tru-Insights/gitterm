@@ -2855,38 +2855,106 @@ fn at_310pt_branch_title_wraps_to_two_lines_across_the_row(cx: &mut gpui::TestAp
     assert!(title.size.width > px(180.), "uses the row width: {title:?}");
 }
 
+/// A chat row with a long title and every trailing fact (open, fan-out, age).
+fn long_chat_entry(id: &str, title: &str) -> ChatIndexEntry {
+    use gitterm_core::chat_facts::{ChatChild, ChildKind};
+    let mut entry = entry(id, title, SystemTime::now());
+    let facts = entry.facts.as_mut().unwrap();
+    for index in 0..38 {
+        facts.children.push(ChatChild {
+            session_id: format!("sub-{id}-{index}"),
+            kind: ChildKind::Subagent,
+            delegation_id: None,
+            task_id: None,
+            title: None,
+        });
+    }
+    for kind in [ChildKind::Worker, ChildKind::Review] {
+        facts.children.push(ChatChild {
+            session_id: format!("{kind:?}-{id}"),
+            kind,
+            delegation_id: None,
+            task_id: None,
+            title: None,
+        });
+    }
+    entry
+}
+
 #[gpui::test]
-fn at_310pt_long_chat_title_wraps_unclipped_left_of_the_facts(cx: &mut gpui::TestAppContext) {
+fn chat_titles_wrap_by_word_in_at_least_half_the_row_at_310pt_and_240pt(
+    cx: &mut gpui::TestAppContext,
+) {
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let sidebar = fixture(false);
+    // "recent" is open in the fixture, so it carries open + fan-out + age.
     replace_entries(
         &sidebar,
-        vec![entry(
-            "long",
-            "Revisiting GPUI sidebar parity and keep going on the remaining row layouts",
-            SystemTime::now(),
-        )],
+        vec![
+            long_chat_entry(
+                "recent",
+                "Revisiting GPUI sidebar parity and keep going on the remaining row layouts",
+            ),
+            long_chat_entry(
+                "second",
+                "Investigate why the Chats section title wraps one letter per line when narrow",
+            ),
+        ],
     );
     let (sidebar, cx) = cx.add_window_view(|_, _| sidebar);
-    cx.simulate_resize(gpui::size(px(310.), px(900.)));
-    draw_sidebar(cx);
-    let index = sidebar.read_with(cx, |s, _| {
+    let chats = sidebar.read_with(cx, |s, _| {
         s.rows()
             .iter()
-            .position(|r| r.label.starts_with("✦ Revisiting"))
-            .unwrap()
+            .enumerate()
+            .filter(|(_, row)| row.chat)
+            .map(|(index, row)| (index, row.badges.clone()))
+            .collect::<Vec<_>>()
     });
-    let title = cx
-        .debug_bounds(Box::leak(format!("work-label-{index}").into_boxed_str()))
-        .unwrap();
-    assert!(title.size.height > px(18.), "wraps over lines: {title:?}");
-    let sidebar_bounds = cx.debug_bounds("work-sidebar").unwrap();
-    assert!(title.right() <= sidebar_bounds.right());
-    let badge = cx
-        .debug_bounds(Box::leak(format!("work-badge-{index}-0").into_boxed_str()))
-        .unwrap();
-    assert!(title.right() <= badge.left(), "{title:?} vs {badge:?}");
+    assert_eq!(chats.len(), 2);
+    assert!(
+        chats[0].1.iter().any(|badge| badge.contains("subagents")),
+        "fixture row carries a fan-out fact: {:?}",
+        chats[0].1
+    );
+    let line_height = px(14.);
+    for width in [310., 240.] {
+        cx.simulate_resize(gpui::size(px(width), px(900.)));
+        draw_sidebar(cx);
+        for (index, badges) in &chats {
+            let title = cx
+                .debug_bounds(Box::leak(format!("work-label-{index}").into_boxed_str()))
+                .unwrap();
+            let line = cx
+                .debug_bounds(Box::leak(format!("work-line-{index}").into_boxed_str()))
+                .unwrap();
+            // Iced wraps the Fill title by word; per-letter wrapping made a
+            // ~75-character title dozens of lines tall; by word it is at most 5.
+            assert!(
+                title.size.height > line_height * 1.5,
+                "{width}pt chat {index} long title wraps like Iced: {title:?}"
+            );
+            assert!(
+                title.size.height <= line_height * 7.,
+                "{width}pt chat {index} title wraps by word, not per letter: {title:?}"
+            );
+            assert!(
+                title.size.width > line.size.width * 0.5,
+                "{width}pt chat {index} title keeps most of the row: {title:?} in {line:?}"
+            );
+            for badge_index in 0..badges.len() {
+                let badge = cx
+                    .debug_bounds(Box::leak(
+                        format!("work-badge-{index}-{badge_index}").into_boxed_str(),
+                    ))
+                    .unwrap();
+                assert!(
+                    title.right() <= badge.left(),
+                    "{width}pt chat {index} title overlaps fact {badge_index}: {title:?} vs {badge:?}"
+                );
+            }
+        }
+    }
 }
 
 #[gpui::test]
