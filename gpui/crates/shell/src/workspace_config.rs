@@ -728,7 +728,7 @@ mod preview_terminal_restore_test {
             assert!(imported.session.is_none());
             assert!(matches!(
                 state.panes["session-777"].read(cx).content,
-                crate::pane::PaneContent::Terminal(_)
+                crate::pane::PaneContent::IcedSession(ref text) if text.contains("idle")
             ));
             assert_eq!(state.store.terminals.as_ref().unwrap()[0].id, 777);
             state.store.save(&state.dock.read(cx).dump(cx)).unwrap();
