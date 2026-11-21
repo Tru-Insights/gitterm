@@ -1561,6 +1561,8 @@ struct RowView {
     flashed: bool,
     busy: bool,
     expanded_edits: HashSet<usize>,
+    /// Iced's `card.selected`: unset until first rendered, then every finding id.
+    selected_findings: Option<HashSet<String>>,
     run_tooltip: String,
     work_summary: Option<String>,
     work_open: bool,
@@ -1619,6 +1621,7 @@ impl RowView {
             flashed: false,
             busy: false,
             expanded_edits: HashSet::new(),
+            selected_findings: None,
             run_tooltip: String::new(),
             work_summary: None,
             work_open: true,
