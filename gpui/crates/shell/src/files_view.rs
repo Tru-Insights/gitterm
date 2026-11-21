@@ -1,40 +1,31 @@
-//! Presentation and Tree action bridge; filesystem work stays with WorkspaceOwner.
+//! Iced's flat directory browser; filesystem work stays with WorkspaceOwner.
 use crate::{
     WorkspaceOwner,
     data::{FileNode, ShellData, WorkspaceId},
-    files::{FileTree, Row},
-    theme::Palette,
+    files::{Entry, Row},
+    theme::{LABEL_FONT, LABEL_LINE_HEIGHT, Palette},
 };
-use gpui::base::actions::Confirm;
+use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::{
-    ActiveTheme,
-    button::{Button, ButtonVariants},
-    list::ListItem,
-    tree::{TreeEvent, TreeItem, TreeState, tree},
-};
+use gpui_component::ActiveTheme;
 use std::{collections::HashMap, path::PathBuf, rc::Rc};
-
-const FILES_LIST_LEFT_PADDING: f32 = 8.0;
-const FILES_TREE_INDENT: f32 = 16.0;
-
-fn files_row_x_origin(depth: usize) -> f32 {
-    FILES_LIST_LEFT_PADDING + depth as f32 * FILES_TREE_INDENT
-}
 
 #[derive(Clone)]
 enum EntryAction {
     Directory(PathBuf),
     Open(PathBuf),
-    More(PathBuf),
 }
 pub(crate) struct FilesView {
-    state: Entity<TreeState>,
     owner: Option<Entity<WorkspaceOwner>>,
     workspace: WorkspaceId,
     actions: HashMap<SharedString, EntryAction>,
+    rows: Vec<Row>,
     roots: Option<Vec<PathBuf>>,
     browsing_root: Option<PathBuf>,
+    directory: PathBuf,
+    source_root: PathBuf,
+    selected_file: Option<PathBuf>,
+    samples: Vec<FileNode>,
 }
 impl FilesView {
     pub(crate) fn new(
@@ -42,245 +33,260 @@ impl FilesView {
         data: Rc<dyn ShellData>,
         cx: &mut Context<Self>,
     ) -> Self {
-        // 0.9.1 binds Tree arrows, but binds Enter only in other controls.
-        // Use its existing Confirm action for both folder and leaf activation.
-        cx.bind_keys([KeyBinding::new(
-            "enter",
-            Confirm { secondary: false },
-            Some(gpui::base::tree_key_context()),
-        )]);
-        let state = cx.new(|cx| TreeState::new(cx));
         let owner = data.local_owner();
         let roots = owner.as_ref().and_then(|owner| {
             let saved = owner.read(cx).iced_workspace(workspace)?;
             let work = gitterm_core::work::catalog::is_work(&saved.chats, false);
             work.then(|| work_roots(&saved.repos, PathBuf::from(&saved.dir).join("docs")))
         });
+        let directory = owner
+            .as_ref()
+            .and_then(|owner| {
+                owner
+                    .read(cx)
+                    .files
+                    .get(&workspace)
+                    .map(|tree| tree.root.clone())
+            })
+            .or_else(|| data.terminal_cwd(workspace, cx))
+            .unwrap_or_default();
+        let source_root = owner
+            .as_ref()
+            .and_then(|owner| {
+                owner
+                    .read(cx)
+                    .model
+                    .workspaces
+                    .iter()
+                    .find(|local| local.id == workspace)
+                    .map(|local| local.root.clone())
+            })
+            .unwrap_or_else(|| directory.clone());
         let mut this = Self {
-            state,
             owner,
             workspace,
             actions: HashMap::new(),
+            rows: vec![],
             roots,
             browsing_root: None,
+            source_root,
+            directory,
+            selected_file: None,
+            samples: vec![],
         };
         if let Some(owner) = this.owner.clone() {
             cx.observe(&owner, |this, _, cx| this.sync(cx)).detach();
-            cx.subscribe(&this.state, |this, _, event: &TreeEvent, cx| {
-                let (TreeEvent::Expanded(id) | TreeEvent::Collapsed(id)) = event;
-                if let Some(EntryAction::Directory(path)) = this.actions.get(id).cloned() {
-                    this.owner.as_ref().unwrap().update(cx, |owner, cx| {
-                        owner.toggle_directory(this.workspace, path, cx);
-                    });
+            cx.subscribe(&owner, |this, _, event: &crate::FileOpen, cx| {
+                if event.workspace == this.workspace {
+                    this.selected_file = event.from_files.then(|| event.path.clone());
+                    cx.notify();
                 }
             })
             .detach();
             this.sync(cx);
         } else {
-            let items = sample_items(data.files(workspace, cx), "");
-            this.state
-                .update(cx, |state, cx| state.set_items(items, cx));
+            this.samples = data.files(workspace, cx);
+            this.sync(cx);
         }
         this
     }
     fn browse_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.browsing_root = Some(root.clone());
+        self.source_root = root.clone();
+        self.navigate(root, cx);
+    }
+    fn navigate(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
+        self.directory = directory.clone();
         if let Some(owner) = &self.owner {
             owner.update(cx, |owner, cx| {
-                let tree = owner.files.entry(self.workspace).or_default();
-                tree.set_root(root.clone());
-                owner.toggle_directory(self.workspace, root, cx);
+                owner
+                    .files
+                    .entry(self.workspace)
+                    .or_default()
+                    .set_root(directory.clone());
+                owner.toggle_directory(self.workspace, directory, cx);
             });
         }
-        cx.notify();
+        self.sync(cx);
+    }
+    fn parent(&self) -> Option<PathBuf> {
+        self.directory
+            .parent()
+            .filter(|parent| parent.starts_with(&self.source_root))
+            .map(|parent| parent.to_path_buf())
     }
     fn sync(&mut self, cx: &mut Context<Self>) {
-        let Some(owner) = self.owner.clone() else {
-            return;
-        };
-        if let Some(root) = &self.browsing_root
-            && owner
+        self.actions.clear();
+        if let Some(owner) = self.owner.clone() {
+            if owner
                 .read(cx)
                 .files
                 .get(&self.workspace)
-                .is_none_or(|tree| tree.root != *root)
-        {
-            self.browse_root(root.clone(), cx);
+                .is_some_and(|tree| tree.root != self.directory)
+            {
+                self.navigate(self.directory.clone(), cx);
+                return;
+            }
+            let rows = owner
+                .read(cx)
+                .files
+                .get(&self.workspace)
+                .map(|tree| tree.rows())
+                .unwrap_or_default();
+            // The owner's shared tree API pages reads. Finish them automatically:
+            // Iced exposes the complete directory, never an actionable pager.
+            let more = rows
+                .iter()
+                .any(|row| matches!(row, Row::More { depth: 0, .. }));
+            let loading = rows
+                .iter()
+                .any(|row| matches!(row, Row::Loading { depth: 0 }));
+            let error = rows
+                .iter()
+                .any(|row| matches!(row, Row::Error { depth: 0, .. }));
+            if more && !error {
+                self.rows = vec![Row::Loading { depth: 0 }];
+                if !loading {
+                    owner.update(cx, |owner, cx| {
+                        owner.more_files(self.workspace, self.directory.clone(), cx)
+                    });
+                }
+            } else {
+                self.rows = rows
+                    .into_iter()
+                    .filter(|row| match row {
+                        Row::Entry { depth, .. }
+                        | Row::Loading { depth }
+                        | Row::Empty { depth }
+                        | Row::Error { depth, .. } => *depth == 0,
+                        Row::More { .. } => false,
+                    })
+                    .collect();
+            }
+        } else {
+            let mut nodes = &self.samples;
+            if let Ok(relative) = self.directory.strip_prefix(&self.source_root) {
+                for name in relative.components() {
+                    nodes = nodes
+                        .iter()
+                        .find(|node| node.name == name.as_os_str().to_string_lossy())
+                        .map(|node| &node.children)
+                        .expect("sample navigation only uses existing directories");
+                }
+            }
+            self.rows = nodes
+                .iter()
+                .map(|node| Row::Entry {
+                    entry: Entry {
+                        path: self.directory.join(&node.name),
+                        name: node.name.clone(),
+                        is_dir: !node.children.is_empty(),
+                    },
+                    expanded: false,
+                    depth: 0,
+                })
+                .collect();
         }
-        self.actions.clear();
-        let items = owner
-            .read(cx)
-            .files
-            .get(&self.workspace)
-            .map(|files| local_items(files, &mut self.actions))
-            .unwrap_or_default();
-        self.state.update(cx, |state, cx| {
-            let selected = state.selected_item().map(|item| item.id.clone());
-            state.set_items(items, cx);
-            let ix = selected.and_then(|id| state.index_of(&id));
-            state.set_selected_index(ix, cx);
-        });
+        for row in &self.rows {
+            if let Row::Entry { entry, .. } = row {
+                self.actions.insert(
+                    entry_id(entry),
+                    if entry.is_dir {
+                        EntryAction::Directory(entry.path.clone())
+                    } else {
+                        EntryAction::Open(entry.path.clone())
+                    },
+                );
+            }
+        }
         cx.notify();
     }
     fn activate(&mut self, id: &SharedString, cx: &mut Context<Self>) {
-        let Some(owner) = &self.owner else { return };
-        match self.actions.get(id) {
-            Some(EntryAction::Open(path)) => owner.update(cx, |owner, cx| {
-                owner.open_file(self.workspace, path.clone(), cx);
-            }),
-            Some(EntryAction::More(path)) => owner.update(cx, |owner, cx| {
-                owner.more_files(self.workspace, path.clone(), cx);
-            }),
-            _ => {}
-        }
-    }
-    fn confirm(&mut self, _: &Confirm, _: &mut Window, cx: &mut Context<Self>) {
-        // TreeState handles Confirm for folders, but has no leaf activation event.
-        let selected = self
-            .state
-            .read(cx)
-            .selected_entry()
-            .filter(|entry| !entry.is_folder() && !entry.is_disabled())
-            .map(|entry| entry.item().id.clone());
-        if let Some(id) = selected {
-            self.activate(&id, cx);
-        }
-        cx.propagate();
-    }
-}
-
-fn sample_items(nodes: Vec<FileNode>, parent: &str) -> Vec<TreeItem> {
-    nodes
-        .into_iter()
-        .map(|node| {
-            let path = format!("{parent}/{}", node.name);
-            let children = sample_items(node.children, &path);
-            TreeItem::new(path.clone(), node.name)
-                .children(children)
-                .expanded(path == "/src")
-        })
-        .collect()
-}
-
-fn local_items(
-    files: &FileTree,
-    actions: &mut HashMap<SharedString, EntryAction>,
-) -> Vec<TreeItem> {
-    fn level(
-        rows: &mut std::iter::Peekable<std::vec::IntoIter<Row>>,
-        depth: usize,
-        parent: &str,
-        actions: &mut HashMap<SharedString, EntryAction>,
-    ) -> Vec<TreeItem> {
-        let mut items = Vec::new();
-        while rows.peek().is_some_and(|row| row_depth(row) == depth) {
-            let row = rows.next().unwrap();
-            let (id, label, action, expanded, directory) = match row {
-                Row::Entry {
-                    entry, expanded, ..
-                } => (
-                    format!("entry:{:?}", entry.path),
-                    entry.name,
-                    Some(if entry.is_dir {
-                        EntryAction::Directory(entry.path)
-                    } else {
-                        EntryAction::Open(entry.path)
-                    }),
-                    expanded,
-                    entry.is_dir,
-                ),
-                Row::More { path, .. } => (
-                    format!("more:{path:?}"),
-                    "Show more…".into(),
-                    Some(EntryAction::More(path)),
-                    false,
-                    false,
-                ),
-                Row::Loading { .. } => (
-                    format!("loading:{parent}"),
-                    "Loading files…".into(),
-                    None,
-                    false,
-                    false,
-                ),
-                Row::Empty { .. } => (
-                    format!("empty:{parent}"),
-                    "Empty directory".into(),
-                    None,
-                    false,
-                    false,
-                ),
-                Row::Error { message, .. } => {
-                    (format!("error:{parent}"), message, None, false, false)
+        match self.actions.get(id).cloned() {
+            Some(EntryAction::Directory(path)) => self.navigate(path, cx),
+            Some(EntryAction::Open(path)) => {
+                self.selected_file = Some(path.clone());
+                if let Some(owner) = &self.owner {
+                    owner.update(cx, |owner, cx| owner.open_file(self.workspace, path, cx));
                 }
-            };
-            let mut children = if directory && expanded {
-                level(rows, depth + 1, &id, actions)
-            } else {
-                vec![]
-            };
-            // A folder is defined by nonempty children. Keep collapsed folders
-            // expandable without reading them; expanded empty/error folders have
-            // their own disabled status child from the owner's rows.
-            if directory && children.is_empty() {
-                children
-                    .push(TreeItem::new(format!("pending:{id}"), "Loading files…").disabled(true));
+                cx.notify();
             }
-            let disabled = action.is_none();
-            if let Some(action) = action {
-                actions.insert(id.clone().into(), action);
-            }
-            items.push(
-                TreeItem::new(id, label)
-                    .children(children)
-                    .expanded(expanded)
-                    .disabled(disabled),
-            );
+            None => {}
         }
-        items
     }
-    level(&mut files.rows().into_iter().peekable(), 0, "root", actions)
+    fn edit_file(&self, cx: &mut Context<Self>) {
+        if let Some(owner) = &self.owner {
+            owner.update(cx, |owner, cx| {
+                owner.error = Some("Edit file · not available in preview".into());
+                cx.notify();
+            });
+        }
+    }
 }
-fn row_depth(row: &Row) -> usize {
-    match row {
-        Row::Entry { depth, .. }
-        | Row::Loading { depth }
-        | Row::Error { depth, .. }
-        | Row::More { depth, .. }
-        | Row::Empty { depth } => *depth,
+fn entry_id(entry: &Entry) -> SharedString {
+    format!("entry:{:?}", entry.path).into()
+}
+
+// Plain rows avoid Button's internally centered child. Iced uses an 8px
+// outer inset and [4, 8] button padding, with no tree indentation.
+fn file_button(id: impl Into<ElementId>) -> Stateful<Div> {
+    div()
+        .id(id)
+        .role(Role::Button)
+        .flex_shrink_0()
+        .flex()
+        .items_start()
+        .gap(px(4.))
+        .px(px(8.))
+        .py(px(4.))
+        .cursor_pointer()
+}
+fn file_icon_color(name: &str, p: Palette) -> u32 {
+    match std::path::Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+    {
+        "ts" | "tsx" => p.blue,
+        "js" | "jsx" | "json" => p.yellow,
+        "md" => p.green,
+        "rs" => p.peach,
+        "toml" | "yml" | "yaml" => p.teal,
+        "css" | "scss" => {
+            if p.base == Palette::for_mode(true).base {
+                0xcba6f7
+            } else {
+                0x8839ef
+            }
+        }
+        "html" => p.red,
+        _ => p.subtext0,
     }
 }
 impl Render for FilesView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = cx.weak_entity();
         let p = Palette::current(cx);
         let font: f32 = cx.theme().font_size.into();
-        let badges: HashMap<SharedString, (String, bool)> = self
-            .owner
-            .as_ref()
-            .map(|owner| {
-                let owner = owner.read(cx);
-                let root = owner
-                    .model
-                    .workspaces
-                    .iter()
-                    .find(|w| w.id == self.workspace)
-                    .map(|w| &w.root);
-                owner
-                    .model
-                    .status_view(self.workspace)
-                    .files
-                    .into_iter()
-                    .filter_map(|file| {
-                        Some((
-                            format!("entry:{:?}", root?.join(&file.path)).into(),
-                            (file.status, file.staged),
-                        ))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut body = div().size_full().flex().flex_col();
+        let mut body = div()
+            .id("files-browser")
+            .size_full()
+            .flex()
+            .flex_col()
+            .font_family(LABEL_FONT)
+            .text_size(px(font))
+            .line_height(relative(LABEL_LINE_HEIGHT))
+            .text_color(rgb(p.text));
+        let mut listing = div()
+            .id("files-list")
+            .debug_selector(|| "files-list".into())
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .items_start()
+            .gap(px(2.))
+            .p(px(8.));
         if let Some(roots) = &self.roots {
             if self.browsing_root.is_none() {
                 for (ix, root) in roots.iter().enumerate() {
@@ -291,115 +297,186 @@ impl Render for FilesView {
                             .unwrap_or(root.as_os_str())
                             .to_string_lossy()
                     );
-                    body = body.child(
-                        Button::new(("files-root", ix))
-                            .ghost()
+                    listing = listing.child(
+                        file_button(("files-root", ix))
+                            .debug_selector(move || format!("files-root-{ix}"))
                             .w_full()
-                            .justify_start()
-                            .px(px(8.))
-                            .py(px(4.))
-                            .text_size(px(font))
                             .text_color(rgb(p.blue))
-                            .accessibility_label(format!("📁 {label}"))
+                            .aria_label(format!("📁 {label}"))
                             .child(
                                 div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(4.))
-                                    .child(div().w(px(24.)).child("📁"))
-                                    .child(label),
+                                    .w(px(24.))
+                                    .flex_shrink_0()
+                                    .debug_selector(move || format!("files-root-icon-{ix}"))
+                                    .child("📁"),
                             )
+                            .child(label)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.browse_root(root.clone(), cx)
                             })),
                     );
                 }
-                return body;
+                return body.child(listing);
             }
             body = body.child(
-                Button::new("files-all-folders")
-                    .ghost()
-                    .label("← All folders")
-                    .w_full()
-                    .justify_start()
-                    .px(px(8.))
-                    .py(px(4.))
-                    .text_size(px(font))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.browsing_root = None;
-                        cx.notify();
-                    })),
+                div().flex().flex_shrink_0().p(px(4.)).child(
+                    file_button("files-all-folders")
+                        .debug_selector(|| "files-all-folders".into())
+                        .border_1()
+                        .border_color(rgb(p.overlay0))
+                        .rounded(px(6.))
+                        .px(px(7.))
+                        .py(px(3.))
+                        .hover(move |row| row.bg(rgb(p.overlay)))
+                        .text_size(px(font - 1.))
+                        .text_color(rgb(p.blue))
+                        .child(
+                            div()
+                                .debug_selector(|| "files-all-folders-label".into())
+                                .child("← All folders"),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.browsing_root = None;
+                            cx.notify();
+                        })),
+                ),
             );
         }
-        if let Some(root) = &self.browsing_root {
-            body = body.child(
-                div()
-                    .px(px(FILES_LIST_LEFT_PADDING))
-                    .py(px(4.))
-                    .text_size(px(font))
-                    .text_color(rgb(p.blue))
-                    .child(root.display().to_string()),
-            );
-        }
-        body.capture_action(cx.listener(Self::confirm)).child(
-            tree(&self.state, move |ix, entry, _, _, _| {
-                let id = entry.item().id.clone();
-                let view = view.clone();
-                let badge = badges.get(&id);
-                ListItem::new(ix)
-                    .h(px(28.))
-                    .w_full()
-                    .justify_start()
-                    .pl(px(files_row_x_origin(entry.depth())))
-                    .text_size(px(font))
-                    .text_color(rgb(if id.starts_with("error:") {
-                        p.red
-                    } else if entry.is_disabled() {
-                        p.muted
-                    } else {
-                        p.text
-                    }))
+        let root_name = self
+            .source_root
+            .file_name()
+            .unwrap_or(self.source_root.as_os_str())
+            .to_string_lossy();
+        let relative = self
+            .directory
+            .strip_prefix(&self.source_root)
+            .unwrap_or(&self.directory);
+        let display = if relative.as_os_str().is_empty() {
+            format!("{root_name}/")
+        } else {
+            format!("{root_name}/{}/", relative.display())
+        };
+        listing = listing.child(
+            div()
+                .flex_shrink_0()
+                .py(px(4.))
+                .text_color(rgb(p.blue))
+                .child(display),
+        );
+        if let Some(parent) = self.parent() {
+            listing = listing.child(
+                file_button("files-parent")
+                    .debug_selector(|| "files-parent".into())
+                    .gap(px(8.))
+                    .text_color(rgb(p.subtext0))
+                    .aria_label(".. (parent)")
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(px(4.))
-                            .child(
-                                div()
-                                    .w(px(24.))
-                                    .text_color(rgb(if entry.is_folder() { p.blue } else { p.text }))
-                                    .child(if entry.is_folder() { "📁" } else { "  " }),
-                            )
-                            .child(
-                                div()
-                                    .text_color(rgb(if id.starts_with("error:") {
-                                        p.red
-                                    } else if entry.is_disabled() {
-                                        p.muted
-                                    } else if entry.is_folder() {
-                                        p.blue
-                                    } else {
-                                        p.text
-                                    }))
-                                    .child(format!(
-                                        "{}{}{}",
-                                        entry.item().label,
-                                        if entry.is_folder() { "/" } else { "" },
-                                        badge
-                                            .map(|(status, staged)| format!(
-                                                "  {status}{}",
-                                                if *staged { " ●" } else { "" }
-                                            ))
-                                            .unwrap_or_default()
-                                    )),
-                            ),
+                            .w(px(20.))
+                            .debug_selector(|| "files-parent-icon".into())
+                            .child(".."),
                     )
-                    .on_click(move |_, _, cx| {
-                        let _ = view.update(cx, |this, cx| this.activate(&id, cx));
-                    })
-            })
-            .size_full(),
-        )
+                    .child(div().text_size(px(font - 1.)).child("(parent)"))
+                    .on_click(cx.listener(move |this, _, _, cx| this.navigate(parent.clone(), cx))),
+            );
+        }
+        for (ix, row) in self.rows.iter().enumerate() {
+            match row {
+                Row::Entry { entry, .. } => {
+                    let id = entry_id(entry);
+                    let selected =
+                        !entry.is_dir && self.selected_file.as_ref() == Some(&entry.path);
+                    let label = format!("{}{}", entry.name, if entry.is_dir { "/" } else { "" });
+                    let button = file_button(id.clone())
+                        .debug_selector(move || format!("files-entry-{ix}"))
+                        .flex_1()
+                        .min_w_0()
+                        .when(selected, |row| {
+                            row.bg(rgb(p.blue))
+                                .rounded(px(6.))
+                                .hover(move |row| row.bg(rgb(p.blue).blend(rgba(0xffffff26))))
+                        })
+                        .text_color(rgb(if selected {
+                            0xffffff
+                        } else if entry.is_dir {
+                            p.blue
+                        } else {
+                            p.text
+                        }))
+                        .aria_label(if entry.is_dir {
+                            format!("📁 {label}")
+                        } else {
+                            label.clone()
+                        })
+                        .child(
+                            div()
+                                .w(px(24.))
+                                .flex_shrink_0()
+                                .text_color(rgb(if entry.is_dir {
+                                    p.blue
+                                } else {
+                                    file_icon_color(&entry.name, p)
+                                }))
+                                .debug_selector(move || format!("files-icon-{ix}"))
+                                .child(if entry.is_dir { "📁" } else { "  " }),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(move || format!("files-name-{ix}"))
+                                .child(label),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| this.activate(&id, cx)));
+                    let mut row = div()
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .w_full()
+                        .when(entry.is_dir, |row| row.bg(rgb(p.base)))
+                        .child(button);
+                    if !entry.is_dir {
+                        row = row.child(
+                            file_button(("files-edit", ix))
+                                .debug_selector(move || format!("files-edit-{ix}"))
+                                .px(px(6.))
+                                .flex_shrink_0()
+                                .text_size(px(font - 1.))
+                                .text_color(rgb(p.subtext0))
+                                .aria_label(format!("Edit {}", entry.name))
+                                .child("✎")
+                                .on_click(cx.listener(|this, _, _, cx| this.edit_file(cx))),
+                        );
+                    }
+                    listing = listing.child(row);
+                }
+                Row::Loading { .. } => {
+                    listing = listing.child(
+                        div()
+                            .text_size(px(font - 1.))
+                            .text_color(rgb(p.subtext0))
+                            .child("Loading..."),
+                    )
+                }
+                Row::Empty { .. } => {
+                    listing =
+                        listing.child(div().text_color(rgb(p.subtext0)).child("Empty directory"))
+                }
+                Row::Error { message, .. } => {
+                    listing = listing.child(
+                        div()
+                            .w_full()
+                            .px(px(8.))
+                            .py(px(6.))
+                            .rounded(px(6.))
+                            .bg(rgb(p.red).opacity(0.12))
+                            .text_size(px(font - 1.))
+                            .text_color(rgb(p.red))
+                            .child(message.clone()),
+                    )
+                }
+                Row::More { .. } => unreachable!("pager rows are consumed by sync"),
+            }
+        }
+        body.child(listing)
     }
 }
 
