@@ -39,7 +39,7 @@ const RESEED_POLL: Duration = Duration::from_secs(2);
 const SERVER_DRAIN: Duration = Duration::from_millis(500);
 
 /// The app's task host, for B6 chat descriptors and B8 panes.
-pub(crate) struct GpuiTaskHost(#[allow(dead_code)] pub(crate) Entity<TaskHostOwner>);
+pub(crate) struct GpuiTaskHost(pub(crate) Entity<TaskHostOwner>);
 impl Global for GpuiTaskHost {}
 
 /// Where commands come from. Production takes the process ingress; tests
@@ -353,6 +353,17 @@ impl TaskHostOwner {
                 _quit: quit,
             }
         }))
+    }
+
+    /// The task server for one native Claude chat, attributed to `caller`
+    /// (the chat's `session_uid`); `None` once the servers have shut down.
+    pub(crate) fn claude_mcp_server(
+        &self,
+        caller: &str,
+    ) -> Option<gitterm_core::harness::claude::ClaudeMcpServer> {
+        self.servers
+            .as_ref()
+            .map(|servers| servers.task_mcp.claude_mcp_server(Some(caller)))
     }
 
     #[cfg(test)]
