@@ -285,3 +285,101 @@ fn legacy_split_renders_only_the_active_session(cx: &mut TestAppContext) {
             .is_some()
     );
 }
+
+/// Two sample workspaces whose own layout files say 492 / 200; Iced's global
+/// width (fixture settings.json) must win for both.
+fn sidebar_shell<'a>(
+    iced: &Path,
+    cx: &'a mut TestAppContext,
+) -> (Entity<Shell>, &'a mut VisualTestContext, tempfile::TempDir) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let config = tempfile::tempdir().unwrap();
+    for (key, width) in [("1", 492.), ("2", 200.)] {
+        let mut store = LayoutStore::new(layout::workspace_layout_path(config.path(), key));
+        store.regions.sidebar_width = width;
+        store
+            .save(&gpui_component::dock::DockAreaState::default())
+            .unwrap();
+    }
+    let settings = workspace_config::load_iced_settings_from(iced);
+    let dir = config.path().to_path_buf();
+    let (shell, cx) = cx.add_window_view(|window, cx| {
+        let data: Rc<dyn ShellData> = Rc::new(data::SampleData);
+        let model = WorkspaceStatus::sample(data.workspaces(cx).into_iter().map(|w| w.id));
+        let owner = cx.new(|cx| WorkspaceOwner::new(model, None, cx));
+        Shell::with_owner_settings(data, owner, &dir, false, &settings, window, cx).unwrap()
+    });
+    (shell, cx, config)
+}
+fn sidebar_widths(shell: &Entity<Shell>, cx: &VisualTestContext) -> Vec<f32> {
+    cx.read(|cx| {
+        shell
+            .read(cx)
+            .workspaces
+            .iter()
+            .map(|w| w.store.regions.sidebar_width)
+            .collect()
+    })
+}
+
+#[gpui::test]
+fn sidebar_width_comes_from_iced_settings_for_every_workspace(cx: &mut TestAppContext) {
+    let iced = tempfile::tempdir().unwrap();
+    std::fs::write(
+        iced.path().join("settings.json"),
+        br#"{"sidebar_width": 310}"#,
+    )
+    .unwrap();
+    let (shell, cx, _config) = sidebar_shell(iced.path(), cx);
+    cx.simulate_resize(size(px(1400.), px(800.)));
+    draw(cx);
+    assert_eq!(sidebar_widths(&shell, cx)[..2], [310., 310.]);
+    assert_eq!(cx.debug_bounds("sidebar").unwrap().size.width, px(310.));
+    // The second workspace renders the same width.
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, cx| {
+            let id = shell.workspaces[1].workspace.id;
+            shell.owner.update(cx, |owner, cx| {
+                owner.dispatch(Intent::Activate(id), Instant::now(), cx)
+            });
+        })
+    });
+    draw(cx);
+    assert_eq!(cx.debug_bounds("sidebar").unwrap().size.width, px(310.));
+
+    // A drag resizes every workspace and never touches Iced's file.
+    let before = std::fs::read(iced.path().join("settings.json")).unwrap();
+    let divider = cx.debug_bounds("sidebar-divider").unwrap().center();
+    cx.simulate_mouse_down(divider, gpui::MouseButton::Left, gpui::Modifiers::none());
+    let target = divider + gpui::point(px(40.), px(0.));
+    cx.simulate_mouse_move(target, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.simulate_mouse_up(target, gpui::MouseButton::Left, gpui::Modifiers::none());
+    assert_eq!(sidebar_widths(&shell, cx)[..2], [350., 350.]);
+    assert_eq!(
+        std::fs::read(iced.path().join("settings.json")).unwrap(),
+        before
+    );
+}
+
+#[gpui::test]
+fn sidebar_width_clamps_like_iced_and_defaults_when_settings_missing(cx: &mut TestAppContext) {
+    let iced = tempfile::tempdir().unwrap();
+    std::fs::write(
+        iced.path().join("settings.json"),
+        br#"{"sidebar_width": 900}"#,
+    )
+    .unwrap();
+    let (shell, cx, _config) = sidebar_shell(iced.path(), cx);
+    assert_eq!(sidebar_widths(&shell, cx)[..2], [600., 600.]);
+    std::fs::write(
+        iced.path().join("settings.json"),
+        br#"{"sidebar_width": 20}"#,
+    )
+    .unwrap();
+    let (shell, cx, _config) = sidebar_shell(iced.path(), cx);
+    assert_eq!(sidebar_widths(&shell, cx)[..2], [150., 150.]);
+    let missing = tempfile::tempdir().unwrap();
+    let (shell, cx, _config) = sidebar_shell(missing.path(), cx);
+    assert_eq!(sidebar_widths(&shell, cx)[..2], [360., 360.]);
+}

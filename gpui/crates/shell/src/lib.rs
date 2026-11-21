@@ -163,6 +163,10 @@ pub struct Shell {
     /// The branch checkout last opened in review per workspace; the sidebar
     /// marks it only while that review is still the visible viewer.
     branch_reviews: HashMap<WorkspaceId, std::path::PathBuf>,
+    /// Sidebar panel width shared by every workspace, like Iced's one global
+    /// setting. Read once from Iced's settings (read-only); a drag changes it
+    /// for the session and is never written back to Iced.
+    sidebar_width: f32,
     #[cfg(test)]
     dock_fixture: bool,
 }
@@ -209,6 +213,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Result<Self> {
         let client_height = f32::from(window.viewport_size().height);
+        let sidebar_width = layout::clamp_sidebar(settings.sidebar_width);
         let bottom = cx.new(|_| {
             bottom_panel::BottomPanel::new(bottom_panel::Input::from_settings(
                 settings,
@@ -301,6 +306,7 @@ impl Shell {
                 state.store.regions.bottom_visible = settings.console_expanded;
             }
             load_workspace_layout(state, window, cx)?;
+            state.store.regions.resize_sidebar(sidebar_width);
             if !bottom_pane_ids(state, cx).is_empty() {
                 state.store.regions.bottom_opened = true;
             }
@@ -416,6 +422,7 @@ impl Shell {
             work_sidebars: HashMap::new(),
             work_subscriptions: HashMap::new(),
             branch_reviews: HashMap::new(),
+            sidebar_width,
             #[cfg(test)]
             dock_fixture: false,
         };
@@ -670,6 +677,7 @@ impl Shell {
                     .map(|(id, p)| (id.clone(), p.downgrade())),
             );
             load_workspace_layout(&mut state, window, cx)?;
+            state.store.regions.resize_sidebar(self.sidebar_width);
             self._subscriptions.push(subscribe_git(&state, window, cx));
             self._subscriptions.push(subscribe_dock(&state, cx));
             self._subscriptions
@@ -3965,26 +3973,28 @@ impl Render for Shell {
             .on_mouse_move(
                 cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
                     if let Some((bottom, start, original)) = this.resize {
-                        let active = this.active_workspace(cx);
-                        if let Some(state) = this
-                            .workspaces
-                            .iter_mut()
-                            .find(|w| Some(w.workspace.id) == active)
-                        {
-                            if bottom {
+                        if bottom {
+                            let active = this.active_workspace(cx);
+                            if let Some(state) = this
+                                .workspaces
+                                .iter_mut()
+                                .find(|w| Some(w.workspace.id) == active)
+                            {
                                 state.store.regions.bottom_height =
                                     (original + start - f32::from(event.position.y)).clamp(
                                         32.,
                                         (f32::from(window.viewport_size().height) - 140.).max(32.),
                                     );
-                            } else {
-                                state
-                                    .store
-                                    .regions
-                                    .resize_sidebar(original + f32::from(event.position.x) - start);
                             }
-                            cx.notify();
+                        } else {
+                            this.sidebar_width = layout::clamp_sidebar(
+                                original + f32::from(event.position.x) - start,
+                            );
+                            for workspace in &mut this.workspaces {
+                                workspace.store.regions.resize_sidebar(this.sidebar_width);
+                            }
                         }
+                        cx.notify();
                     }
                 }),
             )
