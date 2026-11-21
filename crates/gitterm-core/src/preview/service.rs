@@ -1,0 +1,494 @@
+//! What the shared task host's services may do, per operation and effect.
+//!
+//! A [`ServiceContext`] is built once at composition and carries the state
+//! root, the task MCP namespace, the browser profile directory and the child
+//! environment rule. Hosts ask it before dispatching a task MCP operation and
+//! again before executing each reducer effect or runner, because a denied
+//! dispatch alone does not stop effects that start from restored or imported
+//! state (queue promotion, automatic delivery, restore).
+//!
+//! The mode is fixed by the constructor. Nothing here reads an environment
+//! variable to choose it, so no inherited value can widen a preview context.
+use super::{absolute, refuse, Effect as ProcessEffect, Preview};
+use crate::config_paths::CONFIG_DIR_ENV;
+use crate::session;
+use crate::task_commands::TaskMutationAction;
+use std::{
+    ffi::{OsStr, OsString},
+    fmt, fs, io,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+/// Every inherited variable with this prefix is GitTerm service or identity
+/// state (task/browser MCP URL and token, agent address and token, config
+/// dir, instance id, Chrome path, worker pid file) and never reaches a child.
+pub const SCRUBBED_ENV_PREFIX: &str = "GITTERM_";
+
+/// A disposable fixture root carries this regular file.
+pub const FIXTURE_MARKER: &str = ".gitterm-fixture-root";
+/// Provider and browser-control homes a preview or fixture child must not
+/// share with production: they are removed and the provider homes are
+/// pinned under the preview state root.
+pub const PROVIDER_HOME_ENV: [(&str, &str); 2] = [
+    ("CODEX_HOME", "provider-homes/codex"),
+    ("CLAUDE_CONFIG_DIR", "provider-homes/claude"),
+];
+pub const SCRUBBED_PREVIEW_ENV_PREFIXES: [&str; 1] = ["AGENT_BROWSER_"];
+
+/// The same wording the preview UI uses for a disabled action.
+pub fn preview_notice(label: &str) -> String {
+    format!("{label} · not available in preview")
+}
+
+/// What an operation or effect does, which decides whether a context allows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    /// Stage 1–3 terminal and Git authority, unchanged by this gate.
+    Existing,
+    /// Reads state or replies; writes nothing durable and starts nothing.
+    Read,
+    /// Writes task, delegation, worktree or merge-plan state.
+    Write,
+    /// Starts, stops, signals or delivers input to a harness or helper process.
+    Process,
+    /// Acts outside any fixture target: launches Chrome, writes browser
+    /// scratch/config, restores imported sessions or publishes to a remote.
+    Outside,
+}
+
+/// One classified operation or effect: the label for its notice, and its access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Class {
+    pub label: &'static str,
+    pub access: Access,
+}
+
+const fn class(label: &'static str, access: Access) -> Class {
+    Class { label, access }
+}
+
+/// A refusal carrying the user-facing notice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Denied {
+    notice: String,
+}
+
+impl Denied {
+    pub fn notice(&self) -> &str {
+        &self.notice
+    }
+}
+
+impl fmt::Display for Denied {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.notice)
+    }
+}
+
+impl std::error::Error for Denied {}
+
+/// Runner boundaries that no operation or reducer effect carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunnerEffect {
+    /// The injected `html_preview` runner, which launches headless Chrome.
+    HtmlPreview,
+    /// The task MCP `/notify` ingress, before it dispatches a session event.
+    NotifyIngress,
+    /// Restarting, reattaching or re-arming deadlines of a restored or
+    /// imported session.
+    RestoreSession,
+    /// Starting a queued task session or delegation once capacity frees.
+    QueuePromotion,
+    /// Delivering a finished result or objective to a chat without a user action.
+    AutomaticDelivery,
+}
+
+/// The browser crate maps each of its tools to one of these with an
+/// exhaustive match, and passes the tool name as the label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserAccess {
+    /// Status, targets, snapshots, DOM/node inspection, console, network,
+    /// diagnostics, viewport, waits and captures returned as content.
+    Read,
+    /// Opening Chrome or a target.
+    Launch,
+    /// Navigating, clicking, typing, pressing, scrolling, resizing,
+    /// reloading, focusing/closing targets, disconnecting.
+    Interact,
+    /// agent-browser scratch files, engine config or network capture on disk.
+    Scratch,
+}
+
+pub fn classify_runner(effect: RunnerEffect) -> Class {
+    match effect {
+        RunnerEffect::HtmlPreview => class("html_preview", Access::Outside),
+        RunnerEffect::NotifyIngress => class("notify", Access::Write),
+        RunnerEffect::RestoreSession => class("Restore session", Access::Outside),
+        RunnerEffect::QueuePromotion => class("Start queued session", Access::Process),
+        RunnerEffect::AutomaticDelivery => class("Automatic delivery", Access::Process),
+    }
+}
+
+pub fn classify_browser(access: BrowserAccess) -> Access {
+    match access {
+        BrowserAccess::Read => Access::Read,
+        BrowserAccess::Launch | BrowserAccess::Interact | BrowserAccess::Scratch => Access::Outside,
+    }
+}
+
+/// The preview's existing process effects keep their stage 1–3 meaning.
+pub fn classify_process(effect: ProcessEffect) -> Class {
+    match effect {
+        ProcessEffect::Terminal => class("Terminal", Access::Existing),
+        ProcessEffect::Git => class("Git", Access::Existing),
+        ProcessEffect::Snapshot => class("Snapshot", Access::Write),
+        ProcessEffect::MutateHistory => class("Edit history", Access::Write),
+        ProcessEffect::Agent => class("Agent", Access::Process),
+        ProcessEffect::Worker => class("Worker", Access::Process),
+        ProcessEffect::Helper => class("Helper", Access::Process),
+        ProcessEffect::Resume => class("Resume session", Access::Outside),
+        ProcessEffect::RestoreProcess => class("Restore process", Access::Outside),
+    }
+}
+
+/// Labels are the MCP tool names, so the notice reads "<tool> · not available in preview".
+#[cfg(feature = "runtime")]
+pub fn classify_operation(operation: &crate::task_mcp::TaskControlOperation) -> Class {
+    use crate::task_mcp::TaskControlOperation as Op;
+    match operation {
+        Op::PlanLimits => class("plan_limits", Access::Read),
+        // Content goes to the caller's chat; the host keeps it unsaved in preview.
+        Op::HtmlRender(_) => class("html_render", Access::Read),
+        Op::List(_) => class("task_list", Access::Read),
+        Op::Get(_) => class("task_get", Access::Read),
+        Op::GetDelegation(_) => class("delegation_get", Access::Read),
+        Op::ListDelegations(_) => class("delegation_list", Access::Read),
+        Op::MergePlanGet => class("merge_plan_get", Access::Read),
+        Op::Create(_) => class("task_create", Access::Write),
+        Op::UpdateHandoff(_) => class("task_update_handoff", Access::Write),
+        // Every notify type, not only turn completion: the ingress is closed.
+        Op::SessionEvent(_) => class("notify", Access::Write),
+        Op::MergePlanSet(_) => class("merge_plan_set", Access::Write),
+        Op::LaunchSession(_) => class("task_launch_session", Access::Process),
+        Op::RequestReview(_) => class("review_request", Access::Process),
+        Op::RequestConsult(_) => class("consult_request", Access::Process),
+        Op::DelegateTask(_) => class("delegate_task", Access::Process),
+    }
+}
+
+#[cfg(feature = "runtime")]
+pub fn classify_delegation_effect(effect: &crate::delegation_state::Effect) -> Class {
+    use crate::delegation_state::Effect as E;
+    match effect {
+        E::Check { .. } => class("Check delegation checkout", Access::Read),
+        E::Refresh(_) => class("Refresh delegation", Access::Read),
+        E::Rejected(_) => class("Reject delegation", Access::Read),
+        E::AlreadyDelivered => class("Delivery", Access::Read),
+        E::Insert { .. } => class("Save delegation", Access::Write),
+        E::StartRejected { .. } => class("Save delegation", Access::Write),
+        E::RecordStarted { .. } => class("Save delegation", Access::Write),
+        E::RecordCompletion(_) => class("Save delegation", Access::Write),
+        E::PersistDismiss { .. } => class("Dismiss delegation", Access::Write),
+        // Only queue admission emits CheckStart: it is the promotion step.
+        E::CheckStart { .. } => class("Start queued delegation", Access::Process),
+        E::Start(_) => class("Start delegation", Access::Process),
+        E::Abort(_) => class("Stop delegation", Access::Process),
+        E::Flush(_) => class("Deliver results", Access::Process),
+        E::Deliver { .. } => class("Deliver results", Access::Process),
+    }
+}
+
+pub fn classify_task_action(action: &TaskMutationAction) -> Class {
+    use TaskMutationAction as A;
+    match action {
+        A::None => class("Task", Access::Read),
+        // `git status` without --no-optional-locks can rewrite the checkout's
+        // index, so inspection is a write until that path is proven read-only.
+        A::InspectCleanup { .. } => class("Inspect worktree", Access::Write),
+        A::ConfirmPublish { .. } => class("Publish", Access::Read),
+        A::WorkerAuthorityChecked { .. } => class("Check worker", Access::Read),
+        A::PrepareTask(_) => class("Create task", Access::Write),
+        A::PersistPreparing { .. } => class("Save task", Access::Write),
+        A::PersistPreparation { .. } => class("Save task", Access::Write),
+        A::PersistDelivery { .. } => class("Save delivery", Access::Write),
+        A::PersistHandoff { .. } => class("Save handoff", Access::Write),
+        A::ArchiveTask { .. } => class("Close task", Access::Write),
+        A::RemoveWorktree { .. } => class("Remove worktree", Access::Write),
+        A::ClearWorktree { .. } => class("Remove worktree", Access::Write),
+        A::QueueSession { .. } => class("Queue session", Access::Write),
+        A::PersistWorkerPreparation { .. } => class("Save task", Access::Write),
+        A::PersistWorkerPreparationFailure { .. } => class("Save task", Access::Write),
+        A::PersistWorkerCheckoutReuse { .. } => class("Save task", Access::Write),
+        A::Session(effect) => classify_session_effect(effect),
+        A::LaunchSession { .. } => class("Launch session", Access::Process),
+        A::StartWorker { .. } => class("Start worker", Access::Process),
+        A::Publish { .. } => class("Publish", Access::Outside),
+    }
+}
+
+pub fn classify_session_effect(effect: &session::Effect) -> Class {
+    use session::Effect as S;
+    match effect {
+        S::None => class("Session", Access::Read),
+        S::ConfirmClose(_) => class("Close session", Access::Read),
+        S::Close(_) => class("Close session", Access::Process),
+        S::InterruptHarness(_) => class("Stop turn", Access::Process),
+        S::CancelTaskTurn(_) => class("Stop turn", Access::Process),
+    }
+}
+
+/// The task MCP listener identity and bearer secret this context's server uses.
+#[derive(Clone)]
+pub struct TaskMcpNamespace {
+    instance_id: String,
+    token: String,
+}
+
+impl TaskMcpNamespace {
+    fn fresh(instance_id: String) -> Self {
+        let token = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        Self { instance_id, token }
+    }
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+}
+
+impl fmt::Debug for TaskMcpNamespace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskMcpNamespace")
+            .field("instance_id", &self.instance_id)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+enum Mode {
+    Preview(Arc<Preview>),
+    FixtureLaunch {
+        preview: Arc<Preview>,
+        fixtures: Vec<PathBuf>,
+    },
+    Production,
+}
+
+/// Composition-time authority for the shared task host's services.
+#[derive(Debug)]
+pub struct ServiceContext {
+    mode: Mode,
+    root: PathBuf,
+    task_mcp: TaskMcpNamespace,
+}
+
+impl ServiceContext {
+    /// Normal preview: reads are allowed; every write, launch and outside
+    /// effect is denied. The root is the already validated preview root.
+    pub fn preview(preview: Arc<Preview>) -> io::Result<Self> {
+        let root = preview.scoped(preview.root())?;
+        Ok(Self {
+            mode: Mode::Preview(preview),
+            root,
+            task_mcp: TaskMcpNamespace::fresh(preview_instance_id()),
+        })
+    }
+
+    /// Test/acceptance only: also allows writes and process effects whose
+    /// resolved target lies in one of `fixtures`. Each fixture must resolve
+    /// to a directory under the system temp dir, outside every protected root,
+    /// holding a regular [`FIXTURE_MARKER`] file. Normal preview startup never
+    /// calls this; a [`ServiceContext::preview`] value is never widened by it.
+    pub fn fixture_launch(
+        preview: Arc<Preview>,
+        fixtures: impl IntoIterator<Item = PathBuf>,
+    ) -> io::Result<Self> {
+        let temp = fs::canonicalize(std::env::temp_dir())?;
+        let fixtures = fixtures
+            .into_iter()
+            .map(|path| fixture_root(&preview, &temp, &path))
+            .collect::<io::Result<Vec<_>>>()?;
+        if fixtures.is_empty() {
+            return Err(refuse("fixture launch needs at least one fixture root"));
+        }
+        let root = preview.scoped(preview.root())?;
+        Ok(Self {
+            mode: Mode::FixtureLaunch { preview, fixtures },
+            root,
+            task_mcp: TaskMcpNamespace::fresh(preview_instance_id()),
+        })
+    }
+
+    /// Cutover only, when Iced no longer runs: the real V6 root with every
+    /// operation and effect allowed. Deliberately no protected-root check.
+    pub fn production(root: &Path, instance_id: impl Into<String>) -> io::Result<Self> {
+        absolute(root)?;
+        Ok(Self {
+            mode: Mode::Production,
+            root: root.to_path_buf(),
+            task_mcp: TaskMcpNamespace::fresh(instance_id.into()),
+        })
+    }
+
+    pub fn is_preview(&self) -> bool {
+        !matches!(self.mode, Mode::Production)
+    }
+    pub fn state_root(&self) -> &Path {
+        &self.root
+    }
+    pub fn task_mcp(&self) -> &TaskMcpNamespace {
+        &self.task_mcp
+    }
+    /// The same relative name as production's `browser-profile`, so cutover
+    /// changes only the root. In preview it is checked to stay inside it.
+    pub fn browser_profile_dir(&self) -> io::Result<PathBuf> {
+        let dir = self.root.join("browser-profile");
+        match &self.mode {
+            Mode::Preview(preview) | Mode::FixtureLaunch { preview, .. } => preview.scoped(&dir),
+            Mode::Production => Ok(dir),
+        }
+    }
+
+    /// The environment for a child: every inherited `GITTERM_*` variable is
+    /// removed and the V6 config dir is pinned to this root, because legacy
+    /// config discovery falls back to the real home when it is absent. The
+    /// host adds its own MCP URL/token afterwards. Spawn with `env_clear()`
+    /// and this list, so nothing else is inherited behind it.
+    pub fn child_env(
+        &self,
+        inherited: impl IntoIterator<Item = (OsString, OsString)>,
+    ) -> Vec<(OsString, OsString)> {
+        let preview = self.is_preview();
+        let mut env: Vec<_> = inherited
+            .into_iter()
+            .filter(|(name, _)| !(is_scrubbed(name) || (preview && is_preview_scrubbed(name))))
+            .collect();
+        env.push((CONFIG_DIR_ENV.into(), self.root.clone().into_os_string()));
+        if preview {
+            // shortcut: HOME itself is still inherited (shells and git need it);
+            // tools that write under ~ outside these homes are not isolated yet.
+            // Revisit when H5b wires real preview children.
+            for (name, dir) in PROVIDER_HOME_ENV {
+                env.push((name.into(), self.root.join(dir).into_os_string()));
+            }
+        }
+        env
+    }
+
+    pub fn authorize(&self, class: Class, target: Option<&Path>) -> Result<(), Denied> {
+        self.decide(class.label, class.access, target)
+    }
+
+    /// Check before dispatch. `target` is the checkout the operation acts in,
+    /// when the host knows it; only a fixture-launch context uses it.
+    #[cfg(feature = "runtime")]
+    pub fn operation(
+        &self,
+        operation: &crate::task_mcp::TaskControlOperation,
+        target: Option<&Path>,
+    ) -> Result<(), Denied> {
+        self.authorize(classify_operation(operation), target)
+    }
+
+    #[cfg(feature = "runtime")]
+    pub fn delegation_effect(
+        &self,
+        effect: &crate::delegation_state::Effect,
+        target: Option<&Path>,
+    ) -> Result<(), Denied> {
+        self.authorize(classify_delegation_effect(effect), target)
+    }
+
+    pub fn task_action(
+        &self,
+        action: &TaskMutationAction,
+        target: Option<&Path>,
+    ) -> Result<(), Denied> {
+        self.authorize(classify_task_action(action), target)
+    }
+
+    pub fn process(&self, effect: ProcessEffect, target: Option<&Path>) -> Result<(), Denied> {
+        self.authorize(classify_process(effect), target)
+    }
+
+    pub fn runner(&self, effect: RunnerEffect, target: Option<&Path>) -> Result<(), Denied> {
+        self.authorize(classify_runner(effect), target)
+    }
+
+    /// `tool` is the browser MCP tool name, used as the notice label.
+    pub fn browser(&self, tool: &str, access: BrowserAccess) -> Result<(), Denied> {
+        self.decide(tool, classify_browser(access), None)
+    }
+
+    fn decide(&self, label: &str, access: Access, target: Option<&Path>) -> Result<(), Denied> {
+        let allowed = match (&self.mode, access) {
+            (Mode::Production, _) | (_, Access::Existing | Access::Read) => true,
+            (Mode::Preview(_), _) | (Mode::FixtureLaunch { .. }, Access::Outside) => false,
+            (Mode::FixtureLaunch { preview, fixtures }, Access::Write | Access::Process) => target
+                .and_then(|target| preview.protected().check(target).ok())
+                .is_some_and(|actual| fixtures.iter().any(|root| actual.starts_with(root))),
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(Denied {
+                notice: preview_notice(label),
+            })
+        }
+    }
+}
+
+fn is_preview_scrubbed(name: &OsStr) -> bool {
+    name.to_str().is_none_or(|name| {
+        PROVIDER_HOME_ENV.iter().any(|(env, _)| name == *env)
+            || SCRUBBED_PREVIEW_ENV_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+    })
+}
+
+pub fn is_scrubbed(name: &OsStr) -> bool {
+    name.to_str()
+        .is_none_or(|name| name.starts_with(SCRUBBED_ENV_PREFIX))
+}
+
+fn preview_instance_id() -> String {
+    format!("gpui-preview-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// The resolved path decides, so a link inside the temp dir to a real
+/// checkout is refused.
+///
+/// shortcut: only the checkout path is resolved. A fixture whose `.git` file
+/// or `commondir` points into protected state (e.g. `--separate-git-dir`)
+/// is not detected, and the preview root is not re-resolved when child env
+/// is exported, so a later swap of the root for a link is not caught there.
+/// Both need a deliberately crafted setup (Codex review 9f9354eb F3/F4);
+/// validate Git admin dirs and re-check the root when H5b wires hosting.
+fn fixture_root(preview: &Preview, temp: &Path, path: &Path) -> io::Result<PathBuf> {
+    let actual = preview.protected().check(path)?;
+    if actual == temp || !actual.starts_with(temp) || !fs::symlink_metadata(&actual)?.is_dir() {
+        return Err(refuse(format!(
+            "fixture root is not a directory under the temp dir: {}",
+            path.display()
+        )));
+    }
+    if !fs::symlink_metadata(actual.join(FIXTURE_MARKER))?.is_file() {
+        return Err(refuse(format!(
+            "fixture marker is not a regular file: {}",
+            path.display()
+        )));
+    }
+    Ok(actual)
+}
+
+#[cfg(test)]
+#[path = "service_tests.rs"]
+mod tests;
