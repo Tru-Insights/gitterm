@@ -3206,14 +3206,101 @@ fn h11_delegation_fold_shows_kind_model_target_state_marker_and_toggles(cx: &mut
     assert!(open(&chat, cx));
 }
 
-#[gpui::test]
-fn c04_queued_withdraw_is_a_times_button_with_the_harness_tooltip(cx: &mut TestAppContext) {
-    use crate::composer::QueuedRow;
-    use gitterm_core::chat::state::PromptStatus;
+use gitterm_core::chat::types::MessageState;
+/// A chat streaming a turn, with `synthetic-message` queued behind it, as
+/// the shell drives it: core state through the adapter, presented to the view.
+struct QueuedChat {
+    adapter: crate::adapter::ChatAdapter,
+    stamp: gitterm_core::chat::state::RuntimeStamp,
+    target: gitterm_core::session::Target,
+    intents: Rc<std::cell::RefCell<Vec<ChatIntent>>>,
+}
+impl QueuedChat {
+    fn facts(&self) -> crate::adapter::Admission {
+        use gitterm_core::session;
+        crate::adapter::Admission {
+            authority: session::State {
+                target: self.target.clone(),
+                control: session::TurnControl::Harness,
+                task_live: false,
+                last_tab: false,
+            },
+            config: gitterm_core::chat::types::AgentBackendConfig::Claude {
+                model: String::new(),
+                permission_mode: Some("default".into()),
+                effort: None,
+            },
+            process_running: true,
+            just_spawned: false,
+            message_id: "synthetic-message".into(),
+        }
+    }
+    fn receive(
+        &mut self,
+        event: HarnessEvent,
+        chat: &Entity<ChatView>,
+        cx: &mut VisualTestContext,
+    ) {
+        let update = self
+            .adapter
+            .receive(
+                &self.stamp,
+                &self.target,
+                gitterm_core::chat::state::AgentEvent::Harness(event),
+                None,
+                |_, _| {},
+            )
+            .unwrap();
+        self.present(update, chat, cx);
+    }
+    fn run(&mut self, intent: ChatIntent, chat: &Entity<ChatView>, cx: &mut VisualTestContext) {
+        let prepared = self.adapter.admit(intent, self.facts()).unwrap();
+        let (_, update) = self
+            .adapter
+            .execute(prepared, &self.target, 1000, |_| Ok(()));
+        self.present(update, chat, cx);
+    }
+    fn present(
+        &self,
+        update: crate::adapter::Update,
+        chat: &Entity<ChatView>,
+        cx: &mut VisualTestContext,
+    ) {
+        chat.update_in(cx, |view, window, cx| {
+            view.present(&self.stamp, self.adapter.state(), update, window, cx)
+        });
+        draw(cx);
+    }
+    fn lifecycle(
+        &mut self,
+        state: MessageState,
+        chat: &Entity<ChatView>,
+        cx: &mut VisualTestContext,
+    ) {
+        self.receive(
+            HarnessEvent::MessageLifecycle {
+                id: "synthetic-message".into(),
+                state,
+            },
+            chat,
+            cx,
+        );
+    }
+}
+fn queued_chat(cx: &mut TestAppContext) -> (Entity<ChatView>, &mut VisualTestContext, QueuedChat) {
     let (chat, cx) = setup(vec![], cx);
+    let mut adapter = crate::adapter::ChatAdapter::default();
+    let target = gitterm_core::session::Target {
+        tab_id: 1,
+        session_uid: "synthetic".into(),
+        task_id: None,
+        task_session_id: None,
+    };
+    let stamp = adapter.begin_runtime(target.clone());
     let intents = Rc::new(std::cell::RefCell::new(Vec::new()));
     let captured = intents.clone();
     chat.update_in(cx, |view, _, cx| {
+        view.set_backend(gitterm_core::chat::types::AgentBackend::Claude, cx);
         view.set_read_only(None, cx);
         view.set_intent_callback(
             Rc::new(move |intent, _| {
@@ -3222,34 +3309,115 @@ fn c04_queued_withdraw_is_a_times_button_with_the_harness_tooltip(cx: &mut TestA
             }),
             cx,
         );
-        view.composer_state.backend = Some(gitterm_core::chat::types::AgentBackend::Claude);
-        view.composer_state.queue = vec![QueuedRow {
-            id: "m1".into(),
-            text: "later".into(),
-            status: PromptStatus::Queued,
-            withdraw_pending: false,
-        }];
-        assert_eq!(
-            view.composer_state.withdraw_tooltip(),
-            "Withdraw this message (Claude keeps working)"
-        );
     });
-    draw(cx);
-    click(cx, "withdraw-m1");
-    draw(cx);
-    assert_eq!(
-        *intents.borrow(),
-        [ChatIntent::Withdraw {
-            message_id: "m1".into()
-        }]
+    let mut queued = QueuedChat {
+        adapter,
+        stamp,
+        target,
+        intents,
+    };
+    queued.receive(
+        HarnessEvent::TurnStarted {
+            session_id: None,
+            model: None,
+        },
+        &chat,
+        cx,
     );
-    // Preview gating: a read-only chat sends nothing.
+    queued.run(
+        ChatIntent::Send {
+            text: "later".into(),
+            images: vec![],
+        },
+        &chat,
+        cx,
+    );
+    queued.lifecycle(MessageState::Queued, &chat, cx);
+    (chat, cx, queued)
+}
+fn bubble_tag(
+    chat: &Entity<ChatView>,
+    cx: &mut VisualTestContext,
+) -> Option<crate::composer::QueuedTag> {
+    chat.read_with(cx, |view, cx| {
+        let index = view
+            .model
+            .rows
+            .iter()
+            .position(|row| row.prompt_id.as_deref() == Some("synthetic-message"))
+            .expect("queued bubble");
+        view.row_views[index]
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .queued
+            .clone()
+    })
+}
+
+#[gpui::test]
+fn queued_bubble_shows_withdraw(cx: &mut TestAppContext) {
+    let (chat, cx, _queued) = queued_chat(cx);
+    let tag = bubble_tag(&chat, cx).expect("queued tag on the bubble");
+    assert_eq!(tag.label, "Queued · Claude reads it at its next step");
+    assert_eq!(tag.withdraw, Some(true));
+    assert_eq!(tag.tooltip, "Withdraw this message (Claude keeps working)");
+    // On the bubble, as Iced: the composer has no queue strip.
+    let bubble = cx.debug_bounds("transcript-row-0").expect("bubble");
+    let times = cx.debug_bounds("withdraw-synthetic-message").expect("×");
+    assert!(bubble.contains(&times.center()));
+    assert!(cx.debug_bounds("composer-queue").is_none());
+    let input = cx.debug_bounds("composer-input").expect("composer");
+    assert!(!input.contains(&times.center()));
+}
+
+#[gpui::test]
+fn withdraw_from_bubble_removes_queued_message(cx: &mut TestAppContext) {
+    let (chat, cx, mut queued) = queued_chat(cx);
+    click(cx, "withdraw-synthetic-message");
+    draw(cx);
+    let intent = ChatIntent::Withdraw {
+        message_id: "synthetic-message".into(),
+    };
+    assert_eq!(*queued.intents.borrow(), std::slice::from_ref(&intent));
+    queued.run(intent, &chat, cx);
+    let tag = bubble_tag(&chat, cx).unwrap();
+    assert_eq!(tag.label, "Withdrawing…");
+    assert_eq!(tag.withdraw, Some(false));
+    queued.lifecycle(MessageState::Cancelled, &chat, cx);
+    assert_eq!(bubble_tag(&chat, cx), None);
+    assert!(cx.debug_bounds("withdraw-synthetic-message").is_none());
+}
+
+#[gpui::test]
+fn delivered_message_has_no_withdraw(cx: &mut TestAppContext) {
+    let (chat, cx, mut queued) = queued_chat(cx);
+    assert!(cx.debug_bounds("withdraw-synthetic-message").is_some());
+    queued.lifecycle(MessageState::Started, &chat, cx);
+    assert_eq!(bubble_tag(&chat, cx), None);
+    assert!(cx.debug_bounds("withdraw-synthetic-message").is_none());
+    click(cx, "transcript-row-0");
+    assert!(
+        queued
+            .intents
+            .borrow()
+            .iter()
+            .all(|intent| !matches!(intent, ChatIntent::Withdraw { .. }))
+    );
+}
+
+#[gpui::test]
+fn read_only_withdraw_inert(cx: &mut TestAppContext) {
+    let (chat, cx, queued) = queued_chat(cx);
     chat.update_in(cx, |view, _, cx| {
         view.set_read_only(Some("preview".into()), cx)
     });
     draw(cx);
-    click(cx, "withdraw-m1");
-    assert_eq!(intents.borrow().len(), 1);
+    assert_eq!(bubble_tag(&chat, cx).unwrap().withdraw, Some(false));
+    let sent = queued.intents.borrow().len();
+    click(cx, "withdraw-synthetic-message");
+    draw(cx);
+    assert_eq!(queued.intents.borrow().len(), sent);
 }
 
 #[gpui::test]
