@@ -2842,7 +2842,7 @@ impl Shell {
                 };
                 view.read(cx)
                     .focus_handle()
-                    .is_focused(window)
+                    .contains_focused(window, cx)
                     .then(|| view.clone())
             })
     }
@@ -3113,9 +3113,7 @@ impl Shell {
             .on_action(cx.listener(|this, _: &ToggleSearch, w, cx| {
                 if let Some(view) = this.focused_terminal(w, cx) {
                     if view.read(cx).is_find_open() {
-                        w.defer(cx, |w, cx| {
-                            w.dispatch_keystroke(gpui::Keystroke::parse("escape").unwrap(), cx);
-                        });
+                        view.update(cx, |v, cx| v.close_find(w, cx));
                     } else {
                         view.update(cx, |v, cx| v.open_find(cx));
                     }
@@ -3125,8 +3123,7 @@ impl Shell {
             .on_action(cx.listener(|this, _: &SearchNext, w, cx| {
                 if let Some(view) = this.focused_terminal(w, cx) {
                     view.update(cx, |v, cx| {
-                        v.backend_mut().next_find(false);
-                        cx.notify();
+                        v.navigate_find(false, cx);
                     });
                 }
             }))
@@ -3492,6 +3489,17 @@ impl Shell {
         cx.notify();
     }
     fn escape(&mut self, _: &app_menus::Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.task_switcher.is_none()
+            && self.session_picker.is_none()
+            && self.park_sheet.is_none()
+            && self.new_work_sheet.is_none()
+            && !Self::has_dialog(window, cx)
+            && self
+                .bottom
+                .update(cx, |bottom, cx| bottom.dismiss_quick_picker(cx))
+        {
+            return;
+        }
         if self.plans_open {
             self.toggle_plans(window, cx);
             return;
@@ -3564,6 +3572,18 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         if self.task_switcher.is_some() {
+            return;
+        }
+        if event.keystroke.key == "escape"
+            && self.session_picker.is_none()
+            && self.park_sheet.is_none()
+            && self.new_work_sheet.is_none()
+            && !Self::has_dialog(window, cx)
+            && self
+                .bottom
+                .update(cx, |bottom, cx| bottom.dismiss_quick_picker(cx))
+        {
+            cx.stop_propagation();
             return;
         }
         if event.keystroke.key == "escape"
