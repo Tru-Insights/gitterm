@@ -247,6 +247,8 @@ pub struct WorkSidebar {
     loaded_at: Option<std::time::Instant>,
     focus: Focus,
     error: Option<String>,
+    /// The checkout whose review is shown, as Iced's `open_review_checkout`.
+    review_checkout: Option<PathBuf>,
 }
 
 impl WorkSidebar {
@@ -274,6 +276,18 @@ impl WorkSidebar {
             loaded_at: None,
             focus: Default::default(),
             error: None,
+            review_checkout: None,
+        }
+    }
+
+    pub fn review_checkout(&self) -> Option<&std::path::Path> {
+        self.review_checkout.as_deref()
+    }
+
+    pub fn set_review_checkout(&mut self, checkout: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.review_checkout != checkout {
+            self.review_checkout = checkout;
+            cx.notify();
         }
     }
 
@@ -1289,7 +1303,11 @@ impl WorkSidebar {
             40,
         ));
         row.indent = true;
-        row.selected = self.workspace.selected_checkout.as_ref() == Some(&branch.owned.checkout);
+        row.selected = self
+            .review_checkout
+            .as_ref()
+            .or(self.workspace.selected_checkout.as_ref())
+            == Some(&branch.owned.checkout);
         row.fold = Some(fold);
         row.expanded = expanded;
         row.action = Some(Action::Emit(WorkSidebarOutcome::OpenReview {
@@ -1491,19 +1509,13 @@ impl WorkSidebar {
         }
     }
 
-    fn button(&self, id: String, control: Control, wrap: bool, cx: &Context<Self>) -> Button {
+    fn button(&self, id: String, control: Control, repo_row: bool, cx: &Context<Self>) -> Button {
         let p = crate::theme::Palette::current(cx);
         let run = matches!(
             control.action,
             Action::Emit(WorkSidebarOutcome::RunRepoCommand { .. })
         );
-        let color = match control.action {
-            Action::Emit(WorkSidebarOutcome::RunRepoCommand { .. }) => p.green,
-            Action::Edit(_)
-            | Action::Toggle(_)
-            | Action::Emit(WorkSidebarOutcome::RemoveRepo { .. }) => p.muted,
-            _ => p.blue,
-        };
+        let color = control_color(&control.action, repo_row, &p);
         let tooltip = match control.label.as_str() {
             "↗" => "Open chat",
             "×" => "Remove or dismiss",
@@ -1552,17 +1564,38 @@ impl WorkSidebar {
                 );
             }))
             .map(|button| {
-                if wrap {
+                if repo_row {
+                    // Repo-row slots stay on one line; only the command may
+                    // truncate, after the name, when the sidebar is too narrow.
                     button
-                        .flex_shrink_1()
-                        .min_w_0()
                         .h_auto()
+                        .whitespace_nowrap()
                         .accessibility_label(control.label.clone())
-                        .child(div().min_w_0().whitespace_normal().child(control.label))
+                        .when(run, |button| button.flex_shrink_1().min_w_0())
+                        .child(
+                            div()
+                                .min_w_0()
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(control.label),
+                        )
                 } else {
                     button.label(control.label)
                 }
             })
+    }
+}
+
+fn control_color(action: &Action, repo_row: bool, p: &crate::theme::Palette) -> u32 {
+    match action {
+        Action::Emit(WorkSidebarOutcome::RunRepoCommand { .. }) => p.green,
+        Action::Edit(_)
+        | Action::Toggle(_)
+        | Action::Emit(WorkSidebarOutcome::RemoveRepo { .. }) => p.muted,
+        // Iced draws the repo row's Open in editor in text_muted.
+        Action::Emit(WorkSidebarOutcome::OpenEditor { .. }) if repo_row => p.muted,
+        _ => p.blue,
     }
 }
 
@@ -1669,10 +1702,13 @@ impl Render for WorkSidebar {
                 label = label.text_color(rgb(if row.small { p.subtext0 } else { p.muted }));
             }
             if repo {
+                // One line like Iced's Shrink name slot; a narrow sidebar truncates it.
                 label = label
                     .font_family("Menlo")
                     .text_size(px(12.))
-                    .whitespace_normal();
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis();
             }
             if row.heading || repo {
                 label = label.font_weight(gpui::FontWeight::BOLD);
@@ -1853,7 +1889,9 @@ impl Render for WorkSidebar {
                 }))
                 .child(line);
             if row.selected {
-                block = block.bg(rgb(p.surface));
+                block = block
+                    .bg(rgb(p.surface))
+                    .debug_selector(|| format!("work-selected-{index}"));
             }
             if row.indent {
                 block = block.ml_2();

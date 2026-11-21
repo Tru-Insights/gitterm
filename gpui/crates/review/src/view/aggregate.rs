@@ -215,10 +215,12 @@ impl AggregateView {
             .take(range.len())
             .map(|(old, new, sign, text, color)| {
                 div()
-                    .h(px(20.))
+                    .h(px(18.))
                     .flex()
                     .gap_3()
-                    .font_family("monospace")
+                    .font_family(MONO_FONT)
+                    .text_size(px(12.))
+                    .line_height(px(18.))
                     .whitespace_nowrap()
                     .text_color(rgb(color))
                     .child(
@@ -239,6 +241,9 @@ impl AggregateView {
             .collect()
     }
 }
+
+/// Code surfaces are monospace like Iced's `--mono`; "monospace" is not a macOS family.
+pub(crate) const MONO_FONT: &str = "Menlo";
 
 #[cfg(test)]
 mod tests;
@@ -414,7 +419,7 @@ impl Render for AggregateView {
             sidebar = sidebar.child(
                 ListItem::new(("aggregate-file", index))
                     .accessibility_label(label.clone())
-                    .child(label)
+                    .child(div().font_family(MONO_FONT).text_size(px(12.)).child(label))
                     .selected(self.selected.as_ref() == Some(&row.file.path))
                     .on_click(cx.listener(move |view, _, _, cx| {
                         view.selected = Some(path.clone());
@@ -443,6 +448,8 @@ impl Render for AggregateView {
                     .child(
                         div()
                             .flex_1()
+                            .font_family(MONO_FONT)
+                            .text_size(px(12.5))
                             .child(format!("{title}  +{} −{}", file.additions, file.deletions)),
                     )
                     .child(

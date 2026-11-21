@@ -253,6 +253,42 @@ fn diff_navigation_back_and_edit_notice_are_mounted(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn work_branch_review_marks_the_sidebar_checkout_until_the_review_closes(cx: &mut TestAppContext) {
+    let (_folder, _config, shell, cx) = fixture(cx);
+    let checkout = PathBuf::from("/private/tmp/gt-branch-selection-fixture");
+    let marked = |cx: &mut VisualTestContext| {
+        draw(cx);
+        cx.read(|cx| {
+            shell
+                .read(cx)
+                .work_sidebars
+                .get(&WorkspaceId(1))
+                .and_then(|sidebar| sidebar.read(cx).review_checkout().map(PathBuf::from))
+        })
+    };
+    assert_eq!(marked(cx), None);
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.work_outcome(
+                &work_sidebar::WorkSidebarOutcome::OpenReview {
+                    checkout: checkout.clone(),
+                    vs_base: false,
+                },
+                window,
+                cx,
+            );
+        })
+    });
+    assert_eq!(marked(cx), Some(checkout.clone()));
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.close_file_viewer(WorkspaceId(1), window, cx)
+        })
+    });
+    assert_eq!(marked(cx), None, "closing the review clears the highlight");
+}
+
+#[gpui::test]
 fn work_branch_outcome_reviews_given_checkout_with_given_source(cx: &mut TestAppContext) {
     use gitterm_core::review::model::ReviewSource;
     let (_folder, _config, shell, cx) = fixture(cx);

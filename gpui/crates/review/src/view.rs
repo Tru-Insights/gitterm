@@ -370,7 +370,12 @@ impl Render for ReviewView {
                     ListItem::new(("review-file", index))
                         .w_full()
                         .accessibility_label(label.clone())
-                        .child(label)
+                        .child(
+                            div()
+                                .font_family(aggregate::MONO_FONT)
+                                .text_size(px(12.))
+                                .child(label),
+                        )
                         .selected(self.model.selected == Some(index))
                         .on_click(
                             cx.listener(move |this, _, window, cx| this.select(index, window, cx)),
@@ -393,7 +398,13 @@ impl Render for ReviewView {
                     .items_center()
                     .gap_3()
                     .p_3()
-                    .child(div().flex_1().child(file.title()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_family(aggregate::MONO_FONT)
+                            .text_size(px(12.5))
+                            .child(file.title()),
+                    )
                     .child(
                         Button::new("review-viewed")
                             .small()

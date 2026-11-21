@@ -1891,7 +1891,7 @@ impl Render for RowView {
                                                                         .appearance
                                                                         .size(90.)))
                                                                     .flex_shrink_0()
-                                                                    .font_family("monospace")
+                                                                    .font_family("Menlo")
                                                                     .text_size(px(self
                                                                         .appearance
                                                                         .size(11.)))
