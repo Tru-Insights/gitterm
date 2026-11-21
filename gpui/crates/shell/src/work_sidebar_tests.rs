@@ -2882,7 +2882,9 @@ fn long_chat_entry(id: &str, title: &str) -> ChatIndexEntry {
 }
 
 #[gpui::test]
-fn chat_titles_stay_on_one_ellipsized_line_at_310pt_and_240pt(cx: &mut gpui::TestAppContext) {
+fn chat_titles_wrap_by_word_in_at_least_half_the_row_at_310pt_and_240pt(
+    cx: &mut gpui::TestAppContext,
+) {
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let sidebar = fixture(false);
@@ -2926,9 +2928,15 @@ fn chat_titles_stay_on_one_ellipsized_line_at_310pt_and_240pt(cx: &mut gpui::Tes
             let line = cx
                 .debug_bounds(Box::leak(format!("work-line-{index}").into_boxed_str()))
                 .unwrap();
+            // Iced wraps the Fill title by word; per-letter wrapping made a
+            // ~75-character title dozens of lines tall; by word it is at most 5.
             assert!(
-                title.size.height <= line_height * 1.5,
-                "{width}pt chat {index} title is one line: {title:?}"
+                title.size.height > line_height * 1.5,
+                "{width}pt chat {index} long title wraps like Iced: {title:?}"
+            );
+            assert!(
+                title.size.height <= line_height * 7.,
+                "{width}pt chat {index} title wraps by word, not per letter: {title:?}"
             );
             assert!(
                 title.size.width > line.size.width * 0.5,

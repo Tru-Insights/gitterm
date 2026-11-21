@@ -1888,21 +1888,19 @@ impl Render for WorkSidebar {
                     .overflow_hidden();
             }
             if row.chat {
-                // One line, ellipsized. A `flex_1` title has a basis of zero,
-                // so the fixed facts took the whole row and it wrapped one
-                // letter per line. Start from the full row instead and give
-                // way to the facts only down to half of it; the fan-out line
-                // (shrink factor 2) gives way before the title does.
+                // Wraps by word like Iced's Fill title. A `flex_1` title has a
+                // basis of zero, so the fixed facts took the whole row and it
+                // wrapped one letter per line. Start from the full row instead
+                // and give way to the facts only down to half of it; the
+                // fan-out line (shrink factor 2) gives way before the title.
                 label = label
                     .flex_grow(1.)
                     .flex_shrink(1.)
                     .flex_basis(gpui::relative(1.))
                     .min_w(gpui::relative(0.5))
-                    .overflow_hidden()
                     .font_family(".SystemUIFont")
                     .text_size(px(12.))
-                    .whitespace_nowrap()
-                    .text_ellipsis();
+                    .whitespace_normal();
             }
             if row.small {
                 label = label
