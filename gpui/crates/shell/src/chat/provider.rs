@@ -1,6 +1,6 @@
 //! Fixed provider context. A reported login is evidence, never execution authority.
 use anyhow::{Context, Result, ensure};
-use gitterm_core::{chat::context::ProbeSpec, preview::Preview};
+use gitterm_core::{chat::context::ProbeSpec, harness::claude::ClaudeMcpServer, preview::Preview};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -180,18 +180,27 @@ impl Provider {
         self.preview.scoped(&self.preview.provider())?;
         Ok(())
     }
+    /// `task_mcp` is the chat's task server, its caller already fixed by the
+    /// pane; `None` launches with no MCP server at all.
     pub fn start(
         self: Arc<Self>,
         cwd: PathBuf,
+        task_mcp: Option<ClaudeMcpServer>,
     ) -> Result<(
         super::OwnedRuntime,
         tokio::sync::mpsc::UnboundedReceiver<gitterm_core::chat::runtime::RuntimeEvent>,
     )> {
-        self.start_with_policy(cwd, super::auth::AUTH_STATUS_SCHEMA, PathBuf::from("/"))
+        self.start_with_policy(
+            cwd,
+            task_mcp,
+            super::auth::AUTH_STATUS_SCHEMA,
+            PathBuf::from("/"),
+        )
     }
     fn start_with_policy(
         self: Arc<Self>,
         cwd: PathBuf,
+        task_mcp: Option<ClaudeMcpServer>,
         schema: super::auth::Schema,
         managed_root: PathBuf,
     ) -> Result<(
@@ -200,6 +209,19 @@ impl Provider {
     )> {
         self.validate_workspace(&cwd)?;
         self.prepare()?;
+        if let Some(server) = &task_mcp {
+            // The MCP env only adds keys: it never replaces the isolated
+            // HOME/config/temp environment the probe and sign-in share.
+            for (key, _) in &server.env {
+                ensure!(
+                    !self
+                        .spec
+                        .environment()
+                        .contains_key(std::ffi::OsStr::new(key)),
+                    "task MCP env {key} would replace the fixed Claude environment"
+                );
+            }
+        }
         let lease = Arc::new(super::lease::ProviderLease::claim(&self.preview)?);
         let session_lease = lease.clone();
         let (session, events) = gitterm_core::chat::runtime::Session::spawn_runtime(
@@ -226,7 +248,7 @@ impl Provider {
                 session_lease
                     .validate(&self.preview)
                     .map_err(|e| format!("{e:#}"))?;
-                Ok(self.launch(cwd, session_lease))
+                Ok(self.launch(cwd, session_lease, task_mcp))
             },
         );
         Ok((
@@ -298,9 +320,32 @@ impl Provider {
         &self,
         cwd: PathBuf,
         lease: Arc<super::lease::ProviderLease>,
+        task_mcp: Option<ClaudeMcpServer>,
     ) -> gitterm_core::harness::claude::Launch {
+        use gitterm_core::harness::claude::LaunchFlags;
+        // Only the task server. The browser server waits for its own
+        // server-side preview gate (H5b B7) before a chat may reach it.
+        let flags = if task_mcp.is_some() {
+            LaunchFlags::PreviewTools
+        } else {
+            LaunchFlags::FreshPreview
+        };
+        // The token reaches the child only here, never argv: the config
+        // names it as ${VAR}, and PreviewTools refuses a literal.
+        let mut environment: Vec<_> = self
+            .spec
+            .environment()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        environment.extend(
+            task_mcp
+                .iter()
+                .flat_map(|server| &server.env)
+                .map(|(k, v)| (k.into(), v.into())),
+        );
         gitterm_core::harness::claude::Launch {
-            flags: gitterm_core::harness::claude::LaunchFlags::FreshPreview,
+            flags,
             config: gitterm_core::harness::claude::ClaudeSessionConfig {
                 snapshot_facts_dir: None,
                 cwd,
@@ -309,18 +354,13 @@ impl Provider {
                 effort: None,
                 resume: None,
                 wire_log_dir: None,
-                mcp_servers: vec![],
+                mcp_servers: task_mcp.into_iter().collect(),
                 chrome: false,
                 guidelines_file: None,
                 guidelines_content: None,
             },
             program: self.spec.executable().into(),
-            environment: self
-                .spec
-                .environment()
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
+            environment,
             temporary_dir: PathBuf::from(
                 self.spec
                     .environment()
@@ -384,6 +424,7 @@ impl Provider {
     pub async fn fake_start(
         self: Arc<Self>,
         cwd: PathBuf,
+        task_mcp: Option<ClaudeMcpServer>,
     ) -> Result<
         Option<(
             super::OwnedRuntime,
@@ -395,7 +436,7 @@ impl Provider {
             return Ok(None);
         }
         let managed = self.preview.root().join("fixture-no-managed-policy");
-        self.start_with_policy(cwd, super::auth::FIXTURE_SCHEMA, managed)
+        self.start_with_policy(cwd, task_mcp, super::auth::FIXTURE_SCHEMA, managed)
             .map(Some)
     }
 }
@@ -580,7 +621,7 @@ mod gate_tests {
         super::super::tests::independent_clone(&cwd);
         let provider = Arc::new(Provider::fixture(preview.clone(), &fake).unwrap());
         let (runtime, _events) = provider
-            .start_with_policy(cwd, FIXTURE_SCHEMA, dir.path().join("no-policy"))
+            .start_with_policy(cwd, None, FIXTURE_SCHEMA, dir.path().join("no-policy"))
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while !entered.exists() {

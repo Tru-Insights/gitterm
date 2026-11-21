@@ -65,14 +65,30 @@ Exact preview argv (after the resolved absolute Claude executable):
 --output-format stream-json --verbose --input-format stream-json --permission-prompt-tool stdio --include-partial-messages --no-chrome --permission-mode default --restricted --strict-mcp-config --safe-mode
 ```
 
+When the preview task host (H5b B4, `task_host.rs`) is running, the chat
+launches with `LaunchFlags::PreviewTools` instead, and two arguments sit
+between `--permission-mode default` and the fence (H5b B6):
+
+```text
+--mcp-config={"mcpServers":{"gitterm_tasks":{"headers":{"Authorization":"Bearer ${GITTERM_V6_TASK_MCP_TOKEN}"},"type":"http","url":"http://127.0.0.1:<port>/mcp?caller=<session uid>"}}} --allowedTools=mcp__gitterm_tasks
+```
+
+The caller is the pane's `session_uid`, fixed in `ChatPane::new` before the
+gate runs. The token is only in the child environment
+(`GITTERM_V6_TASK_MCP_TOKEN`, beside `GITTERM_V6_TASK_MCP_URL`), added to the
+fixed environment above; a key that would replace a fixed one refuses the
+launch. Only the task server is attached: the browser server waits for its
+server-side preview gate (B7). Without a running host the chat launches with
+the plain argv above and logs why once.
+
 Core `harness/claude.rs::LaunchFlags::FreshPreview` supplies only the three fence
 flags and validates the fixed session config before any guideline writes.
 `LaunchFlags::Standard` is the default; Iced's argv is byte-identical. Both are
 pinned by tests. No bypass flag, `--add-dir`, `--bare`, tools override, MCP config
-or resume can enter a preview launch. Host writers stay disabled: snapshot
+other than the task server, or resume can enter a preview launch. Host writers stay disabled: snapshot
 capture/`git add`, snapshot publication and close maintenance (`None` facts root
 plus no-op recorder), generated guideline/context files and reinjection, wire
-logs, injected task/browser MCP, Chrome, worker/delegation/helper launch,
+logs, injected browser MCP, Chrome, worker/delegation/helper launch,
 remember-permission persistence, remote/phone and resume.
 
 The coordinator accepts that `--restricted` removes Bash/code-running tools and
