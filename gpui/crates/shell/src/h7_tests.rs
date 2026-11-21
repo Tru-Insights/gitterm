@@ -330,50 +330,59 @@ fn usage_limits_filters_and_pin_are_read_only(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn saved_run_inventory_and_workspace_switches_never_start_a_terminal(cx: &mut TestAppContext) {
+fn saved_run_inventory_restores_plain_shells_once_before_panel_or_workspace_selection(
+    cx: &mut TestAppContext,
+) {
     let (root, shell, cx) = fixture(cx);
-    let cwd = root.path().join("work");
-    let id = SessionId(42);
+    let nested = root.path().join("work/nested");
+    std::fs::create_dir(&nested).unwrap();
+    let saved = [
+        (WorkspaceId(1), SessionId(42), root.path().join("work")),
+        (WorkspaceId(1), SessionId(43), nested),
+        (WorkspaceId(2), SessionId(44), root.path().join("second")),
+    ];
     let (owner, config) = cx.update(|window, cx| {
         shell.update(cx, |shell, cx| {
-            // Model a saved run tab without ever creating a real PTY in the fixture.
-            let workspace = shell.active(cx).workspace.id;
-            let pane_id = session_pane_id(id);
-            let pane = cx.new(|cx| {
-                Pane::new(
-                    pane_id.clone(),
-                    "printf x >> h7-run.txt".into(),
-                    PaneKind::StoppedTerminal(cwd.clone(), true),
-                    workspace,
-                    shell.data.clone(),
-                    window,
-                    cx,
-                )
-            });
-            let state = shell
-                .workspaces
-                .iter_mut()
-                .find(|w| w.workspace.id == workspace)
-                .unwrap();
-            state.sessions.push(Session {
-                id,
-                title: "printf x >> h7-run.txt".into(),
-                kind: data::SessionKind::Terminal,
-            });
-            state
-                .store
-                .terminals
-                .as_mut()
-                .unwrap()
-                .push(layout::TerminalSession {
-                    id: id.0,
-                    cwd: cwd.clone(),
+            for (workspace, id, cwd) in &saved {
+                // Saving a run tab persists its cwd, never its command (like Iced).
+                let pane_id = session_pane_id(*id);
+                let pane = cx.new(|cx| {
+                    Pane::new(
+                        pane_id.clone(),
+                        "printf x >> h7-run.txt".into(),
+                        PaneKind::StoppedTerminal(cwd.clone(), true),
+                        *workspace,
+                        shell.data.clone(),
+                        window,
+                        cx,
+                    )
                 });
-            state.panes.insert(pane_id, pane.clone());
-            state.dock.update(cx, |dock, cx| {
-                dock.add_panel_view(panel_handle(pane), DockPlacement::Bottom, None, window, cx)
-            });
-            state.store.save(&state.dock.read(cx).dump(cx)).unwrap();
+                let state = shell
+                    .workspaces
+                    .iter_mut()
+                    .find(|w| w.workspace.id == *workspace)
+                    .unwrap();
+                state.sessions.push(Session {
+                    id: *id,
+                    title: "printf x >> h7-run.txt".into(),
+                    kind: data::SessionKind::Terminal,
+                });
+                state
+                    .store
+                    .terminals
+                    .as_mut()
+                    .unwrap()
+                    .push(layout::TerminalSession {
+                        id: id.0,
+                        cwd: cwd.clone(),
+                    });
+                state.panes.insert(pane_id, pane.clone());
+                state.dock.update(cx, |dock, cx| {
+                    dock.add_panel_view(panel_handle(pane), DockPlacement::Bottom, None, window, cx)
+                });
+                state.store.regions.bottom_visible = false;
+                state.store.save(&state.dock.read(cx).dump(cx)).unwrap();
+            }
             (shell.owner.clone(), shell.config_dir.clone())
         })
     });
@@ -390,36 +399,107 @@ fn saved_run_inventory_and_workspace_switches_never_start_a_terminal(cx: &mut Te
             .unwrap()
         })
     });
+    // All saved tabs, including the hidden workspace's, already own live PTYs.
+    let originals = cx.read(|cx| {
+        let shell = restored.read(cx);
+        assert!(!shell.bottom.read(cx).input.visible());
+        assert!(shell.run_tabs.is_empty());
+        saved
+            .iter()
+            .map(|(workspace, id, _)| {
+                let state = shell
+                    .workspaces
+                    .iter()
+                    .find(|w| w.workspace.id == *workspace)
+                    .unwrap();
+                let pane = state.panes[&session_pane_id(*id)].read(cx);
+                let pane::PaneContent::Terminal(view) = &pane.content else {
+                    panic!("restored tab must own a plain shell at startup");
+                };
+                assert_eq!(
+                    view.read(cx).backend().state(),
+                    gitterm_terminal::SessionState::Running
+                );
+                (view.clone(), pane.session.clone().unwrap())
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut pids = vec![];
+    for ((_, id, cwd), (view, _)) in saved.iter().zip(&originals) {
+        view.update(cx, |view, _| {
+            view.backend_mut().handle(gitterm_terminal::Command::Write(
+                format!(
+                    "printf '%s\\n' \"$$\" > h7-pid-{}.txt; printf '%s' \"$PWD\" > h7-cwd-{}.txt\r",
+                    id.0, id.0
+                )
+                .into_bytes(),
+            ));
+        });
+        wait_file(
+            &cwd.join(format!("h7-cwd-{}.txt", id.0)),
+            cwd.to_str().unwrap(),
+            cx,
+        );
+        let pid = std::fs::read_to_string(cwd.join(format!("h7-pid-{}.txt", id.0))).unwrap();
+        assert!(pid.trim().parse::<u32>().unwrap() > 0);
+        pids.push(pid);
+        assert!(!cwd.join("h7-run.txt").exists());
+    }
+    assert_eq!(pids.iter().collect::<HashSet<_>>().len(), saved.len());
     for workspace in [WorkspaceId(1), WorkspaceId(2), WorkspaceId(1)] {
         cx.update(|window, cx| {
             restored.update(cx, |shell, cx| {
                 shell.select_workspace_id(workspace, window, cx);
                 shell.refresh_bottom_panel(window, cx);
-                if workspace == WorkspaceId(1) {
+                shell.open_bottom_terminal(window, cx);
+                for (_, id, _) in saved.iter().filter(|(ws, _, _)| *ws == workspace) {
                     shell.bottom_outcome(
                         bottom_panel::Outcome::SelectTab { id: id.0 as usize },
                         window,
                         cx,
                     );
+                    assert!(pane_id_visible(shell.active(cx), &session_pane_id(*id), cx));
                 }
                 assert!(shell.run_tabs.is_empty());
-                // There is no terminal backend to spawn a child or receive PTY writes.
-                assert!(
+                assert_eq!(
                     shell
                         .workspaces
                         .iter()
                         .flat_map(|w| w.panes.values())
-                        .all(|p| !matches!(p.read(cx).content, pane::PaneContent::Terminal(_)))
+                        .filter(|p| matches!(p.read(cx).content, pane::PaneContent::Terminal(_)))
+                        .count(),
+                    saved.len()
                 );
-                assert!(
-                    matches!(&shell.workspaces[0].panes[&session_pane_id(id)].read(cx).content,
-                pane::PaneContent::IcedSession(text) if text.contains("idle"))
-                );
+                for ((workspace, id, _), (original, target)) in saved.iter().zip(&originals) {
+                    let state = shell
+                        .workspaces
+                        .iter()
+                        .find(|w| w.workspace.id == *workspace)
+                        .unwrap();
+                    let pane = state.panes[&session_pane_id(*id)].read(cx);
+                    let pane::PaneContent::Terminal(view) = &pane.content else {
+                        panic!("restored shell was replaced");
+                    };
+                    assert_eq!(view.entity_id(), original.entity_id());
+                    assert_eq!(pane.session.as_ref(), Some(target));
+                }
             })
         });
         draw(cx);
     }
-    assert!(!cwd.join("h7-run.txt").exists());
+    for (((_, id, cwd), (view, _)), pid) in saved.iter().zip(&originals).zip(&pids) {
+        view.update(cx, |view, _| {
+            view.backend_mut().handle(gitterm_terminal::Command::Write(
+                format!("printf '%s\\n' \"$$\" >> h7-pid-{}.txt\r", id.0).into_bytes(),
+            ));
+        });
+        wait_file(
+            &cwd.join(format!("h7-pid-{}.txt", id.0)),
+            &format!("{pid}{pid}"),
+            cx,
+        );
+        assert!(!cwd.join("h7-run.txt").exists());
+    }
 }
 
 #[gpui::test]
