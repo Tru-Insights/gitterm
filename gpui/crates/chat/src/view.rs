@@ -669,8 +669,7 @@ impl ChatView {
             {
                 self.composer_state.checkout_choices = source();
             }
-        } else if !self.settings_enabled()
-            || self.composer_state.catalog.options(picker).is_empty()
+        } else if !self.settings_enabled() || self.composer_state.catalog.options(picker).is_empty()
         {
             return;
         }

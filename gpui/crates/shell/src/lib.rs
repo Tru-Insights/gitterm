@@ -10,7 +10,6 @@ pub mod bottom_panel;
 mod center_tests;
 mod chat;
 pub mod connect_form;
-pub mod phone;
 pub mod content;
 #[cfg(test)]
 mod content_shell_tests;
@@ -20,6 +19,8 @@ pub mod files;
 mod files_view;
 pub mod find_sidebar;
 pub mod folder_picker;
+#[cfg(test)]
+mod h10_tests;
 #[cfg(test)]
 mod h2_tests;
 #[cfg(test)]
@@ -35,16 +36,15 @@ mod h8_tests;
 #[cfg(test)]
 mod h9_tests;
 #[cfg(test)]
-mod h10_tests;
-#[cfg(test)]
 mod hookup_tests;
 mod layout;
 mod owner;
-mod pane;
 #[cfg(test)]
 mod page_tests;
+mod pane;
 mod park;
 pub mod park_sheet;
+pub mod phone;
 mod pr_confirm;
 pub mod preview;
 #[cfg(test)]
@@ -54,18 +54,18 @@ pub mod remote_client;
 mod remote_shell;
 #[cfg(test)]
 mod remote_shell_tests;
-#[cfg(test)]
-mod small_parity_tests;
 mod review_reload;
 pub mod session_picker;
 pub mod session_strip;
 mod sessions;
 pub mod settings;
+#[cfg(test)]
+mod small_parity_tests;
 pub mod spine;
 mod task_host;
-mod task_panel;
 #[cfg(test)]
 mod task_host_tests;
+mod task_panel;
 pub mod task_switcher;
 pub mod tasks;
 mod theme;
@@ -814,8 +814,10 @@ impl Shell {
         {
             return;
         }
-        if Some(id) != self.active_workspace(cx) || self.new_work_sheet.is_some()
-            || self.settings_sheet.is_some() {
+        if Some(id) != self.active_workspace(cx)
+            || self.new_work_sheet.is_some()
+            || self.settings_sheet.is_some()
+        {
             self.session_picker = None;
             self.picker_subscription = None;
             self.park_sheet = None;
@@ -3289,12 +3291,10 @@ impl Shell {
                 cx.listener(|this, a: &TabSelect, w, cx| this.select_session(a.index, w, cx)),
             )
             .on_action(cx.listener(|this, _: &WorkspaceClose, w, cx| this.open_park_sheet(w, cx)))
-            .on_action(
-                cx.listener(|this, _: &OpenFolder, w, cx| {
-                    // Iced's ⌥⇧T / ⌘O: the in-app folder picker, not the new-work sheet.
-                    this.bar_outcome(workspace_bar::Outcome::OpenFolder, w, cx)
-                }),
-            )
+            .on_action(cx.listener(|this, _: &OpenFolder, w, cx| {
+                // Iced's ⌥⇧T / ⌘O: the in-app folder picker, not the new-work sheet.
+                this.bar_outcome(workspace_bar::Outcome::OpenFolder, w, cx)
+            }))
             .on_action(cx.listener(|this, _: &ToggleHelp, w, cx| {
                 use gpui_component::WindowExt;
                 if Self::has_dialog(w, cx) {
@@ -3889,7 +3889,7 @@ impl Shell {
             && (self.session_picker.is_some()
                 || self.park_sheet.is_some()
                 || self.new_work_sheet.is_some()
-            || self.settings_sheet.is_some()
+                || self.settings_sheet.is_some()
                 || self.phone_panel().is_some()
                 || Self::has_dialog(window, cx)
                 || self
@@ -3990,7 +3990,7 @@ impl Render for Shell {
                 || self.session_picker.is_some()
                 || self.park_sheet.is_some()
                 || self.new_work_sheet.is_some()
-            || self.settings_sheet.is_some()
+                || self.settings_sheet.is_some()
                 || self.phone_panel().is_some()
                 || self.task_panel_modal_open(cx);
             content.sync_covers(window, cx);
@@ -4197,9 +4197,11 @@ impl Render for Shell {
             .children(self.new_work_sheet.clone())
             .children(self.settings_sheet.clone())
             .children(self.task_switcher.clone())
-            .children(self.task_panel.as_ref().and_then(|panel| {
-                task_panel::modal_view(panel, self.task_inputs(cx), cx)
-            }))
+            .children(
+                self.task_panel
+                    .as_ref()
+                    .and_then(|panel| task_panel::modal_view(panel, self.task_inputs(cx), cx)),
+            )
             .when(self.plans_open, |view| view.child(self.plans_viewer(cx)))
             .children(self.remote_overlays())
             .child(content::visual::reconciler(self.content.clone()))
