@@ -1116,3 +1116,46 @@ fn go_to_session_focuses_the_open_tab(cx: &mut TestAppContext) {
         Some("Launch session · not available in preview")
     );
 }
+
+/// Iced `task_session_count` / `first_open_task_tab` search every workspace.
+#[gpui::test]
+fn overview_session_verbs_find_sessions_in_other_workspaces(cx: &mut TestAppContext) {
+    let (_fixture, _root, shell, _panel, cx) = shell_with_tasks(cx, |work| {
+        vec![with_worktree(
+            in_dir(task("ready", TaskLifecycle::Ready), work),
+            work.to_owned(),
+        )]
+    });
+    let pane = cx.read(|cx| {
+        let this = shell.read(cx);
+        let active = this.active_workspace(cx);
+        let other = this
+            .workspaces
+            .iter()
+            .find(|state| Some(state.workspace.id) != active)
+            .expect("a second workspace");
+        other.panes[&crate::session_pane_id(other.sessions[0].id)].clone()
+    });
+    cx.update(|_, cx| {
+        pane.update(cx, |pane, _| {
+            pane.session = Some(Target {
+                task_id: Some("ready".into()),
+                task_session_id: Some("session-ready".into()),
+                ..target("ready")
+            })
+        })
+    });
+    let inputs = cx.read(|cx| shell.read(cx).task_inputs(cx));
+    assert_eq!(inputs.task_sessions("ready").count(), 1);
+    let task = task("ready", TaskLifecycle::Ready);
+    let task = with_worktree(task, PathBuf::from(DIR));
+    let verbs = verbs(&task, &inputs);
+    assert!(matches!(
+        verbs[0],
+        Verb::Start {
+            continuing: true,
+            ..
+        }
+    ));
+    assert!(verbs.contains(&Verb::GoToSession("session-ready".into())));
+}

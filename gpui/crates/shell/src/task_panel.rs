@@ -136,7 +136,7 @@ pub(crate) struct Inputs {
     pub general_sessions: usize,
     /// Iced's `sidebar_panel_width() <= 160`.
     pub compact: bool,
-    /// The open task sessions in this workspace, first per task first
+    /// The open task sessions in every workspace, in workspace then tab order
     /// (Iced `first_open_task_tab`).
     pub open_sessions: Vec<Target>,
     /// Each open session's tab title, by `session_uid`.
@@ -2189,11 +2189,14 @@ impl crate::Shell {
         };
         let state = self.active(cx);
         let mut titles = std::collections::HashMap::new();
-        let targets: Vec<Target> = state
-            .sessions
+        // Iced `task_session_count` / `first_open_task_tab` / `task_state_copy`
+        // search every workspace: a task's sessions can live outside this one.
+        let targets: Vec<Target> = self
+            .workspaces
             .iter()
-            .filter_map(|session| {
-                let target = state
+            .flat_map(|other| other.sessions.iter().map(move |session| (other, session)))
+            .filter_map(|(other, session)| {
+                let target = other
                     .panes
                     .get(&crate::session_pane_id(session.id))?
                     .read(cx)
