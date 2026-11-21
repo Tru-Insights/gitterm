@@ -842,10 +842,10 @@ fn find_busy_polls_notify_only_when_visible_state_changes(cx: &mut TestAppContex
     let entity = cx.new(|cx| {
         let mut view =
             TerminalView::new_deferred(BackendSettings::default(), TerminalConfig::default(), cx);
-        // Keep admission Busy deterministically, without a worker timing race.
         view.backend.service_busy.store(true, Ordering::Release);
-        view.find_open = true;
-        view.find_status = "Busy".into();
+        view.open_find(cx);
+        view.set_find_query("needle".into(), cx);
+        view.execute_find(cx);
         view
     });
     let notifications = Rc::new(Cell::new(0));
@@ -854,30 +854,23 @@ fn find_busy_polls_notify_only_when_visible_state_changes(cx: &mut TestAppContex
         cx.update(|cx| cx.observe(&entity, move |_, _| observed.set(observed.get() + 1)));
     entity.update(cx, |view, cx| view.poll_services(cx));
     assert_eq!(notifications.get(), 0);
-
-    entity.update(cx, |view, cx| {
-        view.find_revision = Some(view.backend.revision());
-        view.find_status = "2 matches".into();
-        view.backend.events.invalidate();
-        view.poll_services(cx);
-        assert_eq!(view.find_status, "Busy");
-        assert!(view.find_revision.is_none());
-    });
-    assert_eq!(notifications.get(), 1);
     entity.update(cx, |view, cx| view.poll_services(cx));
-    assert_eq!(notifications.get(), 1);
+    assert_eq!(notifications.get(), 0);
 }
 
 #[::gpui::test]
-fn find_shortcuts_edit_navigate_close_restore_focus_and_export_callback(cx: &mut TestAppContext) {
+fn iced_find_input_submit_count_buttons_shortcuts_and_close_without_process(
+    cx: &mut TestAppContext,
+) {
     use alacritty_terminal::vte::ansi::Processor;
-    use gpui_kit::Modifiers;
+    use gpui_kit::{Entity, VisualTestContext, component::Root, size};
     cx.background_executor.allow_parking();
-    let backend = Backend::new(BackendSettings {
-        program: "/bin/cat".into(),
+    cx.update(gpui_kit::init);
+    let mut backend = Backend::new_deferred(BackendSettings {
+        program: "/must-not-spawn-find-fixture".into(),
         ..Default::default()
-    })
-    .unwrap();
+    });
+    backend.cancel(); // In-memory terminal only: rendering cannot start a PTY.
     {
         let mut term = backend.term.lock_unfair();
         let mut parser: Processor = Processor::new();
@@ -885,96 +878,157 @@ fn find_shortcuts_edit_navigate_close_restore_focus_and_export_callback(cx: &mut
         backend.events.invalidate();
     }
     let received = Arc::new(parking_lot::Mutex::new(None));
-    let received_callback = received.clone();
-    let handle = cx.add_window(|_, cx| {
-        TerminalView::new(backend, TerminalConfig::default(), cx).with_export_callback(
-            move |result, _| {
-                *received_callback.lock() = Some(result);
-            },
-        )
+    let callback = received.clone();
+    let mut entity: Option<Entity<TerminalView>> = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| {
+            TerminalView::new(backend, TerminalConfig::default(), cx)
+                .with_export_callback(move |result, _| *callback.lock() = Some(result))
+        });
+        entity = Some(view.clone());
+        Root::new(view, window, cx)
     });
-    let key = |key: &str, platform, shift| KeyDownEvent {
-        keystroke: Keystroke {
-            key: key.into(),
-            modifiers: Modifiers {
-                platform,
-                shift,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        is_held: false,
-        prefer_character_input: false,
-    };
-    handle
-        .update(cx, |view, window, cx| {
-            assert!(view.backend.sync());
-            view.on_key_down(&key("f", true, false), window, cx);
-            assert!(view.find_open);
-            view.replace_text_in_range(None, "[.]", window, cx);
-            assert_eq!(view.find_query, "[.]");
-            assert_eq!(view.find_status, "Busy");
-        })
-        .unwrap();
+    let entity = entity.unwrap();
+    fn draw(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+    }
+    fn click(id: &'static str, cx: &mut VisualTestContext) {
+        draw(cx);
+        let bounds = cx
+            .debug_bounds(id)
+            .unwrap_or_else(|| panic!("missing {id}"));
+        cx.simulate_click(bounds.center(), gpui_kit::Modifiers::none());
+        draw(cx);
+    }
+    cx.simulate_resize(size(px(1000.), px(400.)));
+    cx.update(|window, cx| entity.read(cx).focus_handle.clone().focus(window, cx));
+    draw(cx);
+    cx.simulate_keystrokes("cmd-f");
+    draw(cx);
+    cx.simulate_input("[x]");
+    cx.simulate_keystrokes("left backspace");
+    cx.simulate_input("."); // Edit in the middle: this must be a real editable field.
+    draw(cx);
+    cx.read(|cx| {
+        let view = entity.read(cx);
+        assert_eq!(view.find_query, "[.]");
+        assert_eq!(view.find_count_text(), "No matches");
+        assert!(
+            view.find_job.is_none(),
+            "typing must not execute the search"
+        );
+    });
+    click("terminal-find-next", cx);
+    click("terminal-find-prev", cx);
+    cx.read(|cx| assert_eq!(entity.read(cx).find_count, 0));
+    cx.simulate_keystrokes("enter");
     wait(|| {
-        handle
-            .update(cx, |view, _, cx| {
-                view.poll_services(cx);
-                view.find_status == "2 matches"
-            })
+        entity.update(cx, |view, cx| {
+            view.poll_services(cx);
+            view.find_count_text() == "1/2"
+        })
+    });
+    draw(cx);
+    let first = cx.read(|cx| {
+        entity
+            .read(cx)
+            .backend
+            .renderable_content()
+            .find_match
+            .as_ref()
             .unwrap()
+            .start
     });
-    handle
-        .update(cx, |view, window, cx| {
-            let first = view.backend.last_content.find_match.as_ref().unwrap().start;
-            view.on_key_down(&key("g", true, false), window, cx);
-            assert_ne!(
-                view.backend.last_content.find_match.as_ref().unwrap().start,
-                first
-            );
-            view.on_key_down(&key("g", true, true), window, cx);
-            assert_eq!(
-                view.backend.last_content.find_match.as_ref().unwrap().start,
-                first
-            );
-            view.on_key_down(&key("escape", false, false), window, cx);
-            assert!(!view.find_open);
-            assert!(view.backend.last_content.find_match.is_none());
-            assert!(view.focus_handle.is_focused(window));
-        })
-        .unwrap();
-    // Reopening the retained query must rebuild highlights after Esc cleared them.
-    handle
-        .update(cx, |view, window, cx| {
-            view.on_key_down(&key("f", true, false), window, cx)
-        })
-        .unwrap();
-    wait(|| {
-        handle
-            .update(cx, |view, _, cx| {
-                view.poll_services(cx);
-                view.backend.last_content.find_match.is_some()
-            })
-            .unwrap()
+    click("terminal-find-next", cx);
+    cx.read(|cx| {
+        let view = entity.read(cx);
+        assert_eq!(view.find_count_text(), "2/2");
+        assert_ne!(
+            view.backend
+                .renderable_content()
+                .find_match
+                .as_ref()
+                .unwrap()
+                .start,
+            first
+        );
     });
-    handle
-        .update(cx, |view, window, cx| {
-            view.on_key_down(&key("escape", false, false), window, cx)
+    click("terminal-find-prev", cx);
+    cx.read(|cx| assert_eq!(entity.read(cx).find_count_text(), "1/2"));
+    click("terminal-find-prev", cx);
+    cx.read(|cx| assert_eq!(entity.read(cx).find_count_text(), "2/2"));
+    click("terminal-find-next", cx);
+    cx.read(|cx| assert_eq!(entity.read(cx).find_count_text(), "1/2"));
+    cx.simulate_keystrokes("cmd-g");
+    draw(cx);
+    cx.read(|cx| assert_eq!(entity.read(cx).find_count_text(), "2/2"));
+    // The terminal must not add a previous-match binding for the host's debug chord.
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.read(|cx| assert_eq!(entity.read(cx).find_count_text(), "2/2"));
+    cx.simulate_keystrokes("enter");
+    wait(|| {
+        entity.update(cx, |view, cx| {
+            view.poll_services(cx);
+            view.find_count_text() == "1/2"
         })
-        .unwrap();
-    wait(|| {
-        handle
-            .update(cx, |view, _, _| view.request_export().is_ok())
-            .unwrap()
     });
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_input("draft");
+    cx.read(|cx| {
+        let view = entity.read(cx);
+        assert_eq!(view.find_query, "draft");
+        assert_eq!(
+            view.find_count_text(),
+            "1/2",
+            "editing retains executed results"
+        );
+        assert!(view.find_job.is_none());
+    });
+    click("terminal-find-close", cx);
+    cx.update(|window, cx| {
+        let view = entity.read(cx);
+        assert!(!view.find_open);
+        assert!(view.find_query.is_empty());
+        assert!(view.backend.renderable_content().find_match.is_none());
+        assert!(view.focus_handle.is_focused(window));
+    });
+    cx.simulate_keystrokes("cmd-f");
+    draw(cx);
+    cx.simulate_input("missing");
+    cx.simulate_keystrokes("enter");
     wait(|| {
-        handle
-            .update(cx, |view, _, cx| view.poll_services(cx))
-            .unwrap();
+        entity.update(cx, |view, cx| {
+            view.poll_services(cx);
+            view.find_revision.is_some()
+        })
+    });
+    cx.read(|cx| assert_eq!(entity.read(cx).find_count_text(), "No matches"));
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    assert!(cx.debug_bounds("terminal-find").is_none());
+    cx.read(|cx| {
+        let view = entity.read(cx);
+        assert!(!view.find_open);
+        assert!(!view.backend.is_deferred());
+        assert_eq!(view.backend.state(), crate::SessionState::Cancelled);
+    });
+    wait(|| entity.update(cx, |view, _| view.request_export().is_ok()));
+    wait(|| {
+        entity.update(cx, |view, cx| view.poll_services(cx));
         received.lock().is_some()
     });
-    let text = received.lock().take().unwrap().unwrap();
-    assert!(text.starts_with("first[.]\nsecond[.]\n"));
+    assert!(
+        received
+            .lock()
+            .take()
+            .unwrap()
+            .unwrap()
+            .starts_with("first[.]\nsecond[.]\n")
+    );
 }
 
 #[::gpui::test]
