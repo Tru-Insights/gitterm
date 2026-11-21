@@ -104,17 +104,18 @@ pub enum RunnerEffect {
     AutomaticDelivery,
 }
 
-/// The browser crate maps each of its tools to one of these with an
-/// exhaustive match, and passes the tool name as the label.
+/// The browser crate maps each of its tools to one of these in a table
+/// (`BROWSER_TOOL_ACCESS`, tested to cover every routed tool once; a name
+/// outside it counts as Interact), and passes the tool name as the label.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrowserAccess {
     /// Status, targets, snapshots, DOM/node inspection, console, network,
-    /// diagnostics, viewport, waits and captures returned as content.
+    /// diagnostics, waits, captures and diffs returned as content.
     Read,
     /// Opening Chrome or a target.
     Launch,
-    /// Navigating, clicking, typing, pressing, scrolling, resizing,
-    /// reloading, focusing/closing targets, disconnecting.
+    /// Navigating, clicking, typing, pressing, scrolling, resizing, setting
+    /// the viewport, reloading, focusing/closing targets, disconnecting.
     Interact,
     /// agent-browser scratch files, engine config or network capture on disk.
     Scratch,

@@ -6,7 +6,7 @@ use crate::agent_browser::{
 use crate::browser_control::{
     BrowserCaptureMode, BrowserControlError, BrowserControlService, BrowserKey,
     BrowserLaunchOptions, BrowserLocator, BrowserNodeSelector, BrowserOperation, BrowserSnapshot,
-    BrowserViewport, BrowserWaitCondition,
+    BrowserViewport, BrowserWaitCondition, DefaultTarget,
 };
 use crate::browser_engine::{BrowserEngine, BrowserEngineKind};
 use axum::{
@@ -21,12 +21,21 @@ use base64::Engine;
 use gitterm_core::harness::acp::AcpMcpServer;
 use gitterm_core::harness::claude::ClaudeMcpServer;
 use gitterm_core::loopback::ListenerBind;
+use gitterm_core::preview::service::{BrowserAccess, Denied, ServiceContext};
 use gitterm_core::task_commands::mcp_protocol::{
     caller_endpoint, caller_from_query, TASK_MCP_CALLER_QUERY,
 };
 use rmcp::{
-    handler::server::{router::tool::ToolRouter, tool::Extension, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
+    handler::server::{
+        router::tool::ToolRouter,
+        tool::{Extension, ToolCallContext},
+        wrapper::Parameters,
+    },
+    model::{
+        CallToolRequestParams, CallToolResult, ContentBlock, Implementation, ServerCapabilities,
+        ServerInfo,
+    },
+    service::RequestContext,
     tool, tool_handler, tool_router,
     transport::{
         streamable_http_server::{
@@ -34,7 +43,7 @@ use rmcp::{
         },
         StreamableHttpServerConfig,
     },
-    ServerHandler,
+    ErrorData, RoleServer, ServerHandler,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -55,6 +64,48 @@ const BROWSER_MCP_BASE_PORT: u16 = 34_030;
 const BROWSER_MCP_PORTS_PER_INSTANCE: u16 = 10;
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 10_000;
 const MAX_WAIT_TIMEOUT_MS: u64 = 60_000;
+
+/// What each browser tool does, for a host's [`ServiceContext`] gate. Every
+/// tool either engine routes is listed (`every_routed_tool_has_one_access`);
+/// the Read rows are exactly the tools annotated read-only, which are also
+/// the ones Claude pre-approves.
+pub const BROWSER_TOOL_ACCESS: [(&str, BrowserAccess); 26] = [
+    ("browser_status", BrowserAccess::Read),
+    ("browser_targets", BrowserAccess::Read),
+    ("browser_snapshot", BrowserAccess::Read),
+    ("browser_capture", BrowserAccess::Read),
+    ("browser_wait_for", BrowserAccess::Read),
+    ("browser_console", BrowserAccess::Read),
+    ("browser_network", BrowserAccess::Read),
+    ("browser_target_diagnostics", BrowserAccess::Read),
+    ("browser_dom_outline", BrowserAccess::Read),
+    ("browser_node_inspect", BrowserAccess::Read),
+    ("browser_snapshot_refs", BrowserAccess::Read),
+    ("browser_diff", BrowserAccess::Read),
+    ("browser_open", BrowserAccess::Launch),
+    ("browser_target_open", BrowserAccess::Launch),
+    ("browser_target_focus", BrowserAccess::Interact),
+    ("browser_target_close", BrowserAccess::Interact),
+    ("browser_navigate", BrowserAccess::Interact),
+    ("browser_click", BrowserAccess::Interact),
+    ("browser_type", BrowserAccess::Interact),
+    ("browser_press", BrowserAccess::Interact),
+    ("browser_scroll", BrowserAccess::Interact),
+    ("browser_resize", BrowserAccess::Interact),
+    ("browser_reload", BrowserAccess::Interact),
+    ("browser_disconnect", BrowserAccess::Interact),
+    ("browser_viewport", BrowserAccess::Interact),
+    ("browser_network_capture", BrowserAccess::Scratch),
+];
+
+/// The access of `tool`. A name outside the table counts as Interact, so a
+/// gating context refuses it rather than letting it through unclassified.
+pub fn browser_tool_access(tool: &str) -> BrowserAccess {
+    BROWSER_TOOL_ACCESS
+        .iter()
+        .find(|(name, _)| *name == tool)
+        .map_or(BrowserAccess::Interact, |(_, access)| *access)
+}
 
 /// Connection data retained by the app and inherited by local terminals.
 ///
@@ -289,6 +340,9 @@ pub struct BrowserMcpServer {
     token: String,
     cancellation: CancellationToken,
     engine: BrowserEngine,
+    /// The gate every tool call passes in dispatch; `None` (Iced) allows
+    /// every call, as before the gate existed.
+    services: Option<Arc<ServiceContext>>,
     /// The host app's version, reported as the MCP server version.
     version: &'static str,
 }
@@ -305,21 +359,55 @@ pub fn prepare(
     prepare_listener(v6_global_config_dir.as_ref(), listener, version)
 }
 
-/// [`prepare`] on a bind the host chose (a preview host: an OS-assigned
-/// loopback port) instead of the V6 band. The server still generates its
-/// own bearer token.
-pub fn prepare_on(
-    v6_global_config_dir: impl AsRef<Path>,
+/// The browser server for a host's [`ServiceContext`] (the GPUI preview),
+/// on a bind the host chose (an OS-assigned loopback port) instead of the V6
+/// band, with its own bearer token. Its config dir is
+/// `services.state_root()`, its profile `services.browser_profile_dir()`,
+/// and every tool call is checked against
+/// `services` in the server's dispatch, so a client that ignores
+/// `--allowedTools` is refused too. A preview context always runs the
+/// GitTerm engine: the agent-browser engine starts its own binary and writes
+/// its state dir even for reads. Its reads never open a default tab
+/// ([`DefaultTarget::Never`]): `browser_status` may adopt a Chrome already
+/// running on the preview profile, and a read must not change that Chrome.
+pub fn prepare_scoped(
+    services: Arc<ServiceContext>,
     bind: ListenerBind,
     version: &'static str,
 ) -> std::io::Result<(BrowserMcpConnection, BrowserMcpServer)> {
     let listener = bind.bind()?;
-    prepare_listener(v6_global_config_dir.as_ref(), listener, version)
+    let default_target = if services.is_preview() {
+        DefaultTarget::Never
+    } else {
+        DefaultTarget::OpenOnFirstUse
+    };
+    let browser =
+        BrowserControlService::with_profile_dir(services.browser_profile_dir()?, default_target);
+    let engine = if services.is_preview() {
+        BrowserEngine::GitTerm(browser.clone())
+    } else {
+        BrowserEngine::from_shared_config(services.state_root(), browser.clone())
+    };
+    serve_on(listener, browser, engine, Some(services), version)
 }
 
 fn prepare_listener(
     shared_config_dir: &Path,
     listener: std::net::TcpListener,
+    version: &'static str,
+) -> std::io::Result<(BrowserMcpConnection, BrowserMcpServer)> {
+    let browser = BrowserControlService::new(shared_config_dir);
+    // The engine choice is the shared config's browser.json (TRU-177),
+    // read once: the tool list an agent sees depends on it.
+    let engine = BrowserEngine::from_shared_config(shared_config_dir, browser.clone());
+    serve_on(listener, browser, engine, None, version)
+}
+
+fn serve_on(
+    listener: std::net::TcpListener,
+    browser: BrowserControlService,
+    engine: BrowserEngine,
+    services: Option<Arc<ServiceContext>>,
     version: &'static str,
 ) -> std::io::Result<(BrowserMcpConnection, BrowserMcpServer)> {
     listener.set_nonblocking(true)?;
@@ -328,10 +416,6 @@ fn prepare_listener(
     let endpoint = format!("http://{address}/mcp");
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let cancellation = CancellationToken::new();
-    let browser = BrowserControlService::new(shared_config_dir);
-    // The engine choice is the shared config's browser.json (TRU-177),
-    // read once: the tool list an agent sees depends on it.
-    let engine = BrowserEngine::from_shared_config(shared_config_dir, browser.clone());
     eprintln!("GitTerm V6 browser engine: {}", engine.describe());
     Ok((
         BrowserMcpConnection {
@@ -346,6 +430,7 @@ fn prepare_listener(
             token,
             cancellation,
             engine,
+            services,
             version,
         },
     ))
@@ -378,7 +463,8 @@ impl BrowserMcpServer {
         let listener = tokio::net::TcpListener::from_std(self.listener).map_err(|error| {
             format!("failed to activate the GitTerm V6 browser MCP listener: {error}")
         })?;
-        let tools = BrowserMcpTools::new(self.engine, self.version);
+        let mut tools = BrowserMcpTools::new(self.engine, self.version);
+        tools.services = self.services;
         let mcp_service: StreamableHttpService<BrowserMcpTools, LocalSessionManager> =
             StreamableHttpService::new(
                 move || Ok::<_, std::io::Error>(tools.clone()),
@@ -431,6 +517,8 @@ struct BrowserMcpTools {
     engine: BrowserEngine,
     version: &'static str,
     agent_operation_lock: Arc<Mutex<()>>,
+    /// Checked in [`ServerHandler::call_tool`] before any tool runs.
+    services: Option<Arc<ServiceContext>>,
     /// The tools this engine offers: the common set, plus the
     /// agent-browser-only tools when that engine runs (TRU-177).
     tool_router: ToolRouter<Self>,
@@ -448,7 +536,17 @@ impl BrowserMcpTools {
             engine,
             version,
             agent_operation_lock: Arc::new(Mutex::new(())),
+            services: None,
             tool_router,
+        }
+    }
+
+    /// The dispatch gate: `services` classifies `tool` by its table row.
+    /// Without a context (Iced) every call passes, as before the gate.
+    fn gate(&self, tool: &str) -> Result<(), Denied> {
+        match &self.services {
+            Some(services) => services.browser(tool, browser_tool_access(tool)),
+            None => Ok(()),
         }
     }
 
@@ -1368,6 +1466,22 @@ const SERVER_INSTRUCTIONS: &str = "These are the GitTerm browser tools, the brow
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for BrowserMcpTools {
+    /// The macro's router call, behind the gate: a refused call is answered
+    /// with the notice before its arguments are parsed or the browser is
+    /// reached.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(denied) = self.gate(&request.name) {
+            return Ok(tool_error(denied));
+        }
+        self.tool_router
+            .call(ToolCallContext::new(self, request, context))
+            .await
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("gitterm-v6-browser", self.version))
@@ -1525,7 +1639,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let protected = ProtectedRoots::new(&dir.path().join("host"), []).unwrap();
         let preview = Arc::new(Preview::validate(&dir.path().join("preview"), protected).unwrap());
-        let services = ServiceContext::preview(preview).unwrap();
+        let services = Arc::new(ServiceContext::preview(preview).unwrap());
 
         let (commands, _requests) = gitterm_core::task_commands::runtime::command_channel();
         let refused: gitterm_core::task_mcp::HtmlPreviewRunner =
@@ -1538,8 +1652,8 @@ mod tests {
             TEST_VERSION,
         )
         .unwrap();
-        let (browser, browser_server) = prepare_on(
-            services.state_root(),
+        let (browser, browser_server) = prepare_scoped(
+            services.clone(),
             ListenerBind::LoopbackEphemeral,
             TEST_VERSION,
         )
@@ -2119,5 +2233,470 @@ mod tests {
             .expect("browser MCP server did not shut down")
             .expect("browser MCP task panicked")
             .expect("browser MCP server returned an error");
+    }
+
+    // ----- H5b B7: the preview gate ---------------------------------------
+
+    fn preview_services(dir: &Path) -> Arc<ServiceContext> {
+        use gitterm_core::preview::{Preview, ProtectedRoots};
+        let protected = ProtectedRoots::new(&dir.join("host"), []).unwrap();
+        let preview = Arc::new(Preview::validate(&dir.join("preview"), protected).unwrap());
+        Arc::new(ServiceContext::preview(preview).unwrap())
+    }
+
+    /// A running server and an authenticated client whose URL names
+    /// `caller`. The client sends no allowed-tools list: it can call any tool.
+    async fn serve_and_connect(
+        connection: &BrowserMcpConnection,
+        server: BrowserMcpServer,
+        caller: &str,
+    ) -> (
+        rmcp::service::RunningService<rmcp::RoleClient, ()>,
+        tokio::task::JoinHandle<Result<(), String>>,
+    ) {
+        let server_task = tokio::spawn(server.run());
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(caller_endpoint(
+                connection.endpoint(),
+                Some(caller),
+            ))
+            .auth_header(connection.token.clone()),
+        );
+        let client = tokio::time::timeout(Duration::from_secs(5), ().serve(transport))
+            .await
+            .expect("MCP initialization timed out")
+            .expect("MCP initialization failed");
+        (client, server_task)
+    }
+
+    async fn call(
+        client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+        tool: &'static str,
+        arguments: serde_json::Value,
+    ) -> CallToolResult {
+        let serde_json::Value::Object(arguments) = arguments else {
+            panic!("arguments must be an object");
+        };
+        client
+            .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments))
+            .await
+            .unwrap()
+    }
+
+    /// A fake Chrome the profile's DevToolsActivePort points at, so a call
+    /// that got past the gate would reach it (and `browser_open` would find
+    /// it running) instead of starting real Chrome.
+    async fn fake_chrome_in(profile: &Path) -> crate::browser_control::test_support::FakeDevTools {
+        let devtools =
+            crate::browser_control::test_support::FakeDevTools::start(&["tab-user"]).await;
+        std::fs::create_dir_all(profile).unwrap();
+        std::fs::write(
+            profile.join("DevToolsActivePort"),
+            format!("{}\n/devtools/browser/fake\n", devtools.port),
+        )
+        .unwrap();
+        devtools
+    }
+
+    /// The tool → access table covers exactly the tools either engine
+    /// routes, once each, and its Read rows are the read-only annotations.
+    #[test]
+    fn every_routed_tool_has_one_access() {
+        let routed: std::collections::BTreeMap<String, bool> = (BrowserMcpTools::tool_router()
+            + BrowserMcpTools::agent_browser_tool_router())
+        .list_all()
+        .into_iter()
+        .map(|tool| {
+            let read_only = tool
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.read_only_hint)
+                == Some(true);
+            (tool.name.to_string(), read_only)
+        })
+        .collect();
+        let table: std::collections::BTreeMap<String, bool> = BROWSER_TOOL_ACCESS
+            .iter()
+            .map(|(name, access)| (name.to_string(), *access == BrowserAccess::Read))
+            .collect();
+        assert_eq!(table.len(), BROWSER_TOOL_ACCESS.len(), "duplicate row");
+        assert_eq!(table, routed);
+        let mut reads: Vec<_> = BROWSER_TOOL_ACCESS
+            .iter()
+            .filter(|(_, access)| *access == BrowserAccess::Read)
+            .map(|(name, _)| *name)
+            .collect();
+        let mut allowed = CLAUDE_ALLOWED_READ_TOOLS.to_vec();
+        reads.sort();
+        allowed.sort();
+        assert_eq!(reads, allowed);
+        assert_eq!(
+            browser_tool_access("browser_unknown"),
+            BrowserAccess::Interact
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_browser_reads_ok_launch_denied() {
+        use gitterm_core::preview::service::preview_notice;
+        let dir = tempdir().unwrap();
+        let services = preview_services(dir.path());
+        let (connection, server) = prepare_scoped(
+            services.clone(),
+            ListenerBind::LoopbackEphemeral,
+            TEST_VERSION,
+        )
+        .unwrap();
+        // The gate itself: every Read row passes, every other row is refused.
+        let mut gated = BrowserMcpTools::new(connection.engine(), TEST_VERSION);
+        gated.services = Some(services.clone());
+        for (tool, access) in BROWSER_TOOL_ACCESS {
+            match gated.gate(tool) {
+                Ok(()) => assert_eq!(access, BrowserAccess::Read, "{tool}"),
+                Err(denied) => {
+                    assert_ne!(access, BrowserAccess::Read, "{tool}");
+                    assert_eq!(denied.notice(), preview_notice(tool));
+                }
+            }
+        }
+        let devtools = fake_chrome_in(&services.browser_profile_dir().unwrap()).await;
+        let (client, server_task) = serve_and_connect(&connection, server, "chat-a").await;
+
+        let status = call(&client, "browser_status", serde_json::json!({})).await;
+        assert_eq!(status.is_error, Some(false), "{status:?}");
+        assert_eq!(status.structured_content.unwrap()["state"], "running");
+        for (tool, arguments) in [
+            ("browser_open", serde_json::json!({})),
+            (
+                "browser_target_open",
+                serde_json::json!({"name": "design", "url": "https://example.com/"}),
+            ),
+        ] {
+            let result = call(&client, tool, arguments).await;
+            assert_eq!(error_text(&result), preview_notice(tool));
+        }
+        // Status listed pages; nothing opened a target or touched a page.
+        assert!(devtools.calls.lock().unwrap().is_empty());
+        assert_eq!(*devtools.pages.lock().unwrap(), ["tab-user"]);
+        let telemetry = connection.browser().telemetry().await;
+        assert_eq!(
+            telemetry.last_agent_operation.unwrap().operation,
+            BrowserOperation::Status
+        );
+
+        client.cancel().await.unwrap();
+        drop(connection);
+        server_task.await.unwrap().unwrap();
+    }
+
+    /// An authenticated client that ignores allowed-tools calls every
+    /// mutating tool directly, with valid and with missing arguments: each
+    /// is answered with the notice in dispatch and reaches nothing.
+    #[tokio::test]
+    async fn direct_browser_mutation_call_denied_in_preview() {
+        use gitterm_core::preview::service::preview_notice;
+        let dir = tempdir().unwrap();
+        let services = preview_services(dir.path());
+        let profile = services.browser_profile_dir().unwrap();
+        let devtools = fake_chrome_in(&profile).await;
+        let (connection, server) = prepare_scoped(
+            services.clone(),
+            ListenerBind::LoopbackEphemeral,
+            TEST_VERSION,
+        )
+        .unwrap();
+        let (client, server_task) = serve_and_connect(&connection, server, "chat-a").await;
+        let locator = serde_json::json!({"kind": "css", "selector": "body"});
+        let valid = |tool: &str| match tool {
+            "browser_navigate" => serde_json::json!({"url": "https://example.com/"}),
+            "browser_target_open" => {
+                serde_json::json!({"name": "design", "url": "https://example.com/"})
+            }
+            "browser_target_focus" | "browser_target_close" => {
+                serde_json::json!({"target": "default"})
+            }
+            "browser_click" => serde_json::json!({"locator": locator}),
+            "browser_type" => serde_json::json!({"locator": locator, "text": "x"}),
+            "browser_press" => serde_json::json!({"key": "enter"}),
+            "browser_scroll" => serde_json::json!({"delta_y": 100.0}),
+            "browser_resize" => {
+                serde_json::json!({"viewport": {
+                    "width": 800, "height": 600, "deviceScaleFactor": 1.0, "mobile": false,
+                }})
+            }
+            "browser_network_capture" => serde_json::json!({"action": "start"}),
+            "browser_viewport" => serde_json::json!({"width": 800, "height": 600}),
+            _ => serde_json::json!({}),
+        };
+        let mut refused = 0;
+        for (tool, access) in BROWSER_TOOL_ACCESS {
+            if access == BrowserAccess::Read {
+                continue;
+            }
+            for arguments in [valid(tool), serde_json::json!({})] {
+                let result = call(&client, tool, arguments).await;
+                assert_eq!(error_text(&result), preview_notice(tool), "{tool}");
+            }
+            refused += 1;
+        }
+        assert_eq!(refused, 14);
+        assert!(devtools.calls.lock().unwrap().is_empty());
+        assert_eq!(*devtools.pages.lock().unwrap(), ["tab-user"]);
+        // No operation began, and nothing but the fake's port file is in the
+        // profile or anywhere else in the state root.
+        let telemetry = connection.browser().telemetry().await;
+        assert!(telemetry.last_agent_operation.is_none());
+        let entries = |dir: &Path| -> Vec<String> {
+            let mut names: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(entries(&profile), ["DevToolsActivePort"]);
+        assert!(entries(services.state_root()).contains(&"browser-profile".to_string()));
+
+        client.cancel().await.unwrap();
+        drop(connection);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn browser_profile_inside_preview_root() {
+        let dir = tempdir().unwrap();
+        let services = preview_services(dir.path());
+        // A browser.json selecting agent-browser is ignored in preview.
+        std::fs::create_dir_all(services.state_root()).unwrap();
+        std::fs::write(
+            services
+                .state_root()
+                .join(crate::browser_engine::BROWSER_ENGINE_CONFIG_FILE),
+            r#"{"engine": "agent-browser"}"#,
+        )
+        .unwrap();
+        let (connection, _server) = prepare_scoped(
+            services.clone(),
+            ListenerBind::LoopbackEphemeral,
+            TEST_VERSION,
+        )
+        .unwrap();
+        let profile = connection.browser().profile_dir().await;
+        assert_eq!(profile, services.browser_profile_dir().unwrap());
+        assert!(profile.starts_with(services.state_root()));
+        assert!(!profile.starts_with(dir.path().join("host")));
+        assert_eq!(connection.engine().kind(), Some(BrowserEngineKind::Gitterm));
+        // Building the server created nothing in the root.
+        assert!(!profile.exists());
+    }
+
+    /// Arguments that get each Read tool past its own validation to the
+    /// browser, so a call reaches `page_session_for` when it would.
+    fn read_arguments(tool: &str) -> serde_json::Value {
+        let locator = serde_json::json!({"kind": "css", "selector": "body"});
+        match tool {
+            "browser_capture" => serde_json::json!({"label": "before"}),
+            "browser_wait_for" => serde_json::json!({
+                "condition": {"kind": "loading_state", "state": "complete"},
+                "timeout_ms": 50,
+            }),
+            "browser_target_diagnostics" => serde_json::json!({
+                "target": crate::browser_control::DEFAULT_BROWSER_TARGET_NAME,
+            }),
+            "browser_node_inspect" => {
+                serde_json::json!({"selector": {"kind": "locator", "locator": locator}})
+            }
+            _ => serde_json::json!({}),
+        }
+    }
+
+    /// Chrome already runs on the preview profile and `browser_status`
+    /// adopts it. No Read then opens the chat's default tab, attaches to a
+    /// page or installs the title script: a page read answers that the
+    /// target does not exist, and `browser_targets` lists none.
+    #[tokio::test]
+    async fn preview_read_tools_never_create_targets_or_scripts() {
+        let dir = tempdir().unwrap();
+        let services = preview_services(dir.path());
+        let devtools = fake_chrome_in(&services.browser_profile_dir().unwrap()).await;
+        let (connection, server) = prepare_scoped(
+            services.clone(),
+            ListenerBind::LoopbackEphemeral,
+            TEST_VERSION,
+        )
+        .unwrap();
+        let (client, server_task) = serve_and_connect(&connection, server, "chat-a").await;
+
+        let status = call(&client, "browser_status", serde_json::json!({})).await;
+        assert_eq!(status.structured_content.unwrap()["state"], "running");
+        let not_found = crate::browser_control::browser_target_not_found(
+            crate::browser_control::DEFAULT_BROWSER_TARGET_NAME,
+        )
+        .to_string();
+        let mut page_reads = 0;
+        for (tool, access) in BROWSER_TOOL_ACCESS {
+            if access != BrowserAccess::Read || tool == "browser_status" {
+                continue;
+            }
+            // Agent-browser only: the GitTerm engine the preview runs does
+            // not route them, so the client cannot reach them at all.
+            if matches!(tool, "browser_snapshot_refs" | "browser_diff") {
+                assert!(
+                    !BrowserMcpTools::tool_router().has_route(tool),
+                    "{tool} is routed"
+                );
+                continue;
+            }
+            let result = call(&client, tool, read_arguments(tool)).await;
+            match tool {
+                "browser_targets" => {
+                    assert_eq!(result.is_error, Some(false), "{result:?}");
+                    assert_eq!(
+                        result.structured_content.unwrap()["result"],
+                        serde_json::json!([])
+                    );
+                }
+                _ => {
+                    assert_eq!(error_text(&result), not_found, "{tool}");
+                    page_reads += 1;
+                }
+            }
+        }
+        // snapshot, capture, wait_for, console, network, target_diagnostics,
+        // dom_outline, node_inspect.
+        assert_eq!(page_reads, 8);
+        // No CDP command at all: no Target.createTarget, no page session,
+        // no Page.addScriptToEvaluateOnNewDocument.
+        assert!(
+            devtools.calls.lock().unwrap().is_empty(),
+            "{:?}",
+            devtools.calls.lock().unwrap()
+        );
+        assert!(devtools.created_target_params.lock().unwrap().is_empty());
+        assert_eq!(*devtools.pages.lock().unwrap(), ["tab-user"]);
+
+        client.cancel().await.unwrap();
+        drop(connection);
+        server_task.await.unwrap().unwrap();
+    }
+
+    /// Iced (no context) keeps opening the chat's default tab on its first
+    /// read and marking it with the owner title script, as before the gate.
+    #[tokio::test]
+    async fn iced_first_read_still_opens_the_default_tab() {
+        let temp = tempdir().unwrap();
+        let devtools = fake_chrome_in(&temp.path().join("browser-profile")).await;
+        let (connection, server) = prepare(temp.path(), "iced-default", TEST_VERSION).unwrap();
+        let (client, server_task) = serve_and_connect(&connection, server, "chat-a").await;
+
+        let status = call(&client, "browser_status", serde_json::json!({})).await;
+        assert_eq!(status.structured_content.unwrap()["state"], "running");
+        let listed = call(&client, "browser_targets", serde_json::json!({})).await;
+        assert_eq!(listed.is_error, Some(false), "{listed:?}");
+        let listed = listed.structured_content.unwrap();
+        let listed = listed["result"].as_array().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["targetId"], "created-page");
+        let calls = devtools.calls.lock().unwrap().clone();
+        assert!(
+            calls.contains(&"Target.createTarget".to_string()),
+            "{calls:?}"
+        );
+        assert!(
+            calls.contains(&"Page.addScriptToEvaluateOnNewDocument".to_string()),
+            "{calls:?}"
+        );
+        assert_eq!(
+            *devtools.pages.lock().unwrap(),
+            ["tab-user", "created-page"]
+        );
+
+        client.cancel().await.unwrap();
+        drop(connection);
+        server_task.await.unwrap().unwrap();
+    }
+
+    /// Iced's server (`prepare`) has no context: every tool passes the gate
+    /// exactly as a production context would pass it, and a mutating call
+    /// reaches the browser (which is not running) instead of the notice.
+    #[tokio::test]
+    async fn iced_browser_dispatch_unchanged() {
+        let temp = tempdir().unwrap();
+        let (connection, server) = prepare(temp.path(), "iced-dispatch", TEST_VERSION).unwrap();
+        assert!(server.services.is_none());
+        let iced = BrowserMcpTools::new(connection.engine(), TEST_VERSION);
+        let mut production = BrowserMcpTools::new(connection.engine(), TEST_VERSION);
+        production.services = Some(Arc::new(
+            ServiceContext::production(temp.path(), "iced-dispatch").unwrap(),
+        ));
+        for (tool, _) in BROWSER_TOOL_ACCESS {
+            assert_eq!(iced.gate(tool), Ok(()), "{tool}");
+            assert_eq!(production.gate(tool), Ok(()), "{tool}");
+        }
+        assert_eq!(
+            connection.browser().profile_dir().await,
+            temp.path().join("browser-profile")
+        );
+
+        let (client, server_task) = serve_and_connect(&connection, server, "chat-a").await;
+        let status = call(&client, "browser_status", serde_json::json!({})).await;
+        assert_eq!(status.is_error, Some(false));
+        let navigate = call(
+            &client,
+            "browser_navigate",
+            serde_json::json!({"url": "https://example.com/"}),
+        )
+        .await;
+        let error = error_text(&navigate);
+        assert!(error.contains("browser is not running"), "{error}");
+        assert_eq!(
+            connection
+                .browser()
+                .telemetry()
+                .await
+                .last_agent_operation
+                .unwrap()
+                .operation,
+            BrowserOperation::Navigate
+        );
+
+        client.cancel().await.unwrap();
+        drop(connection);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn html_preview_denied_spawns_nothing() {
+        use crate::browser_control::{gate_html_preview, html_preview_runner_in};
+        use gitterm_core::content::html_render::HtmlPreviewRequest;
+        use gitterm_core::preview::service::preview_notice;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let runs = Arc::new(AtomicUsize::new(0));
+        let recorder: gitterm_core::task_mcp::HtmlPreviewRunner = {
+            let runs = runs.clone();
+            Arc::new(move |_| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(serde_json::json!({"recorded": true})) })
+            })
+        };
+        let request = || -> HtmlPreviewRequest {
+            serde_json::from_value(serde_json::json!({"html": "<p>hi</p>"})).unwrap()
+        };
+        let dir = tempdir().unwrap();
+        let preview = preview_services(dir.path());
+        let denied = gate_html_preview(&preview, recorder.clone());
+        assert_eq!(denied(request()).await, Err(preview_notice("html_preview")));
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        // The real runner behind the preview gate refuses the same way.
+        assert_eq!(
+            html_preview_runner_in(&preview)(request()).await,
+            Err(preview_notice("html_preview"))
+        );
+
+        let production = ServiceContext::production(dir.path(), "html-preview").unwrap();
+        let allowed = gate_html_preview(&production, recorder);
+        assert!(allowed(request()).await.is_ok());
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 }

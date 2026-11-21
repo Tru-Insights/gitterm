@@ -13,6 +13,8 @@ gitterm-core = { path = "../../../crates/gitterm-core", features = ["runtime", "
 gitterm-browser = { path = "../../../crates/gitterm-browser" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 tokio-stream = { version = "0.1", default-features = false }
+# The phone list request (`list_phones`); the same tonic core builds its client with.
+tonic = { version = "0.12", default-features = false }
 gitterm-terminal = { path = "../terminal" }
 gitterm-gpui-review = { path = "../review" }
 gitterm-gpui-chat = { path = "../chat" }

@@ -9,6 +9,7 @@ use gitterm_core::{
     remote::{
         client::RemoteAgentHandshake,
         config::RemoteAgentConfig,
+        phone_panel::PairedPhoneInfo,
         source::{SourceDirEntry, SourceDirListing, SourcePath, remote_parent_within_root},
         ssh_sessions::{RemoteHostConfig, RemoteSessionEntry, RemoteSessionsSnapshot},
     },
@@ -22,11 +23,21 @@ use std::{
 #[derive(Default)]
 pub(crate) struct FakeRemote {
     calls: Mutex<Vec<String>>,
+    /// What the handshake reports the agent serves.
+    pub(crate) capabilities: Vec<String>,
+    /// The paired phones `list_phones` answers; none listed by default.
+    pub(crate) phones: Option<Result<Vec<PairedPhoneInfo>, String>>,
 }
 
 impl FakeRemote {
     pub(crate) fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
+    }
+    /// The calls after the bar's startup handshakes.
+    pub(crate) fn calls_after_handshake(&self) -> Vec<String> {
+        let mut calls = self.calls();
+        calls.retain(|call| !call.starts_with("handshake "));
+        calls
     }
     fn record(&self, call: String) {
         self.calls.lock().unwrap().push(call);
@@ -42,7 +53,7 @@ impl RemoteClient for FakeRemote {
             agent_name: "fixture-agent".into(),
             agent_version: "0".into(),
             protocol_version: 1,
-            capabilities: vec![],
+            capabilities: self.capabilities.clone(),
             home_dir: "/home/fixture".into(),
         })
     }
@@ -111,6 +122,10 @@ impl RemoteClient for FakeRemote {
             error: None,
         }
     }
+    fn list_phones(&self, remote: &RemoteAgentConfig) -> Result<Vec<PairedPhoneInfo>, String> {
+        self.record(format!("list_phones {}", remote.id));
+        self.phones.clone().unwrap_or(Ok(vec![]))
+    }
 }
 
 pub(crate) fn draw(cx: &mut VisualTestContext) {
@@ -159,6 +174,14 @@ impl Fixture {
 }
 
 pub(crate) fn fixture(cx: &mut TestAppContext) -> (Fixture, &mut VisualTestContext) {
+    fixture_with(FakeRemote::default(), cx)
+}
+
+/// The fixture with `fake` as the remote client from the first handshake.
+pub(crate) fn fixture_with(
+    fake: FakeRemote,
+    cx: &mut TestAppContext,
+) -> (Fixture, &mut VisualTestContext) {
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     cx.update(install_app_menus);
@@ -192,7 +215,7 @@ pub(crate) fn fixture(cx: &mut TestAppContext) -> (Fixture, &mut VisualTestConte
     let layout = store.guard.as_ref().unwrap().preview().layout();
     let settings = workspace_config::load_iced_settings_from(&source);
     cx.update(|cx| theme::apply_settings(&settings, None, cx));
-    let fake = Arc::new(FakeRemote::default());
+    let fake = Arc::new(fake);
     let client = fake.clone();
     let local_home = root.path().to_owned();
     let (shell, cx) = cx.add_window_view(|window, cx| {
@@ -424,7 +447,7 @@ fn refresh_lists_remote_sessions_through_the_client(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("remote-session-home").is_some());
     click("remote-session-refresh", cx);
     assert_eq!(
-        f.fake.calls(),
+        f.fake.calls_after_handshake(),
         ["list_sessions box dev@box.invalid".to_string()]
     );
     cx.read(|cx| {
