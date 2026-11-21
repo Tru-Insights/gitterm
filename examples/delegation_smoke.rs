@@ -139,8 +139,13 @@ async fn smoke(workdir: &Path) -> Result<(), String> {
     });
 
     let (commands, requests) = gitterm_core::task_commands::runtime::command_channel();
-    let (task, server) =
-        task_mcp::prepare("delegation-smoke", commands).map_err(|error| error.to_string())?;
+    let (task, server) = task_mcp::prepare(
+        "delegation-smoke",
+        commands,
+        gitterm::browser_control::html_preview_runner(),
+        env!("CARGO_PKG_VERSION"),
+    )
+    .map_err(|error| error.to_string())?;
     tokio::spawn(server.run());
     tokio::spawn(run_bridge(requests, bridge.clone()));
     println!("task MCP {}", task.endpoint());

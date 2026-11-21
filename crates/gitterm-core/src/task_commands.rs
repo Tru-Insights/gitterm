@@ -34,5 +34,6 @@ pub struct TaskReadEffect {
 #[cfg(feature = "runtime")]
 pub mod runtime;
 
+pub mod mcp_protocol;
 mod mutation;
 pub use mutation::*;

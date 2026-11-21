@@ -2264,14 +2264,17 @@ dependencies = [
 name = "gitterm-core"
 version = "0.1.0"
 dependencies = [
+ "axum 0.8.9",
  "chrono",
  "dirs",
  "git2",
+ "hyper 0.14.32",
  "libc",
  "prost",
  "protoc-bin-vendored",
  "pulldown-cmark",
  "ring",
+ "rmcp",
  "schemars",
  "serde",
  "serde_json",
