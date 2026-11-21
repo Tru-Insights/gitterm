@@ -45,6 +45,7 @@ pub mod task_worktree;
 pub mod chat_facts;
 pub mod chats;
 pub mod find;
+pub mod folder_picker;
 
 pub mod work;
 pub mod work_notes;

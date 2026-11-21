@@ -152,3 +152,16 @@ fn remote_index_uses_sixty_second_freshness_and_query_does_not_own_index() {
         Effect::LoadIndex(_)
     ));
 }
+
+#[test]
+fn remote_index_status_names_each_sync_state() {
+    use super::RemoteIndexStatus as S;
+    assert_eq!(S::of(None).label(), "○ not yet synced");
+    assert_eq!(S::of(Some((true, true, true))).label(), "⟳ syncing");
+    assert_eq!(S::of(Some((false, true, false))).label(), "○ unreachable");
+    assert_eq!(
+        S::of(Some((false, true, true))).label(),
+        "○ unreachable · cached index"
+    );
+    assert_eq!(S::of(Some((false, false, false))).label(), "● connected");
+}
