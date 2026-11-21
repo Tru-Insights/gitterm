@@ -231,6 +231,7 @@ pub struct WorkSidebar {
     repo_recency: Vec<(PathBuf, std::time::SystemTime)>,
     source: Option<IcedWorkSource>,
     pull_requests: Vec<PullRequestGroup>,
+    indexed_chats: Vec<gitterm_core::chats::ChatIndexEntry>,
     issues: gitterm_core::issues::IssueTitlesFile,
     collapsed_issue_groups: Vec<gitterm_core::issues::IssueGroup>,
     loading: bool,
@@ -255,6 +256,7 @@ impl WorkSidebar {
             repo_recency: vec![],
             source: None,
             pull_requests: vec![],
+            indexed_chats: vec![],
             issues: Default::default(),
             collapsed_issue_groups: vec![],
             loading: false,
@@ -349,12 +351,19 @@ impl WorkSidebar {
             })
             .collect();
         let config = source.config.clone();
+        let previous = self.indexed_chats.clone();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let job = cx.background_executor().spawn(async move {
-            let result =
-                crate::data::IcedWorkData::read(&source.config, id, &saved, focus, |data| {
+            let result = crate::data::IcedWorkData::read(
+                &source.config,
+                id,
+                &saved,
+                focus,
+                &previous,
+                |data| {
                     _ = sender.send(Ok(data.clone()));
-                });
+                },
+            );
             _ = sender.send(result);
         });
         cx.spawn(async move |view, cx| {
@@ -373,6 +382,7 @@ impl WorkSidebar {
                             this.running_task_ids = data.running_task_ids;
                             this.repo_recency = data.repo_recency;
                             this.pull_requests = data.pull_requests;
+                            this.indexed_chats = data.indexed_chats;
                             this.issues = data.issues;
                             this.collapsed_issue_groups = data.collapsed_issue_groups;
                             this.error = None;

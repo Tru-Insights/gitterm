@@ -724,8 +724,15 @@ impl IcedFixture {
         }
     }
     fn load(&self) -> crate::data::IcedWorkData {
-        crate::data::IcedWorkData::read(&self.config, 1, &self.workspace, Focus::Latest, |_| {})
-            .unwrap()
+        crate::data::IcedWorkData::read(
+            &self.config,
+            1,
+            &self.workspace,
+            Focus::Latest,
+            &[],
+            |_| {},
+        )
+        .unwrap()
     }
 }
 
@@ -750,8 +757,27 @@ fn tree_snapshot(
 #[test]
 fn iced_work_fixture_has_real_rows_in_order_and_never_changes_source_bytes_or_mtimes() {
     let fixture = IcedFixture::new();
+    let home = fixture.root.path().join("harness-home");
+    indexed_transcript(
+        &home,
+        "root-chat",
+        std::path::Path::new(&fixture.workspace.dir),
+        "Fixture chat title",
+        "Fixture request",
+        "2026-11-20T12:00:00Z",
+    );
+    let load = || {
+        crate::data::IcedWorkData::read_with_home(
+            &fixture.config,
+            Some(&home),
+            1,
+            &fixture.workspace,
+            Focus::Latest,
+        )
+        .unwrap()
+    };
     let before = tree_snapshot(fixture.root.path());
-    let data = fixture.load();
+    let data = load();
     assert_eq!(data.tasks.len(), 1);
     assert_eq!(data.workers.len(), 1);
     assert_eq!(
@@ -822,7 +848,7 @@ fn iced_work_fixture_has_real_rows_in_order_and_never_changes_source_bytes_or_mt
     );
     // A second load also must not acquire a lease, migrate a task, or write
     // status refresh metadata in the repositories or source config directory.
-    fixture.load();
+    load();
     assert_eq!(tree_snapshot(fixture.root.path()), before);
 }
 
@@ -840,6 +866,7 @@ fn missing_and_malformed_task_stores_are_read_only_and_errors_are_visible() {
         1,
         &fixture.workspace,
         Focus::Latest,
+        &[],
         |_| {},
     );
     assert!(result.err().unwrap().to_string().contains("task store"));
@@ -1130,7 +1157,7 @@ fn indexed_work_uses_iced_titles_latest_and_child_activity_in_iced_order_read_on
             (cwd, noon + Duration::from_secs(3600))
         ]
     );
-    // Without transcripts, task links must not change the previous fallback rows.
+    // Without transcripts or an earlier index, owned roots are omitted from Chats.
     let fallback = crate::data::IcedWorkData::read_with_home(
         &fixture.config,
         Some(&home.join("absent-index")),
@@ -1141,20 +1168,12 @@ fn indexed_work_uses_iced_titles_latest_and_child_activity_in_iced_order_read_on
     .unwrap();
     let mut state = State::default();
     fallback.apply(&mut state);
-    assert!(
-        state
-            .pane(1)
-            .unwrap()
-            .summary
-            .coordinators
-            .iter()
-            .all(|c| c.fan_out.is_none())
-    );
+    assert!(state.pane(1).unwrap().summary.coordinators.is_empty());
     assert_eq!(tree_snapshot(fixture.root.path()), before);
 }
 
 #[test]
-fn folder_work_includes_historical_chats_and_missing_index_preserves_fallback() {
+fn folder_work_includes_historical_chats_and_missing_index_omits_unknown_chats() {
     let fixture = IcedFixture::new();
     let home = fixture.root.path().join("harness-home");
     let missing = fixture.root.path().join("absent-home");
@@ -1169,9 +1188,14 @@ fn folder_work_includes_historical_chats_and_missing_index_preserves_fallback() 
     .unwrap();
     let state = Rc::new(RefCell::new(State::default()));
     fallback.apply(&mut state.borrow_mut());
-    assert_eq!(
-        state.borrow().pane(1).unwrap().summary.coordinators[0].title,
-        "root-chat"
+    assert!(
+        state
+            .borrow()
+            .pane(1)
+            .unwrap()
+            .summary
+            .coordinators
+            .is_empty()
     );
     assert!(fallback.repo_recency.is_empty());
     assert_eq!(tree_snapshot(fixture.root.path()), before);
@@ -1244,6 +1268,7 @@ pub(crate) fn h8_install(sidebar: &mut WorkSidebar, data: crate::data::IcedWorkD
     sidebar.tasks = data.tasks;
     sidebar.workers = data.workers;
     sidebar.repo_recency = data.repo_recency;
+    sidebar.indexed_chats = data.indexed_chats;
     sidebar.loaded_at = Some(Instant::now());
 }
 
@@ -1360,6 +1385,7 @@ fn realistic_catalog_partial_index_publishes_repos_chats_docs_before_branch_chec
         4,
         saved,
         Focus::Latest,
+        &[],
         true,
         |data| {
             publications += 1;
@@ -1402,7 +1428,7 @@ fn realistic_catalog_partial_index_publishes_repos_chats_docs_before_branch_chec
             );
             assert_eq!(
                 rows.iter().find(|row| row.label == "Chats").unwrap().badges,
-                ["7"]
+                ["1"]
             );
             assert_eq!(
                 rows.iter()
