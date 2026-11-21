@@ -1,15 +1,17 @@
+use crate::host::ReviewHost;
 use crate::model::AggregateModel;
 use gitterm_core::{
     git_facts::{BaseChoice, DiffSource},
     review::{
         model::{FileStatus, LineOp, ReviewFile, ReviewSource},
         state::{Effect, Intent},
-        viewed::{ViewedMarks, ViewedState},
+        viewed::ViewedState,
     },
 };
 use gpui::{
     Context, InteractiveElement, IntoElement, ListHorizontalSizingBehavior, ParentElement, Render,
-    StatefulInteractiveElement, Styled, Window, div, px, rgb, uniform_list,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px, rgb,
+    uniform_list,
 };
 use gpui_component::{
     Disableable, Selectable, Sizable,
@@ -26,10 +28,16 @@ pub(super) struct AggregateView {
     bases: Vec<BaseChoice>,
     error: Option<String>,
     executor: Arc<tokio::runtime::Runtime>,
+    pub(super) host: ReviewHost,
 }
 
 impl AggregateView {
-    pub(super) fn new(root: PathBuf, source: ReviewSource, cx: &mut Context<Self>) -> Self {
+    pub(super) fn new(
+        root: PathBuf,
+        source: ReviewSource,
+        host: ReviewHost,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let executor = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -67,14 +75,18 @@ impl AggregateView {
         })
         .detach();
         let mut model = AggregateModel::default();
-        // This preview never discovers or writes the user's settings directory.
-        model.dispatch(Intent::MarksLoaded(Ok(ViewedMarks::default())));
+        // Iced's marks are read-only here; the host's preview root is the only write target.
+        model.dispatch(Intent::MarksLoaded(crate::marks::load_merged(
+            host.iced_marks_dir.as_deref(),
+            host.preview_marks_dir.as_deref(),
+        )));
         Self {
             model,
             selected: None,
             bases: Vec::new(),
             error: None,
             executor,
+            host,
         }
     }
 
@@ -85,9 +97,10 @@ impl AggregateView {
             match effect {
                 Effect::Collect(stamp) => {
                     self.error = None;
-                    let worker = self
-                        .executor
-                        .spawn(crate::repo::collect_aggregate(stamp.clone()));
+                    let worker = self.executor.spawn(crate::repo::collect_aggregate_with(
+                        stamp.clone(),
+                        self.host.snapshot_roots.clone(),
+                    ));
                     let lifetime = self.executor.clone();
                     cx.spawn(async move |view, cx| {
                         let intent = worker
@@ -105,12 +118,24 @@ impl AggregateView {
                     self.error = Some(error);
                     changed = true;
                 }
-                Effect::Render | Effect::SaveMarks => {
+                Effect::Render => {
                     self.error = None;
                     changed = true;
                 }
-                // No native control in this pane emits open-file or close IPC.
-                Effect::Close | Effect::OpenFile(_) => {}
+                Effect::SaveMarks => {
+                    self.error = self.save_marks().err();
+                    changed = true;
+                }
+                Effect::OpenFile(full) => {
+                    if !full.is_file() {
+                        self.error = Some(format!("open: {} is not a file", full.display()));
+                    } else if let Some(open) = self.host.open_file.clone() {
+                        open(full, cx);
+                    }
+                    changed = true;
+                }
+                // No native control in this pane emits close IPC.
+                Effect::Close => {}
             }
         }
         // MarksLoaded and ToggleViewed need a native repaint even without Render.
@@ -127,6 +152,36 @@ impl AggregateView {
             }
         }
         cx.notify();
+    }
+
+    /// Persists the merged marks into the host's preview root. With no writer the
+    /// marks stay in memory for this session.
+    fn save_marks(&self) -> Result<(), String> {
+        let (Some(save), Some(Ok(marks))) = (&self.host.save_marks, self.model.state().marks())
+        else {
+            return Ok(());
+        };
+        crate::marks::overlay(
+            self.host.iced_marks_dir.as_deref(),
+            self.host.preview_marks_dir.as_deref(),
+            marks,
+        )?
+        .encode()
+        .and_then(|bytes| save(bytes))
+    }
+
+    fn select_turn(&mut self, number: u64, cx: &mut Context<Self>) {
+        if let Some(intent) = self.model.turn_intent(number) {
+            self.dispatch(intent, cx);
+        }
+    }
+
+    fn open_selected_file(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.selected.clone()
+            && let Some(intent) = self.model.open_file_intent(&path)
+        {
+            self.dispatch(intent, cx);
+        }
     }
 
     fn choose_base(&mut self, base: BaseChoice, cx: &mut Context<Self>) {
@@ -242,6 +297,36 @@ impl AggregateView {
     }
 }
 
+/// The small text under a turn, as Iced's `render_turns` writes it.
+fn turn_detail(turn: &gitterm_core::review::model::ReviewTurn) -> String {
+    format!(
+        "{}{}",
+        turn_age(turn.timestamp),
+        if turn.start.is_none() {
+            " · no start snapshot"
+        } else if turn.end.is_none() {
+            " · running or incomplete"
+        } else {
+            ""
+        }
+    )
+}
+
+/// Iced's `commit_age` buckets, shown beside each turn.
+fn turn_age(timestamp: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64);
+    let seconds = now.saturating_sub(timestamp).max(0);
+    match seconds {
+        0..60 => "now".to_string(),
+        60..3_600 => format!("{}m ago", seconds / 60),
+        3_600..86_400 => format!("{}h ago", seconds / 3_600),
+        86_400..2_592_000 => format!("{}d ago", seconds / 86_400),
+        _ => format!("{}mo ago", seconds / 2_592_000),
+    }
+}
+
 /// Code surfaces are monospace like Iced's `--mono`; "monospace" is not a macOS family.
 pub(crate) const MONO_FONT: &str = "Menlo";
 
@@ -299,6 +384,19 @@ impl Render for AggregateView {
                     })),
             )
             .child(
+                Button::new("aggregate-turns")
+                    .small()
+                    .label("Turns")
+                    .selected(matches!(source, Some(ReviewSource::Turns { .. })))
+                    .disabled(pane.is_none() || self.host.active_chat.is_none())
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        if let Some(intent) = view.model.turns_intent(view.host.active_chat.clone())
+                        {
+                            view.dispatch(intent, cx);
+                        }
+                    })),
+            )
+            .child(
                 Button::new("aggregate-base-picker")
                     .small()
                     .label(format!(
@@ -345,7 +443,11 @@ impl Render for AggregateView {
             div()
                 .px_3()
                 .text_color(rgb(0x9399b2))
-                .child("Aggregate review · Viewed marks are kept for this preview session"),
+                .child(if self.host.save_marks.is_some() {
+                    "Aggregate review"
+                } else {
+                    "Aggregate review · Viewed marks are kept for this preview session"
+                }),
         );
         for notice in &projection.notices {
             top = top.child(div().px_3().text_color(rgb(0xf9e2af)).child(notice.clone()));
@@ -407,6 +509,37 @@ impl Render for AggregateView {
                 );
             }
         }
+        if let Some(pane) = pane
+            && let ReviewSource::Turns { selected, .. } = &pane.source
+        {
+            sidebar = sidebar.child(div().py_2().child("Turns of the active chat"));
+            if pane.turns.is_empty() {
+                sidebar = sidebar.child(
+                    div()
+                        .py_2()
+                        .child("No turn snapshots for this chat in this checkout."),
+                );
+            }
+            for (index, turn) in pane.turns.iter().enumerate() {
+                let number = turn.number;
+                let detail = turn_detail(turn);
+                let label = format!("Turn {number} {detail}");
+                sidebar = sidebar.child(
+                    ListItem::new(("aggregate-turn", index))
+                        .accessibility_label(label)
+                        .disabled(turn.start.is_none() || turn.end.is_none())
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(format!("Turn {number}"))
+                                .child(div().text_color(rgb(0x9399b2)).child(detail)),
+                        )
+                        .selected(*selected == Some(number))
+                        .on_click(cx.listener(move |view, _, _, cx| view.select_turn(number, cx))),
+                );
+            }
+        }
         sidebar = sidebar.child(div().py_2().child("Changed files"));
         for (index, row) in projection.files.iter().enumerate() {
             let path = row.file.path.clone();
@@ -445,6 +578,9 @@ impl Render for AggregateView {
         {
             let file = row.file;
             let path = file.path.clone();
+            let can_open = !matches!(source, Some(ReviewSource::Commits(_)))
+                && file.status != FileStatus::Deleted
+                && self.host.open_file.is_some();
             let title = file
                 .old_path
                 .as_ref()
@@ -462,6 +598,19 @@ impl Render for AggregateView {
                             .text_size(px(12.5))
                             .child(format!("{title}  +{} −{}", file.additions, file.deletions)),
                     )
+                    // Iced's per-file Open button, before Viewed (review_pane.rs render_file).
+                    .when(can_open, |row| {
+                        row.child(
+                            div().debug_selector(|| "aggregate-open".into()).child(
+                                Button::new("aggregate-open")
+                                    .small()
+                                    .label("Open")
+                                    .on_click(
+                                        cx.listener(|view, _, _, cx| view.open_selected_file(cx)),
+                                    ),
+                            ),
+                        )
+                    })
                     .child(
                         Button::new("aggregate-viewed")
                             .small()
@@ -516,13 +665,14 @@ impl Render for AggregateView {
                 body = body.child(div().p_3().child("No text changes (metadata only)"));
             }
         } else if !loading {
-            body = body.child(div().p_3().child(
-                if matches!(source, Some(ReviewSource::Commits(None))) {
-                    "Select commits to review"
-                } else {
-                    "No changed files"
-                },
-            ));
+            body = body.child(div().p_3().child(match source {
+                Some(ReviewSource::Commits(None)) => "Select commits to review",
+                Some(ReviewSource::Turns { selected: None, .. }) => {
+                    "Select a completed turn to review its changes"
+                }
+                Some(ReviewSource::Turns { .. }) => "No changes in the selected turn",
+                _ => "No changed files",
+            }));
         }
         div()
             .size_full()

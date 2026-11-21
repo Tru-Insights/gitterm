@@ -309,10 +309,11 @@ impl ReviewView {
         &mut self,
         checkout: PathBuf,
         source: gitterm_core::review::model::ReviewSource,
+        host: crate::host::ReviewHost,
         cx: &mut Context<Self>,
     ) {
         // A new entity also isolates completions from a previously selected checkout.
-        self.aggregate = Some(cx.new(|cx| AggregateView::new(checkout, source, cx)));
+        self.aggregate = Some(cx.new(|cx| AggregateView::new(checkout, source, host, cx)));
         self.show_aggregate = true;
         cx.notify();
     }

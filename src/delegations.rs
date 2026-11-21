@@ -14,25 +14,6 @@ use crate::task_mcp;
 use crate::tasks::{NewDelegation, TaskHandoff, TaskStore};
 use gitterm_core::delegation_request as input;
 
-fn review_input(request: &task_mcp::ReviewDelegationRequest) -> input::ReviewDelegationRequest {
-    input::ReviewDelegationRequest {
-        target: match request.target {
-            task_mcp::ReviewTargetKind::Uncommitted => input::ReviewTargetKind::Uncommitted,
-            task_mcp::ReviewTargetKind::Base => input::ReviewTargetKind::Base,
-            task_mcp::ReviewTargetKind::Commit => input::ReviewTargetKind::Commit,
-        },
-        base_ref: request.base_ref.clone(),
-        commit: request.commit.clone(),
-        focus: request.focus.clone(),
-        reviewer: request.reviewer.clone(),
-        model: request.model.clone(),
-        user_model_choice: request.user_model_choice,
-        checkout: request.checkout.clone(),
-        effort: request.effort,
-        time_limit_minutes: request.time_limit_minutes,
-    }
-}
-
 pub fn review_delegation(
     request: &task_mcp::ReviewDelegationRequest,
     caller: &CallerTab,
@@ -40,7 +21,7 @@ pub fn review_delegation(
     previous: Option<String>,
 ) -> Result<NewDelegation, String> {
     gitterm_core::delegations::review_delegation(
-        &review_input(request),
+        &request.into(),
         caller,
         configured_model,
         previous,
@@ -54,14 +35,7 @@ pub fn consult_delegation(
     previous: Option<String>,
 ) -> Result<NewDelegation, String> {
     gitterm_core::delegations::consult_delegation(
-        &input::ConsultDelegationRequest {
-            brief: request.brief.clone(),
-            model: request.model.clone(),
-            user_model_choice: request.user_model_choice,
-            checkout: request.checkout.clone(),
-            effort: request.effort,
-            time_limit_minutes: request.time_limit_minutes,
-        },
+        &request.into(),
         caller,
         configured_model,
         previous,
@@ -71,38 +45,13 @@ pub fn consult_delegation(
 pub fn review_request_from_popover(
     request: &crate::review::ReviewRequest,
 ) -> task_mcp::ReviewDelegationRequest {
-    let request = gitterm_core::delegations::review_request_from_popover(request);
-    task_mcp::ReviewDelegationRequest {
-        target: match request.target {
-            input::ReviewTargetKind::Uncommitted => task_mcp::ReviewTargetKind::Uncommitted,
-            input::ReviewTargetKind::Base => task_mcp::ReviewTargetKind::Base,
-            input::ReviewTargetKind::Commit => task_mcp::ReviewTargetKind::Commit,
-        },
-        base_ref: request.base_ref,
-        commit: request.commit,
-        focus: request.focus,
-        reviewer: request.reviewer,
-        model: request.model,
-        user_model_choice: request.user_model_choice,
-        checkout: request.checkout,
-        effort: request.effort,
-        time_limit_minutes: request.time_limit_minutes,
-    }
+    gitterm_core::delegations::review_request_from_popover(request).into()
 }
 
 pub fn worker_targets(
     request: &task_mcp::DelegateTaskRequest,
 ) -> Result<(WorkerPlace, crate::tasks::DelegationRunOptions), String> {
-    gitterm_core::delegations::worker_targets(&input::WorkerTargetRequest {
-        checkout: request.checkout.clone(),
-        repo: request.repo.clone(),
-        base_reference: request.base_reference.clone(),
-        add_dirs: request.add_dirs.clone(),
-        model: request.model.clone(),
-        user_model_choice: request.user_model_choice,
-        effort: request.effort,
-        time_limit_minutes: request.time_limit_minutes,
-    })
+    gitterm_core::delegations::worker_targets(&request.into())
 }
 
 pub fn record_handoff(

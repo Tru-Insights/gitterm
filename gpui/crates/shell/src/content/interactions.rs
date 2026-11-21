@@ -416,3 +416,65 @@ fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
     visit(root, root, &mut files);
     files
 }
+
+#[gpui::test]
+fn review_host_saves_marks_under_the_preview_root_and_opens_files_like_the_tree(
+    cx: &mut TestAppContext,
+) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let folder = tempfile::tempdir_in("/private/tmp").unwrap();
+    let config = tempfile::tempdir_in("/private/tmp").unwrap();
+    let preview = config.path().join("preview");
+    let root = folder.path().to_path_buf();
+    let config_root = config.path().to_path_buf();
+    let (shell, cx) = cx.add_window_view(|window, cx| {
+        let mut model = WorkspaceStatus::default();
+        model.add(root, Instant::now());
+        let owner = cx.new(|cx| {
+            WorkspaceOwner::new(
+                model,
+                Some(crate::preview::tests::guarded_store(&preview)),
+                cx,
+            )
+        });
+        Shell::with_owner(
+            Rc::new(data::LocalData(owner.clone())),
+            owner,
+            &config_root,
+            true,
+            window,
+            cx,
+        )
+        .unwrap()
+    });
+    let opened = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let host = cx.update(|_, cx| {
+        let owner = shell.read(cx).owner.clone();
+        let sink = opened.clone();
+        let subscription = cx.subscribe(&owner, move |_, event: &FileOpen, _| {
+            sink.borrow_mut()
+                .push((event.workspace, event.path.clone(), event.from_files))
+        });
+        std::mem::forget(subscription);
+        shell.update(cx, |shell, cx| shell.review_host(WorkspaceId(1), cx))
+    });
+    // No Iced catalog here: nothing of Iced's is read, so no turn source either.
+    assert!(host.iced_marks_dir.is_none() && host.snapshot_roots.is_none());
+    assert!(host.active_chat.is_none());
+    let preview = config.path().join("preview");
+    assert_eq!(host.preview_marks_dir.as_deref(), Some(preview.as_path()));
+    (host.save_marks.unwrap())(br#"{"checkouts":{}}"#.to_vec()).unwrap();
+    let saved = preview.join("review-viewed.json");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !saved.is_file() {
+        assert!(Instant::now() < deadline, "marks were not written");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(std::fs::read(&saved).unwrap(), br#"{"checkouts":{}}"#);
+    cx.update(|_, cx| (host.open_file.unwrap())("/fixture/a.rs".into(), cx));
+    assert_eq!(
+        *opened.borrow(),
+        [(WorkspaceId(1), PathBuf::from("/fixture/a.rs"), true)]
+    );
+}
