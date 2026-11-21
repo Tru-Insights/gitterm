@@ -571,3 +571,67 @@ fn an_agent_without_phone_access_explains_each_failure() {
         Some("Could not list paired phones: list_phones failed: missing or invalid bearer token")
     );
 }
+
+/// Iced's executor for the core's calls, against the fixture agent: the
+/// payload each call carries reaches the agent, and the answer comes back
+/// as the event the panel applies.
+#[test]
+fn iced_runs_the_core_calls_against_the_fixture_agent() {
+    if isolated("iced_runs_the_core_calls_against_the_fixture_agent") {
+        return;
+    }
+    let agent = FixtureAgent::start(true);
+    let registry = agent.phones.clone().unwrap();
+    let (_dir, mut app) = app_with_remote(&agent.endpoint);
+    let client = app.remote_chat_client(REMOTE).unwrap();
+    let resolve = |_: &str| Ok::<_, String>(client.clone());
+    let _ = app.update_event(Event::PhonePanelOpen(REMOTE.into()));
+    let _ = app.update_event(Event::PhoneDeviceNameChanged(" Work phone ".into()));
+    let _ = app.update_event(Event::PhoneAllowActToggled(true));
+
+    let call = app.phone_panel.as_mut().unwrap().create(resolve).unwrap();
+    assert_eq!(
+        call.request,
+        PhoneRequest::Create {
+            device_name: "Work phone".into(),
+            scope: "act",
+        }
+    );
+    let event = agent.runtime.block_on(run_phone_call(call));
+    assert!(
+        matches!(&event, Event::PhonePairingCreated(id, Ok(p)) if id == REMOTE && p.scope == "act")
+    );
+    let _ = app.update_event(event);
+    let code = panel(&app)
+        .pairing
+        .as_ref()
+        .unwrap()
+        .url
+        .rsplit('#')
+        .next()
+        .unwrap()
+        .to_string();
+    registry.redeem(&code).unwrap();
+
+    let call = app.phone_panel.as_mut().unwrap().list(resolve).unwrap();
+    let event = agent.runtime.block_on(run_phone_call(call));
+    let _ = app.update_event(event);
+    let phones = panel(&app).phones.clone().unwrap();
+    assert_eq!(phones.len(), 1);
+    assert_eq!(
+        (phones[0].name.as_str(), phones[0].scope.as_str()),
+        ("Work phone", "act")
+    );
+
+    let call = app
+        .phone_panel
+        .as_mut()
+        .unwrap()
+        .revoke(phones[0].id.clone(), resolve)
+        .unwrap();
+    let event = agent.runtime.block_on(run_phone_call(call));
+    assert!(matches!(&event, Event::PhoneRevoked(id, Ok(true)) if id == REMOTE));
+    let _ = app.update_event(event);
+    assert!(registry.list().is_empty());
+    assert!(!panel(&app).busy && panel(&app).error.is_none());
+}

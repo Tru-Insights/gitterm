@@ -8688,6 +8688,9 @@ fn remote_session_definitions_from_config(
 }
 
 use gitterm_core::remote::config::push_remote_agent_config;
+use gitterm_core::remote::phone_panel::{
+    self, scope_label as phone_scope_label, PhoneCall, PhoneRequest,
+};
 
 /// Insert or update an agent by id. Updates touch only the fields the
 /// connect form edits; hand-maintained `shell_command` / `session_commands`
@@ -9148,49 +9151,45 @@ fn remote_connect_form_done(form: &RemoteConnectForm, remote_id: &str, connected
 }
 
 /// The "Pair a phone" panel (TRU-151) for one remote agent: a pairing QR
-/// code and the phones already paired, with Revoke.
-#[derive(Debug, Clone)]
-struct PhonePanel {
-    remote_id: String,
-    machine_name: String,
-    /// Shown in the paired-phones list.
-    device_name: String,
-    /// "Allow sending and approving": the next pairing gets act scope.
-    /// Off by default; a phone already paired keeps its scope.
-    allow_act: bool,
-    pairing: Option<PhonePairingView>,
-    /// `None` while loading.
-    phones: Option<Vec<PairedPhoneInfo>>,
-    /// A pairing or revoke is in flight.
-    busy: bool,
-    error: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct PhonePairingView {
-    url: String,
-    /// The same pairing, typed into the phone's home-screen app
-    /// (`XXXX-XXXX`). Empty from an agent that predates short codes.
-    short_code: String,
-    /// The scope the agent granted ("view" or "act").
-    scope: String,
-    expires_unix_secs: u64,
-    qr: iced::widget::image::Handle,
-}
-
-/// How the pairing panel names a phone scope from the agent.
-fn phone_scope_label(scope: &str) -> String {
-    match scope {
-        "view" => "view only".to_string(),
-        "act" => "can send and approve".to_string(),
-        other => other.to_string(),
-    }
-}
+/// code and the phones already paired, with Revoke. Its state and rules are
+/// in core; Iced draws it, draws the QR and runs the agent calls.
+type PhonePanel = phone_panel::PhonePanel<iced::widget::image::Handle>;
 
 /// Pixels per QR module in the pairing panel, and the quiet zone around
 /// the code (modules) that scanners need.
 const PHONE_QR_SCALE: usize = 6;
 const PHONE_QR_QUIET: usize = 4;
+
+/// Run one phone panel call against the remote's agent; the answer comes
+/// back as the event the panel applies.
+async fn run_phone_call(call: PhoneCall<RemoteAgentClientConfig>) -> Event {
+    let PhoneCall {
+        remote_id,
+        request,
+        client,
+    } = call;
+    let backend = RemoteAgentBackend::new(client);
+    match request {
+        PhoneRequest::List => {
+            let result = backend.list_phones().await.map_err(|err| err.to_string());
+            Event::PhonesLoaded(remote_id, result)
+        }
+        PhoneRequest::Create { device_name, scope } => {
+            let result = backend
+                .create_phone_pairing(device_name, scope.to_string())
+                .await
+                .map_err(|err| err.to_string());
+            Event::PhonePairingCreated(remote_id, result)
+        }
+        PhoneRequest::Revoke { id } => {
+            let result = backend
+                .revoke_phone(id)
+                .await
+                .map_err(|err| err.to_string());
+            Event::PhoneRevoked(remote_id, result)
+        }
+    }
+}
 
 /// The pairing URL as a QR image (black on white, quiet zone included).
 fn phone_pairing_qr(url: &str) -> Result<iced::widget::image::Handle, String> {
@@ -11255,46 +11254,20 @@ impl App {
         )
     }
 
-    /// Load the phone panel's paired phones from its agent.
-    fn load_paired_phones(&mut self) -> Task<Event> {
-        let Some(panel) = self.phone_panel.as_ref() else {
+    /// Run a panel rule that may start an agent call, with this app's
+    /// client lookup, and start the call it returns.
+    fn phone_panel_call(
+        &mut self,
+        rule: impl FnOnce(&mut PhonePanel, &Self) -> Option<PhoneCall<RemoteAgentClientConfig>>,
+    ) -> Task<Event> {
+        let Some(mut panel) = self.phone_panel.take() else {
             return Task::none();
         };
-        let remote_id = panel.remote_id.clone();
-        let client = match self.remote_chat_client(&remote_id) {
-            Ok(client) => client,
-            Err(error) => {
-                if let Some(panel) = self.phone_panel.as_mut() {
-                    panel.error = Some(error);
-                    panel.phones = Some(Vec::new());
-                }
-                return Task::none();
-            }
-        };
-        Task::perform(
-            async move {
-                let result = RemoteAgentBackend::new(client)
-                    .list_phones()
-                    .await
-                    .map_err(|err| err.to_string());
-                (remote_id, result)
-            },
-            |(remote_id, result)| Event::PhonesLoaded(remote_id, result),
-        )
-    }
-
-    /// The phone panel's agent client, or the panel shows why there is none.
-    fn phone_panel_client(&mut self) -> Option<(String, RemoteAgentClientConfig)> {
-        let remote_id = self.phone_panel.as_ref()?.remote_id.clone();
-        match self.remote_chat_client(&remote_id) {
-            Ok(client) => Some((remote_id, client)),
-            Err(error) => {
-                if let Some(panel) = self.phone_panel.as_mut() {
-                    panel.error = Some(error);
-                }
-                None
-            }
-        }
+        let call = rule(&mut panel, self);
+        self.phone_panel = Some(panel);
+        call.map_or_else(Task::none, |call| {
+            Task::perform(run_phone_call(call), |event| event)
+        })
     }
 
     /// Whether a remote's agent owns its Claude chats (TRU-152): they
@@ -32588,17 +32561,10 @@ fi
                     .remote_agent_config_by_id(&remote_id)
                     .map(|agent| agent.name.clone())
                     .unwrap_or_else(|| remote_id.clone());
-                self.phone_panel = Some(PhonePanel {
-                    remote_id,
-                    machine_name,
-                    device_name: "iPhone".to_string(),
-                    allow_act: false,
-                    pairing: None,
-                    phones: None,
-                    busy: false,
-                    error: None,
-                });
-                return Task::batch([self.load_paired_phones(), self.apply_webview_surfaces()]);
+                self.phone_panel = Some(PhonePanel::open(remote_id, machine_name));
+                let list =
+                    self.phone_panel_call(|panel, app| panel.list(|id| app.remote_chat_client(id)));
+                return Task::batch([list, self.apply_webview_surfaces()]);
             }
             Event::PhonePanelClose => {
                 self.phone_panel = None;
@@ -32606,132 +32572,38 @@ fi
             }
             Event::PhoneDeviceNameChanged(value) => {
                 if let Some(panel) = self.phone_panel.as_mut() {
-                    panel.device_name = value;
+                    panel.set_device_name(value);
                 }
             }
             Event::PhoneAllowActToggled(allow) => {
                 if let Some(panel) = self.phone_panel.as_mut() {
-                    panel.allow_act = allow;
+                    panel.set_allow_act(allow);
                 }
             }
             Event::PhonePairingCreate => {
-                let Some(panel) = self.phone_panel.as_mut() else {
-                    return Task::none();
-                };
-                if panel.busy {
-                    return Task::none();
-                }
-                let device_name = panel.device_name.trim().to_string();
-                if device_name.is_empty() {
-                    panel.error = Some("Name the phone first.".to_string());
-                    return Task::none();
-                }
-                let scope = if panel.allow_act { "act" } else { "view" };
-                let Some((remote_id, client)) = self.phone_panel_client() else {
-                    return Task::none();
-                };
-                if let Some(panel) = self.phone_panel.as_mut() {
-                    panel.busy = true;
-                    panel.error = None;
-                }
-                return Task::perform(
-                    async move {
-                        let result = RemoteAgentBackend::new(client)
-                            .create_phone_pairing(device_name, scope.to_string())
-                            .await
-                            .map_err(|err| err.to_string());
-                        (remote_id, result)
-                    },
-                    |(remote_id, result)| Event::PhonePairingCreated(remote_id, result),
-                );
+                return self
+                    .phone_panel_call(|panel, app| panel.create(|id| app.remote_chat_client(id)));
             }
             Event::PhoneShortCodeEdited(_) => {}
             Event::PhonePairingCreated(remote_id, result) => {
-                let Some(panel) = self
-                    .phone_panel
-                    .as_mut()
-                    .filter(|panel| panel.remote_id == remote_id)
-                else {
-                    return Task::none();
-                };
-                panel.busy = false;
-                let view = result.and_then(|pairing| {
-                    phone_pairing_qr(&pairing.pairing_url).map(|qr| PhonePairingView {
-                        url: pairing.pairing_url,
-                        short_code: pairing.short_code,
-                        scope: pairing.scope,
-                        expires_unix_secs: pairing.expires_unix_secs,
-                        qr,
-                    })
-                });
-                match view {
-                    Ok(view) => {
-                        panel.pairing = Some(view);
-                        panel.error = None;
-                    }
-                    Err(error) => {
-                        eprintln!("[phone] pairing on {remote_id} failed: {error}");
-                        panel.error = Some(format!("Could not create a pairing: {error}"));
-                    }
+                if let Some(panel) = self.phone_panel.as_mut() {
+                    panel.pairing_created(&remote_id, result, phone_pairing_qr);
                 }
             }
             Event::PhonesLoaded(remote_id, result) => {
-                let Some(panel) = self
-                    .phone_panel
-                    .as_mut()
-                    .filter(|panel| panel.remote_id == remote_id)
-                else {
-                    return Task::none();
-                };
-                match result {
-                    Ok(phones) => panel.phones = Some(phones),
-                    Err(error) => {
-                        eprintln!("[phone] listing phones on {remote_id} failed: {error}");
-                        panel.phones = Some(Vec::new());
-                        panel.error = Some(format!("Could not list paired phones: {error}"));
-                    }
+                if let Some(panel) = self.phone_panel.as_mut() {
+                    panel.phones_loaded(&remote_id, result);
                 }
             }
             Event::PhoneRevoke(id) => {
-                let Some((remote_id, client)) = self.phone_panel_client() else {
-                    return Task::none();
-                };
-                if let Some(panel) = self.phone_panel.as_mut() {
-                    panel.busy = true;
-                    panel.error = None;
-                }
-                return Task::perform(
-                    async move {
-                        let result = RemoteAgentBackend::new(client)
-                            .revoke_phone(id)
-                            .await
-                            .map_err(|err| err.to_string());
-                        (remote_id, result)
-                    },
-                    |(remote_id, result)| Event::PhoneRevoked(remote_id, result),
-                );
+                return self.phone_panel_call(|panel, app| {
+                    panel.revoke(id, |id| app.remote_chat_client(id))
+                });
             }
             Event::PhoneRevoked(remote_id, result) => {
-                let Some(panel) = self
-                    .phone_panel
-                    .as_mut()
-                    .filter(|panel| panel.remote_id == remote_id)
-                else {
-                    return Task::none();
-                };
-                panel.busy = false;
-                match result {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        panel.error =
-                            Some("That phone was no longer paired with the agent.".to_string());
-                    }
-                    Err(error) => {
-                        eprintln!("[phone] revoking a phone on {remote_id} failed: {error}");
-                        panel.error = Some(format!("Could not revoke: {error}"));
-                    }
-                }
-                return self.load_paired_phones();
+                return self.phone_panel_call(|panel, app| {
+                    panel.revoked(&remote_id, result, |id| app.remote_chat_client(id))
+                });
             }
             Event::RemoteWorkspaceBrowse(remote_id) => {
                 return self.open_folder_picker(FolderPickerPurpose::NewWorkspace, Some(remote_id));
@@ -34545,11 +34417,7 @@ fi
                     selection: accent,
                 },
             );
-        let create_label = if panel.pairing.is_some() {
-            "New code"
-        } else {
-            "Show pairing code"
-        };
+        let create_label = panel.create_label();
         let name_row = row![
             column![
                 text("Phone name").size(11).color(text_secondary),
