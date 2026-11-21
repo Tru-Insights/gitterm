@@ -208,11 +208,23 @@ impl Render for AgentSidebar {
                                         .child(div().size(px(6.)).rounded(px(3.)).bg(rgb(dot)))
                                         .child(div().w(px(8.)))
                                         .child(
-                                            div().text_color(rgb(p.text)).child(item.name.clone()),
+                                            div()
+                                                .debug_selector(move || {
+                                                    format!("agent-name-{key}-{index}")
+                                                })
+                                                .flex_1()
+                                                .min_w_0()
+                                                .whitespace_normal()
+                                                .text_color(rgb(p.text))
+                                                .child(item.name.clone()),
                                         )
-                                        .child(div().flex_1())
                                         .child(
                                             div()
+                                                .debug_selector(move || {
+                                                    format!("agent-scope-{key}-{index}")
+                                                })
+                                                .flex_shrink_0()
+                                                .ml(px(4.))
                                                 .px(px(4.))
                                                 .py(px(1.))
                                                 .rounded(px(4.))
@@ -385,4 +397,28 @@ fn the_agent_pane_reads_the_active_tabs_repo_like_iced() {
     tab.repo_dir = Some("/ws/repo".into());
     assert_eq!(tab_repo_dir(Some(&tab)), Some(PathBuf::from("/ws/repo")));
     assert_eq!(tab_repo_dir(None), None);
+}
+
+#[cfg(test)]
+#[gpui::test]
+fn a_long_plugin_name_never_overlaps_the_scope_tag(cx: &mut gpui::TestAppContext) {
+    use gitterm_core::agent_config::{AgentConfigItem, ConfigScope};
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let (_, cx) = cx.add_window_view(|_, _| {
+        let mut sidebar = AgentSidebar::new(PathBuf::from("/ws"));
+        sidebar.config.plugins.push(AgentConfigItem {
+            name: "frontend-design@claude-code-plugins".into(),
+            file_path: PathBuf::from("/ws/p"),
+            scope: ConfigScope::User,
+        });
+        sidebar.expanded.insert("plugins");
+        sidebar
+    });
+    cx.simulate_resize(gpui::size(px(310.), px(700.)));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let name = cx.debug_bounds("agent-name-plugins-0").unwrap();
+    let tag = cx.debug_bounds("agent-scope-plugins-0").unwrap();
+    assert!(name.right() <= tag.left(), "{name:?} overlaps {tag:?}");
 }

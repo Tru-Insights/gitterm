@@ -1639,17 +1639,11 @@ impl WorkSidebar {
                         .h_auto()
                         .accessibility_label(control.label.clone())
                         .map(|button| {
-                            if run {
-                                button.whitespace_nowrap()
-                            } else {
-                                button.flex_shrink_1().min_w_0().whitespace_normal()
-                            }
+                            // Buttons keep their intrinsic one-line width; the
+                            // slot clips at the row's right edge instead.
+                            button.whitespace_nowrap().flex_shrink_0()
                         })
-                        .child(
-                            div()
-                                .when(run, |d| d.whitespace_nowrap())
-                                .child(control.label),
-                        )
+                        .child(div().whitespace_nowrap().child(control.label))
                 } else {
                     button.label(control.label)
                 }
@@ -1658,14 +1652,27 @@ impl WorkSidebar {
 }
 
 fn age_label(index: usize, age: String, repo: bool, p: &crate::theme::Palette) -> gpui::Div {
-    div()
+    let base = div()
         .debug_selector(move || format!("work-age-{index}"))
         .font_family("Menlo")
         .text_size(px(10.))
-        .text_color(rgb(p.muted))
-        // Iced's age text wraps ("14s" / "ago") when the slot is squeezed.
-        .when(repo, |d| d.flex_shrink_1().min_w_0().whitespace_normal())
-        .child(age)
+        .text_color(rgb(p.muted));
+    if repo {
+        // Iced's age text wraps between words ("14s" / "ago") when the slot
+        // is squeezed: each word is nowrap, the container wraps.
+        base.flex()
+            .flex_wrap()
+            .flex_shrink_1()
+            .min_w_0()
+            .gap(px(4.))
+            .children(
+                age.split(' ')
+                    .map(|word| div().whitespace_nowrap().child(word.to_string()))
+                    .collect::<Vec<_>>(),
+            )
+    } else {
+        base.child(age)
+    }
 }
 
 fn control_color(action: &Action, repo_row: bool, p: &crate::theme::Palette) -> u32 {
@@ -1769,9 +1776,7 @@ impl Render for WorkSidebar {
                     .flex_1()
                     .font_family(".SystemUIFont")
                     .text_size(px(12.))
-                    .whitespace_normal()
-                    .line_clamp(2)
-                    .overflow_hidden();
+                    .whitespace_normal();
             }
             if row.small {
                 label = label
@@ -1853,7 +1858,7 @@ impl Render for WorkSidebar {
                         .child(Input::new(input)),
                 );
             }
-            if !row.heading && !pr && !row.small && !row.chat {
+            if !row.heading && !pr && !row.small && !row.chat && !row.indent {
                 line = line.child(
                     div()
                         .debug_selector(|| format!("work-space-{index}"))
@@ -1896,8 +1901,12 @@ impl Render for WorkSidebar {
                 .min_w_0()
                 .flex()
                 .flex_shrink_1()
+                .overflow_hidden()
                 .items_center()
                 .gap(px(6.));
+            // The repo row's × sits beside the disclosure, outside the clipped
+            // actions slot, so a narrow sidebar never hides it (TRU-274).
+            let mut remove = None;
             for (control_index, control) in row.controls.into_iter().enumerate() {
                 if matches!(
                     control.action,
@@ -1919,8 +1928,14 @@ impl Render for WorkSidebar {
                 } else {
                     format!("work-control-{index}-{control_index}")
                 };
+                let is_remove = matches!(
+                    control.action,
+                    Action::Emit(WorkSidebarOutcome::RemoveRepo { .. })
+                );
                 let button = self.button(id, control, repo, cx);
-                if repo {
+                if repo && is_remove {
+                    remove = Some(button);
+                } else if repo {
                     actions = actions.child(button);
                 } else {
                     line = line.child(button);
@@ -1945,7 +1960,8 @@ impl Render for WorkSidebar {
                     .flex()
                     .items_center()
                     .gap(px(6.))
-                    .child(div().flex_1().min_w_0().overflow_hidden().child(line));
+                    .child(div().flex_1().min_w_0().overflow_hidden().child(line))
+                    .children(remove);
             }
             if let Some(fold) = row.fold {
                 let label = if fold == Fold::Focus {
