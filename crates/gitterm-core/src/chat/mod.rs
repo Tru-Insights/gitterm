@@ -2,6 +2,8 @@
 
 pub mod types;
 
+pub mod checkout;
+
 pub mod history;
 pub mod html_render;
 

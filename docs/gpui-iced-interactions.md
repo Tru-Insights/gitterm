@@ -39,7 +39,7 @@ Each row is a control or a repeated control family whose instances share behavio
 
 ## Verdict counts
 
-Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this refresh the map showed 143 MATCH and 193 DIFF; it now shows 198 MATCH, 80 PREVIEW and 58 DIFF (336 rows).
+Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this refresh the map showed 143 MATCH and 193 DIFF; it now shows 200 MATCH, 80 PREVIEW and 56 DIFF (336 rows).
 
 | Section | MATCH | PREVIEW | DIFF |
 | --- | ---: | ---: | ---: |
@@ -49,14 +49,14 @@ Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this
 | Find sidebar and preview | 17 | 7 | 1 |
 | Content area and file viewer | 8 | 1 | 2 |
 | Chat transcript, cards, roster | 29 | 6 | 0 |
-| Composer and Review / Consult | 17 | 2 | 6 |
+| Composer and Review / Consult | 19 | 2 | 4 |
 | Bottom panel and terminal find | 16 | 1 | 0 |
 | Workspace bar, menus, settings | 11 | 21 | 4 |
 | Sheets and dialogs | 23 | 8 | 5 |
 | Task detail and other dialogs | 4 | 7 | 31 |
 | Usage page | 7 | 2 | 1 |
 | Native menus and shortcuts | 22 | 3 | 4 |
-| **Total** | **198** | **80** | **58** |
+| **Total** | **200** | **80** | **56** |
 
 `PREVIEW` means a deliberate preview limit (write/launch control shows "not available in preview"), kept until cutover.
 
@@ -252,19 +252,19 @@ Sources: [Iced composer](../assets/agent_chat.html#L2333), [slash/mode](../asset
 | ID / control | I glyph/label and states | G glyph/label and states | Hover / tooltip I; G | Gesture / keyboard | I event → effect | G equivalent → effect | Parity |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | C01 input | Multiline prompt, grows to 200px; typing stays possible pending request | Native Textarea, disabled when read-only/unavailable | Input focus; native | Type, paste text; Enter send, Shift+Enter newline; IME composition protected | Draft in `promptEl`; `submitPrompt` | Textarea draft; `send` | **MATCH** draft editing/submit keys; read-only guards explicit. |
-| C02 Send **P/W** | `Send`; disabled on read-only, pending request, busy non-steerable; empty click does nothing; busy steerable T explains queue | `Send`; disabled on empty draft/no images, pending request, image prep, IME/unresolved submission/read-only/no callback | I queue explanation T; G no equivalent Send T | Click or Enter unless slash consumes | `submit` IPC; clears draft/images immediately | `ChatIntent::Send`, receipt reconciliation preserves rejected/uncertain draft | **DIFF** Send has no queue-explanation tooltip (composer.rs:568-571); draft clears on receipt, not immediately. |
+| C02 Send **P/W** | `Send`; disabled on read-only, pending request, busy non-steerable; empty click does nothing; busy steerable T explains queue | `Send`; disabled on empty draft/no images, pending request, image prep, IME/unresolved submission/read-only/no callback; box and images empty at once | I queue explanation T; G same text while a turn runs | Click or Enter unless slash consumes | `submit` IPC; clears draft/images immediately | `ChatIntent::Send`, receipt reconciliation preserves rejected/uncertain draft | **MATCH** queue T and immediate clear (TRU-274 `view/tests.rs`); GPUI also disables Send on an empty draft, and a rejected/uncertain receipt puts the unedited draft back (Iced loses it).
 | C03 Stop **P/W** | `Stop`, disabled idle/read-only | `Stop`, disabled idle/unavailable | Danger button H; native danger | Click | `stop` IPC → interrupt current turn | `ChatIntent::Stop` → adapter | **MATCH** stops turn without withdrawing queued draft. |
-| C04 queued withdraw **P/W** | Queued bubble `×`, T `Withdraw this message ({harness} keeps working)` | Queue row `Withdraw`, state-gated | I withdraw T; G N/— | Click | `withdraw {id}` IPC | `ChatIntent::Withdraw {message_id}` | **MATCH** `×` with withdraw tooltip (composer.rs:528, 70-77); test `c04_withdraw_tooltip_keeps_the_current_harness_working`. |
-| C05 slash row | `/name {argumentHint}`, selected row; description tooltip | Same label/description, no per-command tooltip | I H/T; G N/description text | Click or Tab **fills only**; ↑↓ wrap; Enter runs no-arg, fills argument command; Esc dismisses | `fillSlash` / `slashKey` / `submitPrompt` | `select_slash` / `slash_key` → fill/send | **MATCH** slash row description tooltip (composer.rs:553); test `c05_slash_keeps_full_iced_description_for_the_tooltip`. |
-| C06 model picker **P/W** | Model icon + label; pending `current → requested…`; `✓` current, `…` pending | Model icon + confirmed/pending label; catalog rows `✓` selected | I T `Model: {id}`; G no equivalent T | Click chip/option, Esc/click-away | `set_model` IPC; usable configured values before session ready | `ChangeSetting(Model)`; chip gated by `commands_ready` and callback | **DIFF** model chip disabled until commands ready, so no pre-start choice; no `Model: {id}` chip tooltip (composer.rs:586). |
-| C07 effort/context picker **P/W** | Gauge + Auto/Low/Medium/High/X-High/Max as offered; `200k`/`1M` section for Claude; pending arrow | Same catalog concepts and offered levels; confirmed selected tick | I effort/applied-auto/context T; G no equivalent T | Click chip/option; Esc/click-away | `set_effort` / `set_model` for context | `ChangeSetting` catalog choice, ready-gated | **DIFF** effort/context chip still ready-gated and has no tooltip (composer.rs:586). |
-| C08 permission mode **P/W** | Lock + Default/Accept edits/Plan mode/Auto mode/extra modes or ACP labels; pending arrow | Same projected mode catalog | I T `Permission mode (Shift+Tab in the message box cycles)`; G — | Click option; Shift+Tab in composer cycles | `set_permission_mode`; configured mode usable before process starts | `ChangeSetting` / `CycleMode`, settings enabled only when ready | **DIFF** mode chip ready-gated, no `Permission mode (Shift+Tab…)` tooltip (composer.rs:586, pickers.rs:218). |
+| C04 queued withdraw **P/W** | Queued bubble `×`, T `Withdraw this message ({harness} keeps working)` | Queue row `Withdraw`, state-gated | I withdraw T; G N/— | Click | `withdraw {id}` IPC | `ChatIntent::Withdraw {message_id}` | **DIFF** same operation, label/placement/tooltip differ. |
+| C05 slash row | `/name {argumentHint}`, selected row; description tooltip | Same label/description, no per-command tooltip | I H/T; G N/description text | Click or Tab **fills only**; ↑↓ wrap; Enter runs no-arg, fills argument command; Esc dismisses | `fillSlash` / `slashKey` / `submitPrompt` | `select_slash` / `slash_key` → fill/send | **DIFF** core gestures match; G omits command tooltip. |
+| C06 model picker **P/W** | Model icon + label; pending `current → requested…`; `✓` current, `…` pending | Model icon + confirmed label (pre-start pick shown at once); catalog rows `✓` selected, `…` pending; hint `Model · full list after the session starts` before ready | I T `Model: {id}`; G same | Click chip/option, Esc/click-away | `set_model` IPC; usable configured values before session ready | `ChangeSetting(Model)`; chip enabled before ready, pick held then sent after Ready (Iced writes config before spawn) | **DIFF** pre-start pick (held, sent after Ready), tooltip and `…` option marker match; chip label lacks `current → requested…` pending arrow.
+| C07 effort/context picker **P/W** | Gauge + Auto/Low/Medium/High/X-High/Max as offered; `200k`/`1M` section for Claude; pending arrow | Same catalog concepts and offered levels; confirmed selected tick | I effort/applied-auto/context T; G same | Click chip/option; Esc/click-away | `set_effort` / `set_model` for context | `ChangeSetting` catalog choice; enabled before ready, sent after Ready | **DIFF** pre-start pick and informative tooltip match; chip label lacks the pending arrow.
+| C08 permission mode **P/W** | Lock + Default/Accept edits/Plan mode/Auto mode/extra modes or ACP labels; pending arrow | Same projected mode catalog | I T `Permission mode (Shift+Tab in the message box cycles)`; G same | Click option; Shift+Tab in composer cycles | `set_permission_mode`; configured mode usable before process starts | `ChangeSetting` / `CycleMode`; enabled before ready, sent after Ready | **DIFF** pre-start pick/cycle and tooltip match; chip label lacks the pending arrow.
 | C09 picker dismissal | Menus close on outside click/Esc; restore composer focus on choice | Picker closes on composer click/Esc/choice | Menu item H; N | Click outside; Esc | `closeChipMenus`, mode dismissal | `close_picker`, choose_setting, focus composer | **MATCH** explicit dismissal/choice returns to draft; generic outside-focus behavior untested. |
-| C10 checkout choice **W** | Folder chip, `{label}…` pending, locked after start; unlocked list with `✓` | Checkout label as permanently disabled chip (`Picker` only has Model/Effort/Mode) | I full path + lock reason T; G path T | Click; choose checkout if unlocked | `checkout_context`, `set_checkout` IPC | No checkout picker/setting outcome | **DIFF** checkout chip permanently disabled, no picker, no lock-reason tooltip (composer.rs:354, 586, 603). |
-| C11 checkout editor **P/X** | `Open in editor` remains available even when checkout locked | Absent | I menu description `Open this checkout folder`; — | Click | `open_checkout` IPC → configured editor | — | **PREVIEW** checkout-chip `Open in editor` not mounted; sibling editor controls show the preview notice (content/actions.rs:117). |
+| C10 checkout choice **W** | Folder chip, `{label}…` pending, locked after start; unlocked list with `✓` | Folder chip with `Current checkout` + prepared task worktrees (label, task title, `✓`); locked once the chat has a prompt/session id; a pick shows `{label} · not available in preview` | I full path + lock reason T; G same (`{path}\n{reason or Where this chat runs}`) | Click; choose checkout if unlocked | `checkout_context`, `set_checkout` IPC | Host-supplied read-only menu (`tasks.json`); no `set_checkout` outcome | **DIFF** entries, labels, lock rule and tooltip match; the pick applies nothing (preview), `Open in editor` (C11) is absent so a locked chip stays disabled, and task/remote lock reasons are unreachable in a preview chat.
+| C11 checkout editor **P/X** | `Open in editor` remains available even when checkout locked | Absent | I menu description `Open this checkout folder`; — | Click | `open_checkout` IPC → configured editor | — | **DIFF** checkout editor action missing. |
 | C12 image add **R** | Paste/drop into composer; max 4, 1568px longest edge, 5MiB; transparency preserved | Native paste/drop queue with same caps/downscale intent | Drop highlight in I; native drop target | `⌘V` image / file drop; not thumbnail click | `queueAttach` prepares attachments | `paste_images`, `attach_paths` → queued preparation | **MATCH** attaches images rather than sending immediately. |
 | C13 image remove | Thumbnail `×`, T `Remove image` | Same | Same T | Click × → composer focus | Splice attachments/render | `remove_image` | **MATCH** removes draft image only. |
-| C14 Review / Consult opener **R** | `Review / Consult…`, T asks Claude subagent/Codex; opens fresh context | Same text; enabled only for Claude backend | I descriptive T; G N/no same T | Click toggles; click-away/Esc close | `review_context` → fresh repo facts/settings | `ReviewOutcome::ContextRequested` → background `review_context` | **DIFF** open-form outcome matches, but the chip has no descriptive tooltip (composer.rs:586-603). |
+| C14 Review / Consult opener **R** | `Review / Consult…`, T asks Claude subagent/Codex; opens fresh context | Same text; enabled only for Claude backend | I descriptive T; G same text | Click toggles; click-away/Esc close | `review_context` → fresh repo facts/settings | `ReviewOutcome::ContextRequested` → background `review_context` | **MATCH** reads context and opens form; tooltip matches; submission differs (C17).
 | C15 review kind | Review / Consult radios | Native radio/select/input equivalents | I Codex model default T; G native focus/labels | Click choice | Local form kind draft | `ReviewComposer` draft | **MATCH** changes form kind without launch. |
 | C15a reviewer | Claude subagent / Codex radios | Native radio/select/input equivalents | I Codex model default T; G native focus/labels | Click choice | Local reviewer draft | `ReviewComposer` draft | **MATCH** chooses intended runner without launch. |
 | C15b reviewer model | Claude model select / free-text Codex model | Native radio/select/input equivalents | I Codex model default T; G native focus/labels | Select model or type | Local reviewer model draft | `ReviewComposer` draft | **MATCH** collects intended model. |
@@ -509,34 +509,32 @@ Refreshed 2026-11-21 against `7c3b587` (after PRs #280–#310). Only rows still 
 7. V08 — no empty-content `Open Folder` button; `⌥⇧T` opens the workspace sheet instead of the folder flow.
 
 **Composer**
-8. C02 — Send has no queue tooltip; draft clears on receipt, not immediately.
-9. C06 / C07 / C08 — model, effort/context and mode chips stay disabled until the session is ready (Iced allows pre-start choice) and lack Iced's tooltips.
-10. C10 — checkout chip is permanently disabled: no picker, no lock-reason tooltip.
-11. C14 — Review / Consult chip has no descriptive tooltip.
+8. C06 / C07 / C08 — pre-start picks, tooltips and option markers match; the chip label lacks Iced's pending `current → requested…` arrow.
+9. C10 — picker entries, lock rule and tooltip match; a pick shows `{label} · not available in preview` (preview limit) and the locked chip has no `Open in editor` (C11).
 
 **Workspace bar, sheets and menus**
-12. A12b / A12c — `New workspace…` is a preview control; `⌥⇧T` still opens the workspace sheet.
-13. A15 / D25 / D26 — Ready count and list: no Ready list to open, resume or close.
-14. A16 / D18 — Parked count has no list; the mounted park list uses different labels (`Mark done`, `Stop terminals`) and restores plain terminals only.
-15. D14 — park sheet facts omit shared repos and note chats.
-16. D23b — no PR confirmation panel, so no Cancel/Close.
-17. M06 — Clear Terminal targets the focused terminal (possibly the bottom one); Iced targets the active main tab.
-18. M08 — attention jump reads mounted GPUI facts only, not live Iced urgency.
-19. M09 — `⌥⇧T` opens the workspace sheet, not Iced's folder flow.
-20. M11 — dictation (`SttToggle`) has no handler or mic state.
+10. A12b / A12c — `New workspace…` is a preview control; `⌥⇧T` still opens the workspace sheet.
+11. A15 / D25 / D26 — Ready count and list: no Ready list to open, resume or close.
+12. A16 / D18 — Parked count has no list; the mounted park list uses different labels (`Mark done`, `Stop terminals`) and restores plain terminals only.
+13. D14 — park sheet facts omit shared repos and note chats.
+14. D23b — no PR confirmation panel, so no Cancel/Close.
+15. M06 — Clear Terminal targets the focused terminal (possibly the bottom one); Iced targets the active main tab.
+16. M08 — attention jump reads mounted GPUI facts only, not live Iced urgency.
+17. M09 — `⌥⇧T` opens the workspace sheet, not Iced's folder flow.
+18. M11 — dictation (`SttToggle`) has no handler or mic state.
 
 **Usage**
-21. U04 — Refresh reloads saved plan limits instead of a fresh Codex-limits read.
+19. U04 — Refresh reloads saved plan limits instead of a fresh Codex-limits read.
 
 **Task detail (not mounted)**
-22. T01–T01d — new-task, filter chips and archive controls absent.
-23. T05–T06c — Review changes, Push branch, Open draft PR, publish confirmation absent.
-24. T07 / T07a — Stop and Cancel queue absent.
-25. T08–T08b — worktree delete opener and confirmation absent.
-26. T09–T09f — task create form is a fixture only.
-27. T10 / T10a — Stop and close / Keep open absent.
-28. T12–T12e — phone pairing and revocation absent.
-29. T13 — browser evidence viewer absent.
+20. T01–T01d — new-task, filter chips and archive controls absent.
+21. T05–T06c — Review changes, Push branch, Open draft PR, publish confirmation absent.
+22. T07 / T07a — Stop and Cancel queue absent.
+23. T08–T08b — worktree delete opener and confirmation absent.
+24. T09–T09f — task create form is a fixture only.
+25. T10 / T10a — Stop and close / Keep open absent.
+26. T12–T12e — phone pairing and revocation absent.
+27. T13 — browser evidence viewer absent.
 
 ## Verification boundary
 
