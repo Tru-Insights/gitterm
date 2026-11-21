@@ -350,7 +350,6 @@ mod interaction_tests {
             assert!(cx.debug_bounds("folder-picker").is_none(), "{selector}");
         }
         for (selector, label) in [
-            ("pstrip-repo-action-0-0", "New workspace…"),
             ("pstrip-repo-action-0-1", "Add a repo to acme-api…"),
             ("pstrip-repo-action-0-3", "Keep repos in this menu only"),
             ("pstrip-repo-action-1-1", "Reconnect…"),

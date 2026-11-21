@@ -334,13 +334,7 @@ impl RowView {
                     .justify_start()
                     .debug_selector(move || format!("delegation-fold-{id}"))
                     .tooltip(card.header())
-                    .label(format!(
-                        "{} {} · {} · {}",
-                        if self.open { "▾" } else { "▸" },
-                        card.header(),
-                        card.target(),
-                        card.state_text(crate::composer::now_ms())
-                    ))
+                    .label(card.fold_label(self.open, crate::composer::now_ms()))
                     .on_click(cx.listener(Self::toggle)),
             )
             .when(self.open, |view| {

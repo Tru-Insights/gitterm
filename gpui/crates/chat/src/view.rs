@@ -635,6 +635,17 @@ impl ChatView {
         self.focus_composer(window, cx);
         cx.notify();
     }
+    /// Iced posts `open_checkout` to launch the configured editor; the preview
+    /// launches nothing and says so as the other Open in editor controls do.
+    pub(crate) fn open_checkout_in_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer_state.picker = None;
+        self.composer_state.notice = Some(format!(
+            "Open in editor · {}",
+            crate::composer::NOT_IN_PREVIEW
+        ));
+        self.focus_composer(window, cx);
+        cx.notify();
+    }
     pub(crate) fn close_picker(&mut self, cx: &mut Context<Self>) {
         self.composer_state.picker = None;
         cx.notify();
@@ -646,10 +657,13 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) {
         if picker == crate::pickers::Picker::Checkout {
-            if self.read_only_reason.is_some() || self.composer_state.checkout_locked.is_some() {
+            if self.read_only_reason.is_some() {
                 return;
             }
-            if let Some(source) = &self.checkout_source {
+            // A locked chat's menu lists only Open in editor, as in Iced.
+            if self.composer_state.checkout_locked.is_none()
+                && let Some(source) = &self.checkout_source
+            {
                 self.composer_state.checkout_choices = source();
             }
         } else if !self.settings_enabled()

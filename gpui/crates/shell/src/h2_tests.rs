@@ -292,6 +292,24 @@ fn bottom_plus_opens_sheet_create_keeps_draft_and_existing_work_selects(cx: &mut
 }
 
 #[gpui::test]
+fn a12b_new_workspace_menu_entry_opens_the_bar_plus_sheet(cx: &mut TestAppContext) {
+    let (_root, shell, cx) = fixture(cx);
+    click(cx, "pstrip-repos");
+    click(cx, "pstrip-repo-action-0-0");
+    cx.read(|cx| {
+        let s = shell.read(cx);
+        assert!(s.new_work_sheet.is_some());
+        assert_eq!(s.owner.read(cx).error, None, "no preview notice");
+    });
+    assert!(cx.debug_bounds("workspace-sheet-card").is_some());
+    click(cx, "workspace-sheet-cancel");
+    cx.read(|cx| assert!(shell.read(cx).new_work_sheet.is_none()));
+    // The bar `+` opens the same sheet.
+    click(cx, "pstrip-new-work");
+    assert!(cx.debug_bounds("workspace-sheet-card").is_some());
+}
+
+#[gpui::test]
 fn sheet_folder_picker_returns_selection_and_cancel_without_creating_work(cx: &mut TestAppContext) {
     let (root, shell, cx) = fixture(cx);
     let repo = root.path().join("picked-repo");
@@ -333,22 +351,21 @@ fn sheet_folder_picker_returns_selection_and_cancel_without_creating_work(cx: &m
 fn missing_host_controls_keep_iced_controls_and_report_unavailable(cx: &mut TestAppContext) {
     let (_root, shell, cx) = fixture(cx);
     // Iced labels; the preview reports them (I6, interaction map A02/A14).
-    for selector in ["pstrip-browser"] {
-        click(cx, selector);
-        cx.read(|cx| {
-            let error = shell
-                .read(cx)
-                .owner
-                .read(cx)
-                .error
-                .clone()
-                .unwrap_or_default();
-            assert!(
-                error.ends_with(" · not available in preview"),
-                "{selector}: {error}"
-            )
-        });
-    }
+    let selector = "pstrip-browser";
+    click(cx, selector);
+    cx.read(|cx| {
+        let error = shell
+            .read(cx)
+            .owner
+            .read(cx)
+            .error
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            error.ends_with(" · not available in preview"),
+            "{selector}: {error}"
+        )
+    });
     // The gear now opens the settings sheet (A02); it closes with Escape.
     click(cx, "pstrip-settings");
     cx.read(|cx| assert!(shell.read(cx).settings_sheet.is_some()));

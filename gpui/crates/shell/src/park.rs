@@ -510,7 +510,6 @@ impl Shell {
                             .iter()
                             .any(|s| s.kind == crate::data::SessionKind::Chat)
                     }),
-                ..Default::default()
             },
         )
     }
