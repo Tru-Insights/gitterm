@@ -10,6 +10,9 @@ use std::{
 };
 
 #[cfg(test)]
+#[path = "lists_tests.rs"]
+mod list_tests;
+#[cfg(test)]
 #[path = "park_tests.rs"]
 mod tests;
 
@@ -76,6 +79,12 @@ impl WorkspaceDock {
     pub(crate) fn on_bar(&self) -> bool {
         self.parked.is_none()
     }
+    pub(crate) fn chat_count(&self) -> usize {
+        self.sessions
+            .iter()
+            .filter(|s| s.kind == crate::data::SessionKind::Chat)
+            .count()
+    }
 }
 
 impl Shell {
@@ -128,72 +137,6 @@ impl Shell {
                 cx,
             );
         }
-    }
-    pub(crate) fn parked_controls(&self, cx: &Context<Self>) -> gpui::AnyElement {
-        use gpui::{IntoElement as _, ParentElement as _, Styled as _, div};
-        use gpui_component::button::{Button, ButtonVariants as _};
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .children(self.workspaces.iter().filter_map(|state| {
-                let parked = state.parked.as_ref().filter(|parked| !parked.done)?;
-                let key = state.park_key(cx);
-                let resume = key.clone();
-                let done = key;
-                let target = state.park_target(cx);
-                let stop = target.clone();
-                Some(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(format!(
-                            "{} · {}",
-                            state.workspace.name,
-                            if parked.running {
-                                "Parked · running"
-                            } else {
-                                "Parked · stopped"
-                            }
-                        ))
-                        .child(
-                            Button::new(("resume-workspace", state.workspace.id.0))
-                                .ghost()
-                                .label("Resume")
-                                .on_click(cx.listener(move |shell, _, window, cx| {
-                                    shell.park_intent(
-                                        None,
-                                        Intent::Resume(resume.clone()),
-                                        window,
-                                        cx,
-                                    )
-                                })),
-                        )
-                        .children(parked.running.then(|| {
-                            Button::new(("stop-workspace", state.workspace.id.0))
-                                .ghost()
-                                .label("Stop terminals")
-                                .on_click(cx.listener(move |shell, _, window, cx| {
-                                    shell.park_workspace(&stop, Mode::Stop, window, cx)
-                                }))
-                        }))
-                        .child(
-                            Button::new(("done-workspace", state.workspace.id.0))
-                                .ghost()
-                                .label("Mark done")
-                                .on_click(cx.listener(move |shell, _, window, cx| {
-                                    shell.park_intent(
-                                        Some(&target),
-                                        Intent::Done(done.clone()),
-                                        window,
-                                        cx,
-                                    )
-                                })),
-                        ),
-                )
-            }))
-            .into_any_element()
     }
     pub(crate) fn restore_parked(&mut self, saved: Vec<SavedPark>, cx: &mut Context<Self>) {
         for state in &mut self.workspaces {
@@ -250,6 +193,7 @@ impl Shell {
             });
         }
     }
+    #[cfg(test)]
     pub(crate) fn park_workspace(
         &mut self,
         target: &Target,
@@ -496,10 +440,63 @@ impl Shell {
                 crate::pane::PaneContent::PreviewChat(view) => view.read(cx).is_working(),
                 _ => false,
             });
+        let owner = self.owner.read(cx);
+        let saved = owner.iced_workspace(workspace);
+        let others: Vec<_> = self
+            .workspaces
+            .iter()
+            .filter(|s| s.workspace.id != workspace)
+            .filter_map(|s| owner.iced_workspace(s.workspace.id))
+            .collect();
+        // Iced lists a workspace's repos by dir; a file without the list has `[dir]`.
+        let repos_of = |config: &gitterm_core::workspace_config::WorkspaceConfig| {
+            if config.repos.is_empty() {
+                vec![config.dir.clone()]
+            } else {
+                config.repos.clone()
+            }
+        };
+        let shared_repos: Vec<(String, String)> = saved
+            .map(|saved| {
+                repos_of(saved)
+                    .into_iter()
+                    .filter_map(|dir| {
+                        let other = others.iter().find(|other| repos_of(other).contains(&dir))?;
+                        let label = std::path::Path::new(&dir)
+                            .file_name()
+                            .map_or_else(|| dir.clone(), |name| name.to_string_lossy().into());
+                        Some((label, other.name.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let own_roots = saved.map(|saved| saved.chats.clone()).unwrap_or_default();
+        let own_tab_ids: Vec<String> = saved
+            .map(|saved| {
+                saved
+                    .tabs
+                    .iter()
+                    .filter_map(|tab| tab.chat_session_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let other_roots: Vec<String> = others
+            .iter()
+            .flat_map(|other| other.chats.iter().cloned())
+            .collect();
+        let entries = self
+            .work_sidebars
+            .get(&workspace)
+            .map(|sidebar| sidebar.read(cx).indexed_chats())
+            .unwrap_or_default();
+        let note_chats =
+            crate::park_sheet::note_chats(entries, &own_roots, &own_tab_ids, &other_roots);
         crate::park_sheet::WorkspaceSheet::open(
             &self.park_projection(cx),
             state.runtime_uid,
             crate::park_sheet::WorkspaceFacts {
+                shared_repos: &shared_repos,
+                note_chats: &note_chats,
                 owns_chats: chats > 0,
                 terminals,
                 chats,
@@ -557,5 +554,162 @@ impl Shell {
         ));
         self.park_sheet = Some(sheet);
         cx.notify();
+    }
+}
+
+impl Shell {
+    /// Iced's Parked list order: live parks first, then stopped and saved
+    /// entries newest first (stamp-less entries keep their order, last).
+    pub(crate) fn parked_list_rows(&self, cx: &App) -> Vec<crate::park_sheet::ParkedRow> {
+        use crate::park_sheet::ParkedRow;
+        let colors =
+            crate::workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark());
+        let hsla = |color: u32| gpui::rgb(color).into();
+        let owner = self.owner.read(cx);
+        let mut running = vec![];
+        let mut closed: Vec<(Option<SystemTime>, ParkedRow)> = vec![];
+        for state in &self.workspaces {
+            let Some(parked) = state.parked.as_ref().filter(|parked| !parked.done) else {
+                continue;
+            };
+            let saved = owner.iced_workspace(state.workspace.id);
+            let row = ParkedRow {
+                id: state.park_key(cx),
+                chats: saved.map_or_else(|| state.chat_count(), |saved| saved.chats.len()),
+                info: Some(parked.info.clone()),
+                running: parked.running,
+                color: hsla(
+                    colors.workspace(
+                        saved
+                            .map(|saved| saved.color)
+                            .unwrap_or(gitterm_core::settings::WorkspaceColor::Lavender),
+                    ),
+                ),
+                pr_news: None,
+            };
+            if parked.running {
+                running.push(row);
+            } else {
+                let at = gitterm_core::work::summary::parse_stamp(&parked.info.parked_at);
+                closed.push((at, row));
+            }
+        }
+        for saved in self.saved_facts.snapshot().parked_rows {
+            let at = saved
+                .info
+                .as_ref()
+                .and_then(|info| gitterm_core::work::summary::parse_stamp(&info.parked_at));
+            closed.push((
+                at,
+                ParkedRow {
+                    id: saved.key,
+                    chats: saved.chats,
+                    info: saved.info,
+                    running: false,
+                    color: hsla(saved.color),
+                    pr_news: saved.news.map(|news| (news.label, hsla(news.color))),
+                },
+            ));
+        }
+        closed.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+        running
+            .into_iter()
+            .chain(closed.into_iter().map(|(_, row)| row))
+            .collect()
+    }
+    fn mount_list_sheet(
+        &mut self,
+        sheet: gpui::Entity<crate::park_sheet::ParkSheet>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous_focus = window.focused(cx).unwrap_or_else(|| self.focus.clone());
+        self.session_picker = None;
+        self.picker_subscription = None;
+        self.cover_sheet(true, window, cx);
+        self.park_subscription = Some(cx.subscribe_in(
+            &sheet,
+            window,
+            move |shell, sheet, outcome: &crate::park_sheet::Outcome, window, cx| {
+                use crate::park_sheet::Outcome;
+                if matches!(outcome, Outcome::Done { .. }) {
+                    // Iced keeps the list open and refreshes its rows.
+                    if let Outcome::Done { id } = outcome {
+                        shell.done_parked(id.clone(), window, cx);
+                    }
+                    let rows = shell.parked_list_rows(cx);
+                    sheet.update(cx, |sheet, cx| sheet.set_rows(rows, cx));
+                    return;
+                }
+                shell.park_sheet = None;
+                shell.park_subscription = None;
+                shell.cover_sheet(false, window, cx);
+                previous_focus.focus(window, cx);
+                match outcome {
+                    Outcome::Resume { id } => shell.resume_parked(id.clone(), window, cx),
+                    Outcome::ReadyGo(crate::park_sheet::ReadyHome::Open(id)) => {
+                        shell.pick_workspace_id(*id, window, cx)
+                    }
+                    Outcome::ReadyGo(crate::park_sheet::ReadyHome::Parked(_)) => {
+                        shell.chrome_unavailable("Resume", cx)
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            },
+        ));
+        self.park_sheet = Some(sheet);
+        cx.notify();
+    }
+    pub(crate) fn open_parked_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui::AppContext as _;
+        if self.park_sheet.is_some() || self.settings_sheet.is_some() {
+            return;
+        }
+        let rows = self.parked_list_rows(cx);
+        let sheet = cx.new(|cx| crate::park_sheet::ParkSheet::parked(rows, window, cx));
+        self.mount_list_sheet(sheet, window, cx);
+    }
+    pub(crate) fn open_ready_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui::AppContext as _;
+        if self.park_sheet.is_some() || self.settings_sheet.is_some() {
+            return;
+        }
+        let groups = self.saved_facts.snapshot().ready_groups;
+        let sheet = cx.new(|cx| crate::park_sheet::ParkSheet::ready(groups, window, cx));
+        self.mount_list_sheet(sheet, window, cx);
+    }
+    fn own_parked(&self, key: &Key, cx: &App) -> bool {
+        self.workspaces
+            .iter()
+            .any(|state| state.parked.is_some() && &state.park_key(cx) == key)
+    }
+    /// Resume restores this preview's own parks; plain terminals restart, but
+    /// chats are a launch, and an Iced-saved park would write Iced's file.
+    fn resume_parked(&mut self, id: Key, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.own_parked(&id, cx) {
+            self.chrome_unavailable("Resume", cx);
+            return;
+        }
+        let had_chats = self
+            .workspaces
+            .iter()
+            .any(|state| state.park_key(cx) == id && state.chat_count() > 0);
+        self.park_intent(None, Intent::Resume(id), window, cx);
+        if had_chats {
+            self.chrome_unavailable("Resume chats", cx);
+        }
+    }
+    fn done_parked(&mut self, id: Key, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.own_parked(&id, cx) {
+            self.chrome_unavailable("Done", cx);
+            return;
+        }
+        let target = self
+            .workspaces
+            .iter()
+            .find(|state| state.park_key(cx) == id)
+            .map(|state| state.park_target(cx));
+        self.park_intent(target.as_ref(), Intent::Done(id), window, cx);
     }
 }

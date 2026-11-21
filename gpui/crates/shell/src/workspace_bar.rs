@@ -32,6 +32,19 @@ pub(crate) struct SavedFacts {
     pub machines: Vec<News>,
     pub repo_machines: Vec<Machine>,
     pub remote_workspaces: Vec<String>,
+    /// Iced's Ready list: each home with a next-to-merge PR or open news.
+    pub ready_groups: Vec<crate::park_sheet::ReadyGroup>,
+    /// Iced's Parked list entries read from `workspaces.json`, newest first.
+    pub parked_rows: Vec<SavedParked>,
+}
+/// A closed, parked workspace of Iced's file, as the Parked list shows it.
+#[derive(Clone, Debug)]
+pub(crate) struct SavedParked {
+    pub key: gitterm_core::park::Key,
+    pub color: u32,
+    pub chats: usize,
+    pub info: Option<gitterm_core::park::Info>,
+    pub news: Option<News>,
 }
 impl SavedFacts {
     pub(crate) fn read_from(
@@ -63,6 +76,14 @@ impl SavedFacts {
             parked: file.workspaces.iter().filter(|w| w.is_parked()).count(),
             ..Default::default()
         };
+        let news_color = |kind: prs::NewsKind| match kind {
+            prs::NewsKind::ChecksFailed | prs::NewsKind::Conflicting | prs::NewsKind::Closed => {
+                colors.red
+            }
+            prs::NewsKind::RequiredChecksPassed | prs::NewsKind::Merged => colors.green,
+            prs::NewsKind::NewActivity => colors.blue,
+        };
+        let mut parked_news: HashMap<(String, String), News> = HashMap::new();
         result.attention_counts = iced_tab_attention_counts(workspaces, &tasks);
         // Iced's machines: remote-agents.json, then workspaces.json's copies.
         result.repo_machines = crate::remote_client::read_remotes(source)?
@@ -128,14 +149,28 @@ impl SavedFacts {
             let mut seen_roots = HashSet::new();
             let mut seen_prs = HashSet::new();
             let mut newest = None;
+            let mut next_rows = Vec::new();
+            let mut home_news: Vec<(String, crate::park_sheet::ReadyNews)> = Vec::new();
             for root in home_roots
                 .into_iter()
                 .filter(|root| seen_roots.insert(root.clone()))
             {
-                if let Some(plan) = plans.get(&root) {
-                    result.ready += usize::from(
-                        merge_plan::next_to_merge(&merge_plan::order_plan(plan, &briefs)).is_some(),
-                    );
+                if let Some(plan) = plans.get(&root)
+                    && let Some(next) =
+                        merge_plan::next_to_merge(&merge_plan::order_plan(plan, &briefs))
+                {
+                    result.ready += 1;
+                    let key = next.entry.key();
+                    next_rows.push(crate::park_sheet::ReadyNext {
+                        number: key.number,
+                        repo: key.repo.clone(),
+                        title: watch
+                            .prs
+                            .get(&key.id())
+                            .and_then(|pr| pr.snapshot.core.as_ref())
+                            .map(|core| core.title.clone())
+                            .unwrap_or_default(),
+                    });
                 }
                 let mut keys: Vec<_> = plans
                     .get(&root)
@@ -165,6 +200,15 @@ impl SavedFacts {
                     if let Some(pr) = watch.prs.get(&key.id()) {
                         for news in pr.open_news() {
                             result.news_count += 1;
+                            home_news.push((
+                                news.at.clone(),
+                                crate::park_sheet::ReadyNews {
+                                    number: pr.key.number,
+                                    label: pr.key.label(),
+                                    text: news.text.clone(),
+                                    color: news_color(news.kind),
+                                },
+                            ));
                             if newest
                                 .as_ref()
                                 .is_none_or(|(_, old): &(_, &prs::NewsItem)| news.at > old.at)
@@ -175,24 +219,79 @@ impl SavedFacts {
                     }
                 }
             }
+            // Newest first, as Iced's `home_news`.
+            home_news.sort_by(|a, b| b.0.cmp(&a.0));
+            let home_news: Vec<_> = home_news.into_iter().map(|(_, news)| news).collect();
+            if id.is_none()
+                && let Some(first) = home_news.first()
+            {
+                let mut label = format!("{} {}", first.label, first.text);
+                if home_news.len() > 1 {
+                    label.push_str(&format!(" \u{00B7} +{} more", home_news.len() - 1));
+                }
+                parked_news.insert(
+                    (saved.name.clone(), saved.dir.clone()),
+                    News {
+                        label,
+                        color: first.color,
+                    },
+                );
+            }
+            if !next_rows.is_empty() || !home_news.is_empty() {
+                result.ready_groups.push(crate::park_sheet::ReadyGroup {
+                    name: saved.name.clone(),
+                    home: match id {
+                        Some(id) => crate::park_sheet::ReadyHome::Open(id),
+                        None => crate::park_sheet::ReadyHome::Parked(gitterm_core::park::Key {
+                            name: saved.name.clone(),
+                            dir: saved.dir.clone(),
+                        }),
+                    },
+                    next: next_rows,
+                    news: home_news,
+                });
+            }
             if let (Some(id), Some((number, news))) = (id, newest) {
                 result.news.insert(
                     id,
                     News {
                         label: format!("#{number} {}", news.text),
-                        color: match news.kind {
-                            prs::NewsKind::ChecksFailed
-                            | prs::NewsKind::Conflicting
-                            | prs::NewsKind::Closed => colors.red,
-                            prs::NewsKind::RequiredChecksPassed | prs::NewsKind::Merged => {
-                                colors.green
-                            }
-                            prs::NewsKind::NewActivity => colors.blue,
-                        },
+                        color: news_color(news.kind),
                     },
                 );
             }
         }
+        // Iced's `parked_order`: most recently parked first; stamp-less entries
+        // keep file order after them.
+        let mut parked: Vec<_> = file
+            .workspaces
+            .iter()
+            .filter(|w| w.is_parked())
+            .map(|w| {
+                let at = w
+                    .parked
+                    .as_ref()
+                    .and_then(|p| gitterm_core::work::summary::parse_stamp(&p.parked_at));
+                (at, w)
+            })
+            .collect();
+        parked.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+        result.parked_rows = parked
+            .into_iter()
+            .map(|(_, w)| SavedParked {
+                key: gitterm_core::park::Key {
+                    name: w.name.clone(),
+                    dir: w.dir.clone(),
+                },
+                color: colors.workspace(w.color),
+                chats: w.chats.len(),
+                info: w
+                    .parked
+                    .as_ref()
+                    .map(|p| gitterm_core::park::Info::new(&p.note, p.parked_at.clone())),
+                news: parked_news.remove(&(w.name.clone(), w.dir.clone())),
+            })
+            .collect();
         Ok(result)
     }
 }
