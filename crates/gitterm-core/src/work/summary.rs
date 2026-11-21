@@ -1420,6 +1420,13 @@ mod tests {
         assert!(work_issue_keys(&per_chat, &[]).is_empty());
         let padded = keys(&["PRJ-05"]);
         assert!(work_issue_keys(&[&padded], &["prj-101-x"]).is_empty());
+        // Words after a name's key give no prefixes: chat text naming
+        // STAGE-5 or PR-17 stays out (TRU-274).
+        let text = keys(&["STAGE-5", "PR-17", "PRJ-9"]);
+        assert_eq!(
+            work_issue_keys(&[&text], &["PRJ-274-prj-274-stage-5-pr-17-delegation"]),
+            ["PRJ-9"]
+        );
     }
 
     #[test]
