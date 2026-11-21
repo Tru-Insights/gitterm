@@ -380,8 +380,12 @@ impl TerminalView {
             } else {
                 self.open_find(cx);
             }
-        } else if self.find_open && event.keystroke.modifiers.platform && key == "g" {
-            self.navigate_find(event.keystroke.modifiers.shift, cx);
+        } else if self.find_open
+            && event.keystroke.modifiers.platform
+            && key == "g"
+            && !event.keystroke.modifiers.shift
+        {
+            self.navigate_find(false, cx);
         } else {
             return;
         }
