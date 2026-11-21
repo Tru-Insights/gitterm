@@ -371,11 +371,27 @@ impl ServiceContext {
     /// config discovery falls back to the real home when it is absent. The
     /// host adds its own MCP URL/token afterwards. Spawn with `env_clear()`
     /// and this list, so nothing else is inherited behind it.
+    ///
+    /// In preview the root is re-scoped first: a root that has moved, or was
+    /// replaced by a link since composition, is refused.
     pub fn child_env(
         &self,
         inherited: impl IntoIterator<Item = (OsString, OsString)>,
-    ) -> Vec<(OsString, OsString)> {
-        let preview = self.is_preview();
+    ) -> io::Result<Vec<(OsString, OsString)>> {
+        let preview = match &self.mode {
+            Mode::Preview(preview) | Mode::FixtureLaunch { preview, .. } => Some(preview),
+            Mode::Production => None,
+        };
+        if let Some(preview) = preview {
+            let root = preview.scoped(&self.root)?;
+            if !fs::symlink_metadata(&root)?.is_dir() {
+                return Err(refuse(format!(
+                    "preview root is no longer a directory: {}",
+                    root.display()
+                )));
+            }
+        }
+        let preview = preview.is_some();
         let mut env: Vec<_> = inherited
             .into_iter()
             .filter(|(name, _)| !(is_scrubbed(name) || (preview && is_preview_scrubbed(name))))
@@ -389,7 +405,7 @@ impl ServiceContext {
                 env.push((name.into(), self.root.join(dir).into_os_string()));
             }
         }
-        env
+        Ok(env)
     }
 
     pub fn authorize(&self, class: Class, target: Option<&Path>) -> Result<(), Denied> {
@@ -437,21 +453,78 @@ impl ServiceContext {
         self.decide(tool, classify_browser(access), None)
     }
 
+    /// Authorizes `class` for every target, keeping what each resolved to so
+    /// [`Self::recheck`] can refuse a path swapped after async preparation.
+    /// No target means the decision without one (denied for a fixture write).
+    pub fn authorize_targets(
+        &self,
+        class: Class,
+        targets: &[PathBuf],
+    ) -> Result<AuthorizedTargets, Denied> {
+        if targets.is_empty() {
+            self.authorize(class, None)?;
+        }
+        let resolved = targets
+            .iter()
+            .map(|target| {
+                self.authorize(class, Some(target))?;
+                let actual = match &self.mode {
+                    Mode::Production => target.clone(),
+                    Mode::Preview(preview) | Mode::FixtureLaunch { preview, .. } => preview
+                        .protected()
+                        .check(target)
+                        .map_err(|_| denied(class.label))?,
+                };
+                Ok((target.clone(), actual))
+            })
+            .collect::<Result<_, Denied>>()?;
+        Ok(AuthorizedTargets { class, resolved })
+    }
+
+    /// Re-authorizes targets after async preparation: each must still pass
+    /// and still resolve to the path it resolved to when it was authorized.
+    pub fn recheck(&self, authorized: &AuthorizedTargets) -> Result<(), Denied> {
+        let class = authorized.class;
+        if authorized.resolved.is_empty() {
+            return self.authorize(class, None);
+        }
+        for (target, actual) in &authorized.resolved {
+            self.authorize(class, Some(target))?;
+            if let Mode::Preview(preview) | Mode::FixtureLaunch { preview, .. } = &self.mode {
+                if preview.protected().check(target).ok().as_ref() != Some(actual) {
+                    return Err(denied(class.label));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn decide(&self, label: &str, access: Access, target: Option<&Path>) -> Result<(), Denied> {
         let allowed = match (&self.mode, access) {
             (Mode::Production, _) | (_, Access::Existing | Access::Read) => true,
             (Mode::Preview(_), _) | (Mode::FixtureLaunch { .. }, Access::Outside) => false,
-            (Mode::FixtureLaunch { preview, fixtures }, Access::Write | Access::Process) => target
-                .and_then(|target| preview.protected().check(target).ok())
-                .is_some_and(|actual| fixtures.iter().any(|root| actual.starts_with(root))),
+            (Mode::FixtureLaunch { preview, fixtures }, Access::Write | Access::Process) => {
+                target.is_some_and(|target| fixture_target(preview, fixtures, target).is_ok())
+            }
         };
         if allowed {
             Ok(())
         } else {
-            Err(Denied {
-                notice: preview_notice(label),
-            })
+            Err(denied(label))
         }
+    }
+}
+
+/// Targets one decision authorized, with the path each resolved to then.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizedTargets {
+    class: Class,
+    resolved: Vec<(PathBuf, PathBuf)>,
+}
+
+fn denied(label: &str) -> Denied {
+    Denied {
+        notice: preview_notice(label),
     }
 }
 
@@ -474,14 +547,8 @@ fn preview_instance_id() -> String {
 }
 
 /// The resolved path decides, so a link inside the temp dir to a real
-/// checkout is refused.
-///
-/// shortcut: only the checkout path is resolved. A fixture whose `.git` file
-/// or `commondir` points into protected state (e.g. `--separate-git-dir`)
-/// is not detected, and the preview root is not re-resolved when child env
-/// is exported, so a later swap of the root for a link is not caught there.
-/// Both need a deliberately crafted setup (Codex review 9f9354eb F3/F4);
-/// validate Git admin dirs and re-check the root when H5b wires hosting.
+/// checkout is refused. The fixture's own Git admin dirs (a `.git` file's
+/// `gitdir:` and its `commondir`) must resolve inside it too.
 fn fixture_root(preview: &Preview, temp: &Path, path: &Path) -> io::Result<PathBuf> {
     let actual = preview.protected().check(path)?;
     if actual == temp || !actual.starts_with(temp) || !fs::symlink_metadata(&actual)?.is_dir() {
@@ -496,7 +563,96 @@ fn fixture_root(preview: &Preview, temp: &Path, path: &Path) -> io::Result<PathB
             path.display()
         )));
     }
+    check_git_admin(preview, &actual, &actual)?;
     Ok(actual)
+}
+
+/// A fixture write or launch target: it resolves inside one fixture, and so
+/// does the Git admin dir (and its `commondir`) of every checkout between
+/// it and that fixture's root, because Git writes there too.
+fn fixture_target(preview: &Preview, fixtures: &[PathBuf], target: &Path) -> io::Result<PathBuf> {
+    let actual = preview.protected().check(target)?;
+    let fixture = fixtures
+        .iter()
+        .find(|root| actual.starts_with(root))
+        .ok_or_else(|| refuse(format!("not in a fixture: {}", target.display())))?;
+    for dir in actual
+        .ancestors()
+        .take_while(|dir| dir.starts_with(fixture))
+    {
+        check_git_admin(preview, fixture, dir)?;
+    }
+    Ok(actual)
+}
+
+/// `checkout/.git`, when present, and the `commondir` it names must resolve
+/// inside `fixture` and outside every protected root.
+fn check_git_admin(preview: &Preview, fixture: &Path, checkout: &Path) -> io::Result<()> {
+    let dot_git = checkout.join(".git");
+    let metadata = match fs::metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // A dangling `.git` link is refused, not mistaken for absence.
+            return match fs::symlink_metadata(&dot_git) {
+                Ok(_) => Err(refuse(format!("dangling git link: {}", dot_git.display()))),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            };
+        }
+        Err(error) => return Err(error),
+    };
+    // Git writes a relative `commondir` (`../..`), which the protected check
+    // refuses as traversal; the OS resolves it, and a missing one is refused.
+    let inside = |path: &Path| -> io::Result<PathBuf> {
+        let actual = preview.protected().check(&fs::canonicalize(path)?)?;
+        if !actual.starts_with(fixture) {
+            return Err(refuse(format!(
+                "git admin dir outside the fixture: {}",
+                path.display()
+            )));
+        }
+        Ok(actual)
+    };
+    let git_dir = if metadata.is_file() {
+        let pointer = git_pointer(&dot_git, "gitdir:")?;
+        inside(&checkout.join(pointer))?
+    } else {
+        inside(&dot_git)?
+    };
+    let commondir = git_dir.join("commondir");
+    match fs::read_to_string(&commondir) {
+        Ok(contents) => {
+            let common = contents.trim_end_matches(['\n', '\r']);
+            if common.is_empty() {
+                return Err(refuse(format!("empty commondir: {}", commondir.display())));
+            }
+            inside(&git_dir.join(common))?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if fs::symlink_metadata(&commondir).is_ok() {
+                return Err(refuse(format!(
+                    "dangling commondir link: {}",
+                    commondir.display()
+                )));
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+/// The path a `.git` file names after `prefix`. A relative path is relative
+/// to the file's directory; the caller joins it, which keeps absolute ones.
+fn git_pointer(file: &Path, prefix: &str) -> io::Result<PathBuf> {
+    let contents = fs::read_to_string(file)?;
+    contents
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix(prefix))
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| refuse(format!("not a gitdir file: {}", file.display())))
 }
 
 #[cfg(test)]

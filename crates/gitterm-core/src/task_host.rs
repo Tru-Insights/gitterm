@@ -40,6 +40,7 @@ use crate::tasks::state::TaskAuthority;
 use crate::tasks::{Delegation, DelegationChild, DelegationStatus, TaskStore};
 use serde_json::{json, Value};
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio_stream::Stream;
@@ -197,16 +198,36 @@ impl TaskHost {
         self.commands.close();
     }
 
-    /// `None` when the host has answered the command itself.
+    /// `None` when the host has answered the command itself. The caller's
+    /// own task is not known here, so an operation that would default to
+    /// the caller's task worktree has no target (see
+    /// [`Self::dispatch_with_caller_task`]).
     pub fn dispatch(&self, envelope: TaskControlEnvelope) -> Option<HostEffect> {
+        self.dispatch_with_caller_task(envelope, None)
+    }
+
+    /// [`Self::dispatch`], with `caller_task` the task the calling tab
+    /// belongs to: the frontend knows its tabs; the store knows the task's
+    /// worktree. Every write target the operation resolves to must pass the
+    /// gate, and an unresolved one is checked as no target, which a
+    /// fixture-launch context denies.
+    pub fn dispatch_with_caller_task(
+        &self,
+        envelope: TaskControlEnvelope,
+        caller_task: Option<&str>,
+    ) -> Option<HostEffect> {
         let TaskControlEnvelope {
             operation,
             caller,
             reply,
         } = envelope;
-        // shortcut: no operation names its checkout here, so a fixture-launch
-        // context denies every write; H5 passes the resolved target.
-        if let Err(denied) = self.services.operation(&operation, None) {
+        let authorized = match self.write_targets(&operation, caller_task) {
+            Some(targets) if !targets.is_empty() => targets
+                .iter()
+                .try_for_each(|target| self.services.operation(&operation, Some(target))),
+            _ => self.services.operation(&operation, None),
+        };
+        if let Err(denied) = authorized {
             reply.send(Err(denied.notice().to_string()));
             return None;
         }
@@ -279,6 +300,54 @@ impl TaskHost {
             },
             Op::MergePlanGet => HostEffect::MergePlanGet { reply, caller },
         })
+    }
+
+    /// Every path a write or launch would act in, from the request and the
+    /// store. `None` when any one of them cannot be resolved, and for
+    /// operations with no checkout (reads, `merge_plan_set`). Git admin dirs
+    /// of each target are checked by the gate itself.
+    fn write_targets(
+        &self,
+        operation: &TaskControlOperation,
+        caller_task: Option<&str>,
+    ) -> Option<Vec<PathBuf>> {
+        use TaskControlOperation as Op;
+        let worktree = |task_id: &str| self.store().as_ref()?.get(task_id)?.worktree.path.clone();
+        let checkout_or_caller =
+            |checkout: Option<&PathBuf>| checkout.cloned().or_else(|| worktree(caller_task?));
+        match operation {
+            Op::Create(request) => Some(vec![request.repository_path.clone()]),
+            Op::LaunchSession(request) => Some(vec![worktree(&request.task_id)?]),
+            Op::UpdateHandoff(request) => Some(vec![worktree(&request.task_id)?]),
+            Op::SessionEvent(request) => Some(vec![worktree(&request.task_id)?]),
+            Op::RequestReview(request) => {
+                Some(vec![checkout_or_caller(request.checkout.as_ref())?])
+            }
+            Op::RequestConsult(request) => {
+                Some(vec![checkout_or_caller(request.checkout.as_ref())?])
+            }
+            Op::DelegateTask(request) => {
+                let mut targets: Vec<_> = request
+                    .checkout
+                    .iter()
+                    .chain(&request.repo)
+                    .cloned()
+                    .collect();
+                if targets.is_empty() {
+                    targets.push(worktree(caller_task?)?);
+                }
+                targets.extend(request.add_dirs.iter().cloned());
+                Some(targets)
+            }
+            Op::MergePlanSet(_)
+            | Op::PlanLimits
+            | Op::HtmlRender(_)
+            | Op::List(_)
+            | Op::Get(_)
+            | Op::GetDelegation(_)
+            | Op::ListDelegations(_)
+            | Op::MergePlanGet => None,
+        }
     }
 
     fn read(&self, reply: TaskControlReply, query: TaskRead) -> HostEffect {
