@@ -2,11 +2,22 @@
 //! data: typing and the checkbox are local, while every control that would
 //! grant a pairing or revoke a phone shows a notice and calls nothing.
 //!
-//! Paired phones and an issued pairing only ever come from a live agent, which
-//! this preview never contacts, so the shell passes neither; `set_phones` and
-//! `set_pairing` take a read-only source if one appears. The pairing QR image
+//! The state and rules are core's `remote::phone_panel` (Iced's too); this
+//! file draws them. Paired phones and an issued pairing only ever come from a
+//! live agent, which this preview never contacts, so the shell passes neither;
+//! `phones_loaded` and `pairing_created` take a read-only source if one
+//! appears. The pairing QR image
 //! is not drawn (no QR dependency, and no pairing to draw it for).
 
+use std::{
+    cell::Cell,
+    time::{Duration, UNIX_EPOCH},
+};
+
+use gitterm_core::{
+    chats,
+    remote::phone_panel::{self, DEFAULT_DEVICE_NAME, PairedPhoneInfo, PhonePairing, scope_label},
+};
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
@@ -26,10 +37,6 @@ use crate::theme::Palette;
 mod tests;
 
 const MONO: &str = "Menlo";
-/// Iced's initial `device_name`; the placeholder is the same word.
-pub const DEFAULT_PHONE_NAME: &str = "iPhone";
-pub const CREATE_LABEL: &str = "Show pairing code";
-pub const RECREATE_LABEL: &str = "New code";
 pub const REVOKE_LABEL: &str = "Revoke";
 pub const ALLOW_ACT_LABEL: &str = "Allow sending and approving";
 pub const EXPLANATION: &str = "Scan the code with the phone's camera; the phone must be on the \
@@ -38,27 +45,6 @@ pub const EXPLANATION: &str = "Scan the code with the phone's camera; the phone 
      To change what a phone may do, revoke it and pair it again.";
 pub const SHORT_CODE_HINT: &str = "Using the home-screen app? Open it and type this code.";
 pub const PAIRED_PHONES_UNAVAILABLE: &str = "Paired phones are not listed in preview.";
-
-/// A phone already paired with the agent.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PairedPhone {
-    pub id: String,
-    pub name: String,
-    /// "view only" / "can send and approve", as Iced's `phone_scope_label`.
-    pub scope: String,
-    /// "never used" or "seen 5m ago".
-    pub seen: String,
-}
-
-/// An issued pairing, as the panel shows it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Pairing {
-    pub url: String,
-    /// `XXXX-XXXX`; empty from an agent that predates short codes.
-    pub short_code: String,
-    pub scope: String,
-    pub expires: String,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PhonePanelOutcome {
@@ -71,24 +57,60 @@ pub fn unavailable_notice(label: &str) -> String {
     format!("{label} · not available in preview")
 }
 
+/// The preview has no agent client, so a write rule's lookup always says
+/// the control is unavailable; `declined` records that it was asked.
+///
+/// shortcut: the shell has no `ServiceContext` yet, so the notice text is
+/// the preview's own; take it from `ServiceContext::phone(&call)` once it has
+/// one and a client to build the call with.
+fn no_client<'a>(
+    label: &'a str,
+    declined: &'a Cell<bool>,
+) -> impl FnOnce(&str) -> Result<(), String> + 'a {
+    move |_| {
+        declined.set(true);
+        Err(unavailable_notice(label))
+    }
+}
+
+/// `HH:MM` on this Mac's clock, as Iced's `local_clock_time`.
+fn local_clock_time(unix_secs: u64) -> String {
+    chrono::DateTime::from_timestamp(unix_secs as i64, 0)
+        .map(|at| at.with_timezone(&chrono::Local).format("%H:%M").to_string())
+        .unwrap_or_else(|| unix_secs.to_string())
+}
+
+fn seen_text(last_seen_unix_secs: u64) -> String {
+    if last_seen_unix_secs == 0 {
+        "never used".to_string()
+    } else {
+        format!(
+            "seen {} ago",
+            chats::format_age(UNIX_EPOCH + Duration::from_secs(last_seen_unix_secs))
+        )
+    }
+}
+
 pub struct PhonePanel {
-    machine_name: String,
+    /// Iced's rules and state; the name field's text lives in `name` and is
+    /// copied over when a pairing is asked for.
+    pub panel: phone_panel::PhonePanel<()>,
     name: Entity<InputState>,
-    allow_act: bool,
-    pairing: Option<Pairing>,
-    phones: Option<Vec<PairedPhone>>,
-    busy: bool,
-    notice: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl EventEmitter<PhonePanelOutcome> for PhonePanel {}
 
 impl PhonePanel {
-    pub fn new(machine_name: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        remote_id: String,
+        machine_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let name = cx.new(|cx| {
-            let mut input = InputState::new(window, cx).placeholder(DEFAULT_PHONE_NAME);
-            input.set_value(DEFAULT_PHONE_NAME, window, cx);
+            let mut input = InputState::new(window, cx).placeholder(DEFAULT_DEVICE_NAME);
+            input.set_value(DEFAULT_DEVICE_NAME, window, cx);
             input.focus(window, cx);
             input
         });
@@ -98,13 +120,8 @@ impl PhonePanel {
             }
         });
         Self {
-            machine_name,
+            panel: phone_panel::PhonePanel::open(remote_id, machine_name),
             name,
-            allow_act: false,
-            pairing: None,
-            phones: None,
-            busy: false,
-            notice: None,
             _subscriptions: vec![subscription],
         }
     }
@@ -114,53 +131,70 @@ impl PhonePanel {
     }
 
     pub fn allow_act(&self) -> bool {
-        self.allow_act
+        self.panel.allow_act
     }
 
     pub fn notice(&self) -> Option<&str> {
-        self.notice.as_deref()
+        self.panel.error.as_deref()
     }
 
-    pub fn set_phones(&mut self, phones: Option<Vec<PairedPhone>>, cx: &mut Context<Self>) {
-        self.phones = phones;
+    pub fn create_label(&self) -> &'static str {
+        self.panel.create_label()
+    }
+
+    /// The answer to a list call, from a read-only source if one appears.
+    pub fn phones_loaded(
+        &mut self,
+        remote_id: &str,
+        result: Result<Vec<PairedPhoneInfo>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.panel.phones_loaded(remote_id, result);
         cx.notify();
     }
 
-    pub fn set_pairing(&mut self, pairing: Option<Pairing>, cx: &mut Context<Self>) {
-        self.pairing = pairing;
+    /// The answer to a create call. The QR image is not drawn.
+    pub fn pairing_created(
+        &mut self,
+        remote_id: &str,
+        result: Result<PhonePairing, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.panel.pairing_created(remote_id, result, |_| Ok(()));
         cx.notify();
     }
 
     /// A pairing or revoke in flight disables the write controls.
     pub fn set_busy(&mut self, busy: bool, cx: &mut Context<Self>) {
-        self.busy = busy;
+        self.panel.busy = busy;
         cx.notify();
-    }
-
-    fn create_label(&self) -> &'static str {
-        if self.pairing.is_some() {
-            RECREATE_LABEL
-        } else {
-            CREATE_LABEL
-        }
     }
 
     /// Show pairing code / New code, and Enter in the name field.
     pub fn create(&mut self, cx: &mut Context<Self>) {
-        if !self.busy {
-            self.unavailable(self.create_label(), cx);
-        }
+        let label = self.panel.create_label();
+        let declined = Cell::new(false);
+        self.panel.set_device_name(self.device_name(cx));
+        let _ = self.panel.create(no_client(label, &declined));
+        self.finish(label, declined.get(), cx);
     }
 
-    pub fn revoke(&mut self, cx: &mut Context<Self>) {
-        if !self.busy {
-            self.unavailable(REVOKE_LABEL, cx);
+    pub fn revoke(&mut self, id: String, cx: &mut Context<Self>) {
+        // Iced disables Revoke while busy; the rule itself does not check.
+        if self.panel.busy {
+            return;
         }
+        let declined = Cell::new(false);
+        let _ = self.panel.revoke(id, no_client(REVOKE_LABEL, &declined));
+        self.finish(REVOKE_LABEL, declined.get(), cx);
     }
 
-    fn unavailable(&mut self, label: &str, cx: &mut Context<Self>) {
-        self.notice = Some(unavailable_notice(label));
-        cx.emit(PhonePanelOutcome::Unavailable(label.to_string()));
+    /// Only a refused lookup is the preview's "unavailable"; a refused name
+    /// shows its own notice and the shell hears nothing.
+    fn finish(&mut self, label: &str, declined: bool, cx: &mut Context<Self>) {
+        if declined {
+            cx.emit(PhonePanelOutcome::Unavailable(label.to_string()));
+        }
         cx.notify();
     }
 }
@@ -175,7 +209,7 @@ impl Render for PhonePanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::current(cx);
         let dark = p.base == 0x1e1e2e;
-        let busy = self.busy;
+        let busy = self.panel.busy;
         let text = |value: SharedString, size: f32, color: u32| {
             div()
                 .text_size(px(size))
@@ -194,7 +228,7 @@ impl Render for PhonePanel {
                 .disabled(busy)
         };
 
-        let create = outline("phone-create".into(), self.create_label(), p.blue)
+        let create = outline("phone-create".into(), self.panel.create_label(), p.blue)
             .debug_selector(|| "phone-create".into())
             .on_click(cx.listener(|this, _, _, cx| this.create(cx)));
         let name_row = div()
@@ -218,10 +252,10 @@ impl Render for PhonePanel {
         let allow = div().debug_selector(|| "phone-allow-act".into()).child(
             Checkbox::new("phone-allow-act-box")
                 .label(ALLOW_ACT_LABEL)
-                .checked(self.allow_act)
+                .checked(self.panel.allow_act)
                 .disabled(busy)
                 .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                    this.allow_act = *checked;
+                    this.panel.set_allow_act(*checked);
                     cx.notify();
                 })),
         );
@@ -243,7 +277,7 @@ impl Render for PhonePanel {
             .on_click(|_, _, cx| cx.stop_propagation())
             .child(
                 text(
-                    format!("Pair a phone with {}", self.machine_name).into(),
+                    format!("Pair a phone with {}", self.panel.machine_name).into(),
                     14.,
                     p.text,
                 )
@@ -253,7 +287,7 @@ impl Render for PhonePanel {
             .child(name_row)
             .child(allow);
 
-        if let Some(pairing) = &self.pairing {
+        if let Some(pairing) = &self.panel.pairing {
             let mut block = div().flex().flex_col().items_center().gap(px(6.));
             // An older agent sends no short code; the pairing still works.
             if !pairing.short_code.is_empty() {
@@ -273,7 +307,8 @@ impl Render for PhonePanel {
                     .child(text(
                         format!(
                             "{} · works once · expires at {}",
-                            pairing.scope, pairing.expires
+                            scope_label(&pairing.scope),
+                            local_clock_time(pairing.expires_unix_secs)
                         )
                         .into(),
                         10.,
@@ -282,14 +317,14 @@ impl Render for PhonePanel {
             );
         }
 
-        if let Some(notice) = &self.notice {
+        if let Some(notice) = &self.panel.error {
             card = card.child(
                 text(notice.clone().into(), 11., p.red).debug_selector(|| "phone-notice".into()),
             );
         }
 
         card = card.child(text("Paired phones".into(), 12., p.subtext0));
-        match &self.phones {
+        match &self.panel.phones {
             None => {
                 card = card.child(
                     text(PAIRED_PHONES_UNAVAILABLE.into(), 11., p.muted)
@@ -303,6 +338,7 @@ impl Render for PhonePanel {
                 for phone in phones {
                     let selector = format!("phone-revoke-{}", phone.id);
                     let id = selector.clone();
+                    let phone_id = phone.id.clone();
                     card = card.child(
                         div()
                             .flex()
@@ -316,7 +352,12 @@ impl Render for PhonePanel {
                                     .gap(px(2.))
                                     .child(text(phone.name.clone().into(), 12., p.text))
                                     .child(text(
-                                        format!("{} · {}", phone.scope, phone.seen).into(),
+                                        format!(
+                                            "{} · {}",
+                                            scope_label(&phone.scope),
+                                            seen_text(phone.last_seen_unix_secs)
+                                        )
+                                        .into(),
                                         10.,
                                         p.muted,
                                     )),
@@ -324,7 +365,9 @@ impl Render for PhonePanel {
                             .child(
                                 outline(selector.clone().into(), REVOKE_LABEL, p.red)
                                     .debug_selector(move || id.clone())
-                                    .on_click(cx.listener(|this, _, _, cx| this.revoke(cx))),
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.revoke(phone_id.clone(), cx)
+                                    })),
                             ),
                     );
                 }

@@ -2831,6 +2831,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "block2 0.6.2",
+ "chrono",
  "dirs 6.0.0",
  "git2",
  "gitterm-browser",
@@ -2851,6 +2852,7 @@ dependencies = [
  "shell-words",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "toml 0.8.23",
 ]
 
