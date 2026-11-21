@@ -343,13 +343,18 @@ mod interaction_tests {
             click(cx, selector);
             notice(&shell, label, cx);
         }
+        // "+" and "Open a repo…" open the in-app folder picker (D24, read-only).
+        for selector in ["pstrip-machine-add-0", "pstrip-repo-action-0-2"] {
+            click(cx, "pstrip-repos");
+            click(cx, selector);
+            assert!(cx.debug_bounds("folder-picker").is_some(), "{selector}");
+            click(cx, "folder-picker-cancel");
+            assert!(cx.debug_bounds("folder-picker").is_none(), "{selector}");
+        }
         for (selector, label) in [
-            ("pstrip-machine-add-0", "+"),
             ("pstrip-repo-action-0-0", "New workspace…"),
             ("pstrip-repo-action-0-1", "Add a repo to acme-api…"),
-            ("pstrip-repo-action-0-2", "Open a repo…"),
             ("pstrip-repo-action-0-3", "Keep repos in this menu only"),
-            ("pstrip-repo-action-0-4", "Show this Mac chats"),
             ("pstrip-repo-action-1-1", "Reconnect…"),
             ("pstrip-repo-action-1-2", "Pair a phone…"),
             ("pstrip-remote-workspace-0", "+ Fixture:repo"),

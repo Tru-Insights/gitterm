@@ -64,8 +64,8 @@ impl SavedFacts {
             ..Default::default()
         };
         result.attention_counts = iced_tab_attention_counts(workspaces, &tasks);
-        result.repo_machines = file
-            .remote_agents
+        // Iced's machines: remote-agents.json, then workspaces.json's copies.
+        result.repo_machines = crate::remote_client::read_remotes(source)?
             .iter()
             .map(|machine| Machine {
                 key: format!("agent:{}", machine.id),
@@ -615,6 +615,12 @@ pub enum Outcome {
     ToggleTerminal,
     Browser(BrowserAction),
     OpenMoreMenu,
+    /// A machine header's "+": the folder picker on that machine (key).
+    AddWorkspace(String),
+    /// "Open a repo…": the folder picker on the active machine.
+    OpenFolder,
+    /// "Show {machine} chats" (machine key): Find, that machine only.
+    ShowMachineChats(String),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Item {
@@ -734,6 +740,16 @@ impl Input {
         }
         machines
     }
+    /// The outcome a repo-menu action emits; None is a preview notice.
+    fn repo_action_outcome(machine: &Machine, label: &str) -> Option<Outcome> {
+        if label == "Open a repo…" {
+            Some(Outcome::OpenFolder)
+        } else if label == format!("Show {} chats", machine.name) {
+            Some(Outcome::ShowMachineChats(machine.key.clone()))
+        } else {
+            None
+        }
+    }
     fn repo_actions(&self, machine: &Machine, has_workspaces: bool) -> Vec<String> {
         let mut entries = vec![];
         if machine.key == workspace::LOCAL_GROUP {
@@ -818,6 +834,32 @@ pub(crate) fn control<T: Clone + 'static>(
             emit(outcome.clone(), window, cx);
         })
         .child(label.into())
+}
+
+/// A menu entry that closes the popover, then emits `outcome`.
+fn menu_control(
+    id: String,
+    label: String,
+    outcome: Outcome,
+    colors: Colors,
+    emit: Handler<Outcome>,
+    cx: &mut gpui::Context<gpui_component::popover::PopoverState>,
+) -> Stateful<Div> {
+    let weak = cx.entity().downgrade();
+    let selector = id.clone();
+    control(
+        id,
+        label.clone(),
+        label,
+        colors.muted,
+        colors,
+        outcome,
+        Rc::new(move |outcome, window, cx| {
+            let _ = weak.update(cx, |state, cx| state.dismiss(window, cx));
+            emit(outcome, window, cx);
+        }),
+    )
+    .debug_selector(move || selector.clone())
 }
 
 fn preview_control(
@@ -1060,10 +1102,12 @@ pub fn render(
                                 if machine.key == workspace::LOCAL_GROUP
                                     || machine.key.starts_with("agent:")
                                 {
-                                    header = header.child(preview_control(
+                                    header = header.child(menu_control(
                                         format!("pstrip-machine-add-{position}"),
                                         "+".into(),
+                                        Outcome::AddWorkspace(machine.key.clone()),
                                         colors,
+                                        menu_emit.clone(),
                                         cx,
                                     ));
                                 }
@@ -1135,12 +1179,20 @@ pub fn render(
                                     .into_iter()
                                     .enumerate()
                                 {
-                                    menu = menu.child(preview_control(
-                                        format!("pstrip-repo-action-{position}-{index}"),
-                                        label,
-                                        colors,
-                                        cx,
-                                    ));
+                                    let id = format!("pstrip-repo-action-{position}-{index}");
+                                    menu = menu.child(
+                                        match Input::repo_action_outcome(machine, &label) {
+                                            Some(outcome) => menu_control(
+                                                id,
+                                                label,
+                                                outcome,
+                                                colors,
+                                                menu_emit.clone(),
+                                                cx,
+                                            ),
+                                            None => preview_control(id, label, colors, cx),
+                                        },
+                                    );
                                 }
                             }
                             if !menu_input.remote_workspaces.is_empty() {

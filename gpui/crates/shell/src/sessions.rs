@@ -395,6 +395,25 @@ impl crate::Shell {
             O::Browser(_) => self.unavailable("Browser", cx),
             O::OpenMoreMenu => self.unavailable("Help and browser actions", cx),
             O::ToggleTerminal => self.unavailable("Terminal", cx),
+            O::AddWorkspace(key) => {
+                let machine = key.strip_prefix("agent:").map(str::to_string);
+                self.open_folder_picker(
+                    crate::workspace_sheet::FolderPickerPurpose::NewWorkspace,
+                    machine,
+                    window,
+                    cx,
+                )
+            }
+            O::OpenFolder => {
+                let machine = self.active_machine(cx);
+                self.open_folder_picker(
+                    crate::workspace_sheet::FolderPickerPurpose::OpenFolder,
+                    machine,
+                    window,
+                    cx,
+                )
+            }
+            O::ShowMachineChats(key) => self.show_machine_chats(&key, window, cx),
         }
     }
     pub(crate) fn spine_outcome(
@@ -574,7 +593,7 @@ impl crate::Shell {
                 self.new_work_subscription = None;
                 self.cover_sheet(false, window, cx);
             }
-            O::PickFolder { .. } => self.pick_folder(window, cx),
+            O::PickFolder { purpose } => self.open_folder_picker(*purpose, None, window, cx),
         }
         cx.notify();
     }

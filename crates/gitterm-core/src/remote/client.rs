@@ -103,6 +103,21 @@ pub struct RemoteAgentClientConfig {
     pub token_ref: String,
 }
 
+impl From<super::config::RemoteAgentConfig> for RemoteAgentClientConfig {
+    /// The transport identity of a saved remote; the token stays a reference.
+    fn from(agent: super::config::RemoteAgentConfig) -> Self {
+        let token_ref = match agent.auth {
+            super::config::RemoteAgentAuthConfig::Token { token_ref } => token_ref,
+        };
+        Self {
+            remote_id: agent.id,
+            name: agent.name,
+            endpoint: agent.endpoint,
+            token_ref,
+        }
+    }
+}
+
 pub use super::state::RemoteAgentHandshake;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
