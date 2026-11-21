@@ -39,24 +39,24 @@ Each row is a control or a repeated control family whose instances share behavio
 
 ## Verdict counts
 
-Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this refresh the map showed 143 MATCH and 193 DIFF; it now shows 200 MATCH, 80 PREVIEW and 56 DIFF (336 rows).
+Re-verified against current code (`7c3b587`, after PRs #280–#310). Before this refresh the map showed 143 MATCH and 193 DIFF; it now shows 209 MATCH, 81 PREVIEW and 46 DIFF (336 rows) after the TRU-274 small-parity pass.
 
 | Section | MATCH | PREVIEW | DIFF |
 | --- | ---: | ---: | ---: |
 | Spine and session strip | 6 | 0 | 4 |
 | Sidebar modes, Files, Git | 15 | 5 | 0 |
 | Work sidebar | 23 | 17 | 0 |
-| Find sidebar and preview | 17 | 7 | 1 |
-| Content area and file viewer | 8 | 1 | 2 |
+| Find sidebar and preview | 18 | 7 | 0 |
+| Content area and file viewer | 10 | 1 | 0 |
 | Chat transcript, cards, roster | 29 | 6 | 0 |
-| Composer and Review / Consult | 19 | 2 | 4 |
+| Composer and Review / Consult | 22 | 2 | 1 |
 | Bottom panel and terminal find | 16 | 1 | 0 |
-| Workspace bar, menus, settings | 11 | 21 | 4 |
+| Workspace bar, menus, settings | 12 | 21 | 3 |
 | Sheets and dialogs | 23 | 8 | 5 |
 | Task detail and other dialogs | 4 | 7 | 31 |
-| Usage page | 7 | 2 | 1 |
-| Native menus and shortcuts | 22 | 3 | 4 |
-| **Total** | **200** | **80** | **56** |
+| Usage page | 8 | 2 | 0 |
+| Native menus and shortcuts | 23 | 4 | 2 |
+| **Total** | **209** | **81** | **46** |
 
 `PREVIEW` means a deliberate preview limit (write/launch control shows "not available in preview"), kept until cutover.
 
@@ -176,7 +176,7 @@ Sources: [Iced Find](../src/main.rs#L44327), [rows](../src/main.rs#L45024), [ove
 | N13a idle overview fold | Idle group count + disclosure | No equivalent overview/summary controls in `find_content`/preview | I H; — | Click | `ToggleChatOverviewIdle` | Preview renders header + CONVERSATION only | **MATCH** idle fold ▸/▾ (find_sidebar.rs:1788-1805); same test. |
 | N13b summary ask/reply folds | LATEST ASK / LATEST REPLY: `more` ↔ `less` when clipped | No equivalent overview/summary controls in `find_content`/preview | I H; — | Click more/less | `ToggleChatSummaryAsk` / `ToggleChatSummaryReply` | Preview renders header + CONVERSATION only | **MATCH** ask/reply more↔less (find_sidebar.rs:1990, 2060); test `n13b_summary_folds_match_iced_limits_and_files_emit_local_open`. |
 | N13c summary changed file **R** | Relative path link only if local and openable | No equivalent overview/summary controls in `find_content`/preview | I H; — | Click | `ViewFile(Local(full))` | Preview renders header + CONVERSATION only | **MATCH** local openable file → `OpenFile` (find_sidebar.rs:2012-2030, 2682); same test. |
-| N13d summary waiting action | Waiting/approval action button for actionable target | No equivalent overview/summary controls in `find_content`/preview | I H; — | Click | `ChatOverviewGo(target)` → pending session/preview | Preview renders header + CONVERSATION only | **DIFF** "Go to prompt" only raises an Unavailable notice (find_sidebar.rs:2042); Iced navigates to the pending session. |
+| N13d summary waiting action | Waiting/approval action button for actionable target | No equivalent overview/summary controls in `find_content`/preview | I H; — | Click | `ChatOverviewGo(target)` → pending session/preview | Preview renders header + CONVERSATION only | **MATCH** `Go to prompt` emits the Open outcome and selects the waiting session as Iced's `ChatOverviewGo` does, shown only while that session is open here (find_sidebar.rs; test find_sidebar_tests.rs). Iced also reveals the roster's `ask` row; GPUI does not. |
 | N14 relevance **R** | `Relevant`, selected/unselected | No relevance/backfill controls; ordinary scope chips available | I H/disabled when inappropriate; — | Click | `ChatsRelevanceToggled` | Only scope/filter outcomes | **MATCH** `Relevant` toggle (find_sidebar.rs:1465-1485); test `n14_relevant_guard_and_n14a_widen_clicks_preserve_filters`. |
 | N14a widen search **R** | Contextual wider-machine / Everywhere suggestions | No relevance/backfill controls; ordinary scope chips available | I H/disabled when inappropriate; — | Click | `ChatsScopeChanged` | Only scope/filter outcomes | **MATCH** widen suggestions (find_sidebar.rs:1457); same test. |
 | N14b backfill **R/W** | `Index older chats` / indexing state | No relevance/backfill controls; ordinary scope chips available | I H/disabled when inappropriate; — | Click | `ChatFactsBackfill` | Only scope/filter outcomes | **PREVIEW** `Index older chats` → Unavailable (find_sidebar.rs:1452). |
@@ -195,11 +195,11 @@ Sources: [Iced headers](../src/main.rs#L35724), [file viewer](../src/main.rs#L46
 | V04 file browser **X** | `Open in Browser` | Absent from file wrapper | H/—; — | Click | `OpenFileInBrowser` → snapshot/browser route | — | **MATCH** `Open in Browser` mounted (content/session.rs:626); same test. |
 | V04a embedded page browser **X** | `Open in browser` in Page header | Same, in Page header | H/—; H/— | Click | `OpenViewerPageInBrowser` → external URL | `page-open-browser` → `cx.open_url` for HTTP(S) | **MATCH** opens the Page's URL externally. |
 | V05 copy file **C** | `Copy All` for raw/text file | Absent | H/—; — | Click | `CopyFileContent` → clipboard | — | **MATCH** `Copy All` mounted (content/session.rs:609); same test. |
-| V06 document interaction | Scroll/select text, Markdown links, rendered HTML controls | Native text/Review or retained WKWebView depending type | Content-defined | Scroll, selection; links click | File view scroll event; Markdown/link/viewer routes | WKWebView delegate permits initial injected document only; cancels subsequent local/custom/external navigation | **DIFF** http(s) links load in place or open externally (content/host.rs `document_navigation`; test content/tests.rs:475); file:, mailto:, custom and javascript: links are still cancelled. |
+| V06 document interaction | Scroll/select text, Markdown links, rendered HTML controls | Native text/Review or retained WKWebView depending type | Content-defined | Scroll, selection; links click | File view scroll event; Markdown/link/viewer routes | WKWebView delegate permits initial injected document only; cancels subsequent local/custom/external navigation | **MATCH** same-frame links have no policy (as Iced's Viewer, which has no navigation handler); popups open http(s) externally and cancel every other scheme (content/host.rs `document_navigation`; test content/tests.rs). |
 | V07 Plans close | `Back to Terminal`, `Esc: close` hint | Plans toggle and file-viewer `Close` | H/—; N/— | Click/Esc; ⌘⇧P toggles | `ClosePlansViewer` | `toggle_plans` | **MATCH** dismisses plans surface; page internals out of scope. |
 | V07a embedded Page close | `×` | `×` | H/—; H/— | Click/Esc | `CloseViewerPage` → underlying session | `close_file_viewer` → underlying session | **MATCH** hides the Page, kept for the next open in the same store. In-page links follow the shared `gitterm_core::page_navigation` decision: load in place, open in the browser, or reopen in another login's store. |
 | V07b review close | Review close/back affordance | Viewer `Close` | H/—; N/— | Click/Esc | Review/viewer close route → session | `close_file_viewer` | **MATCH** chrome dismissal purpose; retained-surface routing differs. |
-| V08 empty content Open Folder **P/W/X** | No-workspace content: `Open Folder` | No matching empty-content button | I primary H/—; — | Click; ⌥⇧T | `OpenFolder` → folder picker, then open workspace/terminal | Folder shortcut opens recent-work sheet; no equivalent content button | **DIFF** no `Open Folder` content button; `⌥⇧T` opens the new-work sheet (lib.rs:3249), not Iced's folder picker. |
+| V08 empty content Open Folder **P/W/X** | No-workspace content: `Open Folder` | No matching empty-content button | I primary H/—; — | Click; ⌥⇧T | `OpenFolder` → folder picker, then open workspace/terminal | Folder shortcut opens recent-work sheet; no equivalent content button | **MATCH** with no workspace the content area shows an `Open Folder` button that opens the same folder picker as `⌥⇧T` (lib.rs `open_folder_button`); test small_parity_tests.rs. A workspace that has zero sessions is not checked. |
 
 ## Chat transcript, cards and roster
 
@@ -256,9 +256,9 @@ Sources: [Iced composer](../assets/agent_chat.html#L2333), [slash/mode](../asset
 | C03 Stop **P/W** | `Stop`, disabled idle/read-only | `Stop`, disabled idle/unavailable | Danger button H; native danger | Click | `stop` IPC → interrupt current turn | `ChatIntent::Stop` → adapter | **MATCH** stops turn without withdrawing queued draft. |
 | C04 queued withdraw **P/W** | Queued bubble `×`, T `Withdraw this message ({harness} keeps working)` | Queue row `Withdraw`, state-gated | I withdraw T; G N/— | Click | `withdraw {id}` IPC | `ChatIntent::Withdraw {message_id}` | **DIFF** same operation, label/placement/tooltip differ. |
 | C05 slash row | `/name {argumentHint}`, selected row; description tooltip | Same label/description, no per-command tooltip | I H/T; G N/description text | Click or Tab **fills only**; ↑↓ wrap; Enter runs no-arg, fills argument command; Esc dismisses | `fillSlash` / `slashKey` / `submitPrompt` | `select_slash` / `slash_key` → fill/send | **DIFF** core gestures match; G omits command tooltip. |
-| C06 model picker **P/W** | Model icon + label; pending `current → requested…`; `✓` current, `…` pending | Model icon + confirmed label (pre-start pick shown at once); catalog rows `✓` selected, `…` pending; hint `Model · full list after the session starts` before ready | I T `Model: {id}`; G same | Click chip/option, Esc/click-away | `set_model` IPC; usable configured values before session ready | `ChangeSetting(Model)`; chip enabled before ready, pick held then sent after Ready (Iced writes config before spawn) | **DIFF** pre-start pick (held, sent after Ready), tooltip and `…` option marker match; chip label lacks `current → requested…` pending arrow.
-| C07 effort/context picker **P/W** | Gauge + Auto/Low/Medium/High/X-High/Max as offered; `200k`/`1M` section for Claude; pending arrow | Same catalog concepts and offered levels; confirmed selected tick | I effort/applied-auto/context T; G same | Click chip/option; Esc/click-away | `set_effort` / `set_model` for context | `ChangeSetting` catalog choice; enabled before ready, sent after Ready | **DIFF** pre-start pick and informative tooltip match; chip label lacks the pending arrow.
-| C08 permission mode **P/W** | Lock + Default/Accept edits/Plan mode/Auto mode/extra modes or ACP labels; pending arrow | Same projected mode catalog | I T `Permission mode (Shift+Tab in the message box cycles)`; G same | Click option; Shift+Tab in composer cycles | `set_permission_mode`; configured mode usable before process starts | `ChangeSetting` / `CycleMode`; enabled before ready, sent after Ready | **DIFF** pre-start pick/cycle and tooltip match; chip label lacks the pending arrow.
+| C06 model picker **P/W** | Model icon + label; pending `current → requested…`; `✓` current, `…` pending | Model icon + confirmed label (pre-start pick shown at once); catalog rows `✓` selected, `…` pending; hint `Model · full list after the session starts` before ready | I T `Model: {id}`; G same | Click chip/option, Esc/click-away | `set_model` IPC; usable configured values before session ready | `ChangeSetting(Model)`; chip enabled before ready, pick held then sent after Ready (Iced writes config before spawn) | **MATCH** pre-start pick, tooltip and option markers match; the chip reads `current → requested…` while a change is pending (composer.rs `project`; test adapter/tests.rs).
+| C07 effort/context picker **P/W** | Gauge + Auto/Low/Medium/High/X-High/Max as offered; `200k`/`1M` section for Claude; pending arrow | Same catalog concepts and offered levels; confirmed selected tick | I effort/applied-auto/context T; G same | Click chip/option; Esc/click-away | `set_effort` / `set_model` for context | `ChangeSetting` catalog choice; enabled before ready, sent after Ready | **MATCH** pre-start pick, tooltip and option markers match; the chip reads `current → requested…` while a change is pending (composer.rs `project`; test adapter/tests.rs).
+| C08 permission mode **P/W** | Lock + Default/Accept edits/Plan mode/Auto mode/extra modes or ACP labels; pending arrow | Same projected mode catalog | I T `Permission mode (Shift+Tab in the message box cycles)`; G same | Click option; Shift+Tab in composer cycles | `set_permission_mode`; configured mode usable before process starts | `ChangeSetting` / `CycleMode`; enabled before ready, sent after Ready | **MATCH** pre-start pick, tooltip and option markers match; the chip reads `current → requested…` while a change is pending (composer.rs `project`; test adapter/tests.rs).
 | C09 picker dismissal | Menus close on outside click/Esc; restore composer focus on choice | Picker closes on composer click/Esc/choice | Menu item H; N | Click outside; Esc | `closeChipMenus`, mode dismissal | `close_picker`, choose_setting, focus composer | **MATCH** explicit dismissal/choice returns to draft; generic outside-focus behavior untested. |
 | C10 checkout choice **W** | Folder chip, `{label}…` pending, locked after start; unlocked list with `✓` | Folder chip with `Current checkout` + prepared task worktrees (label, task title, `✓`); locked once the chat has a prompt/session id; a pick shows `{label} · not available in preview` | I full path + lock reason T; G same (`{path}\n{reason or Where this chat runs}`) | Click; choose checkout if unlocked | `checkout_context`, `set_checkout` IPC | Host-supplied read-only menu (`tasks.json`); no `set_checkout` outcome | **DIFF** entries, labels, lock rule and tooltip match; the pick applies nothing (preview), `Open in editor` (C11) is absent so a locked chip stays disabled, and task/remote lock reasons are unreachable in a preview chat.
 | C11 checkout editor **P/X** | `Open in editor` remains available even when checkout locked | Absent | I menu description `Open this checkout folder`; — | Click | `open_checkout` IPC → configured editor | — | **DIFF** checkout editor action missing. |
@@ -328,7 +328,7 @@ Sources: [Iced bar](../src/main.rs#L37831), [repos/more menus](../src/main.rs#L3
 | A12 repo-menu workspace row | Workspace name/status | Workspace selection row | I row H/status; G native selection hints | Click | `WorkspaceSelect` | `SelectWorkspace` | **MATCH** selects an existing workspace. |
 | A12a machine add **W/X** | Machine header `+` | Same | I row H/status; G native selection hints | Click | `WorkspaceCreateLocal` or `RemoteWorkspaceBrowse` | `AddWorkspace(key)` → folder picker (NewWorkspace) on that machine | **MATCH** opens the picker; remote create is D24g. |
 | A12b new workspace entry | `New workspace…` | Absent in menu (bar + exists) | I row H/status; G native selection hints | Click | `NewWorkOpen` → workspace sheet | — | **DIFF** `New workspace…` entry present (workspace_bar.rs:756) but is a preview control; Iced opens the workspace sheet. |
-| A12c open repo **P/W/X** | `Open a repo…` | Same menu entry | I row H/status; G native selection hints | Click; I ⌥⇧T | `OpenFolder` → repo/folder picker | Menu → folder picker (OpenFolder) on the active machine | **DIFF** menu entry opens the folder picker (workspace_bar.rs:745) but `⌥⇧T` still opens the workspace sheet (lib.rs:3249). |
+| A12c open repo **P/W/X** | `Open a repo…` | Same menu entry | I row H/status; G native selection hints | Click; I ⌥⇧T | `OpenFolder` → repo/folder picker | Menu → folder picker (OpenFolder) on the active machine | **MATCH** menu entry and `⌥⇧T` both open the in-app folder picker (OpenFolder purpose; lib.rs `OpenFolder` action → `bar_outcome`); test small_parity_tests.rs. |
 | A12d repos zone **W (UI)** | `Keep repos in this menu only` / `Show repos on the bar too` | Absent | I row H/status; G native selection hints | Click | `ToggleReposZone` | — | **PREVIEW** entry present, preview control (workspace_bar.rs:767). |
 | A12e machine chats **R** | `Show {machine} chats` | Same | I row H/status; G native selection hints | Click | `ShowMachineChats` → scoped Find | `ShowMachineChats(key)` → Find, Everywhere, only that machine open; remote index via `RemoteClient::list_chats` | **MATCH** machine-to-Find shortcut. |
 | A12f reconnect **W/X** | Disconnected machine: `Reconnect…` | Absent | I row H/status; G native selection hints | Click | `MachineReconnect` → connection workflow | — | **PREVIEW** `Reconnect…` present, preview control (workspace_bar.rs:778). |
@@ -447,7 +447,7 @@ Sources: [Iced Usage](../src/main.rs#L43821), [Iced plan controls](../src/plan_l
 | U01 time window **R** | `7d`, `30d`, `90d`; selected chip | Same core labels/order | H/active style; H/active style | Click | `UsageWindowSelected` → report scan | `SelectWindow` → async scan, follow-up if window changes mid-scan | **MATCH** changes reporting window. |
 | U02 chart units | `Cost`, `Tokens`; selected | Same | H; H | Click | `UsageChartTokens(bool)` | `ChartTokens(bool)` | **MATCH** chart/legend/share units change; dollar totals remain costs. |
 | U03 headless toggle | `headless shown` / `headless hidden` | Same projected label | H; H | Click | `UsageHeadlessToggled` | `ToggleHeadless` | **MATCH** filters usage report, not plan quota readings. |
-| U04 refresh **R** | `refresh` / `scanning…`; scan request coalesced while scanning | Same | H/—; H/— | Click | `UsageRefresh` → transcript scan **and fresh Codex limits read** | `Refresh` → reload saved limits + transcript scan | **DIFF** Refresh reloads saved plan limits plus a transcript scan; no fresh Codex limits read (lib.rs:3514-3539). |
+| U04 refresh **R** | `refresh` / `scanning…`; scan request coalesced while scanning | Same | H/—; H/— | Click | `UsageRefresh` → transcript scan **and fresh Codex limits read** | `Refresh` → reload saved limits + transcript scan | **MATCH** Refresh reads the newest Codex rollout's limits and shows them (lib.rs `request_codex_limits`; test small_parity_tests.rs). Iced then saves its plan-limits file; GPUI keeps the reading in memory and writes nothing. |
 | U05 repo row | Repo table name, selected state | Same | Row H; row H | Click row | `UsageRepoFilter(Some(repo))`, or None if already selected | `SelectRepo(Some(repo))`, or None if already selected | **MATCH** report filtering and clear. |
 | U05a repo filter clear | Selected repo header `×`; no button in All repos state | Same | Row H; row H | Click × | `UsageRepoFilter(None)` | `SelectRepo(None)` | **MATCH** report filtering and clear. |
 | U06 routing pin **W** | Provider `1h`, `4h`, `24h`, optional `until reset` | Same visible controls | Button H; H | Click duration/provider | `PlanLimits(PinChanged)` → save routing choice | `PinChanged` → preview error unless unchanged | **PREVIEW** `PinChanged` → "Routing pin is not available in preview" (lib.rs:3543-3547). |
@@ -481,10 +481,10 @@ Sources: [GPUI complete menu/key inventory](../gpui/crates/shell/src/app_menus.r
 | M14 mirroring menu **W** | `Toggle Terminal Log Mirroring` | Same menu item, no registered action handler | Native menu highlight; G validation unavailable | `⌘⇧L` / menu | `ToggleTerminalLogMirroring` → save setting/log output | Reserved binding without handler | **PREVIEW** handler shows "Toggle Terminal Log Mirroring · not available in preview" (lib.rs:3294-3296). |
 | M04 Plans | `Plans Viewer` | Same | Native menu H | `⌘⇧P` / menu | `OpenPlansViewer` | `toggle_plans` | **MATCH** toggles plans surface. |
 | M05 sidebar/panel/context **W (UI)** | No separate native menu items; keyboard paths | Same action inventory | — | `⌘B`, `⌘J`, `⌘T`, `⌘↑`, `⌘0`, `⌘⇧W`, `Ctrl+1…9`, `⌘1…9` | Toggle/sidebar/console/task/workspace/tab events | Named actions route to shell/overlays | **MATCH** main-context routes; individual pane effect differences listed above. |
-| M06 Clear Terminal **P** | View → Terminal Font → Clear Terminal | Same label | Native menu H | `⌘K` / menu | `ClearTerminal` writes `clear\n` to **active main tab** backend | Writes `clear\n` to **focused terminal**, including bottom | **DIFF** `clear\n` goes to the focused terminal, possibly the bottom one; Iced targets the active main tab (lib.rs:3300-3306). |
+| M06 Clear Terminal **P** | View → Terminal Font → Clear Terminal | Same label | Native menu H | `⌘K` / menu | `ClearTerminal` writes `clear\n` to **active main tab** backend | Writes `clear\n` to **focused terminal**, including bottom | **MATCH** writes `clear\n` only to the active main tab's terminal; a chat or bottom-panel tab writes nothing (lib.rs `active_main_terminal`); test small_parity_tests.rs. |
 | M07 help | `Keyboard shortcuts` overlay with full inventory | Dialog with only `⌃1–9`, `⌘1–9`, `⌥/` | I/G dialog controls | `⌥/`, Esc; I More-menu entry | `ToggleHelp` | `dialogs::shortcuts` | **MATCH** full shortcut inventory (dialogs.rs:9); test `help_contains_the_full_iced_inventory_in_order`; More-menu entry (workspace_bar.rs:1363). |
 | M08 attention jump | No visible menu item | Same named action | — | `Ctrl+backtick` | `AttentionJumpNext` → next actionable tab in visible order | `attention_jump` → host session facts | **DIFF** `attention_jump` works (lib.rs:4558) but reads only mounted GPUI facts, not live Iced urgency. |
-| M09 launch shortcuts **P/W** | `⌥⇧1…9` preset or task child; `⌥⇧T` folder; `⌘⇧G` debug agent | Same reserved chords | — | Chord | Launch preset/child, `OpenFolder`, debug agent | Preset/child/debug handlers report preview error; `OpenFolder` opens recent workspace sheet | **DIFF** preset/child/debug launches → preview notice (lib.rs:3185-3193); `⌥⇧T` opens the workspace sheet, not the folder flow (lib.rs:3249). |
+| M09 launch shortcuts **P/W** | `⌥⇧1…9` preset or task child; `⌥⇧T` folder; `⌘⇧G` debug agent | Same reserved chords | — | Chord | Launch preset/child, `OpenFolder`, debug agent | Preset/child/debug handlers report preview error; `OpenFolder` opens recent workspace sheet | **PREVIEW** `⌥⇧T` now opens the folder picker as Iced does (test small_parity_tests.rs); preset/child/debug launches show a preview notice (lib.rs `LaunchAgentPreset`, `TaskChildLaunchPreset`, `DebugSpawnAgentTab`). |
 | M10 editing/clipboard **C/P** | No native Edit menu; WebView implements copy/cut/select/undo; paste forwarded natively; terminal owns its editing | No Edit menu; input/native chat actions; terminal context menu Copy/Paste/Clear | Native selection/menu | `⌘C/X/V/A/Z`, `⌘⇧Z`, transcript `⌘⇧C`; right-click | WebView editing command/IPC or PTY key handling | Native input actions/ChatView copy/native terminal | **MATCH** context-specific editing intent; selection/link/input implementation differences are documented separately. |
 | M11 dictation **P** | `Ctrl+Space` in voice-enabled build; mic state | `SttToggle` binding gated `IcedStt`, but host never supplies it/handler/mic facts | I mic status; G none | `Ctrl+Space` | `SttToggle` → voice flow | No active context/handler | **DIFF** `SttToggle` has no handler or mic state (app_menus.rs:598). |
 | M12 Escape precedence | Page-local find/pickers/review/request layers first, then host modal/preview/navigation; quick commands close | Shell handles plans/switcher/Usage, delegates sheets/terminal/chat find, file viewer; else focuses shell | — | Esc | Iced central handler plus `pageHasOpenLayer` | `Shell::escape` + local handlers | **MATCH** Escape order covers switcher, Usage, sheets, bar menu, bottom quick picker, plans, find, file, Find preview (lib.rs:3690-3770); test dialogs.rs:426. Bottom repo picker via shell Escape not verified. |
@@ -503,38 +503,27 @@ Refreshed 2026-11-21 against `7c3b587` (after PRs #280–#310). Only rows still 
 3. S02 — imported Iced sessions cannot be closed from `×` (sessions.rs:459-468).
 4. S07 — worktree-follow control never renders (`worktree_follow: None`, lib.rs:1963).
 
-**Find and content viewer**
-5. N13d — summary "Go to prompt" shows a notice instead of navigating to the pending session (find_sidebar.rs:2042).
-6. V06 — viewer links: http(s) works, but file:, mailto:, custom and javascript: links are cancelled.
-7. V08 — no empty-content `Open Folder` button; `⌥⇧T` opens the workspace sheet instead of the folder flow.
-
 **Composer**
-8. C06 / C07 / C08 — pre-start picks, tooltips and option markers match; the chip label lacks Iced's pending `current → requested…` arrow.
-9. C10 — picker entries, lock rule and tooltip match; a pick shows `{label} · not available in preview` (preview limit) and the locked chip has no `Open in editor` (C11).
+5. C10 — picker entries, lock rule and tooltip match; a pick shows `{label} · not available in preview` (preview limit) and the locked chip has no `Open in editor` (C11).
 
 **Workspace bar, sheets and menus**
-10. A12b / A12c — `New workspace…` is a preview control; `⌥⇧T` still opens the workspace sheet.
-11. A15 / D25 / D26 — Ready count and list: no Ready list to open, resume or close.
-12. A16 / D18 — Parked count has no list; the mounted park list uses different labels (`Mark done`, `Stop terminals`) and restores plain terminals only.
-13. D14 — park sheet facts omit shared repos and note chats.
-14. D23b — no PR confirmation panel, so no Cancel/Close.
-15. M06 — Clear Terminal targets the focused terminal (possibly the bottom one); Iced targets the active main tab.
-16. M08 — attention jump reads mounted GPUI facts only, not live Iced urgency.
-17. M09 — `⌥⇧T` opens the workspace sheet, not Iced's folder flow.
-18. M11 — dictation (`SttToggle`) has no handler or mic state.
-
-**Usage**
-19. U04 — Refresh reloads saved plan limits instead of a fresh Codex-limits read.
+6. A12b — `New workspace…` is a preview control.
+7. A15 / D25 / D26 — Ready count and list: no Ready list to open, resume or close.
+8. A16 / D18 — Parked count has no list; the mounted park list uses different labels (`Mark done`, `Stop terminals`) and restores plain terminals only.
+9. D14 — park sheet facts omit shared repos and note chats.
+10. D23b — no PR confirmation panel, so no Cancel/Close.
+11. M08 — attention jump reads mounted GPUI facts only, not live Iced urgency.
+12. M11 — dictation (`SttToggle`) has no handler or mic state.
 
 **Task detail (not mounted)**
-20. T01–T01d — new-task, filter chips and archive controls absent.
-21. T05–T06c — Review changes, Push branch, Open draft PR, publish confirmation absent.
-22. T07 / T07a — Stop and Cancel queue absent.
-23. T08–T08b — worktree delete opener and confirmation absent.
-24. T09–T09f — task create form is a fixture only.
-25. T10 / T10a — Stop and close / Keep open absent.
-26. T12–T12e — phone pairing and revocation absent.
-27. T13 — browser evidence viewer absent.
+13. T01–T01d — new-task, filter chips and archive controls absent.
+14. T05–T06c — Review changes, Push branch, Open draft PR, publish confirmation absent.
+15. T07 / T07a — Stop and Cancel queue absent.
+16. T08–T08b — worktree delete opener and confirmation absent.
+17. T09–T09f — task create form is a fixture only.
+18. T10 / T10a — Stop and close / Keep open absent.
+19. T12–T12e — phone pairing and revocation absent.
+20. T13 — browser evidence viewer absent.
 
 ## Verification boundary
 

@@ -204,12 +204,14 @@ pub(super) fn document_navigation(
             )
         }) && url.host().is_some_and(|host| !host.is_empty())
     });
-    if network {
-        if new_window {
-            DocumentNavigation::External
-        } else {
-            DocumentNavigation::Allow
-        }
+    // Iced's Viewer has a new-window handler only: a popup opens http(s) in
+    // the browser and drops every other scheme. Navigation inside the frame
+    // has no policy, so file:, mailto:, custom and javascript: links go to
+    // WebKit as they do there.
+    if !new_window {
+        DocumentNavigation::Allow
+    } else if network {
+        DocumentNavigation::External
     } else {
         DocumentNavigation::Cancel
     }

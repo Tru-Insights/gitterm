@@ -52,6 +52,8 @@ pub mod remote_client;
 mod remote_shell;
 #[cfg(test)]
 mod remote_shell_tests;
+#[cfg(test)]
+mod small_parity_tests;
 mod review_reload;
 pub mod session_picker;
 pub mod session_strip;
@@ -129,6 +131,9 @@ pub struct Shell {
     usage_input: usage::UsageInput,
     usage_cache: gitterm_core::usage::UsageCache,
     usage_scan_task: Option<gpui::Task<()>>,
+    codex_limits_task: Option<gpui::Task<()>>,
+    /// Where usage sources are read from; tests point it at a fixture.
+    usage_home: Option<std::path::PathBuf>,
     run_sidebar_subscriptions: HashMap<WorkspaceId, Subscription>,
     workspaces: Vec<WorkspaceDock>,
     owner: Entity<WorkspaceOwner>,
@@ -394,6 +399,8 @@ impl Shell {
             usage_input,
             usage_cache: gitterm_core::usage::UsageCache::default(),
             usage_scan_task: None,
+            codex_limits_task: None,
+            usage_home: None,
             run_sidebar_subscriptions: HashMap::new(),
             workspaces,
             owner,
@@ -3034,6 +3041,36 @@ impl Shell {
                     .then(|| view.clone())
             })
     }
+    /// Iced's empty-content `Open Folder` button: the same folder flow as ⌥⇧T.
+    fn open_folder_button(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        use gpui_component::button::{Button, ButtonVariants as _};
+        div()
+            .id("empty-open-folder")
+            .debug_selector(|| "empty-open-folder".into())
+            .child(
+                Button::new("empty-open-folder-button")
+                    .primary()
+                    .label("Open Folder")
+                    .on_click(cx.listener(|this, _, w, cx| {
+                        this.bar_outcome(workspace_bar::Outcome::OpenFolder, w, cx)
+                    })),
+            )
+            .into_any_element()
+    }
+    fn active_main_terminal(&self, cx: &App) -> Option<Entity<gitterm_terminal::TerminalView>> {
+        let state = self
+            .workspaces
+            .iter()
+            .find(|s| Some(s.workspace.id) == self.active_workspace(cx))?;
+        let id = session_pane_id(state.active_session?);
+        if bottom_pane_ids(state, cx).contains(&id) {
+            return None;
+        }
+        match &state.panes.get(&id)?.read(cx).content {
+            pane::PaneContent::Terminal(view) => Some(view.clone()),
+            _ => None,
+        }
+    }
     fn focused_chat(&self, window: &Window, cx: &App) -> Option<gpui::EntityId> {
         self.workspaces
             .iter()
@@ -3246,7 +3283,10 @@ impl Shell {
             )
             .on_action(cx.listener(|this, _: &WorkspaceClose, w, cx| this.open_park_sheet(w, cx)))
             .on_action(
-                cx.listener(|this, _: &OpenFolder, w, cx| this.open_recent_work_sheet(w, cx)),
+                cx.listener(|this, _: &OpenFolder, w, cx| {
+                    // Iced's ⌥⇧T / ⌘O: the in-app folder picker, not the new-work sheet.
+                    this.bar_outcome(workspace_bar::Outcome::OpenFolder, w, cx)
+                }),
             )
             .on_action(cx.listener(|this, _: &ToggleHelp, w, cx| {
                 use gpui_component::WindowExt;
@@ -3297,8 +3337,9 @@ impl Shell {
             .on_action(cx.listener(|this, action: &PreviewUnavailable, _, cx| {
                 this.chrome_unavailable(&action.label, cx);
             }))
-            .on_action(cx.listener(|this, _: &ClearTerminal, w, cx| {
-                if let Some(view) = this.focused_terminal(w, cx) {
+            .on_action(cx.listener(|this, _: &ClearTerminal, _, cx| {
+                // Iced writes to the active main tab, never the bottom panel.
+                if let Some(view) = this.active_main_terminal(cx) {
                     view.update(cx, |v, _| {
                         v.backend_mut()
                             .handle(gitterm_terminal::Command::Write(b"clear\n".to_vec()));
@@ -3428,7 +3469,7 @@ impl Shell {
         if self.usage_input.scanning {
             return;
         }
-        let Some(home) = dirs::home_dir() else {
+        let Some(home) = self.usage_home.clone().or_else(dirs::home_dir) else {
             self.usage_input.error = Some("Could not resolve home directory for usage scan".into());
             self.sync_usage(cx);
             return;
@@ -3464,6 +3505,31 @@ impl Shell {
                 } else {
                     shell.usage_input.report = Some(Box::new(report));
                     shell.usage_input.error = None;
+                }
+                shell.sync_usage(cx);
+            });
+        }));
+    }
+    /// Iced's Refresh reads the newest Codex rollout's limits. Iced then
+    /// saves them to its plan-limits file; this keeps the reading in memory
+    /// only (shortcut: lost on exit, until GPUI owns that file).
+    fn request_codex_limits(&mut self, cx: &mut Context<Self>) {
+        if self.codex_limits_task.is_some() {
+            return;
+        }
+        let Some(home) = self.usage_home.clone().or_else(dirs::home_dir) else {
+            return;
+        };
+        let root = gitterm_core::usage::UsageSources::under(&home).codex_sessions;
+        self.codex_limits_task = Some(cx.spawn(async move |shell, cx| {
+            let reading = cx
+                .background_executor()
+                .spawn(async move { gitterm_core::plan_limits::latest_codex_limits(&root) })
+                .await;
+            let _ = shell.update(cx, |shell, cx| {
+                shell.codex_limits_task = None;
+                if let Some(reading) = reading {
+                    shell.usage_input.plan_limits.absorb(reading);
                 }
                 shell.sync_usage(cx);
             });
@@ -3535,6 +3601,7 @@ impl Shell {
             }
             I::Refresh => {
                 self.refresh_usage_limits(cx);
+                self.request_codex_limits(cx);
                 self.request_usage_scan(cx);
             }
             I::SelectRepo(repo) => self.usage_input.repo = repo,
@@ -3967,6 +4034,7 @@ impl Render for Shell {
                                 .when(self.usage_open, |area| area.child(self.usage_page.clone()))
                                 .when(!self.usage_open, |area| {
                                     area.child("No local workspaces yet")
+                                        .child(self.open_folder_button(cx))
                                         .child(self.parked_controls(cx))
                                 })
                                 .children(
