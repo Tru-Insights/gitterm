@@ -206,7 +206,7 @@ fn assert_pending(pending: &mut Pin<Box<PendingReply>>) {
     assert!(pending.as_mut().now_or_never().is_none());
 }
 
-fn fixture_worker_source(path: &Path) -> Repository {
+pub(super) fn fixture_worker_source(path: &Path) -> Repository {
     let mut options = git2::RepositoryInitOptions::new();
     options.initial_head("fixture");
     let repo = Repository::init_opts(path, &options).unwrap();
@@ -220,7 +220,7 @@ fn fixture_worker_source(path: &Path) -> Repository {
     repo
 }
 
-fn fixture_worker_checkout(source: &Path, path: &Path, name: &str) {
+pub(super) fn fixture_worker_checkout(source: &Path, path: &Path, name: &str) {
     let repo = Repository::open(source).unwrap();
     let commit = repo.head().unwrap().peel_to_commit().unwrap();
     let reference = repo.branch(name, &commit, false).unwrap().into_reference();
@@ -229,7 +229,7 @@ fn fixture_worker_checkout(source: &Path, path: &Path, name: &str) {
     repo.worktree(name, path, Some(&options)).unwrap();
 }
 
-fn pending_worker_fixture(
+pub(super) fn pending_worker_fixture(
     app: &mut App,
     dir: &Path,
 ) -> (

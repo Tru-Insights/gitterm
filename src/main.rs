@@ -1636,6 +1636,21 @@ macro_rules! freeze_time {
     }};
 }
 
+/// `freeze_time!` that logs every duration: a stall can be the sum of many
+/// short steps (TRU-274, worker start).
+macro_rules! freeze_span {
+    ($label:expr, $block:block) => {{
+        let _start = std::time::Instant::now();
+        let result = $block;
+        freeze_debug!(
+            "{} took {:.1}ms",
+            $label,
+            _start.elapsed().as_secs_f64() * 1000.0
+        );
+        result
+    }};
+}
+
 // Menu item IDs stored globally for event matching
 static MENU_IDS: OnceLock<MenuIds> = OnceLock::new();
 
@@ -12784,9 +12799,23 @@ impl App {
         &mut self,
         mutation: TaskMutation,
     ) -> Result<TaskMutationAction, String> {
+        let facts = self.mutation_facts(&mutation);
+        self.task_host
+            .reduce_mutation(
+                TaskMutationCommand {
+                    reply: None,
+                    mutation,
+                },
+                &facts,
+            )
+            .action
+    }
+
+    /// The facts `reduce_task_mutation` hands the reducer for `mutation`.
+    fn mutation_facts(&self, mutation: &TaskMutation) -> TaskMutationFacts {
         let mut facts = self.task_mutation_facts();
         if matches!(
-            &mutation,
+            mutation,
             TaskMutation::BeginWorkerPreparation { .. }
                 | TaskMutation::CheckWorkerPreparation { .. }
                 | TaskMutation::BindWorkerPreparation { .. }
@@ -12795,23 +12824,24 @@ impl App {
                 | TaskMutation::ReuseWorkerCheckout { .. }
                 | TaskMutation::WorkerCheckoutReuseSaved { .. }
         ) {
-            facts.callers = self
-                .workspaces
-                .iter()
-                .flat_map(|ws| &ws.tabs)
-                .filter_map(|tab| self.worker_authority_caller(&tab.session_uid).ok())
-                .collect();
+            facts.callers = freeze_span!("worker facts: callers", {
+                self.workspaces
+                    .iter()
+                    .flat_map(|ws| &ws.tabs)
+                    .filter_map(|tab| self.worker_authority_caller(&tab.session_uid).ok())
+                    .collect()
+            });
         }
         if let TaskMutation::PreparationCompleted {
             cleanup_path: Some(path),
             ..
-        } = &mutation
+        } = mutation
         {
             if path.exists() {
                 facts.existing_paths.push(path.clone());
             }
         }
-        let destination = match &mutation {
+        let destination = match mutation {
             TaskMutation::CheckWorkerDestination { expected } => Some(expected.path.clone()),
             TaskMutation::CheckWorkerCheckout { path, .. } => Some(path.clone()),
             TaskMutation::ReuseWorkerCheckout { replacement, .. } => {
@@ -12824,17 +12854,19 @@ impl App {
             _ => None,
         };
         if matches!(
-            &mutation,
+            mutation,
             TaskMutation::WorkerPreparationSaved { .. }
                 | TaskMutation::WorkerCheckoutReuseSaved { .. }
         ) {
             if let Some(store) = self.task_host.store() {
-                facts.checkouts = store
-                    .tasks()
-                    .iter()
-                    .filter_map(|task| task.worktree.path.as_ref())
-                    .filter_map(|path| worker_checkout_fact(path).ok())
-                    .collect();
+                facts.checkouts = freeze_span!("worker facts: checkouts", {
+                    store
+                        .tasks()
+                        .iter()
+                        .filter_map(|task| task.worktree.path.as_ref())
+                        .filter_map(|path| worker_checkout_fact(path).ok())
+                        .collect()
+                });
             }
         }
         if let Some(path) = destination {
@@ -12845,15 +12877,7 @@ impl App {
                 facts.checkouts.push(checkout);
             }
         }
-        self.task_host
-            .reduce_mutation(
-                TaskMutationCommand {
-                    reply: None,
-                    mutation,
-                },
-                &facts,
-            )
-            .action
+        facts
     }
 
     fn worker_authority_caller(&self, uid: &str) -> Result<WorkerCaller, String> {
@@ -12910,6 +12934,43 @@ impl App {
         })
     }
 
+    /// The facts a worker's `WorkerPrepared` completion is reduced with;
+    /// `resolved` is the destination the preparation was asked to create.
+    fn worker_completion_facts(
+        &self,
+        completion: &TaskMutation,
+        resolved: Option<&Path>,
+    ) -> TaskMutationFacts {
+        let mut facts = self.task_mutation_facts();
+        facts.callers = freeze_span!("worker completion facts: callers", {
+            self.workspaces
+                .iter()
+                .flat_map(|ws| &ws.tabs)
+                .filter_map(|tab| self.worker_authority_caller(&tab.session_uid).ok())
+                .collect()
+        });
+        facts.existing_paths = resolved
+            .iter()
+            .filter(|path| path.exists())
+            .filter_map(|path| std::fs::canonicalize(path).ok())
+            .collect();
+        if let Some(path) = resolved {
+            if let Ok(path) = normalized_worker_path(path) {
+                facts.preparation_paths.push(path);
+            }
+        }
+        if let TaskMutation::WorkerPrepared {
+            result: Ok(prepared),
+            ..
+        } = completion
+        {
+            if let Ok(checkout) = worker_checkout_fact(&prepared.path) {
+                facts.checkouts.push(checkout);
+            }
+        }
+        facts
+    }
+
     fn cancel_worker_preparation(&mut self, id: WorkerPreparationId) {
         let _ = self.reduce_task_mutation(TaskMutation::CancelWorkerPreparation { id });
     }
@@ -12922,38 +12983,18 @@ impl App {
         let worker = pending.worker.clone().expect("worker completion");
         let reply = pending.control_reply.clone().expect("worker reply");
         let id = worker.authority;
-        let mut facts = self.task_mutation_facts();
-        facts.callers = self
-            .workspaces
-            .iter()
-            .flat_map(|ws| &ws.tabs)
-            .filter_map(|tab| self.worker_authority_caller(&tab.session_uid).ok())
-            .collect();
-        facts.existing_paths = pending
-            .resolved_worktree_path
-            .iter()
-            .filter(|path| path.exists())
-            .filter_map(|path| std::fs::canonicalize(path).ok())
-            .collect();
-        if let Some(path) = &pending.resolved_worktree_path {
-            if let Ok(path) = normalized_worker_path(path) {
-                facts.preparation_paths.push(path);
-            }
-        }
-        if let Ok(prepared) = &result {
-            if let Ok(checkout) = worker_checkout_fact(&prepared.path) {
-                facts.checkouts.push(checkout);
-            }
-        }
+        let mutation = TaskMutation::WorkerPrepared {
+            id,
+            result: result.map(Into::into),
+        };
+        let facts =
+            self.worker_completion_facts(&mutation, pending.resolved_worktree_path.as_deref());
         let effect = self
             .task_host
             .reduce_mutation(
                 TaskMutationCommand {
                     reply: Some(reply.id()),
-                    mutation: TaskMutation::WorkerPrepared {
-                        id,
-                        result: result.map(Into::into),
-                    },
+                    mutation,
                 },
                 &facts,
             )
@@ -12968,13 +13009,14 @@ impl App {
                     .as_mut()
                     .ok_or("The task store became unavailable".to_string())
                     .and_then(|store| {
-                        store
-                            .complete_worktree_preparation(
+                        freeze_span!("task store: complete worker preparation", {
+                            store.complete_worktree_preparation(
                                 &task_id,
                                 prepared,
                                 &chrono::Utc::now().to_rfc3339(),
                             )
-                            .map_err(|error| error.to_string())
+                        })
+                        .map_err(|error| error.to_string())
                     });
                 if let Err(error) = &saved {
                     self.task_store_error = Some(error.clone());
@@ -12990,12 +13032,14 @@ impl App {
                 cleanup_path,
             } => {
                 if let Some(store) = self.task_host.store_mut().as_mut() {
-                    if let Err(store_error) = store.fail_worktree_preparation(
-                        &task_id,
-                        error.clone(),
-                        cleanup_path,
-                        &chrono::Utc::now().to_rfc3339(),
-                    ) {
+                    if let Err(store_error) = freeze_span!("task store: fail worker preparation", {
+                        store.fail_worktree_preparation(
+                            &task_id,
+                            error.clone(),
+                            cleanup_path,
+                            &chrono::Utc::now().to_rfc3339(),
+                        )
+                    }) {
                         self.task_store_error = Some(store_error.to_string());
                     }
                 }
@@ -13020,12 +13064,15 @@ impl App {
         else {
             unreachable!("metadata effect")
         };
-        self.task_host
+        let store = self
+            .task_host
             .store_mut()
             .as_mut()
-            .ok_or("GitTerm's task store became unavailable")?
-            .insert(*record)
-            .map_err(|error| error.to_string())
+            .ok_or("GitTerm's task store became unavailable")?;
+        freeze_span!("task store: insert preparing task", {
+            store.insert(*record)
+        })
+        .map_err(|error| error.to_string())
     }
 
     fn archive_task(&mut self, task_id: &str, timestamp: &str) -> Result<(), String> {
@@ -14329,13 +14376,15 @@ impl App {
         let workspace_idx =
             self.ensure_local_workspace_for_chat(directory, Some(directory), &task.workspace.name);
         let workspace_name = self.workspaces[workspace_idx].name.clone();
-        let mut tab = self.create_tab_with_session_uid(
-            worktree_path.clone(),
-            command,
-            Some(&workspace_name),
-            None,
-            true,
-        );
+        let mut tab = freeze_span!("task launch: create_tab_with_session_uid", {
+            self.create_tab_with_session_uid(
+                worktree_path.clone(),
+                command,
+                Some(&workspace_name),
+                None,
+                true,
+            )
+        });
         if tab.terminal().is_none() {
             self.task_host.abandon_launch(ticket);
             return Err(self.task_ui_error.take().unwrap_or_else(|| {
@@ -14395,17 +14444,20 @@ impl App {
         });
         // The host saves the session and attaches the worker before the tab
         // is published; on failure it drops the tab, stopping the terminal.
-        let tab = self.task_host.publish_launch(
-            ticket,
-            LaunchedSession {
-                label: child_label.clone(),
-                harness: harness.clone(),
-                conversation,
-                objective_delivery,
-                timestamp,
-            },
-            tab,
-        )?;
+        // The host's session save and worker attach are store writes.
+        let tab = freeze_span!("task store: publish launch (session + worker attach)", {
+            self.task_host.publish_launch(
+                ticket,
+                LaunchedSession {
+                    label: child_label.clone(),
+                    harness: harness.clone(),
+                    conversation,
+                    objective_delivery,
+                    timestamp,
+                },
+                tab,
+            )
+        })?;
         self.workspaces[workspace_idx].tabs.push(tab);
         let tab_idx = self.workspaces[workspace_idx].tabs.len() - 1;
         if focus {
@@ -19636,9 +19688,10 @@ impl App {
                         .as_mut()
                         .ok_or("GitTerm's task store is unavailable".to_string())
                         .and_then(|store| {
-                            store
-                                .replace(*replacement)
-                                .map_err(|error| error.to_string())
+                            freeze_span!("task store: reuse worker checkout", {
+                                store.replace(*replacement)
+                            })
+                            .map_err(|error| error.to_string())
                         });
                     self.reduce_task_mutation(TaskMutation::WorkerCheckoutReuseSaved {
                         id: authority,
@@ -19719,9 +19772,10 @@ impl App {
                         .as_mut()
                         .ok_or("GitTerm's task store is unavailable".to_string())
                         .and_then(|store| {
-                            store
-                                .complete_worktree_preparation(&task_id, prepared, &timestamp)
-                                .map_err(|error| error.to_string())
+                            freeze_span!("task store: complete adopted worker checkout", {
+                                store.complete_worktree_preparation(&task_id, prepared, &timestamp)
+                            })
+                            .map_err(|error| error.to_string())
                         });
                     self.reduce_task_mutation(TaskMutation::WorkerPreparationSaved {
                         id: authority,
@@ -19854,9 +19908,10 @@ impl App {
         let delegation = gitterm::tasks::Delegation::new_requested(new, now);
         let delegation_id = delegation.delegation_id.clone();
         let inserted = match self.task_host.store_mut().as_mut() {
-            Some(store) => store
-                .insert_delegation(delegation)
-                .map_err(|error| error.to_string()),
+            Some(store) => freeze_span!("task store: insert worker delegation", {
+                store.insert_delegation(delegation)
+            })
+            .map_err(|error| error.to_string()),
             None => Err("GitTerm's task store is unavailable".to_string()),
         };
         if let Err(error) = inserted {
