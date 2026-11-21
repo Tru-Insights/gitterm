@@ -697,7 +697,7 @@ impl IcedWorkData {
         let links = if !indexed {
             vec![]
         } else {
-            iced_chat_links(&catalog, &store)
+            iced_chat_links(&catalog.workspaces, &store)
         };
         gitterm_core::chat_facts::resolve_tree(&mut entries, &links);
         let indexed_chats = entries.clone();
@@ -1177,8 +1177,8 @@ impl IcedWorkData {
 }
 
 // Read-only counterpart of Iced chat_facts::store_links; no facts are written.
-fn iced_chat_links(
-    catalog: &crate::workspace_config::IcedCatalog,
+pub(crate) fn iced_chat_links(
+    workspaces: &[gitterm_core::workspace_config::WorkspaceConfig],
     store: &gitterm_core::tasks::TaskStore,
 ) -> Vec<gitterm_core::chat_facts::ChildLink> {
     use gitterm_core::{
@@ -1188,8 +1188,7 @@ fn iced_chat_links(
     use std::collections::HashMap;
     let delegations = store.delegations();
     let tasks = store.tasks();
-    let mut uid_to_chat: HashMap<String, String> = catalog
-        .workspaces
+    let mut uid_to_chat: HashMap<String, String> = workspaces
         .iter()
         .flat_map(|w| &w.tabs)
         .filter_map(|t| Some((t.session_uid.clone()?, t.chat_session_id.clone()?)))

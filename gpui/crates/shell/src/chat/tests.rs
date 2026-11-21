@@ -1425,7 +1425,7 @@ fn start_host(
     let (sender, receiver) = gitterm_core::task_commands::runtime::command_channel();
     let config = crate::task_host::HostConfig {
         roots: preview.clone(),
-        iced_tasks: dir.join("production/tasks.json"),
+        iced_config: dir.join("production"),
         ingress: crate::task_host::Ingress::Channel(sender, receiver),
     };
     let owner = cx

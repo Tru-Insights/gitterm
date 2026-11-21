@@ -37,6 +37,7 @@ use gitterm::merge_plan::{
 use gitterm::pr_watch::PrAction;
 use gitterm::pr_watch::{self, NewsItem, NewsKind, WatchedPr};
 use gitterm::task_mcp::MergePlanSetRequest;
+use gitterm_core::chat_facts::{load_root_prs, root_through_links};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -255,125 +256,6 @@ where
     results
 }
 
-/// Follow direct parents so flattened indexed ancestry cannot skip an owned root.
-fn saved_chat_root<'a>(
-    chat: &'a str,
-    index: &'a [chats::ChatIndexEntry],
-    parents: &'a HashMap<String, String>,
-    root: &str,
-) -> Option<&'a str> {
-    let mut current = chat;
-    let mut seen = HashSet::new();
-    while seen.insert(current) {
-        if current == root {
-            return Some(current);
-        }
-        let parent = parents.get(current).or_else(|| {
-            index
-                .iter()
-                .find(|entry| entry.id == current)
-                .and_then(|entry| entry.root_id.as_ref())
-        });
-        let Some(parent) = parent else {
-            return Some(current);
-        };
-        current = parent;
-    }
-    None
-}
-
-/// Read saved facts by id, including descendants absent from the index.
-/// Called only when PR homes rebuild, never from a view.
-fn load_root_prs(
-    dir: &Path,
-    index: &[chats::ChatIndexEntry],
-    links: &[chat_facts::ChildLink],
-    root: &str,
-    mut log: impl FnMut(&str),
-) -> Vec<PrRef> {
-    let mut parents = HashMap::new();
-    // Match resolve_tree's first indexed parent before using raw links for
-    // chats whose parents are also absent from the index.
-    for entry in index {
-        for child in entry.facts.iter().flat_map(|facts| &facts.children) {
-            if child.session_id != entry.id {
-                parents
-                    .entry(child.session_id.clone())
-                    .or_insert_with(|| entry.id.clone());
-            }
-        }
-    }
-    for link in links {
-        if link.child.session_id != link.parent {
-            parents
-                .entry(link.child.session_id.clone())
-                .or_insert_with(|| link.parent.clone());
-        }
-    }
-    let mut pending = vec![root.to_string()];
-    pending.extend(
-        overview::chats_under(index, &[root.to_string()])
-            .into_iter()
-            .map(|entry| entry.id.clone()),
-    );
-    let mut seen = HashSet::new();
-    let mut prs = Vec::new();
-    while let Some(chat) = pending.pop() {
-        if !seen.insert(chat.clone()) {
-            continue;
-        }
-        if chat != root
-            && saved_chat_root(&chat, index, &parents, root).is_some_and(|owner| owner != root)
-        {
-            continue;
-        }
-        pending.extend(
-            chat_facts::links_for_parent(links, &chat)
-                .into_iter()
-                .map(|child| child.session_id),
-        );
-        for entry in index.iter().filter(|entry| entry.id == chat) {
-            if let Some(facts) = &entry.facts {
-                prs.extend(facts.prs.iter().cloned());
-                pending.extend(facts.children.iter().map(|child| child.session_id.clone()));
-            }
-        }
-        // Owned lists carry ids without a backend. Probe the supported facts
-        // names so an unindexed chat needs no transcript or index entry.
-        for backend in chats::ChatBackend::ALL {
-            let path = match chat_facts::facts_path(dir, backend, &chat) {
-                Ok(path) => path,
-                Err(error) => {
-                    log(&format!(
-                        "[pr-watch] facts for chat {chat:?} in {}: {error}",
-                        dir.display()
-                    ));
-                    break;
-                }
-            };
-            match chat_facts::load_facts(&path) {
-                Ok(Some(facts)) => {
-                    prs.extend(facts.prs);
-                    for child in facts.children {
-                        if child.session_id != chat {
-                            parents
-                                .entry(child.session_id.clone())
-                                .or_insert_with(|| chat.clone());
-                        }
-                        pending.push(child.session_id);
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => log(&format!(
-                    "[pr-watch] facts for chat {chat:?} at {}: {error}",
-                    path.display()
-                )),
-            }
-        }
-    }
-    prs
-}
-
 /// What resolving roots needs, built once per PR-homes rebuild.
 struct RootResolver {
     /// Index chat id to its root; the first entry for an id wins, as a
@@ -393,19 +275,6 @@ impl RootResolver {
     }
 }
 
-/// Follows `chat`'s parents through `links` to the top, stopping at a cycle.
-fn root_through_links(links: &[chat_facts::ChildLink], chat: &str) -> String {
-    let mut current = chat.to_string();
-    let mut seen: HashSet<String> = HashSet::from([current.clone()]);
-    while let Some(link) = links.iter().find(|link| link.child.session_id == current) {
-        if !seen.insert(link.parent.clone()) {
-            break;
-        }
-        current = link.parent.clone();
-    }
-    current
-}
-
 /// Facts, live tabs and cached task branches share one PR identity set.
 fn collect_root_prs(
     index: &[chats::ChatIndexEntry],
@@ -414,40 +283,27 @@ fn collect_root_prs(
     branches: &[(TaskPrOrigin, TaskBranch)],
     root_of: impl Fn(&str) -> String,
 ) -> Vec<PrRef> {
-    let mut found = Vec::new();
-    let mut seen = HashSet::new();
-    let mut push = |pr: &PrRef| {
-        if seen.insert(pr.key().id()) {
-            found.push(pr.clone());
-        }
-    };
-    for entry in overview::chats_under(index, &[root.to_string()]) {
-        for pr in entry.facts.iter().flat_map(|facts| &facts.prs) {
-            push(pr);
-        }
-    }
-    for pr in prs.saved_root_prs.get(root).into_iter().flatten() {
-        push(pr);
-    }
-    for (chat, live) in &prs.live_prs {
-        if chat == root || root_of(chat) == root {
-            for pr in live {
-                push(pr);
-            }
-        }
-    }
-    for (parent, branch) in branches {
-        if root_of(&parent.chat) == root {
-            for found in prs.task_branch_prs.get(branch).into_iter().flatten() {
-                if found.created_at >= parent.started_at
-                    && parent.before.is_none_or(|before| found.created_at < before)
-                {
-                    push(&found.pr);
-                }
-            }
-        }
-    }
-    found
+    let saved = prs.saved_root_prs.get(root).into_iter().flatten();
+    let live = prs
+        .live_prs
+        .iter()
+        .filter(|(chat, _)| *chat == root || root_of(chat) == root)
+        .flat_map(|(_, live)| live);
+    let task_branches = branches
+        .iter()
+        .filter(|(parent, _)| root_of(&parent.chat) == root)
+        .flat_map(|(parent, branch)| {
+            prs.task_branch_prs
+                .get(branch)
+                .into_iter()
+                .flatten()
+                .filter(move |found| {
+                    found.created_at >= parent.started_at
+                        && parent.before.is_none_or(|before| found.created_at < before)
+                })
+                .map(|found| &found.pr)
+        });
+    chat_facts::root_prs(index, root, saved.chain(live).chain(task_branches))
 }
 
 /// Splits `keys` into the open ones (state unknown counts as open) and the
@@ -839,10 +695,7 @@ impl App {
     /// The root `chat` folds under: its index root, else its parent chain
     /// through delegations and tasks, else itself.
     pub(super) fn root_chat_of(&self, chat: &str) -> String {
-        if let Some(entry) = self.chat_index.iter().find(|entry| entry.id == chat) {
-            return entry.root_id.clone().unwrap_or_else(|| chat.to_string());
-        }
-        root_through_links(&self.chat_child_links(), chat)
+        chat_facts::root_chat_of(&self.chat_index, chat, || self.chat_child_links())
     }
 
     /// The PRs root `root`'s chats recorded: indexed and saved facts, what
@@ -1405,82 +1258,12 @@ impl App {
     /// The plan of `root` with live state per PR, the next to merge, and
     /// the root's PRs the plan does not list.
     fn merge_plan_value(&self, root: &str) -> Value {
-        let plan = self.prs.plans.get(root);
-        let rows = plan
-            .map(|plan| merge_plan::order_plan(plan, &self.pr_briefs()))
-            .unwrap_or_default();
-        let entries: Vec<Value> = rows
-            .iter()
-            .map(|row| {
-                let key = row.entry.key();
-                let waits_for = match &row.status {
-                    RowStatus::Blocked(waits) => waits.clone(),
-                    _ => Vec::new(),
-                };
-                serde_json::json!({
-                    "position": row.entry.unordered_reason.is_none().then_some(row.position),
-                    "unordered_reason": row.entry.unordered_reason,
-                    "pr": key.label(),
-                    "repo": row.entry.repo,
-                    "number": row.entry.number,
-                    "url": key.url(),
-                    "step": row.entry.step,
-                    "after": row.entry.after,
-                    "stacked_on": if row.stacked { row.waits.first().cloned() } else { None },
-                    "hold": row.entry.hold,
-                    "method": row.entry.method.unwrap_or_default().label(),
-                    "note": row.entry.note,
-                    "status": row.status.label(),
-                    "waits_for": waits_for,
-                    "live": self.pr_live_value(&key),
-                })
-            })
-            .collect();
-        let unplanned: Vec<Value> = self
-            .root_fact_prs(root)
-            .into_iter()
-            .filter(|pr| plan.is_none_or(|plan| plan.entry(&pr.key()).is_none()))
-            .map(|pr| {
-                serde_json::json!({
-                    "pr": pr.key().label(),
-                    "repo": pr.repo,
-                    "number": pr.number,
-                    "url": pr.url,
-                    "live": self.pr_live_value(&pr.key()),
-                })
-            })
-            .collect();
-        serde_json::json!({
-            "root_chat_id": root,
-            "updated_at": plan.map(|plan| plan.updated_at.clone()),
-            "source": plan.and_then(|plan| plan.source.as_deref()),
-            "next": merge_plan::next_to_merge(&rows).map(|row| row.entry.key().label()),
-            "entries": entries,
-            "unplanned_prs": unplanned,
-        })
-    }
-
-    fn pr_live_value(&self, key: &PrKey) -> Value {
-        let Some(watched) = self.watched(key) else {
-            return Value::Null;
-        };
-        let Some(core) = watched.snapshot.core.as_ref() else {
-            return serde_json::json!({ "checked_at": watched.checked_at, "error": watched.error });
-        };
-        let s = &watched.snapshot;
-        serde_json::json!({
-            "title": core.title,
-            "state": core.state.map(|state| state.label()),
-            "head": core.head_ref,
-            "base": core.base_ref,
-            "checks": s.checks().label(),
-            "failing_checks": s.failing_checks(),
-            "required_checks_passed": s.required_passed(),
-            "review": s.review_decision().label(),
-            "conflicting": s.conflicting(),
-            "checked_at": watched.checked_at,
-            "error": watched.error,
-        })
+        pr_watch::merge_plan_value(
+            root,
+            self.prs.plans.get(root),
+            &self.prs.watch,
+            self.root_fact_prs(root),
+        )
     }
 
     // -----------------------------------------------------------------------
