@@ -13321,8 +13321,6 @@ impl App {
     }
 
     fn task_control_value(&self, task: &TaskRecord) -> Result<serde_json::Value, String> {
-        let mut value = serde_json::to_value(task)
-            .map_err(|error| format!("could not serialize task {}: {error}", task.task_id))?;
         let sessions = self
             .workspaces
             .iter()
@@ -13332,26 +13330,17 @@ impl App {
                     .tabs
                     .iter()
                     .filter(|tab| tab.task_id.as_deref() == Some(task.task_id.as_str()))
-                    .map(move |tab| {
-                        serde_json::json!({
-                            "session_id": tab.task_session_id,
-                            "label": tab.status.repo_name,
-                            "workspace": workspace.name,
-                            "is_active": workspace_idx == self.active_workspace_index()
-                                && workspace.active_tab < workspace.tabs.len()
-                                && workspace.tabs[workspace.active_tab].id == tab.id,
-                        })
+                    .map(move |tab| gitterm_core::task_host::OpenSession {
+                        session_id: tab.task_session_id.clone(),
+                        label: tab.status.repo_name.clone(),
+                        workspace: workspace.name.clone(),
+                        is_active: workspace_idx == self.active_workspace_index()
+                            && workspace.active_tab < workspace.tabs.len()
+                            && workspace.tabs[workspace.active_tab].id == tab.id,
                     })
             })
             .collect::<Vec<_>>();
-        value
-            .as_object_mut()
-            .ok_or_else(|| format!("task {} did not serialize as an object", task.task_id))?
-            .insert(
-                "open_sessions".to_string(),
-                serde_json::Value::Array(sessions),
-            );
-        Ok(value)
+        gitterm_core::task_host::task_control_value(task, &sessions)
     }
 
     /// Startup probes read harness files off the UI thread even when Chats

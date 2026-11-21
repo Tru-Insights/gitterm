@@ -1618,6 +1618,99 @@ pub async fn poll(request: PollRequest) -> PollOutcome {
     outcome
 }
 
+/// `merge_plan_get`'s answer for `root`: the plan in merge order with live
+/// state per PR from `watch`, the next to merge, and the `found` PRs the
+/// plan does not list (`unplanned_prs`).
+pub fn merge_plan_value(
+    root: &str,
+    plan: Option<&crate::merge_plan::MergePlan>,
+    watch: &WatchFile,
+    found: Vec<PrRef>,
+) -> Value {
+    use crate::merge_plan::{self, RowStatus};
+    let live = |key: &PrKey| pr_live_value(watch.prs.get(&key.id()));
+    let briefs: HashMap<String, PrBrief> = watch
+        .prs
+        .iter()
+        .filter_map(|(id, watched)| Some((id.clone(), watched.brief()?)))
+        .collect();
+    let rows = plan
+        .map(|plan| merge_plan::order_plan(plan, &briefs))
+        .unwrap_or_default();
+    let entries: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let key = row.entry.key();
+            let waits_for = match &row.status {
+                RowStatus::Blocked(waits) => waits.clone(),
+                _ => Vec::new(),
+            };
+            serde_json::json!({
+                "position": row.entry.unordered_reason.is_none().then_some(row.position),
+                "unordered_reason": row.entry.unordered_reason,
+                "pr": key.label(),
+                "repo": row.entry.repo,
+                "number": row.entry.number,
+                "url": key.url(),
+                "step": row.entry.step,
+                "after": row.entry.after,
+                "stacked_on": if row.stacked { row.waits.first().cloned() } else { None },
+                "hold": row.entry.hold,
+                "method": row.entry.method.unwrap_or_default().label(),
+                "note": row.entry.note,
+                "status": row.status.label(),
+                "waits_for": waits_for,
+                "live": live(&key),
+            })
+        })
+        .collect();
+    let unplanned: Vec<Value> = found
+        .into_iter()
+        .filter(|pr| plan.is_none_or(|plan| plan.entry(&pr.key()).is_none()))
+        .map(|pr| {
+            serde_json::json!({
+                "pr": pr.key().label(),
+                "repo": pr.repo,
+                "number": pr.number,
+                "url": pr.url,
+                "live": live(&pr.key()),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "root_chat_id": root,
+        "updated_at": plan.map(|plan| plan.updated_at.clone()),
+        "source": plan.and_then(|plan| plan.source.as_deref()),
+        "next": merge_plan::next_to_merge(&rows).map(|row| row.entry.key().label()),
+        "entries": entries,
+        "unplanned_prs": unplanned,
+    })
+}
+
+/// One PR's live state for the merge plan tools; `null` when unwatched.
+pub fn pr_live_value(watched: Option<&WatchedPr>) -> Value {
+    let Some(watched) = watched else {
+        return Value::Null;
+    };
+    let Some(core) = watched.snapshot.core.as_ref() else {
+        return serde_json::json!({ "checked_at": watched.checked_at, "error": watched.error });
+    };
+    let s = &watched.snapshot;
+    serde_json::json!({
+        "title": core.title,
+        "state": core.state.map(|state| state.label()),
+        "head": core.head_ref,
+        "base": core.base_ref,
+        "checks": s.checks().label(),
+        "failing_checks": s.failing_checks(),
+        "required_checks_passed": s.required_passed(),
+        "review": s.review_decision().label(),
+        "conflicting": s.conflicting(),
+        "checked_at": watched.checked_at,
+        "error": watched.error,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

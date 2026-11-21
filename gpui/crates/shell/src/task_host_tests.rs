@@ -10,7 +10,7 @@ use gitterm_core::{
     },
     tasks::{Delegation, TaskLifecycle, TaskRecord, TaskStoreDocument},
 };
-use gpui::{Entity, TestAppContext};
+use gpui::{AppContext as _, Entity, TestAppContext};
 use std::{
     io::{BufRead, Read, Write},
     path::{Path, PathBuf},
@@ -61,7 +61,7 @@ impl Fixture {
         (
             HostConfig {
                 roots: self.roots.clone(),
-                iced_tasks: self.source(),
+                iced_config: self.iced.clone(),
                 ingress: Ingress::Channel(sender.clone(), receiver),
             },
             sender,
@@ -159,7 +159,19 @@ fn dispatch(
     sender: &TaskControlSender,
     operation: TaskControlOperation,
 ) -> Result<serde_json::Value, String> {
-    let pending = sender.enqueue(operation, Some("caller".into())).unwrap();
+    dispatch_as(cx, sender, operation, Some("caller"))
+}
+
+/// [`dispatch`] from the tab `caller`.
+fn dispatch_as(
+    cx: &mut TestAppContext,
+    sender: &TaskControlSender,
+    operation: TaskControlOperation,
+    caller: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let pending = sender
+        .enqueue(operation, caller.map(str::to_string))
+        .unwrap();
     let (send, receive) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -312,23 +324,6 @@ fn gpui_host_lists_seeded_tasks(cx: &mut TestAppContext) {
     while owner.read_with(cx, |owner, _| owner.log_port()).is_none() {
         assert!(Instant::now() < deadline, "log server did not bind");
         std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-#[gpui::test]
-fn every_b4_effect_answers_the_preview_notice(cx: &mut TestAppContext) {
-    cx.background_executor.allow_parking();
-    let fixture = Fixture::new();
-    fixture.write_iced(vec![task("queued", TaskLifecycle::Queued)], vec![]);
-    let (_owner, sender) = fixture.start(cx);
-    for (operation, label) in [
-        (TaskControlOperation::PlanLimits, "plan_limits"),
-        (TaskControlOperation::MergePlanGet, "merge_plan_get"),
-    ] {
-        assert_eq!(
-            dispatch(cx, &sender, operation),
-            Err(format!("{label} · not available in preview"))
-        );
     }
 }
 
@@ -653,4 +648,505 @@ fn failed_reseed_keeps_last_snapshot_and_raises_a_notice(cx: &mut TestAppContext
         Reseed::Reseeded
     );
     assert!(owner.read_with(cx, |owner, _| owner.notice.is_none()));
+}
+
+// ---------------------------------------------------------------------------
+// H5b B5: the executor's read arms and notice arms.
+
+/// A workspace owner with GPUI chat panes, published the way the shell
+/// publishes it, so the host's arms find the chats.
+struct Chats {
+    owner: Entity<crate::WorkspaceOwner>,
+}
+impl Chats {
+    fn new(fixture: &Fixture, cx: &mut TestAppContext) -> Self {
+        cx.update(gpui_component::init);
+        let owner = cx.new(|cx| {
+            crate::WorkspaceOwner::new(
+                crate::workspace_status::WorkspaceStatus::default(),
+                None,
+                cx,
+            )
+        });
+        cx.update(|cx| {
+            cx.set_global(crate::work_sidebar::IcedWorkSource {
+                config: fixture.iced.clone(),
+                workspaces: vec![],
+                repos: vec![],
+                owner: owner.downgrade(),
+            })
+        });
+        Self { owner }
+    }
+    /// Opens a chat pane whose provider conversation is `conversation`;
+    /// returns its task MCP caller id.
+    fn open(
+        &self,
+        fixture: &Fixture,
+        conversation: Option<&str>,
+        cx: &mut TestAppContext,
+    ) -> String {
+        let saved = crate::chat::SavedChat {
+            uid: "saved".into(),
+            cwd: fixture.iced.parent().unwrap().join("work"),
+            provider: fixture.roots.provider(),
+            session_id: conversation.map(str::to_string),
+            records: vec![],
+        };
+        let (pane, cx) = cx.add_window_view(|window, cx| {
+            crate::chat::ChatPane::history(crate::chat::RuntimeShutdown::new(), saved, window, cx)
+        });
+        let uid = pane.read_with(cx, |pane, _| pane.target().session_uid);
+        self.owner.update(cx, |owner, _| {
+            owner.chats.insert(uid.clone(), pane.clone());
+        });
+        uid
+    }
+}
+
+fn req<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> T {
+    serde_json::from_value(value).unwrap()
+}
+
+/// Every write, launch and run: through the gate, and straight into its
+/// executor arm. Each answers the notice, and nothing is written or started.
+#[cfg(unix)]
+#[gpui::test]
+fn every_write_tool_answers_preview_notice(cx: &mut TestAppContext) {
+    use gitterm_core::{
+        preview::service::preview_notice,
+        task_commands::SessionLaunch,
+        task_host::HostEffect,
+        task_mcp::{TaskControlOperation as Op, TaskSessionEventRequest},
+    };
+    use serde_json::json;
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    fixture.write_iced(
+        vec![
+            task("running", TaskLifecycle::Running),
+            task("queued", TaskLifecycle::Queued),
+        ],
+        vec![delegation("d1", "running")],
+    );
+    let (owner, sender) = fixture.start(cx);
+    let iced_before = recorded(&fixture.iced);
+    let preview_before = recorded(fixture.roots.root());
+    let operations = || {
+        vec![
+            (
+                Op::Create(req(
+                    json!({"title": "t", "objective": "o", "repository_path": "/fixture/repo"}),
+                )),
+                "task_create",
+            ),
+            (
+                Op::UpdateHandoff(req(json!({"task_id": "running", "summary": "s"}))),
+                "task_update_handoff",
+            ),
+            (
+                Op::SessionEvent(TaskSessionEventRequest {
+                    task_id: "running".into(),
+                    session_id: "child-d1".into(),
+                    event_type: "agent-turn-complete".into(),
+                }),
+                "notify",
+            ),
+            (
+                Op::MergePlanSet(req(json!({"entries": []}))),
+                "merge_plan_set",
+            ),
+            (
+                Op::LaunchSession(req(json!({"task_id": "queued"}))),
+                "task_launch_session",
+            ),
+            (
+                Op::RequestReview(req(json!({"target": "uncommitted"}))),
+                "review_request",
+            ),
+            (
+                Op::RequestConsult(req(json!({"brief": "b"}))),
+                "consult_request",
+            ),
+            (
+                Op::DelegateTask(req(json!({"title": "t", "objective": "o"}))),
+                "delegate_task",
+            ),
+        ]
+    };
+    for (operation, label) in operations() {
+        assert_eq!(
+            dispatch(cx, &sender, operation),
+            Err(preview_notice(label)),
+            "{label}"
+        );
+    }
+    // The arms themselves, for the effects the gate never lets through.
+    for (operation, label) in operations() {
+        let (commands, mut receiver) = command_channel();
+        let pending = commands.enqueue(operation, Some("caller".into())).unwrap();
+        let envelope = receiver.try_recv().unwrap();
+        let reply = envelope.reply;
+        let caller = envelope.caller;
+        let effect = match envelope.operation {
+            Op::Create(request) => HostEffect::Create {
+                reply,
+                caller,
+                request,
+            },
+            Op::UpdateHandoff(request) => HostEffect::UpdateHandoff {
+                reply,
+                caller,
+                request,
+            },
+            Op::SessionEvent(request) => HostEffect::TurnEnded {
+                reply,
+                task_id: request.task_id,
+                session_id: request.session_id,
+            },
+            Op::MergePlanSet(request) => HostEffect::MergePlanSet {
+                reply,
+                caller,
+                request,
+            },
+            Op::LaunchSession(request) => HostEffect::LaunchSession {
+                reply,
+                launch: SessionLaunch {
+                    task_id: request.task_id,
+                    preset_name: request.preset_name,
+                    origin: TaskLaunchOrigin::Agent,
+                    user_model_choice: request.user_model_choice,
+                },
+            },
+            Op::RequestReview(request) => HostEffect::RequestReview {
+                reply,
+                caller,
+                request,
+            },
+            Op::RequestConsult(request) => HostEffect::RequestConsult {
+                reply,
+                caller,
+                request,
+            },
+            Op::DelegateTask(request) => HostEffect::DelegateTask {
+                reply,
+                caller,
+                request,
+            },
+            other => panic!("not a write: {other:?}"),
+        };
+        owner.update(cx, |owner, cx| owner.execute_effect(effect, label, cx));
+        let answer = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(pending);
+        assert_eq!(answer, Err(preview_notice(label)), "{label}");
+    }
+    cx.run_until_parked();
+    // Nothing written in either tree, nothing queued, admitted or started.
+    assert_eq!(recorded(&fixture.iced), iced_before);
+    assert_eq!(recorded(fixture.roots.root()), preview_before);
+    assert_inert(&owner, cx, &["d1"]);
+}
+
+#[gpui::test]
+fn reads_work_in_preview(cx: &mut TestAppContext) {
+    use gitterm_core::task_mcp::TaskControlOperation as Op;
+    use serde_json::json;
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    fixture.write_iced(
+        vec![
+            task("running", TaskLifecycle::Running),
+            task("ready", TaskLifecycle::Ready),
+        ],
+        vec![delegation("d1", "running")],
+    );
+    std::fs::write(
+        fixture.iced.join("settings.json"),
+        serde_json::to_vec(&json!({
+            "agent_presets": [{"name": "Fixture Agent", "command": "fixture-agent"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let chats = Chats::new(&fixture, cx);
+    let caller = chats.open(&fixture, Some("root-chat"), cx);
+    let (owner, sender) = fixture.start(cx);
+    let stored = |id: &str, cx: &mut TestAppContext| {
+        owner.read_with(cx, |owner, _| {
+            owner
+                .host()
+                .store()
+                .as_ref()
+                .unwrap()
+                .get(id)
+                .unwrap()
+                .clone()
+        })
+    };
+
+    // task_get: the record with Iced's open_sessions (no GPUI pane is a
+    // task session).
+    let got = dispatch(cx, &sender, Op::Get(req(json!({"task_id": "ready"})))).unwrap();
+    let expected = gitterm_core::task_host::task_control_value(&stored("ready", cx), &[]).unwrap();
+    assert_eq!(got, expected);
+    assert_eq!(got["open_sessions"], json!([]));
+
+    // task_list: every task in that shape, and Iced's preset names.
+    let listed = dispatch(cx, &sender, Op::List(req(json!({})))).unwrap();
+    assert_eq!(
+        listed,
+        json!({
+            "tasks": [
+                gitterm_core::task_host::task_control_value(&stored("running", cx), &[]).unwrap(),
+                gitterm_core::task_host::task_control_value(&stored("ready", cx), &[]).unwrap(),
+            ],
+            "available_presets": ["Fixture Agent"],
+        })
+    );
+
+    // plan_limits: Iced's policy report on Iced's (here empty) file.
+    let limits = dispatch(cx, &sender, Op::PlanLimits).unwrap();
+    let file = gitterm_core::plan_limits::PlanLimitsFile::load(
+        &gitterm_core::plan_limits::PlanLimitsFile::path_in(&fixture.iced),
+    );
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert_eq!(
+        limits,
+        serde_json::to_value(gitterm_core::plan_limits::evaluate_policy(&file, now).report)
+            .unwrap()
+    );
+
+    // delegation_get: the stored record, with no live worker card.
+    let record = dispatch(
+        cx,
+        &sender,
+        Op::GetDelegation(req(json!({"delegation_id": "d1"}))),
+    )
+    .unwrap();
+    let expected = owner.read_with(cx, |owner, _| {
+        let host = owner.host();
+        let delegation = host.store().as_ref().unwrap().delegation("d1").unwrap();
+        gitterm_core::delegations::delegation_record(delegation, host.services().state_root())
+            .unwrap()
+    });
+    assert_eq!(record, expected);
+    assert!(record.get("worker").is_none(), "{record}");
+    // delegation_list is answered by the host itself.
+    let listed = dispatch(cx, &sender, Op::ListDelegations(req(json!({})))).unwrap();
+    assert!(listed.is_object(), "{listed}");
+
+    // merge_plan_get: Iced's shape for a root with no plan or PRs.
+    assert_eq!(
+        dispatch_as(cx, &sender, Op::MergePlanGet, Some(&caller)).unwrap(),
+        json!({
+            "root_chat_id": "root-chat",
+            "updated_at": null,
+            "source": null,
+            "next": null,
+            "entries": [],
+            "unplanned_prs": [],
+        })
+    );
+    // Iced's errors: no caller, a caller that is no open chat, and a chat
+    // with no conversation yet.
+    assert_eq!(
+        dispatch_as(cx, &sender, Op::MergePlanGet, None),
+        Err(gitterm_core::task_mcp::missing_plan_caller_error(
+            "merge_plan_get"
+        ))
+    );
+    assert_eq!(
+        dispatch_as(cx, &sender, Op::MergePlanGet, Some("closed")),
+        Err("merge_plan_get: no GitTerm tab on this Mac has session closed; merge plans are for this Mac's chats".into())
+    );
+    let fresh = chats.open(&fixture, None, cx);
+    assert_eq!(
+        dispatch_as(cx, &sender, Op::MergePlanGet, Some(&fresh)),
+        Err("merge_plan_get: this tab has no conversation id yet; call it again after your first reply".into())
+    );
+}
+
+#[gpui::test]
+fn html_render_requires_open_gpui_chat(cx: &mut TestAppContext) {
+    use gitterm_core::task_mcp::TaskControlOperation as Op;
+    use serde_json::json;
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    let chats = Chats::new(&fixture, cx);
+    let caller = chats.open(&fixture, Some("root-chat"), cx);
+    let (_owner, sender) = fixture.start(cx);
+    let render = |html: &str| Op::HtmlRender(req(json!({"html": html, "height": 300})));
+    let refused = "html_render requires an open local native Claude or ACP chat tab (Pi does not restore conversation history)";
+    if !gitterm_core::content::html_render::NATIVE_HTML_SUPPORTED {
+        let error = dispatch_as(cx, &sender, render("<p>x</p>"), Some(&caller)).unwrap_err();
+        assert!(error.contains("requires GitTerm for macOS"), "{error}");
+        return;
+    }
+    assert_eq!(
+        dispatch_as(cx, &sender, render("<p>x</p>"), Some(&caller)).unwrap(),
+        json!({"html_render": {"html": "<p>x</p>", "height": 300}})
+    );
+    for other in [None, Some("closed-chat")] {
+        assert_eq!(
+            dispatch_as(cx, &sender, render("<p>x</p>"), other),
+            Err(refused.into()),
+            "{other:?}"
+        );
+    }
+    // Validation comes first, as in Iced.
+    let invalid = dispatch_as(cx, &sender, render(" "), Some("closed-chat")).unwrap_err();
+    assert_ne!(invalid, refused);
+}
+
+/// Two root chats in one workspace: each caller gets its own root's plan
+/// (a worker's conversation resolves to its coordinator's root through the
+/// store), in Iced's full response shape.
+#[gpui::test]
+fn merge_plan_scoped_to_root_chat(cx: &mut TestAppContext) {
+    use gitterm_core::{
+        chat_facts,
+        chats::ChatBackend,
+        merge_plan::{self, MergePlan},
+        prs::{WatchFile, WatchedPr},
+        task_mcp::TaskControlOperation as Op,
+    };
+    use serde_json::json;
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    // root-a delegated a worker whose conversation is worker-a.
+    let worker: Delegation = serde_json::from_value(json!({
+        "delegation_id": "wa", "kind": "implement",
+        "parent": {"session_uid": "uid-a", "chat_session_id": "root-a", "workspace": "A", "cwd": "/fixture/work"},
+        "child": {"runner": "task_session", "task_id": "running", "task_session_id": "child-wa",
+                  "conversation": {"backend": "claude", "session_id": "worker-a"}},
+        "brief": "Fixture", "status": {"state": "running"},
+        "created_at": "2026-11-20T12:00:00Z", "updated_at": "2026-11-20T12:01:00Z"
+    }))
+    .unwrap();
+    fixture.write_iced(vec![task("running", TaskLifecycle::Running)], vec![worker]);
+    let plans = merge_plan::plans_dir(&fixture.iced);
+    let plan = |root: &str, entries: serde_json::Value| -> MergePlan {
+        req(json!({"root_chat_id": root, "updated_at": "2026-11-20T10:00:00Z", "entries": entries}))
+    };
+    merge_plan::write_plan(
+        &plans,
+        &plan(
+            "root-a",
+            json!([
+                {"repo": "acme/api", "number": 1},
+                {"repo": "acme/api", "number": 2, "after": ["acme/api#1"], "note": "after one"},
+            ]),
+        ),
+    )
+    .unwrap();
+    merge_plan::write_plan(
+        &plans,
+        &plan(
+            "root-b",
+            json!([{"repo": "acme/web", "number": 5, "hold": "waiting"}]),
+        ),
+    )
+    .unwrap();
+    // Watch: #1 polled open, #2 polled with an error only (no live state:
+    // its row is unknown, not blocked).
+    let mut watch = WatchFile::default();
+    let mut one = WatchedPr::new(merge_plan::PrKey::new("acme/api", 1));
+    one.snapshot.core = Some(req(json!({
+        "title": "One", "state": "open", "url": "https://github.com/acme/api/pull/1",
+        "author": "dev", "head_repo": "acme/api", "head_ref": "feat-one", "head_sha": "abc",
+        "base_ref": "main", "mergeable": true, "mergeable_state": "clean", "requested_reviewers": 0
+    })));
+    one.checked_at = Some("2026-11-20T11:00:00Z".into());
+    let mut two = WatchedPr::new(merge_plan::PrKey::new("acme/api", 2));
+    two.checked_at = Some("2026-11-20T11:00:00Z".into());
+    two.error = Some("rate limited".into());
+    watch.prs.insert(one.key.id(), one);
+    watch.prs.insert(two.key.id(), two);
+    std::fs::write(
+        WatchFile::path_in(&fixture.iced),
+        serde_json::to_vec(&watch).unwrap(),
+    )
+    .unwrap();
+    // Saved chat facts: root-a names a planned and an unplanned PR, its
+    // worker another; root-b one of its own.
+    let facts_dir = chat_facts::facts_dir(&fixture.iced);
+    std::fs::create_dir_all(&facts_dir).unwrap();
+    let facts = |chat: &str, numbers: &[(&str, u64)]| {
+        let prs: Vec<_> = numbers
+            .iter()
+            .map(|(repo, n)| json!({"repo": repo, "number": n, "url": format!("https://github.com/{repo}/pull/{n}")}))
+            .collect();
+        std::fs::write(
+            chat_facts::facts_path(&facts_dir, ChatBackend::Claude, chat).unwrap(),
+            serde_json::to_vec(&json!({"prs": prs})).unwrap(),
+        )
+        .unwrap();
+    };
+    facts("root-a", &[("acme/api", 1), ("acme/api", 3)]);
+    facts("worker-a", &[("acme/api", 4)]);
+    facts("root-b", &[("acme/web", 6)]);
+
+    let chats = Chats::new(&fixture, cx);
+    let root_a = chats.open(&fixture, Some("root-a"), cx);
+    let worker_a = chats.open(&fixture, Some("worker-a"), cx);
+    let root_b = chats.open(&fixture, Some("root-b"), cx);
+    let (_owner, sender) = fixture.start(cx);
+
+    let live_one = json!({
+        "title": "One", "state": "open", "head": "feat-one", "base": "main",
+        "checks": "no checks", "failing_checks": [], "required_checks_passed": false,
+        "review": "no review", "conflicting": false,
+        "checked_at": "2026-11-20T11:00:00Z", "error": null,
+    });
+    let expected_a = json!({
+        "root_chat_id": "root-a",
+        "updated_at": "2026-11-20T10:00:00Z",
+        "source": null,
+        "next": "acme/api#1",
+        "entries": [
+            {
+                "position": 1, "unordered_reason": null, "pr": "acme/api#1", "repo": "acme/api",
+                "number": 1, "url": "https://github.com/acme/api/pull/1", "step": null, "after": [],
+                "stacked_on": null, "hold": null, "method": "merge", "note": null,
+                "status": "next", "waits_for": [], "live": live_one,
+            },
+            {
+                "position": 2, "unordered_reason": null, "pr": "acme/api#2", "repo": "acme/api",
+                "number": 2, "url": "https://github.com/acme/api/pull/2", "step": null,
+                "after": ["acme/api#1"], "stacked_on": null, "hold": null, "method": "merge",
+                "note": "after one", "status": "unknown", "waits_for": [],
+                "live": {"checked_at": "2026-11-20T11:00:00Z", "error": "rate limited"},
+            },
+        ],
+        "unplanned_prs": [
+            {"pr": "acme/api#3", "repo": "acme/api", "number": 3, "url": "https://github.com/acme/api/pull/3", "live": null},
+            {"pr": "acme/api#4", "repo": "acme/api", "number": 4, "url": "https://github.com/acme/api/pull/4", "live": null},
+        ],
+    });
+    let expected_b = json!({
+        "root_chat_id": "root-b",
+        "updated_at": "2026-11-20T10:00:00Z",
+        "source": null,
+        "next": null,
+        "entries": [{
+            "position": 1, "unordered_reason": null, "pr": "acme/web#5", "repo": "acme/web",
+            "number": 5, "url": "https://github.com/acme/web/pull/5", "step": null, "after": [],
+            "stacked_on": null, "hold": "waiting", "method": "merge", "note": null,
+            "status": "unknown", "waits_for": [], "live": null,
+        }],
+        "unplanned_prs": [
+            {"pr": "acme/web#6", "repo": "acme/web", "number": 6, "url": "https://github.com/acme/web/pull/6", "live": null},
+        ],
+    });
+    let get = |caller: &str, cx: &mut TestAppContext| {
+        dispatch_as(cx, &sender, Op::MergePlanGet, Some(caller)).unwrap()
+    };
+    assert_eq!(get(&root_a, cx), expected_a);
+    assert_eq!(get(&worker_a, cx), expected_a);
+    assert_eq!(get(&root_b, cx), expected_b);
 }

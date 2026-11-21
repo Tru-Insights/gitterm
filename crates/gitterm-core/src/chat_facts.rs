@@ -642,6 +642,138 @@ pub struct ChildLink {
     pub child: ChatChild,
 }
 
+/// Follow direct parents so flattened indexed ancestry cannot skip an owned root.
+fn saved_chat_root<'a>(
+    chat: &'a str,
+    index: &'a [ChatIndexEntry],
+    parents: &'a HashMap<String, String>,
+    root: &str,
+) -> Option<&'a str> {
+    let mut current = chat;
+    let mut seen = HashSet::new();
+    while seen.insert(current) {
+        if current == root {
+            return Some(current);
+        }
+        let parent = parents.get(current).or_else(|| {
+            index
+                .iter()
+                .find(|entry| entry.id == current)
+                .and_then(|entry| entry.root_id.as_ref())
+        });
+        let Some(parent) = parent else {
+            return Some(current);
+        };
+        current = parent;
+    }
+    None
+}
+
+/// Read saved facts by id, including descendants absent from the index.
+/// Iced calls it when PR homes rebuild, never from a view.
+pub fn load_root_prs(
+    dir: &Path,
+    index: &[ChatIndexEntry],
+    links: &[ChildLink],
+    root: &str,
+    mut log: impl FnMut(&str),
+) -> Vec<PrRef> {
+    let mut parents = HashMap::new();
+    // Match resolve_tree's first indexed parent before using raw links for
+    // chats whose parents are also absent from the index.
+    for entry in index {
+        for child in entry.facts.iter().flat_map(|facts| &facts.children) {
+            if child.session_id != entry.id {
+                parents
+                    .entry(child.session_id.clone())
+                    .or_insert_with(|| entry.id.clone());
+            }
+        }
+    }
+    for link in links {
+        if link.child.session_id != link.parent {
+            parents
+                .entry(link.child.session_id.clone())
+                .or_insert_with(|| link.parent.clone());
+        }
+    }
+    let mut pending = vec![root.to_string()];
+    pending.extend(
+        crate::work::summary::chats_under(index, &[root.to_string()])
+            .into_iter()
+            .map(|entry| entry.id.clone()),
+    );
+    let mut seen = HashSet::new();
+    let mut prs = Vec::new();
+    while let Some(chat) = pending.pop() {
+        if !seen.insert(chat.clone()) {
+            continue;
+        }
+        if chat != root
+            && saved_chat_root(&chat, index, &parents, root).is_some_and(|owner| owner != root)
+        {
+            continue;
+        }
+        pending.extend(
+            links_for_parent(links, &chat)
+                .into_iter()
+                .map(|child| child.session_id),
+        );
+        for entry in index.iter().filter(|entry| entry.id == chat) {
+            if let Some(facts) = &entry.facts {
+                prs.extend(facts.prs.iter().cloned());
+                pending.extend(facts.children.iter().map(|child| child.session_id.clone()));
+            }
+        }
+        // Owned lists carry ids without a backend. Probe the supported facts
+        // names so an unindexed chat needs no transcript or index entry.
+        for backend in ChatBackend::ALL {
+            let path = match facts_path(dir, backend, &chat) {
+                Ok(path) => path,
+                Err(error) => {
+                    log(&format!(
+                        "[pr-watch] facts for chat {chat:?} in {}: {error}",
+                        dir.display()
+                    ));
+                    break;
+                }
+            };
+            match load_facts(&path) {
+                Ok(Some(facts)) => {
+                    prs.extend(facts.prs);
+                    for child in facts.children {
+                        if child.session_id != chat {
+                            parents
+                                .entry(child.session_id.clone())
+                                .or_insert_with(|| chat.clone());
+                        }
+                        pending.push(child.session_id);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => log(&format!(
+                    "[pr-watch] facts for chat {chat:?} at {}: {error}",
+                    path.display()
+                )),
+            }
+        }
+    }
+    prs
+}
+
+/// Follows `chat`'s parents through `links` to the top, stopping at a cycle.
+pub fn root_through_links(links: &[ChildLink], chat: &str) -> String {
+    let mut current = chat.to_string();
+    let mut seen: HashSet<String> = HashSet::from([current.clone()]);
+    while let Some(link) = links.iter().find(|link| link.child.session_id == current) {
+        if !seen.insert(link.parent.clone()) {
+            break;
+        }
+        current = link.parent.clone();
+    }
+    current
+}
+
 /// The children `links` name for one parent chat.
 pub fn links_for_parent(links: &[ChildLink], parent: &str) -> Vec<ChatChild> {
     links
