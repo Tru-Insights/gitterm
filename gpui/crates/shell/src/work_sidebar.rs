@@ -238,6 +238,7 @@ pub struct WorkSidebar {
     repo_recency: Vec<(PathBuf, std::time::SystemTime)>,
     source: Option<IcedWorkSource>,
     pull_requests: Vec<PullRequestGroup>,
+    indexed_chats: Vec<gitterm_core::chats::ChatIndexEntry>,
     pr_plans: HashMap<String, gitterm_core::merge_plan::MergePlan>,
     pr_accounts: BTreeMap<String, String>,
     issues: gitterm_core::issues::IssueTitlesFile,
@@ -264,6 +265,7 @@ impl WorkSidebar {
             repo_recency: vec![],
             source: None,
             pull_requests: vec![],
+            indexed_chats: vec![],
             pr_plans: HashMap::new(),
             pr_accounts: BTreeMap::new(),
             issues: Default::default(),
@@ -360,16 +362,23 @@ impl WorkSidebar {
             })
             .collect();
         let config = source.config.clone();
+        let previous = self.indexed_chats.clone();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let job = cx.background_executor().spawn(async move {
             let plans = gitterm_core::merge_plan::load_plans(&gitterm_core::merge_plan::plans_dir(
                 &source.config,
             ));
             let accounts = read_pr_accounts(&source.config);
-            let result =
-                crate::data::IcedWorkData::read(&source.config, id, &saved, focus, |data| {
+            let result = crate::data::IcedWorkData::read(
+                &source.config,
+                id,
+                &saved,
+                focus,
+                &previous,
+                |data| {
                     _ = sender.send((Ok(data.clone()), plans.clone(), accounts.clone()));
-                });
+                },
+            );
             _ = sender.send((result, plans, accounts));
         });
         cx.spawn(async move |view, cx| {
@@ -390,6 +399,7 @@ impl WorkSidebar {
                             this.running_task_ids = data.running_task_ids;
                             this.repo_recency = data.repo_recency;
                             this.pull_requests = data.pull_requests;
+                            this.indexed_chats = data.indexed_chats;
                             this.issues = data.issues;
                             this.collapsed_issue_groups = data.collapsed_issue_groups;
                             this.error = None;
