@@ -184,11 +184,20 @@ fn optional_controls_and_selected_run_url_only() {
 
 struct Harness(Entity<BottomPanel>);
 impl Render for Harness {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .flex()
             .flex_col()
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape"
+                    && this
+                        .0
+                        .update(cx, |panel, cx| panel.dismiss_quick_picker(cx))
+                {
+                    cx.stop_propagation();
+                }
+            }))
             .child(div().flex_1())
             .child(self.0.clone())
     }
@@ -391,4 +400,134 @@ fn divider_drag_emits_clamped_height_even_outside_the_panel(cx: &mut TestAppCont
     let before = outcomes.borrow().len();
     cx.simulate_mouse_move(start, MouseButton::Left, gpui::Modifiers::none());
     assert_eq!(outcomes.borrow().len(), before);
+}
+
+#[test]
+fn chevron_follows_expansion_even_though_collapsed_header_is_hidden() {
+    let mut input = input();
+    for (expanded, glyph) in [(true, "▼"), (false, "▶")] {
+        input.expanded = expanded;
+        assert_eq!(input.controls(false)[0].label, glyph);
+        assert_eq!(input.visible(), expanded);
+    }
+}
+
+#[gpui::test]
+fn tab_click_closes_repo_picker_without_launch_outcome(cx: &mut TestAppContext) {
+    let (view, cx, outcomes) = fixture(cx, input());
+    click("bottom-control-8", cx);
+    cx.read(|cx| assert!(view.read(cx).repo_picker_open));
+    click("bottom-control-1", cx);
+    cx.read(|cx| assert!(!view.read(cx).repo_picker_open));
+    assert_eq!(&*outcomes.borrow(), &[Outcome::SelectTab { id: 4 }]);
+}
+
+#[gpui::test]
+fn escape_dismisses_quick_picker_before_focused_content_and_keeps_repo_picker(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx, outcomes) = fixture(cx, input());
+    let received = Rc::new(Cell::new(0));
+    let keys = received.clone();
+    let focus = cx.update(|_, cx| cx.focus_handle());
+    let slot_focus = focus.clone();
+    view.update(cx, |view, cx| {
+        view.set_content(
+            Some(Rc::new(move |_, _| {
+                let keys = keys.clone();
+                div()
+                    .size_full()
+                    .track_focus(&slot_focus)
+                    .on_key_down(move |_, _, _| keys.set(keys.get() + 1))
+                    .into_any_element()
+            })),
+            cx,
+        )
+    });
+    click("bottom-control-8", cx);
+    // The inserted repo controls shift the quick picker button to index 12.
+    click("bottom-control-12", cx);
+    cx.update(|window, cx| focus.focus(window, cx));
+    draw(cx);
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    cx.read(|cx| {
+        assert!(!view.read(cx).quick_picker_open);
+        assert!(
+            view.read(cx).repo_picker_open,
+            "Iced leaves the repo picker open"
+        );
+    });
+    assert_eq!(
+        received.get(),
+        0,
+        "Escape must not reach terminal/find first"
+    );
+    assert!(
+        outcomes.borrow().is_empty(),
+        "dismissal cannot launch anything"
+    );
+    cx.simulate_keystrokes("escape");
+    assert_eq!(
+        received.get(),
+        1,
+        "Escape propagates when quick picker is closed"
+    );
+}
+
+#[gpui::test]
+fn host_escape_routes_quick_picker_before_plans_and_search(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let dir = tempfile::tempdir().unwrap();
+    let handle = cx.add_window(|window, cx| {
+        crate::Shell::new(Rc::new(crate::data::SampleData), dir.path(), window, cx).unwrap()
+    });
+    handle
+        .update(cx, |shell, window, cx| {
+            // Cancel every deferred terminal before any window draw can launch it.
+            let mut search = None;
+            for workspace in &shell.workspaces {
+                for pane in workspace.panes.values() {
+                    if let crate::pane::PaneContent::Terminal(view) = &pane.read(cx).content {
+                        let view = view.clone();
+                        view.update(cx, |view, cx| {
+                            view.backend_mut().cancel();
+                            view.open_find(cx);
+                        });
+                        search = Some(view);
+                    }
+                }
+            }
+            let search = search.expect("fixture terminal");
+            shell.plans_open = true;
+            for raw in [true, false] {
+                shell.bottom.update(cx, |bottom, _| {
+                    bottom.input = input();
+                    bottom.quick_picker_open = true;
+                    bottom.repo_picker_open = true;
+                });
+                if raw {
+                    shell.guard_app_shortcut(
+                        &gpui::KeyDownEvent {
+                            keystroke: gpui::Keystroke::parse("escape").unwrap(),
+                            is_held: false,
+                            prefer_character_input: false,
+                        },
+                        window,
+                        cx,
+                    );
+                } else {
+                    shell.escape(&crate::app_menus::Escape, window, cx);
+                }
+                assert!(shell.plans_open, "quick picker precedes plans dismissal");
+                assert!(
+                    search.read(cx).is_find_open(),
+                    "quick picker precedes search dismissal"
+                );
+                assert!(!shell.bottom.read(cx).quick_picker_open);
+                assert!(shell.bottom.read(cx).repo_picker_open);
+            }
+        })
+        .unwrap();
 }

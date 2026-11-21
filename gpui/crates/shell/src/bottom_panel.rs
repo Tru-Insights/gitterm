@@ -105,7 +105,10 @@ impl Input {
 
     /// Same sequence as Iced view_bottom_tab_bar; a spacer separates URL/runs.
     pub fn controls(&self, repo_picker_open: bool) -> Vec<Control> {
-        let mut controls = vec![Control::new("▼", Action::Emit(Outcome::Toggle))];
+        let mut controls = vec![Control::new(
+            if self.expanded { "▼" } else { "▶" },
+            Action::Emit(Outcome::Toggle),
+        )];
         for (index, tab) in self.tabs.iter().enumerate() {
             let glyph = match (&tab.run_repo, tab.alive) {
                 (Some(_), true) => "▶",
@@ -294,7 +297,10 @@ impl BottomPanel {
     fn activate(&mut self, action: Action, cx: &mut Context<Self>) {
         match action {
             Action::Emit(outcome) => {
-                if matches!(outcome, Outcome::AddTerminal { .. }) {
+                if matches!(
+                    outcome,
+                    Outcome::AddTerminal { .. } | Outcome::SelectTab { .. }
+                ) {
                     self.repo_picker_open = false;
                 }
                 cx.emit(outcome);
@@ -304,6 +310,17 @@ impl BottomPanel {
             Action::Spacer => {}
         }
         cx.notify();
+    }
+
+    /// Iced dismisses quick commands before search/viewers; Escape does not
+    /// dismiss the inline repo picker. The host calls this during key capture.
+    pub fn dismiss_quick_picker(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.quick_picker_open {
+            return false;
+        }
+        self.quick_picker_open = false;
+        cx.notify();
+        true
     }
 
     fn quick_command(&mut self, id: usize, cx: &mut Context<Self>) {
