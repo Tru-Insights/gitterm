@@ -68,7 +68,7 @@ use gpui::{
     size,
 };
 use gpui_component::{
-    Root, Selectable,
+    Root,
     button::{Button, ButtonVariants},
     dock::{
         DockArea, DockEvent, DockLayout, DockPlacement, DockSkin, PanelId, PanelStyle,
@@ -1328,6 +1328,12 @@ fn build_workspace(
                 session.title.clone(),
                 if let Some(text) = data.imported_session(workspace.id, session.id, cx) {
                     PaneKind::IcedSession(text)
+                } else if imported {
+                    // Saved preview panes are inventory, never permission to start a shell.
+                    PaneKind::IcedSession(
+                        "Restored terminal · idle. Use + for a terminal or ▶ to run a command."
+                            .into(),
+                    )
                 } else if let Some(terminals) = &store.terminals {
                     let cwd = terminals
                         .iter()
@@ -1349,6 +1355,15 @@ fn build_workspace(
                 cx,
             )
         });
+        if imported
+            && data
+                .imported_session(workspace.id, session.id, cx)
+                .is_none()
+        {
+            pane.update(cx, |pane, _| {
+                pane.session = Some(sessions::fresh_target());
+            });
+        }
         panes.insert(id, pane);
     }
     for (name, title, kind) in [
@@ -1888,32 +1903,45 @@ impl Shell {
             (SidebarMode::Files, "Files", "F"),
             (SidebarMode::Find, "Find", "⌕"),
         ] {
+            let selected = regions.sidebar_mode == mode
+                || (mode == SidebarMode::Work && regions.sidebar_mode == SidebarMode::Git);
             modes = modes.child(
-                Button::new(title)
-                    .debug_selector(move || title.into())
-                    .ghost()
-                    .label(if regions.sidebar_collapsed {
-                        icon
-                    } else {
-                        title
-                    })
-                    .tooltip(title)
-                    .h(px(28.))
+                div()
                     .flex_1()
-                    .selected(
-                        regions.sidebar_mode == mode
-                            || (mode == SidebarMode::Work
-                                && regions.sidebar_mode == SidebarMode::Git),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.update_regions(
-                            |regions| {
-                                regions.sidebar_mode = mode;
-                                regions.sidebar_collapsed = false;
-                            },
-                            cx,
-                        )
-                    })),
+                    .min_w_0()
+                    .border_b_2()
+                    .border_color(if selected {
+                        rgb(p.blue).into()
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .child(
+                        Button::new(title)
+                            .debug_selector(move || title.into())
+                            .ghost()
+                            .label(if regions.sidebar_collapsed {
+                                icon
+                            } else {
+                                title
+                            })
+                            .tooltip(title)
+                            .h(px(26.))
+                            .w_full()
+                            .justify_start()
+                            .rounded_none()
+                            .px(px(10.))
+                            .text_size(px(12.))
+                            .text_color(rgb(if selected { p.text } else { p.subtext0 }))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.update_regions(
+                                    |regions| {
+                                        regions.sidebar_mode = mode;
+                                        regions.sidebar_collapsed = false;
+                                    },
+                                    cx,
+                                )
+                            })),
+                    ),
             );
         }
         modes = modes.child(
@@ -3583,6 +3611,14 @@ impl Focusable for Shell {
 }
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.active_workspace(cx).is_some() {
+            let state = self.active(cx);
+            window.set_window_title(&window_title(
+                "GitTerm V6 Development",
+                &state.workspace.name,
+                state.store.regions.sidebar_mode,
+            ));
+        }
         for state in &self.workspaces {
             for pane in state.panes.values() {
                 if let pane::PaneContent::Chat(view) = &pane.read(cx).content {
@@ -3623,6 +3659,7 @@ impl Render for Shell {
                         if let work_sidebar::WorkSidebarOutcome::OpenTask { task } = outcome {
                             shell.activate_task(task, window, cx);
                         }
+                        // The repo row's ▶ is an explicit Run, as in Iced (RunRepoCommand).
                         if let work_sidebar::WorkSidebarOutcome::RunRepoCommand { repo } = outcome {
                             shell.run_repo(
                                 gitterm_core::workspace_config::RepoKey::local(repo),
@@ -3703,9 +3740,6 @@ impl Render for Shell {
             .flex()
             .flex_col()
             .child(self.session_strip(cx));
-        if let Some(error) = &self.owner.read(cx).error {
-            content = content.child(div().p_2().text_color(rgb(p.red)).child(error.clone()));
-        }
         if let Some(error) = &state.error {
             content = content.child(div().p_2().text_color(rgb(p.red)).child(error.clone()));
         }
@@ -3773,6 +3807,30 @@ impl Render for Shell {
                             }),
                     )
                     .child(self.bottom.clone())
+                    .children(self.owner.read(cx).error.clone().map(|error| {
+                        div()
+                            .id("preview-notice")
+                            .debug_selector(|| "preview-notice".into())
+                            .px_2()
+                            .py_1()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(12.))
+                            .text_color(rgb(p.red))
+                            .child(div().flex_1().child(error))
+                            .child(
+                                Button::new("dismiss-preview-notice")
+                                    .ghost()
+                                    .label("×")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.owner.update(cx, |owner, cx| {
+                                            owner.error = None;
+                                            cx.notify();
+                                        });
+                                    })),
+                            )
+                    }))
                     .child(self.workspace_bar(cx)),
             )
             .child(
@@ -3843,10 +3901,25 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
     };
     let title_workspace = model
         .active()
-        .and_then(|active| model.workspaces.iter().find(|workspace| workspace.id == active))
+        .and_then(|active| {
+            model
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == active)
+        })
         .map(|workspace| workspace.status.repo_name.clone())
-        .unwrap_or_else(|| if sample { "Sample data".into() } else { "GitTerm".into() });
-    let window_title = window_title("GitTerm V6 Development", &title_workspace, SidebarMode::Work);
+        .unwrap_or_else(|| {
+            if sample {
+                "Sample data".into()
+            } else {
+                "GitTerm".into()
+            }
+        });
+    let window_title = window_title(
+        "GitTerm V6 Development",
+        &title_workspace,
+        SidebarMode::Work,
+    );
     gpui_kit::application().run(move |cx| {
         preview.release_on_quit(cx);
         gpui_kit::init(cx);
@@ -4986,7 +5059,11 @@ mod tests {
     #[test]
     fn window_title_matches_iced_workspace_and_sidebar_format() {
         assert_eq!(
-            window_title("GitTerm V6 Development", "GitTerm V6 Upgrade", SidebarMode::Work),
+            window_title(
+                "GitTerm V6 Development",
+                "GitTerm V6 Upgrade",
+                SidebarMode::Work
+            ),
             "GitTerm V6 Development - GitTerm V6 Upgrade - Work"
         );
         assert_eq!(
