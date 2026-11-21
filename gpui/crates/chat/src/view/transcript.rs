@@ -317,6 +317,10 @@ impl RowView {
             .findings()
             .map(|f| f.findings.clone())
             .unwrap_or_default();
+        let selected = self
+            .selected_findings
+            .get_or_insert_with(|| findings.iter().map(|f| f.id.clone()).collect())
+            .clone();
         div()
             .flex()
             .flex_col()
@@ -342,8 +346,6 @@ impl RowView {
             .when(self.open, |view| {
                 view.child(self.copyable_text(cx))
                     .children(findings.into_iter().map(|finding| {
-                        let action = self.action.clone();
-                        let label = finding.title.clone();
                         let location = crate::delegation::finding_location(&finding);
                         let file = finding.file.clone();
                         let open = self.action.clone();
@@ -365,22 +367,26 @@ impl RowView {
                                     "finding-{}",
                                     finding.id
                                 )))
-                                .checked(true)
+                                .checked(selected.contains(&finding.id))
                                 .accessibility_label(finding.title.clone())
                                 .disabled(card.delivered())
                                 .debug_selector({
                                     let fid = finding.id.clone();
                                     move || format!("finding-select-{id}-{fid}")
                                 })
-                                .on_click(move |_, _, cx| {
-                                    cx.stop_propagation();
-                                    action(
-                                        TranscriptAction::PreviewOnly {
-                                            label: label.clone(),
-                                        },
-                                        cx,
-                                    );
-                                }),
+                                .on_click(cx.listener({
+                                    let fid = finding.id.clone();
+                                    move |this, checked: &bool, _, cx| {
+                                        if let Some(set) = this.selected_findings.as_mut() {
+                                            if *checked {
+                                                set.insert(fid.clone());
+                                            } else {
+                                                set.remove(&fid);
+                                            }
+                                        }
+                                        cx.notify();
+                                    }
+                                })),
                             )
                             .child(
                                 div()
