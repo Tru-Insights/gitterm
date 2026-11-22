@@ -1,7 +1,7 @@
 #[cfg(test)]
 use git2::Status;
 use git2::{DiffOptions, Repository};
-use gitterm::chats::{ChatBackendResume, ChatEntryResume};
+use gitterm::chats::ChatEntryResume;
 #[cfg(test)]
 use gitterm::task_worktree::DEFAULT_TASK_BASE;
 use gitterm::tasks::task_handoff_prompt;
@@ -4771,45 +4771,8 @@ fn resumed_claude_chat_session(
 /// full history. Derived from the task store alone — the Chats index
 /// is only built when the Chats panel opens, so resume must not
 /// depend on it.
-/// A persisted `claude … --session-id <id>` launch whose session has since
-/// been written cannot be re-run: the CLI refuses with "Session ID <id> is
-/// already in use". Returns the resume command (other flags kept) and the
-/// id in that case. None leaves the command alone: not a Claude launch, no
-/// `--session-id`, a quoted command (an embedded brief) or a session that
-/// never got a message, where the fresh launch is still right.
-fn resume_for_preassigned_claude_launch(
-    command: &str,
-    session_exists: impl Fn(&str) -> bool,
-) -> Option<(String, String)> {
-    if command.contains(['"', '\'']) {
-        return None;
-    }
-    let mut words = command.split_whitespace();
-    if words.next() != Some("claude") {
-        return None;
-    }
-    let words: Vec<&str> = words.collect();
-    let idx = words.iter().position(|w| *w == "--session-id")?;
-    let id = *words.get(idx + 1)?;
-    if !session_exists(id) {
-        return None;
-    }
-    let mut out = vec!["claude"];
-    out.extend(
-        words
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != idx && *i != idx + 1)
-            .map(|(_, w)| *w),
-    );
-    out.push("--resume");
-    out.push(id);
-    Some((out.join(" "), id.to_string()))
-}
-
 fn conversation_resume_command(conversation: &HarnessConversationRef) -> String {
-    let backend = conversation_chat_backend(conversation.backend);
-    backend.resume_command(backend.label(), &conversation.session_id)
+    gitterm_core::task_host::conversation_resume_command(conversation)
 }
 
 fn preset_conversation_backend(preset: &AgentPreset) -> Option<HarnessConversationBackend> {
@@ -20806,12 +20769,6 @@ impl App {
                 } else {
                     repo_dir.clone()
                 };
-                // A task tab reopens its recorded conversation on
-                // launch — relaunching the persisted plain harness
-                // command would fork a fresh session and flip the
-                // task back to Running, hiding the Resume verb.
-                let mut startup_command = tab_config.startup_command.clone();
-                let mut chat_session_id = tab_config.chat_session_id.clone();
                 // Fixed before the terminal starts so the Codex
                 // notify hook can carry the session identity.
                 let restored_task_session_id = tab_config.task_id.as_ref().map(|_| {
@@ -20820,95 +20777,36 @@ impl App {
                         .clone()
                         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
                 });
-                if startup_command.is_some() {
-                    let conversation = tab_config.task_id.as_ref().and_then(|task_id| {
-                        let task = self.task_host.store().as_ref()?.get(task_id)?;
-                        let own_session = task.sessions.iter().find(|session| {
-                            Some(&session.task_session_id) == tab_config.task_session_id.as_ref()
-                        });
-                        own_session
-                            .and_then(|session| session.conversation.as_ref())
-                            .or_else(|| {
-                                // pi/codex conversations are linked to
-                                // synthetic session records by the
-                                // Chats sync; fall back to the task's
-                                // latest conversation of this tab's own
-                                // backend, so a Codex tab never
-                                // relaunches another session's Claude
-                                // resume.
-                                let own_backend = own_session.and_then(|session| match session
-                                    .harness
-                                    .as_ref()
-                                    .map(|harness| &harness.kind)
-                                {
-                                    Some(HarnessKind::TerminalPreset { preset_name }) => self
-                                        .agent_presets
-                                        .iter()
-                                        .find(|preset| &preset.name == preset_name)
-                                        .and_then(preset_conversation_backend),
-                                    Some(HarnessKind::NativeClaude) => {
-                                        Some(HarnessConversationBackend::Claude)
-                                    }
-                                    Some(HarnessKind::NativePi) => {
-                                        Some(HarnessConversationBackend::Pi)
-                                    }
-                                    None => None,
-                                })?;
-                                task.sessions.iter().rev().find_map(|session| {
-                                    session
-                                        .conversation
-                                        .as_ref()
-                                        .filter(|conversation| conversation.backend == own_backend)
-                                })
-                            })
-                    });
-                    if let Some(conversation) = conversation {
-                        let mut command = conversation_resume_command(conversation);
-                        if conversation.backend == HarnessConversationBackend::Codex {
-                            if let (Some(task_id), Some(task_session_id)) = (
-                                tab_config.task_id.as_ref(),
-                                restored_task_session_id.as_ref(),
-                            ) {
-                                command = self.codex_task_notify_command(
-                                    command,
-                                    task_id,
-                                    task_session_id,
-                                );
-                            }
+                // A task tab reopens its recorded conversation on launch
+                // (see gitterm_core::task_host::restored_startup).
+                let gitterm_core::task_host::RestoredStartup {
+                    startup_command,
+                    chat_session_id,
+                } = gitterm_core::task_host::restored_startup(
+                    tab_config.startup_command.clone(),
+                    tab_config.chat_session_id.clone(),
+                    tab_config
+                        .task_id
+                        .as_ref()
+                        .and_then(|task_id| self.task_host.store().as_ref()?.get(task_id)),
+                    tab_config.task_session_id.as_deref(),
+                    |preset_name| {
+                        self.agent_presets
+                            .iter()
+                            .find(|preset| preset.name == preset_name)
+                            .and_then(preset_conversation_backend)
+                    },
+                    chats::claude_session_exists,
+                    |command| match (
+                        tab_config.task_id.as_ref(),
+                        restored_task_session_id.as_ref(),
+                    ) {
+                        (Some(task_id), Some(task_session_id)) => {
+                            self.codex_task_notify_command(command, task_id, task_session_id)
                         }
-                        startup_command = Some(command);
-                        chat_session_id = Some(conversation.session_id.clone());
-                    } else if let Some(session_id) = startup_command
-                        .as_deref()
-                        .and_then(|command| command.strip_prefix("claude --resume "))
-                        .map(str::trim)
-                    {
-                        // A persisted resume against a Claude session
-                        // that never received a message (the transcript
-                        // is only written on first message) errors on
-                        // launch; start a fresh session instead.
-                        if !session_id.contains(char::is_whitespace)
-                            && !chats::claude_session_exists(session_id)
-                        {
-                            startup_command = Some("claude".to_string());
-                            chat_session_id = None;
-                        }
-                    } else if let Some((resume, session_id)) =
-                        startup_command.as_deref().and_then(|command| {
-                            resume_for_preassigned_claude_launch(
-                                command,
-                                chats::claude_session_exists,
-                            )
-                        })
-                    {
-                        // A plain `claude --session-id X` launch whose
-                        // session has since been written cannot be
-                        // re-run (the CLI refuses: "Session ID X is
-                        // already in use"); resume it instead.
-                        startup_command = Some(resume);
-                        chat_session_id = Some(session_id);
-                    }
-                }
+                        _ => command,
+                    },
+                );
                 match (
                     tab_config.tab_kind.as_deref(),
                     tab_config.agent_config.as_ref(),
@@ -51932,43 +51830,6 @@ mod tests {
             HarnessConversationBackend::Pi
         )));
         assert!(!backend_accepts_initial_prompt(None));
-    }
-
-    #[test]
-    fn preassigned_claude_launch_resumes_once_the_session_exists() {
-        let exists = |id: &str| id == "abc";
-        assert_eq!(
-            resume_for_preassigned_claude_launch("claude --session-id abc", exists),
-            Some(("claude --resume abc".to_string(), "abc".to_string()))
-        );
-        assert_eq!(
-            resume_for_preassigned_claude_launch("claude --model opus --session-id abc", exists),
-            Some((
-                "claude --model opus --resume abc".to_string(),
-                "abc".to_string()
-            ))
-        );
-        // The session never got a message: the fresh launch still works.
-        assert_eq!(
-            resume_for_preassigned_claude_launch("claude --session-id new", exists),
-            None
-        );
-        assert_eq!(
-            resume_for_preassigned_claude_launch("claude --resume abc", exists),
-            None
-        );
-        assert_eq!(
-            resume_for_preassigned_claude_launch("codex --session-id abc", exists),
-            None
-        );
-        // An embedded brief is quoted; leave it to the task restore path.
-        assert_eq!(
-            resume_for_preassigned_claude_launch(
-                "claude --session-id abc \"$(cat 'b.md')\"",
-                exists
-            ),
-            None
-        );
     }
 
     #[test]

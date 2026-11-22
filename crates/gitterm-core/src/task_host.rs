@@ -50,6 +50,7 @@ mod create;
 mod delivery;
 mod launch;
 mod live;
+mod restore;
 mod runner;
 pub use create::{
     assemble_task_create, canonical_task_workspace_directory, stopping_boundary_from_control,
@@ -67,6 +68,10 @@ pub use launch::{
 pub use live::{
     aggregate_task_live_states, task_session_signal, LinkedSession, TaskSessionLiveState,
     TaskSessionOutcome,
+};
+pub use restore::{
+    conversation_resume_command, restored_startup, resume_for_preassigned_claude_launch,
+    RestoredStartup,
 };
 pub use runner::RunnerCapacity;
 

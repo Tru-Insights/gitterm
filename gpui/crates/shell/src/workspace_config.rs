@@ -695,6 +695,8 @@ mod preview_terminal_restore_test {
             id: 777,
             cwd: dir.path().canonicalize().unwrap(),
             startup_command: None,
+            task_id: None,
+            task_session_id: None,
         }]);
         let state = gpui_component::dock::DockAreaState {
             version: Some(1),

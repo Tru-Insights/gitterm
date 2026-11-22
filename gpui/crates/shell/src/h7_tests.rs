@@ -376,6 +376,8 @@ fn saved_run_inventory_restores_plain_shells_once_before_panel_or_workspace_sele
                         id: id.0,
                         cwd: cwd.clone(),
                         startup_command: None,
+                        task_id: None,
+                        task_session_id: None,
                     });
                 state.panes.insert(pane_id, pane.clone());
                 state.dock.update(cx, |dock, cx| {
