@@ -1077,6 +1077,58 @@ fn reads_do_not_touch_disk_on_the_ui_thread(cx: &mut TestAppContext) {
     );
 }
 
+/// `plan_limits` and the task list's preset names are read on the
+/// background executor too: the arm answers nothing until it runs, and
+/// the answer is the synchronous functions' on the same files.
+#[gpui::test]
+fn plan_limits_and_preset_reads_leave_the_ui_thread(cx: &mut TestAppContext) {
+    use gitterm_core::task_mcp::TaskControlOperation as Op;
+    use std::task::Poll;
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    fixture.write_iced(vec![], vec![]);
+    let (owner, _sender) = fixture.start(cx);
+    let presets = crate::task_host::preset_names(&fixture.iced);
+    assert!(!presets.is_empty(), "the fixture has Iced presets");
+    let expected = [
+        (
+            "plan_limits",
+            Op::PlanLimits,
+            crate::task_host::plan_limits(&fixture.iced).unwrap(),
+        ),
+        (
+            "task_list",
+            Op::List(req(serde_json::json!({}))),
+            serde_json::json!({"tasks": [], "available_presets": presets}),
+        ),
+    ];
+    let (commands, mut receiver) = command_channel();
+    for (label, operation, expected) in expected {
+        let mut pending = commands.enqueue(operation, None).unwrap();
+        let envelope = receiver.try_recv().unwrap();
+        let effect = owner
+            .update(cx, |owner, _| {
+                owner.host().dispatch_with_caller(envelope, None, None)
+            })
+            .expect("a read effect");
+        let mut poll = || {
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            std::pin::Pin::new(&mut pending).poll(&mut context)
+        };
+        owner.update(cx, |owner, cx| owner.execute_effect(effect, label, cx));
+        assert!(poll().is_pending(), "{label} answered on the UI thread");
+        let mut answer = None;
+        wait_until(cx, |_| match poll() {
+            Poll::Ready(reply) => {
+                answer = Some(reply);
+                true
+            }
+            Poll::Pending => false,
+        });
+        assert_eq!(answer.unwrap().unwrap(), expected, "{label}");
+    }
+}
+
 #[gpui::test]
 fn html_render_requires_open_gpui_chat(cx: &mut TestAppContext) {
     use gitterm_core::task_mcp::TaskControlOperation as Op;

@@ -1350,3 +1350,6 @@ fn fixture_codex_run_gets_guidelines(cx: &mut TestAppContext) {
 
 #[path = "task_host_delegate_tests.rs"]
 mod delegate_tests;
+
+#[path = "task_host_launch_turn_tests.rs"]
+mod turn_tests;
