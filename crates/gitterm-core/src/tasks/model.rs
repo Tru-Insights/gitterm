@@ -76,6 +76,11 @@ pub struct TaskRecord {
 }
 
 impl TaskRecord {
+    /// A fresh task id: a hyphenated UUID, as Iced's create path makes.
+    pub fn fresh_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
     pub fn new_draft(input: NewTaskRecord, timestamp: impl Into<String>) -> Self {
         let timestamp = timestamp.into();
         Self {
