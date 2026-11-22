@@ -77,12 +77,16 @@ pub fn restored_startup(
         }
         restored.startup_command = Some(command);
         restored.chat_session_id = Some(conversation.session_id.clone());
-    } else if saved.starts_with("claude ") && saved.split_whitespace().any(|w| w == "--resume") {
+    } else if let Some(fresh) = fresh_claude_for_missing_resume(saved, &claude_session_exists) {
         // A persisted resume against a Claude session that never received a
         // message (the transcript is only written on first message) errors
-        // on launch; start a fresh session instead.
-        if let Some(fresh) = fresh_claude_for_missing_resume(saved, &claude_session_exists) {
-            restored.startup_command = Some(fresh);
+        // on launch; start a fresh session instead, options kept (issue 88).
+        restored.startup_command = Some(fresh);
+        restored.chat_session_id = None;
+    } else if let Some(session_id) = saved.strip_prefix("claude --resume ").map(str::trim) {
+        // Iced's original bare rule, for what the option form above leaves.
+        if !session_id.contains(char::is_whitespace) && !claude_session_exists(session_id) {
+            restored.startup_command = Some("claude".to_string());
             restored.chat_session_id = None;
         }
     } else if let Some((resume, session_id)) =
@@ -100,36 +104,50 @@ pub fn restored_startup(
 /// The fresh `claude` launch for a saved `claude … --resume <id>` whose
 /// transcript was never written (`session_exists` false): the command
 /// without `--resume <id>`, other options kept (a bare resume becomes plain
-/// `claude`, Iced's original rule). None leaves the command alone: the
-/// transcript exists, or the command is quoted (an embedded brief) or has
-/// no plain `--resume <id>`.
+/// `claude`, as Iced's original rule). Only a command made of plain option
+/// words and their values qualifies: no `--` terminator, no positional
+/// word, no quoting or shell syntax, and one `--resume` followed by a plain
+/// id. None leaves the command to Iced's earlier rules unchanged.
 fn fresh_claude_for_missing_resume(
     command: &str,
     session_exists: impl Fn(&str) -> bool,
 ) -> Option<String> {
-    // The bare form keeps Iced's original rule exactly.
-    if let Some(id) = command.strip_prefix("claude --resume ").map(str::trim) {
-        if !id.contains(char::is_whitespace) {
-            return (!session_exists(id)).then(|| "claude".to_string());
-        }
-    }
-    if command.contains(['"', '\'']) {
-        return None;
-    }
+    let plain = |word: &str| {
+        word.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '-' | '_' | '.' | '/' | '=' | ':' | ',' | '@' | '+' | '%')
+        })
+    };
     let words: Vec<&str> = command.split_whitespace().collect();
-    if words.first() != Some(&"claude") {
+    let (&"claude", args) = words.split_first()? else {
+        return None;
+    };
+    let option_form = args.iter().enumerate().all(|(i, word)| {
+        *word != "--"
+            && plain(word)
+            && (word.starts_with('-') || i > 0 && args[i - 1].starts_with('-'))
+    });
+    let mut resumes = args.iter().enumerate().filter(|(_, w)| **w == "--resume");
+    let (idx, _) = resumes.next()?;
+    if !option_form || resumes.next().is_some() {
         return None;
     }
-    let idx = words.iter().position(|w| *w == "--resume")?;
-    let id = words.get(idx + 1).filter(|id| !id.starts_with('-'))?;
+    let id = args.get(idx + 1).filter(|id| {
+        !id.starts_with('-')
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    })?;
     if session_exists(id) {
         return None;
     }
-    let kept: Vec<&str> = words
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != idx && *i != idx + 1)
-        .map(|(_, w)| *w)
+    let kept: Vec<&str> = std::iter::once("claude")
+        .chain(
+            args.iter()
+                .enumerate()
+                .filter(|(i, _)| *i != idx && *i != idx + 1)
+                .map(|(_, w)| *w),
+        )
         .collect();
     Some(kept.join(" "))
 }
@@ -385,6 +403,29 @@ mod tests {
             "claude --model opus --resume --effort high",
         ] {
             assert_eq!(restore(saved, None, None, &[]), restored(saved, None));
+        }
+    }
+
+    /// Only plain option words take the issue 88 rewrite: a `--`
+    /// terminator, shell syntax, a positional word or a second `--resume`
+    /// leaves the command exactly as Iced left it before.
+    #[test]
+    fn a_claude_resume_outside_the_option_form_is_left_as_saved() {
+        for saved in [
+            "claude --print -- --resume abc",
+            "claude --model opus --resume abc; echo done",
+            "claude --model opus --resume abc && echo done",
+            "claude --model opus --resume abc | tee log",
+            "claude --model $MODEL --resume abc",
+            "claude hello --resume abc",
+            "claude --resume abc --resume def",
+            "claude --model opus --resume ab$c",
+        ] {
+            assert_eq!(
+                restore(saved, None, None, &[]),
+                restored(saved, None),
+                "{saved}"
+            );
         }
     }
 
