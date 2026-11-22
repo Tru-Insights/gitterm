@@ -1232,6 +1232,8 @@ fn iced_footer_chip_order_and_host_roster_render_below_input(cx: &mut TestAppCon
     cx.simulate_resize(size(px(1200.), px(900.)));
     chat.update_in(cx, |view, _, cx| {
         view.set_preview(cx);
+        // A writable composer: a read-only one hides the idle activity row.
+        view.set_read_only(None, cx);
         view.set_roster(
             vec![roster::RosterEntry {
                 id: "worker-1".into(),
@@ -3585,4 +3587,188 @@ fn c05_slash_row_names_the_command_and_tooltips_its_description(cx: &mut TestApp
         chat.read_with(cx, |view, cx| view.composer.read(cx).value().to_string()),
         "/review "
     );
+}
+
+/// A review card whose findings carry long synthetic text: words, one long
+/// unbroken token and a deep path.
+fn long_findings_card() -> crate::delegation::DelegationCard {
+    let mut card = crate::delegation::tests::card("review", "completed");
+    let long = "the explanation keeps going so that it is much wider than any card ".repeat(6);
+    let token = "x".repeat(240);
+    let path = format!("src/{}/module.rs", "nested-directory-name".repeat(8));
+    card.delegation.result = Some(
+        serde_json::from_value(serde_json::json!({
+            "reviewed":{"head":"123456789abc","dirty":false,"target_description":"vs v6"},
+            "findings":{"verdict":"needs_changes","structured":true,"summary":"Two issues","reviewer":{"harness":"Codex"},
+                "findings":[
+                    {"id":"F1","severity":"P2","title":format!("A long finding title {long}"),"body":long,"file":path,"line_start":12,"line_end":14},
+                    {"id":"F2","severity":"P3","title":"Unbroken token","body":token}
+                ]}
+        }))
+        .unwrap(),
+    );
+    card.delegation.target.as_mut().unwrap().focus = Some(format!("focus {long}"));
+    card
+}
+fn right(bounds: gpui::Bounds<gpui::Pixels>) -> f32 {
+    f32::from(bounds.origin.x + bounds.size.width)
+}
+
+#[gpui::test]
+fn transcript_finding_rows_wrap_within_card(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    install_card(long_findings_card(), &chat, cx);
+    for width in [900., 600.] {
+        cx.simulate_resize(size(px(width), px(900.)));
+        draw(cx);
+        let card = cx.debug_bounds("delegation-card-0").expect("card drawn");
+        assert!(
+            right(card) <= width + 0.5,
+            "card {card:?} wider than {width}"
+        );
+        for selector in [
+            "delegation-fold-0",
+            "finding-main-0-F1",
+            "finding-main-0-F2",
+            "finding-location-0-F1",
+        ] {
+            let inner = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("missing {selector}"));
+            assert!(
+                right(inner) <= right(card) + 0.5,
+                "{selector} {inner:?} runs past card {card:?} at {width}"
+            );
+        }
+        // Wrapped, not clipped: the long text takes several lines.
+        let main = cx.debug_bounds("finding-main-0-F1").unwrap();
+        assert!(
+            main.size.height > px(80.),
+            "{main:?} did not wrap at {width}"
+        );
+        let token = cx.debug_bounds("finding-main-0-F2").unwrap();
+        assert!(
+            token.size.height > px(40.),
+            "{token:?} did not wrap at {width}"
+        );
+    }
+}
+
+#[gpui::test]
+fn composer_worker_rows_stay_inside_composer(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    chat.update_in(cx, |view, _, cx| {
+        view.set_roster(
+            vec![
+                roster::RosterEntry {
+                    id: "worker-1".into(),
+                    name: "Worker · Codex".into(),
+                    model: "default model".into(),
+                    checkout: format!(
+                        "/private/tmp/worktrees/601a3046-{}-default-task-base-fetched-origin-dev",
+                        "synthetic-worktree-name".repeat(6)
+                    ),
+                    activity: "Running Bash".into(),
+                    state: roster::WorkerState::Running,
+                    started_at_ms: crate::composer::now_ms().saturating_sub(5_000),
+                    ended_at_ms: None,
+                },
+                roster::RosterEntry {
+                    id: "worker-2".into(),
+                    name: "Review · Codex review".into(),
+                    model: "default model".into(),
+                    checkout: format!("/private/tmp/{}", "x".repeat(200)),
+                    activity: String::new(),
+                    state: roster::WorkerState::Done,
+                    started_at_ms: 0,
+                    ended_at_ms: Some(60_000),
+                },
+            ],
+            cx,
+        );
+    });
+    for width in [900., 600.] {
+        cx.simulate_resize(size(px(width), px(900.)));
+        draw(cx);
+        let footer = cx.debug_bounds("chat-footer").expect("footer drawn");
+        for id in ["worker-1", "worker-2"] {
+            for part in ["roster", "roster-what", "roster-meta", "roster-dismiss"] {
+                let selector: &'static str = Box::leak(format!("{part}-{id}").into_boxed_str());
+                let inner = cx
+                    .debug_bounds(selector)
+                    .unwrap_or_else(|| panic!("missing {selector}"));
+                assert!(
+                    right(inner) <= right(footer) + 0.5,
+                    "{selector} {inner:?} runs past the composer {footer:?} at {width}"
+                );
+            }
+        }
+    }
+}
+
+/// The reason `ChatPane::history` gives an imported Iced chat.
+const IMPORTED_REASON: &str = "Preview history · read only · resume not in preview yet";
+
+#[gpui::test]
+fn imported_chat_composer_shows_read_only(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    let intents = Rc::new(std::cell::Cell::new(0));
+    let captured = intents.clone();
+    chat.update_in(cx, |view, window, cx| {
+        view.set_intent_callback(
+            Rc::new(move |_, _| {
+                captured.set(captured.get() + 1);
+                Receipt::rejected("synthetic")
+            }),
+            cx,
+        );
+        view.set_read_only(Some(IMPORTED_REASON.into()), cx);
+        view.composer
+            .update(cx, |input, cx| input.focus(window, cx));
+    });
+    draw(cx);
+    cx.simulate_input("typed into a read-only chat");
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        let input = view.composer.read(cx).presentation();
+        assert!(input.is_disabled());
+        assert_eq!(input.placeholder().as_ref(), "Read-only chat");
+        assert_eq!(view.composer.read(cx).value().as_ref(), "");
+    });
+    assert!(
+        cx.debug_bounds("chat-read-only-note").is_some(),
+        "Iced's read-only note shows the reason"
+    );
+    assert!(
+        cx.debug_bounds("chat-activity").is_none(),
+        "no `Ready` for a chat that cannot run"
+    );
+    click(cx, "composer-send");
+    click(cx, "composer-stop");
+    assert_eq!(intents.get(), 0, "Send and Stop are disabled");
+}
+
+#[gpui::test]
+fn native_chat_composer_unchanged(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    chat.update_in(cx, |view, _, cx| {
+        view.set_intent_callback(Rc::new(|_, _| Receipt::rejected("synthetic")), cx);
+        view.set_read_only(Some(IMPORTED_REASON.into()), cx);
+    });
+    draw(cx);
+    // A chat that becomes writable gets its composer back.
+    chat.update_in(cx, |view, _, cx| view.set_read_only(None, cx));
+    draw(cx);
+    chat.read_with(cx, |view, cx| {
+        let input = view.composer.read(cx).presentation();
+        assert!(!input.is_disabled());
+        assert_eq!(
+            input.placeholder().as_ref(),
+            "Message… (Enter to send, Shift+Enter for newline)"
+        );
+    });
+    assert!(cx.debug_bounds("chat-read-only-note").is_none());
+    assert!(cx.debug_bounds("chat-activity").is_some());
+    assert!(cx.debug_bounds("composer-send").is_some());
+    assert!(cx.debug_bounds("composer-stop").is_some());
 }

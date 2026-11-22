@@ -329,9 +329,15 @@ impl RowView {
             .selected_findings
             .get_or_insert_with(|| findings.iter().map(|f| f.id.clone()).collect())
             .clone();
+        let [head, target, state] = card.fold_parts(self.open, crate::composer::now_ms());
+        // Iced lays each flex child out with `min-width: 0`: a long line
+        // wraps (findings) or shortens with an ellipsis (summary, location)
+        // instead of widening the card past the transcript.
         div()
+            .debug_selector(move || format!("delegation-card-{id}"))
             .flex()
             .flex_col()
+            .min_w_0()
             .p(px(10.))
             .gap(px(6.))
             .child(
@@ -339,10 +345,15 @@ impl RowView {
                     .ghost()
                     .h_auto()
                     .w_full()
+                    .min_w_0()
+                    .overflow_hidden()
                     .justify_start()
+                    .gap(px(8.))
                     .debug_selector(move || format!("delegation-fold-{id}"))
                     .tooltip(card.header())
-                    .label(card.fold_label(self.open, crate::composer::now_ms()))
+                    .child(div().min_w_0().text_ellipsis().child(head))
+                    .child(div().flex_1().min_w_0().text_ellipsis().child(target))
+                    .child(div().flex_shrink_0().child(state))
                     .on_click(cx.listener(Self::toggle)),
             )
             .when(self.open, |view| {
@@ -353,6 +364,7 @@ impl RowView {
                         let open = self.action.clone();
                         div()
                             .flex()
+                            .min_w_0()
                             .gap(px(8.))
                             .items_start()
                             .when(
@@ -392,10 +404,15 @@ impl RowView {
                             )
                             .child(
                                 div()
+                                    .debug_selector({
+                                        let fid = finding.id.clone();
+                                        move || format!("finding-main-{id}-{fid}")
+                                    })
                                     .flex()
                                     .flex_col()
                                     .gap(px(3.))
                                     .flex_1()
+                                    .min_w_0()
                                     .child(format!(
                                         "{:?} {} {}",
                                         finding.severity, finding.id, finding.title
@@ -407,7 +424,10 @@ impl RowView {
                                         )))
                                         .ghost()
                                         .small()
-                                        .label(location)
+                                        .max_w_full()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .child(div().min_w_0().text_ellipsis().child(location))
                                         .debug_selector({
                                             let fid = finding.id.clone();
                                             move || format!("finding-location-{id}-{fid}")

@@ -216,7 +216,7 @@ impl ChatView {
             TextareaState::new(window, cx)
                 .auto_grow(2, 8)
                 .submit_on_enter(true)
-                .placeholder("Message… (Enter to send, Shift+Enter for newline)")
+                .placeholder(COMPOSER_PLACEHOLDER)
         });
         subscriptions.push(
             cx.subscribe_in(&composer, window, |this, _, event, window, cx| {
@@ -1483,9 +1483,23 @@ impl Focusable for ChatView {
         self.focus.clone()
     }
 }
+/// Iced's prompt placeholders: a writable chat, then `readOnlyReason` set.
+const COMPOSER_PLACEHOLDER: &str = "Message… (Enter to send, Shift+Enter for newline)";
+const READ_ONLY_PLACEHOLDER: &str = "Read-only chat";
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.appearance.palette();
+        // `set_read_only` has no window; the placeholder follows it here.
+        let placeholder = if self.read_only_reason.is_some() {
+            READ_ONLY_PLACEHOLDER
+        } else {
+            COMPOSER_PLACEHOLDER
+        };
+        if self.composer.read(cx).presentation().placeholder().as_ref() != placeholder {
+            self.composer.update(cx, |input, cx| {
+                input.set_placeholder(placeholder, window, cx)
+            });
+        }
         let send_blocked = self.send_blocked(window, cx);
         let copy_owner = cx.entity().downgrade();
         let composer_focused = self.composer.read(cx).focus_handle(cx).is_focused(window);
@@ -1680,8 +1694,22 @@ impl Render for ChatView {
                     .border_color(rgb(palette.border))
                     .rounded(px(10.))
                     .child(self.render_imported_offer(cx))
-                    .child(self.composer_state.render_activity(self.appearance))
+                    // Iced shows no activity until a turn runs, and a
+                    // read-only chat never runs one: no `Ready` there.
+                    .children(
+                        (self.read_only_reason.is_none() || self.composer_state.status != "Ready")
+                            .then(|| self.composer_state.render_activity(self.appearance)),
+                    )
                     .child(self.pending_panel(window, cx))
+                    // Iced's `#read-only-note`, above the composer.
+                    .children(self.read_only_reason.clone().map(|reason| {
+                        div()
+                            .id("chat-read-only-note")
+                            .debug_selector(|| "chat-read-only-note".into())
+                            .text_size(px(self.appearance.size(12.)))
+                            .text_color(rgb(palette.muted))
+                            .child(reason)
+                    }))
                     .children(
                         self.submission
                             .iter()

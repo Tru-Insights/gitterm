@@ -671,7 +671,7 @@ mod ui {
     use crate::view::ChatView;
     use gpui::{
         Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement,
-        StatefulInteractiveElement, Styled, div, px, rgb,
+        StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px, rgb,
     };
     use gpui_component::{
         Disableable,
@@ -777,10 +777,14 @@ mod ui {
                     .child({ let send = Button::new("send").debug_selector(|| "composer-send".into())
                         .child(div().text_size(px(appearance.size(13.))).child("Send")).px(px(14.)).py(px(5.)).h_auto().bg(rgb(palette.accent)).text_color(rgb(palette.base))
                         .disabled(send_blocked)
+                        // The instance `bg` outlives the disabled style, so a
+                        // read-only chat dims Send and Stop as Iced's `button:disabled` does.
+                        .when(disabled, |send| send.opacity(0.4))
                         .on_click(cx.listener(|view, _, window, cx| view.send(window, cx)));
                         match self.send_tooltip(disabled || self.pending_request) { Some(tip) => send.tooltip(tip), None => send } })
-                    .child(Button::new("stop").child(div().text_size(px(appearance.size(13.))).child("Stop")).px(px(14.)).py(px(5.)).h_auto().bg(rgb(palette.err)).text_color(rgb(palette.base))
+                    .child(Button::new("stop").debug_selector(|| "composer-stop".into()).child(div().text_size(px(appearance.size(13.))).child("Stop")).px(px(14.)).py(px(5.)).h_auto().bg(rgb(palette.err)).text_color(rgb(palette.base))
                         .disabled(disabled || !self.streaming)
+                        .when(disabled, |stop| stop.opacity(0.4))
                         .on_click(cx.listener(|view, _, _, cx| view.stop(cx)))))
                 .child(div().id("composer-chips").relative().flex().flex_wrap().gap(px(4.))
                     .font_family("Menlo").text_size(px(appearance.size(12.))).text_color(rgb(palette.muted))
