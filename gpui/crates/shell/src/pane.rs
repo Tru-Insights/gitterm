@@ -221,6 +221,12 @@ impl Pane {
         };
         target.task_id.is_some().then_some(target)
     }
+    /// An adopted terminal's child exited: as the exit callback of a pane's
+    /// own terminal marks it.
+    pub(crate) fn mark_exited(&mut self) {
+        self.exited = true;
+        self.exit_pending = true;
+    }
     pub(crate) fn terminal_alive(&self) -> bool {
         matches!(self.content, PaneContent::Terminal(_)) && !self.exited
     }

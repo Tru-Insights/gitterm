@@ -49,6 +49,7 @@ use tokio_stream::Stream;
 mod create;
 mod delivery;
 mod launch;
+mod live;
 mod runner;
 pub use create::{
     assemble_task_create, canonical_task_workspace_directory, stopping_boundary_from_control,
@@ -62,6 +63,10 @@ pub use launch::{
     cancel_queued_worker_launch, launch_provider, update_queued_task_request, AwaitingWorker,
     LaunchAdmission, LaunchPolicy, LaunchRequest, LaunchTicket, LaunchedSession, Promotion,
     QueuedTaskLaunch,
+};
+pub use live::{
+    aggregate_task_live_states, task_session_signal, LinkedSession, TaskSessionLiveState,
+    TaskSessionOutcome,
 };
 pub use runner::RunnerCapacity;
 

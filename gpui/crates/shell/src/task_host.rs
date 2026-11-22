@@ -86,9 +86,9 @@ mod runs;
 pub(crate) use delivery::forward_turn_ends;
 #[cfg(test)]
 pub(crate) use delivery::{DELIVERY_POLL, SubmitHook};
-pub(crate) use launch::TerminalLaunched;
 #[cfg(test)]
 pub(crate) use launch::with_preassigned_session_id as launch_session_id;
+pub(crate) use launch::{TerminalExited, TerminalLaunched};
 
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HOST_LOCK: &str = ".task-host.lock";
@@ -354,7 +354,8 @@ pub(crate) struct TaskHostOwner {
     pub(crate) submit_hook: Option<SubmitHook>,
     _pump: Task<()>,
     _reseed: Task<()>,
-    /// Fixture mode's delivery tick; none in plain preview.
+    /// Fixture mode's delivery and queue-promotion tick; none in plain
+    /// preview.
     _deliver: Option<Task<()>>,
     _quit: Subscription,
 }
@@ -490,8 +491,12 @@ impl TaskHostOwner {
                         cx.background_executor()
                             .timer(delivery::DELIVERY_POLL)
                             .await;
+                        // Iced's Tick also starts queued launches.
                         if owner
-                            .update(cx, |owner, cx| owner.deliver_results(cx))
+                            .update(cx, |owner, cx| {
+                                owner.deliver_results(cx);
+                                owner.promote_queued_tasks(cx);
+                            })
                             .is_err()
                         {
                             break;
@@ -757,8 +762,9 @@ impl TaskHostOwner {
 
     /// Iced's `update_handoff_requested`, on the preview's store: the core
     /// reducer and `record_handoff`, so done/blocked for an open worker
-    /// delegation is accepted only from the pane hosting its task session,
-    /// then the task's lifecycle mirrors it. Iced's tab, attention, parent
+    /// delegation is accepted only from the pane (a chat or a launched
+    /// terminal) hosting its task session, then the task's lifecycle
+    /// mirrors it. Iced's tab, attention, parent
     /// and PR-lookup steps are UI and are not run; the report reaches the
     /// parent chat through the delivery tick ([`delivery`]), as in Iced.
     fn update_handoff(
@@ -770,8 +776,14 @@ impl TaskHostOwner {
     ) -> Result<serde_json::Value, String> {
         self.authorize_write(label, &self.task_worktree(&request.task_id))?;
         let chats = open_chats(cx);
+        // A launched terminal's report is its task session's, as Iced's
+        // facts list a task tab.
         let facts = TaskMutationFacts {
-            sessions: chats.iter().map(OpenChat::session_state).collect(),
+            sessions: chats
+                .iter()
+                .map(OpenChat::session_state)
+                .chain(self.terminal_session_states())
+                .collect(),
             ..Default::default()
         };
         let timestamp = chrono::Utc::now().to_rfc3339();

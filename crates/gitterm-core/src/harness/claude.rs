@@ -304,6 +304,28 @@ pub fn chrome_flag(chrome: bool) -> &'static str {
     }
 }
 
+/// A terminal startup command with the Claude in Chrome option added right
+/// after the executable when it starts `claude` (TRU-181). A command that
+/// already passes `--chrome` or `--no-chrome` keeps that choice; any other
+/// command is returned unchanged.
+pub fn configure_terminal_chrome(command: &str, chrome: bool) -> String {
+    let trimmed = command.trim();
+    let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    let (executable, rest) = trimmed.split_at(end);
+    let name = executable
+        .trim_matches(['\'', '"'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(executable);
+    let chosen = rest
+        .split_whitespace()
+        .any(|word| word == "--chrome" || word == "--no-chrome");
+    if name != "claude" || chosen {
+        return command.to_string();
+    }
+    format!("{executable} {}{rest}", chrome_flag(chrome))
+}
+
 struct RemoteGuidelinesFile(PathBuf);
 
 impl RemoteGuidelinesFile {
@@ -1131,6 +1153,21 @@ async fn answer_unhandled_control(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_chrome_option_follows_the_switch() {
+        assert_eq!(configure_terminal_chrome("claude", true), "claude --chrome");
+        assert_eq!(
+            configure_terminal_chrome("/usr/local/bin/claude --model m", false),
+            "/usr/local/bin/claude --no-chrome --model m"
+        );
+        // An explicit choice is kept; another harness is untouched.
+        assert_eq!(
+            configure_terminal_chrome("claude --no-chrome", true),
+            "claude --no-chrome"
+        );
+        assert_eq!(configure_terminal_chrome("codex", true), "codex");
+    }
+
     use super::*;
     #[test]
     fn remote_guidelines_use_a_temporary_prompt_file() {
