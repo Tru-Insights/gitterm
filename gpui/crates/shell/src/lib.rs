@@ -153,6 +153,8 @@ pub struct Shell {
     resize: Option<(bool, f32, f32)>,
     task_switcher: Option<Entity<task_switcher::TaskSwitcher>>,
     task_panel: Option<Entity<task_panel::TaskPanel>>,
+    /// Iced's configured agent presets, read once with the host settings.
+    agent_presets: Vec<gitterm_core::settings::AgentPreset>,
     /// Background actions the modal guard refused, for the guard's tests.
     #[cfg(test)]
     blocked_actions: Vec<&'static str>,
@@ -424,6 +426,7 @@ impl Shell {
             resize: None,
             task_switcher: None,
             task_panel: None,
+            agent_presets: settings.agent_presets.clone(),
             #[cfg(test)]
             blocked_actions: vec![],
             task_switcher_subscription: None,
@@ -5236,7 +5239,7 @@ fn roster_entries(
                         live = true;
                         WorkerState::Waiting
                     }
-                    "blocked" => WorkerState::Waiting,
+                    "blocked" => WorkerState::Blocked,
                     "done" => WorkerState::Done,
                     _ => WorkerState::Failed,
                 }
@@ -5251,7 +5254,7 @@ fn roster_entries(
                         WorkerState::Running
                     }
                     DelegationStatus::Completed => WorkerState::Done,
-                    DelegationStatus::Blocked => WorkerState::Waiting,
+                    DelegationStatus::Blocked => WorkerState::Blocked,
                     _ => WorkerState::Failed,
                 }
             };
@@ -5292,7 +5295,7 @@ fn roster_entries(
     rows.sort_by_key(|row| std::cmp::Reverse(row.ended_at_ms.is_none()));
     let mut finished = 0;
     rows.retain(|row| {
-        if row.ended_at_ms.is_some() && row.state != WorkerState::Waiting {
+        if row.ended_at_ms.is_some() && row.state != WorkerState::Blocked {
             finished += 1;
             finished <= 10
         } else {

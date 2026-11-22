@@ -6,6 +6,8 @@ pub enum WorkerState {
     Queued,
     Running,
     Waiting,
+    /// Iced's `blocked`: reported it cannot go on; not live, so it can be hidden.
+    Blocked,
     Done,
     Failed,
 }
@@ -139,6 +141,7 @@ pub(crate) fn render(
                 .children(rows.into_iter().map(|row| {
                     let id = row.id.clone();
                     let dismiss_id = row.id.clone();
+                    let show_dismiss = shows_dismiss(row.state);
                     let selector = format!("roster-{}", row.id);
                     div()
                         .id(gpui::SharedString::from(selector.clone()))
@@ -169,7 +172,7 @@ pub(crate) fn render(
                                 .bg(rgb(match row.state {
                                     WorkerState::Running => palette.accent,
                                     WorkerState::Queued => palette.muted,
-                                    WorkerState::Waiting => palette.warn,
+                                    WorkerState::Waiting | WorkerState::Blocked => palette.warn,
                                     WorkerState::Done => palette.result,
                                     WorkerState::Failed => palette.err,
                                 })),
@@ -203,7 +206,7 @@ pub(crate) fn render(
                                 .flex_shrink_0()
                                 .child(row.elapsed),
                         )
-                        .child(
+                        .children(show_dismiss.then(|| {
                             Button::new(gpui::SharedString::from(format!(
                                 "roster-dismiss-{}",
                                 row.id
@@ -227,15 +230,34 @@ pub(crate) fn render(
                                         cx,
                                     );
                                 },
-                            )),
-                        )
+                            ))
+                        }))
                 }))
         }))
+}
+
+/// Iced hides the `×` on live rows and shows it on finished ones
+/// (assets/agent_chat.html `v.x.style.display = row.live ? 'none' : ''`).
+pub fn shows_dismiss(state: WorkerState) -> bool {
+    !state.is_live()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dismiss_shown_only_on_finished_rows() {
+        for live in [
+            WorkerState::Queued,
+            WorkerState::Running,
+            WorkerState::Waiting,
+        ] {
+            assert!(!shows_dismiss(live), "{live:?}");
+        }
+        for done in [WorkerState::Blocked, WorkerState::Done, WorkerState::Failed] {
+            assert!(shows_dismiss(done), "{done:?}");
+        }
+    }
     #[test]
     fn roster_matches_iced_backend_model_worktree_and_elapsed() {
         let worker = |id: &str, state, started_at_ms, ended_at_ms| RosterEntry {
@@ -266,7 +288,7 @@ mod tests {
         assert!(super::rows(&[], 0).is_empty());
         assert_eq!(elapsed(0), "0.0s");
         let row = super::rows(
-            &[worker("saved", WorkerState::Waiting, 0, Some(1_014_000))],
+            &[worker("saved", WorkerState::Blocked, 0, Some(1_014_000))],
             2_000_000,
         )
         .remove(0);
@@ -291,7 +313,7 @@ mod tests {
         let iced_order = vec![
             worker("live", WorkerState::Running, 3_000, None),
             worker("finished", WorkerState::Done, 4_000, Some(5_000)),
-            worker("waiting-ended", WorkerState::Waiting, 2_000, Some(6_000)),
+            worker("waiting-ended", WorkerState::Blocked, 2_000, Some(6_000)),
         ];
 
         let rows = rows(&iced_order, 10_000);
