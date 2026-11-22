@@ -35,8 +35,7 @@ pub(crate) const BRIEFS: &str = "task-briefs";
 /// Variables the PTY launcher sets itself when the overlay does not.
 /// The terminal's own variables (gitterm_terminal's `BackendSettings`
 /// defaults), added on top of the fixture env.
-pub(crate) const TERMINAL_SET: [(&str, &str); 2] =
-    [("TERM", "xterm-256color"), ("COLORTERM", "truecolor")];
+const TERMINAL_SET: [(&str, &str); 2] = [("TERM", "xterm-256color"), ("COLORTERM", "truecolor")];
 
 const LAUNCHER_SET: [&str; 7] = [
     "LANG",

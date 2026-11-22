@@ -504,7 +504,7 @@ fn launched_terminal_env_has_only_the_fixture_env(cx: &mut TestAppContext) {
     }
     expected.retain(|name, _| !name.starts_with("DYLD_"));
     // The terminal's own TERM/COLORTERM, whatever the parent has.
-    for (name, value) in crate::task_host_launch::TERMINAL_SET {
+    for (name, value) in [("TERM", "xterm-256color"), ("COLORTERM", "truecolor")] {
         expected.insert(name.into(), value.into());
     }
     // Nothing else the launcher or the PTY adds survives. Only names are
