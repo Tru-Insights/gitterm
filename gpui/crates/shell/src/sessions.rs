@@ -128,16 +128,16 @@ impl crate::Shell {
 }
 
 impl crate::Shell {
-    fn picker_inputs(
+    pub(crate) fn picker_inputs(
         &self,
         task: Option<crate::session_picker::TaskContext>,
     ) -> crate::session_picker::PickerInputs {
         crate::session_picker::PickerInputs {
             chat: gitterm_core::settings::ChatDefaults::default().new_chat_selection(),
             local_workspace: self.local,
-            // TODO(TRU-274 P-src): project the settings/ACP catalogs here.
+            // TODO(TRU-274 P-src): project the ACP catalog here.
             acp_chats: vec![],
-            presets: vec![],
+            presets: self.agent_presets.clone(),
             task,
         }
     }

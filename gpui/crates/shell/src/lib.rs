@@ -153,6 +153,8 @@ pub struct Shell {
     resize: Option<(bool, f32, f32)>,
     task_switcher: Option<Entity<task_switcher::TaskSwitcher>>,
     task_panel: Option<Entity<task_panel::TaskPanel>>,
+    /// Iced's configured agent presets, read once with the host settings.
+    agent_presets: Vec<gitterm_core::settings::AgentPreset>,
     /// Background actions the modal guard refused, for the guard's tests.
     #[cfg(test)]
     blocked_actions: Vec<&'static str>,
@@ -424,6 +426,7 @@ impl Shell {
             resize: None,
             task_switcher: None,
             task_panel: None,
+            agent_presets: settings.agent_presets.clone(),
             #[cfg(test)]
             blocked_actions: vec![],
             task_switcher_subscription: None,

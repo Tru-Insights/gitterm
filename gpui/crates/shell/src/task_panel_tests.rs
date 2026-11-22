@@ -120,6 +120,8 @@ fn inputs(open: &[&str]) -> Inputs {
         compact: false,
         open_sessions: open.iter().map(|id| target(id)).collect(),
         titles: Default::default(),
+        presets: vec![],
+        open_chats: vec![],
     }
 }
 
@@ -1288,4 +1290,299 @@ fn overview_copies_handoff_prompt(cx: &mut TestAppContext) {
     );
     // Iced's `handoff copied` line under CONTINUE TASK.
     assert!(visible("session-picker-handoff-copied", cx));
+}
+
+fn preset(name: &str, command: &str) -> gitterm_core::settings::AgentPreset {
+    gitterm_core::settings::AgentPreset {
+        name: name.into(),
+        command: command.into(),
+        resume_command: None,
+        icon: String::new(),
+        color: gitterm_core::settings::WorkspaceColor::Blue,
+    }
+}
+
+fn conversation_session(id: &str, backend: &str, chat: &str, created: &str) -> serde_json::Value {
+    serde_json::json!({
+        "task_session_id": id,
+        "label": format!("{backend} worker"),
+        "conversation": {"backend": backend, "session_id": chat},
+        "objective_delivery": "unknown",
+        "created_at": created,
+        "updated_at": created,
+    })
+}
+
+/// A task with an open, a finished, a plain and (no worktree) a kept
+/// conversation, per Iced's CONVERSATION HISTORY.
+fn history_task(id: &str, worktree: Option<PathBuf>) -> TaskRecord {
+    let mut task = task(id, TaskLifecycle::Stopped);
+    task.sessions = ["open", "final", "plain"]
+        .iter()
+        .zip(["codex", "claude", "pi"])
+        .map(|(name, backend)| {
+            serde_json::from_value(conversation_session(
+                &format!("worker-{name}"),
+                backend,
+                &format!("chat-{name}"),
+                &task.created_at,
+            ))
+            .unwrap()
+        })
+        .collect();
+    match worktree {
+        Some(path) => with_worktree(task, path),
+        None => task,
+    }
+}
+
+fn open_chat(chat: &str, task_id: &str, session: &str) -> OpenChat {
+    OpenChat {
+        chat_id: chat.into(),
+        target: Target {
+            tab_id: 9,
+            session_uid: format!("uid-{chat}"),
+            task_id: Some(task_id.into()),
+            task_session_id: Some(session.into()),
+        },
+    }
+}
+
+fn finished_worker(task_id: &str, session: &str) -> serde_json::Value {
+    serde_json::json!({
+        "delegation_id": "delegation-1", "kind": "implement",
+        "parent": {"session_uid": "parent", "workspace": "Fixture", "cwd": DIR},
+        "child": {"runner": "task_session", "task_id": task_id, "task_session_id": session},
+        "brief": "work", "status": {"state": "failed", "message": "worker ended"},
+        "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+    })
+}
+
+fn history_labels(
+    task_id: &str,
+    inputs: &Inputs,
+    cx: &mut VisualTestContext,
+) -> Vec<(String, String, String, &'static str)> {
+    cx.read(|cx| {
+        let host = host(cx).unwrap();
+        let store = host.store().as_ref().unwrap();
+        history(store.get(task_id).unwrap(), store, inputs)
+            .into_iter()
+            .map(|row| (row.badge, row.title, row.short_id, row.state.label()))
+            .collect()
+    })
+}
+
+/// T03b: the history rows read the task record: Iced's labels, order and
+/// per-row state. `Open` focuses the tab; `Resume`/`Reopen` are launches.
+#[gpui::test]
+fn conversation_history_matches_iced(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let ready = fixture.worktree("ready");
+    let mut tasks = vec![
+        history_task("hist", Some(ready.clone())),
+        history_task("kept", None),
+        with_worktree(task("empty", TaskLifecycle::Stopped), ready),
+    ];
+    let mut document = TaskStoreDocument {
+        tasks: vec![],
+        ..Default::default()
+    };
+    document
+        .delegations
+        .push(serde_json::from_value(finished_worker("hist", "worker-final")).unwrap());
+    document.tasks.append(&mut tasks);
+    std::fs::write(fixture.source(), serde_json::to_vec(&document).unwrap()).unwrap();
+    fixture.start(cx);
+    let mut open = inputs(&[]);
+    open.presets = vec![preset("Claude", "claude")];
+    open.open_chats = vec![open_chat("chat-open", "hist", "worker-open")];
+    let (panel, shared, cx, outcomes) = surfaces(cx, open.clone());
+    shared.borrow_mut().selected = Some("hist".into());
+    draw(cx);
+
+    assert_eq!(
+        history_labels("hist", &open, cx),
+        [
+            (
+                "⌁".into(),
+                "Codex · codex worker".into(),
+                "chat-ope".into(),
+                "Open"
+            ),
+            // The Claude preset has no icon: its first letter.
+            (
+                "C".into(),
+                "Claude · claude worker".into(),
+                "chat-fin".into(),
+                "Reopen"
+            ),
+            (
+                "π".into(),
+                "Pi · pi worker".into(),
+                "chat-pla".into(),
+                "Resume"
+            ),
+        ]
+    );
+    let none = inputs(&[]);
+    assert_eq!(
+        history_labels("kept", &none, cx)
+            .into_iter()
+            .map(|row| row.3)
+            .collect::<Vec<_>>(),
+        ["Transcript kept"; 3]
+    );
+
+    click("task-history-row-0", cx);
+    assert_eq!(
+        outcomes.borrow().as_slice(),
+        [TaskPanelOutcome::FocusConversation("uid-chat-open".into())]
+    );
+    assert!(notice(&panel, cx).is_none());
+    let launch = Some("Launch session · not available in preview");
+    for row in [1, 2] {
+        panel.update(cx, |panel, cx| {
+            panel.notice = None;
+            cx.notify()
+        });
+        click(&format!("task-history-row-{row}"), cx);
+        assert_eq!(notice(&panel, cx).as_deref(), launch, "row {row}");
+    }
+
+    // No worktree: the row is inert, as Iced's disabled button.
+    shared.borrow_mut().selected = Some("kept".into());
+    panel.update(cx, |panel, cx| {
+        panel.notice = None;
+        cx.notify()
+    });
+    outcomes.borrow_mut().clear();
+    click("task-history-row-1", cx);
+    assert!(notice(&panel, cx).is_none() && outcomes.borrow().is_empty());
+
+    // No conversations: Iced's empty state, no rows.
+    shared.borrow_mut().selected = Some("empty".into());
+    assert!(!visible("task-history-row-0", cx));
+    assert!(visible("task-history", cx));
+}
+
+/// T03a: `▸ Resume` focuses the tab of the recorded conversation when it
+/// is open, as Iced's `resume_task_conversation`, and launches otherwise.
+#[gpui::test]
+fn resume_finds_the_open_conversation_tab(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let ready = fixture.worktree("ready");
+    let mut document = TaskStoreDocument {
+        tasks: vec![history_task("hist", Some(ready))],
+        ..Default::default()
+    };
+    document
+        .delegations
+        .push(serde_json::from_value(finished_worker("hist", "worker-plain")).unwrap());
+    std::fs::write(fixture.source(), serde_json::to_vec(&document).unwrap()).unwrap();
+    fixture.start(cx);
+    // The latest conversation is `chat-plain`.
+    let mut open = inputs(&[]);
+    let (panel, shared, cx, outcomes) = surfaces(cx, open.clone());
+    shared.borrow_mut().selected = Some("hist".into());
+    click("task-resume", cx);
+    assert_eq!(
+        notice(&panel, cx).as_deref(),
+        Some("Launch session · not available in preview")
+    );
+    assert!(!focused(&outcomes));
+
+    // Another conversation open does not count; the latest one does.
+    open.open_chats = vec![open_chat("chat-open", "hist", "worker-open")];
+    *shared.borrow_mut() = Inputs {
+        selected: Some("hist".into()),
+        ..open.clone()
+    };
+    panel.update(cx, |panel, cx| {
+        panel.notice = None;
+        cx.notify()
+    });
+    click("task-resume", cx);
+    assert!(!focused(&outcomes));
+
+    // The latest conversation is open, but its worker finished: Iced refuses.
+    open.open_chats = vec![open_chat("chat-plain", "hist", "worker-plain")];
+    *shared.borrow_mut() = Inputs {
+        selected: Some("hist".into()),
+        ..open.clone()
+    };
+    panel.update(cx, |panel, cx| {
+        panel.notice = None;
+        cx.notify()
+    });
+    click("task-resume", cx);
+    assert_eq!(
+        notice(&panel, cx).as_deref(),
+        Some("This finished worker is closing. Reopen its conversation after its tab closes.")
+    );
+    assert!(!focused(&outcomes));
+
+    // An open, live tab is focused; nothing launches.
+    open.open_chats = vec![open_chat("chat-plain", "hist", "worker-live")];
+    *shared.borrow_mut() = Inputs {
+        selected: Some("hist".into()),
+        ..open
+    };
+    panel.update(cx, |panel, cx| {
+        panel.notice = None;
+        cx.notify()
+    });
+    outcomes.borrow_mut().clear();
+    click("task-resume", cx);
+    assert!(notice(&panel, cx).is_none());
+    assert_eq!(
+        outcomes.borrow().as_slice(),
+        [TaskPanelOutcome::FocusConversation("uid-chat-plain".into())]
+    );
+}
+
+fn focused(outcomes: &Outcomes) -> bool {
+    outcomes
+        .borrow()
+        .iter()
+        .any(|outcome| matches!(outcome, TaskPanelOutcome::FocusConversation(_)))
+}
+
+/// T03: the first verb names Iced's first agent preset and the task picker
+/// lists the presets, then Terminal.
+#[gpui::test]
+fn start_names_the_first_preset_and_the_picker_lists_presets(cx: &mut TestAppContext) {
+    assert_eq!(start_label(false, "agent"), "▸ Start with agent ▾");
+    assert_eq!(start_label(true, "Claude"), "+ Continue ▾");
+    let (_fixture, _root, shell, _panel, cx) = shell_with_tasks(cx, |work| {
+        vec![with_worktree(
+            in_dir(task("ready", TaskLifecycle::Ready), work),
+            work.to_owned(),
+        )]
+    });
+    shell.update(cx, |shell, _| {
+        shell.agent_presets = vec![preset("Fixture Agent", "fixture-agent"), preset("Pi", "pi")]
+    });
+    let inputs = cx.read(|cx| shell.read(cx).task_inputs(cx));
+    assert_eq!(
+        start_label(false, inputs.default_agent()),
+        "▸ Start with Fixture Agent ▾"
+    );
+    let labels = cx.read(|cx| {
+        let shell = shell.read(cx);
+        let host = host(cx).unwrap();
+        let task = host.store().as_ref().unwrap().get("ready").unwrap();
+        let context = crate::session_picker::TaskContext::from_task(task, 0, true);
+        let mut model = crate::session_picker::PickerModel::new(shell.picker_inputs(Some(context)));
+        model.open();
+        model
+            .entries()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                crate::session_picker::PickerEntry::Row(row) => Some(row.label),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(labels, ["Fixture Agent", "Pi", "Terminal"]);
 }

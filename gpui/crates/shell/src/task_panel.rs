@@ -24,9 +24,9 @@ use gitterm_core::{
         suggested_task_worktree_path,
     },
     tasks::{
-        CleanupInspection, CleanupRisk, HarnessKind, StoppingBoundary, TaskCreatorKind,
-        TaskLifecycle, TaskRecord, TaskStore, TaskWorktreeState, VerificationState,
-        WorkspaceLocationIdentity, task_handoff_prompt,
+        CleanupInspection, CleanupRisk, HarnessConversationBackend, HarnessKind, StoppingBoundary,
+        TaskCreatorKind, TaskLifecycle, TaskRecord, TaskStore, TaskWorktreeState,
+        VerificationState, WorkspaceLocationIdentity, task_handoff_prompt,
     },
 };
 use gpui::{
@@ -147,8 +147,31 @@ pub(crate) struct Inputs {
     pub open_sessions: Vec<Target>,
     /// Each open session's tab title, by `session_uid`.
     pub titles: std::collections::HashMap<String, String>,
+    /// Iced's `agent_presets`, in order.
+    pub presets: Vec<gitterm_core::settings::AgentPreset>,
+    /// The local chat tabs, by provider conversation id (Iced `find_chat_tab`).
+    pub open_chats: Vec<OpenChat>,
+}
+
+/// An open chat tab and the provider conversation it carries.
+#[derive(Clone, Debug)]
+pub(crate) struct OpenChat {
+    pub chat_id: String,
+    pub target: Target,
 }
 impl Inputs {
+    fn open_chat(&self, chat_id: &str) -> Option<&Target> {
+        self.open_chats
+            .iter()
+            .find(|chat| chat.chat_id == chat_id)
+            .map(|chat| &chat.target)
+    }
+    /// Iced's `Start with {first preset}`; `agent` when none is configured.
+    fn default_agent(&self) -> &str {
+        self.presets
+            .first()
+            .map_or("agent", |preset| preset.name.as_str())
+    }
     fn open_session(&self, task_id: &str) -> Option<&Target> {
         self.open_sessions
             .iter()
@@ -285,6 +308,15 @@ pub(crate) enum Verb {
     Archive {
         enabled: bool,
     },
+}
+
+/// Iced `view_task_detail`'s first verb: it names the first agent preset.
+pub(crate) fn start_label(continuing: bool, agent: &str) -> String {
+    if continuing {
+        "+ Continue ▾".to_owned()
+    } else {
+        format!("▸ Start with {agent} ▾")
+    }
 }
 
 /// Iced `view_task_detail`'s state verbs in its order. Publishing is never
@@ -557,6 +589,16 @@ pub(crate) enum Write {
     },
     /// Iced `TaskResume` with a recorded conversation.
     Resume(String),
+    /// A history row's `Resume` / `Reopen` (Iced `TaskResumeConversation`).
+    ResumeConversation {
+        task_id: String,
+        chat_id: String,
+    },
+    /// A history row's `Open`, or `Resume` of an open conversation.
+    OpenConversation {
+        task_id: String,
+        chat_id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -569,6 +611,8 @@ pub(crate) enum TaskPanelOutcome {
     Pick(String),
     /// Iced `TaskFocusSession`.
     FocusSession(String),
+    /// Focus the open tab (by `session_uid`) carrying a conversation.
+    FocusConversation(String),
 }
 
 /// Iced `TaskResume` resumes the newest recorded conversation.
@@ -581,11 +625,177 @@ fn latest_conversation(task: &TaskRecord) -> Option<&str> {
     })
 }
 
+/// Iced `resume_task_conversation`'s checks before it launches.
+fn worktree_check(task: &TaskRecord) -> Result<(), String> {
+    match &task.worktree.path {
+        None => Err(format!("Task {} has no prepared worktree", task.title)),
+        Some(path) if !path.is_dir() => Err(format!(
+            "Task {} worktree is gone at {}",
+            task.title,
+            path.display()
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Iced `resume_task_conversation`: the task must link the conversation.
+fn link_check(task: &TaskRecord, chat_id: &str) -> Result<(), String> {
+    let linked = task.sessions.iter().any(|session| {
+        session
+            .conversation
+            .as_ref()
+            .is_some_and(|conversation| conversation.session_id == chat_id)
+    });
+    if linked {
+        Ok(())
+    } else {
+        Err(format!(
+            "Task {} no longer links conversation {chat_id}",
+            task.title
+        ))
+    }
+}
+
+/// Resuming a conversation that is not open is a launch.
+fn resume_launch(task: &TaskRecord, chat_id: &str) -> Result<TaskMutationAction, String> {
+    link_check(task, chat_id)?;
+    worktree_check(task)?;
+    Ok(launch(&task.task_id, None))
+}
+
+/// Resuming an open conversation focuses its tab (Iced
+/// `resume_task_conversation`, the `find_chat_tab` branch), after the same
+/// checks, in Iced's order.
+fn focus_check(
+    store: &TaskStore,
+    task: &TaskRecord,
+    chat_id: &str,
+    tab: &Target,
+) -> Result<(), String> {
+    link_check(task, chat_id)?;
+    if store.worker_session_is_final(&task.task_id, tab.task_session_id.as_deref()) {
+        return Err(
+            "This finished worker is closing. Reopen its conversation after its tab closes.".into(),
+        );
+    }
+    worktree_check(task)?;
+    match &tab.task_id {
+        Some(other) if *other != task.task_id => Err(format!(
+            "Conversation {chat_id} is already attached to another task"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Iced `preset_conversation_backend`.
+fn preset_backend(
+    preset: &gitterm_core::settings::AgentPreset,
+) -> Option<HarnessConversationBackend> {
+    let name = preset.name.to_lowercase();
+    let executable = preset
+        .command
+        .split_whitespace()
+        .next()
+        .and_then(|word| Path::new(word.trim_matches(['\'', '"'])).file_name())
+        .map(|word| word.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if name.contains("claude") || executable == "claude" {
+        Some(HarnessConversationBackend::Claude)
+    } else if name.contains("codex") || executable == "codex" {
+        Some(HarnessConversationBackend::Codex)
+    } else if name == "pi" || executable == "pi" {
+        Some(HarnessConversationBackend::Pi)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HistoryState {
+    Open,
+    Resume,
+    Reopen,
+    TranscriptKept,
+}
+impl HistoryState {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::Resume => "Resume",
+            Self::Reopen => "Reopen",
+            Self::TranscriptKept => "Transcript kept",
+        }
+    }
+}
+
+pub(crate) struct HistoryRow {
+    pub chat_id: String,
+    pub badge: String,
+    pub title: String,
+    pub short_id: String,
+    pub state: HistoryState,
+}
+
+/// Iced `view_task_detail`'s CONVERSATION HISTORY rows: each session with a
+/// recorded conversation, in record order.
+pub(crate) fn history(task: &TaskRecord, store: &TaskStore, inputs: &Inputs) -> Vec<HistoryRow> {
+    let worktree_ready = task.worktree.path.is_some();
+    task.sessions
+        .iter()
+        .filter_map(|session| {
+            let conversation = session.conversation.as_ref()?;
+            let backend = match conversation.backend {
+                HarnessConversationBackend::Claude => "Claude",
+                HarnessConversationBackend::Codex => "Codex",
+                HarnessConversationBackend::Pi => "Pi",
+            };
+            // Iced `backend_badge`: the preset's icon, else the backend glyph.
+            let badge = inputs
+                .presets
+                .iter()
+                .find(|preset| preset_backend(preset) == Some(conversation.backend))
+                .map(|preset| {
+                    if preset.icon.is_empty() {
+                        preset.name.chars().next().unwrap_or('?').to_string()
+                    } else {
+                        preset.icon.clone()
+                    }
+                })
+                .unwrap_or_else(|| {
+                    match conversation.backend {
+                        HarnessConversationBackend::Claude => "✦",
+                        HarnessConversationBackend::Codex => "⌁",
+                        HarnessConversationBackend::Pi => "π",
+                    }
+                    .to_owned()
+                });
+            let state = if inputs.open_chat(&conversation.session_id).is_some() {
+                HistoryState::Open
+            } else if worktree_ready {
+                if store.worker_session_is_final(&task.task_id, Some(&session.task_session_id)) {
+                    HistoryState::Reopen
+                } else {
+                    HistoryState::Resume
+                }
+            } else {
+                HistoryState::TranscriptKept
+            };
+            Some(HistoryRow {
+                chat_id: conversation.session_id.clone(),
+                badge,
+                title: format!("{backend} · {}", session.label),
+                short_id: conversation.session_id.chars().take(8).collect(),
+                state,
+            })
+        })
+        .collect()
+}
+
 fn launch(task_id: &str, preset_index: Option<usize>) -> TaskMutationAction {
     TaskMutationAction::LaunchSession {
         request: SessionLaunch {
             task_id: task_id.to_owned(),
-            // The preview has no agent presets (`picker_inputs`).
+            // The picked preset travels as `preset_index`.
             preset_name: None,
             origin: TaskLaunchOrigin::User,
             user_model_choice: false,
@@ -1023,21 +1233,18 @@ impl TaskPanel {
             // Iced `resume_task_conversation`'s worktree checks, then the
             // resume launch (its session-record refresh is a write too).
             Write::Resume(task_id) => match store.get(task_id) {
-                Some(task) if latest_conversation(task).is_some() => match &task.worktree.path {
-                    None => {
-                        return Err(format!("Task {} has no prepared worktree", task.title));
-                    }
-                    Some(path) if !path.is_dir() => {
-                        return Err(format!(
-                            "Task {} worktree is gone at {}",
-                            task.title,
-                            path.display()
-                        ));
-                    }
-                    Some(_) => Some(launch(task_id, None)),
+                Some(task) => match latest_conversation(task) {
+                    Some(chat_id) => Some(resume_launch(task, chat_id)?),
+                    None => None,
                 },
-                _ => None,
+                None => None,
             },
+            Write::ResumeConversation { task_id, chat_id } => match store.get(task_id) {
+                Some(task) => Some(resume_launch(task, chat_id)?),
+                None => None,
+            },
+            // A UI action, decided in `write` before the launch policy.
+            Write::OpenConversation { .. } => None,
         })
     }
 
@@ -1049,6 +1256,55 @@ impl TaskPanel {
             self.submit_create(cx);
             return;
         }
+        // Iced `resume_task_conversation` focuses the tab of an open conversation.
+        let open = match &write {
+            Write::OpenConversation { task_id, chat_id } => {
+                Some((task_id.clone(), chat_id.clone()))
+            }
+            Write::Resume(task_id) => host(cx)
+                .and_then(|host| host.store().as_ref())
+                .and_then(|store| store.get(task_id))
+                .and_then(latest_conversation)
+                .map(|chat_id| (task_id.clone(), chat_id.to_owned())),
+            _ => None,
+        };
+        if let Some((task_id, chat_id)) = open {
+            match inputs.open_chat(&chat_id).cloned() {
+                Some(tab) => self.focus_conversation(&task_id, &chat_id, &tab, cx),
+                // The tab closed since the row drew: Iced resumes it.
+                None if matches!(write, Write::OpenConversation { .. }) => {
+                    self.write(Write::ResumeConversation { task_id, chat_id }, inputs, cx)
+                }
+                None => self.write_launch(write, inputs, cx),
+            }
+            return;
+        }
+        self.write_launch(write, inputs, cx)
+    }
+
+    fn focus_conversation(
+        &mut self,
+        task_id: &str,
+        chat_id: &str,
+        tab: &Target,
+        cx: &mut Context<Self>,
+    ) {
+        let checked = host(cx)
+            .and_then(|host| host.store().as_ref())
+            .ok_or_else(|| "The task store is unavailable".to_owned())
+            .and_then(|store| {
+                let task = store
+                    .get(task_id)
+                    .ok_or_else(|| format!("Task {task_id} is not available"))?;
+                focus_check(store, task, chat_id, tab)
+            });
+        match checked {
+            Ok(()) => cx.emit(TaskPanelOutcome::FocusConversation(tab.session_uid.clone())),
+            Err(error) => self.show_notice(error, cx),
+        }
+    }
+
+    fn write_launch(&mut self, write: Write, inputs: &Inputs, cx: &mut Context<Self>) {
         // Without a recorded conversation Iced's Resume opens the picker.
         if let Write::Resume(task_id) = &write
             && host(cx)
@@ -1473,6 +1729,7 @@ pub(crate) fn overview_view(
             .into_any_element();
     };
     let inputs = std::rc::Rc::new(inputs);
+    let agent = inputs.default_agent().to_owned();
     let mut row = div().flex().flex_wrap().gap(px(10.));
     for verb in verbs(&task, &inputs) {
         let (writer, inputs, id) = (panel.clone(), inputs.clone(), task.task_id.clone());
@@ -1491,18 +1748,10 @@ pub(crate) fn overview_view(
             Verb::Start {
                 continuing,
                 enabled,
-            } => ghost(
-                "task-start",
-                if continuing {
-                    "+ Continue ▾".to_owned()
-                } else {
-                    // Iced names its first agent preset; the preview has none.
-                    "▸ Start with agent ▾".to_owned()
-                },
-            )
-            .text_color(rgb(p.blue))
-            .disabled(!enabled)
-            .on_click(emit(TaskPanelOutcome::Pick(id))),
+            } => ghost("task-start", start_label(continuing, &agent))
+                .text_color(rgb(p.blue))
+                .disabled(!enabled)
+                .on_click(emit(TaskPanelOutcome::Pick(id))),
             Verb::Resume => ghost("task-resume", "▸ Resume").on_click(write(Write::Resume(id))),
             Verb::GoToSession(session) => ghost("task-go-to-session", "Go to session")
                 .on_click(emit(TaskPanelOutcome::FocusSession(session))),
@@ -1638,6 +1887,89 @@ pub(crate) fn overview_view(
                 .child("No sessions yet. Add an agent or terminal to begin."),
         );
     }
+    let mut conversations = div()
+        .id("task-history")
+        .debug_selector(|| "task-history".into())
+        .flex()
+        .flex_col()
+        .gap(px(5.));
+    let rows = host(cx)
+        .and_then(|host| host.store().as_ref())
+        .map(|store| history(&task, store, &inputs))
+        .unwrap_or_default();
+    if rows.is_empty() {
+        // Iced's `Looking for agent conversations…` needs its chat index.
+        conversations = conversations.child(
+            div()
+                .text_size(px(11.))
+                .text_color(muted(&p))
+                .child("No resumable agent conversations found yet."),
+        );
+    }
+    for (index, row) in rows.into_iter().enumerate() {
+        let (panel, inputs, task_id) = (panel.clone(), inputs.clone(), task.task_id.clone());
+        let enabled = row.state != HistoryState::TranscriptKept;
+        let (state, chat_id) = (row.state, row.chat_id.clone());
+        conversations = conversations.child(
+            div()
+                .id(("task-history-row", index))
+                .debug_selector(move || format!("task-history-row-{index}"))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(9.))
+                .py(px(6.))
+                .rounded(px(6.))
+                .when(enabled, |row| row.hover(|row| row.bg(rgb(p.overlay))))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(p.peach))
+                                        .child(row.badge),
+                                )
+                                .child(div().child(row.title)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(muted(&p))
+                                .child(row.short_id),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(match state {
+                            HistoryState::Open => rgb(p.blue),
+                            HistoryState::TranscriptKept => muted(&p),
+                            _ => rgb(p.subtext0),
+                        })
+                        .child(state.label()),
+                )
+                .on_click(move |_, _, cx| {
+                    if !enabled {
+                        return;
+                    }
+                    let (task_id, chat_id) = (task_id.clone(), chat_id.clone());
+                    let write = if state == HistoryState::Open {
+                        Write::OpenConversation { task_id, chat_id }
+                    } else {
+                        Write::ResumeConversation { task_id, chat_id }
+                    };
+                    panel.update(cx, |panel, cx| panel.write(write, &inputs, cx))
+                }),
+        );
+    }
     let section = |label: &'static str| div().text_size(px(10.)).text_color(muted(&p)).child(label);
     let mut page = page
         .child(
@@ -1662,7 +1994,9 @@ pub(crate) fn overview_view(
         .child(section("LATEST HANDOFF"))
         .child(handoff)
         .child(section("SESSIONS"))
-        .child(sessions);
+        .child(sessions)
+        .child(section("CONVERSATION HISTORY"))
+        .child(conversations);
     if let Some(notice) = &panel.read(cx).notice {
         page = page.child(
             div()
@@ -2145,6 +2479,9 @@ impl crate::Shell {
                     TaskPanelOutcome::FocusSession(session) => {
                         shell.focus_task_session(session, window, cx)
                     }
+                    TaskPanelOutcome::FocusConversation(uid) => {
+                        shell.focus_open_session(uid, window, cx)
+                    }
                 }
             },
         );
@@ -2255,6 +2592,45 @@ impl crate::Shell {
         });
     }
 
+    fn find_open_session(
+        &self,
+        matches: impl Fn(&Target) -> bool,
+        cx: &App,
+    ) -> Option<(crate::data::WorkspaceId, crate::data::SessionId)> {
+        self.workspaces.iter().find_map(|state| {
+            state.sessions.iter().find_map(|tab| {
+                let pane = state.panes.get(&crate::session_pane_id(tab.id))?;
+                matches(pane.read(cx).session.as_ref()?).then_some((state.workspace.id, tab.id))
+            })
+        })
+    }
+
+    /// Focus the open tab with this `session_uid` (a history row's `Open`).
+    pub(crate) fn focus_open_session(
+        &mut self,
+        uid: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.find_open_session(|target| target.session_uid == uid, cx) {
+            Some((workspace, id)) => {
+                if self.active_workspace(cx) != Some(workspace) {
+                    self.select_workspace_id(workspace, window, cx);
+                }
+                self.select_host_session(workspace, id, window, cx);
+                cx.notify();
+            }
+            None => {
+                if let Some(panel) = &self.task_panel {
+                    panel.update(cx, |panel, cx| {
+                        panel.notice = Some("That conversation's tab is no longer open".into());
+                        cx.notify();
+                    });
+                }
+            }
+        }
+    }
+
     /// Iced `TaskFocusSession`: the open tab carrying that task session, in
     /// any workspace.
     pub(crate) fn focus_task_session(
@@ -2263,13 +2639,10 @@ impl crate::Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let found = self.workspaces.iter().find_map(|state| {
-            state.sessions.iter().find_map(|tab| {
-                let pane = state.panes.get(&crate::session_pane_id(tab.id))?;
-                (pane.read(cx).session.as_ref()?.task_session_id.as_deref() == Some(session))
-                    .then_some((state.workspace.id, tab.id))
-            })
-        });
+        let found = self.find_open_session(
+            |target| target.task_session_id.as_deref() == Some(session),
+            cx,
+        );
         match found {
             Some((workspace, id)) => {
                 if self.active_workspace(cx) != Some(workspace) {
@@ -2350,7 +2723,37 @@ impl crate::Shell {
             (_, Some(dir)) => Location::local(dir),
             (_, None) => Location::None,
         };
+        let open_chats = self
+            .workspaces
+            .iter()
+            // Iced `find_chat_tab` matches workspaces that are not on a remote agent.
+            .filter(|other| {
+                !matches!(
+                    self.owner
+                        .read(cx)
+                        .iced_workspace(other.workspace.id)
+                        .and_then(|saved| saved.location.as_ref()),
+                    Some(WorkspaceLocationConfig::RemoteAgent { .. })
+                )
+            })
+            .flat_map(|other| other.sessions.iter().map(move |session| (other, session)))
+            .filter_map(|(other, session)| {
+                let pane = other
+                    .panes
+                    .get(&crate::session_pane_id(session.id))?
+                    .read(cx);
+                let crate::pane::PaneContent::PreviewChat(view) = &pane.content else {
+                    return None;
+                };
+                Some(OpenChat {
+                    chat_id: view.read(cx).chat_session_id()?,
+                    target: pane.session.clone()?,
+                })
+            })
+            .collect();
         Inputs {
+            presets: self.agent_presets.clone(),
+            open_chats,
             workspace_name: state.workspace.name.clone(),
             location,
             selected: self.selected_task.clone(),
