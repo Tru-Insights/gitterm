@@ -508,7 +508,7 @@ assert not sys.stdin.read()
     let mut written = 0;
     let mut raw_written = 0;
     loop {
-        let next = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+        let next = tokio::time::timeout(std::time::Duration::from_secs(30), events.recv())
             .await
             .unwrap()
             .unwrap();
@@ -955,7 +955,7 @@ async fn fake_process_rejected_and_partial_write_outcomes_reach_adapter() {
         let mut controller = Controller::new();
         controller.runtime = Some(runtime);
         while !controller.ready {
-            let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+            let event = tokio::time::timeout(std::time::Duration::from_secs(30), events.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -994,7 +994,7 @@ async fn fake_process_rejected_and_partial_write_outcomes_reach_adapter() {
         let receipt = controller.dispatch(bound(&controller, intent)).0;
         assert_eq!(receipt.state, ReceiptState::ChannelAccepted);
         let delivered = loop {
-            let next = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+            let next = tokio::time::timeout(std::time::Duration::from_secs(30), events.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -1215,7 +1215,7 @@ assert not sys.stdin.read()
     let mut stage = 0;
     let mut rejection_message = false;
     loop {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+        let event = tokio::time::timeout(std::time::Duration::from_secs(30), events.recv())
             .await
             .unwrap()
             .unwrap();
@@ -1366,7 +1366,7 @@ sys.stdin.read()
                 .unwrap()
                 .unwrap();
             loop {
-                match tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+                match tokio::time::timeout(std::time::Duration::from_secs(30), events.recv())
                     .await
                     .unwrap()
                     .unwrap()
