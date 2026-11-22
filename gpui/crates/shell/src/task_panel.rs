@@ -544,18 +544,26 @@ pub(crate) fn delete_opener(task: &TaskRecord) -> bool {
 }
 
 /// Iced's tab-close rule: a task session that is still running asks first.
-/// The preview hosts no task process, so "running" is the record's lifecycle.
+/// A session the task host launched is running while it is observably live
+/// (Iced's `task_live_state`); for any other the preview hosts no process,
+/// so "running" is the record's lifecycle.
 pub(crate) fn close_needs_confirm(
     current: &Target,
     requested: &Target,
     last: bool,
     cx: &App,
 ) -> bool {
-    let task_live = requested.task_id.as_deref().is_some_and(|id| {
-        host(cx)
-            .and_then(|host| host.store().as_ref())
-            .and_then(|store| store.get(id))
-            .is_some_and(|task| task.lifecycle.is_active())
+    let launched = requested.task_session_id.as_deref().and_then(|session| {
+        cx.try_global::<GpuiTaskHost>()
+            .and_then(|host| host.0.read(cx).launched_live(session))
+    });
+    let task_live = launched.unwrap_or_else(|| {
+        requested.task_id.as_deref().is_some_and(|id| {
+            host(cx)
+                .and_then(|host| host.store().as_ref())
+                .and_then(|store| store.get(id))
+                .is_some_and(|task| task.lifecycle.is_active())
+        })
     });
     let state = session::State {
         target: current.clone(),
@@ -618,6 +626,8 @@ pub(crate) enum TaskPanelOutcome {
     FocusSession(String),
     /// Focus the open tab (by `session_uid`) carrying a conversation.
     FocusConversation(String),
+    /// Iced `TaskTabStopAndClose`: close the confirmed task session.
+    StopAndClose(Target),
 }
 
 /// Iced `TaskResume` resumes the newest recorded conversation.
@@ -1286,6 +1296,21 @@ impl TaskPanel {
     pub(crate) fn write(&mut self, write: Write, inputs: &Inputs, cx: &mut Context<Self>) {
         if write == Write::CreateSubmit {
             self.submit_create(cx);
+            return;
+        }
+        // Iced `TaskTabStopAndClose` for a session the task host launched,
+        // which it can stop; any other still answers the preview notice.
+        if write == Write::StopAndClose
+            && let Some(Modal::StopAndClose { target, .. }) = &self.modal
+            && target.task_session_id.as_deref().is_some_and(|session| {
+                cx.try_global::<GpuiTaskHost>()
+                    .is_some_and(|host| host.0.read(cx).launched_live(session).is_some())
+            })
+        {
+            let target = target.clone();
+            self.modal = None;
+            cx.emit(TaskPanelOutcome::StopAndClose(target));
+            cx.notify();
             return;
         }
         // Iced `resume_task_conversation` focuses the tab of an open conversation.
@@ -2513,6 +2538,9 @@ impl crate::Shell {
                     }
                     TaskPanelOutcome::FocusConversation(uid) => {
                         shell.focus_open_session(uid, window, cx)
+                    }
+                    TaskPanelOutcome::StopAndClose(target) => {
+                        shell.close_target_with(target, true, window, cx)
                     }
                 }
             },

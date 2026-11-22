@@ -21,6 +21,9 @@
 //! ([`TaskHostOwner::promote_queued_tasks`]), a launched agent's exit folds
 //! into its task's lifecycle ([`TaskHostOwner::terminal_exited`]), and the
 //! terminal's `task_update_handoff` is attributed to its task session.
+//! Closing its pane folds the session into its task
+//! ([`TaskHostOwner::session_closed`]); a worker's final session closes
+//! once its result went out ([`TaskHostOwner::close_final_workers`]).
 use super::*;
 use gitterm_core::{
     plan_limits::Provider,
@@ -37,7 +40,14 @@ use gitterm_core::{
     workers::{WorkerProvider, provider_for_command},
 };
 use gitterm_terminal::{SessionState, TerminalLaunch, TerminalView};
-use std::{collections::HashMap, ffi::OsString};
+use std::{
+    collections::HashMap,
+    ffi::OsString,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 /// Composed task briefs, under the preview root (Iced's `task-briefs`).
 pub(crate) const BRIEFS: &str = "task-briefs";
@@ -79,6 +89,14 @@ pub(crate) struct TerminalExited {
 }
 impl gpui::EventEmitter<TerminalExited> for TaskHostOwner {}
 
+/// Iced's `FinalWorkerStopped` closing the tab: the shell closes the pane
+/// holding this worker's final session ([`TaskHostOwner::close_final_workers`]).
+#[derive(Clone, Debug)]
+pub(crate) struct FinalWorkerClose {
+    pub target: session::Target,
+}
+impl gpui::EventEmitter<FinalWorkerClose> for TaskHostOwner {}
+
 /// A launched terminal the host still owns. Dropping it kills the child's
 /// process group (the PTY child leads one); the entity's release then
 /// reaps the killed child.
@@ -117,6 +135,12 @@ pub(super) struct Launched {
     /// Iced's `task_live_state` for the tab: working from an agent's
     /// launch, none once its child exited.
     live: Option<TaskSessionLiveState>,
+    /// Iced's tab attention `HumanInputRequired`: set when the worker
+    /// reports blocked or its turn ends, cleared by a keystroke into the
+    /// terminal (the terminal's key handler, off the host).
+    needs_input: Arc<AtomicBool>,
+    /// Iced's `worker_closing`: its final-worker close is under way.
+    closing: bool,
 }
 
 pub(super) enum Started {
@@ -308,12 +332,14 @@ impl TaskHostOwner {
             .recheck(&authorized)
             .and_then(|()| services.recheck_git_work_trees(&authorized, &env))
             .map_err(|denied| denied.notice().to_string())?;
+        let needs_input = Arc::new(AtomicBool::new(false));
         let terminal = spawn_terminal(
             &folder,
             Some(runtime),
             env,
             cx.weak_entity(),
             &session_id,
+            &needs_input,
             cx,
         )?;
         let target = session::Target {
@@ -331,6 +357,8 @@ impl TaskHostOwner {
                 view: terminal.view.downgrade(),
                 target: target.clone(),
                 live: None,
+                needs_input,
+                closing: false,
             },
         );
         self.terminals.insert(session_id.clone(), terminal);
@@ -535,6 +563,7 @@ impl TaskHostOwner {
             ..crate::sessions::fresh_target()
         };
         let owner = cx.weak_entity();
+        let needs_input = Arc::new(AtomicBool::new(false));
         let prepared = (|| {
             let notify = self
                 .servers
@@ -596,7 +625,15 @@ impl TaskHostOwner {
                 .recheck(&authorized)
                 .and_then(|()| services.recheck_git_work_trees(&authorized, &env))
                 .map_err(|denied| denied.notice().to_string())?;
-            let terminal = spawn_terminal(&worktree, command, env, owner, &session_id, cx)?;
+            let terminal = spawn_terminal(
+                &worktree,
+                command,
+                env,
+                owner,
+                &session_id,
+                &needs_input,
+                cx,
+            )?;
             Ok::<_, String>((terminal, objective_delivery, pre_injection))
         })();
         let (terminal, objective_delivery, pre_injection) = match prepared {
@@ -661,6 +698,8 @@ impl TaskHostOwner {
                 view: terminal.view.downgrade(),
                 target: target.clone(),
                 live: launched_agent.then_some(TaskSessionLiveState::Working),
+                needs_input,
+                closing: false,
             },
         );
         self.terminals.insert(session_id.clone(), terminal);
@@ -822,24 +861,112 @@ impl TaskHostOwner {
             .collect()
     }
 
-    /// Iced's `worker_reported` for a launched terminal (main.rs:19876):
-    /// done clears its live state, blocked leaves it awaiting input.
+    /// Iced's `worker_reported` for a launched terminal (src/main.rs
+    /// `worker_reported`): done clears its live state, blocked leaves it
+    /// awaiting input and needing the user.
     pub(super) fn worker_reported_live(&mut self, session_id: &str, done: bool) {
         if let Some(launched) = self.launched.get_mut(session_id) {
             launched.live = (!done).then_some(TaskSessionLiveState::AwaitingInput);
+            if !done {
+                launched.needs_input.store(true, Ordering::Relaxed);
+            }
         }
     }
 
     /// Iced's `TurnEnded` arm for a launched terminal: a still-open terminal
-    /// of `task_id` running `session_id` now awaits input. Whether one did.
+    /// of `task_id` running `session_id` now awaits input and needs the
+    /// user. Whether one did.
     pub(super) fn terminal_turn_ended(&mut self, task_id: &str, session_id: &str) -> bool {
         match self.launched.get_mut(session_id) {
             Some(launched) if launched.task_id == task_id && launched.view.upgrade().is_some() => {
                 launched.live = Some(TaskSessionLiveState::AwaitingInput);
+                launched.needs_input.store(true, Ordering::Relaxed);
                 true
             }
             _ => false,
         }
+    }
+
+    /// Whether launched session `session_id` shows Iced's input-needed
+    /// attention on its pane.
+    pub(crate) fn needs_input(&self, session_id: &str) -> bool {
+        self.launched
+            .get(session_id)
+            .is_some_and(|launched| launched.needs_input.load(Ordering::Relaxed))
+    }
+
+    /// Whether this host launched `session_id` and, if so, whether its
+    /// session is observably live (Iced's `task_live_state.is_some()`, the
+    /// fact its close prompt reads).
+    pub(crate) fn launched_live(&self, session_id: &str) -> Option<bool> {
+        self.launched
+            .get(session_id)
+            .map(|launched| launched.live.is_some())
+    }
+
+    /// Iced's `close_task_tab` once the tab is gone: the session no longer
+    /// counts for its task, whose other sessions decide its lifecycle; one
+    /// that was live stopped. The pane that held the terminal stops and
+    /// reaps its child; a terminal still unadopted is dropped, which kills
+    /// its group.
+    pub(crate) fn session_closed(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        self.terminals.remove(session_id);
+        let Some(launched) = self.launched.remove(session_id) else {
+            return;
+        };
+        self.apply_task_session_signal(
+            &launched.task_id,
+            launched
+                .live
+                .is_some()
+                .then_some((TaskLifecycle::Stopped, None)),
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Iced's `close_final_worker` over the launched terminals still open:
+    /// each worker's final session whose result is `ready` starts closing
+    /// and claims no live state. Their targets, for the shell to close.
+    pub(super) fn start_final_worker_closes(
+        &mut self,
+        ready: &std::collections::HashSet<String>,
+    ) -> Vec<session::Target> {
+        let Some(store) = self.host.store().as_ref() else {
+            return Vec::new();
+        };
+        let mut closing = Vec::new();
+        for (session_id, launched) in &mut self.launched {
+            if launched.view.upgrade().is_none() {
+                continue;
+            }
+            let worker = gitterm_core::task_host::WorkerSession {
+                task_id: Some(&launched.task_id),
+                task_session_id: Some(session_id),
+                closing: launched.closing,
+                // GPUI's close drops the PTY and never verifies a launch
+                // identity first, so no stop is refused.
+                shutdown_refused: false,
+                live: launched.live,
+            };
+            if gitterm_core::task_host::final_worker_closes(store, &worker, ready) {
+                launched.closing = true;
+                launched.live = None;
+                closing.push(launched.target.clone());
+            }
+        }
+        closing
+    }
+
+    /// Iced's `close_final_workers` live check: another open session of
+    /// `task_id`, not itself closing, is observably live.
+    pub(super) fn task_live_besides_closing(&self, task_id: &str) -> bool {
+        self.launched.values().any(|launched| {
+            launched.task_id == task_id
+                && launched.view.upgrade().is_some()
+                && !launched.closing
+                && launched.live.is_some()
+        })
     }
 
     /// Iced's `working_sessions` for launched terminals still open: those
@@ -1145,6 +1272,7 @@ fn spawn_terminal(
     env: Vec<(OsString, OsString)>,
     owner: gpui::WeakEntity<TaskHostOwner>,
     session_id: &str,
+    needs_input: &Arc<AtomicBool>,
     cx: &mut App,
 ) -> Result<HostTerminal, String> {
     let mut overlay: HashMap<String, Option<String>> = HashMap::new();
@@ -1178,14 +1306,22 @@ fn spawn_terminal(
     // shortcut: an unadopted terminal's exit is not seen (nothing delivers
     // its events); deliver them from the host if a launch can stay unadopted.
     let session_id = session_id.to_string();
+    // Iced clears a tab's input-needed attention on its input; the key is
+    // still the terminal's.
+    let typed = needs_input.clone();
     let view = cx.new(|cx| {
-        TerminalView::launch(launch, Default::default(), cx).with_exit_callback(move |_, cx| {
-            let owner = owner.clone();
-            let session_id = session_id.clone();
-            cx.defer(move |cx| {
-                _ = owner.update(cx, |owner, cx| owner.terminal_exited(&session_id, cx));
-            });
-        })
+        TerminalView::launch(launch, Default::default(), cx)
+            .with_exit_callback(move |_, cx| {
+                let owner = owner.clone();
+                let session_id = session_id.clone();
+                cx.defer(move |cx| {
+                    _ = owner.update(cx, |owner, cx| owner.terminal_exited(&session_id, cx));
+                });
+            })
+            .with_key_handler(move |_| {
+                typed.store(false, Ordering::Relaxed);
+                false
+            })
     });
     let backend = view.read(cx).backend();
     let Some(pid) = backend.child_pid() else {

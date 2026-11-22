@@ -414,6 +414,13 @@ impl Shell {
                     shell.task_terminal_exited(exited, cx);
                 },
             ));
+            subscriptions.push(cx.subscribe_in(
+                &host,
+                window,
+                |shell, _, close: &task_host::FinalWorkerClose, window, cx| {
+                    shell.close_target_with(&close.target, true, window, cx);
+                },
+            ));
         }
         if local {
             owner.update(cx, |owner, cx| {
@@ -2132,6 +2139,17 @@ impl Shell {
             .iter()
             .find(|w| Some(w.workspace.id) == self.active_workspace(cx));
         let saved = state.and_then(|w| self.owner.read(cx).iced_workspace(w.workspace.id));
+        let host = cx
+            .try_global::<task_host::GpuiTaskHost>()
+            .map(|host| host.0.read(cx));
+        let needs_input = |id: SessionId| {
+            let session = state
+                .and_then(|state| state.panes.get(&session_pane_id(id)))
+                .and_then(|pane| pane.read(cx).session.as_ref())
+                .and_then(|target| target.task_session_id.clone());
+            host.zip(session)
+                .is_some_and(|(host, session)| host.needs_input(&session))
+        };
         session_strip::Input {
             workspace: state.map(|w| w.workspace.id),
             workspace_name: state.map(|w| w.workspace.name.clone()).unwrap_or_default(),
@@ -2205,11 +2223,17 @@ impl Shell {
                                 })
                                 .map(|session| session.label.clone())
                         }),
-                        attention: session_strip::attention(
-                            task.map(|task| &task.attention),
-                            workers,
-                            tab.and_then(|tab| tab.session_uid.as_deref()),
-                        ),
+                        // Iced's input-needed tab attention on a launched
+                        // task terminal outranks the durable kinds.
+                        attention: needs_input(s.id)
+                            .then_some(workspace_bar::AttentionKind::NeedsYou)
+                            .or_else(|| {
+                                session_strip::attention(
+                                    task.map(|task| &task.attention),
+                                    workers,
+                                    tab.and_then(|tab| tab.session_uid.as_deref()),
+                                )
+                            }),
                         running,
                         // ChatPane does not yet expose its pending-request projection.
                         pending_requests: 0,
