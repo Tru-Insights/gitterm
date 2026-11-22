@@ -123,7 +123,7 @@ pub struct Dismissal {
     pub saved: Result<(), String>,
 }
 
-fn chat_for(chats: &[DeliveryChat], parent: &DelegationParent) -> Option<usize> {
+pub(super) fn chat_for(chats: &[DeliveryChat], parent: &DelegationParent) -> Option<usize> {
     delegations::parent_tab_id(
         parent,
         chats.iter().map(|chat| {

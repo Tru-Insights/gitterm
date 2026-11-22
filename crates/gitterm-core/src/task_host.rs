@@ -48,6 +48,7 @@ use tokio_stream::Stream;
 
 mod create;
 mod delivery;
+mod final_worker;
 mod launch;
 mod live;
 mod restore;
@@ -59,6 +60,9 @@ pub use create::{
 pub use delivery::{
     waiting_delegation_log_lines, DeliveryChat, DeliveryCompletion, DeliveryEffect,
     DeliveryReceipt, DeliveryTick, Dismissal, Submission,
+};
+pub use final_worker::{
+    closed_worker_task_outcomes, final_worker_closes, worker_delivery_allows_close, WorkerSession,
 };
 pub use launch::{
     cancel_queued_worker_launch, launch_provider, update_queued_task_request, AwaitingWorker,

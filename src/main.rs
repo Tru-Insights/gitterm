@@ -19925,7 +19925,7 @@ impl App {
                 let parent = self.delegation_chat_tab_id(&d.parent);
                 let held =
                     parent.is_some_and(|id| self.task_host.delivery_held(id, &d.delegation_id));
-                worker_delivery_allows_close(
+                gitterm_core::task_host::worker_delivery_allows_close(
                     d,
                     self.delegations_config.auto_tell,
                     parent.is_some(),
@@ -19942,39 +19942,8 @@ impl App {
                 closing.push(close);
             }
         }
-        let mut ending_tasks = HashSet::new();
-        let ended: Vec<_> = store
-            .delegations()
-            .iter()
-            .rev()
-            .filter(|d| d.status.is_final())
-            .filter_map(|d| {
-                let gitterm::tasks::DelegationChild::TaskSession {
-                    task_id,
-                    task_session_id: Some(session),
-                    ..
-                } = &d.child
-                else {
-                    return None;
-                };
-                if !closing.iter().any(|(id, _)| id == session)
-                    || !store.open_worker_delegations(task_id).is_empty()
-                    || !ending_tasks.insert(task_id.clone())
-                {
-                    return None;
-                }
-                let state = match d.status {
-                    gitterm::tasks::DelegationStatus::Completed => TaskLifecycle::Completed,
-                    gitterm::tasks::DelegationStatus::Failed { .. }
-                        if d.time_limit_reached_at.is_none() =>
-                    {
-                        TaskLifecycle::Failed
-                    }
-                    _ => TaskLifecycle::Stopped,
-                };
-                Some((task_id.clone(), state))
-            })
-            .collect();
+        let closing_sessions: Vec<String> = closing.iter().map(|(id, _)| id.clone()).collect();
+        let ended = gitterm_core::task_host::closed_worker_task_outcomes(store, &closing_sessions);
         for (task_id, state) in ended {
             let live = self.workspaces.iter().flat_map(|ws| &ws.tabs).any(|tab| {
                 tab.task_id.as_deref() == Some(&task_id)
@@ -20475,25 +20444,20 @@ fn close_final_worker<T>(
     ready: &HashSet<String>,
     close: impl FnOnce(&str, Option<gitterm::worker_process::WorkerProcess>) -> T,
 ) -> Option<T> {
-    let (Some(task), Some(session)) = (&tab.task_id, &tab.task_session_id) else {
-        return None;
+    let session = gitterm_core::task_host::WorkerSession {
+        task_id: tab.task_id.as_deref(),
+        task_session_id: tab.task_session_id.as_deref(),
+        closing: tab.worker_closing,
+        shutdown_refused: tab.worker_shutdown_refused,
+        live: tab.task_live_state,
     };
-    let delegation = store.delegations().iter().rev().find(|d| {
-        matches!(&d.child, gitterm::tasks::DelegationChild::TaskSession { task_id, task_session_id: Some(id), .. }
-            if task_id == task && id == session)
-    })?;
-    if tab.worker_closing
-        || tab.worker_shutdown_refused
-        || !store.worker_session_is_final(task, Some(session))
-        || !ready.contains(&delegation.delegation_id)
-        || (delegation.superseded_by.is_some()
-            && tab.task_live_state == Some(TaskSessionLiveState::Working))
-    {
+    if !gitterm_core::task_host::final_worker_closes(store, &session, ready) {
         return None;
     }
+    let session = tab.task_session_id.clone()?;
     tab.worker_closing = true;
     tab.task_live_state = None;
-    Some(close(session, tab.worker_process.take()))
+    Some(close(&session, tab.worker_process.take()))
 }
 
 /// Closing a tab drops its PTY, which SIGHUPs whatever the terminal runs, so
@@ -20539,20 +20503,6 @@ fn persist_worker_launch_identity(store: &mut TaskStore, tab: &mut TabState) -> 
         .map_err(|e| e.to_string())?;
     process.persisted_identity = Some(identity);
     Ok(())
-}
-
-fn worker_delivery_allows_close(
-    d: &gitterm::tasks::Delegation,
-    auto_tell: bool,
-    parent_present: bool,
-    held: bool,
-) -> bool {
-    let handoff_stored = d
-        .result
-        .as_ref()
-        .and_then(|result| result.handoff.as_ref())
-        .is_some();
-    handoff_stored && (d.is_delivered() || held || !auto_tell || !parent_present)
 }
 
 fn load_task_store_for_startup(
@@ -48901,6 +48851,7 @@ impl App {
 mod tests {
     use super::*;
     use gitterm::tasks::{GitBase, RepositoryIdentity};
+    use gitterm_core::task_host::worker_delivery_allows_close;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -51231,42 +51182,6 @@ mod tests {
         assert!(worker_accepts_input(&tab, Some(&store)));
         assert!(!tab.worker_closing);
         assert_eq!(tab.task_live_state, Some(TaskSessionLiveState::Working));
-    }
-
-    #[test]
-    fn rejected_worker_delivery_waits_for_next_tick_receipt_before_close() {
-        let temp = tempfile::tempdir().unwrap();
-        let (mut store, id, _) = final_worker_fixture(temp.path());
-        let mut tab = TabState::new(1, temp.path().into());
-        tab.task_id = Some("task-slot".into());
-        tab.task_session_id = Some("worker".into());
-        store
-            .complete_delegation(
-                &id,
-                gitterm::delegations::worker_result(worker_test_handoff()),
-                "t2",
-            )
-            .unwrap();
-        let rejected = store.delegation(&id).unwrap();
-        assert!(!worker_delivery_allows_close(rejected, true, true, false));
-        let ready = HashSet::new(); // submission rejected, nothing held
-        assert!(close_final_worker(&store, &mut tab, &ready, |_, _| panic!(
-            "rejected send must retry"
-        ))
-        .is_none());
-        assert!(!tab.worker_closing);
-        assert!(worker_delivery_allows_close(rejected, true, true, true));
-        assert!(worker_delivery_allows_close(rejected, false, true, false));
-        assert!(worker_delivery_allows_close(rejected, true, false, false));
-        store.mark_delegation_delivered(&id, "t3").unwrap();
-        let persisted = TaskStore::load(temp.path().join("tasks.json")).unwrap();
-        let ready = persisted
-            .delegations()
-            .iter()
-            .filter(|d| worker_delivery_allows_close(d, true, true, false))
-            .map(|d| d.delegation_id.clone())
-            .collect();
-        assert!(close_final_worker(&persisted, &mut tab, &ready, |_, _| ()).is_some());
     }
 
     /// The agent exited and the terminal now runs something else: the stop
