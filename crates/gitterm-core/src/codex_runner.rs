@@ -236,6 +236,11 @@ pub struct CodexEnvironment {
     pub search_path: OsString,
     /// `$CODEX_HOME/sessions`, else `~/.codex/sessions`.
     pub sessions_root: PathBuf,
+    /// The child's whole environment. `None` inherits this process's, as
+    /// production always has. `Some` clears it and sets exactly these, for
+    /// Codex and for the git preflight; PATH still comes from
+    /// `search_path` and the git location variables are still removed.
+    pub child_env: Option<Vec<(OsString, OsString)>>,
 }
 
 impl CodexEnvironment {
@@ -255,6 +260,7 @@ impl CodexEnvironment {
         Ok(Self {
             search_path: child_path(),
             sessions_root: codex_home.join("sessions"),
+            child_env: None,
         })
     }
 }
@@ -375,7 +381,7 @@ async fn run_inner(
         });
     }
     let program = resolve_codex(&environment.search_path)?;
-    let git = git_state(&run.cwd).await?;
+    let git = git_state(&run.cwd, environment).await?;
     let last_message_path = run.log_path.with_extension("last.md");
     let (args, stdin_text) = codex_args(run, &last_message_path);
 
@@ -399,6 +405,7 @@ async fn run_inner(
     };
 
     let mut command = tokio::process::Command::new(&program);
+    scope_env(&mut command, environment);
     command
         .args(&args)
         .current_dir(&run.cwd)
@@ -1010,17 +1017,35 @@ struct GitState {
     dirty: bool,
 }
 
-async fn git_state(cwd: &Path) -> Result<GitState, CodexRunError> {
-    let head = git_output(cwd, &["rev-parse", "HEAD"]).await?;
-    let status = git_output(cwd, &["status", "--porcelain"]).await?;
+/// An explicit child environment replaces the inherited one; callers set
+/// PATH and remove the git location variables after this.
+fn scope_env(command: &mut tokio::process::Command, environment: &CodexEnvironment) {
+    if let Some(env) = &environment.child_env {
+        command.env_clear();
+        command.envs(env.iter().map(|(name, value)| (name, value)));
+    }
+}
+
+async fn git_state(cwd: &Path, environment: &CodexEnvironment) -> Result<GitState, CodexRunError> {
+    let head = git_output(cwd, &["rev-parse", "HEAD"], environment).await?;
+    let status = git_output(cwd, &["status", "--porcelain"], environment).await?;
     Ok(GitState {
         head: head.trim().to_string(),
         dirty: !status.trim().is_empty(),
     })
 }
 
-async fn git_output(cwd: &Path, args: &[&str]) -> Result<String, CodexRunError> {
+async fn git_output(
+    cwd: &Path,
+    args: &[&str],
+    environment: &CodexEnvironment,
+) -> Result<String, CodexRunError> {
     let mut command = tokio::process::Command::new("git");
+    scope_env(&mut command, environment);
+    if environment.child_env.is_some() {
+        // A cleared environment has no PATH to find git with.
+        command.env("PATH", &environment.search_path);
+    }
     command.args(args).current_dir(cwd).stdin(Stdio::null());
     for var in GIT_LOCATION_VARS {
         command.env_remove(var);
@@ -1581,6 +1606,7 @@ mod tests {
         let env = CodexEnvironment {
             search_path: OsString::new(),
             sessions_root: PathBuf::from("/nonexistent"),
+            child_env: None,
         };
         let error = run_with(run, progress, &env).await.unwrap_err();
         assert!(error
@@ -1810,6 +1836,7 @@ mod tests {
                     ])
                     .expect("join paths"),
                     sessions_root: self.sessions.path().to_path_buf(),
+                    child_env: None,
                 }
             }
 
@@ -1881,6 +1908,82 @@ mod tests {
                 events.push(event);
             }
             (result, events)
+        }
+
+        /// The variables `file` (one `env` dump) holds, without the ones
+        /// `/bin/sh` adds itself.
+        fn recorded_env(file: &Path) -> Vec<(String, String)> {
+            let mut env: Vec<(String, String)> = std::fs::read_to_string(file)
+                .expect("recorded env")
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .filter(|(name, _)| !matches!(*name, "PWD" | "OLDPWD" | "SHLVL" | "_"))
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            env.sort();
+            env
+        }
+
+        #[tokio::test]
+        async fn explicit_child_env_replaces_the_inherited_one_for_codex_and_git() {
+            let fake = FakeCodex::new("", 0);
+            // Codex records its environment too.
+            let script = format!(
+                "#!/bin/sh\nenv > '{dir}/codex.env'\nprintf '%s\\n' \"$@\" > '{dir}/args'\ncat > '{dir}/stdin'\n",
+                dir = fake.dir.path().display(),
+            );
+            std::fs::write(fake.dir.path().join("codex"), script).expect("write fake codex");
+            // A `git` ahead of the real one records the preflight's
+            // environment, then runs the real git.
+            let real_git = std::process::Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .expect("find git");
+            let real_git = String::from_utf8(real_git.stdout).expect("utf-8");
+            let git_script = format!(
+                "#!/bin/sh\nenv > '{dir}/git.env'\nexec '{git}' \"$@\"\n",
+                dir = fake.dir.path().display(),
+                git = real_git.trim(),
+            );
+            let wrapper = fake.dir.path().join("git");
+            std::fs::write(&wrapper, git_script).expect("write git wrapper");
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod git wrapper");
+            let mut environment = fake.environment();
+            let ceiling = fake.repo.path().parent().expect("repo parent");
+            environment.child_env = Some(vec![
+                ("HOME".into(), "/fixture/home".into()),
+                ("GIT_CEILING_DIRECTORIES".into(), ceiling.into()),
+                // Location variables are removed even when given.
+                ("GIT_DIR".into(), "/elsewhere/.git".into()),
+                ("PATH".into(), "/ignored".into()),
+            ]);
+            let (sender, _receiver) = mpsc::unbounded_channel();
+            let run = fake.run(CodexRunKind::Consult {
+                brief: "Scoped.".to_string(),
+            });
+            let _ = run_with(run, sender, &environment).await;
+            let expected = |path: &OsString| {
+                let mut env = vec![
+                    (
+                        "GIT_CEILING_DIRECTORIES".to_string(),
+                        ceiling.display().to_string(),
+                    ),
+                    ("HOME".to_string(), "/fixture/home".to_string()),
+                    ("PATH".to_string(), path.to_string_lossy().into_owned()),
+                ];
+                env.sort();
+                env
+            };
+            let program = fake.dir.path().join("codex");
+            assert_eq!(
+                recorded_env(&fake.dir.path().join("codex.env")),
+                expected(&child_search_path(&environment.search_path, &program))
+            );
+            assert_eq!(
+                recorded_env(&fake.dir.path().join("git.env")),
+                expected(&environment.search_path)
+            );
         }
 
         #[tokio::test]
@@ -2219,6 +2322,7 @@ mod tests {
             let environment = CodexEnvironment {
                 search_path: std::env::join_paths([empty.path()]).expect("join"),
                 sessions_root: fake.sessions.path().to_path_buf(),
+                child_env: None,
             };
             let (sender, mut receiver) = mpsc::unbounded_channel();
             let result = run_with(
