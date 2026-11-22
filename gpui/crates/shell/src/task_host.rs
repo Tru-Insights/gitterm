@@ -19,7 +19,9 @@
 //! created task's worktree is prepared inside that fixture.
 //!
 //! In fixture mode (H5b B10) `review_request` and `consult_request` also run
-//! Codex headlessly in a fixture checkout ([`runs`]). Plain preview still
+//! Codex headlessly in a fixture checkout ([`runs`]), and `task_launch_session`
+//! starts a task session's terminal for a task this host created
+//! ([`launch`]), which the shell adopts into a pane. Plain preview still
 //! answers every launch and run with the notice and starts nothing.
 use anyhow::{Context as _, Result};
 use gitterm_browser::browser_mcp::BrowserMcpConnection;
@@ -59,9 +61,18 @@ pub(crate) type RecheckHook = Box<dyn FnOnce(&Path)>;
 /// string is reached, before its shutdown guard.
 #[cfg(test)]
 pub(crate) type ContinuationHook = (&'static str, Box<dyn FnOnce(&mut TaskHostOwner)>);
+/// Runs on the owner after a fixture launch's child started, before it is
+/// published.
+#[cfg(test)]
+pub(crate) type PublishHook = Box<dyn FnOnce(&mut TaskHostOwner)>;
 
+#[path = "task_host_launch.rs"]
+mod launch;
 #[path = "task_host_runs.rs"]
 mod runs;
+pub(crate) use launch::TerminalLaunched;
+#[cfg(test)]
+pub(crate) use launch::with_preassigned_session_id as launch_session_id;
 
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HOST_LOCK: &str = ".task-host.lock";
@@ -292,6 +303,12 @@ pub(crate) struct TaskHostOwner {
     /// Delegations this host stored, with the targets authorized at their
     /// request; only these are started or settled.
     own_delegations: std::collections::HashMap<String, AuthorizedTargets>,
+    /// Tasks this host created; only these are launched.
+    own_tasks: std::collections::HashSet<String>,
+    /// Launched terminals no pane has adopted yet, by task session.
+    terminals: std::collections::HashMap<String, launch::HostTerminal>,
+    /// Every launched task session, adopted or not.
+    launched: std::collections::HashMap<String, launch::Launched>,
     /// Runs on a prepared worktree path before its post-preparation recheck.
     #[cfg(test)]
     pub(crate) before_recheck: Option<RecheckHook>,
@@ -303,6 +320,8 @@ pub(crate) struct TaskHostOwner {
     pub(crate) codex_search_path: Option<std::ffi::OsString>,
     #[cfg(test)]
     pub(crate) before_continuation: Option<ContinuationHook>,
+    #[cfg(test)]
+    pub(crate) before_publish: Option<PublishHook>,
     _pump: Task<()>,
     _reseed: Task<()>,
     _quit: Subscription,
@@ -435,8 +454,8 @@ impl TaskHostOwner {
             });
             // Synchronous: GPUI's quit timeout starts after the callbacks
             // return. Registered before the workspace owner's chat drain.
-            let quit = cx.on_app_quit(|owner: &mut Self, _| {
-                owner.shutdown();
+            let quit = cx.on_app_quit(|owner: &mut Self, cx| {
+                owner.quit(cx);
                 std::future::ready(())
             });
             Self {
@@ -459,6 +478,9 @@ impl TaskHostOwner {
                 wrote: false,
                 runs: Default::default(),
                 own_delegations: Default::default(),
+                own_tasks: Default::default(),
+                terminals: Default::default(),
+                launched: Default::default(),
                 #[cfg(test)]
                 before_recheck: None,
                 #[cfg(test)]
@@ -467,6 +489,8 @@ impl TaskHostOwner {
                 codex_search_path: None,
                 #[cfg(test)]
                 before_continuation: None,
+                #[cfg(test)]
+                before_publish: None,
                 _pump: pump,
                 _reseed: reseed,
                 _quit: quit,
@@ -538,7 +562,8 @@ impl TaskHostOwner {
     /// themselves, so in plain preview they answer the same notice and do
     /// nothing else; in fixture mode they write the preview's own store and
     /// state. Review and consult run Codex in a fixture checkout in fixture
-    /// mode (B10); launch and delegate arms answer the notice in both modes.
+    /// mode (B10), and a launch starts a task session's terminal (B10b);
+    /// delegate arms answer the notice in both modes.
     pub(crate) fn execute_effect(
         &mut self,
         effect: HostEffect,
@@ -621,6 +646,9 @@ impl TaskHostOwner {
                 label,
                 cx,
             ),
+            HostEffect::LaunchSession { reply, launch } if !self.fixtures.is_empty() => {
+                self.launch_session(reply, launch, label, cx)
+            }
             HostEffect::LaunchSession { reply, .. }
             | HostEffect::DelegateTask { reply, .. }
             | HostEffect::RequestReview { reply, .. }
@@ -1054,6 +1082,7 @@ impl TaskHostOwner {
         self.writable_store()?
             .insert(*record)
             .map_err(|error| error.to_string())?;
+        self.own_tasks.insert(pending.task_id.clone());
         pending.worktree = Some(resolved.proposal.path);
         Ok(())
     }
@@ -1273,11 +1302,27 @@ impl TaskHostOwner {
     }
 
     /// Quit order: stop ingress (resolving pending replies), kill every
-    /// run's Codex process group, drop both MCP connections, signal the log
-    /// server, drain the servers, then release the host lock. The runs are
-    /// reaped on a background thread, so a slow run never blocks the UI.
+    /// run's Codex process group and every unadopted task terminal's process
+    /// group, drop both MCP connections, signal the log server, drain the
+    /// servers, then release the host lock. The runs and terminals are
+    /// reaped on a background thread, so a slow child never blocks the UI.
     /// Chat drains run in the workspace owner's later callback.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn shutdown(&mut self) {
+        // Dropping each unadopted terminal kills its process group; GPUI
+        // reaps the killed child when it releases the terminal.
+        self.terminals.clear();
+        self.stop(Vec::new());
+    }
+
+    /// [`Self::shutdown`] at quit, with the killed terminals' children
+    /// reaped on the background thread too.
+    pub(crate) fn quit(&mut self, cx: &mut App) {
+        let terminals = self.stop_terminals(cx);
+        self.stop(terminals);
+    }
+
+    fn stop(&mut self, terminals: Vec<gitterm_terminal::Backend>) {
         self.host.shutdown();
         let mut runs: Vec<runs::RunHandle> = self.runs.drain().map(|(_, run)| run).collect();
         // On Unix this kills each spawned Codex's group before it returns,
@@ -1305,6 +1350,8 @@ impl TaskHostOwner {
                 .await;
             });
             let reap = move || {
+                // Each killed terminal's child is reaped as its backend drops.
+                drop(terminals);
                 // Each stopped run reaps its Codex child.
                 runtime.block_on(async {
                     let _ = tokio::time::timeout(RUN_STOP, async {

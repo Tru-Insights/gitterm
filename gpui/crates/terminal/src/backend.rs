@@ -200,6 +200,9 @@ pub struct Backend {
     size: TerminalSize,
     applied_size: TerminalSize,
     session: Option<Session>,
+    /// The PTY child's pid; alacritty starts it with `setsid`, so it also
+    /// names the child's process group.
+    child_pid: Option<u32>,
     pending_settings: Option<BackendSettings>,
     startup_output_pending: bool,
     deferred_resize: Option<(usize, usize)>,
@@ -245,9 +248,12 @@ impl Backend {
             escape_args: true,
         };
         let pty = tty::new(&pty_config, size.into(), 278)?;
+        let child_pid = pty.child().id();
         #[cfg(unix)]
         let pty = crate::session::OwnedPty::new(pty);
-        Self::with_pty_sized(settings, pty, size)
+        let mut backend = Self::with_pty_sized(settings, pty, size)?;
+        backend.child_pid = Some(child_pid);
+        Ok(backend)
     }
 
     /// Construct the terminal state without starting a shell. The view starts
@@ -263,6 +269,7 @@ impl Backend {
             size,
             applied_size: size,
             session: None,
+            child_pid: None,
             integration: None,
             pending_settings: Some(settings),
             startup_output_pending: false,
@@ -307,6 +314,7 @@ impl Backend {
             escape_args: true,
         };
         let pty = tty::new(&pty_config, size.into(), 278)?;
+        self.child_pid = Some(pty.child().id());
         #[cfg(unix)]
         let pty = crate::session::OwnedPty::new(pty);
         let config = term::Config {
@@ -368,6 +376,7 @@ impl Backend {
             size,
             applied_size: size,
             session: Some(session),
+            child_pid: None,
             integration: None,
             pending_settings: None,
             startup_output_pending: false,
@@ -900,6 +909,13 @@ impl Backend {
                 .input_rejected()
                 .then(|| "Input queue full: input was not sent; retry a smaller paste".into())
         })
+    }
+
+    /// The started PTY child's pid, which is also its process group (the
+    /// child is a session leader). `None` before a deferred start or for a
+    /// launch that failed.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child_pid
     }
 
     /// Idempotent: stops and joins the reader, and reaps the owned child.

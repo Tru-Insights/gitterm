@@ -2612,3 +2612,7 @@ fn slow_preflight_blocks_shutdown(cx: &mut TestAppContext) {
     );
     assert_eq!(runs.codex.runs(), 0, "Codex started after shutdown");
 }
+
+#[cfg(unix)]
+#[path = "task_host_launch_tests.rs"]
+mod launch_tests;
