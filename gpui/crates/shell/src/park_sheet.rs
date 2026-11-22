@@ -398,6 +398,10 @@ impl Focusable for ParkSheet {
 }
 
 impl ParkSheet {
+    /// Iced's `park_sheet` (Park or Close), not its Parked and Ready lists.
+    pub(crate) fn is_workspace_sheet(&self) -> bool {
+        matches!(self.content, Content::Workspace(_))
+    }
     pub(crate) fn submit(&mut self, cx: &mut Context<Self>) {
         if let Content::Workspace(model) = &self.content {
             self.emit(model.key("enter"), cx);
