@@ -2137,6 +2137,8 @@ fn queued_start_rechecks_policy_trust_and_batch_capacity(cx: &mut TestAppContext
     let first = runs.consult(cx);
     let second = runs.consult(cx);
     let third = runs.consult(cx);
+    // Wait for the first start; the settle then shows no second one starts.
+    wait_until(cx, |_| runs.codex.runs() == 1);
     settle(cx);
     assert_eq!(runs.codex.runs(), 1);
     assert_eq!(runs.status(&second, cx), "requested");
