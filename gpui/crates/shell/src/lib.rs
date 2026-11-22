@@ -3439,7 +3439,7 @@ impl Shell {
         }
         context
     }
-    /// The open shell modal, topmost first. While one is open, Iced consumes
+    /// The open true modal, topmost first. While one is open, Iced consumes
     /// every background command except `app_menus::Modal::allows`.
     fn shell_modal(&self, window: &mut Window, cx: &mut App) -> Option<app_menus::Modal> {
         use app_menus::Modal;
@@ -3449,14 +3449,23 @@ impl Shell {
             (Self::has_dialog(window, cx), Modal::Dialog),
             (self.task_panel_modal_open(cx), Modal::Task),
             (self.session_picker.is_some(), Modal::SessionPicker),
-            (self.park_sheet.is_some(), Modal::Park),
-            (self.new_work_sheet.is_some(), Modal::NewWork),
-            (self.settings_sheet.is_some(), Modal::Settings),
-            (self.phone_panel().is_some(), Modal::Phone),
-            (self.plans_open, Modal::Plans),
         ]
         .into_iter()
         .find_map(|(open, modal)| open.then_some(modal))
+    }
+    /// The open sheet, Plans view or phone panel. Iced catches only Escape
+    /// there, so none of these guards a background command.
+    fn open_sheet(&self) -> Option<app_menus::Sheet> {
+        use app_menus::Sheet;
+        [
+            (self.park_sheet.is_some(), Sheet::Park),
+            (self.new_work_sheet.is_some(), Sheet::NewWork),
+            (self.settings_sheet.is_some(), Sheet::Settings),
+            (self.phone_panel().is_some(), Sheet::Phone),
+            (self.plans_open, Sheet::Plans),
+        ]
+        .into_iter()
+        .find_map(|(open, sheet)| open.then_some(sheet))
     }
     /// Every shell action handler, behind the modal guard. GPUI dispatches a
     /// key's bound action before raw-key capture, and context-free bindings
@@ -4189,7 +4198,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.shell_modal(window, cx).is_none() {
+        if self.shell_modal(window, cx).is_none() && self.open_sheet().is_none() {
             return;
         }
         cx.stop_propagation();
