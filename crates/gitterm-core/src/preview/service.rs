@@ -692,12 +692,19 @@ fn check_effective_git(
         if rev_parse(&["--absolute-git-dir"])?.status.success() {
             return Err(failed("a repository with no work tree"));
         }
-        // With no repository found, the folder must hold no `.git` and no
-        // Git dir up to its fixture root, so the failure is not a broken
-        // repository of the fixture's own.
+        // With no repository found, nothing Git's discovery reaches (every
+        // folder up to the child's ceiling, past the fixture root when the
+        // ceiling is another fixture's parent) may hold a `.git` or be a Git
+        // dir, so the failure is not a repository Git could not open.
+        let ceilings: Vec<PathBuf> = env
+            .iter()
+            .filter(|(name, _)| name == "GIT_CEILING_DIRECTORIES")
+            .flat_map(|(_, value)| std::env::split_paths(value).collect::<Vec<_>>())
+            .map(|ceiling| fs::canonicalize(&ceiling).unwrap_or(ceiling))
+            .collect();
         for dir in checkout
             .ancestors()
-            .take_while(|dir| dir.starts_with(fixture))
+            .take_while(|dir| !ceilings.iter().any(|ceiling| ceiling == dir))
         {
             if exists_no_follow(&dir.join(".git"))? || exists_no_follow(&dir.join("HEAD"))? {
                 return Err(failed(String::from_utf8_lossy(&output.stderr).trim()));

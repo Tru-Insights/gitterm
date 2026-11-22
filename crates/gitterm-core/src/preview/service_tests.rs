@@ -1529,3 +1529,36 @@ fn git_is_found_from_the_checkout_as_the_child_finds_it() {
         WORKER_DENIED
     );
 }
+
+#[test]
+fn extra_folder_under_an_unreadable_outside_repository_refused() {
+    let f = fixture();
+    let root = fixture_repo(f.dir.path(), "fixture");
+    // An outside repository Git finds but cannot open, holding a second
+    // fixture, below the cwd fixture's ceiling: both probes fail.
+    let broken = outside_repo(f.dir.path());
+    git(&broken, &["config", "core.repositoryformatversion", "999"]);
+    let second = fixture_repo(&broken, "second");
+    fs::create_dir_all(second.join("notes")).unwrap();
+    let context =
+        ServiceContext::fixture_launch(f.preview.clone(), [root.clone(), second.clone()]).unwrap();
+    let root = fs::canonicalize(root).unwrap();
+    let second = fs::canonicalize(second).unwrap();
+    let repo = root.join("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    let granted = context
+        .authorize_targets(
+            classify_process(ProcessEffect::Worker),
+            &[repo, second.join("notes")],
+        )
+        .unwrap();
+    let env = child_git_env(&context, &root);
+    assert_eq!(context.recheck(&granted), Ok(()));
+    assert_eq!(
+        context
+            .recheck_git_work_trees(&granted, &env)
+            .unwrap_err()
+            .notice(),
+        WORKER_DENIED
+    );
+}
