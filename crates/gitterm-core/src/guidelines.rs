@@ -301,6 +301,27 @@ pub fn document_places(
     })
 }
 
+/// The document places of a saved workspace entry (a workspace not open
+/// yet): a work entry owns chats; its home is where they start. Iced's
+/// `config_document_places` for core's entry type (Iced keeps its own
+/// `config::WorkspaceConfig`), which GPUI reads.
+pub fn config_document_places<C>(
+    cfg: &crate::workspace_config::WorkspaceConfig<C>,
+) -> Option<DocumentPlaces> {
+    let local = matches!(
+        cfg.location,
+        None | Some(crate::remote::config::WorkspaceLocationConfig::Local { .. })
+    ) && cfg.remote_session.is_none();
+    document_places(
+        !cfg.chats.is_empty(),
+        local,
+        Path::new(&cfg.dir),
+        cfg.decisions_repo.as_deref().map(Path::new),
+        &cfg.name,
+        &cfg.repos.iter().map(PathBuf::from).collect::<Vec<_>>(),
+    )
+}
+
 /// The text appended for `places`, naming both locations as paths.
 pub fn documents_note(places: &DocumentPlaces) -> String {
     let mut note = format!(
@@ -1082,6 +1103,33 @@ mod tests {
             launch_instructions(Some(sample()), Some(&places), false, launch.path()).unwrap();
         assert!(!without.text.contains("Starting Codex"));
         assert_eq!(launch_instructions(None, None, false, launch.path()), None);
+    }
+
+    #[test]
+    fn saved_work_entry_has_document_places() {
+        let mut cfg: crate::workspace_config::WorkspaceConfig =
+            serde_json::from_value(serde_json::json!({
+                "name": "Example work", "abbrev": "EW", "dir": "/work/w",
+                "color": "blue", "tabs": [], "repos": ["/code/api"],
+                "decisions_repo": "/code/api"
+            }))
+            .unwrap();
+        // No chats: a folder workspace, told nothing.
+        assert_eq!(config_document_places(&cfg), None);
+        cfg.chats = vec!["chat".into()];
+        let places = config_document_places(&cfg).unwrap();
+        assert_eq!(places.docs_dir, Path::new("/work/w/docs"));
+        assert_eq!(places.repos, [PathBuf::from("/code/api")]);
+        assert_eq!(places.decisions_repo, Some(PathBuf::from("/code/api")));
+        assert_eq!(places.workspace_name, "Example work");
+        cfg.location = Some(
+            crate::remote::config::WorkspaceLocationConfig::RemoteAgent {
+                remote_id: "remote".into(),
+                workspace_id: "w".into(),
+                root: "/work/w".into(),
+            },
+        );
+        assert_eq!(config_document_places(&cfg), None);
     }
 
     #[test]

@@ -23,7 +23,7 @@ use gitterm_core::task_host::{cancel_queued_worker_launch, update_queued_task_re
 use gitterm_core::task_host::{
     launch_provider, DeliveryChat, DeliveryCompletion, DeliveryEffect, DeliveryReceipt, HostEffect,
     LaunchAdmission, LaunchPolicy, LaunchRequest, LaunchedSession, Promotion, QueuedTaskLaunch,
-    RunnerCapacity, Submission, TaskHost,
+    RunnerCapacity, Submission, TaskHost, TaskSessionLiveState, TaskSessionOutcome,
 };
 use iced::advanced::graphics::core::Element;
 use iced::keyboard::{self, key, Key, Modifiers};
@@ -4068,39 +4068,6 @@ fn format_attention_age(elapsed_secs: u64) -> String {
     } else {
         format!("{}d", elapsed.as_secs() / (24 * 60 * 60))
     }
-}
-
-/// The outcome a finished task session implies: the lifecycle it ends in,
-/// plus failure detail for the task's `last_error` when there is any.
-type TaskSessionOutcome = (TaskLifecycle, Option<String>);
-
-/// What a task-linked session is observably doing right now, from harness
-/// signals only (agent stream state, terminal-title heuristics, launch and
-/// exit of the harness process). Ephemeral view state — the durable record
-/// is the task's persisted lifecycle. `None` means no live execution signal:
-/// an open shell with nothing observably running claims nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TaskSessionLiveState {
-    Working,
-    AwaitingInput,
-}
-
-/// Aggregate the live states of every session linked to one task into a
-/// single lifecycle observation. A session awaiting input outranks work in
-/// progress — the human is the blocker; work elsewhere doesn't unblock it.
-/// No live signal at all yields None: the caller falls back to the ending
-/// session's own outcome, or leaves the durable lifecycle untouched.
-fn aggregate_task_live_states(
-    states: impl Iterator<Item = TaskSessionLiveState>,
-) -> Option<TaskLifecycle> {
-    let mut working = false;
-    for state in states {
-        match state {
-            TaskSessionLiveState::AwaitingInput => return Some(TaskLifecycle::WaitingForInput),
-            TaskSessionLiveState::Working => working = true,
-        }
-    }
-    working.then_some(TaskLifecycle::Running)
 }
 
 /// One look at something that can need the human, fed to
@@ -12062,27 +12029,19 @@ impl App {
                 store.worker_session_is_final(task_id, tab.task_session_id.as_deref())
             })
         };
-        let tabs: Vec<_> = self
+        let sessions: Vec<_> = self
             .workspaces
             .iter()
             .flat_map(|ws| &ws.tabs)
             .filter(|tab| tab.task_id.as_deref() == Some(task_id))
+            .map(|tab| gitterm_core::task_host::LinkedSession {
+                live: tab.task_live_state,
+                is_final: final_session(tab),
+            })
             .collect();
-        if !tabs.is_empty() && tabs.iter().all(|tab| final_session(tab)) {
+        let Some((target, detail)) = gitterm_core::task_host::task_session_signal(&sessions, ended)
+        else {
             return;
-        }
-        let live = aggregate_task_live_states(
-            self.workspaces
-                .iter()
-                .flat_map(|workspace| workspace.tabs.iter())
-                .filter(|tab| tab.task_id.as_deref() == Some(task_id))
-                .filter(|tab| !final_session(tab))
-                .filter_map(|tab| tab.task_live_state),
-        );
-        let (target, detail) = match (live, ended) {
-            (Some(state), ended) => (state, ended.and_then(|(_, detail)| detail)),
-            (None, Some((state, detail))) => (state, detail),
-            (None, None) => return,
         };
         let Some(store) = self.task_host.store_mut().as_mut() else {
             return;
@@ -51099,25 +51058,6 @@ mod tests {
         );
         assert_eq!(terminal_title_attention_reason("Claude Code"), None);
         assert_eq!(terminal_title_attention_reason("* shell"), None);
-    }
-
-    #[test]
-    fn task_live_state_aggregation_lets_waiting_outrank_working() {
-        assert_eq!(aggregate_task_live_states(std::iter::empty()), None);
-        assert_eq!(
-            aggregate_task_live_states([TaskSessionLiveState::Working].into_iter()),
-            Some(TaskLifecycle::Running)
-        );
-        assert_eq!(
-            aggregate_task_live_states(
-                [
-                    TaskSessionLiveState::Working,
-                    TaskSessionLiveState::AwaitingInput,
-                ]
-                .into_iter()
-            ),
-            Some(TaskLifecycle::WaitingForInput)
-        );
     }
 
     #[test]
