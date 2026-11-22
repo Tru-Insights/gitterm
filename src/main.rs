@@ -97,7 +97,7 @@ use gitterm::review_pane;
 use gitterm::task_mcp::TaskControlOperation;
 use gitterm::task_mcp::{
     self, CreateTaskRequest as McpCreateTaskRequest, TaskControlEnvelope, TaskControlReply,
-    TaskMcpConnection, TaskStoppingBoundary,
+    TaskMcpConnection,
 };
 use gitterm::task_worktree::{
     discover_task_delivery, inspect_task_cleanup, open_task_draft_pr, prepare_task_worktree,
@@ -5058,15 +5058,6 @@ fn check_delegate_targets(mut targets: DelegateTargets) -> Result<DelegateTarget
         }
     }
     Ok(targets)
-}
-
-/// The task MCP's stopping boundary as the store's.
-fn stopping_boundary_from_control(boundary: Option<TaskStoppingBoundary>) -> StoppingBoundary {
-    match boundary.unwrap_or(TaskStoppingBoundary::ImplementUntilTestsPass) {
-        TaskStoppingBoundary::PlanOnly => StoppingBoundary::PlanOnly,
-        TaskStoppingBoundary::ImplementUntilTestsPass => StoppingBoundary::ImplementUntilTestsPass,
-        TaskStoppingBoundary::PrepareDraftPr => StoppingBoundary::PrepareDraftPr,
-    }
 }
 
 /// Restored tabs subscribe to the same durable deadline as newly launched ones.
@@ -11938,36 +11929,12 @@ impl App {
         self.mark_log_server_dirty();
     }
 
-    /// Managed task worktrees are execution directories inside their owning
-    /// repository workspace, never peer workspaces in the bottom bar. Follow
-    /// any worktree ancestry back to that logical workspace.
+    /// See [`gitterm_core::task_host::canonical_task_workspace_directory`].
     fn canonical_task_workspace_directory(&self, directory: &Path) -> PathBuf {
-        let Some(store) = self.task_host.store().as_ref() else {
-            return directory.to_path_buf();
-        };
-        let mut canonical = directory.to_path_buf();
-        let mut visited = HashSet::new();
-        loop {
-            if !visited.insert(canonical.clone()) {
-                break;
-            }
-            let Some(owner) = store.tasks().iter().find(|task| {
-                task.worktree
-                    .path
-                    .as_deref()
-                    .is_some_and(|worktree| canonical.starts_with(worktree))
-            }) else {
-                break;
-            };
-            let WorkspaceLocationIdentity::Local { directory } = &owner.workspace.location else {
-                break;
-            };
-            if paths_equal(&canonical, directory) {
-                break;
-            }
-            canonical = directory.clone();
-        }
-        canonical
+        gitterm_core::task_host::canonical_task_workspace_directory(
+            self.task_host.store().as_ref(),
+            directory,
+        )
     }
 
     fn task_session_count(&self, task_id: &str) -> usize {
@@ -13643,49 +13610,30 @@ impl App {
                 workspace_name: input.workspace_name,
                 issue_key: input.issue_key,
                 base_reference: input.base_reference,
-                stopping_boundary: stopping_boundary_from_control(input.stopping_boundary),
+                stopping_boundary: gitterm_core::task_host::stopping_boundary_from_control(
+                    input.stopping_boundary,
+                ),
                 origin: TaskCreateOrigin::Control,
             }))?
         else {
             unreachable!("create must prepare a task")
         };
-        let title = input.title;
-        let objective = input.objective;
-        let issue_key = input.issue_key;
-        let base_reference = input.base_reference.expect("normalized base");
-        let repository_path = self.canonical_task_workspace_directory(&input.repository_path);
-        let came_from_managed_worktree = !paths_equal(&repository_path, &input.repository_path);
-        let workspace_name = (!came_from_managed_worktree)
-            .then_some(input.workspace_name)
-            .flatten()
-            .map(|name| name.trim().to_string())
-            .filter(|name| !name.is_empty())
-            .or_else(|| {
-                repository_path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            })
-            .unwrap_or_else(|| "Task workspace".to_string());
-        let stopping_boundary = input.stopping_boundary;
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let request = PrepareTaskWorktreeRequest {
-            repository_path: repository_path.clone(),
-            worktree_root: self.task_worktree_root.clone(),
-            task_id: task_id.clone(),
-            title: title.clone(),
-            issue_key: issue_key.clone(),
-            base_reference,
-        };
+        let worktree_root = self.task_worktree_root.clone();
+        let assembled = gitterm_core::task_host::assemble_task_create(
+            self.task_host.store().as_ref(),
+            input,
+            |_| Ok(worktree_root),
+        )?;
         Ok(PendingTaskLaunch {
-            task_id,
-            workspace_name,
-            workspace_dir: repository_path,
-            title,
-            objective,
-            issue_key,
-            stopping_boundary,
+            task_id: assembled.task_id,
+            workspace_name: assembled.workspace_name,
+            workspace_dir: assembled.workspace_dir,
+            title: assembled.title,
+            objective: assembled.objective,
+            issue_key: assembled.issue_key,
+            stopping_boundary: assembled.stopping_boundary,
             resolved_worktree_path: None,
-            request,
+            request: assembled.request,
             control_reply: Some(reply),
             creator_session_id: caller,
             worker: None,
@@ -19514,7 +19462,8 @@ impl App {
             {
                 return Err("Linear issue must look like TRU-106".to_string());
             }
-            let stopping_boundary = stopping_boundary_from_control(request.stopping_boundary);
+            let stopping_boundary =
+                gitterm_core::task_host::stopping_boundary_from_control(request.stopping_boundary);
             if let Some(resolution) = &adoption {
                 self.reduce_task_mutation(TaskMutation::CheckWorkerDestination {
                     expected: CompletedWorktreePreparation {
