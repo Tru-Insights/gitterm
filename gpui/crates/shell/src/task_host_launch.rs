@@ -161,6 +161,175 @@ impl TaskHostOwner {
         self.terminals.remove(session_id).map(HostTerminal::release)
     }
 
+    /// Iced's relaunch restore of a task tab (src/main.rs, the saved tab
+    /// loop of workspace restore, then `create_tab_with_session_uid`), in
+    /// fixture mode: a restored layout pane with a saved command and task
+    /// runs the command rebuilt as a launch builds it, as the same task
+    /// session, in a terminal this host owns until the shell adopts it
+    /// ([`Self::take_terminal`]). None restores a plain shell and keeps the
+    /// saved fields: no command or task, a task this host did not create
+    /// (always so in plain preview), neither folder there, or a refusal.
+    pub(crate) fn restore_terminal(
+        &mut self,
+        saved: &crate::layout::TerminalSession,
+        cx: &mut Context<Self>,
+    ) -> Option<TerminalLaunched> {
+        let (Some(_), Some(task_id)) = (&saved.startup_command, &saved.task_id) else {
+            return None;
+        };
+        self.try_restore(saved, task_id, cx)
+            .inspect_err(|error| {
+                eprintln!("[tasks] {task_id}: restored a plain shell, not its command: {error}");
+            })
+            .ok()
+    }
+
+    fn try_restore(
+        &mut self,
+        saved: &crate::layout::TerminalSession,
+        task_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<TerminalLaunched, String> {
+        const LABEL: &str = "task_launch_session";
+        if !self.own_tasks.contains(task_id) {
+            return Err(preview_notice(LABEL));
+        }
+        let mut task = self
+            .host
+            .store()
+            .as_ref()
+            .and_then(|store| store.get(task_id))
+            .cloned()
+            .ok_or_else(|| format!("Task {task_id} is not available"))?;
+        let WorkspaceLocationIdentity::Local { .. } = &task.workspace.location else {
+            return Err("Remote task sessions require the later remote-executor slice".into());
+        };
+        let worktree = task.worktree.path.clone().filter(|path| path.is_dir());
+        // Iced's folder: the saved one while it is a directory, else the
+        // task's worktree.
+        let folder = if saved.cwd.is_dir() {
+            saved.cwd.clone()
+        } else {
+            worktree.clone().ok_or_else(|| {
+                format!(
+                    "neither {} nor task {task_id}'s worktree is a folder",
+                    saved.cwd.display()
+                )
+            })?
+        };
+        let fixture = self.fixture_of(&folder, LABEL)?;
+        // Trust and guidelines read the task's worktree, as its launch did.
+        let worktree = worktree.unwrap_or_else(|| folder.clone());
+        // Iced keeps the saved task session, or fixes a new one before the
+        // terminal starts.
+        let session_id = saved
+            .task_session_id
+            .clone()
+            .unwrap_or_else(TaskRecord::fresh_id);
+        let env = self.terminal_child_env(&fixture, &session_id)?;
+        let settings = crate::workspace_config::load_iced_settings_from(&self.iced_config);
+        let notify = self
+            .servers
+            .as_ref()
+            .ok_or(SHUT_DOWN)?
+            .task_mcp
+            .notify_endpoint();
+        // A transcript lives where the fixture child's Claude writes it.
+        let projects = runs::value_of(&env, "CLAUDE_CONFIG_DIR")
+            .map(|dir| PathBuf::from(dir).join("projects"));
+        let transcript_exists = |id: &str| {
+            projects
+                .as_deref()
+                .is_some_and(|projects| claude_transcript_exists(projects, id))
+        };
+        // Iced prunes phantom Claude refs at startup, before tabs restore:
+        // a launched session that never got a message resumes nothing.
+        gitterm_core::task_host::prune_phantom_claude_conversations(&mut task, transcript_exists);
+        let restored = gitterm_core::task_host::restored_startup(
+            saved.startup_command.clone(),
+            None,
+            Some(&task),
+            saved.task_session_id.as_deref(),
+            |name| {
+                settings
+                    .agent_presets
+                    .iter()
+                    .find(|preset| preset.name == name)
+                    .and_then(|preset| preset_backend(&preset.name, &preset.command))
+            },
+            transcript_exists,
+            |command| {
+                gitterm_core::task_mcp::configure_codex_notify(
+                    &command,
+                    &notify,
+                    task_id,
+                    &session_id,
+                )
+            },
+        );
+        let command = restored
+            .startup_command
+            .clone()
+            .ok_or("the saved command was dropped")?;
+        // The command's own extra folders join the folder and worktree under
+        // the guard; a command whose folders are uncertain never starts.
+        let mut targets = vec![folder.clone()];
+        let add_dirs = gitterm_core::workers::launch_add_dirs(&command)
+            .map_err(|error| format!("its extra folders cannot be checked: {error}"))?;
+        for target in std::iter::once(worktree.clone()).chain(add_dirs) {
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+        let authorized = self.authorize_process(LABEL, &targets)?;
+        let runtime = self.runtime_command(&command, &worktree, &env, &task, cx)?;
+        // The fixture guard once more, right before the child starts, with
+        // the work tree Git itself would use (issue 84).
+        let services = self.host.services();
+        services
+            .recheck(&authorized)
+            .and_then(|()| services.recheck_git_work_trees(&authorized, &env))
+            .map_err(|denied| denied.notice().to_string())?;
+        let terminal = spawn_terminal(
+            &folder,
+            Some(runtime),
+            env,
+            cx.weak_entity(),
+            &session_id,
+            cx,
+        )?;
+        let target = session::Target {
+            session_uid: session_id.clone(),
+            task_id: Some(task_id.to_string()),
+            task_session_id: Some(session_id.clone()),
+            ..crate::sessions::fresh_target()
+        };
+        // Iced's restored tab tracks no live state until its agent signals.
+        self.launched.insert(
+            session_id.clone(),
+            Launched {
+                task_id: task_id.to_string(),
+                provider: launch_provider(&command),
+                view: terminal.view.downgrade(),
+                target: target.clone(),
+                live: None,
+            },
+        );
+        self.terminals.insert(session_id.clone(), terminal);
+        let label = task
+            .sessions
+            .iter()
+            .find(|session| session.task_session_id == session_id)
+            .map_or("Terminal", |session| session.label.as_str());
+        Ok(TerminalLaunched {
+            title: format!("{label} · {}", task.title),
+            session_id,
+            cwd: folder,
+            startup_command: restored.startup_command,
+            target,
+        })
+    }
+
     /// Iced's `LaunchSession` arm, after the fixture guard authorized the
     /// task's worktree.
     fn launch_task_session(
@@ -1055,6 +1224,26 @@ fn persisted_startup_command(
                 resume
             }),
     )
+}
+
+/// Iced's `claude_session_exists`, under the fixture child's Claude
+/// `projects` dir instead of ~/.claude: Claude writes
+/// `<projects>/<cwd-slug>/<id>.jsonl` on the first message. An id that is
+/// not a plain name never names a file.
+fn claude_transcript_exists(projects: &Path, session_id: &str) -> bool {
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return false;
+    }
+    let file = format!("{session_id}.jsonl");
+    std::fs::read_dir(projects).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.path().join(&file).is_file())
+    })
 }
 
 /// Iced's `preset_conversation_backend`.

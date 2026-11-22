@@ -122,6 +122,8 @@ struct WorkspaceDock {
     panes: HashMap<String, Entity<Pane>>,
     store: LayoutStore,
     error: Option<String>,
+    /// Event delivery for task terminals a restore adopted into panes.
+    _adopted: Vec<Subscription>,
 }
 pub struct Shell {
     data: Rc<dyn ShellData>,
@@ -1105,14 +1107,24 @@ impl Shell {
             .terminals
             .as_mut()
             .expect("local sessions")
-            .push(layout::TerminalSession {
-                id,
-                cwd,
-                startup_command: match &launch {
-                    Some(PaneStart::Adopt {
-                        startup_command, ..
-                    }) => startup_command.clone(),
-                    _ => None,
+            .push(match &launch {
+                Some(PaneStart::Adopt {
+                    startup_command,
+                    target,
+                    ..
+                }) => layout::TerminalSession {
+                    id,
+                    cwd,
+                    startup_command: startup_command.clone(),
+                    task_id: target.task_id.clone(),
+                    task_session_id: target.task_session_id.clone(),
+                },
+                _ => layout::TerminalSession {
+                    id,
+                    cwd,
+                    startup_command: None,
+                    task_id: None,
+                    task_session_id: None,
                 },
             });
         if placement == DockPlacement::Center {
@@ -1211,23 +1223,8 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A new pane: its stopped placeholder holds no terminal to close.
-        pane.update(cx, |pane, _| {
-            pane.session = Some(target);
-            pane.exit_pending = false;
-        });
-        self._subscriptions
-            .push(cx.observe_in(&view, window, |_, view, window, cx| {
-                let view = view.clone();
-                window.defer(cx, move |window, cx| {
-                    view.update(cx, |view, cx| view.process_events(window, cx));
-                });
-                cx.notify();
-            }));
-        pane.update(cx, |pane, cx| {
-            pane.content = pane::PaneContent::Terminal(view);
-            cx.notify();
-        });
+        let subscription = adopt_view(pane, view, target, window, cx);
+        self._subscriptions.push(subscription);
     }
     #[cfg(test)]
     fn close_session(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<Self>) {
@@ -1582,7 +1579,11 @@ fn build_workspace(
     } else {
         data.sessions(workspace.id, cx)
     };
+    let host = cx
+        .try_global::<task_host::GpuiTaskHost>()
+        .map(|host| host.0.clone());
     let mut panes = HashMap::new();
+    let mut adopted = Vec::new();
     for session in &sessions {
         ensure!(
             session_ids.insert(session.id.0),
@@ -1590,34 +1591,69 @@ fn build_workspace(
             session.id
         );
         let id = session_pane_id(session.id);
+        let imported = data.imported_session(workspace.id, session.id, cx);
+        let saved = store
+            .terminals
+            .as_ref()
+            .filter(|_| imported.is_none())
+            .map(|terminals| {
+                terminals
+                    .iter()
+                    .find(|t| t.id == session.id.0)
+                    .unwrap()
+                    .clone()
+            });
+        // Like Iced's relaunch, a task terminal with a saved command runs
+        // it again; only the fixture task host starts one, and anything
+        // else restores a plain shell with the saved fields kept.
+        let restored = match (&saved, &host) {
+            (Some(saved), Some(host)) if !stopped => {
+                host.update(cx, |host, cx| host.restore_terminal(saved, cx))
+            }
+            _ => None,
+        };
+        let kind = if let Some(text) = imported {
+            PaneKind::IcedSession(text)
+        } else if let Some(restored) = &restored {
+            // Its placeholder until the host's terminal is adopted below.
+            PaneKind::StoppedTerminal(restored.cwd.clone(), true)
+        } else if let Some(saved) = &saved {
+            if stopped {
+                PaneKind::StoppedTerminal(saved.cwd.clone(), true)
+            } else {
+                PaneKind::CenterTerminal(saved.cwd.clone())
+            }
+        } else {
+            session.kind.into()
+        };
         let pane = cx.new(|cx| {
             Pane::new(
                 id.clone(),
                 session.title.clone(),
-                if let Some(text) = data.imported_session(workspace.id, session.id, cx) {
-                    PaneKind::IcedSession(text)
-                } else if let Some(terminals) = &store.terminals {
-                    let cwd = terminals
-                        .iter()
-                        .find(|t| t.id == session.id.0)
-                        .unwrap()
-                        .cwd
-                        .clone();
-                    if stopped {
-                        PaneKind::StoppedTerminal(cwd, true)
-                    } else {
-                        // Like Iced, restore a plain shell now, without a saved run command.
-                        PaneKind::CenterTerminal(cwd)
-                    }
-                } else {
-                    session.kind.into()
-                },
+                kind,
                 workspace.id,
                 data.clone(),
                 window,
                 cx,
             )
         });
+        if let (Some(restored), Some(host)) = (restored, &host)
+            && let Some(view) = host.update(cx, |host, _| host.take_terminal(&restored.session_id))
+        {
+            adopted.push(adopt_view(&pane, view, restored.target.clone(), window, cx));
+            pane.update(cx, |pane, _| pane.title = restored.title.clone());
+            // Iced saves the tab as it restored it: its folder, rewritten
+            // command and task session.
+            if let Some(entry) = store
+                .terminals
+                .as_mut()
+                .and_then(|terminals| terminals.iter_mut().find(|t| t.id == session.id.0))
+            {
+                entry.cwd = restored.cwd;
+                entry.startup_command = restored.startup_command;
+                entry.task_session_id = restored.target.task_session_id;
+            }
+        }
         panes.insert(id, pane);
     }
     for (name, title, kind) in [
@@ -1656,9 +1692,37 @@ fn build_workspace(
         panes,
         dock,
         error: None,
+        _adopted: adopted,
     })
 }
 
+/// A running terminal becomes `pane`'s, which delivers its events; the
+/// subscription keeps them flowing.
+fn adopt_view(
+    pane: &Entity<Pane>,
+    view: Entity<gitterm_terminal::TerminalView>,
+    target: gitterm_core::session::Target,
+    window: &mut Window,
+    cx: &mut Context<Shell>,
+) -> Subscription {
+    // A new pane: its stopped placeholder holds no terminal to close.
+    pane.update(cx, |pane, _| {
+        pane.session = Some(target);
+        pane.exit_pending = false;
+    });
+    let subscription = cx.observe_in(&view, window, |_, view, window, cx| {
+        let view = view.clone();
+        window.defer(cx, move |window, cx| {
+            view.update(cx, |view, cx| view.process_events(window, cx));
+        });
+        cx.notify();
+    });
+    pane.update(cx, |pane, cx| {
+        pane.content = pane::PaneContent::Terminal(view);
+        cx.notify();
+    });
+    subscription
+}
 fn session_pane_id(id: SessionId) -> String {
     format!("session-{}", id.0)
 }

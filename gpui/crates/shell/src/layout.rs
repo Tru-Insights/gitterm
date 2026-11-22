@@ -109,6 +109,13 @@ pub struct TerminalSession {
     /// Absent in layouts written before it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_command: Option<String>,
+    /// Iced's `WorkspaceTabConfig.task_id` and `task_session_id`: the task
+    /// session a launched task terminal runs, so a restore starts it with
+    /// the same caller identity. Absent in older layouts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_session_id: Option<String>,
 }
 
 pub struct LayoutStore {
@@ -504,6 +511,33 @@ mod tests {
             saved["terminal_sessions"][1]["startup_command"],
             "claude --resume abc"
         );
+        for key in ["task_id", "task_session_id"] {
+            assert!(no_session_has(&saved, key), "{key} saved: {saved}");
+        }
+    }
+    fn no_session_has(saved: &serde_json::Value, key: &str) -> bool {
+        saved["terminal_sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|session| session.get(key).is_none())
+    }
+    /// A task terminal's identity round-trips through the layout file.
+    #[test]
+    fn terminal_session_task_identity_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let mut store = LayoutStore::new(dir.path().join("layout.json"));
+        let session = TerminalSession {
+            id: 3,
+            cwd,
+            startup_command: Some("codex".into()),
+            task_id: Some("task-1".into()),
+            task_session_id: Some("session-1".into()),
+        };
+        store.terminals = Some(vec![session.clone()]);
+        std::fs::write(&store.path, store.bytes(&fixture()).unwrap()).unwrap();
+        assert_eq!(store.load_terminals().unwrap(), Some(vec![session]));
     }
     #[test]
     fn region_defaults_clamp_collapse_and_require_explicit_terminal() {
