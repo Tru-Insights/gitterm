@@ -180,8 +180,29 @@ pub(crate) fn render(
                                 .text_color(rgb(palette.fg))
                                 .child(row.name),
                         )
-                        .child(div().flex_shrink_0().child(row.what))
-                        .child(div().flex_shrink_0().child(row.elapsed))
+                        // Iced's `.ro-what`: the checkout shortens with an
+                        // ellipsis so the time and `×` stay inside the footer.
+                        .child(
+                            div()
+                                .debug_selector({
+                                    let id = row.id.clone();
+                                    move || format!("roster-what-{id}")
+                                })
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(row.what),
+                        )
+                        .child(
+                            div()
+                                .debug_selector({
+                                    let id = row.id.clone();
+                                    move || format!("roster-meta-{id}")
+                                })
+                                .flex_shrink_0()
+                                .child(row.elapsed),
+                        )
                         .child(
                             Button::new(gpui::SharedString::from(format!(
                                 "roster-dismiss-{}",
