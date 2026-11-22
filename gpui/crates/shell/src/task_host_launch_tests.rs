@@ -1231,7 +1231,8 @@ fn launched_terminal_handoff_routes_to_its_task_session(cx: &mut TestAppContext)
 
 /// Iced's exit path for a task tab (`Action::Shutdown`): an adopted agent
 /// terminal whose child exits stops its task and shows exited; a worker
-/// that already reported done keeps its task's Completed.
+/// that already reported done keeps its task's Completed, whether its
+/// pane shows the exit or the tick closed it as a final worker first.
 #[gpui::test]
 fn adopted_terminal_exit_updates_its_task(cx: &mut TestAppContext) {
     let launches = Launches::start(cx);
@@ -1282,7 +1283,9 @@ fn adopted_terminal_exit_updates_its_task(cx: &mut TestAppContext) {
     )
     .unwrap();
     launches.kill(2);
-    tick_until(vcx, |cx| pane_exited(&second, cx));
+    tick_until(vcx, |cx| {
+        pane_exited(&second, cx) || session_holding(&shell, &second, cx).is_none()
+    });
     vcx.run_until_parked();
     assert_eq!(
         launches.saved().get(&worker).unwrap().lifecycle,
@@ -1772,6 +1775,9 @@ fn restore_of_an_unmessaged_claude_launch_starts_fresh(cx: &mut TestAppContext) 
 
 #[path = "task_host_launch_turn_tests.rs"]
 mod turn_tests;
+
+#[path = "task_host_launch_close_tests.rs"]
+mod close_tests;
 
 /// Issue 86 F1: a saved command not in the form GPUI's launch saves (a
 /// wrapper around a harness, a quoted executable, an option GPUI never

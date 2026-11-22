@@ -88,7 +88,7 @@ pub(crate) use delivery::forward_turn_ends;
 pub(crate) use delivery::{DELIVERY_POLL, SubmitHook};
 #[cfg(test)]
 pub(crate) use launch::with_preassigned_session_id as launch_session_id;
-pub(crate) use launch::{TerminalExited, TerminalLaunched};
+pub(crate) use launch::{FinalWorkerClose, TerminalExited, TerminalLaunched};
 
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HOST_LOCK: &str = ".task-host.lock";
@@ -501,10 +501,12 @@ impl TaskHostOwner {
                         cx.background_executor()
                             .timer(delivery::DELIVERY_POLL)
                             .await;
-                        // Iced's Tick also starts queued launches.
+                        // Iced's Tick closes final workers after delivery,
+                        // and starts queued launches.
                         if owner
                             .update(cx, |owner, cx| {
                                 owner.deliver_results(cx);
+                                owner.close_final_workers(cx);
                                 owner.promote_queued_tasks(cx);
                             })
                             .is_err()

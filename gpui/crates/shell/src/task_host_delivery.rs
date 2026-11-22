@@ -74,6 +74,62 @@ impl TaskHostOwner {
         }
     }
 
+    /// Iced's `close_final_workers`, on the tick after delivery: a worker's
+    /// final session closes once its result went out (core decides which,
+    /// [`gitterm_core::task_host::final_worker_closes`]); a task left with
+    /// no open worker ends as its final delegation did, unless another of
+    /// its sessions is live. The shell closes each pane
+    /// ([`super::FinalWorkerClose`]), which ends its terminal, and the
+    /// close folds the session into its task ([`Self::session_closed`]).
+    /// Iced stops the worker's process with a grace period first; GPUI's
+    /// close drops the PTY, which hangs up the child, then reaps it.
+    pub(crate) fn close_final_workers(&mut self, cx: &mut Context<Self>) {
+        if !self.delivers() {
+            return;
+        }
+        let ready = self
+            .host
+            .final_workers_ready(&delivery_chats(cx), self.auto_tell());
+        let closing = self.start_final_worker_closes(&ready);
+        if closing.is_empty() {
+            return;
+        }
+        let sessions: Vec<String> = closing
+            .iter()
+            .filter_map(|target| target.task_session_id.clone())
+            .collect();
+        let ended = self.host.store().as_ref().map_or_else(Vec::new, |store| {
+            gitterm_core::task_host::closed_worker_task_outcomes(store, &sessions)
+        });
+        for (task_id, state) in ended {
+            if self.task_live_besides_closing(&task_id) {
+                continue;
+            }
+            if let Err(error) = self.writable_store().and_then(|store| {
+                store
+                    .record_lifecycle_signal(
+                        &task_id,
+                        state,
+                        None,
+                        &chrono::Utc::now().to_rfc3339(),
+                    )
+                    .map_err(|error| error.to_string())
+            }) {
+                eprintln!("[tasks] finalize worker task {task_id}: {error}");
+            }
+        }
+        for target in closing {
+            match target.task_session_id.as_deref() {
+                // Never adopted: the host holds the terminal and ends it.
+                Some(session) if self.terminals.contains_key(session) => {
+                    self.session_closed(session, cx)
+                }
+                _ => cx.emit(super::FinalWorkerClose { target }),
+            }
+        }
+        cx.notify();
+    }
+
     /// Fixture mode only, while the host runs; a kept receipt may be saved,
     /// so the store must still be the copy under the preview root.
     fn delivers(&self) -> bool {

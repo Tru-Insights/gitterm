@@ -59,6 +59,9 @@ pub type ResizeCallback = Box<dyn Fn(usize, usize) + Send + Sync>;
 
 pub type KeyHandler = Box<dyn Fn(&KeyDownEvent) -> bool + Send + Sync>;
 
+/// Called after the user's input (a key, Tab, a paste) reaches the PTY.
+pub type InputCallback = Box<dyn Fn() + Send + Sync>;
+
 pub type BellCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>)>;
 
 pub type CwdCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>, &std::path::Path)>;
@@ -96,6 +99,8 @@ pub struct TerminalView {
     resize_callback: Option<Arc<ResizeCallback>>,
 
     key_handler: Option<Arc<KeyHandler>>,
+
+    input_callback: Option<Arc<InputCallback>>,
 
     bell_callback: Option<BellCallback>,
 
@@ -216,6 +221,7 @@ impl TerminalView {
             _notification_task: reader_task,
             resize_callback: None,
             key_handler: None,
+            input_callback: None,
             bell_callback: None,
             title_callback: None,
             cwd_callback: None,
@@ -539,6 +545,11 @@ impl TerminalView {
         handler: impl Fn(&KeyDownEvent) -> bool + Send + Sync + 'static,
     ) -> Self {
         self.key_handler = Some(Arc::new(Box::new(handler)));
+        self
+    }
+
+    pub fn with_input_callback(mut self, callback: impl Fn() + Send + Sync + 'static) -> Self {
+        self.input_callback = Some(Arc::new(Box::new(callback)));
         self
     }
 
@@ -973,13 +984,20 @@ impl TerminalView {
         if let Ok(mut clipboard) = crate::clipboard::Clipboard::new()
             && let Ok(text) = clipboard.get_text()
         {
-            return self.backend.paste(&text);
+            return self.wrote_input(self.backend.paste(&text));
         }
         false
     }
 
     fn write_input_bytes(&self, bytes: &[u8]) -> bool {
-        self.backend.input_bytes(bytes)
+        self.wrote_input(self.backend.input_bytes(bytes))
+    }
+
+    fn wrote_input(&self, wrote: bool) -> bool {
+        if wrote && let Some(callback) = &self.input_callback {
+            callback();
+        }
+        wrote
     }
 
     fn build_context_menu(

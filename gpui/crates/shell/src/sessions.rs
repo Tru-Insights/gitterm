@@ -64,6 +64,18 @@ impl crate::Shell {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        self.close_target_with(requested, false, window, cx);
+    }
+
+    /// Iced's `CloseSession`: `confirmed` once its running-task prompt was
+    /// answered (or a final worker closes), so it is not asked again.
+    pub(crate) fn close_target_with(
+        &mut self,
+        requested: &Target,
+        confirmed: bool,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
         let Some(state) = self.workspaces.iter_mut().find(|state| {
             state
                 .panes
@@ -81,12 +93,14 @@ impl crate::Shell {
         let pane_id = crate::session_pane_id(id);
         let pane = &state.panes[&pane_id];
         // Iced's running-task prompt (`TaskTabClose` → Stop and close / Keep open).
-        if crate::task_panel::close_needs_confirm(
-            pane.read(cx).session.as_ref().unwrap(),
-            requested,
-            state.sessions.len() <= 1,
-            cx,
-        ) {
+        if !confirmed
+            && crate::task_panel::close_needs_confirm(
+                pane.read(cx).session.as_ref().unwrap(),
+                requested,
+                state.sessions.len() <= 1,
+                cx,
+            )
+        {
             let workspace = state.workspace.id;
             self.show_workspace_pane(workspace, &pane_id, window, cx);
             let panel = self.ensure_task_panel(window, cx);
@@ -105,6 +119,16 @@ impl crate::Shell {
             self.show_workspace_pane(workspace, &pane_id, window, cx);
             return;
         }
+        // Iced's `close_task_tab`: a launched task session's close folds into
+        // its task, then dropping the PTY hangs up its child and reaps it.
+        if let (Some(session), Some(host)) = (
+            requested.task_session_id.as_deref(),
+            cx.try_global::<crate::task_host::GpuiTaskHost>()
+                .map(|host| host.0.clone()),
+        ) {
+            host.update(cx, |host, cx| host.session_closed(session, cx));
+        }
+        let pane = &state.panes[&pane_id];
         pane.update(cx, |pane, cx| pane.stop_target(requested, cx));
         self.owner.update(cx, |owner, _| {
             owner.chats.remove(&requested.session_uid);
