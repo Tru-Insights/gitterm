@@ -57,8 +57,8 @@ pub use create::{
     AssembledTaskCreate,
 };
 pub use delivery::{
-    DeliveryChat, DeliveryCompletion, DeliveryEffect, DeliveryReceipt, DeliveryTick, Dismissal,
-    Submission,
+    waiting_delegation_log_lines, DeliveryChat, DeliveryCompletion, DeliveryEffect,
+    DeliveryReceipt, DeliveryTick, Dismissal, Submission,
 };
 pub use launch::{
     cancel_queued_worker_launch, launch_provider, update_queued_task_request, AwaitingWorker,

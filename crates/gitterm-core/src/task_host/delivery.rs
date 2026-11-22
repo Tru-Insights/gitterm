@@ -93,6 +93,29 @@ pub struct DeliveryTick {
     pub tabs: Vec<usize>,
 }
 
+/// The log lines for finished results whose chat is not open: one per chat
+/// whose count differs from the previous tick's, which `previous` then
+/// becomes. Names no result body, only the chat's session uid and a count.
+pub fn waiting_delegation_log_lines(
+    previous: &mut std::collections::HashMap<String, usize>,
+    waiting: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut counts = std::collections::HashMap::new();
+    for chat in waiting {
+        *counts.entry(chat).or_insert(0) += 1;
+    }
+    let mut lines = Vec::new();
+    for (chat, count) in &counts {
+        if previous.get(chat) != Some(count) {
+            lines.push(format!(
+                "[delegation] {count} finished results wait for chat {chat} until it is open"
+            ));
+        }
+    }
+    *previous = counts;
+    lines
+}
+
 /// A dismissed card: the runs to stop, and whether the store took it.
 #[derive(Debug)]
 pub struct Dismissal {

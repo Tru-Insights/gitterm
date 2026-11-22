@@ -21,9 +21,10 @@ use gitterm_core::task_commands::{
 #[cfg(test)]
 use gitterm_core::task_host::{cancel_queued_worker_launch, update_queued_task_request};
 use gitterm_core::task_host::{
-    launch_provider, DeliveryChat, DeliveryCompletion, DeliveryEffect, DeliveryReceipt, HostEffect,
-    LaunchAdmission, LaunchPolicy, LaunchRequest, LaunchedSession, Promotion, QueuedTaskLaunch,
-    RunnerCapacity, Submission, TaskHost, TaskSessionLiveState, TaskSessionOutcome,
+    launch_provider, waiting_delegation_log_lines, DeliveryChat, DeliveryCompletion,
+    DeliveryEffect, DeliveryReceipt, HostEffect, LaunchAdmission, LaunchPolicy, LaunchRequest,
+    LaunchedSession, Promotion, QueuedTaskLaunch, RunnerCapacity, Submission, TaskHost,
+    TaskSessionLiveState, TaskSessionOutcome,
 };
 use iced::advanced::graphics::core::Element;
 use iced::keyboard::{self, key, Key, Modifiers};
@@ -20552,26 +20553,6 @@ fn worker_delivery_allows_close(
         .and_then(|result| result.handoff.as_ref())
         .is_some();
     handoff_stored && (d.is_delivered() || held || !auto_tell || !parent_present)
-}
-
-fn waiting_delegation_log_lines(
-    previous: &mut HashMap<String, usize>,
-    waiting: impl IntoIterator<Item = String>,
-) -> Vec<String> {
-    let mut counts = HashMap::new();
-    for chat in waiting {
-        *counts.entry(chat).or_insert(0) += 1;
-    }
-    let mut lines = Vec::new();
-    for (chat, count) in &counts {
-        if previous.get(chat) != Some(count) {
-            lines.push(format!(
-                "[delegation] {count} finished results wait for chat {chat} until it is open"
-            ));
-        }
-    }
-    *previous = counts;
-    lines
 }
 
 fn load_task_store_for_startup(
@@ -53779,33 +53760,6 @@ mod tests {
     }
 
     // === AppTheme::toggle ===
-
-    #[test]
-    fn closed_chat_results_log_once_until_the_count_changes() {
-        let mut previous = HashMap::new();
-        let waiting = || vec!["closed-chat".to_string(); 3];
-        assert_eq!(
-            waiting_delegation_log_lines(&mut previous, waiting()),
-            vec!["[delegation] 3 finished results wait for chat closed-chat until it is open"]
-        );
-        assert!(waiting_delegation_log_lines(&mut previous, waiting()).is_empty());
-        let mut more = waiting();
-        more.push("closed-chat".into());
-        more.push("other-chat".into());
-        let lines = waiting_delegation_log_lines(&mut previous, more);
-        assert_eq!(lines.len(), 2);
-        assert!(lines
-            .iter()
-            .any(|line| line.contains("4 finished results wait for chat closed-chat")));
-        assert!(lines
-            .iter()
-            .any(|line| line.contains("1 finished results wait for chat other-chat")));
-        assert!(waiting_delegation_log_lines(&mut previous, Vec::new()).is_empty());
-        assert_eq!(
-            waiting_delegation_log_lines(&mut previous, waiting()).len(),
-            1
-        );
-    }
 
     #[test]
     fn theme_toggle_dark_to_light() {
