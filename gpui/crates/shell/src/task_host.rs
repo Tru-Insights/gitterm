@@ -845,59 +845,38 @@ impl TaskHostOwner {
             workspace_name: request.workspace_name,
             issue_key: request.issue_key,
             base_reference: request.base_reference,
-            stopping_boundary: stopping_boundary_from_control(request.stopping_boundary),
+            stopping_boundary: gitterm_core::task_host::stopping_boundary_from_control(
+                request.stopping_boundary,
+            ),
             origin: TaskCreateOrigin::Control,
         });
         let TaskMutationAction::PrepareTask(input) = self.reduce(mutation, &Default::default())?
         else {
             return Err("task_create: the reducer did not prepare a task".into());
         };
-        let base_reference = input
-            .base_reference
-            .ok_or("task_create: the reducer left no base reference")?;
-        let repository_path = self.host.store().as_ref().map_or_else(
-            || input.repository_path.clone(),
-            |store| owning_workspace_directory(store, &input.repository_path),
-        );
-        let came_from_managed_worktree =
-            !gitterm_core::chat::checkout::paths_equal(&repository_path, &input.repository_path);
-        let workspace_name = (!came_from_managed_worktree)
-            .then_some(input.workspace_name)
-            .flatten()
-            .map(|name| name.trim().to_string())
-            .filter(|name| !name.is_empty())
-            .or_else(|| {
-                repository_path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            })
-            .unwrap_or_else(|| "Task workspace".to_string());
-        let worktree_root = self.fixture_worktree_root(&repository_path, label)?;
+        let original_repository_path = input.repository_path.clone();
+        let assembled = gitterm_core::task_host::assemble_task_create(
+            self.host.store().as_ref(),
+            input,
+            |repository_path| self.fixture_worktree_root(repository_path, label),
+        )?;
         let targets = vec![
-            input.repository_path,
-            repository_path.clone(),
-            worktree_root.clone(),
+            original_repository_path,
+            assembled.workspace_dir.clone(),
+            assembled.request.worktree_root.clone(),
         ];
         let authorized = self.authorize_write(label, &targets)?;
-        let task_id = TaskRecord::fresh_id();
         Ok(PendingCreate {
             reply,
             caller,
             label,
-            request: PrepareTaskWorktreeRequest {
-                repository_path,
-                worktree_root,
-                task_id: task_id.clone(),
-                title: input.title.clone(),
-                issue_key: input.issue_key.clone(),
-                base_reference,
-            },
-            task_id,
-            workspace_name,
-            title: input.title,
-            objective: input.objective,
-            issue_key: input.issue_key,
-            stopping_boundary: input.stopping_boundary,
+            task_id: assembled.task_id,
+            workspace_name: assembled.workspace_name,
+            title: assembled.title,
+            objective: assembled.objective,
+            issue_key: assembled.issue_key,
+            stopping_boundary: assembled.stopping_boundary,
+            request: assembled.request,
             targets,
             authorized,
             worktree: None,
@@ -1306,45 +1285,6 @@ struct PendingCreate {
     authorized: AuthorizedTargets,
     /// The proposed worktree, once the preparing record is saved.
     worktree: Option<PathBuf>,
-}
-
-/// Iced's `stopping_boundary_from_control`.
-fn stopping_boundary_from_control(
-    boundary: Option<gitterm_core::task_mcp::TaskStoppingBoundary>,
-) -> StoppingBoundary {
-    use gitterm_core::task_mcp::TaskStoppingBoundary as B;
-    match boundary.unwrap_or(B::ImplementUntilTestsPass) {
-        B::PlanOnly => StoppingBoundary::PlanOnly,
-        B::ImplementUntilTestsPass => StoppingBoundary::ImplementUntilTestsPass,
-        B::PrepareDraftPr => StoppingBoundary::PrepareDraftPr,
-    }
-}
-
-/// Iced's `canonical_task_workspace_directory`: a managed task worktree
-/// belongs to its owning repository workspace, followed back through any
-/// worktree ancestry.
-fn owning_workspace_directory(store: &TaskStore, directory: &Path) -> PathBuf {
-    use gitterm_core::{chat::checkout::paths_equal, tasks::WorkspaceLocationIdentity};
-    let mut canonical = directory.to_path_buf();
-    let mut visited = std::collections::HashSet::new();
-    while visited.insert(canonical.clone()) {
-        let Some(owner) = store.tasks().iter().find(|task| {
-            task.worktree
-                .path
-                .as_deref()
-                .is_some_and(|worktree| canonical.starts_with(worktree))
-        }) else {
-            break;
-        };
-        let WorkspaceLocationIdentity::Local { directory } = &owner.workspace.location else {
-            break;
-        };
-        if paths_equal(&canonical, directory) {
-            break;
-        }
-        canonical = directory.clone();
-    }
-    canonical
 }
 
 /// The workspace owner's open chat panes; none before the window exists.
