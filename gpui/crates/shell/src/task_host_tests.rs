@@ -1812,9 +1812,10 @@ fn path_swapped_after_prep_refused(cx: &mut TestAppContext) {
 // ---------------------------------------------------------------------------
 // H5b B10: review and consult run a fake Codex in fixture mode.
 
-/// A fake `codex` on its own PATH dir. Run `n` records `env-n`, `args-n`
-/// and `stdin-n`, waits while `hold-n` exists, then prints a consult
-/// stream. `runs` holds one line per start.
+/// A fake `codex` on its own PATH dir. Run `n` records `env-n`, `args-n`,
+/// `stdin-n` and `pwd-n`, starts a `sleep` recording its pid in `child-n`
+/// when `spawn-n` exists, waits while `hold-n` exists, then prints a
+/// consult stream. `runs` holds one line per start.
 struct FakeCodex {
     dir: tempfile::TempDir,
 }
@@ -1828,6 +1829,11 @@ n=$(wc -l < 'DIR/runs' | tr -d ' ')
 env > "DIR/env-$n"
 printf '%s\n' "$@" > "DIR/args-$n"
 cat > "DIR/stdin-$n"
+pwd -P > "DIR/pwd-$n"
+if [ -f "DIR/spawn-$n" ]; then
+  sleep 600 >/dev/null 2>&1 &
+  echo $! > "DIR/child-$n"
+fi
 while [ -f "DIR/hold-$n" ]; do sleep 0.05; done
 echo '{"type":"thread.started","thread_id":"thread-'"$n"'"}'
 echo '{"type":"turn.started"}'
@@ -1871,6 +1877,18 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
             .filter_map(|line| line.split_once('='))
             .map(|(name, value)| (name.to_string(), value.to_string()))
             .collect()
+    }
+    fn pwd(&self, run: usize) -> PathBuf {
+        let pwd = std::fs::read_to_string(self.dir.path().join(format!("pwd-{run}"))).unwrap();
+        PathBuf::from(pwd.trim_end())
+    }
+    /// Run `run` starts a descendant; its pid, once recorded.
+    fn spawn_descendant(&self, run: usize) {
+        std::fs::write(self.dir.path().join(format!("spawn-{run}")), b"").unwrap();
+    }
+    fn descendant(&self, run: usize) -> Option<u32> {
+        let pid = std::fs::read_to_string(self.dir.path().join(format!("child-{run}"))).ok()?;
+        pid.ends_with('\n').then(|| pid.trim().parse().unwrap())
     }
     fn args(&self, run: usize) -> Vec<String> {
         std::fs::read_to_string(self.dir.path().join(format!("args-{run}")))
@@ -1977,6 +1995,19 @@ impl Runs {
                 .label()
                 .to_string()
         })
+    }
+    /// The delegations in the preview store's file, as saved.
+    fn saved(&self) -> Vec<Delegation> {
+        gitterm_core::tasks::TaskStore::load(self.fixture.copy())
+            .unwrap()
+            .delegations()
+            .to_vec()
+    }
+    /// Shuts the host down when the run continuation at `stage` is reached.
+    fn shut_down_at(&self, stage: &'static str, cx: &mut TestAppContext) {
+        self.owner.update(cx, |owner, _| {
+            owner.before_continuation = Some((stage, Box::new(|owner| owner.shutdown())))
+        });
     }
     fn delegation_count(&self, cx: &mut TestAppContext) -> usize {
         self.owner.read_with(cx, |owner, _| {
@@ -2305,4 +2336,189 @@ fn imported_requested_run_inert_in_fixture_mode(cx: &mut TestAppContext) {
         runs.owner
             .read_with(cx, |owner, _| owner.host().launch_queue().is_empty())
     );
+}
+
+/// A script at `path` that, once, moves `repo` aside and puts a symlink to
+/// `outside` in its place.
+#[cfg(unix)]
+fn swap_script(path: &Path, prelude: &str, repo: &Path, outside: &Path, tail: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let script = format!(
+        "#!/bin/sh\n{prelude}\nif [ ! -L '{repo}' ]; then mv '{repo}' '{repo}-moved' && ln -s '{outside}' '{repo}'; fi\n{tail}\n",
+        repo = repo.display(),
+        outside = outside.display(),
+    );
+    std::fs::write(path, script).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Waits for `id` to leave requested and running.
+fn settled_status(runs: &Runs, id: &str, cx: &mut TestAppContext) -> String {
+    wait_until(cx, |cx| {
+        !matches!(runs.status(id, cx).as_str(), "requested" | "running")
+    });
+    runs.status(id, cx)
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn fsmonitor_hook_never_runs_in_run_preflight(cx: &mut TestAppContext) {
+    let runs = Runs::start(2, cx);
+    let marker = runs.fixture.iced.parent().unwrap().join("fsmonitor-ran");
+    // The checkout's own hook would put the outside repo in its place
+    // during the runner's `git status`.
+    let hook = runs.git.root.join("fsmonitor-hook");
+    swap_script(
+        &hook,
+        &format!("touch '{}'", marker.display()),
+        &runs.git.repo,
+        &runs.git.outside,
+        "exit 1",
+    );
+    git(
+        &runs.git.repo,
+        &["config", "core.fsmonitor", hook.to_str().unwrap()],
+    );
+    let outside_before = tree(&runs.git.outside);
+    let id = runs.consult(cx);
+    assert_eq!(settled_status(&runs, &id, cx), "completed");
+    assert!(!marker.exists(), "the run's git preflight ran the hook");
+    assert_eq!(runs.codex.runs(), 1);
+    assert_eq!(runs.codex.pwd(1), runs.git.repo.canonicalize().unwrap());
+    assert_eq!(tree(&runs.git.outside), outside_before);
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn checkout_swapped_during_preflight_refused(cx: &mut TestAppContext) {
+    let runs = Runs::start(2, cx);
+    // A `git` ahead of the real one swaps the checkout during the runner's
+    // `git status`, as any hook it runs could.
+    let wrapper = tempfile::tempdir().unwrap();
+    let real_git = std::process::Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real_git = String::from_utf8(real_git.stdout).unwrap();
+    swap_script(
+        &wrapper.path().join("git"),
+        "for arg in \"$@\"; do [ \"$arg\" = status ] && swap=1; done\n[ -n \"$swap\" ] || exec '{git}' \"$@\""
+            .replace("{git}", real_git.trim())
+            .as_str(),
+        &runs.git.repo,
+        &runs.git.outside,
+        &format!("exec '{}' \"$@\"", real_git.trim()),
+    );
+    let mut path = vec![wrapper.path().to_path_buf()];
+    path.extend(std::env::split_paths(&runs.codex.search_path()));
+    runs.owner.update(cx, |owner, _| {
+        owner.codex_search_path = Some(std::env::join_paths(path).unwrap())
+    });
+    let outside_before = tree(&runs.git.outside);
+    let id = runs.consult(cx);
+    assert_eq!(settled_status(&runs, &id, cx), "failed");
+    assert!(
+        std::fs::symlink_metadata(&runs.git.repo)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the preflight swapped the checkout"
+    );
+    let status = runs.saved()[0].status.clone();
+    assert_eq!(
+        status,
+        gitterm_core::tasks::DelegationStatus::Failed {
+            message: gitterm_core::preview::service::preview_notice("Start delegation")
+        }
+    );
+    assert_eq!(runs.codex.runs(), 0, "Codex started outside the fixture");
+    assert_eq!(tree(&runs.git.outside), outside_before);
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn shutdown_during_pending_check_persists_nothing(cx: &mut TestAppContext) {
+    let runs = Runs::start(2, cx);
+    runs.shut_down_at("checked", cx);
+    let reply = runs.consult_in(&runs.git.repo, cx);
+    assert!(reply.is_err(), "{reply:?}");
+    settle(cx);
+    assert_eq!(runs.delegation_count(cx), 0);
+    assert!(runs.saved().is_empty());
+    assert_eq!(runs.codex.runs(), 0);
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn shutdown_during_queued_start_check_persists_nothing(cx: &mut TestAppContext) {
+    let runs = Runs::start(1, cx);
+    runs.codex.hold(1);
+    let first = runs.consult(cx);
+    let second = runs.consult(cx);
+    settle(cx);
+    runs.shut_down_at("queued start", cx);
+    runs.codex.release(1);
+    wait_until(cx, |cx| {
+        runs.owner
+            .read_with(cx, |owner, _| owner.before_continuation.is_none())
+    });
+    settle(cx);
+    let saved = runs.saved();
+    let status = |id: &str| {
+        saved
+            .iter()
+            .find(|d| d.delegation_id == id)
+            .unwrap()
+            .status
+            .label()
+    };
+    assert_eq!(status(&first), "completed");
+    assert_eq!(status(&second), "requested");
+    assert_eq!(runs.codex.runs(), 1);
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn shutdown_with_buffered_progress_persists_nothing(cx: &mut TestAppContext) {
+    let runs = Runs::start(2, cx);
+    runs.shut_down_at("progress", cx);
+    let id = runs.consult(cx);
+    wait_until(cx, |cx| {
+        runs.owner
+            .read_with(cx, |owner, _| owner.before_continuation.is_none())
+    });
+    settle(cx);
+    // Neither the start nor the result reached the store.
+    assert_eq!(runs.saved()[0].delegation_id, id);
+    assert_eq!(runs.saved()[0].status.label(), "requested");
+    assert_eq!(runs.status(&id, cx), "requested");
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn shutdown_kills_codex_descendants(cx: &mut TestAppContext) {
+    let runs = Runs::start(2, cx);
+    runs.codex.spawn_descendant(1);
+    runs.codex.hold(1);
+    let _id = runs.consult(cx);
+    wait_until(cx, |_| runs.codex.descendant(1).is_some());
+    let pid = runs.codex.descendant(1).unwrap().to_string();
+    let alive = || {
+        std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(alive());
+    runs.owner.update(cx, |owner, _| owner.shutdown());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while alive() {
+        assert!(
+            Instant::now() < deadline,
+            "descendant {pid} outlived shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

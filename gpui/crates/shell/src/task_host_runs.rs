@@ -7,12 +7,17 @@
 //! and again after a queued start's check. Codex runs with a cleared
 //! environment whose homes lie under the preview root.
 //!
+//! Codex's cwd is checked once more after the runner's git preflight,
+//! immediately before the spawn, and that preflight runs no fsmonitor hook.
+//! Every continuation stops at shutdown, which kills and reaps each run's
+//! Codex process tree.
+//!
 //! Only delegations this host stored are started or settled; an imported
 //! record is never touched. Results are stored; delivering them into the
 //! chat is B11.
 use super::*;
 use gitterm_core::{
-    codex_runner::{CodexEnvironment, CodexRunEvent, CodexRunOutcome},
+    codex_runner::{BeforeSpawn, CodexEnvironment, CodexRunEvent, CodexRunOutcome, CodexStop},
     delegation_state::{Authority, Caller, Effect, Intent, RequestId},
     delegations::{CallerTab, RunFailure},
     task_host::RunnerCapacity,
@@ -36,6 +41,14 @@ pub(crate) enum CodexRequest {
 }
 
 type Outcome = Result<Box<CodexRunOutcome>, RunFailure>;
+
+/// A fixture run in flight.
+pub(super) struct RunHandle {
+    pub stop: CodexStop,
+    /// Closes when the run's task ends, after Codex has been reaped.
+    pub done: tokio::sync::oneshot::Receiver<()>,
+    pub abort: tokio::task::AbortHandle,
+}
 
 impl TaskHostOwner {
     /// Iced's `request_delegation`, after the fixture guard has authorized
@@ -126,6 +139,9 @@ impl TaskHostOwner {
         label: &'static str,
         cx: &mut Context<Self>,
     ) {
+        if !self.continues("checked") {
+            return reply.send(Err(SHUT_DOWN.to_string()));
+        }
         let result = result.and_then(|authority| {
             self.recheck_run(label, &authorized, &new_targets(&new), &authority)?;
             Ok(authority)
@@ -260,6 +276,9 @@ impl TaskHostOwner {
         result: Result<Authority, String>,
         cx: &mut Context<Self>,
     ) {
+        if !self.continues("queued start") {
+            return;
+        }
         let Some(delegation) = self
             .host
             .store()
@@ -320,14 +339,27 @@ impl TaskHostOwner {
                 .ok_or_else(|| format!("delegation {id} is not stored"))?;
             let run = gitterm_core::delegations::codex_run(delegation, self.roots.root())?;
             let fixture = self.fixture_of(&run.cwd, START_LABEL)?;
+            let resolved =
+                std::fs::canonicalize(&run.cwd).map_err(|_| preview_notice(START_LABEL))?;
             let env = self.fixture_child_env(&fixture, None)?;
             let codex_home = value_of(&env, "CODEX_HOME")
                 .map(PathBuf::from)
                 .ok_or("the fixture child has no CODEX_HOME")?;
+            // The fixture check once more, after the runner's git preflight
+            // and immediately before Codex starts: the checkout still
+            // resolves where it did, inside the fixture.
+            let before_spawn =
+                BeforeSpawn::new(move |cwd: &Path| match std::fs::canonicalize(cwd) {
+                    Ok(now) if now == resolved && now.starts_with(&fixture) => Ok(()),
+                    _ => Err(preview_notice(START_LABEL)),
+                });
+            let stop = CodexStop::new();
             let environment = CodexEnvironment {
                 search_path: self.codex_search_path(&env),
                 sessions_root: codex_home.join("sessions"),
                 child_env: Some(env),
+                before_spawn: Some(before_spawn),
+                stop: Some(stop.clone()),
             };
             let runtime = &self
                 .servers
@@ -340,16 +372,27 @@ impl TaskHostOwner {
                 run.cwd.display(),
                 run.log_path.display()
             );
+            let (finished, done) = tokio::sync::oneshot::channel::<()>();
             let handle = runtime.spawn(async move {
-                gitterm_core::codex_runner::run_with(run, progress, &environment).await
+                let result =
+                    gitterm_core::codex_runner::run_with(run, progress, &environment).await;
+                drop(finished);
+                result
             });
-            Ok::<_, String>((handle, events))
+            Ok::<_, String>((handle, events, stop, done))
         })();
-        let (handle, mut events) = match started {
+        let (handle, mut events, stop, done) = match started {
             Ok(started) => started,
             Err(error) => return self.finish_run(id, Err(RunFailure::Failed(error)), cx),
         };
-        self.runs.insert(id.to_string(), handle.abort_handle());
+        self.runs.insert(
+            id.to_string(),
+            RunHandle {
+                stop,
+                done,
+                abort: handle.abort_handle(),
+            },
+        );
         let id = id.to_string();
         cx.spawn(async move |owner: gpui::WeakEntity<Self>, cx| {
             while let Some(event) = events.recv().await {
@@ -378,6 +421,9 @@ impl TaskHostOwner {
     }
 
     fn run_progress(&mut self, id: &str, event: CodexRunEvent, cx: &mut Context<Self>) {
+        if !self.continues("progress") {
+            return;
+        }
         let Some(effects) = self
             .host
             .reduce_delegation(id, |delegation| Intent::Progress { delegation, event })
@@ -405,7 +451,7 @@ impl TaskHostOwner {
     /// Iced's `finish_delegation`. A run stopped by shutdown records nothing.
     fn finish_run(&mut self, id: &str, outcome: Outcome, cx: &mut Context<Self>) {
         self.runs.remove(id);
-        if self.servers.is_none() {
+        if !self.continues("finish") {
             return;
         }
         let Some(mut effects) = self
@@ -475,6 +521,22 @@ impl TaskHostOwner {
         }
         cx.notify();
         self.start_queued_runs(cx);
+    }
+
+    /// Whether a fixture run's continuation at `stage` goes on: not once the
+    /// host has shut down, when it writes nothing to the store.
+    fn continues(&mut self, stage: &'static str) -> bool {
+        #[cfg(test)]
+        if let Some((at, hook)) = self.before_continuation.take() {
+            if at == stage {
+                hook(self);
+            } else {
+                self.before_continuation = Some((at, hook));
+            }
+        }
+        #[cfg(not(test))]
+        let _ = stage;
+        !self.is_shut_down()
     }
 
     /// After a checkout check: the targets authorized before it still

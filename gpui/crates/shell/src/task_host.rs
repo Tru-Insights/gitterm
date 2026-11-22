@@ -55,6 +55,10 @@ use std::{
 
 #[cfg(test)]
 pub(crate) type RecheckHook = Box<dyn FnOnce(&Path)>;
+/// Runs on the owner when a fixture run's continuation named by the
+/// string is reached, before its shutdown guard.
+#[cfg(test)]
+pub(crate) type ContinuationHook = (&'static str, Box<dyn FnOnce(&mut TaskHostOwner)>);
 
 #[path = "task_host_runs.rs"]
 mod runs;
@@ -66,6 +70,10 @@ const RESEED_POLL: Duration = Duration::from_secs(2);
 /// Bounds quit: the servers were cancelled already; this only lets their
 /// graceful shutdown finish before the runtime is dropped.
 const SERVER_DRAIN: Duration = Duration::from_millis(500);
+/// Bounds quit: a stopped fixture run kills its Codex process tree and
+/// reaps it; this only waits for that.
+const RUN_STOP: Duration = Duration::from_secs(3);
+const SHUT_DOWN: &str = "GitTerm's task host has shut down";
 const STORE_UNAVAILABLE: &str = "GitTerm's task store is unavailable";
 /// A fixture create's worktrees go here, inside the repository's fixture.
 const FIXTURE_WORKTREES: &str = "worktrees";
@@ -280,7 +288,7 @@ pub(crate) struct TaskHostOwner {
     /// Iced's file would discard.
     wrote: bool,
     /// Fixture Codex runs in flight, by delegation id.
-    runs: std::collections::HashMap<String, tokio::task::AbortHandle>,
+    runs: std::collections::HashMap<String, runs::RunHandle>,
     /// Delegations this host stored, with the targets authorized at their
     /// request; only these are started or settled.
     own_delegations: std::collections::HashMap<String, AuthorizedTargets>,
@@ -293,6 +301,8 @@ pub(crate) struct TaskHostOwner {
     /// Where a fixture run finds `codex`, in place of the child's PATH.
     #[cfg(test)]
     pub(crate) codex_search_path: Option<std::ffi::OsString>,
+    #[cfg(test)]
+    pub(crate) before_continuation: Option<ContinuationHook>,
     _pump: Task<()>,
     _reseed: Task<()>,
     _quit: Subscription,
@@ -455,6 +465,8 @@ impl TaskHostOwner {
                 before_run_recheck: Default::default(),
                 #[cfg(test)]
                 codex_search_path: None,
+                #[cfg(test)]
+                before_continuation: None,
                 _pump: pump,
                 _reseed: reseed,
                 _quit: quit,
@@ -646,6 +658,10 @@ impl TaskHostOwner {
     /// re-scoped first so a swapped link never redirects the save. Marks
     /// the store as the host's own, so no re-seed discards the write.
     fn writable_store(&mut self) -> Result<&mut TaskStore, String> {
+        // The host lock is released at shutdown; nothing is saved after it.
+        if self.is_shut_down() {
+            return Err(SHUT_DOWN.to_string());
+        }
         let store = self.host.store_mut().as_mut().ok_or(STORE_UNAVAILABLE)?;
         self.roots
             .scoped(store.path())
@@ -1261,9 +1277,9 @@ impl TaskHostOwner {
     /// the host lock. Chat drains run in the workspace owner's later callback.
     pub(crate) fn shutdown(&mut self) {
         self.host.shutdown();
-        // A dropped run kills its Codex child (`kill_on_drop`).
-        for (_, run) in self.runs.drain() {
-            run.abort();
+        let mut runs: Vec<runs::RunHandle> = self.runs.drain().map(|(_, run)| run).collect();
+        for run in &runs {
+            run.stop.stop();
         }
         if let Some(Servers {
             task_mcp,
@@ -1273,6 +1289,20 @@ impl TaskHostOwner {
             runtime,
         }) = self.servers.take()
         {
+            // Each stopped run kills its Codex process tree and reaps it.
+            runtime.block_on(async {
+                let _ = tokio::time::timeout(RUN_STOP, async {
+                    for run in &mut runs {
+                        let _ = (&mut run.done).await;
+                    }
+                })
+                .await;
+            });
+            // A run that did not stop in time is dropped, which still kills
+            // its direct Codex child (`kill_on_drop`).
+            for run in runs {
+                run.abort.abort();
+            }
             drop(task_mcp);
             drop(browser);
             log.shutdown.notify_one();
@@ -1287,6 +1317,11 @@ impl TaskHostOwner {
             runtime.shutdown_timeout(Duration::ZERO);
         }
         self.lock = None;
+    }
+
+    /// After [`Self::shutdown`]: the servers are gone and the lock released.
+    fn is_shut_down(&self) -> bool {
+        self.servers.is_none()
     }
 }
 
