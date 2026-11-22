@@ -21,8 +21,10 @@
 //! In fixture mode (H5b B10) `review_request` and `consult_request` also run
 //! Codex headlessly in a fixture checkout ([`runs`]), and `task_launch_session`
 //! starts a task session's terminal for a task this host created
-//! ([`launch`]), which the shell adopts into a pane. Plain preview still
-//! answers every launch and run with the notice and starts nothing.
+//! ([`launch`]), which the shell adopts into a pane. `delegate_task` creates
+//! a task in a fixture repository and launches its worker there
+//! ([`delegate`]). Plain preview still answers every launch, run and
+//! delegation with the notice and starts nothing.
 use anyhow::{Context as _, Result};
 use gitterm_browser::browser_mcp::BrowserMcpConnection;
 use gitterm_core::{
@@ -66,6 +68,8 @@ pub(crate) type ContinuationHook = (&'static str, Box<dyn FnOnce(&mut TaskHostOw
 #[cfg(test)]
 pub(crate) type PublishHook = Box<dyn FnOnce(&mut TaskHostOwner)>;
 
+#[path = "task_host_delegate.rs"]
+mod delegate;
 #[path = "task_host_launch.rs"]
 mod launch;
 #[path = "task_host_runs.rs"]
@@ -562,8 +566,8 @@ impl TaskHostOwner {
     /// themselves, so in plain preview they answer the same notice and do
     /// nothing else; in fixture mode they write the preview's own store and
     /// state. Review and consult run Codex in a fixture checkout in fixture
-    /// mode (B10), and a launch starts a task session's terminal (B10b);
-    /// delegate arms answer the notice in both modes.
+    /// mode (B10), a launch starts a task session's terminal (B10b), and
+    /// `delegate_task` creates a task and launches its worker (B10c).
     pub(crate) fn execute_effect(
         &mut self,
         effect: HostEffect,
@@ -649,6 +653,11 @@ impl TaskHostOwner {
             HostEffect::LaunchSession { reply, launch } if !self.fixtures.is_empty() => {
                 self.launch_session(reply, launch, label, cx)
             }
+            HostEffect::DelegateTask {
+                reply,
+                caller,
+                request,
+            } if !self.fixtures.is_empty() => self.delegate_task(reply, caller, request, label, cx),
             HostEffect::LaunchSession { reply, .. }
             | HostEffect::DelegateTask { reply, .. }
             | HostEffect::RequestReview { reply, .. }
@@ -896,13 +905,14 @@ impl TaskHostOwner {
         label: &'static str,
         cx: &mut Context<Self>,
     ) {
-        let pending = match self.begin_create(reply.clone(), caller, request, label) {
-            Ok(pending) => pending,
-            Err(error) => {
-                reply.send(Err(error));
-                return;
-            }
-        };
+        match self.begin_create(reply.clone(), caller, request, label) {
+            Ok(pending) => self.resolve_create(pending, cx),
+            Err(error) => reply.send(Err(error)),
+        }
+    }
+
+    /// A begun create's resolution, off the UI thread.
+    fn resolve_create(&mut self, pending: PendingCreate, cx: &mut Context<Self>) {
         self.creating += 1;
         let request = pending.request.clone();
         cx.spawn(async move |owner: gpui::WeakEntity<Self>, cx| {
@@ -969,6 +979,7 @@ impl TaskHostOwner {
             targets,
             authorized,
             worktree: None,
+            worker: None,
         })
     }
 
@@ -997,8 +1008,11 @@ impl TaskHostOwner {
         resolved: Result<ResolvedTaskPreparation, String>,
         cx: &mut Context<Self>,
     ) {
-        if let Err(error) = self.save_preparing(&mut pending, resolved) {
+        if let Err(error) = self.save_preparing(&mut pending, resolved, cx) {
             self.creating -= 1;
+            if let Some(worker) = &pending.worker {
+                self.cancel_worker_preparation(worker.authority());
+            }
             pending.reply.send(Err(error));
             return;
         }
@@ -1020,6 +1034,7 @@ impl TaskHostOwner {
         &mut self,
         pending: &mut PendingCreate,
         resolved: Result<ResolvedTaskPreparation, String>,
+        cx: &App,
     ) -> Result<(), String> {
         use gitterm_core::tasks::{
             ExecutorTarget, IssueProvider, IssueReference, NewTaskRecord, TaskCreator,
@@ -1030,6 +1045,12 @@ impl TaskHostOwner {
             .services()
             .recheck(&pending.authorized)
             .map_err(|denied| denied.notice().to_string())?;
+        // A worker's authority holds before anything is saved.
+        if let Some(worker) = pending.worker.take() {
+            let checked = self.check_worker(&worker, cx);
+            pending.worker = Some(worker);
+            checked?;
+        }
         let resolved = resolved?;
         pending.targets.push(resolved.repository.top_level.clone());
         pending.targets.push(resolved.proposal.path.clone());
@@ -1083,6 +1104,11 @@ impl TaskHostOwner {
             .insert(*record)
             .map_err(|error| error.to_string())?;
         self.own_tasks.insert(pending.task_id.clone());
+        if let Some(worker) = pending.worker.take() {
+            let bound = self.bind_worker(&worker, &pending.task_id, &resolved, cx);
+            pending.worker = Some(worker);
+            bound?;
+        }
         pending.worktree = Some(resolved.proposal.path);
         Ok(())
     }
@@ -1092,7 +1118,7 @@ impl TaskHostOwner {
     /// notice, and its path is left alone.
     fn create_prepared(
         &mut self,
-        pending: PendingCreate,
+        mut pending: PendingCreate,
         prepared: Result<PreparedTaskWorktree, String>,
         cx: &mut Context<Self>,
     ) {
@@ -1102,8 +1128,19 @@ impl TaskHostOwner {
             hook(path);
         }
         let prepared = match self.host.services().recheck(&pending.authorized) {
-            Ok(()) => prepared,
-            Err(denied) => Err(denied.notice().to_string()),
+            Ok(()) => {
+                if let Some(worker) = pending.worker.take() {
+                    return self.worker_prepared(pending, worker, prepared, cx);
+                }
+                prepared
+            }
+            Err(denied) => {
+                // A refused worker fails its task as a create does.
+                if let Some(worker) = pending.worker.take() {
+                    self.cancel_worker_preparation(worker.authority());
+                }
+                Err(denied.notice().to_string())
+            }
         };
         let cleanup_path = pending.worktree.clone();
         let facts = TaskMutationFacts {
@@ -1434,6 +1471,9 @@ struct PendingCreate {
     authorized: AuthorizedTargets,
     /// The proposed worktree, once the preparing record is saved.
     worktree: Option<PathBuf>,
+    /// Set by `delegate_task`: once the worktree is ready its worker is
+    /// recorded and launched, instead of answering with the bare task.
+    worker: Option<delegate::PendingWorker>,
 }
 
 /// The workspace owner's open chat panes; none before the window exists.

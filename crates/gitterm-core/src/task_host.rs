@@ -389,7 +389,12 @@ impl TaskHost {
                     .cloned()
                     .collect();
                 if targets.is_empty() {
-                    targets.push(worktree(caller_task?)?);
+                    // The worker's worktree comes from the calling tab's
+                    // repository, the folder it works in.
+                    targets.push(match caller_checkout {
+                        Some(checkout) => checkout.to_path_buf(),
+                        None => worktree(caller_task?)?,
+                    });
                 }
                 targets.extend(request.add_dirs.iter().cloned());
                 Some(targets)

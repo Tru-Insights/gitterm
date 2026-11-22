@@ -721,25 +721,75 @@ fn preview_still_answers_notice_for_launch_and_delegate(cx: &mut TestAppContext)
         .unwrap_err()
     };
     assert!(delegate(&sender, cx).contains("not available in preview"));
-    // Fixture mode does not run delegate_task yet either.
+    // Fixture mode refuses a delegate_task with no caller, and so no
+    // target it can check.
     let launches = Launches::start(cx);
     assert!(delegate(&launches.runs.sender, cx).contains("not available in preview"));
     assert_eq!(launches.agent.runs(), 0);
 }
 
-/// The preview pins CLAUDE_CONFIG_DIR under its root, and core's Claude
-/// trust check refuses any CLAUDE_CONFIG_DIR, so a fixture Claude launch is
-/// refused before its child starts rather than checking a trust file Claude
-/// would not read.
+/// The preview pins CLAUDE_CONFIG_DIR under its root, so a fixture Claude
+/// child reads trust from `$CLAUDE_CONFIG_DIR/.claude.json`; with no such
+/// file the repository is not trusted, and the launch is refused before
+/// its child starts.
 #[gpui::test]
 fn claude_launch_refused_on_pinned_config_dir(cx: &mut TestAppContext) {
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let error = launches.launch(&task, Some("Claude"), cx).unwrap_err();
-    assert!(error.contains("CLAUDE_CONFIG_DIR"), "{error}");
+    assert!(
+        error.contains("is not trusted in $CLAUDE_CONFIG_DIR/.claude.json"),
+        "{error}"
+    );
     assert_eq!(launches.agent.runs(), 0);
     assert!(launches.host_terminals(cx).is_empty());
     assert!(launches.saved().get(&task).unwrap().sessions.is_empty());
+}
+
+/// Writes the pinned Claude config with `repo`'s trust bit.
+fn pin_claude_trust(launches: &Launches, repo: &Path, trusted: bool) -> PathBuf {
+    let roots = &launches.runs.fixture.roots;
+    let dir = roots.root().join("provider-homes/claude");
+    for dir in [dir.parent().unwrap(), &dir] {
+        roots.create_private_dir(dir).unwrap();
+    }
+    let key = repo.canonicalize().unwrap().display().to_string();
+    std::fs::write(
+        dir.join(".claude.json"),
+        serde_json::json!({"projects": {key: {"hasTrustDialogAccepted": trusted}}}).to_string(),
+    )
+    .unwrap();
+    dir
+}
+
+/// The fixture Claude check reads the file the child's own
+/// CLAUDE_CONFIG_DIR names: an untrusted entry refuses, a trusted one
+/// launches, and the child gets that same directory.
+#[gpui::test]
+fn fixture_claude_trust_reads_the_pinned_config(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let task = launches.create(cx);
+    let repo = launches.runs.git.repo.clone();
+    pin_claude_trust(&launches, &repo, false);
+    let error = launches.launch(&task, Some("Claude"), cx).unwrap_err();
+    assert!(
+        error.contains("is not trusted in $CLAUDE_CONFIG_DIR/.claude.json"),
+        "{error}"
+    );
+    assert_eq!(launches.agent.runs(), 0);
+    assert!(launches.saved().get(&task).unwrap().sessions.is_empty());
+
+    let dir = pin_claude_trust(&launches, &repo, true);
+    let reply = launches.launch(&task, Some("Claude"), cx).unwrap();
+    assert!(reply["session_id"].is_string(), "{reply}");
+    wait_until(cx, |_| launches.agent.started(1));
+    let env = launches.agent.env(1);
+    launches.kill(1);
+    assert!(
+        env.get("CLAUDE_CONFIG_DIR").map(PathBuf::from) == Some(dir),
+        "the child's CLAUDE_CONFIG_DIR is not the dir the check read"
+    );
+    assert_eq!(launches.saved().get(&task).unwrap().sessions.len(), 1);
 }
 
 #[test]
@@ -780,3 +830,6 @@ fn fixture_codex_run_gets_guidelines(cx: &mut TestAppContext) {
             .is_file()
     );
 }
+
+#[path = "task_host_delegate_tests.rs"]
+mod delegate_tests;
