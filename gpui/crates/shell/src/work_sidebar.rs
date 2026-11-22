@@ -275,6 +275,28 @@ pub struct WorkSidebar {
     login_reading: bool,
     /// The last read failure logged, so a repeating failure logs once.
     login_error: Option<String>,
+    /// How the login is read; tests can never reach the real gh.
+    login_reader: LoginReader,
+}
+
+/// Reads gh's active login. Runs on a background thread.
+type LoginReader = std::sync::Arc<dyn Fn() -> Result<String, String> + Send + Sync>;
+
+#[cfg(not(test))]
+fn default_login_reader() -> LoginReader {
+    std::sync::Arc::new(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("gh api user: {error}"))?
+            .block_on(gitterm_core::prs::login_of(None))
+    })
+}
+
+/// Tests never spawn a process; a test that needs a login sets its own reader.
+#[cfg(test)]
+fn default_login_reader() -> LoginReader {
+    std::sync::Arc::new(|| Err("login reader not set in tests".to_string()))
 }
 
 impl WorkSidebar {
@@ -329,6 +351,7 @@ impl WorkSidebar {
             active_login: None,
             login_reading: false,
             login_error: None,
+            login_reader: default_login_reader(),
         }
     }
 
@@ -533,13 +556,8 @@ impl WorkSidebar {
             return;
         }
         self.login_reading = true;
-        let read = cx.background_executor().spawn(async {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| format!("gh api user: {error}"))?
-                .block_on(gitterm_core::prs::login_of(None))
-        });
+        let reader = self.login_reader.clone();
+        let read = cx.background_executor().spawn(async move { reader() });
         cx.spawn(async move |view, cx| {
             let result = read.await;
             _ = view.update(cx, |this, cx| {
