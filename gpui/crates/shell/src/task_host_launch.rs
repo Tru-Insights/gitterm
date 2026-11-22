@@ -226,8 +226,26 @@ impl TaskHostOwner {
             .task_session_id
             .clone()
             .unwrap_or_else(TaskRecord::fresh_id);
+        // Both ids reach the Codex notify hook's `/bin/sh -c` script, so
+        // only ids in the form GPUI makes go on.
+        if !is_gpui_id(task_id) || !is_gpui_id(&session_id) {
+            return Err("its task or session id is not one GPUI makes".into());
+        }
         let env = self.terminal_child_env(&fixture, &session_id)?;
         let settings = crate::workspace_config::load_iced_settings_from(&self.iced_config);
+        let presets: Vec<&str> = settings
+            .agent_presets
+            .iter()
+            .map(|preset| preset.command.as_str())
+            .collect();
+        // The saved command itself must be in GPUI's saved form: the
+        // rewrite below may unquote it or replace it with a recorded
+        // conversation, which would hide a form GPUI never saves.
+        let saved_command = saved
+            .startup_command
+            .as_deref()
+            .ok_or("there is no saved command")?;
+        restorable_add_dirs(saved_command, &presets, task_id, &session_id)?;
         let notify = self
             .servers
             .as_ref()
@@ -274,11 +292,6 @@ impl TaskHostOwner {
         // Only a command in the form GPUI's own launch saves runs (issue
         // 86); its extra folders join the folder and worktree under the
         // guard, and a command whose folders are uncertain never starts.
-        let presets: Vec<&str> = settings
-            .agent_presets
-            .iter()
-            .map(|preset| preset.command.as_str())
-            .collect();
         let add_dirs = restorable_add_dirs(&command, &presets, task_id, &session_id)?;
         let mut targets = vec![folder.clone()];
         for target in std::iter::once(worktree.clone()).chain(add_dirs) {
@@ -1237,8 +1250,11 @@ fn persisted_startup_command(
 /// executable is the plain word `claude`, `codex` or `pi`, never a path,
 /// a quoted name or a wrapper such as `env`; the other words are one of
 /// `presets`' own arguments for that executable plus only the options
-/// GPUI writes, in the forms it writes them. Any other command is an
-/// error, so the restore keeps a plain shell.
+/// GPUI writes, in the forms it writes them, each written as GPUI writes
+/// it ([`gitterm_core::workers::shell_word`]). Preset arguments that could
+/// name a folder outside the restored one (a `/`, `\` or `..`) are refused,
+/// not checked: the restore cannot tell which of them are folders. Any
+/// other command is an error, so the restore keeps a plain shell.
 fn restorable_add_dirs(
     command: &str,
     presets: &[&str],
@@ -1255,16 +1271,25 @@ fn restorable_add_dirs(
     }
     let words = shell_words::split(command).map_err(|_| not_gpuis())?;
     let args = &words[1..];
-    // The preset's own arguments sit together after GPUI's options; a
-    // restore rewrite may have none of them.
-    let mut rests = vec![Vec::new()];
+    // The preset's own arguments sit together among GPUI's options, as the
+    // preset's own text; a restore rewrite may have none of them.
+    let mut rests = vec![(Vec::new(), "")];
     rests.extend(presets.iter().filter_map(|preset| {
         let preset_words = shell_words::split(preset).ok()?;
-        (preset.split_whitespace().next() == Some(executable))
-            .then(|| preset_words[1..].to_vec())
-            .filter(|rest| !rest.is_empty())
+        let (first, text) = preset.trim().split_once(char::is_whitespace)?;
+        let rest = preset_words[1..].to_vec();
+        let may_name_a_folder = rest
+            .iter()
+            .any(|word| word.contains(['/', '\\']) || word.contains(".."));
+        (first == executable && !rest.is_empty() && !may_name_a_folder).then(|| (rest, text.trim()))
     }));
-    for rest in rests {
+    let written = |words: &[&str]| -> Vec<String> {
+        words
+            .iter()
+            .map(|word| gitterm_core::workers::shell_word(word))
+            .collect()
+    };
+    for (rest, text) in rests {
         let starts: Vec<usize> = if rest.is_empty() {
             vec![0]
         } else {
@@ -1273,12 +1298,19 @@ fn restorable_add_dirs(
                 .collect()
         };
         for start in starts {
-            let others: Vec<&str> = args[..start]
+            let before: Vec<&str> = args[..start].iter().map(String::as_str).collect();
+            let after: Vec<&str> = args[start + rest.len()..]
                 .iter()
-                .chain(&args[start + rest.len()..])
                 .map(String::as_str)
                 .collect();
-            if gpui_options(executable, &others, task_id, session_id) {
+            let mut as_written = vec![executable.to_string()];
+            as_written.extend(written(&before));
+            as_written.extend((!text.is_empty()).then(|| text.to_string()));
+            as_written.extend(written(&after));
+            let others = [before, after].concat();
+            if as_written.join(" ") == command.trim()
+                && gpui_options(executable, &others, task_id, session_id)
+            {
                 return Ok(add_dirs);
             }
         }
@@ -1324,6 +1356,16 @@ fn gpui_options(executable: &str, args: &[&str], task_id: &str, session_id: &str
         seen.push(option);
     }
     !(seen.contains(&"--resume") && seen.contains(&"--session-id"))
+}
+
+/// Whether `id` is in the form GPUI makes task and task session ids
+/// ([`TaskRecord::fresh_id`]): a lowercase hyphenated UUID.
+fn is_gpui_id(id: &str) -> bool {
+    id.len() == 36
+        && id.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_digit() || matches!(c, 'a'..='f'),
+        })
 }
 
 /// Whether `value` is the `notify=[…]` override
@@ -1597,6 +1639,45 @@ mod saved_form_tests {
             "pi --resume",
             elsewhere.as_str(),
             remote.as_str(),
+        ] {
+            assert!(check(command).is_err(), "{command}");
+        }
+    }
+
+    /// F2: preset arguments that could name a folder outside the restored
+    /// one are refused, not checked; others still restore.
+    #[test]
+    fn preset_arguments_that_may_name_a_folder_are_not_restorable() {
+        for preset in [
+            "pi --session-dir /outside",
+            "codex -C ../up",
+            "claude --settings 'a\\b'",
+        ] {
+            assert!(
+                restorable_add_dirs(preset, &[preset], "t-1", "s-1").is_err(),
+                "{preset}"
+            );
+        }
+        assert_eq!(
+            restorable_add_dirs(
+                "pi --no-tools --session p-1",
+                &["pi --no-tools"],
+                "t-1",
+                "s-1"
+            ),
+            Ok(vec![])
+        );
+    }
+
+    /// F3: a word GPUI writes bare (or quotes only as `shell_word` does)
+    /// but saved quoted another way is not GPUI's saved form.
+    #[test]
+    fn a_form_quoted_unlike_gpui_is_not_restorable() {
+        for command in [
+            "claude --resume 'abc'",
+            "claude --model \"opus\"",
+            "codex --add-dir '/w/notes'",
+            "pi --session p\\-1",
         ] {
             assert!(check(command).is_err(), "{command}");
         }

@@ -1397,6 +1397,10 @@ fn restored_shell<'a>(
 }
 
 /// The terminal sessions in the layout file at `path`.
+/// A saved task session id in the form GPUI makes (a hyphenated UUID): a
+/// restore refuses any other.
+const RESTORED_SESSION: &str = "5e0c1b7a-3f1d-4c8e-9a2b-6d4f8e1c0a37";
+
 fn saved_sessions(path: &Path) -> Option<Vec<serde_json::Value>> {
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     value["terminal_sessions"].as_array().cloned()
@@ -1423,7 +1427,7 @@ fn fixture_restore_runs_the_saved_command_in_the_saved_folder(cx: &mut TestAppCo
     let config = tempfile::tempdir().unwrap();
     let saved = serde_json::json!({
         "cwd": folder, "startup_command": "codex",
-        "task_id": task, "task_session_id": "restored-session",
+        "task_id": task, "task_session_id": RESTORED_SESSION,
     });
     let (shell, vcx) = restored_shell(
         &launches.runs.owner,
@@ -1441,8 +1445,8 @@ fn fixture_restore_runs_the_saved_command_in_the_saved_folder(cx: &mut TestAppCo
     );
     let target = vcx.read(|cx| only_pane(&shell, cx).read(cx).session.clone().unwrap());
     assert_eq!(target.task_id.as_deref(), Some(task.as_str()));
-    assert_eq!(target.task_session_id.as_deref(), Some("restored-session"));
-    assert_eq!(target.session_uid, "restored-session");
+    assert_eq!(target.task_session_id.as_deref(), Some(RESTORED_SESSION));
+    assert_eq!(target.session_uid, RESTORED_SESSION);
     // The pane owns the terminal; the host kept none.
     assert!(launches.host_terminals(vcx).is_empty());
     assert!(vcx.read(|cx| only_pane(&shell, cx).read(cx).terminal_alive()));
@@ -1451,7 +1455,7 @@ fn fixture_restore_runs_the_saved_command_in_the_saved_folder(cx: &mut TestAppCo
     assert_eq!(terminals[0].task_id.as_deref(), Some(task.as_str()));
     assert_eq!(
         terminals[0].task_session_id.as_deref(),
-        Some("restored-session")
+        Some(RESTORED_SESSION)
     );
     launches.kill(1);
 }
@@ -1465,7 +1469,7 @@ fn restore_falls_back_to_the_worktree_then_a_plain_shell(cx: &mut TestAppContext
     let worktree = launches.worktree(&task, cx);
     let saved = serde_json::json!({
         "cwd": worktree.join("gone"), "startup_command": "codex",
-        "task_id": task, "task_session_id": "restored-session",
+        "task_id": task, "task_session_id": RESTORED_SESSION,
     });
     let config = tempfile::tempdir().unwrap();
     let (shell, vcx) = restored_shell(
@@ -1504,7 +1508,7 @@ fn restore_falls_back_to_the_worktree_then_a_plain_shell(cx: &mut TestAppContext
     assert_eq!(terminals[0].task_id.as_deref(), Some(task.as_str()));
     assert_eq!(
         terminals[0].task_session_id.as_deref(),
-        Some("restored-session")
+        Some(RESTORED_SESSION)
     );
     std::fs::rename(&moved, &worktree).unwrap();
 }
@@ -1563,7 +1567,7 @@ fn fixture_restore_rewrites_claude_against_the_fixture_transcripts(cx: &mut Test
         let config = tempfile::tempdir().unwrap();
         let saved = serde_json::json!({
             "cwd": worktree, "startup_command": command,
-            "task_id": task, "task_session_id": "restored-session",
+            "task_id": task, "task_session_id": RESTORED_SESSION,
         });
         let (shell, vcx) = restored_shell(
             &launches.runs.owner,
@@ -1655,7 +1659,7 @@ fn restore_refuses_a_saved_add_dir_outside_the_fixture(cx: &mut TestAppContext) 
     );
     let saved = serde_json::json!({
         "cwd": worktree, "startup_command": command,
-        "task_id": task, "task_session_id": "restored-session",
+        "task_id": task, "task_session_id": RESTORED_SESSION,
     });
     let config = tempfile::tempdir().unwrap();
     let (shell, vcx) = restored_shell(
@@ -1676,7 +1680,7 @@ fn restore_refuses_a_saved_add_dir_outside_the_fixture(cx: &mut TestAppContext) 
     assert_eq!(terminals[0].task_id.as_deref(), Some(task.as_str()));
     assert_eq!(
         terminals[0].task_session_id.as_deref(),
-        Some("restored-session")
+        Some(RESTORED_SESSION)
     );
 }
 
@@ -1694,7 +1698,7 @@ fn restore_runs_a_saved_add_dir_inside_the_fixture(cx: &mut TestAppContext) {
     );
     let saved = serde_json::json!({
         "cwd": worktree, "startup_command": command,
-        "task_id": task, "task_session_id": "restored-session",
+        "task_id": task, "task_session_id": RESTORED_SESSION,
     });
     let config = tempfile::tempdir().unwrap();
     let (_shell, vcx) = restored_shell(
@@ -1779,7 +1783,7 @@ fn restore_runs_only_a_command_in_gpuis_saved_form(cx: &mut TestAppContext) {
     ] {
         let saved = serde_json::json!({
             "cwd": worktree, "startup_command": command,
-            "task_id": task, "task_session_id": "restored-session",
+            "task_id": task, "task_session_id": RESTORED_SESSION,
         });
         let config = tempfile::tempdir().unwrap();
         let (shell, vcx) = restored_shell(
@@ -1870,7 +1874,7 @@ fn restore_runs_gpuis_own_saved_forms(cx: &mut TestAppContext) {
     assert_eq!(
         restore(
             &format!("claude --model opus --effort high --add-dir {notes} --resume abc"),
-            "restored-session",
+            RESTORED_SESSION,
             cx
         ),
         Some(fresh)
@@ -1883,4 +1887,75 @@ fn restore_runs_gpuis_own_saved_forms(cx: &mut TestAppContext) {
         "{args:?}"
     );
     launches.kill(3);
+}
+
+/// Restores `command` saved as task session `session` of `task` and
+/// asserts a plain shell came back: nothing started and the saved fields
+/// are kept.
+fn restores_a_plain_shell(
+    launches: &Launches,
+    worktree: &Path,
+    task: &str,
+    command: &str,
+    session: &str,
+    cx: &mut TestAppContext,
+) {
+    let saved = serde_json::json!({
+        "cwd": worktree, "startup_command": command,
+        "task_id": task, "task_session_id": session,
+    });
+    let config = tempfile::tempdir().unwrap();
+    let (shell, vcx) = restored_shell(
+        &launches.runs.owner,
+        &launches.runs.git.root,
+        config.path(),
+        saved,
+        cx,
+    );
+    plain_shell_answers(&shell, vcx);
+    assert_eq!(launches.agent.runs(), 0, "{command}");
+    assert!(launches.host_terminals(vcx).is_empty(), "{command}");
+    let terminals = vcx.read(|cx| shell.read(cx).active(cx).store.terminals.clone().unwrap());
+    assert_eq!(terminals[0].startup_command.as_deref(), Some(command));
+    assert_eq!(terminals[0].task_session_id.as_deref(), Some(session));
+    vcx.update(|window, _| window.remove_window());
+}
+
+/// F1: a saved task session id GPUI never makes is refused before any
+/// notify hook is built from it, so a saved hook that embeds it in its
+/// `/bin/sh -c` script never runs.
+#[gpui::test]
+fn restore_refuses_a_saved_session_id_gpui_never_makes(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let task = launches.create(cx);
+    let worktree = launches.worktree(&task, cx);
+    let outside = tempfile::tempdir().unwrap();
+    let marker = outside.path().join("pwned");
+    let session = format!("$(touch {})", marker.display());
+    let command = gitterm_core::task_mcp::configure_codex_notify(
+        "codex",
+        "http://127.0.0.1:4242/notify",
+        &task,
+        &session,
+    );
+    restores_a_plain_shell(&launches, &worktree, &task, &command, &session, cx);
+    assert!(!marker.exists());
+}
+
+/// F3: the saved command is checked before the restore rewrite: a saved
+/// `claude --resume 'abc'` (quoted unlike GPUI) without a transcript would
+/// rewrite to plain `claude`, but restores a plain shell.
+#[gpui::test]
+fn restore_checks_the_saved_form_before_the_rewrite(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let task = launches.create(cx);
+    let worktree = launches.worktree(&task, cx);
+    restores_a_plain_shell(
+        &launches,
+        &worktree,
+        &task,
+        "claude --resume 'abc'",
+        RESTORED_SESSION,
+        cx,
+    );
 }
