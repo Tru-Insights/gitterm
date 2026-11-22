@@ -114,7 +114,9 @@ fn target(task_id: &str) -> Target {
 fn inputs(open: &[&str]) -> Inputs {
     Inputs {
         workspace_name: "Fixture".into(),
+        has_workspace: true,
         location: Location::local(DIR),
+        active_repo: Some(PathBuf::from(DIR)),
         selected: None,
         general_sessions: 1,
         compact: false,
@@ -122,6 +124,16 @@ fn inputs(open: &[&str]) -> Inputs {
         titles: Default::default(),
         presets: vec![],
         open_chats: vec![],
+    }
+}
+
+/// `inputs` whose active session sits in a real, empty Git repository at
+/// `repo` (Iced's `tab.status.is_git_repo`).
+fn repo_inputs(repo: &Path, open: &[&str]) -> Inputs {
+    git2::Repository::init(repo).unwrap();
+    Inputs {
+        active_repo: Some(repo.to_owned()),
+        ..inputs(open)
     }
 }
 
@@ -264,7 +276,7 @@ fn task_write_intents_show_notice(cx: &mut TestAppContext) {
     let owner = fixture.start(cx);
     let source = std::fs::read(fixture.source()).unwrap();
     let copy = std::fs::read(fixture.copy()).unwrap();
-    let open = inputs(&["running"]);
+    let open = repo_inputs(&fixture.worktree("session-repo"), &["running"]);
     let (panel, _, cx, outcomes) = surfaces(cx, open.clone());
     let expect = |write: Write, label: &str, cx: &mut VisualTestContext| {
         panel.update(cx, |panel, cx| panel.write(write.clone(), &open, cx));
@@ -666,7 +678,7 @@ fn escape_dismisses_task_modals(cx: &mut TestAppContext) {
     let work = root.path().join("work");
     let open = Inputs {
         location: Location::local(&work),
-        ..inputs(&[])
+        ..repo_inputs(&work, &[])
     };
     type Open<'a> = &'a dyn Fn(&mut TaskPanel, &mut Window, &mut Context<TaskPanel>);
     let opens: [Open; 4] = [
@@ -705,7 +717,7 @@ fn create_uses_core_validation(cx: &mut TestAppContext) {
     let fixture = Fixture::new();
     fixture.write_iced(vec![]);
     let _owner = fixture.start(cx);
-    let open = inputs(&[]);
+    let open = repo_inputs(&fixture.worktree("session-repo"), &[]);
     let (panel, _, cx, _) = surfaces(cx, open.clone());
     let form_error = |cx: &mut VisualTestContext| {
         panel.read_with(cx, |panel, _| match &panel.modal {
@@ -864,6 +876,7 @@ fn create_form_lists_local_branches(cx: &mut TestAppContext) {
     };
     let open = Inputs {
         location: Location::local(&repo),
+        active_repo: Some(repo.clone()),
         ..inputs(&[])
     };
     panel.update_in(cx, |panel, window, cx| panel.open_create(&open, window, cx));
@@ -875,15 +888,81 @@ fn create_form_lists_local_branches(cx: &mut TestAppContext) {
             .count(),
         refs_before
     );
-    // Not a repository: Iced's pre-load choices stay.
+}
+
+/// Iced `TaskCreateOpen`'s refusals, in its order, each with Iced's text and
+/// no form opened.
+#[gpui::test]
+fn create_refuses_without_workspace_session_or_git_repository(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    fixture.write_iced(vec![]);
+    fixture.start(cx);
+    let (panel, _, cx, _) = surfaces(cx, inputs(&[]));
+    let refusal = |open: Inputs, cx: &mut VisualTestContext| {
+        panel.update_in(cx, |panel, window, cx| panel.open_create(&open, window, cx));
+        assert!(
+            !panel.read_with(cx, |panel, _| panel.modal_open()),
+            "no form opens"
+        );
+        notice(&panel, cx)
+    };
+    assert_eq!(
+        refusal(Inputs::default(), cx).as_deref(),
+        Some("Open a local workspace before creating a task")
+    );
+    // Point 3: a workspace with no active session.
+    assert_eq!(
+        refusal(
+            Inputs {
+                active_repo: None,
+                ..inputs(&[])
+            },
+            cx
+        )
+        .as_deref(),
+        Some("Open a repository session before creating a task")
+    );
+    // Point 4: the active session's folder is not a Git repository.
     let plain = fixture.worktree("plain");
+    assert_eq!(
+        refusal(
+            Inputs {
+                active_repo: Some(plain.clone()),
+                ..inputs(&[])
+            },
+            cx
+        ),
+        Some(format!("{} is not a Git repository", plain.display()))
+    );
+}
+
+/// Iced's `canonical_task_workspace_directory`: a session inside another
+/// task's worktree creates its task against the owning repository.
+#[gpui::test]
+fn create_from_a_task_worktree_uses_the_owning_repository(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    let owner_repo = fixture.worktree("owner-repo");
+    let tree = fixture.worktree("owner-repo-task-tree");
+    let session = tree.join("crates");
+    std::fs::create_dir_all(&session).unwrap();
+    git2::Repository::init(&tree).unwrap();
+    fixture.write_iced(vec![in_dir(
+        with_worktree(task("sibling", TaskLifecycle::Ready), tree.clone()),
+        &owner_repo,
+    )]);
+    fixture.start(cx);
     let open = Inputs {
-        location: Location::local(&plain),
+        location: Location::local(&owner_repo),
+        active_repo: Some(session),
         ..inputs(&[])
     };
+    let (panel, _, cx, _) = surfaces(cx, open.clone());
     panel.update_in(cx, |panel, window, cx| panel.open_create(&open, window, cx));
-    draw(cx);
-    assert_eq!(base(&panel, cx), (false, Some("HEAD".to_owned())));
+    panel.read_with(cx, |panel, _| match &panel.modal {
+        Some(Modal::Create(form)) => assert_eq!(form.repository_path, owner_repo),
+        _ => panic!("create form should be open"),
+    });
 }
 
 fn with_conversation(mut task: TaskRecord) -> TaskRecord {

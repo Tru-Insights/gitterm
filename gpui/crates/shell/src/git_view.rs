@@ -759,6 +759,11 @@ fn git(root: &std::path::Path, args: &[&str]) -> Result<String, String> {
     }
     String::from_utf8(output.stdout).map_err(|error| format!("{what}: {error}"))
 }
+/// Whether `root` is inside a Git work tree: Iced's
+/// `Repository::discover(path).is_ok()` for a tab's `is_git_repo`.
+pub(crate) fn is_git_repo(root: &std::path::Path) -> bool {
+    git(root, &["--no-optional-locks", "rev-parse", "--git-dir"]).is_ok()
+}
 /// Local branch names, each with whether it is checked out here: the
 /// `refs/heads` read Iced's worktree snapshot feeds the task base picker.
 pub(crate) fn local_branches(root: &std::path::Path) -> Result<Vec<(String, bool)>, String> {

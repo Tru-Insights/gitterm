@@ -301,7 +301,11 @@ impl crate::Shell {
 
     /// The active session's repo, as Iced's tab `repo_path`; the workspace
     /// folder when the session has none.
-    fn active_repo_dir(&self, workspace: crate::WorkspaceId, cx: &App) -> Option<PathBuf> {
+    pub(crate) fn active_repo_dir(
+        &self,
+        workspace: crate::WorkspaceId,
+        cx: &App,
+    ) -> Option<PathBuf> {
         let state = self
             .workspaces
             .iter()
