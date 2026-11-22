@@ -38,6 +38,8 @@ mod h9_tests;
 #[cfg(test)]
 mod hookup_tests;
 mod layout;
+#[cfg(test)]
+mod modal_input_tests;
 mod owner;
 #[cfg(test)]
 mod page_tests;
@@ -3465,6 +3467,23 @@ impl Shell {
         .into_iter()
         .find_map(|(open, sheet)| open.then_some(sheet))
     }
+    /// Iced drops every PTY write while one of these is open (main.rs
+    /// `Event::TerminalEvent` and `Event::BottomTerminalEvent`): the task
+    /// switcher, the new-task form and task prompts, the New Work and Park
+    /// sheets (not the Parked and Ready lists) and a PR action confirmation.
+    fn pty_blocked(&self, cx: &App) -> bool {
+        self.task_switcher.is_some()
+            || self.task_panel_modal_open(cx)
+            || self.new_work_sheet.is_some()
+            || self
+                .park_sheet
+                .as_ref()
+                .is_some_and(|sheet| sheet.read(cx).is_workspace_sheet())
+            || self
+                .work_sidebars
+                .values()
+                .any(|sidebar| sidebar.read(cx).confirm_open())
+    }
     /// Every shell action handler, behind the modal guard. GPUI dispatches a
     /// key's bound action before raw-key capture, and context-free bindings
     /// (and menu items) match behind a modal, so the guard sits on the
@@ -4208,6 +4227,12 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A terminal can hold focus behind these (its focus is set in code,
+        // or the sheet's field lost it); no key may reach its PTY.
+        if self.pty_blocked(cx) && self.focused_terminal(window, cx).is_some() {
+            cx.stop_propagation();
+            return;
+        }
         if self.task_switcher.is_some() {
             return;
         }

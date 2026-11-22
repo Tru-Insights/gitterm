@@ -1678,7 +1678,7 @@ impl WorkSidebar {
     }
 
     /// Iced `ActionOpen`: the method defaults to the plan's, else merge.
-    fn open_confirm(
+    pub(crate) fn open_confirm(
         &mut self,
         key: gitterm_core::merge_plan::PrKey,
         kind: ActionKind,
@@ -1707,6 +1707,10 @@ impl WorkSidebar {
             confirm.choose_method(method);
             cx.notify();
         }
+    }
+
+    pub(crate) fn confirm_open(&self) -> bool {
+        self.confirm.is_some()
     }
 
     /// Iced `ActionClose`: no other effect.
