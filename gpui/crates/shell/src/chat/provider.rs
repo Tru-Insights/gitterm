@@ -394,7 +394,7 @@ impl Provider {
             .take(16 * 1024 + 1);
         let mut bytes = Vec::new();
         let read = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(30),
             stdout.read_to_end(&mut bytes),
         )
         .await;
@@ -403,7 +403,7 @@ impl Provider {
             child.wait().await?;
             return Ok(gitterm_core::chat::context::ProbeStatus::Unavailable);
         }
-        let status = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+        let status = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
         match status {
             Ok(status) => Ok(self.spec.parse(status?.code(), false, &bytes)),
             Err(_) => {
