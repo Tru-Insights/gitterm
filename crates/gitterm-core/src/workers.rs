@@ -422,6 +422,86 @@ fn with_launch_options_for_shell(
     ))
 }
 
+/// The extra writable folders a saved launch command passes with
+/// `--add-dir`, for the fixture guard to check before a restore runs it.
+/// It reads the form [`with_launch_options`] writes (`--add-dir <dir>`,
+/// the folder bare or single-quoted by [`shell_word`]) and, since Claude's
+/// option is variadic, every plain word after it until the next option.
+/// An error when the folders cannot be told for certain: shell syntax
+/// beyond plain words and quotes (expansions, operators, `~`), another
+/// spelling of the option, a missing or relative folder, or a Codex
+/// `writable_roots` override.
+pub fn launch_add_dirs(command: &str) -> Result<Vec<PathBuf>, String> {
+    let words = plain_shell_words(command)?;
+    let mut dirs = Vec::new();
+    let mut words = words.iter().peekable();
+    while let Some(word) = words.next() {
+        if word.contains("writable_roots") {
+            return Err("the command overrides Codex's writable_roots".into());
+        }
+        if word != "--add-dir" {
+            if word.starts_with("--add-dir") {
+                return Err(format!("unknown --add-dir form {word:?}"));
+            }
+            continue;
+        }
+        let before = dirs.len();
+        while let Some(dir) = words.next_if(|next| !next.starts_with('-')) {
+            let dir = PathBuf::from(dir);
+            if !dir.is_absolute() {
+                return Err(format!("--add-dir {} is not absolute", dir.display()));
+            }
+            dirs.push(dir);
+        }
+        if dirs.len() == before {
+            return Err("--add-dir names no folder".into());
+        }
+    }
+    Ok(dirs)
+}
+
+/// `command` split as a POSIX shell would, when it is only words of plain
+/// characters, backslash escapes, single-quoted text and double-quoted
+/// text with nothing the shell expands; any other shell syntax is an error.
+fn plain_shell_words(command: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' => words.extend(word.take()),
+            '\'' | '"' => {
+                let text = word.get_or_insert_with(String::new);
+                loop {
+                    match chars.next() {
+                        Some(end) if end == c => break,
+                        Some(inner @ ('$' | '`' | '\\' | '!')) if c == '"' => {
+                            return Err(format!("{inner:?} inside double quotes"));
+                        }
+                        Some(inner) => text.push(inner),
+                        None => return Err("an unterminated quote".into()),
+                    }
+                }
+            }
+            // `'\''` is how shell_word writes a single quote.
+            '\\' => match chars.next() {
+                Some(escaped) if escaped != '\n' => {
+                    word.get_or_insert_with(String::new).push(escaped)
+                }
+                _ => return Err("a trailing backslash".into()),
+            },
+            // zsh expands a word that starts with `=` to a command's path.
+            '=' if word.is_none() => return Err("a word that starts with '='".into()),
+            c if c.is_ascii_alphanumeric() || "/._-:=,+@%".contains(c) => {
+                word.get_or_insert_with(String::new).push(c);
+            }
+            c => return Err(format!("the shell character {c:?}")),
+        }
+    }
+    words.extend(word);
+    Ok(words)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,6 +565,53 @@ mod tests {
                 with_launch_options_for_shell(command, None, &[], false).unwrap(),
                 command
             );
+        }
+    }
+
+    #[test]
+    fn launch_add_dirs_reads_what_launches_write_and_refuses_the_rest() {
+        let dirs = [
+            std::path::PathBuf::from("/work/notes"),
+            std::path::PathBuf::from("/repos/api wt"),
+            std::path::PathBuf::from("/repos/it's"),
+        ];
+        for command in ["codex -m gpt-6-luna", "claude --model opus --resume abc"] {
+            let written =
+                with_launch_options_for_shell(command, Some(ReasoningEffort::High), &dirs, true)
+                    .unwrap();
+            assert_eq!(launch_add_dirs(&written).unwrap(), dirs, "{written}");
+        }
+        assert!(launch_add_dirs("claude --resume abc").unwrap().is_empty());
+        // Claude's --add-dir takes every plain word after it.
+        assert_eq!(
+            launch_add_dirs("claude --add-dir /a /b --model opus").unwrap(),
+            [PathBuf::from("/a"), PathBuf::from("/b")]
+        );
+        assert_eq!(
+            launch_add_dirs("codex -c 'model_reasoning_effort=\"high\"' --add-dir \"/a b\"")
+                .unwrap(),
+            [PathBuf::from("/a b")]
+        );
+        assert_eq!(
+            launch_add_dirs("codex --add-dir /a\\ b").unwrap(),
+            [PathBuf::from("/a b")]
+        );
+        for refused in [
+            "codex --add-dir=/outside",
+            "codex --add-dir",
+            "codex --add-dir --yolo",
+            "codex --add-dir notes",
+            "codex --add-dir ~/notes",
+            "codex --add-dir $HOME",
+            "codex --add-dir \"$HOME\"",
+            "codex --add-dir /a; codex --add-dir /b",
+            "codex --add-dir '/a",
+            "codex --add-dir /a\\",
+            "codex --add-dir =ls",
+            "codex -c 'sandbox_workspace_write.writable_roots=[\"/outside\"]'",
+            "claude $(printf -- --add-dir) /outside",
+        ] {
+            assert!(launch_add_dirs(refused).is_err(), "{refused}");
         }
     }
 

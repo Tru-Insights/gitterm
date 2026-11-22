@@ -1532,30 +1532,8 @@ fn preview_restore_starts_a_plain_shell_and_keeps_the_saved_fields(cx: &mut Test
         "task_id": "worker", "task_session_id": "child-1",
     });
     let (shell, vcx) = restored_shell(&owner, &git.root, config.path(), saved, cx);
-    let pane = vcx.read(|cx| only_pane(&shell, cx));
-    let view = vcx.read(|cx| match &pane.read(cx).content {
-        crate::pane::PaneContent::Terminal(view) => view.clone(),
-        _ => panic!("a plain shell is restored"),
-    });
-    view.update_in(vcx, |view, _, _| {
-        view.backend_mut().handle(gitterm_terminal::Command::Write(
-            b"echo RESTORED_PLAIN_$((40+2))\r".to_vec(),
-        ));
-    });
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !vcx.read(|cx| {
-        view.read(cx)
-            .backend()
-            .get_all_text()
-            .is_some_and(|text| text.contains("RESTORED_PLAIN_42"))
-    }) {
-        assert!(Instant::now() < deadline, "the plain shell did not answer");
-        vcx.run_until_parked();
-        vcx.executor().advance_clock(Duration::from_millis(20));
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    plain_shell_answers(&shell, vcx);
     assert_eq!(agent.runs(), 0);
-    assert!(vcx.read(|cx| pane.read(cx).task_session(cx).is_none()));
     // A layout save keeps the saved fields.
     let path = vcx.read(|cx| shell.read(cx).active(cx).store.path.clone());
     std::fs::remove_file(&path).unwrap();
@@ -1631,6 +1609,152 @@ fn fixture_restore_rewrites_claude_against_the_fixture_transcripts(cx: &mut Test
         args.windows(2).any(|pair| pair == ["--resume", "abc"]),
         "{args:?}"
     );
+    launches.kill(2);
+}
+
+/// The restored pane is a plain shell, not a task session, and it runs
+/// what it is sent (it echoes a marker): the restore has finished.
+fn plain_shell_answers(shell: &Entity<crate::Shell>, vcx: &mut gpui::VisualTestContext) {
+    let pane = vcx.read(|cx| only_pane(shell, cx));
+    let view = vcx.read(|cx| match &pane.read(cx).content {
+        crate::pane::PaneContent::Terminal(view) => view.clone(),
+        _ => panic!("a plain shell is restored"),
+    });
+    view.update_in(vcx, |view, _, _| {
+        view.backend_mut().handle(gitterm_terminal::Command::Write(
+            b"echo RESTORED_PLAIN_$((40+2))\r".to_vec(),
+        ));
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !vcx.read(|cx| {
+        view.read(cx)
+            .backend()
+            .get_all_text()
+            .is_some_and(|text| text.contains("RESTORED_PLAIN_42"))
+    }) {
+        assert!(Instant::now() < deadline, "the plain shell did not answer");
+        vcx.run_until_parked();
+        vcx.executor().advance_clock(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(vcx.read(|cx| pane.read(cx).task_session(cx).is_none()));
+}
+
+/// Issue 86: a saved command's `--add-dir` folders are under the fixture
+/// guard too. One outside the fixture restores a plain shell, starts
+/// nothing and keeps the saved fields.
+#[gpui::test]
+fn restore_refuses_a_saved_add_dir_outside_the_fixture(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let task = launches.create(cx);
+    let worktree = launches.worktree(&task, cx);
+    let outside = tempfile::tempdir().unwrap();
+    let command = format!(
+        "codex --add-dir {}",
+        gitterm_core::workers::shell_word(&outside.path().display().to_string())
+    );
+    let saved = serde_json::json!({
+        "cwd": worktree, "startup_command": command,
+        "task_id": task, "task_session_id": "restored-session",
+    });
+    let config = tempfile::tempdir().unwrap();
+    let (shell, vcx) = restored_shell(
+        &launches.runs.owner,
+        &launches.runs.git.root,
+        config.path(),
+        saved,
+        cx,
+    );
+    plain_shell_answers(&shell, vcx);
+    assert_eq!(launches.agent.runs(), 0);
+    assert!(launches.host_terminals(vcx).is_empty());
+    let terminals = vcx.read(|cx| shell.read(cx).active(cx).store.terminals.clone().unwrap());
+    assert_eq!(
+        terminals[0].startup_command.as_deref(),
+        Some(command.as_str())
+    );
+    assert_eq!(terminals[0].task_id.as_deref(), Some(task.as_str()));
+    assert_eq!(
+        terminals[0].task_session_id.as_deref(),
+        Some("restored-session")
+    );
+}
+
+/// A saved `--add-dir` folder inside the fixture passes the guard: the
+/// command runs with it.
+#[gpui::test]
+fn restore_runs_a_saved_add_dir_inside_the_fixture(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let task = launches.create(cx);
+    let worktree = launches.worktree(&task, cx);
+    let notes = launches.runs.git.repo.clone();
+    let command = format!(
+        "codex --add-dir {}",
+        gitterm_core::workers::shell_word(&notes.display().to_string())
+    );
+    let saved = serde_json::json!({
+        "cwd": worktree, "startup_command": command,
+        "task_id": task, "task_session_id": "restored-session",
+    });
+    let config = tempfile::tempdir().unwrap();
+    let (_shell, vcx) = restored_shell(
+        &launches.runs.owner,
+        &launches.runs.git.root,
+        config.path(),
+        saved,
+        cx,
+    );
+    wait_until(vcx, |_| launches.agent.started(1));
+    let args = launches.agent.args(1);
+    let notes = notes.display().to_string();
+    assert!(
+        args.windows(2)
+            .any(|pair| pair[0] == "--add-dir" && pair[1] == notes),
+        "{args:?}"
+    );
+    launches.kill(1);
+}
+
+/// Iced prunes a launched Claude session's pre-assigned conversation ref
+/// when no transcript was written (src/main.rs, before tabs restore): the
+/// restore starts a fresh `claude`, never `--resume` of a missing id.
+#[gpui::test]
+fn restore_of_an_unmessaged_claude_launch_starts_fresh(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let task = launches.create(cx);
+    let worktree = launches.worktree(&task, cx);
+    pin_claude_trust(&launches, &launches.runs.git.repo, true);
+    launches.launch(&task, Some("Claude"), cx).unwrap();
+    wait_until(cx, |_| launches.agent.started(1));
+    launches.kill(1);
+    let (session_id, chat_id) = stored_task(&launches.runs.owner, &task, cx)
+        .sessions
+        .iter()
+        .find_map(|session| {
+            let conversation = session.conversation.as_ref()?;
+            Some((
+                session.task_session_id.clone(),
+                conversation.session_id.clone(),
+            ))
+        })
+        .expect("the Claude launch records its pre-assigned conversation");
+    let saved = serde_json::json!({
+        "cwd": worktree, "startup_command": format!("claude --resume {chat_id}"),
+        "task_id": task, "task_session_id": session_id,
+    });
+    let config = tempfile::tempdir().unwrap();
+    let (shell, vcx) = restored_shell(
+        &launches.runs.owner,
+        &launches.runs.git.root,
+        config.path(),
+        saved,
+        cx,
+    );
+    wait_until(vcx, |_| launches.agent.started(2));
+    let restored = vcx.read(|cx| shell.read(cx).active(cx).store.terminals.clone().unwrap());
+    assert_eq!(restored[0].startup_command.as_deref(), Some("claude"));
+    let args = launches.agent.args(2);
+    assert!(!args.contains(&"--resume".to_string()), "{args:?}");
     launches.kill(2);
 }
 

@@ -20963,26 +20963,16 @@ impl App {
             let phantom_tasks: Vec<TaskRecord> = store
                 .tasks()
                 .iter()
-                .filter(|task| {
-                    task.sessions.iter().any(|session| {
-                        session.conversation.as_ref().is_some_and(|conversation| {
-                            conversation.backend == HarnessConversationBackend::Claude
-                                && !chats::claude_session_exists(&conversation.session_id)
-                        })
-                    })
+                .filter_map(|task| {
+                    let mut task = task.clone();
+                    gitterm_core::task_host::prune_phantom_claude_conversations(
+                        &mut task,
+                        chats::claude_session_exists,
+                    )
+                    .then_some(task)
                 })
-                .cloned()
                 .collect();
-            for mut task in phantom_tasks {
-                for session in &mut task.sessions {
-                    let phantom = session.conversation.as_ref().is_some_and(|conversation| {
-                        conversation.backend == HarnessConversationBackend::Claude
-                            && !chats::claude_session_exists(&conversation.session_id)
-                    });
-                    if phantom {
-                        session.conversation = None;
-                    }
-                }
+            for task in phantom_tasks {
                 if let Err(error) = store.replace(task) {
                     eprintln!(
                         "GitTerm V6 could not prune a phantom Claude conversation ref: {error}"

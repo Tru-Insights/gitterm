@@ -70,8 +70,8 @@ pub use live::{
     TaskSessionOutcome,
 };
 pub use restore::{
-    conversation_resume_command, restored_startup, resume_for_preassigned_claude_launch,
-    RestoredStartup,
+    conversation_resume_command, prune_phantom_claude_conversations, restored_startup,
+    resume_for_preassigned_claude_launch, RestoredStartup,
 };
 pub use runner::RunnerCapacity;
 

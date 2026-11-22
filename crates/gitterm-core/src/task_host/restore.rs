@@ -97,6 +97,29 @@ pub fn restored_startup(
     restored
 }
 
+/// Drops `task`'s Claude conversation refs whose transcript was never
+/// written (`claude_session_exists` false). Claude ids are pre-assigned at
+/// launch, but Claude Code writes the transcript only on the first message,
+/// so a phantom ref would make restore and Resume run `claude --resume`
+/// against a missing id. True when a ref was dropped.
+pub fn prune_phantom_claude_conversations(
+    task: &mut TaskRecord,
+    claude_session_exists: impl Fn(&str) -> bool,
+) -> bool {
+    let mut pruned = false;
+    for session in &mut task.sessions {
+        let phantom = session.conversation.as_ref().is_some_and(|conversation| {
+            conversation.backend == HarnessConversationBackend::Claude
+                && !claude_session_exists(&conversation.session_id)
+        });
+        if phantom {
+            session.conversation = None;
+            pruned = true;
+        }
+    }
+    pruned
+}
+
 /// Shell command that reopens a recorded task conversation with its full
 /// history. Derived from the task store alone: the Chats index is only built
 /// when the Chats panel opens, so resume must not depend on it.
@@ -237,6 +260,27 @@ mod tests {
         // No saved command: nothing starts.
         let none = restored_startup(None, None, task, Some("claude"), |_| None, |_| true, |c| c);
         assert_eq!(none.startup_command, None);
+    }
+
+    #[test]
+    fn phantom_claude_refs_are_pruned_and_others_kept() {
+        use HarnessConversationBackend::{Claude, Codex};
+        let mut task = crate::delegation_test_support::test_task("t", Path::new("/wt/t"));
+        task.sessions = vec![
+            session("phantom", None, Some((Claude, "gone"))),
+            session("written", None, Some((Claude, "kept"))),
+            session("codex", None, Some((Codex, "gone"))),
+            session("plain", None, None),
+        ];
+        let exists = |id: &str| id == "kept";
+        assert!(prune_phantom_claude_conversations(&mut task, exists));
+        let ids: Vec<_> = task
+            .sessions
+            .iter()
+            .map(|session| session.conversation.as_ref().map(|c| c.session_id.as_str()))
+            .collect();
+        assert_eq!(ids, [None, Some("kept"), Some("gone"), None]);
+        assert!(!prune_phantom_claude_conversations(&mut task, exists));
     }
 
     #[test]

@@ -194,7 +194,7 @@ impl TaskHostOwner {
         if !self.own_tasks.contains(task_id) {
             return Err(preview_notice(LABEL));
         }
-        let task = self
+        let mut task = self
             .host
             .store()
             .as_ref()
@@ -220,11 +220,6 @@ impl TaskHostOwner {
         let fixture = self.fixture_of(&folder, LABEL)?;
         // Trust and guidelines read the task's worktree, as its launch did.
         let worktree = worktree.unwrap_or_else(|| folder.clone());
-        let mut targets = vec![folder.clone()];
-        if worktree != folder {
-            targets.push(worktree.clone());
-        }
-        let authorized = self.authorize_process(LABEL, &targets)?;
         // Iced keeps the saved task session, or fixes a new one before the
         // terminal starts.
         let session_id = saved
@@ -242,6 +237,14 @@ impl TaskHostOwner {
         // A transcript lives where the fixture child's Claude writes it.
         let projects = runs::value_of(&env, "CLAUDE_CONFIG_DIR")
             .map(|dir| PathBuf::from(dir).join("projects"));
+        let transcript_exists = |id: &str| {
+            projects
+                .as_deref()
+                .is_some_and(|projects| claude_transcript_exists(projects, id))
+        };
+        // Iced prunes phantom Claude refs at startup, before tabs restore:
+        // a launched session that never got a message resumes nothing.
+        gitterm_core::task_host::prune_phantom_claude_conversations(&mut task, transcript_exists);
         let restored = gitterm_core::task_host::restored_startup(
             saved.startup_command.clone(),
             None,
@@ -254,11 +257,7 @@ impl TaskHostOwner {
                     .find(|preset| preset.name == name)
                     .and_then(|preset| preset_backend(&preset.name, &preset.command))
             },
-            |id| {
-                projects
-                    .as_deref()
-                    .is_some_and(|projects| claude_transcript_exists(projects, id))
-            },
+            transcript_exists,
             |command| {
                 gitterm_core::task_mcp::configure_codex_notify(
                     &command,
@@ -272,6 +271,17 @@ impl TaskHostOwner {
             .startup_command
             .clone()
             .ok_or("the saved command was dropped")?;
+        // The command's own extra folders join the folder and worktree under
+        // the guard; a command whose folders are uncertain never starts.
+        let mut targets = vec![folder.clone()];
+        let add_dirs = gitterm_core::workers::launch_add_dirs(&command)
+            .map_err(|error| format!("its extra folders cannot be checked: {error}"))?;
+        for target in std::iter::once(worktree.clone()).chain(add_dirs) {
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+        let authorized = self.authorize_process(LABEL, &targets)?;
         let runtime = self.runtime_command(&command, &worktree, &env, &task, cx)?;
         // The fixture guard once more, right before the child starts, with
         // the work tree Git itself would use (issue 84).
