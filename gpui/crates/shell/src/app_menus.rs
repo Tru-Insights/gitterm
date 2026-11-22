@@ -628,25 +628,15 @@ pub enum Modal {
     Dialog,
     Task,
     SessionPicker,
-    Park,
-    NewWork,
-    Settings,
-    Phone,
-    Plans,
 }
 
 impl Modal {
-    pub const ALL: [Modal; 10] = [
+    pub const ALL: [Modal; 5] = [
         Modal::TaskSwitcher,
         Modal::Usage,
         Modal::Dialog,
         Modal::Task,
         Modal::SessionPicker,
-        Modal::Park,
-        Modal::NewWork,
-        Modal::Settings,
-        Modal::Phone,
-        Modal::Plans,
     ];
 
     /// The keys Iced's `KeyPressed` hands to this modal (Escape for all).
@@ -664,8 +654,6 @@ impl Modal {
             Modal::Usage => &["UsageViewToggle", "ChatsOverviewOpen", "WorkspaceSelect"],
             // Escape or ⌥/ closes the help.
             Modal::Dialog => &["ToggleHelp"],
-            // Enter parks.
-            Modal::Park => &["ParkSubmit"],
             _ => &[],
         }
     }
@@ -676,6 +664,28 @@ impl Modal {
         let name = name.strip_prefix("gitterm_iced::").unwrap_or(name);
         name == "Escape" || NATIVE_MENU_ACTIONS.contains(&name) || self.own().contains(&name)
     }
+}
+
+/// A surface Iced's `KeyPressed` handler catches only Escape for (Park also
+/// Enter); every other key and command reaches the window behind, so these
+/// are not guarded and `menu_context` keeps `IcedMain` behind them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sheet {
+    Park,
+    NewWork,
+    Settings,
+    Phone,
+    Plans,
+}
+
+impl Sheet {
+    pub const ALL: [Sheet; 5] = [
+        Sheet::Park,
+        Sheet::NewWork,
+        Sheet::Settings,
+        Sheet::Phone,
+        Sheet::Plans,
+    ];
 }
 
 /// Actions without a host adapter remain unregistered, so GPUI's native menu

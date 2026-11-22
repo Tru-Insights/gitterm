@@ -433,8 +433,7 @@ fn modal_allowances_are_iceds_menu_bar_and_own_keys() {
     assert!(Modal::Usage.allows("WorkspaceSelect"));
     assert!(!Modal::Task.allows("WorkspaceSelect"));
     assert!(Modal::Dialog.allows("ToggleHelp"));
-    assert!(!Modal::Plans.allows("ToggleHelp"));
-    assert!(Modal::Park.allows("ParkSubmit"));
+    assert!(!Modal::Task.allows("ToggleHelp"));
     assert!(Modal::TaskSwitcher.allows("TaskSwitcherNext"));
 }
 
@@ -458,20 +457,61 @@ fn open_modal(shell: &Entity<Shell>, modal: Modal, cx: &mut VisualTestContext) {
             });
         }),
         Modal::SessionPicker => shell.update(cx, |s, cx| s.open_session_picker(window, cx)),
-        Modal::Park => shell.update(cx, |s, cx| s.open_park_sheet(window, cx)),
-        Modal::NewWork => shell.update(cx, |s, cx| s.open_new_work_sheet(window, cx)),
-        Modal::Settings => shell.update(cx, |s, cx| {
+    });
+    draw(cx);
+}
+
+fn open_sheet(shell: &Entity<Shell>, sheet: Sheet, cx: &mut VisualTestContext) {
+    cx.update(|window, cx| match sheet {
+        Sheet::Park => shell.update(cx, |s, cx| s.open_park_sheet(window, cx)),
+        Sheet::NewWork => shell.update(cx, |s, cx| s.open_new_work_sheet(window, cx)),
+        Sheet::Settings => shell.update(cx, |s, cx| {
             let id = s.active_workspace(cx).unwrap();
             s.open_settings_sheet(id, window, cx)
         }),
-        Modal::Phone => shell.update(cx, |s, cx| s.open_phone_panel("agent:fixture", window, cx)),
-        Modal::Plans => shell.update(cx, |s, cx| s.toggle_plans(window, cx)),
+        Sheet::Phone => shell.update(cx, |s, cx| s.open_phone_panel("agent:fixture", window, cx)),
+        Sheet::Plans => shell.update(cx, |s, cx| s.toggle_plans(window, cx)),
     });
     draw(cx);
 }
 
 fn open(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> Option<Modal> {
     cx.update(|window, cx| shell.update(cx, |s, cx| s.shell_modal(window, cx)))
+}
+
+/// Iced catches only Escape behind a sheet, the Plans view or the phone
+/// panel: background commands reach the window behind, `IcedMain` stays in
+/// the key context, and Escape closes the surface.
+#[gpui::test]
+fn sheets_plans_and_phone_let_background_commands_through(cx: &mut TestAppContext) {
+    let (_root, shell, cx) = h7_tests::fixture(cx);
+    let collapsed = |shell: &Entity<Shell>, cx: &mut VisualTestContext| {
+        cx.read(|cx| shell.read(cx).active(cx).store.regions.sidebar_collapsed)
+    };
+    for sheet in Sheet::ALL {
+        open_sheet(&shell, sheet, cx);
+        assert_eq!(cx.read(|cx| shell.read(cx).open_sheet()), Some(sheet));
+        assert_eq!(open(&shell, cx), None, "{sheet:?} is not a true modal");
+        cx.update(|window, cx| {
+            let context = shell.update(cx, |s, cx| s.menu_context(window, cx));
+            assert!(context.contains("IcedMain"), "{sheet:?}: {context}");
+        });
+        shell.update(cx, |shell, _| shell.blocked_actions.clear());
+        let before = collapsed(&shell, cx);
+        cx.simulate_keystrokes("cmd-b");
+        draw(cx);
+        assert_ne!(collapsed(&shell, cx), before, "{sheet:?}: cmd-b ran");
+        cx.read(|cx| assert!(shell.read(cx).blocked_actions.is_empty(), "{sheet:?}"));
+        dispatch(ToggleSidebar, cx);
+        assert_eq!(collapsed(&shell, cx), before, "{sheet:?}: menu path ran");
+        cx.simulate_keystrokes("escape");
+        draw(cx);
+        assert_eq!(
+            cx.read(|cx| shell.read(cx).open_sheet()),
+            None,
+            "Escape closes {sheet:?}"
+        );
+    }
 }
 
 /// While each kind of modal is open, every app_menus action except Iced's
