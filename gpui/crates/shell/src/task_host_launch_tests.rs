@@ -1760,3 +1760,127 @@ fn restore_of_an_unmessaged_claude_launch_starts_fresh(cx: &mut TestAppContext) 
 
 #[path = "task_host_launch_turn_tests.rs"]
 mod turn_tests;
+
+/// Issue 86 F1: a saved command not in the form GPUI's launch saves (a
+/// wrapper around a harness, a quoted executable, an option GPUI never
+/// writes) restores a plain shell, starts nothing and keeps the saved
+/// fields.
+#[gpui::test]
+fn restore_runs_only_a_command_in_gpuis_saved_form(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let task = launches.create(cx);
+    let worktree = launches.worktree(&task, cx);
+    let outside = tempfile::tempdir().unwrap();
+    let word = |path: &Path| gitterm_core::workers::shell_word(&path.display().to_string());
+    for command in [
+        format!("env codex --cd {}", word(outside.path())),
+        "co'dex'".to_string(),
+        "codex --sandbox danger-full-access".to_string(),
+    ] {
+        let saved = serde_json::json!({
+            "cwd": worktree, "startup_command": command,
+            "task_id": task, "task_session_id": "restored-session",
+        });
+        let config = tempfile::tempdir().unwrap();
+        let (shell, vcx) = restored_shell(
+            &launches.runs.owner,
+            &launches.runs.git.root,
+            config.path(),
+            saved,
+            cx,
+        );
+        plain_shell_answers(&shell, vcx);
+        assert_eq!(launches.agent.runs(), 0, "{command}");
+        assert!(launches.host_terminals(vcx).is_empty(), "{command}");
+        let terminals = vcx.read(|cx| shell.read(cx).active(cx).store.terminals.clone().unwrap());
+        assert_eq!(
+            terminals[0].startup_command.as_deref(),
+            Some(command.as_str())
+        );
+        assert_eq!(terminals[0].task_id.as_deref(), Some(task.as_str()));
+        vcx.update(|window, _| window.remove_window());
+    }
+}
+
+/// GPUI's own saved forms still run on restore: a Codex launch's saved
+/// command (its notify hook included), and a Claude worker's resume with
+/// options whose transcript was never written, which starts a fresh
+/// `claude` with its options (issue 88).
+#[gpui::test]
+fn restore_runs_gpuis_own_saved_forms(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let task = launches.create(cx);
+    let worktree = launches.worktree(&task, cx);
+    let config = tempfile::tempdir().unwrap();
+    let (shell, vcx) = task_shell(&launches, config.path(), cx);
+    let reply = launches.launch(&task, Some("Codex"), vcx).unwrap();
+    let session = reply["session_id"].as_str().unwrap().to_string();
+    let saved_command = |cx: &mut TestAppContext| {
+        cx.read(|cx| {
+            shell
+                .read(cx)
+                .active(cx)
+                .store
+                .terminals
+                .as_ref()?
+                .iter()
+                .find(|t| t.task_session_id.as_deref() == Some(session.as_str()))?
+                .startup_command
+                .clone()
+        })
+    };
+    wait_until(vcx, |cx| saved_command(cx).is_some());
+    let command = saved_command(vcx).unwrap();
+    assert!(command.contains("notify=["), "{command}");
+    wait_until(vcx, |_| launches.agent.started(1));
+    launches.kill(1);
+    vcx.update(|window, _| window.remove_window());
+
+    let restore = |command: &str, session: &str, cx: &mut TestAppContext| {
+        let saved = serde_json::json!({
+            "cwd": worktree, "startup_command": command,
+            "task_id": task, "task_session_id": session,
+        });
+        let config = tempfile::tempdir().unwrap();
+        let (shell, vcx) = restored_shell(
+            &launches.runs.owner,
+            &launches.runs.git.root,
+            config.path(),
+            saved,
+            cx,
+        );
+        let saved = vcx.read(|cx| {
+            shell.read(cx).active(cx).store.terminals.clone().unwrap()[0]
+                .startup_command
+                .clone()
+        });
+        vcx.update(|window, _| window.remove_window());
+        saved
+    };
+    assert_eq!(
+        restore(&command, &session, cx).as_deref(),
+        Some(command.as_str())
+    );
+    wait_until(cx, |_| launches.agent.started(2));
+    assert!(launches.agent.args(2).contains(&"--config".to_string()));
+    launches.kill(2);
+
+    let notes = gitterm_core::workers::shell_word(&launches.runs.git.repo.display().to_string());
+    let fresh = format!("claude --model opus --effort high --add-dir {notes}");
+    assert_eq!(
+        restore(
+            &format!("claude --model opus --effort high --add-dir {notes} --resume abc"),
+            "restored-session",
+            cx
+        ),
+        Some(fresh)
+    );
+    wait_until(cx, |_| launches.agent.started(3));
+    let args = launches.agent.args(3);
+    assert!(!args.contains(&"--resume".to_string()), "{args:?}");
+    assert!(
+        args.windows(2).any(|pair| pair == ["--model", "opus"]),
+        "{args:?}"
+    );
+    launches.kill(3);
+}

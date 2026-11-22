@@ -271,11 +271,16 @@ impl TaskHostOwner {
             .startup_command
             .clone()
             .ok_or("the saved command was dropped")?;
-        // The command's own extra folders join the folder and worktree under
-        // the guard; a command whose folders are uncertain never starts.
+        // Only a command in the form GPUI's own launch saves runs (issue
+        // 86); its extra folders join the folder and worktree under the
+        // guard, and a command whose folders are uncertain never starts.
+        let presets: Vec<&str> = settings
+            .agent_presets
+            .iter()
+            .map(|preset| preset.command.as_str())
+            .collect();
+        let add_dirs = restorable_add_dirs(&command, &presets, task_id, &session_id)?;
         let mut targets = vec![folder.clone()];
-        let add_dirs = gitterm_core::workers::launch_add_dirs(&command)
-            .map_err(|error| format!("its extra folders cannot be checked: {error}"))?;
         for target in std::iter::once(worktree.clone()).chain(add_dirs) {
             if !targets.contains(&target) {
                 targets.push(target);
@@ -1226,6 +1231,132 @@ fn persisted_startup_command(
     )
 }
 
+/// The extra folders of `command`, when a fixture restore may run it
+/// (issue 86): only in the form GPUI's own launch saves
+/// ([`persisted_startup_command`]) or the restore rewrite returns. The
+/// executable is the plain word `claude`, `codex` or `pi`, never a path,
+/// a quoted name or a wrapper such as `env`; the other words are one of
+/// `presets`' own arguments for that executable plus only the options
+/// GPUI writes, in the forms it writes them. Any other command is an
+/// error, so the restore keeps a plain shell.
+fn restorable_add_dirs(
+    command: &str,
+    presets: &[&str],
+    task_id: &str,
+    session_id: &str,
+) -> Result<Vec<PathBuf>, String> {
+    // Plain shell words only, so the split below is the shell's.
+    let add_dirs = gitterm_core::workers::launch_add_dirs(command)
+        .map_err(|error| format!("its extra folders cannot be checked: {error}"))?;
+    let not_gpuis = || "it is not in the form GPUI saves".to_string();
+    let executable = command.split_whitespace().next().unwrap_or_default();
+    if !["claude", "codex", "pi"].contains(&executable) {
+        return Err(not_gpuis());
+    }
+    let words = shell_words::split(command).map_err(|_| not_gpuis())?;
+    let args = &words[1..];
+    // The preset's own arguments sit together after GPUI's options; a
+    // restore rewrite may have none of them.
+    let mut rests = vec![Vec::new()];
+    rests.extend(presets.iter().filter_map(|preset| {
+        let preset_words = shell_words::split(preset).ok()?;
+        (preset.split_whitespace().next() == Some(executable))
+            .then(|| preset_words[1..].to_vec())
+            .filter(|rest| !rest.is_empty())
+    }));
+    for rest in rests {
+        let starts: Vec<usize> = if rest.is_empty() {
+            vec![0]
+        } else {
+            (0..args.len().saturating_sub(rest.len() - 1))
+                .filter(|&start| args[start..start + rest.len()] == rest[..])
+                .collect()
+        };
+        for start in starts {
+            let others: Vec<&str> = args[..start]
+                .iter()
+                .chain(&args[start + rest.len()..])
+                .map(String::as_str)
+                .collect();
+            if gpui_options(executable, &others, task_id, session_id) {
+                return Ok(add_dirs);
+            }
+        }
+    }
+    Err(not_gpuis())
+}
+
+/// Whether `args` are only options GPUI writes on an `executable` command:
+/// `--add-dir <absolute folder>` ([`gitterm_core::workers::with_launch_options`],
+/// one folder each), the model ([`gitterm_core::workers::with_model_flag`]),
+/// the effort, Claude's `--resume`/`--session-id <id>`, pi's
+/// `--session <id>`, Codex's `resume <id>` last and its notify hook
+/// ([`gitterm_core::task_mcp::configure_codex_notify`] for this task
+/// session). Each but `--add-dir` at most once.
+fn gpui_options(executable: &str, args: &[&str], task_id: &str, session_id: &str) -> bool {
+    use gitterm_core::tasks::ReasoningEffort::{High, Low, Max, Medium, Xhigh};
+    let is_id = |id: &str| {
+        !id.is_empty()
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    let mut seen = Vec::new();
+    for (index, pair) in args.chunks(2).enumerate() {
+        let (option, value) = (pair[0], pair.get(1).copied().unwrap_or(""));
+        let known = match (executable, option) {
+            (_, "--add-dir") => Path::new(value).is_absolute(),
+            ("claude", "--model") | ("codex", "-m") => gitterm_core::workers::is_model_name(value),
+            ("claude", "--effort") => [Low, Medium, High, Xhigh, Max]
+                .iter()
+                .any(|effort| value == effort.label()),
+            ("codex", "-c") => [Low, Medium, High, Xhigh]
+                .iter()
+                .any(|effort| value == effort.codex_config_value()),
+            ("claude", "--resume" | "--session-id") | ("pi", "--session") => is_id(value),
+            ("codex", "resume") => (index + 1) * 2 == args.len() && is_id(value),
+            ("codex", "--config") => is_gpui_codex_notify(value, task_id, session_id),
+            _ => false,
+        };
+        if !known || (option != "--add-dir" && seen.contains(&option)) {
+            return false;
+        }
+        seen.push(option);
+    }
+    !(seen.contains(&"--resume") && seen.contains(&"--session-id"))
+}
+
+/// Whether `value` is the `notify=[…]` override
+/// [`gitterm_core::task_mcp::configure_codex_notify`] writes for this task
+/// session, with any loopback notify endpoint (each run has its own port).
+fn is_gpui_codex_notify(value: &str, task_id: &str, session_id: &str) -> bool {
+    const ENDPOINT: &str = "GITTERMNOTIFYENDPOINT";
+    let written =
+        gitterm_core::task_mcp::configure_codex_notify("codex", ENDPOINT, task_id, session_id);
+    let Some((before, after)) = shell_words::split(&written)
+        .ok()
+        .and_then(|words| words.get(2).cloned())
+        .and_then(|word| {
+            let (before, after) = word.split_once(ENDPOINT)?;
+            Some((before.to_string(), after.to_string()))
+        })
+    else {
+        return false;
+    };
+    let Some(endpoint) = value
+        .strip_prefix(before.as_str())
+        .and_then(|rest| rest.strip_suffix(after.as_str()))
+    else {
+        return false;
+    };
+    ["http://127.0.0.1:", "http://[::1]:"].iter().any(|host| {
+        endpoint
+            .strip_prefix(host)
+            .and_then(|rest| rest.strip_suffix("/notify"))
+            .is_some_and(|port| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
+    })
+}
+
 /// Iced's `claude_session_exists`, under the fixture child's Claude
 /// `projects` dir instead of ~/.claude: Claude writes
 /// `<projects>/<cwd-slug>/<id>.jsonl` on the first message. An id that is
@@ -1375,5 +1506,99 @@ impl TaskHostOwner {
         env.into_iter()
             .map(|(name, value)| (name.into_string().unwrap(), value.into_string().unwrap()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod saved_form_tests {
+    use super::*;
+    use gitterm_core::tasks::{DelegationRunOptions, ReasoningEffort};
+
+    const ENDPOINT: &str = "http://127.0.0.1:4242/notify";
+
+    fn check(command: &str) -> Result<Vec<PathBuf>, String> {
+        restorable_add_dirs(command, &["claude", "codex --yolo", "pi"], "t-1", "s-1")
+    }
+
+    /// Issue 86: what GPUI's launch saves and the restore rewrite returns
+    /// runs, with its folders.
+    #[test]
+    fn gpui_saved_forms_are_restorable() {
+        let options = DelegationRunOptions {
+            effort: Some(ReasoningEffort::High),
+            add_dirs: vec![PathBuf::from("/w/notes"), PathBuf::from("/w/my notes")],
+            ..Default::default()
+        };
+        let claude = persisted_startup_command(Some("abc"), Some("opus"), &options, None).unwrap();
+        assert_eq!(
+            check(&claude),
+            Ok(vec![
+                PathBuf::from("/w/notes"),
+                PathBuf::from("/w/my notes")
+            ])
+        );
+        let codex = gitterm_core::workers::with_model_flag("codex --yolo", "gpt-6").unwrap();
+        let codex =
+            gitterm_core::workers::with_launch_options(&codex, options.effort, &options.add_dirs)
+                .unwrap();
+        let codex = gitterm_core::task_mcp::configure_codex_notify(&codex, ENDPOINT, "t-1", "s-1");
+        assert_eq!(check(&codex).map(|dirs| dirs.len()), Ok(2));
+        let resume = gitterm_core::task_mcp::configure_codex_notify(
+            "codex resume x-1",
+            ENDPOINT,
+            "t-1",
+            "s-1",
+        );
+        for command in [
+            "claude",
+            "claude --session-id abc",
+            "claude --resume abc",
+            "claude --model opus",
+            "codex",
+            "codex --yolo",
+            "pi",
+            "pi --session p-1",
+            &resume,
+        ] {
+            assert_eq!(check(command), Ok(vec![]), "{command}");
+        }
+    }
+
+    /// Issue 86 F1: a wrapper, a quoted or pathed executable, an option GPUI
+    /// never writes, or a notify hook for another session or host is not
+    /// restorable.
+    #[test]
+    fn other_forms_are_not_restorable() {
+        let elsewhere =
+            gitterm_core::task_mcp::configure_codex_notify("codex", ENDPOINT, "t-1", "s-2");
+        let remote = gitterm_core::task_mcp::configure_codex_notify(
+            "codex",
+            "http://example.test:80/notify",
+            "t-1",
+            "s-1",
+        );
+        for command in [
+            "env codex --cd /outside",
+            "co'dex'",
+            "\"codex\"",
+            "/usr/bin/codex",
+            "codex --cd /outside",
+            "codex -C /outside",
+            "codex --add-dir /a /b",
+            "codex --add-dir relative",
+            "codex --model gpt-6",
+            "codex resume x-1 --cd /outside",
+            "codex resume x-1 -m gpt-6",
+            "codex --yolo --yolo",
+            "claude --model opus --model sonnet",
+            "claude --resume a --session-id b",
+            "claude --effort extreme",
+            "claude --dangerously-skip-permissions",
+            "pi --resume",
+            elsewhere.as_str(),
+            remote.as_str(),
+        ] {
+            assert!(check(command).is_err(), "{command}");
+        }
     }
 }
