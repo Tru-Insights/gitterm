@@ -635,20 +635,31 @@ impl TaskHostOwner {
         cx: &mut Context<Self>,
     ) {
         match effect {
-            HostEffect::PlanLimits { reply } => reply.send(plan_limits(&self.iced_config)),
+            // The plan-limits file is read on the background executor, which
+            // sends the reply, so the UI thread never waits on it.
+            HostEffect::PlanLimits { reply } => {
+                let iced_config = self.iced_config.clone();
+                cx.background_spawn(async move { reply.send(plan_limits(&iced_config)) })
+                    .detach();
+            }
             HostEffect::HtmlRender {
                 reply,
                 caller,
                 request,
             } => reply.send(html_render(request, caller.as_deref(), &open_chats(cx))),
+            // Iced's settings file is read on the background executor; the
+            // panes are read back on the UI thread, which sends the reply.
             HostEffect::Read { reply, effect } => {
-                let presets: Vec<String> =
-                    crate::workspace_config::load_iced_settings_from(&self.iced_config)
-                        .agent_presets
-                        .iter()
-                        .map(|preset| preset.name.clone())
-                        .collect();
-                reply.send(read_projection(effect, &self.panes, &presets));
+                let iced_config = self.iced_config.clone();
+                cx.spawn(async move |owner: gpui::WeakEntity<Self>, cx| {
+                    let presets = cx
+                        .background_spawn(async move { preset_names(&iced_config) })
+                        .await;
+                    let _ = owner.update(cx, |owner, _| {
+                        reply.send(read_projection(effect, &owner.panes, &presets));
+                    });
+                })
+                .detach();
             }
             // Iced adds the live worker card; the preview runs no workers.
             HostEffect::DelegationRecord { reply, record, .. } => reply.send(Ok(record)),
@@ -868,11 +879,12 @@ impl TaskHostOwner {
         Ok(value)
     }
 
-    /// Iced's `TurnEnded` arm, store part only: a pane hosting the session
-    /// now waits for input, so the task does, unless the session is a
-    /// worker's final one. Preview panes carry no other live state, so the
-    /// ended session decides Iced's aggregate. Delivery waits for the next
-    /// delivery tick ([`delivery`]).
+    /// Iced's `TurnEnded` arm, store part only: a chat pane or launched
+    /// terminal hosting the session now waits for input, so the task does,
+    /// unless the session is a worker's final one. A terminal carries live
+    /// state, so the task's sessions decide the lifecycle together; chat
+    /// panes carry none, so the ended session decides. Delivery waits for
+    /// the next delivery tick ([`delivery`]).
     fn turn_ended(
         &mut self,
         task_id: &str,
@@ -881,11 +893,19 @@ impl TaskHostOwner {
         cx: &App,
     ) -> Result<serde_json::Value, String> {
         self.authorize_write(label, &self.task_worktree(task_id))?;
-        let hosted = open_chats(cx).iter().any(|chat| {
-            chat.task_id.as_deref() == Some(task_id)
-                && chat.task_session_id.as_deref() == Some(session_id)
-        });
-        if hosted {
+        // Iced checks every tab, terminals included: a launched terminal of
+        // the task's session sets its live state and the task's sessions
+        // decide the lifecycle (`apply_task_session_signal`).
+        let terminal = self.terminal_turn_ended(task_id, session_id);
+        if terminal {
+            self.apply_task_session_signal(task_id, None, cx);
+        }
+        let hosted = terminal
+            || open_chats(cx).iter().any(|chat| {
+                chat.task_id.as_deref() == Some(task_id)
+                    && chat.task_session_id.as_deref() == Some(session_id)
+            });
+        if hosted && !terminal {
             let store = self.writable_store()?;
             if !store.worker_session_is_final(task_id, Some(session_id))
                 && let Err(error) = store.record_lifecycle_signal(
@@ -1609,6 +1629,15 @@ pub(crate) fn html_render(
         html_render: request,
     })
     .map_err(|error| format!("cannot encode visual reply: {error}"))
+}
+
+/// Iced's preset names, as the task list's `available_presets`.
+pub(crate) fn preset_names(iced_config: &Path) -> Vec<String> {
+    crate::workspace_config::load_iced_settings_from(iced_config)
+        .agent_presets
+        .iter()
+        .map(|preset| preset.name.clone())
+        .collect()
 }
 
 /// The task read in Iced's shape: each task with the shell's panes holding
