@@ -360,13 +360,7 @@ impl TaskHostOwner {
                 other => (other, ObjectiveDeliveryState::NotDelivered),
             };
             let fixture = self.fixture_of(&worktree, label)?;
-            #[cfg_attr(not(test), allow(unused_mut))]
-            let mut env = self.fixture_child_env(&fixture, Some(&session_id))?;
-            #[cfg(test)]
-            if let Some(path) = &self.codex_search_path {
-                env.retain(|(name, _)| name != "PATH");
-                env.push(("PATH".into(), path.clone()));
-            }
+            let env = self.terminal_child_env(&fixture, &session_id)?;
             let command = command
                 .map(|command| self.runtime_command(&command, &worktree, &env, &task, cx))
                 .transpose()?;
@@ -466,9 +460,36 @@ impl TaskHostOwner {
         })))
     }
 
+    /// The whole environment a task terminal's child gets: the fixture
+    /// child environment naming `session_id`, with the terminal's own
+    /// TERM/COLORTERM. The trust checks read this same list.
+    fn terminal_child_env(
+        &self,
+        fixture: &Path,
+        session_id: &str,
+    ) -> Result<Vec<(OsString, OsString)>, String> {
+        let mut env = self.fixture_child_env(fixture, Some(session_id))?;
+        #[cfg(test)]
+        if let Some(path) = &self.codex_search_path {
+            env.retain(|(name, _)| name != "PATH");
+            env.push(("PATH".into(), path.clone()));
+        }
+        // Every GPUI terminal gets the backend's TERM/COLORTERM (an agent
+        // CLI needs TERM), so the child env is the same whatever the parent
+        // has.
+        env.retain(|(name, _)| !TERMINAL_SET.iter().any(|(set, _)| name == *set));
+        env.extend(
+            TERMINAL_SET
+                .iter()
+                .map(|(name, value)| ((*name).into(), (*value).into())),
+        );
+        Ok(env)
+    }
+
     /// Iced's `create_tab_with_session_uid` command steps for a task launch:
-    /// the provider's trust check against the home the child gets, then the
-    /// guidelines and Claude in Chrome (always off in fixture mode).
+    /// the provider's trust check against the environment the child gets
+    /// (for Claude, the trust file its pinned CLAUDE_CONFIG_DIR names), then
+    /// the guidelines and Claude in Chrome (always off in fixture mode).
     fn runtime_command(
         &self,
         command: &str,
@@ -487,23 +508,11 @@ impl TaskHostOwner {
         let roots = self.trust_roots(cx);
         let command = command.trim();
         let command = match provider_for_command(command) {
+            // Iced's validate_claude_trust_launch refuses any
+            // CLAUDE_CONFIG_DIR, and the preview pins one so a fixture child
+            // never reads the real ~/.claude: check the file it pins.
             WorkerProvider::Claude => {
-                gitterm_core::workers::validate_claude_trust_launch(
-                    command,
-                    &home,
-                    &readable,
-                    |_| None,
-                )?;
-                if let Some(main) = gitterm_core::workers::claude_task_trust(
-                    worktree,
-                    &roots,
-                    &home.join(".claude.json"),
-                )? {
-                    eprintln!(
-                        "[tasks] accepted Claude workspace trust for {} in the fixture home",
-                        main.display()
-                    );
-                }
+                gitterm_core::workers::validate_claude_trust_config(command, worktree, &readable)?;
                 command.to_string()
             }
             WorkerProvider::Codex => {
@@ -715,8 +724,9 @@ impl TaskHostOwner {
 }
 
 /// Starts the child: `/bin/sh -c <command>` (a shell for a plain
-/// terminal) with exactly `env`. Every inherited variable not in `env` is
-/// removed, and so are the ones the PTY launcher would add.
+/// terminal) with exactly `env` ([`TaskHostOwner::terminal_child_env`]).
+/// Every inherited variable not in `env` is removed, and so are the ones
+/// the PTY launcher would add.
 fn spawn_terminal(
     cwd: &Path,
     command: Option<String>,
@@ -741,12 +751,6 @@ fn spawn_terminal(
     }
     for name in LAUNCHER_SET {
         overlay.entry(name.into()).or_insert(None);
-    }
-    // Every GPUI terminal gets the backend's TERM/COLORTERM (an agent CLI
-    // needs TERM). Set them here, so the child env is the same whatever the
-    // parent has.
-    for (name, value) in TERMINAL_SET {
-        overlay.insert(name.into(), Some(value.into()));
     }
     let launch = TerminalLaunch {
         cwd: Some(cwd.to_path_buf()),
@@ -920,11 +924,7 @@ impl TaskHostOwner {
     /// The environment a launch of `session` in `worktree` gives its child.
     pub(crate) fn launch_env(&self, worktree: &Path, session: &str) -> Vec<(String, String)> {
         let fixture = self.fixture_of(worktree, "test").unwrap();
-        let mut env = self.fixture_child_env(&fixture, Some(session)).unwrap();
-        if let Some(path) = &self.codex_search_path {
-            env.retain(|(name, _)| name != "PATH");
-            env.push(("PATH".into(), path.clone()));
-        }
+        let env = self.terminal_child_env(&fixture, session).unwrap();
         env.into_iter()
             .map(|(name, value)| (name.into_string().unwrap(), value.into_string().unwrap()))
             .collect()

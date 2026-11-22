@@ -1250,22 +1250,7 @@ pub fn validate_claude_trust_launch(
     extra_env: &[(String, String)],
     mut ambient_env: impl FnMut(&str) -> Option<String>,
 ) -> Result<(), String> {
-    validate_trust_shell_syntax(command, "Claude")?;
-    let words =
-        shell_words::split(command).map_err(|_| "Cannot parse Claude task preset".to_string())?;
-    for arg in words.iter().skip(1) {
-        if arg == "-w"
-            || arg.starts_with("-w")
-            || arg == "--worktree"
-            || arg.starts_with("--worktree=")
-            || arg == "--teleport"
-            || arg.starts_with("--teleport=")
-            || arg == "--remote"
-            || arg.starts_with("--remote=")
-        {
-            return Err("Claude task preset changes its checkout; remove worktree/remote/teleport options before GitTerm can verify trust".into());
-        }
-    }
+    validate_claude_trust_command(command)?;
     for key in [
         "HOME",
         "CLAUDE_CONFIG_DIR",
@@ -1287,6 +1272,140 @@ pub fn validate_claude_trust_launch(
         }
     }
     Ok(())
+}
+
+/// The command rules of [`validate_claude_trust_launch`]: plain shell
+/// syntax, and no option that moves Claude to another checkout.
+fn validate_claude_trust_command(command: &str) -> Result<(), String> {
+    validate_trust_shell_syntax(command, "Claude")?;
+    let words =
+        shell_words::split(command).map_err(|_| "Cannot parse Claude task preset".to_string())?;
+    for arg in words.iter().skip(1) {
+        if arg == "-w"
+            || arg.starts_with("-w")
+            || arg == "--worktree"
+            || arg.starts_with("--worktree=")
+            || arg == "--teleport"
+            || arg.starts_with("--teleport=")
+            || arg == "--remote"
+            || arg.starts_with("--remote=")
+        {
+            return Err("Claude task preset changes its checkout; remove worktree/remote/teleport options before GitTerm can verify trust".into());
+        }
+    }
+    Ok(())
+}
+
+/// Where [`validate_claude_trust_config`] reads trust, as its errors name
+/// it: never the directory's value.
+const PINNED_CLAUDE_TRUST: &str = "$CLAUDE_CONFIG_DIR/.claude.json";
+
+/// The Claude trust check for a child whose environment pins
+/// CLAUDE_CONFIG_DIR (the GPUI preview's fixture children): Claude then
+/// reads its global config, and so the trust state, from
+/// `$CLAUDE_CONFIG_DIR/.claude.json`, and this reads that same file.
+/// `env` is the child's whole environment (it starts from a cleared one).
+///
+/// The rules are [`validate_claude_trust_launch`]'s and
+/// [`claude_task_trust`]'s: the same command rules, the other trust
+/// overrides refused, the entry keyed by the checkout's canonical main
+/// repository, the file a regular file (not a symlink) holding an object,
+/// and `hasTrustDialogAccepted` a boolean where present. It only reads:
+/// false and missing both mean not yet trusted, and so does a missing
+/// file, so the launch is refused unless the entry is already trusted.
+/// Returns the trusted repository. Errors name variables, never values.
+#[cfg(feature = "runtime")]
+pub fn validate_claude_trust_config(
+    command: &str,
+    cwd: &std::path::Path,
+    env: &[(String, String)],
+) -> Result<std::path::PathBuf, String> {
+    validate_claude_trust_command(command)?;
+    let value = |key: &str| {
+        env.iter()
+            .rev()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    };
+    for key in [
+        "CLAUDE_CODE_CUSTOM_OAUTH_URL",
+        "CLAUDE_CODE_IGNORE_PERSISTED_TRUST",
+    ] {
+        if value(key).is_some_and(|value| !value.is_empty()) {
+            return Err(format!("Claude task {key} changes its trust source; remove the override so GitTerm can verify {PINNED_CLAUDE_TRUST}"));
+        }
+    }
+    let dir = value("CLAUDE_CONFIG_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(std::path::Path::new)
+        .ok_or("Claude task has no CLAUDE_CONFIG_DIR; this check reads the trust file it pins")?;
+    if !dir.is_absolute() {
+        return Err(
+            "Claude task CLAUDE_CONFIG_DIR is not an absolute path; GitTerm cannot tell which trust file Claude reads"
+                .into(),
+        );
+    }
+    let config_path = dir.join(".claude.json");
+    let main = trust_main_repository(cwd)?;
+    let key = main
+        .to_str()
+        .ok_or_else(|| "Claude trust requires a UTF-8 repository path".to_string())?;
+    let untrusted = || {
+        format!(
+            "Refusing Claude worker: repository {} is not trusted in {PINNED_CLAUDE_TRUST}. Accept its trust there before launching",
+            main.display()
+        )
+    };
+    match std::fs::symlink_metadata(&config_path) {
+        Ok(info) if info.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(format!(
+                "Claude trust file {PINNED_CLAUDE_TRUST} must be a regular file, not a symlink"
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(untrusted()),
+        Err(error) => {
+            return Err(format!(
+                "inspect Claude trust file {PINNED_CLAUDE_TRUST}: {}",
+                error.kind()
+            ))
+        }
+    }
+    let bytes = std::fs::read(&config_path).map_err(|error| {
+        format!(
+            "read Claude trust file {PINNED_CLAUDE_TRUST}: {}",
+            error.kind()
+        )
+    })?;
+    let config: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "parse Claude trust file {PINNED_CLAUDE_TRUST}: invalid JSON at line {}, column {}",
+            error.line(),
+            error.column()
+        )
+    })?;
+    let object = config
+        .as_object()
+        .ok_or_else(|| format!("Claude trust file {PINNED_CLAUDE_TRUST} must contain an object"))?;
+    let Some(projects) = object.get("projects") else {
+        return Err(untrusted());
+    };
+    let projects = projects
+        .as_object()
+        .ok_or_else(|| format!("projects in {PINNED_CLAUDE_TRUST} must be an object"))?;
+    let Some(project) = projects.get(key) else {
+        return Err(untrusted());
+    };
+    let project = project.as_object().ok_or_else(|| {
+        format!("Claude project trust entry in {PINNED_CLAUDE_TRUST} must be an object")
+    })?;
+    match project.get("hasTrustDialogAccepted") {
+        Some(serde_json::Value::Bool(true)) => Ok(main),
+        None | Some(serde_json::Value::Bool(false)) => Err(untrusted()),
+        Some(_) => Err(format!(
+            "hasTrustDialogAccepted in {PINNED_CLAUDE_TRUST} must be a boolean"
+        )),
+    }
 }
 
 /// Persist only the canonical workspace repository's trust bit. False and
@@ -2001,6 +2120,112 @@ mod reliability_tests {
             |_| None,
         )
         .unwrap();
+    }
+
+    /// The pinned-config check reads `$CLAUDE_CONFIG_DIR/.claude.json` with
+    /// Iced's trust rules, only reads it, and names no variable's value.
+    #[test]
+    fn claude_config_trust_reads_the_pinned_file() {
+        use serde_json::json;
+        let temp = tempfile::tempdir().unwrap();
+        let (root, linked) = linked_repo(temp.path());
+        let dir = temp.path().join("private-secret-source");
+        std::fs::create_dir(&dir).unwrap();
+        let config = dir.join(".claude.json");
+        let env = vec![(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            dir.to_str().unwrap().to_string(),
+        )];
+        let check = |command: &str, env: &[(String, String)]| {
+            validate_claude_trust_config(command, &linked, env)
+        };
+        let refused = |error: String| {
+            assert!(!error.contains("private-secret-source"), "{error}");
+            error
+        };
+        let untrusted = |error: String| {
+            let error = refused(error);
+            assert!(error.contains("is not trusted in $CLAUDE_CONFIG_DIR/.claude.json"));
+            assert!(error.contains(root.to_str().unwrap()), "{error}");
+        };
+        // No file, no projects, no entry, and a false entry: not trusted.
+        untrusted(check("claude", &env).unwrap_err());
+        for value in [
+            json!({}),
+            json!({"projects": {}}),
+            json!({"projects": {root.to_str().unwrap(): {}}}),
+            json!({"projects": {root.to_str().unwrap(): {"hasTrustDialogAccepted": false}}}),
+            // The linked worktree's own path is not the key.
+            json!({"projects": {linked.to_str().unwrap(): {"hasTrustDialogAccepted": true}}}),
+        ] {
+            std::fs::write(&config, value.to_string()).unwrap();
+            untrusted(check("claude", &env).unwrap_err());
+        }
+        std::fs::write(
+            &config,
+            json!({"projects": {root.to_str().unwrap(): {"hasTrustDialogAccepted": "true"}}})
+                .to_string(),
+        )
+        .unwrap();
+        assert!(refused(check("claude", &env).unwrap_err()).contains("must be a boolean"));
+        std::fs::write(&config, "{\"secret\": ").unwrap();
+        assert!(refused(check("claude", &env).unwrap_err()).contains("invalid JSON"));
+
+        // A trusted entry for the main repository: accepted, file untouched.
+        let trusted =
+            json!({"projects": {root.to_str().unwrap(): {"hasTrustDialogAccepted": true}}})
+                .to_string();
+        std::fs::write(&config, &trusted).unwrap();
+        assert_eq!(check("claude --session-id fixture", &env).unwrap(), root);
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), trusted);
+
+        // The command rules and the other overrides still refuse.
+        assert!(check("claude -w", &env).is_err());
+        assert!(check("claude $(echo secret)", &env).is_err());
+        for key in [
+            "CLAUDE_CODE_CUSTOM_OAUTH_URL",
+            "CLAUDE_CODE_IGNORE_PERSISTED_TRUST",
+        ] {
+            let mut env = env.clone();
+            env.push((key.into(), "/private-secret-source".into()));
+            assert!(refused(check("claude", &env).unwrap_err()).contains(key));
+        }
+        // No pinned dir, an empty one, or a relative one: nothing to read.
+        for value in [None, Some(""), Some("private-secret-source")] {
+            let env: Vec<(String, String)> = value
+                .map(|value| ("CLAUDE_CONFIG_DIR".into(), value.into()))
+                .into_iter()
+                .collect();
+            assert!(refused(check("claude", &env).unwrap_err()).contains("CLAUDE_CONFIG_DIR"));
+        }
+        // A symlinked trust file is refused, as Iced refuses it.
+        #[cfg(unix)]
+        {
+            let real = temp.path().join("real.json");
+            std::fs::rename(&config, &real).unwrap();
+            std::os::unix::fs::symlink(&real, &config).unwrap();
+            assert!(refused(check("claude", &env).unwrap_err()).contains("not a symlink"));
+        }
+    }
+
+    /// Iced's check is unchanged: the environment the pinned-config check
+    /// accepts is still refused there, with Iced's message.
+    #[test]
+    fn iced_claude_trust_check_still_refuses_any_config_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let home_value = home.path().to_str().unwrap().to_string();
+        let env = [
+            ("HOME".to_string(), home_value),
+            (
+                "CLAUDE_CONFIG_DIR".to_string(),
+                home.path().join("claude").to_str().unwrap().to_string(),
+            ),
+        ];
+        assert_eq!(
+            validate_claude_trust_launch("claude", home.path(), &env, |_| None).unwrap_err(),
+            "Claude task CLAUDE_CONFIG_DIR changes its trust source; remove the override so GitTerm can verify ~/.claude.json"
+        );
+        validate_claude_trust_launch("claude", home.path(), &env[..1], |_| None).unwrap();
     }
 }
 
