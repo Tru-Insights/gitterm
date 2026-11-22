@@ -4,10 +4,12 @@
 //! `view_task_tab_close_modal`), mounted over the preview task host's seeded
 //! store (H5b B8a).
 //!
-//! Reads work: filters, selection, opening and dismissing the forms, typing.
-//! Every write or launch is built as the core `TaskMutationAction` Iced would
-//! run, checked by `ServiceContext::task_action`, and stops at its preview
-//! notice. Nothing here writes the store, runs git or starts a process.
+//! Reads work: filters, selection, opening and dismissing the forms, typing,
+//! the worktree inspection behind `Delete worktree…` (read-only git) and the
+//! handoff-prompt clipboard copy. Every write or launch is built as the core
+//! `TaskMutationAction` Iced would run, checked by
+//! `ServiceContext::task_action`, and stops at its preview notice. Nothing
+//! here writes the store, runs a writing git command or starts a process.
 use crate::{task_host::GpuiTaskHost, theme::Palette};
 use gitterm_core::{
     preview::service::{ServiceContext, classify_task_action},
@@ -17,10 +19,14 @@ use gitterm_core::{
         TaskMutationAction, TaskMutationCommand, TaskMutationFacts, TaskPublish,
     },
     task_host::TaskHost,
-    task_worktree::{pr_base_branch, suggested_task_branch, suggested_task_worktree_path},
+    task_worktree::{
+        CleanupContext, inspect_cleanup, pr_base_branch, suggested_task_branch,
+        suggested_task_worktree_path,
+    },
     tasks::{
-        HarnessKind, StoppingBoundary, TaskCreatorKind, TaskLifecycle, TaskRecord, TaskStore,
-        TaskWorktreeState, VerificationState, WorkspaceLocationIdentity,
+        CleanupInspection, CleanupRisk, HarnessKind, StoppingBoundary, TaskCreatorKind,
+        TaskLifecycle, TaskRecord, TaskStore, TaskWorktreeState, VerificationState,
+        WorkspaceLocationIdentity, task_handoff_prompt,
     },
 };
 use gpui::{
@@ -618,11 +624,11 @@ pub(crate) enum Modal {
     Delete {
         task_id: String,
         path: PathBuf,
-        /// Iced decides this from the inspection; the preview cannot inspect
-        /// (it may write the index), so the record's missing path decides.
-        record_only: bool,
-        inspection: String,
+        /// Iced `TaskWorktreeDeletePrompt::inspection`: `None` while the
+        /// inspection runs.
+        inspection: Option<Result<CleanupInspection, String>>,
         error: Option<String>,
+        _inspect: gpui::Task<()>,
     },
     StopAndClose {
         target: Target,
@@ -831,7 +837,9 @@ impl TaskPanel {
         }
     }
 
-    /// Iced `TaskWorktreeDeleteOpen`: the inspection it starts is checked first.
+    /// Iced `TaskWorktreeDeleteOpen`: the core inspection (read-only git, so
+    /// the preview allows it) runs off the UI thread; until it returns the
+    /// modal shows `Checking for unsaved work…`.
     pub(crate) fn open_delete(&mut self, task_id: &str, inputs: &Inputs, cx: &mut Context<Self>) {
         let Some(host) = host(cx) else { return };
         let Some(store) = host.store().as_ref() else {
@@ -845,22 +853,60 @@ impl TaskPanel {
         else {
             return;
         };
-        let inspect = TaskMutationAction::InspectCleanup {
-            task_id: task_id.to_owned(),
-            repository: directory.clone(),
-            path: path.clone(),
-            branch: task.branch.clone(),
-            base_commit: task.base.commit.clone(),
-            process_running: inputs.open_session(task_id).is_some(),
+        // The core `TaskMutation::InspectDelete` facts: an active lifecycle
+        // or an open session of the task.
+        let context = CleanupContext {
+            process_running: task.lifecycle.is_active() || inputs.open_session(task_id).is_some(),
             pull_request_url: task.delivery.pr_url.clone(),
         };
-        let inspection = refuse(host.services(), &inspect);
+        let (repository, branch, base_commit) = (
+            directory.clone(),
+            task.branch.clone(),
+            task.base.commit.clone(),
+        );
+        let inspect = TaskMutationAction::InspectCleanup {
+            task_id: task_id.to_owned(),
+            repository: repository.clone(),
+            path: path.clone(),
+            branch: branch.clone(),
+            base_commit: base_commit.clone(),
+            process_running: context.process_running,
+            pull_request_url: context.pull_request_url.clone(),
+        };
+        let (inspection, job) = match host.services().task_action(&inspect, None) {
+            Err(denied) => (Some(Err(denied.notice().to_owned())), gpui::Task::ready(())),
+            Ok(()) => {
+                let (id, worktree) = (task_id.to_owned(), path.clone());
+                let job = cx.spawn(async move |panel, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            inspect_cleanup(&repository, &worktree, &branch, &base_commit, &context)
+                                .map_err(|error| error.to_string())
+                        })
+                        .await;
+                    _ = panel.update(cx, |panel, cx| {
+                        if let Some(Modal::Delete {
+                            task_id,
+                            inspection,
+                            ..
+                        }) = &mut panel.modal
+                            && *task_id == id
+                        {
+                            *inspection = Some(result);
+                            cx.notify();
+                        }
+                    });
+                });
+                (None, job)
+            }
+        };
         self.modal = Some(Modal::Delete {
             task_id: task_id.to_owned(),
             path,
-            record_only: store.task_worktree_missing(task_id),
             inspection,
             error: None,
+            _inspect: job,
         });
         cx.notify();
     }
@@ -934,17 +980,23 @@ impl TaskPanel {
                     record: Box::new(record),
                 }
             }),
+            // Iced `TaskWorktreeDeleteConfirm`: nothing until the inspection
+            // succeeds, then the core `TaskMutation::DeleteWorktree` policy.
             Write::DeleteConfirm => match &self.modal {
                 Some(Modal::Delete {
                     task_id,
                     path,
-                    record_only,
+                    inspection: Some(Ok(inspection)),
                     ..
-                }) => match (*record_only, store.get(task_id)) {
-                    (true, _) => Some(TaskMutationAction::ClearWorktree {
-                        task_id: task_id.clone(),
-                    }),
-                    (false, Some(task)) => match &task.workspace.location {
+                }) => match store.get(task_id) {
+                    None => return Err("Task is no longer in the task store".into()),
+                    Some(_) if delete_blocked(inspection) => None,
+                    Some(_) if !inspection.path_exists || !inspection.registered => {
+                        Some(TaskMutationAction::ClearWorktree {
+                            task_id: task_id.clone(),
+                        })
+                    }
+                    Some(task) => match &task.workspace.location {
                         WorkspaceLocationIdentity::Local { directory } => {
                             Some(TaskMutationAction::RemoveWorktree {
                                 task_id: task_id.clone(),
@@ -954,7 +1006,6 @@ impl TaskPanel {
                         }
                         _ => return Err("Could not resolve the task's repository directory".into()),
                     },
-                    (false, None) => None,
                 },
                 _ => None,
             },
@@ -1649,6 +1700,32 @@ pub(crate) fn overview_view(
     page.into_any_element()
 }
 
+/// Iced's lines for the risks that block a worktree delete (the core
+/// `TaskMutation::DeleteWorktree` policy refuses the same three).
+fn blocking_lines(inspection: &CleanupInspection) -> Vec<String> {
+    inspection
+        .risks
+        .iter()
+        .filter_map(|risk| match risk {
+            CleanupRisk::ActiveProcess => {
+                Some("An agent or session is still attached — stop it first".to_owned())
+            }
+            CleanupRisk::UncommittedChanges => {
+                Some("The worktree has uncommitted changes".to_owned())
+            }
+            CleanupRisk::UnpushedCommits { count } => Some(format!(
+                "{count} commit{} not pushed anywhere",
+                if *count == 1 { "" } else { "s" }
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn delete_blocked(inspection: &CleanupInspection) -> bool {
+    !blocking_lines(inspection).is_empty()
+}
+
 fn boundary_label(boundary: StoppingBoundary) -> &'static str {
     match boundary {
         StoppingBoundary::PlanOnly => "Plan only",
@@ -1745,15 +1822,10 @@ pub(crate) fn modal_view(
         Modal::Delete {
             task_id,
             path,
-            record_only,
             inspection,
             error: err,
+            ..
         } => {
-            let label = if *record_only {
-                "Clear worktree record"
-            } else {
-                "Delete worktree"
-            };
             card = card
                 .w(px(560.))
                 .child(div().text_size(px(16.)).child("Delete worktree?"))
@@ -1766,22 +1838,65 @@ pub(crate) fn modal_view(
                             task_title(task_id, "this task"),
                             path.display()
                         )),
-                )
-                .child(
-                    div()
-                        .text_color(rgb(p.red))
-                        .child(format!("Could not inspect the worktree: {inspection}")),
-                )
-                .children(error(err))
-                .child(
-                    buttons()
-                        .child(dismiss("task-delete-keep", "Keep worktree"))
-                        .child(confirm(
-                            "task-delete-confirm",
-                            label.into(),
-                            Write::DeleteConfirm,
-                        )),
                 );
+            // Iced `view_task_worktree_delete_modal`: the confirm label comes
+            // from the inspection; none while pending, failed or blocked.
+            let secondary = |line: &str| div().text_color(rgb(p.subtext0)).child(line.to_owned());
+            let mut label = None;
+            match inspection {
+                None => card = card.child(secondary("Checking for unsaved work…")),
+                Some(Err(failure)) => {
+                    card = card.child(
+                        div()
+                            .text_color(rgb(p.red))
+                            .child(format!("Could not inspect the worktree: {failure}")),
+                    )
+                }
+                Some(Ok(inspection)) => {
+                    let blocking = blocking_lines(inspection);
+                    if !blocking.is_empty() {
+                        card = card.child(secondary(
+                            "This worktree still holds work that would be lost:",
+                        ));
+                        for line in blocking {
+                            card = card.child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(p.red))
+                                    .child(format!("· {line}")),
+                            );
+                        }
+                    } else if !inspection.path_exists || !inspection.registered {
+                        card = card.child(secondary(
+                            "The worktree is no longer on disk. This clears it from the task record.",
+                        ));
+                        label = Some("Clear worktree record");
+                    } else {
+                        card = card.child(secondary(
+                            "No unsaved work detected. The task branch and record stay; only the \
+                             working copy is deleted.",
+                        ));
+                        if let Some(CleanupRisk::ExistingPullRequest { url }) = inspection
+                            .risks
+                            .iter()
+                            .find(|risk| matches!(risk, CleanupRisk::ExistingPullRequest { .. }))
+                        {
+                            card =
+                                card.child(div().text_size(px(11.)).text_color(muted(&p)).child(
+                                    format!("A pull request exists for this branch: {url}"),
+                                ));
+                        }
+                        label = Some("Delete worktree");
+                    }
+                }
+            }
+            card = card.children(error(err)).child(
+                buttons()
+                    .child(dismiss("task-delete-keep", "Keep worktree"))
+                    .children(label.map(|label| {
+                        confirm("task-delete-confirm", label.into(), Write::DeleteConfirm)
+                    })),
+            );
         }
         Modal::StopAndClose { target, error: err } => {
             let title = target
@@ -2089,8 +2204,9 @@ impl crate::Shell {
             .is_some_and(|panel| panel.read(cx).modal_open())
     }
 
-    /// Iced `TaskChildAdd`: the session picker over the task. Iced also
-    /// copies the task's handoff prompt; the preview does not.
+    /// Iced `TaskChildAdd`: the session picker over the task, with the
+    /// task's handoff prompt copied to the clipboard (a local write the
+    /// preview allows) and the picker's `handoff copied` line.
     pub(crate) fn open_task_picker(
         &mut self,
         task_id: &str,
@@ -2103,13 +2219,18 @@ impl crate::Shell {
         else {
             return;
         };
+        let handoff = task_handoff_prompt(task, None);
         let inputs = self.task_inputs(cx);
         let context = crate::session_picker::TaskContext::from_task(
             task,
             inputs.task_sessions(task_id).count(),
-            false,
+            true,
         );
         self.open_picker(Some(context), window, cx);
+        // Only when the picker opened, so its line never claims a copy.
+        if self.session_picker.is_some() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(handoff));
+        }
     }
 
     /// The task picker's choice is a launch: it stops at the preview notice.

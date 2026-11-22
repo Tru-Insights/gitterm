@@ -344,7 +344,7 @@ fn every_task_action_and_session_effect_is_classified() {
                 pull_request_url: None,
             },
             "Inspect worktree",
-            Access::Write,
+            Access::Read,
         ),
         (
             A::ConfirmPublish {

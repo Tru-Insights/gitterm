@@ -440,6 +440,7 @@ impl Render for SessionPicker {
                     if handoff_copied {
                         header = header.child(
                             div()
+                                .debug_selector(|| "session-picker-handoff-copied".into())
                                 .text_size(px(9.))
                                 .text_color(rgb(p.muted))
                                 .child(HANDOFF_HINT),

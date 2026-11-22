@@ -230,9 +230,9 @@ pub fn classify_task_action(action: &TaskMutationAction) -> Class {
     use TaskMutationAction as A;
     match action {
         A::None => class("Task", Access::Read),
-        // `git status` without --no-optional-locks can rewrite the checkout's
-        // index, so inspection is a write until that path is proven read-only.
-        A::InspectCleanup { .. } => class("Inspect worktree", Access::Write),
+        // Read-only Git: no command writes or takes optional locks
+        // (`task_worktree::inspect_cleanup`, test `inspection_spawns_only_read_git`).
+        A::InspectCleanup { .. } => class("Inspect worktree", Access::Read),
         A::ConfirmPublish { .. } => class("Publish", Access::Read),
         A::WorkerAuthorityChecked { .. } => class("Check worker", Access::Read),
         A::PrepareTask(_) => class("Create task", Access::Write),
