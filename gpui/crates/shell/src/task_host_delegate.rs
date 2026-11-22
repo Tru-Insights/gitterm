@@ -8,17 +8,21 @@
 //! worktree is prepared and saved the worker delegation is stored and its
 //! session launched through B10b's launch path.
 //!
-//! The fixture guard authorizes every target before preparation (the
-//! repository or the calling tab's checkout, and each extra folder), again
-//! with the checked paths, and rechecks them after the asynchronous
-//! preparation together with the prepared worktree; the launch rechecks the
-//! worktree and extra folders right before the child starts.
+//! A `checkout` (an existing worktree) follows Iced's
+//! `delegate_task_in_checkout`: the task this host created there carries
+//! the new objective, or a new task is set up around the worktree (as
+//! Adopt does), and the worker launches there.
 //!
-//! Only delegations this host stored are started. The worker's report
-//! reaches the requesting chat through the delivery tick
-//! ([`super::delivery`]).
-// shortcut: a `checkout` (an existing worktree) is refused in fixture mode;
-// add Iced's reuse and adoption paths when a fixture needs them.
+//! The fixture guard authorizes every target before preparation (the
+//! repository, the requested checkout or the calling tab's checkout, and
+//! each extra folder), again with the checked paths, and rechecks them
+//! after the asynchronous preparation together with the prepared worktree;
+//! the launch rechecks the worktree and extra folders right before the
+//! child starts.
+//!
+//! Only delegations this host stored are started, and only tasks it
+//! created are reused. The worker's report reaches the requesting chat
+//! through the delivery tick ([`super::delivery`]).
 use super::*;
 use gitterm_core::{
     delegations::{CallerTab, WorkerPlace},
@@ -26,6 +30,7 @@ use gitterm_core::{
         SessionLaunch, TaskLaunchOrigin, WorkerCaller, WorkerCheckout, WorkerPreparationId,
     },
     task_mcp::DelegateTaskRequest,
+    task_worktree::{AdoptWorktreeRequest, AdoptedWorktreeResolution},
     tasks::{
         CompletedWorktreePreparation, Delegation, DelegationRunOptions, DelegationStatus,
         WorkspaceIdentity, WorkspaceLocationIdentity,
@@ -58,6 +63,8 @@ struct Targets {
     place: WorkerPlace,
     options: DelegationRunOptions,
     authorized: AuthorizedTargets,
+    /// How to set a task up around the requested checkout.
+    adoption: Option<AdoptedWorktreeResolution>,
 }
 
 impl PendingWorker {
@@ -120,11 +127,6 @@ impl TaskHostOwner {
                 &options.add_dirs,
             )
             .map_err(|error| format!("preset {}: {error}", choice.preset_name))?;
-            if matches!(place, WorkerPlace::Checkout(_)) {
-                return Err(format!(
-                    "{label} in an existing checkout is not available in fixture mode yet"
-                ));
-            }
             let authorized =
                 self.authorize_process(label, &place_targets(&place, &tab, &options))?;
             let facts = self.worker_facts(uid, true, cx)?;
@@ -146,6 +148,7 @@ impl TaskHostOwner {
                 place,
                 options,
                 authorized,
+                adoption: None,
             })
         })();
         let targets = match prepared {
@@ -206,9 +209,16 @@ impl TaskHostOwner {
             let authorized = self.authorize_process(label, &worker_targets)?;
             let repository = match &targets.place {
                 WorkerPlace::Repository(repo) => repo.clone(),
-                _ => targets.tab.cwd.clone(),
+                WorkerPlace::Checkout(checkout) => {
+                    return Ok(Checked::Checkout {
+                        checkout: checkout.clone(),
+                        worker_targets,
+                        authorized,
+                    });
+                }
+                WorkerPlace::TabRepository => targets.tab.cwd.clone(),
             };
-            let request = targets.request;
+            let request = targets.request.clone();
             let create = CreateTaskRequest {
                 title: request.title,
                 objective: request.objective,
@@ -218,7 +228,8 @@ impl TaskHostOwner {
                 base_reference: request.base_reference,
                 stopping_boundary: request.stopping_boundary,
             };
-            let mut pending = self.begin_create(reply.clone(), targets.caller, create, label)?;
+            let mut pending =
+                self.begin_create(reply.clone(), targets.caller.clone(), create, label)?;
             // Check the delegation's own rules before any worktree exists.
             gitterm_core::delegations::worker_delegation(
                 &targets.tab,
@@ -230,21 +241,365 @@ impl TaskHostOwner {
             )?;
             pending.worker = Some(PendingWorker {
                 authority,
-                caller: targets.tab,
-                choice: targets.choice,
-                options: targets.options,
+                caller: targets.tab.clone(),
+                choice: targets.choice.clone(),
+                options: targets.options.clone(),
                 targets: worker_targets,
                 authorized,
             });
-            Ok(pending)
+            Ok(Checked::Create(Box::new(pending)))
         })();
         match pending {
-            Ok(pending) => self.resolve_create(pending, cx),
+            Ok(Checked::Create(pending)) => self.resolve_create(*pending, cx),
+            Ok(Checked::Checkout {
+                checkout,
+                worker_targets,
+                authorized,
+            }) => self.delegate_in_checkout(
+                targets,
+                checkout,
+                worker_targets,
+                authorized,
+                reply,
+                label,
+                cx,
+            ),
             Err(error) => {
                 self.cancel_worker_preparation(authority);
                 reply.send(Err(error));
             }
         }
+    }
+
+    /// Iced's `delegate_task_in_checkout`: the task that owns the checkout
+    /// carries the new objective, or a new task is set up around it (as
+    /// Adopt does), and the worker launches there. Nothing is written when
+    /// the request is refused: an archived task, one with a worker or a
+    /// live session still in it, or (fixture only) a task this host did
+    /// not create. The checkout passes the guard before each write, and
+    /// the launch rechecks it right before the child starts.
+    #[allow(clippy::too_many_arguments)]
+    fn delegate_in_checkout(
+        &mut self,
+        targets: Targets,
+        checkout: PathBuf,
+        worker_targets: Vec<PathBuf>,
+        authorized: AuthorizedTargets,
+        reply: TaskControlReply,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        use gitterm_core::tasks::{
+            ExecutorTarget, IssueProvider, IssueReference, NewTaskRecord, TaskCreator,
+            TaskCreatorKind, TaskWorktree, TaskWorktreeState,
+        };
+        let Targets {
+            authority,
+            request,
+            caller,
+            tab,
+            choice,
+            options,
+            adoption,
+            ..
+        } = targets;
+        let uid = tab.session_uid.clone();
+        let prepared = (|| {
+            let facts = self.worker_facts(&uid, false, cx)?;
+            self.reduce(
+                TaskMutation::CheckWorkerPreparation { id: authority },
+                &facts,
+            )?;
+            let title = request.title.trim().to_string();
+            let objective = request.objective.trim().to_string();
+            let issue_key = request
+                .issue_key
+                .as_deref()
+                .map(|key| key.trim().to_uppercase())
+                .filter(|key| !key.is_empty());
+            if issue_key
+                .as_deref()
+                .is_some_and(|key| !gitterm_core::tasks::is_linear_issue_key(key))
+            {
+                return Err("Linear issue must look like TRU-106".to_string());
+            }
+            let stopping_boundary =
+                gitterm_core::task_host::stopping_boundary_from_control(request.stopping_boundary);
+            if let Some(resolution) = &adoption {
+                let facts = self.checkout_facts(&uid, Some(&checkout), label, cx)?;
+                self.reduce(
+                    TaskMutation::CheckWorkerDestination {
+                        expected: CompletedWorktreePreparation {
+                            repository: resolution.repository.identity.clone(),
+                            base: resolution.base.clone(),
+                            branch: resolution.branch.clone(),
+                            path: checkout.clone(),
+                        },
+                    },
+                    &facts,
+                )?;
+            }
+            let owner = self.worktree_task(&checkout).cloned();
+            let task_id = match &owner {
+                Some(task) => task.task_id.clone(),
+                None => TaskRecord::fresh_id(),
+            };
+            gitterm_core::delegations::worker_delegation(
+                &tab, &task_id, &title, &objective, &choice, &options,
+            )?;
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            let issue = issue_key.map(|key| IssueReference {
+                provider: IssueProvider::Linear,
+                key,
+                url: None,
+            });
+            match owner {
+                Some(mut task) => {
+                    // An imported task stays as Iced wrote it.
+                    if !self.own_tasks.contains(&task_id) {
+                        return Err(preview_notice(label));
+                    }
+                    let written = self.authorize_write(label, std::slice::from_ref(&checkout))?;
+                    let facts = self.checkout_facts(&uid, Some(&checkout), label, cx)?;
+                    self.reduce(
+                        TaskMutation::CheckWorkerCheckout {
+                            task_id: task_id.clone(),
+                            path: checkout.clone(),
+                        },
+                        &facts,
+                    )?;
+                    // The task now carries this work; its last handoff
+                    // stays as the worker's context.
+                    task.title = title;
+                    task.objective = objective;
+                    if issue.is_some() {
+                        task.issue = issue;
+                    }
+                    task.stopping_boundary = stopping_boundary;
+                    task.updated_at = timestamp;
+                    let TaskMutationAction::PersistWorkerCheckoutReuse { replacement, .. } = self
+                        .reduce(
+                        TaskMutation::ReuseWorkerCheckout {
+                            id: authority,
+                            replacement: Box::new(task),
+                        },
+                        &facts,
+                    )?
+                    else {
+                        unreachable!("reuse effect")
+                    };
+                    let saved = self
+                        .host
+                        .services()
+                        .recheck(&written)
+                        .map_err(|denied| denied.notice().to_string())
+                        .and_then(|()| self.writable_store())
+                        .and_then(|store| {
+                            store
+                                .replace(*replacement)
+                                .map_err(|error| error.to_string())
+                        });
+                    let facts = self.saved_facts(&uid, authority, label, cx)?;
+                    self.reduce(
+                        TaskMutation::WorkerCheckoutReuseSaved {
+                            id: authority,
+                            result: saved,
+                        },
+                        &facts,
+                    )
+                }
+                None => {
+                    let resolution = adoption.ok_or_else(|| {
+                        format!(
+                            "checkout {} was not resolved as a worktree; try again",
+                            checkout.display()
+                        )
+                    })?;
+                    let top_level = resolution.repository.top_level.clone();
+                    let written = self.authorize_write(label, &[checkout.clone(), top_level])?;
+                    let workspace_name = request
+                        .workspace_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            gitterm_core::checkout_name::repo_name(&resolution.repository.top_level)
+                        });
+                    let mut record = TaskRecord::new_draft(
+                        NewTaskRecord {
+                            task_id: task_id.clone(),
+                            title,
+                            objective,
+                            workspace: WorkspaceIdentity {
+                                name: workspace_name,
+                                location: WorkspaceLocationIdentity::Local {
+                                    directory: resolution.repository.top_level.clone(),
+                                },
+                            },
+                            repository: resolution.repository.identity.clone(),
+                            issue,
+                            base: resolution.base.clone(),
+                            branch: resolution.branch.clone(),
+                            executor: ExecutorTarget::Local,
+                            harness: None,
+                            stopping_boundary,
+                        },
+                        timestamp.clone(),
+                    );
+                    record.created_by = Some(TaskCreator {
+                        kind: TaskCreatorKind::Coordinator,
+                        session_id: caller.clone(),
+                        harness_label: None,
+                        created_at: timestamp.clone(),
+                    });
+                    record.lifecycle = TaskLifecycle::Preparing;
+                    record.worktree = TaskWorktree {
+                        state: TaskWorktreeState::Preparing,
+                        path: None,
+                    };
+                    let TaskMutationAction::PersistPreparing { record } = self.reduce(
+                        TaskMutation::InsertPreparing {
+                            record: Box::new(record),
+                        },
+                        &Default::default(),
+                    )?
+                    else {
+                        unreachable!("metadata effect")
+                    };
+                    self.host
+                        .services()
+                        .recheck(&written)
+                        .map_err(|denied| denied.notice().to_string())?;
+                    self.writable_store()?
+                        .insert(*record)
+                        .map_err(|error| error.to_string())?;
+                    self.own_tasks.insert(task_id.clone());
+                    let expected = CompletedWorktreePreparation {
+                        repository: resolution.repository.identity.clone(),
+                        base: resolution.base.clone(),
+                        branch: resolution.branch.clone(),
+                        path: checkout.clone(),
+                    };
+                    let facts = self.worker_facts(&uid, false, cx)?;
+                    self.reduce(
+                        TaskMutation::BindWorkerPreparation {
+                            id: authority,
+                            task_id: task_id.clone(),
+                            expected: expected.clone(),
+                        },
+                        &facts,
+                    )?;
+                    let facts = self.checkout_facts(&uid, Some(&checkout), label, cx)?;
+                    let TaskMutationAction::PersistWorkerPreparation { prepared, .. } = self
+                        .reduce(
+                            TaskMutation::WorkerPrepared {
+                                id: authority,
+                                result: Ok(expected),
+                            },
+                            &facts,
+                        )?
+                    else {
+                        unreachable!("adoption effect")
+                    };
+                    let saved = self
+                        .host
+                        .services()
+                        .recheck(&written)
+                        .map_err(|denied| denied.notice().to_string())
+                        .and_then(|()| self.writable_store())
+                        .and_then(|store| {
+                            store
+                                .complete_worktree_preparation(&task_id, prepared, &timestamp)
+                                .map_err(|error| error.to_string())
+                        });
+                    let facts = self.saved_facts(&uid, authority, label, cx)?;
+                    self.reduce(
+                        TaskMutation::WorkerPreparationSaved {
+                            id: authority,
+                            result: saved,
+                        },
+                        &facts,
+                    )
+                }
+            }
+        })();
+        cx.notify();
+        match prepared {
+            Ok(TaskMutationAction::StartWorker { task_id, .. }) => {
+                let worker = PendingWorker {
+                    authority,
+                    caller: tab,
+                    choice,
+                    options,
+                    targets: worker_targets,
+                    authorized,
+                };
+                self.start_delegated_worker(&task_id, worker, reply, label, cx)
+            }
+            Ok(_) => unreachable!("worker start effect"),
+            Err(error) => {
+                self.cancel_worker_preparation(authority);
+                reply.send(Err(error));
+            }
+        }
+    }
+
+    /// Iced's `worktree_task`: the task whose worktree is `path`.
+    fn worktree_task(&self, path: &Path) -> Option<&TaskRecord> {
+        self.host.store().as_ref()?.tasks().iter().find(|task| {
+            task.worktree
+                .path
+                .as_deref()
+                .is_some_and(|worktree| gitterm_core::chat::checkout::paths_equal(worktree, path))
+        })
+    }
+
+    /// Iced's `mutation_facts` for a worker mutation naming a destination
+    /// checkout: the worker facts, with that destination as a preparation
+    /// path and, when Git resolves it below the fixture, its checkout.
+    fn checkout_facts(
+        &self,
+        uid: &str,
+        destination: Option<&Path>,
+        label: &'static str,
+        cx: &App,
+    ) -> Result<TaskMutationFacts, String> {
+        let mut facts = self.worker_facts(uid, false, cx)?;
+        if let Some(path) = destination {
+            if let Ok(normalized) = normalized_worker_path(path) {
+                facts.preparation_paths.push(normalized);
+            }
+            if let Ok(checkout) = self
+                .ceiling_for(path, label)
+                .and_then(|ceiling| worker_checkout_fact(path, &ceiling))
+            {
+                facts.checkouts.push(checkout);
+            }
+        }
+        Ok(facts)
+    }
+
+    /// The facts a worker save is reduced with: a save rechecks only its own
+    /// task's checkout (Iced's `mutation_facts` for the saved arms).
+    fn saved_facts(
+        &self,
+        uid: &str,
+        id: WorkerPreparationId,
+        label: &'static str,
+        cx: &App,
+    ) -> Result<TaskMutationFacts, String> {
+        let mut facts = self.worker_facts(uid, false, cx)?;
+        if let Some((_, Some(path))) = self.host.pending_worker_subject(id) {
+            let path = path.to_path_buf();
+            facts.checkouts = self
+                .ceiling_for(&path, label)
+                .and_then(|ceiling| worker_checkout_fact(&path, &ceiling))
+                .ok()
+                .into_iter()
+                .collect();
+        }
+        Ok(facts)
     }
 
     /// The `TaskMetadataResolved` arm's worker steps, after the preparing
@@ -542,7 +897,12 @@ impl TaskHostOwner {
             Err(_) => Vec::new(),
         };
         Ok(TaskMutationFacts {
-            sessions: open_chats(cx).iter().map(OpenChat::session_state).collect(),
+            sessions: open_chats(cx)
+                .iter()
+                .map(OpenChat::session_state)
+                .chain(self.terminal_session_states())
+                .collect(),
+            working_sessions: self.terminal_working_sessions(),
             callers,
             ..Default::default()
         })
@@ -593,6 +953,17 @@ impl TaskHostOwner {
     }
 }
 
+/// A checked request's next step: a new task worktree, or the requested
+/// existing checkout.
+enum Checked {
+    Create(Box<PendingCreate>),
+    Checkout {
+        checkout: PathBuf,
+        worker_targets: Vec<PathBuf>,
+        authorized: AuthorizedTargets,
+    },
+}
+
 /// Where a worker acts before its worktree exists: the repository its
 /// worktree comes from (the calling tab's, unless it names one) and each
 /// extra folder.
@@ -611,17 +982,38 @@ fn place_targets(
         .collect()
 }
 
-/// Iced's `check_delegate_targets` for a new task worktree: the extra
-/// folders and the named repository checked against the caller's
-/// workspace, the repository folded to its main checkout. Blocking.
+/// Iced's `check_delegate_targets`: the extra folders and the named
+/// repository or checkout checked against the caller's workspace, a
+/// repository folded to its main checkout, and for a checkout how a task
+/// is set up around it. Blocking.
 fn check_targets(targets: &mut Targets) -> Result<(), String> {
     gitterm_core::delegations::resolve_targets(&mut targets.options, &targets.tab)?;
-    if let WorkerPlace::Repository(repo) = &targets.place {
-        let top = gitterm_core::delegations::resolve_checkout("repo", repo, &targets.tab)?;
-        // Iced folds with workspace_repos::main_checkout; the strict core
-        // counterpart refuses where that one would keep the folder.
-        targets.place =
-            WorkerPlace::Repository(gitterm_core::workers::trust_main_repository(&top)?);
+    match &targets.place {
+        WorkerPlace::TabRepository => {}
+        WorkerPlace::Repository(repo) => {
+            let top = gitterm_core::delegations::resolve_checkout("repo", repo, &targets.tab)?;
+            targets.place = WorkerPlace::Repository(gitterm_core::workers::main_checkout(&top));
+        }
+        WorkerPlace::Checkout(_) => {
+            let checkout = targets.options.checkout.clone().ok_or_else(|| {
+                "delegate_task lost its checkout during the target check".to_string()
+            })?;
+            let request = AdoptWorktreeRequest {
+                repository_path: gitterm_core::workers::main_checkout(&checkout),
+                worktree_path: checkout.clone(),
+            };
+            let resolution = gitterm_core::task_worktree::resolve_worktree_adoption_blocking(
+                &request,
+            )
+            .map_err(|error| {
+                format!(
+                    "checkout {} cannot carry a worker: {error}",
+                    checkout.display()
+                )
+            })?;
+            targets.adoption = Some(resolution);
+            targets.place = WorkerPlace::Checkout(checkout);
+        }
     }
     Ok(())
 }

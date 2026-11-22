@@ -635,6 +635,25 @@ impl TaskHostOwner {
             .collect()
     }
 
+    /// Iced's `worker_reported` for a launched terminal (main.rs:19876):
+    /// done clears its live state, blocked leaves it awaiting input.
+    pub(super) fn worker_reported_live(&mut self, session_id: &str, done: bool) {
+        if let Some(launched) = self.launched.get_mut(session_id) {
+            launched.live = (!done).then_some(TaskSessionLiveState::AwaitingInput);
+        }
+    }
+
+    /// Iced's `working_sessions` for launched terminals still open: those
+    /// whose agent is working.
+    pub(super) fn terminal_working_sessions(&self) -> Vec<String> {
+        self.launched
+            .values()
+            .filter(|launched| launched.view.upgrade().is_some())
+            .filter(|launched| matches!(launched.live, Some(TaskSessionLiveState::Working)))
+            .map(|launched| launched.target.session_uid.clone())
+            .collect()
+    }
+
     /// The whole environment a task terminal's child gets: the fixture
     /// child environment naming `session_id`, with the terminal's own
     /// TERM/COLORTERM. The trust checks read this same list.
@@ -662,8 +681,9 @@ impl TaskHostOwner {
     }
 
     /// Iced's `create_tab_with_session_uid` command steps for a task launch:
-    /// the provider's trust check against the environment the child gets
-    /// (for Claude, the trust file its pinned CLAUDE_CONFIG_DIR names), then
+    /// the provider's trust check and write against the environment the
+    /// child gets (for Claude, the trust file its pinned CLAUDE_CONFIG_DIR
+    /// names), then
     /// the guidelines and Claude in Chrome as the task's saved workspace
     /// sets it (Iced's `saved_ws` fallback; off unless switched on).
     fn runtime_command(
@@ -686,9 +706,22 @@ impl TaskHostOwner {
         let command = match provider_for_command(command) {
             // Iced's validate_claude_trust_launch refuses any
             // CLAUDE_CONFIG_DIR, and the preview pins one so a fixture child
-            // never reads the real ~/.claude: check the file it pins.
+            // never reads the real ~/.claude: Iced's checks against the file
+            // it pins, then Iced's trust write into that file, never outside
+            // the preview root.
             WorkerProvider::Claude => {
-                gitterm_core::workers::validate_claude_trust_config(command, worktree, &readable)?;
+                let config = gitterm_core::workers::claude_pinned_trust_file(command, &readable)?;
+                let config = self.roots.scoped(&config).map_err(|error| {
+                    format!("the fixture's Claude trust file is outside the preview: {error}")
+                })?;
+                if let Some(main) =
+                    gitterm_core::workers::claude_task_trust(worktree, &roots, &config)?
+                {
+                    eprintln!(
+                        "[tasks] accepted Claude workspace trust for {} in $CLAUDE_CONFIG_DIR/.claude.json",
+                        main.display()
+                    );
+                }
                 command.to_string()
             }
             WorkerProvider::Codex => {

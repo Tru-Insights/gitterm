@@ -228,3 +228,183 @@ fn preview_delegate_task_answers_notice(cx: &mut TestAppContext) {
         assert!(store.delegations().is_empty());
     });
 }
+
+/// Iced's `delegate_task_in_checkout`, reuse: a checkout that is a task's
+/// worktree gives that task the new work, and the worker starts there.
+/// While its worker delegation is open the checkout takes no more work.
+#[gpui::test]
+fn delegate_into_task_checkout_reuses_the_task(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let task = launches.create(cx);
+    let worktree = launches.worktree(&task, cx);
+    let reply = launches
+        .delegate(
+            serde_json::json!({
+                "title": "Reused worker", "objective": "More work here",
+                "preset_name": "Codex", "checkout": worktree,
+            }),
+            cx,
+        )
+        .unwrap();
+    assert_eq!(reply["task_id"], task.as_str(), "{reply}");
+    assert_worker_started(&launches, &reply, 1, cx);
+    let saved = launches.saved();
+    let record = saved.get(&task).unwrap();
+    assert_eq!(record.title, "Reused worker");
+    assert_eq!(record.objective, "More work here");
+    assert_eq!(launches.tasks(cx).len(), 1);
+
+    let error = launches
+        .delegate(
+            serde_json::json!({"preset_name": "Codex", "checkout": worktree}),
+            cx,
+        )
+        .unwrap_err();
+    assert!(error.contains("is still open there"), "{error}");
+    launches.kill(1);
+    assert_eq!(launches.agent.runs(), 1);
+    assert_eq!(launches.saved().delegations().len(), 1);
+}
+
+/// Iced's `worker_reported` (main.rs:19890): a worker that reports
+/// `blocked` from its still-open terminal waits for input, so it no longer
+/// counts as working and its checkout can be delegated into again.
+#[gpui::test]
+fn blocked_worker_checkout_can_be_delegated_again(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let task = launches.create(cx);
+    let worktree = launches.worktree(&task, cx);
+    let first = launches
+        .delegate(
+            serde_json::json!({"preset_name": "Codex", "checkout": worktree}),
+            cx,
+        )
+        .unwrap();
+    assert_worker_started(&launches, &first, 1, cx);
+    let session = first["task_session_id"].as_str().unwrap().to_string();
+    let blocked = dispatch_as(
+        cx,
+        &launches.runs.sender,
+        TaskControlOperation::UpdateHandoff(req(serde_json::json!({
+            "task_id": task, "summary": "Stuck", "status": "blocked",
+            "blockers": ["needs a decision"]
+        }))),
+        Some(&session),
+    )
+    .unwrap();
+    assert_eq!(blocked["delegation_status"], "blocked", "{blocked}");
+    let again = launches.delegate(
+        serde_json::json!({
+            "objective": "Carry on", "preset_name": "Codex", "checkout": worktree
+        }),
+        cx,
+    );
+    launches.kill(1);
+    let again = again.unwrap();
+    assert_eq!(again["task_id"], task.as_str(), "{again}");
+    wait_until(cx, |_| launches.agent.started(2));
+    launches.kill(2);
+}
+
+/// Iced's `delegate_task_in_checkout`, adoption: a registered worktree no
+/// task owns gets a new task set up around it, and the worker starts
+/// there. A checkout outside the fixture is refused before anything is
+/// written.
+#[gpui::test]
+fn delegate_into_unowned_worktree_adopts_it(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let git = &launches.runs.git;
+    assert_eq!(
+        launches.delegate(
+            serde_json::json!({"preset_name": "Codex", "checkout": git.outside}),
+            cx
+        ),
+        Err(preview_notice(NOTICE))
+    );
+    assert!(launches.tasks(cx).is_empty());
+
+    let adopt = git.root.join("adopt");
+    super::git(
+        &git.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "adopted",
+            adopt.to_str().unwrap(),
+        ],
+    );
+    let reply = launches
+        .delegate(
+            serde_json::json!({"preset_name": "Codex", "checkout": adopt}),
+            cx,
+        )
+        .unwrap();
+    assert_worker_started(&launches, &reply, 1, cx);
+    launches.kill(1);
+    let task_id = reply["task_id"].as_str().unwrap();
+    let saved = launches.saved();
+    let record = saved.get(task_id).unwrap();
+    assert_eq!(record.worktree.path, Some(adopt.canonicalize().unwrap()));
+    assert_eq!(
+        record.worktree.state,
+        gitterm_core::tasks::TaskWorktreeState::Ready
+    );
+    assert_eq!(record.branch, "adopted");
+    assert_eq!(launches.tasks(cx).len(), 1);
+}
+
+/// Iced folds a named `repo` with `workspace_repos::main_checkout`, which
+/// keeps a worktree of a bare repository as it is (the strict trust fold
+/// refuses it). The task is made from that worktree; the worker's own
+/// checkout check then refuses it, as Iced's does.
+#[gpui::test]
+fn delegate_repo_folds_as_iced_main_checkout(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let git = &launches.runs.git;
+    let bare = git.root.join("bare.git");
+    let linked = git.root.join("bare-wt");
+    super::git(
+        &git.root,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            git.repo.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    super::git(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let linked = linked.canonicalize().unwrap();
+    cx.update(|cx| {
+        cx.global_mut::<crate::work_sidebar::IcedWorkSource>()
+            .workspaces[0]
+            .repos
+            .push(linked.display().to_string())
+    });
+    let error = launches
+        .delegate(
+            serde_json::json!({"preset_name": "Codex", "repo": linked}),
+            cx,
+        )
+        .unwrap_err();
+    assert!(!error.contains("for trust"), "{error}");
+    let tasks = launches.tasks(cx);
+    assert_eq!(tasks.len(), 1, "{error}");
+    assert_eq!(
+        tasks[0].workspace.location,
+        gitterm_core::tasks::WorkspaceLocationIdentity::Local { directory: linked }
+    );
+    assert_eq!(launches.agent.runs(), 0);
+}
