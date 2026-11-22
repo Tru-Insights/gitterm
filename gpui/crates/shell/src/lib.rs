@@ -410,6 +410,8 @@ impl Shell {
                 owner.dispatch(Intent::Opened, Instant::now(), cx)
             });
         }
+        // Panes, their sessions and the active one change with the shell.
+        subscriptions.push(cx.observe_self(|shell, cx| shell.sync_task_panes(cx)));
         let mut shell = Self {
             data,
             content,
@@ -804,6 +806,47 @@ impl Shell {
             }
         });
     }
+    /// Every pane holding a task session, in Iced's tab order (workspaces,
+    /// then their sessions), as Iced's `task_control_value` lists a task's
+    /// tabs: labelled with the pane's title, as Iced's with the tab's
+    /// (`status.repo_name`, which a task launch sets to the same
+    /// `"{child} · {task}"`), and active when it is the active workspace's
+    /// active session.
+    fn task_panes(&self, cx: &App) -> Vec<task_host::TaskPane> {
+        let active = self.active_workspace(cx);
+        self.workspaces
+            .iter()
+            .flat_map(|state| {
+                state.sessions.iter().filter_map(move |session| {
+                    let pane = state.panes.get(&session_pane_id(session.id))?.read(cx);
+                    let target = pane.task_session(cx)?;
+                    Some(task_host::TaskPane {
+                        task_id: target.task_id?,
+                        session: gitterm_core::task_host::OpenSession {
+                            session_id: target.task_session_id,
+                            label: pane.title.clone(),
+                            workspace: state.workspace.name.clone(),
+                            is_active: active == Some(state.workspace.id)
+                                && state.active_session == Some(session.id),
+                        },
+                    })
+                })
+            })
+            .collect()
+    }
+    /// Pushes [`Self::task_panes`] to the task host when they changed.
+    fn sync_task_panes(&mut self, cx: &mut Context<Self>) {
+        let Some(host) = cx
+            .try_global::<task_host::GpuiTaskHost>()
+            .map(|host| host.0.clone())
+        else {
+            return;
+        };
+        let panes = self.task_panes(cx);
+        if host.read(cx).panes() != panes.as_slice() {
+            host.update(cx, |host, _| host.set_panes(panes));
+        }
+    }
     fn active_workspace(&self, cx: &App) -> Option<WorkspaceId> {
         self.owner.read(cx).model.active()
     }
@@ -915,6 +958,9 @@ impl Shell {
                 owner.update(cx, |owner, cx| owner.save_chat(saved.clone(), cx));
             }),
         );
+        // Iced flushes a chat's held results when its turn ends.
+        self._subscriptions
+            .push(task_host::forward_turn_ends(&view, cx));
         self.owner.update(cx, |owner, _| {
             owner.chats.insert(target.session_uid.clone(), view.clone());
         });

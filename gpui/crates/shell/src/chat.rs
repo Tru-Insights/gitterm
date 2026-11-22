@@ -276,7 +276,11 @@ pub(crate) struct ChatPane {
     _review_subscription: gpui::Subscription,
     _review_context_load: Option<gpui::Task<()>>,
 }
+/// The provider finished a turn (Iced's `HarnessEvent::TurnCompleted`).
+#[derive(Clone, Debug)]
+pub(crate) struct TurnEnded;
 impl EventEmitter<SavedChat> for ChatPane {}
+impl EventEmitter<TurnEnded> for ChatPane {}
 impl EventEmitter<gitterm_gpui_chat::model::roster::RosterOutcome> for ChatPane {}
 impl ChatPane {
     #[cfg(test)]
@@ -626,10 +630,17 @@ impl ChatPane {
                             &event,
                             RuntimeEvent::Harness(HarnessEvent::ProcessExited { .. })
                         );
+                        let turn_ended = matches!(
+                            &event,
+                            RuntimeEvent::Harness(HarnessEvent::TurnCompleted { .. })
+                        );
                         if let Some(update) = pane.controller.apply_runtime_outcome(&source, event)
                         {
                             pane.pending.push(update);
                             pane.changed(cx);
+                        }
+                        if turn_ended {
+                            cx.emit(TurnEnded);
                         }
                         if exited {
                             pane.shutdown_runtime();

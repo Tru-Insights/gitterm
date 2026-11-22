@@ -692,6 +692,172 @@ fn shell_adopts_launched_terminal_into_a_pane(cx: &mut TestAppContext) {
     launches.kill(1);
 }
 
+/// A local shell over the fixture repo; the host's launched terminals
+/// become its panes.
+fn task_shell<'a>(
+    launches: &Launches,
+    config_dir: &Path,
+    cx: &'a mut TestAppContext,
+) -> (Entity<crate::Shell>, &'a mut gpui::VisualTestContext) {
+    let owner = launches.runs.owner.clone();
+    cx.update(|cx| cx.set_global(crate::task_host::GpuiTaskHost(owner)));
+    let folder = launches.runs.git.root.clone();
+    cx.add_window_view(|window, cx| {
+        let mut model = crate::workspace_status::WorkspaceStatus::default();
+        model.add(folder.clone(), Instant::now());
+        let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, None, cx));
+        crate::Shell::with_owner(
+            Rc::new(crate::data::LocalData(owner.clone())),
+            owner,
+            config_dir,
+            true,
+            window,
+            cx,
+        )
+        .unwrap()
+    })
+}
+
+/// `task_get`'s `open_sessions` for `task`.
+fn open_sessions_of(launches: &Launches, task: &str, cx: &mut TestAppContext) -> serde_json::Value {
+    let got = dispatch(
+        cx,
+        &launches.runs.sender,
+        TaskControlOperation::Get(req(serde_json::json!({"task_id": task}))),
+    )
+    .unwrap();
+    got["open_sessions"].clone()
+}
+
+/// The shell's session holding task session `session`.
+fn session_holding(
+    shell: &Entity<crate::Shell>,
+    session: &str,
+    cx: &mut TestAppContext,
+) -> Option<crate::data::SessionId> {
+    cx.read(|cx| {
+        let state = shell.read(cx).active(cx);
+        state.sessions.iter().map(|s| s.id).find(|id| {
+            state.panes[&crate::session_pane_id(*id)]
+                .read(cx)
+                .task_session(cx)
+                .is_some_and(|target| target.task_session_id.as_deref() == Some(session))
+        })
+    })
+}
+
+/// Iced lists a task's tabs as `open_sessions` (src/main.rs
+/// `task_control_value`): the pane holding the launched session, in Iced's
+/// shape, with the tab's label and workspace. Another task lists none.
+#[gpui::test]
+fn open_sessions_lists_panes_holding_the_task(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let task = launches.create(cx);
+    let other = launches.create(cx);
+    let config = tempfile::tempdir().unwrap();
+    let (shell, vcx) = task_shell(&launches, config.path(), cx);
+    assert_eq!(
+        open_sessions_of(&launches, &task, vcx),
+        serde_json::json!([])
+    );
+    let reply = launches.launch(&task, Some("Codex"), vcx).unwrap();
+    let session = reply["session_id"].as_str().unwrap().to_string();
+    wait_until(vcx, |cx| session_holding(&shell, &session, cx).is_some());
+    let workspace = vcx.read(|cx| shell.read(cx).active(cx).workspace.name.clone());
+    let expected = serde_json::json!([{
+        "session_id": session,
+        "label": "Codex · Fixture task 1",
+        "workspace": workspace,
+        "is_active": true,
+    }]);
+    wait_until(vcx, |cx| open_sessions_of(&launches, &task, cx) == expected);
+    // The whole reply is core's task_control_value over that one session.
+    let got = dispatch(
+        vcx,
+        &launches.runs.sender,
+        TaskControlOperation::Get(req(serde_json::json!({"task_id": task}))),
+    )
+    .unwrap();
+    let sessions: Vec<gitterm_core::task_host::OpenSession> =
+        vec![gitterm_core::task_host::OpenSession {
+            session_id: Some(session.clone()),
+            label: "Codex · Fixture task 1".into(),
+            workspace,
+            is_active: true,
+        }];
+    assert_eq!(
+        got,
+        gitterm_core::task_host::task_control_value(
+            &stored_task(&launches.runs.owner, &task, vcx),
+            &sessions
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        open_sessions_of(&launches, &other, vcx),
+        serde_json::json!([])
+    );
+    // task_list carries the same open_sessions per task.
+    let listed = dispatch(
+        vcx,
+        &launches.runs.sender,
+        TaskControlOperation::List(req(serde_json::json!({}))),
+    )
+    .unwrap();
+    let listed = |id: &str| {
+        listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["task_id"] == id)
+            .unwrap()["open_sessions"]
+            .clone()
+    };
+    assert_eq!(
+        (listed(&task), listed(&other)),
+        (expected, serde_json::json!([]))
+    );
+    wait_until(vcx, |_| launches.agent.started(1));
+    launches.kill(1);
+}
+
+/// Iced's `is_active`: the tab is the active workspace's active tab. A new
+/// terminal takes the active pane from the task's session; selecting the
+/// session's pane again gives it back.
+#[gpui::test]
+fn is_active_follows_the_active_pane(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let task = launches.create(cx);
+    let config = tempfile::tempdir().unwrap();
+    let (shell, vcx) = task_shell(&launches, config.path(), cx);
+    let reply = launches.launch(&task, Some("Codex"), vcx).unwrap();
+    let session = reply["session_id"].as_str().unwrap().to_string();
+    let active = |cx: &mut TestAppContext| {
+        open_sessions_of(&launches, &task, cx)
+            .as_array()
+            .and_then(|sessions| sessions.first().map(|s| s["is_active"].clone()))
+    };
+    wait_until(vcx, |cx| active(cx) == Some(serde_json::json!(true)));
+    shell.update_in(vcx, |shell, window, cx| shell.new_terminal(window, cx));
+    wait_until(vcx, |cx| active(cx) == Some(serde_json::json!(false)));
+    let id = session_holding(&shell, &session, vcx).unwrap();
+    // The strip lists one task context at a time; select the pane as its
+    // session tab does.
+    shell.update_in(vcx, |shell, window, cx| {
+        let active = shell.active_workspace(cx);
+        shell
+            .workspaces
+            .iter_mut()
+            .find(|w| Some(w.workspace.id) == active)
+            .unwrap()
+            .active_session = Some(id);
+        shell.show_pane(&crate::session_pane_id(id), window, cx);
+    });
+    wait_until(vcx, |cx| active(cx) == Some(serde_json::json!(true)));
+    wait_until(vcx, |_| launches.agent.started(1));
+    launches.kill(1);
+}
+
 #[gpui::test]
 fn preview_still_answers_notice_for_launch_and_delegate(cx: &mut TestAppContext) {
     use gitterm_core::preview::service::preview_notice;
