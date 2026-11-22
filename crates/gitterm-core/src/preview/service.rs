@@ -534,6 +534,38 @@ impl ServiceContext {
         Ok(())
     }
 
+    /// Fixture launch only, right before a child starts in `authorized`'s
+    /// targets with `child_env` as its whole environment: Git, run in that
+    /// environment, names the work tree, Git dir and common dir each target
+    /// uses, and each must resolve inside the target's fixture. Git config
+    /// can name a work tree elsewhere (`core.worktree`, also from a
+    /// `config.worktree` under `extensions.worktreeConfig`), which
+    /// [`Self::recheck`] cannot see: it checks the admin dirs only. Call it
+    /// after `recheck`. A Git failure is a refusal, except for a target in
+    /// no repository at all (nothing between it and its fixture root holds
+    /// a `.git` or is a Git dir), where no config can name a work tree.
+    ///
+    /// Preview and production pass unchanged: preview never authorizes a
+    /// launch, and production checks nothing.
+    pub fn recheck_git_work_trees(
+        &self,
+        authorized: &AuthorizedTargets,
+        child_env: &[(OsString, OsString)],
+    ) -> Result<(), Denied> {
+        let Mode::FixtureLaunch { preview, fixtures } = &self.mode else {
+            return Ok(());
+        };
+        let label = authorized.class.label;
+        for (_, actual) in &authorized.resolved {
+            let fixture = fixtures
+                .iter()
+                .find(|root| actual.starts_with(root))
+                .ok_or_else(|| denied(label))?;
+            check_effective_git(preview, fixture, actual, child_env).map_err(|_| denied(label))?;
+        }
+        Ok(())
+    }
+
     fn decide(&self, label: &str, access: Access, target: Option<&Path>) -> Result<(), Denied> {
         let allowed = match (&self.mode, access) {
             (Mode::Production, _) | (_, Access::Existing | Access::Read) => true,
@@ -618,6 +650,88 @@ fn fixture_target(preview: &Preview, fixtures: &[PathBuf], target: &Path) -> io:
         check_git_admin(preview, fixture, dir)?;
     }
     Ok(actual)
+}
+
+/// What a child started in `checkout` with `env` (its whole environment)
+/// works on, as Git itself resolves it: the work tree, Git dir and common
+/// dir from `rev-parse` (which only reads, and fetches nothing), with no
+/// fsmonitor hook and no transport allowed. Each must resolve inside
+/// `fixture` and outside every protected root, as [`fixture_root`] checks.
+fn check_effective_git(
+    preview: &Preview,
+    fixture: &Path,
+    checkout: &Path,
+    env: &[(OsString, OsString)],
+) -> io::Result<()> {
+    let output = std::process::Command::new("git")
+        .env_clear()
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .args(["-c", "core.fsmonitor=false", "-c", "protocol.allow=never"])
+        .arg("-C")
+        .arg(checkout)
+        .args([
+            "rev-parse",
+            "--show-toplevel",
+            "--absolute-git-dir",
+            "--git-common-dir",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    let failed = |why: &str| {
+        refuse(format!(
+            "git cannot name the work tree of {}: {why}",
+            checkout.display()
+        ))
+    };
+    if !output.status.success() {
+        // Discovery stops at the fixture's parent (the child's ceiling), so
+        // with no `.git` and no Git dir up to the root there is no repository.
+        for dir in checkout
+            .ancestors()
+            .take_while(|dir| dir.starts_with(fixture))
+        {
+            if exists_no_follow(&dir.join(".git"))? || exists_no_follow(&dir.join("HEAD"))? {
+                return Err(failed(String::from_utf8_lossy(&output.stderr).trim()));
+            }
+        }
+        return Ok(());
+    }
+    let paths: [PathBuf; 3] = rev_parse_paths(checkout, &output.stdout).map_err(failed)?;
+    for path in paths {
+        let actual = preview.protected().check(&fs::canonicalize(&path)?)?;
+        if !actual.starts_with(fixture) {
+            return Err(refuse(format!(
+                "git work tree or admin dir outside the fixture: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `N` paths from `rev-parse`, one per line, each joined to `checkout`
+/// (Git prints a common dir relative to it). A path holding a newline shows
+/// as extra lines and is refused.
+fn rev_parse_paths<const N: usize>(
+    checkout: &Path,
+    stdout: &[u8],
+) -> Result<[PathBuf; N], &'static str> {
+    const UNEXPECTED: &str = "unexpected rev-parse output";
+    let stdout = std::str::from_utf8(stdout).map_err(|_| "non-UTF-8 path")?;
+    let lines: Vec<&str> = stdout
+        .strip_suffix('\n')
+        .ok_or(UNEXPECTED)?
+        .split('\n')
+        .collect();
+    if lines.iter().any(|line| line.is_empty()) {
+        return Err(UNEXPECTED);
+    }
+    lines
+        .into_iter()
+        .map(|line| checkout.join(line))
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|_| UNEXPECTED)
 }
 
 /// When `checkout` holds a `.git` or is itself a Git dir (it holds `HEAD`),
@@ -741,18 +855,8 @@ fn git_admin_dirs(checkout: &Path) -> io::Result<(PathBuf, PathBuf)> {
     if !output.status.success() {
         return Err(failed(String::from_utf8_lossy(&output.stderr).trim()));
     }
-    // One path per line, so a path holding a newline shows as extra lines.
-    let stdout = std::str::from_utf8(&output.stdout).map_err(|_| failed("non-UTF-8 path"))?;
-    match stdout
-        .strip_suffix('\n')
-        .map(|text| text.split('\n').collect::<Vec<_>>())
-        .as_deref()
-    {
-        Some([git_dir, common_dir]) if !git_dir.is_empty() && !common_dir.is_empty() => {
-            Ok((checkout.join(git_dir), checkout.join(common_dir)))
-        }
-        _ => Err(failed("unexpected rev-parse output")),
-    }
+    let [git_dir, common_dir] = rev_parse_paths(checkout, &output.stdout).map_err(failed)?;
+    Ok((git_dir, common_dir))
 }
 
 #[cfg(test)]

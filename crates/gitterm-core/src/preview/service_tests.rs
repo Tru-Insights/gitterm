@@ -1304,3 +1304,153 @@ fn path_swapped_after_prep_refused() {
         .unwrap();
     assert_eq!(production.recheck(&granted), Ok(()));
 }
+
+/// A fixture child's environment for Git: the context's own, with no
+/// inherited `GIT_*`, no user or system config, and a ceiling at the
+/// fixture's parent, as the task host builds it.
+fn child_git_env(context: &ServiceContext, root: &Path) -> Vec<(OsString, OsString)> {
+    let inherited = std::env::vars_os()
+        .filter(|(name, _)| !name.to_str().is_none_or(|name| name.starts_with("GIT_")));
+    let mut env = context.child_env(inherited).unwrap();
+    env.extend([
+        ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
+        ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+        (
+            "GIT_CEILING_DIRECTORIES".into(),
+            root.parent().unwrap().into(),
+        ),
+    ]);
+    env
+}
+
+/// A fixture with a committed repository `repo`, a linked worktree `wt`
+/// and a plain folder `notes`, all authorized for a worker.
+struct WorkTrees {
+    f: Fixture,
+    root: PathBuf,
+    outside: PathBuf,
+    context: ServiceContext,
+    granted: AuthorizedTargets,
+    env: Vec<(OsString, OsString)>,
+}
+
+fn work_trees() -> WorkTrees {
+    let f = fixture();
+    let outside = outside_repo(f.dir.path());
+    let root = fixture_repo(f.dir.path(), "fixture");
+    let context = ServiceContext::fixture_launch(f.preview.clone(), [root.clone()]).unwrap();
+    let root = fs::canonicalize(root).unwrap();
+    let repo = root.join("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "x"]);
+    git(&repo, &["worktree", "add", "-q", "../wt", "-b", "wt"]);
+    fs::create_dir_all(root.join("notes")).unwrap();
+    let granted = context
+        .authorize_targets(
+            classify_process(ProcessEffect::Worker),
+            &[repo, root.join("wt"), root.join("notes")],
+        )
+        .unwrap();
+    let env = child_git_env(&context, &root);
+    WorkTrees {
+        f,
+        root,
+        outside,
+        context,
+        granted,
+        env,
+    }
+}
+
+impl WorkTrees {
+    fn check(&self) -> Result<(), Denied> {
+        self.context.recheck(&self.granted)?;
+        self.context
+            .recheck_git_work_trees(&self.granted, &self.env)
+    }
+    /// The work tree Git uses from `dir`, as the test's own Git sees it.
+    fn top_level(&self, dir: &str) -> PathBuf {
+        let top = git(&self.root.join(dir), &["rev-parse", "--show-toplevel"]);
+        PathBuf::from(top.trim_end())
+    }
+}
+
+#[test]
+fn untouched_fixture_work_trees_pass() {
+    let w = work_trees();
+    assert_eq!(w.check(), Ok(()));
+    // A plain folder in no repository has no work tree to redirect.
+    assert!(!w.root.join("notes/.git").exists());
+    // Preview never authorizes a launch, and production checks nothing.
+    let worker = classify_process(ProcessEffect::Worker);
+    let production = ServiceContext::production(w.f.preview.root(), "1").unwrap();
+    let anything = production
+        .authorize_targets(worker, std::slice::from_ref(&w.outside))
+        .unwrap();
+    assert_eq!(production.recheck_git_work_trees(&anything, &w.env), Ok(()));
+}
+
+#[test]
+fn core_worktree_outside_the_fixture_refused() {
+    let w = work_trees();
+    git(
+        &w.root.join("repo"),
+        &["config", "core.worktree", w.outside.to_str().unwrap()],
+    );
+    // A real escape that the admin-dir recheck does not see.
+    assert_eq!(w.top_level("repo"), w.outside);
+    assert_eq!(w.context.recheck(&w.granted), Ok(()));
+    assert_eq!(
+        w.context
+            .recheck_git_work_trees(&w.granted, &w.env)
+            .unwrap_err()
+            .notice(),
+        WORKER_DENIED
+    );
+    // A work tree Git cannot enter is a Git failure, refused too.
+    git(
+        &w.root.join("repo"),
+        &[
+            "config",
+            "core.worktree",
+            w.root.join("gone").to_str().unwrap(),
+        ],
+    );
+    assert!(w.check().is_err());
+    git(
+        &w.root.join("repo"),
+        &["config", "--unset", "core.worktree"],
+    );
+    assert_eq!(w.check(), Ok(()));
+}
+
+#[test]
+fn worktree_config_outside_the_fixture_refused() {
+    let w = work_trees();
+    let wt = w.root.join("wt");
+    git(&wt, &["config", "extensions.worktreeConfig", "true"]);
+    git(
+        &wt,
+        &[
+            "config",
+            "--worktree",
+            "core.worktree",
+            w.outside.to_str().unwrap(),
+        ],
+    );
+    // Only the linked worktree's own config.worktree names it.
+    assert!(w
+        .root
+        .join("repo/.git/worktrees/wt/config.worktree")
+        .is_file());
+    assert_eq!(w.top_level("wt"), w.outside);
+    assert_eq!(w.top_level("repo"), w.root.join("repo"));
+    assert_eq!(w.context.recheck(&w.granted), Ok(()));
+    assert_eq!(
+        w.context
+            .recheck_git_work_trees(&w.granted, &w.env)
+            .unwrap_err()
+            .notice(),
+        WORKER_DENIED
+    );
+}

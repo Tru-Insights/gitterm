@@ -8,10 +8,11 @@
 //! environment whose homes lie under the preview root.
 //!
 //! The full fixture guard runs once more on Codex's cwd and extra folders
-//! after the runner's git preflight, immediately before the spawn, and that
-//! preflight runs no fsmonitor hook. Every continuation stops at shutdown,
-//! which kills each run's Codex process group at once and reaps it on a
-//! background thread.
+//! after the runner's git preflight, immediately before the spawn, with Git
+//! itself (in Codex's environment) naming each one's work tree, Git dir and
+//! common dir inside the fixture; that preflight runs no fsmonitor hook.
+//! Every continuation stops at shutdown, which kills each run's Codex
+//! process group at once and reaps it on a background thread.
 //!
 //! Only delegations this host stored are started or settled; an imported
 //! record is never touched. Results are stored; the delivery tick
@@ -363,13 +364,19 @@ impl TaskHostOwner {
             // dir and common dir still resolve inside the fixture with no
             // link under them. So whatever a config-driven program in the
             // preflight changed (a clean filter, a hook) cannot redirect the
-            // run. The remaining gap is the instant between this check and
-            // the exec.
+            // run. Then Git itself, in Codex's own environment, names the
+            // work tree, Git dir and common dir of each, which must lie in
+            // the fixture too: config the preflight rewrote (`core.worktree`,
+            // a `config.worktree`) can point the work tree elsewhere while
+            // the admin dirs stay put. The remaining gap is the instant
+            // between this check and the exec.
             let services = self.host.services().clone();
+            let child_env = env.clone();
             let before_spawn = BeforeSpawn::new(move |_cwd: &Path| {
                 // The cwd is the first authorized target.
                 services
                     .recheck(&authorized)
+                    .and_then(|()| services.recheck_git_work_trees(&authorized, &child_env))
                     .map_err(|denied| denied.notice().to_string())
             });
             let stop = CodexStop::new();

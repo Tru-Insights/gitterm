@@ -2439,6 +2439,64 @@ fn checkout_swapped_during_preflight_refused(cx: &mut TestAppContext) {
 
 #[cfg(unix)]
 #[gpui::test]
+fn work_tree_moved_out_by_preflight_config_refused(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt;
+    let runs = Runs::start(2, cx);
+    // A `git` ahead of the real one stands in for a config-driven program
+    // in the runner's `git status`: once that status has run, it points the
+    // checkout's work tree at the outside repository. The checkout and its
+    // Git dirs stay where they were.
+    let wrapper = tempfile::tempdir().unwrap();
+    let real_git = std::process::Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real_git = String::from_utf8(real_git.stdout).unwrap();
+    let script = wrapper.path().join("git");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do [ \"$arg\" = status ] && moved=1; done\n\
+             '{git}' \"$@\"\nstatus=$?\n\
+             [ -n \"$moved\" ] && '{git}' -C '{repo}' config core.worktree '{outside}'\n\
+             exit $status\n",
+            git = real_git.trim(),
+            repo = runs.git.repo.display(),
+            outside = runs.git.outside.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = vec![wrapper.path().to_path_buf()];
+    path.extend(std::env::split_paths(&runs.codex.search_path()));
+    runs.owner.update(cx, |owner, _| {
+        owner.codex_search_path = Some(std::env::join_paths(path).unwrap())
+    });
+    let outside_before = tree(&runs.git.outside);
+    let id = runs.consult(cx);
+    assert_eq!(settled_status(&runs, &id, cx), "failed");
+    // The preflight did move the work tree.
+    let top = git(&runs.git.repo, &["rev-parse", "--show-toplevel"]);
+    assert_eq!(
+        Path::new(top.trim_end()),
+        runs.git.outside.canonicalize().unwrap()
+    );
+    assert_eq!(
+        runs.saved()[0].status,
+        gitterm_core::tasks::DelegationStatus::Failed {
+            message: gitterm_core::preview::service::preview_notice("Start delegation")
+        }
+    );
+    assert_eq!(
+        runs.codex.runs(),
+        0,
+        "Codex started on the outside work tree"
+    );
+    assert_eq!(tree(&runs.git.outside), outside_before);
+}
+
+#[cfg(unix)]
+#[gpui::test]
 fn shutdown_during_pending_check_persists_nothing(cx: &mut TestAppContext) {
     let runs = Runs::start(2, cx);
     runs.shut_down_at("checked", cx);
