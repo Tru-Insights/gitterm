@@ -36,6 +36,29 @@ fn dir_name(path: &Path) -> String {
 /// benefits from fsmonitor/untracked-cache and takes no optional locks;
 /// falls back to git2 when no git binary is installed.
 pub fn collect_repo_status(repo_path: &Path) -> RepoStatus {
+    collect_repo_status_with(repo_path, StatusReadOptions::default())
+}
+
+/// How a status read talks to git.
+#[derive(Debug, Clone, Copy)]
+pub struct StatusReadOptions {
+    /// `false` runs git with `-c core.fsmonitor=false`, so a configured
+    /// fsmonitor hook or daemon never starts and nothing is written under
+    /// `.git`. The default (`true`) keeps git's own configuration.
+    pub fsmonitor: bool,
+}
+
+impl Default for StatusReadOptions {
+    fn default() -> Self {
+        Self { fsmonitor: true }
+    }
+}
+
+/// `collect_repo_status` with explicit options.
+///
+/// The git2 fallback never runs an fsmonitor hook: libgit2 does not implement
+/// `core.fsmonitor`, so the option needs no handling there.
+pub fn collect_repo_status_with(repo_path: &Path, options: StatusReadOptions) -> RepoStatus {
     let mut status = RepoStatus {
         root: repo_path.to_path_buf(),
         repo_name: dir_name(repo_path),
@@ -48,15 +71,13 @@ pub fn collect_repo_status(repo_path: &Path) -> RepoStatus {
 
     // Diff paths and the git2 fallback use the repo root, even when a
     // chat's cwd is a subfolder.
-    let cli_result = git_command()
-        .args([
-            "--no-optional-locks",
-            "-c",
-            "status.relativePaths=false",
-            "status",
-            "--porcelain=v2",
-            "--branch",
-        ])
+    let mut cmd = git_command();
+    cmd.args(["--no-optional-locks", "-c", "status.relativePaths=false"]);
+    if !options.fsmonitor {
+        cmd.args(["-c", "core.fsmonitor=false"]);
+    }
+    let cli_result = cmd
+        .args(["status", "--porcelain=v2", "--branch"])
         .current_dir(repo_path)
         .output();
 
@@ -254,4 +275,83 @@ fn collect_repo_status_git2(mut status: RepoStatus, repo_path: &Path) -> RepoSta
     }
 
     status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = git_command().args(args).current_dir(dir).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {:?}", out);
+    }
+
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        git(dir.path(), &["add", "."]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        );
+        std::fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
+        std::fs::write(dir.path().join("new.txt"), "n\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn fsmonitor_off_matches_default_output_without_fsmonitor() {
+        let dir = repo();
+        let on = collect_repo_status(dir.path());
+        let off = collect_repo_status_with(dir.path(), StatusReadOptions { fsmonitor: false });
+        assert!(on.is_git_repo);
+        assert_eq!(on.branch_name, off.branch_name);
+        assert_eq!(on.root, off.root);
+        let paths = |v: &[GitFileStatus]| v.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
+        assert_eq!(paths(&on.unstaged), paths(&off.unstaged));
+        assert_eq!(paths(&on.untracked), paths(&off.untracked));
+        assert_eq!(paths(&on.staged), paths(&off.staged));
+        assert_eq!(paths(&off.unstaged), ["a.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fsmonitor_off_never_runs_the_configured_hook() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = repo();
+        let hooks = tempfile::tempdir().unwrap();
+        let marker = hooks.path().join("marker");
+        let hook = hooks.path().join("hook.sh");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\necho ran >> '{}'\nprintf '\\0'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(
+            dir.path(),
+            &["config", "core.fsmonitor", hook.to_str().unwrap()],
+        );
+
+        collect_repo_status_with(dir.path(), StatusReadOptions { fsmonitor: false });
+        assert!(!marker.exists(), "fsmonitor hook ran with fsmonitor off");
+        assert!(!dir.path().join(".git/fsmonitor--daemon").exists());
+
+        // Control: the plain collector still runs the hook, so the check above
+        // would catch a regression.
+        collect_repo_status(dir.path());
+        assert!(marker.exists(), "default collector should run the hook");
+    }
 }
