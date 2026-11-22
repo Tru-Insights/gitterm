@@ -1996,6 +1996,7 @@ mod tests {
 
     /// `--no-optional-locks` does not stop a configured fsmonitor: the hook
     /// would run (and the daemon write cookies) during the preview's read.
+    #[cfg(unix)]
     #[test]
     fn inspection_with_fsmonitor_hook_writes_nothing() {
         let repository = TestRepository::new();
