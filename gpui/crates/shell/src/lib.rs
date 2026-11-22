@@ -404,6 +404,12 @@ impl Shell {
                     shell.adopt_task_terminal(host, launched, window, cx);
                 },
             ));
+            subscriptions.push(cx.subscribe(
+                &host,
+                |shell, _, exited: &task_host::TerminalExited, cx| {
+                    shell.task_terminal_exited(exited, cx);
+                },
+            ));
         }
         if local {
             owner.update(cx, |owner, cx| {
@@ -1141,11 +1147,7 @@ impl Shell {
         let Some(view) = host.update(cx, |host, _| host.take_terminal(&launched.session_id)) else {
             return;
         };
-        let target = gitterm_core::session::Target {
-            task_id: Some(launched.task_id.clone()),
-            task_session_id: Some(launched.session_id.clone()),
-            ..sessions::fresh_target()
-        };
+        let target = launched.target.clone();
         self.new_terminal_launch(
             DockPlacement::Center,
             Some(launched.cwd.clone()),
@@ -1162,6 +1164,27 @@ impl Shell {
             let title = launched.title.clone();
             self.active(cx).panes[&id].update(cx, |pane, cx| {
                 pane.title = title;
+                cx.notify();
+            });
+        }
+    }
+    /// The pane holding an adopted task terminal whose child exited shows
+    /// it exited, as a pane's own terminal does.
+    fn task_terminal_exited(&mut self, exited: &task_host::TerminalExited, cx: &mut Context<Self>) {
+        let panes: Vec<_> = self
+            .workspaces
+            .iter()
+            .flat_map(|state| state.panes.values())
+            .filter(|pane| {
+                pane.read(cx).session.as_ref().is_some_and(|target| {
+                    target.task_session_id.as_deref() == Some(exited.session_id.as_str())
+                })
+            })
+            .cloned()
+            .collect();
+        for pane in panes {
+            pane.update(cx, |pane, cx| {
+                pane.mark_exited();
                 cx.notify();
             });
         }

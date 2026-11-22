@@ -16,11 +16,20 @@
 //! pane ([`TerminalLaunched`]); one never adopted is killed at shutdown.
 //! Only tasks and worker delegations this host stored are launched or
 //! attached: a record imported from Iced answers the preview notice.
+//!
+//! As in Iced, the fixture tick starts queued launches when a slot frees
+//! ([`TaskHostOwner::promote_queued_tasks`]), a launched agent's exit folds
+//! into its task's lifecycle ([`TaskHostOwner::terminal_exited`]), and the
+//! terminal's `task_update_handoff` is attributed to its task session.
 use super::*;
 use gitterm_core::{
     plan_limits::Provider,
+    session,
     task_commands::{SessionLaunch, TaskLaunchOrigin, TaskPreset},
-    task_host::{LaunchAdmission, LaunchPolicy, LaunchRequest, LaunchedSession, launch_provider},
+    task_host::{
+        LaunchAdmission, LaunchPolicy, LaunchRequest, LaunchedSession, LinkedSession, Promotion,
+        TaskSessionLiveState, TaskSessionOutcome, launch_provider,
+    },
     tasks::{
         ExecutorTarget, HarnessConversationBackend, HarnessConversationRef, HarnessKind,
         HarnessSelection, ObjectiveDeliveryState, TaskWorktreeState, WorkspaceLocationIdentity,
@@ -51,12 +60,21 @@ const LAUNCHER_SET: [&str; 7] = [
 /// its terminal with [`TaskHostOwner::take_terminal`].
 #[derive(Clone, Debug)]
 pub(crate) struct TerminalLaunched {
-    pub task_id: String,
     pub session_id: String,
     pub title: String,
     pub cwd: PathBuf,
+    /// The pane's session target. Its `session_uid` is the task MCP caller
+    /// the child's environment names (the task session id).
+    pub target: session::Target,
 }
 impl gpui::EventEmitter<TerminalLaunched> for TaskHostOwner {}
+
+/// A launched terminal's child exited; the shell marks its pane exited.
+#[derive(Clone, Debug)]
+pub(crate) struct TerminalExited {
+    pub session_id: String,
+}
+impl gpui::EventEmitter<TerminalExited> for TaskHostOwner {}
 
 /// A launched terminal the host still owns. Dropping it kills the child's
 /// process group (the PTY child leads one); the entity's release then
@@ -91,6 +109,11 @@ pub(super) struct Launched {
     task_id: String,
     provider: Option<Provider>,
     view: gpui::WeakEntity<TerminalView>,
+    /// The pane's target, for the reducer's session facts.
+    target: session::Target,
+    /// Iced's `task_live_state` for the tab: working from an agent's
+    /// launch, none once its child exited.
+    live: Option<TaskSessionLiveState>,
 }
 
 pub(super) enum Started {
@@ -313,6 +336,15 @@ impl TaskHostOwner {
             LaunchAdmission::Open(ticket) => ticket,
         };
         let session_id = ticket.session_id().to_string();
+        // Iced's tab target. The caller uid is the task session id, which
+        // the child's task MCP URL already names (Iced's is the tab's own).
+        let target = session::Target {
+            session_uid: session_id.clone(),
+            task_id: Some(task_id.to_string()),
+            task_session_id: Some(session_id.clone()),
+            ..crate::sessions::fresh_target()
+        };
+        let owner = cx.weak_entity();
         let prepared = (|| {
             let notify = self
                 .servers
@@ -371,7 +403,7 @@ impl TaskHostOwner {
                 .recheck(&authorized)
                 .and_then(|()| services.recheck_git_work_trees(&authorized, &env))
                 .map_err(|denied| denied.notice().to_string())?;
-            let terminal = spawn_terminal(&worktree, command, env, cx)?;
+            let terminal = spawn_terminal(&worktree, command, env, owner, &session_id, cx)?;
             Ok::<_, String>((terminal, objective_delivery))
         })();
         let (terminal, objective_delivery) = match prepared {
@@ -428,6 +460,8 @@ impl TaskHostOwner {
                 task_id: task_id.to_string(),
                 provider,
                 view: terminal.view.downgrade(),
+                target: target.clone(),
+                live: launched_agent.then_some(TaskSessionLiveState::Working),
             },
         );
         self.terminals.insert(session_id.clone(), terminal);
@@ -444,10 +478,10 @@ impl TaskHostOwner {
             .and_then(|item| item.conversation.as_ref())
             .map(|conversation| conversation.session_id.clone());
         cx.emit(TerminalLaunched {
-            task_id: task_id.to_string(),
             session_id: session_id.clone(),
             title: format!("{child_label} · {}", task.title),
             cwd: worktree.clone(),
+            target,
         });
         cx.notify();
         Ok(Started::Session(serde_json::json!({
@@ -460,6 +494,132 @@ impl TaskHostOwner {
             "conversation_id": conversation_id,
             "objective_submitted": false,
         })))
+    }
+
+    /// Iced's `promote_queued_tasks`, on the fixture tick: start queued
+    /// launches while capacity allows, oldest first. A launch that can no
+    /// longer start fails its task rather than sitting Queued.
+    pub(super) fn promote_queued_tasks(&mut self, cx: &mut Context<Self>) {
+        const LABEL: &str = "task_launch_session";
+        if self.host.launch_queue().is_empty() || self.is_shut_down() {
+            return;
+        }
+        let settings = crate::workspace_config::load_iced_settings_from(&self.iced_config);
+        for _ in 0..self.host.launch_queue().len() {
+            let running = self.slot_holders(cx).len();
+            let entry = match self
+                .host
+                .next_queued_launch(running, settings.max_concurrent_local_tasks)
+            {
+                Promotion::Stop => break,
+                Promotion::Skip => continue,
+                Promotion::Start(entry) => entry,
+            };
+            // Only this host's own tasks are queued; anything else drops out.
+            if !self.own_tasks.contains(&entry.task_id) {
+                continue;
+            }
+            let launch = SessionLaunch {
+                task_id: entry.task_id.clone(),
+                preset_name: entry
+                    .preset_idx
+                    .and_then(|index| settings.agent_presets.get(index))
+                    .map(|preset| preset.name.clone()),
+                origin: entry.origin,
+                user_model_choice: entry.user_model_choice,
+            };
+            let facts = self.launch_facts(&settings, cx);
+            match self.try_launch(&launch, entry.preset_idx, &settings, facts, LABEL, cx) {
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("[tasks] {}: queued launch failed: {error}", entry.task_id);
+                    match self.writable_store() {
+                        Ok(_) => self.host.fail_queued_launch(&entry.task_id, &error),
+                        Err(store) => eprintln!(
+                            "[tasks] {}: queued-launch failure not saved: {store}",
+                            entry.task_id
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Iced's `Action::Shutdown` arm for a task tab: a session that was
+    /// observably live ended without reporting an outcome, so it stopped;
+    /// the task's other sessions decide its lifecycle with it.
+    pub(super) fn terminal_exited(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        let Some(launched) = self.launched.get_mut(session_id) else {
+            return;
+        };
+        let task_id = launched.task_id.clone();
+        let was_live = launched.live.take().is_some();
+        cx.emit(TerminalExited {
+            session_id: session_id.to_string(),
+        });
+        if was_live {
+            self.apply_task_session_signal(&task_id, Some((TaskLifecycle::Stopped, None)), cx);
+        }
+        cx.notify();
+    }
+
+    /// Iced's `apply_task_session_signal` over the task's launched
+    /// terminals still open and its chat panes, which track no live state.
+    fn apply_task_session_signal(
+        &mut self,
+        task_id: &str,
+        ended: Option<TaskSessionOutcome>,
+        cx: &App,
+    ) {
+        let Some(store) = self.host.store().as_ref() else {
+            return;
+        };
+        let is_final = |session: Option<&str>| store.worker_session_is_final(task_id, session);
+        let terminals = self
+            .launched
+            .iter()
+            .filter(|(_, launched)| {
+                launched.task_id == task_id && launched.view.upgrade().is_some()
+            })
+            .map(|(session, launched)| LinkedSession {
+                live: launched.live,
+                is_final: is_final(Some(session)),
+            });
+        let chats = open_chats(cx)
+            .into_iter()
+            .filter(|chat| chat.task_id.as_deref() == Some(task_id))
+            .map(|chat| LinkedSession {
+                live: None,
+                is_final: is_final(chat.task_session_id.as_deref()),
+            });
+        let sessions: Vec<LinkedSession> = terminals.chain(chats).collect();
+        let Some((target, detail)) = gitterm_core::task_host::task_session_signal(&sessions, ended)
+        else {
+            return;
+        };
+        if let Err(error) = self.writable_store().and_then(|store| {
+            store
+                .record_lifecycle_signal(task_id, target, detail, &chrono::Utc::now().to_rfc3339())
+                .map_err(|error| error.to_string())
+        }) {
+            eprintln!("GitTerm GPUI dropped a task lifecycle signal: {error}");
+        }
+    }
+
+    /// The reducer's session facts for launched terminals still open, as
+    /// Iced's facts list a task tab: its target, terminal turn control and
+    /// whether it is observably live.
+    pub(super) fn terminal_session_states(&self) -> Vec<session::State> {
+        self.launched
+            .values()
+            .filter(|launched| launched.view.upgrade().is_some())
+            .map(|launched| session::State {
+                target: launched.target.clone(),
+                control: session::TurnControl::Terminal,
+                task_live: launched.live.is_some(),
+                last_tab: false,
+            })
+            .collect()
     }
 
     /// The whole environment a task terminal's child gets: the fixture
@@ -491,7 +651,8 @@ impl TaskHostOwner {
     /// Iced's `create_tab_with_session_uid` command steps for a task launch:
     /// the provider's trust check against the environment the child gets
     /// (for Claude, the trust file its pinned CLAUDE_CONFIG_DIR names), then
-    /// the guidelines and Claude in Chrome (always off in fixture mode).
+    /// the guidelines and Claude in Chrome as the task's saved workspace
+    /// sets it (Iced's `saved_ws` fallback; off unless switched on).
     fn runtime_command(
         &self,
         command: &str,
@@ -547,16 +708,21 @@ impl TaskHostOwner {
         } else {
             command
         };
-        Ok(without_chrome(&command))
+        let chrome =
+            saved_workspace(&task.workspace.name, cx).is_some_and(|ws| ws.claude_in_chrome);
+        Ok(gitterm_core::harness::claude::configure_terminal_chrome(
+            &command, chrome,
+        ))
     }
 
-    /// Iced's `launch_instructions`: the change guidelines and, for an agent
-    /// with the task tools, the Codex tools note. The guidelines settings and
-    /// file, and the combined file, live under the preview root (a missing
-    /// guidelines file is written there from the default), so Iced's config
-    /// dir is never written.
-    // shortcut: no documents note (TRU-191): a work's docs folder may lie
-    // outside every fixture; add it with a fixture check when a test needs it.
+    /// Iced's `launch_instructions`: the change guidelines, the documents
+    /// note of a work (TRU-191, from its saved workspace entry, as Iced
+    /// reads a workspace that is not open) and, for an agent with the task
+    /// tools, the Codex tools note. The note only names the work's folders;
+    /// nothing is written there. The guidelines settings and file, and the
+    /// combined file, live under the preview root (a missing guidelines
+    /// file is written there from the default), so Iced's config dir is
+    /// never written.
     pub(super) fn launch_instructions(
         &self,
         cwd: &Path,
@@ -565,14 +731,13 @@ impl TaskHostOwner {
         task_tools: bool,
         cx: &App,
     ) -> Option<gitterm_core::guidelines::Guidelines> {
-        let workspace_off = cx
-            .try_global::<crate::work_sidebar::IcedWorkSource>()
-            .and_then(|source| source.workspaces.iter().find(|ws| ws.name == workspace))
-            .is_some_and(|ws| ws.guidelines_off);
+        let saved = saved_workspace(workspace, cx);
+        let workspace_off = saved.is_some_and(|ws| ws.guidelines_off);
+        let places = saved.and_then(gitterm_core::guidelines::config_document_places);
         let root = self.roots.root();
         gitterm_core::guidelines::launch_instructions(
             gitterm_core::guidelines::for_launch(root, cwd, workspace_off, instruction_file),
-            None,
+            places.as_ref(),
             task_tools,
             root,
         )
@@ -733,6 +898,8 @@ fn spawn_terminal(
     cwd: &Path,
     command: Option<String>,
     env: Vec<(OsString, OsString)>,
+    owner: gpui::WeakEntity<TaskHostOwner>,
+    session_id: &str,
     cx: &mut App,
 ) -> Result<HostTerminal, String> {
     let mut overlay: HashMap<String, Option<String>> = HashMap::new();
@@ -761,7 +928,20 @@ fn spawn_terminal(
         args: command.map_or_else(Vec::new, |command| vec!["-c".into(), command]),
         ..Default::default()
     };
-    let view = cx.new(|cx| TerminalView::launch(launch, Default::default(), cx));
+    // The pane that adopts the terminal delivers its events, so the exit
+    // reaches the host once adopted. Deferred: the host reads the view.
+    // shortcut: an unadopted terminal's exit is not seen (nothing delivers
+    // its events); deliver them from the host if a launch can stay unadopted.
+    let session_id = session_id.to_string();
+    let view = cx.new(|cx| {
+        TerminalView::launch(launch, Default::default(), cx).with_exit_callback(move |_, cx| {
+            let owner = owner.clone();
+            let session_id = session_id.clone();
+            cx.defer(move |cx| {
+                _ = owner.update(cx, |owner, cx| owner.terminal_exited(&session_id, cx));
+            });
+        })
+    });
     let backend = view.read(cx).backend();
     let Some(pid) = backend.child_pid() else {
         let error = backend
@@ -776,6 +956,17 @@ fn spawn_terminal(
         view,
         group: Some(pid),
     })
+}
+
+/// The saved entry of workspace `name` in Iced's workspaces file.
+fn saved_workspace<'a>(
+    name: &str,
+    cx: &'a App,
+) -> Option<&'a gitterm_core::workspace_config::WorkspaceConfig> {
+    cx.try_global::<crate::work_sidebar::IcedWorkSource>()?
+        .workspaces
+        .iter()
+        .find(|ws| ws.name == name)
 }
 
 /// Iced's `preset_conversation_backend`.
@@ -812,29 +1003,6 @@ fn command_with_initial_prompt(command: &str, brief: &Path) -> String {
         ""
     };
     format!("{command}{flag} \"$(cat '{}')\"", brief.display())
-}
-
-/// Iced's `configure_terminal_chrome` with Claude in Chrome off: a fixture
-/// launch never drives the browser.
-fn without_chrome(command: &str) -> String {
-    let trimmed = command.trim();
-    let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
-    let (executable, rest) = trimmed.split_at(end);
-    let name = executable
-        .trim_matches(['\'', '"'])
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(executable);
-    let chosen = rest
-        .split_whitespace()
-        .any(|word| word == "--chrome" || word == "--no-chrome");
-    if name != "claude" || chosen {
-        return command.to_string();
-    }
-    format!(
-        "{executable} {}{rest}",
-        gitterm_core::harness::claude::chrome_flag(false)
-    )
 }
 
 /// Iced's `with_preassigned_session_id`: a new Claude launch gets a session

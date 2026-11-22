@@ -188,7 +188,7 @@ impl Launches {
                 move |_, launched: &TerminalLaunched, _| {
                     let saved = TaskStore::load(&path)
                         .unwrap()
-                        .get(&launched.task_id)
+                        .get(launched.target.task_id.as_deref().unwrap())
                         .is_some_and(|task| {
                             task.sessions
                                 .iter()
@@ -1010,6 +1010,208 @@ fn fixture_claude_trust_reads_the_pinned_config(cx: &mut TestAppContext) {
         "the child's CLAUDE_CONFIG_DIR is not the dir the check read"
     );
     assert_eq!(launches.saved().get(&task).unwrap().sessions.len(), 1);
+}
+
+/// Advances the fixture tick (delivery and queue promotion) until `done`.
+fn tick_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) {
+    wait_until(cx, |cx| {
+        cx.executor().advance_clock(crate::task_host::DELIVERY_POLL);
+        cx.run_until_parked();
+        done(cx)
+    });
+}
+
+/// Iced's `promote_queued_tasks` on the Tick: a launch the concurrency
+/// limit queued waits while the slot is held and starts once the running
+/// session's child exits, its task then running.
+#[gpui::test]
+fn queued_launch_promoted_when_a_slot_frees(cx: &mut TestAppContext) {
+    let launches = Launches::start_with(
+        |runs0| {
+            std::fs::write(
+                runs0.fixture.iced.join("settings.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "max_concurrent_local_tasks": 1,
+                    "agent_presets": [{"name": "Codex", "command": "codex"}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        },
+        cx,
+    );
+    let running = launches.create(cx);
+    let waiting = launches.create(cx);
+    launches.launch(&running, Some("Codex"), cx).unwrap();
+    wait_until(cx, |_| launches.agent.started(1));
+    let queued = launches.launch(&waiting, Some("Codex"), cx).unwrap();
+    assert_eq!(queued["queued"], true, "{queued}");
+    // The slot is held: a tick starts nothing.
+    cx.executor().advance_clock(crate::task_host::DELIVERY_POLL);
+    cx.run_until_parked();
+    assert_eq!(launches.agent.runs(), 1);
+    assert_eq!(
+        stored_task(&launches.runs.owner, &waiting, cx).lifecycle,
+        TaskLifecycle::Queued
+    );
+    // The running session's child exits, freeing the slot.
+    launches.kill(1);
+    tick_until(cx, |_| launches.agent.started(2));
+    let task = stored_task(&launches.runs.owner, &waiting, cx);
+    assert_eq!(task.lifecycle, TaskLifecycle::Running);
+    assert_eq!(task.sessions.len(), 1);
+    assert_eq!(launches.saved().get(&waiting).unwrap().sessions.len(), 1);
+    assert!(
+        launches
+            .runs
+            .owner
+            .read_with(cx, |owner, _| owner.host().launch_queue().is_empty())
+    );
+    launches.kill(2);
+}
+
+/// Iced routes a task tab's `task_update_handoff` to its task session: the
+/// launched worker's own terminal (its MCP caller) reports done, which
+/// completes its delegation; another caller cannot.
+#[gpui::test]
+fn launched_terminal_handoff_routes_to_its_task_session(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let task = launches.create(cx);
+    launches.runs.owner.update(cx, |owner, _| {
+        owner.own_worker(worker_delegation("worker", &task, "gone"))
+    });
+    let reply = launches.launch(&task, Some("Codex"), cx).unwrap();
+    let session = reply["session_id"].as_str().unwrap().to_string();
+    wait_until(cx, |_| launches.agent.started(1));
+    let done = |caller: &str, cx: &mut TestAppContext| {
+        dispatch_as(
+            cx,
+            &launches.runs.sender,
+            TaskControlOperation::UpdateHandoff(req(serde_json::json!({
+                "task_id": task, "summary": "Finished", "status": "done"
+            }))),
+            Some(caller),
+        )
+    };
+    // Some other pane is not the worker's.
+    assert!(done(&launches.runs.caller, cx).is_err());
+    let reply = done(&session, cx).unwrap();
+    assert_eq!(reply["delegation_id"], "worker", "{reply}");
+    assert_eq!(reply["delegation_status"], "completed", "{reply}");
+    let saved = launches.saved();
+    let handoff = saved.get(&task).unwrap().handoff.clone().unwrap();
+    assert_eq!(
+        handoff.updated_by_session_id.as_deref(),
+        Some(session.as_str())
+    );
+    assert_eq!(
+        saved.get(&task).unwrap().lifecycle,
+        TaskLifecycle::Completed
+    );
+    launches.kill(1);
+}
+
+/// Iced's exit path for a task tab (`Action::Shutdown`): an adopted agent
+/// terminal whose child exits stops its task and shows exited; a worker
+/// that already reported done keeps its task's Completed.
+#[gpui::test]
+fn adopted_terminal_exit_updates_its_task(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let plain = launches.create(cx);
+    let worker = launches.create(cx);
+    launches.runs.owner.update(cx, |owner, _| {
+        owner.own_worker(worker_delegation("worker", &worker, "gone"))
+    });
+    let config = tempfile::tempdir().unwrap();
+    let (shell, vcx) = task_shell(&launches, config.path(), cx);
+    let pane_exited = |session: &str, cx: &mut TestAppContext| {
+        cx.read(|cx| {
+            shell.read(cx).active(cx).panes.values().any(|pane| {
+                let pane = pane.read(cx);
+                pane.session
+                    .as_ref()
+                    .is_some_and(|target| target.task_session_id.as_deref() == Some(session))
+                    && pane.tab_title().ends_with("· Exited")
+            })
+        })
+    };
+    let reply = launches.launch(&plain, Some("Codex"), vcx).unwrap();
+    let first = reply["session_id"].as_str().unwrap().to_string();
+    wait_until(vcx, |cx| session_holding(&shell, &first, cx).is_some());
+    wait_until(vcx, |_| launches.agent.started(1));
+    assert_eq!(
+        stored_task(&launches.runs.owner, &plain, vcx).lifecycle,
+        TaskLifecycle::Running
+    );
+    launches.kill(1);
+    // The terminal view polls its backend on a timer.
+    tick_until(vcx, |cx| pane_exited(&first, cx));
+    wait_until(vcx, |_| {
+        launches.saved().get(&plain).unwrap().lifecycle == TaskLifecycle::Stopped
+    });
+
+    let reply = launches.launch(&worker, Some("Codex"), vcx).unwrap();
+    let second = reply["session_id"].as_str().unwrap().to_string();
+    wait_until(vcx, |cx| session_holding(&shell, &second, cx).is_some());
+    wait_until(vcx, |_| launches.agent.started(2));
+    dispatch_as(
+        vcx,
+        &launches.runs.sender,
+        TaskControlOperation::UpdateHandoff(req(serde_json::json!({
+            "task_id": worker, "summary": "Finished", "status": "done"
+        }))),
+        Some(&second),
+    )
+    .unwrap();
+    launches.kill(2);
+    tick_until(vcx, |cx| pane_exited(&second, cx));
+    vcx.run_until_parked();
+    assert_eq!(
+        launches.saved().get(&worker).unwrap().lifecycle,
+        TaskLifecycle::Completed
+    );
+}
+
+/// Iced's launch adds the work's documents note to the instructions and
+/// passes Claude in Chrome as the task's saved workspace sets it, read from
+/// the workspaces the fixture host was given.
+#[gpui::test]
+fn launch_adds_documents_note_and_workspace_chrome(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let task = launches.create(cx);
+    let name = stored_task(&launches.runs.owner, &task, cx).workspace.name;
+    cx.update(|cx| {
+        let source = cx.global_mut::<crate::work_sidebar::IcedWorkSource>();
+        // The fixture's workspace, under the name the task was given.
+        let ws = &mut source.workspaces[0];
+        ws.name = name;
+        ws.chats = vec!["root-chat".into()];
+        ws.claude_in_chrome = true;
+    });
+    let docs = launches.runs.git.root.join("docs");
+    launches.launch(&task, Some("Codex"), cx).unwrap();
+    wait_until(cx, |_| launches.agent.started(1));
+    launches.kill(1);
+    let instructions = launches
+        .agent
+        .args(1)
+        .into_iter()
+        .find(|arg| arg.starts_with("developer_instructions="))
+        .unwrap();
+    assert!(
+        instructions.contains("# Documents for this work (added by GitTerm)")
+            && instructions.contains(&docs.display().to_string()),
+        "{instructions}"
+    );
+
+    let repo = launches.runs.git.repo.clone();
+    pin_claude_trust(&launches, &repo, true);
+    launches.launch(&task, Some("Claude"), cx).unwrap();
+    wait_until(cx, |_| launches.agent.started(2));
+    launches.kill(2);
+    let args = launches.agent.args(2);
+    assert!(args.contains(&"--chrome".to_string()), "{args:?}");
+    assert!(!args.contains(&"--no-chrome".to_string()), "{args:?}");
 }
 
 #[test]
