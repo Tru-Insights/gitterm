@@ -63,6 +63,9 @@ pub(crate) struct TerminalLaunched {
     pub session_id: String,
     pub title: String,
     pub cwd: PathBuf,
+    /// Iced's persisted `startup_command` for the tab (see
+    /// [`persisted_startup_command`]).
+    pub startup_command: Option<String>,
     /// The pane's session target. Its `session_uid` is the task MCP caller
     /// the child's environment names (the task session id).
     pub target: session::Target,
@@ -363,6 +366,9 @@ impl TaskHostOwner {
                 }
                 other => other,
             };
+            // Kept for the persisted command: a restart must never re-submit
+            // the objective (Iced's `pre_injection_command`).
+            let pre_injection = command.clone();
             // Iced's TRU-128 brief delivery, written under the preview root.
             let (command, objective_delivery) = match command {
                 Some(command) if accepts_initial_prompt(&command, backend) => {
@@ -404,9 +410,9 @@ impl TaskHostOwner {
                 .and_then(|()| services.recheck_git_work_trees(&authorized, &env))
                 .map_err(|denied| denied.notice().to_string())?;
             let terminal = spawn_terminal(&worktree, command, env, owner, &session_id, cx)?;
-            Ok::<_, String>((terminal, objective_delivery))
+            Ok::<_, String>((terminal, objective_delivery, pre_injection))
         })();
-        let (terminal, objective_delivery) = match prepared {
+        let (terminal, objective_delivery, pre_injection) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.host.abandon_launch(ticket);
@@ -417,6 +423,12 @@ impl TaskHostOwner {
         if let Some(hook) = self.before_publish.take() {
             hook(self);
         }
+        let startup_command = persisted_startup_command(
+            chat_session_id.as_deref(),
+            worker_model.as_deref(),
+            &options,
+            pre_injection,
+        );
         let conversation = chat_session_id.map(|session_id| HarnessConversationRef {
             backend: backend.unwrap_or(HarnessConversationBackend::Claude),
             session_id,
@@ -481,6 +493,7 @@ impl TaskHostOwner {
             session_id: session_id.clone(),
             title: format!("{child_label} · {}", task.title),
             cwd: worktree.clone(),
+            startup_command,
             target,
         });
         cx.notify();
@@ -992,6 +1005,36 @@ fn saved_workspace<'a>(
         .workspaces
         .iter()
         .find(|ws| ws.name == name)
+}
+
+/// Iced's stored `startup_command` for a launched task tab (main.rs, after
+/// `create_tab_with_session_uid`): a pre-assigned Claude session persists
+/// as its resume command, so a restart reconnects instead of creating the
+/// session again, and a worker keeps its model, effort and folders; any
+/// other launch persists its brief-free command, so a restart never
+/// re-submits the objective. A plain terminal has none.
+fn persisted_startup_command(
+    chat_session_id: Option<&str>,
+    worker_model: Option<&str>,
+    options: &gitterm_core::tasks::DelegationRunOptions,
+    pre_injection: Option<String>,
+) -> Option<String> {
+    let Some(chat_session_id) = chat_session_id else {
+        return pre_injection;
+    };
+    let model = worker_model
+        .map(|model| format!("--model {model} "))
+        .unwrap_or_default();
+    let resume = format!("claude {model}--resume {chat_session_id}");
+    Some(
+        gitterm_core::workers::with_launch_options(&resume, options.effort, &options.add_dirs)
+            .unwrap_or_else(|error| {
+                // The launch command took the same options, so this cannot
+                // refuse; Iced keeps the plain resume if it ever does.
+                eprintln!("[tasks] worker resume command for {chat_session_id}: {error}");
+                resume
+            }),
+    )
 }
 
 /// Iced's `preset_conversation_backend`.

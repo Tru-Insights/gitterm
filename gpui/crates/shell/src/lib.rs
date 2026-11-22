@@ -1105,7 +1105,16 @@ impl Shell {
             .terminals
             .as_mut()
             .expect("local sessions")
-            .push(layout::TerminalSession { id, cwd });
+            .push(layout::TerminalSession {
+                id,
+                cwd,
+                startup_command: match &launch {
+                    Some(PaneStart::Adopt {
+                        startup_command, ..
+                    }) => startup_command.clone(),
+                    _ => None,
+                },
+            });
         if placement == DockPlacement::Center {
             state.active_session = Some(SessionId(id));
         }
@@ -1122,7 +1131,7 @@ impl Shell {
                 let pane = self.active(cx).panes[&pane_id].clone();
                 self.launch_run_terminal(&pane, launch, window, cx);
             }
-            Some(PaneStart::Adopt { view, target }) => {
+            Some(PaneStart::Adopt { view, target, .. }) => {
                 let pane = self.active(cx).panes[&pane_id].clone();
                 self.adopt_terminal_view(&pane, view, target, window, cx);
             }
@@ -1151,7 +1160,11 @@ impl Shell {
         self.new_terminal_launch(
             DockPlacement::Center,
             Some(launched.cwd.clone()),
-            Some(PaneStart::Adopt { view, target }),
+            Some(PaneStart::Adopt {
+                view,
+                target,
+                startup_command: launched.startup_command.clone(),
+            }),
             window,
             cx,
         );
@@ -5481,6 +5494,9 @@ enum PaneStart {
     Adopt {
         view: Entity<gitterm_terminal::TerminalView>,
         target: gitterm_core::session::Target,
+        /// What the terminal runs, kept on its layout entry as Iced keeps it
+        /// on the tab.
+        startup_command: Option<String>,
     },
 }
 

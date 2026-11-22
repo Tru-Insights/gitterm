@@ -746,6 +746,91 @@ fn shell_adopts_launched_terminal_into_a_pane(cx: &mut TestAppContext) {
     launches.kill(1);
 }
 
+/// Iced stores the launch's command on the tab (`set_startup_command`,
+/// main.rs): Claude's pre-assigned session as its resume command, any other
+/// agent's brief-free command, a plain terminal none. The pane's layout
+/// entry holds the same, in memory and in the saved file.
+#[gpui::test]
+fn adopted_terminal_saves_its_startup_command_on_its_layout_pane(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let repo = launches.runs.git.repo.clone();
+    pin_claude_trust(&launches, &repo, true);
+    let claude = launches.create(cx);
+    let codex = launches.create(cx);
+    let plain = launches.create(cx);
+    let config = tempfile::tempdir().unwrap();
+    let (shell, vcx) = task_shell(&launches, config.path(), cx);
+    let saved_command = |session: &str, cx: &mut TestAppContext| -> Option<Option<String>> {
+        cx.read(|cx| {
+            let state = shell.read(cx).active(cx);
+            let pane = state.panes.values().find(|pane| {
+                pane.read(cx)
+                    .session
+                    .as_ref()
+                    .is_some_and(|target| target.task_session_id.as_deref() == Some(session))
+            })?;
+            let id = state
+                .sessions
+                .iter()
+                .find(|s| crate::session_pane_id(s.id) == pane.read(cx).id)?
+                .id
+                .0;
+            let terminals = state.store.terminals.as_ref()?;
+            Some(
+                terminals
+                    .iter()
+                    .find(|t| t.id == id)?
+                    .startup_command
+                    .clone(),
+            )
+        })
+    };
+    let reply = launches.launch(&claude, Some("Claude"), vcx).unwrap();
+    let session = reply["session_id"].as_str().unwrap().to_string();
+    let conversation = reply["conversation_id"].as_str().unwrap().to_string();
+    wait_until(vcx, |cx| saved_command(&session, cx).is_some());
+    assert_eq!(
+        saved_command(&session, vcx),
+        Some(Some(format!("claude --resume {conversation}")))
+    );
+    wait_until(vcx, |_| launches.agent.started(1));
+    launches.kill(1);
+
+    let reply = launches.launch(&codex, Some("Codex"), vcx).unwrap();
+    let session = reply["session_id"].as_str().unwrap().to_string();
+    wait_until(vcx, |cx| saved_command(&session, cx).is_some());
+    let command = saved_command(&session, vcx).unwrap().unwrap();
+    assert!(command.starts_with("codex"), "{command}");
+    assert!(
+        !command.contains("task-briefs"),
+        "a restart must not re-submit the brief: {command}"
+    );
+    wait_until(vcx, |_| launches.agent.started(2));
+    launches.kill(2);
+
+    let reply = launches.launch(&plain, None, vcx).unwrap();
+    let session = reply["session_id"].as_str().unwrap().to_string();
+    wait_until(vcx, |cx| saved_command(&session, cx).is_some());
+    assert_eq!(saved_command(&session, vcx), Some(None));
+
+    // The layout file carries them, and only for the panes that have one.
+    let path = vcx.read(|cx| shell.read(cx).active(cx).store.path.clone());
+    wait_until(vcx, |_| {
+        std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|value| {
+                let sessions = value["terminal_sessions"].as_array()?.clone();
+                let commands = sessions
+                    .iter()
+                    .filter(|session| session.get("startup_command").is_some())
+                    .count();
+                Some(sessions.len() == 3 && commands == 2)
+            })
+            .unwrap_or(false)
+    });
+}
+
 /// A local shell over the fixture repo; the host's launched terminals
 /// become its panes.
 fn task_shell<'a>(
