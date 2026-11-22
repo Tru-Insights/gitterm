@@ -1075,3 +1075,30 @@ fn fixture_delegate_without_place_targets_the_caller_checkout() {
     assert!(dispatched(None, Some("inside")));
     assert!(!dispatched(None, None));
 }
+
+#[test]
+fn closed_chat_results_log_once_until_the_count_changes() {
+    let mut previous = std::collections::HashMap::new();
+    let waiting = || vec!["closed-chat".to_string(); 3];
+    assert_eq!(
+        waiting_delegation_log_lines(&mut previous, waiting()),
+        vec!["[delegation] 3 finished results wait for chat closed-chat until it is open"]
+    );
+    assert!(waiting_delegation_log_lines(&mut previous, waiting()).is_empty());
+    let mut more = waiting();
+    more.push("closed-chat".into());
+    more.push("other-chat".into());
+    let lines = waiting_delegation_log_lines(&mut previous, more);
+    assert_eq!(lines.len(), 2);
+    assert!(lines
+        .iter()
+        .any(|line| line.contains("4 finished results wait for chat closed-chat")));
+    assert!(lines
+        .iter()
+        .any(|line| line.contains("1 finished results wait for chat other-chat")));
+    assert!(waiting_delegation_log_lines(&mut previous, Vec::new()).is_empty());
+    assert_eq!(
+        waiting_delegation_log_lines(&mut previous, waiting()).len(),
+        1
+    );
+}

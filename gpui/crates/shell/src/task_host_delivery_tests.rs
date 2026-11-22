@@ -580,3 +580,93 @@ fn turn_end_flushes_delivery_without_waiting_for_the_tick(cx: &mut TestAppContex
     assert_eq!(prompts(&checkout).len(), 2);
     pane.update(cx, |pane, cx| pane.close(cx));
 }
+
+/// Iced's `auto_deliver_delegations` logs finished results whose chat is
+/// not open, once per change of that chat's count: the tick records the
+/// counts it logged against, and keeps them while nothing changes.
+#[gpui::test]
+fn tick_counts_results_waiting_for_a_closed_chat(cx: &mut TestAppContext) {
+    let delivery = Delivery::start(true, vec![], cx);
+    std::fs::write(
+        delivery.fixture.iced.join("settings.json"),
+        r#"{"delegations": {"auto_tell": true}}"#,
+    )
+    .unwrap();
+    let counts = |cx: &mut TestAppContext| {
+        delivery
+            .owner
+            .read_with(cx, |owner, _| owner.delegation_waiting_counts.clone())
+    };
+    delivery.own_result("d1", "closed-chat", cx);
+    delivery.tick(cx);
+    assert_eq!(counts(cx), [("closed-chat".to_string(), 1)].into());
+    delivery.tick(cx);
+    assert_eq!(counts(cx), [("closed-chat".to_string(), 1)].into());
+    delivery.own_result("d2", "closed-chat", cx);
+    delivery.tick(cx);
+    assert_eq!(counts(cx), [("closed-chat".to_string(), 2)].into());
+    assert!(!delivery.delivered("d1", cx));
+}
+
+/// Iced's `delegation_card` shows a result held for its chat's turn end:
+/// the pane takes core's held delegations, and the card flag follows them.
+#[gpui::test]
+fn roster_card_shows_a_held_result(cx: &mut TestAppContext) {
+    let delivery = Delivery::start(true, vec![], cx);
+    std::fs::write(
+        delivery.fixture.iced.join("settings.json"),
+        r#"{"delegations": {"auto_tell": true}}"#,
+    )
+    .unwrap();
+    let owner = delivery.owner.clone();
+    cx.update(|cx| cx.set_global(crate::task_host::GpuiTaskHost(owner)));
+    let parent = delivery.open(None, cx);
+    let tab = delivery.tab(&parent, cx);
+    delivery.own_result("d1", &parent, cx);
+    let pane = delivery
+        .chats
+        .owner
+        .read_with(cx, |owner, _| owner.chats[&parent].clone());
+    let held = |cx: &mut TestAppContext| pane.read_with(cx, |pane, _| pane.delivery_held().clone());
+    assert!(held(cx).is_empty());
+
+    // The chat is mid-turn: core holds the finished result for its end.
+    let mut busy = delivery.chat(&parent, cx);
+    busy[0].streaming = true;
+    delivery.owner.update(cx, |owner, _| {
+        let effects = owner
+            .host_mut()
+            .flush_delivery_where(&busy, tab, true, |_| true);
+        assert_eq!(submits(&effects), 0);
+        assert!(owner.host().delivery_held(tab, "d1"));
+    });
+    delivery
+        .owner
+        .update(cx, |owner, cx| owner.show_held(tab, cx));
+    assert_eq!(held(cx), ["d1".to_string()].into());
+
+    // The turn ends: the flush delivers it and the card is no longer held.
+    delivery.hook(vec![Some(true)], cx);
+    delivery
+        .owner
+        .update(cx, |owner, cx| owner.chat_turn_ended(tab, cx));
+    cx.run_until_parked();
+    assert!(delivery.delivered("d1", cx));
+    assert!(held(cx).is_empty());
+
+    // The flag lands on exactly the held cards.
+    let card = |id: &str| gitterm_gpui_chat::delegation::DelegationCard {
+        delegation: finished(
+            worker_delegation(id, "worker", &format!("child-{id}")),
+            &parent,
+        ),
+        activity: None,
+        held: false,
+        worker: None,
+    };
+    let shown = crate::chat::with_held(&[card("d1"), card("d2")], &["d2".to_string()].into());
+    assert_eq!(
+        shown.iter().map(|card| card.held).collect::<Vec<_>>(),
+        [false, true]
+    );
+}

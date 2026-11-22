@@ -266,12 +266,31 @@ impl RosterProjection {
     }
 }
 
+/// `cards` with `held` set on those whose delegation id is in `held`.
+pub(crate) fn with_held(
+    cards: &[gitterm_gpui_chat::delegation::DelegationCard],
+    held: &std::collections::HashSet<String>,
+) -> Vec<gitterm_gpui_chat::delegation::DelegationCard> {
+    cards
+        .iter()
+        .cloned()
+        .map(|mut card| {
+            card.held = held.contains(&card.delegation.delegation_id);
+            card
+        })
+        .collect()
+}
+
 pub(crate) struct ChatPane {
     controller: Controller,
     saved: SavedChat,
     view: Entity<ChatView>,
     pending: Vec<Update>,
     shutdown: Arc<RuntimeShutdown>,
+    /// The roster's cards as last projected, before `held` is applied.
+    cards: Vec<gitterm_gpui_chat::delegation::DelegationCard>,
+    /// Delegations whose result waits for this chat's turn end.
+    held: std::collections::HashSet<String>,
     _roster_subscription: gpui::Subscription,
     _review_subscription: gpui::Subscription,
     _review_context_load: Option<gpui::Task<()>>,
@@ -347,6 +366,8 @@ impl ChatPane {
             view,
             pending: vec![],
             shutdown,
+            cards: vec![],
+            held: Default::default(),
             _roster_subscription: roster_subscription,
             _review_subscription: review_subscription,
             _review_context_load: None,
@@ -500,16 +521,42 @@ impl ChatPane {
             view,
             pending: vec![],
             shutdown,
+            cards: vec![],
+            held: Default::default(),
             _roster_subscription: roster_subscription,
             _review_subscription: review_subscription,
             _review_context_load: None,
         }
     }
-    pub(crate) fn set_roster(&self, projection: RosterProjection, cx: &mut Context<Self>) {
-        self.view.update(cx, |view, cx| {
-            view.set_delegations(projection.cards, cx);
-            view.set_roster(projection.rows, cx);
-        });
+    pub(crate) fn set_roster(&mut self, projection: RosterProjection, cx: &mut Context<Self>) {
+        self.cards = projection.cards;
+        self.show_cards(cx);
+        self.view
+            .update(cx, |view, cx| view.set_roster(projection.rows, cx));
+    }
+
+    /// The delegations whose result is held for this chat's turn end, as
+    /// core's delivery state has them; their cards show it.
+    pub(crate) fn set_delivery_held(
+        &mut self,
+        held: std::collections::HashSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.held != held {
+            self.held = held;
+            self.show_cards(cx);
+        }
+    }
+
+    fn show_cards(&self, cx: &mut Context<Self>) {
+        let cards = with_held(&self.cards, &self.held);
+        self.view
+            .update(cx, |view, cx| view.set_delegations(cards, cx));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delivery_held(&self) -> &std::collections::HashSet<String> {
+        &self.held
     }
 
     pub(crate) fn cwd(&self) -> &std::path::Path {

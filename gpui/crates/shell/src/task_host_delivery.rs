@@ -23,6 +23,7 @@
 use super::*;
 use gitterm_core::task_host::{
     DeliveryChat, DeliveryCompletion, DeliveryEffect, DeliveryReceipt, Submission,
+    waiting_delegation_log_lines,
 };
 use gitterm_gpui_chat::adapter::ReceiptState;
 
@@ -52,6 +53,12 @@ impl TaskHostOwner {
             });
         if let Some(error) = tick.receipt_error {
             eprintln!("[delegation] retry delivery acknowledgements: {error}");
+        }
+        // Iced's `auto_deliver_delegations`: a finished result whose chat is
+        // not open is logged once per change of its chat's count.
+        for line in waiting_delegation_log_lines(&mut self.delegation_waiting_counts, tick.waiting)
+        {
+            eprintln!("{line}");
         }
         for tab_id in tick.tabs {
             self.flush_chat(tab_id, auto_tell, cx);
@@ -121,6 +128,25 @@ impl TaskHostOwner {
                     unreachable!("manual send effect from a flush")
                 }
             }
+        }
+        self.show_held(tab_id, cx);
+    }
+
+    /// Iced's `delegation_card` `held`: a card whose result waits for its
+    /// chat's turn end, read from core's delivery state after each flush
+    /// (the only place it changes). The pane is told, not asked to read
+    /// the owner, which is being updated here.
+    pub(crate) fn show_held(&self, tab_id: usize, cx: &mut Context<Self>) {
+        let held: std::collections::HashSet<String> = self
+            .host
+            .delegations()
+            .held(tab_id)
+            .into_iter()
+            .flatten()
+            .map(|send| send.delegation_id.clone())
+            .collect();
+        if let Some(pane) = chat_pane(tab_id, cx) {
+            pane.update(cx, |pane, cx| pane.set_delivery_held(held, cx));
         }
     }
 
