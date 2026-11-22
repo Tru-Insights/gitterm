@@ -326,47 +326,53 @@ fn preview_host_never_promotes_queued_work() {
 /// requested by the chat [`chat`] returns.
 fn delivery_host(dir: &tempfile::TempDir, services: ServiceContext, ids: &[&str]) -> TaskHost {
     let mut store = TaskStore::load(dir.path().join("tasks.json")).unwrap();
+    for id in ids {
+        insert_finished_consult(&mut store, id, Path::new("/fixture/repo"));
+    }
+    let (commands, _receiver) = command_channel();
+    TaskHost::new(Some(store), services, commands)
+}
+
+/// A finished consult `id` run in `cwd`, requested by the chat [`chat`]
+/// returns.
+fn insert_finished_consult(store: &mut TaskStore, id: &str, cwd: &Path) {
     let caller = crate::delegations::CallerTab {
         session_uid: "chat-uid".into(),
         chat_session_id: None,
         workspace: "fixture".into(),
-        cwd: "/fixture/repo".into(),
+        cwd: cwd.to_path_buf(),
         remote: false,
-        home: "/fixture/repo".into(),
+        home: cwd.to_path_buf(),
         repos: vec![],
     };
-    for id in ids {
-        let new = crate::delegations::consult_delegation(
-            &req(json!({"brief": format!("Inspect {id}")})),
-            &caller,
-            None,
-            None,
+    let new = crate::delegations::consult_delegation(
+        &req(json!({"brief": format!("Inspect {id}")})),
+        &caller,
+        None,
+        None,
+    )
+    .unwrap();
+    let mut delegation = Delegation::new_requested(new, "t0");
+    delegation.delegation_id = id.to_string();
+    store.insert_delegation(delegation).unwrap();
+    store
+        .complete_delegation(
+            id,
+            crate::tasks::DelegationResult {
+                handoff: Some(crate::tasks::TaskHandoff {
+                    summary: format!("Result {id}"),
+                    decisions: vec![],
+                    next_steps: vec![],
+                    blockers: vec![],
+                    updated_by_session_id: None,
+                    updated_at: "t1".into(),
+                }),
+                findings: None,
+                reviewed: None,
+            },
+            "t1",
         )
         .unwrap();
-        let mut delegation = Delegation::new_requested(new, "t0");
-        delegation.delegation_id = id.to_string();
-        store.insert_delegation(delegation).unwrap();
-        store
-            .complete_delegation(
-                id,
-                crate::tasks::DelegationResult {
-                    handoff: Some(crate::tasks::TaskHandoff {
-                        summary: format!("Result {id}"),
-                        decisions: vec![],
-                        next_steps: vec![],
-                        blockers: vec![],
-                        updated_by_session_id: None,
-                        updated_at: "t1".into(),
-                    }),
-                    findings: None,
-                    reviewed: None,
-                },
-                "t1",
-            )
-            .unwrap();
-    }
-    let (commands, _receiver) = command_channel();
-    TaskHost::new(Some(store), services, commands)
 }
 
 fn chat(streaming: bool) -> Vec<DeliveryChat> {
@@ -519,6 +525,49 @@ fn preview_host_never_delivers_automatically() {
     let dir = tempfile::tempdir().unwrap();
     let mut host = delivery_host(&dir, production(&dir), &["a"]);
     assert_eq!(host.deliver_finished(&chat(false), true).tabs, [7]);
+}
+
+/// The `_where` variants send only eligible results, each gated for the
+/// checkout it ran in: a fixture host sends fixture work alone, and a
+/// preview host nothing.
+#[test]
+fn delivery_where_sends_only_eligible_results_gated_by_their_checkout() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut host, repo, outside) = target_host(&dir, true);
+    let store = host.store_mut().as_mut().unwrap();
+    insert_finished_consult(store, "inside", &repo);
+    insert_finished_consult(store, "foreign", &repo);
+    insert_finished_consult(store, "outside", &outside);
+    let own = |d: &Delegation| d.delegation_id != "foreign";
+    // The target-less gate denies every result in fixture mode.
+    assert!(host.deliver_finished(&chat(false), true).tabs.is_empty());
+    assert!(submissions(host.flush_delivery(&chat(false), 7, true)).is_empty());
+    // auto_tell off: results stay on their cards.
+    assert!(host
+        .deliver_finished_where(&chat(false), false, own)
+        .waiting
+        .is_empty());
+    assert!(submissions(host.flush_delivery_where(&chat(false), 7, false, own)).is_empty());
+    let tick = host.deliver_finished_where(&chat(false), true, own);
+    assert_eq!(tick.tabs, [7]);
+    assert!(tick.waiting.is_empty());
+    let out = submissions(host.flush_delivery_where(&chat(false), 7, true, own));
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].batch.delegation_ids, ["inside"]);
+    assert_eq!(
+        host.delivery_completed(7, out[0].delivery, DeliveryCompletion::Accepted),
+        DeliveryReceipt::Saved
+    );
+    assert!(submissions(host.flush_delivery_where(&chat(false), 7, true, own)).is_empty());
+    assert!(!is_delivered(&host, "foreign") && !is_delivered(&host, "outside"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut host = delivery_host(&dir, preview(&dir), &["a"]);
+    assert!(host
+        .deliver_finished_where(&chat(false), true, |_| true)
+        .tabs
+        .is_empty());
+    assert!(submissions(host.flush_delivery_where(&chat(false), 7, true, |_| true)).is_empty());
 }
 
 /// A fixture-launch host over `dir`: its one fixture holds `repo/`, and the

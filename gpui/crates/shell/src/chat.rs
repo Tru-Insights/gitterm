@@ -427,14 +427,28 @@ impl ChatPane {
     }
     fn intent_callback(weak: gpui::WeakEntity<Self>) -> gitterm_gpui_chat::IntentCallback {
         Rc::new(move |intent, cx| {
-            weak.update(cx, |pane, cx| {
-                let (receipt, update) = pane.controller.dispatch(intent);
-                pane.pending.push(update);
-                pane.changed(cx);
-                receipt
-            })
-            .unwrap_or_else(|_| Receipt::rejected("Preview chat closed"))
+            weak.update(cx, |pane, cx| pane.dispatch(intent, cx))
+                .unwrap_or_else(|_| Receipt::rejected("Preview chat closed"))
         })
+    }
+    fn dispatch(&mut self, intent: ChatIntent, cx: &mut Context<Self>) -> Receipt {
+        let (receipt, update) = self.controller.dispatch(intent);
+        self.pending.push(update);
+        self.changed(cx);
+        receipt
+    }
+    /// Sends `text` as a user turn the way the composer does, for the task
+    /// host's result delivery. The receipt is the composer's own:
+    /// `ChannelAccepted` means the runtime took the prompt, as Iced's
+    /// `submit_prompt` Ok does; any other state means nothing was sent.
+    pub(crate) fn submit_prompt(&mut self, text: String, cx: &mut Context<Self>) -> Receipt {
+        self.dispatch(
+            ChatIntent::Send {
+                text,
+                images: vec![],
+            },
+            cx,
+        )
     }
     pub fn history(
         shutdown: Arc<RuntimeShutdown>,
@@ -633,6 +647,43 @@ impl ChatPane {
         .detach();
         self.view
             .update(cx, |view, cx| view.set_read_only(None, cx));
+    }
+}
+
+#[cfg(test)]
+impl ChatPane {
+    /// Starts this pane's runtime on the fake Claude `program` in the pane's
+    /// folder, through the fixture provider's probe and launch.
+    pub(crate) fn start_fake_runtime(
+        &mut self,
+        preview: Arc<gitterm_core::preview::Preview>,
+        program: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let provider = Arc::new(Provider::fixture(preview, program)?);
+        let started = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(provider.fake_start(self.saved.cwd.clone(), vec![]))?;
+        let (runtime, events) = started.context("the fake Claude reported no sign-in")?;
+        self.install_runtime(runtime, events, window, cx);
+        Ok(())
+    }
+    /// The provider acknowledged the launch.
+    pub(crate) fn runtime_ready(&self) -> bool {
+        self.controller.ready
+    }
+    /// The user turns this chat recorded, in order.
+    pub(crate) fn user_prompts(&self) -> Vec<String> {
+        self.saved
+            .records
+            .iter()
+            .filter_map(|record| match &record.entry {
+                Entry::UserPrompt(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
     }
 }
 
