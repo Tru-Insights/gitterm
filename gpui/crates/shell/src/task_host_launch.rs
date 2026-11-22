@@ -737,7 +737,7 @@ impl TaskHostOwner {
 
     /// Iced's `apply_task_session_signal` over the task's launched
     /// terminals still open and its chat panes, which track no live state.
-    fn apply_task_session_signal(
+    pub(super) fn apply_task_session_signal(
         &mut self,
         task_id: &str,
         ended: Option<TaskSessionOutcome>,
@@ -799,6 +799,18 @@ impl TaskHostOwner {
     pub(super) fn worker_reported_live(&mut self, session_id: &str, done: bool) {
         if let Some(launched) = self.launched.get_mut(session_id) {
             launched.live = (!done).then_some(TaskSessionLiveState::AwaitingInput);
+        }
+    }
+
+    /// Iced's `TurnEnded` arm for a launched terminal: a still-open terminal
+    /// of `task_id` running `session_id` now awaits input. Whether one did.
+    pub(super) fn terminal_turn_ended(&mut self, task_id: &str, session_id: &str) -> bool {
+        match self.launched.get_mut(session_id) {
+            Some(launched) if launched.task_id == task_id && launched.view.upgrade().is_some() => {
+                launched.live = Some(TaskSessionLiveState::AwaitingInput);
+                true
+            }
+            _ => false,
         }
     }
 

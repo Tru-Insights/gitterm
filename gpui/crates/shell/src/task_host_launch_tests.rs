@@ -1633,3 +1633,6 @@ fn fixture_restore_rewrites_claude_against_the_fixture_transcripts(cx: &mut Test
     );
     launches.kill(2);
 }
+
+#[path = "task_host_launch_turn_tests.rs"]
+mod turn_tests;
