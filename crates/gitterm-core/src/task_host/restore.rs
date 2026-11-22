@@ -112,31 +112,54 @@ fn fresh_claude_for_missing_resume(
     command: &str,
     session_exists: impl Fn(&str) -> bool,
 ) -> Option<String> {
+    // Any whitespace but a plain space (a newline is a shell separator)
+    // leaves the command alone.
+    if command.chars().any(|c| c.is_whitespace() && c != ' ') {
+        return None;
+    }
     let plain = |word: &str| {
-        word.chars().all(|c| {
-            c.is_ascii_alphanumeric()
-                || matches!(c, '-' | '_' | '.' | '/' | '=' | ':' | ',' | '@' | '+' | '%')
-        })
+        !word.is_empty()
+            && word.chars().all(|c| {
+                c.is_ascii_alphanumeric()
+                    || matches!(c, '-' | '_' | '.' | '/' | '=' | ':' | ',' | '@' | '+' | '%')
+            })
     };
-    let words: Vec<&str> = command.split_whitespace().collect();
+    let words: Vec<&str> = command.split(' ').filter(|w| !w.is_empty()).collect();
     let (&"claude", args) = words.split_first()? else {
         return None;
     };
-    let option_form = args.iter().enumerate().all(|(i, word)| {
-        *word != "--"
-            && plain(word)
-            && (word.starts_with('-') || i > 0 && args[i - 1].starts_with('-'))
-    });
-    let mut resumes = args.iter().enumerate().filter(|(_, w)| **w == "--resume");
-    let (idx, _) = resumes.next()?;
-    if !option_form || resumes.next().is_some() {
+    // Only options that take exactly one value, each followed by it: a flag
+    // or positional word (a prompt after `--print`) could be read as a value,
+    // so anything else leaves the command to Iced's earlier rules.
+    const VALUED: [&str; 5] = [
+        "--model",
+        "--effort",
+        "--add-dir",
+        "--permission-mode",
+        "--resume",
+    ];
+    if args.is_empty() || args.len() % 2 != 0 {
         return None;
     }
+    let pairs: Vec<(&str, &str)> = args.chunks(2).map(|pair| (pair[0], pair[1])).collect();
+    if !pairs
+        .iter()
+        .all(|(option, value)| VALUED.contains(option) && plain(value) && !value.starts_with('-'))
+    {
+        return None;
+    }
+    let mut resumes = pairs
+        .iter()
+        .enumerate()
+        .filter(|(_, (option, _))| *option == "--resume");
+    let (pair_idx, _) = resumes.next()?;
+    if resumes.next().is_some() {
+        return None;
+    }
+    let idx = pair_idx * 2;
     let id = args.get(idx + 1).filter(|id| {
-        !id.starts_with('-')
-            && id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        id.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     })?;
     if session_exists(id) {
         return None;
@@ -420,6 +443,10 @@ mod tests {
             "claude hello --resume abc",
             "claude --resume abc --resume def",
             "claude --model opus --resume ab$c",
+            "claude --print hello --resume abc",
+            "claude --model opus\n--resume abc",
+            "claude --model opus\t--resume abc",
+            "claude --verbose --resume abc",
         ] {
             assert_eq!(
                 restore(saved, None, None, &[]),

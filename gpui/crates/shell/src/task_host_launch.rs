@@ -1277,7 +1277,8 @@ fn restorable_add_dirs(
     rests.extend(presets.iter().filter_map(|preset| {
         let preset_words = shell_words::split(preset).ok()?;
         let (first, text) = preset.trim().split_once(char::is_whitespace)?;
-        let rest = preset_words[1..].to_vec();
+        // A comment-only preset parses to no words at all.
+        let rest = preset_words.get(1..)?.to_vec();
         let may_name_a_folder = rest
             .iter()
             .any(|word| word.contains(['/', '\\']) || word.contains(".."));
@@ -1665,6 +1666,19 @@ mod saved_form_tests {
                 "t-1",
                 "s-1"
             ),
+            Ok(vec![])
+        );
+    }
+
+    /// A comment-only preset parses to no words; it is skipped, not a panic.
+    #[test]
+    fn a_comment_only_preset_is_skipped() {
+        assert_eq!(
+            restorable_add_dirs("codex", &["codex # disabled"], "t-1", "s-1"),
+            Ok(vec![])
+        );
+        assert_eq!(
+            restorable_add_dirs("codex", &["# disabled preset"], "t-1", "s-1"),
             Ok(vec![])
         );
     }
