@@ -4,8 +4,9 @@
 //! before anything is seeded or bound, the task store is a seeded copy of
 //! Iced's `tasks.json` (read, never opened for writing), the task, browser
 //! and log servers bind OS-assigned loopback ports, and the owner is the only
-//! receiver of the task command ingress. Nothing here launches, attaches,
-//! notifies or delivers: imported running or queued records stay inert.
+//! receiver of the task command ingress. Plain preview launches, attaches,
+//! notifies and delivers nothing: imported running or queued records stay
+//! inert.
 //!
 //! Reads answer in Iced's shapes from what the preview reads: the seeded
 //! store, the GPUI chat panes, and Iced's settings, plan-limits, merge-plan,
@@ -25,6 +26,11 @@
 //! a task in a fixture repository and launches its worker there
 //! ([`delegate`]). Plain preview still answers every launch, run and
 //! delegation with the notice and starts nothing.
+//!
+//! In fixture mode (H5b B11) a finished result of a delegation this host
+//! started is delivered into the GPUI chat that requested it, through core's
+//! delivery reducer ([`delivery`]). Imported records are never delivered,
+//! and plain preview delivers nothing.
 use anyhow::{Context as _, Result};
 use gitterm_browser::browser_mcp::BrowserMcpConnection;
 use gitterm_core::{
@@ -70,10 +76,14 @@ pub(crate) type PublishHook = Box<dyn FnOnce(&mut TaskHostOwner)>;
 
 #[path = "task_host_delegate.rs"]
 mod delegate;
+#[path = "task_host_delivery.rs"]
+mod delivery;
 #[path = "task_host_launch.rs"]
 mod launch;
 #[path = "task_host_runs.rs"]
 mod runs;
+#[cfg(test)]
+pub(crate) use delivery::{DELIVERY_POLL, SubmitHook};
 pub(crate) use launch::TerminalLaunched;
 #[cfg(test)]
 pub(crate) use launch::with_preassigned_session_id as launch_session_id;
@@ -259,7 +269,7 @@ pub(crate) fn seed_copy(roots: &Preview, source: &Path) -> Result<(TaskStore, St
 }
 
 /// Anything `replace_store` would carry across a new store or drop with the
-/// old one. B4 starts none of it; B9–B11 do.
+/// old one. Plain preview starts none of it; fixture mode does.
 pub(crate) fn owns_in_flight_work(host: &TaskHost) -> bool {
     !host.launch_queue().is_empty()
         || host.delegations().busy()
@@ -326,8 +336,13 @@ pub(crate) struct TaskHostOwner {
     pub(crate) before_continuation: Option<ContinuationHook>,
     #[cfg(test)]
     pub(crate) before_publish: Option<PublishHook>,
+    /// Replaces writing a delivery into its chat pane.
+    #[cfg(test)]
+    pub(crate) submit_hook: Option<SubmitHook>,
     _pump: Task<()>,
     _reseed: Task<()>,
+    /// Fixture mode's delivery tick; none in plain preview.
+    _deliver: Option<Task<()>>,
     _quit: Subscription,
 }
 
@@ -456,6 +471,21 @@ impl TaskHostOwner {
                     }
                 }
             });
+            let deliver = (!fixtures.is_empty()).then(|| {
+                cx.spawn(async move |owner: gpui::WeakEntity<Self>, cx| {
+                    loop {
+                        cx.background_executor()
+                            .timer(delivery::DELIVERY_POLL)
+                            .await;
+                        if owner
+                            .update(cx, |owner, cx| owner.deliver_results(cx))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+            });
             // Synchronous: GPUI's quit timeout starts after the callbacks
             // return. Registered before the workspace owner's chat drain.
             let quit = cx.on_app_quit(|owner: &mut Self, cx| {
@@ -495,8 +525,11 @@ impl TaskHostOwner {
                 before_continuation: None,
                 #[cfg(test)]
                 before_publish: None,
+                #[cfg(test)]
+                submit_hook: None,
                 _pump: pump,
                 _reseed: reseed,
+                _deliver: deliver,
                 _quit: quit,
             }
         }))
@@ -711,7 +744,8 @@ impl TaskHostOwner {
     /// reducer and `record_handoff`, so done/blocked for an open worker
     /// delegation is accepted only from the pane hosting its task session,
     /// then the task's lifecycle mirrors it. Iced's tab, attention, parent
-    /// and PR-lookup steps are UI or delivery (B11) and are not run.
+    /// and PR-lookup steps are UI and are not run; the report reaches the
+    /// parent chat through the delivery tick ([`delivery`]), as in Iced.
     fn update_handoff(
         &mut self,
         request: UpdateTaskHandoffRequest,
@@ -802,7 +836,8 @@ impl TaskHostOwner {
     /// Iced's `TurnEnded` arm, store part only: a pane hosting the session
     /// now waits for input, so the task does, unless the session is a
     /// worker's final one. Preview panes carry no other live state, so the
-    /// ended session decides Iced's aggregate. Nothing is delivered (B11).
+    /// ended session decides Iced's aggregate. Delivery waits for the next
+    /// delivery tick ([`delivery`]).
     fn turn_ended(
         &mut self,
         task_id: &str,

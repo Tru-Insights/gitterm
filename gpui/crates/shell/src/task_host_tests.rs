@@ -2616,3 +2616,7 @@ fn slow_preflight_blocks_shutdown(cx: &mut TestAppContext) {
 #[cfg(unix)]
 #[path = "task_host_launch_tests.rs"]
 mod launch_tests;
+
+#[cfg(unix)]
+#[path = "task_host_delivery_tests.rs"]
+mod delivery_tests;
