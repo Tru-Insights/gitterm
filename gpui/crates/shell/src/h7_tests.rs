@@ -375,6 +375,7 @@ fn saved_run_inventory_restores_plain_shells_once_before_panel_or_workspace_sele
                     .push(layout::TerminalSession {
                         id: id.0,
                         cwd: cwd.clone(),
+                        startup_command: None,
                     });
                 state.panes.insert(pane_id, pane.clone());
                 state.dock.update(cx, |dock, cx| {
