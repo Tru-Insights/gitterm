@@ -1272,12 +1272,16 @@ impl TaskHostOwner {
         cx.notify();
     }
 
-    /// Quit order: stop ingress (resolving pending replies), drop both MCP
-    /// connections, signal the log server, drain the servers, then release
-    /// the host lock. Chat drains run in the workspace owner's later callback.
+    /// Quit order: stop ingress (resolving pending replies), kill every
+    /// run's Codex process group, drop both MCP connections, signal the log
+    /// server, drain the servers, then release the host lock. The runs are
+    /// reaped on a background thread, so a slow run never blocks the UI.
+    /// Chat drains run in the workspace owner's later callback.
     pub(crate) fn shutdown(&mut self) {
         self.host.shutdown();
         let mut runs: Vec<runs::RunHandle> = self.runs.drain().map(|(_, run)| run).collect();
+        // On Unix this kills each spawned Codex's group before it returns,
+        // and a run that has not spawned Codex yet never does.
         for run in &runs {
             run.stop.stop();
         }
@@ -1289,20 +1293,6 @@ impl TaskHostOwner {
             runtime,
         }) = self.servers.take()
         {
-            // Each stopped run kills its Codex process tree and reaps it.
-            runtime.block_on(async {
-                let _ = tokio::time::timeout(RUN_STOP, async {
-                    for run in &mut runs {
-                        let _ = (&mut run.done).await;
-                    }
-                })
-                .await;
-            });
-            // A run that did not stop in time is dropped, which still kills
-            // its direct Codex child (`kill_on_drop`).
-            for run in runs {
-                run.abort.abort();
-            }
             drop(task_mcp);
             drop(browser);
             log.shutdown.notify_one();
@@ -1314,7 +1304,31 @@ impl TaskHostOwner {
                 })
                 .await;
             });
-            runtime.shutdown_timeout(Duration::ZERO);
+            let reap = move || {
+                // Each stopped run reaps its Codex child.
+                runtime.block_on(async {
+                    let _ = tokio::time::timeout(RUN_STOP, async {
+                        for run in &mut runs {
+                            let _ = (&mut run.done).await;
+                        }
+                    })
+                    .await;
+                });
+                // A run that did not stop in time is dropped, which still
+                // kills its direct Codex child (`kill_on_drop`).
+                for run in runs {
+                    run.abort.abort();
+                }
+                runtime.shutdown_timeout(Duration::ZERO);
+            };
+            if let Err(error) = std::thread::Builder::new()
+                .name("gitterm-run-reaper".into())
+                .spawn(reap)
+            {
+                // The closure, and the runtime with it, was dropped, which
+                // drops each run and so kills its direct Codex child.
+                eprintln!("[delegation] could not start the run reaper: {error}");
+            }
         }
         self.lock = None;
     }

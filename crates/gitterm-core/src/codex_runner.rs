@@ -280,16 +280,65 @@ impl fmt::Debug for BeforeSpawn {
 
 /// See [`CodexEnvironment::stop`]. Clones share one signal.
 #[derive(Clone, Debug, Default)]
-pub struct CodexStop(tokio_util::sync::CancellationToken);
+pub struct CodexStop {
+    signal: tokio_util::sync::CancellationToken,
+    /// The spawned Codex's process group, from its spawn until its reap.
+    /// The spawn and [`Self::stop`] hold this lock, so a stop either finds
+    /// the group or keeps Codex from starting.
+    group: std::sync::Arc<Mutex<Option<u32>>>,
+}
 
 impl CodexStop {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Asks the run to stop; a run that has not spawned Codex yet never does.
+    /// Stops the run: on Unix the Codex process group is killed before this
+    /// returns, and a run that has not spawned Codex yet never does. The run
+    /// itself then reaps the child (and on Windows kills its tree).
     pub fn stop(&self) {
-        self.0.cancel();
+        let group = lock_group(&self.group);
+        self.signal.cancel();
+        #[cfg(unix)]
+        if let Some(pid) = *group {
+            kill_group(pid);
+        }
+        #[cfg(not(unix))]
+        let _ = group;
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.signal.is_cancelled()
+    }
+
+    /// After the child is reaped, so a later stop signals no recycled id.
+    // shortcut: a stop in the instant between the reap and this clear
+    // signals a group id that is already free (ESRCH, unless the id was
+    // recycled within that instant); closing it needs reaping under the lock.
+    fn reaped(&self) {
+        *lock_group(&self.group) = None;
+    }
+}
+
+fn lock_group(group: &Mutex<Option<u32>>) -> std::sync::MutexGuard<'_, Option<u32>> {
+    group
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// SIGKILL to the process group `pid` leads; a group already gone is fine.
+#[cfg(unix)]
+fn kill_group(pid: u32) {
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    // SAFETY: killpg only sends a signal; the group is the one this runner
+    // created for the child.
+    if unsafe { libc::killpg(pid, libc::SIGKILL) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            eprintln!("[codex-runner] could not kill process group {pid}: {error}");
+        }
     }
 }
 
@@ -486,17 +535,15 @@ async fn run_inner(
     if let Some(BeforeSpawn(check)) = &environment.before_spawn {
         check(&run.cwd).map_err(|message| CodexRunError::Refused { message })?;
     }
-    if environment
-        .stop
-        .as_ref()
-        .is_some_and(|stop| stop.0.is_cancelled())
-    {
-        return Err(CodexRunError::Stopped);
-    }
-    let mut child = command.spawn().map_err(|source| CodexRunError::Io {
-        context: format!("start {} in {}", program.display(), run.cwd.display()),
-        source,
-    })?;
+    let mut child = spawn_unless_stopped(&mut command, environment.stop.as_ref()).map_err(
+        |error| match error {
+            None => CodexRunError::Stopped,
+            Some(source) => CodexRunError::Io {
+                context: format!("start {} in {}", program.display(), run.cwd.display()),
+                source,
+            },
+        },
+    )?;
     let stdin = child.stdin.take();
     let stdout = child.stdout.take().ok_or_else(|| missing_pipe("stdout"))?;
     let stderr = child.stderr.take().ok_or_else(|| missing_pipe("stderr"))?;
@@ -551,8 +598,9 @@ async fn run_inner(
         None => limited.await,
         Some(stop) => tokio::select! {
             finished = limited => finished,
-            () = stop.0.cancelled() => {
+            () = stop.signal.cancelled() => {
                 stop_process_tree(&mut child, child_id).await;
+                stop.reaped();
                 log.append(&serde_json::json!({"type": "gitterm.stopped"}).to_string())?;
                 return Err(CodexRunError::Stopped);
             }
@@ -561,6 +609,9 @@ async fn run_inner(
     let Some(((stdin_result, stream, stderr_tail), status)) = finished else {
         let limit = run.time_limit.unwrap_or_default();
         stop_process_tree(&mut child, child_id).await;
+        if let Some(stop) = &environment.stop {
+            stop.reaped();
+        }
         log.append(
             &serde_json::json!({
                 "type": "gitterm.time_limit",
@@ -570,6 +621,9 @@ async fn run_inner(
         )?;
         return Err(CodexRunError::TimeLimit { limit });
     };
+    if let Some(stop) = &environment.stop {
+        stop.reaped();
+    }
     let status = status.map_err(|source| CodexRunError::Io {
         context: "wait for codex to exit".to_string(),
         source,
@@ -682,20 +736,32 @@ async fn run_inner(
     }
 }
 
+/// Spawns `command` unless `stop` has been signalled (`Err(None)`), and
+/// records the child's process group, under the lock [`CodexStop::stop`]
+/// takes.
+fn spawn_unless_stopped(
+    command: &mut tokio::process::Command,
+    stop: Option<&CodexStop>,
+) -> Result<tokio::process::Child, Option<std::io::Error>> {
+    let Some(stop) = stop else {
+        return command.spawn().map_err(Some);
+    };
+    let mut group = lock_group(&stop.group);
+    if stop.is_stopped() {
+        return Err(None);
+    }
+    let child = command.spawn().map_err(Some)?;
+    *group = child.id();
+    Ok(child)
+}
+
 /// Kills Codex at its time limit or on a stop: its process group on Unix
 /// (it was started as the group leader), its process tree on Windows, then
 /// reaps the child. Failures are logged; the run ends as stopped either way.
 async fn stop_process_tree(child: &mut tokio::process::Child, child_id: Option<u32>) {
     #[cfg(unix)]
-    if let Some(pid) = child_id.and_then(|pid| i32::try_from(pid).ok()) {
-        // SAFETY: killpg only sends a signal; the group is the one this
-        // runner created for the child.
-        if unsafe { libc::killpg(pid, libc::SIGKILL) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                eprintln!("[codex-runner] could not kill process group {pid}: {error}");
-            }
-        }
+    if let Some(pid) = child_id {
+        kill_group(pid);
     }
     #[cfg(windows)]
     if let Some(pid) = child_id {
@@ -1126,6 +1192,11 @@ async fn git_output(
         command.args(["-c", "core.fsmonitor=false"]);
     }
     command.args(args).current_dir(cwd).stdin(Stdio::null());
+    if environment.stop.is_some() {
+        // A stopped run that is dropped (the host's abort fallback) ends
+        // its preflight's git too.
+        command.kill_on_drop(true);
+    }
     for var in GIT_LOCATION_VARS {
         command.env_remove(var);
     }
@@ -2145,6 +2216,51 @@ mod tests {
                 !fake.dir.path().join("args").exists(),
                 "Codex started after a refusal"
             );
+        }
+
+        #[test]
+        fn a_stop_kills_the_process_group_before_it_returns() {
+            let fake = FakeCodex::hanging();
+            let mut environment = fake.environment();
+            let stop = CodexStop::new();
+            environment.stop = Some(stop.clone());
+            let run = fake.run(CodexRunKind::Consult {
+                brief: "Until stopped.".to_string(),
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let (sender, _receiver) = mpsc::unbounded_channel();
+            let _running = runtime.spawn(async move { run_with(run, sender, &environment).await });
+            let pid_file = fake.dir.path().join("sleep.pid");
+            runtime.block_on(async {
+                for _ in 0..100 {
+                    if std::fs::read_to_string(&pid_file).is_ok_and(|pid| pid.ends_with('\n')) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            });
+            let pid: i32 = fake
+                .recorded("sleep.pid")
+                .trim()
+                .parse()
+                .expect("sleep pid");
+            stop.stop();
+            // The run is never polled again: dropping it kills only its
+            // direct child, so the descendant ends only if `stop` killed
+            // the group.
+            runtime.shutdown_timeout(std::time::Duration::ZERO);
+            let gone = (0..50).any(|_| {
+                // SAFETY: signal 0 only checks that the process exists.
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                if alive {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                !alive
+            });
+            assert!(gone, "sleep {pid} outlived the stop");
         }
 
         #[tokio::test]

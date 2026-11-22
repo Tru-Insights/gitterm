@@ -7,10 +7,11 @@
 //! and again after a queued start's check. Codex runs with a cleared
 //! environment whose homes lie under the preview root.
 //!
-//! Codex's cwd is checked once more after the runner's git preflight,
-//! immediately before the spawn, and that preflight runs no fsmonitor hook.
-//! Every continuation stops at shutdown, which kills and reaps each run's
-//! Codex process tree.
+//! The full fixture guard runs once more on Codex's cwd and extra folders
+//! after the runner's git preflight, immediately before the spawn, and that
+//! preflight runs no fsmonitor hook. Every continuation stops at shutdown,
+//! which kills each run's Codex process group at once and reaps it on a
+//! background thread.
 //!
 //! Only delegations this host stored are started or settled; an imported
 //! record is never touched. Results are stored; delivering them into the
@@ -339,20 +340,29 @@ impl TaskHostOwner {
                 .ok_or_else(|| format!("delegation {id} is not stored"))?;
             let run = gitterm_core::delegations::codex_run(delegation, self.roots.root())?;
             let fixture = self.fixture_of(&run.cwd, START_LABEL)?;
-            let resolved =
-                std::fs::canonicalize(&run.cwd).map_err(|_| preview_notice(START_LABEL))?;
+            let targets: Vec<PathBuf> = std::iter::once(run.cwd.clone())
+                .chain(delegation.options.add_dirs.iter().cloned())
+                .collect();
+            let authorized = self.authorize_process(START_LABEL, &targets)?;
             let env = self.fixture_child_env(&fixture, None)?;
             let codex_home = value_of(&env, "CODEX_HOME")
                 .map(PathBuf::from)
                 .ok_or("the fixture child has no CODEX_HOME")?;
-            // The fixture check once more, after the runner's git preflight
-            // and immediately before Codex starts: the checkout still
-            // resolves where it did, inside the fixture.
-            let before_spawn =
-                BeforeSpawn::new(move |cwd: &Path| match std::fs::canonicalize(cwd) {
-                    Ok(now) if now == resolved && now.starts_with(&fixture) => Ok(()),
-                    _ => Err(preview_notice(START_LABEL)),
-                });
+            // The whole fixture guard once more, after the runner's git
+            // preflight and immediately before Codex starts: the cwd and
+            // each extra folder still resolve where they did, and their Git
+            // dir and common dir still resolve inside the fixture with no
+            // link under them. So whatever a config-driven program in the
+            // preflight changed (a clean filter, a hook) cannot redirect the
+            // run. The remaining gap is the instant between this check and
+            // the exec.
+            let services = self.host.services().clone();
+            let before_spawn = BeforeSpawn::new(move |_cwd: &Path| {
+                // The cwd is the first authorized target.
+                services
+                    .recheck(&authorized)
+                    .map_err(|denied| denied.notice().to_string())
+            });
             let stop = CodexStop::new();
             let environment = CodexEnvironment {
                 search_path: self.codex_search_path(&env),

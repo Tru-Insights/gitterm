@@ -2524,3 +2524,91 @@ fn shutdown_kills_codex_descendants(cx: &mut TestAppContext) {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[cfg(unix)]
+#[gpui::test]
+fn clean_filter_can_redirect_git_dir(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt;
+    let runs = Runs::start(2, cx);
+    let repo = &runs.git.repo;
+    // The fixture's own config names a clean filter for a tracked file; the
+    // runner's `git status` runs it, and it points `.git` outside.
+    let tracked = repo.join("filtered");
+    std::fs::write(&tracked, "one\n").unwrap();
+    std::fs::write(repo.join(".gitattributes"), "filtered filter=swap\n").unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-qm", "filtered baseline"]);
+    let filter = runs.git.root.join("clean-filter");
+    std::fs::write(
+        &filter,
+        format!(
+            "#!/bin/sh\nif [ ! -L .git ]; then mv .git .git-original; ln -s '{}' .git; fi\ncat\n",
+            runs.git.outside.join(".git").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+    git(
+        repo,
+        &["config", "filter.swap.clean", filter.to_str().unwrap()],
+    );
+    std::fs::write(&tracked, "two\n").unwrap();
+    let id = runs.consult(cx);
+    assert_eq!(settled_status(&runs, &id, cx), "failed");
+    assert!(
+        std::fs::symlink_metadata(repo.join(".git"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the preflight ran the clean filter"
+    );
+    assert_eq!(
+        runs.codex.runs(),
+        0,
+        "Codex started with a Git dir outside the fixture"
+    );
+    assert_eq!(
+        runs.saved()[0].status,
+        gitterm_core::tasks::DelegationStatus::Failed {
+            message: gitterm_core::preview::service::preview_notice("Start delegation")
+        }
+    );
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn slow_preflight_blocks_shutdown(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt;
+    let runs = Runs::start(2, cx);
+    // A `git` ahead of the real one that sleeps in the runner's `git status`.
+    let wrapper = tempfile::tempdir().unwrap();
+    let real_git = std::process::Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real_git = String::from_utf8(real_git.stdout).unwrap();
+    let marker = wrapper.path().join("in-status");
+    let script = format!(
+        "#!/bin/sh\nfor arg in \"$@\"; do if [ \"$arg\" = status ]; then touch '{}'; sleep 4; fi; done\nexec '{}' \"$@\"\n",
+        marker.display(),
+        real_git.trim()
+    );
+    let program = wrapper.path().join("git");
+    std::fs::write(&program, script).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = vec![wrapper.path().to_path_buf()];
+    path.extend(std::env::split_paths(&runs.codex.search_path()));
+    runs.owner.update(cx, |owner, _| {
+        owner.codex_search_path = Some(std::env::join_paths(path).unwrap())
+    });
+    let _id = runs.consult(cx);
+    wait_until(cx, |_| marker.exists());
+    let start = Instant::now();
+    runs.owner.update(cx, |owner, _| owner.shutdown());
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "shutdown blocked the UI for {elapsed:?}"
+    );
+    assert_eq!(runs.codex.runs(), 0, "Codex started after shutdown");
+}

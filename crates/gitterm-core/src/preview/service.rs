@@ -298,7 +298,7 @@ impl fmt::Debug for TaskMcpNamespace {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Mode {
     Preview(Arc<Preview>),
     FixtureLaunch {
@@ -308,8 +308,9 @@ enum Mode {
     Production,
 }
 
-/// Composition-time authority for the shared task host's services.
-#[derive(Debug)]
+/// Composition-time authority for the shared task host's services. A clone
+/// decides the same way, for a check that runs off the host's thread.
+#[derive(Clone, Debug)]
 pub struct ServiceContext {
     mode: Mode,
     root: PathBuf,
