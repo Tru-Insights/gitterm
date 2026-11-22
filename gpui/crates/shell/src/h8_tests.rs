@@ -335,7 +335,6 @@ fn roster_periodic_read_finds_new_workers_and_preserves_local_dismissal(cx: &mut
     task.worktree.state = TaskWorktreeState::Ready;
     task.worktree.path = Some(fixture.root.path().join("worker-worktree"));
     std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
-    let before = snapshot(&fixture.source);
     cx.executor()
         .advance_clock(std::time::Duration::from_secs(15));
     draw(cx);
@@ -351,6 +350,22 @@ fn roster_periodic_read_finds_new_workers_and_preserves_local_dismissal(cx: &mut
                 .all(|row| Path::new(&row.checkout).file_name().unwrap() == "worker-worktree")
         );
     });
+    // Iced hides the × on a live row and shows it once the worker finished.
+    assert!(cx.debug_bounds("roster-dismiss-dlg:new-worker").is_none());
+    let mut document: TaskStoreDocument =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for worker in &mut document.delegations {
+        if worker.delegation_id == "new-worker" {
+            worker.status = DelegationStatus::Failed {
+                message: "fixture".into(),
+            };
+        }
+    }
+    std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+    let before = snapshot(&fixture.source);
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(15));
+    draw(cx);
     click(cx, "roster-dismiss-dlg:new-worker");
     assert!(cx.debug_bounds("roster-dlg:new-worker").is_none());
     cx.executor()
