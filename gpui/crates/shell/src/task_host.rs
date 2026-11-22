@@ -9,9 +9,10 @@
 //! inert.
 //!
 //! Reads answer in Iced's shapes from what the preview reads: the seeded
-//! store, the GPUI chat panes, and Iced's settings, plan-limits, merge-plan,
-//! PR-watch and chat-facts files (only read). Every write, launch and run
-//! answers the preview notice.
+//! store, the shell's panes (pushed as [`TaskPane`]s), the GPUI chat panes,
+//! and Iced's settings, plan-limits, merge-plan, PR-watch and chat-facts
+//! files (only read). Every write, launch and run answers the preview
+//! notice.
 //!
 //! Fixture mode (H5b B9, tests and acceptance only: [`TaskHostOwner::start_fixture`])
 //! gives the host a fixture-launch service context. Then `task_create`,
@@ -84,6 +85,7 @@ mod launch;
 mod runs;
 #[cfg(test)]
 pub(crate) use delivery::{DELIVERY_POLL, SubmitHook};
+pub(crate) use delivery::forward_turn_ends;
 pub(crate) use launch::TerminalLaunched;
 #[cfg(test)]
 pub(crate) use launch::with_preassigned_session_id as launch_session_id;
@@ -292,8 +294,19 @@ struct Servers {
     runtime: tokio::runtime::Runtime,
 }
 
+/// One shell pane holding a task session, as Iced's `task_control_value`
+/// lists a tab of the task (src/main.rs `task_control_value`). The shell
+/// pushes every such pane in Iced's tab order ([`TaskHostOwner::set_panes`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TaskPane {
+    pub task_id: String,
+    pub session: OpenSession,
+}
+
 pub(crate) struct TaskHostOwner {
     host: TaskHost,
+    /// The shell's panes holding task sessions, as last pushed.
+    panes: Vec<TaskPane>,
     roots: Arc<Preview>,
     /// Iced's config dir; never written.
     iced_config: PathBuf,
@@ -494,6 +507,7 @@ impl TaskHostOwner {
             });
             Self {
                 host,
+                panes: Vec::new(),
                 roots,
                 iced_config,
                 source: iced_tasks,
@@ -552,6 +566,14 @@ impl TaskHostOwner {
 
     pub(crate) fn host(&self) -> &TaskHost {
         &self.host
+    }
+    /// The shell's panes holding task sessions; the shell pushes them when
+    /// they change.
+    pub(crate) fn set_panes(&mut self, panes: Vec<TaskPane>) {
+        self.panes = panes;
+    }
+    pub(crate) fn panes(&self) -> &[TaskPane] {
+        &self.panes
     }
     pub(crate) fn host_mut(&mut self) -> &mut TaskHost {
         &mut self.host
@@ -615,25 +637,18 @@ impl TaskHostOwner {
                 request,
             } => reply.send(html_render(request, caller.as_deref(), &open_chats(cx))),
             HostEffect::Read { reply, effect } => {
-                let source = cx.try_global::<crate::work_sidebar::IcedWorkSource>();
-                let workspaces = source.map_or(&[][..], |source| &source.workspaces[..]);
                 let presets: Vec<String> =
                     crate::workspace_config::load_iced_settings_from(&self.iced_config)
                         .agent_presets
                         .iter()
                         .map(|preset| preset.name.clone())
                         .collect();
-                reply.send(read_projection(
-                    effect,
-                    &open_chats(cx),
-                    workspaces,
-                    &presets,
-                ));
+                reply.send(read_projection(effect, &self.panes, &presets));
             }
             // Iced adds the live worker card; the preview runs no workers.
             HostEffect::DelegationRecord { reply, record, .. } => reply.send(Ok(record)),
             HostEffect::MergePlanGet { reply, caller } => {
-                reply.send(self.merge_plan_get(caller.as_deref(), cx));
+                self.merge_plan_get(reply, caller.as_deref(), cx)
             }
             HostEffect::Create {
                 reply,
@@ -815,7 +830,7 @@ impl TaskHostOwner {
             .get(&task_id)
             .cloned()
             .ok_or_else(|| format!("Task {task_id} disappeared after updating its handoff"))?;
-        let mut value = self.task_value(&task, &chats, cx)?;
+        let mut value = self.task_value(&task)?;
         value["handoff_status"] = serde_json::Value::String(status.label().to_string());
         value["delegation_id"] = report_to
             .map(serde_json::Value::String)
@@ -1206,7 +1221,7 @@ impl TaskHostOwner {
                         )
                     })
                 })
-                .and_then(|task| self.task_value(&task, &open_chats(cx), cx)),
+                .and_then(|task| self.task_value(&task)),
             Ok(TaskMutationAction::PersistWorkerPreparationFailure {
                 error,
                 cleanup_path,
@@ -1251,16 +1266,8 @@ impl TaskHostOwner {
     }
 
     /// A task in the tools' shape, with its panes as `open_sessions`.
-    fn task_value(
-        &self,
-        task: &TaskRecord,
-        chats: &[OpenChat],
-        cx: &App,
-    ) -> Result<serde_json::Value, String> {
-        let workspaces = cx
-            .try_global::<crate::work_sidebar::IcedWorkSource>()
-            .map_or(&[][..], |source| &source.workspaces[..]);
-        gitterm_core::task_host::task_control_value(task, &open_sessions(task, chats, workspaces))
+    fn task_value(&self, task: &TaskRecord) -> Result<serde_json::Value, String> {
+        gitterm_core::task_host::task_control_value(task, &open_sessions(task, &self.panes))
     }
 
     /// The caller's provider conversation and the store's chat links, as
@@ -1307,17 +1314,29 @@ impl TaskHostOwner {
     /// Iced's `merge_plan_get`: the plan of the caller's root chat (caller
     /// pane, its conversation, then the conversation's root through saved
     /// facts and the store's links), with live PR state and the root's
-    /// unplanned PRs.
-    // shortcut: the plan, watch and facts files are read on the UI thread per
-    // call; move them to the background executor if a call shows up in frames.
-    fn merge_plan_get(&self, caller: Option<&str>, cx: &App) -> Result<serde_json::Value, String> {
-        let (conversation, links) = self.caller_conversation("merge_plan_get", caller, cx)?;
-        Ok(merge_plan_in(
-            &self.iced_config,
-            &self.plans_dir(),
-            &links,
-            &conversation,
-        ))
+    /// unplanned PRs. The caller and links are resolved here; the plan,
+    /// watch and facts files are read on the background executor, which
+    /// sends the reply, so the UI thread never waits on them.
+    fn merge_plan_get(
+        &self,
+        reply: TaskControlReply,
+        caller: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let (conversation, links) = match self.caller_conversation("merge_plan_get", caller, cx) {
+            Ok(resolved) => resolved,
+            Err(error) => return reply.send(Err(error)),
+        };
+        let (iced_config, plans_dir) = (self.iced_config.clone(), self.plans_dir());
+        cx.background_spawn(async move {
+            reply.send(Ok(merge_plan_in(
+                &iced_config,
+                &plans_dir,
+                &links,
+                &conversation,
+            )));
+        })
+        .detach();
     }
 
     /// Re-seeds when Iced's file changed and the host owns no in-flight work
@@ -1572,17 +1591,16 @@ pub(crate) fn html_render(
     .map_err(|error| format!("cannot encode visual reply: {error}"))
 }
 
-/// The task read in Iced's shape: each task with the GPUI chats bound to it
-/// as `open_sessions`, and Iced's preset names on a list.
+/// The task read in Iced's shape: each task with the shell's panes holding
+/// it as `open_sessions`, and Iced's preset names on a list.
 pub(crate) fn read_projection(
     effect: gitterm_core::task_commands::TaskReadEffect,
-    chats: &[OpenChat],
-    workspaces: &[gitterm_core::workspace_config::WorkspaceConfig],
+    panes: &[TaskPane],
     presets: &[String],
 ) -> Result<serde_json::Value, String> {
     use gitterm_core::task_commands::TaskProjection;
     let value = |task: &gitterm_core::tasks::TaskRecord| {
-        gitterm_core::task_host::task_control_value(task, &open_sessions(task, chats, workspaces))
+        gitterm_core::task_host::task_control_value(task, &open_sessions(task, panes))
     };
     match effect.projection? {
         TaskProjection::List(tasks) => Ok(serde_json::json!({
@@ -1593,34 +1611,13 @@ pub(crate) fn read_projection(
     }
 }
 
-/// Iced lists the task's tabs; the preview's are its chat panes. Preview
-/// panes start without a task (`sessions::fresh_target`), so this is empty
-/// until GPUI opens task sessions.
-fn open_sessions(
-    task: &gitterm_core::tasks::TaskRecord,
-    chats: &[OpenChat],
-    workspaces: &[gitterm_core::workspace_config::WorkspaceConfig],
-) -> Vec<OpenSession> {
-    chats
+/// Iced lists the tabs whose task is `task` (src/main.rs
+/// `task_control_value`); the preview's are the shell's panes.
+fn open_sessions(task: &gitterm_core::tasks::TaskRecord, panes: &[TaskPane]) -> Vec<OpenSession> {
+    panes
         .iter()
-        .filter(|chat| chat.task_id.as_deref() == Some(task.task_id.as_str()))
-        .map(|chat| OpenSession {
-            session_id: chat.task_session_id.clone(),
-            label: chat.cwd.file_name().map_or_else(
-                || chat.cwd.display().to_string(),
-                |name| name.to_string_lossy().into_owned(),
-            ),
-            workspace: workspaces
-                .iter()
-                .find(|workspace| chat.cwd.starts_with(&workspace.dir))
-                .map_or_else(
-                    || chat.cwd.display().to_string(),
-                    |workspace| workspace.name.clone(),
-                ),
-            // shortcut: the active pane lives on the Shell, which the host
-            // cannot read; report it when B8 gives the host pane state.
-            is_active: false,
-        })
+        .filter(|pane| pane.task_id == task.task_id)
+        .map(|pane| pane.session.clone())
         .collect()
 }
 

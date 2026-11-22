@@ -501,3 +501,78 @@ fn preview_never_auto_delivers(cx: &mut TestAppContext) {
     let saved = gitterm_core::tasks::TaskStore::load(delivery.fixture.copy()).unwrap();
     assert!(!saved.delegation("d1").unwrap().is_delivered());
 }
+
+/// Iced flushes a chat's delivery when its turn ends (the `TurnCompleted`
+/// arm), not only from the tick: a result that finished while no tick ran
+/// reaches the requesting chat as soon as that chat's turn ends. The test
+/// clock never advances, so the tick never fires.
+#[gpui::test]
+fn turn_end_flushes_delivery_without_waiting_for_the_tick(cx: &mut TestAppContext) {
+    let delivery = Delivery::start(true, vec![], cx);
+    std::fs::write(
+        delivery.fixture.iced.join("settings.json"),
+        r#"{"delegations": {"auto_tell": true}}"#,
+    )
+    .unwrap();
+    let owner = delivery.owner.clone();
+    cx.update(|cx| cx.set_global(crate::task_host::GpuiTaskHost(owner)));
+    let checkout = delivery.git.outside.clone();
+    let saved = crate::chat::SavedChat {
+        uid: "requester".into(),
+        cwd: checkout.clone(),
+        provider: delivery.fixture.roots.provider(),
+        session_id: None,
+        records: vec![],
+    };
+    let (pane, window) = cx.add_window_view(|window, cx| {
+        crate::chat::ChatPane::history(crate::chat::RuntimeShutdown::new(), saved, window, cx)
+    });
+    let program = fake_claude(delivery.fixture.iced.parent().unwrap());
+    let preview = delivery.fixture.roots.clone();
+    pane.update_in(window, |pane, window, cx| {
+        pane.start_fake_runtime(preview, &program, window, cx)
+    })
+    .unwrap();
+    // The shell's wiring for a live chat pane.
+    let _turn_ends = cx.update(|cx| crate::task_host::forward_turn_ends(&pane, cx));
+    let parent = pane.read_with(cx, |pane, _| pane.target().session_uid);
+    delivery.chats.owner.update(cx, |owner, _| {
+        owner.chats.insert(parent.clone(), pane.clone());
+    });
+    let hosted = delivery
+        .chats
+        .open_in(&delivery.fixture, None, &delivery.git.worktree, cx);
+    delivery.chats.owner.update(cx, |owner, cx| {
+        owner.chats[&hosted].update(cx, |pane, _| pane.bind_task_session("worker", "child-d1"))
+    });
+    let mut worker = worker_delegation("d1", "worker", "child-d1");
+    worker.parent.session_uid = parent.clone();
+    worker.parent.chat_session_id = None;
+    delivery
+        .owner
+        .update(cx, |owner, _| owner.own_worker(worker));
+    wait_until(cx, |cx| pane.read_with(cx, |pane, _| pane.runtime_ready()));
+
+    let done = Op::UpdateHandoff(req(serde_json::json!({
+        "task_id": "worker", "summary": "Finished the fixture change", "status": "done"
+    })));
+    dispatch_as(cx, &delivery.sender, done, Some(&hosted)).unwrap();
+    cx.run_until_parked();
+    // No tick ran and no turn ended: nothing is delivered yet.
+    assert!(!delivery.delivered("d1", cx));
+    assert!(prompts(&checkout).is_empty());
+
+    // The user's turn ends; its end sends the held result at once.
+    pane.update(cx, |pane, cx| {
+        pane.submit_prompt("Fixture question".into(), cx);
+    });
+    wait_until(cx, |cx| delivery.delivered("d1", cx));
+    wait_until(cx, |_| prompts(&checkout).len() == 2);
+    let sent = prompts(&checkout);
+    assert!(sent[0].contains("Fixture question"), "{}", sent[0]);
+    assert!(sent[1].contains("Finished the fixture change"), "{}", sent[1]);
+    // The delivered turn's own end finds nothing more to send.
+    cx.run_until_parked();
+    assert_eq!(prompts(&checkout).len(), 2);
+    pane.update(cx, |pane, cx| pane.close(cx));
+}
