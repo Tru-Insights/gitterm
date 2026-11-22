@@ -661,7 +661,34 @@ fn check_git_admin(preview: &Preview, fixture: &Path, checkout: &Path) -> io::Re
         // A dangling link fails here rather than reading as absent.
         check_pointer_text(&commondir)?;
     }
-    inside(&common_dir)?;
+    let common_dir = inside(&common_dir)?;
+    // A link under the admin dirs can send a ref or object write out of the
+    // fixture (`refs/heads/task` -> elsewhere); Git's own dirs hold none.
+    refuse_symlinks_under(&git_dir)?;
+    if common_dir != git_dir {
+        refuse_symlinks_under(&common_dir)?;
+    }
+    Ok(())
+}
+
+/// Walks `dir` without following links and refuses the first symlink.
+fn refuse_symlinks_under(dir: &Path) -> io::Result<()> {
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let path = entry?.path();
+            let kind = fs::symlink_metadata(&path)?.file_type();
+            if kind.is_symlink() {
+                return Err(refuse(format!(
+                    "symlink inside a git admin dir: {}",
+                    path.display()
+                )));
+            }
+            if kind.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
     Ok(())
 }
 
