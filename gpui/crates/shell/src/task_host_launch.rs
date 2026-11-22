@@ -33,6 +33,11 @@ use std::{collections::HashMap, ffi::OsString};
 /// Composed task briefs, under the preview root (Iced's `task-briefs`).
 pub(crate) const BRIEFS: &str = "task-briefs";
 /// Variables the PTY launcher sets itself when the overlay does not.
+/// The terminal's own variables (gitterm_terminal's `BackendSettings`
+/// defaults), added on top of the fixture env.
+pub(crate) const TERMINAL_SET: [(&str, &str); 2] =
+    [("TERM", "xterm-256color"), ("COLORTERM", "truecolor")];
+
 const LAUNCHER_SET: [&str; 7] = [
     "LANG",
     "PATH",
@@ -737,6 +742,12 @@ fn spawn_terminal(
     }
     for name in LAUNCHER_SET {
         overlay.entry(name.into()).or_insert(None);
+    }
+    // Every GPUI terminal gets the backend's TERM/COLORTERM (an agent CLI
+    // needs TERM). Set them here, so the child env is the same whatever the
+    // parent has.
+    for (name, value) in TERMINAL_SET {
+        overlay.insert(name.into(), Some(value.into()));
     }
     let launch = TerminalLaunch {
         cwd: Some(cwd.to_path_buf()),

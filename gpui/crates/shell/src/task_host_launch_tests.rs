@@ -503,11 +503,24 @@ fn launched_terminal_env_has_only_the_fixture_env(cx: &mut TestAppContext) {
         expected.remove(name);
     }
     expected.retain(|name, _| !name.starts_with("DYLD_"));
-    // Nothing the launcher or the PTY adds on its own survives.
-    assert_eq!(env, expected);
+    // The terminal's own TERM/COLORTERM, whatever the parent has.
+    for (name, value) in crate::task_host_launch::TERMINAL_SET {
+        expected.insert(name.into(), value.into());
+    }
+    // Nothing else the launcher or the PTY adds survives. Only names are
+    // printed: the values hold tokens.
+    let differing: Vec<&String> = env
+        .keys()
+        .chain(expected.keys())
+        .filter(|name| env.get(*name) != expected.get(*name))
+        .collect();
+    assert!(differing.is_empty(), "env differs in: {differing:?}");
     // The task MCP URL names the task session.
     use gitterm_core::task_commands::mcp_protocol::TASK_MCP_URL_ENV;
-    assert!(env[TASK_MCP_URL_ENV].contains(&session), "{env:?}");
+    assert!(
+        env[TASK_MCP_URL_ENV].contains(&session),
+        "{TASK_MCP_URL_ENV} does not name the session"
+    );
     assert_eq!(
         PathBuf::from(launches.agent.read("pwd", 1).unwrap().trim_end()),
         worktree.canonicalize().unwrap()
