@@ -230,9 +230,9 @@ pub fn classify_task_action(action: &TaskMutationAction) -> Class {
     use TaskMutationAction as A;
     match action {
         A::None => class("Task", Access::Read),
-        // `git status` without --no-optional-locks can rewrite the checkout's
-        // index, so inspection is a write until that path is proven read-only.
-        A::InspectCleanup { .. } => class("Inspect worktree", Access::Write),
+        // Read-only Git: no command writes or takes optional locks
+        // (`task_worktree::inspect_cleanup`, test `inspection_spawns_only_read_git`).
+        A::InspectCleanup { .. } => class("Inspect worktree", Access::Read),
         A::ConfirmPublish { .. } => class("Publish", Access::Read),
         A::WorkerAuthorityChecked { .. } => class("Check worker", Access::Read),
         A::PrepareTask(_) => class("Create task", Access::Write),
@@ -661,7 +661,34 @@ fn check_git_admin(preview: &Preview, fixture: &Path, checkout: &Path) -> io::Re
         // A dangling link fails here rather than reading as absent.
         check_pointer_text(&commondir)?;
     }
-    inside(&common_dir)?;
+    let common_dir = inside(&common_dir)?;
+    // A link under the admin dirs can send a ref or object write out of the
+    // fixture (`refs/heads/task` -> elsewhere); Git's own dirs hold none.
+    refuse_symlinks_under(&git_dir)?;
+    if common_dir != git_dir {
+        refuse_symlinks_under(&common_dir)?;
+    }
+    Ok(())
+}
+
+/// Walks `dir` without following links and refuses the first symlink.
+fn refuse_symlinks_under(dir: &Path) -> io::Result<()> {
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let path = entry?.path();
+            let kind = fs::symlink_metadata(&path)?.file_type();
+            if kind.is_symlink() {
+                return Err(refuse(format!(
+                    "symlink inside a git admin dir: {}",
+                    path.display()
+                )));
+            }
+            if kind.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
     Ok(())
 }
 

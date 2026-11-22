@@ -344,7 +344,7 @@ fn every_task_action_and_session_effect_is_classified() {
                 pull_request_url: None,
             },
             "Inspect worktree",
-            Access::Write,
+            Access::Read,
         ),
         (
             A::ConfirmPublish {
@@ -1181,6 +1181,48 @@ fn fixture_admin_dirs_resolved_by_git() {
     // The same Git dir sharing a common dir inside the fixture is allowed.
     fs::write(bare.join("commondir"), "../repo/.git\n").unwrap();
     assert!(worker(&bare).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_with_symlinked_ref_dir_is_refused() {
+    use std::os::unix::fs::symlink;
+    let f = fixture();
+    let outside = f.dir.path().join("elsewhere");
+    fs::create_dir_all(&outside).unwrap();
+    let root = fixture_repo(f.dir.path(), "fixture");
+    let context = ServiceContext::fixture_launch(f.preview.clone(), [root.clone()]).unwrap();
+    let root = fs::canonicalize(root).unwrap();
+    let repo = root.join("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    // A plain fixture is accepted.
+    assert!(context.process(ProcessEffect::Worker, Some(&repo)).is_ok());
+    fs::create_dir_all(repo.join(".git/refs/heads")).unwrap();
+    symlink(&outside, repo.join(".git/refs/heads/task")).unwrap();
+    assert!(context.process(ProcessEffect::Worker, Some(&repo)).is_err());
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_with_symlink_deep_in_linked_common_dir_is_refused() {
+    use std::os::unix::fs::symlink;
+    let f = fixture();
+    let outside = f.dir.path().join("elsewhere");
+    fs::create_dir_all(&outside).unwrap();
+    let root = fixture_repo(f.dir.path(), "fixture");
+    let context = ServiceContext::fixture_launch(f.preview.clone(), [root.clone()]).unwrap();
+    let root = fs::canonicalize(root).unwrap();
+    let repo = root.join("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "x"]);
+    git(&repo, &["worktree", "add", "-q", "../wt", "-b", "wt"]);
+    let wt = root.join("wt");
+    assert!(context.process(ProcessEffect::Worker, Some(&wt)).is_ok());
+    fs::create_dir_all(repo.join(".git/refs/heads/deep")).unwrap();
+    symlink(&outside, repo.join(".git/refs/heads/deep/task")).unwrap();
+    assert!(context.process(ProcessEffect::Worker, Some(&wt)).is_err());
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
 }
 
 #[cfg(unix)]
