@@ -22,7 +22,7 @@ fn pr(number: u64, title: &str, state: PrState) -> WatchedPr {
 
 /// PR 1 open (plan step 1 → the next to merge), PR 2 open (waits for 1,
 /// plan method squash), PR 3 a draft. `github-accounts.json` maps the owner.
-fn sidebar_with_prs() -> WorkSidebar {
+pub(super) fn sidebar_with_prs() -> WorkSidebar {
     let mut fixture = fixture(false);
     fixture.pr_accounts = [("EXAMPLE".to_string(), " fixture ".to_string())].into();
     fixture.pr_plans.insert(
@@ -50,13 +50,13 @@ fn sidebar_with_prs() -> WorkSidebar {
     fixture
 }
 
-fn model(sidebar: &Entity<WorkSidebar>, cx: &mut gpui::VisualTestContext) -> Model {
+pub(super) fn model(sidebar: &Entity<WorkSidebar>, cx: &mut gpui::VisualTestContext) -> Model {
     sidebar.read_with(cx, |s, _| {
         s.confirm_model(s.confirm.as_ref().expect("the panel is open"))
     })
 }
 
-fn open_panel(
+pub(super) fn open_panel(
     cx: &mut gpui::TestAppContext,
 ) -> (
     Entity<WorkSidebar>,
