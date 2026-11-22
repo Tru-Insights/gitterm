@@ -14,8 +14,9 @@
 //! preparation together with the prepared worktree; the launch rechecks the
 //! worktree and extra folders right before the child starts.
 //!
-//! Only delegations this host stored are started. Delivering the worker's
-//! report into the chat is B11.
+//! Only delegations this host stored are started. The worker's report
+//! reaches the requesting chat through the delivery tick
+//! ([`super::delivery`]).
 // shortcut: a `checkout` (an existing worktree) is refused in fixture mode;
 // add Iced's reuse and adoption paths when a fixture needs them.
 use super::*;
@@ -401,7 +402,7 @@ impl TaskHostOwner {
     /// Iced's `start_delegated_worker`: the worker delegation is stored as
     /// this host's own, then its session launches through the fixture
     /// launch path, and `delegate_task` is answered. The card and parent
-    /// notifications are B11.
+    /// attention are UI and are not run.
     fn start_delegated_worker(
         &mut self,
         task_id: &str,

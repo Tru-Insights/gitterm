@@ -18,7 +18,7 @@ use super::TaskHost;
 use crate::delegation_state::{Effect, Intent, RequestId};
 use crate::delegations::{self, SendBatch};
 use crate::preview::service::RunnerEffect;
-use crate::tasks::{Delegation, DelegationParent};
+use crate::tasks::{Delegation, DelegationChild, DelegationParent};
 
 const STORE_UNAVAILABLE: &str = "GitTerm's task store is unavailable";
 
@@ -123,6 +123,25 @@ impl TaskHost {
                 .is_ok()
     }
 
+    /// The automatic-delivery gate for one result, checked for the checkout
+    /// its work ran in (a worker's task worktree): a fixture host sends only
+    /// results of work done inside its fixtures, and preview none.
+    fn automatic_delivery_of(&self, auto_tell: bool, delegation: &Delegation) -> bool {
+        let target = match &delegation.child {
+            DelegationChild::TaskSession { task_id, .. } => self
+                .store()
+                .as_ref()
+                .and_then(|store| store.get(task_id)?.worktree.path.clone()),
+            _ => Some(delegation.run_checkout().to_path_buf()),
+        };
+        auto_tell
+            && target.is_some_and(|target| {
+                self.services
+                    .runner(RunnerEffect::AutomaticDelivery, Some(&target))
+                    .is_ok()
+            })
+    }
+
     /// The stored delegation behind a card on `tab_id`, checked to belong
     /// to that chat.
     pub fn chat_delegation(
@@ -158,17 +177,41 @@ impl TaskHost {
     /// From the tick: saves receipts kept from a failed save, then names
     /// every chat with held results or finished ones to send automatically.
     pub fn deliver_finished(&mut self, chats: &[DeliveryChat], auto_tell: bool) -> DeliveryTick {
+        let automatic = self.automatic_delivery(auto_tell);
+        self.deliver_finished_with(chats, |_, _| automatic)
+    }
+
+    /// [`Self::deliver_finished`] for a host that sends only the results
+    /// `eligible` accepts, each gated for the checkout its work ran in.
+    pub fn deliver_finished_where(
+        &mut self,
+        chats: &[DeliveryChat],
+        auto_tell: bool,
+        eligible: impl Fn(&Delegation) -> bool,
+    ) -> DeliveryTick {
+        self.deliver_finished_with(chats, |host, delegation| {
+            eligible(delegation) && host.automatic_delivery_of(auto_tell, delegation)
+        })
+    }
+
+    fn deliver_finished_with(
+        &mut self,
+        chats: &[DeliveryChat],
+        automatic: impl Fn(&Self, &Delegation) -> bool,
+    ) -> DeliveryTick {
         let mut tick = DeliveryTick::default();
         if let Some(store) = self.store_mut().as_mut() {
             if let Err(error) = store.retry_delivery_acknowledgements() {
                 tick.receipt_error = Some(error.to_string());
             }
         }
-        let automatic = self.automatic_delivery(auto_tell);
         let mut tabs: std::collections::HashSet<usize> = self.delegations.held_tabs().collect();
         if let Some(store) = self.store().as_ref() {
             for delegation in store.delegations() {
-                if !(automatic && delegation.status.is_sendable() && !delegation.is_delivered()) {
+                if !(delegation.status.is_sendable()
+                    && !delegation.is_delivered()
+                    && automatic(self, delegation))
+                {
                     continue;
                 }
                 match chat_for(chats, &delegation.parent) {
@@ -193,6 +236,31 @@ impl TaskHost {
         auto_tell: bool,
     ) -> Vec<DeliveryEffect> {
         let automatic = self.automatic_delivery(auto_tell);
+        self.flush_delivery_with(chats, tab_id, automatic, |_, _| true)
+    }
+
+    /// [`Self::flush_delivery`] over only the results `eligible` accepts,
+    /// each gated as [`Self::deliver_finished_where`] gates it. Any other
+    /// record of the chat is left alone, held or not.
+    pub fn flush_delivery_where(
+        &mut self,
+        chats: &[DeliveryChat],
+        tab_id: usize,
+        auto_tell: bool,
+        eligible: impl Fn(&Delegation) -> bool,
+    ) -> Vec<DeliveryEffect> {
+        self.flush_delivery_with(chats, tab_id, auto_tell, |host, delegation| {
+            eligible(delegation) && host.automatic_delivery_of(auto_tell, delegation)
+        })
+    }
+
+    fn flush_delivery_with(
+        &mut self,
+        chats: &[DeliveryChat],
+        tab_id: usize,
+        automatic: bool,
+        include: impl Fn(&Self, &Delegation) -> bool,
+    ) -> Vec<DeliveryEffect> {
         let chat = chats.iter().find(|chat| chat.tab_id == tab_id);
         // Oldest first, including results requested before Resume as Chat.
         let records: Vec<&Delegation> = self
@@ -203,7 +271,7 @@ impl TaskHost {
                 store
                     .delegations()
                     .iter()
-                    .filter(|d| chat_for(chats, &d.parent) == Some(tab_id))
+                    .filter(|d| include(self, d) && chat_for(chats, &d.parent) == Some(tab_id))
                     .collect()
             })
             .unwrap_or_default();

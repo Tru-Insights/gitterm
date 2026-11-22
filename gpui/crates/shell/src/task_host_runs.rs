@@ -14,8 +14,8 @@
 //! background thread.
 //!
 //! Only delegations this host stored are started or settled; an imported
-//! record is never touched. Results are stored; delivering them into the
-//! chat is B11.
+//! record is never touched. Results are stored; the delivery tick
+//! ([`super::delivery`]) sends them into the requesting chat.
 use super::*;
 use gitterm_core::{
     codex_runner::{BeforeSpawn, CodexEnvironment, CodexRunEvent, CodexRunOutcome, CodexStop},
