@@ -1332,6 +1332,15 @@ fn roster_click_and_dismiss_emit_typed_outcomes_and_dismissal_survives_refresh(
             id: "worker".into()
         }]
     );
+    // Iced hides the × on live rows; it appears once the worker has finished.
+    assert!(cx.debug_bounds("roster-dismiss-worker").is_none());
+    let row = roster::RosterEntry {
+        state: roster::WorkerState::Done,
+        ended_at_ms: Some(1_000),
+        ..row
+    };
+    chat.update_in(cx, |view, _, cx| view.set_roster(vec![row.clone()], cx));
+    draw(cx);
     let dismiss = cx.debug_bounds("roster-dismiss-worker").unwrap();
     cx.simulate_click(dismiss.center(), gpui::Modifiers::none());
     draw(cx);
@@ -3693,6 +3702,11 @@ fn composer_worker_rows_stay_inside_composer(cx: &mut TestAppContext) {
         let footer = cx.debug_bounds("chat-footer").expect("footer drawn");
         for id in ["worker-1", "worker-2"] {
             for part in ["roster", "roster-what", "roster-meta", "roster-dismiss"] {
+                // worker-1 is live, so Iced draws no ×.
+                if id == "worker-1" && part == "roster-dismiss" {
+                    assert!(cx.debug_bounds("roster-dismiss-worker-1").is_none());
+                    continue;
+                }
                 let selector: &'static str = Box::leak(format!("{part}-{id}").into_boxed_str());
                 let inner = cx
                     .debug_bounds(selector)

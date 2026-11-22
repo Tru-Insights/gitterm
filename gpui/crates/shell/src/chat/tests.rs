@@ -1628,3 +1628,18 @@ fn chat_without_host_launches_without_mcp(cx: &mut gpui::TestAppContext) {
         key.starts_with("GITTERM_V6_TASK_MCP") || key.starts_with("GITTERM_V6_BROWSER_MCP")
     }));
 }
+
+#[test]
+fn folder_refusal_shows_only_the_clone_reason_not_sign_in() {
+    let (dir, preview) = fixture();
+    let provider = Arc::new(Provider::fixture(preview, Path::new("/fake/claude")).unwrap());
+    let cwd = dir.path().join("plain");
+    std::fs::create_dir(&cwd).unwrap();
+    let Err(error) = super::start_runtime(&provider, cwd, vec![]) else {
+        panic!("a plain folder must be refused");
+    };
+    let text = format!("Claude unavailable: {error:#}");
+    assert!(text.contains("independent clone"), "{text}");
+    assert!(!text.contains("Sign in"), "{text}");
+    assert!(!text.contains("/login"), "{text}");
+}
