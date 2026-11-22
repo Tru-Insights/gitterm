@@ -221,6 +221,14 @@ impl Pane {
         };
         target.task_id.is_some().then_some(target)
     }
+    /// The folder the pane's session runs in: a chat's working folder, else
+    /// the terminal's.
+    pub(crate) fn task_folder(&self, cx: &App) -> Option<std::path::PathBuf> {
+        match &self.content {
+            PaneContent::PreviewChat(view) => Some(view.read(cx).cwd().to_path_buf()),
+            _ => self.terminal_cwd.clone(),
+        }
+    }
     /// An adopted terminal's child exited: as the exit callback of a pane's
     /// own terminal marks it.
     pub(crate) fn mark_exited(&mut self) {

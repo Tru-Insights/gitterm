@@ -2764,6 +2764,112 @@ fn slow_preflight_blocks_shutdown(cx: &mut TestAppContext) {
     assert_eq!(runs.codex.runs(), 0, "Codex started after shutdown");
 }
 
+/// A pane of task `ready` titled `title` in `folder`.
+fn labelled_pane(folder: &Path, title: &str) -> crate::task_host::TaskPane {
+    crate::task_host::TaskPane {
+        task_id: "ready".into(),
+        session: gitterm_core::task_host::OpenSession {
+            session_id: Some("s1".into()),
+            label: title.into(),
+            workspace: "w".into(),
+            is_active: true,
+        },
+        folder: Some(folder.to_path_buf()),
+    }
+}
+
+/// `task_get ready`'s `open_sessions` labels.
+fn open_session_labels(
+    sender: &TaskControlSender,
+    cx: &mut TestAppContext,
+) -> Vec<serde_json::Value> {
+    use gitterm_core::task_mcp::TaskControlOperation as Op;
+    let got = dispatch(
+        cx,
+        sender,
+        Op::Get(req(serde_json::json!({"task_id": "ready"}))),
+    )
+    .unwrap();
+    got["open_sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|session| session["label"].clone())
+        .collect()
+}
+
+/// Iced's steady-state tab label (`status.repo_name`) is the git root's
+/// folder name, whichever folder inside the repo the session runs in; a
+/// folder outside git keeps its own name. Until the background read
+/// returns, the label is the pane title, as Iced's tab keeps its launch
+/// title until its first status poll.
+#[gpui::test]
+fn open_sessions_label_is_the_repo_folder_name(cx: &mut TestAppContext) {
+    use serde_json::json;
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    fixture.write_iced(vec![task("ready", TaskLifecycle::Ready)], vec![]);
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("the-repo");
+    let sub = repo.join("crates").join("inner");
+    let plain = dir.path().join("plain-folder");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::create_dir_all(&plain).unwrap();
+    git(&repo, &["init", "-q"]);
+    let (owner, sender) = fixture.start(cx);
+    owner.update(cx, |owner, cx| {
+        owner.set_panes(
+            vec![
+                labelled_pane(&sub, "Codex \u{b7} Task"),
+                labelled_pane(&plain, "Claude \u{b7} Task"),
+            ],
+            cx,
+        )
+    });
+    // Nothing has run since the push, so the reads have not returned.
+    assert_eq!(
+        owner.read_with(cx, |owner, _| owner
+            .labelled_panes()
+            .iter()
+            .map(|pane| pane.session.label.clone())
+            .collect::<Vec<_>>()),
+        ["Codex \u{b7} Task", "Claude \u{b7} Task"]
+    );
+    let expected = [json!("the-repo"), json!("plain-folder")];
+    wait_until(cx, |cx| open_session_labels(&sender, cx) == expected);
+}
+
+/// A pane that leaves its folder drops the folder's label, so a pane that
+/// returns reads it afresh, as a new Iced tab would.
+#[gpui::test]
+fn open_sessions_label_is_read_again_after_the_folder_is_left(cx: &mut TestAppContext) {
+    use serde_json::json;
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    fixture.write_iced(vec![task("ready", TaskLifecycle::Ready)], vec![]);
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("later-a-repo");
+    std::fs::create_dir_all(&folder).unwrap();
+    let (owner, sender) = fixture.start(cx);
+    let push = |panes: Vec<crate::task_host::TaskPane>, cx: &mut TestAppContext| {
+        owner.update(cx, |owner, cx| owner.set_panes(panes, cx))
+    };
+    push(vec![labelled_pane(&folder, "T")], cx);
+    wait_until(cx, |cx| {
+        open_session_labels(&sender, cx) == [json!("later-a-repo")]
+    });
+    push(vec![], cx);
+    assert!(owner.read_with(cx, |owner, _| owner.folder_labels.is_empty()));
+    push(vec![labelled_pane(&folder, "T")], cx);
+    assert_eq!(
+        owner.read_with(cx, |owner, _| owner.labelled_panes()[0]
+            .session
+            .label
+            .clone()),
+        "T"
+    );
+}
+
 #[cfg(unix)]
 #[path = "task_host_launch_tests.rs"]
 mod launch_tests;

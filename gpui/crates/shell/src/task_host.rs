@@ -301,12 +301,19 @@ struct Servers {
 pub(crate) struct TaskPane {
     pub task_id: String,
     pub session: OpenSession,
+    /// The folder the pane's session runs in. Iced's tab label becomes that
+    /// folder's git root name once its status polls; see
+    /// [`TaskHostOwner::set_panes`].
+    pub folder: Option<PathBuf>,
 }
 
 pub(crate) struct TaskHostOwner {
     host: TaskHost,
     /// The shell's panes holding task sessions, as last pushed.
     panes: Vec<TaskPane>,
+    /// Iced's steady-state tab label for each pane folder: `None` while its
+    /// background read runs. Held only while a pane has the folder.
+    pub(crate) folder_labels: std::collections::HashMap<PathBuf, Option<String>>,
     roots: Arc<Preview>,
     /// Iced's config dir; never written.
     iced_config: PathBuf,
@@ -516,6 +523,7 @@ impl TaskHostOwner {
             Self {
                 host,
                 panes: Vec::new(),
+                folder_labels: std::collections::HashMap::new(),
                 roots,
                 iced_config,
                 source: iced_tasks,
@@ -577,9 +585,55 @@ impl TaskHostOwner {
         &self.host
     }
     /// The shell's panes holding task sessions; the shell pushes them when
-    /// they change.
-    pub(crate) fn set_panes(&mut self, panes: Vec<TaskPane>) {
+    /// they change. A pane keeps its title as `open_sessions` label until
+    /// the read of its folder's label returns, as Iced's tab keeps the launch
+    /// title until its first status poll. The read runs once per folder
+    /// while a pane holds it (a `git init` in a held folder shows after the
+    /// pane closes), off the UI thread.
+    pub(crate) fn set_panes(&mut self, panes: Vec<TaskPane>, cx: &mut Context<Self>) {
+        let held: std::collections::HashSet<&PathBuf> = panes
+            .iter()
+            .filter_map(|pane| pane.folder.as_ref())
+            .collect();
+        self.folder_labels.retain(|folder, _| held.contains(folder));
+        for folder in held {
+            if self.folder_labels.contains_key(folder) {
+                continue;
+            }
+            self.folder_labels.insert(folder.clone(), None);
+            let folder = folder.clone();
+            cx.spawn(async move |owner: gpui::WeakEntity<Self>, cx| {
+                let read = folder.clone();
+                let label = cx
+                    .background_executor()
+                    .spawn(async move { folder_label(&read) })
+                    .await;
+                let _ = owner.update(cx, |owner, _| {
+                    // Gone if every pane in the folder closed meanwhile.
+                    if let Some(slot) = owner.folder_labels.get_mut(&folder) {
+                        *slot = Some(label);
+                    }
+                });
+            })
+            .detach();
+        }
         self.panes = panes;
+    }
+    /// The panes as `open_sessions` lists them: each labelled with its
+    /// folder's name once that is read, else with its title.
+    pub(crate) fn labelled_panes(&self) -> Vec<TaskPane> {
+        self.panes
+            .iter()
+            .map(|pane| {
+                let mut pane = pane.clone();
+                if let Some(Some(label)) =
+                    pane.folder.as_ref().and_then(|f| self.folder_labels.get(f))
+                {
+                    pane.session.label = label.clone();
+                }
+                pane
+            })
+            .collect()
     }
     pub(crate) fn panes(&self) -> &[TaskPane] {
         &self.panes
@@ -660,7 +714,7 @@ impl TaskHostOwner {
                         .background_spawn(async move { preset_names(&iced_config) })
                         .await;
                     let _ = owner.update(cx, |owner, _| {
-                        reply.send(read_projection(effect, &owner.panes, &presets));
+                        reply.send(read_projection(effect, &owner.labelled_panes(), &presets));
                     });
                 })
                 .detach();
@@ -1311,7 +1365,10 @@ impl TaskHostOwner {
 
     /// A task in the tools' shape, with its panes as `open_sessions`.
     fn task_value(&self, task: &TaskRecord) -> Result<serde_json::Value, String> {
-        gitterm_core::task_host::task_control_value(task, &open_sessions(task, &self.panes))
+        gitterm_core::task_host::task_control_value(
+            task,
+            &open_sessions(task, &self.labelled_panes()),
+        )
     }
 
     /// The caller's provider conversation and the store's chat links, as
@@ -1662,6 +1719,19 @@ pub(crate) fn read_projection(
         })),
         TaskProjection::Get(task) => value(&task),
     }
+}
+
+/// Iced's tab label once the tab's status polls (src/main.rs
+/// `status.repo_name`, from core's `collect_repo_status`): the folder name of
+/// the git root of `folder`, else the folder's own name, else `repo`.
+/// Blocking; fsmonitor off so the read starts no daemon and writes nothing
+/// under `.git`.
+fn folder_label(folder: &Path) -> String {
+    gitterm_core::git_status::collect_repo_status_with(
+        folder,
+        gitterm_core::git_status::StatusReadOptions { fsmonitor: false },
+    )
+    .repo_name
 }
 
 /// Iced lists the tabs whose task is `task` (src/main.rs
