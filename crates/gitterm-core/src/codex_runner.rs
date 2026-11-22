@@ -161,6 +161,13 @@ pub enum CodexRunError {
     TimeLimit {
         limit: std::time::Duration,
     },
+    /// [`CodexEnvironment::before_spawn`] refused the run; Codex never started.
+    Refused {
+        message: String,
+    },
+    /// [`CodexEnvironment::stop`] was signalled; Codex's process tree was
+    /// killed and reaped.
+    Stopped,
 }
 
 impl CodexRunError {
@@ -208,6 +215,8 @@ impl fmt::Display for CodexRunError {
                 "stopped at the time limit ({}); GitTerm ended the Codex run, it did not crash",
                 describe_limit(*limit)
             ),
+            Self::Refused { message } => formatter.write_str(message),
+            Self::Stopped => formatter.write_str("GitTerm stopped the Codex run"),
         }
     }
 }
@@ -230,12 +239,107 @@ fn or_none(text: &str) -> &str {
 }
 
 /// Where to look for `codex` and its session rollouts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CodexEnvironment {
     /// PATH used both to find `codex` and as the child's PATH.
     pub search_path: OsString,
     /// `$CODEX_HOME/sessions`, else `~/.codex/sessions`.
     pub sessions_root: PathBuf,
+    /// The child's whole environment. `None` inherits this process's, as
+    /// production always has. `Some` clears it and sets exactly these, for
+    /// Codex and for the git preflight; PATH still comes from
+    /// `search_path` and the git location variables are still removed.
+    pub child_env: Option<Vec<(OsString, OsString)>>,
+    /// Runs on the run's cwd after the git preflight, immediately before
+    /// Codex is spawned; an error refuses the run. `None` checks nothing.
+    pub before_spawn: Option<BeforeSpawn>,
+    /// Stops the run when signalled: Codex runs as a process group leader,
+    /// and the whole group is killed and the child reaped. `None` leaves a
+    /// run without a time limit in this process's group, as production
+    /// always has.
+    pub stop: Option<CodexStop>,
+}
+
+/// See [`CodexEnvironment::before_spawn`].
+#[derive(Clone)]
+pub struct BeforeSpawn(std::sync::Arc<SpawnCheck>);
+
+type SpawnCheck = dyn Fn(&Path) -> Result<(), String> + Send + Sync;
+
+impl BeforeSpawn {
+    pub fn new(check: impl Fn(&Path) -> Result<(), String> + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(check))
+    }
+}
+
+impl fmt::Debug for BeforeSpawn {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BeforeSpawn(..)")
+    }
+}
+
+/// See [`CodexEnvironment::stop`]. Clones share one signal.
+#[derive(Clone, Debug, Default)]
+pub struct CodexStop {
+    signal: tokio_util::sync::CancellationToken,
+    /// The spawned Codex's process group, from its spawn until its reap.
+    /// The spawn and [`Self::stop`] hold this lock, so a stop either finds
+    /// the group or keeps Codex from starting.
+    group: std::sync::Arc<Mutex<Option<u32>>>,
+}
+
+impl CodexStop {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stops the run: on Unix the Codex process group is killed before this
+    /// returns, and a run that has not spawned Codex yet never does. The run
+    /// itself then reaps the child (and on Windows kills its tree).
+    pub fn stop(&self) {
+        let group = lock_group(&self.group);
+        self.signal.cancel();
+        #[cfg(unix)]
+        if let Some(pid) = *group {
+            kill_group(pid);
+        }
+        #[cfg(not(unix))]
+        let _ = group;
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.signal.is_cancelled()
+    }
+
+    /// After the child is reaped, so a later stop signals no recycled id.
+    // shortcut: a stop in the instant between the reap and this clear
+    // signals a group id that is already free (ESRCH, unless the id was
+    // recycled within that instant); closing it needs reaping under the lock.
+    fn reaped(&self) {
+        *lock_group(&self.group) = None;
+    }
+}
+
+fn lock_group(group: &Mutex<Option<u32>>) -> std::sync::MutexGuard<'_, Option<u32>> {
+    group
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// SIGKILL to the process group `pid` leads; a group already gone is fine.
+#[cfg(unix)]
+fn kill_group(pid: u32) {
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    // SAFETY: killpg only sends a signal; the group is the one this runner
+    // created for the child.
+    if unsafe { libc::killpg(pid, libc::SIGKILL) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            eprintln!("[codex-runner] could not kill process group {pid}: {error}");
+        }
+    }
 }
 
 impl CodexEnvironment {
@@ -255,6 +359,9 @@ impl CodexEnvironment {
         Ok(Self {
             search_path: child_path(),
             sessions_root: codex_home.join("sessions"),
+            child_env: None,
+            before_spawn: None,
+            stop: None,
         })
     }
 }
@@ -375,7 +482,7 @@ async fn run_inner(
         });
     }
     let program = resolve_codex(&environment.search_path)?;
-    let git = git_state(&run.cwd).await?;
+    let git = git_state(&run.cwd, environment).await?;
     let last_message_path = run.log_path.with_extension("last.md");
     let (args, stdin_text) = codex_args(run, &last_message_path);
 
@@ -399,6 +506,7 @@ async fn run_inner(
     };
 
     let mut command = tokio::process::Command::new(&program);
+    scope_env(&mut command, environment);
     command
         .args(&args)
         .current_dir(&run.cwd)
@@ -414,19 +522,28 @@ async fn run_inner(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // Its own process group, so the time limit stops what Codex started
-    // too (the npm `codex` is a Node shim around the native binary).
+    // Its own process group, so the time limit or a stop ends what Codex
+    // started too (the npm `codex` is a Node shim around the native binary).
     #[cfg(unix)]
-    if run.time_limit.is_some() {
+    if run.time_limit.is_some() || environment.stop.is_some() {
         command.process_group(0);
     }
     for var in GIT_LOCATION_VARS {
         command.env_remove(var);
     }
-    let mut child = command.spawn().map_err(|source| CodexRunError::Io {
-        context: format!("start {} in {}", program.display(), run.cwd.display()),
-        source,
-    })?;
+    // After the preflight's git, which can run repository hooks.
+    if let Some(BeforeSpawn(check)) = &environment.before_spawn {
+        check(&run.cwd).map_err(|message| CodexRunError::Refused { message })?;
+    }
+    let mut child = spawn_unless_stopped(&mut command, environment.stop.as_ref()).map_err(
+        |error| match error {
+            None => CodexRunError::Stopped,
+            Some(source) => CodexRunError::Io {
+                context: format!("start {} in {}", program.display(), run.cwd.display()),
+                source,
+            },
+        },
+    )?;
     let stdin = child.stdin.take();
     let stdout = child.stdout.take().ok_or_else(|| missing_pipe("stdout"))?;
     let stderr = child.stderr.take().ok_or_else(|| missing_pipe("stderr"))?;
@@ -471,13 +588,30 @@ async fn run_inner(
         let streams = tokio::join!(write_stdin, read_stdout, read_stderr);
         (streams, child.wait().await)
     };
-    let finished = match run.time_limit {
-        None => Some(work.await),
-        Some(limit) => tokio::time::timeout(limit, work).await.ok(),
+    let limited = async move {
+        match run.time_limit {
+            None => Some(work.await),
+            Some(limit) => tokio::time::timeout(limit, work).await.ok(),
+        }
+    };
+    let finished = match &environment.stop {
+        None => limited.await,
+        Some(stop) => tokio::select! {
+            finished = limited => finished,
+            () = stop.signal.cancelled() => {
+                stop_process_tree(&mut child, child_id).await;
+                stop.reaped();
+                log.append(&serde_json::json!({"type": "gitterm.stopped"}).to_string())?;
+                return Err(CodexRunError::Stopped);
+            }
+        },
     };
     let Some(((stdin_result, stream, stderr_tail), status)) = finished else {
         let limit = run.time_limit.unwrap_or_default();
-        stop_at_time_limit(&mut child, child_id).await;
+        stop_process_tree(&mut child, child_id).await;
+        if let Some(stop) = &environment.stop {
+            stop.reaped();
+        }
         log.append(
             &serde_json::json!({
                 "type": "gitterm.time_limit",
@@ -487,6 +621,9 @@ async fn run_inner(
         )?;
         return Err(CodexRunError::TimeLimit { limit });
     };
+    if let Some(stop) = &environment.stop {
+        stop.reaped();
+    }
     let status = status.map_err(|source| CodexRunError::Io {
         context: "wait for codex to exit".to_string(),
         source,
@@ -599,20 +736,32 @@ async fn run_inner(
     }
 }
 
-/// Kills Codex at its time limit: its process group on Unix (it was started
-/// as the group leader), its process tree on Windows, then reaps the child.
-/// Failures are logged; the run ends as stopped either way.
-async fn stop_at_time_limit(child: &mut tokio::process::Child, child_id: Option<u32>) {
+/// Spawns `command` unless `stop` has been signalled (`Err(None)`), and
+/// records the child's process group, under the lock [`CodexStop::stop`]
+/// takes.
+fn spawn_unless_stopped(
+    command: &mut tokio::process::Command,
+    stop: Option<&CodexStop>,
+) -> Result<tokio::process::Child, Option<std::io::Error>> {
+    let Some(stop) = stop else {
+        return command.spawn().map_err(Some);
+    };
+    let mut group = lock_group(&stop.group);
+    if stop.is_stopped() {
+        return Err(None);
+    }
+    let child = command.spawn().map_err(Some)?;
+    *group = child.id();
+    Ok(child)
+}
+
+/// Kills Codex at its time limit or on a stop: its process group on Unix
+/// (it was started as the group leader), its process tree on Windows, then
+/// reaps the child. Failures are logged; the run ends as stopped either way.
+async fn stop_process_tree(child: &mut tokio::process::Child, child_id: Option<u32>) {
     #[cfg(unix)]
-    if let Some(pid) = child_id.and_then(|pid| i32::try_from(pid).ok()) {
-        // SAFETY: killpg only sends a signal; the group is the one this
-        // runner created for the child.
-        if unsafe { libc::killpg(pid, libc::SIGKILL) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                eprintln!("[codex-runner] could not kill process group {pid}: {error}");
-            }
-        }
+    if let Some(pid) = child_id {
+        kill_group(pid);
     }
     #[cfg(windows)]
     if let Some(pid) = child_id {
@@ -636,7 +785,7 @@ async fn stop_at_time_limit(child: &mut tokio::process::Child, child_id: Option<
     let _ = child_id;
     if let Err(error) = child.kill().await {
         if error.kind() != std::io::ErrorKind::InvalidInput {
-            eprintln!("[codex-runner] could not kill codex at its time limit: {error}");
+            eprintln!("[codex-runner] could not kill codex: {error}");
         }
     }
 }
@@ -1010,18 +1159,44 @@ struct GitState {
     dirty: bool,
 }
 
-async fn git_state(cwd: &Path) -> Result<GitState, CodexRunError> {
-    let head = git_output(cwd, &["rev-parse", "HEAD"]).await?;
-    let status = git_output(cwd, &["status", "--porcelain"]).await?;
+/// An explicit child environment replaces the inherited one; callers set
+/// PATH and remove the git location variables after this.
+fn scope_env(command: &mut tokio::process::Command, environment: &CodexEnvironment) {
+    if let Some(env) = &environment.child_env {
+        command.env_clear();
+        command.envs(env.iter().map(|(name, value)| (name, value)));
+    }
+}
+
+async fn git_state(cwd: &Path, environment: &CodexEnvironment) -> Result<GitState, CodexRunError> {
+    let head = git_output(cwd, &["rev-parse", "HEAD"], environment).await?;
+    let status = git_output(cwd, &["status", "--porcelain"], environment).await?;
     Ok(GitState {
         head: head.trim().to_string(),
         dirty: !status.trim().is_empty(),
     })
 }
 
-async fn git_output(cwd: &Path, args: &[&str]) -> Result<String, CodexRunError> {
+async fn git_output(
+    cwd: &Path,
+    args: &[&str],
+    environment: &CodexEnvironment,
+) -> Result<String, CodexRunError> {
     let mut command = tokio::process::Command::new("git");
+    scope_env(&mut command, environment);
+    if environment.child_env.is_some() {
+        // A cleared environment has no PATH to find git with.
+        command.env("PATH", &environment.search_path);
+        // A scoped run's checkout must not run its own fsmonitor hook, which
+        // could move the checkout before Codex starts there.
+        command.args(["-c", "core.fsmonitor=false"]);
+    }
     command.args(args).current_dir(cwd).stdin(Stdio::null());
+    if environment.stop.is_some() {
+        // A stopped run that is dropped (the host's abort fallback) ends
+        // its preflight's git too.
+        command.kill_on_drop(true);
+    }
     for var in GIT_LOCATION_VARS {
         command.env_remove(var);
     }
@@ -1581,6 +1756,9 @@ mod tests {
         let env = CodexEnvironment {
             search_path: OsString::new(),
             sessions_root: PathBuf::from("/nonexistent"),
+            child_env: None,
+            before_spawn: None,
+            stop: None,
         };
         let error = run_with(run, progress, &env).await.unwrap_err();
         assert!(error
@@ -1810,6 +1988,9 @@ mod tests {
                     ])
                     .expect("join paths"),
                     sessions_root: self.sessions.path().to_path_buf(),
+                    child_env: None,
+                    before_spawn: None,
+                    stop: None,
                 }
             }
 
@@ -1881,6 +2062,249 @@ mod tests {
                 events.push(event);
             }
             (result, events)
+        }
+
+        /// The variables `file` (one `env` dump) holds, without the ones
+        /// `/bin/sh` adds itself.
+        fn recorded_env(file: &Path) -> Vec<(String, String)> {
+            let mut env: Vec<(String, String)> = std::fs::read_to_string(file)
+                .expect("recorded env")
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .filter(|(name, _)| !matches!(*name, "PWD" | "OLDPWD" | "SHLVL" | "_"))
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            env.sort();
+            env
+        }
+
+        #[tokio::test]
+        async fn explicit_child_env_replaces_the_inherited_one_for_codex_and_git() {
+            let fake = FakeCodex::new("", 0);
+            // Codex records its environment too.
+            let script = format!(
+                "#!/bin/sh\nenv > '{dir}/codex.env'\nprintf '%s\\n' \"$@\" > '{dir}/args'\ncat > '{dir}/stdin'\n",
+                dir = fake.dir.path().display(),
+            );
+            std::fs::write(fake.dir.path().join("codex"), script).expect("write fake codex");
+            // A `git` ahead of the real one records the preflight's
+            // environment, then runs the real git.
+            let real_git = std::process::Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .expect("find git");
+            let real_git = String::from_utf8(real_git.stdout).expect("utf-8");
+            let git_script = format!(
+                "#!/bin/sh\nenv > '{dir}/git.env'\nexec '{git}' \"$@\"\n",
+                dir = fake.dir.path().display(),
+                git = real_git.trim(),
+            );
+            let wrapper = fake.dir.path().join("git");
+            std::fs::write(&wrapper, git_script).expect("write git wrapper");
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod git wrapper");
+            let mut environment = fake.environment();
+            let ceiling = fake.repo.path().parent().expect("repo parent");
+            environment.child_env = Some(vec![
+                ("HOME".into(), "/fixture/home".into()),
+                ("GIT_CEILING_DIRECTORIES".into(), ceiling.into()),
+                // Location variables are removed even when given.
+                ("GIT_DIR".into(), "/elsewhere/.git".into()),
+                ("PATH".into(), "/ignored".into()),
+            ]);
+            let (sender, _receiver) = mpsc::unbounded_channel();
+            let run = fake.run(CodexRunKind::Consult {
+                brief: "Scoped.".to_string(),
+            });
+            let _ = run_with(run, sender, &environment).await;
+            let expected = |path: &OsString| {
+                let mut env = vec![
+                    (
+                        "GIT_CEILING_DIRECTORIES".to_string(),
+                        ceiling.display().to_string(),
+                    ),
+                    ("HOME".to_string(), "/fixture/home".to_string()),
+                    ("PATH".to_string(), path.to_string_lossy().into_owned()),
+                ];
+                env.sort();
+                env
+            };
+            let program = fake.dir.path().join("codex");
+            assert_eq!(
+                recorded_env(&fake.dir.path().join("codex.env")),
+                expected(&child_search_path(&environment.search_path, &program))
+            );
+            assert_eq!(
+                recorded_env(&fake.dir.path().join("git.env")),
+                expected(&environment.search_path)
+            );
+        }
+
+        /// The fake's search path with the real git's directory added.
+        fn with_real_git(fake: &FakeCodex) -> CodexEnvironment {
+            let real_git = std::process::Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .expect("find git");
+            let real_git = PathBuf::from(String::from_utf8(real_git.stdout).expect("utf-8").trim());
+            let mut environment = fake.environment();
+            let mut path: Vec<PathBuf> = std::env::split_paths(&environment.search_path).collect();
+            path.push(real_git.parent().expect("git dir").to_path_buf());
+            environment.search_path = std::env::join_paths(path).expect("join paths");
+            environment.child_env = Some(vec![("HOME".into(), fake.dir.path().into())]);
+            environment
+        }
+
+        #[tokio::test]
+        async fn scoped_preflight_never_runs_the_checkouts_fsmonitor_hook() {
+            let fake = FakeCodex::new("", 0);
+            let marker = fake.dir.path().join("fsmonitor-ran");
+            let hook = fake.dir.path().join("fsmonitor-hook");
+            std::fs::write(
+                &hook,
+                format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+            )
+            .expect("write hook");
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod hook");
+            git(
+                fake.repo.path(),
+                &["config", "core.fsmonitor", hook.to_str().expect("utf-8")],
+            );
+            // A plain `git status` runs it.
+            git(fake.repo.path(), &["status", "--porcelain"]);
+            assert!(marker.exists(), "the fixture hook runs under plain git");
+            std::fs::remove_file(&marker).expect("reset marker");
+
+            let (sender, _receiver) = mpsc::unbounded_channel();
+            let run = fake.run(CodexRunKind::Consult {
+                brief: "Scoped.".to_string(),
+            });
+            let _ = run_with(run, sender, &with_real_git(&fake)).await;
+            assert!(
+                fake.dir.path().join("args").exists(),
+                "the preflight passed"
+            );
+            assert!(!marker.exists(), "the preflight ran the fsmonitor hook");
+        }
+
+        #[tokio::test]
+        async fn before_spawn_runs_after_the_preflight_and_can_refuse() {
+            let fake = FakeCodex::new("", 0);
+            let mut environment = with_real_git(&fake);
+            let seen = std::sync::Arc::new(Mutex::new(None));
+            environment.before_spawn = Some(BeforeSpawn::new({
+                let seen = seen.clone();
+                move |cwd: &Path| {
+                    *seen.lock().unwrap() = Some(cwd.to_path_buf());
+                    Err("the checkout moved".to_string())
+                }
+            }));
+            let (sender, _receiver) = mpsc::unbounded_channel();
+            let run = fake.run(CodexRunKind::Consult {
+                brief: "Refused.".to_string(),
+            });
+            let error = run_with(run, sender, &environment)
+                .await
+                .expect_err("refused");
+            assert!(
+                matches!(&error, CodexRunError::Refused { message } if message == "the checkout moved"),
+                "{error:?}"
+            );
+            assert_eq!(seen.lock().unwrap().as_deref(), Some(fake.repo.path()));
+            assert!(
+                !fake.dir.path().join("args").exists(),
+                "Codex started after a refusal"
+            );
+        }
+
+        #[test]
+        fn a_stop_kills_the_process_group_before_it_returns() {
+            let fake = FakeCodex::hanging();
+            let mut environment = fake.environment();
+            let stop = CodexStop::new();
+            environment.stop = Some(stop.clone());
+            let run = fake.run(CodexRunKind::Consult {
+                brief: "Until stopped.".to_string(),
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let (sender, _receiver) = mpsc::unbounded_channel();
+            let _running = runtime.spawn(async move { run_with(run, sender, &environment).await });
+            let pid_file = fake.dir.path().join("sleep.pid");
+            runtime.block_on(async {
+                for _ in 0..100 {
+                    if std::fs::read_to_string(&pid_file).is_ok_and(|pid| pid.ends_with('\n')) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            });
+            let pid: i32 = fake
+                .recorded("sleep.pid")
+                .trim()
+                .parse()
+                .expect("sleep pid");
+            stop.stop();
+            // The run is never polled again: dropping it kills only its
+            // direct child, so the descendant ends only if `stop` killed
+            // the group.
+            runtime.shutdown_timeout(std::time::Duration::ZERO);
+            let gone = (0..50).any(|_| {
+                // SAFETY: signal 0 only checks that the process exists.
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                if alive {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                !alive
+            });
+            assert!(gone, "sleep {pid} outlived the stop");
+        }
+
+        #[tokio::test]
+        async fn a_stop_kills_and_reaps_the_whole_process_tree() {
+            let fake = FakeCodex::hanging();
+            let mut environment = fake.environment();
+            let stop = CodexStop::new();
+            environment.stop = Some(stop.clone());
+            let run = fake.run(CodexRunKind::Consult {
+                brief: "Until stopped.".to_string(),
+            });
+            let log_path = run.log_path.clone();
+            let (sender, _receiver) = mpsc::unbounded_channel();
+            let running = tokio::spawn(async move { run_with(run, sender, &environment).await });
+            let pid_file = fake.dir.path().join("sleep.pid");
+            for _ in 0..100 {
+                if std::fs::read_to_string(&pid_file).is_ok_and(|pid| pid.ends_with('\n')) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            let pid: i32 = fake
+                .recorded("sleep.pid")
+                .trim()
+                .parse()
+                .expect("sleep pid");
+            stop.stop();
+            let error = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+                .await
+                .expect("the stop ends the run")
+                .expect("join")
+                .expect_err("stopped");
+            assert!(matches!(error, CodexRunError::Stopped), "{error:?}");
+            let log = std::fs::read_to_string(log_path).expect("log");
+            assert!(log.lines().any(|line| line.contains("gitterm.stopped")));
+            let gone = (0..50).any(|_| {
+                // SAFETY: signal 0 only checks that the process exists.
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                if alive {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                !alive
+            });
+            assert!(gone, "sleep {pid} outlived the stop");
         }
 
         #[tokio::test]
@@ -2219,6 +2643,9 @@ mod tests {
             let environment = CodexEnvironment {
                 search_path: std::env::join_paths([empty.path()]).expect("join"),
                 sessions_root: fake.sessions.path().to_path_buf(),
+                child_env: None,
+                before_spawn: None,
+                stop: None,
             };
             let (sender, mut receiver) = mpsc::unbounded_channel();
             let result = run_with(

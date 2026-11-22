@@ -16,8 +16,11 @@
 //! gives the host a fixture-launch service context. Then `task_create`,
 //! `task_update_handoff`, `merge_plan_set` and turn-end notifications whose
 //! target lies in a fixture write the preview's own store and state, and a
-//! created task's worktree is prepared inside that fixture. Launches and runs
-//! still answer the notice.
+//! created task's worktree is prepared inside that fixture.
+//!
+//! In fixture mode (H5b B10) `review_request` and `consult_request` also run
+//! Codex headlessly in a fixture checkout ([`runs`]). Plain preview still
+//! answers every launch and run with the notice and starts nothing.
 use anyhow::{Context as _, Result};
 use gitterm_browser::browser_mcp::BrowserMcpConnection;
 use gitterm_core::{
@@ -52,6 +55,13 @@ use std::{
 
 #[cfg(test)]
 pub(crate) type RecheckHook = Box<dyn FnOnce(&Path)>;
+/// Runs on the owner when a fixture run's continuation named by the
+/// string is reached, before its shutdown guard.
+#[cfg(test)]
+pub(crate) type ContinuationHook = (&'static str, Box<dyn FnOnce(&mut TaskHostOwner)>);
+
+#[path = "task_host_runs.rs"]
+mod runs;
 
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HOST_LOCK: &str = ".task-host.lock";
@@ -60,6 +70,10 @@ const RESEED_POLL: Duration = Duration::from_secs(2);
 /// Bounds quit: the servers were cancelled already; this only lets their
 /// graceful shutdown finish before the runtime is dropped.
 const SERVER_DRAIN: Duration = Duration::from_millis(500);
+/// Bounds quit: a stopped fixture run kills its Codex process tree and
+/// reaps it; this only waits for that.
+const RUN_STOP: Duration = Duration::from_secs(3);
+const SHUT_DOWN: &str = "GitTerm's task host has shut down";
 const STORE_UNAVAILABLE: &str = "GitTerm's task store is unavailable";
 /// A fixture create's worktrees go here, inside the repository's fixture.
 const FIXTURE_WORKTREES: &str = "worktrees";
@@ -273,9 +287,22 @@ pub(crate) struct TaskHostOwner {
     /// The preview store holds the host's own writes, which a re-seed from
     /// Iced's file would discard.
     wrote: bool,
+    /// Fixture Codex runs in flight, by delegation id.
+    runs: std::collections::HashMap<String, runs::RunHandle>,
+    /// Delegations this host stored, with the targets authorized at their
+    /// request; only these are started or settled.
+    own_delegations: std::collections::HashMap<String, AuthorizedTargets>,
     /// Runs on a prepared worktree path before its post-preparation recheck.
     #[cfg(test)]
     pub(crate) before_recheck: Option<RecheckHook>,
+    /// Runs on a run's checkout before its post-check recheck.
+    #[cfg(test)]
+    pub(crate) before_run_recheck: std::cell::RefCell<Option<RecheckHook>>,
+    /// Where a fixture run finds `codex`, in place of the child's PATH.
+    #[cfg(test)]
+    pub(crate) codex_search_path: Option<std::ffi::OsString>,
+    #[cfg(test)]
+    pub(crate) before_continuation: Option<ContinuationHook>,
     _pump: Task<()>,
     _reseed: Task<()>,
     _quit: Subscription,
@@ -430,8 +457,16 @@ impl TaskHostOwner {
                 fixtures,
                 creating: 0,
                 wrote: false,
+                runs: Default::default(),
+                own_delegations: Default::default(),
                 #[cfg(test)]
                 before_recheck: None,
+                #[cfg(test)]
+                before_run_recheck: Default::default(),
+                #[cfg(test)]
+                codex_search_path: None,
+                #[cfg(test)]
+                before_continuation: None,
                 _pump: pump,
                 _reseed: reseed,
                 _quit: quit,
@@ -502,8 +537,8 @@ impl TaskHostOwner {
     /// runs before dispatch. The store-write arms check their targets again
     /// themselves, so in plain preview they answer the same notice and do
     /// nothing else; in fixture mode they write the preview's own store and
-    /// state. Launch and run arms answer the notice in both modes: no
-    /// process, no network (B10–B11).
+    /// state. Review and consult run Codex in a fixture checkout in fixture
+    /// mode (B10); launch and delegate arms answer the notice in both modes.
     pub(crate) fn execute_effect(
         &mut self,
         effect: HostEffect,
@@ -564,6 +599,28 @@ impl TaskHostOwner {
                 caller,
                 request,
             } => reply.send(self.merge_plan_set(caller.as_deref(), request, label, cx)),
+            HostEffect::RequestReview {
+                reply,
+                caller,
+                request,
+            } if !self.fixtures.is_empty() => self.request_codex_run(
+                reply,
+                caller,
+                runs::CodexRequest::Review(request),
+                label,
+                cx,
+            ),
+            HostEffect::RequestConsult {
+                reply,
+                caller,
+                request,
+            } if !self.fixtures.is_empty() => self.request_codex_run(
+                reply,
+                caller,
+                runs::CodexRequest::Consult(request),
+                label,
+                cx,
+            ),
             HostEffect::LaunchSession { reply, .. }
             | HostEffect::DelegateTask { reply, .. }
             | HostEffect::RequestReview { reply, .. }
@@ -601,6 +658,10 @@ impl TaskHostOwner {
     /// re-scoped first so a swapped link never redirects the save. Marks
     /// the store as the host's own, so no re-seed discards the write.
     fn writable_store(&mut self) -> Result<&mut TaskStore, String> {
+        // The host lock is released at shutdown; nothing is saved after it.
+        if self.is_shut_down() {
+            return Err(SHUT_DOWN.to_string());
+        }
         let store = self.host.store_mut().as_mut().ok_or(STORE_UNAVAILABLE)?;
         self.roots
             .scoped(store.path())
@@ -1177,7 +1238,11 @@ impl TaskHostOwner {
         if stamp == self.stamp {
             return Reseed::Unchanged;
         }
-        if owns_in_flight_work(&self.host) || self.creating > 0 || self.wrote {
+        if owns_in_flight_work(&self.host)
+            || self.creating > 0
+            || self.wrote
+            || !self.runs.is_empty()
+        {
             // The stamp stays old, so the next poll retries.
             return Reseed::Deferred;
         }
@@ -1207,11 +1272,19 @@ impl TaskHostOwner {
         cx.notify();
     }
 
-    /// Quit order: stop ingress (resolving pending replies), drop both MCP
-    /// connections, signal the log server, drain the servers, then release
-    /// the host lock. Chat drains run in the workspace owner's later callback.
+    /// Quit order: stop ingress (resolving pending replies), kill every
+    /// run's Codex process group, drop both MCP connections, signal the log
+    /// server, drain the servers, then release the host lock. The runs are
+    /// reaped on a background thread, so a slow run never blocks the UI.
+    /// Chat drains run in the workspace owner's later callback.
     pub(crate) fn shutdown(&mut self) {
         self.host.shutdown();
+        let mut runs: Vec<runs::RunHandle> = self.runs.drain().map(|(_, run)| run).collect();
+        // On Unix this kills each spawned Codex's group before it returns,
+        // and a run that has not spawned Codex yet never does.
+        for run in &runs {
+            run.stop.stop();
+        }
         if let Some(Servers {
             task_mcp,
             browser,
@@ -1231,9 +1304,38 @@ impl TaskHostOwner {
                 })
                 .await;
             });
-            runtime.shutdown_timeout(Duration::ZERO);
+            let reap = move || {
+                // Each stopped run reaps its Codex child.
+                runtime.block_on(async {
+                    let _ = tokio::time::timeout(RUN_STOP, async {
+                        for run in &mut runs {
+                            let _ = (&mut run.done).await;
+                        }
+                    })
+                    .await;
+                });
+                // A run that did not stop in time is dropped, which still
+                // kills its direct Codex child (`kill_on_drop`).
+                for run in runs {
+                    run.abort.abort();
+                }
+                runtime.shutdown_timeout(Duration::ZERO);
+            };
+            if let Err(error) = std::thread::Builder::new()
+                .name("gitterm-run-reaper".into())
+                .spawn(reap)
+            {
+                // The closure, and the runtime with it, was dropped, which
+                // drops each run and so kills its direct Codex child.
+                eprintln!("[delegation] could not start the run reaper: {error}");
+            }
         }
         self.lock = None;
+    }
+
+    /// After [`Self::shutdown`]: the servers are gone and the lock released.
+    fn is_shut_down(&self) -> bool {
+        self.servers.is_none()
     }
 }
 

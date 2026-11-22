@@ -1808,3 +1808,807 @@ fn path_swapped_after_prep_refused(cx: &mut TestAppContext) {
     assert_eq!(task.worktree.path, None, "{task:?}");
     assert_eq!(tree(&elsewhere), elsewhere_before);
 }
+
+// ---------------------------------------------------------------------------
+// H5b B10: review and consult run a fake Codex in fixture mode.
+
+/// A fake `codex` on its own PATH dir. Run `n` records `env-n`, `args-n`,
+/// `stdin-n` and `pwd-n`, starts a `sleep` recording its pid in `child-n`
+/// when `spawn-n` exists, waits while `hold-n` exists, then prints a
+/// consult stream. `runs` holds one line per start.
+struct FakeCodex {
+    dir: tempfile::TempDir,
+}
+impl FakeCodex {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+echo run >> 'DIR/runs'
+n=$(wc -l < 'DIR/runs' | tr -d ' ')
+env > "DIR/env-$n"
+printf '%s\n' "$@" > "DIR/args-$n"
+cat > "DIR/stdin-$n"
+pwd -P > "DIR/pwd-$n"
+if [ -f "DIR/spawn-$n" ]; then
+  sleep 600 >/dev/null 2>&1 &
+  echo $! > "DIR/child-$n"
+fi
+while [ -f "DIR/hold-$n" ]; do sleep 0.05; done
+echo '{"type":"thread.started","thread_id":"thread-'"$n"'"}'
+echo '{"type":"turn.started"}'
+echo '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Fixture answer"}}'
+echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
+"#
+        .replace("DIR", &dir.path().display().to_string());
+        let program = dir.path().join("codex");
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Self { dir }
+    }
+    /// The fake first, then the system tools and the real git.
+    fn search_path(&self) -> std::ffi::OsString {
+        let git = std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap();
+        let git = PathBuf::from(String::from_utf8(git.stdout).unwrap().trim());
+        std::env::join_paths([
+            self.dir.path(),
+            Path::new("/bin"),
+            Path::new("/usr/bin"),
+            git.parent().unwrap(),
+        ])
+        .unwrap()
+    }
+    fn runs(&self) -> usize {
+        std::fs::read_to_string(self.dir.path().join("runs")).map_or(0, |runs| runs.lines().count())
+    }
+    fn hold(&self, run: usize) {
+        std::fs::write(self.dir.path().join(format!("hold-{run}")), b"").unwrap();
+    }
+    fn release(&self, run: usize) {
+        std::fs::remove_file(self.dir.path().join(format!("hold-{run}"))).unwrap();
+    }
+    fn env(&self, run: usize) -> std::collections::BTreeMap<String, String> {
+        std::fs::read_to_string(self.dir.path().join(format!("env-{run}")))
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+    fn pwd(&self, run: usize) -> PathBuf {
+        let pwd = std::fs::read_to_string(self.dir.path().join(format!("pwd-{run}"))).unwrap();
+        PathBuf::from(pwd.trim_end())
+    }
+    /// Run `run` starts a descendant; its pid, once recorded.
+    fn spawn_descendant(&self, run: usize) {
+        std::fs::write(self.dir.path().join(format!("spawn-{run}")), b"").unwrap();
+    }
+    fn descendant(&self, run: usize) -> Option<u32> {
+        let pid = std::fs::read_to_string(self.dir.path().join(format!("child-{run}"))).ok()?;
+        pid.ends_with('\n').then(|| pid.trim().parse().unwrap())
+    }
+    fn args(&self, run: usize) -> Vec<String> {
+        std::fs::read_to_string(self.dir.path().join(format!("args-{run}")))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+/// A fixture host whose one Iced workspace is the fixture, with a chat
+/// pane in the fixture repo and a fake Codex.
+struct Runs {
+    fixture: Fixture,
+    git: GitFixture,
+    _chats: Chats,
+    caller: String,
+    owner: Entity<TaskHostOwner>,
+    sender: TaskControlSender,
+    codex: FakeCodex,
+}
+impl Runs {
+    fn start(max_concurrent: usize, cx: &mut TestAppContext) -> Self {
+        Self::start_with(max_concurrent, |_| {}, cx)
+    }
+    /// [`Self::start`] after `seed` writes Iced's files.
+    fn start_with(
+        max_concurrent: usize,
+        seed: impl FnOnce(&Runs0),
+        cx: &mut TestAppContext,
+    ) -> Self {
+        cx.background_executor.allow_parking();
+        let fixture = Fixture::new();
+        let git = GitFixture::new(&fixture);
+        std::fs::write(
+            fixture.iced.join("settings.json"),
+            serde_json::to_vec(
+                &serde_json::json!({"review": {"max_concurrent_reviews": max_concurrent}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let chats = Chats::new(&fixture, cx);
+        let workspace = serde_json::from_value(serde_json::json!({
+            "name": "FX", "abbrev": "FX", "color": "blue",
+            "dir": git.root, "repos": [git.repo], "tabs": []
+        }))
+        .unwrap();
+        cx.update(|cx| {
+            cx.global_mut::<crate::work_sidebar::IcedWorkSource>()
+                .workspaces = vec![workspace]
+        });
+        let caller = chats.open_in(&fixture, Some("root-chat"), &git.repo, cx);
+        seed(&Runs0 {
+            fixture: &fixture,
+            git: &git,
+            caller: &caller,
+        });
+        let (owner, sender) = git.start(&fixture, cx);
+        let codex = FakeCodex::new();
+        owner.update(cx, |owner, _| {
+            owner.codex_search_path = Some(codex.search_path())
+        });
+        Self {
+            fixture,
+            git,
+            _chats: chats,
+            caller,
+            owner,
+            sender,
+            codex,
+        }
+    }
+    fn consult_in(
+        &self,
+        checkout: &Path,
+        cx: &mut TestAppContext,
+    ) -> Result<serde_json::Value, String> {
+        dispatch_as(
+            cx,
+            &self.sender,
+            TaskControlOperation::RequestConsult(req(serde_json::json!({
+                "brief": "What does this fixture hold?",
+                "checkout": checkout,
+            }))),
+            Some(&self.caller),
+        )
+    }
+    fn consult(&self, cx: &mut TestAppContext) -> String {
+        let reply = self.consult_in(&self.git.repo, cx).unwrap();
+        assert_eq!(reply["status"], "requested", "{reply}");
+        reply["delegation_id"].as_str().unwrap().to_string()
+    }
+    fn status(&self, id: &str, cx: &mut TestAppContext) -> String {
+        self.owner.read_with(cx, |owner, _| {
+            owner
+                .host()
+                .store()
+                .as_ref()
+                .unwrap()
+                .delegation(id)
+                .unwrap()
+                .status
+                .label()
+                .to_string()
+        })
+    }
+    /// The delegations in the preview store's file, as saved.
+    fn saved(&self) -> Vec<Delegation> {
+        gitterm_core::tasks::TaskStore::load(self.fixture.copy())
+            .unwrap()
+            .delegations()
+            .to_vec()
+    }
+    /// Shuts the host down when the run continuation at `stage` is reached.
+    fn shut_down_at(&self, stage: &'static str, cx: &mut TestAppContext) {
+        self.owner.update(cx, |owner, _| {
+            owner.before_continuation = Some((stage, Box::new(|owner| owner.shutdown())))
+        });
+    }
+    fn delegation_count(&self, cx: &mut TestAppContext) -> usize {
+        self.owner.read_with(cx, |owner, _| {
+            owner.host().store().as_ref().unwrap().delegations().len()
+        })
+    }
+}
+
+/// What a seed step sees before the host starts.
+struct Runs0<'a> {
+    fixture: &'a Fixture,
+    git: &'a GitFixture,
+    caller: &'a str,
+}
+
+/// Runs the executor until `done`, or fails after 15 seconds.
+fn wait_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        cx.run_until_parked();
+        if done(cx) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed out");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Lets a started fake run reach its hold and the host settle.
+fn settle(cx: &mut TestAppContext) {
+    for _ in 0..10 {
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn delegate_runs_fake_codex_with_scoped_env(cx: &mut TestAppContext) {
+    let runs = Runs::start(2, cx);
+    let iced_before = tree(&runs.fixture.iced);
+    let reply = runs.consult_in(&runs.git.repo, cx).unwrap();
+    assert_eq!(reply["queued"], false, "{reply}");
+    assert_eq!(reply["provider"], "codex", "{reply}");
+    let id = reply["delegation_id"].as_str().unwrap().to_string();
+    wait_until(cx, |cx| runs.status(&id, cx) == "completed");
+    let delegation = runs.owner.read_with(cx, |owner, _| {
+        owner
+            .host()
+            .store()
+            .as_ref()
+            .unwrap()
+            .delegation(&id)
+            .unwrap()
+            .clone()
+    });
+    assert_eq!(
+        delegation.result.unwrap().handoff.unwrap().summary,
+        "Fixture answer"
+    );
+    // Saved in the preview's own store; Iced's tree is untouched.
+    let saved = gitterm_core::tasks::TaskStore::load(runs.fixture.copy()).unwrap();
+    assert_eq!(saved.delegation(&id).unwrap().status.label(), "completed");
+    assert_eq!(tree(&runs.fixture.iced), iced_before);
+
+    let args = runs.codex.args(1);
+    assert_eq!(&args[..3], ["exec", "--sandbox", "read-only"], "{args:?}");
+    let env = runs.codex.env(1);
+    let root = runs.fixture.roots.root();
+    let home = root.join("provider-homes/home");
+    assert_eq!(env["HOME"], home.display().to_string());
+    assert_eq!(env["CODEX_HOME"], home.join(".codex").display().to_string());
+    assert_eq!(
+        env["GIT_CEILING_DIRECTORIES"],
+        runs.git.root.parent().unwrap().display().to_string()
+    );
+    let git_vars: Vec<_> = env.keys().filter(|name| name.starts_with("GIT_")).collect();
+    assert_eq!(git_vars, ["GIT_CEILING_DIRECTORIES"], "{env:?}");
+    // Only the host's own GitTerm variables: its config root and its task
+    // server, never an inherited (production) token.
+    use gitterm_core::task_commands::mcp_protocol::{TASK_MCP_TOKEN_ENV, TASK_MCP_URL_ENV};
+    let gitterm: Vec<_> = env
+        .keys()
+        .filter(|name| name.starts_with("GITTERM_"))
+        .collect();
+    assert_eq!(
+        gitterm,
+        [
+            gitterm_core::config_paths::CONFIG_DIR_ENV,
+            TASK_MCP_TOKEN_ENV,
+            TASK_MCP_URL_ENV
+        ],
+        "{env:?}"
+    );
+    assert_eq!(
+        env[gitterm_core::config_paths::CONFIG_DIR_ENV],
+        root.display().to_string()
+    );
+    let token = runs.owner.read_with(cx, |owner, _| {
+        owner.host().services().task_mcp().token().to_string()
+    });
+    assert_eq!(env[TASK_MCP_TOKEN_ENV], token);
+    if let Ok(inherited) = std::env::var(TASK_MCP_TOKEN_ENV) {
+        assert_ne!(env[TASK_MCP_TOKEN_ENV], inherited);
+    }
+    let endpoint = runs
+        .owner
+        .read_with(cx, |owner, _| owner.task_endpoint().unwrap());
+    assert!(env[TASK_MCP_URL_ENV].starts_with(&endpoint), "{env:?}");
+    // The Codex trust check reads the home the child got.
+    gitterm_core::workers::validate_codex_trust_home(
+        &home,
+        &env.iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<Vec<_>>(),
+        |_| None,
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn queued_start_rechecks_policy_trust_and_batch_capacity(cx: &mut TestAppContext) {
+    use gitterm_core::plan_limits::{LimitWindow, PlanLimits, PlanLimitsFile, Provider};
+    let runs = Runs::start(1, cx);
+    runs.codex.hold(1);
+    let first = runs.consult(cx);
+    let second = runs.consult(cx);
+    let third = runs.consult(cx);
+    // Wait for the first start; the settle then shows no second one starts.
+    wait_until(cx, |_| runs.codex.runs() == 1);
+    settle(cx);
+    assert_eq!(runs.codex.runs(), 1);
+    assert_eq!(runs.status(&second, cx), "requested");
+    assert_eq!(runs.status(&third, cx), "requested");
+    // Codex's weekly window is used up before the slot frees: the queued
+    // runs stay queued.
+    let now = chrono::Utc::now().timestamp();
+    let mut limits = PlanLimitsFile::default();
+    limits.absorb(PlanLimits {
+        provider: Provider::Codex,
+        observed_at: now,
+        local: Some(true),
+        windows: vec![LimitWindow {
+            label: "7d".into(),
+            used_percent: Some(99.0),
+            resets_at: Some(now + 86_400),
+        }],
+        alerts: vec![],
+        plan_type: None,
+        credits: None,
+    });
+    let limits_path = PlanLimitsFile::path_in(&runs.fixture.iced);
+    limits.save(&limits_path).unwrap();
+    runs.codex.release(1);
+    wait_until(cx, |cx| runs.status(&first, cx) == "completed");
+    settle(cx);
+    assert_eq!(runs.codex.runs(), 1);
+    assert_eq!(runs.status(&second, cx), "requested");
+    assert_eq!(runs.status(&third, cx), "requested");
+    // Once it frees, one slot starts one of the batch, oldest first.
+    std::fs::remove_file(&limits_path).unwrap();
+    runs.codex.hold(2);
+    runs.owner
+        .update(cx, |owner, cx| owner.start_queued_runs(cx));
+    wait_until(cx, |_| runs.codex.runs() == 2);
+    settle(cx);
+    assert_eq!(runs.codex.runs(), 2);
+    assert_eq!(runs.status(&third, cx), "requested");
+    // Every start gets the same checked home.
+    assert_eq!(
+        runs.codex.env(2)["CODEX_HOME"],
+        runs.codex.env(1)["CODEX_HOME"]
+    );
+    runs.codex.release(2);
+    wait_until(cx, |cx| runs.status(&third, cx) == "completed");
+    assert_eq!(runs.status(&second, cx), "completed");
+    assert_eq!(runs.codex.runs(), 3);
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn fixture_checkout_with_outside_repo_refused(cx: &mut TestAppContext) {
+    let runs = Runs::start(2, cx);
+    // A worktree of the outside repo placed inside the fixture: its Git
+    // admin dir lies outside.
+    let linked = runs.git.root.join("outside-worktree");
+    git(
+        &runs.git.outside,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let outside_before = tree(&runs.git.outside);
+    for checkout in [&linked, &runs.git.outside] {
+        assert_eq!(
+            runs.consult_in(checkout, cx),
+            Err(gitterm_core::preview::service::preview_notice(
+                "consult_request"
+            )),
+            "{}",
+            checkout.display()
+        );
+    }
+    settle(cx);
+    assert_eq!(runs.codex.runs(), 0);
+    assert_eq!(runs.delegation_count(cx), 0);
+    assert_eq!(tree(&runs.git.outside), outside_before);
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn run_path_swapped_after_check_refused(cx: &mut TestAppContext) {
+    let runs = Runs::start(2, cx);
+    let elsewhere = runs.fixture.iced.parent().unwrap().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let moved = runs.git.root.join("moved");
+    runs.owner.update(cx, |owner, _| {
+        let (elsewhere, moved) = (elsewhere.clone(), moved.clone());
+        *owner.before_run_recheck.borrow_mut() = Some(Box::new(move |path: &Path| {
+            std::fs::rename(path, &moved).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, path).unwrap();
+        }));
+    });
+    assert_eq!(
+        runs.consult_in(&runs.git.repo, cx),
+        Err(gitterm_core::preview::service::preview_notice(
+            "consult_request"
+        ))
+    );
+    settle(cx);
+    assert_eq!(runs.codex.runs(), 0);
+    assert_eq!(runs.delegation_count(cx), 0);
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn mixed_allowed_and_denied_headless_queue(cx: &mut TestAppContext) {
+    let runs = Runs::start(1, cx);
+    // A second checkout in the fixture, a worktree of the listed repo.
+    let other = runs.git.root.join("other");
+    git(
+        &runs.git.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "other",
+            other.to_str().unwrap(),
+        ],
+    );
+    runs.codex.hold(1);
+    let first = runs.consult(cx);
+    let reply = runs.consult_in(&other, cx).unwrap();
+    let denied = reply["delegation_id"].as_str().unwrap().to_string();
+    let allowed = runs.consult(cx);
+    // The queued run's checkout now leads out of the fixture.
+    let elsewhere = runs.fixture.iced.parent().unwrap().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::fs::rename(&other, runs.git.root.join("other-moved")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &other).unwrap();
+    runs.codex.release(1);
+    wait_until(cx, |cx| runs.status(&allowed, cx) == "completed");
+    assert_eq!(runs.status(&first, cx), "completed");
+    // The denied one stays queued and untouched; the allowed one ran.
+    assert_eq!(runs.status(&denied, cx), "requested");
+    assert_eq!(runs.codex.runs(), 2);
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn imported_requested_run_inert_in_fixture_mode(cx: &mut TestAppContext) {
+    // Iced's record looks like a run of this very chat in this fixture.
+    let runs = Runs::start_with(
+        2,
+        |seed| {
+            let imported: Delegation = serde_json::from_value(serde_json::json!({
+                "delegation_id": "imported", "kind": "consult",
+                "parent": {"session_uid": seed.caller, "workspace": "FX", "cwd": seed.git.repo},
+                "child": {"runner": "codex_consult"},
+                "brief": "Imported", "status": {"state": "requested"},
+                "created_at": "2026-11-20T12:00:00Z", "updated_at": "2026-11-20T12:01:00Z"
+            }))
+            .unwrap();
+            seed.fixture.write_iced(
+                vec![
+                    task("running", TaskLifecycle::Running),
+                    task("queued", TaskLifecycle::Queued),
+                ],
+                vec![imported],
+            );
+        },
+        cx,
+    );
+    let imported = |cx: &mut TestAppContext| {
+        runs.owner.read_with(cx, |owner, _| {
+            owner
+                .host()
+                .store()
+                .as_ref()
+                .unwrap()
+                .delegation("imported")
+                .unwrap()
+                .clone()
+        })
+    };
+    let before = imported(cx);
+    let id = runs.consult(cx);
+    wait_until(cx, |cx| runs.status(&id, cx) == "completed");
+    settle(cx);
+    assert_eq!(imported(cx), before);
+    assert_eq!(runs.codex.runs(), 1);
+    assert_eq!(
+        stored_task(&runs.owner, "running", cx).lifecycle,
+        TaskLifecycle::Running
+    );
+    assert_eq!(
+        stored_task(&runs.owner, "queued", cx).lifecycle,
+        TaskLifecycle::Queued
+    );
+    assert!(
+        runs.owner
+            .read_with(cx, |owner, _| owner.host().launch_queue().is_empty())
+    );
+}
+
+/// A script at `path` that, once, moves `repo` aside and puts a symlink to
+/// `outside` in its place.
+#[cfg(unix)]
+fn swap_script(path: &Path, prelude: &str, repo: &Path, outside: &Path, tail: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let script = format!(
+        "#!/bin/sh\n{prelude}\nif [ ! -L '{repo}' ]; then mv '{repo}' '{repo}-moved' && ln -s '{outside}' '{repo}'; fi\n{tail}\n",
+        repo = repo.display(),
+        outside = outside.display(),
+    );
+    std::fs::write(path, script).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Waits for `id` to leave requested and running.
+fn settled_status(runs: &Runs, id: &str, cx: &mut TestAppContext) -> String {
+    wait_until(cx, |cx| {
+        !matches!(runs.status(id, cx).as_str(), "requested" | "running")
+    });
+    runs.status(id, cx)
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn fsmonitor_hook_never_runs_in_run_preflight(cx: &mut TestAppContext) {
+    let runs = Runs::start(2, cx);
+    let marker = runs.fixture.iced.parent().unwrap().join("fsmonitor-ran");
+    // The checkout's own hook would put the outside repo in its place
+    // during the runner's `git status`.
+    let hook = runs.git.root.join("fsmonitor-hook");
+    swap_script(
+        &hook,
+        &format!("touch '{}'", marker.display()),
+        &runs.git.repo,
+        &runs.git.outside,
+        "exit 1",
+    );
+    git(
+        &runs.git.repo,
+        &["config", "core.fsmonitor", hook.to_str().unwrap()],
+    );
+    let outside_before = tree(&runs.git.outside);
+    let id = runs.consult(cx);
+    assert_eq!(settled_status(&runs, &id, cx), "completed");
+    assert!(!marker.exists(), "the run's git preflight ran the hook");
+    assert_eq!(runs.codex.runs(), 1);
+    assert_eq!(runs.codex.pwd(1), runs.git.repo.canonicalize().unwrap());
+    assert_eq!(tree(&runs.git.outside), outside_before);
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn checkout_swapped_during_preflight_refused(cx: &mut TestAppContext) {
+    let runs = Runs::start(2, cx);
+    // A `git` ahead of the real one swaps the checkout during the runner's
+    // `git status`, as any hook it runs could.
+    let wrapper = tempfile::tempdir().unwrap();
+    let real_git = std::process::Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real_git = String::from_utf8(real_git.stdout).unwrap();
+    swap_script(
+        &wrapper.path().join("git"),
+        "for arg in \"$@\"; do [ \"$arg\" = status ] && swap=1; done\n[ -n \"$swap\" ] || exec '{git}' \"$@\""
+            .replace("{git}", real_git.trim())
+            .as_str(),
+        &runs.git.repo,
+        &runs.git.outside,
+        &format!("exec '{}' \"$@\"", real_git.trim()),
+    );
+    let mut path = vec![wrapper.path().to_path_buf()];
+    path.extend(std::env::split_paths(&runs.codex.search_path()));
+    runs.owner.update(cx, |owner, _| {
+        owner.codex_search_path = Some(std::env::join_paths(path).unwrap())
+    });
+    let outside_before = tree(&runs.git.outside);
+    let id = runs.consult(cx);
+    assert_eq!(settled_status(&runs, &id, cx), "failed");
+    assert!(
+        std::fs::symlink_metadata(&runs.git.repo)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the preflight swapped the checkout"
+    );
+    let status = runs.saved()[0].status.clone();
+    assert_eq!(
+        status,
+        gitterm_core::tasks::DelegationStatus::Failed {
+            message: gitterm_core::preview::service::preview_notice("Start delegation")
+        }
+    );
+    assert_eq!(runs.codex.runs(), 0, "Codex started outside the fixture");
+    assert_eq!(tree(&runs.git.outside), outside_before);
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn shutdown_during_pending_check_persists_nothing(cx: &mut TestAppContext) {
+    let runs = Runs::start(2, cx);
+    runs.shut_down_at("checked", cx);
+    let reply = runs.consult_in(&runs.git.repo, cx);
+    assert!(reply.is_err(), "{reply:?}");
+    settle(cx);
+    assert_eq!(runs.delegation_count(cx), 0);
+    assert!(runs.saved().is_empty());
+    assert_eq!(runs.codex.runs(), 0);
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn shutdown_during_queued_start_check_persists_nothing(cx: &mut TestAppContext) {
+    let runs = Runs::start(1, cx);
+    runs.codex.hold(1);
+    let first = runs.consult(cx);
+    let second = runs.consult(cx);
+    settle(cx);
+    runs.shut_down_at("queued start", cx);
+    runs.codex.release(1);
+    wait_until(cx, |cx| {
+        runs.owner
+            .read_with(cx, |owner, _| owner.before_continuation.is_none())
+    });
+    settle(cx);
+    let saved = runs.saved();
+    let status = |id: &str| {
+        saved
+            .iter()
+            .find(|d| d.delegation_id == id)
+            .unwrap()
+            .status
+            .label()
+    };
+    assert_eq!(status(&first), "completed");
+    assert_eq!(status(&second), "requested");
+    assert_eq!(runs.codex.runs(), 1);
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn shutdown_with_buffered_progress_persists_nothing(cx: &mut TestAppContext) {
+    let runs = Runs::start(2, cx);
+    runs.shut_down_at("progress", cx);
+    let id = runs.consult(cx);
+    wait_until(cx, |cx| {
+        runs.owner
+            .read_with(cx, |owner, _| owner.before_continuation.is_none())
+    });
+    settle(cx);
+    // Neither the start nor the result reached the store.
+    assert_eq!(runs.saved()[0].delegation_id, id);
+    assert_eq!(runs.saved()[0].status.label(), "requested");
+    assert_eq!(runs.status(&id, cx), "requested");
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn shutdown_kills_codex_descendants(cx: &mut TestAppContext) {
+    let runs = Runs::start(2, cx);
+    runs.codex.spawn_descendant(1);
+    runs.codex.hold(1);
+    let _id = runs.consult(cx);
+    wait_until(cx, |_| runs.codex.descendant(1).is_some());
+    let pid = runs.codex.descendant(1).unwrap().to_string();
+    let alive = || {
+        std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(alive());
+    runs.owner.update(cx, |owner, _| owner.shutdown());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while alive() {
+        assert!(
+            Instant::now() < deadline,
+            "descendant {pid} outlived shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn clean_filter_can_redirect_git_dir(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt;
+    let runs = Runs::start(2, cx);
+    let repo = &runs.git.repo;
+    // The fixture's own config names a clean filter for a tracked file; the
+    // runner's `git status` runs it, and it points `.git` outside.
+    let tracked = repo.join("filtered");
+    std::fs::write(&tracked, "one\n").unwrap();
+    std::fs::write(repo.join(".gitattributes"), "filtered filter=swap\n").unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-qm", "filtered baseline"]);
+    let filter = runs.git.root.join("clean-filter");
+    std::fs::write(
+        &filter,
+        format!(
+            "#!/bin/sh\nif [ ! -L .git ]; then mv .git .git-original; ln -s '{}' .git; fi\ncat\n",
+            runs.git.outside.join(".git").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+    git(
+        repo,
+        &["config", "filter.swap.clean", filter.to_str().unwrap()],
+    );
+    std::fs::write(&tracked, "two\n").unwrap();
+    let id = runs.consult(cx);
+    assert_eq!(settled_status(&runs, &id, cx), "failed");
+    assert!(
+        std::fs::symlink_metadata(repo.join(".git"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the preflight ran the clean filter"
+    );
+    assert_eq!(
+        runs.codex.runs(),
+        0,
+        "Codex started with a Git dir outside the fixture"
+    );
+    assert_eq!(
+        runs.saved()[0].status,
+        gitterm_core::tasks::DelegationStatus::Failed {
+            message: gitterm_core::preview::service::preview_notice("Start delegation")
+        }
+    );
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn slow_preflight_blocks_shutdown(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt;
+    let runs = Runs::start(2, cx);
+    // A `git` ahead of the real one that sleeps in the runner's `git status`.
+    let wrapper = tempfile::tempdir().unwrap();
+    let real_git = std::process::Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real_git = String::from_utf8(real_git.stdout).unwrap();
+    let marker = wrapper.path().join("in-status");
+    let script = format!(
+        "#!/bin/sh\nfor arg in \"$@\"; do if [ \"$arg\" = status ]; then touch '{}'; sleep 4; fi; done\nexec '{}' \"$@\"\n",
+        marker.display(),
+        real_git.trim()
+    );
+    let program = wrapper.path().join("git");
+    std::fs::write(&program, script).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = vec![wrapper.path().to_path_buf()];
+    path.extend(std::env::split_paths(&runs.codex.search_path()));
+    runs.owner.update(cx, |owner, _| {
+        owner.codex_search_path = Some(std::env::join_paths(path).unwrap())
+    });
+    let _id = runs.consult(cx);
+    wait_until(cx, |_| marker.exists());
+    let start = Instant::now();
+    runs.owner.update(cx, |owner, _| owner.shutdown());
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "shutdown blocked the UI for {elapsed:?}"
+    );
+    assert_eq!(runs.codex.runs(), 0, "Codex started after shutdown");
+}
