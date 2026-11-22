@@ -334,12 +334,7 @@ impl ChatPane {
             let program = claude_program()?;
             let provider = Arc::new(Provider::new(preview, &program)?);
             provider.prepare()?;
-            let command = provider.sign_in_command();
-            let (runtime, events) = provider.start(saved.cwd.clone(), mcp_servers).with_context(|| {
-                format!(
-                    "Sign in once with a personal Pro/Max account in the isolated root:\n{command}"
-                )
-            })?;
+            let (runtime, events) = start_runtime(&provider, saved.cwd.clone(), mcp_servers)?;
             Ok((runtime, events))
         })();
         let mut pane = Self {
@@ -947,4 +942,21 @@ mod appearance_tests {
             assert_eq!(crate::theme::chat_appearance(cx).font_size, 22.);
         });
     }
+}
+
+/// Starts the runtime. A folder refusal is reported alone: the sign-in hint
+/// is only attached to failures where sign-in can be the cause.
+fn start_runtime(
+    provider: &Arc<Provider>,
+    cwd: PathBuf,
+    mcp_servers: Vec<gitterm_core::harness::claude::ClaudeMcpServer>,
+) -> Result<(
+    OwnedRuntime,
+    tokio::sync::mpsc::UnboundedReceiver<gitterm_core::chat::runtime::RuntimeEvent>,
+)> {
+    provider.validate_workspace(&cwd)?;
+    let command = provider.sign_in_command();
+    provider.clone().start(cwd, mcp_servers).with_context(|| {
+        format!("Sign in once with a personal Pro/Max account in the isolated root:\n{command}")
+    })
 }

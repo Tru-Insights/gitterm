@@ -5239,7 +5239,7 @@ fn roster_entries(
                         live = true;
                         WorkerState::Waiting
                     }
-                    "blocked" => WorkerState::Waiting,
+                    "blocked" => WorkerState::Blocked,
                     "done" => WorkerState::Done,
                     _ => WorkerState::Failed,
                 }
@@ -5254,7 +5254,7 @@ fn roster_entries(
                         WorkerState::Running
                     }
                     DelegationStatus::Completed => WorkerState::Done,
-                    DelegationStatus::Blocked => WorkerState::Waiting,
+                    DelegationStatus::Blocked => WorkerState::Blocked,
                     _ => WorkerState::Failed,
                 }
             };
@@ -5295,7 +5295,7 @@ fn roster_entries(
     rows.sort_by_key(|row| std::cmp::Reverse(row.ended_at_ms.is_none()));
     let mut finished = 0;
     rows.retain(|row| {
-        if row.ended_at_ms.is_some() && row.state != WorkerState::Waiting {
+        if row.ended_at_ms.is_some() && row.state != WorkerState::Blocked {
             finished += 1;
             finished <= 10
         } else {
