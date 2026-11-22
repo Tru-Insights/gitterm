@@ -1200,13 +1200,21 @@ async fn git_output(
     for var in GIT_LOCATION_VARS {
         command.env_remove(var);
     }
-    let output = command
-        .output()
-        .await
-        .map_err(|source| CodexRunError::Git {
-            cwd: cwd.to_path_buf(),
-            message: format!("could not run `git {}`: {source}", args.join(" ")),
-        })?;
+    let output = match &environment.stop {
+        Some(stop) => stopped_git_output(&mut command, stop)
+            .await?
+            .map_err(|source| CodexRunError::Git {
+                cwd: cwd.to_path_buf(),
+                message: format!("could not run `git {}`: {source}", args.join(" ")),
+            })?,
+        None => command
+            .output()
+            .await
+            .map_err(|source| CodexRunError::Git {
+                cwd: cwd.to_path_buf(),
+                message: format!("could not run `git {}`: {source}", args.join(" ")),
+            })?,
+    };
     if !output.status.success() {
         return Err(CodexRunError::Git {
             cwd: cwd.to_path_buf(),
@@ -1219,6 +1227,59 @@ async fn git_output(
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Runs a preflight git as its own process group, recorded with `stop` so a
+/// stop kills git and what git started (a filter program, a hook). A stop
+/// ends the run as `Stopped` once the group is killed and git is reaped. The
+/// outer error is the stop; the inner one is git failing to run.
+async fn stopped_git_output(
+    command: &mut tokio::process::Command,
+    stop: &CodexStop,
+) -> Result<std::io::Result<std::process::Output>, CodexRunError> {
+    #[cfg(unix)]
+    command.process_group(0);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = match spawn_unless_stopped(command, Some(stop)) {
+        Ok(child) => child,
+        Err(None) => return Err(CodexRunError::Stopped),
+        Err(Some(source)) => return Ok(Err(source)),
+    };
+    let child_id = child.id();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let work = async {
+        let (out, err, status) = tokio::join!(read_all(stdout), read_all(stderr), child.wait());
+        Ok::<_, std::io::Error>(std::process::Output {
+            status: status?,
+            stdout: out?,
+            stderr: err?,
+        })
+    };
+    let result = tokio::select! {
+        result = work => Some(result),
+        () = stop.signal.cancelled() => None,
+    };
+    // Both branches can be ready when a stop kills git before this task is
+    // polled again; a requested stop wins over git's (killed) exit.
+    let stopped = result.is_none() || stop.signal.is_cancelled();
+    if stopped {
+        stop_process_tree(&mut child, child_id).await;
+    }
+    stop.reaped();
+    if stopped {
+        Err(CodexRunError::Stopped)
+    } else {
+        Ok(result.expect("not stopped"))
+    }
+}
+
+async fn read_all(pipe: Option<impl AsyncRead + Unpin>) -> std::io::Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    if let Some(mut pipe) = pipe {
+        tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut buffer).await?;
+    }
+    Ok(buffer)
 }
 
 /// Finds `rollout-*-<thread_id>.jsonl` in the `YYYY/MM/DD` directories of
@@ -2261,6 +2322,163 @@ mod tests {
                 !alive
             });
             assert!(gone, "sleep {pid} outlived the stop");
+        }
+
+        /// A `git` that records its process group, answers `rev-parse`, and
+        /// for `status` starts a background `sleep` (recording its pid)
+        /// and waits. Needs a scoped environment so PATH finds it.
+        fn with_fake_git(fake: &FakeCodex) -> CodexEnvironment {
+            let script = format!(
+                "#!/bin/sh\nps -o pgid= -p $$ | tr -d ' ' > '{dir}/git.pgid'\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    rev-parse) echo 0123456789abcdef; exit 0;;\n    status) sleep 30 &\n      echo $! > '{dir}/git-sleep.pid'\n      wait;;\n  esac\ndone\n",
+                dir = fake.dir.path().display(),
+            );
+            let program = fake.dir.path().join("git");
+            std::fs::write(&program, script).expect("write fake git");
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake git");
+            let mut environment = fake.environment();
+            environment.child_env = Some(Vec::new());
+            environment
+        }
+
+        async fn wait_for_file(path: &Path, complete: impl Fn(&str) -> bool) {
+            for _ in 0..600 {
+                if std::fs::read_to_string(path).is_ok_and(|text| complete(&text)) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("{} never appeared", path.display());
+        }
+
+        #[tokio::test]
+        async fn stop_during_preflight_kills_git_descendants() {
+            let fake = FakeCodex::new("", 0);
+            let mut environment = with_fake_git(&fake);
+            let stop = CodexStop::new();
+            environment.stop = Some(stop.clone());
+            let run = fake.run(CodexRunKind::Consult {
+                brief: "Stopped early.".to_string(),
+            });
+            let (sender, _receiver) = mpsc::unbounded_channel();
+            let running = tokio::spawn(async move { run_with(run, sender, &environment).await });
+            let pid_file = fake.dir.path().join("git-sleep.pid");
+            wait_for_file(&pid_file, |pid| pid.ends_with('\n')).await;
+            let pid: i32 = fake
+                .recorded("git-sleep.pid")
+                .trim()
+                .parse()
+                .expect("sleep pid");
+            stop.stop();
+            let error = tokio::time::timeout(std::time::Duration::from_secs(30), running)
+                .await
+                .expect("the stop ends the run")
+                .expect("join")
+                .expect_err("stopped");
+            assert!(matches!(error, CodexRunError::Stopped), "{error:?}");
+            let gone = (0..300).any(|_| {
+                // SAFETY: signal 0 only checks that the process exists.
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                if alive {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                !alive
+            });
+            assert!(gone, "git's sleep {pid} outlived the stop");
+            assert!(
+                !fake.dir.path().join("args").exists(),
+                "Codex started after a stop"
+            );
+        }
+
+        /// A stop that kills git while the runner isn't polled leaves both
+        /// select branches ready; the run must still end as `Stopped`. The
+        /// unbiased select picks either, so 20 rounds catch a regression.
+        // Multi-thread: the runtime notices git's exit while this test, not
+        // the runner, holds the thread, so both branches are ready together.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_stop_wins_when_git_has_already_exited() {
+            for round in 0..20 {
+                let fake = FakeCodex::new("", 0);
+                let mut environment = with_fake_git(&fake);
+                let stop = CodexStop::new();
+                environment.stop = Some(stop.clone());
+                let run = fake.run(CodexRunKind::Consult {
+                    brief: "Stopped while parked.".to_string(),
+                });
+                let (sender, _receiver) = mpsc::unbounded_channel();
+                let running = run_with(run, sender, &environment);
+                tokio::pin!(running);
+                let pid_file = fake.dir.path().join("git-sleep.pid");
+                // Drive the run until git waits in `status`.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !std::fs::read_to_string(&pid_file).is_ok_and(|pid| pid.ends_with('\n')) {
+                    assert!(std::time::Instant::now() < deadline, "git never started");
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_millis(20), &mut running)
+                            .await;
+                }
+                let pid: i32 = fake
+                    .recorded("git-sleep.pid")
+                    .trim()
+                    .parse()
+                    .expect("sleep pid");
+                // Kill the group without polling the run, and let git die.
+                stop.stop();
+                let gone = (0..300).any(|_| {
+                    // SAFETY: signal 0 only checks that the process exists.
+                    let alive = unsafe { libc::kill(pid, 0) } == 0;
+                    if alive {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    !alive
+                });
+                assert!(gone, "round {round}: git's sleep {pid} outlived the stop");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let error = tokio::time::timeout(std::time::Duration::from_secs(30), running)
+                    .await
+                    .expect("the stop ends the run")
+                    .expect_err("stopped");
+                assert!(
+                    matches!(error, CodexRunError::Stopped),
+                    "round {round}: {error:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn the_preflight_leads_its_own_group_only_with_a_stop() {
+            for (with_stop, same_group) in [(false, true), (true, false)] {
+                let fake = FakeCodex::new("", 0);
+                let mut environment = with_fake_git(&fake);
+                if with_stop {
+                    environment.stop = Some(CodexStop::new());
+                }
+                // Ends the run right after the preflight, before Codex.
+                environment.before_spawn =
+                    Some(BeforeSpawn::new(|_| Err("after the preflight".to_string())));
+                let run = fake.run(CodexRunKind::Consult {
+                    brief: "Refused.".to_string(),
+                });
+                let (sender, _receiver) = mpsc::unbounded_channel();
+                // A fast fake git (it never waits in `status`).
+                std::fs::write(
+                    fake.dir.path().join("git"),
+                    format!(
+                        "#!/bin/sh\nps -o pgid= -p $$ | tr -d ' ' > '{}/git.pgid'\necho 0123456789abcdef\n",
+                        fake.dir.path().display()
+                    ),
+                )
+                .expect("rewrite fake git");
+                let error = run_with(run, sender, &environment)
+                    .await
+                    .expect_err("refused");
+                assert!(matches!(error, CodexRunError::Refused { .. }), "{error:?}");
+                let pgid: i32 = fake.recorded("git.pgid").trim().parse().expect("pgid");
+                // SAFETY: getpgrp has no preconditions.
+                let ours = unsafe { libc::getpgrp() };
+                assert_eq!(pgid == ours, same_group, "stop={with_stop} pgid={pgid}");
+            }
         }
 
         #[tokio::test]
