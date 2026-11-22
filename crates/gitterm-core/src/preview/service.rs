@@ -663,20 +663,22 @@ fn check_effective_git(
     checkout: &Path,
     env: &[(OsString, OsString)],
 ) -> io::Result<()> {
-    let output = std::process::Command::new("git")
-        .env_clear()
-        .envs(env.iter().map(|(name, value)| (name, value)))
-        .args(["-c", "core.fsmonitor=false", "-c", "protocol.allow=never"])
-        .arg("-C")
-        .arg(checkout)
-        .args([
-            "rev-parse",
-            "--show-toplevel",
-            "--absolute-git-dir",
-            "--git-common-dir",
-        ])
-        .stdin(std::process::Stdio::null())
-        .output()?;
+    // Started in `checkout`, as the child is, so a relative `PATH` entry
+    // finds the same `git` the child would.
+    let rev_parse = |args: &[&str]| {
+        std::process::Command::new("git")
+            .current_dir(checkout)
+            .env_clear()
+            .envs(env.iter().map(|(name, value)| (name, value)))
+            .args(["-c", "core.fsmonitor=false", "-c", "protocol.allow=never"])
+            .arg("-C")
+            .arg(checkout)
+            .arg("rev-parse")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+    };
+    let output = rev_parse(&["--show-toplevel", "--absolute-git-dir", "--git-common-dir"])?;
     let failed = |why: &str| {
         refuse(format!(
             "git cannot name the work tree of {}: {why}",
@@ -684,8 +686,15 @@ fn check_effective_git(
         ))
     };
     if !output.status.success() {
-        // Discovery stops at the fixture's parent (the child's ceiling), so
-        // with no `.git` and no Git dir up to the root there is no repository.
+        // A repository Git finds without a work tree (a bare one, possibly
+        // above this fixture when the child's ceiling is another fixture's
+        // parent) is not one a fixture run may use.
+        if rev_parse(&["--absolute-git-dir"])?.status.success() {
+            return Err(failed("a repository with no work tree"));
+        }
+        // With no repository found, the folder must hold no `.git` and no
+        // Git dir up to its fixture root, so the failure is not a broken
+        // repository of the fixture's own.
         for dir in checkout
             .ancestors()
             .take_while(|dir| dir.starts_with(fixture))

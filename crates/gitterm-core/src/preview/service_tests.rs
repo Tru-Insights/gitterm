@@ -1454,3 +1454,78 @@ fn worktree_config_outside_the_fixture_refused() {
         WORKER_DENIED
     );
 }
+
+#[test]
+fn extra_folder_under_an_outside_bare_repository_refused() {
+    let f = fixture();
+    let root = fixture_repo(f.dir.path(), "fixture");
+    let bare = f.dir.path().join("bare.git");
+    git(
+        f.dir.path(),
+        &["init", "-q", "--bare", bare.to_str().unwrap()],
+    );
+    // A second fixture inside the bare repository, below the cwd
+    // fixture's ceiling, so Git discovers the bare repository from it.
+    let second = fixture_repo(&bare, "second");
+    fs::create_dir_all(second.join("notes")).unwrap();
+    let context =
+        ServiceContext::fixture_launch(f.preview.clone(), [root.clone(), second.clone()]).unwrap();
+    let root = fs::canonicalize(root).unwrap();
+    let second = fs::canonicalize(second).unwrap();
+    let repo = root.join("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    let granted = context
+        .authorize_targets(
+            classify_process(ProcessEffect::Worker),
+            &[repo, second.join("notes")],
+        )
+        .unwrap();
+    let env = child_git_env(&context, &root);
+    assert_eq!(context.recheck(&granted), Ok(()));
+    assert_eq!(
+        context
+            .recheck_git_work_trees(&granted, &env)
+            .unwrap_err()
+            .notice(),
+        WORKER_DENIED
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn git_is_found_from_the_checkout_as_the_child_finds_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut w = work_trees();
+    // A relative PATH entry resolves against the child's cwd, so the probe
+    // must run this `git`, which names a work tree outside the fixture.
+    let bin = w.root.join("repo/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let fake = bin.join("git");
+    let outside = w.outside.to_str().unwrap();
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' '{outside}' '{outside}/.git' '{outside}/.git'\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = w
+        .env
+        .iter_mut()
+        .find(|(name, _)| name == "PATH")
+        .map(|(_, value)| value)
+        .expect("the child env has a PATH");
+    let mut relative = OsString::from("bin:");
+    relative.push(&*path);
+    *path = relative;
+    // The real git, from this test's cwd, still passes the fixture.
+    assert_eq!(w.context.recheck(&w.granted), Ok(()));
+    assert_eq!(
+        w.context
+            .recheck_git_work_trees(&w.granted, &w.env)
+            .unwrap_err()
+            .notice(),
+        WORKER_DENIED
+    );
+}
