@@ -570,7 +570,11 @@ fn turn_end_flushes_delivery_without_waiting_for_the_tick(cx: &mut TestAppContex
     wait_until(cx, |_| prompts(&checkout).len() == 2);
     let sent = prompts(&checkout);
     assert!(sent[0].contains("Fixture question"), "{}", sent[0]);
-    assert!(sent[1].contains("Finished the fixture change"), "{}", sent[1]);
+    assert!(
+        sent[1].contains("Finished the fixture change"),
+        "{}",
+        sent[1]
+    );
     // The delivered turn's own end finds nothing more to send.
     cx.run_until_parked();
     assert_eq!(prompts(&checkout).len(), 2);

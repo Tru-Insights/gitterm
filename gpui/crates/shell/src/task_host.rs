@@ -83,9 +83,9 @@ mod delivery;
 mod launch;
 #[path = "task_host_runs.rs"]
 mod runs;
+pub(crate) use delivery::forward_turn_ends;
 #[cfg(test)]
 pub(crate) use delivery::{DELIVERY_POLL, SubmitHook};
-pub(crate) use delivery::forward_turn_ends;
 pub(crate) use launch::TerminalLaunched;
 #[cfg(test)]
 pub(crate) use launch::with_preassigned_session_id as launch_session_id;

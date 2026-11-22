@@ -756,7 +756,10 @@ fn open_sessions_lists_panes_holding_the_task(cx: &mut TestAppContext) {
     let other = launches.create(cx);
     let config = tempfile::tempdir().unwrap();
     let (shell, vcx) = task_shell(&launches, config.path(), cx);
-    assert_eq!(open_sessions_of(&launches, &task, vcx), serde_json::json!([]));
+    assert_eq!(
+        open_sessions_of(&launches, &task, vcx),
+        serde_json::json!([])
+    );
     let reply = launches.launch(&task, Some("Codex"), vcx).unwrap();
     let session = reply["session_id"].as_str().unwrap().to_string();
     wait_until(vcx, |cx| session_holding(&shell, &session, cx).is_some());
@@ -775,12 +778,13 @@ fn open_sessions_lists_panes_holding_the_task(cx: &mut TestAppContext) {
         TaskControlOperation::Get(req(serde_json::json!({"task_id": task}))),
     )
     .unwrap();
-    let sessions: Vec<gitterm_core::task_host::OpenSession> = vec![gitterm_core::task_host::OpenSession {
-        session_id: Some(session.clone()),
-        label: "Codex · Fixture task 1".into(),
-        workspace,
-        is_active: true,
-    }];
+    let sessions: Vec<gitterm_core::task_host::OpenSession> =
+        vec![gitterm_core::task_host::OpenSession {
+            session_id: Some(session.clone()),
+            label: "Codex · Fixture task 1".into(),
+            workspace,
+            is_active: true,
+        }];
     assert_eq!(
         got,
         gitterm_core::task_host::task_control_value(
@@ -789,7 +793,10 @@ fn open_sessions_lists_panes_holding_the_task(cx: &mut TestAppContext) {
         )
         .unwrap()
     );
-    assert_eq!(open_sessions_of(&launches, &other, vcx), serde_json::json!([]));
+    assert_eq!(
+        open_sessions_of(&launches, &other, vcx),
+        serde_json::json!([])
+    );
     // task_list carries the same open_sessions per task.
     let listed = dispatch(
         vcx,
@@ -806,7 +813,10 @@ fn open_sessions_lists_panes_holding_the_task(cx: &mut TestAppContext) {
             .unwrap()["open_sessions"]
             .clone()
     };
-    assert_eq!((listed(&task), listed(&other)), (expected, serde_json::json!([])));
+    assert_eq!(
+        (listed(&task), listed(&other)),
+        (expected, serde_json::json!([]))
+    );
     wait_until(vcx, |_| launches.agent.started(1));
     launches.kill(1);
 }
