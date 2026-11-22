@@ -804,7 +804,10 @@ fn collect(root: PathBuf) -> Snapshot {
             if record.is_empty() {
                 if let Some(mut row) = current.take() {
                     if row.path.is_dir() {
-                        let status = gitterm_core::git_status::collect_repo_status(&row.path);
+                        let status = gitterm_core::git_status::collect_repo_status_with(
+                            &row.path,
+                            gitterm_core::git_status::StatusReadOptions { fsmonitor: false },
+                        );
                         row.available = status.is_git_repo;
                         row.counts = [
                             status.staged.len(),

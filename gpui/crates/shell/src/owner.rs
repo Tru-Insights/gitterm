@@ -314,7 +314,12 @@ impl WorkspaceOwner {
                 ) {
                     self.error = Some(error.to_string());
                 } else {
-                    self.jobs.execute(executor.handle(), owner, command);
+                    self.jobs.execute_with(
+                        executor.handle(),
+                        owner,
+                        command,
+                        gitterm_core::git_status::StatusReadOptions { fsmonitor: false },
+                    );
                 }
             }
         }

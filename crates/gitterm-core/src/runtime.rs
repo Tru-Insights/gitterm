@@ -1,5 +1,6 @@
 //! Process-owned Git jobs. No domain state, clock, timeout or freshness policy.
 
+use crate::git_status::StatusReadOptions;
 use crate::status::{GitStatusSnapshot, StatusCommand};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -251,11 +252,22 @@ impl StatusRuntime {
 
     /// SchedulePoll remains the host's existing maintenance input, never a new timer.
     pub fn execute(&self, handle: &Handle, owner: usize, command: StatusCommand) -> Option<JobId> {
+        self.execute_with(handle, owner, command, StatusReadOptions::default())
+    }
+
+    /// `execute` with explicit status-read options.
+    pub fn execute_with(
+        &self,
+        handle: &Handle,
+        owner: usize,
+        command: StatusCommand,
+        options: StatusReadOptions,
+    ) -> Option<JobId> {
         let StatusCommand::CollectStatus { root } = command else {
             return None;
         };
-        self.submit(handle, owner, root, true, |handle, owner, root| {
-            handle.spawn_blocking(move || collect_snapshot(owner, root))
+        self.submit(handle, owner, root, true, move |handle, owner, root| {
+            handle.spawn_blocking(move || collect_snapshot_with(owner, root, options))
         })
     }
 
@@ -331,7 +343,15 @@ impl DiffRuntime {
 }
 
 pub fn collect_snapshot(tab_id: usize, root: PathBuf) -> GitStatusSnapshot {
-    let status = crate::git_status::collect_repo_status(&root);
+    collect_snapshot_with(tab_id, root, StatusReadOptions::default())
+}
+
+pub fn collect_snapshot_with(
+    tab_id: usize,
+    root: PathBuf,
+    options: StatusReadOptions,
+) -> GitStatusSnapshot {
+    let status = crate::git_status::collect_repo_status_with(&root, options);
     GitStatusSnapshot {
         tab_id,
         repo_path: status.root,
