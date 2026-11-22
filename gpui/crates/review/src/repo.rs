@@ -27,6 +27,8 @@ pub async fn aggregate_target(root: PathBuf) -> Result<(ReviewTarget, Vec<BaseCh
         &root,
         &[
             "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
             "status",
             "--porcelain=v2",
             "--branch",
@@ -126,10 +128,11 @@ pub async fn load(
     let (diff_jobs, mut diff_results) = DiffRuntime::new();
     let result = async {
         let id = status_jobs
-            .execute(
+            .execute_with(
                 handle,
                 owner,
                 StatusCommand::CollectStatus { root: root.clone() },
+                gitterm_core::git_status::StatusReadOptions { fsmonitor: false },
             )
             .ok_or("status runtime closed")?;
         let Some(StatusOutcome::Completed { job, mut snapshot }) = status_results.recv().await

@@ -1413,6 +1413,8 @@ impl WorkGit {
                 &owned.checkout,
                 &[
                     "--no-optional-locks",
+                    "-c",
+                    "core.fsmonitor=false",
                     "status",
                     "--porcelain=v2",
                     "--branch",

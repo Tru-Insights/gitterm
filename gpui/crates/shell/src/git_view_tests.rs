@@ -68,6 +68,33 @@ impl Fixture {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn git_view_status_read_never_runs_fsmonitor_hook() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let hooks = tempfile::tempdir().unwrap();
+    let marker = hooks.path().join("marker");
+    let hook = hooks.path().join("hook.sh");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\necho ran >> '{}'\nprintf '\\0'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fixture.git(&["config", "core.fsmonitor", hook.to_str().unwrap()]);
+    let snapshot = collect(fixture.root.clone());
+    assert!(snapshot.worktrees.iter().any(|row| row.available));
+    assert!(!marker.exists(), "git view ran the fsmonitor hook");
+    assert!(!fixture.root.join(".git/fsmonitor--daemon").exists());
+    // Control: a plain status in the same repo does run the hook.
+    gitterm_core::git_status::collect_repo_status(&fixture.root);
+    assert!(marker.exists());
+}
+
 #[test]
 fn fixture_changes_have_iced_order_labels_counts_and_badges() {
     let fixture = Fixture::new();
