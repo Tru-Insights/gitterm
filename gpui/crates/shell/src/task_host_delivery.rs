@@ -14,9 +14,12 @@
 //! Only delegations this host stored (`own_delegations`) are offered to
 //! core, which gates each for the checkout its work ran in: imported
 //! records are never delivered, and plain preview delivers nothing.
-// shortcut: a chat's turn end is picked up by the next delivery tick, not
-// flushed at once as Iced's turn-end arm does; subscribe to the panes'
-// turn ends if the extra few seconds matter.
+//!
+//! As in Iced, delivery runs from two places: the tick
+//! ([`TaskHostOwner::deliver_results`], Iced's `Tick` at src/main.rs
+//! `auto_deliver_delegations`) and a chat's turn end
+//! ([`TaskHostOwner::chat_turn_ended`], Iced's `TurnCompleted` arm calling
+//! `flush_held_delegation`), which the shell reports for its chat panes.
 use super::*;
 use gitterm_core::task_host::{
     DeliveryChat, DeliveryCompletion, DeliveryEffect, DeliveryReceipt, Submission,
@@ -34,20 +37,10 @@ pub(crate) type SubmitHook = Box<dyn FnMut(&Submission) -> Option<bool>>;
 impl TaskHostOwner {
     /// Iced's `auto_deliver_delegations`, from the fixture delivery tick:
     /// collects every finished result at the same moment; idle chats flush
-    /// now, busy ones keep their held results until a later tick.
+    /// now, busy ones keep their held results until their turn ends
+    /// ([`Self::chat_turn_ended`]) or a later tick.
     pub(crate) fn deliver_results(&mut self, cx: &mut Context<Self>) {
-        if self.fixtures.is_empty() || self.is_shut_down() {
-            return;
-        }
-        // A kept receipt may be saved by this tick: the store must still be
-        // the copy under the preview root.
-        if let Some(store) = self.host.store().as_ref()
-            && let Err(error) = self.roots.scoped(store.path())
-        {
-            eprintln!(
-                "[delegation] delivery skipped: task store {}: {error}",
-                store.path().display()
-            );
+        if !self.delivers() {
             return;
         }
         let auto_tell = self.auto_tell();
@@ -63,6 +56,33 @@ impl TaskHostOwner {
         for tab_id in tick.tabs {
             self.flush_chat(tab_id, auto_tell, cx);
         }
+    }
+
+    /// Iced's `TurnCompleted` arm: the chat's held results go out as soon
+    /// as its turn ends, including those finished since the last tick.
+    pub(crate) fn chat_turn_ended(&mut self, tab_id: usize, cx: &mut Context<Self>) {
+        if self.delivers() {
+            let auto_tell = self.auto_tell();
+            self.flush_chat(tab_id, auto_tell, cx);
+        }
+    }
+
+    /// Fixture mode only, while the host runs; a kept receipt may be saved,
+    /// so the store must still be the copy under the preview root.
+    fn delivers(&self) -> bool {
+        if self.fixtures.is_empty() || self.is_shut_down() {
+            return false;
+        }
+        if let Some(store) = self.host.store().as_ref()
+            && let Err(error) = self.roots.scoped(store.path())
+        {
+            eprintln!(
+                "[delegation] delivery skipped: task store {}: {error}",
+                store.path().display()
+            );
+            return false;
+        }
+        true
     }
 
     /// Iced's `delegations.auto_tell`, from the host's settings file: in
@@ -190,6 +210,20 @@ impl TaskHostOwner {
             }
         })
     }
+}
+
+/// Flushes `view`'s delivery whenever its turn ends; the shell holds one
+/// per live chat pane.
+pub(crate) fn forward_turn_ends(
+    view: &Entity<crate::chat::ChatPane>,
+    cx: &mut App,
+) -> Subscription {
+    cx.subscribe(view, |view, _: &crate::chat::TurnEnded, cx| {
+        let tab_id = view.read(cx).target().tab_id;
+        if let Some(host) = cx.try_global::<GpuiTaskHost>().map(|host| host.0.clone()) {
+            host.update(cx, |host, cx| host.chat_turn_ended(tab_id, cx));
+        }
+    })
 }
 
 /// The GPUI chat panes, as core resolves a result's requesting chat. Every

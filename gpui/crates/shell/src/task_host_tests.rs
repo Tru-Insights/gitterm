@@ -1036,6 +1036,47 @@ fn reads_work_in_preview(cx: &mut TestAppContext) {
     );
 }
 
+/// `merge_plan_get` resolves its caller on the UI thread, then reads the
+/// plan, watch and facts files on the background executor, which answers:
+/// when the arm returns, the reply is not there yet; once the background
+/// work runs it is Iced's value for the same files.
+#[gpui::test]
+fn reads_do_not_touch_disk_on_the_ui_thread(cx: &mut TestAppContext) {
+    use gitterm_core::{task_host::HostEffect, task_mcp::TaskControlOperation as Op};
+    use std::task::Poll;
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    fixture.write_iced(vec![], vec![]);
+    let chats = Chats::new(&fixture, cx);
+    let caller = chats.open(&fixture, Some("root-chat"), cx);
+    let (owner, _sender) = fixture.start(cx);
+    let (commands, mut receiver) = command_channel();
+    let mut pending = commands
+        .enqueue(Op::MergePlanGet, Some(caller.clone()))
+        .unwrap();
+    let envelope = receiver.try_recv().unwrap();
+    let effect = HostEffect::MergePlanGet {
+        reply: envelope.reply,
+        caller: envelope.caller,
+    };
+    let mut poll = || {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        std::pin::Pin::new(&mut pending).poll(&mut context)
+    };
+    owner.update(cx, |owner, cx| {
+        owner.execute_effect(effect, "merge_plan_get", cx)
+    });
+    assert!(poll().is_pending(), "the arm answered on the UI thread");
+    cx.run_until_parked();
+    let Poll::Ready(reply) = poll() else {
+        panic!("the background read did not answer");
+    };
+    assert_eq!(
+        reply.unwrap(),
+        crate::task_host::merge_plan_for(&fixture.iced, &[], "root-chat")
+    );
+}
+
 #[gpui::test]
 fn html_render_requires_open_gpui_chat(cx: &mut TestAppContext) {
     use gitterm_core::task_mcp::TaskControlOperation as Op;

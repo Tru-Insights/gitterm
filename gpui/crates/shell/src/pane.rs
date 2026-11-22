@@ -212,6 +212,15 @@ impl Pane {
             }),
         }
     }
+    /// The task session this pane holds: a chat's live target, else the
+    /// terminal's (a B10b task terminal).
+    pub(crate) fn task_session(&self, cx: &App) -> Option<gitterm_core::session::Target> {
+        let target = match &self.content {
+            PaneContent::PreviewChat(view) => view.read(cx).target(),
+            _ => self.session.clone()?,
+        };
+        target.task_id.is_some().then_some(target)
+    }
     pub(crate) fn terminal_alive(&self) -> bool {
         matches!(self.content, PaneContent::Terminal(_)) && !self.exited
     }
