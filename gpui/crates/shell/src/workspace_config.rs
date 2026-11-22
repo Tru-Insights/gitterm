@@ -694,6 +694,7 @@ mod preview_terminal_restore_test {
         saved.terminals = Some(vec![crate::layout::TerminalSession {
             id: 777,
             cwd: dir.path().canonicalize().unwrap(),
+            startup_command: None,
         }]);
         let state = gpui_component::dock::DockAreaState {
             version: Some(1),

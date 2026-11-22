@@ -104,6 +104,11 @@ impl RegionLayout {
 pub struct TerminalSession {
     pub id: u64,
     pub cwd: PathBuf,
+    /// Iced's `WorkspaceTabConfig.startup_command`: what a launched task
+    /// terminal runs, or the resume command once it has a conversation.
+    /// Absent in layouts written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_command: Option<String>,
 }
 
 pub struct LayoutStore {
@@ -461,6 +466,44 @@ mod tests {
             )),
             ..Default::default()
         }
+    }
+    /// Layouts written before a terminal pane could hold a startup command
+    /// load unchanged, and one without a command saves without the key.
+    #[test]
+    fn terminal_sessions_without_a_startup_command_load_and_save_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let path = dir.path().join("layout.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "terminal_sessions": [
+                    {"id": 1, "cwd": cwd},
+                    {"id": 2, "cwd": cwd, "startup_command": "claude --resume abc"},
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut store = LayoutStore::new(path);
+        let loaded = store.load_terminals().unwrap().unwrap();
+        assert_eq!(loaded[0].startup_command, None);
+        assert_eq!(
+            loaded[1].startup_command.as_deref(),
+            Some("claude --resume abc")
+        );
+        store.terminals = Some(loaded);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&store.bytes(&fixture()).unwrap()).unwrap();
+        assert!(
+            saved["terminal_sessions"][0]
+                .get("startup_command")
+                .is_none()
+        );
+        assert_eq!(
+            saved["terminal_sessions"][1]["startup_command"],
+            "claude --resume abc"
+        );
     }
     #[test]
     fn region_defaults_clamp_collapse_and_require_explicit_terminal() {
