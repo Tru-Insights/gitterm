@@ -137,7 +137,12 @@ impl Location {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Inputs {
     pub workspace_name: String,
+    /// Whether a workspace is active at all (Iced `active_workspace()`).
+    pub has_workspace: bool,
     pub location: Location,
+    /// The active session's repository, as Iced's active tab `repo_path`;
+    /// `None` when the workspace has no active session (Iced `active_tab()`).
+    pub active_repo: Option<PathBuf>,
     pub selected: Option<String>,
     pub general_sessions: usize,
     /// Iced's `sidebar_panel_width() <= 160`.
@@ -911,12 +916,39 @@ impl TaskPanel {
             cx.notify();
             return;
         }
-        let Some(dir) = inputs.location.dir().map(Path::to_owned) else {
+        // Iced `TaskCreateOpen`, in order: workspace, local, active session,
+        // Git repository.
+        if !inputs.has_workspace {
+            self.notice = Some("Open a local workspace before creating a task".into());
+            cx.notify();
+            return;
+        }
+        if inputs.location.dir().is_none() {
             self.notice =
                 Some("Local task creation is available only from a workspace on this Mac".into());
             cx.notify();
             return;
+        }
+        let Some(session_repo) = inputs.active_repo.as_deref() else {
+            self.notice = Some("Open a repository session before creating a task".into());
+            cx.notify();
+            return;
         };
+        if !crate::pane::git_view::is_git_repo(session_repo) {
+            self.notice = Some(format!(
+                "{} is not a Git repository",
+                session_repo.display()
+            ));
+            cx.notify();
+            return;
+        }
+        // Creating a task from inside another task's worktree resolves the
+        // owning repository, so the new task is a sibling and the base
+        // never lands on the current task's branch.
+        let dir = gitterm_core::task_host::canonical_task_workspace_directory(
+            host(cx).and_then(|host| host.store().as_ref()),
+            session_repo,
+        );
         let mut input = |placeholder: &'static str, cx: &mut Context<Self>| {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
         };
@@ -2752,6 +2784,10 @@ impl crate::Shell {
             })
             .collect();
         Inputs {
+            has_workspace: true,
+            active_repo: state
+                .active_session
+                .and_then(|_| self.active_repo_dir(workspace, cx)),
             presets: self.agent_presets.clone(),
             open_chats,
             workspace_name: state.workspace.name.clone(),

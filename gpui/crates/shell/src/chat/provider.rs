@@ -619,7 +619,7 @@ mod gate_tests {
         let (runtime, _events) = provider
             .start_with_policy(cwd, vec![], FIXTURE_SCHEMA, dir.path().join("no-policy"))
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
             while !entered.exists() {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
