@@ -332,6 +332,9 @@ pub(crate) struct TaskHostOwner {
     own_delegations: std::collections::HashMap<String, AuthorizedTargets>,
     /// Tasks this host created; only these are launched.
     own_tasks: std::collections::HashSet<String>,
+    /// Finished results waiting for a closed chat, by its session uid, as of
+    /// the last delivery tick; their log line repeats only when this changes.
+    pub(crate) delegation_waiting_counts: std::collections::HashMap<String, usize>,
     /// Launched terminals no pane has adopted yet, by task session.
     terminals: std::collections::HashMap<String, launch::HostTerminal>,
     /// Every launched task session, adopted or not.
@@ -532,6 +535,7 @@ impl TaskHostOwner {
                 runs: Default::default(),
                 own_delegations: Default::default(),
                 own_tasks: Default::default(),
+                delegation_waiting_counts: Default::default(),
                 terminals: Default::default(),
                 launched: Default::default(),
                 #[cfg(test)]
