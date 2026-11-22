@@ -289,3 +289,22 @@ fn executable(path: &std::path::Path) -> bool {
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
+
+/// SIGKILL to the process group `pid` leads: a PTY child from
+/// [`crate::Backend::child_pid`] and everything it started that kept its
+/// group. While any member of the group lives its id cannot be reused.
+// shortcut: once the child exited by itself, was reaped and left no group
+// member, a new session leader could take the same pid and be signalled;
+// track the child's exit before killing if this is used outside tests.
+pub fn kill_process_group(pid: u32) -> io::Result<()> {
+    let pid = i32::try_from(pid).map_err(|_| invalid("pid out of range"))?;
+    // SAFETY: killpg only sends a signal.
+    if unsafe { libc::killpg(pid, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    match io::Error::last_os_error() {
+        // The group is already gone.
+        error if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+        error => Err(error),
+    }
+}

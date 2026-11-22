@@ -32,7 +32,7 @@ use std::{
 
 /// The provider homes a fixture child gets, under the preview root.
 pub(crate) const FIXTURE_HOME: &str = "provider-homes/home";
-const COST_NOTE: &str = "Explicit user model choice overrides plan limits; this may consume remaining allowance or credits.";
+pub(super) const COST_NOTE: &str = "Explicit user model choice overrides plan limits; this may consume remaining allowance or credits.";
 /// The label a queued start's refusal carries.
 const START_LABEL: &str = "Start delegation";
 
@@ -235,7 +235,7 @@ impl TaskHostOwner {
             running: &running,
             max_concurrent,
             policy: &policy,
-            running_workers: self.running_codex_workers(),
+            running_workers: self.running_codex_workers(cx),
         };
         for effect in self.host.admit_delegations(capacity, &callers) {
             match effect {
@@ -309,7 +309,7 @@ impl TaskHostOwner {
             running: &running,
             max_concurrent: self.max_concurrent_runs(),
             policy: &policy,
-            running_workers: self.running_codex_workers(),
+            running_workers: self.running_codex_workers(cx),
         };
         let caller = self
             .delegation_identity(&delegation.parent.session_uid, cx)
@@ -338,7 +338,16 @@ impl TaskHostOwner {
                 .as_ref()
                 .and_then(|store| store.delegation(id))
                 .ok_or_else(|| format!("delegation {id} is not stored"))?;
-            let run = gitterm_core::delegations::codex_run(delegation, self.roots.root())?;
+            let mut run = gitterm_core::delegations::codex_run(delegation, self.roots.root())?;
+            // Iced's start_delegation_run: the guidelines for an AGENTS.md
+            // reader, without the task tools note.
+            run.guidelines = self.launch_instructions(
+                &run.cwd,
+                gitterm_core::guidelines::InstructionFile::AgentsMd,
+                &delegation.parent.workspace,
+                false,
+                cx,
+            );
             let fixture = self.fixture_of(&run.cwd, START_LABEL)?;
             let targets: Vec<PathBuf> = std::iter::once(run.cwd.clone())
                 .chain(delegation.options.add_dirs.iter().cloned())
@@ -671,10 +680,8 @@ impl TaskHostOwner {
     }
 
     /// Live Codex worker sessions, for the plan-limit policy.
-    // shortcut: no fixture launch starts a Codex worker yet; count them
-    // when LaunchSession runs presets in fixture mode.
-    fn running_codex_workers(&self) -> usize {
-        0
+    fn running_codex_workers(&self, cx: &App) -> usize {
+        self.running_workers(gitterm_core::plan_limits::Provider::Codex, cx)
     }
 
     fn max_concurrent_runs(&self) -> usize {
@@ -747,7 +754,7 @@ pub(super) struct PolicyNow {
     pub report: gitterm_core::plan_limits::PolicyReport,
 }
 
-fn value_of<'a>(env: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsString> {
+pub(super) fn value_of<'a>(env: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsString> {
     env.iter()
         .rev()
         .find(|(key, _)| key == name)

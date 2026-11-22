@@ -392,6 +392,19 @@ impl Shell {
                 shell.usage_intent(intent.clone(), cx);
             },
         ));
+        // A fixture task launch's terminal becomes a pane here (H5b B10b).
+        if let Some(host) = cx
+            .try_global::<task_host::GpuiTaskHost>()
+            .map(|host| host.0.clone())
+        {
+            subscriptions.push(cx.subscribe_in(
+                &host,
+                window,
+                |shell, host, launched: &task_host::TerminalLaunched, window, cx| {
+                    shell.adopt_task_terminal(host, launched, window, cx);
+                },
+            ));
+        }
         if local {
             owner.update(cx, |owner, cx| {
                 owner.dispatch(Intent::Opened, Instant::now(), cx)
@@ -968,7 +981,7 @@ impl Shell {
         &mut self,
         placement: DockPlacement,
         cwd: Option<std::path::PathBuf>,
-        launch: Option<gitterm_terminal::TerminalLaunch>,
+        launch: Option<PaneStart>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1052,11 +1065,87 @@ impl Shell {
             state.store.regions.bottom_visible = true;
             state.store.regions.bottom_opened = true;
         }
-        if let Some(launch) = launch {
-            let pane = self.active(cx).panes[&pane_id].clone();
-            self.launch_run_terminal(&pane, launch, window, cx);
+        match launch {
+            Some(PaneStart::Launch(launch)) => {
+                let pane = self.active(cx).panes[&pane_id].clone();
+                self.launch_run_terminal(&pane, launch, window, cx);
+            }
+            Some(PaneStart::Adopt { view, target }) => {
+                let pane = self.active(cx).panes[&pane_id].clone();
+                self.adopt_terminal_view(&pane, view, target, window, cx);
+            }
+            None => {}
         }
         self.show_pane(&pane_id, window, cx);
+    }
+    /// Iced opens a tab for a launched task session; GPUI adopts the task
+    /// host's terminal into a new center pane of the active workspace. A
+    /// shell that cannot hold one leaves it with the host, which stops it
+    /// at quit.
+    fn adopt_task_terminal(
+        &mut self,
+        host: &Entity<task_host::TaskHostOwner>,
+        launched: &task_host::TerminalLaunched,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.local || !self.workspaces.iter().any(|state| state.on_bar()) {
+            return;
+        }
+        let Some(view) = host.update(cx, |host, _| host.take_terminal(&launched.session_id)) else {
+            return;
+        };
+        let target = gitterm_core::session::Target {
+            task_id: Some(launched.task_id.clone()),
+            task_session_id: Some(launched.session_id.clone()),
+            ..sessions::fresh_target()
+        };
+        self.new_terminal_launch(
+            DockPlacement::Center,
+            Some(launched.cwd.clone()),
+            Some(PaneStart::Adopt { view, target }),
+            window,
+            cx,
+        );
+        if let Some(id) = self
+            .active(cx)
+            .sessions
+            .last()
+            .map(|session| session_pane_id(session.id))
+        {
+            let title = launched.title.clone();
+            self.active(cx).panes[&id].update(cx, |pane, cx| {
+                pane.title = title;
+                cx.notify();
+            });
+        }
+    }
+    /// [`Self::launch_run_terminal`] for a terminal that is already running.
+    fn adopt_terminal_view(
+        &mut self,
+        pane: &Entity<Pane>,
+        view: Entity<gitterm_terminal::TerminalView>,
+        target: gitterm_core::session::Target,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A new pane: its stopped placeholder holds no terminal to close.
+        pane.update(cx, |pane, _| {
+            pane.session = Some(target);
+            pane.exit_pending = false;
+        });
+        self._subscriptions
+            .push(cx.observe_in(&view, window, |_, view, window, cx| {
+                let view = view.clone();
+                window.defer(cx, move |window, cx| {
+                    view.update(cx, |view, cx| view.process_events(window, cx));
+                });
+                cx.notify();
+            }));
+        pane.update(cx, |pane, cx| {
+            pane.content = pane::PaneContent::Terminal(view);
+            cx.notify();
+        });
     }
     #[cfg(test)]
     fn close_session(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<Self>) {
@@ -2818,7 +2907,7 @@ impl Shell {
             self.new_terminal_launch(
                 DockPlacement::Bottom,
                 Some(cwd.clone()),
-                Some(launch),
+                Some(PaneStart::Launch(launch)),
                 window,
                 cx,
             );
@@ -5314,6 +5403,16 @@ fn roster_checkout(
         .or(Some(&worker.parent.cwd))
         .map(|path| path.display().to_string())
         .unwrap_or_default()
+}
+
+/// What a new terminal pane starts with besides a fresh shell.
+enum PaneStart {
+    Launch(gitterm_terminal::TerminalLaunch),
+    /// A running terminal another owner started (a task session).
+    Adopt {
+        view: Entity<gitterm_terminal::TerminalView>,
+        target: gitterm_core::session::Target,
+    },
 }
 
 #[cfg(test)]

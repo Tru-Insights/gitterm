@@ -18,6 +18,8 @@ tonic = { version = "0.12", default-features = false }
 gitterm-terminal = { path = "../terminal" }
 gitterm-gpui-review = { path = "../review" }
 gitterm-gpui-chat = { path = "../chat" }
+# Iced's Claude preset session-id parsing (H5b B10b fixture launches).
+shell-words = "=1.1.1"
 gpui-kit = "=0.9.1"
 gpui-component = "=0.9.1"
 anyhow = "1"
@@ -39,4 +41,3 @@ gpui-component = { version = "=0.9.1", features = ["test-support"] }
 # tests/codex_trust.rs: core's trust cases under this workspace's toml.
 git2 = "0.19"
 toml = "0.8"
-shell-words = "=1.1.1"
