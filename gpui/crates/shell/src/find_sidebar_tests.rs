@@ -1191,11 +1191,34 @@ fn tree_snapshot(root: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
         if path.is_dir() {
             entries.extend(tree_snapshot(&path));
         } else {
-            entries.push((path.clone(), std::fs::read(path).unwrap()));
+            match std::fs::read(&path) {
+                Ok(bytes) => entries.push((path, bytes)),
+                // A writer's temp file renamed away between listing and read.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("read {}: {error}", path.display()),
+            }
         }
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     entries
+}
+
+/// The tree once background writers (preview temp files, index loads) have
+/// gone quiet: two snapshots 200 ms apart agree, within a 30 s deadline.
+fn settled_tree_snapshot(root: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let first = tree_snapshot(root);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let second = tree_snapshot(root);
+        if first == second {
+            return second;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the preview tree never settled"
+        );
+    }
 }
 
 #[gpui::test]
@@ -1205,7 +1228,7 @@ fn pw_notices_do_not_write_or_create_a_process_or_session(cx: &mut TestAppContex
         window.dispatch_action(Box::new(crate::app_menus::ChatsOverviewOpen), cx)
     });
     draw_host(cx);
-    let before = tree_snapshot(root.path());
+    let before = settled_tree_snapshot(root.path());
     let sessions = cx.read(|cx| {
         shell
             .read(cx)
@@ -1256,7 +1279,7 @@ fn pw_notices_do_not_write_or_create_a_process_or_session(cx: &mut TestAppContex
             );
         });
     }
-    assert_eq!(tree_snapshot(root.path()), before);
+    assert_eq!(settled_tree_snapshot(root.path()), before);
 }
 
 #[test]

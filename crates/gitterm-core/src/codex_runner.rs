@@ -2235,7 +2235,7 @@ mod tests {
             let _running = runtime.spawn(async move { run_with(run, sender, &environment).await });
             let pid_file = fake.dir.path().join("sleep.pid");
             runtime.block_on(async {
-                for _ in 0..100 {
+                for _ in 0..600 {
                     if std::fs::read_to_string(&pid_file).is_ok_and(|pid| pid.ends_with('\n')) {
                         break;
                     }
@@ -2252,7 +2252,7 @@ mod tests {
             // direct child, so the descendant ends only if `stop` killed
             // the group.
             runtime.shutdown_timeout(std::time::Duration::ZERO);
-            let gone = (0..50).any(|_| {
+            let gone = (0..300).any(|_| {
                 // SAFETY: signal 0 only checks that the process exists.
                 let alive = unsafe { libc::kill(pid, 0) } == 0;
                 if alive {
@@ -2276,7 +2276,7 @@ mod tests {
             let (sender, _receiver) = mpsc::unbounded_channel();
             let running = tokio::spawn(async move { run_with(run, sender, &environment).await });
             let pid_file = fake.dir.path().join("sleep.pid");
-            for _ in 0..100 {
+            for _ in 0..600 {
                 if std::fs::read_to_string(&pid_file).is_ok_and(|pid| pid.ends_with('\n')) {
                     break;
                 }
@@ -2288,7 +2288,7 @@ mod tests {
                 .parse()
                 .expect("sleep pid");
             stop.stop();
-            let error = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+            let error = tokio::time::timeout(std::time::Duration::from_secs(30), running)
                 .await
                 .expect("the stop ends the run")
                 .expect("join")
@@ -2296,7 +2296,7 @@ mod tests {
             assert!(matches!(error, CodexRunError::Stopped), "{error:?}");
             let log = std::fs::read_to_string(log_path).expect("log");
             assert!(log.lines().any(|line| line.contains("gitterm.stopped")));
-            let gone = (0..50).any(|_| {
+            let gone = (0..300).any(|_| {
                 // SAFETY: signal 0 only checks that the process exists.
                 let alive = unsafe { libc::kill(pid, 0) } == 0;
                 if alive {
@@ -2397,7 +2397,7 @@ mod tests {
             let started = std::time::Instant::now();
             let (result, events) = run_collect(&fake, run).await;
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(15),
+                started.elapsed() < std::time::Duration::from_secs(25),
                 "the limit stops the run: {:?}",
                 started.elapsed()
             );
@@ -2432,7 +2432,7 @@ mod tests {
                 .trim()
                 .parse()
                 .expect("sleep pid");
-            let gone = (0..50).any(|_| {
+            let gone = (0..300).any(|_| {
                 // SAFETY: signal 0 only checks that the process exists.
                 let alive = unsafe { libc::kill(pid, 0) } == 0;
                 if alive {

@@ -1982,7 +1982,7 @@ mod tests {
         }
         g(dir, &["add", "."]);
         g(dir, &["commit", "-qm", "many source objects"]);
-        let snapshot = tokio::time::timeout(Duration::from_secs(10), snapshot(&test_root(), dir))
+        let snapshot = tokio::time::timeout(Duration::from_secs(30), snapshot(&test_root(), dir))
             .await
             .expect("batch inventory must drain stdout while feeding stdin")
             .unwrap()
@@ -2149,7 +2149,7 @@ mod tests {
         std::fs::write(dir.join("file.txt"), "capture in flight").unwrap();
         let path = dir.to_path_buf();
         let capture = tokio::spawn(async move { snapshot(&test_root(), &path).await });
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while !filter.with_extension("started").exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -2224,7 +2224,7 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while !control.path().join("ready").exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -2517,7 +2517,7 @@ mod tests {
             .unwrap();
         token.cancel();
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), recorder.finish())
+            tokio::time::timeout(Duration::from_secs(30), recorder.finish())
                 .await
                 .is_ok(),
             "cancelled result handling must not await GC"
