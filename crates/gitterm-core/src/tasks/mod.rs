@@ -2,6 +2,11 @@ pub mod model;
 pub use model::*;
 
 #[cfg(feature = "runtime")]
+mod handoff;
+#[cfg(feature = "runtime")]
+pub use handoff::task_handoff_prompt;
+
+#[cfg(feature = "runtime")]
 pub mod state;
 
 #[cfg(feature = "runtime")]

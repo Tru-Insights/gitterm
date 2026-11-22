@@ -241,6 +241,7 @@ fn task_rows_from_host_snapshot(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn task_write_intents_show_notice(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
     let fixture = Fixture::new();
     let ready = fixture.worktree("ready");
     // A recorded worktree that is gone makes this task "finished" too.
@@ -307,44 +308,18 @@ fn task_write_intents_show_notice(cx: &mut TestAppContext) {
     click("task-publish-cancel", cx);
     assert!(!panel.read_with(cx, |panel, _| panel.modal_open()));
 
-    // Delete: the inspection is refused, the confirm reaches the notice.
+    // Delete: the fixture's repository is not a git checkout, so the
+    // inspection fails and, as in Iced, no confirm is offered.
     panel.update(cx, |panel, cx| panel.open_delete("linked", &open, cx));
+    draw(cx);
     panel.read_with(cx, |panel, _| match &panel.modal {
         Some(Modal::Delete {
-            record_only,
-            inspection,
+            inspection: Some(Err(_)),
             ..
-        }) => {
-            assert!(!record_only);
-            assert_eq!(inspection, "Inspect worktree · not available in preview");
-        }
-        _ => panic!("delete confirmation should be open"),
+        }) => {}
+        _ => panic!("delete confirmation should show the failed inspection"),
     });
-    click("task-delete-confirm", cx);
-    assert_eq!(
-        notice(&panel, cx).as_deref(),
-        Some("Remove worktree · not available in preview")
-    );
-    click("task-delete-keep", cx);
-    panel.update(cx, |panel, cx| panel.open_delete("failed", &open, cx));
-    assert!(matches!(
-        panel.read_with(cx, |panel, _| panel.modal.as_ref().map(|m| matches!(
-            m,
-            Modal::Delete {
-                record_only: true,
-                ..
-            }
-        ))),
-        Some(true)
-    ));
-    draw(cx);
-    let bounds = cx.debug_bounds("task-delete-confirm").unwrap();
-    assert!(bounds.size.width > px(0.));
-    click("task-delete-confirm", cx);
-    assert_eq!(
-        notice(&panel, cx).as_deref(),
-        Some("Remove worktree · not available in preview")
-    );
+    assert!(!visible("task-delete-confirm", cx));
     click("task-delete-keep", cx);
 
     // Create: Iced's validation first, then the refusal.
@@ -1158,4 +1133,159 @@ fn overview_session_verbs_find_sessions_in_other_workspaces(cx: &mut TestAppCont
         }
     ));
     assert!(verbs.contains(&Verb::GoToSession("session-ready".into())));
+}
+
+/// T08/T08a: `Delete worktree…` runs Iced's inspection (read-only git) in
+/// the preview; the confirm label comes from it and the delete is refused.
+#[gpui::test]
+fn worktree_inspection_runs_in_preview_and_delete_refused(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    let repo = fixture.worktree("repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "fixture"]);
+    let base = gitterm_core::git_status::git_command()
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let base = String::from_utf8(base.stdout).unwrap().trim().to_owned();
+    let clean = fixture.dir.path().canonicalize().unwrap().join("wt-clean");
+    let dirty = fixture.dir.path().canonicalize().unwrap().join("wt-dirty");
+    for (path, branch) in [(&clean, "task/clean"), (&dirty, "task/dirty")] {
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                branch,
+                path.to_str().unwrap(),
+                "main",
+            ],
+        );
+    }
+    std::fs::write(dirty.join("note.txt"), "unsaved\n").unwrap();
+    // The gone worktree's branch outlives it, as after a manual removal.
+    git(&repo, &["branch", "task/gone"]);
+    let record = |id: &str, path: &Path| {
+        let mut task = with_worktree(
+            in_dir(task(id, TaskLifecycle::Ready), &repo),
+            path.to_owned(),
+        );
+        task.branch = format!("task/{id}");
+        task.base.commit = base.clone();
+        task
+    };
+    let gone = fixture.dir.path().canonicalize().unwrap().join("wt-gone");
+    fixture.write_iced(vec![
+        record("clean", &clean),
+        record("dirty", &dirty),
+        record("gone", &gone),
+    ]);
+    fixture.start(cx);
+    let source = std::fs::read(fixture.source()).unwrap();
+    let copy = std::fs::read(fixture.copy()).unwrap();
+    let git_admin = std::fs::read_dir(repo.join(".git/worktrees"))
+        .unwrap()
+        .count();
+    let open = inputs(&[]);
+    let (panel, _, cx, _) = surfaces(cx, open.clone());
+    let inspected = |panel: &Entity<TaskPanel>, cx: &mut VisualTestContext| {
+        panel.read_with(cx, |panel, _| match &panel.modal {
+            Some(Modal::Delete {
+                inspection: Some(Ok(inspection)),
+                ..
+            }) => inspection.clone(),
+            Some(Modal::Delete { inspection, .. }) => {
+                panic!("the inspection should have returned: {inspection:?}")
+            }
+            _ => panic!("the delete confirmation should be open"),
+        })
+    };
+    let label = |cx: &mut VisualTestContext| cx.debug_bounds("task-delete-confirm").map(|_| ());
+
+    // A clean, registered worktree: `Delete worktree`, refused on confirm.
+    panel.update(cx, |panel, cx| panel.open_delete("clean", &open, cx));
+    draw(cx);
+    let clean_inspection = inspected(&panel, cx);
+    assert!(clean_inspection.path_exists && clean_inspection.registered);
+    assert!(clean_inspection.risks.is_empty(), "{clean_inspection:?}");
+    assert!(label(cx).is_some());
+    click("task-delete-confirm", cx);
+    assert_eq!(
+        notice(&panel, cx).as_deref(),
+        Some("Remove worktree · not available in preview")
+    );
+    assert!(clean.is_dir());
+    click("task-delete-keep", cx);
+
+    // Uncommitted work blocks the delete: no confirm, as Iced.
+    panel.update(cx, |panel, cx| panel.open_delete("dirty", &open, cx));
+    draw(cx);
+    assert!(inspected(&panel, cx).dirty);
+    assert!(label(cx).is_none());
+    click("task-delete-keep", cx);
+
+    // A recorded path that is gone: `Clear worktree record`, refused too.
+    panel.update(cx, |panel, cx| {
+        panel.notice = None;
+        panel.open_delete("gone", &open, cx)
+    });
+    draw(cx);
+    assert!(!inspected(&panel, cx).path_exists);
+    click("task-delete-confirm", cx);
+    assert_eq!(
+        notice(&panel, cx).as_deref(),
+        Some("Remove worktree · not available in preview")
+    );
+
+    // Nothing was written: the store, its copy and git's worktree admin.
+    assert_eq!(std::fs::read(fixture.source()).unwrap(), source);
+    assert_eq!(std::fs::read(fixture.copy()).unwrap(), copy);
+    assert_eq!(
+        std::fs::read_dir(repo.join(".git/worktrees"))
+            .unwrap()
+            .count(),
+        git_admin
+    );
+    assert!(dirty.join("note.txt").is_file());
+}
+
+/// T04: `Start with` / `+ Continue` copies the task's handoff prompt (the
+/// core `task_handoff_prompt`, as Iced) and the picker says so.
+#[gpui::test]
+fn overview_copies_handoff_prompt(cx: &mut TestAppContext) {
+    let (_fixture, _root, shell, _panel, cx) = shell_with_tasks(cx, |work| {
+        vec![with_worktree(
+            in_dir(task("ready", TaskLifecycle::Ready), work),
+            work.to_owned(),
+        )]
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.activate_rail_task("ready", window, cx)
+        })
+    });
+    click("task-start", cx);
+    let expected = cx.read(|cx| {
+        task_handoff_prompt(
+            host(cx)
+                .unwrap()
+                .store()
+                .as_ref()
+                .unwrap()
+                .get("ready")
+                .unwrap(),
+            None,
+        )
+    });
+    assert!(expected.starts_with("Continue GitTerm task ready: Task ready"));
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some(expected)
+    );
+    // Iced's `handoff copied` line under CONTINUE TASK.
+    assert!(visible("session-picker-handoff-copied", cx));
 }

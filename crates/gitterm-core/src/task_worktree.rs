@@ -143,6 +143,8 @@ pub fn resolve_repository(path: &Path) -> Result<ResolvedRepository, TaskWorktre
         path,
         "resolve repository",
         &[
+            "-c",
+            "core.fsmonitor=false",
             "--no-optional-locks",
             "rev-parse",
             "--path-format=absolute",
@@ -1011,11 +1013,20 @@ pub fn inspect_cleanup(
         risks.push(CleanupRisk::WorktreeNotRegistered);
     }
 
+    // fsmonitor off: a configured fsmonitor hook or daemon would run (and write
+    // cookies) on status, and `--no-optional-locks` does not stop it. No optional locks: a plain `git status` may refresh and rewrite the
+    // index, and inspection must only read (the preview runs it).
     let dirty = if path_exists {
         !run_git(
             worktree_path,
             "inspect changes",
-            &["status", "--porcelain=v1"],
+            &[
+                "-c",
+                "core.fsmonitor=false",
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v1",
+            ],
         )?
         .stdout
         .is_empty()
@@ -1332,7 +1343,14 @@ fn registered_worktrees(repository_path: &Path) -> Result<Vec<PathBuf>, TaskWork
     let output = run_git(
         repository_path,
         "list registered worktrees",
-        &["--no-optional-locks", "worktree", "list", "--porcelain"],
+        &[
+            "-c",
+            "core.fsmonitor=false",
+            "--no-optional-locks",
+            "worktree",
+            "list",
+            "--porcelain",
+        ],
     )?;
     let text = stdout_text(&output, repository_path, "list registered worktrees")?;
     Ok(text
@@ -1351,6 +1369,8 @@ fn branch_upstream(
         repository_path,
         "inspect branch upstream",
         &[
+            "-c",
+            "core.fsmonitor=false",
             "for-each-ref",
             "--count=1",
             "--format=%(upstream:short)",
@@ -1371,7 +1391,14 @@ fn rev_count(
     let output = run_git(
         repository_path,
         operation,
-        &["rev-list", "--count", "--end-of-options", range],
+        &[
+            "-c",
+            "core.fsmonitor=false",
+            "rev-list",
+            "--count",
+            "--end-of-options",
+            range,
+        ],
     )?;
     let value = stdout_text(&output, repository_path, operation)?;
     value.trim().parse::<u64>().map_err(|error| {
@@ -1395,7 +1422,13 @@ pub fn validate_branch(repository_path: &Path, branch: &str) -> Result<(), TaskW
     run_git(
         repository_path,
         "validate branch",
-        &["check-ref-format", "--branch", branch],
+        &[
+            "-c",
+            "core.fsmonitor=false",
+            "check-ref-format",
+            "--branch",
+            branch,
+        ],
     )?;
     Ok(())
 }
@@ -1896,6 +1929,116 @@ mod tests {
             url: "https://example.invalid/pull/1".to_string()
         }));
         assert!(!guarded.safe_to_remove());
+    }
+
+    /// Every file under `root` with its bytes and modification time.
+    fn snapshot(
+        root: &Path,
+    ) -> std::collections::BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)> {
+        let mut files = std::collections::BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                let meta = fs::symlink_metadata(&path).unwrap();
+                if meta.is_dir() {
+                    pending.push(path);
+                } else {
+                    files.insert(
+                        path.clone(),
+                        (fs::read(&path).unwrap(), meta.modified().unwrap()),
+                    );
+                }
+            }
+        }
+        files
+    }
+
+    /// The preview runs this inspection as a read (TRU-274 T08), so it must
+    /// write nothing: not the index a plain `git status` would refresh.
+    #[test]
+    fn inspection_spawns_only_read_git() {
+        let repository = TestRepository::new();
+        let request = repository.request("task-read", None, "Inspect read", "main");
+        let prepared = prepare_task_worktree_blocking(&request).unwrap();
+        fs::write(prepared.path.join("untracked.txt"), "change\n").unwrap();
+        // Same content, new mtime: the index's stat data is stale, which a
+        // plain `git status` refreshes by rewriting the index.
+        fs::File::options()
+            .write(true)
+            .open(prepared.path.join("README.md"))
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
+            )
+            .unwrap();
+        let git_dir = repository.path.join(".git");
+        let before = (snapshot(&git_dir), snapshot(&prepared.path));
+
+        let inspection = inspect_cleanup(
+            &repository.path,
+            &prepared.path,
+            &prepared.branch,
+            &prepared.base.commit,
+            &CleanupContext {
+                process_running: false,
+                pull_request_url: None,
+            },
+        )
+        .unwrap();
+        assert!(inspection.dirty);
+        assert_eq!(before, (snapshot(&git_dir), snapshot(&prepared.path)));
+
+        // The fixture would catch the write: a plain status rewrites the index.
+        git_ok(&prepared.path, &["status", "--porcelain=v1"]);
+        assert_ne!(before.0, snapshot(&git_dir));
+    }
+
+    /// `--no-optional-locks` does not stop a configured fsmonitor: the hook
+    /// would run (and the daemon write cookies) during the preview's read.
+    #[cfg(unix)]
+    #[test]
+    fn inspection_with_fsmonitor_hook_writes_nothing() {
+        let repository = TestRepository::new();
+        let request = repository.request("task-fsmon", None, "Inspect fsmonitor", "main");
+        let prepared = prepare_task_worktree_blocking(&request).unwrap();
+        // Git runs the hook through a shell unquoted, so keep spaces out of its path.
+        let hook_dir = tempfile::tempdir().unwrap();
+        let marker = hook_dir.path().join("fsmonitor-ran");
+        let hook = hook_dir.path().join("fsmonitor-hook.sh");
+        fs::write(
+            &hook,
+            format!("#!/bin/sh\necho ran > '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        git_ok(
+            &repository.path,
+            &["config", "core.fsmonitor", hook.to_str().unwrap()],
+        );
+        fs::write(prepared.path.join("untracked.txt"), "change\n").unwrap();
+
+        let inspection = inspect_cleanup(
+            &repository.path,
+            &prepared.path,
+            &prepared.branch,
+            &prepared.base.commit,
+            &CleanupContext {
+                process_running: false,
+                pull_request_url: None,
+            },
+        )
+        .unwrap();
+        assert!(inspection.dirty);
+        assert!(!marker.exists(), "fsmonitor hook ran during inspection");
+        assert!(!repository.path.join(".git/fsmonitor--daemon").exists());
+
+        // Control: a plain status does run the hook.
+        git_ok(&repository.path, &["status", "--porcelain=v1"]);
+        assert!(marker.exists());
     }
 
     #[test]
