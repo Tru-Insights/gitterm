@@ -79,13 +79,17 @@ impl DelegationCard {
     }
     /// The card's fold summary: marker, kind · model, target, state.
     pub fn fold_label(&self, open: bool, now_ms: u64) -> String {
-        format!(
-            "{} {} · {} · {}",
-            if open { "▾" } else { "▸" },
-            self.header(),
+        let [head, target, state] = self.fold_parts(open, now_ms);
+        format!("{head} · {target} · {state}")
+    }
+    /// Iced's summary spans: `marker kind · model`, the target, the state.
+    /// The first two shorten with an ellipsis; the state always shows.
+    pub fn fold_parts(&self, open: bool, now_ms: u64) -> [String; 3] {
+        [
+            format!("{} {}", if open { "▾" } else { "▸" }, self.header()),
             self.target(),
-            self.state_text(now_ms)
-        )
+            self.state_text(now_ms),
+        ]
     }
     pub fn target(&self) -> String {
         if self.is_worker() {
