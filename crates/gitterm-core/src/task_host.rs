@@ -46,9 +46,14 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio_stream::Stream;
 
+mod create;
 mod delivery;
 mod launch;
 mod runner;
+pub use create::{
+    assemble_task_create, canonical_task_workspace_directory, stopping_boundary_from_control,
+    AssembledTaskCreate,
+};
 pub use delivery::{
     DeliveryChat, DeliveryCompletion, DeliveryEffect, DeliveryReceipt, DeliveryTick, Dismissal,
     Submission,
