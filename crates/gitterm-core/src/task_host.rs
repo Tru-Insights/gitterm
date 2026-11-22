@@ -253,12 +253,24 @@ impl TaskHost {
         envelope: TaskControlEnvelope,
         caller_task: Option<&str>,
     ) -> Option<HostEffect> {
+        self.dispatch_with_caller(envelope, caller_task, None)
+    }
+
+    /// [`Self::dispatch_with_caller_task`], with `caller_checkout` the
+    /// directory the calling chat works in: the target of a write that has
+    /// no checkout of its own (`merge_plan_set`).
+    pub fn dispatch_with_caller(
+        &self,
+        envelope: TaskControlEnvelope,
+        caller_task: Option<&str>,
+        caller_checkout: Option<&std::path::Path>,
+    ) -> Option<HostEffect> {
         let TaskControlEnvelope {
             operation,
             caller,
             reply,
         } = envelope;
-        let authorized = match self.write_targets(&operation, caller_task) {
+        let authorized = match self.write_targets(&operation, caller_task, caller_checkout) {
             Some(targets) if !targets.is_empty() => targets
                 .iter()
                 .try_for_each(|target| self.services.operation(&operation, Some(target))),
@@ -339,14 +351,15 @@ impl TaskHost {
         })
     }
 
-    /// Every path a write or launch would act in, from the request and the
-    /// store. `None` when any one of them cannot be resolved, and for
-    /// operations with no checkout (reads, `merge_plan_set`). Git admin dirs
-    /// of each target are checked by the gate itself.
+    /// Every path a write or launch would act in, from the request, the
+    /// store and the caller. `None` when any one of them cannot be resolved,
+    /// and for reads. `merge_plan_set` acts in the caller's checkout. Git
+    /// admin dirs of each target are checked by the gate itself.
     fn write_targets(
         &self,
         operation: &TaskControlOperation,
         caller_task: Option<&str>,
+        caller_checkout: Option<&std::path::Path>,
     ) -> Option<Vec<PathBuf>> {
         use TaskControlOperation as Op;
         let worktree = |task_id: &str| self.store().as_ref()?.get(task_id)?.worktree.path.clone();
@@ -376,8 +389,8 @@ impl TaskHost {
                 targets.extend(request.add_dirs.iter().cloned());
                 Some(targets)
             }
-            Op::MergePlanSet(_)
-            | Op::PlanLimits
+            Op::MergePlanSet(_) => Some(vec![caller_checkout?.to_path_buf()]),
+            Op::PlanLimits
             | Op::HtmlRender(_)
             | Op::List(_)
             | Op::Get(_)
