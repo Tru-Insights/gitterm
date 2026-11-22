@@ -77,12 +77,12 @@ pub fn restored_startup(
         }
         restored.startup_command = Some(command);
         restored.chat_session_id = Some(conversation.session_id.clone());
-    } else if let Some(session_id) = saved.strip_prefix("claude --resume ").map(str::trim) {
+    } else if saved.starts_with("claude ") && saved.split_whitespace().any(|w| w == "--resume") {
         // A persisted resume against a Claude session that never received a
         // message (the transcript is only written on first message) errors
         // on launch; start a fresh session instead.
-        if !session_id.contains(char::is_whitespace) && !claude_session_exists(session_id) {
-            restored.startup_command = Some("claude".to_string());
+        if let Some(fresh) = fresh_claude_for_missing_resume(saved, &claude_session_exists) {
+            restored.startup_command = Some(fresh);
             restored.chat_session_id = None;
         }
     } else if let Some((resume, session_id)) =
@@ -95,6 +95,43 @@ pub fn restored_startup(
         restored.chat_session_id = Some(session_id);
     }
     restored
+}
+
+/// The fresh `claude` launch for a saved `claude … --resume <id>` whose
+/// transcript was never written (`session_exists` false): the command
+/// without `--resume <id>`, other options kept (a bare resume becomes plain
+/// `claude`, Iced's original rule). None leaves the command alone: the
+/// transcript exists, or the command is quoted (an embedded brief) or has
+/// no plain `--resume <id>`.
+fn fresh_claude_for_missing_resume(
+    command: &str,
+    session_exists: impl Fn(&str) -> bool,
+) -> Option<String> {
+    // The bare form keeps Iced's original rule exactly.
+    if let Some(id) = command.strip_prefix("claude --resume ").map(str::trim) {
+        if !id.contains(char::is_whitespace) {
+            return (!session_exists(id)).then(|| "claude".to_string());
+        }
+    }
+    if command.contains(['"', '\'']) {
+        return None;
+    }
+    let words: Vec<&str> = command.split_whitespace().collect();
+    if words.first() != Some(&"claude") {
+        return None;
+    }
+    let idx = words.iter().position(|w| *w == "--resume")?;
+    let id = words.get(idx + 1).filter(|id| !id.starts_with('-'))?;
+    if session_exists(id) {
+        return None;
+    }
+    let kept: Vec<&str> = words
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != idx && *i != idx + 1)
+        .map(|(_, w)| *w)
+        .collect();
+    Some(kept.join(" "))
 }
 
 /// Drops `task`'s Claude conversation refs whose transcript was never
@@ -293,11 +330,62 @@ mod tests {
             restore("claude --resume abc", None, None, &["abc"]),
             restored("claude --resume abc", None)
         );
-        // Not a bare resume: left as saved.
-        assert_eq!(
-            restore("claude --resume abc --model opus", None, None, &[]),
-            restored("claude --resume abc --model opus", None)
-        );
+    }
+
+    /// Iced's bare-form rule, pinned: these are exactly what the rule
+    /// returned before option forms were handled.
+    #[test]
+    fn the_bare_claude_resume_rule_is_unchanged() {
+        for (saved, exists, expected) in [
+            ("claude --resume abc", &[][..], "claude"),
+            ("claude --resume  abc ", &[], "claude"),
+            ("claude --resume 'abc'", &[], "claude"),
+            ("claude --resume abc", &["abc"], "claude --resume abc"),
+        ] {
+            assert_eq!(
+                restore(saved, None, None, exists),
+                restored(expected, None),
+                "{saved}"
+            );
+        }
+    }
+
+    /// Issue 88: a Claude resume with options whose transcript was never
+    /// written starts a fresh `claude` with the other options kept.
+    #[test]
+    fn claude_resume_with_options_without_a_transcript_starts_fresh() {
+        for (saved, fresh) in [
+            ("claude --model opus --resume abc", "claude --model opus"),
+            (
+                "claude --resume abc --add-dir /w/notes",
+                "claude --add-dir /w/notes",
+            ),
+            (
+                "claude --effort high --add-dir /w/notes --model opus --resume abc",
+                "claude --effort high --add-dir /w/notes --model opus",
+            ),
+            ("claude --resume abc --model opus", "claude --model opus"),
+        ] {
+            assert_eq!(
+                restore(saved, None, None, &[]),
+                restored(fresh, None),
+                "{saved}"
+            );
+            // An existing transcript still resumes.
+            assert_eq!(
+                restore(saved, None, None, &["abc"]),
+                restored(saved, None),
+                "{saved}"
+            );
+        }
+        // Quoted (an embedded brief), or no id after --resume: as saved.
+        for saved in [
+            "claude --model opus --resume abc \"$(cat 'b.md')\"",
+            "claude --model opus --resume",
+            "claude --model opus --resume --effort high",
+        ] {
+            assert_eq!(restore(saved, None, None, &[]), restored(saved, None));
+        }
     }
 
     #[test]
