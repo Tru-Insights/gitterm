@@ -480,6 +480,60 @@ fn fixture_add_dir_outside_refused(cx: &mut TestAppContext) {
     assert!(launches.saved().get(&task).unwrap().sessions.is_empty());
 }
 
+/// Git in `dir` with no inherited `GIT_*` and no user or system config.
+fn fixture_git(dir: &Path, args: &[&str]) -> String {
+    let mut command = std::process::Command::new("git");
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_none_or(|name| name.starts_with("GIT_")) {
+            command.env_remove(name);
+        }
+    }
+    let output = command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?} failed");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[gpui::test]
+fn launch_refused_when_git_names_a_work_tree_outside(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let task = launches.create(cx);
+    let worktree = launches.worktree(&task, cx);
+    let outside = launches.runs.git.outside.clone();
+    // Only this worktree's own config.worktree names the outside folder,
+    // which the admin-dir recheck cannot see.
+    fixture_git(&worktree, &["config", "extensions.worktreeConfig", "true"]);
+    fixture_git(
+        &worktree,
+        &[
+            "config",
+            "--worktree",
+            "core.worktree",
+            outside.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        PathBuf::from(fixture_git(&worktree, &["rev-parse", "--show-toplevel"]).trim_end())
+            .canonicalize()
+            .unwrap(),
+        outside.canonicalize().unwrap()
+    );
+    let error = launches.launch(&task, Some("Codex"), cx).unwrap_err();
+    assert_eq!(
+        error,
+        gitterm_core::preview::service::preview_notice("task_launch_session")
+    );
+    assert_eq!(launches.agent.runs(), 0);
+    assert!(launches.saved().get(&task).unwrap().sessions.is_empty());
+    assert!(launches.host_terminals(cx).is_empty());
+}
+
 #[gpui::test]
 fn launched_terminal_env_has_only_the_fixture_env(cx: &mut TestAppContext) {
     let launches = Launches::start(cx);

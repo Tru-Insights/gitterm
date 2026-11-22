@@ -364,10 +364,12 @@ impl TaskHostOwner {
             let command = command
                 .map(|command| self.runtime_command(&command, &worktree, &env, &task, cx))
                 .transpose()?;
-            // The fixture guard once more, right before the child starts.
-            self.host
-                .services()
+            // The fixture guard once more, right before the child starts,
+            // with the work tree Git itself would use (issue 84).
+            let services = self.host.services();
+            services
                 .recheck(&authorized)
+                .and_then(|()| services.recheck_git_work_trees(&authorized, &env))
                 .map_err(|denied| denied.notice().to_string())?;
             let terminal = spawn_terminal(&worktree, command, env, cx)?;
             Ok::<_, String>((terminal, objective_delivery))
