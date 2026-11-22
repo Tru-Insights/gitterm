@@ -740,9 +740,20 @@ impl Chats {
         conversation: Option<&str>,
         cx: &mut TestAppContext,
     ) -> String {
+        let cwd = fixture.iced.parent().unwrap().join("work");
+        self.open_in(fixture, conversation, &cwd, cx)
+    }
+    /// [`Self::open`] with the pane working in `cwd`.
+    fn open_in(
+        &self,
+        fixture: &Fixture,
+        conversation: Option<&str>,
+        cwd: &Path,
+        cx: &mut TestAppContext,
+    ) -> String {
         let saved = crate::chat::SavedChat {
             uid: "saved".into(),
-            cwd: fixture.iced.parent().unwrap().join("work"),
+            cwd: cwd.to_path_buf(),
             provider: fixture.roots.provider(),
             session_id: conversation.map(str::to_string),
             records: vec![],
@@ -1242,4 +1253,558 @@ fn merge_plan_root_through_facts_only_link_and_prs_once() {
             "{caller}: {value}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// H5b B9: fixture-mode store writes.
+
+/// A fixture root under the fixture's temp base (`fx/`, marked) holding a
+/// Git repository `fx/repo` with one commit on `main`, a plain directory
+/// `fx/wt` standing in for a task worktree, and an unmarked repository
+/// `outside-repo` beside it.
+struct GitFixture {
+    root: PathBuf,
+    repo: PathBuf,
+    worktree: PathBuf,
+    outside: PathBuf,
+}
+impl GitFixture {
+    fn new(fixture: &Fixture) -> Self {
+        let base = fixture.iced.parent().unwrap();
+        let root = base.join("fx");
+        let repo = root.join("repo");
+        let worktree = root.join("wt");
+        let outside = base.join("outside-repo");
+        for dir in [&repo, &worktree, &outside] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            root.join(gitterm_core::preview::service::FIXTURE_MARKER),
+            b"",
+        )
+        .unwrap();
+        for repo in [&repo, &outside] {
+            git(repo, &["init", "-q", "-b", "main"]);
+            std::fs::write(repo.join("README"), "fixture\n").unwrap();
+            git(repo, &["add", "README"]);
+            git(repo, &["commit", "-q", "-m", "fixture"]);
+        }
+        Self {
+            root,
+            repo,
+            worktree,
+            outside,
+        }
+    }
+    fn start(
+        &self,
+        fixture: &Fixture,
+        cx: &mut TestAppContext,
+    ) -> (Entity<TaskHostOwner>, TaskControlSender) {
+        let (config, sender) = fixture.config();
+        let fixtures = vec![self.root.clone()];
+        let owner = cx
+            .update(|cx| TaskHostOwner::start_fixture(config, fixtures, cx))
+            .unwrap();
+        (owner, sender)
+    }
+}
+
+/// Git with no user or system config, so the fixture repo is the same on
+/// every machine.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// Every file and directory under `dir`, with contents, mtimes and modes.
+#[cfg(unix)]
+fn tree(dir: &Path) -> Vec<(PathBuf, Vec<u8>, SystemTime, u32)> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut entries = vec![];
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read {
+            let path = entry.unwrap().path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            let bytes = if meta.is_file() {
+                std::fs::read(&path).unwrap()
+            } else {
+                if meta.is_dir() {
+                    pending.push(path.clone());
+                }
+                vec![]
+            };
+            entries.push((
+                path,
+                bytes,
+                meta.modified().unwrap(),
+                meta.permissions().mode(),
+            ));
+        }
+    }
+    entries.sort();
+    entries
+}
+
+/// A task whose worktree is `worktree`.
+fn task_at(id: &str, lifecycle: TaskLifecycle, worktree: &Path) -> TaskRecord {
+    use gitterm_core::tasks::{TaskWorktree, TaskWorktreeState};
+    let mut task = task(id, lifecycle);
+    task.worktree = TaskWorktree {
+        state: TaskWorktreeState::Ready,
+        path: Some(worktree.to_path_buf()),
+    };
+    task
+}
+
+/// An open worker delegation whose child is task `task_id`'s session `session`.
+fn worker_delegation(id: &str, task_id: &str, session: &str) -> Delegation {
+    serde_json::from_value(serde_json::json!({
+        "delegation_id": id, "kind": "implement",
+        "parent": {"session_uid": "parent", "chat_session_id": "parent-history", "workspace": "A", "cwd": "/fixture/work"},
+        "child": {"runner": "task_session", "task_id": task_id, "task_session_id": session, "preset_name": "Codex", "model": "fixture-model"},
+        "brief": "Fixture", "status": {"state": "running"},
+        "created_at": "2026-11-20T12:00:00Z", "updated_at": "2026-11-20T12:01:00Z"
+    }))
+    .unwrap()
+}
+
+fn stored_task(owner: &Entity<TaskHostOwner>, id: &str, cx: &mut TestAppContext) -> TaskRecord {
+    owner.read_with(cx, |owner, _| {
+        owner
+            .host()
+            .store()
+            .as_ref()
+            .unwrap()
+            .get(id)
+            .unwrap()
+            .clone()
+    })
+}
+
+fn create_in(repo: &Path) -> TaskControlOperation {
+    TaskControlOperation::Create(req(serde_json::json!({
+        "title": "Fixture task", "objective": "Prepare a fixture worktree",
+        "repository_path": repo.display().to_string(), "issue_key": "tru-1"
+    })))
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn fixture_create_prepares_worktree_in_fixture_repo(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    let git_fixture = GitFixture::new(&fixture);
+    let (owner, sender) = git_fixture.start(&fixture, cx);
+    let iced_before = tree(&fixture.iced);
+
+    let created = dispatch(cx, &sender, create_in(&git_fixture.repo)).unwrap();
+    let task_id = created["task_id"].as_str().unwrap().to_string();
+    let path = PathBuf::from(created["worktree"]["path"].as_str().unwrap());
+    assert_eq!(created["worktree"]["state"], "ready", "{created}");
+    assert_eq!(created["lifecycle"], "ready", "{created}");
+    assert_eq!(created["issue"]["key"], "TRU-1", "{created}");
+    assert_eq!(created["created_by"]["session_id"], "caller", "{created}");
+    // Under the fixture's worktree root, not the repo and not any config dir.
+    assert!(
+        path.starts_with(git_fixture.root.join("worktrees")),
+        "{}",
+        path.display()
+    );
+    let branch = created["branch"].as_str().unwrap();
+    assert_eq!(
+        git(&path, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        branch
+    );
+    assert!(git(&git_fixture.repo, &["worktree", "list"]).contains(path.to_str().unwrap()));
+    // Saved in the preview's own store, on disk at the preview root.
+    assert_eq!(stored_task(&owner, &task_id, cx).worktree.path, Some(path));
+    let saved = gitterm_core::tasks::TaskStore::load(fixture.copy()).unwrap();
+    assert!(saved.get(&task_id).is_some());
+    // Iced's tree is untouched, and the preview's writes are not re-seeded away.
+    assert_eq!(tree(&fixture.iced), iced_before);
+    fixture.write_iced(vec![], vec![]);
+    assert_eq!(
+        owner.update(cx, |owner, cx| owner.refresh_seed(cx)),
+        Reseed::Deferred
+    );
+    assert_eq!(task_ids(&owner, cx), [task_id]);
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn handoff_done_only_from_hosted_session(cx: &mut TestAppContext) {
+    use gitterm_core::{task_mcp::TaskControlOperation as Op, tasks::DelegationStatus};
+    use serde_json::json;
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    let git_fixture = GitFixture::new(&fixture);
+    fixture.write_iced(
+        vec![task_at(
+            "worker",
+            TaskLifecycle::Running,
+            &git_fixture.worktree,
+        )],
+        vec![worker_delegation("d1", "worker", "child-d1")],
+    );
+    let chats = Chats::new(&fixture, cx);
+    let hosted = chats.open_in(&fixture, Some("worker-chat"), &git_fixture.worktree, cx);
+    let other = chats.open_in(&fixture, Some("other-chat"), &git_fixture.worktree, cx);
+    chats.owner.update(cx, |owner, cx| {
+        owner.chats[&hosted].update(cx, |pane, _| pane.bind_task_session("worker", "child-d1"));
+    });
+    let (owner, sender) = git_fixture.start(&fixture, cx);
+    let iced_before = tree(&fixture.iced);
+    let done = |summary: &str| {
+        Op::UpdateHandoff(req(
+            json!({"task_id": "worker", "summary": summary, "status": "done"}),
+        ))
+    };
+
+    // Another pane, or no pane, cannot report done for the worker.
+    for caller in [Some(other.as_str()), Some("closed"), None] {
+        let refused = dispatch_as(cx, &sender, done("not mine"), caller).unwrap_err();
+        assert!(
+            refused.contains("only the worker's own GitTerm tab"),
+            "{refused}"
+        );
+    }
+    let delegation_status = |cx: &mut TestAppContext| {
+        owner.read_with(cx, |owner, _| {
+            let store = owner.host().store().as_ref().unwrap();
+            store.delegation("d1").unwrap().status.clone()
+        })
+    };
+    assert!(matches!(delegation_status(cx), DelegationStatus::Running));
+    assert!(stored_task(&owner, "worker", cx).handoff.is_none());
+    // Progress from anyone is only a note on the task.
+    dispatch_as(
+        cx,
+        &sender,
+        Op::UpdateHandoff(req(json!({"task_id": "worker", "summary": "note"}))),
+        Some(&other),
+    )
+    .unwrap();
+    assert!(matches!(delegation_status(cx), DelegationStatus::Running));
+
+    // The pane hosting the worker's session completes the delegation.
+    let value = dispatch_as(cx, &sender, done("finished"), Some(&hosted)).unwrap();
+    assert_eq!(value["handoff_status"], "done", "{value}");
+    assert_eq!(value["delegation_id"], "d1", "{value}");
+    assert_eq!(value["handoff"]["summary"], "finished", "{value}");
+    // The task records no session child-d1, so the caller is named, as Iced.
+    assert_eq!(
+        value["handoff"]["updated_by_session_id"],
+        hosted.as_str(),
+        "{value}"
+    );
+    assert!(matches!(delegation_status(cx), DelegationStatus::Completed));
+    assert_eq!(
+        stored_task(&owner, "worker", cx).lifecycle,
+        TaskLifecycle::Completed
+    );
+    // Saved to the preview's copy only.
+    let saved = gitterm_core::tasks::TaskStore::load(fixture.copy()).unwrap();
+    assert_eq!(
+        saved
+            .get("worker")
+            .unwrap()
+            .handoff
+            .as_ref()
+            .unwrap()
+            .summary,
+        "finished"
+    );
+    assert_eq!(tree(&fixture.iced), iced_before);
+}
+
+/// Each write whose target is outside every fixture: a task worktree, a
+/// repository, and a caller pane directory under the temp dir but unmarked.
+#[cfg(unix)]
+#[gpui::test]
+fn non_fixture_target_denied(cx: &mut TestAppContext) {
+    use gitterm_core::task_mcp::{TaskControlOperation as Op, TaskSessionEventRequest};
+    use serde_json::json;
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    let git_fixture = GitFixture::new(&fixture);
+    fixture.write_iced(
+        vec![task_at(
+            "outside",
+            TaskLifecycle::Running,
+            &git_fixture.outside,
+        )],
+        vec![],
+    );
+    let chats = Chats::new(&fixture, cx);
+    let caller = chats.open_in(&fixture, Some("root-chat"), &git_fixture.outside, cx);
+    chats.owner.update(cx, |owner, cx| {
+        owner.chats[&caller].update(cx, |pane, _| pane.bind_task_session("outside", "s1"));
+    });
+    let (owner, sender) = git_fixture.start(&fixture, cx);
+    let iced_before = tree(&fixture.iced);
+    let preview_before = tree(fixture.roots.root());
+    let outside_before = tree(&git_fixture.outside);
+    let base = fixture.iced.parent().unwrap().to_path_buf();
+    for (operation, label) in [
+        (create_in(&git_fixture.outside), "task_create"),
+        (
+            Op::UpdateHandoff(req(json!({"task_id": "outside", "summary": "s"}))),
+            "task_update_handoff",
+        ),
+        (
+            Op::SessionEvent(TaskSessionEventRequest {
+                task_id: "outside".into(),
+                session_id: "s1".into(),
+                event_type: "agent-turn-complete".into(),
+            }),
+            "notify",
+        ),
+        (
+            Op::MergePlanSet(req(json!({"entries": [{"repo": "acme/api", "number": 1}]}))),
+            "merge_plan_set",
+        ),
+    ] {
+        assert_eq!(
+            dispatch_as(cx, &sender, operation, Some(&caller)),
+            Err(gitterm_core::preview::service::preview_notice(label)),
+            "{label}"
+        );
+    }
+    cx.run_until_parked();
+    assert_eq!(tree(&fixture.iced), iced_before);
+    assert_eq!(tree(fixture.roots.root()), preview_before);
+    assert_eq!(tree(&git_fixture.outside), outside_before);
+    assert!(!base.join("worktrees").exists());
+    assert_eq!(
+        stored_task(&owner, "outside", cx).lifecycle,
+        TaskLifecycle::Running
+    );
+}
+
+/// Plain preview over the same fixture: the gate and each write arm
+/// itself answer the notice, with valid fixture targets, and write nothing.
+#[cfg(unix)]
+#[gpui::test]
+fn plain_preview_still_refuses_all_writes(cx: &mut TestAppContext) {
+    use gitterm_core::{
+        preview::service::preview_notice,
+        task_host::HostEffect,
+        task_mcp::{TaskControlOperation as Op, TaskSessionEventRequest},
+    };
+    use serde_json::json;
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    let git_fixture = GitFixture::new(&fixture);
+    fixture.write_iced(
+        vec![task_at(
+            "worker",
+            TaskLifecycle::Running,
+            &git_fixture.worktree,
+        )],
+        vec![worker_delegation("d1", "worker", "child-d1")],
+    );
+    let chats = Chats::new(&fixture, cx);
+    let caller = chats.open_in(&fixture, Some("root-chat"), &git_fixture.worktree, cx);
+    chats.owner.update(cx, |owner, cx| {
+        owner.chats[&caller].update(cx, |pane, _| pane.bind_task_session("worker", "child-d1"));
+    });
+    let (owner, sender) = fixture.start(cx);
+    let iced_before = tree(&fixture.iced);
+    let preview_before = tree(fixture.roots.root());
+    let fixture_before = tree(&git_fixture.root);
+    let operations = || {
+        [
+            (create_in(&git_fixture.repo), "task_create"),
+            (
+                Op::UpdateHandoff(req(
+                    json!({"task_id": "worker", "summary": "s", "status": "done"}),
+                )),
+                "task_update_handoff",
+            ),
+            (
+                Op::SessionEvent(TaskSessionEventRequest {
+                    task_id: "worker".into(),
+                    session_id: "child-d1".into(),
+                    event_type: "agent-turn-complete".into(),
+                }),
+                "notify",
+            ),
+            (
+                Op::MergePlanSet(req(json!({"entries": [{"repo": "acme/api", "number": 1}]}))),
+                "merge_plan_set",
+            ),
+        ]
+    };
+    for (operation, label) in operations() {
+        assert_eq!(
+            dispatch_as(cx, &sender, operation, Some(&caller)),
+            Err(preview_notice(label)),
+            "{label}"
+        );
+    }
+    for (operation, label) in operations() {
+        let (commands, mut receiver) = command_channel();
+        let pending = commands.enqueue(operation, Some(caller.clone())).unwrap();
+        let envelope = receiver.try_recv().unwrap();
+        let (reply, caller) = (envelope.reply, envelope.caller);
+        let effect = match envelope.operation {
+            Op::Create(request) => HostEffect::Create {
+                reply,
+                caller,
+                request,
+            },
+            Op::UpdateHandoff(request) => HostEffect::UpdateHandoff {
+                reply,
+                caller,
+                request,
+            },
+            Op::SessionEvent(request) => HostEffect::TurnEnded {
+                reply,
+                task_id: request.task_id,
+                session_id: request.session_id,
+            },
+            Op::MergePlanSet(request) => HostEffect::MergePlanSet {
+                reply,
+                caller,
+                request,
+            },
+            other => panic!("not a store write: {other:?}"),
+        };
+        owner.update(cx, |owner, cx| owner.execute_effect(effect, label, cx));
+        let answer = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(pending);
+        assert_eq!(answer, Err(preview_notice(label)), "{label}");
+    }
+    cx.run_until_parked();
+    assert_eq!(tree(&fixture.iced), iced_before);
+    assert_eq!(tree(fixture.roots.root()), preview_before);
+    assert_eq!(tree(&git_fixture.root), fixture_before);
+    assert_eq!(
+        stored_task(&owner, "worker", cx).lifecycle,
+        TaskLifecycle::Running
+    );
+    assert!(!owner.read_with(cx, |owner, _| owns_in_flight_work(owner.host())));
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn merge_plan_set_writes_preview_state_only(cx: &mut TestAppContext) {
+    use gitterm_core::{
+        merge_plan::{self, MergePlan},
+        task_mcp::TaskControlOperation as Op,
+    };
+    use serde_json::json;
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    let git_fixture = GitFixture::new(&fixture);
+    // Iced already has a plan for this root; the preview neither reads
+    // nor changes it in fixture mode.
+    let iced_plans = merge_plan::plans_dir(&fixture.iced);
+    let iced_plan: MergePlan = req(json!({
+        "root_chat_id": "root-a", "updated_at": "2026-11-20T10:00:00Z",
+        "entries": [{"repo": "acme/web", "number": 9}]
+    }));
+    merge_plan::write_plan(&iced_plans, &iced_plan).unwrap();
+    let chats = Chats::new(&fixture, cx);
+    let caller = chats.open_in(&fixture, Some("root-a"), &git_fixture.repo, cx);
+    let (_owner, sender) = git_fixture.start(&fixture, cx);
+    let iced_before = tree(&fixture.iced);
+
+    let set = Op::MergePlanSet(req(json!({"entries": [
+        {"repo": "acme/api", "number": 1},
+        {"repo": "acme/api", "number": 2, "after": ["acme/api#1"]},
+    ]})));
+    let value = dispatch_as(cx, &sender, set, Some(&caller)).unwrap();
+    assert_eq!(value["root_chat_id"], "root-a", "{value}");
+    assert_eq!(value["kept_holds"], json!([]), "{value}");
+    let prs: Vec<_> = value["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["pr"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(prs, ["acme/api#1", "acme/api#2"]);
+    // The file is the preview's; Iced's dir is unchanged.
+    let preview_plans = merge_plan::plans_dir(fixture.roots.root());
+    let saved = merge_plan::load_plans(&preview_plans);
+    assert_eq!(saved["root-a"].entries.len(), 2);
+    assert_eq!(tree(&fixture.iced), iced_before);
+    // merge_plan_get reads the plan the preview wrote.
+    let got = dispatch_as(cx, &sender, Op::MergePlanGet, Some(&caller)).unwrap();
+    assert_eq!(got["entries"], value["entries"]);
+    // Iced's validation and caller errors still apply.
+    let invalid = Op::MergePlanSet(req(json!({"entries": [
+        {"repo": "acme/api", "number": 1}, {"repo": "acme/api", "number": 1},
+    ]})));
+    assert!(dispatch_as(cx, &sender, invalid, Some(&caller)).is_err());
+    assert_eq!(
+        merge_plan::load_plans(&preview_plans)["root-a"]
+            .entries
+            .len(),
+        2
+    );
+}
+
+/// The prepared worktree is replaced by a link out of the fixture before
+/// the post-preparation recheck: the create is refused with the notice, the
+/// task fails in the preview store, and the link's target is not touched.
+#[cfg(unix)]
+#[gpui::test]
+fn path_swapped_after_prep_refused(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    let git_fixture = GitFixture::new(&fixture);
+    let (owner, sender) = git_fixture.start(&fixture, cx);
+    let elsewhere = fixture.iced.parent().unwrap().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let elsewhere_before = tree(&elsewhere);
+    let moved = git_fixture.root.join("moved");
+    owner.update(cx, |owner, _| {
+        let (elsewhere, moved) = (elsewhere.clone(), moved.clone());
+        owner.before_recheck = Some(Box::new(move |path: &Path| {
+            std::fs::rename(path, &moved).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, path).unwrap();
+        }));
+    });
+
+    assert_eq!(
+        dispatch(cx, &sender, create_in(&git_fixture.repo)),
+        Err(gitterm_core::preview::service::preview_notice(
+            "task_create"
+        ))
+    );
+    let tasks = owner.read_with(cx, |owner, _| {
+        owner.host().store().as_ref().unwrap().tasks().to_vec()
+    });
+    assert_eq!(tasks.len(), 1);
+    let task = &tasks[0];
+    assert_ne!(task.lifecycle, TaskLifecycle::Ready, "{task:?}");
+    assert_eq!(task.worktree.path, None, "{task:?}");
+    assert_eq!(tree(&elsewhere), elsewhere_before);
 }
