@@ -985,3 +985,23 @@ fn task_control_value_matches_iced() {
         ])
     );
 }
+
+#[test]
+fn fixture_merge_plan_set_targets_the_caller_checkout() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host, repo, outside) = target_host(&dir, true);
+    let dispatched = |checkout: Option<&Path>| {
+        let (sender, mut receiver) = command_channel();
+        let _pending = sender
+            .enqueue(
+                Op::MergePlanSet(req(json!({"entries": []}))),
+                Some("caller".into()),
+            )
+            .unwrap();
+        host.dispatch_with_caller(receiver.try_recv().unwrap(), None, checkout)
+            .is_some()
+    };
+    assert!(dispatched(Some(&repo)));
+    assert!(!dispatched(Some(&outside)));
+    assert!(!dispatched(None));
+}

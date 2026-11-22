@@ -522,6 +522,13 @@ impl ChatPane {
     pub fn target(&self) -> session::Target {
         self.controller.target.clone()
     }
+    /// Preview panes start without a task; host tests bind one to a task
+    /// session, as a launched task session pane will be.
+    #[cfg(test)]
+    pub(crate) fn bind_task_session(&mut self, task_id: &str, task_session_id: &str) {
+        self.controller.target.task_id = Some(task_id.into());
+        self.controller.target.task_session_id = Some(task_session_id.into());
+    }
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.controller.ready = false;
         self.shutdown_runtime();
