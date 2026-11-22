@@ -918,9 +918,17 @@ fn open_sessions_lists_panes_holding_the_task(cx: &mut TestAppContext) {
     let session = reply["session_id"].as_str().unwrap().to_string();
     wait_until(vcx, |cx| session_holding(&shell, &session, cx).is_some());
     let workspace = vcx.read(|cx| shell.read(cx).active(cx).workspace.name.clone());
+    // The label is the launch title until the pane folder's name is read,
+    // then that folder's git root name (Iced's `status.repo_name`): the
+    // task's worktree.
+    let folder = stored_task(&launches.runs.owner, &task, vcx)
+        .worktree
+        .path
+        .unwrap();
+    let label = folder.file_name().unwrap().to_string_lossy().to_string();
     let expected = serde_json::json!([{
         "session_id": session,
-        "label": "Codex · Fixture task 1",
+        "label": label,
         "workspace": workspace,
         "is_active": true,
     }]);
@@ -935,7 +943,7 @@ fn open_sessions_lists_panes_holding_the_task(cx: &mut TestAppContext) {
     let sessions: Vec<gitterm_core::task_host::OpenSession> =
         vec![gitterm_core::task_host::OpenSession {
             session_id: Some(session.clone()),
-            label: "Codex · Fixture task 1".into(),
+            label,
             workspace,
             is_active: true,
         }];
