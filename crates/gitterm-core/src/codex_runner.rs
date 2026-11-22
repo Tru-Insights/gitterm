@@ -1260,7 +1260,9 @@ async fn stopped_git_output(
         result = work => Some(result),
         () = stop.signal.cancelled() => None,
     };
-    let stopped = result.is_none();
+    // Both branches can be ready when a stop kills git before this task is
+    // polled again; a requested stop wins over git's (killed) exit.
+    let stopped = result.is_none() || stop.signal.is_cancelled();
     if stopped {
         stop_process_tree(&mut child, child_id).await;
     }
@@ -2387,6 +2389,61 @@ mod tests {
                 !fake.dir.path().join("args").exists(),
                 "Codex started after a stop"
             );
+        }
+
+        /// A stop that kills git while the runner isn't polled leaves both
+        /// select branches ready; the run must still end as `Stopped`. The
+        /// unbiased select picks either, so 20 rounds catch a regression.
+        // Multi-thread: the runtime notices git's exit while this test, not
+        // the runner, holds the thread, so both branches are ready together.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_stop_wins_when_git_has_already_exited() {
+            for round in 0..20 {
+                let fake = FakeCodex::new("", 0);
+                let mut environment = with_fake_git(&fake);
+                let stop = CodexStop::new();
+                environment.stop = Some(stop.clone());
+                let run = fake.run(CodexRunKind::Consult {
+                    brief: "Stopped while parked.".to_string(),
+                });
+                let (sender, _receiver) = mpsc::unbounded_channel();
+                let running = run_with(run, sender, &environment);
+                tokio::pin!(running);
+                let pid_file = fake.dir.path().join("git-sleep.pid");
+                // Drive the run until git waits in `status`.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !std::fs::read_to_string(&pid_file).is_ok_and(|pid| pid.ends_with('\n')) {
+                    assert!(std::time::Instant::now() < deadline, "git never started");
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_millis(20), &mut running)
+                            .await;
+                }
+                let pid: i32 = fake
+                    .recorded("git-sleep.pid")
+                    .trim()
+                    .parse()
+                    .expect("sleep pid");
+                // Kill the group without polling the run, and let git die.
+                stop.stop();
+                let gone = (0..300).any(|_| {
+                    // SAFETY: signal 0 only checks that the process exists.
+                    let alive = unsafe { libc::kill(pid, 0) } == 0;
+                    if alive {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    !alive
+                });
+                assert!(gone, "round {round}: git's sleep {pid} outlived the stop");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let error = tokio::time::timeout(std::time::Duration::from_secs(30), running)
+                    .await
+                    .expect("the stop ends the run")
+                    .expect_err("stopped");
+                assert!(
+                    matches!(error, CodexRunError::Stopped),
+                    "round {round}: {error:?}"
+                );
+            }
         }
 
         #[tokio::test]
