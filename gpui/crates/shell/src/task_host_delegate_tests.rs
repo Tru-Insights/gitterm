@@ -266,6 +266,46 @@ fn delegate_into_task_checkout_reuses_the_task(cx: &mut TestAppContext) {
     assert_eq!(launches.saved().delegations().len(), 1);
 }
 
+/// Iced's `worker_reported` (main.rs:19890): a worker that reports
+/// `blocked` from its still-open terminal waits for input, so it no longer
+/// counts as working and its checkout can be delegated into again.
+#[gpui::test]
+fn blocked_worker_checkout_can_be_delegated_again(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let task = launches.create(cx);
+    let worktree = launches.worktree(&task, cx);
+    let first = launches
+        .delegate(
+            serde_json::json!({"preset_name": "Codex", "checkout": worktree}),
+            cx,
+        )
+        .unwrap();
+    assert_worker_started(&launches, &first, 1, cx);
+    let session = first["task_session_id"].as_str().unwrap().to_string();
+    let blocked = dispatch_as(
+        cx,
+        &launches.runs.sender,
+        TaskControlOperation::UpdateHandoff(req(serde_json::json!({
+            "task_id": task, "summary": "Stuck", "status": "blocked",
+            "blockers": ["needs a decision"]
+        }))),
+        Some(&session),
+    )
+    .unwrap();
+    assert_eq!(blocked["delegation_status"], "blocked", "{blocked}");
+    let again = launches.delegate(
+        serde_json::json!({
+            "objective": "Carry on", "preset_name": "Codex", "checkout": worktree
+        }),
+        cx,
+    );
+    launches.kill(1);
+    let again = again.unwrap();
+    assert_eq!(again["task_id"], task.as_str(), "{again}");
+    wait_until(cx, |_| launches.agent.started(2));
+    launches.kill(2);
+}
+
 /// Iced's `delegate_task_in_checkout`, adoption: a registered worktree no
 /// task owns gets a new task set up around it, and the worker starts
 /// there. A checkout outside the fixture is refused before anything is

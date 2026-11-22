@@ -842,6 +842,14 @@ impl TaskHostOwner {
             .get(&task_id)
             .cloned()
             .ok_or_else(|| format!("Task {task_id} disappeared after updating its handoff"))?;
+        if report_to.is_some() {
+            // Iced's worker_reported, tab part: the reporting terminal waits
+            // for input after `blocked` and claims nothing after `done`, so
+            // its checkout can be delegated into again.
+            if let Some(session) = hosted_session.as_deref() {
+                self.worker_reported_live(session, status == HandoffStatus::Done);
+            }
+        }
         let mut value = self.task_value(&task)?;
         value["handoff_status"] = serde_json::Value::String(status.label().to_string());
         value["delegation_id"] = report_to

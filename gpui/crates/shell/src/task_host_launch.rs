@@ -635,6 +635,14 @@ impl TaskHostOwner {
             .collect()
     }
 
+    /// Iced's `worker_reported` for a launched terminal (main.rs:19876):
+    /// done clears its live state, blocked leaves it awaiting input.
+    pub(super) fn worker_reported_live(&mut self, session_id: &str, done: bool) {
+        if let Some(launched) = self.launched.get_mut(session_id) {
+            launched.live = (!done).then_some(TaskSessionLiveState::AwaitingInput);
+        }
+    }
+
     /// Iced's `working_sessions` for launched terminals still open: those
     /// whose agent is working.
     pub(super) fn terminal_working_sessions(&self) -> Vec<String> {
