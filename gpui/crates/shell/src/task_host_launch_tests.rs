@@ -948,24 +948,6 @@ fn preview_still_answers_notice_for_launch_and_delegate(cx: &mut TestAppContext)
     assert_eq!(launches.agent.runs(), 0);
 }
 
-/// The preview pins CLAUDE_CONFIG_DIR under its root, so a fixture Claude
-/// child reads trust from `$CLAUDE_CONFIG_DIR/.claude.json`; with no such
-/// file the repository is not trusted, and the launch is refused before
-/// its child starts.
-#[gpui::test]
-fn claude_launch_refused_on_pinned_config_dir(cx: &mut TestAppContext) {
-    let launches = Launches::start(cx);
-    let task = launches.create(cx);
-    let error = launches.launch(&task, Some("Claude"), cx).unwrap_err();
-    assert!(
-        error.contains("is not trusted in $CLAUDE_CONFIG_DIR/.claude.json"),
-        "{error}"
-    );
-    assert_eq!(launches.agent.runs(), 0);
-    assert!(launches.host_terminals(cx).is_empty());
-    assert!(launches.saved().get(&task).unwrap().sessions.is_empty());
-}
-
 /// Writes the pinned Claude config with `repo`'s trust bit.
 fn pin_claude_trust(launches: &Launches, repo: &Path, trusted: bool) -> PathBuf {
     let roots = &launches.runs.fixture.roots;
@@ -982,34 +964,62 @@ fn pin_claude_trust(launches: &Launches, repo: &Path, trusted: bool) -> PathBuf 
     dir
 }
 
-/// The fixture Claude check reads the file the child's own
-/// CLAUDE_CONFIG_DIR names: an untrusted entry refuses, a trusted one
-/// launches, and the child gets that same directory.
+/// Iced's Claude trust write (`claude_task_trust` before every task
+/// process start), aimed at the preview's pinned CLAUDE_CONFIG_DIR: with no
+/// trust file there nothing is written and the launch goes ahead, as Iced
+/// skips an absent `~/.claude.json`; with one, the workspace repository is
+/// trusted in it before the child starts. Neither the host HOME nor the
+/// child's HOME gets a trust file.
 #[gpui::test]
-fn fixture_claude_trust_reads_the_pinned_config(cx: &mut TestAppContext) {
+fn fixture_claude_trust_written_to_pinned_config(cx: &mut TestAppContext) {
     let launches = Launches::start(cx);
-    let task = launches.create(cx);
     let repo = launches.runs.git.repo.clone();
-    pin_claude_trust(&launches, &repo, false);
-    let error = launches.launch(&task, Some("Claude"), cx).unwrap_err();
-    assert!(
-        error.contains("is not trusted in $CLAUDE_CONFIG_DIR/.claude.json"),
-        "{error}"
-    );
-    assert_eq!(launches.agent.runs(), 0);
-    assert!(launches.saved().get(&task).unwrap().sessions.is_empty());
+    let root = launches.runs.fixture.roots.root().to_path_buf();
+    let pinned = root.join("provider-homes/claude/.claude.json");
+    let child_home = root.join("provider-homes/home");
+    // The fixture's stand-in for the real HOME, with Iced's trust file.
+    let host_home = launches
+        .runs
+        .fixture
+        .iced
+        .parent()
+        .unwrap()
+        .join("fixture-home");
+    std::fs::create_dir(&host_home).unwrap();
+    std::fs::write(host_home.join(".claude.json"), "{}").unwrap();
+    let host_before = tree(&host_home);
 
-    let dir = pin_claude_trust(&launches, &repo, true);
+    // No pinned trust file: nothing written, the child starts.
+    let first = launches.create(cx);
+    launches.launch(&first, Some("Claude"), cx).unwrap();
+    wait_until(cx, |_| launches.agent.started(1));
+    launches.kill(1);
+    assert!(!pinned.exists());
+
+    // An untrusted entry: trusted before the child starts, in the file
+    // the child's own CLAUDE_CONFIG_DIR names.
+    let dir = pin_claude_trust(&launches, &repo, false);
+    let task = launches.create(cx);
     let reply = launches.launch(&task, Some("Claude"), cx).unwrap();
     assert!(reply["session_id"].is_string(), "{reply}");
-    wait_until(cx, |_| launches.agent.started(1));
-    let env = launches.agent.env(1);
-    launches.kill(1);
+    wait_until(cx, |_| launches.agent.started(2));
+    let env = launches.agent.env(2);
+    launches.kill(2);
     assert!(
-        env.get("CLAUDE_CONFIG_DIR").map(PathBuf::from) == Some(dir),
-        "the child's CLAUDE_CONFIG_DIR is not the dir the check read"
+        env.get("CLAUDE_CONFIG_DIR").map(PathBuf::from) == Some(dir.clone()),
+        "the child's CLAUDE_CONFIG_DIR is not the dir trust was written to"
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join(".claude.json")).unwrap()).unwrap();
+    let key = repo.canonicalize().unwrap().display().to_string();
+    assert_eq!(
+        saved["projects"][key.as_str()]["hasTrustDialogAccepted"],
+        true
     );
     assert_eq!(launches.saved().get(&task).unwrap().sessions.len(), 1);
+    assert_eq!(tree(&host_home), host_before);
+    assert!(!child_home.join(".claude.json").exists());
+    assert!(!child_home.join(".claude").exists());
 }
 
 /// Advances the fixture tick (delivery and queue promotion) until `done`.
