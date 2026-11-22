@@ -140,22 +140,7 @@ impl crate::Shell {
         }
         state.sessions.retain(|session| session.id != id);
         if state.active_session == Some(id) {
-            // Iced lands on a sibling task tab of a closed task tab.
-            let sibling = requested.task_id.as_ref().and_then(|task| {
-                state
-                    .sessions
-                    .iter()
-                    .map(|session| session.id)
-                    .find(|sibling| {
-                        state
-                            .panes
-                            .get(&crate::session_pane_id(*sibling))
-                            .and_then(|pane| pane.read(cx).task_session(cx))
-                            .is_some_and(|target| target.task_id.as_ref() == Some(task))
-                    })
-            });
-            state.active_session =
-                sibling.or_else(|| state.sessions.first().map(|session| session.id));
+            state.active_session = state.sessions.first().map(|session| session.id);
         }
         state
             .dock

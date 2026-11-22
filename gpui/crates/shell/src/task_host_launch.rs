@@ -1306,8 +1306,7 @@ fn spawn_terminal(
     // shortcut: an unadopted terminal's exit is not seen (nothing delivers
     // its events); deliver them from the host if a launch can stay unadopted.
     let session_id = session_id.to_string();
-    // Iced clears a tab's input-needed attention on its input; the key is
-    // still the terminal's.
+    // Iced clears a tab's input-needed attention on any input written to it.
     let typed = needs_input.clone();
     let view = cx.new(|cx| {
         TerminalView::launch(launch, Default::default(), cx)
@@ -1318,10 +1317,7 @@ fn spawn_terminal(
                     _ = owner.update(cx, |owner, cx| owner.terminal_exited(&session_id, cx));
                 });
             })
-            .with_key_handler(move |_| {
-                typed.store(false, Ordering::Relaxed);
-                false
-            })
+            .with_input_callback(move || typed.store(false, Ordering::Relaxed))
     });
     let backend = view.read(cx).backend();
     let Some(pid) = backend.child_pid() else {

@@ -130,6 +130,9 @@ fn a_blocked_worker_pane_needs_the_user_until_typed_into(cx: &mut TestAppContext
     )
     .unwrap();
     assert_eq!(attention(vcx), Some(AttentionKind::NeedsYou));
+    // Tab is sent by its own action, not the key handler; it is input too.
+    vcx.simulate_keystrokes("tab");
+    assert_eq!(attention(vcx), None);
     launches.kill(1);
 }
 
