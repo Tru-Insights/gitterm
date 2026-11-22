@@ -721,7 +721,8 @@ fn preview_still_answers_notice_for_launch_and_delegate(cx: &mut TestAppContext)
         .unwrap_err()
     };
     assert!(delegate(&sender, cx).contains("not available in preview"));
-    // Fixture mode does not run delegate_task yet either.
+    // Fixture mode refuses a delegate_task with no caller, and so no
+    // target it can check.
     let launches = Launches::start(cx);
     assert!(delegate(&launches.runs.sender, cx).contains("not available in preview"));
     assert_eq!(launches.agent.runs(), 0);
@@ -829,3 +830,6 @@ fn fixture_codex_run_gets_guidelines(cx: &mut TestAppContext) {
             .is_file()
     );
 }
+
+#[path = "task_host_delegate_tests.rs"]
+mod delegate_tests;

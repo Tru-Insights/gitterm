@@ -544,7 +544,7 @@ impl TaskHostOwner {
 
     /// Whether a fixture run's continuation at `stage` goes on: not once the
     /// host has shut down, when it writes nothing to the store.
-    fn continues(&mut self, stage: &'static str) -> bool {
+    pub(super) fn continues(&mut self, stage: &'static str) -> bool {
         #[cfg(test)]
         if let Some((at, hook)) = self.before_continuation.take() {
             if at == stage {
@@ -612,7 +612,7 @@ impl TaskHostOwner {
     }
 
     /// Git discovery from `path` stops below the fixture's parent.
-    fn ceiling_for(&self, path: &Path, label: &'static str) -> Result<PathBuf, String> {
+    pub(super) fn ceiling_for(&self, path: &Path, label: &'static str) -> Result<PathBuf, String> {
         let fixture = self.fixture_of(path, label)?;
         Ok(fixture.parent().unwrap_or(&fixture).to_path_buf())
     }
@@ -814,7 +814,7 @@ fn check_delegation_run(
 /// The work tree Git discovers from `checkout` (Iced opens it with git2),
 /// with the caller's `GIT_*` variables cleared and discovery stopped below
 /// `ceiling`. `rev-parse` only reads.
-fn work_tree(checkout: &Path, ceiling: &Path) -> Result<PathBuf, String> {
+pub(super) fn work_tree(checkout: &Path, ceiling: &Path) -> Result<PathBuf, String> {
     let mut command = std::process::Command::new("git");
     for (name, _) in std::env::vars_os() {
         if name.to_str().is_none_or(|name| name.starts_with("GIT_")) {

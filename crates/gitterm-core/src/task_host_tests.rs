@@ -1005,3 +1005,24 @@ fn fixture_merge_plan_set_targets_the_caller_checkout() {
     assert!(!dispatched(Some(&outside)));
     assert!(!dispatched(None));
 }
+
+/// A `delegate_task` naming no checkout or repo makes its worktree from the
+/// calling tab's repository: the gate checks the caller's checkout, and
+/// falls back to the caller task's worktree only without one.
+#[test]
+fn fixture_delegate_without_place_targets_the_caller_checkout() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host, repo, outside) = target_host(&dir, true);
+    let dispatched = |checkout: Option<&Path>, caller_task: Option<&str>| {
+        let (sender, mut receiver) = command_channel();
+        let _pending = sender
+            .enqueue(delegate(json!({})), Some("caller".into()))
+            .unwrap();
+        host.dispatch_with_caller(receiver.try_recv().unwrap(), caller_task, checkout)
+            .is_some()
+    };
+    assert!(dispatched(Some(&repo), None));
+    assert!(!dispatched(Some(&outside), Some("inside")));
+    assert!(dispatched(None, Some("inside")));
+    assert!(!dispatched(None, None));
+}

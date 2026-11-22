@@ -93,7 +93,7 @@ pub(super) struct Launched {
     view: gpui::WeakEntity<TerminalView>,
 }
 
-enum Started {
+pub(super) enum Started {
     Session(serde_json::Value),
     Queued(usize),
 }
@@ -174,7 +174,7 @@ impl TaskHostOwner {
     }
 
     /// Iced's `try_launch_task_child`, with the fixture's terminal.
-    fn try_launch(
+    pub(super) fn try_launch(
         &mut self,
         launch: &SessionLaunch,
         preset_idx: Option<usize>,
@@ -611,7 +611,7 @@ impl TaskHostOwner {
 
     /// Iced's task facts for a launch, from Iced's settings and this host's
     /// sessions.
-    fn launch_facts(
+    pub(super) fn launch_facts(
         &self,
         settings: &crate::workspace_config::IcedSettings,
         cx: &App,
