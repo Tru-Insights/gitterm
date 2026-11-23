@@ -2726,14 +2726,10 @@ impl crate::Shell {
             return;
         };
         let target = self.workspaces.iter().find_map(|workspace| {
-            workspace
-                .sessions
-                .iter()
-                .enumerate()
-                .find_map(|(index, session)| {
-                    (self.find_conversation(workspace, session, cx).as_ref() == Some(id))
-                        .then_some((workspace.workspace.id, index))
-                })
+            workspace.sessions.iter().find_map(|session| {
+                (self.find_conversation(workspace, session, cx).as_ref() == Some(id))
+                    .then_some((workspace.workspace.id, session.id))
+            })
         });
         if let Some((workspace, session)) = target {
             self.find_state
@@ -2742,7 +2738,7 @@ impl crate::Shell {
             self.reopen_workspace(workspace, window, cx);
             self.select_workspace_id(workspace, window, cx);
             self.close_file_viewer(workspace, window, cx);
-            self.select_session(session, window, cx);
+            self.select_session_id(session, window, cx);
             let target_owner = self.find_owner(cx);
             self.find_state
                 .borrow_mut()
