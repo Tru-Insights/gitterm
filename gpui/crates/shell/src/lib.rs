@@ -4156,6 +4156,11 @@ impl Shell {
             self.toggle_usage(window, cx);
             return;
         }
+        if self.focused_terminal(window, cx).is_some()
+            && self.close_sheet_behind_terminal(window, cx)
+        {
+            return;
+        }
         if self.session_picker.is_some()
             || self.park_sheet.is_some()
             || self.new_work_sheet.is_some()
@@ -4166,7 +4171,7 @@ impl Shell {
             cx.propagate();
             return;
         }
-        if self.dismiss_task_modal(window, cx) {
+        if self.dismiss_task_modal(window, cx) || self.close_pr_confirm(window, cx) {
             return;
         }
         if self.bar_menu.take().is_some() {
@@ -4247,6 +4252,40 @@ impl Shell {
         cx.stop_propagation();
         self.escape(&app_menus::Escape, window, cx);
     }
+    /// Iced's key handler closes a sheet on Escape wherever focus is (main.rs
+    /// `Event::KeyPressed`); a sheet's own key handler only sees the key when
+    /// focus is inside it. With a terminal holding focus behind the sheet,
+    /// in Iced's order: New Work, Park, workspace settings, phone panel.
+    fn close_sheet_behind_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if let Some(sheet) = self.new_work_sheet.clone() {
+            sheet.update(cx, |sheet, cx| sheet.cancel(cx));
+        } else if let Some(sheet) = self.park_sheet.clone() {
+            sheet.update(cx, |sheet, cx| sheet.cancel(cx));
+        } else if let Some(sheet) = self.settings_sheet.clone() {
+            sheet.update(cx, |sheet, cx| sheet.escape(window, cx));
+        } else if let Some(panel) = self.phone_panel().cloned() {
+            panel.update(cx, |panel, cx| panel.close(cx));
+        } else {
+            return false;
+        }
+        true
+    }
+    /// Iced `PrEvent::ActionClose` on Escape (a running command keeps the
+    /// confirmation open). It was open, so this reports true.
+    fn close_pr_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self
+            .work_sidebars
+            .values()
+            .any(|sidebar| sidebar.read(cx).confirm_open())
+        {
+            return false;
+        }
+        for sidebar in self.work_sidebars.values() {
+            sidebar.update(cx, |sidebar, cx| sidebar.confirm_close(cx));
+        }
+        self.focus.focus(window, cx);
+        true
+    }
     fn guard_app_shortcut(
         &mut self,
         event: &gpui::KeyDownEvent,
@@ -4256,6 +4295,11 @@ impl Shell {
         // A terminal can hold focus behind these (its focus is set in code,
         // or the sheet's field lost it); no key may reach its PTY.
         if self.pty_blocked(cx) && self.focused_terminal(window, cx).is_some() {
+            // Iced's key handler closes the surface on Escape wherever focus
+            // is; only the PTY write is dropped.
+            if event.keystroke.key == "escape" {
+                self.escape(&app_menus::Escape, window, cx);
+            }
             cx.stop_propagation();
             return;
         }
@@ -4362,6 +4406,7 @@ impl Focusable for Shell {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_task_panel(window, cx);
+        gitterm_terminal::InputGate::set(self.pty_blocked(cx), cx);
         if self.active_workspace(cx).is_some() {
             let state = self.active(cx);
             window.set_window_title(&window_title(

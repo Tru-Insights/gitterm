@@ -82,6 +82,10 @@ pub struct PhonePanel {
 impl EventEmitter<PhonePanelOutcome> for PhonePanel {}
 
 impl PhonePanel {
+    /// Escape, also while a terminal behind the panel holds focus.
+    pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
+        cx.emit(PhonePanelOutcome::Close);
+    }
     pub fn new(
         remote_id: String,
         machine_name: String,
@@ -372,9 +376,9 @@ impl Render for PhonePanel {
             .items_center()
             .justify_center()
             .bg(rgba(if dark { 0x11111bcc } else { 0xdce0e8cc }))
-            .on_key_down(cx.listener(|_, event: &gpui::KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" {
-                    cx.emit(PhonePanelOutcome::Close);
+                    this.close(cx);
                     cx.stop_propagation();
                 }
             }))
