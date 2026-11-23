@@ -185,6 +185,16 @@ impl Focusable for WorkspaceSettingsSheet {
 }
 
 impl WorkspaceSettingsSheet {
+    /// Escape cancels an inline rename before closing. Also the shell's
+    /// Escape while a terminal behind the sheet holds focus.
+    pub(crate) fn escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rename.take().is_some() {
+            self.focus.focus(window, cx);
+            cx.notify();
+        } else {
+            cx.emit(Outcome::Close);
+        }
+    }
     pub fn new(model: SheetModel, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let key = cx.new(|cx| InputState::new(window, cx).placeholder("KEY"));
         let value = cx.new(|cx| InputState::new(window, cx).placeholder("VALUE"));
@@ -635,13 +645,7 @@ impl Render for WorkspaceSettingsSheet {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
                     cx.stop_propagation();
-                    // Escape cancels an inline rename before closing.
-                    if this.rename.take().is_some() {
-                        this.focus.focus(window, cx);
-                        cx.notify();
-                    } else {
-                        cx.emit(Outcome::Close);
-                    }
+                    this.escape(window, cx);
                 }
             }))
             .child(card)
