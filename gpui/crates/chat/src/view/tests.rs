@@ -1958,7 +1958,7 @@ fn finished_work_uses_iced_fold_and_keeps_final_answer_visible(cx: &mut TestAppC
 }
 
 #[gpui::test]
-fn history_fold_keeps_short_reply_before_later_tools_and_has_no_empty_tail(
+fn history_fold_takes_short_reply_before_later_tools_and_has_no_empty_tail(
     cx: &mut TestAppContext,
 ) {
     let mut records = vec![
@@ -2039,21 +2039,18 @@ fn history_fold_keeps_short_reply_before_later_tools_and_has_no_empty_tail(
             .iter()
             .position(|row| row.kind == RowKind::Assistant)
             .unwrap();
+        // Iced folds a short reply with the work around it; only substantial
+        // answers stay out (isSubstantialAssistantText).
         let reply_view = view.row(reply, window, cx);
-        assert!(!reply_view.read(cx).hidden_by_work);
-        assert!(reply_view.read(cx).work_summary.is_none());
+        assert!(reply_view.read(cx).hidden_by_work);
         let fold = turns::work_folds(&view.model);
         assert_eq!(fold.len(), 1);
-        assert!(fold.iter().all(|f| f.label == "Worked for 1m 20s"));
-        assert!(fold.iter().all(|f| !f.range.contains(&reply)));
-        let runs = tool_runs::group(&view.model.rows, &view.model.completed_turns);
-        assert_eq!(runs.last().unwrap().label, "Ran 1 command");
-        let mid_turn = view.row(runs.last().unwrap().range.start, window, cx);
-        assert!(mid_turn.read(cx).work_summary.is_none());
-        assert_eq!(
-            mid_turn.read(cx).run_summary.as_deref(),
-            Some("Ran 1 command")
-        );
+        assert_eq!(fold[0].label, "Worked for 1m 20s");
+        assert!(fold[0].range.contains(&reply));
+        assert_eq!(fold[0].range.end, view.model.rows.len());
+        let runs = tool_runs::group(&view.model, &fold);
+        let labels: Vec<_> = runs.iter().map(|run| run.label.as_str()).collect();
+        assert_eq!(labels, ["Ran 79 commands", "Ran 1 command"]);
         assert!(view.scroller.read(cx).is_following_tail());
         (
             view.model.rows[reply].id,
@@ -2062,13 +2059,12 @@ fn history_fold_keeps_short_reply_before_later_tools_and_has_no_empty_tail(
     });
     draw(cx);
     assert_eq!((reply_id, fold_id), (80, 1));
-    let reply = cx
-        .debug_bounds("transcript-row-80")
-        .expect("reply drawn at tail");
+    assert!(cx.debug_bounds("transcript-row-80").is_none());
     let fold = cx.debug_bounds("work-fold-1").expect("fold drawn at tail");
-    assert!(reply.origin.y >= fold.origin.y);
+    // Following the tail, the prompt still shows right above the fold.
+    let prompt = cx.debug_bounds("transcript-row-0").expect("prompt drawn");
     assert!(
-        reply.origin.y - fold.origin.y < px(100.),
+        fold.origin.y - prompt.bottom() < px(30.),
         "hidden tools must occupy no space"
     );
 }
@@ -3785,4 +3781,185 @@ fn native_chat_composer_unchanged(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("chat-activity").is_some());
     assert!(cx.debug_bounds("composer-send").is_some());
     assert!(cx.debug_bounds("composer-stop").is_some());
+}
+
+/// Issue 98's shape, as the Iced history import records it: a prompt; text,
+/// tools, text, thinking, tools; a final text; then a second prompt and turn.
+fn two_replayed_turns(finished: bool) -> Vec<Record> {
+    let harness = |event| Record {
+        at_ms: None,
+        entry: Entry::Harness(event),
+    };
+    let timing = |start_ms, end_ms| Record {
+        at_ms: None,
+        entry: Entry::TurnTiming {
+            start_ms,
+            end_ms,
+            split_ms: None,
+        },
+    };
+    let text = |text: &str| harness(HarnessEvent::TextDelta(text.into()));
+    let thinking = |text: &str| harness(HarnessEvent::ThinkingDelta(text.into()));
+    let tool = |id: &str, name: &str, input: serde_json::Value| {
+        [
+            harness(HarnessEvent::ItemStarted {
+                id: id.into(),
+                kind: ItemKind::ToolCall {
+                    name: name.into(),
+                    input,
+                },
+            }),
+            harness(HarnessEvent::ItemCompleted {
+                id: id.into(),
+                output: "ok".into(),
+                is_error: false,
+            }),
+        ]
+    };
+    let bash = |id: &str| tool(id, "Bash", serde_json::json!({"command": id}));
+    let completed = || {
+        harness(HarnessEvent::TurnCompleted {
+            status: TurnStatus::Completed,
+            usage: serde_json::Value::Null,
+            cost_usd: None,
+            rate_limit: None,
+        })
+    };
+    let prompt = |text: &str| Record {
+        at_ms: None,
+        entry: Entry::UserPrompt(text.into()),
+    };
+    let mut records = vec![
+        prompt("Check the build"),
+        timing(Some(0), None),
+        text("Looking at the build."),
+    ];
+    records.extend(bash("one"));
+    records.extend(bash("two"));
+    records.push(text("Two checks pass."));
+    records.push(thinking("Read the config"));
+    records.extend(bash("three"));
+    records.extend(tool(
+        "four",
+        "Read",
+        serde_json::json!({"file_path": "a.toml"}),
+    ));
+    records.extend([
+        text("The build is fine."),
+        timing(None, Some(65_000)),
+        completed(),
+        prompt("And the tests?"),
+        timing(Some(70_000), None),
+        thinking("Run them"),
+    ]);
+    records.extend(bash("five"));
+    records.push(text("They pass."));
+    if finished {
+        records.extend([timing(None, Some(81_000)), completed()]);
+    }
+    records
+}
+
+#[gpui::test]
+fn replayed_history_folds_each_finished_turn_closed_with_iced_label(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(two_replayed_turns(true), cx);
+    cx.simulate_resize(size(px(1200.), px(1600.)));
+    draw(cx);
+    // Rows: 0 prompt, 1 text, 2-3 tools, 4 text, 5 thinking, 6-7 tools,
+    // 8 final text, 9 prompt, 10 thinking, 11 tool, 12 final text.
+    chat.update_in(cx, |view, window, cx| {
+        let folds = turns::work_folds(&view.model);
+        assert_eq!(
+            folds
+                .iter()
+                .map(|fold| (fold.range.clone(), fold.label.as_str()))
+                .collect::<Vec<_>>(),
+            [(1..8, "Worked for 1m 5s"), (10..12, "Worked for 11.0s")]
+        );
+        for (start, label) in [(1, "Worked for 1m 5s"), (10, "Worked for 11.0s")] {
+            let row = view.row(start, window, cx);
+            let row = row.read(cx);
+            assert_eq!(row.work_summary.as_deref(), Some(label));
+            assert!(!row.work_open, "folds start closed");
+        }
+        for index in [2, 3, 4, 5, 6, 7, 11] {
+            assert!(view.row(index, window, cx).read(cx).hidden_by_work);
+        }
+        // The final text after the last work stays out, in the last turn too.
+        for index in [8, 12] {
+            let row = view.row(index, window, cx);
+            assert!(!row.read(cx).hidden_by_work && !row.read(cx).in_work);
+        }
+    });
+    let fold = cx.debug_bounds("work-fold-1").unwrap();
+    cx.simulate_click(fold.center(), gpui::Modifiers::none());
+    draw(cx);
+    // Opened: narration as text, each run of tool cards between paragraphs
+    // (thinking included) one summary line.
+    chat.update_in(cx, |view, window, cx| {
+        for index in [1, 4] {
+            let row = view.row(index, window, cx);
+            assert!(!row.read(cx).hidden_by_work && !row.read(cx).hidden_by_run);
+        }
+        let first = view.row(2, window, cx);
+        assert_eq!(
+            first.read(cx).run_summary.as_deref(),
+            Some("Ran 2 commands")
+        );
+        let second = view.row(5, window, cx);
+        assert_eq!(
+            second.read(cx).run_summary.as_deref(),
+            Some("Ran 1 command and read 1 file")
+        );
+        for index in [3, 6, 7] {
+            assert!(view.row(index, window, cx).read(cx).hidden_by_run);
+        }
+        assert!(view.row(11, window, cx).read(cx).hidden_by_work);
+    });
+    // Iced's `.tf-body`: the opened body sits 12px plus its 2px border right
+    // of the fold label, which starts where message text does.
+    let label = cx.debug_bounds("work-fold-label-1").unwrap();
+    let answer = cx.debug_bounds("transcript-row-8").unwrap();
+    assert_eq!(label.left(), answer.left());
+    let narration = cx.debug_bounds("transcript-row-4").unwrap();
+    let run = cx.debug_bounds("tool-run-label-2").unwrap();
+    assert_eq!(narration.left(), label.left() + px(14.));
+    assert_eq!(run.left(), narration.left());
+}
+
+#[gpui::test]
+fn live_running_turn_shows_its_work_unfolded_from_the_left(cx: &mut TestAppContext) {
+    let mut records = two_replayed_turns(false);
+    // The running turn's thinking stands alone between paragraphs.
+    records.push(Record {
+        at_ms: None,
+        entry: Entry::Harness(HarnessEvent::ThinkingDelta("Next step".into())),
+    });
+    let (chat, cx) = setup(records, cx);
+    cx.simulate_resize(size(px(1200.), px(1600.)));
+    draw(cx);
+    chat.update_in(cx, |view, window, cx| {
+        let folds = turns::work_folds(&view.model);
+        assert!(folds.iter().all(|fold| fold.range.end <= 9), "turn 2 runs");
+        for index in 10..14 {
+            let row = view.row(index, window, cx);
+            assert!(!row.read(cx).hidden_by_work && !row.read(cx).in_work);
+        }
+        assert_eq!(
+            view.row(11, window, cx).read(cx).run_summary.as_deref(),
+            Some("Ran 1 command")
+        );
+    });
+    draw(cx);
+    // Issue 99: Iced's `details.thinking` summary and run summary start at
+    // the left, in line with the message text, not centred.
+    let text = cx.debug_bounds("transcript-row-12").unwrap();
+    let thinking = cx.debug_bounds("row-fold-label-13").unwrap();
+    let run = cx.debug_bounds("tool-run-label-11").unwrap();
+    assert_eq!(thinking.left(), text.left());
+    assert_eq!(run.left(), text.left());
+    assert!(
+        thinking.size.width > text.size.width * 0.5,
+        "label fills the row"
+    );
 }

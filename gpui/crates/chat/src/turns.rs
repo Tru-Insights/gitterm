@@ -33,72 +33,149 @@ pub(super) fn containing(turns: &[Turn], row: usize) -> Option<&Turn> {
     turns.iter().find(|turn| turn.contains(row))
 }
 
-/// Fold tool/thinking work, keeping replies and attention in the timeline.
+/// Iced's turn fold (agent_chat.html "turn folds (TRU-209)"): a finished turn
+/// folds everything from its prompt up to its last tool call or thinking.
+/// Narration stays inside the fold; what needs the human and substantial
+/// answers stay out and split it.
 pub(super) struct WorkFold {
     pub range: std::ops::Range<usize>,
     pub label: String,
 }
 
 pub(super) fn work_folds(model: &crate::model::ChatModel) -> Vec<WorkFold> {
+    let pending = model
+        .rows
+        .iter()
+        .any(|row| row.request.as_ref().is_some_and(|r| !r.resolved));
     let mut folds = Vec::new();
     for turn in &model.completed_turns {
-        let mut segments = model.rows[turn.rows.clone()].split(|row| row.kind == RowKind::User);
-        let split = model.rows[turn.rows.clone()]
-            .iter()
-            .any(|row| row.kind == RowKind::User);
-        let label = if !split {
-            turn.duration_ms
-                .map(|ms| format!("Worked for {}", crate::composer::elapsed(ms)))
-        } else {
-            None
-        }
-        .unwrap_or_else(|| "Worked".into());
+        let rows = &model.rows[turn.rows.clone()];
+        // shortcut: a turn split by a mid-turn message has one duration and no
+        // per-segment split times, so its folds say "Worked" (Iced times each).
+        let split = rows.iter().any(|row| row.kind == RowKind::User);
+        let label = turn
+            .duration_ms
+            .filter(|_| !split)
+            .map(|ms| format!("Worked for {}", crate::composer::elapsed(ms)))
+            .unwrap_or_else(|| "Worked".into());
         let mut offset = turn.rows.start;
-        for segment in segments.by_ref() {
-            if let Some(last) = segment
-                .iter()
-                .rposition(|row| matches!(row.kind, RowKind::Thinking | RowKind::Tool))
-            {
-                let mut first = None;
-                let mut has_work = false;
-                for index in 0..=last + 1 {
-                    let row = segment.get(index).filter(|_| index <= last);
-                    let boundary = row.is_none_or(|row| {
-                        !row.scope.is_empty()
-                            || !matches!(row.kind, RowKind::Thinking | RowKind::Tool)
-                            || row.tool.as_ref().is_some_and(|tool| {
-                                tool.is_error
-                                    || (matches!(tool.name.as_str(), "Agent" | "Task")
-                                        && tool.output.is_none())
-                            })
-                            || (row.kind == RowKind::Tool
-                                && model.rows.iter().any(|other| {
-                                    other.request.as_ref().is_some_and(|r| !r.resolved)
-                                }))
-                    });
-                    if boundary {
-                        if let Some(start) = first.take()
-                            && has_work
-                            // Work between narration paragraphs is a tool run. The
-                            // turn disclosure owns the work before the first reply.
-                            && !segment[..start].iter().any(|row| row.kind == RowKind::Assistant)
-                        {
-                            folds.push(WorkFold {
-                                range: offset + start..offset + index,
-                                label: label.clone(),
-                            });
-                        }
-                        has_work = false;
-                    } else if let Some(row) = row {
-                        first.get_or_insert(index);
-                        has_work |= matches!(row.kind, RowKind::Thinking | RowKind::Tool);
-                    }
-                }
+        // A message sent mid-turn ends one fold and starts the next.
+        for segment in rows.split(|row| row.kind == RowKind::User) {
+            for range in fold_segment(segment, pending) {
+                folds.push(WorkFold {
+                    range: offset + range.start..offset + range.end,
+                    label: label.clone(),
+                });
             }
             offset += segment.len() + 1;
         }
     }
     folds
+}
+
+/// Iced's `WORK`: a top-level tool card or thinking block.
+pub(super) fn is_work(row: &Row) -> bool {
+    row.scope.is_empty() && matches!(row.kind, RowKind::Thinking | RowKind::Tool)
+}
+
+/// Rows Iced has no top-level block for: a subagent's rows live in its card,
+/// a withdrawn prompt is removed. They go wherever the block before them goes.
+fn follows_previous(row: &Row) -> bool {
+    !row.scope.is_empty() || row.kind == RowKind::Withdrawn
+}
+
+/// Iced's `foldSegment`: the groups of one segment that fold, or none.
+fn fold_segment(segment: &[Row], pending: bool) -> Vec<std::ops::Range<usize>> {
+    let Some(last) = segment.iter().rposition(is_work) else {
+        return Vec::new(); // a reply with no work: nothing to fold
+    };
+    let end = last
+        + 1
+        + segment[last + 1..]
+            .iter()
+            .take_while(|row| follows_previous(row))
+            .count();
+    let mut groups = Vec::new();
+    let mut start = None;
+    for (index, row) in segment[..end].iter().enumerate() {
+        if follows_previous(row) {
+            continue;
+        }
+        if keeps_out_of_fold(row, pending) || substantial(row) {
+            if let Some(start) = start.take() {
+                groups.push(start..index);
+            }
+            continue;
+        }
+        start.get_or_insert(index);
+        // Iced appends a visual reply after its tool card, outside the fold.
+        if row
+            .tool
+            .as_ref()
+            .is_some_and(|tool| super::visual::visual_request(tool).is_some())
+            && let Some(start) = start.take()
+        {
+            groups.push(start..index + 1);
+        }
+    }
+    if let Some(start) = start {
+        groups.push(start..end);
+    }
+    if !groups
+        .iter()
+        .any(|range| segment[range.clone()].iter().any(is_work))
+    {
+        return Vec::new();
+    }
+    groups
+}
+
+/// Iced's `keepsOutOfFold`: error blocks, delegation cards, a failed tool, a
+/// running subagent's card and a card whose request still waits.
+fn keeps_out_of_fold(row: &Row, pending: bool) -> bool {
+    match row.kind {
+        // Iced shows requests in its panel, not the timeline. GPUI's request
+        // cards record the human's decision, so they never fold.
+        RowKind::Error | RowKind::Delegation | RowKind::Permission | RowKind::Question => true,
+        // shortcut: rows do not link a request to its tool card, so any
+        // waiting request keeps every tool card out; fine while requests
+        // rarely outlive their turn.
+        RowKind::Tool => {
+            pending
+                || row.tool.as_ref().is_some_and(|tool| {
+                    tool.is_error
+                        || (matches!(tool.name.as_str(), "Agent" | "Task") && tool.output.is_none())
+                })
+        }
+        _ => row.delivery.is_some() || row.delegation.is_some(),
+    }
+}
+
+/// Iced's `isSubstantialAssistantText`: an answer long or structured enough
+/// to stay visible.
+fn substantial(row: &Row) -> bool {
+    if row.kind != RowKind::Assistant {
+        return false;
+    }
+    // JavaScript string length: UTF-16 code units.
+    if row.body.encode_utf16().count() >= 280 {
+        return true;
+    }
+    // Iced keeps text it cannot parse visible rather than hide an answer.
+    markdown::to_mdast(&row.body, &markdown::ParseOptions::gfm()).map_or(true, |node| {
+        node.children().is_some_and(|children| {
+            children.iter().any(|node| {
+                matches!(
+                    node,
+                    markdown::mdast::Node::Heading(_)
+                        | markdown::mdast::Node::Table(_)
+                        | markdown::mdast::Node::List(_)
+                        | markdown::mdast::Node::Blockquote(_)
+                        | markdown::mdast::Node::Code(_)
+                )
+            })
+        })
+    })
 }
 
 #[cfg(test)]

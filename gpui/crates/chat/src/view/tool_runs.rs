@@ -7,7 +7,36 @@ pub(super) struct Run {
     pub label: String,
 }
 
-pub(super) fn group(rows: &[Row], completed: &[crate::model::CompletedTurn]) -> Vec<Run> {
+pub(super) fn group(model: &crate::model::ChatModel, folds: &[super::turns::WorkFold]) -> Vec<Run> {
+    let (rows, completed) = (&model.rows, &model.completed_turns);
+    let finished = |index: usize| completed.iter().any(|turn| turn.rows.contains(&index));
+    // Iced's `foldNodes`: in a finished turn's fold, everything between two
+    // narration paragraphs that has a tool card is one run; outside a fold a
+    // finished turn has no runs.
+    let mut runs = Vec::new();
+    for fold in folds {
+        let mut start = fold.range.start;
+        for index in fold.range.start..=fold.range.end {
+            let narration = rows
+                .get(index)
+                .is_some_and(|row| row.scope.is_empty() && row.kind == RowKind::Assistant);
+            if index < fold.range.end && !narration {
+                continue;
+            }
+            let tools: Vec<_> = rows[start..index]
+                .iter()
+                .filter(|row| row.scope.is_empty())
+                .filter_map(|row| row.tool.as_ref())
+                .collect();
+            if !tools.is_empty() {
+                runs.push(Run {
+                    range: start..index,
+                    label: run_label(&tools),
+                });
+            }
+            start = index + 1;
+        }
+    }
     let pending_scopes: HashSet<_> = rows
         .iter()
         .filter(|row| row.request.as_ref().is_some_and(|r| !r.resolved))
@@ -21,16 +50,18 @@ pub(super) fn group(rows: &[Row], completed: &[crate::model::CompletedTurn]) -> 
                 matches!(tool.name.as_str(), "Agent" | "Task") && tool.output.is_none()
             })
     };
-    let mut runs = Vec::new();
     let mut index = 0;
     while index < rows.len() {
-        if !eligible(&rows[index]) {
+        if finished(index) || !eligible(&rows[index]) {
             index += 1;
             continue;
         }
         let start = index;
         index += 1;
-        while index < rows.len() && rows[index].scope == rows[start].scope && eligible(&rows[index])
+        while index < rows.len()
+            && !finished(index)
+            && rows[index].scope == rows[start].scope
+            && eligible(&rows[index])
         {
             index += 1;
         }
@@ -39,11 +70,7 @@ pub(super) fn group(rows: &[Row], completed: &[crate::model::CompletedTurn]) -> 
             .filter_map(|row| row.tool.as_ref())
             .collect();
         let mut label = run_label(&tools);
-        if !completed
-            .iter()
-            .any(|turn| turn.rows.start <= start && index <= turn.rows.end)
-            && let Some(tool) = tools.iter().rev().find(|tool| tool.output.is_none())
-        {
+        if let Some(tool) = tools.iter().rev().find(|tool| tool.output.is_none()) {
             label.push_str(" · now: ");
             label.push_str(salient(tool).unwrap_or(&tool.name));
         }
@@ -52,12 +79,19 @@ pub(super) fn group(rows: &[Row], completed: &[crate::model::CompletedTurn]) -> 
             label,
         });
     }
+    runs.sort_by_key(|run| run.range.start);
     runs
 }
 
 pub(super) fn tooltip(rows: &[Row]) -> String {
     let mut counts: Vec<(&str, usize)> = Vec::new();
-    for tool in rows.iter().filter_map(|row| row.tool.as_ref()) {
+    // Iced names the run's own calls, not a subagent's inside its card.
+    let scope = rows.first().map(|row| row.scope.as_str());
+    for tool in rows
+        .iter()
+        .filter(|row| Some(row.scope.as_str()) == scope)
+        .filter_map(|row| row.tool.as_ref())
+    {
         if let Some((_, n)) = counts.iter_mut().find(|(name, _)| *name == tool.name) {
             *n += 1;
         } else {
@@ -221,7 +255,7 @@ mod tests {
 {"type":"text_delta","data":"reply"}
 {"type":"item_started","data":{"id":"d","kind":{"type":"tool_call","name":"Read","input":{"file_path":"a.rs"}}}}"#).unwrap();
         let model = ChatModel::from_records(&records);
-        let runs = group(&model.rows, &model.completed_turns);
+        let runs = group(&model, &super::super::turns::work_folds(&model));
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].range, 0..3);
         assert_eq!(runs[0].label, "Ran 3 commands · now: three");

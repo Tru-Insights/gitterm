@@ -162,13 +162,11 @@ impl ChatView {
             self.folded_turns.remove(&self.model.rows[turn.user_row].id);
             self.sync_turn_visibility(cx);
         }
-        for fold in turns::work_folds(&self.model)
-            .iter()
-            .filter(|fold| fold.range.contains(&index))
-        {
+        let work_folds = turns::work_folds(&self.model);
+        for fold in work_folds.iter().filter(|fold| fold.range.contains(&index)) {
             self.open_work.insert(self.model.rows[fold.range.start].id);
         }
-        for run in tool_runs::group(&self.model.rows, &self.model.completed_turns)
+        for run in tool_runs::group(&self.model, &work_folds)
             .iter()
             .filter(|run| run.range.contains(&index))
         {

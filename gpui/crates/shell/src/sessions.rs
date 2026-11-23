@@ -1365,4 +1365,127 @@ mod tests {
             assert!(!can_close(&current, &stale, false));
         }
     }
+
+    /// Issue 98: a replayed Claude transcript folds each finished turn, as Iced.
+    /// The transcript is synthetic: prompt; text, tools, text, thinking, tools;
+    /// a final text; then a second prompt and turn.
+    #[gpui::test]
+    fn replayed_claude_transcript_folds_each_finished_turn(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext as _, VisualTestContext};
+        fn draw(cx: &mut VisualTestContext) {
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+        }
+        let at = |s: u32| format!("2026-01-01T00:{:02}:{:02}.000Z", s / 60, s % 60);
+        let assistant = |s: u32, content: serde_json::Value| serde_json::json!({"type":"assistant","timestamp":at(s),"message":{"content":content}});
+        let user = |s: u32, content: serde_json::Value| serde_json::json!({"type":"user","timestamp":at(s),"message":{"content":content}});
+        let result = |s: u32, id: &str| {
+            user(
+                s,
+                serde_json::json!([{"type":"tool_result","tool_use_id":id,"content":"ok"}]),
+            )
+        };
+        let bash = |id: &str| serde_json::json!({"type":"tool_use","id":id,"name":"Bash","input":{"command":id}});
+        let lines = [
+            user(0, "Check the build".into()),
+            assistant(
+                1,
+                serde_json::json!([{"type":"text","text":"Looking at the build."}]),
+            ),
+            assistant(2, serde_json::json!([bash("one"), bash("two")])),
+            result(3, "one"),
+            result(4, "two"),
+            assistant(
+                5,
+                serde_json::json!([{"type":"text","text":"Two checks pass."}]),
+            ),
+            assistant(
+                6,
+                serde_json::json!([{"type":"thinking","thinking":"Read the config"}]),
+            ),
+            assistant(
+                7,
+                serde_json::json!([bash("three"), {"type":"tool_use","id":"four","name":"Read","input":{"file_path":"a.toml"}}]),
+            ),
+            result(8, "three"),
+            result(9, "four"),
+            assistant(
+                65,
+                serde_json::json!([{"type":"text","text":"The build is fine."}]),
+            ),
+            user(70, "And the tests?".into()),
+            assistant(
+                71,
+                serde_json::json!([{"type":"thinking","thinking":"Run them"}]),
+            ),
+            assistant(72, serde_json::json!([bash("five")])),
+            result(80, "five"),
+            assistant(81, serde_json::json!([{"type":"text","text":"They pass."}])),
+        ];
+        let projects = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(projects.path().join("fixture")).unwrap();
+        std::fs::write(
+            projects.path().join("fixture/synthetic.jsonl"),
+            lines.map(|line| line.to_string()).join("\n"),
+        )
+        .unwrap();
+        let saved = read_iced_history(
+            projects.path(),
+            "synthetic",
+            "/fixture/repo",
+            projects.path().join("provider"),
+        )
+        .unwrap();
+        // The transcript has no turn markers: each prompt and the end of the
+        // file end the turn before them, as in Iced's history replay.
+        let model = gitterm_gpui_chat::model::ChatModel::from_records(&saved.records);
+        assert_eq!(
+            model
+                .completed_turns
+                .iter()
+                .map(|turn| (turn.rows.clone(), turn.duration_ms))
+                .collect::<Vec<_>>(),
+            [(1..9, Some(65_000)), (10..13, Some(11_000))]
+        );
+        let (_root, shell, cx) = crate::h6_tests::sample(cx);
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(crate::app_menus::TabSelect { index: 0 }), cx)
+        });
+        draw(cx);
+        cx.update(|window, cx| {
+            let shutdown = shell.read(cx).owner.read(cx).chat_shutdown.clone();
+            let preview = cx.new(|cx| crate::chat::ChatPane::history(shutdown, saved, window, cx));
+            let state = shell.read(cx).active(cx);
+            let pane = state.panes[&crate::session_pane_id(state.active_session.unwrap())].clone();
+            pane.update(cx, |pane, cx| {
+                pane.content = crate::pane::PaneContent::PreviewChat(preview);
+                cx.notify();
+            });
+        });
+        draw(cx);
+        // Rows: 0 prompt, 1 text, 2-3 tools, 4 text, 5 thinking, 6-7 tools,
+        // 8 final text, 9 prompt, 10 thinking, 11 tool, 12 final text.
+        for fold in ["work-fold-1", "work-fold-10"] {
+            assert!(cx.debug_bounds(fold).is_some(), "{fold} drawn");
+        }
+        for hidden in [2, 3, 4, 5, 6, 7, 11] {
+            let selector = Box::leak(format!("transcript-row-{hidden}").into_boxed_str());
+            assert!(cx.debug_bounds(selector).is_none(), "row {hidden} folded");
+        }
+        for shown in [0, 8, 9, 12] {
+            let selector = Box::leak(format!("transcript-row-{shown}").into_boxed_str());
+            assert!(cx.debug_bounds(selector).is_some(), "row {shown} shown");
+        }
+        let fold = cx.debug_bounds("work-fold-1").unwrap();
+        cx.simulate_click(fold.center(), gpui::Modifiers::none());
+        draw(cx);
+        // Opened: narration as text, each tool run between paragraphs one line.
+        for shown in ["transcript-row-4", "tool-run-2", "tool-run-5"] {
+            assert!(cx.debug_bounds(shown).is_some(), "{shown} shown");
+        }
+        for hidden in ["transcript-row-3", "transcript-row-6", "transcript-row-7"] {
+            assert!(cx.debug_bounds(hidden).is_none(), "{hidden} in its run");
+        }
+    }
 }

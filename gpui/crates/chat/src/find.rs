@@ -159,7 +159,8 @@ impl ChatView {
                     self.sync_turn_visibility(cx);
                 }
             }
-            if let Some(work) = turns::work_folds(&self.model)
+            let work_folds = turns::work_folds(&self.model);
+            if let Some(work) = work_folds
                 .iter()
                 .find(|fold| fold.range.contains(&found.row))
             {
@@ -169,7 +170,7 @@ impl ChatView {
                     self.sync_runs(cx);
                 }
             }
-            if let Some(run) = tool_runs::group(&self.model.rows, &self.model.completed_turns)
+            if let Some(run) = tool_runs::group(&self.model, &work_folds)
                 .iter()
                 .find(|run| run.range.contains(&found.row))
             {
