@@ -1488,4 +1488,87 @@ mod tests {
             assert!(cx.debug_bounds(hidden).is_none(), "{hidden} in its run");
         }
     }
+    /// Issue 98: a real Claude turn's transcript shape (its text replaced by
+    /// placeholders) folds into one closed "Worked for" row, as in Iced. The
+    /// turn has thinking, narration, Bash calls among metadata lines, an
+    /// answered AskUserQuestion, ToolSearch and MCP calls, a final text, a stop
+    /// hook summary, and then a GitTerm delivery and the next turn.
+    #[gpui::test]
+    fn real_claude_turn_shape_folds_into_one_worked_row(cx: &mut gpui::TestAppContext) {
+        use gitterm_gpui_chat::model::RowKind;
+        use gpui::{AppContext as _, VisualTestContext};
+        fn draw(cx: &mut VisualTestContext) {
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+        }
+        let projects = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(projects.path().join("fixture")).unwrap();
+        std::fs::write(
+            projects.path().join("fixture/real-shape.jsonl"),
+            include_str!("chat/fixtures/claude-turn-with-question.jsonl"),
+        )
+        .unwrap();
+        let saved = read_iced_history(
+            projects.path(),
+            "real-shape",
+            "/fixture/repo",
+            projects.path().join("provider"),
+        )
+        .unwrap();
+        let model = gitterm_gpui_chat::model::ChatModel::from_records(&saved.records);
+        // Rows: 0 prompt, 1..=50 the turn's work and narration, 51 its final
+        // text, 52 the delivery card, 53..=57 the next turn, 58 the last prompt.
+        let turn = &model.completed_turns[0];
+        assert_eq!(turn.rows, 1..52);
+        assert_eq!(turn.duration_ms, Some(470_458));
+        let rows = &model.rows[1..52];
+        // The answered question is an ordinary tool card, as Iced shows it.
+        assert!(rows.iter().all(|row| matches!(
+            row.kind,
+            RowKind::Thinking | RowKind::Assistant | RowKind::Tool
+        )));
+        assert!(rows.iter().any(|row| {
+            row.tool
+                .as_ref()
+                .is_some_and(|tool| tool.name == "AskUserQuestion")
+        }));
+        assert_eq!(model.rows[51].kind, RowKind::Assistant);
+        assert!(model.rows[52].delivery.is_some());
+        assert_eq!(model.rows[58].kind, RowKind::User);
+        let (_root, shell, cx) = crate::h6_tests::sample(cx);
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(crate::app_menus::TabSelect { index: 0 }), cx)
+        });
+        draw(cx);
+        cx.update(|window, cx| {
+            let shutdown = shell.read(cx).owner.read(cx).chat_shutdown.clone();
+            let preview = cx.new(|cx| crate::chat::ChatPane::history(shutdown, saved, window, cx));
+            let state = shell.read(cx).active(cx);
+            let pane = state.panes[&crate::session_pane_id(state.active_session.unwrap())].clone();
+            pane.update(cx, |pane, cx| {
+                pane.content = crate::pane::PaneContent::PreviewChat(preview);
+                cx.notify();
+            });
+        });
+        draw(cx);
+        let label = cx
+            .debug_bounds("work-fold-label-1")
+            .expect("one Worked row for the first turn");
+        assert!(label.size.width > gpui::px(0.));
+        assert!(cx.debug_bounds("work-fold-1").is_some());
+        for hidden in 2..51 {
+            let selector = Box::leak(format!("transcript-row-{hidden}").into_boxed_str());
+            assert!(cx.debug_bounds(selector).is_none(), "row {hidden} folded");
+            let fold = Box::leak(format!("work-fold-{hidden}").into_boxed_str());
+            assert!(
+                cx.debug_bounds(fold).is_none(),
+                "no second fold at {hidden}"
+            );
+        }
+        for shown in [0, 51] {
+            let selector = Box::leak(format!("transcript-row-{shown}").into_boxed_str());
+            assert!(cx.debug_bounds(selector).is_some(), "row {shown} shown");
+        }
+    }
 }

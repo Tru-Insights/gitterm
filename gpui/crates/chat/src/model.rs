@@ -49,6 +49,12 @@ pub struct Request {
     pub identity: Option<gitterm_core::chat::state::RequestIdentity>,
     pub kind: RuntimeRequestKind,
     pub resolved: bool,
+    /// The top-level tool card this request is for (a subagent's request:
+    /// its Agent card), as Iced's `keepsOutOfFold` links them.
+    pub tool_row: Option<usize>,
+    /// Its turn ended before the human answered. Iced folds a finished turn
+    /// before clearing its requests, so this card and its tool stay out.
+    pub waiting_at_turn_end: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -469,9 +475,15 @@ impl ChatModel {
                 | HarnessEvent::ProcessExited { .. }
                 | HarnessEvent::ConversationReset { .. }
         ) {
+            let turn_end = matches!(event, HarnessEvent::TurnCompleted { .. });
             for ((owner, _), &index) in &self.requests {
                 if owner.starts_with(&self.request_owner) {
-                    self.rows[index].request.as_mut().unwrap().resolved = true;
+                    let waiting = self.rows[index].decision.is_none();
+                    let request = self.rows[index].request.as_mut().unwrap();
+                    if turn_end && !request.resolved && waiting {
+                        request.waiting_at_turn_end = true;
+                    }
+                    request.resolved = true;
                     changed.push(index);
                 }
             }
@@ -576,9 +588,16 @@ impl ChatModel {
                 }
             }
             HarnessEvent::RuntimeRequest {
-                request_id, kind, ..
+                request_id,
+                tool_use_id,
+                kind,
             } => {
                 self.streams.remove(scope);
+                let tool_row = match scope.split('/').next().filter(|root| !root.is_empty()) {
+                    Some(root) => self.items.get(&(String::new(), root.to_string())),
+                    None => self.items.get(&(String::new(), tool_use_id.clone())),
+                }
+                .copied();
                 let (row_kind, body) = match kind {
                     RuntimeRequestKind::Permission {
                         tool_name,
@@ -619,6 +638,8 @@ impl ChatModel {
                     identity: None,
                     kind: kind.clone(),
                     resolved: false,
+                    tool_row,
+                    waiting_at_turn_end: false,
                 });
                 if let Some(old) = self.requests.insert((self.request_owner.clone(), request_id.clone()), index) {
                     if !self.rows[old].request.as_ref().unwrap().resolved {

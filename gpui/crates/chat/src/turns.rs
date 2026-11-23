@@ -43,10 +43,13 @@ pub(super) struct WorkFold {
 }
 
 pub(super) fn work_folds(model: &crate::model::ChatModel) -> Vec<WorkFold> {
-    let pending = model
+    // Tool cards whose request still waits, or waited when its turn ended.
+    let held: std::collections::HashSet<usize> = model
         .rows
         .iter()
-        .any(|row| row.request.as_ref().is_some_and(|r| !r.resolved));
+        .filter(|row| waits(row))
+        .filter_map(|row| row.request.as_ref()?.tool_row)
+        .collect();
     let mut folds = Vec::new();
     for turn in &model.completed_turns {
         let rows = &model.rows[turn.rows.clone()];
@@ -61,7 +64,7 @@ pub(super) fn work_folds(model: &crate::model::ChatModel) -> Vec<WorkFold> {
         let mut offset = turn.rows.start;
         // A message sent mid-turn ends one fold and starts the next.
         for segment in rows.split(|row| row.kind == RowKind::User) {
-            for range in fold_segment(segment, pending) {
+            for range in fold_segment(segment, offset, &held) {
                 folds.push(WorkFold {
                     range: offset + range.start..offset + range.end,
                     label: label.clone(),
@@ -85,7 +88,13 @@ fn follows_previous(row: &Row) -> bool {
 }
 
 /// Iced's `foldSegment`: the groups of one segment that fold, or none.
-fn fold_segment(segment: &[Row], pending: bool) -> Vec<std::ops::Range<usize>> {
+/// `first` is the segment's first row index; `held` are tool rows a waiting
+/// request keeps out.
+fn fold_segment(
+    segment: &[Row],
+    first: usize,
+    held: &std::collections::HashSet<usize>,
+) -> Vec<std::ops::Range<usize>> {
     let Some(last) = segment.iter().rposition(is_work) else {
         return Vec::new(); // a reply with no work: nothing to fold
     };
@@ -101,7 +110,7 @@ fn fold_segment(segment: &[Row], pending: bool) -> Vec<std::ops::Range<usize>> {
         if follows_previous(row) {
             continue;
         }
-        if keeps_out_of_fold(row, pending) || substantial(row) {
+        if keeps_out_of_fold(row, held.contains(&(first + index))) || substantial(row) {
             if let Some(start) = start.take() {
                 groups.push(start..index);
             }
@@ -130,22 +139,29 @@ fn fold_segment(segment: &[Row], pending: bool) -> Vec<std::ops::Range<usize>> {
     groups
 }
 
+/// Iced's "a card whose request still waits": not answered, and not closed by
+/// the harness before its turn ended (Iced folds before clearing requests).
+fn waits(row: &Row) -> bool {
+    row.decision.is_none()
+        && row
+            .request
+            .as_ref()
+            .is_some_and(|r| !r.resolved || r.waiting_at_turn_end)
+}
+
 /// Iced's `keepsOutOfFold`: error blocks, delegation cards, a failed tool, a
 /// running subagent's card and a card whose request still waits.
-fn keeps_out_of_fold(row: &Row, pending: bool) -> bool {
+fn keeps_out_of_fold(row: &Row, held: bool) -> bool {
     match row.kind {
-        // Iced shows requests in its panel, not the timeline. GPUI's request
-        // cards record the human's decision, so they never fold.
-        RowKind::Error | RowKind::Delegation | RowKind::Permission | RowKind::Question => true,
-        // shortcut: rows do not link a request to its tool card, so any
-        // waiting request keeps every tool card out; fine while requests
-        // rarely outlive their turn.
+        RowKind::Error | RowKind::Delegation => true,
+        // Iced shows a request in its panel and folds the tool card once the
+        // request is answered; GPUI's request card folds the same way.
+        RowKind::Permission | RowKind::Question => waits(row),
         RowKind::Tool => {
-            pending
-                || row.tool.as_ref().is_some_and(|tool| {
-                    tool.is_error
-                        || (matches!(tool.name.as_str(), "Agent" | "Task") && tool.output.is_none())
-                })
+            held || row.tool.as_ref().is_some_and(|tool| {
+                tool.is_error
+                    || (matches!(tool.name.as_str(), "Agent" | "Task") && tool.output.is_none())
+            })
         }
         _ => row.delivery.is_some() || row.delegation.is_some(),
     }
@@ -302,5 +318,82 @@ mod tests {
         assert!(turns[0].contains(1));
         assert!(!turns[0].contains(2));
         assert!(turns[1].contains(3));
+    }
+    /// Iced folds an answered request's card and its tool with the turn; a
+    /// request still waiting when the turn ends keeps both out, because Iced
+    /// folds before it clears the turn's requests.
+    #[test]
+    fn answered_request_folds_and_one_waiting_at_turn_end_stays_out() {
+        use crate::events::{ItemKind, RuntimeRequestKind, TurnStatus};
+        let harness = |event| Record {
+            at_ms: None,
+            entry: Entry::Harness(event),
+        };
+        let started = |id: &str, name: &str| {
+            harness(HarnessEvent::ItemStarted {
+                id: id.into(),
+                kind: ItemKind::ToolCall {
+                    name: name.into(),
+                    input: serde_json::json!({}),
+                },
+            })
+        };
+        let completed = |id: &str| {
+            harness(HarnessEvent::ItemCompleted {
+                id: id.into(),
+                output: "ok".into(),
+                is_error: false,
+            })
+        };
+        let model = |answered: bool| {
+            let mut records = vec![
+                Record {
+                    at_ms: None,
+                    entry: Entry::UserPrompt("Go".into()),
+                },
+                started("one", "Bash"),
+                completed("one"),
+                started("ask", "AskUserQuestion"),
+                harness(HarnessEvent::RuntimeRequest {
+                    request_id: "q".into(),
+                    tool_use_id: "ask".into(),
+                    kind: RuntimeRequestKind::Question {
+                        questions: serde_json::json!([{"question": "Which?"}]),
+                    },
+                }),
+            ];
+            if answered {
+                records.push(harness(HarnessEvent::RuntimeRequestResolved {
+                    request_id: "q".into(),
+                }));
+                records.push(completed("ask"));
+            }
+            records.extend([
+                started("two", "Bash"),
+                completed("two"),
+                harness(HarnessEvent::TextDelta("Done.".into())),
+                harness(HarnessEvent::TurnCompleted {
+                    status: TurnStatus::Completed,
+                    usage: serde_json::Value::Null,
+                    cost_usd: None,
+                    rate_limit: None,
+                }),
+            ]);
+            ChatModel::from_records(&records)
+        };
+        let ranges = |model: &ChatModel| {
+            work_folds(model)
+                .into_iter()
+                .map(|fold| fold.range)
+                .collect::<Vec<_>>()
+        };
+        // Rows: 0 prompt, 1 Bash, 2 AskUserQuestion, 3 question, 4 Bash, 5 text.
+        let answered = model(true);
+        assert_eq!(answered.rows[3].kind, RowKind::Question);
+        assert_eq!(ranges(&answered), vec![1..5]);
+        let waiting = model(false);
+        assert_eq!(waiting.rows[3].kind, RowKind::Question);
+        assert!(waiting.rows[3].request.as_ref().unwrap().resolved);
+        assert_eq!(ranges(&waiting), [1..2, 4..5]);
     }
 }
