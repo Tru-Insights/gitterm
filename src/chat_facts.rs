@@ -573,9 +573,19 @@ impl LiveFacts {
     fn observe_results(&mut self, event: &HarnessEvent) {
         match event {
             HarnessEvent::SubagentEvent { event, .. } => self.observe_results(event),
-            HarnessEvent::ItemCompleted { id, output, .. } => {
+            HarnessEvent::ItemCompleted {
+                id,
+                output,
+                is_error,
+            } => {
                 if let Some(command) = self.bash_commands.remove(id) {
-                    let prs = created_prs(&command, output);
+                    // A failed create made no PR (the transcript scans skip
+                    // errored results too); its output can still quote one.
+                    let prs = if *is_error {
+                        Vec::new()
+                    } else {
+                        created_prs(&command, output)
+                    };
                     self.pending
                         .live_created_prs
                         .extend(prs.iter().map(|pr| pr.key().id()));
@@ -5011,6 +5021,38 @@ branch refs/heads/tracey/tru-12-thing
         for query in queries.split(',').map(str::trim).filter(|q| !q.is_empty()) {
             eprintln!("query {query:?}: {:?}", entry.query_match(query));
             assert!(entry.matches_query(query), "query {query:?} did not match");
+        }
+    }
+
+    /// Issue 96: a live `gh pr create` that failed records no PR, even when
+    /// its output quotes one; a successful one still does.
+    #[test]
+    fn a_failed_live_pr_create_is_not_recorded() {
+        let url = "https://github.com/acme/app/pull/42";
+        for (is_error, recorded) in [(true, 0), (false, 1)] {
+            let mut live = LiveFacts::default();
+            live.observe(
+                &HarnessEvent::ItemStarted {
+                    id: "b1".into(),
+                    kind: ItemKind::ToolCall {
+                        name: "Bash".into(),
+                        input: json!({"command": "cargo test && gh pr create --fill"}),
+                    },
+                },
+                None,
+            );
+            live.observe(
+                &HarnessEvent::ItemCompleted {
+                    id: "b1".into(),
+                    output: format!("output naming {url}"),
+                    is_error,
+                },
+                None,
+            );
+            let prs = live
+                .take_due(Instant::now(), true)
+                .map_or(0, |raw| raw.prs.len());
+            assert_eq!(prs, recorded, "is_error {is_error}");
         }
     }
 }
