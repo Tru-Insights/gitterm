@@ -19,6 +19,28 @@ use std::time::Duration;
 
 const CONTEXT: &str = "GitTermTerminal";
 
+/// Whether the host is dropping every PTY write (Iced drops them while a
+/// capture layer is open). The host refreshes it each frame; pastes check it,
+/// because a paste reaches the PTY from the context menu, not only from a key
+/// the host's key guard sees.
+#[derive(Default)]
+pub struct InputGate(Arc<std::sync::atomic::AtomicBool>);
+
+impl Global for InputGate {}
+
+impl InputGate {
+    pub fn set(blocked: bool, cx: &mut App) {
+        cx.default_global::<Self>()
+            .0
+            .store(blocked, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn blocked(cx: &App) -> bool {
+        cx.try_global::<Self>()
+            .is_some_and(|gate| gate.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 actions!(gitterm_terminal, [SendTab, SendBacktab]);
 
 #[derive(Clone, Debug)]
@@ -663,7 +685,7 @@ impl TerminalView {
 
         if (event.keystroke.modifiers.platform || event.keystroke.modifiers.control)
             && key == "v"
-            && self.paste_from_clipboard()
+            && self.paste_unless_blocked(_cx)
         {
             _cx.notify();
             return;
@@ -980,6 +1002,12 @@ impl TerminalView {
         false
     }
 
+    /// A paste from the keyboard or the context menu: dropped while the host
+    /// blocks PTY writes.
+    pub fn paste_unless_blocked(&self, cx: &App) -> bool {
+        !InputGate::blocked(cx) && self.paste_from_clipboard()
+    }
+
     pub fn paste_from_clipboard(&self) -> bool {
         if let Ok(mut clipboard) = crate::clipboard::Clipboard::new()
             && let Ok(text) = clipboard.get_text()
@@ -1023,7 +1051,7 @@ impl TerminalView {
             let view = view.clone();
             move |_, _, cx| {
                 let _ = view.update(cx, |this, cx| {
-                    let _ = this.paste_from_clipboard();
+                    let _ = this.paste_unless_blocked(cx);
                     cx.notify();
                 });
             }

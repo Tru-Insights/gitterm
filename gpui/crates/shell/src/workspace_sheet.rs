@@ -205,7 +205,7 @@ impl WorkspaceSheet {
         }
     }
 
-    fn cancel(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn cancel(&mut self, cx: &mut Context<Self>) {
         if !self.picking_folder {
             cx.emit(WorkspaceSheetOutcome::Cancel);
         }
