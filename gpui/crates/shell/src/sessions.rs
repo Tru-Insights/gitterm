@@ -189,9 +189,22 @@ impl crate::Shell {
             .map(|session| session.id)
             .find(|id| self.session_task(*id, cx).is_none());
         if self.active_workspace(cx) == Some(workspace) {
-            match sibling {
-                Some(sibling) => self.select_session_id(sibling, window, cx),
-                None => {
+            let first = state.sessions.first().map(|session| session.id);
+            match (sibling, general, first) {
+                (Some(sibling), _, _) => self.select_session_id(sibling, window, cx),
+                (None, Some(_), _) => {
+                    self.selected_task = Some(task);
+                    self.general_context(true, window, cx);
+                }
+                // Only other tasks' panes are left: Iced lands on its first
+                // tab (`unwrap_or(0)`), with the Tasks rail and the closed
+                // task selected.
+                (None, None, Some(first)) => {
+                    self.select_session_id(first, window, cx);
+                    self.selected_task = Some(task);
+                    self.show_task_rail(cx);
+                }
+                (None, None, None) => {
                     self.selected_task = Some(task);
                     self.general_context(true, window, cx);
                 }

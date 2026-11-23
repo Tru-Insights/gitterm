@@ -323,6 +323,35 @@ fn closing_a_task_s_last_pane_lands_on_its_overview(cx: &mut TestAppContext) {
     launches.kill(1);
 }
 
+/// With only other tasks' panes left (no non-task pane), Iced lands on its
+/// first tab (`unwrap_or(0)`); the Tasks rail opens with the task selected.
+#[gpui::test]
+fn closing_a_task_s_last_pane_with_no_general_pane_lands_on_the_first(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let (a, b) = (launches.create(cx), launches.create(cx));
+    let config = tempfile::tempdir().unwrap();
+    let (shell, vcx, session) = adopted_in(&launches, &a, config.path(), false, cx);
+    let a1 = session_holding(&shell, &session, vcx).unwrap();
+    let b1 = open(&launches, &shell, &b, vcx);
+    assert!(
+        session_tasks(&shell, vcx)
+            .iter()
+            .all(|(_, task)| task.is_some())
+    );
+
+    stop_and_close(&shell, a1, vcx);
+    assert_eq!(landed(&shell, vcx), (Some(b1), true));
+    vcx.read(|cx| {
+        let shell = shell.read(cx);
+        assert_eq!(shell.selected_task, Some(a.clone()));
+        assert_eq!(
+            shell.active(cx).store.regions.sidebar_mode,
+            crate::layout::SidebarMode::Tasks
+        );
+    });
+    launches.kill(1);
+}
+
 /// A shell whose launched Codex session of a fresh task is its worker's
 /// session, reported blocked; with the pane focused.
 fn blocked_worker<'a>(
