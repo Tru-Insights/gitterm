@@ -939,7 +939,13 @@ impl crate::Shell {
                     saved.map(Ok).unwrap_or_else(|| {
                         let projects =
                             projects.ok_or_else(|| "transcript source unavailable".to_string())?;
-                        read_iced_history(&projects, &conversation, &tab.dir, provider, &delegations)
+                        read_iced_history(
+                            &projects,
+                            &conversation,
+                            &tab.dir,
+                            provider,
+                            &delegations,
+                        )
                     })
                 })
                 .await;
@@ -992,9 +998,11 @@ fn chat_delegation_times(
     facts: &crate::data::RosterFacts,
     tab: &gitterm_core::workspace_config::WorkspaceTabConfig,
 ) -> Vec<(String, String)> {
-    let Some(this) = facts.tabs.iter().position(|t| {
-        t.session_uid == tab.session_uid && t.chat_session_id == tab.chat_session_id
-    }) else {
+    let Some(this) = facts
+        .tabs
+        .iter()
+        .position(|t| t.session_uid == tab.session_uid && t.chat_session_id == tab.chat_session_id)
+    else {
         return Vec::new();
     };
     let tabs = facts.tabs.iter().enumerate().filter_map(|(index, t)| {
@@ -1009,9 +1017,7 @@ fn chat_delegation_times(
         .workers
         .iter()
         .rev()
-        .filter(|d| {
-            gitterm_core::delegations::parent_tab_id(&d.parent, tabs.clone()) == Some(this)
-        })
+        .filter(|d| gitterm_core::delegations::parent_tab_id(&d.parent, tabs.clone()) == Some(this))
         .map(|d| (d.delegation_id.clone(), d.created_at.clone()))
         .collect()
 }
@@ -1122,10 +1128,9 @@ fn read_iced_history(
     let timeline = gitterm_core::chat::history::parse_claude_transcript_timed(&source);
     // Iced's history_timeline rule: each card goes back where it was requested;
     // a card with no place stays out here and lands at the end.
-    let mut anchors =
-        gitterm_core::chat::history::history_anchor_positions(&timeline, delegations)
-            .into_iter()
-            .peekable();
+    let mut anchors = gitterm_core::chat::history::history_anchor_positions(&timeline, delegations)
+        .into_iter()
+        .peekable();
     let anchor = |id: String| Record {
         at_ms: None,
         entry: Entry::DisplayDelegation {
