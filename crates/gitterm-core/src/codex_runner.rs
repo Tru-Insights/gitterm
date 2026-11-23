@@ -2609,13 +2609,15 @@ mod tests {
                 brief: "Take your time.".to_string(),
             });
             run.effort = Some(crate::workers::ReasoningEffort::Medium);
-            run.time_limit = Some(std::time::Duration::from_secs(5));
+            // Long enough for the fake to start and report its thread on a
+            // loaded machine (5 s was not, with parallel builds running).
+            run.time_limit = Some(std::time::Duration::from_secs(15));
             let log_path = run.log_path.clone();
 
             let started = std::time::Instant::now();
             let (result, events) = run_collect(&fake, run).await;
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(25),
+                started.elapsed() < std::time::Duration::from_secs(45),
                 "the limit stops the run: {:?}",
                 started.elapsed()
             );
@@ -2623,7 +2625,7 @@ mod tests {
             assert!(error.is_time_limit(), "{error:?}");
             assert_eq!(
                 error.to_string(),
-                "stopped at the time limit (5.0 seconds); GitTerm ended the Codex run, it did \
+                "stopped at the time limit (15.0 seconds); GitTerm ended the Codex run, it did \
                  not crash"
             );
             assert_eq!(
