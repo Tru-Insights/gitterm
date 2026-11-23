@@ -352,6 +352,85 @@ fn closing_a_task_s_last_pane_with_no_general_pane_lands_on_the_first(cx: &mut T
     launches.kill(1);
 }
 
+/// A shell of three plain terminal panes, the first of them selected.
+fn three_normal_panes<'a>(
+    launches: &Launches,
+    config: &Path,
+    cx: &'a mut TestAppContext,
+) -> (
+    Entity<crate::Shell>,
+    &'a mut gpui::VisualTestContext,
+    [crate::data::SessionId; 3],
+) {
+    let (shell, vcx) = task_shell(launches, config, cx);
+    for _ in 0..3 {
+        shell.update_in(vcx, |shell, window, cx| shell.new_terminal(window, cx));
+        vcx.run_until_parked();
+    }
+    let ids: Vec<_> = session_tasks(&shell, vcx)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let ids: [crate::data::SessionId; 3] = ids[ids.len() - 3..].try_into().unwrap();
+    (shell, vcx, ids)
+}
+
+fn select_and_close(
+    shell: &Entity<crate::Shell>,
+    select: crate::data::SessionId,
+    close: crate::data::SessionId,
+    cx: &mut gpui::VisualTestContext,
+) {
+    shell.update_in(cx, |shell, window, cx| {
+        shell.strip_outcome(
+            crate::session_strip::Outcome::SelectSession(select),
+            window,
+            cx,
+        );
+        shell.strip_outcome(
+            crate::session_strip::Outcome::CloseSession(close),
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+}
+
+/// Issue 97, Iced's `Event::TabClose` (src/main.rs): closing the active
+/// normal pane keeps its index, so the pane to its right is active and shown.
+#[gpui::test]
+fn closing_the_middle_normal_pane_lands_on_the_right_one(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let config = tempfile::tempdir().unwrap();
+    let (shell, vcx, [_, b, c]) = three_normal_panes(&launches, config.path(), cx);
+    select_and_close(&shell, b, b, vcx);
+    assert_eq!(landed(&shell, vcx), (Some(c), true));
+}
+
+/// Closing the last normal pane lands on the new last one.
+#[gpui::test]
+fn closing_the_last_normal_pane_lands_on_the_new_last(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let config = tempfile::tempdir().unwrap();
+    let (shell, vcx, [_, b, c]) = three_normal_panes(&launches, config.path(), cx);
+    select_and_close(&shell, c, c, vcx);
+    assert_eq!(landed(&shell, vcx), (Some(b), true));
+}
+
+/// Closing a normal pane that is not active leaves the active pane active
+/// and shown. (Iced keeps the active *index*, so closing a tab left of the
+/// active one shifts its active tab one to the right; GPUI keeps the pane.)
+#[gpui::test]
+fn closing_an_inactive_normal_pane_keeps_the_active_one(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let config = tempfile::tempdir().unwrap();
+    let (shell, vcx, [a, b, c]) = three_normal_panes(&launches, config.path(), cx);
+    select_and_close(&shell, b, c, vcx);
+    assert_eq!(landed(&shell, vcx), (Some(b), true));
+    select_and_close(&shell, b, a, vcx);
+    assert_eq!(landed(&shell, vcx), (Some(b), true));
+}
+
 /// A shell whose launched Codex session of a fresh task is its worker's
 /// session, reported blocked; with the pane focused.
 fn blocked_worker<'a>(
