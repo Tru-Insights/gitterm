@@ -904,6 +904,13 @@ impl crate::Shell {
         ) {
             return;
         }
+        // shortcut: before the first task-store read there are no facts, so the
+        // cards land at the end as before; reopening the chat places them.
+        let delegations = self
+            .roster_facts
+            .as_ref()
+            .map(|facts| chat_delegation_times(facts, &tab))
+            .unwrap_or_default();
         let Some(conversation) = tab.chat_session_id else {
             return;
         };
@@ -932,7 +939,7 @@ impl crate::Shell {
                     saved.map(Ok).unwrap_or_else(|| {
                         let projects =
                             projects.ok_or_else(|| "transcript source unavailable".to_string())?;
-                        read_iced_history(&projects, &conversation, &tab.dir, provider)
+                        read_iced_history(&projects, &conversation, &tab.dir, provider, &delegations)
                     })
                 })
                 .await;
@@ -977,6 +984,36 @@ impl crate::Shell {
         })
         .detach();
     }
+}
+
+/// Iced's `delegation_times_for_tab`: the chat's delegations as
+/// (id, created_at), oldest first, matched to their parent tab by core's rule.
+fn chat_delegation_times(
+    facts: &crate::data::RosterFacts,
+    tab: &gitterm_core::workspace_config::WorkspaceTabConfig,
+) -> Vec<(String, String)> {
+    let Some(this) = facts.tabs.iter().position(|t| {
+        t.session_uid == tab.session_uid && t.chat_session_id == tab.chat_session_id
+    }) else {
+        return Vec::new();
+    };
+    let tabs = facts.tabs.iter().enumerate().filter_map(|(index, t)| {
+        (t.tab_kind.as_deref() == Some("agent")).then_some((
+            index,
+            t.session_uid.as_deref()?,
+            t.chat_session_id.as_deref(),
+            false,
+        ))
+    });
+    facts
+        .workers
+        .iter()
+        .rev()
+        .filter(|d| {
+            gitterm_core::delegations::parent_tab_id(&d.parent, tabs.clone()) == Some(this)
+        })
+        .map(|d| (d.delegation_id.clone(), d.created_at.clone()))
+        .collect()
 }
 
 /// Use Iced's index rules (generated title, summary/first real user message),
@@ -1034,6 +1071,7 @@ fn read_iced_history(
     conversation: &str,
     cwd: &str,
     provider: std::path::PathBuf,
+    delegations: &[(String, String)],
 ) -> Result<crate::chat::SavedChat, String> {
     use gitterm_core::harness::transcript::TranscriptEntry;
     use gitterm_gpui_chat::events::{Entry, Record};
@@ -1081,7 +1119,26 @@ fn read_iced_history(
         .map_err(|e| format!("Read transcript {}: {e}", path.display()))?;
     let mut records = Vec::new();
     let mut last_activity_ms = None;
-    for timed in gitterm_core::chat::history::parse_claude_transcript_timed(&source) {
+    let timeline = gitterm_core::chat::history::parse_claude_transcript_timed(&source);
+    // Iced's history_timeline rule: each card goes back where it was requested;
+    // a card with no place stays out here and lands at the end.
+    let mut anchors =
+        gitterm_core::chat::history::history_anchor_positions(&timeline, delegations)
+            .into_iter()
+            .peekable();
+    let anchor = |id: String| Record {
+        at_ms: None,
+        entry: Entry::DisplayDelegation {
+            id,
+            title: String::new(),
+            state: "requested".into(),
+            body: String::new(),
+        },
+    };
+    for (index, timed) in timeline.into_iter().enumerate() {
+        while let Some((_, id)) = anchors.next_if(|(at, _)| *at == index) {
+            records.push(anchor(id));
+        }
         let at_ms = timestamp_ms(timed.at.as_deref());
         let entry = match timed.entry {
             TranscriptEntry::UserPrompt(text) => {
@@ -1126,6 +1183,7 @@ fn read_iced_history(
     if records.is_empty() {
         return Err("Transcript has no recorded history".into());
     }
+    records.extend(anchors.map(|(_, id)| anchor(id)));
     Ok(crate::chat::SavedChat {
         uid: format!("iced-{conversation}"),
         cwd: cwd.into(),
@@ -1255,6 +1313,7 @@ mod tests {
             "fixture-chat",
             "/fixture/cwd",
             "/fixture/provider".into(),
+            &[],
         )
         .unwrap();
         assert_eq!(saved.session_id.as_deref(), Some("fixture-chat"));
@@ -1275,7 +1334,8 @@ mod tests {
                 dir.path(),
                 "../escape",
                 "/fixture/cwd",
-                "/fixture/provider".into()
+                "/fixture/provider".into(),
+                &[]
             )
             .is_err()
         );
@@ -1284,7 +1344,8 @@ mod tests {
                 dir.path(),
                 "missing",
                 "/fixture/cwd",
-                "/fixture/provider".into()
+                "/fixture/provider".into(),
+                &[]
             )
             .is_err()
         );
@@ -1298,9 +1359,62 @@ mod tests {
                 dir.path(),
                 "empty",
                 "/fixture/cwd",
-                "/fixture/provider".into()
+                "/fixture/provider".into(),
+                &[]
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn imported_transcript_puts_cards_where_they_were_requested() {
+        use gitterm_gpui_chat::events::Entry;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("fixture-project");
+        std::fs::create_dir(&project).unwrap();
+        let source = concat!(
+            "{\"type\":\"user\",\"timestamp\":\"2026-01-01T10:00:00Z\",\"message\":{\"content\":\"Question\"}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-01-01T10:00:05Z\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"tool-1\",\"name\":\"mcp__gitterm_tasks__delegate_task\",\"input\":{}}]}}\n",
+            "{\"type\":\"user\",\"timestamp\":\"2026-01-01T10:00:06Z\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tool-1\",\"content\":\"{\\\"delegation_id\\\":\\\"d-tool\\\"}\",\"is_error\":false}]}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-01-01T10:00:07Z\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Started a worker\"}]}}\n",
+            "{\"type\":\"user\",\"timestamp\":\"2026-01-01T10:30:00Z\",\"message\":{\"content\":\"Later question\"}}\n"
+        );
+        std::fs::write(project.join("cards-chat.jsonl"), source).unwrap();
+        let delegations = [
+            ("d-tool".to_string(), "2026-01-01T10:00:05Z".to_string()),
+            ("d-page".to_string(), "2026-01-01T10:10:00Z".to_string()),
+            ("d-after".to_string(), "2026-01-02T00:00:00Z".to_string()),
+        ];
+        let saved = read_iced_history(
+            dir.path(),
+            "cards-chat",
+            "/fixture/cwd",
+            "/fixture/provider".into(),
+            &delegations,
+        )
+        .unwrap();
+        let order: Vec<String> = saved
+            .records
+            .iter()
+            .filter_map(|r| match &r.entry {
+                Entry::DisplayDelegation { id, .. } => Some(format!("card {id}")),
+                Entry::UserPrompt(text) => Some(format!("prompt {text}")),
+                Entry::Harness(gitterm_core::chat::types::HarnessEvent::ItemCompleted {
+                    ..
+                }) => Some("result".into()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "prompt Question",
+                "result",
+                "card d-tool",
+                "card d-page",
+                "prompt Later question",
+                "card d-after",
+            ]
         );
     }
 
@@ -1322,6 +1436,7 @@ mod tests {
             "timed-chat",
             "/fixture/cwd",
             "/fixture/provider".into(),
+            &[],
         )
         .unwrap();
         let mut timing = (None, None);
@@ -1435,6 +1550,7 @@ mod tests {
             "synthetic",
             "/fixture/repo",
             projects.path().join("provider"),
+            &[],
         )
         .unwrap();
         // The transcript has no turn markers: each prompt and the end of the
@@ -1514,6 +1630,7 @@ mod tests {
             "real-shape",
             "/fixture/repo",
             projects.path().join("provider"),
+            &[],
         )
         .unwrap();
         let model = gitterm_gpui_chat::model::ChatModel::from_records(&saved.records);
