@@ -257,7 +257,10 @@ fn escape_closes_a_surface_while_a_terminal_holds_focus(cx: &mut TestAppContext)
         focus_terminal(&view, cx);
         cx.update(|window, cx| {
             shell.update(cx, |s, cx| {
-                assert!(s.focused_terminal(window, cx).is_some(), "{blocker:?}: focus")
+                assert!(
+                    s.focused_terminal(window, cx).is_some(),
+                    "{blocker:?}: focus"
+                )
             })
         });
         cx.simulate_keystrokes("escape");
@@ -284,7 +287,9 @@ fn escape_closes_a_surface_while_a_terminal_holds_focus(cx: &mut TestAppContext)
                 let id = s.active_workspace(cx).unwrap();
                 s.open_settings_sheet(id, window, cx)
             }),
-            Sheet::Phone => shell.update(cx, |s, cx| s.open_phone_panel("agent:fixture", window, cx)),
+            Sheet::Phone => {
+                shell.update(cx, |s, cx| s.open_phone_panel("agent:fixture", window, cx))
+            }
             Sheet::Plans => shell.update(cx, |s, cx| s.toggle_plans(window, cx)),
         });
         draw(cx);
