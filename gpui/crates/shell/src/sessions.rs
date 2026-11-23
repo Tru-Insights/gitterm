@@ -140,10 +140,15 @@ impl crate::Shell {
         if let Some(terminals) = &mut state.store.terminals {
             terminals.retain(|terminal| terminal.id != id.0);
         }
+        // Iced's `TabClose` keeps the closed tab's index, so the tab to its
+        // right becomes active, or the last when it was the last.
+        let closed_at = state.sessions.iter().position(|session| session.id == id);
         state.sessions.retain(|session| session.id != id);
         let was_active = state.active_session == Some(id);
         if was_active {
-            state.active_session = state.sessions.first().map(|session| session.id);
+            state.active_session = closed_at
+                .and_then(|at| state.sessions.get(at).or(state.sessions.last()))
+                .map(|session| session.id);
         }
         state
             .dock
