@@ -21,7 +21,7 @@ pub use events::{Action, PendingEvents, SessionState};
 pub use launch::{TerminalLaunch, kill_process_group};
 pub use services::{JobState, SearchResults, ServiceError, ServiceJob};
 pub use settings::{BackendSettings, LayoutSize};
-pub use view::{TerminalConfig, TerminalView};
+pub use view::{InputGate, TerminalConfig, TerminalView};
 
 #[cfg(test)]
 mod launch_tests;

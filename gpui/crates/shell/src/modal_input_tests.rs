@@ -242,3 +242,90 @@ fn task_prompts_are_the_task_modal(cx: &mut TestAppContext) {
         });
     }
 }
+
+/// Iced closes the surface on Escape wherever focus is: its key handler
+/// (main.rs `Event::KeyPressed`) runs before any terminal write is dropped.
+/// With a terminal holding focus behind the surface, GPUI consumed the key
+/// without closing anything.
+#[gpui::test]
+fn escape_closes_a_surface_while_a_terminal_holds_focus(cx: &mut TestAppContext) {
+    for blocker in Blocker::ALL {
+        let (_root, shell, cx) = h6_tests::sample(cx);
+        dispatch(TabSelect { index: 1 }, cx);
+        let view = terminal(&shell, cx);
+        blocker.open(&shell, cx);
+        focus_terminal(&view, cx);
+        cx.update(|window, cx| {
+            shell.update(cx, |s, cx| {
+                assert!(
+                    s.focused_terminal(window, cx).is_some(),
+                    "{blocker:?}: focus"
+                )
+            })
+        });
+        cx.simulate_keystrokes("escape");
+        draw(cx);
+        cx.update(|window, cx| {
+            shell.update(cx, |s, cx| {
+                assert!(!s.pty_blocked(cx), "{blocker:?}: Escape left it open");
+                assert_eq!(s.shell_modal(window, cx), None, "{blocker:?}");
+            })
+        });
+        // Nothing was typed behind it.
+        focus_terminal(&view, cx);
+        cx.simulate_keystrokes("k l m");
+        wait_until(cx, |cx| screen(&view, cx).contains("klm"));
+    }
+    for sheet in Sheet::ALL {
+        let (_root, shell, cx) = h7_tests::fixture(cx);
+        dispatch(NewTerminal, cx);
+        let view = terminal(&shell, cx);
+        cx.update(|window, cx| match sheet {
+            Sheet::Park => shell.update(cx, |s, cx| s.open_park_sheet(window, cx)),
+            Sheet::NewWork => shell.update(cx, |s, cx| s.open_new_work_sheet(window, cx)),
+            Sheet::Settings => shell.update(cx, |s, cx| {
+                let id = s.active_workspace(cx).unwrap();
+                s.open_settings_sheet(id, window, cx)
+            }),
+            Sheet::Phone => {
+                shell.update(cx, |s, cx| s.open_phone_panel("agent:fixture", window, cx))
+            }
+            Sheet::Plans => shell.update(cx, |s, cx| s.toggle_plans(window, cx)),
+        });
+        draw(cx);
+        assert_eq!(cx.read(|cx| shell.read(cx).open_sheet()), Some(sheet));
+        focus_terminal(&view, cx);
+        cx.simulate_keystrokes("escape");
+        draw(cx);
+        assert_eq!(
+            cx.read(|cx| shell.read(cx).open_sheet()),
+            None,
+            "{sheet:?}: Escape left it open"
+        );
+    }
+}
+
+/// Iced's terminal ignores right-click (iced_term `handle_mouse_event` acts
+/// on the left button and the wheel only), so it has no right-click Paste;
+/// its paste is Cmd+V or Shift+Insert, which the PTY gate drops while a
+/// capture layer is open. GPUI's right-click context menu offers Paste, and a
+/// menu item is not a key the shell's guard sees, so the terminal's own paste
+/// checks the gate the shell refreshes each frame.
+#[gpui::test]
+fn paste_is_dropped_behind_iceds_capture_layers(cx: &mut TestAppContext) {
+    for blocker in Blocker::ALL {
+        let (_root, shell, cx) = h6_tests::sample(cx);
+        dispatch(TabSelect { index: 1 }, cx);
+        let view = terminal(&shell, cx);
+        let blocked = |cx: &mut VisualTestContext| cx.read(gitterm_terminal::InputGate::blocked);
+        assert!(!blocked(cx), "{blocker:?}: gate open before");
+        blocker.open(&shell, cx);
+        assert!(blocked(cx), "{blocker:?}: gate closed behind it");
+        assert!(
+            !cx.read(|cx| view.read(cx).paste_unless_blocked(cx)),
+            "{blocker:?}: a paste reached the PTY"
+        );
+        blocker.close(&shell, cx);
+        assert!(!blocked(cx), "{blocker:?}: gate open after");
+    }
+}

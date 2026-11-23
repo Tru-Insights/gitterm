@@ -519,6 +519,11 @@ impl ParkSheet {
             cx.notify();
         }
     }
+    /// Escape, for a caller that holds focus elsewhere (a terminal behind
+    /// the sheet): the same outcome as the sheet's own Escape key.
+    pub(crate) fn cancel(&mut self, cx: &mut Context<Self>) {
+        self.activate(SheetAction::Cancel, cx);
+    }
     fn activate(&mut self, action: SheetAction, cx: &mut Context<Self>) {
         let outcome = match &self.content {
             Content::Workspace(model) => model.activate(action),
