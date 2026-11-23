@@ -5013,4 +5013,69 @@ branch refs/heads/tracey/tru-12-thing
             assert!(entry.matches_query(query), "query {query:?} did not match");
         }
     }
+
+    /// TRU-274 issue 96: `fake/repo#42` comes back at startup because it sits
+    /// in a saved facts file (`load_root_prs` -> the PR watch's key list), not
+    /// in `pr-watch.json`. Text that merely mentions `gh pr create <url>` is
+    /// rejected; a real create in the same shell chain, or a failed live
+    /// result, is not.
+    #[test]
+    fn i96_fake_pr_pickup() {
+        let url = "https://github.com/fake/repo/pull/42";
+        let text = format!("gh pr create {url}");
+        // Mentions only: never recorded.
+        for command in [
+            format!("printf '%s\\n' '{text}'"),
+            format!("echo {text}"),
+            format!("cat <<'EOF'\n{text}\nEOF"),
+            format!("git commit -m \"{text}\""),
+        ] {
+            assert!(created_prs(&command, &text).is_empty(), "{command}");
+        }
+        // A real create in the chain: every URL in the whole output counts.
+        let chained = created_prs(
+            "grep -rn fake/repo src; gh pr create --fill",
+            &format!("src/x.rs:1:{url}\nhttps://github.com/acme/app/pull/9"),
+        );
+        assert_eq!(
+            chained.iter().map(|pr| pr.key().id()).collect::<Vec<_>>(),
+            ["fake/repo#42", "acme/app#9"]
+        );
+        // Live tab: a failed chain's output is recorded too (`is_error`
+        // is ignored), while the transcript scan skips errored results.
+        let mut live = LiveFacts::default();
+        live.observe(
+            &HarnessEvent::ItemStarted {
+                id: "b1".into(),
+                kind: ItemKind::ToolCall {
+                    name: "Bash".into(),
+                    input: json!({"command": "cargo test && gh pr create --fill"}),
+                },
+            },
+            None,
+        );
+        live.observe(
+            &HarnessEvent::ItemCompleted {
+                id: "b1".into(),
+                output: format!("assertion failed: {url}"),
+                is_error: true,
+            },
+            None,
+        );
+        let raw = live.take_due(Instant::now(), true).unwrap();
+        assert_eq!(raw.prs.len(), 1, "live path records an errored create");
+        // Persisted facts feed the watch with no pr-watch.json involved.
+        let temp = tempfile::tempdir().unwrap();
+        let mut facts = ChatFacts::default();
+        let mut resolver = GitResolver::default();
+        raw.resolve_into(&mut facts, &mut resolver);
+        write_facts(
+            &facts_path(temp.path(), ChatBackend::Claude, "root").unwrap(),
+            &facts,
+        )
+        .unwrap();
+        let keys = load_root_prs(temp.path(), &[], &[], "root", |m| panic!("{m}"));
+        assert_eq!(keys[0].key().id(), "fake/repo#42");
+        assert!(facts.live_created_prs.contains(&"fake/repo#42".to_string()));
+    }
 }
