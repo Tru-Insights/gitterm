@@ -1074,7 +1074,8 @@ impl ChatView {
             return view.clone();
         }
         let row = self.model.rows[index].clone();
-        let run = tool_runs::group(&self.model.rows, &self.model.completed_turns)
+        let work_folds = turns::work_folds(&self.model);
+        let run = tool_runs::group(&self.model, &work_folds)
             .into_iter()
             .find(|run| run.range.contains(&index));
         let run_open = run.as_ref().is_none_or(|run| {
@@ -1100,7 +1101,7 @@ impl ChatView {
             self.folded_turns
                 .contains(&self.model.rows[turn.user_row].id)
         });
-        let work = turns::work_folds(&self.model)
+        let work = work_folds
             .into_iter()
             .find(|fold| fold.range.contains(&index));
         let work_open = work.as_ref().is_none_or(|fold| {
@@ -1110,6 +1111,7 @@ impl ChatView {
         let hidden_by_work = work
             .as_ref()
             .is_some_and(|fold| fold.range.start != index && !work_open);
+        let in_work = work.is_some();
         let work_summary = work
             .filter(|fold| fold.range.start == index)
             .map(|fold| fold.label);
@@ -1168,6 +1170,7 @@ impl ChatView {
             view.work_toggle = work_toggle;
             view.work_summary = work_summary;
             view.work_open = work_open;
+            view.in_work = in_work;
             view.hidden_by_work = hidden_by_work;
             view.run_toggle = run_toggle;
             view.run_summary = run_summary;
@@ -1186,8 +1189,8 @@ impl ChatView {
         view
     }
     fn sync_runs(&mut self, cx: &mut Context<Self>) {
-        let runs = tool_runs::group(&self.model.rows, &self.model.completed_turns);
         let work_folds = turns::work_folds(&self.model);
+        let runs = tool_runs::group(&self.model, &work_folds);
         for (index, view) in self.row_views.iter().enumerate() {
             let Some(view) = view else { continue };
             let run = runs.iter().find(|run| run.range.contains(&index));
@@ -1211,9 +1214,11 @@ impl ChatView {
                     .contains(&self.model.rows[fold.range.start].id)
             });
             let hidden_by_work = work.is_some_and(|fold| fold.range.start != index && !work_open);
+            let in_work = work.is_some();
             view.update(cx, |view, cx| {
                 if view.work_summary != work_summary
                     || view.work_open != work_open
+                    || view.in_work != in_work
                     || view.hidden_by_work != hidden_by_work
                     || view.run_summary != summary
                     || view.run_tooltip != tooltip
@@ -1222,6 +1227,7 @@ impl ChatView {
                 {
                     view.work_summary = work_summary;
                     view.work_open = work_open;
+                    view.in_work = in_work;
                     view.hidden_by_work = hidden_by_work;
                     view.run_summary = summary;
                     view.run_tooltip = tooltip;
@@ -1784,6 +1790,8 @@ struct RowView {
     run_tooltip: String,
     work_summary: Option<String>,
     work_open: bool,
+    /// Inside a finished turn's fold: opened, Iced indents it as `.tf-body`.
+    in_work: bool,
     hidden_by_work: bool,
     work_toggle: TurnToggle,
     column_width: Option<f32>,
@@ -1845,6 +1853,7 @@ impl RowView {
             run_tooltip: String::new(),
             work_summary: None,
             work_open: true,
+            in_work: false,
             hidden_by_work: false,
             work_toggle: Rc::new(|_, _| {}),
             column_width: Some(840.),
@@ -1986,10 +1995,10 @@ impl Render for RowView {
             .visual
             .clone()
             .filter(|visual| !visual.read(cx).expanded);
-        if self.hidden_by_turn || self.hidden_by_work || self.row.kind == RowKind::Withdrawn {
+        if self.hidden_by_turn || self.row.kind == RowKind::Withdrawn {
             return div().h(px(0.)).mb(px(0.)).into_any_element();
         }
-        if self.hidden_by_run && self.work_summary.is_none() {
+        if self.hidden_by_work || (self.hidden_by_run && self.work_summary.is_none()) {
             return div()
                 .w_full()
                 .when_some(self.column_width, |row, width| row.max_w(px(width)))
@@ -2062,8 +2071,18 @@ impl Render for RowView {
                 .text_size(px(self.appearance.size(12.5)))
                 .text_color(rgb(palette.muted))
                 .tooltip(self.run_tooltip.clone())
-                .child(div().min_w_0().text_ellipsis().child(label))
-                .child(if self.run_open { "⌄" } else { "›" })
+                // The button centres its content; Iced's summary starts at the left.
+                .child(
+                    div()
+                        .debug_selector(move || format!("tool-run-label-{id}"))
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .items_baseline()
+                        .gap(px(6.))
+                        .child(div().min_w_0().text_ellipsis().child(label))
+                        .child(if self.run_open { "⌄" } else { "›" }),
+                )
                 .on_click(move |_, _, cx| toggle(id, cx))
         });
         let show_work = self.work_summary.is_none() || self.work_open;
@@ -2084,8 +2103,17 @@ impl Render for RowView {
                 .cursor_pointer()
                 .text_size(px(self.appearance.size(13.)))
                 .text_color(rgb(palette.muted))
-                .child(label)
-                .child(if self.work_open { "⌄" } else { "›" })
+                .child(
+                    div()
+                        .debug_selector(move || format!("work-fold-label-{id}"))
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .items_baseline()
+                        .gap(px(6.))
+                        .child(label)
+                        .child(if self.work_open { "⌄" } else { "›" }),
+                )
                 .on_click(move |_, _, cx| toggle(id, cx))
         });
         let row =
@@ -2159,8 +2187,8 @@ impl Render for RowView {
                     row.bg(rgb(palette.border))
                         .border_color(rgb(palette.accent))
                 })
-                .children(work_summary)
-                .when(show_work, |row| row.children(run_summary))
+                .when(self.in_work, |row| row.mb_0())
+                .children(run_summary)
                 .when(show_card, |row| {
                     row.child(if self.row.delegation.is_some() {
                         self.render_delegation(cx).into_any_element()
@@ -2202,11 +2230,25 @@ impl Render for RowView {
                                                         |row| row.italic(),
                                                     )
                                                     .when(self.row.delivery.is_none(), |header| {
-                                                        header.child(format!(
-                                                            "{} {}",
-                                                            if self.open { "▾" } else { "▸" },
-                                                            self.row.title
-                                                        ))
+                                                        let id = self.row.id;
+                                                        header.child(
+                                                            div()
+                                                                .debug_selector(move || {
+                                                                    format!("row-fold-label-{id}")
+                                                                })
+                                                                .flex_1()
+                                                                .min_w_0()
+                                                                .text_ellipsis()
+                                                                .child(format!(
+                                                                    "{} {}",
+                                                                    if self.open {
+                                                                        "▾"
+                                                                    } else {
+                                                                        "▸"
+                                                                    },
+                                                                    self.row.title
+                                                                )),
+                                                        )
                                                     })
                                                     .when_some(
                                                         self.row.delivery.as_ref(),
@@ -2303,12 +2345,31 @@ impl Render for RowView {
                     })
                 })
                 .into_any_element();
+        let work_summary = work_summary.map(|header| {
+            div()
+                .mt(px(4.))
+                .mb(px(if self.work_open { 4. } else { 10. }))
+                .child(header)
+        });
+        // Iced's `.tf-body`: one bordered column, so each row's gap sits inside it.
+        let row = if self.in_work {
+            div()
+                .pl(px(12.))
+                .pb(px(10.))
+                .border_l_2()
+                .border_color(rgb(palette.border))
+                .child(row)
+                .into_any_element()
+        } else {
+            row.into_any_element()
+        };
         div()
             .w_full()
             .when_some(self.column_width, |row, width| row.max_w(px(width)))
             .mx_auto()
-            .child(row)
-            .when(show_work, |row| row.children(visual))
+            .children(work_summary)
+            .when(show_work, |outer| outer.child(row))
+            .children(visual)
             .into_any_element()
     }
 }

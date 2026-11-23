@@ -153,7 +153,7 @@ impl ChatView {
 /// Iced pages top-level blocks: a tool run or completed-work fold counts once.
 pub(super) fn block_starts(model: &ChatModel) -> Vec<usize> {
     let work = turns::work_folds(model);
-    let runs = tool_runs::group(&model.rows, &model.completed_turns);
+    let runs = tool_runs::group(model, &work);
     let mut ends = HashMap::new();
     for range in work
         .iter()
