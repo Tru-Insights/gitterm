@@ -221,6 +221,25 @@ impl Pane {
         };
         target.task_id.is_some().then_some(target)
     }
+    /// Iced's tab attention `HumanInputRequired` on the launched task
+    /// terminal this pane holds.
+    pub(crate) fn needs_input(&self, cx: &App) -> bool {
+        self.session
+            .as_ref()
+            .and_then(|target| target.task_session_id.as_deref())
+            .zip(cx.try_global::<crate::task_host::GpuiTaskHost>())
+            .is_some_and(|(session, host)| host.0.read(cx).needs_input(session))
+    }
+    /// The dock tab's title: Iced's tab label leads with `● ` while its
+    /// session needs input.
+    pub(crate) fn dock_title(&self, cx: &App) -> String {
+        let title = self.tab_title();
+        if self.needs_input(cx) {
+            format!("● {title}")
+        } else {
+            title
+        }
+    }
     /// The folder the pane's session runs in: a chat's working folder, else
     /// the terminal's.
     pub(crate) fn task_folder(&self, cx: &App) -> Option<std::path::PathBuf> {
@@ -336,8 +355,8 @@ impl BasePanel for Pane {
     }
 }
 impl Panel for Pane {
-    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        self.tab_title()
+    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.dock_title(cx)
     }
     fn inner_padding(&self, _: &App) -> bool {
         false

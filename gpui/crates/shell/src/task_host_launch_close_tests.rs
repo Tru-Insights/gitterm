@@ -15,7 +15,27 @@ fn adopted<'a>(
     &'a mut gpui::VisualTestContext,
     String,
 ) {
+    adopted_in(launches, task, config, false, cx)
+}
+
+/// [`adopted`], over a shell whose first pane is a General terminal (as
+/// Iced's workspace has) when `general` is set.
+fn adopted_in<'a>(
+    launches: &Launches,
+    task: &str,
+    config: &Path,
+    general: bool,
+    cx: &'a mut TestAppContext,
+) -> (
+    Entity<crate::Shell>,
+    &'a mut gpui::VisualTestContext,
+    String,
+) {
     let (shell, vcx) = task_shell(launches, config, cx);
+    if general {
+        shell.update_in(vcx, |shell, window, cx| shell.new_terminal(window, cx));
+        vcx.run_until_parked();
+    }
     let reply = launches.launch(task, Some("Codex"), vcx).unwrap();
     let session = reply["session_id"].as_str().unwrap().to_string();
     wait_until(vcx, |cx| session_holding(&shell, &session, cx).is_some());
@@ -149,15 +169,26 @@ fn a_final_worker_pane_closes_after_its_result_went_out(cx: &mut TestAppContext)
         owner.own_worker(worker_delegation("worker", &task, "gone"))
     });
     let config = tempfile::tempdir().unwrap();
-    let (shell, vcx, session) = adopted(&launches, &task, config.path(), cx);
+    let (shell, vcx, session) = adopted_in(&launches, &task, config.path(), true, cx);
     let (pid, descendant) = (launches.agent.pid(1), launches.agent.descendant(1));
     vcx.executor()
         .advance_clock(crate::task_host::DELIVERY_POLL);
     vcx.run_until_parked();
     assert!(session_holding(&shell, &session, vcx).is_some());
+    // Iced's `FinalWorkerStopped` keeps another active tab and the selection.
+    let general = session_tasks(&shell, vcx)[0].0;
+    shell.update_in(vcx, |shell, window, cx| {
+        shell.strip_outcome(
+            crate::session_strip::Outcome::SelectSession(general),
+            window,
+            cx,
+        )
+    });
 
     report(&launches, &task, &session, "done", vcx);
     tick_until(vcx, |cx| session_holding(&shell, &session, cx).is_none());
+    assert_eq!(landed(&shell, vcx), (Some(general), true));
+    assert_eq!(vcx.read(|cx| shell.read(cx).selected_task.clone()), None);
     wait_until(vcx, |_| !exists(&pid) && !exists(&descendant));
     assert_eq!(
         launches.saved().get(&task).unwrap().lifecycle,
@@ -168,4 +199,239 @@ fn a_final_worker_pane_closes_after_its_result_went_out(cx: &mut TestAppContext)
         .owner
         .read_with(vcx, |owner, _| owner.launched_live(&session));
     assert_eq!(tracked, None);
+}
+
+/// Launches a plain terminal session of `task` and waits for its pane.
+fn open(
+    launches: &Launches,
+    shell: &Entity<crate::Shell>,
+    task: &str,
+    cx: &mut gpui::VisualTestContext,
+) -> crate::data::SessionId {
+    let reply = launches.launch(task, None, cx).unwrap();
+    let session = reply["session_id"].as_str().unwrap().to_string();
+    wait_until(cx, |cx| session_holding(shell, &session, cx).is_some());
+    session_holding(shell, &session, cx).unwrap()
+}
+
+/// The active workspace's sessions, each with its task.
+fn session_tasks(
+    shell: &Entity<crate::Shell>,
+    cx: &mut gpui::VisualTestContext,
+) -> Vec<(crate::data::SessionId, Option<String>)> {
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        shell
+            .active(cx)
+            .sessions
+            .iter()
+            .map(|s| (s.id, shell.session_task(s.id, cx)))
+            .collect()
+    })
+}
+
+/// The active session, and whether the dock shows its pane.
+fn landed(
+    shell: &Entity<crate::Shell>,
+    cx: &mut gpui::VisualTestContext,
+) -> (Option<crate::data::SessionId>, bool) {
+    cx.read(|cx| {
+        let state = shell.read(cx).active(cx);
+        let active = state.active_session;
+        let shown =
+            active.is_some_and(|id| crate::pane_id_visible(state, &crate::session_pane_id(id), cx));
+        (active, shown)
+    })
+}
+
+/// Selects `id` from the strip, closes it, and answers Iced's running-task
+/// prompt with Stop and close.
+fn stop_and_close(
+    shell: &Entity<crate::Shell>,
+    id: crate::data::SessionId,
+    cx: &mut gpui::VisualTestContext,
+) {
+    shell.update_in(cx, |shell, window, cx| {
+        shell.strip_outcome(crate::session_strip::Outcome::SelectSession(id), window, cx)
+    });
+    assert_eq!(landed(shell, cx), (Some(id), true));
+    shell.update_in(cx, |shell, window, cx| {
+        shell.strip_outcome(crate::session_strip::Outcome::CloseSession(id), window, cx)
+    });
+    let panel = cx.read(|cx| shell.read(cx).task_panel.clone().unwrap());
+    let inputs = cx.read(|cx| shell.read(cx).task_inputs(cx));
+    panel.update(cx, |panel, cx| {
+        assert!(matches!(
+            panel.modal,
+            Some(crate::task_panel::Modal::StopAndClose { .. })
+        ));
+        panel.write(crate::task_panel::Write::StopAndClose, &inputs, cx)
+    });
+    cx.run_until_parked();
+}
+
+/// Issue 93, Iced's `close_task_tab` (src/main.rs): closing a task pane
+/// lands on the first remaining pane of its task, which the strip makes
+/// active and the dock shows.
+#[gpui::test]
+fn closing_a_task_pane_lands_on_its_sibling(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let (a, b) = (launches.create(cx), launches.create(cx));
+    let config = tempfile::tempdir().unwrap();
+    let (shell, vcx, session) = adopted_in(&launches, &a, config.path(), true, cx);
+    let a1 = session_holding(&shell, &session, vcx).unwrap();
+    let b1 = open(&launches, &shell, &b, vcx);
+    let a2 = open(&launches, &shell, &a, vcx);
+    let sessions = session_tasks(&shell, vcx);
+    assert_eq!(sessions.len(), 4);
+    assert_eq!(sessions[0].1, None);
+    assert_eq!(
+        sessions[1..].to_vec(),
+        vec![(a1, Some(a.clone())), (b1, Some(b)), (a2, Some(a.clone()))]
+    );
+
+    stop_and_close(&shell, a1, vcx);
+    assert!(session_holding(&shell, &session, vcx).is_none());
+    assert_eq!(landed(&shell, vcx), (Some(a2), true));
+    assert_eq!(vcx.read(|cx| shell.read(cx).selected_task.clone()), Some(a));
+    launches.kill(1);
+}
+
+/// Issue 93, Iced's `close_task_tab` with no sibling: the first non-task
+/// pane becomes active and shown, the Tasks rail opens and the task stays
+/// selected (its overview).
+#[gpui::test]
+fn closing_a_task_s_last_pane_lands_on_its_overview(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let (a, b) = (launches.create(cx), launches.create(cx));
+    let config = tempfile::tempdir().unwrap();
+    let (shell, vcx, session) = adopted_in(&launches, &a, config.path(), true, cx);
+    let a1 = session_holding(&shell, &session, vcx).unwrap();
+    open(&launches, &shell, &b, vcx);
+    let general = session_tasks(&shell, vcx)[0].0;
+
+    stop_and_close(&shell, a1, vcx);
+    assert_eq!(landed(&shell, vcx), (Some(general), true));
+    vcx.read(|cx| {
+        let shell = shell.read(cx);
+        assert_eq!(shell.selected_task, Some(a.clone()));
+        assert_eq!(
+            shell.active(cx).store.regions.sidebar_mode,
+            crate::layout::SidebarMode::Tasks
+        );
+    });
+    launches.kill(1);
+}
+
+/// A shell whose launched Codex session of a fresh task is its worker's
+/// session, reported blocked; with the pane focused.
+fn blocked_worker<'a>(
+    launches: &Launches,
+    config: &Path,
+    cx: &'a mut TestAppContext,
+) -> (
+    Entity<crate::Shell>,
+    &'a mut gpui::VisualTestContext,
+    String,
+    String,
+) {
+    let task = launches.create(cx);
+    let (shell, vcx, session) = adopted(launches, &task, config, cx);
+    launches.runs.owner.update(vcx, |owner, _| {
+        owner.own_worker(worker_delegation("worker", &task, &session))
+    });
+    shell.update(vcx, |shell, _| shell.selected_task = Some(task.clone()));
+    report(launches, &task, &session, "blocked", vcx);
+    let id = session_holding(&shell, &session, vcx).unwrap();
+    let pane = vcx.read(|cx| shell.read(cx).active(cx).panes[&crate::session_pane_id(id)].clone());
+    vcx.update(|window, cx| pane.read(cx).focus_handle(cx).focus(window, cx));
+    vcx.run_until_parked();
+    (shell, vcx, task, session)
+}
+
+/// Issue 94a, Iced's workspace chip (`Workspace::attention_count`): a
+/// launched pane needing input counts once, as needs-you, until typed into.
+#[gpui::test]
+fn a_blocked_worker_pane_counts_in_the_workspace_bar(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let config = tempfile::tempdir().unwrap();
+    let (shell, vcx, _, _) = blocked_worker(&launches, config.path(), cx);
+    let attention = |cx: &mut gpui::VisualTestContext| {
+        cx.read(|cx| {
+            let shell = shell.read(cx);
+            let active = shell.active_workspace(cx);
+            shell
+                .bar_input(cx)
+                .workspaces
+                .iter()
+                .find(|w| Some(w.id) == active)
+                .and_then(|w| w.attention().map(|a| (a.count, a.kind)))
+        })
+    };
+    assert_eq!(attention(vcx), Some((1, AttentionKind::NeedsYou)));
+    vcx.simulate_keystrokes("x");
+    assert_eq!(attention(vcx), None);
+    launches.kill(1);
+}
+
+/// Issue 94b, Iced's tab label glyph (`● ` for `HumanInputRequired`): the
+/// pane's dock title leads with it while the worker needs input.
+#[gpui::test]
+fn a_blocked_worker_pane_title_shows_the_needs_you_glyph(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let config = tempfile::tempdir().unwrap();
+    let (shell, vcx, _, session) = blocked_worker(&launches, config.path(), cx);
+    let id = session_holding(&shell, &session, vcx).unwrap();
+    let title = |cx: &mut gpui::VisualTestContext| {
+        cx.read(|cx| {
+            let pane = &shell.read(cx).active(cx).panes[&crate::session_pane_id(id)];
+            let pane = pane.read(cx);
+            (pane.dock_title(cx), pane.tab_title())
+        })
+    };
+    let (shown, plain) = title(vcx);
+    assert_eq!(shown, format!("● {plain}"));
+    vcx.simulate_keystrokes("x");
+    let (shown, plain) = title(vcx);
+    assert_eq!(shown, plain);
+    launches.kill(1);
+}
+
+/// Issue 94c, Iced's `resumed_blocked` (src/main.rs, the terminal-write
+/// arm): input into a blocked worker's session makes it working at once,
+/// before its next report.
+#[gpui::test]
+fn typing_into_a_blocked_worker_makes_it_working(cx: &mut TestAppContext) {
+    let launches = Launches::start(cx);
+    let config = tempfile::tempdir().unwrap();
+    let (shell, vcx, task, session) = blocked_worker(&launches, config.path(), cx);
+    let id = session_holding(&shell, &session, vcx).unwrap();
+    let uid = vcx.read(|cx| {
+        shell.read(cx).active(cx).panes[&crate::session_pane_id(id)]
+            .read(cx)
+            .session
+            .clone()
+            .unwrap()
+            .session_uid
+    });
+    let working = |cx: &mut gpui::VisualTestContext| {
+        launches
+            .runs
+            .owner
+            .read_with(cx, |owner, _| owner.terminal_working_sessions())
+            .contains(&uid)
+    };
+    assert!(!working(vcx));
+    assert_eq!(
+        stored_task(&launches.runs.owner, &task, vcx).lifecycle,
+        TaskLifecycle::WaitingForInput
+    );
+    vcx.simulate_keystrokes("x");
+    vcx.run_until_parked();
+    assert!(working(vcx));
+    assert_eq!(
+        stored_task(&launches.runs.owner, &task, vcx).lifecycle,
+        TaskLifecycle::Running
+    );
+    launches.kill(1);
 }

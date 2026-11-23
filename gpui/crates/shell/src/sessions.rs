@@ -101,8 +101,10 @@ impl crate::Shell {
                 cx,
             )
         {
+            // The prompt shows the pane it asks about; the strip's active
+            // session follows, so a Stop and close lands from it.
             let workspace = state.workspace.id;
-            self.show_workspace_pane(workspace, &pane_id, window, cx);
+            self.show_session(workspace, id, window, cx);
             let panel = self.ensure_task_panel(window, cx);
             panel.update(cx, |panel, cx| {
                 panel.open_stop_and_close(requested.clone(), cx)
@@ -116,7 +118,7 @@ impl crate::Shell {
         ) {
             // Dock removal precedes the close decision; keep a protected last tab visible.
             let workspace = state.workspace.id;
-            self.show_workspace_pane(workspace, &pane_id, window, cx);
+            self.show_session(workspace, id, window, cx);
             return;
         }
         // Iced's `close_task_tab`: a launched task session's close folds into
@@ -139,15 +141,145 @@ impl crate::Shell {
             terminals.retain(|terminal| terminal.id != id.0);
         }
         state.sessions.retain(|session| session.id != id);
-        if state.active_session == Some(id) {
+        let was_active = state.active_session == Some(id);
+        if was_active {
             state.active_session = state.sessions.first().map(|session| session.id);
         }
         state
             .dock
             .update(cx, |dock, cx| dock.remove_panel(pane, window, cx));
         crate::save_layout(state, cx);
+        let workspace = state.workspace.id;
+        match requested.task_id.clone() {
+            // Iced's `close_task_tab` lands on a sibling task tab, else on
+            // the task rail with the task selected.
+            Some(task) => self.land_after_task_close(workspace, task, window, cx),
+            None if was_active => {
+                if let Some(next) = self.workspace(workspace).active_session {
+                    self.show_session(workspace, next, window, cx);
+                }
+            }
+            None => {}
+        }
         self.focus.focus(window, cx);
         cx.notify();
+    }
+
+    /// Iced's `close_task_tab` landing in `workspace` after a pane of `task`
+    /// closed: the first remaining pane of the task, in strip order;
+    /// otherwise the first non-task pane, the Tasks rail and the task
+    /// selected (its overview). The strip's active session and the pane the
+    /// dock shows agree after either.
+    fn land_after_task_close(
+        &mut self,
+        workspace: crate::data::WorkspaceId,
+        task: String,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let state = self.workspace(workspace);
+        let sibling = state
+            .sessions
+            .iter()
+            .map(|session| session.id)
+            .find(|id| self.session_task(*id, cx).as_deref() == Some(task.as_str()));
+        let general = state
+            .sessions
+            .iter()
+            .map(|session| session.id)
+            .find(|id| self.session_task(*id, cx).is_none());
+        if self.active_workspace(cx) == Some(workspace) {
+            match sibling {
+                Some(sibling) => self.select_session_id(sibling, window, cx),
+                None => {
+                    self.selected_task = Some(task);
+                    self.general_context(true, window, cx);
+                }
+            }
+            return;
+        }
+        // Another workspace (a final worker's): Iced moves only its active tab.
+        let next = sibling
+            .or(general)
+            .or_else(|| state.sessions.first().map(|session| session.id));
+        if let Some(next) = next {
+            self.show_session(workspace, next, window, cx);
+        }
+    }
+
+    /// Iced's `FinalWorkerStopped` around `close_task_tab`: another tab
+    /// that was active stays active, and the task selection stays when one
+    /// did or the workspace is not the active one.
+    pub(crate) fn close_final_worker(
+        &mut self,
+        target: &Target,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(workspace) = self.workspaces.iter().find(|state| {
+            state
+                .panes
+                .values()
+                .any(|pane| pane.read(cx).session.as_ref() == Some(target))
+        }) else {
+            return;
+        };
+        let workspace_id = workspace.workspace.id;
+        let other_active = workspace.active_session.filter(|id| {
+            workspace
+                .panes
+                .get(&crate::session_pane_id(*id))
+                .is_none_or(|pane| pane.read(cx).session.as_ref() != Some(target))
+        });
+        let preserve_selection =
+            other_active.is_some() || self.active_workspace(cx) != Some(workspace_id);
+        let selection = self.selected_task.clone();
+        self.close_target_with(target, true, window, cx);
+        if let Some(active) = other_active
+            && self
+                .workspace(workspace_id)
+                .sessions
+                .iter()
+                .any(|session| session.id == active)
+        {
+            self.show_session(workspace_id, active, window, cx);
+        }
+        if preserve_selection {
+            self.selected_task = selection;
+            self.remember_context(self.selected_task.clone());
+        }
+        cx.notify();
+    }
+
+    /// Makes session `id` of `workspace` its active session and the pane
+    /// its dock shows: the active workspace's through `select_session_id`.
+    fn show_session(
+        &mut self,
+        workspace: crate::data::WorkspaceId,
+        id: crate::data::SessionId,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.active_workspace(cx) == Some(workspace) {
+            self.select_session_id(id, window, cx);
+        } else {
+            self.workspace_mut(workspace).active_session = Some(id);
+            self.show_workspace_pane(workspace, &crate::session_pane_id(id), window, cx);
+        }
+    }
+
+    fn workspace(&self, id: crate::data::WorkspaceId) -> &crate::WorkspaceDock {
+        self.workspaces
+            .iter()
+            .find(|state| state.workspace.id == id)
+            .expect("closing workspace exists")
+    }
+
+    fn workspace_mut(&mut self, id: crate::data::WorkspaceId) -> &mut crate::WorkspaceDock {
+        self.workspaces
+            .iter_mut()
+            .find(|state| state.workspace.id == id)
+            .expect("closing workspace exists")
     }
 }
 
@@ -396,26 +528,22 @@ impl crate::Shell {
                 if state.workspace.id.0 != workspace {
                     return None;
                 }
-                state
-                    .sessions
-                    .iter()
-                    .enumerate()
-                    .find_map(|(session_index, session)| {
-                        let pane = state
-                            .panes
-                            .get(&crate::session_pane_id(session.id))?
-                            .read(cx);
-                        let crate::pane::PaneContent::PreviewChat(view) = &pane.content else {
-                            return None;
-                        };
-                        view.read(cx)
-                            .matches_chat(chat)
-                            .then_some((state.workspace.id, session_index))
-                    })
+                state.sessions.iter().find_map(|session| {
+                    let pane = state
+                        .panes
+                        .get(&crate::session_pane_id(session.id))?
+                        .read(cx);
+                    let crate::pane::PaneContent::PreviewChat(view) = &pane.content else {
+                        return None;
+                    };
+                    view.read(cx)
+                        .matches_chat(chat)
+                        .then_some((state.workspace.id, session.id))
+                })
             });
         if let Some((workspace, session)) = selected {
             self.select_workspace_id(workspace, window, cx);
-            self.select_session(session, window, cx);
+            self.select_session_id(session, window, cx);
         }
     }
 }
@@ -483,11 +611,7 @@ impl crate::Shell {
                 if self.active_workspace(cx) == Some(workspace) {
                     match target {
                         crate::spine::Target::Tab(id) => {
-                            if let Some(index) =
-                                self.active(cx).sessions.iter().position(|s| s.id.0 == id)
-                            {
-                                self.select_session(index, window, cx);
-                            }
+                            self.select_session_id(crate::data::SessionId(id), window, cx)
                         }
                         crate::spine::Target::Task(_) => self.unavailable("Task", cx),
                     }
@@ -504,11 +628,7 @@ impl crate::Shell {
     ) {
         use crate::session_strip::Outcome as O;
         match outcome {
-            O::SelectSession(id) => {
-                if let Some(index) = self.active(cx).sessions.iter().position(|s| s.id == id) {
-                    self.select_session(index, window, cx);
-                }
-            }
+            O::SelectSession(id) => self.select_session_id(id, window, cx),
             O::CloseSession(id) => {
                 let target = self
                     .active(cx)

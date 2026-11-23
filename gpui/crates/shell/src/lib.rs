@@ -418,7 +418,7 @@ impl Shell {
                 &host,
                 window,
                 |shell, _, close: &task_host::FinalWorkerClose, window, cx| {
-                    shell.close_target_with(&close.target, true, window, cx);
+                    shell.close_final_worker(&close.target, window, cx);
                 },
             ));
         }
@@ -931,21 +931,31 @@ impl Shell {
             return;
         }
         if let Some(session) = self.strip_input(cx).sessions.get(index) {
-            let id = session.id;
-            let active = self.active_workspace(cx);
-            self.workspaces
-                .iter_mut()
-                .find(|w| Some(w.workspace.id) == active)
-                .expect("active workspace exists")
-                .active_session = Some(id);
-            self.selected_task = self.session_task(id, cx);
-            self.remember_context(self.selected_task.clone());
-            if let Some(task) = &self.selected_task {
-                self.task_last_session.insert(task.clone(), id);
-            }
-            self.show_pane(&session_pane_id(id), window, cx);
-            self.load_active_iced_history(window, cx);
+            self.select_session_id(session.id, window, cx);
         }
+    }
+    /// Makes session `id` of the active workspace the active one, the pane
+    /// the dock shows, and its task the selected one. Callers holding an id
+    /// use this: `select_session` indexes the strip, which lists only the
+    /// selected task's sessions.
+    fn select_session_id(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<Self>) {
+        let active = self.active_workspace(cx);
+        let Some(state) = self
+            .workspaces
+            .iter_mut()
+            .find(|w| Some(w.workspace.id) == active)
+            .filter(|w| w.sessions.iter().any(|s| s.id == id))
+        else {
+            return;
+        };
+        state.active_session = Some(id);
+        self.selected_task = self.session_task(id, cx);
+        self.remember_context(self.selected_task.clone());
+        if let Some(task) = &self.selected_task {
+            self.task_last_session.insert(task.clone(), id);
+        }
+        self.show_pane(&session_pane_id(id), window, cx);
+        self.load_active_iced_history(window, cx);
     }
     fn new_claude_chat(
         &mut self,
@@ -1737,6 +1747,14 @@ fn adopt_view(
 fn session_pane_id(id: SessionId) -> String {
     format!("session-{}", id.0)
 }
+/// Whether session `id` of `state` is a launched task terminal needing the
+/// user (Iced's tab attention `HumanInputRequired`).
+fn session_needs_input(state: &WorkspaceDock, id: SessionId, cx: &App) -> bool {
+    state
+        .panes
+        .get(&session_pane_id(id))
+        .is_some_and(|pane| pane.read(cx).needs_input(cx))
+}
 fn default_layout(state: &WorkspaceDock, window: &mut Window, cx: &mut App) {
     let mut center = DockLayout::tabs();
     for session in &state.sessions {
@@ -1880,14 +1898,29 @@ impl Shell {
         let mut workspaces = self.chrome_workspaces(cx);
         let facts = self.connected_facts(self.saved_facts.snapshot(), colors);
         for workspace in &mut workspaces {
+            // Iced's chip counts each tab with live attention; a launched
+            // task pane needing input is one, and needs-you outranks.
+            let launched = self
+                .workspaces
+                .iter()
+                .find(|state| state.workspace.id == workspace.id)
+                .map_or(0, |state| {
+                    state
+                        .sessions
+                        .iter()
+                        .filter(|session| session_needs_input(state, session.id, cx))
+                        .count()
+                });
             let count = facts
                 .attention_counts
                 .get(&workspace.id)
                 .copied()
-                .filter(|count| *count > 0);
+                .map_or(launched, |count| count + launched);
+            let count = (count > 0).then_some(count);
             let kind = workspace
                 .attention
                 .as_ref()
+                .filter(|_| launched == 0)
                 .map_or(workspace_bar::AttentionKind::NeedsYou, |attention| {
                     attention.kind
                 });
@@ -2139,17 +2172,8 @@ impl Shell {
             .iter()
             .find(|w| Some(w.workspace.id) == self.active_workspace(cx));
         let saved = state.and_then(|w| self.owner.read(cx).iced_workspace(w.workspace.id));
-        let host = cx
-            .try_global::<task_host::GpuiTaskHost>()
-            .map(|host| host.0.read(cx));
-        let needs_input = |id: SessionId| {
-            let session = state
-                .and_then(|state| state.panes.get(&session_pane_id(id)))
-                .and_then(|pane| pane.read(cx).session.as_ref())
-                .and_then(|target| target.task_session_id.clone());
-            host.zip(session)
-                .is_some_and(|(host, session)| host.needs_input(&session))
-        };
+        let needs_input =
+            |id: SessionId| state.is_some_and(|state| session_needs_input(state, id, cx));
         session_strip::Input {
             workspace: state.map(|w| w.workspace.id),
             workspace_name: state.map(|w| w.workspace.name.clone()).unwrap_or_default(),

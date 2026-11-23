@@ -136,8 +136,8 @@ pub(super) struct Launched {
     /// launch, none once its child exited.
     live: Option<TaskSessionLiveState>,
     /// Iced's tab attention `HumanInputRequired`: set when the worker
-    /// reports blocked or its turn ends, cleared by a keystroke into the
-    /// terminal (the terminal's key handler, off the host).
+    /// reports blocked or its turn ends, cleared by any input written to the
+    /// terminal (its input callback, off the host).
     needs_input: Arc<AtomicBool>,
     /// Iced's `worker_closing`: its final-worker close is under way.
     closing: bool,
@@ -887,6 +887,37 @@ impl TaskHostOwner {
         }
     }
 
+    /// Iced's terminal-write arm for a task tab (src/main.rs
+    /// `resumed_blocked`): input into a worker whose delegation is blocked
+    /// makes the session live at once, before its next report or any
+    /// harness title arrives.
+    pub(super) fn terminal_input(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        use gitterm_core::tasks::{DelegationChild, DelegationStatus};
+        let Some(task_id) = self
+            .launched
+            .get(session_id)
+            .map(|launched| launched.task_id.clone())
+        else {
+            return;
+        };
+        let resumed_blocked = self.host.store().as_ref().is_some_and(|store| {
+            store.open_worker_delegations(&task_id).iter().any(|d| {
+                d.status == DelegationStatus::Blocked
+                    && matches!(&d.child, DelegationChild::TaskSession {
+                        task_session_id: Some(id), ..
+                    } if id == session_id)
+            })
+        });
+        if !resumed_blocked {
+            return;
+        }
+        if let Some(launched) = self.launched.get_mut(session_id) {
+            launched.live = Some(TaskSessionLiveState::Working);
+        }
+        self.apply_task_session_signal(&task_id, None, cx);
+        cx.notify();
+    }
+
     /// Whether launched session `session_id` shows Iced's input-needed
     /// attention on its pane.
     pub(crate) fn needs_input(&self, session_id: &str) -> bool {
@@ -971,7 +1002,7 @@ impl TaskHostOwner {
 
     /// Iced's `working_sessions` for launched terminals still open: those
     /// whose agent is working.
-    pub(super) fn terminal_working_sessions(&self) -> Vec<String> {
+    pub(crate) fn terminal_working_sessions(&self) -> Vec<String> {
         self.launched
             .values()
             .filter(|launched| launched.view.upgrade().is_some())
@@ -1306,8 +1337,24 @@ fn spawn_terminal(
     // shortcut: an unadopted terminal's exit is not seen (nothing delivers
     // its events); deliver them from the host if a launch can stay unadopted.
     let session_id = session_id.to_string();
-    // Iced clears a tab's input-needed attention on any input written to it.
+    // Iced clears a tab's input-needed attention on any input written to it,
+    // and the host sees the input ([`TaskHostOwner::terminal_input`]). The
+    // callback has no context, so the input reaches the host over a
+    // channel that closes with the view.
     let typed = needs_input.clone();
+    let (input, mut inputs) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (input_owner, input_session) = (owner.clone(), session_id.clone());
+    cx.spawn(async move |cx| {
+        while inputs.recv().await.is_some() {
+            if input_owner
+                .update(cx, |owner, cx| owner.terminal_input(&input_session, cx))
+                .is_err()
+            {
+                return;
+            }
+        }
+    })
+    .detach();
     let view = cx.new(|cx| {
         TerminalView::launch(launch, Default::default(), cx)
             .with_exit_callback(move |_, cx| {
@@ -1317,7 +1364,10 @@ fn spawn_terminal(
                     _ = owner.update(cx, |owner, cx| owner.terminal_exited(&session_id, cx));
                 });
             })
-            .with_input_callback(move || typed.store(false, Ordering::Relaxed))
+            .with_input_callback(move || {
+                typed.store(false, Ordering::Relaxed);
+                _ = input.send(());
+            })
     });
     let backend = view.read(cx).backend();
     let Some(pid) = backend.child_pid() else {
