@@ -1118,18 +1118,24 @@ impl ChatView {
         let work_owner = cx.entity().downgrade();
         let work_toggle: TurnToggle = Rc::new(move |id, cx| {
             _ = work_owner.update(cx, |view, cx| {
-                if !view.open_work.insert(id) {
+                let opening = view.open_work.insert(id);
+                if !opening {
                     view.open_work.remove(&id);
                 }
+                view.scroller
+                    .update(cx, |state, cx| state.hold_for_toggle(opening, cx));
                 view.sync_runs(cx);
             });
         });
         let run_owner = cx.entity().downgrade();
         let run_toggle: TurnToggle = Rc::new(move |id, cx| {
             _ = run_owner.update(cx, |view, cx| {
-                if !view.open_runs.insert(id) {
+                let opening = view.open_runs.insert(id);
+                if !opening {
                     view.open_runs.remove(&id);
                 }
+                view.scroller
+                    .update(cx, |state, cx| state.hold_for_toggle(opening, cx));
                 view.sync_runs(cx);
             });
         });
@@ -1664,6 +1670,8 @@ impl Render for ChatView {
             .when(self.find_open, |view| view.child(self.find_bar(cx)))
             .child(
                 div()
+                    .debug_selector(|| "chat-transcript".into())
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .bg(rgb(palette.alt))
@@ -1671,16 +1679,32 @@ impl Render for ChatView {
                     .child(self.messages(cx))
                     .context_menu(move |menu, window, cx| {
                         Self::selection_menu(copy_owner.clone(), menu, window, cx)
+                    })
+                    // Iced's `#jump`: a small button over the transcript's
+                    // bottom-right corner; the transcript keeps its height.
+                    .when(!self.scroller.read(cx).is_following_tail(), |view| {
+                        view.child(
+                            Button::new("new-messages")
+                                .absolute()
+                                .right(px(18.))
+                                .bottom(px(12.))
+                                .h_auto()
+                                .px(px(10.))
+                                .py(px(4.))
+                                .rounded(px(12.))
+                                .line_height(gpui::relative(1.2))
+                                // Button's own label is a fixed `text_sm`; Iced's is 12/14.
+                                .accessibility_label("↓ Latest")
+                                .child(
+                                    div()
+                                        .text_size(px(self.appearance.size(12.)))
+                                        .child("↓ Latest"),
+                                )
+                                .debug_selector(|| "chat-latest".into())
+                                .on_click(cx.listener(|this, _, _, cx| this.jump(cx))),
+                        )
                     }),
             )
-            .when(!self.scroller.read(cx).is_following_tail(), |view| {
-                view.child(
-                    Button::new("new-messages")
-                        .label("↓ Latest")
-                        .debug_selector(|| "chat-latest".into())
-                        .on_click(cx.listener(|this, _, _, cx| this.jump(cx))),
-                )
-            })
             .child(
                 div()
                     .when_some(self.column_width(), |footer, width| footer.max_w(px(width)))
@@ -1829,7 +1853,7 @@ impl RowView {
         cx: &mut Context<Self>,
     ) -> Self {
         let text = cx.new(|cx| {
-            TextViewState::markdown(&row.body, cx)
+            TextViewState::markdown(&display_body(&row), cx)
                 .selectable(true)
                 .scrollable(false)
                 .motion(TextViewMotion::default().with_stream_fade(Duration::from_millis(280)))
@@ -1889,7 +1913,7 @@ impl RowView {
     fn set_row(&mut self, row: Row, cx: &mut Context<Self>) {
         let images_changed = self.row.images != row.images;
         self.text
-            .update(cx, |text, cx| text.set_text(&row.body, cx));
+            .update(cx, |text, cx| text.set_text(&display_body(&row), cx));
         if self
             .row
             .delegation
@@ -1976,7 +2000,9 @@ impl RowView {
     }
     fn toggle(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.open = !self.open;
+        let opening = self.open;
         self.scroller.update(cx, |state, cx| {
+            state.hold_for_toggle(opening, cx);
             state.remeasure_items(self.index..self.index + 1, cx);
         });
         cx.notify();
@@ -2026,6 +2052,11 @@ impl Render for RowView {
             RowKind::Tool => palette.tool,
             RowKind::Error => palette.err,
             RowKind::Permission | RowKind::Question => palette.warn,
+            RowKind::Delegation if self.row.delivery.is_none() => {
+                self.row.delegation.as_ref().map_or(palette.result, |card| {
+                    transcript::card_border(card, palette)
+                })
+            }
             RowKind::Worker | RowKind::Delegation => palette.result,
             _ => palette.fg,
         };
@@ -2270,9 +2301,9 @@ impl Render for RowView {
                                                                 "▸"
                                                             }),
                                                     )
+                                                    // Iced's `.delivery-kind`, then its id inline.
                                                     .child(
                                                         div()
-                                                            .flex_1()
                                                             .min_w_0()
                                                             .whitespace_normal()
                                                             .font_weight(gpui::FontWeight::SEMIBOLD)
@@ -2283,9 +2314,6 @@ impl Render for RowView {
                                                         |header| {
                                                             header.child(
                                                                 div()
-                                                                    .w(px(self
-                                                                        .appearance
-                                                                        .size(90.)))
                                                                     .flex_shrink_0()
                                                                     .font_family("Menlo")
                                                                     .text_size(px(self
@@ -2372,6 +2400,15 @@ impl Render for RowView {
             .children(visual)
             .into_any_element()
     }
+}
+
+/// The markdown a row's text view shows. A delegation card draws its
+/// other blocks itself (Iced's `.dlg-body` classes); only its report is
+/// markdown. `row.body` stays the whole card, for find and copy.
+fn display_body(row: &Row) -> String {
+    row.delegation
+        .as_ref()
+        .map_or_else(|| row.body.clone(), |card| card.report())
 }
 
 fn running_after(entry: &Entry, previous: bool) -> bool {
