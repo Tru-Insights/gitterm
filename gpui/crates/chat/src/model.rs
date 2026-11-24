@@ -1574,23 +1574,28 @@ impl FindState {
 }
 
 /// Lowercase with a byte map so Unicode case expansion never produces invalid ranges.
+/// Iced's find pattern: the literal query, `giu`: Unicode simple case
+/// folding (as Rust's regex does), leftmost non-overlapping hits.
 pub fn find_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
     if query.is_empty() {
         return vec![];
     }
-    let mut lower = String::new();
-    let mut starts = vec![];
-    let mut ends = vec![];
-    for (offset, ch) in text.char_indices() {
-        let folded = ch.to_lowercase().to_string();
-        starts.extend(std::iter::repeat_n(offset, folded.len()));
-        ends.extend(std::iter::repeat_n(offset + ch.len_utf8(), folded.len()));
-        lower.push_str(&folded);
+    // For an ASCII query, simple case folding is ASCII lowercasing, except
+    // that KELVIN SIGN folds to `k` and LONG S to `s`; without those in the
+    // text a byte search is exact (no other non-ASCII byte can match).
+    if query.is_ascii() && !text.contains(['\u{212a}', '\u{17f}']) {
+        let query = query.to_ascii_lowercase();
+        return text
+            .to_ascii_lowercase()
+            .match_indices(&query)
+            .map(|(start, hit)| start..start + hit.len())
+            .collect();
     }
-    lower
-        .match_indices(&query.to_lowercase())
-        .map(|(index, value)| starts[index]..ends[index + value.len() - 1])
-        .collect()
+    let pattern = regex::RegexBuilder::new(&regex::escape(query))
+        .case_insensitive(true)
+        .build()
+        .expect("an escaped literal is a valid pattern");
+    pattern.find_iter(text).map(|hit| hit.range()).collect()
 }
 
 #[cfg(test)]

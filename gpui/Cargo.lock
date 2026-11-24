@@ -2807,6 +2807,7 @@ dependencies = [
  "gpui-kit",
  "gpui-pre",
  "markdown",
+ "regex",
  "serde",
  "serde_json",
 ]

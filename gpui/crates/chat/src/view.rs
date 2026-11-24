@@ -190,7 +190,10 @@ pub struct ChatView {
     turn_running: bool,
     new_messages: bool,
     cards: HashMap<u64, Entity<CardView>>,
-    recent_rows: VecDeque<usize>,
+    /// Row views by recency, each with the frame that last drew it.
+    recent_rows: VecDeque<(usize, u64)>,
+    /// Counts `render` calls, so eviction knows which rows this frame drew.
+    frame: u64,
     folded: HashMap<u64, bool>,
     retained_edit_expansion: HashMap<u64, HashSet<usize>>,
     /// Iced's `card.selected`, kept while a card's row view is evicted.
@@ -330,6 +333,7 @@ impl ChatView {
             cards: HashMap::new(),
             expanded_visual: None,
             recent_rows: VecDeque::new(),
+            frame: 0,
             folded: HashMap::new(),
             retained_edit_expansion: HashMap::new(),
             retained_finding_selection: HashMap::new(),
@@ -1136,11 +1140,20 @@ impl ChatView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<RowView> {
-        self.recent_rows.retain(|value| *value != index);
-        self.recent_rows.push_back(index);
-        // Rich text/diff entities are bounded even after walking through long history.
-        while self.recent_rows.len() > 96 {
-            if let Some(old) = self.recent_rows.pop_front()
+        self.recent_rows.retain(|(value, _)| *value != index);
+        self.recent_rows.push_back((index, self.frame));
+        // Rich text/diff entities are bounded even after walking through long
+        // history, but never below what this frame draws: closed folds lay
+        // out each hidden row, and a view dropped mid-frame is rebuilt on the
+        // next, its long text unparsed and without height (the reader's place
+        // then jumps), every frame.
+        while self.recent_rows.len() > 96
+            && self
+                .recent_rows
+                .front()
+                .is_some_and(|(_, frame)| *frame != self.frame)
+        {
+            if let Some((old, _)) = self.recent_rows.pop_front()
                 && let Some(view) = self.row_views[old].take()
             {
                 let row = view.read(cx);
@@ -1206,7 +1219,7 @@ impl ChatView {
                     view.open_work.remove(&id);
                 }
                 view.scroller
-                    .update(cx, |state, cx| state.hold_for_toggle(opening, cx));
+                    .update(cx, |state, cx| state.hold_for_toggle(opening, true, cx));
                 view.sync_runs(cx);
             });
         });
@@ -1218,7 +1231,7 @@ impl ChatView {
                     view.open_runs.remove(&id);
                 }
                 view.scroller
-                    .update(cx, |state, cx| state.hold_for_toggle(opening, cx));
+                    .update(cx, |state, cx| state.hold_for_toggle(opening, true, cx));
                 view.sync_runs(cx);
             });
         });
@@ -1566,10 +1579,20 @@ impl ChatView {
         if !changed.is_empty() && !following {
             self.new_messages = true;
         }
+        let prompt = self.model.rows[count..]
+            .iter()
+            .any(|row| row.kind == RowKind::User);
+        let output = self.model.rows.len() > count || !changed.is_empty();
         self.scroller.update(cx, |state, cx| {
             state.append(self.model.rows.len() - count, cx);
             for &index in &changed {
                 state.remeasure_items(index..index + 1, cx);
+            }
+            if output {
+                state.follow_output(cx);
+            }
+            if prompt {
+                state.follow_prompt(cx);
             }
         });
         for &index in &changed {
@@ -1609,6 +1632,7 @@ const COMPOSER_PLACEHOLDER: &str = "Message… (Enter to send, Shift+Enter for n
 const READ_ONLY_PLACEHOLDER: &str = "Read-only chat";
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.frame += 1;
         let palette = self.appearance.palette();
         // `set_read_only` has no window; the placeholder follows it here.
         let placeholder = if self.read_only_reason.is_some() {
@@ -2162,7 +2186,7 @@ impl RowView {
         self.open = !self.open;
         let opening = self.open;
         self.scroller.update(cx, |state, cx| {
-            state.hold_for_toggle(opening, cx);
+            state.hold_for_toggle(opening, false, cx);
             state.remeasure_items(self.index..self.index + 1, cx);
         });
         cx.notify();
