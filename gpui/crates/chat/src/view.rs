@@ -32,8 +32,8 @@ use gpui::{
     App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, Entity, EntityInputHandler,
     FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding, ParentElement, Render,
     StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, TitlebarOptions,
-    Window, WindowBounds, WindowOptions, actions, base::TextSelection, div, prelude::FluentBuilder,
-    px, radians, rgb, size, svg, Transformation,
+    Transformation, Window, WindowBounds, WindowOptions, actions, base::TextSelection, div,
+    prelude::FluentBuilder, px, radians, rgb, size, svg,
 };
 use gpui_component::{
     Disableable, Root, Sizable, WindowExt,
@@ -1233,7 +1233,9 @@ impl ChatView {
             .is_some_and(|fold| fold.range.start != index && !work_open);
         let in_work = work.is_some();
         let work_first = work.as_ref().is_some_and(|fold| fold.range.start == index);
-        let work_last = work.as_ref().is_some_and(|fold| fold.range.end == index + 1);
+        let work_last = work
+            .as_ref()
+            .is_some_and(|fold| fold.range.end == index + 1);
         let work_failed = work.as_ref().map_or(0, |fold| fold.failed);
         let work_summary = work
             .filter(|fold| fold.range.start == index)
