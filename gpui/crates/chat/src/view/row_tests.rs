@@ -449,6 +449,42 @@ fn u02_t01_n01_blocks_keep_iced_bottom_margins(cx: &mut TestAppContext) {
     assert_eq!(gap(3), px(6.));
 }
 
+/// U02: prompts fit their content, stay right-aligned, and wrap at 85% of the row.
+#[gpui::test]
+fn u02_user_prompt_bubbles_fit_content_and_cap_at_85_percent(cx: &mut TestAppContext) {
+    let records = vec![
+        Record {
+            at_ms: None,
+            entry: Entry::UserPrompt("Short prompt".into()),
+        },
+        Record {
+            at_ms: None,
+            entry: Entry::UserPrompt("A deliberately long prompt ".repeat(100)),
+        },
+    ];
+    let (_chat, cx) = setup(records, cx);
+    draw(cx);
+
+    let column = bounds("chat-footer".into(), cx).expect("centered chat column");
+    let short = bounds("transcript-row-0".into(), cx).expect("short prompt bubble");
+    let long = bounds("transcript-row-1".into(), cx).expect("long prompt bubble");
+    let available = column.size.width - px(28.); // messages' horizontal inset
+    let cap = available * 0.85;
+
+    assert!(
+        short.size.width < cap,
+        "short bubble expanded to its max width: short={} cap={} column={}",
+        short.size.width,
+        cap,
+        column.size.width
+    );
+    assert!((short.right() - (column.right() - px(14.))).abs() < px(2.));
+    assert!(
+        long.size.width <= cap + px(1.),
+        "long bubble exceeded its 85% cap"
+    );
+}
+
 /// T12: each edit is Iced's `.ed-block`; its lines scroll past 480px even
 /// after Show all.
 #[gpui::test]

@@ -368,6 +368,7 @@ impl RowView {
             TextView::new(state)
                 .font_family("Menlo")
                 .text_size(px(self.appearance.size(12.)))
+                .text_color(rgb(if error { palette.err } else { palette.fg }))
                 .selectable(true)
                 .scrollable(true)
                 .max_h(px(320.))
