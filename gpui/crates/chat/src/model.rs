@@ -56,6 +56,135 @@ pub struct Tool {
     pub is_error: bool,
     /// Iced's `.tool-badge` while a request for this call waits.
     pub badge: Option<&'static str>,
+    /// Iced's `details.subagent` in an Agent/Task card.
+    pub sub: Option<Subagent>,
+}
+
+/// Iced's subagent states (`details.subagent.<state>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubState {
+    Running,
+    Done,
+    Failed,
+    Stopped,
+}
+
+/// One `.sa-tool` chip.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubTool {
+    pub id: String,
+    pub name: String,
+    /// Iced's chip `title`: the call's salient argument, else its name.
+    pub tip: String,
+    /// The chip's `done`/`error` class once its result arrives: `Some(is_error)`.
+    pub result: Option<bool>,
+}
+
+/// Iced's subagent block, nested in its root Agent/Task card: what the
+/// subagent, and every subagent below it, did (`ensureSubagent`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Subagent {
+    pub state: SubState,
+    /// The subagent's own turn was seen, so only its completion ends it.
+    pub tracked: bool,
+    /// A request from inside the subagent waits.
+    pub waiting: bool,
+    pub tools: Vec<SubTool>,
+    pub text: String,
+    pub model: Option<String>,
+    /// Running when its turn ended: Iced folds then, so the card stays out.
+    pub running_at_turn_end: bool,
+}
+impl Subagent {
+    fn new() -> Self {
+        Self {
+            state: SubState::Running,
+            tracked: false,
+            waiting: false,
+            tools: vec![],
+            text: String::new(),
+            model: None,
+            running_at_turn_end: false,
+        }
+    }
+    /// Iced's `.sa-desc`: description, type and model.
+    pub fn description(&self, input: &Value) -> String {
+        let text = |key: &str| input[key].as_str().filter(|s| !s.is_empty());
+        [
+            text("description"),
+            text("subagent_type"),
+            text("model").or(self.model.as_deref().filter(|s| !s.is_empty())),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ")
+    }
+    /// Iced's `.sa-state`.
+    pub fn state_text(&self) -> String {
+        let state = match self.state {
+            SubState::Running if self.waiting => "waiting for approval",
+            SubState::Running => "running",
+            SubState::Done => "done",
+            SubState::Failed => "failed",
+            SubState::Stopped => "stopped",
+        };
+        match self.tools.len() {
+            0 => state.into(),
+            1 => format!("{state} · 1 tool"),
+            n => format!("{state} · {n} tools"),
+        }
+    }
+    /// Iced's `.sa-latest`: the last nonempty line, cut at 200 characters.
+    pub fn latest(&self) -> Option<String> {
+        if self.text.is_empty() {
+            return None;
+        }
+        let line = self
+            .text
+            .split('\n')
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .unwrap_or("");
+        // JavaScript length and slice: UTF-16 units.
+        if line.encode_utf16().count() <= 200 {
+            return Some(line.into());
+        }
+        let mut units = 0;
+        let end = line
+            .char_indices()
+            .find(|(_, ch)| {
+                units += ch.len_utf16();
+                units > 200
+            })
+            .map_or(line.len(), |(index, _)| index);
+        Some(format!("{}…", &line[..end]))
+    }
+}
+
+/// Iced's `salient(name, input)`: the argument that says what a call does.
+pub fn salient<'a>(name: &str, input: &'a Value) -> Option<&'a str> {
+    let keys: &[&str] = match name {
+        "Bash" => &["command"],
+        "Read" | "Write" | "Edit" | "MultiEdit" => &["file_path"],
+        "NotebookEdit" => &["notebook_path"],
+        "Grep" | "Glob" => &["pattern"],
+        "WebFetch" => &["url"],
+        "WebSearch" => &["query"],
+        "Agent" | "Task" => &["description"],
+        _ => &[
+            "command",
+            "file_path",
+            "filePath",
+            "path",
+            "url",
+            "query",
+            "pattern",
+            "title",
+        ],
+    };
+    keys.iter()
+        .find_map(|key| input[*key].as_str().filter(|s| !s.is_empty()))
 }
 
 /// Iced's `MAX_TOOL_OUTPUT`: a result shows this many characters.
@@ -221,6 +350,9 @@ impl Row {
 pub struct CompletedTurn {
     pub rows: Range<usize>,
     pub duration_ms: Option<u64>,
+    /// Iced's fold segments: one per prompt in the turn, each with its own
+    /// start and end (a mid-turn prompt's time ends one and starts the next).
+    pub segments: Vec<(Option<u64>, Option<u64>)>,
 }
 
 #[derive(Default)]
@@ -235,7 +367,6 @@ pub struct ChatModel {
     prompts: HashMap<String, usize>,
     /// Prompts a withdrawal can no longer remove: started, or dropped by an exit.
     settled_prompts: HashSet<String>,
-    workers: HashMap<String, usize>,
     turn_start: HashMap<String, u64>,
     turn_end: HashMap<String, u64>,
     next_id: u64,
@@ -256,6 +387,18 @@ pub struct ChatModel {
     ready_modes: Vec<Value>,
     /// Each thinking row's text as it streamed.
     thinking: HashMap<usize, String>,
+    /// Iced's `subTools`: a tool a subagent called -> its root Agent call.
+    sub_tools: HashMap<String, String>,
+    /// Iced's `turn.nextPromptAtMs`: a split marker's time for the next prompt.
+    next_split: Option<u64>,
+    /// When each mid-turn prompt row arrived, for its turn's segments.
+    prompt_at: HashMap<usize, u64>,
+    /// Ids of rows whose folds open (Iced's `openFoldsAround`) since the view
+    /// last drained them: a subagent resumed or asked for the human.
+    pub reopened: Vec<u64>,
+    /// An event was applied live since the model was built: Iced groups a
+    /// running turn's tools only then (`refreshLiveRuns` skips a replay).
+    pub live: bool,
 }
 impl ChatModel {
     pub fn with_backend(backend: Option<gitterm_core::chat::types::AgentBackend>) -> Self {
@@ -384,6 +527,8 @@ impl ChatModel {
         }
         // Built, not streamed: no card closes on a result it was built with.
         model.completions.clear();
+        model.reopened.clear();
+        model.live = false;
         model
     }
     /// Rows are a disposable projection of core State::conversation.
@@ -399,10 +544,13 @@ impl ChatModel {
             model.apply_agent(event);
         }
         model.completions.clear();
+        model.reopened.clear();
+        model.live = false;
         model
     }
     pub fn apply_agent(&mut self, event: &gitterm_core::chat::state::AgentEvent) -> Vec<usize> {
         use gitterm_core::chat::state::AgentEvent;
+        self.live = true;
         let entry = match event {
             AgentEvent::Harness(event) => Entry::Harness(event.clone()),
             AgentEvent::Other(value) if value["kind"] == "turn_timing" => Entry::TurnTiming {
@@ -566,8 +714,16 @@ impl ChatModel {
         row.delegation = Some(card);
         vec![index]
     }
+    /// Iced's `turn` once live: the first row of the turn in flight.
+    pub fn live_turn_start(&self) -> Option<usize> {
+        self.turn_row_start
+            .get("")
+            .copied()
+            .filter(|_| self.live && self.busy)
+    }
     /// Returns changed row indexes so UI text state can update without scanning history.
     pub fn apply(&mut self, record: &Record) -> Vec<usize> {
+        self.live = true;
         let mut changed = vec![];
         self.entry(&record.entry, record.at_ms, "", &mut changed);
         changed.sort_unstable();
@@ -578,8 +734,13 @@ impl ChatModel {
         match entry {
             Entry::ImportedOffer(_) => {}
             Entry::TurnTiming {
-                start_ms, end_ms, ..
+                start_ms,
+                end_ms,
+                split_ms,
             } => {
+                if scope.is_empty() && split_ms.is_some() {
+                    self.next_split = *split_ms;
+                }
                 if let Some(start) = start_ms {
                     self.turn_start.insert(scope.into(), *start);
                 }
@@ -673,20 +834,7 @@ impl ChatModel {
                 | HarnessEvent::ProcessExited { .. }
                 | HarnessEvent::ConversationReset { .. }
         ) {
-            let turn_end = matches!(event, HarnessEvent::TurnCompleted { .. });
-            for ((owner, _), &index) in &self.requests {
-                if owner.starts_with(&self.request_owner) {
-                    let waiting = self.rows[index].decision.is_none();
-                    let request = self.rows[index].request.as_mut().unwrap();
-                    if turn_end && !request.resolved && waiting {
-                        request.waiting_at_turn_end = true;
-                    }
-                    request.resolved = true;
-                    changed.push(index);
-                }
-            }
-            // Iced's clearPending; a reset leaves no request answerable either.
-            self.clear_badges(changed);
+            self.end_requests(ends_turn(event), changed);
         }
         match event {
             HarnessEvent::TextDelta(text) | HarnessEvent::ThinkingDelta(text) => {
@@ -731,17 +879,8 @@ impl ChatModel {
                 if let Some(at) = at {
                     self.turn_start.insert(scope.into(), at);
                 }
-                if !scope.is_empty() {
-                    let index = self.push(
-                        RowKind::Worker,
-                        scope,
-                        format!("Worker {scope} · Running"),
-                        literal(model.as_deref().unwrap_or("Model not reported")),
-                    );
-                    self.rows[index].roster_id = Some(format!("sub:{scope}"));
-                    self.workers.insert(scope.into(), index);
-                    changed.push(index);
-                }
+                // A subagent's turn is in its Agent card (`subagent_event`).
+                let _ = model;
             }
             HarnessEvent::ItemStarted {
                 id,
@@ -762,6 +901,7 @@ impl ChatModel {
                     output: None,
                     is_error: false,
                     badge: None,
+                    sub: matches!(name.as_str(), "Agent" | "Task").then(Subagent::new),
                 });
                 self.items.insert((scope.into(), id.clone()), index);
                 self.refresh_tool(index);
@@ -793,6 +933,19 @@ impl ChatModel {
                     tool.output = Some(output.clone());
                     tool.is_error = *is_error;
                     tool.badge = None;
+                    // A foreground subagent is done when its Agent call
+                    // returns; a tracked (background) one only on its own
+                    // completion.
+                    if let Some(sub) = &mut tool.sub
+                        && sub.state == SubState::Running
+                        && !sub.tracked
+                    {
+                        sub.state = if *is_error {
+                            SubState::Failed
+                        } else {
+                            SubState::Done
+                        };
+                    }
                     self.completions.push(self.rows[index].id);
                     self.refresh_tool(index);
                     changed.push(index);
@@ -815,6 +968,16 @@ impl ChatModel {
                     .items
                     .get(&(String::new(), tool_use_id.clone()))
                     .copied();
+                // Iced's `subRoot.sub.waiting`: the block says it waits, and
+                // the folds around its card open.
+                if !scope.is_empty()
+                    && let Some(root) = tool_row
+                    && let Some(sub) = self.rows[root].tool.as_mut().and_then(|t| t.sub.as_mut())
+                {
+                    sub.waiting = true;
+                    self.reopened.push(self.rows[root].id);
+                    changed.push(root);
+                }
                 if let Some(row) = badge_row {
                     self.rows[row].tool.as_mut().expect("tool row").badge = Some(match kind {
                         RuntimeRequestKind::Question { .. } => "waiting for your answer",
@@ -886,6 +1049,19 @@ impl ChatModel {
                 {
                     let row = &mut self.rows[index];
                     let badge = row.request.as_ref().and_then(|request| request.badge_row);
+                    let root = row
+                        .request
+                        .as_ref()
+                        .filter(|_| !row.scope.is_empty())
+                        .and_then(|request| request.tool_row);
+                    if let Some(root) = root
+                        && let Some(sub) =
+                            self.rows[root].tool.as_mut().and_then(|t| t.sub.as_mut())
+                    {
+                        sub.waiting = false;
+                        changed.push(root);
+                    }
+                    let row = &mut self.rows[index];
                     if let Some(request) = &mut row.request {
                         request.resolved = true;
                     }
@@ -906,11 +1082,12 @@ impl ChatModel {
             }
             HarnessEvent::TurnCompleted { status, .. } => {
                 self.streams.remove(scope);
-                let duration_ms = self
-                    .turn_start
-                    .remove(scope)
-                    .zip(self.turn_end.remove(scope).or(at))
+                let turn_start = self.turn_start.remove(scope);
+                let end = self.turn_end.remove(scope).or(at);
+                let duration_ms = turn_start
+                    .zip(end)
                     .map(|(start, end)| end.saturating_sub(start));
+                let duration_ms = (turn_start, duration_ms);
                 let start = self.turn_row_start.remove(scope).unwrap_or_else(|| {
                     self.rows
                         .iter()
@@ -918,21 +1095,9 @@ impl ChatModel {
                         .map_or(0, |index| index + 1)
                 });
                 if scope.is_empty() {
-                    self.completed_turns.push(CompletedTurn {
-                        rows: start..self.rows.len(),
-                        duration_ms,
-                    });
-                    changed.extend(start..self.rows.len());
+                    self.complete_turn(start, duration_ms, end, changed);
                 }
-                let status = match status {
-                    TurnStatus::Completed => "Done".into(),
-                    TurnStatus::Interrupted => "Interrupted".into(),
-                    TurnStatus::Failed(reason) => format!("Failed: {reason}"),
-                };
-                if let Some(&index) = self.workers.get(scope) {
-                    self.rows[index].title = format!("Worker {scope} · {status}");
-                    changed.push(index);
-                }
+                let _ = status;
                 if scope.is_empty() {
                     self.busy = false;
                 }
@@ -967,7 +1132,26 @@ impl ChatModel {
                     format!("{scope}/{parent_tool_use_id}")
                 };
                 self.request_owner.push(parent_tool_use_id.clone());
-                self.event(event, at, &child_scope, changed);
+                match &**event {
+                    // A subagent's request keeps its own (hidden) row: the
+                    // footer panel answers it under the subagent's owner.
+                    HarnessEvent::RuntimeRequest { .. }
+                    | HarnessEvent::RuntimeRequestResolved { .. }
+                    | HarnessEvent::SubagentEvent { .. } => {
+                        self.event(event, at, &child_scope, changed)
+                    }
+                    inner => {
+                        if matches!(
+                            inner,
+                            HarnessEvent::TurnCompleted { .. }
+                                | HarnessEvent::ProcessExited { .. }
+                                | HarnessEvent::ConversationReset { .. }
+                        ) {
+                            self.end_requests(ends_turn(inner), changed);
+                        }
+                        self.subagent_event(parent_tool_use_id, inner, changed);
+                    }
+                }
                 self.request_owner.pop();
             }
             HarnessEvent::UserMessageEcho {
@@ -1010,6 +1194,12 @@ impl ChatModel {
                 self.turn_row_start.entry(scope.into()).or_insert(index + 1);
                 if let Some(at) = at {
                     self.turn_start.entry(scope.into()).or_insert(at);
+                }
+                // Iced's `append(msg, turn.nextPromptAtMs)`.
+                if scope.is_empty()
+                    && let Some(at) = self.next_split.take().or(at)
+                {
+                    self.prompt_at.insert(index, at);
                 }
                 if let Some(id) = id {
                     self.prompts.insert(id.clone(), index);
@@ -1072,7 +1262,7 @@ impl ChatModel {
                     .retain(|(owner, _), _| !owner.starts_with(&self.request_owner));
                 self.prompts.clear();
                 self.settled_prompts.clear();
-                self.workers.clear();
+                self.sub_tools.clear();
                 self.turn_start.clear();
                 self.turn_row_start.clear();
                 // `trigger` says why; Iced's note is the same for every reset.
@@ -1104,16 +1294,12 @@ impl ChatModel {
                 if scope.is_empty()
                     && let Some(start) = self.turn_row_start.remove(scope)
                 {
-                    let duration_ms = self
-                        .turn_start
-                        .remove(scope)
-                        .zip(self.turn_end.remove(scope).or(at))
+                    let turn_start = self.turn_start.remove(scope);
+                    let end = self.turn_end.remove(scope).or(at);
+                    let duration_ms = turn_start
+                        .zip(end)
                         .map(|(start, end)| end.saturating_sub(start));
-                    self.completed_turns.push(CompletedTurn {
-                        rows: start..self.rows.len(),
-                        duration_ms,
-                    });
-                    changed.extend(start..self.rows.len());
+                    self.complete_turn(start, (turn_start, duration_ms), end, changed);
                 }
                 let harness = self.harness_name();
                 let code = exit.map_or_else(String::new, |code| format!(" (code {code})"));
@@ -1238,19 +1424,145 @@ impl ChatModel {
             HarnessEvent::SettingRejected { .. } => {}
         }
     }
+    /// A turn ended, its process exited or the conversation reset: the
+    /// requests of this owner (and below) can no longer be answered.
+    fn end_requests(&mut self, turn_end: bool, changed: &mut Vec<usize>) {
+        for ((owner, _), &index) in &self.requests {
+            if owner.starts_with(&self.request_owner) {
+                let waiting = self.rows[index].decision.is_none();
+                let request = self.rows[index].request.as_mut().unwrap();
+                if turn_end && !request.resolved && waiting {
+                    request.waiting_at_turn_end = true;
+                }
+                request.resolved = true;
+                changed.push(index);
+            }
+        }
+        // Iced's clearPending; a reset leaves no request answerable either.
+        self.clear_badges(changed);
+    }
+    /// Iced's `endTurn(true)`: the top-level turn from row `start` folds, one
+    /// segment per prompt in it, and a subagent still running keeps its card
+    /// out (`keepsOutOfFold` runs at that moment).
+    fn complete_turn(
+        &mut self,
+        start: usize,
+        (turn_start, duration_ms): (Option<u64>, Option<u64>),
+        end: Option<u64>,
+        changed: &mut Vec<usize>,
+    ) {
+        let rows = start..self.rows.len();
+        let mut segments = Vec::new();
+        let mut segment_start = turn_start;
+        for index in rows.clone() {
+            if self.rows[index].kind == RowKind::User {
+                let at = self.prompt_at.get(&index).copied();
+                segments.push((segment_start, at));
+                segment_start = at;
+            }
+            if let Some(sub) = self.rows[index].tool.as_mut().and_then(|t| t.sub.as_mut()) {
+                sub.running_at_turn_end = sub.state == SubState::Running;
+            }
+        }
+        segments.push((segment_start, end));
+        self.completed_turns.push(CompletedTurn {
+            rows: rows.clone(),
+            duration_ms,
+            segments,
+        });
+        changed.extend(rows);
+    }
+    /// Iced's `subagentEvent`: an event from inside a subagent updates the
+    /// block in its root Agent card. Grandchildren roll up into the same
+    /// block; an event for a call this chat never saw is dropped.
+    fn subagent_event(&mut self, parent: &str, event: &HarnessEvent, changed: &mut Vec<usize>) {
+        let root = if self
+            .items
+            .contains_key(&(String::new(), parent.to_string()))
+        {
+            Some(parent.to_string())
+        } else {
+            self.sub_tools.get(parent).cloned()
+        };
+        let Some((root, index)) = root.and_then(|root| {
+            let index = *self.items.get(&(String::new(), root.clone()))?;
+            Some((root, index))
+        }) else {
+            return;
+        };
+        let row_id = self.rows[index].id;
+        let tool = self.rows[index].tool.as_mut().expect("tool row");
+        let sub = tool.sub.get_or_insert_with(Subagent::new);
+        match event {
+            HarnessEvent::TurnStarted { model, .. } => {
+                sub.tracked = true;
+                sub.state = SubState::Running;
+                if let Some(model) = model {
+                    sub.model = Some(model.clone());
+                }
+                self.reopened.push(row_id);
+            }
+            HarnessEvent::TurnCompleted { status, .. } => {
+                sub.state = match status {
+                    TurnStatus::Completed => SubState::Done,
+                    TurnStatus::Interrupted => SubState::Stopped,
+                    TurnStatus::Failed(reason) => {
+                        if !reason.is_empty() {
+                            if !sub.text.is_empty() {
+                                sub.text.push('\n');
+                            }
+                            sub.text.push_str(reason);
+                        }
+                        SubState::Failed
+                    }
+                };
+            }
+            HarnessEvent::TextDelta(text) => sub.text.push_str(text),
+            HarnessEvent::ItemStarted {
+                id,
+                kind: ItemKind::ToolCall { name, input },
+            } => {
+                let tip = salient(name, input).unwrap_or(name).to_string();
+                sub.tools.push(SubTool {
+                    id: id.clone(),
+                    name: name.clone(),
+                    tip,
+                    result: None,
+                });
+                // Separate the text before and after each tool call.
+                if !sub.text.is_empty() && !sub.text.ends_with('\n') {
+                    sub.text.push('\n');
+                }
+                self.sub_tools.insert(id.clone(), root);
+            }
+            HarnessEvent::ItemCompleted { id, is_error, .. } => {
+                if let Some(tool) = sub.tools.iter_mut().find(|tool| &tool.id == id) {
+                    tool.result = Some(*is_error);
+                }
+            }
+            // Thinking only moves Iced's activity strip; the rest has no
+            // place in the block.
+            _ => {}
+        }
+        changed.push(index);
+    }
     fn remove_link_note(&mut self, changed: &mut Vec<usize>) {
         if let Some(index) = self.link_note.take() {
             self.rows[index].kind = RowKind::Withdrawn;
             changed.push(index);
         }
     }
-    /// Iced's `clearPending` for tool badges.
+    /// Iced's `clearPending` for tool badges and waiting subagents.
     fn clear_badges(&mut self, changed: &mut Vec<usize>) {
         for (index, row) in self.rows.iter_mut().enumerate() {
-            if let Some(tool) = &mut row.tool
-                && tool.badge.take().is_some()
-            {
-                changed.push(index);
+            if let Some(tool) = &mut row.tool {
+                let waited = tool
+                    .sub
+                    .as_mut()
+                    .is_some_and(|sub| std::mem::take(&mut sub.waiting));
+                if tool.badge.take().is_some() || waited {
+                    changed.push(index);
+                }
             }
         }
     }
@@ -1375,6 +1687,13 @@ impl ChatModel {
             ));
         }
     }
+}
+
+fn ends_turn(event: &HarnessEvent) -> bool {
+    matches!(
+        event,
+        HarnessEvent::TurnCompleted { .. } | HarnessEvent::ProcessExited { .. }
+    )
 }
 
 /// Iced's input `<pre>`: empty until a non-empty input object arrives.
@@ -1650,7 +1969,7 @@ mod tests {
     }
 
     #[test]
-    fn fixtures_build_stable_rows_and_do_not_merge_workers_into_parent() {
+    fn fixtures_build_stable_rows_and_nest_subagent_text_in_its_agent_card() {
         let records = parse_fixture(include_str!("../fixtures/showcase.jsonl")).unwrap();
         let a = ChatModel::from_records(&records);
         let b = ChatModel::from_records(&records);
@@ -1664,14 +1983,14 @@ mod tests {
                 .map(|row| (row.id, &row.body))
                 .collect::<Vec<_>>()
         );
-        assert!(a.rows.iter().any(|row| row.kind == RowKind::Assistant
-            && row.scope == "worker"
-            && row.body.contains("cap prevents")));
-        assert!(
-            !a.rows
-                .iter()
-                .any(|row| row.scope.is_empty() && row.body.contains("cap prevents"))
-        );
+        // Iced nests a subagent's text in its Agent card, not in rows.
+        assert!(a.rows.iter().any(|row| {
+            row.tool
+                .as_ref()
+                .and_then(|tool| tool.sub.as_ref())
+                .is_some_and(|sub| sub.text.contains("cap prevents"))
+        }));
+        assert!(!a.rows.iter().any(|row| row.body.contains("cap prevents")));
         assert_eq!(
             a.rows
                 .iter()
@@ -2361,3 +2680,7 @@ mod row_parity_tests {
         assert_eq!(plain_markdown(&model.rows[0].body).trim(), "look");
     }
 }
+
+#[cfg(test)]
+#[path = "subagent_tests.rs"]
+pub(crate) mod subagent_tests;

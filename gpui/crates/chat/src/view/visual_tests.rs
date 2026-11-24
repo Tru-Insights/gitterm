@@ -247,6 +247,7 @@ fn html_render_error_results_never_become_visual_replies() {
         output: Some(output),
         is_error: true,
         badge: None,
+        sub: None,
     };
     assert_eq!(visual::visual_request(&tool), None);
 }
@@ -262,6 +263,7 @@ fn only_valid_html_render_results_become_visual_replies() {
         output: Some(output.into()),
         is_error: false,
         badge: None,
+        sub: None,
     };
     for name in [
         "html_render",

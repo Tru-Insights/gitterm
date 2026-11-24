@@ -1843,7 +1843,10 @@ fn iced_transcript_has_one_expandable_run_no_message_chrome_and_a_table(cx: &mut
 {"type":"item_completed","data":{"id":"a","output":"null","is_error":false}}
 {"type":"item_started","data":{"id":"b","kind":{"type":"tool_call","name":"Bash","input":{"command":"two"}}}}
 {"type":"item_started","data":{"id":"c","kind":{"type":"tool_call","name":"Bash","input":{"command":"three"}}}}"#).unwrap();
-    let (chat, cx) = setup(records, cx);
+    // Iced groups a running turn's tools on the first live event after a replay.
+    let (last, replayed) = records.split_last().unwrap();
+    let (chat, cx) = setup(replayed.to_vec(), cx);
+    chat.update(cx, |view, cx| view.append_record(last, cx));
     cx.simulate_resize(size(px(1200.), px(900.)));
     draw(cx);
     assert!(
@@ -1895,7 +1898,8 @@ fn iced_transcript_has_one_expandable_run_no_message_chrome_and_a_table(cx: &mut
 
 #[gpui::test]
 fn run_summary_updates_when_later_tools_finish_or_fail(cx: &mut TestAppContext) {
-    let records = parse_fixture(r#"{"type":"item_started","data":{"id":"a","kind":{"type":"tool_call","name":"Bash","input":{"command":"one"}}}}
+    let records = parse_fixture(r#"{"type":"user_prompt","data":"Go"}
+{"type":"item_started","data":{"id":"a","kind":{"type":"tool_call","name":"Bash","input":{"command":"one"}}}}
 {"type":"item_started","data":{"id":"b","kind":{"type":"tool_call","name":"Bash","input":{"command":"two"}}}}"#).unwrap();
     let (chat, cx) = setup(records, cx);
     draw(cx);
@@ -1919,9 +1923,9 @@ fn run_summary_updates_when_later_tools_finish_or_fail(cx: &mut TestAppContext) 
     });
     draw(cx);
     chat.read_with(cx, |view, cx| {
-        let first = view.row_views[0].as_ref().unwrap().read(cx);
+        let first = view.row_views[1].as_ref().unwrap().read(cx);
         assert_eq!(first.run_summary.as_deref(), Some("Ran 1 command"));
-        let failed = view.row_views[1].as_ref().unwrap().read(cx);
+        let failed = view.row_views[2].as_ref().unwrap().read(cx);
         assert!(!failed.hidden_by_run);
         assert!(failed.run_summary.is_none());
     });
@@ -2527,8 +2531,8 @@ fn h08_edit_show_all_expands_and_h09_review_routes_without_toggling_card(cx: &mu
     let (chat, cx) = setup(records, cx);
     cx.simulate_resize(size(px(1400.), px(2000.)));
     draw(cx);
-    click_selector("tool-run-0".into(), cx);
-    // A running tool card starts open, as Iced's.
+    // Replayed outside a turn: no run line (Iced's refreshLiveRuns needs a
+    // live turn), and a running tool card starts open, as Iced's.
     chat.update_in(cx, |view, _, cx| {
         view.scroller.update(cx, |state, cx| {
             state.scroll_to_item(0, cx);
@@ -2697,23 +2701,42 @@ fn h02_tool_run_counts_and_completed_work_keep_reply_visible(cx: &mut TestAppCon
 
 #[gpui::test]
 fn h03_history_counts_folded_tool_runs_as_one_block(cx: &mut TestAppContext) {
-    let records = (0..220)
-        .map(|index| Record {
-            at_ms: None,
-            entry: Entry::Harness(HarnessEvent::ItemStarted {
+    // A replay groups only finished turns (Iced's refreshLiveRuns skips it).
+    let harness = |event| Record {
+        at_ms: None,
+        entry: Entry::Harness(event),
+    };
+    let mut records = vec![Record {
+        at_ms: None,
+        entry: Entry::UserPrompt("Go".into()),
+    }];
+    records.extend((0..220).flat_map(|index| {
+        [
+            harness(HarnessEvent::ItemStarted {
                 id: format!("tool-{index}"),
                 kind: ItemKind::ToolCall {
                     name: "Bash".into(),
                     input: serde_json::json!({"command":"sample"}),
                 },
             }),
-        })
-        .collect();
+            harness(HarnessEvent::ItemCompleted {
+                id: format!("tool-{index}"),
+                output: "ok".into(),
+                is_error: false,
+            }),
+        ]
+    }));
+    records.push(harness(HarnessEvent::TurnCompleted {
+        status: crate::events::TurnStatus::Completed,
+        usage: serde_json::Value::Null,
+        cost_usd: None,
+        rate_limit: None,
+    }));
     let (chat, cx) = setup(records, cx);
     draw(cx);
     chat.read_with(cx, |view, _| {
         assert_eq!(view.history_start, 0);
-        assert_eq!(scroll::block_starts(&view.model), vec![0]);
+        assert_eq!(scroll::block_starts(&view.model), vec![0, 1]);
     });
     assert!(cx.debug_bounds("show-earlier").is_none());
 }
@@ -3932,13 +3955,19 @@ fn replayed_history_folds_each_finished_turn_closed_with_iced_label(cx: &mut Tes
 
 #[gpui::test]
 fn live_running_turn_shows_its_work_unfolded_from_the_left(cx: &mut TestAppContext) {
-    let mut records = two_replayed_turns(false);
+    let records = two_replayed_turns(false);
     // The running turn's thinking stands alone between paragraphs.
-    records.push(Record {
-        at_ms: None,
-        entry: Entry::Harness(HarnessEvent::ThinkingDelta("Next step".into())),
-    });
     let (chat, cx) = setup(records, cx);
+    // Live, after the replay: Iced groups the running turn's tools now.
+    chat.update(cx, |view, cx| {
+        view.append_record(
+            &Record {
+                at_ms: None,
+                entry: Entry::Harness(HarnessEvent::ThinkingDelta("Next step".into())),
+            },
+            cx,
+        )
+    });
     cx.simulate_resize(size(px(1200.), px(1600.)));
     draw(cx);
     chat.update_in(cx, |view, window, cx| {
