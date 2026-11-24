@@ -358,6 +358,11 @@ impl ChatModel {
         };
         self.push(kind, scope, String::new(), body)
     }
+    /// A yellow note the host adds outside the event stream: Iced's
+    /// `__reviewNote`, why a review, consult or delegation action was not done.
+    pub fn push_warning(&mut self, text: &str) -> Vec<usize> {
+        vec![self.note(RowKind::Warning, "", text.into())]
+    }
     pub fn pending_rows(&self) -> Vec<usize> {
         let mut ordered: Vec<_> = self
             .rows

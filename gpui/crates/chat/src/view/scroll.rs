@@ -2,7 +2,7 @@
 //! GPUI's public ListState supplies layout; older history is gated by the host.
 use super::*;
 use gpui::{FollowMode, ListAlignment, ListOffset, ListState, Pixels, list};
-use gpui_component::scroll::ScrollableElement;
+use gpui_component::scroll::{Scrollbar, ScrollbarMode, ScrollbarThumbStyle};
 
 /// Iced's `atBottom()`: closer than this to the bottom counts as there.
 const AT_BOTTOM: f32 = 40.;
@@ -219,6 +219,46 @@ impl TranscriptScrollerState {
         }
         cx.notify();
     }
+    /// A key scrolls the transcript as it scrolls a WebKit overflow box: a
+    /// line is 40px, a page is the viewport less a 40px overlap (at least
+    /// 7/8 of it). Reaching the end resumes following.
+    pub fn scroll_key(&mut self, key: ScrollKey, cx: &mut Context<Self>) {
+        let viewport = self.list.viewport_bounds().size.height;
+        let page = (viewport * 0.875).max(viewport - px(40.)).max(px(1.));
+        let step = match key {
+            ScrollKey::LineUp => -px(40.),
+            ScrollKey::LineDown => px(40.),
+            ScrollKey::PageUp => -page,
+            ScrollKey::PageDown => page,
+            ScrollKey::Top => {
+                self.scroll_to_offset(
+                    ListOffset {
+                        item_ix: 0,
+                        offset_in_item: px(0.),
+                    },
+                    cx,
+                );
+                return;
+            }
+            ScrollKey::End => return self.scroll_to_end(cx),
+        };
+        let remaining =
+            self.list.max_offset_for_scrollbar().y + self.list.scroll_px_offset_for_scrollbar().y;
+        if step > px(0.) && step >= remaining {
+            return self.scroll_to_end(cx);
+        }
+        self.list.scroll_by(step);
+        cx.notify();
+    }
+}
+#[derive(Clone, Copy)]
+pub enum ScrollKey {
+    LineUp,
+    LineDown,
+    PageUp,
+    PageDown,
+    Top,
+    End,
 }
 impl ChatView {
     pub(super) fn messages(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -238,13 +278,7 @@ impl ChatView {
                         .update(cx, |view, cx| {
                             if !view.find_open && index < view.history_start {
                                 if index + 1 == view.history_start {
-                                    Button::new("show-earlier")
-                                        .debug_selector(|| "show-earlier".into())
-                                        .label(crate::interactions::earlier_label(hidden))
-                                        .on_click(
-                                            cx.listener(|view, _, _, cx| view.show_earlier(cx)),
-                                        )
-                                        .into_any_element()
+                                    view.show_earlier_control(hidden, cx)
                                 } else {
                                     div().h(px(0.)).into_any_element()
                                 }
@@ -288,7 +322,59 @@ impl ChatView {
                 .absolute()
                 .size_0()
             })
-            .vertical_scrollbar(&state)
+            // Iced's `#messages::-webkit-scrollbar`: 10px, always drawn, the
+            // thumb in strong-border with radius 4 (no hover or active change).
+            .child(
+                div().absolute().inset_0().child(
+                    Scrollbar::vertical(&state)
+                        .mode(ScrollbarMode::Always)
+                        .styles(|styles| {
+                            let thumb = |thumb: ScrollbarThumbStyle| {
+                                thumb
+                                    .bg(rgb(self.appearance.palette().strong))
+                                    .width(px(10.))
+                                    .inset(px(0.))
+                                    .radius(px(4.))
+                            };
+                            styles
+                                .track(|track| track.width(px(10.)))
+                                .thumb(thumb)
+                                .thumb_hover(thumb)
+                                .thumb_active(thumb)
+                        }),
+                ),
+            )
+            .into_any_element()
+    }
+    /// Iced's `#messages > .earlier`: a centred pill, block fill, strong
+    /// border, radius 12, padding 3×12, `s(12)`, 10px above the first block.
+    fn show_earlier_control(&self, hidden: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let palette = self.appearance.palette();
+        div()
+            .w_full()
+            .flex()
+            .justify_center()
+            .mb(px(10.))
+            .child(
+                div()
+                    .id("show-earlier")
+                    // A button stays reachable by Tab and Enter/Space.
+                    .tab_index(0)
+                    .debug_selector(|| "show-earlier".into())
+                    .cursor_pointer()
+                    .px(px(12.))
+                    .py(px(3.))
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(rgb(palette.strong))
+                    .bg(rgb(palette.block))
+                    .text_color(rgb(palette.fg))
+                    .text_size(px(self.appearance.size(12.)))
+                    .line_height(gpui::relative(1.5))
+                    .hover(|pill| pill.bg(rgb(palette.border)))
+                    .on_click(cx.listener(|view, _, _, cx| view.show_earlier(cx)))
+                    .child(crate::interactions::earlier_label(hidden)),
+            )
             .into_any_element()
     }
 }
