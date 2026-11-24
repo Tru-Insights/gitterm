@@ -24,7 +24,7 @@ impl RowView {
         self.sub_open = !self.sub_open;
         let opening = self.sub_open;
         self.scroller.update(cx, |state, cx| {
-            state.hold_for_toggle(opening, cx);
+            state.hold_for_toggle(opening, false, cx);
             state.remeasure_items(self.index..self.index + 1, cx);
         });
         cx.notify();

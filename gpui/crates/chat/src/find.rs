@@ -61,7 +61,15 @@ impl TranscriptFind {
         if !self.searches(value) || self.query.is_empty() {
             return vec![];
         }
-        body_ranges(value, &value.find_body(), &self.query)
+        let ranges = match (&value.delegation, &value.delivery) {
+            // A card's roots, one after another, numbered as `card_roots` paints them.
+            (Some(card), None) => card_find_texts(card)
+                .iter()
+                .flat_map(|text| find_ranges(text, &self.query))
+                .collect(),
+            _ => body_ranges(value, &value.find_body(), &self.query),
+        };
+        ranges
             .into_iter()
             .enumerate()
             .map(|(occurrence, range)| SearchMatch {
@@ -79,8 +87,8 @@ impl TranscriptFind {
         self.current = (!self.matches.is_empty()).then_some(0);
     }
     pub(super) fn refresh(&mut self, model: &ChatModel, changed: &[usize]) {
-        let anchor = self.active().cloned();
-        let old_index = self.current.unwrap_or(0);
+        let previous = self.matches.clone();
+        let previous_index = self.current;
         self.matches.retain(|found| !changed.contains(&found.row));
         for &row in changed {
             let matches = self.row_matches(model, row);
@@ -88,9 +96,32 @@ impl TranscriptFind {
         }
         self.matches
             .sort_by_key(|found| (found.row, found.occurrence));
-        self.current = anchor
-            .and_then(|old| self.matches.iter().position(|new| new == &old))
-            .or_else(|| (!self.matches.is_empty()).then(|| old_index.min(self.matches.len() - 1)));
+        // Iced's `refreshFind`: the current hit keeps its row and ordinal;
+        // a row that lost every hit gives way to the nearest old hit whose
+        // row still has some, later ones first; else the old index, clamped.
+        let in_row = |old: &SearchMatch| {
+            let start = self.matches.iter().position(|new| new.row == old.row)?;
+            let count = self.matches[start..]
+                .iter()
+                .take_while(|new| new.row == old.row)
+                .count();
+            Some(start + old.occurrence.min(count - 1))
+        };
+        self.current = previous_index
+            .and_then(|index| {
+                (0..previous.len()).find_map(|distance| {
+                    let later = previous.get(index + distance).and_then(in_row);
+                    let earlier = index
+                        .checked_sub(distance)
+                        .and_then(|index| previous.get(index))
+                        .and_then(in_row);
+                    later.or(earlier)
+                })
+            })
+            .or_else(|| {
+                (!self.matches.is_empty())
+                    .then(|| previous_index.unwrap_or(0).min(self.matches.len() - 1))
+            });
     }
     pub(super) fn active(&self) -> Option<&SearchMatch> {
         self.current.and_then(|index| self.matches.get(index))
@@ -220,11 +251,8 @@ impl ChatView {
         if !self.find_open {
             let top = self.scroller.read(cx).logical_scroll_top();
             self.find.saved_scroller = Some(self.scroller.clone());
-            let temporary = cx.new(|cx| {
-                let mut state = MessageScrollerState::new(self.model.rows.len(), cx);
-                state.scroll_to_offset(top, cx);
-                state
-            });
+            let temporary =
+                cx.new(|cx| MessageScrollerState::searching(self.model.rows.len(), top, cx));
             self.find.scroll_subscription = Some(cx.observe(&temporary, |_, _, cx| cx.notify()));
             self.replace_find_scroller(temporary, cx);
             self.find_open = true;
@@ -293,6 +321,8 @@ impl ChatView {
                 if old_count < self.model.rows.len() {
                     state.append(self.model.rows.len() - old_count, cx);
                 }
+                // Iced's close: `follow = findWasFollowing; scrollIfFollowing()`.
+                state.follow_output(cx);
             });
             self.replace_find_scroller(saved, cx);
         }
@@ -319,30 +349,61 @@ impl ChatView {
         self.reveal_match(window, cx);
     }
     pub(super) fn find_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.appearance.palette();
+        // Iced's `#chat-find`: `em` is its 12/14 font size.
+        let em = self.appearance.size(12.);
         div()
+            .debug_selector(|| "find-bar".into())
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(6.))
-            .p(px(6.))
-            .bg(rgb(self.appearance.palette().footer))
-            .text_size(px(self.appearance.size(12.)))
+            .px(px(10.))
+            .py(px(6.))
+            .bg(rgb(palette.footer))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .text_size(px(em))
             .rounded(px(8.))
-            .child(div().flex_1().child(Input::new(&self.find_input)))
-            .child(if self.find.query.is_empty() {
-                String::new()
-            } else if self.find.matches.is_empty() {
-                "No matches".into()
-            } else {
-                format!(
-                    "{} of {}",
-                    self.find.current.map_or(0, |index| index + 1),
-                    self.find.matches.len()
-                )
-            })
+            .child(
+                // Iced's `input[type=search]`: 4×6 padding, the input
+                // background, a 1px strong border, radius 4, the bar's font.
+                div()
+                    .debug_selector(|| "find-query".into())
+                    .flex_1()
+                    .min_w(px(8. * em))
+                    .px(px(6.))
+                    .py(px(4.))
+                    .bg(rgb(palette.alt))
+                    .border_1()
+                    .border_color(rgb(palette.strong))
+                    .rounded(px(4.))
+                    .line_height(gpui::relative(1.2))
+                    .child(
+                        Input::new(&self.find_input)
+                            .appearance(false)
+                            .xsmall()
+                            .h_auto()
+                            .p_0()
+                            .text_size(px(em))
+                            .line_height(gpui::relative(1.2)),
+                    ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "find-count".into())
+                    .min_w(px(5. * em))
+                    .text_center()
+                    .child(find_count(&self.find)),
+            )
             .child(
                 Button::new("previous")
                     .small()
-                    .label("↑")
+                    .debug_selector(|| "find-previous".into())
+                    // Iced's buttons take the bar's 12/14 size (`font-size:
+                    // inherit`); a Button label is a fixed `text_sm`.
+                    .accessibility_label("↑")
+                    .child(div().text_size(px(em)).child("↑"))
                     .tooltip("Previous match (Shift+Enter)")
                     .disabled(self.find.matches.is_empty())
                     .on_click(cx.listener(|this, _, window, cx| this.navigate(true, window, cx))),
@@ -350,14 +411,18 @@ impl ChatView {
             .child(
                 Button::new("next")
                     .small()
-                    .label("↓")
+                    .debug_selector(|| "find-next".into())
+                    // Iced's buttons take the bar's 12/14 size (`font-size:
+                    // inherit`); a Button label is a fixed `text_sm`.
+                    .accessibility_label("↓")
+                    .child(div().text_size(px(em)).child("↓"))
                     .tooltip("Next match (Enter)")
                     .disabled(self.find.matches.is_empty())
                     .on_click(cx.listener(|this, _, window, cx| this.navigate(false, window, cx))),
             )
             .child(
                 Checkbox::new("find-tools")
-                    .label("Tool output")
+                    .label(FIND_TOOLS_LABEL)
                     .checked(self.find.include_tools)
                     .on_click(
                         cx.listener(|this, _, window, cx| this.toggle_find_tools(window, cx)),
@@ -366,7 +431,11 @@ impl ChatView {
             .child(
                 Button::new("close-find")
                     .small()
-                    .label("×")
+                    .debug_selector(|| "find-close-find".into())
+                    // Iced's buttons take the bar's 12/14 size (`font-size:
+                    // inherit`); a Button label is a fixed `text_sm`.
+                    .accessibility_label("×")
+                    .child(div().text_size(px(em)).child("×"))
                     .tooltip("Close (Esc)")
                     .on_click(
                         cx.listener(|this, _, window, cx| this.close_find(&CloseFind, window, cx)),
@@ -375,6 +444,161 @@ impl ChatView {
     }
 }
 
+/// Iced's find roots in a delegation card, in its order: `.dlg-summary`,
+/// the handoff summary (`.assistant`) and each `li` of its lists (section
+/// items, then findings). The header, path, banner, error, lines, activity
+/// and section titles are not searched.
+pub(super) fn card_find_texts(card: &crate::delegation::DelegationCard) -> Vec<String> {
+    use crate::delegation::CardPart;
+    let mut texts = Vec::new();
+    for part in card.parts() {
+        match part {
+            CardPart::Summary(text) => texts.push(text),
+            CardPart::Report(text) => texts.push(plain_markdown(&text)),
+            CardPart::Section(_, items) => texts.extend(items),
+            _ => {}
+        }
+    }
+    if let Some(findings) = card.findings() {
+        texts.extend(
+            findings
+                .findings
+                .iter()
+                .map(|finding| finding_text(finding).0),
+        );
+    }
+    texts
+}
+/// A finding `li`'s text as Iced's find reads it (`sev id title`, then the
+/// location and body blocks on their own lines), and where the title,
+/// location and body start in it.
+pub(super) fn finding_text(finding: &gitterm_core::tasks::ReviewFinding) -> (String, [usize; 4]) {
+    let mut text = format!("{:?} ", finding.severity);
+    let id = text.len();
+    text.push_str(&finding.id);
+    text.push(' ');
+    let title = text.len();
+    text.push_str(&finding.title);
+    let location = crate::delegation::finding_location(finding).map(|location| {
+        text.push('\n');
+        let start = text.len();
+        text.push_str(&location);
+        start
+    });
+    let body = (!finding.body.is_empty()).then(|| {
+        text.push('\n');
+        let start = text.len();
+        text.push_str(&finding.body);
+        start
+    });
+    let end = text.len();
+    (
+        text,
+        [id, title, location.unwrap_or(end), body.unwrap_or(end)],
+    )
+}
+/// One find root's hits and which of them is the current one.
+#[derive(Default)]
+pub(super) struct RootHits {
+    ranges: Vec<std::ops::Range<usize>>,
+    current: Option<usize>,
+}
+impl RootHits {
+    /// `shown`, the root's bytes `start..start + len` (then any suffix),
+    /// with Iced's hits painted on exactly their text.
+    pub(super) fn piece(&self, shown: String, start: usize, len: usize) -> gpui::StyledText {
+        let (hit, current) = find_hit_colors();
+        let highlights: Vec<_> = self
+            .ranges
+            .iter()
+            .enumerate()
+            .filter_map(|(index, range)| {
+                let from = range.start.max(start);
+                let to = range.end.min(start + len);
+                (from < to).then(|| {
+                    let color = if Some(index) == self.current {
+                        current
+                    } else {
+                        hit
+                    };
+                    (
+                        from - start..to - start,
+                        gpui::HighlightStyle {
+                            background_color: Some(color),
+                            ..Default::default()
+                        },
+                    )
+                })
+            })
+            .collect();
+        gpui::StyledText::new(shown).with_highlights(highlights)
+    }
+    /// Whether the current hit starts in bytes `start..start + len`.
+    pub(super) fn current_in(&self, start: usize, len: usize) -> bool {
+        self.current
+            .and_then(|index| self.ranges.get(index))
+            .is_some_and(|range| (start..start + len.max(1)).contains(&range.start))
+    }
+}
+/// Each of a card's find roots (as `card_find_texts`) with its hits, the
+/// row's current occurrence counted across them in order.
+pub(super) fn card_roots(
+    card: &crate::delegation::DelegationCard,
+    query: &str,
+    active: Option<usize>,
+) -> Vec<RootHits> {
+    let mut first = 0;
+    card_find_texts(card)
+        .iter()
+        .map(|text| {
+            let ranges = find_ranges(text, query);
+            let current = active
+                .and_then(|index| index.checked_sub(first))
+                .filter(|index| *index < ranges.len());
+            first += ranges.len();
+            RootHits { ranges, current }
+        })
+        .collect()
+}
+/// Asks the transcript list to scroll this element into view as it lays
+/// out: Iced's reveal of a hit in card text GPUI draws itself.
+pub(super) fn reveal_here(element: impl IntoElement) -> gpui::Div {
+    div().relative().child(element).child(
+        gpui::canvas(
+            |bounds, window, _| window.request_autoscroll(bounds),
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full(),
+    )
+}
+/// Iced's `#find-tools` label.
+pub(super) const FIND_TOOLS_LABEL: &str = "Include tool output";
+/// Iced's `#find-count`: always `index of count`, `0 of 0` without hits.
+pub(super) fn find_count(find: &TranscriptFind) -> String {
+    format!(
+        "{} of {}",
+        find.current.map_or(0, |index| index + 1),
+        find.matches.len()
+    )
+}
+/// Iced's highlight colours as its `.find-hit` boxes paint them (yellow
+/// `#f9e2af` at 0.35, the current hit peach `#fab387` at 0.5). A GPUI range
+/// highlight paints only a background under the text, as that fallback does;
+/// Iced's `::highlight` dark text and underline have no GPUI counterpart.
+pub(super) fn find_hit_colors() -> (gpui::Hsla, gpui::Hsla) {
+    let hit = gpui::Rgba {
+        a: 0.35,
+        ..gpui::rgb(0xf9e2af)
+    };
+    let current = gpui::Rgba {
+        a: 0.5,
+        ..gpui::rgb(0xfab387)
+    };
+    (hit.into(), current.into())
+}
 impl RowView {
     pub(super) fn highlight(&mut self, cx: &mut Context<Self>) {
         let query = self.query.clone();
@@ -399,9 +623,21 @@ impl RowView {
                 .len()
             })
             .sum();
+        // A card's report text view comes after its `.dlg-summary` roots.
+        let before_text: usize = match (&self.row.delegation, &self.row.delivery) {
+            (Some(card), None) => card
+                .parts()
+                .iter()
+                .map(|part| match part {
+                    crate::delegation::CardPart::Summary(text) => find_ranges(text, &query).len(),
+                    _ => 0,
+                })
+                .sum(),
+            _ => 0,
+        };
         let active = self
             .active
-            .and_then(|index| index.checked_sub(edit_matches));
+            .and_then(|index| index.checked_sub(edit_matches + before_text));
         let reveal = self.reveal_pending;
         // In occurrence order: a tool's input `<pre>` (not an edit's), then
         // its result; any other row's one text.
@@ -435,13 +671,17 @@ impl RowView {
                 } else {
                     body_ranges(&self.row, rendered.as_str(), &query)
                 };
+                let (hit, current) = find_hit_colors();
+                let active = remaining.and_then(|index| ranges.get(index));
+                // The current hit paints its own colour, not peach over yellow.
                 let mut highlights: Vec<_> = ranges
                     .iter()
+                    .filter(|range| Some(*range) != active)
                     .cloned()
-                    .map(|range| RangeHighlight::new(range, rgb(0x665c32)))
+                    .map(|range| RangeHighlight::new(range, hit))
                     .collect();
-                if let Some(range) = remaining.and_then(|index| ranges.get(index)) {
-                    highlights.push(RangeHighlight::new(range.clone(), rgb(0x9a6a28)));
+                if let Some(range) = active {
+                    highlights.push(RangeHighlight::new(range.clone(), current));
                     if reveal {
                         _ = text.reveal_range(range.clone(), cx);
                     }
@@ -467,6 +707,32 @@ impl RowView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Q12: Iced keeps the current hit by row and ordinal; when its row loses
+    /// every hit it moves to the nearest old hit (later first) whose row
+    /// still has one, not to whatever now sits at the old index.
+    #[test]
+    fn live_refresh_keeps_the_hit_by_row_or_its_nearest_old_neighbour() {
+        let prompt = |text: &str| Record {
+            at_ms: None,
+            entry: crate::events::Entry::UserPrompt(text.into()),
+        };
+        let mut model = ChatModel::from_records(&[prompt("one hit"), prompt("hit"), prompt("hit")]);
+        let mut find = TranscriptFind::default();
+        find.search(&model, "hit".into());
+        find.current = Some(1);
+        // Row 0 gains a hit before it while row 1 loses its only one.
+        model.rows[0].body = "hit and hit".into();
+        model.rows[1].body = "gone".into();
+        find.refresh(&model, &[0, 1]);
+        assert_eq!(find.active().unwrap().row, 2, "the next old hit's row");
+        // Same row, text grown before the hit: it keeps its ordinal.
+        find.current = Some(1);
+        model.rows[0].body = "x hit and hit".into();
+        find.refresh(&model, &[0]);
+        let active = find.active().unwrap();
+        assert_eq!((active.row, active.occurrence), (0, 1));
+    }
     use crate::events::parse_fixture;
     use gpui::{TestAppContext, VisualTestContext};
     use std::cell::Cell;

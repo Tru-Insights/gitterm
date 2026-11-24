@@ -612,9 +612,11 @@ impl ChatPane {
     pub(crate) fn cwd(&self) -> &std::path::Path {
         &self.saved.cwd
     }
+    /// Iced's `__reviewNote`: why an action was not done, as a warning note
+    /// in the transcript.
     pub(crate) fn show_notice(&self, notice: String, cx: &mut Context<Self>) {
         self.view
-            .update(cx, |view, cx| view.set_status_error(notice, cx));
+            .update(cx, |view, cx| view.note_warning(notice, cx));
     }
     pub(crate) fn is_working(&self) -> bool {
         matches!(

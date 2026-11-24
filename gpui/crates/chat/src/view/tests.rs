@@ -208,6 +208,10 @@ fn virtual_5000_build_layout_find_and_tail_follow(cx: &mut TestAppContext) {
             .update(cx, |state, cx| state.scroll_to_end(cx))
     });
     draw(cx);
+    // V09: Latest while find shows reaches the bottom without following.
+    assert!(!chat.read_with(cx, |view, cx| view.scroller.read(cx).is_following_tail()));
+    cx.simulate_keystrokes("escape");
+    draw(cx);
     assert!(chat.read_with(cx, |view, cx| view.scroller.read(cx).is_following_tail()));
 }
 
@@ -641,9 +645,11 @@ fn rejected_send_retains_images_and_draft_and_receipts_preserve_new_edits(cx: &m
         assert_eq!(view.images, images);
     });
     draw(cx);
+    // The last receipt is ambiguous: Iced marks that on the prompt's bubble
+    // and adds nothing to the footer (see `u11_*` in polish_tests).
     assert!(
-        cx.debug_bounds("chat-command-error").is_some(),
-        "delivery errors stay visible after telemetry chrome is removed"
+        cx.debug_bounds("chat-command-error").is_none(),
+        "an uncertain delivery is not repeated in the footer"
     );
 }
 
@@ -2840,6 +2846,8 @@ fn h08_expanded_edit_survives_row_eviction_without_changing_source(cx: &mut Test
         let source = view.model.rows[0].body.clone();
         view.row(0, window, cx)
             .update(cx, |row, cx| row.expand_edit(0, cx));
+        // A later frame: the frame that drew a row never evicts it.
+        view.frame += 1;
         for index in 1..view.model.rows.len() {
             view.row(index, window, cx);
         }
@@ -4395,6 +4403,8 @@ fn d22_finding_selection_survives_row_eviction(cx: &mut TestAppContext) {
         let card = view.model.rows.len() - 1;
         view.row(card, window, cx)
             .update(cx, |row, _| row.selected_findings = Some(HashSet::new()));
+        // A later frame: the frame that drew a row never evicts it.
+        view.frame += 1;
         for index in 0..card {
             view.row(index, window, cx);
         }

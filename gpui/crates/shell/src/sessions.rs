@@ -1197,9 +1197,7 @@ fn read_iced_history(
             });
         }
     }
-    if records.is_empty() {
-        return Err("Transcript has no recorded history".into());
-    }
+    // A transcript with no usable entry is an empty chat, as in Iced.
     records.extend(anchors.map(|(_, id)| anchor(id)));
     Ok(crate::chat::SavedChat {
         uid: format!("iced-{conversation}"),
@@ -1310,6 +1308,27 @@ mod tests {
     }
 
     #[test]
+    fn e03_a_transcript_with_no_usable_entry_opens_an_empty_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("fixture-project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(
+            project.join("fixture-empty.jsonl"),
+            "{\"type\":\"user\",\"isMeta\":true,\"message\":{\"content\":\"Ignore metadata\"}}\n",
+        )
+        .unwrap();
+        let saved = read_iced_history(
+            dir.path(),
+            "fixture-empty",
+            "/fixture/cwd",
+            "/fixture/provider".into(),
+            &[],
+        )
+        .expect("an empty history is not an error");
+        assert!(saved.records.is_empty());
+    }
+
+    #[test]
     fn imported_transcript_is_read_only_and_preserves_recorded_history() {
         use gitterm_gpui_chat::events::Entry;
         let dir = tempfile::tempdir().unwrap();
@@ -1371,6 +1390,7 @@ mod tests {
             "{\"type\":\"ai-title\",\"aiTitle\":\"No history\"}\n",
         )
         .unwrap();
+        // Iced opens an empty page for a transcript with no usable entry.
         assert!(
             read_iced_history(
                 dir.path(),
@@ -1379,7 +1399,9 @@ mod tests {
                 "/fixture/provider".into(),
                 &[]
             )
-            .is_err()
+            .unwrap()
+            .records
+            .is_empty()
         );
     }
 

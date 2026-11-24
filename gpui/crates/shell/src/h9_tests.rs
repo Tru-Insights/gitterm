@@ -368,6 +368,50 @@ fn retained_preview_history_changes_width_without_rebuilding(cx: &mut TestAppCon
     });
 }
 
+/// E07: Iced's `__reviewNote` says why an action was not done as a warning
+/// note in the transcript, not a line above the composer.
+#[gpui::test]
+fn e07_a_pane_notice_is_a_warning_note_in_the_transcript(cx: &mut TestAppContext) {
+    let (root, shell, cx) = h6_tests::sample(cx);
+    dispatch(TabSelect { index: 0 }, cx);
+    let preview = cx.update(|window, cx| {
+        let shutdown = shell.read(cx).owner.read(cx).chat_shutdown.clone();
+        let preview = cx.new(|cx| {
+            chat::ChatPane::history(
+                shutdown,
+                chat::SavedChat {
+                    uid: "notice-history".into(),
+                    cwd: root.path().into(),
+                    provider: root.path().join("provider"),
+                    session_id: None,
+                    records: vec![],
+                },
+                window,
+                cx,
+            )
+        });
+        let state = shell.read(cx).active(cx);
+        let pane = state.panes[&session_pane_id(state.active_session.unwrap())].clone();
+        pane.update(cx, |pane, cx| {
+            pane.content = pane::PaneContent::PreviewChat(preview.clone());
+            cx.notify();
+        });
+        preview
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("transcript-row-0").is_none());
+    cx.update(|_, cx| {
+        preview.update(cx, |pane, cx| {
+            pane.show_notice("src/a.rs has no changes in this checkout.".into(), cx)
+        })
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("transcript-row-0").is_some(),
+        "the notice is a transcript row"
+    );
+}
+
 /// Every app_menus action: each key binding's, each menu item's, and the
 /// bar's preview notice (dispatched by the workspace bar, not a key).
 fn every_menu_action() -> Vec<Box<dyn gpui::Action>> {

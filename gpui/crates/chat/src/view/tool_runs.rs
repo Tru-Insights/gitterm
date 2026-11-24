@@ -331,7 +331,7 @@ mod tests {
                 request_id: "x".into(),
             },
         )));
-        assert_eq!(ranges(&model), [1..5]);
+        assert_eq!(ranges(&model), vec![Range { start: 1, end: 5 }]);
     }
 
     /// F09: a replayed running turn has no live runs (Iced's refreshLiveRuns
@@ -353,7 +353,7 @@ mod tests {
         let mut model = ChatModel::from_records(&records);
         assert!(ranges(&model).is_empty());
         model.apply(&harness(HarnessEvent::TextDelta("Still".into())));
-        assert_eq!(ranges(&model), [1..3]);
+        assert_eq!(ranges(&model), vec![Range { start: 1, end: 3 }]);
         assert!(ranges(&live(&records[1..])).is_empty(), "no turn, no runs");
     }
 }

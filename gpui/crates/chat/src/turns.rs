@@ -510,7 +510,10 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         // Rows: 0 prompt, 1 Bash, 2 Agent, 3 Bash, 4 text.
-        assert_eq!(ranges(&turn(false)), [1..4]);
+        assert_eq!(
+            ranges(&turn(false)),
+            vec![std::ops::Range { start: 1, end: 4 }]
+        );
         let mut background = turn(true);
         assert_eq!(ranges(&background), [1..2, 3..4]);
         background.apply(&harness(inside(

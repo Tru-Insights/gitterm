@@ -3,6 +3,7 @@ mod attachments;
 mod copy;
 #[path = "find.rs"]
 mod find;
+mod keys;
 #[path = "review/ui.rs"]
 pub(crate) mod review_ui;
 mod scroll;
@@ -39,8 +40,8 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     collapsible::Collapsible,
     input::{
-        Enter as InputEnter, Escape as InputEscape, IndentInline, Input, InputEvent, InputState,
-        MoveDown, MoveUp, TextareaState,
+        Copy as InputCopy, Enter as InputEnter, Escape as InputEscape, IndentInline, Input,
+        InputEvent, InputState, MoveDown, MoveUp, TextareaState,
     },
     menu::{ContextMenuExt, PopupMenuItem},
     text::{RangeHighlight, SelectionFormat, TextView, TextViewMotion, TextViewState},
@@ -70,7 +71,13 @@ actions!(
         SubmitSlash,
         CloseSlash,
         CycleMode,
-        SubmitReview
+        SubmitReview,
+        ScrollLineUp,
+        ScrollLineDown,
+        ScrollPageUp,
+        ScrollPageDown,
+        ScrollTop,
+        ScrollEnd
     ]
 );
 
@@ -133,6 +140,16 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("escape", CloseFind, Some("NativeChat")),
         KeyBinding::new("cmd-c", CopyPlain, Some("NativeChat")),
         KeyBinding::new("cmd-shift-c", CopyMarkdown, Some("NativeChat")),
+        // A browser scrolls the focused scroll box with these keys. Space is
+        // left out: bound here it would also swallow typing in the inputs.
+        KeyBinding::new("up", ScrollLineUp, Some("NativeChat")),
+        KeyBinding::new("down", ScrollLineDown, Some("NativeChat")),
+        KeyBinding::new("pageup", ScrollPageUp, Some("NativeChat")),
+        KeyBinding::new("pagedown", ScrollPageDown, Some("NativeChat")),
+        KeyBinding::new("home", ScrollTop, Some("NativeChat")),
+        KeyBinding::new("end", ScrollEnd, Some("NativeChat")),
+        KeyBinding::new("cmd-up", ScrollTop, Some("NativeChat")),
+        KeyBinding::new("cmd-down", ScrollEnd, Some("NativeChat")),
     ]);
 }
 
@@ -174,7 +191,10 @@ pub struct ChatView {
     turn_running: bool,
     new_messages: bool,
     cards: HashMap<u64, Entity<CardView>>,
-    recent_rows: VecDeque<usize>,
+    /// Row views by recency, each with the frame that last drew it.
+    recent_rows: VecDeque<(usize, u64)>,
+    /// Counts `render` calls, so eviction knows which rows this frame drew.
+    frame: u64,
     folded: HashMap<u64, bool>,
     retained_edit_expansion: HashMap<u64, HashSet<usize>>,
     /// Iced's `card.selected`, kept while a card's row view is evicted.
@@ -318,6 +338,7 @@ impl ChatView {
             cards: HashMap::new(),
             expanded_visual: None,
             recent_rows: VecDeque::new(),
+            frame: 0,
             folded: HashMap::new(),
             retained_edit_expansion: HashMap::new(),
             retained_finding_selection: HashMap::new(),
@@ -469,6 +490,15 @@ impl ChatView {
         }
         cx.emit(outcome);
         cx.notify();
+    }
+
+    /// Iced's `__reviewNote`: a warning note in the transcript saying why an
+    /// action was not done.
+    pub fn note_warning(&mut self, text: String, cx: &mut Context<Self>) {
+        let following = self.scroller.read(cx).is_following_tail();
+        let count = self.model.rows.len();
+        let changed = self.model.push_warning(&text);
+        self.refresh_rows(count, following, changed, cx);
     }
 
     pub fn set_status_error(&mut self, error: String, cx: &mut Context<Self>) {
@@ -1124,11 +1154,20 @@ impl ChatView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<RowView> {
-        self.recent_rows.retain(|value| *value != index);
-        self.recent_rows.push_back(index);
-        // Rich text/diff entities are bounded even after walking through long history.
-        while self.recent_rows.len() > 96 {
-            if let Some(old) = self.recent_rows.pop_front()
+        self.recent_rows.retain(|(value, _)| *value != index);
+        self.recent_rows.push_back((index, self.frame));
+        // Rich text/diff entities are bounded even after walking through long
+        // history, but never below what this frame draws: closed folds lay
+        // out each hidden row, and a view dropped mid-frame is rebuilt on the
+        // next, its long text unparsed and without height (the reader's place
+        // then jumps), every frame.
+        while self.recent_rows.len() > 96
+            && self
+                .recent_rows
+                .front()
+                .is_some_and(|(_, frame)| *frame != self.frame)
+        {
+            if let Some((old, _)) = self.recent_rows.pop_front()
                 && let Some(view) = self.row_views[old].take()
             {
                 let row = view.read(cx);
@@ -1200,7 +1239,7 @@ impl ChatView {
                     view.open_work.remove(&id);
                 }
                 view.scroller
-                    .update(cx, |state, cx| state.hold_for_toggle(opening, cx));
+                    .update(cx, |state, cx| state.hold_for_toggle(opening, true, cx));
                 view.sync_runs(cx);
             });
         });
@@ -1212,7 +1251,7 @@ impl ChatView {
                     view.open_runs.remove(&id);
                 }
                 view.scroller
-                    .update(cx, |state, cx| state.hold_for_toggle(opening, cx));
+                    .update(cx, |state, cx| state.hold_for_toggle(opening, true, cx));
                 view.sync_runs(cx);
             });
         });
@@ -1230,6 +1269,7 @@ impl ChatView {
         let scroller = self.scroller.clone();
         let open = self.folded.get(&row.id).copied();
         let queued = self.queued_tag(&row);
+        let card_gap = self.card_top_gap(index);
         let view = cx.new(|cx| {
             let mut view = RowView::new(row, index, scroller, cx);
             if let Some(open) = open {
@@ -1263,6 +1303,7 @@ impl ChatView {
                 turn_collapsed && turn.as_ref().is_some_and(|turn| turn.contains(index));
             view.visual_expand = visual_expand;
             view.queued = queued;
+            view.top_gap = card_gap;
             view.sync_visual(cx);
             view
         });
@@ -1573,13 +1614,25 @@ impl ChatView {
         if following && !self.find_open {
             self.trim_history(cx);
         }
+        self.restore_history_after_fold(cx);
+        self.sync_card_gaps(cx);
         if !changed.is_empty() && !following {
             self.new_messages = true;
         }
+        let prompt = self.model.rows[count..]
+            .iter()
+            .any(|row| row.kind == RowKind::User);
+        let output = self.model.rows.len() > count || !changed.is_empty();
         self.scroller.update(cx, |state, cx| {
             state.append(self.model.rows.len() - count, cx);
             for &index in &changed {
                 state.remeasure_items(index..index + 1, cx);
+            }
+            if output {
+                state.follow_output(cx);
+            }
+            if prompt {
+                state.follow_prompt(cx);
             }
         });
         for &index in &changed {
@@ -1619,6 +1672,7 @@ const COMPOSER_PLACEHOLDER: &str = "Message… (Enter to send, Shift+Enter for n
 const READ_ONLY_PLACEHOLDER: &str = "Read-only chat";
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.frame += 1;
         let palette = self.appearance.palette();
         // `set_read_only` has no window; the placeholder follows it here.
         let placeholder = if self.read_only_reason.is_some() {
@@ -1757,12 +1811,42 @@ impl Render for ChatView {
                     cx.propagate();
                 }
             }))
+            .capture_action(cx.listener(|this, _: &InputCopy, window, cx| {
+                if this.copy_focused_text(window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ScrollLineUp, w, cx| {
+                this.scroll_key(scroll::ScrollKey::LineUp, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollLineDown, w, cx| {
+                this.scroll_key(scroll::ScrollKey::LineDown, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollPageUp, w, cx| {
+                this.scroll_key(scroll::ScrollKey::PageUp, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollPageDown, w, cx| {
+                this.scroll_key(scroll::ScrollKey::PageDown, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollTop, w, cx| {
+                this.scroll_key(scroll::ScrollKey::Top, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollEnd, w, cx| {
+                this.scroll_key(scroll::ScrollKey::End, w, cx)
+            }))
             .on_action(cx.listener(Self::open_find))
             .on_action(cx.listener(|this, action: &CloseFind, window, cx| {
                 if this.review.open {
                     this.close_review(window, cx);
-                } else {
+                } else if this.find_open {
                     this.close_find(action, window, cx);
+                } else if this.composer_state.picker.take().is_some() {
+                    cx.notify();
+                } else if this.model.pending_rows().is_empty() {
+                    // Iced forwards Escape to the host unless a page layer
+                    // (find, a menu, the review popover, the request panel)
+                    // is open.
+                    cx.propagate();
                 }
             }))
             .on_action(
@@ -1860,15 +1944,18 @@ impl Render for ChatView {
                             .child(reason)
                     }))
                     .children(
+                        // A prompt's ambiguous delivery is marked on its bubble
+                        // (Iced's `.delivery-uncertain`), so only its refusal
+                        // reaches the footer; a control command has no bubble.
                         self.submission
                             .iter()
-                            .chain(self.control_receipt.iter())
-                            .filter(|receipt| {
+                            .filter(|receipt| matches!(receipt.state, ReceiptState::Rejected(_)))
+                            .chain(self.control_receipt.iter().filter(|receipt| {
                                 matches!(
                                     receipt.state,
                                     ReceiptState::Rejected(_) | ReceiptState::Uncertain(_)
                                 )
-                            })
+                            }))
                             .enumerate()
                             .map(|(index, receipt)| {
                                 div()
@@ -1963,6 +2050,9 @@ struct RowView {
     scroller: Entity<MessageScrollerState>,
     _subscription: Subscription,
     hidden_by_turn: bool,
+    /// Iced's 8px card margin left over once it collapses into the bottom
+    /// margin of the block above (`card_top_gap`).
+    top_gap: f32,
     visual: Option<Entity<visual::VisualReply>>,
     visual_expand: visual::VisualExpand,
     visual_subscription: Option<Subscription>,
@@ -2036,6 +2126,7 @@ impl RowView {
             scroller,
             _subscription: subscription,
             hidden_by_turn: false,
+            top_gap: 0.,
             visual: None,
             visual_expand: Rc::new(|_, _| {}),
             visual_subscription: None,
@@ -2145,7 +2236,7 @@ impl RowView {
         self.open = !self.open;
         let opening = self.open;
         self.scroller.update(cx, |state, cx| {
-            state.hold_for_toggle(opening, cx);
+            state.hold_for_toggle(opening, false, cx);
             state.remeasure_items(self.index..self.index + 1, cx);
         });
         cx.notify();
@@ -2347,12 +2438,7 @@ impl Render for RowView {
                 .w_full()
                 // Iced's bottom margin per block; the next block's smaller
                 // top margin collapses into it.
-                .mb(px(match self.row.kind {
-                    RowKind::User => 12.,
-                    RowKind::Thinking | RowKind::Legacy(_) => 8.,
-                    RowKind::Tool | RowKind::Error | RowKind::Status | RowKind::Warning => 6.,
-                    _ => 10.,
-                }))
+                .mb(px(block_bottom_margin(&self.row)))
                 .when(!self.row.scope.is_empty(), |view| {
                     view.ml(px(18.))
                         .border_l_2()
@@ -2361,10 +2447,11 @@ impl Render for RowView {
                 .when(self.row.delivery.is_some(), |view| {
                     let id = self.row.id;
                     view.debug_selector(move || format!("delivery-card-{id}"))
-                        .my(px(8.))
                 })
-                // Iced's `details.dlg`: margin 8px 0.
-                .when(self.row.delegation.is_some(), |view| view.my(px(8.)))
+                // Iced's `details.dlg` and `.delivery`: margin 8px 0, the top
+                // collapsing into the block above (`top_gap`), the bottom
+                // being the card's own `block_bottom_margin`.
+                .mt(px(self.top_gap))
                 .when(self.row.kind == RowKind::User, |view| {
                     view.w_auto()
                         .max_w(gpui::relative(0.85))
@@ -2651,6 +2738,53 @@ fn flash_outline(id: u64, border: [f32; 4], radius: f32, color: u32) -> gpui::Di
         .border_color(rgb(color))
 }
 
+/// Iced's bottom margin per block; the next block's smaller top margin
+/// collapses into it.
+fn block_bottom_margin(row: &Row) -> f32 {
+    if row.delivery.is_some() || row.delegation.is_some() {
+        return 8.;
+    }
+    match row.kind {
+        RowKind::User => 12.,
+        RowKind::Thinking | RowKind::Legacy(_) => 8.,
+        RowKind::Tool | RowKind::Error | RowKind::Status | RowKind::Warning => 6.,
+        _ => 10.,
+    }
+}
+
+impl ChatView {
+    /// A card's 8px top margin collapses into the block above's bottom
+    /// margin: only the excess is left, all of it with nothing above.
+    fn card_top_gap(&self, index: usize) -> f32 {
+        let row = &self.model.rows[index];
+        if row.delivery.is_none() && row.delegation.is_none() {
+            return 0.;
+        }
+        self.model.rows[..index]
+            .iter()
+            .rev()
+            .find(|previous| !previous.hidden())
+            .map_or(8., |previous| (8. - block_bottom_margin(previous)).max(0.))
+    }
+    fn sync_card_gaps(&mut self, cx: &mut Context<Self>) {
+        for index in 0..self.row_views.len() {
+            let Some(view) = self.row_views[index].clone() else {
+                continue;
+            };
+            let gap = self.card_top_gap(index);
+            if view.read(cx).top_gap != gap {
+                view.update(cx, |view, cx| {
+                    view.top_gap = gap;
+                    cx.notify();
+                });
+                self.scroller.update(cx, |state, cx| {
+                    _ = state.remeasure_items(index..index + 1, cx)
+                });
+            }
+        }
+    }
+}
+
 /// The markdown a row's text view shows. A delegation card draws its
 /// other blocks itself (Iced's `.dlg-body` classes); only its report is
 /// markdown. `row.body` stays the whole card, for find and copy.
@@ -2699,6 +2833,8 @@ fn running_after(entry: &Entry, previous: bool) -> bool {
 
 #[cfg(test)]
 mod fold_tests;
+#[cfg(test)]
+mod polish_tests;
 #[cfg(test)]
 mod row_tests;
 #[cfg(test)]

@@ -707,8 +707,13 @@ fn sign_in_command_quotes_provider_and_executable_paths_without_shell_expansion(
 fn quit_drains_a_closed_slow_child_before_gpui_timeout_and_later_observers(
     cx: &mut gpui::TestAppContext,
 ) {
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::net::UnixListener;
+
     cx.background_executor.allow_parking();
     let (dir, preview) = fixture();
+    let exit_gate_path = dir.path().join("exit-gate");
+    let exit_gate = UnixListener::bind(&exit_gate_path).unwrap();
     let python = std::process::Command::new("python3")
         .args(["-I", "-S", "-c", "import sys; print(sys.executable)"])
         .output()
@@ -719,7 +724,7 @@ fn quit_drains_a_closed_slow_child_before_gpui_timeout_and_later_observers(
         "fake-slow-claude",
         &format!(
             r##"#!{}
-import json, sys, os, time
+import json, sys, os, socket, time
 from pathlib import Path
 if sys.argv[1:] == ['--help']:
     print('  --restricted\n  --strict-mcp-config\n  --safe-mode\n  --permission-mode <mode> (choices: "manual")')
@@ -733,10 +738,15 @@ if sys.argv[1:] == ['auth', 'status']:
 init = json.loads(sys.stdin.readline())
 print(json.dumps({{'type':'control_response','response':{{'subtype':'success','request_id':init['request_id'],'response':{{'models':[]}}}}}}), flush=True)
 assert not sys.stdin.read()
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as gate:
+    gate.connect({})
+    gate.sendall(b'c')
+    assert gate.recv(1) == b'x'
 time.sleep(0.45)
 Path('reaped-marker').write_text('finished')
 "##,
-            String::from_utf8(python.stdout).unwrap().trim()
+            String::from_utf8(python.stdout).unwrap().trim(),
+            serde_json::to_string(&exit_gate_path).unwrap()
         ),
     );
     let provider = Arc::new(Provider::fixture(preview.clone(), &fake).unwrap());
@@ -765,6 +775,25 @@ Path('reaped-marker').write_text('finished')
     // Explicit pane close gives up the view, but the application still owns the
     // completion via its queue. This is exactly the prior detached-close gap.
     let mut app = cx.new_app();
+    let gate = Rc::new(std::cell::RefCell::new(
+        None::<std::os::unix::net::UnixStream>,
+    ));
+    let release = gate.clone();
+    app.update(|app| {
+        app.on_app_quit(move |_| {
+            // GPUI's block_with_timeout uses wall time, not the test clock.
+            // Start the child's existing slow exit only once quit begins, so
+            // descheduling before quit cannot consume the delay being tested.
+            release
+                .borrow_mut()
+                .take()
+                .unwrap()
+                .write_all(b"x")
+                .unwrap();
+            std::future::ready(())
+        })
+        .detach();
+    });
     let owner = app.new(|cx| {
         crate::WorkspaceOwner::new(
             crate::workspace_status::WorkspaceStatus::default(),
@@ -774,6 +803,11 @@ Path('reaped-marker').write_text('finished')
     });
     let shutdown = owner.read_with(&app, |owner, _| owner.chat_shutdown.clone());
     assert!(shutdown.enqueue(runtime).is_ok());
+    let (mut child, _) = exit_gate.accept().unwrap();
+    let mut closed = [0];
+    child.read_exact(&mut closed).unwrap();
+    assert_eq!(&closed, b"c");
+    *gate.borrow_mut() = Some(child);
     assert!(
         super::lease::ProviderLease::claim(&preview).is_err(),
         "lease must survive pane close"
