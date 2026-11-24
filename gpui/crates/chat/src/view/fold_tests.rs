@@ -220,6 +220,50 @@ fn g06_live_run_opened_by_hand_starts_closed_in_the_finished_fold(cx: &mut TestA
     });
 }
 
+/// G05: tool runs use Iced's 4px vertical margins and their closed/open
+/// disclosure indicator is the same chevron path rotated a quarter turn.
+#[gpui::test]
+fn g05_tool_run_matches_iced_margin_and_chevron_geometry(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(resumable_turn(), cx);
+    let id = chat.read_with(cx, |view, _| view.model.rows[1].id);
+    click(format!("work-fold-{id}"), cx);
+    let work_summary = bounds(format!("work-fold-margin-{id}"), cx).unwrap();
+    let closed_run = bounds(format!("tool-run-{id}"), cx).unwrap();
+    assert_eq!(closed_run.top() - work_summary.bottom(), px(4.));
+    click(format!("tool-run-{id}"), cx);
+    let summary = bounds(format!("tool-run-{id}"), cx).unwrap();
+    let card = bounds(format!("tool-card-{id}"), cx).unwrap();
+    assert_eq!(card.top() - summary.bottom(), px(4.));
+    chat.read_with(cx, |view, cx| {
+        assert!(view.row_views[1].as_ref().unwrap().read(cx).run_open);
+    });
+}
+
+/// F10: the work summary, body gutter and trailing fold margin follow Iced's
+/// independent 4/8 fold and 4/2 body spacing.
+#[gpui::test]
+fn f10_work_fold_matches_iced_gutter_and_spacing(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(resumable_turn(), cx);
+    let (first, last, answer) = chat.read_with(cx, |view, _| {
+        let fold = turns::work_folds(&view.model)[0].range.clone();
+        (
+            view.model.rows[fold.start].id,
+            view.model.rows[fold.end - 1].id,
+            view.model.rows.last().unwrap().id,
+        )
+    });
+    click(format!("work-fold-{first}"), cx);
+    click(format!("tool-run-{first}"), cx);
+    let summary = bounds(format!("work-fold-margin-{first}"), cx).unwrap();
+    let first_body = bounds(format!("work-body-{first}"), cx).unwrap();
+    let first_row = bounds(format!("transcript-row-{first}"), cx).unwrap();
+    let last_body = bounds(format!("work-body-{last}"), cx).unwrap();
+    let answer = bounds(format!("transcript-row-{answer}"), cx).unwrap();
+    assert_eq!(first_row.left() - first_body.left(), px(14.));
+    assert_eq!(first_body.top() - summary.bottom(), px(4.));
+    assert_eq!(answer.top() - last_body.bottom(), px(8.));
+}
+
 fn resumable_turn() -> Vec<Record> {
     vec![
         prompt("Go"),

@@ -32,8 +32,8 @@ use gpui::{
     App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, Entity, EntityInputHandler,
     FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding, ParentElement, Render,
     StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, TitlebarOptions,
-    Window, WindowBounds, WindowOptions, actions, base::TextSelection, div, prelude::FluentBuilder,
-    px, rgb, size,
+    Transformation, Window, WindowBounds, WindowOptions, actions, base::TextSelection, div,
+    prelude::FluentBuilder, px, radians, rgb, size, svg,
 };
 use gpui_component::{
     Disableable, Root, Sizable, WindowExt,
@@ -1204,6 +1204,11 @@ impl ChatView {
             .as_ref()
             .map(|run| tool_runs::tooltip(&self.model.rows[run.range.clone()]))
             .unwrap_or_default();
+        let run_live = run.as_ref().is_some_and(|run| {
+            self.model
+                .live_turn_start()
+                .is_some_and(|live| run.range.start >= live)
+        });
         let run_summary = run
             .filter(|run| run.range.start == index)
             .map(|run| run.label);
@@ -1227,6 +1232,10 @@ impl ChatView {
             .as_ref()
             .is_some_and(|fold| fold.range.start != index && !work_open);
         let in_work = work.is_some();
+        let work_first = work.as_ref().is_some_and(|fold| fold.range.start == index);
+        let work_last = work
+            .as_ref()
+            .is_some_and(|fold| fold.range.end == index + 1);
         let work_failed = work.as_ref().map_or(0, |fold| fold.failed);
         let work_summary = work
             .filter(|fold| fold.range.start == index)
@@ -1293,9 +1302,12 @@ impl ChatView {
             view.work_failed = work_failed;
             view.work_open = work_open;
             view.in_work = in_work;
+            view.work_first = work_first;
+            view.work_last = work_last;
             view.hidden_by_work = hidden_by_work;
             view.run_toggle = run_toggle;
             view.run_summary = run_summary;
+            view.run_live = run_live;
             view.run_tooltip = run_tooltip;
             view.run_open = run_open;
             view.hidden_by_run = hidden_by_run;
@@ -1323,6 +1335,11 @@ impl ChatView {
             let summary = run
                 .filter(|run| run.range.start == index)
                 .map(|run| run.label.clone());
+            let run_live = run.is_some_and(|run| {
+                self.model
+                    .live_turn_start()
+                    .is_some_and(|live| run.range.start >= live)
+            });
             let open = run.is_none_or(|run| {
                 self.open_runs
                     .contains(&self.model.rows[run.range.start].id)
@@ -1339,13 +1356,18 @@ impl ChatView {
             });
             let hidden_by_work = work.is_some_and(|fold| fold.range.start != index && !work_open);
             let in_work = work.is_some();
+            let work_first = work.is_some_and(|fold| fold.range.start == index);
+            let work_last = work.is_some_and(|fold| fold.range.end == index + 1);
             view.update(cx, |view, cx| {
                 if view.work_summary != work_summary
                     || view.work_failed != work_failed
                     || view.work_open != work_open
                     || view.in_work != in_work
+                    || view.work_first != work_first
+                    || view.work_last != work_last
                     || view.hidden_by_work != hidden_by_work
                     || view.run_summary != summary
+                    || view.run_live != run_live
                     || view.run_tooltip != tooltip
                     || view.run_open != open
                     || view.hidden_by_run != hidden
@@ -1354,8 +1376,11 @@ impl ChatView {
                     view.work_failed = work_failed;
                     view.work_open = work_open;
                     view.in_work = in_work;
+                    view.work_first = work_first;
+                    view.work_last = work_last;
                     view.hidden_by_work = hidden_by_work;
                     view.run_summary = summary;
+                    view.run_live = run_live;
                     view.run_tooltip = tooltip;
                     view.run_open = open;
                     view.hidden_by_run = hidden;
@@ -2022,10 +2047,13 @@ struct RowView {
     work_open: bool,
     /// Inside a finished turn's fold: opened, Iced indents it as `.tf-body`.
     in_work: bool,
+    work_first: bool,
+    work_last: bool,
     hidden_by_work: bool,
     work_toggle: TurnToggle,
     column_width: Option<f32>,
     run_summary: Option<String>,
+    run_live: bool,
     run_open: bool,
     hidden_by_run: bool,
     run_toggle: TurnToggle,
@@ -2100,10 +2128,13 @@ impl RowView {
             work_summary: None,
             work_open: true,
             in_work: false,
+            work_first: false,
+            work_last: false,
             hidden_by_work: false,
             work_toggle: Rc::new(|_, _| {}),
             column_width: Some(840.),
             run_summary: None,
+            run_live: false,
             run_open: true,
             hidden_by_run: false,
             run_toggle: Rc::new(|_, _| {}),
@@ -2353,6 +2384,8 @@ impl Render for RowView {
                 .h_auto()
                 .w_full()
                 .px_0()
+                .mt(px(4.))
+                .mb(px(4.))
                 .justify_start()
                 .debug_selector(move || format!("tool-run-{id}"))
                 .flex()
@@ -2372,10 +2405,27 @@ impl Render for RowView {
                         .flex()
                         .items_baseline()
                         .gap(px(6.))
-                        .child(div().min_w_0().text_ellipsis().child(label))
-                        .child(if self.run_open { "⌄" } else { "›" }),
+                        .hover(|style| style.text_color(rgb(palette.fg)))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .when(self.run_live, |label| label.text_ellipsis())
+                                .child(label),
+                        )
+                        .child(
+                            svg()
+                                .data(b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2 2 L6 6 L2 10' fill='none' stroke='currentColor' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>")
+                                .with_transformation(Transformation::rotate(radians(if self.run_open {
+                                    std::f32::consts::FRAC_PI_2
+                                } else {
+                                    0.
+                                })))
+                                .w(px(12.))
+                                .h(px(12.)),
+                        ),
                 )
                 .on_click(move |_, _, cx| toggle(id, cx))
+                .into_any_element()
         });
         let show_work = self.work_summary.is_none() || self.work_open;
         let show_card = show_work && (self.run_summary.is_none() || self.run_open);
@@ -2403,6 +2453,7 @@ impl Render for RowView {
                         .flex()
                         .items_baseline()
                         .gap(px(6.))
+                        .hover(|style| style.text_color(rgb(palette.fg)))
                         .child(label)
                         // Iced's `.tr-failed`.
                         .when(self.work_failed > 0, |summary| {
@@ -2413,7 +2464,17 @@ impl Render for RowView {
                                     .child(format!("{} failed", self.work_failed)),
                             )
                         })
-                        .child(if self.work_open { "⌄" } else { "›" }),
+                        .child(
+                            svg()
+                                .data(b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2 2 L6 6 L2 10' fill='none' stroke='currentColor' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>")
+                                .with_transformation(Transformation::rotate(radians(if self.work_open {
+                                    std::f32::consts::FRAC_PI_2
+                                } else {
+                                    0.
+                                })))
+                                .w(px(12.))
+                                .h(px(12.)),
+                        ),
                 )
                 .on_click(move |_, _, cx| toggle(id, cx))
         });
@@ -2516,7 +2577,9 @@ impl Render for RowView {
                         gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
                     })
                 })
-                .when(self.in_work, |row| row.mb_0())
+                .when(self.in_work, |row| {
+                    row.mb(px(if self.work_last { 8. } else { 0. }))
+                })
                 .children(run_summary)
                 .when(show_card, |row| {
                     row.child(if self.row.delegation.is_some() {
@@ -2692,17 +2755,21 @@ impl Render for RowView {
                     })
                 })
                 .into_any_element();
+        let id = self.row.id;
         let work_summary = work_summary.map(|header| {
             div()
+                .debug_selector(move || format!("work-fold-margin-{id}"))
                 .mt(px(4.))
-                .mb(px(if self.work_open { 4. } else { 10. }))
+                .mb_0()
                 .child(header)
         });
         // Iced's `.tf-body`: one bordered column, so each row's gap sits inside it.
         let row = if self.in_work {
             div()
+                .debug_selector(move || format!("work-body-{id}"))
+                .mt(px(if self.work_first { 4. } else { 0. }))
+                .mb(px(if self.work_last { 2. } else { 0. }))
                 .pl(px(12.))
-                .pb(px(10.))
                 .border_l_2()
                 .border_color(rgb(palette.border))
                 .child(row)
