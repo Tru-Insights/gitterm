@@ -44,18 +44,37 @@ pub(crate) fn host_page(html: &str, height: u32, light: bool) -> String {
     let document = serde_json::to_string(html)
         .expect("string serializes")
         .replace('<', "\\u003c");
-    let (theme, background) = if light {
-        ("light", "#eff1f5")
-    } else {
-        ("dark", "#1e1e2e")
-    };
+    let (theme, background) = theme_colors(light);
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><style>html,body{{margin:0;padding:0;height:100%;overflow:hidden;background:{background}}}iframe{{height:100% !important}}</style><script>{RENDER_JS}</script></head><body><script>(() => {{
   const post = window.__gittermVisualPost;
   const render = GitTermHtml.create({document}, {height}, '{theme}', (url) => post({{ type: 'link', url }}), () => post({{ type: 'escape' }}));
   document.body.appendChild(render.frame);
+  Object.defineProperty(window, '__gittermSetTheme', {{
+    value: (theme, background) => {{ render.setTheme(theme); document.documentElement.style.background = background; document.body.style.background = background; }},
+    writable: false, configurable: false
+  }});
   document.addEventListener('keydown', (e) => {{ if (e.key === 'Escape') post({{ type: 'escape' }}); }}, true);
 }})();</script></body></html>"#
+    )
+}
+
+fn theme_colors(light: bool) -> (&'static str, &'static str) {
+    if light {
+        ("light", "#eff1f5")
+    } else {
+        ("dark", "#1e1e2e")
+    }
+}
+
+/// Iced's `__setAppearance` for one frame: `render.setTheme` on the loaded
+/// host page, which keeps its document.
+// shortcut: a change before the host page has run is lost (the frame keeps
+// its first theme); the window between creation and load is milliseconds.
+pub(crate) fn theme_script(light: bool) -> String {
+    let (theme, background) = theme_colors(light);
+    format!(
+        "if (typeof window.__gittermSetTheme === 'function') window.__gittermSetTheme('{theme}', '{background}');"
     )
 }
 
@@ -303,6 +322,15 @@ impl VisualSurface for NativeSurface {
     fn drain(&mut self) -> Vec<VisualMessage> {
         self.0.state.inbox.borrow_mut().drain(..).collect()
     }
+    fn set_theme(&mut self, light: bool) {
+        // SAFETY: the view is used on the main thread, where it was made.
+        unsafe {
+            self.0.view.evaluateJavaScript_completionHandler(
+                &NSString::from_str(&theme_script(light)),
+                None,
+            );
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -388,6 +416,13 @@ mod tests {
         assert!(page.contains("GitTermHtml.create("));
         assert!(page.contains(", 240, 'dark',"));
         assert!(host_page("x", 100, true).contains(", 100, 'light',"));
+        // Y05: the loaded page restyles in place (Iced's render.setTheme).
+        assert!(page.contains("__gittermSetTheme"));
+        assert!(page.contains("render.setTheme(theme)"));
+        assert_eq!(
+            theme_script(true),
+            "if (typeof window.__gittermSetTheme === 'function') window.__gittermSetTheme('light', '#eff1f5');"
+        );
         // The guard installs before any page script and fails closed without it.
         assert!(RENDER_JS.contains("__gittermHtmlGuard !== true"));
         assert!(FRAME_GUARD_JS.contains("__gittermHtmlGuard"));
