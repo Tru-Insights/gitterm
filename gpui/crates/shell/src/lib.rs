@@ -6189,6 +6189,23 @@ mod tests {
         });
         wait_for_text(&terminal, "SURVIVAL_history", cx);
         let chat = cx.read(|cx| chat(&held[0], cx));
+        // The showcase's requests live in the footer panel, not the
+        // transcript: add prompts so the transcript is taller than its pane.
+        cx.update(|_, cx| {
+            chat.update(cx, |chat, cx| {
+                for index in 0..40 {
+                    chat.append_record(
+                        &gitterm_gpui_chat::events::Record {
+                            at_ms: None,
+                            entry: gitterm_gpui_chat::events::Entry::UserPrompt(format!(
+                                "padding {index}"
+                            )),
+                        },
+                        cx,
+                    );
+                }
+            })
+        });
         let scroller = cx.read(|cx| chat.read(cx).scroller().clone());
         cx.update(|_, cx| scroller.update(cx, |state, cx| state.scroll_to_item(2, cx)));
         let scroll = cx.read(|cx| scroller.read(cx).logical_scroll_top());

@@ -1319,7 +1319,11 @@ impl ChatView {
             .when(pending.len() > 1, |panel| {
                 panel.child(format!("{} of {}", position + 1, pending.len()))
             })
-            .child(card)
+            .child(
+                div()
+                    .debug_selector(|| "pending-request-card".into())
+                    .child(card),
+            )
             .into_any_element()
     }
     #[cfg(test)]
@@ -2554,5 +2558,7 @@ fn running_after(entry: &Entry, previous: bool) -> bool {
     }
 }
 
+#[cfg(test)]
+mod row_tests;
 #[cfg(test)]
 mod tests;

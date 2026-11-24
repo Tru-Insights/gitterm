@@ -412,7 +412,11 @@ impl RowView {
         targets.extend(self.output_text.clone());
         let mut signature = std::hash::DefaultHasher::new();
         for target in &targets {
-            target.read(cx).rendered_text().as_str().hash(&mut signature);
+            target
+                .read(cx)
+                .rendered_text()
+                .as_str()
+                .hash(&mut signature);
         }
         (&query, active).hash(&mut signature);
         let signature = signature.finish();
