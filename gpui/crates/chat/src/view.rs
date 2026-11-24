@@ -1936,7 +1936,7 @@ impl RowView {
         cx: &mut Context<Self>,
     ) -> Self {
         let text = cx.new(|cx| {
-            TextViewState::markdown(&display_body(&row), cx)
+            TextViewState::markdown(&copy::markdown_body(&row), cx)
                 .selectable(true)
                 .scrollable(row.tool.is_some())
                 .motion(TextViewMotion::default().with_stream_fade(Duration::from_millis(280)))
@@ -2006,7 +2006,7 @@ impl RowView {
             self.expanded_edits.clear();
         }
         self.text
-            .update(cx, |text, cx| text.set_text(&display_body(&row), cx));
+            .update(cx, |text, cx| text.set_text(&copy::markdown_body(&row), cx));
         if self
             .row
             .delegation
@@ -2102,7 +2102,7 @@ impl RowView {
     }
 }
 impl Render for RowView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(visual) = &self.visual
             && visual.read(cx).light != self.appearance.light
         {
@@ -2173,7 +2173,13 @@ impl Render for RowView {
             .when(self.row.delivery.is_some(), |content| {
                 content.pl(px(22.)).pr(px(10.)).pb(px(8.))
             })
-            .child(self.copyable_text(cx))
+            .child(self.copyable_text(cx).when(
+                self.row.kind == RowKind::Assistant && self.row.scope.is_empty(),
+                |text| {
+                    text.style(copy::assistant_style(self.appearance, window.rem_size()))
+                        .blockquote_style(copy::assistant_quote_style(self.appearance))
+                },
+            ))
             // Iced's `.user-note` for a relayed prompt's images.
             .when(self.row.relayed_images > 0, |content| {
                 content.child(

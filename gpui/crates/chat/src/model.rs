@@ -191,7 +191,13 @@ impl Row {
             }
             return text;
         }
-        let mut text = plain_markdown(&self.body);
+        let mut text = plain_markdown(
+            &if self.kind == RowKind::Assistant && self.scope.is_empty() {
+                crate::markdown::assistant_source(&self.body)
+            } else {
+                self.body.clone()
+            },
+        );
         if let Some(findings) = self.delegation.as_ref().and_then(|card| card.findings()) {
             for finding in &findings.findings {
                 text.push_str(&format!(
