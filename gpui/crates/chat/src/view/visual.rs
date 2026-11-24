@@ -17,7 +17,8 @@ const TOOL_NAMES: [&str; 4] = [
 
 /// The validated document and height of an html_render result.
 pub(super) fn visual_request(tool: &Tool) -> Option<(String, u32)> {
-    if !TOOL_NAMES.contains(&tool.name.as_str()) {
+    // Iced calls showHtmlRender only for a result that is not an error.
+    if tool.is_error || !TOOL_NAMES.contains(&tool.name.as_str()) {
         return None;
     }
     let result: HtmlRenderResult = serde_json::from_str(tool.output.as_deref()?).ok()?;
@@ -61,6 +62,8 @@ pub struct VisualPlacement {
 pub trait VisualSurface {
     fn place(&mut self, placement: VisualPlacement);
     fn drain(&mut self) -> Vec<VisualMessage>;
+    /// Iced's `render.setTheme`: restyle the loaded frame in place.
+    fn set_theme(&mut self, light: bool);
 }
 
 /// Builds a surface for (document, height, light).
@@ -110,10 +113,11 @@ impl VisualReply {
 
     pub(super) fn set_light(&mut self, light: bool, cx: &mut Context<Self>) {
         if self.light != light {
-            // The frame's theme is fixed at load; rebuild it in the new one.
+            // Iced's `__setAppearance`: every frame keeps its document.
             self.light = light;
-            self.surface = None;
-            self.pump = None;
+            if let Some(surface) = &mut self.surface {
+                surface.set_theme(light);
+            }
             cx.notify();
         }
     }
@@ -204,12 +208,15 @@ impl Render for VisualReply {
             .when(self.expanded, |block| block.size_full())
             .when(!self.expanded, |block| block.w_full().my(px(10.)));
         if cx.try_global::<VisualHost>().is_none() {
-            // Iced: pages without the native subframe policy show a note.
+            // Iced: pages without the native subframe policy show a note,
+            // a bare `.html-render` box in the transcript's own text.
             return block
-                .px(px(8.))
-                .py(px(5.))
-                .text_color(rgb(palette.muted))
-                .child("Visual reply available in GitTerm for macOS.")
+                .text_color(rgb(palette.fg))
+                .child(
+                    div()
+                        .debug_selector(move || format!("visual-note-{id}"))
+                        .child("Visual reply available in GitTerm for macOS."),
+                )
                 .into_any_element();
         }
         self.ensure_surface(window, cx);

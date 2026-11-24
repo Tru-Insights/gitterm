@@ -663,10 +663,38 @@ fn roster_card_shows_a_held_result(cx: &mut TestAppContext) {
         activity: None,
         held: false,
         worker: None,
+        checkout_head: None,
     };
     let shown = crate::chat::with_held(&[card("d1"), card("d2")], &["d2".to_string()].into());
     assert_eq!(
         shown.iter().map(|card| card.held).collect::<Vec<_>>(),
         [false, true]
     );
+}
+
+/// D17: the pane re-reads the checkout's HEAD (Iced's
+/// `refresh_delegation_head`) when a card appears or changes state, and
+/// not on a roster refresh that changes neither.
+#[test]
+fn checkout_head_is_reread_when_a_card_appears_or_changes_state() {
+    let card = |id: &str, done: bool| {
+        let delegation = worker_delegation(id, "worker", &format!("child-{id}"));
+        gitterm_gpui_chat::delegation::DelegationCard {
+            delegation: if done {
+                finished(delegation, "parent-chat")
+            } else {
+                delegation
+            },
+            activity: Some("busy".into()),
+            held: false,
+            worker: None,
+            checkout_head: None,
+        }
+    };
+    let running = crate::chat::card_states(&[card("d1", false)]);
+    assert_ne!(running, crate::chat::card_states(&[]));
+    assert_ne!(running, crate::chat::card_states(&[card("d1", true)]));
+    let mut quiet = card("d1", false);
+    quiet.activity = Some("still busy".into());
+    assert_eq!(running, crate::chat::card_states(&[quiet]));
 }
