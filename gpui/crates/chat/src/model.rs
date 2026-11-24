@@ -26,6 +26,9 @@ pub enum RowKind {
     Warning,
     /// A pi block (Iced's `legacyEvent`): its label is the row title.
     Legacy(LegacyBlock),
+    /// Iced's `.html-render`: a tool's visual reply, its own block from when
+    /// the result arrived. The row carries a copy of that tool.
+    Visual,
     /// A block Iced removed: a queued prompt whose withdrawal was confirmed,
     /// or a reconnect notice. The slot stays so row indices remain stable,
     /// but nothing reads it.
@@ -160,6 +163,27 @@ impl Subagent {
             .map_or(line.len(), |(index, _)| index);
         Some(format!("{}…", &line[..end]))
     }
+}
+
+/// Claude's MCP prefix, Antigravity's FQN, OpenCode's server_tool name, and
+/// the unprefixed MCP name, as Iced. Other tool output is never rendered.
+const TOOL_NAMES: [&str; 4] = [
+    "html_render",
+    "mcp__gitterm_tasks__html_render",
+    "mcp_gitterm-tasks_html_render",
+    "gitterm_tasks_html_render",
+];
+
+/// The validated document and height of an html_render result.
+pub fn visual_request(tool: &Tool) -> Option<(String, u32)> {
+    // Iced calls showHtmlRender only for a result that is not an error.
+    if tool.is_error || !TOOL_NAMES.contains(&tool.name.as_str()) {
+        return None;
+    }
+    let result: gitterm_core::chat::html_render::HtmlRenderResult =
+        serde_json::from_str(tool.output.as_deref()?).ok()?;
+    result.html_render.validate().ok()?;
+    Some((result.html_render.html, result.html_render.height))
 }
 
 /// Iced's `salient(name, input)`: the argument that says what a call does.
@@ -870,7 +894,8 @@ impl ChatModel {
                 }
                 changed.push(index);
             }
-            HarnessEvent::TurnStarted { model, .. } => {
+            // A subagent's turn is in its Agent card (`subagent_event`).
+            HarnessEvent::TurnStarted { .. } => {
                 self.streams.remove(scope);
                 if scope.is_empty() {
                     self.busy = true;
@@ -879,8 +904,6 @@ impl ChatModel {
                 if let Some(at) = at {
                     self.turn_start.insert(scope.into(), at);
                 }
-                // A subagent's turn is in its Agent card (`subagent_event`).
-                let _ = model;
             }
             HarnessEvent::ItemStarted {
                 id,
@@ -949,6 +972,17 @@ impl ChatModel {
                     self.completions.push(self.rows[index].id);
                     self.refresh_tool(index);
                     changed.push(index);
+                    // Iced's showHtmlRender appends the reply at completion.
+                    if scope.is_empty()
+                        && let Some(tool) = self.rows[index].tool.clone()
+                        && visual_request(&tool).is_some()
+                    {
+                        self.streams.remove(scope);
+                        let visual =
+                            self.push(RowKind::Visual, scope, "Visual reply".into(), String::new());
+                        self.rows[visual].tool = Some(tool);
+                        changed.push(visual);
+                    }
                 } else {
                     self.orphan(scope, id, "result", changed);
                 }
@@ -1080,14 +1114,10 @@ impl ChatModel {
                     self.orphan(scope, request_id, "request resolution", changed);
                 }
             }
-            HarnessEvent::TurnCompleted { status, .. } => {
+            HarnessEvent::TurnCompleted { .. } => {
                 self.streams.remove(scope);
                 let turn_start = self.turn_start.remove(scope);
                 let end = self.turn_end.remove(scope).or(at);
-                let duration_ms = turn_start
-                    .zip(end)
-                    .map(|(start, end)| end.saturating_sub(start));
-                let duration_ms = (turn_start, duration_ms);
                 let start = self.turn_row_start.remove(scope).unwrap_or_else(|| {
                     self.rows
                         .iter()
@@ -1095,10 +1125,7 @@ impl ChatModel {
                         .map_or(0, |index| index + 1)
                 });
                 if scope.is_empty() {
-                    self.complete_turn(start, duration_ms, end, changed);
-                }
-                let _ = status;
-                if scope.is_empty() {
+                    self.complete_turn(start, turn_start, end, changed);
                     self.busy = false;
                 }
                 // Iced reports completion/usage in the activity strip; an
@@ -1296,10 +1323,7 @@ impl ChatModel {
                 {
                     let turn_start = self.turn_start.remove(scope);
                     let end = self.turn_end.remove(scope).or(at);
-                    let duration_ms = turn_start
-                        .zip(end)
-                        .map(|(start, end)| end.saturating_sub(start));
-                    self.complete_turn(start, (turn_start, duration_ms), end, changed);
+                    self.complete_turn(start, turn_start, end, changed);
                 }
                 let harness = self.harness_name();
                 let code = exit.map_or_else(String::new, |code| format!(" (code {code})"));
@@ -1447,10 +1471,13 @@ impl ChatModel {
     fn complete_turn(
         &mut self,
         start: usize,
-        (turn_start, duration_ms): (Option<u64>, Option<u64>),
+        turn_start: Option<u64>,
         end: Option<u64>,
         changed: &mut Vec<usize>,
     ) {
+        let duration_ms = turn_start
+            .zip(end)
+            .map(|(start, end)| end.saturating_sub(start));
         let rows = start..self.rows.len();
         let mut segments = Vec::new();
         let mut segment_start = turn_start;

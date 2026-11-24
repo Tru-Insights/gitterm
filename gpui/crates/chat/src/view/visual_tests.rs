@@ -91,7 +91,7 @@ fn reply(
             .model
             .rows
             .iter()
-            .position(|row| row.tool.is_some())
+            .position(|row| row.kind == crate::model::RowKind::Visual)
             .unwrap();
         let row = chat.row_views[index].as_ref().expect("row drawn").read(cx);
         (row.row.id, row.visual.clone().expect("visual reply"))

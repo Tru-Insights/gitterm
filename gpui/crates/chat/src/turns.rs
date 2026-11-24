@@ -130,15 +130,6 @@ fn fold_segment(
             continue;
         }
         start.get_or_insert(index);
-        // Iced appends a visual reply after its tool card, outside the fold.
-        if row
-            .tool
-            .as_ref()
-            .is_some_and(|tool| super::visual::visual_request(tool).is_some())
-            && let Some(start) = start.take()
-        {
-            groups.push(start..index + 1);
-        }
     }
     if let Some(start) = start {
         groups.push(start..end);
@@ -162,12 +153,13 @@ fn waits(row: &Row) -> bool {
             .is_some_and(|r| !r.resolved || r.waiting_at_turn_end)
 }
 
-/// Iced's `keepsOutOfFold`: error blocks, warnings, delegation cards, a failed tool, a
+/// Iced's `keepsOutOfFold`: error blocks, warnings, delegation cards, visual
+/// replies, a failed tool, a
 /// running subagent's card and a card whose request still waits.
 fn keeps_out_of_fold(row: &Row, held: bool) -> bool {
     match row.kind {
-        // Iced: `.error-block, .dlg, .note.warn`.
-        RowKind::Error | RowKind::Warning | RowKind::Delegation => true,
+        // Iced: `.error-block, .dlg, .note.warn, .html-render`.
+        RowKind::Error | RowKind::Warning | RowKind::Delegation | RowKind::Visual => true,
         RowKind::Tool => {
             held || row.tool.as_ref().is_some_and(|tool| {
                 tool.is_error || tool.sub.as_ref().is_some_and(|sub| sub.running_at_turn_end)
@@ -581,5 +573,45 @@ mod tests {
         assert_eq!(model.rows[2].kind, RowKind::Warning);
         let ranges: Vec<_> = folds(&model).into_iter().map(|(r, ..)| r).collect();
         assert_eq!(ranges, [1..2, 3..4]);
+    }
+
+    /// Y02: a visual reply is its own block, appended when the result
+    /// arrives (after what came in meanwhile), and it stays out of the fold.
+    #[test]
+    fn y02_visual_reply_is_its_own_block_at_completion_and_stays_out() {
+        use crate::events::{HarnessEvent, TurnStatus};
+        use crate::model::subagent_tests::{harness, tool, turn_done};
+        let html = serde_json::json!({"html": "<h1>Chart</h1>", "height": 240});
+        let output = serde_json::json!({ "html_render": html }).to_string();
+        let model = ChatModel::from_records(&[
+            prompt("Go"),
+            harness(tool("v", "html_render", html.clone())),
+            harness(tool("b", "Bash", serde_json::json!({"command": "check"}))),
+            harness(HarnessEvent::ItemCompleted {
+                id: "v".into(),
+                output,
+                is_error: false,
+            }),
+            harness(crate::model::subagent_tests::done("b", false)),
+            harness(tool("c", "Bash", serde_json::json!({"command": "check"}))),
+            harness(crate::model::subagent_tests::done("c", false)),
+            harness(HarnessEvent::TextDelta("Done.".into())),
+            harness(turn_done(TurnStatus::Completed)),
+        ]);
+        // Rows: 0 prompt, 1 html_render, 2 Bash, 3 visual, 4 Bash, 5 text.
+        let kinds: Vec<_> = model.rows.iter().map(|row| row.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                RowKind::User,
+                RowKind::Tool,
+                RowKind::Tool,
+                RowKind::Visual,
+                RowKind::Tool,
+                RowKind::Assistant
+            ]
+        );
+        let ranges: Vec<_> = folds(&model).into_iter().map(|(r, ..)| r).collect();
+        assert_eq!(ranges, [1..3, 4..5]);
     }
 }

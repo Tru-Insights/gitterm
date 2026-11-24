@@ -2087,7 +2087,7 @@ impl RowView {
     /// A completed html_render result gets its visual reply once. Called
     /// while the list lays the row out, so the caller remeasures.
     fn sync_visual(&mut self, cx: &mut Context<Self>) {
-        if self.visual.is_some() {
+        if self.visual.is_some() || self.row.kind != RowKind::Visual {
             return;
         }
         let Some(request) = self.row.tool.as_ref().and_then(visual::visual_request) else {
@@ -2159,7 +2159,7 @@ impl Render for RowView {
             let light = self.appearance.light;
             visual.update(cx, |visual, cx| visual.set_light(light, cx));
         }
-        // Iced appends the visual reply after its tool item, outside the fold.
+        // Iced's `.html-render`: its own block, the reply alone.
         let visual = self
             .visual
             .clone()
@@ -2167,7 +2167,10 @@ impl Render for RowView {
         if self.hidden_by_turn || self.row.hidden() {
             return div().h(px(0.)).mb(px(0.)).into_any_element();
         }
-        if self.hidden_by_work || (self.hidden_by_run && self.work_summary.is_none()) {
+        if self.row.kind == RowKind::Visual
+            || self.hidden_by_work
+            || (self.hidden_by_run && self.work_summary.is_none())
+        {
             return div()
                 .w_full()
                 .when_some(self.column_width, |row, width| row.max_w(px(width)))
