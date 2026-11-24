@@ -246,6 +246,7 @@ fn html_render_error_results_never_become_visual_replies() {
         partial_input: String::new(),
         output: Some(output),
         is_error: true,
+        badge: None,
     };
     assert_eq!(visual::visual_request(&tool), None);
 }
