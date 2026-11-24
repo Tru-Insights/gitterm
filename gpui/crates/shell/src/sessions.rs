@@ -904,13 +904,13 @@ impl crate::Shell {
         ) {
             return;
         }
-        // shortcut: before the first task-store read there are no facts, so the
-        // cards land at the end as before; reopening the chat places them.
-        let delegations = self
-            .roster_facts
-            .as_ref()
-            .map(|facts| chat_delegation_times(facts, &tab))
-            .unwrap_or_default();
+        // Read the task store with the transcript: the shell's roster facts may
+        // not be loaded yet when a chat opens at launch.
+        let card_source = self.owner.read(cx).iced_catalog().map(|catalog| {
+            let source = catalog.source.clone();
+            let tasks = crate::data::TaskSource::resolve(&source, cx);
+            (source, tasks, tab.clone())
+        });
         let Some(conversation) = tab.chat_session_id else {
             return;
         };
@@ -939,6 +939,18 @@ impl crate::Shell {
                     saved.map(Ok).unwrap_or_else(|| {
                         let projects =
                             projects.ok_or_else(|| "transcript source unavailable".to_string())?;
+                        let delegations = card_source
+                            .and_then(|(source, tasks, tab)| {
+                                match crate::data::RosterFacts::read(&source, &tasks) {
+                                    Ok(facts) => Some(chat_delegation_times(&facts, &tab)),
+                                    Err(error) => {
+                                        // The chat still opens; its cards go at the end.
+                                        eprintln!("read Iced delegations for history: {error:#}");
+                                        None
+                                    }
+                                }
+                            })
+                            .unwrap_or_default();
                         read_iced_history(
                             &projects,
                             &conversation,
