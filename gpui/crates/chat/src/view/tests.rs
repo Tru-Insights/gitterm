@@ -119,7 +119,21 @@ fn embedded_chats_keep_click_focus_find_and_copy_in_their_pane(cx: &mut TestAppC
         let row_id = chats[index].read_with(cx, |view, _| {
             view.row_views[0].as_ref().unwrap().entity_id()
         });
+        let message_id = chats[index].read_with(cx, |view, cx| {
+            view.row_views[0].as_ref().unwrap().read(cx).row.id
+        });
         let selector = Box::leak(format!("copy-code-{row_id}").into_boxed_str());
+        // Both panes have the same transcript row id, so their debug selectors
+        // collide. Translate the observed row bounds into the requested pane.
+        let row_selector = Box::leak(format!("transcript-row-{message_id}").into_boxed_str());
+        let row_bounds = cx.debug_bounds(row_selector).expect("chat row");
+        let source_chat = cx.debug_bounds("chat-1").expect("second chat pane");
+        let target_chat = cx
+            .debug_bounds(if index == 0 { "chat-0" } else { "chat-1" })
+            .expect("target chat pane");
+        let hover_point = target_chat.origin + (row_bounds.center() - source_chat.origin);
+        cx.update(|window, app| window.simulate_mouse_move(hover_point, app));
+        draw(cx);
         let button = cx.debug_bounds(selector).expect("visible code Copy button");
         cx.simulate_click(button.center(), gpui::Modifiers::none());
         draw(cx);

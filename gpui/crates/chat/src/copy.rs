@@ -11,7 +11,21 @@ fn code_copy_button<I>(id: I, label: &'static str, color: gpui::Hsla) -> Button
 where
     I: Into<gpui::ElementId>,
 {
-    Button::new(id).small().text_color(color).label(label)
+    Button::new(id)
+        .text()
+        .text_color(color)
+        .accessibility_label(label)
+        .child(
+            div()
+                .debug_selector(|| "copy-code-label".into())
+                .px(px(8.))
+                .py(px(2.))
+                .text_size(px(11.))
+                .text_color(color)
+                .bg(rgb(0x323232))
+                .rounded(px(4.))
+                .child(label),
+        )
 }
 
 pub(super) fn markdown_body(row: &Row) -> String {
@@ -326,12 +340,18 @@ impl RowView {
                 div()
                     .id(("copy-code-hover", key))
                     .debug_selector(|| "copy-code-action".into())
-                    .opacity(if copied.contains(&CopyTarget::Code(key)) {
-                        1.
-                    } else {
-                        0.
+                    // The dependency anchors this wrapper 8px from the code
+                    // block's top/right. Shift the control 2px to match Iced's
+                    // 6px inset. Opacity leaves child button surfaces painted;
+                    // visibility removes both the surface and its label.
+                    .relative()
+                    .top(px(-2.))
+                    .right(px(-2.))
+                    .invisible()
+                    .group_hover("chat-row", |style| style.visible())
+                    .when(copied.contains(&CopyTarget::Code(key)), |this| {
+                        this.visible()
                     })
-                    .group_hover("chat-row", |style| style.opacity(1.))
                     .child(
                         code_copy_button(
                             ("copy-code", key),
@@ -409,6 +429,14 @@ mod tests {
     fn click(selector: &'static str, cx: &mut VisualTestContext) {
         let bounds = cx.debug_bounds(selector).expect(selector);
         cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        draw(cx);
+    }
+
+    fn hover_row(row: &Entity<RowView>, cx: &mut VisualTestContext) {
+        let id = row.read_with(cx, |row, _| row.row.id);
+        let selector = Box::leak(format!("transcript-row-{id}").into_boxed_str());
+        let bounds = cx.debug_bounds(selector).expect("transcript row");
+        cx.update(|window, app| window.simulate_mouse_move(bounds.center(), app));
         draw(cx);
     }
 
@@ -622,40 +650,64 @@ mod tests {
     }
 
     #[gpui::test]
-    fn code_block_copy_label_contrasts_with_its_hovered_button(cx: &mut TestAppContext) {
+    fn code_block_copy_button_is_absent_at_rest_and_visible_on_row_hover(cx: &mut TestAppContext) {
         let (_chat, cx) = setup(cx);
         cx.update(|window, app| {
             gpui_component::Theme::change(gpui_component::ThemeMode::Dark, Some(window), app);
         });
         draw(cx);
-        let action_bounds = cx
-            .debug_bounds("copy-code-action")
-            .expect("copy button action rendered");
-        cx.update(|window, app| window.simulate_mouse_move(action_bounds.center(), app));
-        draw(cx);
+        let (row_id, row_view_id) = _chat.read_with(cx, |view, cx| {
+            let row = view.row_views[0].as_ref().unwrap().read(cx);
+            (row.row.id, view.row_views[0].as_ref().unwrap().entity_id())
+        });
+        let row_selector = Box::leak(format!("transcript-row-{row_id}").into_boxed_str());
+        let selector = Box::leak(format!("copy-code-{row_view_id}").into_boxed_str());
+        let row = cx.debug_bounds(row_selector).expect("chat row");
+        let rest_quads = cx.update(|window, _| window.painted_quads());
+        let button_background: gpui::Background = rgb(0x323232).into();
 
+        // The debug bounds belong to the Button and therefore also cover its
+        // label text. Visibility must suppress both the label and its surface.
         assert!(
-            cx.debug_bounds("copy-code-action").is_some(),
-            "copy action hovered"
+            cx.debug_bounds(selector).is_none(),
+            "button text is not laid out at rest"
+        );
+        assert!(
+            !rest_quads
+                .iter()
+                .any(|quad| quad.background == button_background),
+            "button background is not painted at rest"
+        );
+        assert!(
+            cx.debug_bounds("copy-code-label").is_none(),
+            "Copy text is not painted at rest"
         );
 
-        let (label, background) = cx.update(|_, app| {
-            let theme = gpui_component::Theme::global(app);
+        cx.update(|window, app| window.simulate_mouse_move(row.center(), app));
+        draw(cx);
+        cx.debug_bounds(selector)
+            .expect("hovering the chat row reveals button and label");
+        cx.debug_bounds("copy-code-label")
+            .expect("hovered Copy text is painted");
+        let hovered_quads = cx.update(|window, _| window.painted_quads());
+        assert!(
+            hovered_quads
+                .iter()
+                .any(|quad| quad.background == button_background),
+            "hovered button background is painted"
+        );
+
+        let label = cx.update(|_, _| {
             let mut button = code_copy_button(
                 "test-copy-code",
                 "Copy",
                 rgb(ChatAppearance::default().palette().fg).into(),
             );
-            let label = button
-                .style()
-                .text
-                .color
-                .expect("copy button sets an explicit label color");
-            (label, theme.tokens.button_hover.color)
+            button.style().text.color.expect("explicit label color")
         });
         assert!(
-            contrast_ratio(label, background) >= 4.5,
-            "copy label {label:?} must contrast with hovered button {background:?}"
+            contrast_ratio(label, rgb(0x323232).into()) >= 4.5,
+            "copy label {label:?} must contrast with hovered button {button_background:?}"
         );
     }
 
@@ -764,9 +816,15 @@ mod tests {
         let (chat, cx) = setup(cx);
         let row = row(&chat, cx);
         let selector = Box::leak(format!("copy-code-{}", row.entity_id()).into_boxed_str());
+        hover_row(&row, cx);
         click(selector, cx);
         assert_eq!(clipboard(cx), "  let x = 1;  \n\t// é");
         assert_eq!(row.read_with(cx, |row, _| row.copied.len()), 1);
+        cx.update(|window, app| {
+            window.simulate_mouse_move(gpui::point(px(0.), px(0.)), app)
+        });
+        draw(cx);
+        assert!(cx.debug_bounds(selector).is_some(), "Copied feedback stays visible");
         cx.executor().advance_clock(Duration::from_millis(800));
         draw(cx);
         click(selector, cx);
