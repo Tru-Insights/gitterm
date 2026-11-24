@@ -820,11 +820,12 @@ mod tests {
         click(selector, cx);
         assert_eq!(clipboard(cx), "  let x = 1;  \n\t// é");
         assert_eq!(row.read_with(cx, |row, _| row.copied.len()), 1);
-        cx.update(|window, app| {
-            window.simulate_mouse_move(gpui::point(px(0.), px(0.)), app)
-        });
+        cx.update(|window, app| window.simulate_mouse_move(gpui::point(px(0.), px(0.)), app));
         draw(cx);
-        assert!(cx.debug_bounds(selector).is_some(), "Copied feedback stays visible");
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "Copied feedback stays visible"
+        );
         cx.executor().advance_clock(Duration::from_millis(800));
         draw(cx);
         click(selector, cx);
