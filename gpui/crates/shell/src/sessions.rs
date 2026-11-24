@@ -904,6 +904,13 @@ impl crate::Shell {
         ) {
             return;
         }
+        // Read the task store with the transcript: the shell's roster facts may
+        // not be loaded yet when a chat opens at launch.
+        let card_source = self.owner.read(cx).iced_catalog().map(|catalog| {
+            let source = catalog.source.clone();
+            let tasks = crate::data::TaskSource::resolve(&source, cx);
+            (source, tasks, tab.clone())
+        });
         let Some(conversation) = tab.chat_session_id else {
             return;
         };
@@ -932,7 +939,25 @@ impl crate::Shell {
                     saved.map(Ok).unwrap_or_else(|| {
                         let projects =
                             projects.ok_or_else(|| "transcript source unavailable".to_string())?;
-                        read_iced_history(&projects, &conversation, &tab.dir, provider)
+                        let delegations = card_source
+                            .and_then(|(source, tasks, tab)| {
+                                match crate::data::RosterFacts::read(&source, &tasks) {
+                                    Ok(facts) => Some(chat_delegation_times(&facts, &tab)),
+                                    Err(error) => {
+                                        // The chat still opens; its cards go at the end.
+                                        eprintln!("read Iced delegations for history: {error:#}");
+                                        None
+                                    }
+                                }
+                            })
+                            .unwrap_or_default();
+                        read_iced_history(
+                            &projects,
+                            &conversation,
+                            &tab.dir,
+                            provider,
+                            &delegations,
+                        )
                     })
                 })
                 .await;
@@ -977,6 +1002,36 @@ impl crate::Shell {
         })
         .detach();
     }
+}
+
+/// Iced's `delegation_times_for_tab`: the chat's delegations as
+/// (id, created_at), oldest first, matched to their parent tab by core's rule.
+fn chat_delegation_times(
+    facts: &crate::data::RosterFacts,
+    tab: &gitterm_core::workspace_config::WorkspaceTabConfig,
+) -> Vec<(String, String)> {
+    let Some(this) = facts
+        .tabs
+        .iter()
+        .position(|t| t.session_uid == tab.session_uid && t.chat_session_id == tab.chat_session_id)
+    else {
+        return Vec::new();
+    };
+    let tabs = facts.tabs.iter().enumerate().filter_map(|(index, t)| {
+        (t.tab_kind.as_deref() == Some("agent")).then_some((
+            index,
+            t.session_uid.as_deref()?,
+            t.chat_session_id.as_deref(),
+            false,
+        ))
+    });
+    facts
+        .workers
+        .iter()
+        .rev()
+        .filter(|d| gitterm_core::delegations::parent_tab_id(&d.parent, tabs.clone()) == Some(this))
+        .map(|d| (d.delegation_id.clone(), d.created_at.clone()))
+        .collect()
 }
 
 /// Use Iced's index rules (generated title, summary/first real user message),
@@ -1034,6 +1089,7 @@ fn read_iced_history(
     conversation: &str,
     cwd: &str,
     provider: std::path::PathBuf,
+    delegations: &[(String, String)],
 ) -> Result<crate::chat::SavedChat, String> {
     use gitterm_core::harness::transcript::TranscriptEntry;
     use gitterm_gpui_chat::events::{Entry, Record};
@@ -1081,7 +1137,25 @@ fn read_iced_history(
         .map_err(|e| format!("Read transcript {}: {e}", path.display()))?;
     let mut records = Vec::new();
     let mut last_activity_ms = None;
-    for timed in gitterm_core::chat::history::parse_claude_transcript_timed(&source) {
+    let timeline = gitterm_core::chat::history::parse_claude_transcript_timed(&source);
+    // Iced's history_timeline rule: each card goes back where it was requested;
+    // a card with no place stays out here and lands at the end.
+    let mut anchors = gitterm_core::chat::history::history_anchor_positions(&timeline, delegations)
+        .into_iter()
+        .peekable();
+    let anchor = |id: String| Record {
+        at_ms: None,
+        entry: Entry::DisplayDelegation {
+            id,
+            title: String::new(),
+            state: "requested".into(),
+            body: String::new(),
+        },
+    };
+    for (index, timed) in timeline.into_iter().enumerate() {
+        while let Some((_, id)) = anchors.next_if(|(at, _)| *at == index) {
+            records.push(anchor(id));
+        }
         let at_ms = timestamp_ms(timed.at.as_deref());
         let entry = match timed.entry {
             TranscriptEntry::UserPrompt(text) => {
@@ -1126,6 +1200,7 @@ fn read_iced_history(
     if records.is_empty() {
         return Err("Transcript has no recorded history".into());
     }
+    records.extend(anchors.map(|(_, id)| anchor(id)));
     Ok(crate::chat::SavedChat {
         uid: format!("iced-{conversation}"),
         cwd: cwd.into(),
@@ -1255,6 +1330,7 @@ mod tests {
             "fixture-chat",
             "/fixture/cwd",
             "/fixture/provider".into(),
+            &[],
         )
         .unwrap();
         assert_eq!(saved.session_id.as_deref(), Some("fixture-chat"));
@@ -1275,7 +1351,8 @@ mod tests {
                 dir.path(),
                 "../escape",
                 "/fixture/cwd",
-                "/fixture/provider".into()
+                "/fixture/provider".into(),
+                &[]
             )
             .is_err()
         );
@@ -1284,7 +1361,8 @@ mod tests {
                 dir.path(),
                 "missing",
                 "/fixture/cwd",
-                "/fixture/provider".into()
+                "/fixture/provider".into(),
+                &[]
             )
             .is_err()
         );
@@ -1298,9 +1376,62 @@ mod tests {
                 dir.path(),
                 "empty",
                 "/fixture/cwd",
-                "/fixture/provider".into()
+                "/fixture/provider".into(),
+                &[]
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn imported_transcript_puts_cards_where_they_were_requested() {
+        use gitterm_gpui_chat::events::Entry;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("fixture-project");
+        std::fs::create_dir(&project).unwrap();
+        let source = concat!(
+            "{\"type\":\"user\",\"timestamp\":\"2026-01-01T10:00:00Z\",\"message\":{\"content\":\"Question\"}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-01-01T10:00:05Z\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"tool-1\",\"name\":\"mcp__gitterm_tasks__delegate_task\",\"input\":{}}]}}\n",
+            "{\"type\":\"user\",\"timestamp\":\"2026-01-01T10:00:06Z\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tool-1\",\"content\":\"{\\\"delegation_id\\\":\\\"d-tool\\\"}\",\"is_error\":false}]}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-01-01T10:00:07Z\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Started a worker\"}]}}\n",
+            "{\"type\":\"user\",\"timestamp\":\"2026-01-01T10:30:00Z\",\"message\":{\"content\":\"Later question\"}}\n"
+        );
+        std::fs::write(project.join("cards-chat.jsonl"), source).unwrap();
+        let delegations = [
+            ("d-tool".to_string(), "2026-01-01T10:00:05Z".to_string()),
+            ("d-page".to_string(), "2026-01-01T10:10:00Z".to_string()),
+            ("d-after".to_string(), "2026-01-02T00:00:00Z".to_string()),
+        ];
+        let saved = read_iced_history(
+            dir.path(),
+            "cards-chat",
+            "/fixture/cwd",
+            "/fixture/provider".into(),
+            &delegations,
+        )
+        .unwrap();
+        let order: Vec<String> = saved
+            .records
+            .iter()
+            .filter_map(|r| match &r.entry {
+                Entry::DisplayDelegation { id, .. } => Some(format!("card {id}")),
+                Entry::UserPrompt(text) => Some(format!("prompt {text}")),
+                Entry::Harness(gitterm_core::chat::types::HarnessEvent::ItemCompleted {
+                    ..
+                }) => Some("result".into()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "prompt Question",
+                "result",
+                "card d-tool",
+                "card d-page",
+                "prompt Later question",
+                "card d-after",
+            ]
         );
     }
 
@@ -1322,6 +1453,7 @@ mod tests {
             "timed-chat",
             "/fixture/cwd",
             "/fixture/provider".into(),
+            &[],
         )
         .unwrap();
         let mut timing = (None, None);
@@ -1435,6 +1567,7 @@ mod tests {
             "synthetic",
             "/fixture/repo",
             projects.path().join("provider"),
+            &[],
         )
         .unwrap();
         // The transcript has no turn markers: each prompt and the end of the
@@ -1486,6 +1619,90 @@ mod tests {
         }
         for hidden in ["transcript-row-3", "transcript-row-6", "transcript-row-7"] {
             assert!(cx.debug_bounds(hidden).is_none(), "{hidden} in its run");
+        }
+    }
+    /// Issue 98: a real Claude turn's transcript shape (its text replaced by
+    /// placeholders) folds into one closed "Worked for" row, as in Iced. The
+    /// turn has thinking, narration, Bash calls among metadata lines, an
+    /// answered AskUserQuestion, ToolSearch and MCP calls, a final text, a stop
+    /// hook summary, and then a GitTerm delivery and the next turn.
+    #[gpui::test]
+    fn real_claude_turn_shape_folds_into_one_worked_row(cx: &mut gpui::TestAppContext) {
+        use gitterm_gpui_chat::model::RowKind;
+        use gpui::{AppContext as _, VisualTestContext};
+        fn draw(cx: &mut VisualTestContext) {
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+        }
+        let projects = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(projects.path().join("fixture")).unwrap();
+        std::fs::write(
+            projects.path().join("fixture/real-shape.jsonl"),
+            include_str!("chat/fixtures/claude-turn-with-question.jsonl"),
+        )
+        .unwrap();
+        let saved = read_iced_history(
+            projects.path(),
+            "real-shape",
+            "/fixture/repo",
+            projects.path().join("provider"),
+            &[],
+        )
+        .unwrap();
+        let model = gitterm_gpui_chat::model::ChatModel::from_records(&saved.records);
+        // Rows: 0 prompt, 1..=50 the turn's work and narration, 51 its final
+        // text, 52 the delivery card, 53..=57 the next turn, 58 the last prompt.
+        let turn = &model.completed_turns[0];
+        assert_eq!(turn.rows, 1..52);
+        assert_eq!(turn.duration_ms, Some(470_458));
+        let rows = &model.rows[1..52];
+        // The answered question is an ordinary tool card, as Iced shows it.
+        assert!(rows.iter().all(|row| matches!(
+            row.kind,
+            RowKind::Thinking | RowKind::Assistant | RowKind::Tool
+        )));
+        assert!(rows.iter().any(|row| {
+            row.tool
+                .as_ref()
+                .is_some_and(|tool| tool.name == "AskUserQuestion")
+        }));
+        assert_eq!(model.rows[51].kind, RowKind::Assistant);
+        assert!(model.rows[52].delivery.is_some());
+        assert_eq!(model.rows[58].kind, RowKind::User);
+        let (_root, shell, cx) = crate::h6_tests::sample(cx);
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(crate::app_menus::TabSelect { index: 0 }), cx)
+        });
+        draw(cx);
+        cx.update(|window, cx| {
+            let shutdown = shell.read(cx).owner.read(cx).chat_shutdown.clone();
+            let preview = cx.new(|cx| crate::chat::ChatPane::history(shutdown, saved, window, cx));
+            let state = shell.read(cx).active(cx);
+            let pane = state.panes[&crate::session_pane_id(state.active_session.unwrap())].clone();
+            pane.update(cx, |pane, cx| {
+                pane.content = crate::pane::PaneContent::PreviewChat(preview);
+                cx.notify();
+            });
+        });
+        draw(cx);
+        let label = cx
+            .debug_bounds("work-fold-label-1")
+            .expect("one Worked row for the first turn");
+        assert!(label.size.width > gpui::px(0.));
+        assert!(cx.debug_bounds("work-fold-1").is_some());
+        for hidden in 2..51 {
+            let selector = Box::leak(format!("transcript-row-{hidden}").into_boxed_str());
+            assert!(cx.debug_bounds(selector).is_none(), "row {hidden} folded");
+            let fold = Box::leak(format!("work-fold-{hidden}").into_boxed_str());
+            assert!(
+                cx.debug_bounds(fold).is_none(),
+                "no second fold at {hidden}"
+            );
+        }
+        for shown in [0, 51] {
+            let selector = Box::leak(format!("transcript-row-{shown}").into_boxed_str());
+            assert!(cx.debug_bounds(selector).is_some(), "row {shown} shown");
         }
     }
 }
