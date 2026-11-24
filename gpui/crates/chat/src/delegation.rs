@@ -5,6 +5,7 @@ use gitterm_core::tasks::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DelegationCard {
@@ -15,6 +16,10 @@ pub struct DelegationCard {
     pub held: bool,
     #[serde(default)]
     pub worker: Option<Value>,
+    /// The chat checkout's HEAD, as Iced's `__setDelegationHead` supplies it,
+    /// for the "branch has moved" banner. The view stamps it on every card.
+    #[serde(default)]
+    pub checkout_head: Option<String>,
 }
 /// One block of Iced's `.dlg-body`, named after its class.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +46,8 @@ pub struct Control {
     pub label: String,
     pub tooltip: String,
     pub disabled: bool,
+    /// Iced's `button.primary`: Send, and Open worker tab while it waits.
+    pub primary: bool,
     pub action: TranscriptAction,
 }
 impl DelegationCard {
@@ -129,7 +136,7 @@ impl DelegationCard {
                     ReviewTargetMode::Base { reference } => {
                         format!("vs {reference} (+ uncommitted)")
                     }
-                    ReviewTargetMode::Commit { sha } => format!("commit {}", short(sha)),
+                    ReviewTargetMode::Commit { sha } => format!("commit {}", short_head(sha)),
                 };
                 if let Some(focus) = t.focus.as_ref().filter(|s| !s.is_empty()) {
                     text.push_str(&format!(" · focus: {focus}"));
@@ -237,10 +244,7 @@ impl DelegationCard {
                 "queued" => Some("Waiting for a free task slot."),
                 "blocked" => Some("The worker is blocked and needs you."),
                 "cancelled" => Some("No longer tracked. The worker tab and task are untouched."),
-                "failed" => Some(match &d.status {
-                    DelegationStatus::Failed { message } => message,
-                    _ => "The worker failed",
-                }),
+                "failed" => Some(failed_message(d, "The worker failed")),
                 _ => None,
             };
             if let Some(banner) = banner {
@@ -267,20 +271,24 @@ impl DelegationCard {
                         }
                     }));
                 }
-                DelegationStatus::Failed { message } => return crate::model::literal(message),
+                DelegationStatus::Failed { .. } => {
+                    return crate::model::literal(failed_message(d, "Codex failed"));
+                }
                 DelegationStatus::Interrupted => {
                     return "GitTerm restarted while this was running. Re-run it to try again."
                         .into();
                 }
                 DelegationStatus::Cancelled => return "Cancelled.".into(),
-                _ => {}
+                // Iced's renderCard renders a result for `completed` only.
+                DelegationStatus::Completed => {}
+                _ => return body,
             }
         }
         if let Some(result) = &d.result {
             if let Some(reviewed) = &result.reviewed {
                 body.push_str(&format!(
                     "Reviewed at {}{}{}\n\n",
-                    short(&reviewed.head),
+                    short_head(&reviewed.head),
                     if reviewed.dirty { ", dirty" } else { "" },
                     if !reviewed.target_description.is_empty()
                         && reviewed.target_description != "consult"
@@ -290,6 +298,10 @@ impl DelegationCard {
                         String::new()
                     }
                 ));
+                if let Some(banner) = self.moved_banner(&reviewed.head) {
+                    body.push_str(&crate::model::literal(&banner));
+                    body.push_str("\n\n");
+                }
             }
             if let Some(f) = &result.findings {
                 body.push_str(&format!(
@@ -350,10 +362,7 @@ impl DelegationCard {
                     path.map(|p| format!(" · {p}")).unwrap_or_default()
                 )));
             }
-            let failed = match &d.status {
-                DelegationStatus::Failed { message } => message.clone(),
-                _ => "The worker failed".into(),
-            };
+            let failed = failed_message(d, "The worker failed").to_owned();
             match self.worker_state() {
                 "waiting" => parts.push(CardPart::Banner(
                     "The worker is waiting for you. Open its tab to answer.".into(),
@@ -398,8 +407,8 @@ impl DelegationCard {
                     )));
                     return parts;
                 }
-                DelegationStatus::Failed { message } => {
-                    parts.push(CardPart::Error(message.clone()));
+                DelegationStatus::Failed { .. } => {
+                    parts.push(CardPart::Error(failed_message(d, "Codex failed").into()));
                     return parts;
                 }
                 DelegationStatus::Interrupted => {
@@ -412,7 +421,9 @@ impl DelegationCard {
                     parts.push(CardPart::Line("Cancelled.".into()));
                     return parts;
                 }
-                _ => {}
+                // Iced's renderCard has no body for a blocked review or consult.
+                DelegationStatus::Completed => {}
+                _ => return parts,
             }
         }
         let Some(result) = &d.result else {
@@ -421,7 +432,7 @@ impl DelegationCard {
         if let Some(reviewed) = &result.reviewed {
             parts.push(CardPart::Line(format!(
                 "Reviewed at {}{}{}",
-                short(&reviewed.head),
+                short_head(&reviewed.head),
                 if reviewed.dirty { ", dirty" } else { "" },
                 if !reviewed.target_description.is_empty()
                     && reviewed.target_description != "consult"
@@ -431,6 +442,9 @@ impl DelegationCard {
                     String::new()
                 }
             )));
+            if let Some(banner) = self.moved_banner(&reviewed.head) {
+                parts.push(CardPart::Banner(banner));
+            }
         }
         if let Some(f) = &result.findings {
             parts.push(CardPart::Line(format!(
@@ -463,6 +477,17 @@ impl DelegationCard {
         }
         parts
     }
+    /// Iced's renderResult banner when the checkout's HEAD is no longer the
+    /// reviewed commit.
+    fn moved_banner(&self, reviewed: &str) -> Option<String> {
+        let head = self.checkout_head.as_deref().filter(|h| !h.is_empty())?;
+        (!reviewed.is_empty() && head != reviewed).then(|| {
+            format!(
+                "The branch has moved since (now at {}); line numbers may have drifted.",
+                short_head(head)
+            )
+        })
+    }
     /// The handoff summary, the one block Iced renders as markdown.
     pub fn report(&self) -> String {
         self.parts()
@@ -479,15 +504,19 @@ impl DelegationCard {
             DelegationStatus::Completed | DelegationStatus::Failed { .. }
         ) || (self.is_worker() && self.delegation.status == DelegationStatus::Blocked)
     }
-    pub fn controls(&self, busy: bool) -> Vec<Control> {
+    /// The actions row. `selected` is the card's checked finding ids
+    /// (Iced's `card.selected`); with findings and none checked, Send is
+    /// disabled (`refreshCardSend`).
+    pub fn controls(&self, busy: bool, selected: &HashSet<String>) -> Vec<Control> {
         let d = &self.delegation;
         let worker = self.is_worker();
         let mut controls = Vec::new();
-        let mut add = |label: &str, tooltip: &str, disabled, action| {
+        let mut add = |label: &str, tooltip: &str, disabled, primary, action| {
             controls.push(Control {
                 label: label.into(),
                 tooltip: tooltip.into(),
                 disabled,
+                primary,
                 action,
             })
         };
@@ -500,6 +529,7 @@ impl DelegationCard {
                     "The worker tab is not open"
                 },
                 false,
+                self.worker_state() == "waiting",
                 TranscriptAction::OpenWorker {
                     id: d.delegation_id.clone(),
                 },
@@ -511,16 +541,22 @@ impl DelegationCard {
             } else {
                 "Send to Claude"
             };
+            // Iced's refreshCardSend runs last and sets the title for every
+            // card it can send, a worker's included; a held button has none.
+            let none = !selected_any(self.findings(), selected);
             add(
                 label,
-                if busy {
+                if self.held {
+                    ""
+                } else if none {
+                    "Select at least one finding"
+                } else if busy {
                     "Claude is working; it is sent when this turn ends"
-                } else if worker {
-                    "Send the worker's report as a message"
                 } else {
                     "Send the selected findings as a message"
                 },
-                self.held,
+                self.held || none,
+                true,
                 TranscriptAction::PreviewOnly {
                     label: label.into(),
                 },
@@ -535,6 +571,7 @@ impl DelegationCard {
             add(
                 "Re-run",
                 "",
+                false,
                 false,
                 TranscriptAction::PreviewOnly {
                     label: "Re-run".into(),
@@ -563,6 +600,7 @@ impl DelegationCard {
                     ""
                 },
                 false,
+                false,
                 TranscriptAction::Dismiss(crate::interactions::DismissRequest {
                     id: d.delegation_id.clone(),
                     label: label.into(),
@@ -590,8 +628,26 @@ pub fn finding_location(f: &gitterm_core::tasks::ReviewFinding) -> Option<String
             .unwrap_or_default()
     ))
 }
-fn short(value: &str) -> String {
-    value.chars().take(8).collect()
+/// Iced's `shortHead`: seven characters, `?` when there is none.
+fn short_head(value: &str) -> String {
+    if value.is_empty() {
+        return "?".into();
+    }
+    value.chars().take(7).collect()
+}
+/// Iced's `(d.status && d.status.message) || fallback`.
+fn failed_message<'a>(d: &'a Delegation, fallback: &'a str) -> &'a str {
+    match &d.status {
+        DelegationStatus::Failed { message } if !message.is_empty() => message,
+        _ => fallback,
+    }
+}
+/// False when the card lists findings and none is checked.
+fn selected_any(
+    findings: Option<&gitterm_core::tasks::ReviewFindings>,
+    selected: &HashSet<String>,
+) -> bool {
+    findings.is_none_or(|f| f.findings.is_empty()) || !selected.is_empty()
 }
 
 #[cfg(test)]

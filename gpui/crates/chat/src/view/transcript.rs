@@ -37,6 +37,28 @@ pub(super) fn card_border(
     }
 }
 
+/// Iced's `.sev.<P0..P3>` badge: background, then text colour.
+pub(super) fn severity_colors(
+    severity: gitterm_core::tasks::ReviewSeverity,
+    palette: crate::appearance::ChatPalette,
+) -> (u32, u32) {
+    use gitterm_core::tasks::ReviewSeverity::*;
+    match severity {
+        P0 => (palette.err, palette.base),
+        P1 => (palette.tool, palette.base),
+        P2 => (palette.warn, palette.base),
+        P3 => (palette.strong, palette.fg),
+    }
+}
+
+/// CSS `filter: brightness(1.1)`: each channel times 1.1, clamped.
+pub(super) fn brightened(color: u32) -> u32 {
+    [16, 8, 0].into_iter().fold(0, |out, shift| {
+        let channel = ((color >> shift) & 0xff) as f32 * 1.1;
+        out | ((channel.round().min(255.) as u32) << shift)
+    })
+}
+
 impl ChatView {
     pub fn set_imported_offer(
         &mut self,
@@ -232,34 +254,298 @@ impl ChatView {
     }
 }
 impl RowView {
-    pub(super) fn update_edit_text(&mut self, cx: &mut Context<Self>) {
-        if self.row.edits().is_empty() {
-            self.edit_text = None;
-            return;
-        }
-        let output = self
+    /// Iced's result `<pre>`: the shown output, or all of it while find
+    /// searches tool output.
+    pub(super) fn update_output_text(&mut self, cx: &mut Context<Self>) {
+        let Some(output) = self
             .row
             .tool
             .as_ref()
-            .and_then(|tool| tool.output.as_ref().map(|output| (tool.is_error, output)))
-            .filter(|(_, output)| !output.trim().is_empty() && output.trim() != "null")
-            .map(|(error, output)| {
-                format!(
-                    "**{}**\n\n{}",
-                    if error { "Error" } else { "Result" },
-                    crate::model::code(output, "text")
-                )
-            })
-            .unwrap_or_default();
-        if let Some(text) = &self.edit_text {
-            text.update(cx, |text, cx| text.set_text(&output, cx));
+            .and_then(|tool| tool.output.as_deref())
+        else {
+            self.output_text = None;
+            return;
+        };
+        self.output_full = !self.query.is_empty();
+        let shown = if self.output_full && !output.is_empty() {
+            output.to_string()
         } else {
-            self.edit_text = Some(cx.new(|cx| {
-                TextViewState::markdown(&output, cx)
+            crate::model::shown_output(output)
+        };
+        let source = crate::model::code(&shown, "text");
+        if let Some(text) = &self.output_text {
+            text.update(cx, |text, cx| text.set_text(&source, cx));
+        } else {
+            self.output_text = Some(cx.new(|cx| {
+                TextViewState::markdown(&source, cx)
                     .selectable(true)
-                    .scrollable(false)
+                    .scrollable(true)
             }));
         }
+    }
+    /// Iced's `.tool-label`.
+    fn tool_label(&self, label: &'static str) -> gpui::Div {
+        div()
+            .mt(px(6.))
+            .mb(px(3.))
+            .text_size(px(self.appearance.size(10.)))
+            .text_color(rgb(self.appearance.palette().muted))
+            .child(label)
+    }
+    /// Iced's `.tool-body pre`: monospace, scrolled past 320px.
+    fn tool_pre(
+        &self,
+        state: Option<&Entity<TextViewState>>,
+        error: bool,
+        selector: String,
+    ) -> gpui::AnyElement {
+        let palette = self.appearance.palette();
+        let pre = div()
+            .debug_selector(move || selector.clone())
+            .px(px(8.))
+            .py(px(6.))
+            .rounded(px(4.))
+            .bg(rgb(palette.alt))
+            .text_color(rgb(if error { palette.err } else { palette.fg }));
+        let Some(state) = state else {
+            // An input not yet known: Iced's empty `<pre>`.
+            return pre.into_any_element();
+        };
+        let blank = gpui::StyleRefinement::default()
+            .p(px(0.))
+            .m(px(0.))
+            .bg(gpui::transparent_black());
+        pre.child(
+            TextView::new(state)
+                .font_family("Menlo")
+                .text_size(px(self.appearance.size(12.)))
+                .selectable(true)
+                .scrollable(true)
+                .max_h(px(320.))
+                .style(gpui_component::text::TextViewStyle::default().code_block(blank)),
+        )
+        .into_any_element()
+    }
+    /// Iced's `details.tool`: summary of name, salient argument, edit counts,
+    /// review action and waiting badge; then its Input (or Changes) and Result.
+    pub(super) fn render_tool(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let palette = self.appearance.palette();
+        let size = |n| px(self.appearance.size(n));
+        let tool = self.row.tool.clone().expect("tool row");
+        let color = if tool.is_error {
+            palette.err
+        } else if tool.output.is_some() {
+            palette.result
+        } else {
+            palette.tool
+        };
+        let edits = self.row.edits();
+        let path = edits.first().map(|edit| edit.path.clone());
+        // Iced's `displayPath`: relative to the chat's checkout.
+        let brief = match &path {
+            Some(path) => self
+                .cwd
+                .as_deref()
+                .map(|cwd| cwd.trim_end_matches('/'))
+                .filter(|cwd| !cwd.is_empty())
+                .and_then(|cwd| path.strip_prefix(&format!("{cwd}/")))
+                .unwrap_or(path)
+                .to_string(),
+            None => super::tool_runs::salient(&tool)
+                .unwrap_or_default()
+                .to_string(),
+        };
+        let (added, removed) = edits.iter().fold((0, 0), |(added, removed), edit| {
+            let rows = crate::interactions::edit_lines(edit).rows;
+            (
+                added + rows.iter().filter(|line| line.sign == '+').count(),
+                removed + rows.iter().filter(|line| line.sign == '-').count(),
+            )
+        });
+        let id = self.row.id;
+        let fold = Button::new("fold")
+            .ghost()
+            .h_auto()
+            .flex_1()
+            .min_w_0()
+            .p_0()
+            .debug_selector(move || "row-fold".into())
+            .flex()
+            .justify_start()
+            .items_baseline()
+            .gap(px(8.))
+            .cursor_pointer()
+            .child(
+                div()
+                    .text_size(size(10.))
+                    .text_color(rgb(palette.muted))
+                    .child(if self.open { "▾" } else { "▸" }),
+            )
+            .child(
+                div()
+                    .debug_selector(move || format!("tool-name-{id}"))
+                    .flex_shrink_0()
+                    .font_family("Menlo")
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(size(12.5))
+                    .text_color(rgb(color))
+                    .child(tool.name.clone()),
+            )
+            .child(
+                div()
+                    .debug_selector(move || format!("tool-brief-{id}"))
+                    .flex_1()
+                    .min_w_0()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .font_family("Menlo")
+                    .text_size(size(12.))
+                    .text_color(rgb(palette.muted))
+                    .child(brief),
+            )
+            .when(path.is_some(), |fold| {
+                fold.child(
+                    div()
+                        .flex_shrink_0()
+                        .flex()
+                        .font_family("Menlo")
+                        .text_size(size(11.5))
+                        .child(
+                            div()
+                                .text_color(rgb(palette.user))
+                                .child(format!("+{added}")),
+                        )
+                        .child(
+                            div()
+                                .ml(px(4.))
+                                .text_color(rgb(palette.err))
+                                .child(format!("−{removed}")),
+                        ),
+                )
+            })
+            .when_some(path.clone(), |fold, path| fold.tooltip(path))
+            .on_click(cx.listener(Self::toggle));
+        // Iced offers review only for an absolute path.
+        let review = path.filter(|path| path.starts_with('/')).map(|path| {
+            let action = self.action.clone();
+            Button::new("edit-review")
+                .ghost()
+                .xsmall()
+                .label("Open in review")
+                .debug_selector(move || format!("edit-review-{id}"))
+                .tooltip(format!("Open {path} in the review pane"))
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    action(
+                        crate::interactions::TranscriptAction::OpenFile {
+                            path: std::path::PathBuf::from(&path),
+                            review: true,
+                        },
+                        cx,
+                    );
+                })
+        });
+        let badge = tool.badge.map(|badge| {
+            div()
+                .debug_selector(move || format!("tool-badge-{id}"))
+                .flex_shrink_0()
+                .whitespace_nowrap()
+                .text_size(size(11.))
+                .text_color(rgb(palette.warn))
+                .child(badge)
+        });
+        let summary = div()
+            .flex()
+            .items_baseline()
+            .gap(px(8.))
+            .pl(px(13.))
+            .pr(px(10.))
+            .py(px(5.))
+            .child(fold)
+            .children(review)
+            .children(badge);
+        let mut body = div().pl(px(13.)).pr(px(10.)).pb(px(8.)).flex().flex_col();
+        if edits.is_empty() {
+            let input = crate::model::tool_input_text(&tool);
+            body = body.child(self.tool_label("INPUT")).child(self.tool_pre(
+                (!input.is_empty()).then_some(&self.text),
+                false,
+                format!("tool-input-{id}"),
+            ));
+        } else {
+            body = body
+                .child(self.tool_label("CHANGES"))
+                .children(self.render_edits(cx));
+        }
+        if tool.output.is_some() {
+            body = body
+                .child(self.tool_label(if tool.is_error { "ERROR" } else { "RESULT" }))
+                .child(self.tool_pre(
+                    self.output_text.as_ref(),
+                    tool.is_error,
+                    format!("tool-output-{id}"),
+                ));
+        }
+        div()
+            .debug_selector(move || format!("tool-card-{id}"))
+            .relative()
+            .bg(rgb(palette.base))
+            .border_1()
+            .border_l_0()
+            .border_color(rgb(palette.border))
+            .rounded(px(6.))
+            .text_size(size(13.))
+            // Iced's 3px state-coloured left border.
+            .child(
+                div()
+                    .debug_selector(move || format!("tool-border-{id}"))
+                    .absolute()
+                    .left_0()
+                    .top(px(-1.))
+                    .bottom(px(-1.))
+                    .w(px(3.))
+                    .rounded_l(px(6.))
+                    .bg(rgb(color)),
+            )
+            .child(
+                Collapsible::new()
+                    .open(self.open)
+                    .child(summary)
+                    .content(body),
+            )
+            .into_any_element()
+    }
+    /// Iced's `.block.<kind>` for a pi event.
+    pub(super) fn render_legacy(
+        &self,
+        block: crate::model::LegacyBlock,
+        content: gpui::Div,
+    ) -> gpui::AnyElement {
+        use crate::model::LegacyBlock;
+        let palette = self.appearance.palette();
+        div()
+            .px(px(10.))
+            .py(px(6.))
+            .rounded(px(6.))
+            .border_l_3()
+            .border_color(rgb(match block {
+                LegacyBlock::Tool => palette.tool,
+                LegacyBlock::ToolResult => palette.result,
+                LegacyBlock::Thinking => palette.strong,
+            }))
+            .when(block != LegacyBlock::Thinking, |div| {
+                div.bg(rgb(palette.block))
+            })
+            .when(block == LegacyBlock::Thinking, |div| div.italic())
+            .child(
+                div()
+                    .mb(px(4.))
+                    .opacity(0.85)
+                    .text_size(px(self.appearance.size(11.)))
+                    .child(self.row.title.to_uppercase()),
+            )
+            .child(content)
+            .into_any_element()
     }
     pub(super) fn expand_edit(&mut self, index: usize, cx: &mut Context<Self>) {
         self.expanded_edits.insert(index);
@@ -268,29 +554,136 @@ impl RowView {
         });
         cx.notify();
     }
+    /// Iced's `.ed-block` per edit: a header with its title and counts, then
+    /// the line diff (scrolled past 480px), Show all and its notes.
     pub(super) fn render_edits(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let palette = self.appearance.palette();
-        self.row.edits().iter().enumerate().map(|(index,edit)| {
-            let diff=edit_lines(edit);
-            let expanded=self.expanded_edits.contains(&index);
-            let added=diff.rows.iter().filter(|line|line.sign=='+').count();
-            let removed=diff.rows.iter().filter(|line|line.sign=='-').count();
-            let skip=|n|div().text_color(rgb(palette.muted)).child(format!("⋯ {n} unchanged line{}",if n==1{""}else{"s"}));
-            div().flex().flex_col().gap(px(2.)).font_family("Menlo").text_size(px(self.appearance.size(12.)))
-                .child(format!("{} · {}  +{added} −{removed}",edit.path,crate::interactions::edit_title(&self.row,index)))
-                .children((diff.skipped_before>0).then(||skip(diff.skipped_before)))
+        let size = |n| px(self.appearance.size(n));
+        let id = self.row.id;
+        let note = |text: String| {
+            div()
+                .px(px(8.))
+                .py(px(1.))
+                .text_size(size(11.))
+                .text_color(rgb(palette.muted))
+                .italic()
+                .child(text)
+        };
+        let skip = |n: usize| {
+            note(format!(
+                "⋯ {n} unchanged line{}",
+                if n == 1 { "" } else { "s" }
+            ))
+        };
+        // `color-mix(in srgb, <colour> 13%, transparent)`.
+        let tint = |color: u32| gpui::rgba((color << 8) | 0x21);
+        self.row.edits().iter().enumerate().map(|(index, edit)| {
+            let diff = edit_lines(edit);
+            let expanded = self.expanded_edits.contains(&index);
+            let added = diff.rows.iter().filter(|line| line.sign == '+').count();
+            let removed = diff.rows.iter().filter(|line| line.sign == '-').count();
+            let head = div()
+                .flex()
+                .items_baseline()
+                .gap(px(8.))
+                .px(px(8.))
+                .py(px(2.))
+                .border_b_1()
+                .border_color(rgb(palette.border))
+                .bg(rgb(palette.block))
+                .text_size(size(11.))
+                .text_color(rgb(palette.muted))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(crate::interactions::edit_title(&self.row, index)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_shrink_0()
+                        .font_family("Menlo")
+                        .child(div().text_color(rgb(palette.user)).child(format!("+{added}")))
+                        .child(div().ml(px(4.)).text_color(rgb(palette.err)).child(format!("−{removed}"))),
+                );
+            let lines = div()
+                .id(("ed-lines", index))
+                .debug_selector(move || format!("edit-lines-{id}-{index}"))
+                .max_h(px(480.))
+                .overflow_y_scroll()
+                .font_family("Menlo")
+                .text_size(size(12.))
+                .line_height(gpui::relative(1.45))
+                .children((diff.skipped_before > 0).then(|| skip(diff.skipped_before)))
                 .children(diff.shown(expanded).iter().map(|line| {
-                    div().flex().gap(px(8.)).w_full()
-                        .text_color(rgb(match line.sign {'+'=>palette.user,'-'=>palette.err,_=>palette.muted}))
-                        .when(!self.query.is_empty() && !find_ranges(&line.text,&self.query).is_empty(),|row|row.bg(rgb(0x665c32)))
-                        .child(line.sign.to_string()).child(if line.text.is_empty(){"\u{200b}".into()}else{line.text.clone()})
+                    let sign = match line.sign {
+                        '+' => palette.user,
+                        '-' => palette.err,
+                        _ => palette.muted,
+                    };
+                    div()
+                        .flex()
+                        .w_full()
+                        .when(line.sign == '+', |row| row.bg(tint(palette.user)))
+                        .when(line.sign == '-', |row| row.bg(tint(palette.err)))
+                        .when(
+                            !self.query.is_empty() && !find_ranges(&line.text, &self.query).is_empty(),
+                            |row| row.bg(rgb(0x665c32)),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(self.appearance.size(12.) * 1.6))
+                                .flex()
+                                .justify_center()
+                                .text_color(rgb(sign))
+                                .child(line.sign.to_string()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .pr(px(8.))
+                                .when(!matches!(line.sign, '+' | '-'), |text| {
+                                    text.text_color(rgb(palette.muted))
+                                })
+                                .child(if line.text.is_empty() {
+                                    "\u{200b}".into()
+                                } else {
+                                    line.text.clone()
+                                }),
+                        )
                 }))
-                .children((diff.skipped_after>0).then(||skip(diff.skipped_after)))
-                .children(diff.more_label(expanded).map(|label| Button::new(("edit-more",index)).ghost().small().label(label)
-                    .debug_selector({let id=self.row.id;move||format!("edit-more-{id}-{index}")})
-                    .on_click(cx.listener(move|row,_,_,cx|row.expand_edit(index,cx)))))
-                .children((added==0 && removed==0).then(||div().child("No line changes")))
-                .children(diff.capped.then(||div().child("Too long to compare line by line: shown as all removed, then all added")))
+                .children((diff.skipped_after > 0).then(|| skip(diff.skipped_after)));
+            div()
+                .debug_selector(move || format!("edit-block-{id}-{index}"))
+                .when(index > 0, |block| block.mt(px(6.)))
+                .flex()
+                .flex_col()
+                .border_1()
+                .border_color(rgb(palette.border))
+                .rounded(px(4.))
+                .bg(rgb(palette.alt))
+                .overflow_hidden()
+                .child(head)
+                .child(lines)
+                .children(diff.more_label(expanded).map(|label| {
+                    div().mt(px(4.)).mx(px(8.)).mb(px(6.)).child(
+                        Button::new(("edit-more", index))
+                            .ghost()
+                            .xsmall()
+                            .label(label)
+                            .debug_selector(move || format!("edit-more-{id}-{index}"))
+                            .on_click(cx.listener(move |row, _, _, cx| row.expand_edit(index, cx))),
+                    )
+                }))
+                .children((added == 0 && removed == 0).then(|| note("No line changes".into())))
+                .children(diff.capped.then(|| {
+                    note("Too long to compare line by line: shown as all removed, then all added".into())
+                }))
                 .into_any_element()
         }).collect()
     }
@@ -300,7 +693,15 @@ impl RowView {
         let palette = appearance.palette();
         let id = self.row.id;
         let class = card.state_class().to_owned();
-        let controls = card.controls(self.busy);
+        let findings = card
+            .findings()
+            .map(|f| f.findings.clone())
+            .unwrap_or_default();
+        let selected = self
+            .selected_findings
+            .get_or_insert_with(|| findings.iter().map(|f| f.id.clone()).collect())
+            .clone();
+        let controls = card.controls(self.busy, &selected);
         let sent = card.sendable() && card.delivered();
         let mut sent_shown = false;
         // Iced's `.dlg-note`: muted, 11.5/14.
@@ -318,10 +719,29 @@ impl RowView {
                 sent_shown = true;
             }
             let action = self.action.clone();
+            let primary = control.primary;
+            let disabled = control.disabled;
             // Iced's `.dlg-actions button`: padding 4px 10px, 12/14.
             actions.push(
                 Button::new(("delegation-action", index))
                     .small()
+                    // Iced's `button.primary`: accent fill and border, base
+                    // text, brightness(1.1) on hover, opacity .4 disabled.
+                    .when(primary, |button| {
+                        button
+                            .custom(
+                                gpui_component::button::ButtonCustomVariant::new(cx)
+                                    .color(rgb(palette.accent).into())
+                                    .foreground(rgb(palette.base).into())
+                                    .hover(rgb(brightened(palette.accent)).into())
+                                    .active(rgb(brightened(palette.accent)).into()),
+                            )
+                            .border_1()
+                            .bg(rgb(palette.accent))
+                            .border_color(rgb(palette.accent))
+                            .text_color(rgb(palette.base))
+                            .when(disabled, |button| button.opacity(0.4))
+                    })
                     .h_auto()
                     .px(px(10.))
                     .py(px(4.))
@@ -334,7 +754,15 @@ impl RowView {
                             .text_size(px(appearance.size(12.)))
                             .child(control.label.clone()),
                     )
-                    .debug_selector(move || format!("delegation-action-{id}-{}", control.label))
+                    .debug_selector({
+                        let label = control.label.clone();
+                        move || {
+                            format!(
+                                "delegation-action-{id}-{label}{}",
+                                if primary { "-primary" } else { "" }
+                            )
+                        }
+                    })
                     .tooltip(control.tooltip)
                     .disabled(control.disabled)
                     .on_click(move |_, _, cx| {
@@ -347,14 +775,6 @@ impl RowView {
         if sent && !sent_shown {
             actions.push(note("sent to chat ✓".into()));
         }
-        let findings = card
-            .findings()
-            .map(|f| f.findings.clone())
-            .unwrap_or_default();
-        let selected = self
-            .selected_findings
-            .get_or_insert_with(|| findings.iter().map(|f| f.id.clone()).collect())
-            .clone();
         let [_, target, state] = card.fold_parts(self.open, crate::composer::now_ms());
         let kind_color = match class.as_str() {
             "completed" | "done" => palette.result,
@@ -367,7 +787,15 @@ impl RowView {
             "waiting" | "blocked" => palette.warn,
             _ => palette.muted,
         };
-        let body = self.render_card_parts(card.parts(), cx);
+        let (body, parts_bottom) = self.render_card_parts(card.parts(), cx);
+        // Iced's `.dlg-findings` (margin 4px 0) and `.dlg-actions`
+        // (margin-top 8px) collapse with the block margin above them.
+        let list_top = f32::max(4. - parts_bottom, 0.);
+        let actions_top = if findings.is_empty() {
+            f32::max(8. - parts_bottom, 0.)
+        } else {
+            4.
+        };
         // Iced lays each flex child out with `min-width: 0`: a long line
         // wraps (findings) or shortens with an ellipsis (summary, location)
         // instead of widening the card past the transcript.
@@ -440,98 +868,26 @@ impl RowView {
                         .pr(px(10.))
                         .pb(px(8.))
                         .children(body)
-                        .children(findings.into_iter().map(|finding| {
-                            let location = crate::delegation::finding_location(&finding);
-                            let file = finding.file.clone();
-                            let open = self.action.clone();
-                            div()
-                                .flex()
-                                .min_w_0()
-                                .gap(px(8.))
-                                .items_start()
-                                .when(
-                                    !self.query.is_empty()
-                                        && !find_ranges(
-                                            &format!("{}\n{}", finding.title, finding.body),
-                                            &self.query,
-                                        )
-                                        .is_empty(),
-                                    |row| row.bg(rgb(0x665c32)),
-                                )
-                                .child(
-                                    Checkbox::new(gpui::SharedString::from(format!(
-                                        "finding-{}",
-                                        finding.id
-                                    )))
-                                    .checked(selected.contains(&finding.id))
-                                    .accessibility_label(finding.title.clone())
-                                    .disabled(card.delivered())
-                                    .debug_selector({
-                                        let fid = finding.id.clone();
-                                        move || format!("finding-select-{id}-{fid}")
-                                    })
-                                    .on_click(cx.listener({
-                                        let fid = finding.id.clone();
-                                        move |this, checked: &bool, _, cx| {
-                                            if let Some(set) = this.selected_findings.as_mut() {
-                                                if *checked {
-                                                    set.insert(fid.clone());
-                                                } else {
-                                                    set.remove(&fid);
-                                                }
-                                            }
-                                            cx.notify();
-                                        }
-                                    })),
-                                )
-                                .child(
-                                    div()
-                                        .debug_selector({
-                                            let fid = finding.id.clone();
-                                            move || format!("finding-main-{id}-{fid}")
-                                        })
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(3.))
-                                        .flex_1()
-                                        .min_w_0()
-                                        .child(format!(
-                                            "{:?} {} {}",
-                                            finding.severity, finding.id, finding.title
-                                        ))
-                                        .children(location.map(|location| {
-                                            Button::new(gpui::SharedString::from(format!(
-                                                "finding-location-{}",
-                                                finding.id
-                                            )))
-                                            .ghost()
-                                            .small()
-                                            .max_w_full()
-                                            .min_w_0()
-                                            .overflow_hidden()
-                                            .child(div().min_w_0().text_ellipsis().child(location))
-                                            .debug_selector({
-                                                let fid = finding.id.clone();
-                                                move || format!("finding-location-{id}-{fid}")
-                                            })
-                                            .tooltip(format!(
-                                                "Open {} in the file viewer",
-                                                file.as_ref().unwrap().display()
-                                            ))
-                                            .on_click(move |_, _, cx| {
-                                                cx.stop_propagation();
-                                                open(
-                                                    TranscriptAction::OpenFile {
-                                                        path: file.clone().unwrap(),
-                                                        review: false,
-                                                    },
-                                                    cx,
-                                                );
-                                            })
-                                        }))
-                                        .child(finding.body),
-                                )
-                        }))
+                        // Iced's `ul.dlg-findings`: margin 4px 0, no padding.
+                        .when(!findings.is_empty(), |body| {
+                            let delivered = card.delivered();
+                            body.child(
+                                div()
+                                    .debug_selector(move || format!("delegation-findings-{id}"))
+                                    .flex()
+                                    .flex_col()
+                                    .min_w_0()
+                                    .mt(px(list_top))
+                                    .mb(px(4.))
+                                    .children(findings.into_iter().enumerate().map(
+                                        |(index, finding)| {
+                                            self.render_finding(
+                                                index, finding, &selected, delivered, cx,
+                                            )
+                                        },
+                                    )),
+                            )
+                        })
                         // Iced's `.dlg-actions`: margin-top 8px, gap 6px.
                         .child(
                             div()
@@ -540,7 +896,7 @@ impl RowView {
                                 .flex_wrap()
                                 .items_center()
                                 .gap(px(6.))
-                                .mt(px(8.))
+                                .mt(px(actions_top))
                                 .children(actions)
                                 .child(note(
                                     card.delegation
@@ -554,13 +910,188 @@ impl RowView {
             })
             .into_any_element()
     }
+    /// Iced's `li.dlg-finding`: checkbox, then `.dlg-fmain` with the
+    /// severity badge, id and title, the location link and the body.
+    fn render_finding(
+        &self,
+        index: usize,
+        finding: gitterm_core::tasks::ReviewFinding,
+        selected: &HashSet<String>,
+        delivered: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let appearance = self.appearance;
+        let palette = appearance.palette();
+        let id = self.row.id;
+        let fid = finding.id.clone();
+        let location = crate::delegation::finding_location(&finding);
+        let file = finding.file.clone();
+        let open = self.action.clone();
+        let (badge_bg, badge_fg) = severity_colors(finding.severity, palette);
+        let severity = format!("{:?}", finding.severity);
+        // `.dlg-finding`: flex, gap 6px, padding 4px 0, a top rule except first.
+        div()
+            .debug_selector({
+                let fid = fid.clone();
+                move || format!("finding-row-{id}-{fid}")
+            })
+            .flex()
+            .min_w_0()
+            .gap(px(6.))
+            .items_start()
+            .py(px(4.))
+            .when(index > 0, |row| {
+                row.border_t_1().border_color(rgb(palette.border))
+            })
+            .when(
+                !self.query.is_empty()
+                    && !find_ranges(&format!("{}\n{}", finding.title, finding.body), &self.query)
+                        .is_empty(),
+                |row| row.bg(rgb(0x665c32)),
+            )
+            .child(
+                // A checkbox's UA margin is 3px 3px 3px 4px; Iced sets the top to 3px.
+                div().flex_none().mt(px(3.)).ml(px(4.)).mr(px(3.)).child(
+                    Checkbox::new(gpui::SharedString::from(format!("finding-{fid}")))
+                        .checked(selected.contains(&fid))
+                        .accessibility_label(finding.title.clone())
+                        .disabled(delivered)
+                        .debug_selector({
+                            let fid = fid.clone();
+                            move || format!("finding-select-{id}-{fid}")
+                        })
+                        .on_click(cx.listener({
+                            let fid = fid.clone();
+                            move |this, checked: &bool, _, cx| {
+                                if let Some(set) = this.selected_findings.as_mut() {
+                                    if *checked {
+                                        set.insert(fid.clone());
+                                    } else {
+                                        set.remove(&fid);
+                                    }
+                                }
+                                cx.notify();
+                            }
+                        })),
+                ),
+            )
+            .child(
+                div()
+                    .debug_selector({
+                        let fid = fid.clone();
+                        move || format!("finding-main-{id}-{fid}")
+                    })
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .flex()
+                            .items_baseline()
+                            .min_w_0()
+                            .child(
+                                // `.sev`: mono 10.5/14, padding 0 5px, radius 4px.
+                                div()
+                                    .debug_selector({
+                                        let fid = fid.clone();
+                                        move || format!("finding-severity-{id}-{fid}")
+                                    })
+                                    .flex_none()
+                                    .px(px(5.))
+                                    .rounded(px(4.))
+                                    .bg(rgb(badge_bg))
+                                    .text_color(rgb(badge_fg))
+                                    .font_family("Menlo")
+                                    .text_size(px(appearance.size(10.5)))
+                                    .line_height(gpui::relative(1.2))
+                                    .child(severity),
+                            )
+                            // The text node between the badge and the id.
+                            .child(div().flex_none().child("\u{a0}"))
+                            .child(
+                                // `.dlg-fid`: mono 11.5/14, muted, then a space.
+                                div()
+                                    .debug_selector({
+                                        let fid = fid.clone();
+                                        move || format!("finding-id-{id}-{fid}")
+                                    })
+                                    .flex_none()
+                                    .font_family("Menlo")
+                                    .text_size(px(appearance.size(11.5)))
+                                    .text_color(rgb(palette.muted))
+                                    .child(format!("{fid}\u{a0}")),
+                            )
+                            .child(
+                                // `.dlg-ftitle`: weight 600.
+                                div()
+                                    .debug_selector({
+                                        let fid = fid.clone();
+                                        move || format!("finding-title-{id}-{fid}")
+                                    })
+                                    .flex_1()
+                                    .min_w_0()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(finding.title.clone()),
+                            ),
+                    )
+                    .children(location.map(|location| {
+                        let file = file.clone().expect("a location has a file");
+                        let tooltip = format!("Open {} in the file viewer", file.display());
+                        // `.dlg-loc`: mono 11.5/14 accent, underlined, a pointer,
+                        // the whole location (no ellipsis), as wide as its text.
+                        div().flex().min_w_0().child(
+                            div()
+                                .id(gpui::SharedString::from(format!("finding-location-{fid}")))
+                                .debug_selector({
+                                    let fid = fid.clone();
+                                    move || format!("finding-location-{id}-{fid}")
+                                })
+                                .min_w_0()
+                                .cursor_pointer()
+                                .font_family("Menlo")
+                                .text_size(px(appearance.size(11.5)))
+                                .text_color(rgb(palette.accent))
+                                .underline()
+                                .text_decoration_color(rgb(palette.accent))
+                                .tooltip(move |window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(tooltip.clone())
+                                        .build(window, cx)
+                                })
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    open(
+                                        TranscriptAction::OpenFile {
+                                            path: file.clone(),
+                                            review: false,
+                                        },
+                                        cx,
+                                    );
+                                })
+                                .child(location),
+                        )
+                    }))
+                    .when(!finding.body.is_empty(), |main| {
+                        // `.dlg-fbody`: muted 12/14, margin-top 2px.
+                        main.child(
+                            div()
+                                .debug_selector(move || format!("finding-body-{id}-{fid}"))
+                                .mt(px(2.))
+                                .text_color(rgb(palette.muted))
+                                .text_size(px(appearance.size(12.)))
+                                .child(finding.body),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
     /// Iced's `.dlg-body` blocks, each with its class's size, colour and box.
     /// Their vertical margins collapse as Iced's block margins do.
     fn render_card_parts(
         &self,
         parts: Vec<crate::delegation::CardPart>,
         cx: &mut Context<Self>,
-    ) -> Vec<gpui::AnyElement> {
+    ) -> (Vec<gpui::AnyElement>, f32) {
         use crate::delegation::CardPart;
         let appearance = self.appearance;
         let palette = appearance.palette();
@@ -659,15 +1190,24 @@ impl RowView {
                         .into_any_element(),
                 ),
                 CardPart::Section(title, items) => {
+                    // `.dlg-section`: uppercase 11/14 with letter-spacing .05em,
+                    // which GPUI text lacks: each letter is followed by that gap.
+                    let size = appearance.size(11.);
                     elements.push(
                         block(6., 2.)
                             .debug_selector(move || format!("delegation-section-{id}-{index}"))
-                            .text_size(px(appearance.size(11.)))
+                            .flex()
+                            .text_size(px(size))
                             .text_color(rgb(palette.muted))
-                            .child(title.to_uppercase())
+                            .children(
+                                section_letters(title)
+                                    .into_iter()
+                                    .map(|letter| div().mr(px(size * 0.05)).child(letter)),
+                            )
                             .into_any_element(),
                     );
-                    // A plain `<ul>`: 1em margins and a 40px indent.
+                    // A plain `<ul>`: 1em margins, content 40px in, the disc
+                    // marker outside it, ending where the content starts.
                     let em = appearance.size(13.);
                     elements.push(
                         block(em, em)
@@ -676,17 +1216,40 @@ impl RowView {
                             .children(items.into_iter().map(|item| {
                                 div()
                                     .flex()
-                                    .gap(px(10.))
-                                    .pl(px(24.))
                                     .when(hit(&item), |row| row.bg(rgb(0x665c32)))
-                                    .child("•")
-                                    .child(div().flex_1().min_w_0().child(item))
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .w(px(40.))
+                                            .flex()
+                                            .justify_end()
+                                            .child("•\u{a0}"),
+                                    )
+                                    .child(
+                                        div()
+                                            .debug_selector(move || {
+                                                format!("delegation-section-item-{id}-{index}")
+                                            })
+                                            .flex_1()
+                                            .min_w_0()
+                                            .child(item),
+                                    )
                             }))
                             .into_any_element(),
                     );
                 }
             }
         }
-        elements
+        (elements, previous_bottom)
     }
+}
+
+/// `.dlg-section` text, uppercased, one string per letter for its spacing.
+pub(super) fn section_letters(title: &str) -> Vec<String> {
+    // A lone space is kept as a no-break space so its width survives.
+    title
+        .to_uppercase()
+        .chars()
+        .map(|c| if c == ' ' { "\u{a0}".into() } else { c.into() })
+        .collect()
 }

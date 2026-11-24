@@ -18,11 +18,26 @@ pub enum RowKind {
     Question,
     Worker,
     Delegation,
+    /// Iced's `.error-block`: the body only, in a red monospace box.
     Error,
+    /// Iced's muted `.note`.
     Status,
-    /// A queued prompt whose withdrawal was confirmed. Iced removes its bubble;
-    /// the slot stays so row indices remain stable, but nothing reads it as a prompt.
+    /// Iced's yellow `.note.warn`.
+    Warning,
+    /// A pi block (Iced's `legacyEvent`): its label is the row title.
+    Legacy(LegacyBlock),
+    /// A block Iced removed: a queued prompt whose withdrawal was confirmed,
+    /// or a reconnect notice. The slot stays so row indices remain stable,
+    /// but nothing reads it.
     Withdrawn,
+}
+
+/// Iced's `.block.<kind>` for pi's legacy events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyBlock {
+    Thinking,
+    Tool,
+    ToolResult,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +54,35 @@ pub struct Tool {
     pub partial_input: String,
     pub output: Option<String>,
     pub is_error: bool,
+    /// Iced's `.tool-badge` while a request for this call waits.
+    pub badge: Option<&'static str>,
+}
+
+/// Iced's `MAX_TOOL_OUTPUT`: a result shows this many characters.
+pub const MAX_TOOL_OUTPUT: usize = 20_000;
+/// Iced's displayed result: `(no output)` for an empty one, and the first
+/// `MAX_TOOL_OUTPUT` JavaScript characters (UTF-16 units) of a long one.
+pub fn shown_output(output: &str) -> String {
+    if output.is_empty() {
+        return "(no output)".into();
+    }
+    let units = output.encode_utf16().count();
+    if units <= MAX_TOOL_OUTPUT {
+        return output.into();
+    }
+    let mut kept = 0;
+    let end = output
+        .char_indices()
+        .find(|(_, ch)| {
+            kept += ch.len_utf16();
+            kept > MAX_TOOL_OUTPUT
+        })
+        .map_or(output.len(), |(index, _)| index);
+    format!(
+        "{}\n… ({} more characters)",
+        &output[..end],
+        units - MAX_TOOL_OUTPUT
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +99,9 @@ pub struct Request {
     /// Its turn ended before the human answered. Iced folds a finished turn
     /// before clearing its requests, so this card and its tool stay out.
     pub waiting_at_turn_end: bool,
+    /// The top-level tool row whose call this is: Iced's `items.get(tool_use_id)`,
+    /// which shows the waiting badge.
+    pub badge_row: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,8 +120,17 @@ pub struct Row {
     pub request: Option<Request>,
     /// The prompt's message id, so its bubble can show the queued state (C04).
     pub prompt_id: Option<String>,
+    /// Images a relayed prompt had on the device that sent it (Iced's `.user-note`).
+    pub relayed_images: usize,
+    /// Iced's `title` on a block: a reconnect notice's error.
+    pub tooltip: Option<String>,
 }
 impl Row {
+    /// Iced draws no transcript block for this row: a removed one, or a
+    /// permission/question request, which only the footer panel shows.
+    pub fn hidden(&self) -> bool {
+        self.kind == RowKind::Withdrawn || self.request.is_some()
+    }
     pub fn collapsible(&self) -> bool {
         matches!(
             self.kind,
@@ -184,8 +240,124 @@ pub struct ChatModel {
     turn_end: HashMap<String, u64>,
     next_id: u64,
     recorded_time: Option<u64>,
+    /// The harness, for Iced's `harnessName()` and `isAcp()` in notes.
+    pub backend: Option<gitterm_core::chat::types::AgentBackend>,
+    /// Ids of tool rows whose result arrived since the view last drained
+    /// them: Iced closes a tool card when its result arrives.
+    pub completions: Vec<u64>,
+    /// Iced's `busy`: a turn is in flight, so an echoed prompt is queued.
+    busy: bool,
+    /// Iced's `queued`: prompts sent mid-turn and not yet picked up.
+    queued: Vec<String>,
+    /// Iced's `linkNote`: the reconnect notice while it shows.
+    link_note: Option<usize>,
+    /// The last `ready` lists, for Iced's mode and model labels.
+    ready_models: Vec<Value>,
+    ready_modes: Vec<Value>,
+    /// Each thinking row's text as it streamed.
+    thinking: HashMap<usize, String>,
 }
 impl ChatModel {
+    pub fn with_backend(backend: Option<gitterm_core::chat::types::AgentBackend>) -> Self {
+        Self {
+            backend,
+            ..Self::default()
+        }
+    }
+    fn is_acp(&self) -> bool {
+        matches!(
+            self.backend,
+            Some(gitterm_core::chat::types::AgentBackend::Acp(_))
+        )
+    }
+    /// Iced's `harnessName()`.
+    fn harness_name(&self) -> &'static str {
+        match self.backend {
+            Some(gitterm_core::chat::types::AgentBackend::Claude) => "Claude",
+            Some(gitterm_core::chat::types::AgentBackend::Acp(agent)) => agent.label(),
+            Some(gitterm_core::chat::types::AgentBackend::Pi) | None => "the agent",
+        }
+    }
+    /// Iced's `modeLabel`.
+    fn mode_label(&self, mode: &str) -> String {
+        if self.is_acp() {
+            return self
+                .ready_modes
+                .iter()
+                .find(|info| info["value"] == mode)
+                .and_then(|info| info["displayName"].as_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(mode)
+                .into();
+        }
+        match mode {
+            "default" => "Default",
+            "acceptEdits" => "Accept edits",
+            "plan" => "Plan mode",
+            "auto" => "Auto mode",
+            "dontAsk" => "Don't ask",
+            "bypassPermissions" => "Bypass permissions",
+            other => other,
+        }
+        .into()
+    }
+    /// Iced's `modelLabel` once the change is confirmed (the value is the
+    /// chip's current model).
+    fn model_label(&self, value: &str) -> String {
+        let find = |value: &str| self.ready_models.iter().find(|info| info["value"] == value);
+        if self.is_acp() {
+            if value == "default" {
+                return format!("{} default", self.harness_name());
+            }
+            return find(value)
+                .and_then(|info| info["displayName"].as_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(value)
+                .into();
+        }
+        let base = value.strip_suffix("[1m]").unwrap_or(value);
+        if self.ready_models.is_empty() {
+            return if base == "default" {
+                "Claude settings".into()
+            } else {
+                base.into()
+            };
+        }
+        // Not listed: Iced's modelList adds the current model as its own name.
+        let info = find(base).or_else(|| find(value));
+        if base == "default" {
+            let description = info
+                .and_then(|info| info["description"].as_str())
+                .unwrap_or("");
+            let end = [" · ", " — ", " - "]
+                .iter()
+                .filter_map(|separator| description.find(separator))
+                .min()
+                .unwrap_or(description.len());
+            let label = description[..end].trim();
+            return if label.is_empty() {
+                "Claude settings".into()
+            } else {
+                label.into()
+            };
+        }
+        match info {
+            Some(info) => info["displayName"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(base)
+                .into(),
+            None => value.into(),
+        }
+    }
+    fn note(&mut self, kind: RowKind, scope: &str, text: String) -> usize {
+        let body = if kind == RowKind::Error {
+            preformatted(&text)
+        } else {
+            literal(&text)
+        };
+        self.push(kind, scope, String::new(), body)
+    }
     pub fn pending_rows(&self) -> Vec<usize> {
         let mut ordered: Vec<_> = self
             .rows
@@ -200,18 +372,33 @@ impl ChatModel {
         ordered.into_iter().map(|(_, index)| index).collect()
     }
     pub fn from_records(records: &[Record]) -> Self {
-        let mut model = Self::default();
+        Self::from_records_for(records, None)
+    }
+    pub fn from_records_for(
+        records: &[Record],
+        backend: Option<gitterm_core::chat::types::AgentBackend>,
+    ) -> Self {
+        let mut model = Self::with_backend(backend);
         for record in records {
             model.apply(record);
         }
+        // Built, not streamed: no card closes on a result it was built with.
+        model.completions.clear();
         model
     }
     /// Rows are a disposable projection of core State::conversation.
     pub fn from_conversation(events: &[gitterm_core::chat::state::AgentEvent]) -> Self {
-        let mut model = Self::default();
+        Self::from_conversation_for(events, None)
+    }
+    pub fn from_conversation_for(
+        events: &[gitterm_core::chat::state::AgentEvent],
+        backend: Option<gitterm_core::chat::types::AgentBackend>,
+    ) -> Self {
+        let mut model = Self::with_backend(backend);
         for event in events {
             model.apply_agent(event);
         }
+        model.completions.clear();
         model
     }
     pub fn apply_agent(&mut self, event: &gitterm_core::chat::state::AgentEvent) -> Vec<usize> {
@@ -264,11 +451,11 @@ impl ChatModel {
                     value.clone(),
                 ) {
                     Ok(card) => self.upsert_delegation(card),
-                    Err(error) => vec![self.push(
+                    // An error box draws its text alone (Iced's `.error-block`).
+                    Err(error) => vec![self.note(
                         RowKind::Error,
                         "",
-                        "Invalid delegation card".into(),
-                        error.to_string(),
+                        format!("Invalid delegation card: {error}"),
                     )],
                 };
             }
@@ -292,6 +479,10 @@ impl ChatModel {
                 );
                 self.rows[index].roster_id = Some(key);
                 return vec![index];
+            }
+            // Iced's `legacyEvent`: what no other entry point takes (pi).
+            AgentEvent::Other(value) if value.get("kind").is_none() => {
+                return self.legacy(value);
             }
             _ => return vec![],
         };
@@ -347,6 +538,8 @@ impl ChatModel {
             decision: None,
             request: None,
             prompt_id: None,
+            relayed_images: 0,
+            tooltip: None,
         });
         self.next_id += 1;
         index
@@ -443,11 +636,10 @@ impl ChatModel {
                     row.body.push_str(&format!("\n\n{}", literal(detail)));
                     changed.push(index);
                 } else {
-                    changed.push(self.push(
+                    changed.push(self.note(
                         RowKind::Error,
                         scope,
-                        "Unmatched display decision".into(),
-                        literal(request_id),
+                        format!("Unmatched display decision: {request_id}"),
                     ));
                 }
             }
@@ -493,6 +685,8 @@ impl ChatModel {
                     changed.push(index);
                 }
             }
+            // Iced's clearPending; a reset leaves no request answerable either.
+            self.clear_badges(changed);
         }
         match event {
             HarnessEvent::TextDelta(text) | HarnessEvent::ThinkingDelta(text) => {
@@ -518,7 +712,11 @@ impl ChatModel {
                     }
                 };
                 if kind == RowKind::Thinking {
-                    self.rows[index].body.push_str(&literal(text));
+                    // Iced's thinking body is `pre-wrap`: keep the raw text
+                    // so a line's leading spaces survive a delta boundary.
+                    let raw = self.thinking.entry(index).or_default();
+                    raw.push_str(text);
+                    self.rows[index].body = preformatted(raw);
                 } else {
                     self.rows[index].body.push_str(text);
                 }
@@ -526,6 +724,9 @@ impl ChatModel {
             }
             HarnessEvent::TurnStarted { model, .. } => {
                 self.streams.remove(scope);
+                if scope.is_empty() {
+                    self.busy = true;
+                }
                 self.turn_row_start.insert(scope.into(), self.rows.len());
                 if let Some(at) = at {
                     self.turn_start.insert(scope.into(), at);
@@ -560,6 +761,7 @@ impl ChatModel {
                     partial_input: String::new(),
                     output: None,
                     is_error: false,
+                    badge: None,
                 });
                 self.items.insert((scope.into(), id.clone()), index);
                 self.refresh_tool(index);
@@ -569,7 +771,10 @@ impl ChatModel {
                 if let Some(&index) = self.items.get(&(scope.into(), id.clone())) {
                     let tool = self.rows[index].tool.as_mut().expect("tool row");
                     tool.partial_input.push_str(partial_json);
-                    if let Ok(input) = serde_json::from_str(&tool.partial_input) {
+                    // Iced shows the input once the accumulated JSON is a whole object.
+                    if tool.partial_input.trim_end().ends_with('}')
+                        && let Ok(input) = serde_json::from_str(&tool.partial_input)
+                    {
                         tool.input = input;
                     }
                     self.refresh_tool(index);
@@ -587,6 +792,8 @@ impl ChatModel {
                     let tool = self.rows[index].tool.as_mut().expect("tool row");
                     tool.output = Some(output.clone());
                     tool.is_error = *is_error;
+                    tool.badge = None;
+                    self.completions.push(self.rows[index].id);
                     self.refresh_tool(index);
                     changed.push(index);
                 } else {
@@ -604,6 +811,17 @@ impl ChatModel {
                     None => self.items.get(&(String::new(), tool_use_id.clone())),
                 }
                 .copied();
+                let badge_row = self
+                    .items
+                    .get(&(String::new(), tool_use_id.clone()))
+                    .copied();
+                if let Some(row) = badge_row {
+                    self.rows[row].tool.as_mut().expect("tool row").badge = Some(match kind {
+                        RuntimeRequestKind::Question { .. } => "waiting for your answer",
+                        RuntimeRequestKind::Permission { .. } => "waiting for approval",
+                    });
+                    changed.push(row);
+                }
                 let (row_kind, body) = match kind {
                     RuntimeRequestKind::Permission {
                         tool_name,
@@ -646,10 +864,15 @@ impl ChatModel {
                     resolved: false,
                     tool_row,
                     waiting_at_turn_end: false,
+                    badge_row,
                 });
-                if let Some(old) = self.requests.insert((self.request_owner.clone(), request_id.clone()), index) {
+                if let Some(old) = self
+                    .requests
+                    .insert((self.request_owner.clone(), request_id.clone()), index)
+                {
                     if !self.rows[old].request.as_ref().unwrap().resolved {
-                        self.rows[index].request.as_mut().unwrap().order = self.rows[old].request.as_ref().unwrap().order;
+                        self.rows[index].request.as_mut().unwrap().order =
+                            self.rows[old].request.as_ref().unwrap().order;
                     }
                     self.rows[old].request.as_mut().unwrap().resolved = true;
                     changed.push(old);
@@ -657,11 +880,20 @@ impl ChatModel {
                 changed.push(index);
             }
             HarnessEvent::RuntimeRequestResolved { request_id } => {
-                if let Some(&index) = self.requests.get(&(self.request_owner.clone(), request_id.clone())) {
+                if let Some(&index) = self
+                    .requests
+                    .get(&(self.request_owner.clone(), request_id.clone()))
+                {
                     let row = &mut self.rows[index];
+                    let badge = row.request.as_ref().and_then(|request| request.badge_row);
                     if let Some(request) = &mut row.request {
                         request.resolved = true;
                     }
+                    if let Some(tool) = badge.and_then(|badge| self.rows[badge].tool.as_mut()) {
+                        tool.badge = None;
+                        changed.push(badge.unwrap());
+                    }
+                    let row = &mut self.rows[index];
                     if row.decision.is_none() {
                         row.title = row
                             .title
@@ -672,17 +904,24 @@ impl ChatModel {
                     self.orphan(scope, request_id, "request resolution", changed);
                 }
             }
-            HarnessEvent::TurnCompleted {
-                status,
-                ..
-            } => {
+            HarnessEvent::TurnCompleted { status, .. } => {
                 self.streams.remove(scope);
-                let duration_ms = self.turn_start.remove(scope).zip(self.turn_end.remove(scope).or(at)).map(|(start, end)| end.saturating_sub(start));
+                let duration_ms = self
+                    .turn_start
+                    .remove(scope)
+                    .zip(self.turn_end.remove(scope).or(at))
+                    .map(|(start, end)| end.saturating_sub(start));
                 let start = self.turn_row_start.remove(scope).unwrap_or_else(|| {
-                    self.rows.iter().rposition(|row| row.scope == scope && row.kind == RowKind::User).map_or(0, |index| index + 1)
+                    self.rows
+                        .iter()
+                        .rposition(|row| row.scope == scope && row.kind == RowKind::User)
+                        .map_or(0, |index| index + 1)
                 });
                 if scope.is_empty() {
-                    self.completed_turns.push(CompletedTurn { rows: start..self.rows.len(), duration_ms });
+                    self.completed_turns.push(CompletedTurn {
+                        rows: start..self.rows.len(),
+                        duration_ms,
+                    });
                     changed.extend(start..self.rows.len());
                 }
                 let status = match status {
@@ -694,11 +933,28 @@ impl ChatModel {
                     self.rows[index].title = format!("Worker {scope} · {status}");
                     changed.push(index);
                 }
-                // Iced reports completion/usage in the activity strip, not a message.
-                match status.as_str() {
-                    "Done" => {}
-                    "Interrupted" => changed.push(self.push(RowKind::Status, scope, status, String::new())),
-                    _ => changed.push(self.push(RowKind::Error, scope, status, String::new())),
+                if scope.is_empty() {
+                    self.busy = false;
+                }
+                // Iced reports completion/usage in the activity strip; an
+                // interruption is a yellow note, a failure its error box.
+                match event {
+                    HarnessEvent::TurnCompleted {
+                        status: TurnStatus::Interrupted,
+                        ..
+                    } => changed.push(self.note(RowKind::Warning, scope, "Interrupted".into())),
+                    HarnessEvent::TurnCompleted {
+                        status: TurnStatus::Failed(reason),
+                        ..
+                    } => {
+                        let text = if reason.is_empty() {
+                            "Turn failed"
+                        } else {
+                            reason
+                        };
+                        changed.push(self.note(RowKind::Error, scope, text.into()))
+                    }
+                    _ => {}
                 }
             }
             HarnessEvent::SubagentEvent {
@@ -724,15 +980,33 @@ impl ChatModel {
                     return;
                 }
                 self.streams.remove(scope);
-                let delivery = delivery.clone().or_else(|| gitterm_core::chat::history::delivery_card(text));
-                let kind = if delivery.is_some() { RowKind::Delegation } else { RowKind::User };
-                let title = delivery.as_ref().map_or_else(|| "You".into(), |card| card.header.clone());
-                let mut body = literal(delivery.as_ref().map_or(text.as_str(), |card| card.body.as_str()));
-                if *image_count > 0 {
-                    body.push_str(&format!("\n\n{image_count} image attachment(s) (not relayed)"));
-                }
+                let delivery = delivery
+                    .clone()
+                    .or_else(|| gitterm_core::chat::history::delivery_card(text));
+                let kind = if delivery.is_some() {
+                    RowKind::Delegation
+                } else {
+                    RowKind::User
+                };
+                let title = delivery
+                    .as_ref()
+                    .map_or_else(|| "You".into(), |card| card.header.clone());
+                let body = literal(
+                    delivery
+                        .as_ref()
+                        .map_or(text.as_str(), |card| card.body.as_str()),
+                );
                 let index = self.push(kind, scope, title, body);
+                self.rows[index].relayed_images = *image_count;
                 self.rows[index].delivery = delivery;
+                // Iced's `queued: busy`: a prompt sent while a turn runs joins
+                // the queue; any other starts the turn.
+                if scope.is_empty() {
+                    match id {
+                        Some(id) if self.busy => self.queued.push(id.clone()),
+                        _ => self.busy = true,
+                    }
+                }
                 self.turn_row_start.entry(scope.into()).or_insert(index + 1);
                 if let Some(at) = at {
                     self.turn_start.entry(scope.into()).or_insert(at);
@@ -744,6 +1018,9 @@ impl ChatModel {
                 changed.push(index);
             }
             HarnessEvent::MessageLifecycle { id, state } => {
+                if *state != MessageState::Queued {
+                    self.queued.retain(|queued| queued != id);
+                }
                 if let Some(&index) = self.prompts.get(id) {
                     match state {
                         MessageState::Started | MessageState::Completed => {
@@ -779,7 +1056,9 @@ impl ChatModel {
                 self.streams.clear();
                 self.items.clear();
                 for ((owner, _), &index) in &self.requests {
-                    if !owner.starts_with(&self.request_owner) { continue; }
+                    if !owner.starts_with(&self.request_owner) {
+                        continue;
+                    }
                     let row = &mut self.rows[index];
                     if let Some(request) = &mut row.request {
                         request.resolved = true;
@@ -789,78 +1068,283 @@ impl ChatModel {
                     }
                     changed.push(index);
                 }
-                self.requests.retain(|(owner, _), _| !owner.starts_with(&self.request_owner));
+                self.requests
+                    .retain(|(owner, _), _| !owner.starts_with(&self.request_owner));
                 self.prompts.clear();
                 self.settled_prompts.clear();
                 self.workers.clear();
                 self.turn_start.clear();
                 self.turn_row_start.clear();
-                changed.push(self.push(
+                // `trigger` says why; Iced's note is the same for every reset.
+                let _ = trigger;
+                changed.push(self.note(
                     RowKind::Status,
                     scope,
-                    "Conversation cleared".into(),
-                    literal(trigger.as_deref().unwrap_or("Harness reset")),
+                    "Conversation cleared · Claude starts fresh; the messages above stay in the previous session".into(),
                 ));
             }
             HarnessEvent::Error(error) => {
                 self.streams.remove(scope);
-                changed.push(self.push(RowKind::Error, scope, "Error".into(), literal(error)));
+                changed.push(self.note(RowKind::Error, scope, error.clone()));
             }
-            HarnessEvent::MessageWithdrawRefused { id, reason } => {
-                changed.push(self.push(
-                    RowKind::Error,
-                    scope,
-                    format!("Withdrawal refused · {id}"),
-                    literal(reason),
-                ));
+            HarnessEvent::MessageWithdrawRefused { reason, .. } => {
+                let text = if reason.starts_with("Not withdrawn") {
+                    reason.clone()
+                } else {
+                    format!("Not withdrawn: {reason}")
+                };
+                changed.push(self.note(RowKind::Warning, scope, text));
             }
             HarnessEvent::ProcessExited { code: exit } => {
                 // Core leaves an exit's queue unsent; a late cancel cannot withdraw it.
                 self.settled_prompts.extend(self.prompts.keys().cloned());
-                changed.push(self.push(
+                self.remove_link_note(changed);
+                self.streams.remove(scope);
+                // Iced's endTurn(true): the turn in flight folds.
+                if scope.is_empty()
+                    && let Some(start) = self.turn_row_start.remove(scope)
+                {
+                    let duration_ms = self
+                        .turn_start
+                        .remove(scope)
+                        .zip(self.turn_end.remove(scope).or(at))
+                        .map(|(start, end)| end.saturating_sub(start));
+                    self.completed_turns.push(CompletedTurn {
+                        rows: start..self.rows.len(),
+                        duration_ms,
+                    });
+                    changed.extend(start..self.rows.len());
+                }
+                let harness = self.harness_name();
+                let code = exit.map_or_else(String::new, |code| format!(" (code {code})"));
+                changed.push(self.note(
                     RowKind::Status,
                     scope,
-                    format!("Process exited · {exit:?}"),
-                    String::new(),
+                    format!(
+                        "{harness} process exited{code}. The next message resumes the session."
+                    ),
                 ));
+                // Iced's dropQueued: one warning for the queue the exit lost.
+                let lost = std::mem::take(&mut self.queued).len();
+                if lost > 0 {
+                    let text = if lost == 1 {
+                        format!(
+                            "A queued message was not delivered because {harness} exited; send it again."
+                        )
+                    } else {
+                        format!(
+                            "{lost} queued messages were not delivered because {harness} exited; send them again."
+                        )
+                    };
+                    changed.push(self.note(RowKind::Warning, scope, text));
+                }
+                if scope.is_empty() {
+                    self.busy = false;
+                }
             }
             HarnessEvent::RemoteDisconnected { machine, error } => {
-                changed.push(self.push(
-                    RowKind::Error,
-                    scope,
-                    format!("Reconnecting · {machine}"),
-                    literal(error),
-                ));
+                self.streams.remove(scope);
+                let text = format!("Reconnecting to {machine}… the chat keeps running there.");
+                // One notice, updated in place, until a reconnect removes it.
+                let index = match self.link_note {
+                    Some(index) => {
+                        self.rows[index].body = literal(&text);
+                        index
+                    }
+                    None => {
+                        let index = self.note(RowKind::Warning, scope, text);
+                        self.link_note = Some(index);
+                        index
+                    }
+                };
+                self.rows[index].tooltip = Some(error.clone()).filter(|error| !error.is_empty());
+                changed.push(index);
             }
             HarnessEvent::RemoteReconnected {
                 machine,
                 history_gap,
             } => {
-                changed.push(self.push(
+                self.remove_link_note(changed);
+                changed.push(self.note(
                     RowKind::Status,
                     scope,
-                    format!("Reconnected · {machine}"),
                     if *history_gap {
-                        "History gap: reload required".into()
+                        format!("Reconnected to {machine} · reloading the conversation")
                     } else {
-                        String::new()
+                        format!("Reconnected to {machine}")
                     },
                 ));
             }
-            HarnessEvent::Ready { .. }
-            | HarnessEvent::PermissionModeChanged(_)
-            | HarnessEvent::ModelChanged(_)
-            | HarnessEvent::EffortChanged { .. }
+            HarnessEvent::Ready {
+                session_id,
+                permission_mode,
+                models,
+                modes,
+                ..
+            } => {
+                if !modes.is_empty() {
+                    self.ready_modes = modes.clone();
+                }
+                if !models.is_empty() {
+                    self.ready_models = models.clone();
+                }
+                let mode = permission_mode.as_deref().unwrap_or("?");
+                let text = if self.is_acp() {
+                    format!(
+                        "{} session {}ready · mode {}",
+                        self.harness_name(),
+                        session_id.as_deref().map_or_else(String::new, |id| format!(
+                            "{} ",
+                            id.chars().take(12).collect::<String>()
+                        )),
+                        self.mode_label(mode)
+                    )
+                } else {
+                    match session_id {
+                        Some(id) => format!(
+                            "Resumed Claude session {} · permission mode {mode}",
+                            id.chars().take(8).collect::<String>()
+                        ),
+                        None => format!("Claude session ready · permission mode {mode}"),
+                    }
+                };
+                changed.push(self.note(RowKind::Status, scope, text));
+            }
+            HarnessEvent::PermissionModeChanged(mode) => {
+                let prefix = if self.is_acp() {
+                    "Mode"
+                } else {
+                    "Permission mode"
+                };
+                let text = format!("{prefix} · {}", self.mode_label(mode));
+                changed.push(self.note(RowKind::Status, scope, text));
+            }
+            HarnessEvent::ModelChanged(model) => {
+                let text = format!("Model · {}", self.model_label(model));
+                changed.push(self.note(RowKind::Status, scope, text));
+            }
+            HarnessEvent::EffortChanged { effort, applied } => {
+                let text = format!(
+                    "Effort · {}{}",
+                    effort.as_deref().unwrap_or("auto"),
+                    match (effort, applied) {
+                        (None, Some(applied)) => format!(" ({applied})"),
+                        _ => String::new(),
+                    }
+                );
+                changed.push(self.note(RowKind::Status, scope, text));
+            }
             // The unchanged Error that follows carries the visible text.
-            | HarnessEvent::SettingRejected { .. } => {}
+            HarnessEvent::SettingRejected { .. } => {}
         }
     }
+    fn remove_link_note(&mut self, changed: &mut Vec<usize>) {
+        if let Some(index) = self.link_note.take() {
+            self.rows[index].kind = RowKind::Withdrawn;
+            changed.push(index);
+        }
+    }
+    /// Iced's `clearPending` for tool badges.
+    fn clear_badges(&mut self, changed: &mut Vec<usize>) {
+        for (index, row) in self.rows.iter_mut().enumerate() {
+            if let Some(tool) = &mut row.tool
+                && tool.badge.take().is_some()
+            {
+                changed.push(index);
+            }
+        }
+    }
+    /// Iced's `legacyEvent` for pi's own events.
+    fn legacy(&mut self, event: &Value) -> Vec<usize> {
+        let mut changed = vec![];
+        let pretty_or_text = |value: &Value| match value {
+            Value::String(text) => text.clone(),
+            value => pretty(value),
+        };
+        match event["type"].as_str() {
+            Some("turn_end") => {
+                for block in event["message"]["content"].as_array().into_iter().flatten() {
+                    match block["type"].as_str() {
+                        Some("thinking") => {
+                            if let Some(text) = block["thinking"].as_str().filter(|t| !t.is_empty())
+                            {
+                                changed.push(self.legacy_block(
+                                    LegacyBlock::Thinking,
+                                    "Thinking".into(),
+                                    text,
+                                ));
+                            }
+                        }
+                        Some("text") => {
+                            if let Some(text) = block["text"].as_str().filter(|t| !t.is_empty()) {
+                                self.event(
+                                    &HarnessEvent::TextDelta(text.into()),
+                                    None,
+                                    "",
+                                    &mut changed,
+                                );
+                                self.streams.remove("");
+                            }
+                        }
+                        Some("toolCall" | "tool_use") => {
+                            let name = block["name"]
+                                .as_str()
+                                .filter(|n| !n.is_empty())
+                                .unwrap_or("tool");
+                            let arguments = match &block["arguments"] {
+                                Value::Null | Value::Bool(false) => String::new(),
+                                Value::String(text) if text.is_empty() => String::new(),
+                                Value::Number(number) if number.as_f64() == Some(0.0) => {
+                                    String::new()
+                                }
+                                value => pretty(value),
+                            };
+                            changed.push(self.legacy_block(
+                                LegacyBlock::Tool,
+                                format!("Tool · {name}"),
+                                &arguments,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                for result in event["toolResults"].as_array().into_iter().flatten() {
+                    changed.push(self.legacy_block(
+                        LegacyBlock::ToolResult,
+                        "Tool result".into(),
+                        &pretty_or_text(result),
+                    ));
+                }
+            }
+            // Iced's endTurn(false): the turn ends without folding.
+            Some("done" | "stopped") => self.end_unfolded(),
+            Some("error") => {
+                self.end_unfolded();
+                let text = event["message"]
+                    .as_str()
+                    .filter(|message| !message.is_empty())
+                    .map_or_else(|| event.to_string(), str::to_owned);
+                changed.push(self.note(RowKind::Error, "", text));
+            }
+            _ => {}
+        }
+        changed
+    }
+    fn legacy_block(&mut self, block: LegacyBlock, label: String, body: &str) -> usize {
+        self.streams.remove("");
+        self.push(RowKind::Legacy(block), "", label, preformatted(body))
+    }
+    fn end_unfolded(&mut self) {
+        self.streams.remove("");
+        self.turn_row_start.remove("");
+        self.turn_start.remove("");
+        self.busy = false;
+    }
     fn orphan(&mut self, scope: &str, id: &str, operation: &str, changed: &mut Vec<usize>) {
-        changed.push(self.push(
+        changed.push(self.note(
             RowKind::Error,
             scope,
-            "Incomplete fixture history".into(),
-            literal(&format!("{operation} references unknown id {id}")),
+            format!("Incomplete fixture history: {operation} references unknown id {id}"),
         ));
     }
     fn refresh_tool(&mut self, index: usize) {
@@ -874,32 +1358,16 @@ impl ChatModel {
             "Running"
         };
         row.title = format!("{} · {state}", tool.name);
-        let input = if tool.partial_input.is_empty() {
-            pretty(&tool.input)
-        } else {
-            tool.partial_input.clone()
-        };
-        row.body = if tool.partial_input.is_empty()
-            && (tool.input.is_null()
-                || tool.input.as_object().is_some_and(|input| input.is_empty()))
-        {
-            String::new()
-        } else {
-            format!(
-                "**Input{}**\n\n{}",
-                if tool.output.is_none() && !tool.partial_input.is_empty() {
-                    " (streaming / partial JSON)"
-                } else {
-                    ""
-                },
-                code(&input, "json")
-            )
-        };
-        if let Some(output) = tool
-            .output
-            .as_ref()
-            .filter(|text| !text.trim().is_empty() && text.trim() != "null")
-        {
+        // Iced's tool body: its input JSON as last parsed, then the whole
+        // result (the card shows `shown_output`; find searches all of it).
+        let input = tool_input_text(tool);
+        row.body = format!("**Input**\n\n{}", code(&input, "json"));
+        if let Some(output) = &tool.output {
+            let output = if output.is_empty() {
+                "(no output)"
+            } else {
+                output
+            };
             row.body.push_str(&format!(
                 "\n\n**{}**\n\n{}",
                 if tool.is_error { "Error" } else { "Result" },
@@ -909,6 +1377,25 @@ impl ChatModel {
     }
 }
 
+/// Iced's input `<pre>`: empty until a non-empty input object arrives.
+pub fn tool_input_text(tool: &Tool) -> String {
+    if tool.input.is_null() || tool.input.as_object().is_some_and(|input| input.is_empty()) {
+        String::new()
+    } else {
+        pretty(&tool.input)
+    }
+}
+
+/// Iced's `pre-wrap` text as Markdown: literal, with leading spaces kept.
+pub fn preformatted(text: &str) -> String {
+    text.split('\n')
+        .map(|line| {
+            let indent = line.len() - line.trim_start_matches(' ').len();
+            format!("{}{}", "\u{a0}".repeat(indent), literal(&line[indent..]))
+        })
+        .collect::<Vec<_>>()
+        .join("  \n")
+}
 fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).expect("JSON Value serializes")
 }
@@ -1128,7 +1615,7 @@ mod tests {
         let event = AgentEvent::submitted_prompt(&prompt, false);
         let mut model = ChatModel::from_conversation(std::slice::from_ref(&event));
         assert_eq!(model.rows[0].images, prompt.images);
-        assert!(!model.rows[0].body.contains("not relayed"));
+        assert_eq!(model.rows[0].relayed_images, 0);
         model.apply_agent(&AgentEvent::Harness(HarnessEvent::MessageLifecycle {
             id: "sent".into(),
             state: MessageState::Started,
@@ -1147,7 +1634,7 @@ mod tests {
             "type": "user_prompt", "text": "remote", "image_count": 2
         }))]);
         assert!(remote.rows[0].images.is_empty());
-        assert!(remote.rows[0].body.contains("not relayed"));
+        assert_eq!(remote.rows[0].relayed_images, 2);
     }
 
     #[test]
@@ -1315,8 +1802,14 @@ mod transcript_parity_tests {
     use super::*;
 
     #[test]
-    fn empty_and_null_results_never_create_code_blocks_or_completion_messages() {
-        for output in ["", " ", "null", "\nnull\n"] {
+    fn t06_results_show_iced_text_and_no_completion_message() {
+        // Iced: `output || '(no output)'`, so only an empty string is replaced.
+        for (output, shown) in [
+            ("", "(no output)"),
+            (" ", " "),
+            ("null", "null"),
+            ("\nnull\n", "\nnull\n"),
+        ] {
             let mut model = ChatModel::default();
             for event in [
                 HarnessEvent::ItemStarted {
@@ -1344,8 +1837,11 @@ mod transcript_parity_tests {
                 });
             }
             assert_eq!(model.rows.len(), 1);
-            assert_eq!(model.rows[0].body, "");
-            assert!(model.rows[0].tool.as_ref().unwrap().output.is_some());
+            assert_eq!(
+                model.rows[0].body,
+                format!("**Input**\n\n```json\n\n```\n\n**Result**\n\n```text\n{shown}\n```")
+            );
+            assert_eq!(shown_output(output), shown);
         }
     }
 
@@ -1433,5 +1929,435 @@ mod delivery_and_timing_tests {
         ];
         let model = ChatModel::from_conversation(&events);
         assert_eq!(model.completed_turns[0].duration_ms, Some(145000));
+    }
+}
+
+/// TRU-274 "rows" lane: the text and lifecycle Iced gives requests, notes,
+/// errors, legacy blocks, tool results and prompts.
+#[cfg(test)]
+mod row_parity_tests {
+    use super::*;
+    use gitterm_core::chat::{
+        state::AgentEvent,
+        types::{AcpAgent, AgentBackend},
+    };
+    use serde_json::json;
+
+    fn harness(event: HarnessEvent) -> Record {
+        Record {
+            at_ms: None,
+            entry: Entry::Harness(event),
+        }
+    }
+    fn texts(model: &ChatModel) -> Vec<(RowKind, String, String)> {
+        model
+            .rows
+            .iter()
+            .filter(|row| !row.hidden())
+            .map(|row| {
+                (
+                    row.kind,
+                    row.title.clone(),
+                    plain_markdown(&row.body).trim().to_string(),
+                )
+            })
+            .collect()
+    }
+    fn turn(status: TurnStatus) -> HarnessEvent {
+        HarnessEvent::TurnCompleted {
+            status,
+            usage: Value::Null,
+            cost_usd: None,
+            rate_limit: None,
+        }
+    }
+    fn note(kind: RowKind, text: &str) -> (RowKind, String, String) {
+        (kind, String::new(), text.into())
+    }
+
+    /// N01, N02, N06: an error is its text alone; an interruption is a
+    /// yellow note; a refused withdrawal says `Not withdrawn`.
+    #[test]
+    fn n01_n02_n06_errors_and_warnings_use_iced_text() {
+        let model = ChatModel::from_records(&[
+            harness(HarnessEvent::Error("boom\n  at line 2".into())),
+            harness(turn(TurnStatus::Interrupted)),
+            harness(turn(TurnStatus::Failed("quota".into()))),
+            harness(turn(TurnStatus::Failed(String::new()))),
+            harness(HarnessEvent::MessageWithdrawRefused {
+                id: "m".into(),
+                reason: "already read".into(),
+            }),
+            harness(HarnessEvent::MessageWithdrawRefused {
+                id: "m".into(),
+                reason: "Not withdrawn: busy".into(),
+            }),
+        ]);
+        assert_eq!(
+            texts(&model),
+            [
+                note(RowKind::Error, "boom\n\u{a0}\u{a0}at line 2"),
+                note(RowKind::Warning, "Interrupted"),
+                note(RowKind::Error, "quota"),
+                note(RowKind::Error, "Turn failed"),
+                note(RowKind::Warning, "Not withdrawn: already read"),
+                note(RowKind::Warning, "Not withdrawn: busy"),
+            ]
+        );
+    }
+
+    /// N03, N04: session and setting notes, for Claude and an ACP agent.
+    #[test]
+    fn n03_n04_ready_and_setting_notes_name_the_session_and_value() {
+        let ready = |session: Option<&str>, models: Vec<Value>, modes: Vec<Value>| {
+            harness(HarnessEvent::Ready {
+                session_id: session.map(str::to_owned),
+                permission_mode: Some("plan".into()),
+                models,
+                modes,
+                commands: vec![],
+            })
+        };
+        let claude = ChatModel::from_records_for(
+            &[
+                ready(None, vec![], vec![]),
+                harness(HarnessEvent::ModelChanged("default".into())),
+                ready(
+                    Some("0123456789abcdef"),
+                    vec![
+                        json!({"value": "default", "description": "Opus 5 · best"}),
+                        json!({"value": "sonnet", "displayName": "Sonnet"}),
+                    ],
+                    vec![],
+                ),
+                harness(HarnessEvent::PermissionModeChanged("acceptEdits".into())),
+                harness(HarnessEvent::ModelChanged("sonnet[1m]".into())),
+                harness(HarnessEvent::ModelChanged("default".into())),
+                harness(HarnessEvent::ModelChanged("custom".into())),
+                harness(HarnessEvent::EffortChanged {
+                    effort: None,
+                    applied: Some("high".into()),
+                }),
+                harness(HarnessEvent::EffortChanged {
+                    effort: Some("low".into()),
+                    applied: Some("low".into()),
+                }),
+            ],
+            Some(AgentBackend::Claude),
+        );
+        assert_eq!(
+            texts(&claude),
+            [
+                note(
+                    RowKind::Status,
+                    "Claude session ready · permission mode plan"
+                ),
+                note(RowKind::Status, "Model · Claude settings"),
+                note(
+                    RowKind::Status,
+                    "Resumed Claude session 01234567 · permission mode plan"
+                ),
+                note(RowKind::Status, "Permission mode · Accept edits"),
+                note(RowKind::Status, "Model · Sonnet"),
+                note(RowKind::Status, "Model · Opus 5"),
+                note(RowKind::Status, "Model · custom"),
+                note(RowKind::Status, "Effort · auto (high)"),
+                note(RowKind::Status, "Effort · low"),
+            ]
+        );
+        let acp = ChatModel::from_records_for(
+            &[
+                ready(
+                    Some("0123456789abcdef"),
+                    vec![json!({"value": "fast", "displayName": "Fast"})],
+                    vec![json!({"value": "plan", "displayName": "Planning"})],
+                ),
+                harness(HarnessEvent::PermissionModeChanged("plan".into())),
+                harness(HarnessEvent::ModelChanged("default".into())),
+                harness(HarnessEvent::ModelChanged("fast".into())),
+            ],
+            Some(AgentBackend::Acp(AcpAgent::OpenCode)),
+        );
+        assert_eq!(
+            texts(&acp),
+            [
+                note(
+                    RowKind::Status,
+                    "OpenCode session 0123456789ab ready · mode Planning"
+                ),
+                note(RowKind::Status, "Mode · Planning"),
+                note(RowKind::Status, "Model · OpenCode default"),
+                note(RowKind::Status, "Model · Fast"),
+            ]
+        );
+    }
+
+    /// N05: one reconnect notice, updated in place with its error as the
+    /// tooltip; reconnecting removes it and adds a normal note.
+    #[test]
+    fn n05_reconnect_notice_is_one_warning_removed_on_reconnect() {
+        let disconnect = |error: &str| {
+            harness(HarnessEvent::RemoteDisconnected {
+                machine: "mini".into(),
+                error: error.into(),
+            })
+        };
+        let mut model = ChatModel::from_records(&[disconnect("reset"), disconnect("timeout")]);
+        assert_eq!(
+            texts(&model),
+            [note(
+                RowKind::Warning,
+                "Reconnecting to mini… the chat keeps running there."
+            )]
+        );
+        assert_eq!(model.rows[0].tooltip.as_deref(), Some("timeout"));
+        model.apply(&harness(HarnessEvent::RemoteReconnected {
+            machine: "mini".into(),
+            history_gap: true,
+        }));
+        assert_eq!(
+            texts(&model),
+            [note(
+                RowKind::Status,
+                "Reconnected to mini · reloading the conversation"
+            )]
+        );
+    }
+
+    /// N07, U10: the exit note names the harness and code, the turn in
+    /// flight folds, and one warning counts the queue the exit lost.
+    #[test]
+    fn n07_u10_process_exit_folds_the_turn_and_warns_about_the_lost_queue() {
+        let echo = |id: &str| {
+            harness(HarnessEvent::UserMessageEcho {
+                id: Some(id.into()),
+                text: id.into(),
+                image_count: 0,
+                delivery: None,
+            })
+        };
+        let records = [
+            echo("first"),
+            harness(HarnessEvent::ItemStarted {
+                id: "t".into(),
+                kind: ItemKind::ToolCall {
+                    name: "Bash".into(),
+                    input: json!({"command": "ls"}),
+                },
+            }),
+            echo("queued-1"),
+            echo("queued-2"),
+            harness(HarnessEvent::MessageLifecycle {
+                id: "queued-1".into(),
+                state: MessageState::Started,
+            }),
+            echo("queued-3"),
+            harness(HarnessEvent::ProcessExited { code: Some(1) }),
+        ];
+        let model = ChatModel::from_records_for(&records, Some(AgentBackend::Claude));
+        assert_eq!(model.completed_turns.len(), 1);
+        assert_eq!(model.completed_turns[0].rows, 1..5);
+        let texts = texts(&model);
+        assert_eq!(
+            texts[texts.len() - 2..],
+            [
+                note(
+                    RowKind::Status,
+                    "Claude process exited (code 1). The next message resumes the session."
+                ),
+                note(
+                    RowKind::Warning,
+                    "2 queued messages were not delivered because Claude exited; send them again."
+                ),
+            ]
+        );
+        let idle = ChatModel::from_records(&[harness(HarnessEvent::ProcessExited { code: None })]);
+        assert_eq!(
+            super::super::model::ChatModel::from_records(&[]).rows.len(),
+            0
+        );
+        assert_eq!(
+            idle.rows
+                .iter()
+                .map(|row| plain_markdown(&row.body).trim().to_string())
+                .collect::<Vec<_>>(),
+            ["the agent process exited. The next message resumes the session."]
+        );
+        assert!(idle.completed_turns.is_empty());
+    }
+
+    /// N09: Iced's clear note, whatever triggered the reset.
+    #[test]
+    fn n09_conversation_clear_note_is_iced_text() {
+        let model = ChatModel::from_records(&[harness(HarnessEvent::ConversationReset {
+            trigger: Some("/clear".into()),
+        })]);
+        assert_eq!(
+            texts(&model),
+            [note(
+                RowKind::Status,
+                "Conversation cleared · Claude starts fresh; the messages above stay in the previous session"
+            )]
+        );
+    }
+
+    /// N10: pi's legacy events become Iced's labelled blocks and error box.
+    #[test]
+    fn n10_legacy_pi_events_draw_labelled_blocks() {
+        let model = ChatModel::from_conversation(&[
+            AgentEvent::Other(json!({"type": "turn_end", "message": {"content": [
+                {"type": "thinking", "thinking": "consider"},
+                {"type": "text", "text": "Answer"},
+                {"type": "toolCall", "name": "read", "arguments": {"path": "a"}},
+                {"type": "tool_use"},
+            ]}, "toolResults": ["contents", {"ok": true}]})),
+            AgentEvent::Other(json!({"type": "error", "message": "pi failed"})),
+            AgentEvent::Other(json!({"type": "error"})),
+            AgentEvent::Other(json!({"type": "agent_start"})),
+        ]);
+        assert_eq!(
+            texts(&model),
+            [
+                (
+                    RowKind::Legacy(LegacyBlock::Thinking),
+                    "Thinking".into(),
+                    "consider".into()
+                ),
+                (RowKind::Assistant, String::new(), "Answer".into()),
+                (
+                    RowKind::Legacy(LegacyBlock::Tool),
+                    "Tool · read".into(),
+                    "{\n\u{a0}\u{a0}\"path\": \"a\"\n}".into()
+                ),
+                (
+                    RowKind::Legacy(LegacyBlock::Tool),
+                    "Tool · tool".into(),
+                    String::new()
+                ),
+                (
+                    RowKind::Legacy(LegacyBlock::ToolResult),
+                    "Tool result".into(),
+                    "contents".into()
+                ),
+                (
+                    RowKind::Legacy(LegacyBlock::ToolResult),
+                    "Tool result".into(),
+                    "{\n\u{a0}\u{a0}\"ok\": true\n}".into()
+                ),
+                note(RowKind::Error, "pi failed"),
+                note(RowKind::Error, "{\"type\":\"error\"}"),
+            ]
+        );
+    }
+
+    /// T06, T07: `(no output)` for an empty result; past 20,000 JavaScript
+    /// characters the rest is counted, not shown.
+    #[test]
+    fn t06_t07_shown_output_matches_iced() {
+        assert_eq!(shown_output(""), "(no output)");
+        assert_eq!(shown_output("ok"), "ok");
+        let exact = "a".repeat(MAX_TOOL_OUTPUT);
+        assert_eq!(shown_output(&exact), exact);
+        // 🦀 is two UTF-16 units, as JavaScript counts it. JavaScript's
+        // slice keeps half of the split crab; a Rust string cannot, so it goes.
+        let long = format!("{}🦀🦀", "a".repeat(MAX_TOOL_OUTPUT - 1));
+        assert_eq!(
+            shown_output(&long),
+            format!("{}\n… (3 more characters)", "a".repeat(MAX_TOOL_OUTPUT - 1))
+        );
+    }
+
+    /// T08: Iced shows streamed input once the accumulated JSON is a whole
+    /// object, never the partial text.
+    #[test]
+    fn t08_streaming_input_shows_only_whole_objects() {
+        let mut model = ChatModel::from_records(&[harness(HarnessEvent::ItemStarted {
+            id: "a".into(),
+            kind: ItemKind::ToolCall {
+                name: "Bash".into(),
+                input: json!({}),
+            },
+        })]);
+        model.apply(&harness(HarnessEvent::ItemInputDelta {
+            id: "a".into(),
+            partial_json: "{\"command\":\"car".into(),
+        }));
+        assert_eq!(tool_input_text(model.rows[0].tool.as_ref().unwrap()), "");
+        assert!(!model.rows[0].body.contains("car"));
+        assert!(!model.rows[0].body.contains("partial"));
+        model.apply(&harness(HarnessEvent::ItemInputDelta {
+            id: "a".into(),
+            partial_json: "go\"}".into(),
+        }));
+        assert_eq!(
+            model.rows[0].tool.as_ref().unwrap().input,
+            json!({"command": "cargo"})
+        );
+    }
+
+    /// T03: the badge follows the request: set for the call's own card,
+    /// cleared on resolution, result or turn end.
+    #[test]
+    fn t03_waiting_badge_follows_the_request() {
+        let request = |id: &str, tool: &str| {
+            harness(HarnessEvent::RuntimeRequest {
+                request_id: id.into(),
+                tool_use_id: tool.into(),
+                kind: RuntimeRequestKind::Permission {
+                    tool_name: "Bash".into(),
+                    input: json!({}),
+                    suggestions: vec![],
+                    decision_reason: None,
+                },
+            })
+        };
+        let mut model = ChatModel::from_records(&[
+            harness(HarnessEvent::ItemStarted {
+                id: "a".into(),
+                kind: ItemKind::ToolCall {
+                    name: "Bash".into(),
+                    input: json!({"command": "ls"}),
+                },
+            }),
+            request("p", "a"),
+        ]);
+        let badge = |model: &ChatModel| model.rows[0].tool.as_ref().unwrap().badge;
+        assert_eq!(badge(&model), Some("waiting for approval"));
+        model.apply(&harness(HarnessEvent::ItemCompleted {
+            id: "a".into(),
+            output: "ok".into(),
+            is_error: false,
+        }));
+        assert_eq!(badge(&model), None);
+        model.apply(&request("p2", "a"));
+        assert_eq!(badge(&model), Some("waiting for approval"));
+        model.apply(&harness(turn(TurnStatus::Completed)));
+        assert_eq!(badge(&model), None);
+        // A request for another call's id badges nothing.
+        let other = ChatModel::from_records(&[request("p", "missing")]);
+        assert!(other.rows.iter().all(|row| row.tool.is_none()));
+    }
+
+    /// T01: thinking keeps its lines and their leading spaces, across deltas.
+    #[test]
+    fn t01_thinking_body_is_pre_wrap_across_deltas() {
+        let model = ChatModel::from_records(&[
+            harness(HarnessEvent::ThinkingDelta("plan:\n ".into())),
+            harness(HarnessEvent::ThinkingDelta(" - step *one*".into())),
+        ]);
+        assert_eq!(
+            plain_markdown(&model.rows[0].body).trim(),
+            "plan:\n\u{a0}\u{a0}- step *one*"
+        );
+    }
+
+    /// U05: a relayed prompt's images are a count, not body text.
+    #[test]
+    fn u05_relayed_images_are_counted_outside_the_prompt_text() {
+        let model = ChatModel::from_conversation(&[AgentEvent::Other(json!({
+            "type": "user_prompt", "text": "look", "image_count": 1
+        }))]);
+        assert_eq!(model.rows[0].relayed_images, 1);
+        assert_eq!(plain_markdown(&model.rows[0].body).trim(), "look");
     }
 }

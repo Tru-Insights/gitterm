@@ -252,6 +252,7 @@ impl RosterProjection {
                     delegation: worker.clone(),
                     activity: None,
                     held: false,
+                    checkout_head: None,
                     worker: matches!(
                         worker.child,
                         gitterm_core::tasks::DelegationChild::TaskSession { .. }
@@ -264,6 +265,21 @@ impl RosterProjection {
             .collect();
         Self { rows, cards }
     }
+}
+
+/// Each card's delegation id and record state, in roster order.
+pub(crate) fn card_states(
+    cards: &[gitterm_gpui_chat::delegation::DelegationCard],
+) -> Vec<(String, String)> {
+    cards
+        .iter()
+        .map(|card| {
+            (
+                card.delegation.delegation_id.clone(),
+                card.delegation.status.label().to_owned(),
+            )
+        })
+        .collect()
 }
 
 /// `cards` with `held` set on those whose delegation id is in `held`.
@@ -291,6 +307,9 @@ pub(crate) struct ChatPane {
     cards: Vec<gitterm_gpui_chat::delegation::DelegationCard>,
     /// Delegations whose result waits for this chat's turn end.
     held: std::collections::HashSet<String>,
+    /// The cards' ids and states when the checkout's HEAD was last read.
+    head_read_for: Vec<(String, String)>,
+    _head_load: Option<gpui::Task<()>>,
     _roster_subscription: gpui::Subscription,
     _review_subscription: gpui::Subscription,
     _review_context_load: Option<gpui::Task<()>>,
@@ -368,6 +387,8 @@ impl ChatPane {
             shutdown,
             cards: vec![],
             held: Default::default(),
+            head_read_for: vec![],
+            _head_load: None,
             _roster_subscription: roster_subscription,
             _review_subscription: review_subscription,
             _review_context_load: None,
@@ -523,6 +544,8 @@ impl ChatPane {
             shutdown,
             cards: vec![],
             held: Default::default(),
+            head_read_for: vec![],
+            _head_load: None,
             _roster_subscription: roster_subscription,
             _review_subscription: review_subscription,
             _review_context_load: None,
@@ -531,6 +554,13 @@ impl ChatPane {
     pub(crate) fn set_roster(&mut self, projection: RosterProjection, cx: &mut Context<Self>) {
         self.cards = projection.cards;
         self.show_cards(cx);
+        // Iced re-reads HEAD when a delegation finishes and when the page
+        // (re)loads with cards; here, when any card appears or changes state.
+        let states = card_states(&self.cards);
+        if states != self.head_read_for {
+            self.head_read_for = states;
+            self.refresh_checkout_head(cx);
+        }
         self.view
             .update(cx, |view, cx| view.set_roster(projection.rows, cx));
     }
@@ -546,6 +576,26 @@ impl ChatPane {
             self.held = held;
             self.show_cards(cx);
         }
+    }
+
+    /// Iced's `refresh_delegation_head`: read the checkout's HEAD off the
+    /// main thread, for the cards' "branch has moved" banner. Read-only git;
+    /// nothing runs without cards. A failed read is logged, as Iced does.
+    fn refresh_checkout_head(&mut self, cx: &mut Context<Self>) {
+        if self.cards.is_empty() {
+            return;
+        }
+        let cwd = self.saved.cwd.clone();
+        let read = cx
+            .background_executor()
+            .spawn(async move { gitterm_core::delegations::current_head(&cwd) });
+        let view = self.view.downgrade();
+        self._head_load = Some(cx.spawn(async move |_, cx| match read.await {
+            Ok(head) => {
+                let _ = view.update(cx, |view, cx| view.set_checkout_head(Some(head), cx));
+            }
+            Err(error) => eprintln!("[delegation] chat checkout: {error}"),
+        }));
     }
 
     fn show_cards(&self, cx: &mut Context<Self>) {
@@ -687,6 +737,7 @@ impl ChatPane {
                             pane.changed(cx);
                         }
                         if turn_ended {
+                            pane.refresh_checkout_head(cx);
                             cx.emit(TurnEnded);
                         }
                         if exited {
