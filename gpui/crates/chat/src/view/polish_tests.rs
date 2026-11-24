@@ -176,14 +176,21 @@ fn x13_escape_stays_with_a_pending_request_panel(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("pending-request-panel").is_some());
     cx.simulate_keystrokes("escape");
     draw(cx);
-    assert_eq!(hits.get(), 0, "the request panel keeps Escape from the host");
+    assert_eq!(
+        hits.get(),
+        0,
+        "the request panel keeps Escape from the host"
+    );
 }
 
 /// W07: Iced's `.earlier`: a centred pill (block fill, strong border, radius
 /// 12, padding 3×12, `s(12)`), 10px above the first block.
 #[gpui::test]
 fn w07_show_earlier_is_a_centred_pill(cx: &mut TestAppContext) {
-    let (chat, cx) = setup((0..250).map(|i| prompt(format!("prompt {i}"))).collect(), cx);
+    let (chat, cx) = setup(
+        (0..250).map(|i| prompt(format!("prompt {i}"))).collect(),
+        cx,
+    );
     draw(cx);
     chat.update_in(cx, |view, _, cx| {
         view.scroller
@@ -268,7 +275,10 @@ fn w08_a_fold_restores_the_chunks_that_now_fit(cx: &mut TestAppContext) {
     let (chat, cx) = setup(records, cx);
     draw(cx);
     let hidden_before = chat.read_with(cx, |view, _| view.history_start);
-    assert!(hidden_before > 200, "the live turn is windowed: {hidden_before}");
+    assert!(
+        hidden_before > 200,
+        "the live turn is windowed: {hidden_before}"
+    );
     chat.update_in(cx, |view, _, cx| {
         view.append_event(
             HarnessEvent::TurnCompleted {
@@ -289,4 +299,82 @@ fn w08_a_fold_restores_the_chunks_that_now_fit(cx: &mut TestAppContext) {
             "the fold left ~100 blocks, so every hidden chunk fits again"
         );
     });
+}
+
+/// X14: a browser scrolls Iced's `#messages` with the cursor, page, Home and
+/// End keys; the transcript here has no other key map.
+#[gpui::test]
+fn x14_keys_scroll_the_transcript_like_a_browser_scroll_box(cx: &mut TestAppContext) {
+    let (chat, cx) = setup((0..80).map(|i| prompt(format!("prompt {i}"))).collect(), cx);
+    draw(cx);
+    let top = |chat: &Entity<ChatView>, cx: &mut VisualTestContext| {
+        chat.read_with(cx, |view, cx| {
+            let state = view.scroller.read(cx);
+            (state.logical_scroll_top(), state.is_following_tail())
+        })
+    };
+    chat.update_in(cx, |view, window, cx| {
+        view.scroller
+            .update(cx, |state, cx| _ = state.scroll_to_item(30, cx));
+        view.focus.focus(window, cx);
+    });
+    draw(cx);
+    let (start, following) = top(&chat, cx);
+    assert!(!following);
+    cx.simulate_keystrokes("down");
+    draw(cx);
+    let (after_line, _) = top(&chat, cx);
+    let advanced = |from: gpui::ListOffset, to: gpui::ListOffset| {
+        (to.item_ix, f32::from(to.offset_in_item)) > (from.item_ix, f32::from(from.offset_in_item))
+    };
+    assert!(advanced(start, after_line), "down scrolls a line");
+    cx.simulate_keystrokes("pagedown");
+    draw(cx);
+    let (after_page, _) = top(&chat, cx);
+    assert!(advanced(after_line, after_page), "pagedown scrolls a page");
+    cx.simulate_keystrokes("pageup up");
+    draw(cx);
+    let (back, _) = top(&chat, cx);
+    assert!(advanced(back, after_page), "pageup and up scroll back");
+    cx.simulate_keystrokes("home");
+    draw(cx);
+    let (home, following) = top(&chat, cx);
+    assert_eq!(
+        (home.item_ix, following),
+        (0, false),
+        "home goes to the top"
+    );
+    cx.simulate_keystrokes("end");
+    draw(cx);
+    assert!(top(&chat, cx).1, "end goes to the bottom and follows");
+}
+
+/// Margin gap: Iced's CSS collapses a card's 8px margins into its neighbours';
+/// GPUI adds them, so a card read 8px further from the reply above it.
+#[gpui::test]
+fn cards_collapse_their_margins_into_their_neighbours(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![harness(HarnessEvent::TextDelta("first".into()))], cx);
+    chat.update_in(cx, |view, _, cx| {
+        view.set_delegations(
+            vec![crate::delegation::tests::card("implement", "running")],
+            cx,
+        )
+    });
+    chat.update_in(cx, |view, _, cx| {
+        view.append_record(&prompt("second".into()), cx)
+    });
+    draw(cx);
+    let ids: Vec<u64> = chat.read_with(cx, |view, _| {
+        view.model.rows.iter().map(|row| row.id).collect()
+    });
+    assert_eq!(ids.len(), 3, "reply, card, prompt");
+    let bounds = |id: u64, cx: &mut VisualTestContext| {
+        let selector: &'static str = Box::leak(format!("transcript-row-{id}").into_boxed_str());
+        cx.debug_bounds(selector).expect(selector)
+    };
+    let (reply, card, after) = (bounds(ids[0], cx), bounds(ids[1], cx), bounds(ids[2], cx));
+    // max(reply 10, card 8), not 10 + 8.
+    assert_eq!(f32::from(card.top() - reply.bottom()), 10.);
+    // max(card 8, prompt 4), not 8 + 4.
+    assert_eq!(f32::from(after.top() - card.bottom()), 8.);
 }

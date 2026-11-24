@@ -1390,6 +1390,7 @@ mod tests {
             "{\"type\":\"ai-title\",\"aiTitle\":\"No history\"}\n",
         )
         .unwrap();
+        // Iced opens an empty page for a transcript with no usable entry.
         assert!(
             read_iced_history(
                 dir.path(),
@@ -1398,7 +1399,9 @@ mod tests {
                 "/fixture/provider".into(),
                 &[]
             )
-            .is_err()
+            .unwrap()
+            .records
+            .is_empty()
         );
     }
 

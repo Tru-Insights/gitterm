@@ -58,7 +58,7 @@ pub fn history_start(rows: usize) -> usize {
 pub fn blocks_restored_by_fold(hidden: usize, live: usize) -> usize {
     let mut room = 150usize.saturating_sub(live);
     let mut sizes = vec![50; hidden / 50];
-    if hidden % 50 > 0 {
+    if !hidden.is_multiple_of(50) {
         sizes.push(hidden % 50);
     }
     let mut restored = 0;

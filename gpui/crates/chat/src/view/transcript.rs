@@ -173,8 +173,7 @@ impl ChatView {
         }
         let starts = scroll::block_starts(&self.model);
         let hidden = starts.partition_point(|index| *index < self.history_start);
-        let restored =
-            crate::interactions::blocks_restored_by_fold(hidden, starts.len() - hidden);
+        let restored = crate::interactions::blocks_restored_by_fold(hidden, starts.len() - hidden);
         if restored == 0 {
             return;
         }

@@ -3,6 +3,7 @@ mod attachments;
 mod copy;
 #[path = "find.rs"]
 mod find;
+mod keys;
 #[path = "review/ui.rs"]
 pub(crate) mod review_ui;
 mod scroll;
@@ -38,8 +39,8 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     collapsible::Collapsible,
     input::{
-        Copy as InputCopy, Enter as InputEnter, Escape as InputEscape, IndentInline, Input, InputEvent, InputState,
-        MoveDown, MoveUp, TextareaState,
+        Copy as InputCopy, Enter as InputEnter, Escape as InputEscape, IndentInline, Input,
+        InputEvent, InputState, MoveDown, MoveUp, TextareaState,
     },
     menu::{ContextMenuExt, PopupMenuItem},
     text::{RangeHighlight, SelectionFormat, TextView, TextViewMotion, TextViewState},
@@ -69,7 +70,13 @@ actions!(
         SubmitSlash,
         CloseSlash,
         CycleMode,
-        SubmitReview
+        SubmitReview,
+        ScrollLineUp,
+        ScrollLineDown,
+        ScrollPageUp,
+        ScrollPageDown,
+        ScrollTop,
+        ScrollEnd
     ]
 );
 
@@ -132,6 +139,16 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("escape", CloseFind, Some("NativeChat")),
         KeyBinding::new("cmd-c", CopyPlain, Some("NativeChat")),
         KeyBinding::new("cmd-shift-c", CopyMarkdown, Some("NativeChat")),
+        // A browser scrolls the focused scroll box with these keys. Space is
+        // left out: bound here it would also swallow typing in the inputs.
+        KeyBinding::new("up", ScrollLineUp, Some("NativeChat")),
+        KeyBinding::new("down", ScrollLineDown, Some("NativeChat")),
+        KeyBinding::new("pageup", ScrollPageUp, Some("NativeChat")),
+        KeyBinding::new("pagedown", ScrollPageDown, Some("NativeChat")),
+        KeyBinding::new("home", ScrollTop, Some("NativeChat")),
+        KeyBinding::new("end", ScrollEnd, Some("NativeChat")),
+        KeyBinding::new("cmd-up", ScrollTop, Some("NativeChat")),
+        KeyBinding::new("cmd-down", ScrollEnd, Some("NativeChat")),
     ]);
 }
 
@@ -1219,6 +1236,7 @@ impl ChatView {
         let scroller = self.scroller.clone();
         let open = self.folded.get(&row.id).copied();
         let queued = self.queued_tag(&row);
+        let card_gap = self.card_top_gap(index);
         let view = cx.new(|cx| {
             let mut view = RowView::new(row, index, scroller, cx);
             if let Some(open) = open {
@@ -1250,6 +1268,7 @@ impl ChatView {
                 turn_collapsed && turn.as_ref().is_some_and(|turn| turn.contains(index));
             view.visual_expand = visual_expand;
             view.queued = queued;
+            view.top_gap = card_gap;
             view.sync_visual(cx);
             view
         });
@@ -1543,6 +1562,7 @@ impl ChatView {
             self.trim_history(cx);
         }
         self.restore_history_after_fold(cx);
+        self.sync_card_gaps(cx);
         if !changed.is_empty() && !following {
             self.new_messages = true;
         }
@@ -1731,6 +1751,24 @@ impl Render for ChatView {
                 if this.copy_focused_text(window, cx) {
                     cx.stop_propagation();
                 }
+            }))
+            .on_action(cx.listener(|this, _: &ScrollLineUp, w, cx| {
+                this.scroll_key(scroll::ScrollKey::LineUp, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollLineDown, w, cx| {
+                this.scroll_key(scroll::ScrollKey::LineDown, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollPageUp, w, cx| {
+                this.scroll_key(scroll::ScrollKey::PageUp, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollPageDown, w, cx| {
+                this.scroll_key(scroll::ScrollKey::PageDown, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollTop, w, cx| {
+                this.scroll_key(scroll::ScrollKey::Top, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollEnd, w, cx| {
+                this.scroll_key(scroll::ScrollKey::End, w, cx)
             }))
             .on_action(cx.listener(Self::open_find))
             .on_action(cx.listener(|this, action: &CloseFind, window, cx| {
@@ -1943,6 +1981,9 @@ struct RowView {
     scroller: Entity<MessageScrollerState>,
     _subscription: Subscription,
     hidden_by_turn: bool,
+    /// Iced's 8px card margin left over once it collapses into the bottom
+    /// margin of the block above (`card_top_gap`).
+    top_gap: f32,
     visual: Option<Entity<visual::VisualReply>>,
     visual_expand: visual::VisualExpand,
     visual_subscription: Option<Subscription>,
@@ -2013,6 +2054,7 @@ impl RowView {
             scroller,
             _subscription: subscription,
             hidden_by_turn: false,
+            top_gap: 0.,
             visual: None,
             visual_expand: Rc::new(|_, _| {}),
             visual_subscription: None,
@@ -2310,12 +2352,7 @@ impl Render for RowView {
                 .w_full()
                 // Iced's bottom margin per block; the next block's smaller
                 // top margin collapses into it.
-                .mb(px(match self.row.kind {
-                    RowKind::User => 12.,
-                    RowKind::Thinking | RowKind::Legacy(_) => 8.,
-                    RowKind::Tool | RowKind::Error | RowKind::Status | RowKind::Warning => 6.,
-                    _ => 10.,
-                }))
+                .mb(px(block_bottom_margin(&self.row)))
                 .when(!self.row.scope.is_empty(), |view| {
                     view.ml(px(18.))
                         .border_l_2()
@@ -2324,10 +2361,11 @@ impl Render for RowView {
                 .when(self.row.delivery.is_some(), |view| {
                     let id = self.row.id;
                     view.debug_selector(move || format!("delivery-card-{id}"))
-                        .my(px(8.))
                 })
-                // Iced's `details.dlg`: margin 8px 0.
-                .when(self.row.delegation.is_some(), |view| view.my(px(8.)))
+                // Iced's `details.dlg` and `.delivery`: margin 8px 0, the top
+                // collapsing into the block above (`top_gap`), the bottom
+                // being the card's own `block_bottom_margin`.
+                .mt(px(self.top_gap))
                 .when(self.row.kind == RowKind::User, |view| {
                     view.w_auto()
                         .max_w(gpui::relative(0.85))
@@ -2589,6 +2627,53 @@ impl Render for RowView {
             .when(show_work, |outer| outer.child(row))
             .children(visual)
             .into_any_element()
+    }
+}
+
+/// Iced's bottom margin per block; the next block's smaller top margin
+/// collapses into it.
+fn block_bottom_margin(row: &Row) -> f32 {
+    if row.delivery.is_some() || row.delegation.is_some() {
+        return 8.;
+    }
+    match row.kind {
+        RowKind::User => 12.,
+        RowKind::Thinking | RowKind::Legacy(_) => 8.,
+        RowKind::Tool | RowKind::Error | RowKind::Status | RowKind::Warning => 6.,
+        _ => 10.,
+    }
+}
+
+impl ChatView {
+    /// A card's 8px top margin collapses into the block above's bottom
+    /// margin: only the excess is left, all of it with nothing above.
+    fn card_top_gap(&self, index: usize) -> f32 {
+        let row = &self.model.rows[index];
+        if row.delivery.is_none() && row.delegation.is_none() {
+            return 0.;
+        }
+        self.model.rows[..index]
+            .iter()
+            .rev()
+            .find(|previous| !previous.hidden())
+            .map_or(8., |previous| (8. - block_bottom_margin(previous)).max(0.))
+    }
+    fn sync_card_gaps(&mut self, cx: &mut Context<Self>) {
+        for index in 0..self.row_views.len() {
+            let Some(view) = self.row_views[index].clone() else {
+                continue;
+            };
+            let gap = self.card_top_gap(index);
+            if view.read(cx).top_gap != gap {
+                view.update(cx, |view, cx| {
+                    view.top_gap = gap;
+                    cx.notify();
+                });
+                self.scroller.update(cx, |state, cx| {
+                    _ = state.remeasure_items(index..index + 1, cx)
+                });
+            }
+        }
     }
 }
 

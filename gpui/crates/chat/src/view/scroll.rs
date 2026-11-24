@@ -109,6 +109,46 @@ impl TranscriptScrollerState {
         self.list.scroll_to_end();
         cx.notify();
     }
+    /// A key scrolls the transcript as it scrolls a WebKit overflow box: a
+    /// line is 40px, a page is the viewport less a 40px overlap (at least
+    /// 7/8 of it). Reaching the end resumes following.
+    pub fn scroll_key(&mut self, key: ScrollKey, cx: &mut Context<Self>) {
+        let viewport = self.list.viewport_bounds().size.height;
+        let page = (viewport * 0.875).max(viewport - px(40.)).max(px(1.));
+        let step = match key {
+            ScrollKey::LineUp => -px(40.),
+            ScrollKey::LineDown => px(40.),
+            ScrollKey::PageUp => -page,
+            ScrollKey::PageDown => page,
+            ScrollKey::Top => {
+                self.scroll_to_offset(
+                    ListOffset {
+                        item_ix: 0,
+                        offset_in_item: px(0.),
+                    },
+                    cx,
+                );
+                return;
+            }
+            ScrollKey::End => return self.scroll_to_end(cx),
+        };
+        let remaining =
+            self.list.max_offset_for_scrollbar().y + self.list.scroll_px_offset_for_scrollbar().y;
+        if step > px(0.) && step >= remaining {
+            return self.scroll_to_end(cx);
+        }
+        self.list.scroll_by(step);
+        cx.notify();
+    }
+}
+#[derive(Clone, Copy)]
+pub enum ScrollKey {
+    LineUp,
+    LineDown,
+    PageUp,
+    PageDown,
+    Top,
+    End,
 }
 impl ChatView {
     pub(super) fn messages(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -184,6 +224,8 @@ impl ChatView {
             .child(
                 div()
                     .id("show-earlier")
+                    // A button stays reachable by Tab and Enter/Space.
+                    .tab_index(0)
                     .debug_selector(|| "show-earlier".into())
                     .cursor_pointer()
                     .px(px(12.))
