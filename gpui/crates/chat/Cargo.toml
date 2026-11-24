@@ -10,6 +10,8 @@ gitterm-core = { path = "../../../crates/gitterm-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 markdown = "=1.0.0"
+# Find matches as Iced's `giu` RegExp: Unicode simple case folding.
+regex = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui-kit = "=0.9.1"

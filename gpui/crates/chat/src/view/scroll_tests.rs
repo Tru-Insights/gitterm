@@ -393,3 +393,27 @@ fn show_earlier_stays_disabled_while_find_shows(cx: &mut TestAppContext) {
         "disabled"
     );
 }
+
+/// Q04: Iced's `giu` literal pattern folds case by Unicode simple case
+/// folding: final sigma matches sigma; dotted capital I is not `i`.
+#[test]
+fn find_matches_by_unicode_simple_case_folding() {
+    use crate::model::find_ranges;
+    assert_eq!(find_ranges("ΟΔΟΣ", "οδος"), vec![0..8]);
+    assert_eq!(
+        find_ranges("İstanbul", "istanbul"),
+        Vec::<std::ops::Range<usize>>::new()
+    );
+    assert_eq!(
+        find_ranges("Straße", "STRASSE"),
+        Vec::<std::ops::Range<usize>>::new()
+    );
+    assert_eq!(find_ranges("a.b A.B", "a.b"), vec![0..3, 4..7]);
+    assert_eq!(find_ranges("aaaa", "aa"), vec![0..2, 2..4]);
+    // Signs that fold to ASCII letters.
+    assert_eq!(
+        find_ranges("\u{212a}ey \u{17f}ize", "KEY SIZE"),
+        vec![0..11]
+    );
+    assert_eq!(find_ranges("é then E", "e"), vec![5..6, 8..9]);
+}
