@@ -10,6 +10,7 @@ struct Fake {
     created: Vec<(String, u32, bool)>,
     placed: Vec<VisualPlacement>,
     inbox: VecDeque<VisualMessage>,
+    themes: Vec<bool>,
 }
 struct FakeSurface(Rc<RefCell<Fake>>);
 impl VisualSurface for FakeSurface {
@@ -18,6 +19,9 @@ impl VisualSurface for FakeSurface {
     }
     fn drain(&mut self) -> Vec<VisualMessage> {
         self.0.borrow_mut().inbox.drain(..).collect()
+    }
+    fn set_theme(&mut self, light: bool) {
+        self.0.borrow_mut().themes.push(light);
     }
 }
 
@@ -188,6 +192,62 @@ fn without_a_native_host_the_reply_shows_the_iced_note(cx: &mut TestAppContext) 
     let (id, _) = reply(&chat, cx);
     assert!(shown(format!("visual-reply-{id}"), cx));
     assert!(!shown(format!("visual-{id}-Expand"), cx));
+}
+
+/// Y04: Iced's note is a bare `.html-render` box: no bar padding.
+#[gpui::test]
+fn the_unavailable_note_sits_in_a_bare_box(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(None, "html_render", cx);
+    let (id, _) = reply(&chat, cx);
+    draw(cx);
+    let block = cx
+        .debug_bounds(format!("visual-reply-{id}").leak())
+        .unwrap();
+    let note = cx
+        .debug_bounds(format!("visual-note-{id}").leak())
+        .expect("note");
+    let left = f32::from(note.left() - block.left());
+    let top = f32::from(note.top() - block.top());
+    assert!(left <= 1.5 && top <= 1.5, "note inset {left},{top}");
+}
+
+/// Y05: Iced's `__setAppearance` restyles each frame; it is not rebuilt.
+#[gpui::test]
+fn a_theme_change_restyles_the_frame_without_rebuilding_it(cx: &mut TestAppContext) {
+    let fake = Rc::new(RefCell::new(Fake::default()));
+    let (chat, cx) = setup(Some(fake.clone()), "html_render", cx);
+    let _ = reply(&chat, cx);
+    draw(cx);
+    assert_eq!(fake.borrow().created.len(), 1);
+    cx.update(|_, cx| {
+        chat.update(cx, |chat, cx| {
+            chat.set_appearance(
+                crate::appearance::ChatAppearance {
+                    light: true,
+                    ..Default::default()
+                },
+                cx,
+            )
+        })
+    });
+    draw(cx);
+    assert_eq!(fake.borrow().created.len(), 1, "the frame was rebuilt");
+    assert_eq!(fake.borrow().themes, [true]);
+}
+
+/// Y01: an error result is never a visual reply, however valid its JSON.
+#[test]
+fn html_render_error_results_never_become_visual_replies() {
+    let output =
+        serde_json::json!({"html_render": {"html": "<p>x</p>", "height": 100}}).to_string();
+    let tool = Tool {
+        name: "html_render".into(),
+        input: serde_json::Value::Null,
+        partial_input: String::new(),
+        output: Some(output),
+        is_error: true,
+    };
+    assert_eq!(visual::visual_request(&tool), None);
 }
 
 #[test]

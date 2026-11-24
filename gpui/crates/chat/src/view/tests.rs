@@ -2320,7 +2320,7 @@ fn h12_h14_h15_h16_h16a_h16b_preview_buttons_only_notice(cx: &mut TestAppContext
         )
     });
     for (card, label) in [
-        (with_findings(), "Send to Claude"),
+        (with_findings(), "Send to Claude-primary"),
         (card("review", "completed"), "Re-run"),
         (card("review", "completed"), "Dismiss"),
         (card("consult", "running"), "Cancel"),
@@ -2329,6 +2329,7 @@ fn h12_h14_h15_h16_h16a_h16b_preview_buttons_only_notice(cx: &mut TestAppContext
         install_card(card.clone(), &chat, cx);
         let id = chat.read_with(cx, |view, _| view.model.rows[0].id);
         click_selector(format!("delegation-action-{id}-{label}"), cx);
+        let label = label.trim_end_matches("-primary");
         chat.read_with(cx, |view, _| {
             assert_eq!(
                 view.composer_state.notice.as_deref(),
@@ -4247,4 +4248,187 @@ fn latest_button_floats_small_over_the_transcript(cx: &mut TestAppContext) {
     assert!((11. ..=13.).contains(&bottom), "bottom gap {bottom}");
     click_selector("chat-latest".into(), cx);
     assert!(chat.read_with(cx, |view, cx| view.scroller.read(cx).is_following_tail()));
+}
+
+fn bounds_of(selector: String, cx: &mut VisualTestContext) -> gpui::Bounds<gpui::Pixels> {
+    let leaked = Box::leak(selector.clone().into_boxed_str());
+    cx.debug_bounds(leaked)
+        .unwrap_or_else(|| panic!("missing {selector}"))
+}
+
+/// D15: `details.dlg` is a neutral 1px box with a 3px state-coloured left
+/// edge and an 8px top margin (an assistant row has none above it).
+#[gpui::test]
+fn d15_delegation_card_has_a_left_state_edge_and_an_8px_margin(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    cx.simulate_resize(size(px(900.), px(900.)));
+    install_card(crate::delegation::tests::with_findings(), &chat, cx);
+    let row = bounds_of("transcript-row-0".into(), cx);
+    let edge = bounds_of("card-edge-0".into(), cx);
+    let transcript = bounds_of("chat-transcript".into(), cx);
+    // The edge covers the row's own left border, top to bottom.
+    assert_eq!(edge.left(), row.left(), "{edge:?} {row:?}");
+    assert_eq!(edge.top(), row.top(), "{edge:?} {row:?}");
+    assert_eq!(edge.size.height, row.size.height, "{edge:?} {row:?}");
+    assert_eq!(
+        chat.read_with(cx, |view, _| transcript::card_border(
+            view.model.rows[0].delegation.as_ref().unwrap(),
+            view.appearance.palette()
+        )),
+        ChatAppearance::default().palette().result
+    );
+    let card_top = f32::from(row.top() - transcript.top());
+
+    let (_, cx) = setup(
+        vec![Record {
+            at_ms: None,
+            entry: Entry::Harness(HarnessEvent::TextDelta("Assistant text".into())),
+        }],
+        cx,
+    );
+    cx.simulate_resize(size(px(900.), px(900.)));
+    draw(cx);
+    let text_top = f32::from(
+        bounds_of("transcript-row-0".into(), cx).top()
+            - bounds_of("chat-transcript".into(), cx).top(),
+    );
+    assert!(
+        (card_top - text_top - 8.).abs() < 0.5,
+        "card {card_top} vs text {text_top}"
+    );
+}
+
+/// D19–D21: the finding row is Iced's: `.sev` badge, mono id, semibold
+/// title, a 4px-padded row, the location link and a 2px-spaced body.
+#[gpui::test]
+fn d19_d20_d21_finding_rows_use_iced_badge_id_title_location_and_body(cx: &mut TestAppContext) {
+    use gitterm_core::tasks::ReviewSeverity::*;
+    let palette = ChatAppearance::default().palette();
+    assert_eq!(
+        transcript::severity_colors(P0, palette),
+        (palette.err, palette.base)
+    );
+    assert_eq!(
+        transcript::severity_colors(P1, palette),
+        (palette.tool, palette.base)
+    );
+    assert_eq!(
+        transcript::severity_colors(P2, palette),
+        (palette.warn, palette.base)
+    );
+    assert_eq!(
+        transcript::severity_colors(P3, palette),
+        (palette.strong, palette.fg)
+    );
+    let (chat, cx) = setup(vec![], cx);
+    cx.simulate_resize(size(px(1200.), px(900.)));
+    install_card(crate::delegation::tests::with_findings(), &chat, cx);
+    let row = bounds_of("finding-row-0-F1".into(), cx);
+    let main = bounds_of("finding-main-0-F1".into(), cx);
+    let badge = bounds_of("finding-severity-0-F1".into(), cx);
+    let fid = bounds_of("finding-id-0-F1".into(), cx);
+    let title = bounds_of("finding-title-0-F1".into(), cx);
+    let location = bounds_of("finding-location-0-F1".into(), cx);
+    let body = bounds_of("finding-body-0-F1".into(), cx);
+    // `.dlg-finding` padding 4px 0.
+    assert!(
+        (f32::from(main.top() - row.top()) - 4.).abs() < 0.5,
+        "{main:?} {row:?}"
+    );
+    // 10.5/14 badge and 11.5/14 id are smaller than the 13/14 title; the
+    // badge leads the line, then the id, then the title.
+    assert!(badge.size.height < title.size.height, "{badge:?} {title:?}");
+    assert!(fid.size.height < title.size.height, "{fid:?} {title:?}");
+    assert!(badge.left() < fid.left() && fid.right() <= title.left());
+    // The location is as wide as its text, not the row, and not cut short.
+    assert!(location.size.width < main.size.width * 0.5, "{location:?}");
+    // `.dlg-fbody` margin-top 2px, 12/14.
+    assert!(
+        (f32::from(body.top() - location.bottom()) - 2.).abs() < 0.5,
+        "{body:?} {location:?}"
+    );
+    assert!(body.size.height < title.size.height, "{body:?} {title:?}");
+}
+
+/// D22: the checked findings outlive the card's row view (96-row bound),
+/// as Iced keeps `card.selected` for the life of the card.
+#[gpui::test]
+fn d22_finding_selection_survives_row_eviction(cx: &mut TestAppContext) {
+    let records = (0..110)
+        .map(|i| Record {
+            at_ms: None,
+            entry: Entry::UserPrompt(format!("prompt {i}")),
+        })
+        .collect();
+    let (chat, cx) = setup(records, cx);
+    chat.update_in(cx, |view, window, cx| {
+        view.set_delegations(vec![crate::delegation::tests::with_findings()], cx);
+        let card = view.model.rows.len() - 1;
+        view.row(card, window, cx)
+            .update(cx, |row, _| row.selected_findings = Some(HashSet::new()));
+        for index in 0..card {
+            view.row(index, window, cx);
+        }
+        assert!(view.row_views[card].is_none(), "evicted");
+        let row = view.row(card, window, cx);
+        assert_eq!(row.read(cx).selected_findings, Some(HashSet::new()));
+    });
+}
+
+/// D23: with every finding unchecked, Send is disabled: a click sends nothing.
+#[gpui::test]
+fn d23_unchecking_every_finding_disables_send(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    cx.simulate_resize(size(px(1400.), px(1000.)));
+    install_card(crate::delegation::tests::with_findings(), &chat, cx);
+    click_selector("finding-select-0-F1".into(), cx);
+    click_selector("delegation-action-0-Send to Claude-primary".into(), cx);
+    chat.read_with(cx, |view, _| assert_eq!(view.composer_state.notice, None));
+    click_selector("finding-select-0-F1".into(), cx);
+    click_selector("delegation-action-0-Send to Claude-primary".into(), cx);
+    chat.read_with(cx, |view, _| {
+        assert_eq!(
+            view.composer_state.notice.as_deref(),
+            Some(crate::interactions::preview_notice("Send to Claude").as_str())
+        )
+    });
+}
+
+/// D24: `.dlg-section` letters carry .05em spacing; a `<ul>` item's text
+/// starts 40px in.
+#[gpui::test]
+fn d24_handoff_sections_space_letters_and_indent_lists_40px(cx: &mut TestAppContext) {
+    assert_eq!(
+        transcript::section_letters("Next steps"),
+        ["N", "E", "X", "T", "\u{a0}", "S", "T", "E", "P", "S"]
+    );
+    let (chat, cx) = setup(vec![], cx);
+    cx.simulate_resize(size(px(900.), px(900.)));
+    install_card(blocked_worker_card(), &chat, cx);
+    let body = bounds_of("delegation-body-0".into(), cx);
+    let item = bounds_of("delegation-section-item-0-3".into(), cx);
+    let indent = f32::from(item.left() - body.left()) - 22.;
+    assert!((indent - 40.).abs() < 0.5, "item indent {indent}");
+}
+
+/// D17: the checkout HEAD the host supplies reaches the card's banner.
+#[gpui::test]
+fn d17_checkout_head_shows_the_branch_moved_banner(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    cx.simulate_resize(size(px(900.), px(900.)));
+    install_card(crate::delegation::tests::with_findings(), &chat, cx);
+    assert!(cx.debug_bounds("delegation-banner-0").is_none());
+    chat.update_in(cx, |view, _, cx| {
+        view.set_checkout_head(Some("fedcba9876543".into()), cx)
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("delegation-banner-0").is_some());
+    // A later registry update keeps the head.
+    install_card(crate::delegation::tests::with_findings(), &chat, cx);
+    assert!(cx.debug_bounds("delegation-banner-0").is_some());
+    chat.update_in(cx, |view, _, cx| {
+        view.set_checkout_head(Some("123456789abc".into()), cx)
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("delegation-banner-0").is_none());
 }

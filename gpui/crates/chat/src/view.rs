@@ -176,6 +176,10 @@ pub struct ChatView {
     recent_rows: VecDeque<usize>,
     folded: HashMap<u64, bool>,
     retained_edit_expansion: HashMap<u64, HashSet<usize>>,
+    /// Iced's `card.selected`, kept while a card's row view is evicted.
+    retained_finding_selection: HashMap<u64, HashSet<String>>,
+    /// The checkout's HEAD for the cards' "branch has moved" banner.
+    checkout_head: Option<String>,
     folded_turns: HashSet<u64>,
     open_runs: HashSet<u64>,
     open_work: HashSet<u64>,
@@ -311,6 +315,8 @@ impl ChatView {
             recent_rows: VecDeque::new(),
             folded: HashMap::new(),
             retained_edit_expansion: HashMap::new(),
+            retained_finding_selection: HashMap::new(),
+            checkout_head: None,
             folded_turns: HashSet::new(),
             open_runs: HashSet::new(),
             open_work: HashSet::new(),
@@ -397,7 +403,33 @@ impl ChatView {
         let mut changed = Vec::new();
         // Registry order is newest-first for the roster; new transcript cards
         // arrive oldest-first when replay has no stored anchor for them.
-        for card in cards.into_iter().rev() {
+        for mut card in cards.into_iter().rev() {
+            card.checkout_head = self.checkout_head.clone();
+            changed.extend(self.model.upsert_delegation(card));
+        }
+        if !changed.is_empty() {
+            self.refresh_rows(count, following, changed, cx);
+        }
+    }
+
+    /// Iced's `__setDelegationHead`: the chat checkout's HEAD, which a
+    /// review card compares with the commit it reviewed.
+    pub fn set_checkout_head(&mut self, head: Option<String>, cx: &mut Context<Self>) {
+        if self.checkout_head == head {
+            return;
+        }
+        self.checkout_head = head;
+        let cards: Vec<_> = self
+            .model
+            .rows
+            .iter()
+            .filter_map(|row| row.delegation.clone())
+            .collect();
+        let count = self.model.rows.len();
+        let following = self.scroller.read(cx).is_following_tail();
+        let mut changed = Vec::new();
+        for mut card in cards {
+            card.checkout_head = self.checkout_head.clone();
             changed.extend(self.model.upsert_delegation(card));
         }
         if !changed.is_empty() {
@@ -1008,6 +1040,7 @@ impl ChatView {
                 self.recent_rows.clear();
                 self.folded.clear();
                 self.retained_edit_expansion.clear();
+                self.retained_finding_selection.clear();
                 self.folded_turns.clear();
                 self.open_runs.clear();
                 self.open_work.clear();
@@ -1088,6 +1121,10 @@ impl ChatView {
                 self.folded.insert(row.row.id, row.open);
                 self.retained_edit_expansion
                     .insert(row.row.id, row.expanded_edits.clone());
+                if let Some(selected) = &row.selected_findings {
+                    self.retained_finding_selection
+                        .insert(row.row.id, selected.clone());
+                }
             }
         }
         if let Some(view) = &self.row_views[index] {
@@ -1184,6 +1221,7 @@ impl ChatView {
                 .get(&view.row.id)
                 .cloned()
                 .unwrap_or_default();
+            view.selected_findings = self.retained_finding_selection.get(&view.row.id).cloned();
             view.action = action;
             view.flashed = self.flashed_row == Some(view.row.id);
             view.busy = self.composer_state.streaming;
@@ -2257,6 +2295,8 @@ impl Render for RowView {
                     view.debug_selector(move || format!("delivery-card-{id}"))
                         .my(px(8.))
                 })
+                // Iced's `details.dlg`: margin 8px 0.
+                .when(self.row.delegation.is_some(), |view| view.my(px(8.)))
                 .when(self.row.kind == RowKind::User, |view| {
                     view.w_auto()
                         .max_w(gpui::relative(0.85))
@@ -2286,15 +2326,24 @@ impl Render for RowView {
                             .rounded(px(6.))
                     },
                 )
-                .when(self.row.delivery.is_some(), |row| {
+                // Delivery and delegation cards: a neutral 1px border with a
+                // 3px left edge in the card's state colour (`color`). Insets
+                // are from the padding box, so the edge reaches back over the
+                // border; drawn as a left border it follows the 6px corners.
+                .when(self.row.kind == RowKind::Delegation, |row| {
+                    let id = self.row.id;
                     row.relative().border_color(rgb(palette.border)).child(
                         div()
+                            .debug_selector(move || format!("card-edge-{id}"))
                             .absolute()
-                            .left_0()
-                            .top_0()
-                            .bottom_0()
-                            .w(px(3.))
-                            .bg(rgb(palette.result)),
+                            .left(px(-3.))
+                            .top(px(-1.))
+                            .bottom(px(-1.))
+                            .w(px(12.))
+                            .rounded_tl(px(6.))
+                            .rounded_bl(px(6.))
+                            .border_l_3()
+                            .border_color(rgb(color)),
                     )
                 })
                 .when(self.flashed, |row| {
