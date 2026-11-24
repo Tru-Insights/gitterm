@@ -87,8 +87,8 @@ impl TranscriptFind {
         self.current = (!self.matches.is_empty()).then_some(0);
     }
     pub(super) fn refresh(&mut self, model: &ChatModel, changed: &[usize]) {
-        let anchor = self.active().cloned();
-        let old_index = self.current.unwrap_or(0);
+        let previous = self.matches.clone();
+        let previous_index = self.current;
         self.matches.retain(|found| !changed.contains(&found.row));
         for &row in changed {
             let matches = self.row_matches(model, row);
@@ -96,9 +96,32 @@ impl TranscriptFind {
         }
         self.matches
             .sort_by_key(|found| (found.row, found.occurrence));
-        self.current = anchor
-            .and_then(|old| self.matches.iter().position(|new| new == &old))
-            .or_else(|| (!self.matches.is_empty()).then(|| old_index.min(self.matches.len() - 1)));
+        // Iced's `refreshFind`: the current hit keeps its row and ordinal;
+        // a row that lost every hit gives way to the nearest old hit whose
+        // row still has some, later ones first; else the old index, clamped.
+        let in_row = |old: &SearchMatch| {
+            let start = self.matches.iter().position(|new| new.row == old.row)?;
+            let count = self.matches[start..]
+                .iter()
+                .take_while(|new| new.row == old.row)
+                .count();
+            Some(start + old.occurrence.min(count - 1))
+        };
+        self.current = previous_index
+            .and_then(|index| {
+                (0..previous.len()).find_map(|distance| {
+                    let later = previous.get(index + distance).and_then(in_row);
+                    let earlier = index
+                        .checked_sub(distance)
+                        .and_then(|index| previous.get(index))
+                        .and_then(in_row);
+                    later.or(earlier)
+                })
+            })
+            .or_else(|| {
+                (!self.matches.is_empty())
+                    .then(|| previous_index.unwrap_or(0).min(self.matches.len() - 1))
+            });
     }
     pub(super) fn active(&self) -> Option<&SearchMatch> {
         self.current.and_then(|index| self.matches.get(index))
@@ -655,6 +678,32 @@ impl RowView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Q12: Iced keeps the current hit by row and ordinal; when its row loses
+    /// every hit it moves to the nearest old hit (later first) whose row
+    /// still has one, not to whatever now sits at the old index.
+    #[test]
+    fn live_refresh_keeps_the_hit_by_row_or_its_nearest_old_neighbour() {
+        let prompt = |text: &str| Record {
+            at_ms: None,
+            entry: crate::events::Entry::UserPrompt(text.into()),
+        };
+        let mut model = ChatModel::from_records(&[prompt("one hit"), prompt("hit"), prompt("hit")]);
+        let mut find = TranscriptFind::default();
+        find.search(&model, "hit".into());
+        find.current = Some(1);
+        // Row 0 gains a hit before it while row 1 loses its only one.
+        model.rows[0].body = "hit and hit".into();
+        model.rows[1].body = "gone".into();
+        find.refresh(&model, &[0, 1]);
+        assert_eq!(find.active().unwrap().row, 2, "the next old hit's row");
+        // Same row, text grown before the hit: it keeps its ordinal.
+        find.current = Some(1);
+        model.rows[0].body = "x hit and hit".into();
+        find.refresh(&model, &[0]);
+        let active = find.active().unwrap();
+        assert_eq!((active.row, active.occurrence), (0, 1));
+    }
     use crate::events::parse_fixture;
     use gpui::{TestAppContext, VisualTestContext};
     use std::cell::Cell;
