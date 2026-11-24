@@ -5,6 +5,15 @@ use gpui_component::menu::PopupMenu;
 
 const COPIED_FOR: Duration = Duration::from_millis(1200);
 
+// TextView passes the row foreground to hosted controls; keep this button's
+// label independent from that inherited color and the button surface.
+fn code_copy_button<I>(id: I, label: &'static str, color: gpui::Hsla) -> Button
+where
+    I: Into<gpui::ElementId>,
+{
+    Button::new(id).small().text_color(color).label(label)
+}
+
 pub(super) fn markdown_body(row: &Row) -> String {
     let source = display_body(row);
     if row.kind == RowKind::Assistant && row.scope.is_empty() {
@@ -254,6 +263,7 @@ impl RowView {
     pub(super) fn copyable_text(&self, cx: &mut Context<Self>) -> TextView {
         let owner = cx.entity().downgrade();
         let copied: HashSet<_> = self.copied.keys().copied().collect();
+        let copy_label_color = rgb(self.appearance.palette().fg);
         let view = TextView::new(self.output_text.as_ref().unwrap_or(&self.text))
             .on_link_click(super::transcript::open_link)
             // TextView resolves Markdown colors from the component theme;
@@ -315,6 +325,7 @@ impl RowView {
                 let owner = owner.clone();
                 div()
                     .id(("copy-code-hover", key))
+                    .debug_selector(|| "copy-code-action".into())
                     .opacity(if copied.contains(&CopyTarget::Code(key)) {
                         1.
                     } else {
@@ -322,16 +333,18 @@ impl RowView {
                     })
                     .group_hover("chat-row", |style| style.opacity(1.))
                     .child(
-                        Button::new(("copy-code", key))
-                            .debug_selector({
-                                let owner = owner.clone();
-                                move || format!("copy-code-{}", owner.entity_id())
-                            })
-                            .small()
-                            .label(if copied.contains(&CopyTarget::Code(key)) {
+                        code_copy_button(
+                            ("copy-code", key),
+                            if copied.contains(&CopyTarget::Code(key)) {
                                 "Copied"
                             } else {
                                 "Copy"
+                            },
+                            copy_label_color.into(),
+                        )
+                            .debug_selector({
+                                let owner = owner.clone();
+                                move || format!("copy-code-{}", owner.entity_id())
                             })
                             .on_click(move |_, _, cx| {
                                 _ = owner
@@ -607,6 +620,67 @@ mod tests {
                 .top,
             None
         );
+    }
+
+    #[gpui::test]
+    fn code_block_copy_label_contrasts_with_its_hovered_button(cx: &mut TestAppContext) {
+        let (_chat, cx) = setup(cx);
+        cx.update(|window, app| {
+            gpui_component::Theme::change(
+                gpui_component::ThemeMode::Dark,
+                Some(window),
+                app,
+            );
+        });
+        draw(cx);
+        let action_bounds = cx
+            .debug_bounds("copy-code-action")
+            .expect("copy button action rendered");
+        cx.update(|window, app| window.simulate_mouse_move(action_bounds.center(), app));
+        draw(cx);
+
+        assert!(cx.debug_bounds("copy-code-action").is_some(), "copy action hovered");
+
+        let (label, background) = cx.update(|_, app| {
+            let theme = gpui_component::Theme::global(app);
+            let mut button = code_copy_button(
+                "test-copy-code",
+                "Copy",
+                rgb(ChatAppearance::default().palette().fg).into(),
+            );
+            let label = button
+                .style()
+                .text
+                .color
+                .expect("copy button sets an explicit label color");
+            (label, theme.tokens.button_hover.color)
+        });
+        assert!(
+            contrast_ratio(label, background) >= 4.5,
+            "copy label {label:?} must contrast with hovered button {background:?}"
+        );
+
+    }
+
+    fn contrast_ratio(foreground: gpui::Hsla, background: gpui::Hsla) -> f32 {
+        fn luminance(color: gpui::Hsla) -> f32 {
+            let rgb = color.to_rgb();
+            let channel = |value: f32| {
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(rgb.r) + 0.7152 * channel(rgb.g) + 0.0722 * channel(rgb.b)
+        }
+
+        let (light, dark) = {
+            let foreground = luminance(foreground);
+            let background = luminance(background);
+            (foreground.max(background), foreground.min(background))
+        };
+        (light + 0.05) / (dark + 0.05)
     }
 
     #[gpui::test]
