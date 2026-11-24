@@ -1537,6 +1537,11 @@ fn appearance_restyles_retained_rows_and_scales_message_and_composer_text(cx: &m
     row.update_in(cx, |row, _, cx| {
         assert!(row.appearance.light);
         let mut text = row.copyable_text(cx);
+        assert_eq!(
+            gpui::Styled::style(&mut text).text.color,
+            Some(rgb(row.appearance.palette().fg).into()),
+            "TextView body text uses the chat palette foreground"
+        );
         let style = gpui::Styled::style(&mut text).text_style();
         assert_eq!(style.font_size, Some(px(20.).into()));
         assert_eq!(style.font_family.as_deref(), Some(".SystemUIFont"));

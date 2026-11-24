@@ -2487,14 +2487,10 @@ impl Render for RowView {
                 })
                 .group("chat-row")
                 .text_size(px(self.appearance.font_size))
-                .text_color(rgb(match self.row.kind {
-                    RowKind::Thinking
-                    | RowKind::Status
-                    | RowKind::Legacy(crate::model::LegacyBlock::Thinking) => palette.muted,
-                    RowKind::Error => palette.err,
-                    RowKind::Warning => palette.warn,
-                    _ => palette.fg,
-                }))
+                .text_color(rgb(copy::transcript_text_color(
+                    self.appearance,
+                    self.row.kind,
+                )))
                 .font_family(".SystemUIFont")
                 .w_full()
                 // Iced's bottom margin per block; the next block's smaller
@@ -2516,8 +2512,7 @@ impl Render for RowView {
                 .when(self.row.kind == RowKind::User, |view| {
                     view.w_auto()
                         .max_w(gpui::relative(0.85))
-                        .ml_auto()
-                        .mr_0()
+                        .self_end()
                         .bg(rgb(palette.block))
                         .border_1()
                         .border_color(rgb(palette.border))
@@ -2781,6 +2776,9 @@ impl Render for RowView {
             .w_full()
             .when_some(self.column_width, |row, width| row.max_w(px(width)))
             .mx_auto()
+            // A user row needs a flex cross-axis so its auto width can fit its
+            // contents while `self_end` holds the bubble against the right edge.
+            .when(self.row.kind == RowKind::User, |row| row.flex().flex_col())
             .children(work_summary)
             .when(show_work, |outer| outer.child(row))
             .children(visual)

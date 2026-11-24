@@ -26,6 +26,18 @@ fn inline_code_style(appearance: ChatAppearance, assistant: bool) -> StyleRefine
     }
 }
 
+pub(super) fn transcript_text_color(appearance: ChatAppearance, kind: RowKind) -> u32 {
+    let palette = appearance.palette();
+    match kind {
+        RowKind::Thinking
+        | RowKind::Status
+        | RowKind::Legacy(crate::model::LegacyBlock::Thinking) => palette.muted,
+        RowKind::Error => palette.err,
+        RowKind::Warning => palette.warn,
+        _ => palette.fg,
+    }
+}
+
 pub(super) fn assistant_style(
     appearance: ChatAppearance,
     rem_size: gpui::Pixels,
@@ -244,6 +256,9 @@ impl RowView {
         let copied: HashSet<_> = self.copied.keys().copied().collect();
         let view = TextView::new(self.output_text.as_ref().unwrap_or(&self.text))
             .on_link_click(super::transcript::open_link)
+            // TextView resolves Markdown colors from the component theme;
+            // pin its body text to the chat palette without changing that theme.
+            .text_color(rgb(transcript_text_color(self.appearance, self.row.kind)))
             // Iced's `.error-block` and legacy `pre` are monospace.
             .font_family(match self.row.kind {
                 RowKind::Error | RowKind::Legacy(_) => "Menlo",
