@@ -74,6 +74,8 @@ the selected workspace.
 
 ## 4. Chat area
 
+Detailed transcript behavior, styling, disclosure states and test coverage: [TRU-274 chat parity checklist](gpui-chat-parity.md).
+
 | Item | Iced shows / does | GPUI today | Difference |
 | --- | --- | --- | --- |
 | Session strip / header | Fixed WORKSPACE/TASK context stamp, task parent crumb/Overview, scrolling tabs with conversation or stable task-session titles, status glyphs and number hints, per-tab `×`; fixed mic/workspace/close/branch metadata and worktree-follow chip: [src/main.rs:39126](../src/main.rs#L39126), [src/main.rs:39303](../src/main.rs#L39303), [src/main.rs:39426](../src/main.rs#L39426), [src/main.rs:39544](../src/main.rs#L39544). | Underlined outer session tabs and dock titles; preview chat title stays “Claude preview”. No context stamp, task filtering/Overview, per-session strip close or worktree-follow metadata: [gpui/crates/shell/src/lib.rs:629](../gpui/crates/shell/src/lib.rs#L629), [gpui/crates/shell/src/lib.rs:1325](../gpui/crates/shell/src/lib.rs#L1325). | **differs** |
