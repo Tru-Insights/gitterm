@@ -417,3 +417,47 @@ fn find_matches_by_unicode_simple_case_folding() {
     );
     assert_eq!(find_ranges("é then E", "e"), vec![5..6, 8..9]);
 }
+
+/// Q02/Q08: a card's find text is Iced's roots only (`.dlg-summary`, the
+/// handoff summary, list items), numbered in order so the current hit is
+/// painted on its own text: here the finding body's "early".
+#[gpui::test]
+fn card_find_searches_iced_roots_and_marks_the_exact_hit(cx: &mut TestAppContext) {
+    use crate::view::find::{card_find_texts, card_roots, find_count, finding_text};
+    let card = crate::delegation::tests::with_findings();
+    assert_eq!(
+        card_find_texts(&card),
+        [
+            "One issue",
+            "P1 F1 Handle empty input\nsrc/lib.rs:12-14\nReturn early."
+        ]
+    );
+    let finding = &card.findings().unwrap().findings[0];
+    let (_, [_, _, _, body_at]) = finding_text(finding);
+    let roots = card_roots(&card, "early", Some(0));
+    assert!(!roots[0].current_in(0, "One issue".len()));
+    assert!(roots[1].current_in(body_at, finding.body.len()));
+    let (chat, cx) = setup(turns(2, 1), cx);
+    chat.update(cx, |view, cx| view.set_delegations(vec![card.clone()], cx));
+    draw(cx);
+    cx.simulate_keystrokes("cmd-f");
+    cx.simulate_input("Verdict");
+    draw(cx);
+    // The `.dlg-line` "Verdict: needs changes" is not searched.
+    assert_eq!(
+        chat.read_with(cx, |view, _| find_count(&view.find)),
+        "0 of 0"
+    );
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_input("early");
+    draw(cx);
+    assert_eq!(
+        chat.read_with(cx, |view, _| find_count(&view.find)),
+        "1 of 1"
+    );
+    let row = chat.read_with(cx, |view, _| view.find.active().unwrap().row);
+    assert_eq!(
+        chat.read_with(cx, |view, _| view.model.rows[row].kind),
+        RowKind::Delegation
+    );
+}

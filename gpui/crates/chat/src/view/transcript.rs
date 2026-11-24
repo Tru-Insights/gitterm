@@ -787,7 +787,12 @@ impl RowView {
             "waiting" | "blocked" => palette.warn,
             _ => palette.muted,
         };
-        let (body, parts_bottom) = self.render_card_parts(card.parts(), cx);
+        // Iced's find roots: hits numbered across the card, the current one
+        // revealed here when the row's text view does not hold it.
+        let roots = super::find::card_roots(&card, &self.query, self.active);
+        let reveal = std::mem::take(&mut self.reveal_pending);
+        let (body, parts_bottom) = self.render_card_parts(card.parts(), &roots, reveal, cx);
+        let finding_roots = roots.len() - findings.len();
         // Iced's `.dlg-findings` (margin 4px 0) and `.dlg-actions`
         // (margin-top 8px) collapse with the block margin above them.
         let list_top = f32::max(4. - parts_bottom, 0.);
@@ -882,7 +887,12 @@ impl RowView {
                                     .children(findings.into_iter().enumerate().map(
                                         |(index, finding)| {
                                             self.render_finding(
-                                                index, finding, &selected, delivered, cx,
+                                                index,
+                                                finding,
+                                                &selected,
+                                                delivered,
+                                                (&roots[finding_roots + index], reveal),
+                                                cx,
                                             )
                                         },
                                     )),
@@ -918,6 +928,7 @@ impl RowView {
         finding: gitterm_core::tasks::ReviewFinding,
         selected: &HashSet<String>,
         delivered: bool,
+        (hits, reveal): (&super::find::RootHits, bool),
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let appearance = self.appearance;
@@ -929,6 +940,16 @@ impl RowView {
         let open = self.action.clone();
         let (badge_bg, badge_fg) = severity_colors(finding.severity, palette);
         let severity = format!("{:?}", finding.severity);
+        // The `li`'s find text, and each piece's hits within it.
+        let (_, [id_at, title_at, location_at, body_at]) = super::find::finding_text(&finding);
+        let piece = |shown: String, start: usize, len: usize| {
+            let text = hits.piece(shown, start, len);
+            if reveal && hits.current_in(start, len) {
+                super::find::reveal_here(text).into_any_element()
+            } else {
+                text.into_any_element()
+            }
+        };
         // `.dlg-finding`: flex, gap 6px, padding 4px 0, a top rule except first.
         div()
             .debug_selector({
@@ -943,12 +964,6 @@ impl RowView {
             .when(index > 0, |row| {
                 row.border_t_1().border_color(rgb(palette.border))
             })
-            .when(
-                !self.query.is_empty()
-                    && !find_ranges(&format!("{}\n{}", finding.title, finding.body), &self.query)
-                        .is_empty(),
-                |row| row.bg(rgb(0x665c32)),
-            )
             .child(
                 // A checkbox's UA margin is 3px 3px 3px 4px; Iced sets the top to 3px.
                 div().flex_none().mt(px(3.)).ml(px(4.)).mr(px(3.)).child(
@@ -1005,7 +1020,7 @@ impl RowView {
                                     .font_family("Menlo")
                                     .text_size(px(appearance.size(10.5)))
                                     .line_height(gpui::relative(1.2))
-                                    .child(severity),
+                                    .child(piece(severity.clone(), 0, severity.len())),
                             )
                             // The text node between the badge and the id.
                             .child(div().flex_none().child("\u{a0}"))
@@ -1020,7 +1035,7 @@ impl RowView {
                                     .font_family("Menlo")
                                     .text_size(px(appearance.size(11.5)))
                                     .text_color(rgb(palette.muted))
-                                    .child(format!("{fid}\u{a0}")),
+                                    .child(piece(format!("{fid}\u{a0}"), id_at, fid.len())),
                             )
                             .child(
                                 // `.dlg-ftitle`: weight 600.
@@ -1032,7 +1047,11 @@ impl RowView {
                                     .flex_1()
                                     .min_w_0()
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child(finding.title.clone()),
+                                    .child(piece(
+                                        finding.title.clone(),
+                                        title_at,
+                                        finding.title.len(),
+                                    )),
                             ),
                     )
                     .children(location.map(|location| {
@@ -1068,7 +1087,7 @@ impl RowView {
                                         cx,
                                     );
                                 })
-                                .child(location),
+                                .child(piece(location.clone(), location_at, location.len())),
                         )
                     }))
                     .when(!finding.body.is_empty(), |main| {
@@ -1079,7 +1098,7 @@ impl RowView {
                                 .mt(px(2.))
                                 .text_color(rgb(palette.muted))
                                 .text_size(px(appearance.size(12.)))
-                                .child(finding.body),
+                                .child(piece(finding.body.clone(), body_at, finding.body.len())),
                         )
                     }),
             )
@@ -1090,14 +1109,27 @@ impl RowView {
     fn render_card_parts(
         &self,
         parts: Vec<crate::delegation::CardPart>,
+        roots: &[super::find::RootHits],
+        reveal: bool,
         cx: &mut Context<Self>,
     ) -> (Vec<gpui::AnyElement>, f32) {
         use crate::delegation::CardPart;
         let appearance = self.appearance;
         let palette = appearance.palette();
         let id = self.row.id;
-        let query = self.query.clone();
-        let hit = move |text: &str| !query.is_empty() && !find_ranges(text, &query).is_empty();
+        let mut roots = roots.iter();
+        // A searched root's text, its hits painted, revealed when current.
+        let mut searched = |text: String| {
+            let hits = roots.next().expect("a root per searched block");
+            let len = text.len();
+            let current = reveal && hits.current_in(0, len);
+            let text = hits.piece(text, 0, len);
+            if current {
+                super::find::reveal_here(text).into_any_element()
+            } else {
+                text.into_any_element()
+            }
+        };
         let mut previous_bottom = 0.;
         let mut elements = Vec::new();
         // Each block's CSS margin top and bottom; adjacent ones collapse.
@@ -1117,7 +1149,6 @@ impl RowView {
                         .font_family("Menlo")
                         .text_size(px(appearance.size(11.5)))
                         .text_color(rgb(palette.muted))
-                        .when(hit(&text), |row| row.bg(rgb(0x665c32)))
                         .child(text)
                         .into_any_element(),
                 ),
@@ -1131,7 +1162,6 @@ impl RowView {
                         .border_color(rgb(palette.warn))
                         .text_color(rgb(palette.warn))
                         .text_size(px(appearance.size(12.)))
-                        .when(hit(&text), |row| row.bg(rgb(0x665c32)))
                         .child(text)
                         .into_any_element(),
                 ),
@@ -1149,7 +1179,6 @@ impl RowView {
                         .text_size(px(appearance.size(12.)))
                         .max_h(px(160.))
                         .overflow_y_scroll()
-                        .when(hit(&text), |row| row.bg(rgb(0x665c32)))
                         .child(text)
                         .into_any_element(),
                 ),
@@ -1158,7 +1187,6 @@ impl RowView {
                         .debug_selector(move || format!("delegation-line-{id}-{index}"))
                         .text_color(rgb(palette.muted))
                         .text_size(px(appearance.size(12.)))
-                        .when(hit(&text), |row| row.bg(rgb(0x665c32)))
                         .child(text)
                         .into_any_element(),
                 ),
@@ -1169,26 +1197,27 @@ impl RowView {
                         .text_size(px(appearance.size(11.5)))
                         .text_color(rgb(palette.muted))
                         .text_ellipsis()
-                        .when(hit(&text), |row| row.bg(rgb(0x665c32)))
                         .child(text)
                         .into_any_element(),
                 ),
                 CardPart::Summary(text) => elements.push(
                     block(4., 6.)
                         .debug_selector(move || format!("delegation-summary-{id}"))
-                        .when(hit(&text), |row| row.bg(rgb(0x665c32)))
-                        .child(text)
+                        .child(searched(text))
                         .into_any_element(),
                 ),
                 // Iced renders the handoff summary as `.assistant` markdown.
                 // It is the row's text view, so it keeps selection, copy and
                 // find highlights.
-                CardPart::Report(_) => elements.push(
+                CardPart::Report(_) => elements.push({
+                    // The text view paints its own hits (`RowView::highlight`);
+                    // this only steps past the report's root.
+                    _ = searched(String::new());
                     block(6., 10.)
                         .debug_selector(move || format!("delegation-report-{id}"))
                         .child(self.copyable_text(cx))
-                        .into_any_element(),
-                ),
+                        .into_any_element()
+                }),
                 CardPart::Section(title, items) => {
                     // `.dlg-section`: uppercase 11/14 with letter-spacing .05em,
                     // which GPUI text lacks: each letter is followed by that gap.
@@ -1216,7 +1245,6 @@ impl RowView {
                             .children(items.into_iter().map(|item| {
                                 div()
                                     .flex()
-                                    .when(hit(&item), |row| row.bg(rgb(0x665c32)))
                                     .child(
                                         div()
                                             .flex_none()
@@ -1232,7 +1260,7 @@ impl RowView {
                                             })
                                             .flex_1()
                                             .min_w_0()
-                                            .child(item),
+                                            .child(searched(item)),
                                     )
                             }))
                             .into_any_element(),

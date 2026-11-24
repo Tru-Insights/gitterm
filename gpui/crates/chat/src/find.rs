@@ -61,7 +61,15 @@ impl TranscriptFind {
         if !self.searches(value) || self.query.is_empty() {
             return vec![];
         }
-        body_ranges(value, &value.find_body(), &self.query)
+        let ranges = match (&value.delegation, &value.delivery) {
+            // A card's roots, one after another, numbered as `card_roots` paints them.
+            (Some(card), None) => card_find_texts(card)
+                .iter()
+                .flat_map(|text| find_ranges(text, &self.query))
+                .collect(),
+            _ => body_ranges(value, &value.find_body(), &self.query),
+        };
+        ranges
             .into_iter()
             .enumerate()
             .map(|(occurrence, range)| SearchMatch {
@@ -384,6 +392,136 @@ impl ChatView {
     }
 }
 
+/// Iced's find roots in a delegation card, in its order: `.dlg-summary`,
+/// the handoff summary (`.assistant`) and each `li` of its lists (section
+/// items, then findings). The header, path, banner, error, lines, activity
+/// and section titles are not searched.
+pub(super) fn card_find_texts(card: &crate::delegation::DelegationCard) -> Vec<String> {
+    use crate::delegation::CardPart;
+    let mut texts = Vec::new();
+    for part in card.parts() {
+        match part {
+            CardPart::Summary(text) => texts.push(text),
+            CardPart::Report(text) => texts.push(plain_markdown(&text)),
+            CardPart::Section(_, items) => texts.extend(items),
+            _ => {}
+        }
+    }
+    if let Some(findings) = card.findings() {
+        texts.extend(
+            findings
+                .findings
+                .iter()
+                .map(|finding| finding_text(finding).0),
+        );
+    }
+    texts
+}
+/// A finding `li`'s text as Iced's find reads it (`sev id title`, then the
+/// location and body blocks on their own lines), and where the title,
+/// location and body start in it.
+pub(super) fn finding_text(finding: &gitterm_core::tasks::ReviewFinding) -> (String, [usize; 4]) {
+    let mut text = format!("{:?} ", finding.severity);
+    let id = text.len();
+    text.push_str(&finding.id);
+    text.push(' ');
+    let title = text.len();
+    text.push_str(&finding.title);
+    let location = crate::delegation::finding_location(finding).map(|location| {
+        text.push('\n');
+        let start = text.len();
+        text.push_str(&location);
+        start
+    });
+    let body = (!finding.body.is_empty()).then(|| {
+        text.push('\n');
+        let start = text.len();
+        text.push_str(&finding.body);
+        start
+    });
+    let end = text.len();
+    (
+        text,
+        [id, title, location.unwrap_or(end), body.unwrap_or(end)],
+    )
+}
+/// One find root's hits and which of them is the current one.
+#[derive(Default)]
+pub(super) struct RootHits {
+    ranges: Vec<std::ops::Range<usize>>,
+    current: Option<usize>,
+}
+impl RootHits {
+    /// `shown`, the root's bytes `start..start + len` (then any suffix),
+    /// with Iced's hits painted on exactly their text.
+    pub(super) fn piece(&self, shown: String, start: usize, len: usize) -> gpui::StyledText {
+        let (hit, current) = find_hit_colors();
+        let highlights: Vec<_> = self
+            .ranges
+            .iter()
+            .enumerate()
+            .filter_map(|(index, range)| {
+                let from = range.start.max(start);
+                let to = range.end.min(start + len);
+                (from < to).then(|| {
+                    let color = if Some(index) == self.current {
+                        current
+                    } else {
+                        hit
+                    };
+                    (
+                        from - start..to - start,
+                        gpui::HighlightStyle {
+                            background_color: Some(color),
+                            ..Default::default()
+                        },
+                    )
+                })
+            })
+            .collect();
+        gpui::StyledText::new(shown).with_highlights(highlights)
+    }
+    /// Whether the current hit starts in bytes `start..start + len`.
+    pub(super) fn current_in(&self, start: usize, len: usize) -> bool {
+        self.current
+            .and_then(|index| self.ranges.get(index))
+            .is_some_and(|range| (start..start + len.max(1)).contains(&range.start))
+    }
+}
+/// Each of a card's find roots (as `card_find_texts`) with its hits, the
+/// row's current occurrence counted across them in order.
+pub(super) fn card_roots(
+    card: &crate::delegation::DelegationCard,
+    query: &str,
+    active: Option<usize>,
+) -> Vec<RootHits> {
+    let mut first = 0;
+    card_find_texts(card)
+        .iter()
+        .map(|text| {
+            let ranges = find_ranges(text, query);
+            let current = active
+                .and_then(|index| index.checked_sub(first))
+                .filter(|index| *index < ranges.len());
+            first += ranges.len();
+            RootHits { ranges, current }
+        })
+        .collect()
+}
+/// Asks the transcript list to scroll this element into view as it lays
+/// out: Iced's reveal of a hit in card text GPUI draws itself.
+pub(super) fn reveal_here(element: impl IntoElement) -> gpui::Div {
+    div().relative().child(element).child(
+        gpui::canvas(
+            |bounds, window, _| window.request_autoscroll(bounds),
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full(),
+    )
+}
 /// Iced's `#find-tools` label.
 pub(super) const FIND_TOOLS_LABEL: &str = "Include tool output";
 /// Iced's `#find-count`: always `index of count`, `0 of 0` without hits.
@@ -433,9 +571,21 @@ impl RowView {
                 .len()
             })
             .sum();
+        // A card's report text view comes after its `.dlg-summary` roots.
+        let before_text: usize = match (&self.row.delegation, &self.row.delivery) {
+            (Some(card), None) => card
+                .parts()
+                .iter()
+                .map(|part| match part {
+                    crate::delegation::CardPart::Summary(text) => find_ranges(text, &query).len(),
+                    _ => 0,
+                })
+                .sum(),
+            _ => 0,
+        };
         let active = self
             .active
-            .and_then(|index| index.checked_sub(edit_matches));
+            .and_then(|index| index.checked_sub(edit_matches + before_text));
         let reveal = self.reveal_pending;
         // In occurrence order: a tool's input `<pre>` (not an edit's), then
         // its result; any other row's one text.
