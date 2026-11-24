@@ -641,9 +641,11 @@ fn rejected_send_retains_images_and_draft_and_receipts_preserve_new_edits(cx: &m
         assert_eq!(view.images, images);
     });
     draw(cx);
+    // The last receipt is ambiguous: Iced marks that on the prompt's bubble
+    // and adds nothing to the footer (see `u11_*` in polish_tests).
     assert!(
-        cx.debug_bounds("chat-command-error").is_some(),
-        "delivery errors stay visible after telemetry chrome is removed"
+        cx.debug_bounds("chat-command-error").is_none(),
+        "an uncertain delivery is not repeated in the footer"
     );
 }
 
