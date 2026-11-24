@@ -479,7 +479,10 @@ fn u02_user_prompt_bubbles_fit_content_and_cap_at_85_percent(cx: &mut TestAppCon
         column.size.width
     );
     assert!((short.right() - (column.right() - px(14.))).abs() < px(2.));
-    assert!(long.size.width <= cap + px(1.), "long bubble exceeded its 85% cap");
+    assert!(
+        long.size.width <= cap + px(1.),
+        "long bubble exceeded its 85% cap"
+    );
 }
 
 /// T12: each edit is Iced's `.ed-block`; its lines scroll past 480px even
