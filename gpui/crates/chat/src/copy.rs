@@ -51,7 +51,7 @@ impl ChatView {
         // rather than treating rendered byte offsets as offsets into Markdown.
         for row in self.row_views.iter().flatten() {
             for state in
-                std::iter::once(row.read(cx).text.clone()).chain(row.read(cx).edit_text.clone())
+                std::iter::once(row.read(cx).text.clone()).chain(row.read(cx).output_text.clone())
             {
                 state.update(cx, |text, cx| {
                     text.set_selection_format(
@@ -68,7 +68,7 @@ impl ChatView {
         let text = TextSelection::selected_text(window, cx);
         for row in self.row_views.iter().flatten() {
             for state in
-                std::iter::once(row.read(cx).text.clone()).chain(row.read(cx).edit_text.clone())
+                std::iter::once(row.read(cx).text.clone()).chain(row.read(cx).output_text.clone())
             {
                 state.update(cx, |text, cx| {
                     text.set_selection_format(SelectionFormat::Plain, cx)
@@ -152,16 +152,25 @@ impl RowView {
     pub(super) fn copyable_text(&self, cx: &mut Context<Self>) -> TextView {
         let owner = cx.entity().downgrade();
         let copied: HashSet<_> = self.copied.keys().copied().collect();
-        let view = TextView::new(self.edit_text.as_ref().unwrap_or(&self.text))
+        let view = TextView::new(self.output_text.as_ref().unwrap_or(&self.text))
             .on_link_click(super::transcript::open_link)
-            .font_family(".SystemUIFont")
+            // Iced's `.error-block` and legacy `pre` are monospace.
+            .font_family(match self.row.kind {
+                RowKind::Error | RowKind::Legacy(_) => "Menlo",
+                _ => ".SystemUIFont",
+            })
             .text_size(px(
                 // Iced's cards (`.delivery`, `.dlg`) set 13/14.
                 if self.row.kind == RowKind::Thinking
+                    || matches!(self.row.kind, RowKind::Legacy(_))
                     || self.row.delivery.is_some()
                     || self.row.delegation.is_some()
                 {
                     self.appearance.size(13.)
+                } else if self.row.kind == RowKind::Error {
+                    self.appearance.size(12.5)
+                } else if matches!(self.row.kind, RowKind::Status | RowKind::Warning) {
+                    self.appearance.size(12.)
                 } else {
                     self.appearance.font_size
                 },

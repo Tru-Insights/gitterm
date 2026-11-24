@@ -26,11 +26,7 @@ fn body_ranges(row: &Row, text: &str, query: &str) -> Vec<std::ops::Range<usize>
     let Some(tool) = &row.tool else {
         return find_ranges(text, query);
     };
-    let input = if tool.partial_input.is_empty() {
-        serde_json::to_string_pretty(&tool.input).expect("tool JSON value")
-    } else {
-        tool.partial_input.clone()
-    };
+    let input = crate::model::tool_input_text(tool);
     let mut offset = 0;
     let mut ranges = Vec::new();
     for content in std::iter::once(input.as_str()).chain(tool.output.as_deref()) {
@@ -382,76 +378,85 @@ impl ChatView {
 impl RowView {
     pub(super) fn highlight(&mut self, cx: &mut Context<Self>) {
         let query = self.query.clone();
-        let display = self.edit_text.as_ref().unwrap_or(&self.text).clone();
-        let edit_matches = if self.edit_text.is_some() {
-            self.row
-                .edits()
-                .iter()
-                .map(|edit| {
-                    find_ranges(
-                        &crate::interactions::edit_lines(edit)
-                            .rows
-                            .into_iter()
-                            .map(|line| line.text)
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                        &query,
-                    )
-                    .len()
-                })
-                .sum()
-        } else {
-            0
-        };
+        // Iced restores a long result's whole output while find searches tools.
+        if self.row.tool.is_some() && self.output_full == query.is_empty() {
+            self.update_output_text(cx);
+        }
+        let edit_matches: usize = self
+            .row
+            .edits()
+            .iter()
+            .map(|edit| {
+                find_ranges(
+                    &crate::interactions::edit_lines(edit)
+                        .rows
+                        .into_iter()
+                        .map(|line| line.text)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    &query,
+                )
+                .len()
+            })
+            .sum();
         let active = self
             .active
             .and_then(|index| index.checked_sub(edit_matches));
         let reveal = self.reveal_pending;
-        let rendered = display.read(cx).rendered_text();
+        // In occurrence order: a tool's input `<pre>` (not an edit's), then
+        // its result; any other row's one text.
+        let mut targets = Vec::new();
+        if self.row.tool.is_none() || self.row.edits().is_empty() {
+            targets.push(self.text.clone());
+        }
+        targets.extend(self.output_text.clone());
         let mut signature = std::hash::DefaultHasher::new();
-        (rendered.as_str(), &query, active).hash(&mut signature);
+        for target in &targets {
+            target.read(cx).rendered_text().as_str().hash(&mut signature);
+        }
+        (&query, active).hash(&mut signature);
         let signature = signature.finish();
         // Native highlight updates notify observers; avoid a render/notify cycle.
         if self.highlight_signature == Some(signature) {
             return;
         }
         self.highlight_signature = Some(signature);
-        let revealed = display.update(cx, |text, cx| {
-            let rendered = text.rendered_text();
-            let ranges = if self.edit_text.is_some() {
-                self.row
-                    .tool
-                    .as_ref()
-                    .and_then(|tool| tool.output.as_deref())
-                    .and_then(|output| rendered.as_str().find(output).map(|start| (start, output)))
-                    .map(|(start, output)| {
-                        find_ranges(output, &query)
-                            .into_iter()
-                            .map(|range| start + range.start..start + range.end)
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            } else {
-                body_ranges(&self.row, rendered.as_str(), &query)
-            };
-            let available = active.is_none() || active.is_some_and(|index| index < ranges.len());
-            let mut highlights: Vec<_> = ranges
-                .iter()
-                .cloned()
-                .map(|range| RangeHighlight::new(range, rgb(0x665c32)))
-                .collect();
-            if let Some(range) = active.and_then(|index| ranges.get(index)) {
-                highlights.push(RangeHighlight::new(range.clone(), rgb(0x9a6a28)));
-                if reveal {
-                    _ = text.reveal_range(range.clone(), cx);
+        let mut remaining = active;
+        let mut available = active.is_none();
+        for target in targets {
+            let found = target.update(cx, |text, cx| {
+                let rendered = text.rendered_text();
+                let ranges = if self.row.tool.is_some() {
+                    find_ranges(rendered.as_str(), &query)
+                } else {
+                    body_ranges(&self.row, rendered.as_str(), &query)
+                };
+                let mut highlights: Vec<_> = ranges
+                    .iter()
+                    .cloned()
+                    .map(|range| RangeHighlight::new(range, rgb(0x665c32)))
+                    .collect();
+                if let Some(range) = remaining.and_then(|index| ranges.get(index)) {
+                    highlights.push(RangeHighlight::new(range.clone(), rgb(0x9a6a28)));
+                    if reveal {
+                        _ = text.reveal_range(range.clone(), cx);
+                    }
                 }
-            }
-            // All ranges were computed against this very revision, never source byte offsets.
-            text.set_range_highlights(highlights, cx)
-                .expect("current rendered ranges");
-            available
-        });
-        self.reveal_pending = reveal && !revealed;
+                // All ranges were computed against this very revision, never source byte offsets.
+                text.set_range_highlights(highlights, cx)
+                    .expect("current rendered ranges");
+                ranges.len()
+            });
+            remaining = match remaining {
+                Some(index) if index < found => {
+                    available = true;
+                    None
+                }
+                Some(index) => Some(index - found),
+                None => None,
+            };
+        }
+        self.reveal_pending = reveal && !available;
     }
 }
 

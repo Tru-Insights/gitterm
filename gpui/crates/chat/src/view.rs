@@ -551,6 +551,23 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) {
         self.composer_state.backend = Some(backend);
+        // Notes name the harness. A transcript built from saved records
+        // before the backend was known is rebuilt with it (same rows).
+        if self.model.backend != Some(backend) {
+            self.model.backend = Some(backend);
+            if self.projection_runtime.is_none() && self.replay.is_none() {
+                let rebuilt = ChatModel::from_records_for(&self.records, Some(backend));
+                if rebuilt.rows.len() == self.model.rows.len() {
+                    self.model = rebuilt;
+                    for (index, view) in self.row_views.iter().enumerate() {
+                        if let Some(view) = view {
+                            let row = self.model.rows[index].clone();
+                            view.update(cx, |view, cx| view.set_row(row, cx));
+                        }
+                    }
+                }
+            }
+        }
         if backend != gitterm_core::chat::types::AgentBackend::Claude {
             self.review.open = false;
         }
@@ -960,7 +977,10 @@ impl ChatView {
         self.sync_activity_tick(cx);
         match update.presentation {
             Some(Presentation::Replay) => {
-                self.model = ChatModel::from_conversation(&state.conversation);
+                self.model = ChatModel::from_conversation_for(
+                    &state.conversation,
+                    self.composer_state.backend,
+                );
                 for row in &mut self.model.rows {
                     if let Some(request) = &mut row.request
                         && !request.resolved
@@ -1157,12 +1177,8 @@ impl ChatView {
             let mut view = RowView::new(row, index, scroller, cx);
             if let Some(open) = open {
                 view.open = open;
-            } else if view.row.kind == RowKind::Thinking
-                && self.turn_running
-                && self.read_only_reason.is_none()
-            {
-                view.open = true;
             }
+            view.cwd = self.composer_state.checkout_path.clone();
             view.expanded_edits = self
                 .retained_edit_expansion
                 .get(&view.row.id)
@@ -1291,10 +1307,12 @@ impl ChatView {
             .flex()
             .flex_col()
             .gap(px(6.))
-            .p(px(10.))
+            .px(px(12.))
+            .py(px(10.))
             .border_1()
-            .border_color(rgb(self.appearance.palette().border))
-            .rounded(px(6.))
+            .border_color(rgb(self.appearance.palette().warn))
+            .bg(rgb(self.appearance.palette().block))
+            .rounded(px(8.))
             .when(position > 0, |panel| {
                 panel.child("Earlier worker requests · read-only")
             })
@@ -1451,6 +1469,25 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) {
         self.row_views.resize(self.model.rows.len(), None);
+        // Iced opens a live thinking block (a replayed one starts closed)...
+        for row in &self.model.rows[count..] {
+            if row.kind == RowKind::Thinking {
+                self.folded.insert(row.id, true);
+            }
+        }
+        // ...and closes a tool card when its result arrives, even one opened by hand.
+        for id in std::mem::take(&mut self.model.completions) {
+            self.folded.insert(id, false);
+            if let Some(view) = self
+                .model
+                .rows
+                .iter()
+                .position(|row| row.id == id)
+                .and_then(|index| self.row_views[index].as_ref())
+            {
+                view.update(cx, |view, _| view.open = false);
+            }
+        }
         if following && !self.find_open {
             self.trim_history(cx);
         }
@@ -1828,7 +1865,7 @@ struct RowView {
     preparing_sent_images: Option<Task<()>>,
     row: Row,
     text: Entity<TextViewState>,
-    edit_text: Option<Entity<TextViewState>>,
+    output_text: Option<Entity<TextViewState>>,
     open: bool,
     query: String,
     active: Option<usize>,
@@ -1844,6 +1881,10 @@ struct RowView {
     visual_subscription: Option<Subscription>,
     /// Iced's queued tag on this prompt's bubble (C04).
     queued: Option<crate::composer::QueuedTag>,
+    /// Iced's `chatCwd()`: an edit card shows its path relative to it.
+    cwd: Option<String>,
+    /// The result `<pre>` shows the whole output (find with tools on).
+    output_full: bool,
 }
 impl RowView {
     fn new(
@@ -1855,7 +1896,7 @@ impl RowView {
         let text = cx.new(|cx| {
             TextViewState::markdown(&display_body(&row), cx)
                 .selectable(true)
-                .scrollable(false)
+                .scrollable(row.tool.is_some())
                 .motion(TextViewMotion::default().with_stream_fade(Duration::from_millis(280)))
         });
         let subscription = cx.observe(&text, |this, _, cx| {
@@ -1864,10 +1905,14 @@ impl RowView {
             });
             cx.notify();
         });
-        let open = row.delegation.as_ref().map_or_else(
-            || !row.collapsible(),
-            |card| card.delegation.dismissed_at.is_none(),
-        );
+        let open = match (&row.delegation, &row.tool) {
+            (Some(card), _) => card.delegation.dismissed_at.is_none(),
+            // Iced opens a tool card, live or replayed, until its result.
+            (None, Some(tool)) => tool.output.is_none(),
+            // A delegation placeholder starts open, as Iced's newCard.
+            (None, None) if row.kind == RowKind::Delegation && row.delivery.is_none() => true,
+            (None, None) => !row.collapsible(),
+        };
         let mut view = Self {
             action: Rc::new(|_, _| {}),
             flashed: false,
@@ -1890,7 +1935,7 @@ impl RowView {
             preparing_sent_images: None,
             row,
             text,
-            edit_text: None,
+            output_text: None,
             open,
             query: String::new(),
             active: None,
@@ -1905,13 +1950,19 @@ impl RowView {
             visual_expand: Rc::new(|_, _| {}),
             visual_subscription: None,
             queued: None,
+            cwd: None,
+            output_full: false,
         };
-        view.update_edit_text(cx);
+        view.update_output_text(cx);
         view.prepare_sent_images(cx);
         view
     }
     fn set_row(&mut self, row: Row, cx: &mut Context<Self>) {
         let images_changed = self.row.images != row.images;
+        // Iced's showEdit replaces the diff view, collapsing Show all.
+        if self.row.edits() != row.edits() {
+            self.expanded_edits.clear();
+        }
         self.text
             .update(cx, |text, cx| text.set_text(&display_body(&row), cx));
         if self
@@ -1927,7 +1978,7 @@ impl RowView {
             self.open = false;
         }
         self.row = row;
-        self.update_edit_text(cx);
+        self.update_output_text(cx);
         if self.visual.is_none() {
             self.sync_visual(cx);
             if self.visual.is_some() {
@@ -2021,7 +2072,7 @@ impl Render for RowView {
             .visual
             .clone()
             .filter(|visual| !visual.read(cx).expanded);
-        if self.hidden_by_turn || self.row.kind == RowKind::Withdrawn {
+        if self.hidden_by_turn || self.row.hidden() {
             return div().h(px(0.)).mb(px(0.)).into_any_element();
         }
         if self.hidden_by_work || (self.hidden_by_run && self.work_summary.is_none()) {
@@ -2037,6 +2088,7 @@ impl Render for RowView {
         let color = match self.row.kind {
             RowKind::User => palette.user,
             RowKind::Thinking | RowKind::Status => palette.muted,
+            RowKind::Warning => palette.warn,
             RowKind::Tool if self.row.tool.as_ref().is_some_and(|tool| tool.is_error) => {
                 palette.err
             }
@@ -2069,16 +2121,33 @@ impl Render for RowView {
             })
             .when(self.row.kind == RowKind::Thinking, |content| {
                 content
+                    .mt(px(4.))
+                    .pt(px(4.))
                     .pl(px(14.))
                     .border_l_2()
                     .border_color(rgb(palette.border))
             })
-            .children(self.render_edits(cx))
             .children((!self.row.images.is_empty()).then(|| self.render_sent_images()))
             .when(self.row.delivery.is_some(), |content| {
                 content.pl(px(22.)).pr(px(10.)).pb(px(8.))
             })
             .child(self.copyable_text(cx))
+            // Iced's `.user-note` for a relayed prompt's images.
+            .when(self.row.relayed_images > 0, |content| {
+                content.child(
+                    div()
+                        .text_size(px(self.appearance.size(11.)))
+                        .text_color(rgb(palette.muted))
+                        .child(if self.row.relayed_images == 1 {
+                            "1 image attached on the sending device".to_string()
+                        } else {
+                            format!(
+                                "{} images attached on the sending device",
+                                self.row.relayed_images
+                            )
+                        }),
+                )
+            })
             .children(self.render_queued_tag());
         let header = div()
             .text_size(px(self.appearance.size(13.)))
@@ -2157,13 +2226,23 @@ impl Render for RowView {
                 .group("chat-row")
                 .text_size(px(self.appearance.font_size))
                 .text_color(rgb(match self.row.kind {
-                    RowKind::Thinking | RowKind::Status => palette.muted,
+                    RowKind::Thinking
+                    | RowKind::Status
+                    | RowKind::Legacy(crate::model::LegacyBlock::Thinking) => palette.muted,
                     RowKind::Error => palette.err,
+                    RowKind::Warning => palette.warn,
                     _ => palette.fg,
                 }))
                 .font_family(".SystemUIFont")
                 .w_full()
-                .mb(px(10.))
+                // Iced's bottom margin per block; the next block's smaller
+                // top margin collapses into it.
+                .mb(px(match self.row.kind {
+                    RowKind::User => 12.,
+                    RowKind::Thinking | RowKind::Legacy(_) => 8.,
+                    RowKind::Tool | RowKind::Error | RowKind::Status | RowKind::Warning => 6.,
+                    _ => 10.,
+                }))
                 .when(!self.row.scope.is_empty(), |view| {
                     view.ml(px(18.))
                         .border_l_2()
@@ -2218,11 +2297,19 @@ impl Render for RowView {
                     row.bg(rgb(palette.border))
                         .border_color(rgb(palette.accent))
                 })
+                // Iced's `title`: a reconnect notice's error.
+                .when_some(self.row.tooltip.clone(), |row, tip| {
+                    row.tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                    })
+                })
                 .when(self.in_work, |row| row.mb_0())
                 .children(run_summary)
                 .when(show_card, |row| {
                     row.child(if self.row.delegation.is_some() {
                         self.render_delegation(cx).into_any_element()
+                    } else if self.row.kind == RowKind::Tool {
+                        self.render_tool(cx)
                     } else if self.row.collapsible() {
                         div()
                             .when(self.row.kind == RowKind::Tool, |card| {
@@ -2362,10 +2449,29 @@ impl Render for RowView {
                                     .content(content),
                             )
                             .into_any_element()
+                    } else if self.row.kind == RowKind::Error {
+                        // Iced's `.error-block`.
+                        div()
+                            .px(px(10.))
+                            .py(px(8.))
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(rgb(palette.err))
+                            .bg(gpui::rgba((palette.err << 8) | 0x14))
+                            .child(content)
+                            .into_any_element()
+                    } else if let RowKind::Legacy(block) = self.row.kind {
+                        self.render_legacy(block, content)
                     } else {
                         div()
                             .when(
-                                !matches!(self.row.kind, RowKind::Assistant | RowKind::User),
+                                !matches!(
+                                    self.row.kind,
+                                    RowKind::Assistant
+                                        | RowKind::User
+                                        | RowKind::Status
+                                        | RowKind::Warning
+                                ),
                                 |row| row.child(header),
                             )
                             .child(content)
@@ -2406,6 +2512,15 @@ impl Render for RowView {
 /// other blocks itself (Iced's `.dlg-body` classes); only its report is
 /// markdown. `row.body` stays the whole card, for find and copy.
 fn display_body(row: &Row) -> String {
+    if let Some(tool) = &row.tool {
+        // The input `<pre>`; an edit card shows its diff instead.
+        let input = crate::model::tool_input_text(tool);
+        return if input.is_empty() || !row.edits().is_empty() {
+            String::new()
+        } else {
+            crate::model::code(&input, "json")
+        };
+    }
     row.delegation
         .as_ref()
         .map_or_else(|| row.body.clone(), |card| card.report())

@@ -200,6 +200,7 @@ fn only_valid_html_render_results_become_visual_replies() {
         partial_input: String::new(),
         output: Some(output.into()),
         is_error: false,
+        badge: None,
     };
     for name in [
         "html_render",

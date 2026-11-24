@@ -270,7 +270,8 @@ fn collapse_diff_and_replay_preserve_find(cx: &mut TestAppContext) {
                 .iter()
                 .all(|edit| !crate::interactions::edit_lines(edit).rows.is_empty())
         );
-        assert!(!row.text.read(cx).rendered_text().is_empty());
+        // Iced hides an edit's input `<pre>`; the diff shows the change.
+        assert!(row.text.read(cx).rendered_text().is_empty());
     });
     let matched_row = chat.read_with(cx, |view, _| view.find.active().unwrap().row);
     let matched_view = chat.read_with(cx, |view, _| {
@@ -1600,7 +1601,7 @@ fn sent_image_payloads_render_real_transcript_thumbnails(cx: &mut TestAppContext
     }
     chat.read_with(cx, |view, cx| {
         assert_eq!(view.model.rows[0].images, images);
-        assert!(!view.model.rows[0].body.contains("not relayed"));
+        assert_eq!(view.model.rows[0].relayed_images, 0);
         let row = view.row_views[0].as_ref().unwrap().read(cx);
         assert_eq!(row.sent_images.len(), 2);
         assert!(row.sent_images.iter().all(Result::is_ok));
@@ -1860,7 +1861,8 @@ fn iced_transcript_has_one_expandable_run_no_message_chrome_and_a_table(cx: &mut
             Some("Ran 3 commands · now: three")
         );
         assert!(!first.run_open);
-        assert!(!first.row.body.contains("null"));
+        // Iced's result `<pre>` shows the literal output.
+        assert!(first.row.body.contains("null"));
         for index in [3, 4] {
             let row = view.row_views[index].as_ref().unwrap().read(cx);
             assert!(row.hidden_by_run);
@@ -2517,7 +2519,7 @@ fn h08_edit_show_all_expands_and_h09_review_routes_without_toggling_card(cx: &mu
             id: "edit".into(),
             kind: ItemKind::ToolCall {
                 name: "Write".into(),
-                input: serde_json::json!({"file_path":"src/lib.rs","content":"line\n".repeat(60)}),
+                input: serde_json::json!({"file_path":"/fixture/src/lib.rs","content":"line\n".repeat(60)}),
             },
         }),
     }];
@@ -2525,7 +2527,7 @@ fn h08_edit_show_all_expands_and_h09_review_routes_without_toggling_card(cx: &mu
     cx.simulate_resize(size(px(1400.), px(2000.)));
     draw(cx);
     click_selector("tool-run-0".into(), cx);
-    click_selector("row-fold".into(), cx);
+    // A running tool card starts open, as Iced's.
     chat.update_in(cx, |view, _, cx| {
         view.scroller.update(cx, |state, cx| {
             state.scroll_to_item(0, cx);
@@ -2560,7 +2562,7 @@ fn h08_edit_show_all_expands_and_h09_review_routes_without_toggling_card(cx: &mu
     assert_eq!(
         *events.borrow(),
         [roster::RosterOutcome::OpenFile {
-            path: "src/lib.rs".into(),
+            path: "/fixture/src/lib.rs".into(),
             review: true
         }]
     );
