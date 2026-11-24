@@ -4294,7 +4294,7 @@ fn bounds_of(selector: String, cx: &mut VisualTestContext) -> gpui::Bounds<gpui:
 }
 
 /// D15: `details.dlg` is a neutral 1px box with a 3px state-coloured left
-/// edge and an 8px top margin (an assistant row has none above it).
+/// edge and an 8px top margin (an assistant row has 6px above it).
 #[gpui::test]
 fn d15_delegation_card_has_a_left_state_edge_and_an_8px_margin(cx: &mut TestAppContext) {
     let (chat, cx) = setup(vec![], cx);
@@ -4330,7 +4330,7 @@ fn d15_delegation_card_has_a_left_state_edge_and_an_8px_margin(cx: &mut TestAppC
             - bounds_of("chat-transcript".into(), cx).top(),
     );
     assert!(
-        (card_top - text_top - 8.).abs() < 0.5,
+        (card_top - text_top - 2.).abs() < 0.5,
         "card {card_top} vs text {text_top}"
     );
 }

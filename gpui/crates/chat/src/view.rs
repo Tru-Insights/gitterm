@@ -1278,7 +1278,7 @@ impl ChatView {
         let scroller = self.scroller.clone();
         let open = self.folded.get(&row.id).copied();
         let queued = self.queued_tag(&row);
-        let card_gap = self.card_top_gap(index);
+        let block_gap = self.block_top_gap(index);
         let view = cx.new(|cx| {
             let mut view = RowView::new(row, index, scroller, cx);
             if let Some(open) = open {
@@ -1315,7 +1315,7 @@ impl ChatView {
                 turn_collapsed && turn.as_ref().is_some_and(|turn| turn.contains(index));
             view.visual_expand = visual_expand;
             view.queued = queued;
-            view.top_gap = card_gap;
+            view.top_gap = block_gap;
             view.sync_visual(cx);
             view
         });
@@ -1640,7 +1640,7 @@ impl ChatView {
             self.trim_history(cx);
         }
         self.restore_history_after_fold(cx);
-        self.sync_card_gaps(cx);
+        self.sync_block_gaps(cx);
         if !changed.is_empty() && !following {
             self.new_messages = true;
         }
@@ -2062,6 +2062,9 @@ struct RowView {
     preparing_sent_images: Option<Task<()>>,
     row: Row,
     text: Entity<TextViewState>,
+    // The component keys its highlighter by Arc identity. Keep immutable theme
+    // configuration with the row so redraws do not interrupt a selection drag.
+    markdown_highlight_theme: Arc<gpui_component::highlighter::HighlightTheme>,
     output_text: Option<Entity<TextViewState>>,
     open: bool,
     /// Iced's nested `details.subagent`, closed until the human opens it.
@@ -2078,8 +2081,8 @@ struct RowView {
     scroller: Entity<MessageScrollerState>,
     _subscription: Subscription,
     hidden_by_turn: bool,
-    /// Iced's 8px card margin left over once it collapses into the bottom
-    /// margin of the block above (`card_top_gap`).
+    /// Iced's top margin left over once it collapses into the bottom
+    /// margin of the block above (`block_top_gap`).
     top_gap: f32,
     visual: Option<Entity<visual::VisualReply>>,
     visual_expand: visual::VisualExpand,
@@ -2143,6 +2146,7 @@ impl RowView {
             preparing_sent_images: None,
             row,
             text,
+            markdown_highlight_theme: copy::assistant_highlight_theme(),
             output_text: None,
             open,
             sub_open: false,
@@ -2351,8 +2355,13 @@ impl Render for RowView {
             .child(self.copyable_text(cx).when(
                 self.row.kind == RowKind::Assistant && self.row.scope.is_empty(),
                 |text| {
-                    text.style(copy::assistant_style(self.appearance, window.rem_size()))
-                        .blockquote_style(copy::assistant_quote_style(self.appearance))
+                    text.style(copy::assistant_style(
+                        self.appearance,
+                        window.rem_size(),
+                        self.markdown_highlight_theme.clone(),
+                    ))
+                    .blockquote_style(copy::assistant_quote_style(self.appearance))
+                    .list_style(copy::assistant_list_style(self.appearance))
                 },
             ))
             // Iced's `.user-note` for a relayed prompt's images.
@@ -2820,25 +2829,31 @@ fn block_bottom_margin(row: &Row) -> f32 {
 }
 
 impl ChatView {
-    /// A card's 8px top margin collapses into the block above's bottom
+    /// CSS top margins collapse into the preceding visible block's bottom
     /// margin: only the excess is left, all of it with nothing above.
-    fn card_top_gap(&self, index: usize) -> f32 {
+    fn block_top_gap(&self, index: usize) -> f32 {
         let row = &self.model.rows[index];
-        if row.delivery.is_none() && row.delegation.is_none() {
+        let top = if row.delivery.is_some() || row.delegation.is_some() {
+            8.
+        } else if row.kind == RowKind::Assistant && row.scope.is_empty() {
+            6.
+        } else {
             return 0.;
-        }
+        };
         self.model.rows[..index]
             .iter()
             .rev()
             .find(|previous| !previous.hidden())
-            .map_or(8., |previous| (8. - block_bottom_margin(previous)).max(0.))
+            .map_or(top, |previous| {
+                (top - block_bottom_margin(previous)).max(0.)
+            })
     }
-    fn sync_card_gaps(&mut self, cx: &mut Context<Self>) {
+    fn sync_block_gaps(&mut self, cx: &mut Context<Self>) {
         for index in 0..self.row_views.len() {
             let Some(view) = self.row_views[index].clone() else {
                 continue;
             };
-            let gap = self.card_top_gap(index);
+            let gap = self.block_top_gap(index);
             if view.read(cx).top_gap != gap {
                 view.update(cx, |view, cx| {
                     view.top_gap = gap;
