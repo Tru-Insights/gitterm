@@ -220,11 +220,8 @@ impl ChatView {
         if !self.find_open {
             let top = self.scroller.read(cx).logical_scroll_top();
             self.find.saved_scroller = Some(self.scroller.clone());
-            let temporary = cx.new(|cx| {
-                let mut state = MessageScrollerState::new(self.model.rows.len(), cx);
-                state.scroll_to_offset(top, cx);
-                state
-            });
+            let temporary =
+                cx.new(|cx| MessageScrollerState::searching(self.model.rows.len(), top, cx));
             self.find.scroll_subscription = Some(cx.observe(&temporary, |_, _, cx| cx.notify()));
             self.replace_find_scroller(temporary, cx);
             self.find_open = true;
@@ -293,6 +290,8 @@ impl ChatView {
                 if old_count < self.model.rows.len() {
                     state.append(self.model.rows.len() - old_count, cx);
                 }
+                // Iced's close: `follow = findWasFollowing; scrollIfFollowing()`.
+                state.follow_output(cx);
             });
             self.replace_find_scroller(saved, cx);
         }
@@ -319,26 +318,36 @@ impl ChatView {
         self.reveal_match(window, cx);
     }
     pub(super) fn find_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.appearance.palette();
+        // Iced's `#chat-find`: `em` is its 12/14 font size.
+        let em = self.appearance.size(12.);
         div()
+            .debug_selector(|| "find-bar".into())
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(6.))
-            .p(px(6.))
-            .bg(rgb(self.appearance.palette().footer))
-            .text_size(px(self.appearance.size(12.)))
+            .px(px(10.))
+            .py(px(6.))
+            .bg(rgb(palette.footer))
+            .border_1()
+            .border_color(rgb(palette.border))
+            .text_size(px(em))
             .rounded(px(8.))
-            .child(div().flex_1().child(Input::new(&self.find_input)))
-            .child(if self.find.query.is_empty() {
-                String::new()
-            } else if self.find.matches.is_empty() {
-                "No matches".into()
-            } else {
-                format!(
-                    "{} of {}",
-                    self.find.current.map_or(0, |index| index + 1),
-                    self.find.matches.len()
-                )
-            })
+            .child(
+                div()
+                    .debug_selector(|| "find-query".into())
+                    .flex_1()
+                    .min_w(px(8. * em))
+                    .child(Input::new(&self.find_input)),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "find-count".into())
+                    .min_w(px(5. * em))
+                    .text_center()
+                    .child(find_count(&self.find)),
+            )
             .child(
                 Button::new("previous")
                     .small()
@@ -357,7 +366,7 @@ impl ChatView {
             )
             .child(
                 Checkbox::new("find-tools")
-                    .label("Tool output")
+                    .label(FIND_TOOLS_LABEL)
                     .checked(self.find.include_tools)
                     .on_click(
                         cx.listener(|this, _, window, cx| this.toggle_find_tools(window, cx)),
@@ -375,6 +384,31 @@ impl ChatView {
     }
 }
 
+/// Iced's `#find-tools` label.
+pub(super) const FIND_TOOLS_LABEL: &str = "Include tool output";
+/// Iced's `#find-count`: always `index of count`, `0 of 0` without hits.
+pub(super) fn find_count(find: &TranscriptFind) -> String {
+    format!(
+        "{} of {}",
+        find.current.map_or(0, |index| index + 1),
+        find.matches.len()
+    )
+}
+/// Iced's highlight colours as its `.find-hit` boxes paint them (yellow
+/// `#f9e2af` at 0.35, the current hit peach `#fab387` at 0.5). A GPUI range
+/// highlight paints only a background under the text, as that fallback does;
+/// Iced's `::highlight` dark text and underline have no GPUI counterpart.
+pub(super) fn find_hit_colors() -> (gpui::Hsla, gpui::Hsla) {
+    let hit = gpui::Rgba {
+        a: 0.35,
+        ..gpui::rgb(0xf9e2af)
+    };
+    let current = gpui::Rgba {
+        a: 0.5,
+        ..gpui::rgb(0xfab387)
+    };
+    (hit.into(), current.into())
+}
 impl RowView {
     pub(super) fn highlight(&mut self, cx: &mut Context<Self>) {
         let query = self.query.clone();
@@ -435,13 +469,17 @@ impl RowView {
                 } else {
                     body_ranges(&self.row, rendered.as_str(), &query)
                 };
+                let (hit, current) = find_hit_colors();
+                let active = remaining.and_then(|index| ranges.get(index));
+                // The current hit paints its own colour, not peach over yellow.
                 let mut highlights: Vec<_> = ranges
                     .iter()
+                    .filter(|range| Some(*range) != active)
                     .cloned()
-                    .map(|range| RangeHighlight::new(range, rgb(0x665c32)))
+                    .map(|range| RangeHighlight::new(range, hit))
                     .collect();
-                if let Some(range) = remaining.and_then(|index| ranges.get(index)) {
-                    highlights.push(RangeHighlight::new(range.clone(), rgb(0x9a6a28)));
+                if let Some(range) = active {
+                    highlights.push(RangeHighlight::new(range.clone(), current));
                     if reveal {
                         _ = text.reveal_range(range.clone(), cx);
                     }

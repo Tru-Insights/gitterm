@@ -688,6 +688,8 @@ mod tests {
             .unwrap();
         draw(cx);
         chat.update_in(cx, |view, window, cx| {
+            // A later frame: the frame that drew a row never evicts it.
+            view.frame += 1;
             for n in 0..110 {
                 view.append_record(
                     &Record {
