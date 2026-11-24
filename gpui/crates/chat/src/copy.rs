@@ -156,7 +156,11 @@ impl RowView {
             .on_link_click(super::transcript::open_link)
             .font_family(".SystemUIFont")
             .text_size(px(
-                if self.row.kind == RowKind::Thinking || self.row.delivery.is_some() {
+                // Iced's cards (`.delivery`, `.dlg`) set 13/14.
+                if self.row.kind == RowKind::Thinking
+                    || self.row.delivery.is_some()
+                    || self.row.delegation.is_some()
+                {
                     self.appearance.size(13.)
                 } else {
                     self.appearance.font_size
