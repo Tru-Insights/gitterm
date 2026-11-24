@@ -425,34 +425,41 @@ impl RowView {
                             _ = owner.update(cx, |view, cx| view.copy_code(key, code.clone(), cx));
                         }),
                     );
-                div().relative().child(copy).children(
-                    assistant
-                        .then(|| block.lang())
-                        .flatten()
-                        .filter(|lang| !lang.is_empty())
-                        .map(|lang| {
-                            div()
-                                .debug_selector({
-                                    let lang = lang.clone();
-                                    move || format!("chat-code-language-{lang}")
-                                })
-                                .absolute()
-                                .right_0()
-                                .whitespace_nowrap()
-                                // shortcut: top/right inside the code box; the action
-                                // slot is right-pinned and overflow-x clips above it.
-                                // Move to Iced's left/border when an unmasked code
-                                // decoration hook is available.
-                                .top(-window.rem_size() * 0.5)
-                                .font_family(".SystemUIFont")
-                                .text_size(px(appearance.size(10.)))
-                                .line_height(gpui::relative(1.5))
-                                .text_color(rgb(appearance.palette().muted))
-                                .bg(rgb(appearance.palette().alt))
-                                .px(px(4.))
-                                .child(lang)
-                        }),
-                )
+                // The label sits left of Copy in one row, so hovering never
+                // stacks the button under it; Copy keeps its slot while hidden.
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(6.))
+                    .children(
+                        assistant
+                            .then(|| block.lang())
+                            .flatten()
+                            .filter(|lang| !lang.is_empty())
+                            .map(|lang| {
+                                div()
+                                    .debug_selector({
+                                        let lang = lang.clone();
+                                        move || format!("chat-code-language-{lang}")
+                                    })
+                                    .relative()
+                                    .whitespace_nowrap()
+                                    // shortcut: top/right inside the code box; the action
+                                    // slot is right-pinned and overflow-x clips above it.
+                                    // Move to Iced's left/border when an unmasked code
+                                    // decoration hook is available.
+                                    .top(-window.rem_size() * 0.5)
+                                    .font_family(".SystemUIFont")
+                                    .text_size(px(appearance.size(10.)))
+                                    .line_height(gpui::relative(1.5))
+                                    .text_color(rgb(appearance.palette().muted))
+                                    .bg(rgb(appearance.palette().alt))
+                                    .px(px(4.))
+                                    .child(lang)
+                            }),
+                    )
+                    .child(copy)
             });
         #[cfg(test)]
         let view = view.table_actions(|_, _, _| {
@@ -755,6 +762,18 @@ mod tests {
         assert!(
             label.top() >= block.top(),
             "label {label:?}, block {block:?}"
+        );
+        // Both sit in the code block's top-right action slot: the hover Copy
+        // must not be stacked under the label.
+        cx.simulate_mouse_move(block.center(), None, gpui::Modifiers::default());
+        draw(cx);
+        let label = cx.debug_bounds("chat-code-language-rust").unwrap();
+        let copy = cx
+            .debug_bounds("copy-code-action")
+            .expect("hovered Copy is painted");
+        assert!(
+            label.right() <= copy.left(),
+            "label {label:?} overlaps Copy {copy:?}"
         );
         reply_source(&chat, "```\nno language\n```", cx);
         assert!(cx.debug_bounds("chat-code-language-rust").is_none());
