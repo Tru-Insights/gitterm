@@ -342,14 +342,13 @@ impl RowView {
                             },
                             copy_label_color.into(),
                         )
-                            .debug_selector({
-                                let owner = owner.clone();
-                                move || format!("copy-code-{}", owner.entity_id())
-                            })
-                            .on_click(move |_, _, cx| {
-                                _ = owner
-                                    .update(cx, |view, cx| view.copy_code(key, code.clone(), cx));
-                            }),
+                        .debug_selector({
+                            let owner = owner.clone();
+                            move || format!("copy-code-{}", owner.entity_id())
+                        })
+                        .on_click(move |_, _, cx| {
+                            _ = owner.update(cx, |view, cx| view.copy_code(key, code.clone(), cx));
+                        }),
                     )
             });
         #[cfg(test)]
@@ -626,11 +625,7 @@ mod tests {
     fn code_block_copy_label_contrasts_with_its_hovered_button(cx: &mut TestAppContext) {
         let (_chat, cx) = setup(cx);
         cx.update(|window, app| {
-            gpui_component::Theme::change(
-                gpui_component::ThemeMode::Dark,
-                Some(window),
-                app,
-            );
+            gpui_component::Theme::change(gpui_component::ThemeMode::Dark, Some(window), app);
         });
         draw(cx);
         let action_bounds = cx
@@ -639,7 +634,10 @@ mod tests {
         cx.update(|window, app| window.simulate_mouse_move(action_bounds.center(), app));
         draw(cx);
 
-        assert!(cx.debug_bounds("copy-code-action").is_some(), "copy action hovered");
+        assert!(
+            cx.debug_bounds("copy-code-action").is_some(),
+            "copy action hovered"
+        );
 
         let (label, background) = cx.update(|_, app| {
             let theme = gpui_component::Theme::global(app);
@@ -659,7 +657,6 @@ mod tests {
             contrast_ratio(label, background) >= 4.5,
             "copy label {label:?} must contrast with hovered button {background:?}"
         );
-
     }
 
     fn contrast_ratio(foreground: gpui::Hsla, background: gpui::Hsla) -> f32 {
