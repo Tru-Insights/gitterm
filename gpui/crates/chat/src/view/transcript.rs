@@ -21,6 +21,22 @@ pub(super) fn open_link(
     }
 }
 
+/// Iced's `details.dlg.<state>` left border; later CSS rules win, so
+/// blocked/waiting beats dismissed, which beats the outcome colours.
+pub(super) fn card_border(
+    card: &crate::delegation::DelegationCard,
+    palette: crate::appearance::ChatPalette,
+) -> u32 {
+    match card.state_class() {
+        "blocked" | "waiting" => palette.warn,
+        _ if card.delegation.dismissed_at.is_some() => palette.muted,
+        "cancelled" => palette.muted,
+        "failed" | "interrupted" | "exited" => palette.err,
+        "completed" | "done" => palette.result,
+        _ => palette.accent,
+    }
+}
+
 impl ChatView {
     pub fn set_imported_offer(
         &mut self,
@@ -280,27 +296,44 @@ impl RowView {
     }
     pub(super) fn render_delegation(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let card = self.row.delegation.clone().expect("delegation card");
-        let palette = self.appearance.palette();
+        let appearance = self.appearance;
+        let palette = appearance.palette();
         let id = self.row.id;
+        let class = card.state_class().to_owned();
         let controls = card.controls(self.busy);
         let sent = card.sendable() && card.delivered();
         let mut sent_shown = false;
+        // Iced's `.dlg-note`: muted, 11.5/14.
+        let note = |text: String| {
+            div()
+                .text_size(px(appearance.size(11.5)))
+                .text_color(rgb(palette.muted))
+                .child(text)
+                .into_any_element()
+        };
         let mut actions = Vec::new();
         for (index, control) in controls.into_iter().enumerate() {
             if sent && !sent_shown && control.label != "Open worker tab" {
-                actions.push(
-                    div()
-                        .text_color(rgb(palette.muted))
-                        .child("sent to chat ✓")
-                        .into_any_element(),
-                );
+                actions.push(note("sent to chat ✓".into()));
                 sent_shown = true;
             }
             let action = self.action.clone();
+            // Iced's `.dlg-actions button`: padding 4px 10px, 12/14.
             actions.push(
                 Button::new(("delegation-action", index))
                     .small()
-                    .label(control.label.clone())
+                    .h_auto()
+                    .px(px(10.))
+                    .py(px(4.))
+                    // A browser button's line height is `normal`, not the transcript's 1.5.
+                    .line_height(gpui::relative(1.2))
+                    // Button's own label is a fixed `text_sm`; Iced's is 12/14.
+                    .accessibility_label(control.label.clone())
+                    .child(
+                        div()
+                            .text_size(px(appearance.size(12.)))
+                            .child(control.label.clone()),
+                    )
                     .debug_selector(move || format!("delegation-action-{id}-{}", control.label))
                     .tooltip(control.tooltip)
                     .disabled(control.disabled)
@@ -312,12 +345,7 @@ impl RowView {
             );
         }
         if sent && !sent_shown {
-            actions.push(
-                div()
-                    .text_color(rgb(palette.muted))
-                    .child("sent to chat ✓")
-                    .into_any_element(),
-            );
+            actions.push(note("sent to chat ✓".into()));
         }
         let findings = card
             .findings()
@@ -327,7 +355,19 @@ impl RowView {
             .selected_findings
             .get_or_insert_with(|| findings.iter().map(|f| f.id.clone()).collect())
             .clone();
-        let [head, target, state] = card.fold_parts(self.open, crate::composer::now_ms());
+        let [_, target, state] = card.fold_parts(self.open, crate::composer::now_ms());
+        let kind_color = match class.as_str() {
+            "completed" | "done" => palette.result,
+            "failed" | "interrupted" => palette.err,
+            "blocked" | "waiting" => palette.warn,
+            _ => palette.accent,
+        };
+        let state_color = match class.as_str() {
+            "running" | "requested" => palette.accent,
+            "waiting" | "blocked" => palette.warn,
+            _ => palette.muted,
+        };
+        let body = self.render_card_parts(card.parts(), cx);
         // Iced lays each flex child out with `min-width: 0`: a long line
         // wraps (findings) or shortens with an ellipsis (summary, location)
         // instead of widening the card past the transcript.
@@ -336,8 +376,8 @@ impl RowView {
             .flex()
             .flex_col()
             .min_w_0()
-            .p(px(10.))
-            .gap(px(6.))
+            .text_size(px(appearance.size(13.)))
+            // Iced's `details.dlg > summary`: padding 6px 10px, gap 8px.
             .child(
                 Button::new("delegation-fold")
                     .ghost()
@@ -346,96 +386,139 @@ impl RowView {
                     .min_w_0()
                     .overflow_hidden()
                     .justify_start()
+                    .px(px(10.))
+                    .py(px(6.))
                     .gap(px(8.))
+                    .text_size(px(appearance.size(13.)))
                     .debug_selector(move || format!("delegation-fold-{id}"))
                     .tooltip(card.header())
-                    .child(div().min_w_0().text_ellipsis().child(head))
-                    .child(div().flex_1().min_w_0().text_ellipsis().child(target))
-                    .child(div().flex_shrink_0().child(state))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(appearance.size(10.)))
+                            .text_color(rgb(palette.muted))
+                            .child(if self.open { "▾" } else { "▸" }),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(move || format!("delegation-kind-{id}"))
+                            .min_w_0()
+                            .text_ellipsis()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_size(px(appearance.size(12.5)))
+                            .text_color(rgb(kind_color))
+                            .child(card.header()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_ellipsis()
+                            .text_color(rgb(palette.muted))
+                            .child(target),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(move || format!("delegation-state-{id}"))
+                            .flex_shrink_0()
+                            .font_family("Menlo")
+                            .text_size(px(appearance.size(11.5)))
+                            .text_color(rgb(state_color))
+                            .child(state),
+                    )
                     .on_click(cx.listener(Self::toggle)),
             )
             .when(self.open, |view| {
-                view.child(self.copyable_text(cx))
-                    .children(findings.into_iter().map(|finding| {
-                        let location = crate::delegation::finding_location(&finding);
-                        let file = finding.file.clone();
-                        let open = self.action.clone();
-                        div()
-                            .flex()
-                            .min_w_0()
-                            .gap(px(8.))
-                            .items_start()
-                            .when(
-                                !self.query.is_empty()
-                                    && !find_ranges(
-                                        &format!("{}\n{}", finding.title, finding.body),
-                                        &self.query,
-                                    )
-                                    .is_empty(),
-                                |row| row.bg(rgb(0x665c32)),
-                            )
-                            .child(
-                                Checkbox::new(gpui::SharedString::from(format!(
-                                    "finding-{}",
-                                    finding.id
-                                )))
-                                .checked(selected.contains(&finding.id))
-                                .accessibility_label(finding.title.clone())
-                                .disabled(card.delivered())
-                                .debug_selector({
-                                    let fid = finding.id.clone();
-                                    move || format!("finding-select-{id}-{fid}")
-                                })
-                                .on_click(cx.listener({
-                                    let fid = finding.id.clone();
-                                    move |this, checked: &bool, _, cx| {
-                                        if let Some(set) = this.selected_findings.as_mut() {
-                                            if *checked {
-                                                set.insert(fid.clone());
-                                            } else {
-                                                set.remove(&fid);
-                                            }
-                                        }
-                                        cx.notify();
-                                    }
-                                })),
-                            )
-                            .child(
-                                div()
+                // Iced's `.dlg-body`: padding 0 10px 8px 22px.
+                view.child(
+                    div()
+                        .debug_selector(move || format!("delegation-body-{id}"))
+                        .flex()
+                        .flex_col()
+                        .min_w_0()
+                        .pl(px(22.))
+                        .pr(px(10.))
+                        .pb(px(8.))
+                        .children(body)
+                        .children(findings.into_iter().map(|finding| {
+                            let location = crate::delegation::finding_location(&finding);
+                            let file = finding.file.clone();
+                            let open = self.action.clone();
+                            div()
+                                .flex()
+                                .min_w_0()
+                                .gap(px(8.))
+                                .items_start()
+                                .when(
+                                    !self.query.is_empty()
+                                        && !find_ranges(
+                                            &format!("{}\n{}", finding.title, finding.body),
+                                            &self.query,
+                                        )
+                                        .is_empty(),
+                                    |row| row.bg(rgb(0x665c32)),
+                                )
+                                .child(
+                                    Checkbox::new(gpui::SharedString::from(format!(
+                                        "finding-{}",
+                                        finding.id
+                                    )))
+                                    .checked(selected.contains(&finding.id))
+                                    .accessibility_label(finding.title.clone())
+                                    .disabled(card.delivered())
                                     .debug_selector({
                                         let fid = finding.id.clone();
-                                        move || format!("finding-main-{id}-{fid}")
+                                        move || format!("finding-select-{id}-{fid}")
                                     })
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(3.))
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(format!(
-                                        "{:?} {} {}",
-                                        finding.severity, finding.id, finding.title
-                                    ))
-                                    .children(location.map(|location| {
-                                        Button::new(gpui::SharedString::from(format!(
-                                            "finding-location-{}",
-                                            finding.id
-                                        )))
-                                        .ghost()
-                                        .small()
-                                        .max_w_full()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .child(div().min_w_0().text_ellipsis().child(location))
+                                    .on_click(cx.listener({
+                                        let fid = finding.id.clone();
+                                        move |this, checked: &bool, _, cx| {
+                                            if let Some(set) = this.selected_findings.as_mut() {
+                                                if *checked {
+                                                    set.insert(fid.clone());
+                                                } else {
+                                                    set.remove(&fid);
+                                                }
+                                            }
+                                            cx.notify();
+                                        }
+                                    })),
+                                )
+                                .child(
+                                    div()
                                         .debug_selector({
                                             let fid = finding.id.clone();
-                                            move || format!("finding-location-{id}-{fid}")
+                                            move || format!("finding-main-{id}-{fid}")
                                         })
-                                        .tooltip(format!(
-                                            "Open {} in the file viewer",
-                                            file.as_ref().unwrap().display()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(3.))
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(format!(
+                                            "{:?} {} {}",
+                                            finding.severity, finding.id, finding.title
                                         ))
-                                        .on_click(
-                                            move |_, _, cx| {
+                                        .children(location.map(|location| {
+                                            Button::new(gpui::SharedString::from(format!(
+                                                "finding-location-{}",
+                                                finding.id
+                                            )))
+                                            .ghost()
+                                            .small()
+                                            .max_w_full()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .child(div().min_w_0().text_ellipsis().child(location))
+                                            .debug_selector({
+                                                let fid = finding.id.clone();
+                                                move || format!("finding-location-{id}-{fid}")
+                                            })
+                                            .tooltip(format!(
+                                                "Open {} in the file viewer",
+                                                file.as_ref().unwrap().display()
+                                            ))
+                                            .on_click(move |_, _, cx| {
                                                 cx.stop_propagation();
                                                 open(
                                                     TranscriptAction::OpenFile {
@@ -444,30 +527,166 @@ impl RowView {
                                                     },
                                                     cx,
                                                 );
-                                            },
-                                        )
-                                    }))
-                                    .child(finding.body),
-                            )
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap(px(6.))
-                            .children(actions)
-                            .child(
-                                div().text_color(rgb(palette.muted)).child(
+                                            })
+                                        }))
+                                        .child(finding.body),
+                                )
+                        }))
+                        // Iced's `.dlg-actions`: margin-top 8px, gap 6px.
+                        .child(
+                            div()
+                                .debug_selector(move || format!("delegation-actions-{id}"))
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap(px(6.))
+                                .mt(px(8.))
+                                .children(actions)
+                                .child(note(
                                     card.delegation
                                         .delegation_id
                                         .chars()
                                         .take(8)
                                         .collect::<String>(),
-                                ),
-                            ),
-                    )
+                                )),
+                        ),
+                )
             })
             .into_any_element()
+    }
+    /// Iced's `.dlg-body` blocks, each with its class's size, colour and box.
+    /// Their vertical margins collapse as Iced's block margins do.
+    fn render_card_parts(
+        &self,
+        parts: Vec<crate::delegation::CardPart>,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        use crate::delegation::CardPart;
+        let appearance = self.appearance;
+        let palette = appearance.palette();
+        let id = self.row.id;
+        let query = self.query.clone();
+        let hit = move |text: &str| !query.is_empty() && !find_ranges(text, &query).is_empty();
+        let mut previous_bottom = 0.;
+        let mut elements = Vec::new();
+        // Each block's CSS margin top and bottom; adjacent ones collapse.
+        let mut block = |top: f32, bottom: f32| {
+            let block = div()
+                .min_w_0()
+                .mt(px(f32::max(top - previous_bottom, 0.)))
+                .mb(px(bottom));
+            previous_bottom = bottom;
+            block
+        };
+        for (index, part) in parts.into_iter().enumerate() {
+            match part {
+                CardPart::Path(text) => elements.push(
+                    block(2., 6.)
+                        .debug_selector(move || format!("delegation-path-{id}"))
+                        .font_family("Menlo")
+                        .text_size(px(appearance.size(11.5)))
+                        .text_color(rgb(palette.muted))
+                        .when(hit(&text), |row| row.bg(rgb(0x665c32)))
+                        .child(text)
+                        .into_any_element(),
+                ),
+                CardPart::Banner(text) => elements.push(
+                    block(4., 6.)
+                        .debug_selector(move || format!("delegation-banner-{id}"))
+                        .px(px(8.))
+                        .py(px(4.))
+                        .rounded(px(4.))
+                        .border_1()
+                        .border_color(rgb(palette.warn))
+                        .text_color(rgb(palette.warn))
+                        .text_size(px(appearance.size(12.)))
+                        .when(hit(&text), |row| row.bg(rgb(0x665c32)))
+                        .child(text)
+                        .into_any_element(),
+                ),
+                CardPart::Error(text) => elements.push(
+                    block(4., 6.)
+                        .id(("delegation-error", id))
+                        .debug_selector(move || format!("delegation-error-{id}"))
+                        .px(px(8.))
+                        .py(px(4.))
+                        .rounded(px(4.))
+                        .border_1()
+                        .border_color(rgb(palette.err))
+                        .text_color(rgb(palette.err))
+                        .font_family("Menlo")
+                        .text_size(px(appearance.size(12.)))
+                        .max_h(px(160.))
+                        .overflow_y_scroll()
+                        .when(hit(&text), |row| row.bg(rgb(0x665c32)))
+                        .child(text)
+                        .into_any_element(),
+                ),
+                CardPart::Line(text) => elements.push(
+                    block(2., 6.)
+                        .debug_selector(move || format!("delegation-line-{id}-{index}"))
+                        .text_color(rgb(palette.muted))
+                        .text_size(px(appearance.size(12.)))
+                        .when(hit(&text), |row| row.bg(rgb(0x665c32)))
+                        .child(text)
+                        .into_any_element(),
+                ),
+                CardPart::Activity(text) => elements.push(
+                    block(0., 0.)
+                        .debug_selector(move || format!("delegation-activity-{id}"))
+                        .font_family("Menlo")
+                        .text_size(px(appearance.size(11.5)))
+                        .text_color(rgb(palette.muted))
+                        .text_ellipsis()
+                        .when(hit(&text), |row| row.bg(rgb(0x665c32)))
+                        .child(text)
+                        .into_any_element(),
+                ),
+                CardPart::Summary(text) => elements.push(
+                    block(4., 6.)
+                        .debug_selector(move || format!("delegation-summary-{id}"))
+                        .when(hit(&text), |row| row.bg(rgb(0x665c32)))
+                        .child(text)
+                        .into_any_element(),
+                ),
+                // Iced renders the handoff summary as `.assistant` markdown.
+                // It is the row's text view, so it keeps selection, copy and
+                // find highlights.
+                CardPart::Report(_) => elements.push(
+                    block(6., 10.)
+                        .debug_selector(move || format!("delegation-report-{id}"))
+                        .child(self.copyable_text(cx))
+                        .into_any_element(),
+                ),
+                CardPart::Section(title, items) => {
+                    elements.push(
+                        block(6., 2.)
+                            .debug_selector(move || format!("delegation-section-{id}-{index}"))
+                            .text_size(px(appearance.size(11.)))
+                            .text_color(rgb(palette.muted))
+                            .child(title.to_uppercase())
+                            .into_any_element(),
+                    );
+                    // A plain `<ul>`: 1em margins and a 40px indent.
+                    let em = appearance.size(13.);
+                    elements.push(
+                        block(em, em)
+                            .flex()
+                            .flex_col()
+                            .children(items.into_iter().map(|item| {
+                                div()
+                                    .flex()
+                                    .gap(px(10.))
+                                    .pl(px(24.))
+                                    .when(hit(&item), |row| row.bg(rgb(0x665c32)))
+                                    .child("•")
+                                    .child(div().flex_1().min_w_0().child(item))
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        elements
     }
 }

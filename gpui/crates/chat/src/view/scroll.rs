@@ -35,6 +35,15 @@ impl TranscriptScrollerState {
     pub fn logical_scroll_top(&self) -> ListOffset {
         self.list.logical_scroll_top()
     }
+    /// Iced's native fold toggle: a fold that opens grows below its row,
+    /// and the row stays where it was, even at the tail. A fold that closes
+    /// keeps following, as Iced's scroll clamps to the new bottom.
+    pub fn hold_for_toggle(&mut self, opening: bool, cx: &mut Context<Self>) {
+        if opening && self.list.is_following_tail() {
+            self.list.pause_following_tail();
+            cx.notify();
+        }
+    }
     pub fn pause_follow(&mut self, cx: &mut Context<Self>) {
         self.list.set_follow_mode(FollowMode::Normal);
         cx.notify();

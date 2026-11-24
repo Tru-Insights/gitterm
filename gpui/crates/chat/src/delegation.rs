@@ -16,6 +16,26 @@ pub struct DelegationCard {
     #[serde(default)]
     pub worker: Option<Value>,
 }
+/// One block of Iced's `.dlg-body`, named after its class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CardPart {
+    /// `.dlg-path`: branch · worktree path.
+    Path(String),
+    /// `.dlg-banner`: a warn-bordered box.
+    Banner(String),
+    /// `.dlg-error`: an err-bordered mono box.
+    Error(String),
+    /// `.dlg-line`: a muted line.
+    Line(String),
+    /// `.dlg-activity`: a muted mono line.
+    Activity(String),
+    /// `.dlg-summary`: a review's plain summary.
+    Summary(String),
+    /// A worker's handoff summary, rendered as markdown.
+    Report(String),
+    /// `.dlg-section` title and its list.
+    Section(&'static str, Vec<String>),
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Control {
     pub label: String,
@@ -303,6 +323,155 @@ impl DelegationCard {
             }
         }
         body
+    }
+    /// Iced's card class (`details.dlg.<state>`): the worker's session
+    /// state for a worker, else the delegation's status.
+    pub fn state_class(&self) -> &str {
+        if self.is_worker() {
+            self.worker_state()
+        } else {
+            self.delegation.status.label()
+        }
+    }
+    /// Iced's `.dlg-body` blocks in order (renderCard / renderWorkerBody /
+    /// renderResult), each with its own class. The findings list and the
+    /// actions row follow them. `body()` is the same content as one
+    /// markdown string, for find and copy.
+    pub fn parts(&self) -> Vec<CardPart> {
+        let d = &self.delegation;
+        let mut parts = Vec::new();
+        if self.is_worker() {
+            let path = self.worker_text("worktree_path");
+            let branch = self.worker_text("branch");
+            if path.is_some() || branch.is_some() {
+                parts.push(CardPart::Path(format!(
+                    "{}{}",
+                    branch.unwrap_or_default(),
+                    path.map(|p| format!(" · {p}")).unwrap_or_default()
+                )));
+            }
+            let failed = match &d.status {
+                DelegationStatus::Failed { message } => message.clone(),
+                _ => "The worker failed".into(),
+            };
+            match self.worker_state() {
+                "waiting" => parts.push(CardPart::Banner(
+                    "The worker is waiting for you. Open its tab to answer.".into(),
+                )),
+                "exited" => parts.push(CardPart::Banner(
+                    "The worker stopped without reporting. Open its tab, or the task, to resume it."
+                        .into(),
+                )),
+                "interrupted" => parts.push(CardPart::Line(
+                    "GitTerm restarted; the worker tab is back. Resume it there.".into(),
+                )),
+                "queued" => parts.push(CardPart::Line("Waiting for a free task slot.".into())),
+                "blocked" => parts.push(CardPart::Banner(
+                    "The worker is blocked and needs you.".into(),
+                )),
+                "failed" => parts.push(CardPart::Error(failed)),
+                "cancelled" => parts.push(CardPart::Line(
+                    "No longer tracked. The worker tab and task are untouched.".into(),
+                )),
+                _ => {}
+            }
+            if !matches!(
+                d.status,
+                DelegationStatus::Completed | DelegationStatus::Blocked
+            ) {
+                if let Some(progress) = self.worker_text("progress") {
+                    parts.push(CardPart::Activity(format!("Latest: {progress}")));
+                }
+                return parts;
+            }
+        } else {
+            match &d.status {
+                DelegationStatus::Running | DelegationStatus::Requested => {
+                    parts.push(CardPart::Activity(self.activity.clone().unwrap_or_else(
+                        || {
+                            if d.status == DelegationStatus::Requested {
+                                "Waiting for a free Codex slot".into()
+                            } else {
+                                "Starting Codex…".into()
+                            }
+                        },
+                    )));
+                    return parts;
+                }
+                DelegationStatus::Failed { message } => {
+                    parts.push(CardPart::Error(message.clone()));
+                    return parts;
+                }
+                DelegationStatus::Interrupted => {
+                    parts.push(CardPart::Line(
+                        "GitTerm restarted while this was running. Re-run it to try again.".into(),
+                    ));
+                    return parts;
+                }
+                DelegationStatus::Cancelled => {
+                    parts.push(CardPart::Line("Cancelled.".into()));
+                    return parts;
+                }
+                _ => {}
+            }
+        }
+        let Some(result) = &d.result else {
+            return parts;
+        };
+        if let Some(reviewed) = &result.reviewed {
+            parts.push(CardPart::Line(format!(
+                "Reviewed at {}{}{}",
+                short(&reviewed.head),
+                if reviewed.dirty { ", dirty" } else { "" },
+                if !reviewed.target_description.is_empty()
+                    && reviewed.target_description != "consult"
+                {
+                    format!(" · {}", reviewed.target_description)
+                } else {
+                    String::new()
+                }
+            )));
+        }
+        if let Some(f) = &result.findings {
+            parts.push(CardPart::Line(format!(
+                "Verdict: {}{}",
+                match f.verdict {
+                    gitterm_core::tasks::ReviewVerdict::Correct => "correct",
+                    gitterm_core::tasks::ReviewVerdict::NeedsChanges => "needs changes",
+                    gitterm_core::tasks::ReviewVerdict::Unknown => "unknown",
+                },
+                if f.structured {
+                    ""
+                } else {
+                    " · unstructured reply"
+                }
+            )));
+            if !f.summary.is_empty() {
+                parts.push(CardPart::Summary(f.summary.clone()));
+            }
+        } else if let Some(h) = &result.handoff {
+            parts.push(CardPart::Report(h.summary.clone()));
+            for (title, items) in [
+                ("Decisions", &h.decisions),
+                ("Next steps", &h.next_steps),
+                ("Blockers", &h.blockers),
+            ] {
+                if !items.is_empty() {
+                    parts.push(CardPart::Section(title, items.clone()));
+                }
+            }
+        }
+        parts
+    }
+    /// The handoff summary, the one block Iced renders as markdown.
+    pub fn report(&self) -> String {
+        self.parts()
+            .into_iter()
+            .find_map(|part| match part {
+                CardPart::Report(text) => Some(text),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
     pub fn sendable(&self) -> bool {
         matches!(

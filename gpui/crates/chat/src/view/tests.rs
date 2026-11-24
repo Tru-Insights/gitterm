@@ -3963,3 +3963,286 @@ fn live_running_turn_shows_its_work_unfolded_from_the_left(cx: &mut TestAppConte
         "label fills the row"
     );
 }
+
+/// `count` finished turns: prompt, thinking, two tools, final text.
+fn finished_turns(count: usize) -> Vec<Record> {
+    let mut lines = Vec::new();
+    for turn in 0..count {
+        let at = turn as u64 * 10_000;
+        lines.push(format!(
+            r#"{{"at_ms":{at},"entry":{{"type":"user_prompt","data":"Question {turn}"}}}}"#
+        ));
+        lines.push(format!(r#"{{"at_ms":{},"entry":{{"type":"harness","data":{{"type":"turn_started","data":{{"session_id":null,"model":null}}}}}}}}"#, at + 100));
+        lines.push(format!(r#"{{"at_ms":{},"entry":{{"type":"harness","data":{{"type":"thinking_delta","data":"Thought {turn}"}}}}}}"#, at + 200));
+        for tool in ["a", "b"] {
+            lines.push(format!(r#"{{"at_ms":{},"entry":{{"type":"harness","data":{{"type":"item_started","data":{{"id":"{tool}{turn}","kind":{{"type":"tool_call","name":"Bash","input":{{"command":"check {tool}"}}}}}}}}}}}}"#, at + 300));
+            lines.push(format!(r#"{{"at_ms":{},"entry":{{"type":"harness","data":{{"type":"item_completed","data":{{"id":"{tool}{turn}","output":"ok\nok\nok","is_error":false}}}}}}}}"#, at + 400));
+        }
+        lines.push(format!(r#"{{"at_ms":{},"entry":{{"type":"harness","data":{{"type":"text_delta","data":"Answer {turn}"}}}}}}"#, at + 500));
+        lines.push(format!(r#"{{"at_ms":{},"entry":{{"type":"harness","data":{{"type":"turn_completed","data":{{"status":{{"state":"completed"}},"usage":null,"cost_usd":null}}}}}}}}"#, at + 1400));
+    }
+    parse_fixture(&lines.join("\n")).unwrap()
+}
+fn top_of(selector: &str, cx: &mut VisualTestContext) -> f32 {
+    let selector = Box::leak(selector.to_owned().into_boxed_str());
+    f32::from(
+        cx.debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector}"))
+            .top(),
+    )
+}
+
+/// Issue 102: Iced's toggle leaves the clicked summary where it was.
+#[gpui::test]
+fn clicked_fold_and_run_rows_keep_their_place_mid_history(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(finished_turns(40), cx);
+    cx.simulate_resize(size(px(900.), px(700.)));
+    draw(cx);
+    let (fold, rows) = chat.read_with(cx, |view, _| {
+        let fold = turns::work_folds(&view.model)[20].range.start;
+        (fold, view.model.rows.len())
+    });
+    assert!(
+        fold > 40 && fold + 40 < rows,
+        "fold {fold} is mid-history of {rows}"
+    );
+    // Scroll so the fold sits mid-viewport, rows above it partly shown.
+    chat.update_in(cx, |view, _, cx| {
+        view.scroller
+            .update(cx, |state, cx| state.scroll_to_item(fold - 3, cx))
+    });
+    draw(cx);
+    let id = chat.read_with(cx, |view, _| view.model.rows[fold].id);
+    let selector = format!("work-fold-{id}");
+    let before = top_of(&selector, cx);
+    for open in [true, false, true] {
+        click_selector(selector.clone(), cx);
+        chat.read_with(cx, |view, cx| {
+            let row = view.row_views[fold].as_ref().unwrap().read(cx);
+            assert_eq!(row.work_open, open);
+        });
+        let after = top_of(&selector, cx);
+        assert!(
+            (after - before).abs() <= 1.,
+            "fold moved from {before} to {after} (open {open})"
+        );
+    }
+    // The opened fold's tool run behaves the same.
+    let run = chat.read_with(cx, |view, cx| {
+        (fold..rows)
+            .find(|index| {
+                view.row_views[*index]
+                    .as_ref()
+                    .is_some_and(|row| row.read(cx).run_summary.is_some())
+            })
+            .map(|index| view.model.rows[index].id)
+            .expect("run in the opened fold")
+    });
+    let selector = format!("tool-run-{run}");
+    let before = top_of(&selector, cx);
+    for _ in 0..2 {
+        click_selector(selector.clone(), cx);
+        let after = top_of(&selector, cx);
+        assert!(
+            (after - before).abs() <= 1.,
+            "run moved from {before} to {after}"
+        );
+    }
+}
+
+/// Issue 102 at the tail: opening the last fold does not pull it up.
+#[gpui::test]
+fn clicked_fold_at_the_tail_keeps_its_place(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(finished_turns(12), cx);
+    cx.simulate_resize(size(px(900.), px(700.)));
+    draw(cx);
+    assert!(chat.read_with(cx, |view, cx| view.scroller.read(cx).is_following_tail()));
+    let id = chat.read_with(cx, |view, _| {
+        let fold = turns::work_folds(&view.model).last().unwrap().range.start;
+        view.model.rows[fold].id
+    });
+    let selector = format!("work-fold-{id}");
+    let before = top_of(&selector, cx);
+    click_selector(selector.clone(), cx);
+    let after = top_of(&selector, cx);
+    assert!(
+        (after - before).abs() <= 1.,
+        "fold moved from {before} to {after}"
+    );
+}
+
+/// Issue 102 as a person gets there: wheel up from the tail, then click.
+#[gpui::test]
+fn wheel_scrolled_fold_keeps_its_place(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(finished_turns(40), cx);
+    cx.simulate_resize(size(px(900.), px(700.)));
+    draw(cx);
+    let (id, fold) = chat.read_with(cx, |view, _| {
+        let fold = turns::work_folds(&view.model)[20].range.start;
+        (view.model.rows[fold].id, fold)
+    });
+    let selector = format!("work-fold-{id}");
+    let leaked: &'static str = Box::leak(selector.clone().into_boxed_str());
+    let transcript = cx.debug_bounds("chat-transcript").unwrap();
+    for _ in 0..400 {
+        if cx.debug_bounds(leaked).is_some_and(|b| {
+            b.top() > transcript.top() + px(150.) && b.top() < transcript.top() + px(400.)
+        }) {
+            break;
+        }
+        cx.simulate_event(gpui::ScrollEvent {
+            position: transcript.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(60.))),
+            ..Default::default()
+        });
+        draw(cx);
+    }
+    let before = top_of(&selector, cx);
+    for open in [true, false, true, false] {
+        click_selector(selector.clone(), cx);
+        chat.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.row_views[fold].as_ref().unwrap().read(cx).work_open,
+                open
+            );
+        });
+        let after = top_of(&selector, cx);
+        assert!(
+            (after - before).abs() <= 1.,
+            "fold moved from {before} to {after} (open {open})"
+        );
+    }
+}
+
+fn blocked_worker_card() -> crate::delegation::DelegationCard {
+    let mut card = crate::delegation::tests::card("implement", "blocked");
+    card.worker.as_mut().unwrap()["session_state"] = "blocked".into();
+    card.delegation.result = Some(
+        serde_json::from_value(serde_json::json!({
+            "handoff":{"summary":"Report line","decisions":["Kept the API"],"next_steps":[],"blockers":["Needs access"],"updated_at":"2026-11-20T00:02:00Z"}
+        }))
+        .unwrap(),
+    );
+    card
+}
+
+/// Issue 101: Iced's `.dlg-body` classes, sized from the chat font.
+#[gpui::test]
+fn delegation_card_uses_iced_block_sizes_and_boxes(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    cx.simulate_resize(size(px(900.), px(900.)));
+    install_card(blocked_worker_card(), &chat, cx);
+    let card = cx.debug_bounds("delegation-card-0").expect("card");
+    let path = cx.debug_bounds("delegation-path-0").expect("path line");
+    let banner = cx.debug_bounds("delegation-banner-0").expect("banner box");
+    let report = cx.debug_bounds("delegation-report-0").expect("report");
+    let kind = cx.debug_bounds("delegation-kind-0").expect("kind");
+    let state = cx.debug_bounds("delegation-state-0").expect("state");
+    let actions = cx.debug_bounds("delegation-actions-0").expect("actions");
+    // `.dlg-body` padding: 22px left of the card's edge (and its 3px border).
+    for (name, block) in [("path", path), ("banner", banner), ("report", report)] {
+        let inset = f32::from(block.left() - card.left());
+        assert!((22. ..=26.).contains(&inset), "{name} inset {inset}");
+    }
+    // Mono 11.5/14 path and state lines are shorter than 13/14 report text.
+    assert!(
+        path.size.height < report.size.height,
+        "{path:?} vs {report:?}"
+    );
+    assert!(
+        state.size.height < report.size.height,
+        "{state:?} vs {report:?}"
+    );
+    assert!(
+        kind.size.height < report.size.height,
+        "{kind:?} vs {report:?}"
+    );
+    // The banner is a box: 4px padding and a 1px border around a 12/14 line.
+    let line = f32::from(path.size.height);
+    let boxed = f32::from(banner.size.height);
+    assert!(boxed >= line + 9., "banner {boxed} not boxed (line {line})");
+    // Uppercase section headings, one per non-empty list.
+    chat.read_with(cx, |view, cx| {
+        let row = view.row_views[0].as_ref().unwrap().read(cx);
+        assert_eq!(
+            row.text.read(cx).rendered_text().as_str().trim(),
+            "Report line"
+        );
+    });
+    assert!(
+        cx.debug_bounds("delegation-section-0-3").is_some(),
+        "Decisions"
+    );
+    assert!(
+        cx.debug_bounds("delegation-section-0-4").is_some(),
+        "Blockers"
+    );
+    assert!(actions.top() > report.bottom());
+    let button = cx
+        .debug_bounds("delegation-action-0-Open worker tab")
+        .expect("action button");
+    assert!(
+        button.size.height < px(26.),
+        "{button:?} is Iced's 12/14 button"
+    );
+}
+
+#[test]
+fn card_parts_are_the_card_body() {
+    use crate::delegation::CardPart;
+    for card in [
+        blocked_worker_card(),
+        crate::delegation::tests::card("implement", "running"),
+        crate::delegation::tests::with_findings(),
+        crate::delegation::tests::card("review", "running"),
+    ] {
+        let body = plain_markdown(&card.body());
+        for part in card.parts() {
+            let texts = match part {
+                CardPart::Section(title, items) => {
+                    let mut texts = items;
+                    texts.push(title.into());
+                    texts
+                }
+                CardPart::Path(text)
+                | CardPart::Banner(text)
+                | CardPart::Error(text)
+                | CardPart::Line(text)
+                | CardPart::Activity(text)
+                | CardPart::Summary(text)
+                | CardPart::Report(text) => vec![text],
+            };
+            for text in texts {
+                assert!(body.contains(&text), "{text:?} not in {body:?}");
+            }
+        }
+    }
+}
+
+/// Issue 103: Iced's `#jump` floats over the transcript's corner.
+#[gpui::test]
+fn latest_button_floats_small_over_the_transcript(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(finished_turns(30), cx);
+    cx.simulate_resize(size(px(900.), px(700.)));
+    draw(cx);
+    assert!(cx.debug_bounds("chat-latest").is_none());
+    let following = cx.debug_bounds("chat-transcript").unwrap();
+    chat.update_in(cx, |view, _, cx| {
+        view.scroller
+            .update(cx, |state, cx| state.scroll_to_item(0, cx))
+    });
+    draw(cx);
+    let transcript = cx.debug_bounds("chat-transcript").unwrap();
+    let latest = cx.debug_bounds("chat-latest").expect("Latest shown");
+    assert_eq!(transcript, following, "the transcript keeps its size");
+    assert!(
+        latest.size.width < transcript.size.width * 0.25,
+        "{latest:?}"
+    );
+    let right = f32::from(transcript.right() - latest.right());
+    let bottom = f32::from(transcript.bottom() - latest.bottom());
+    assert!((17. ..=19.).contains(&right), "right gap {right}");
+    assert!((11. ..=13.).contains(&bottom), "bottom gap {bottom}");
+    click_selector("chat-latest".into(), cx);
+    assert!(chat.read_with(cx, |view, cx| view.scroller.read(cx).is_following_tail()));
+}
