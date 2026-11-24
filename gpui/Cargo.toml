@@ -18,11 +18,9 @@ gitterm-core = { path = "../crates/gitterm-core", features = ["runtime"] }
 gitterm-gpui-review = { path = "crates/review" }
 gitterm-gpui-chat = { path = "crates/chat" }
 gitterm-gpui-shell = { path = "crates/shell" }
-gpui-component = { version = "=0.9.1", features = ["syntect"] }
-gpui-webview = "=0.9.1"
-gpui_xterm = "=0.3.0"
-gpui-kit = "=0.9.1"
-gpui-pre = "=0.3.12"
+gpui-component = { version = "=0.11.0", features = ["syntect"] }
+gpui-kit = "=0.11.0"
+gpui-pre = "=0.3.14"
 
 gitterm-terminal = { path = "crates/terminal" }
 

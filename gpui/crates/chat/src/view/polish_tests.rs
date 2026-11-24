@@ -232,23 +232,64 @@ fn w04_transcript_scrollbar_is_ten_px_with_a_strong_border_thumb(cx: &mut TestAp
     draw(cx);
     let thumb: gpui::Background = gpui::rgb(0x585b70).into();
     let (quads, scale) = cx.update(|window, _| (window.painted_quads(), window.scale_factor()));
-    let found = quads
+    let column = quads
         .iter()
         .filter(|quad| quad.background == thumb)
         // The bubbles' neighbours share nothing with the thumb's colour; the
         // thumb is the tall, narrow one.
-        .find(|quad| quad.bounds.size.height.0 > quad.bounds.size.width.0 * 3.);
-    let quad = found.expect("a strong-border scrollbar thumb");
+        .find(|quad| quad.bounds.size.height.0 > quad.bounds.size.width.0 * 3.)
+        .expect("a strong-border scrollbar thumb")
+        .bounds;
+    // GPUI splits a rounded fill into a square interior and masked edge
+    // pieces. Check their visible union and the pieces at each outer corner.
+    let pieces: Vec<_> = quads
+        .iter()
+        .filter(|quad| quad.background == thumb && quad.bounds == column)
+        .map(|quad| (quad, quad.bounds.intersect(&quad.content_mask.bounds)))
+        .filter(|(_, visible)| !visible.is_empty())
+        .collect();
+    let bounds = pieces
+        .iter()
+        .map(|(_, visible)| *visible)
+        .reduce(|union, visible| union.union(&visible))
+        .expect("visible strong-border scrollbar thumb pieces");
     assert!(
-        (quad.bounds.size.width.0 / scale - 10.).abs() < 0.5,
+        (bounds.size.width.0 / scale - 10.).abs() < 0.5,
         "thumb width {:?}",
-        quad.bounds.size.width
+        bounds.size.width
     );
-    assert!(
-        (quad.corner_radii.top_left.0 / scale - 4.).abs() < 0.5,
-        "thumb radius {:?}",
-        quad.corner_radii.top_left
-    );
+    for (index, corner) in [
+        bounds.origin,
+        bounds.top_right(),
+        bounds.bottom_right(),
+        bounds.bottom_left(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let corner_pieces: Vec<_> = pieces
+            .iter()
+            .filter(|(_, visible)| {
+                visible.left() <= corner.x
+                    && visible.right() >= corner.x
+                    && visible.top() <= corner.y
+                    && visible.bottom() >= corner.y
+            })
+            .collect();
+        assert!(!corner_pieces.is_empty(), "thumb corner {index} is painted");
+        for (quad, _) in corner_pieces {
+            let radius = [
+                quad.corner_radii.top_left,
+                quad.corner_radii.top_right,
+                quad.corner_radii.bottom_right,
+                quad.corner_radii.bottom_left,
+            ][index];
+            assert!(
+                (radius.0 / scale - 4.).abs() < 0.5,
+                "thumb corner {index} radius {radius:?}"
+            );
+        }
+    }
 }
 
 /// W08: a fold frees room in the document, so whole detached chunks that fit
