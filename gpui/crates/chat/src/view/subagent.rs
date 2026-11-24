@@ -148,6 +148,7 @@ impl RowView {
                     .children(self.sub_text.clone().map(|text| {
                         TextView::new(&text)
                             .text_size(size(12.))
+                            .text_color(rgb(palette.fg))
                             .selectable(true)
                             .scrollable(true)
                             .max_h(px(240.))
