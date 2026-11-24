@@ -144,7 +144,7 @@ fn field<'a>(tool: &'a Tool, keys: &[&str]) -> Option<&'a str> {
     keys.iter()
         .find_map(|key| tool.input[*key].as_str().filter(|s| !s.is_empty()))
 }
-fn salient(tool: &Tool) -> Option<&str> {
+pub(super) fn salient(tool: &Tool) -> Option<&str> {
     let keys: &[&str] = match tool.name.as_str() {
         "Bash" => &["command"],
         "Read" | "Write" | "Edit" | "MultiEdit" => &["file_path"],

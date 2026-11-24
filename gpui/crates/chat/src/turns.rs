@@ -82,9 +82,10 @@ pub(super) fn is_work(row: &Row) -> bool {
 }
 
 /// Rows Iced has no top-level block for: a subagent's rows live in its card,
-/// a withdrawn prompt is removed. They go wherever the block before them goes.
+/// a withdrawn prompt is removed, a request shows only in the footer panel.
+/// They go wherever the block before them goes.
 fn follows_previous(row: &Row) -> bool {
-    !row.scope.is_empty() || row.kind == RowKind::Withdrawn
+    !row.scope.is_empty() || row.hidden()
 }
 
 /// Iced's `foldSegment`: the groups of one segment that fold, or none.
@@ -149,14 +150,12 @@ fn waits(row: &Row) -> bool {
             .is_some_and(|r| !r.resolved || r.waiting_at_turn_end)
 }
 
-/// Iced's `keepsOutOfFold`: error blocks, delegation cards, a failed tool, a
+/// Iced's `keepsOutOfFold`: error blocks, warnings, delegation cards, a failed tool, a
 /// running subagent's card and a card whose request still waits.
 fn keeps_out_of_fold(row: &Row, held: bool) -> bool {
     match row.kind {
-        RowKind::Error | RowKind::Delegation => true,
-        // Iced shows a request in its panel and folds the tool card once the
-        // request is answered; GPUI's request card folds the same way.
-        RowKind::Permission | RowKind::Question => waits(row),
+        // Iced: `.error-block, .dlg, .note.warn`.
+        RowKind::Error | RowKind::Warning | RowKind::Delegation => true,
         RowKind::Tool => {
             held || row.tool.as_ref().is_some_and(|tool| {
                 tool.is_error

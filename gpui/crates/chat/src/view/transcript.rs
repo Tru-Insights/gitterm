@@ -254,34 +254,298 @@ impl ChatView {
     }
 }
 impl RowView {
-    pub(super) fn update_edit_text(&mut self, cx: &mut Context<Self>) {
-        if self.row.edits().is_empty() {
-            self.edit_text = None;
-            return;
-        }
-        let output = self
+    /// Iced's result `<pre>`: the shown output, or all of it while find
+    /// searches tool output.
+    pub(super) fn update_output_text(&mut self, cx: &mut Context<Self>) {
+        let Some(output) = self
             .row
             .tool
             .as_ref()
-            .and_then(|tool| tool.output.as_ref().map(|output| (tool.is_error, output)))
-            .filter(|(_, output)| !output.trim().is_empty() && output.trim() != "null")
-            .map(|(error, output)| {
-                format!(
-                    "**{}**\n\n{}",
-                    if error { "Error" } else { "Result" },
-                    crate::model::code(output, "text")
-                )
-            })
-            .unwrap_or_default();
-        if let Some(text) = &self.edit_text {
-            text.update(cx, |text, cx| text.set_text(&output, cx));
+            .and_then(|tool| tool.output.as_deref())
+        else {
+            self.output_text = None;
+            return;
+        };
+        self.output_full = !self.query.is_empty();
+        let shown = if self.output_full && !output.is_empty() {
+            output.to_string()
         } else {
-            self.edit_text = Some(cx.new(|cx| {
-                TextViewState::markdown(&output, cx)
+            crate::model::shown_output(output)
+        };
+        let source = crate::model::code(&shown, "text");
+        if let Some(text) = &self.output_text {
+            text.update(cx, |text, cx| text.set_text(&source, cx));
+        } else {
+            self.output_text = Some(cx.new(|cx| {
+                TextViewState::markdown(&source, cx)
                     .selectable(true)
-                    .scrollable(false)
+                    .scrollable(true)
             }));
         }
+    }
+    /// Iced's `.tool-label`.
+    fn tool_label(&self, label: &'static str) -> gpui::Div {
+        div()
+            .mt(px(6.))
+            .mb(px(3.))
+            .text_size(px(self.appearance.size(10.)))
+            .text_color(rgb(self.appearance.palette().muted))
+            .child(label)
+    }
+    /// Iced's `.tool-body pre`: monospace, scrolled past 320px.
+    fn tool_pre(
+        &self,
+        state: Option<&Entity<TextViewState>>,
+        error: bool,
+        selector: String,
+    ) -> gpui::AnyElement {
+        let palette = self.appearance.palette();
+        let pre = div()
+            .debug_selector(move || selector.clone())
+            .px(px(8.))
+            .py(px(6.))
+            .rounded(px(4.))
+            .bg(rgb(palette.alt))
+            .text_color(rgb(if error { palette.err } else { palette.fg }));
+        let Some(state) = state else {
+            // An input not yet known: Iced's empty `<pre>`.
+            return pre.into_any_element();
+        };
+        let blank = gpui::StyleRefinement::default()
+            .p(px(0.))
+            .m(px(0.))
+            .bg(gpui::transparent_black());
+        pre.child(
+            TextView::new(state)
+                .font_family("Menlo")
+                .text_size(px(self.appearance.size(12.)))
+                .selectable(true)
+                .scrollable(true)
+                .max_h(px(320.))
+                .style(gpui_component::text::TextViewStyle::default().code_block(blank)),
+        )
+        .into_any_element()
+    }
+    /// Iced's `details.tool`: summary of name, salient argument, edit counts,
+    /// review action and waiting badge; then its Input (or Changes) and Result.
+    pub(super) fn render_tool(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let palette = self.appearance.palette();
+        let size = |n| px(self.appearance.size(n));
+        let tool = self.row.tool.clone().expect("tool row");
+        let color = if tool.is_error {
+            palette.err
+        } else if tool.output.is_some() {
+            palette.result
+        } else {
+            palette.tool
+        };
+        let edits = self.row.edits();
+        let path = edits.first().map(|edit| edit.path.clone());
+        // Iced's `displayPath`: relative to the chat's checkout.
+        let brief = match &path {
+            Some(path) => self
+                .cwd
+                .as_deref()
+                .map(|cwd| cwd.trim_end_matches('/'))
+                .filter(|cwd| !cwd.is_empty())
+                .and_then(|cwd| path.strip_prefix(&format!("{cwd}/")))
+                .unwrap_or(path)
+                .to_string(),
+            None => super::tool_runs::salient(&tool)
+                .unwrap_or_default()
+                .to_string(),
+        };
+        let (added, removed) = edits.iter().fold((0, 0), |(added, removed), edit| {
+            let rows = crate::interactions::edit_lines(edit).rows;
+            (
+                added + rows.iter().filter(|line| line.sign == '+').count(),
+                removed + rows.iter().filter(|line| line.sign == '-').count(),
+            )
+        });
+        let id = self.row.id;
+        let fold = Button::new("fold")
+            .ghost()
+            .h_auto()
+            .flex_1()
+            .min_w_0()
+            .p_0()
+            .debug_selector(move || "row-fold".into())
+            .flex()
+            .justify_start()
+            .items_baseline()
+            .gap(px(8.))
+            .cursor_pointer()
+            .child(
+                div()
+                    .text_size(size(10.))
+                    .text_color(rgb(palette.muted))
+                    .child(if self.open { "▾" } else { "▸" }),
+            )
+            .child(
+                div()
+                    .debug_selector(move || format!("tool-name-{id}"))
+                    .flex_shrink_0()
+                    .font_family("Menlo")
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(size(12.5))
+                    .text_color(rgb(color))
+                    .child(tool.name.clone()),
+            )
+            .child(
+                div()
+                    .debug_selector(move || format!("tool-brief-{id}"))
+                    .flex_1()
+                    .min_w_0()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .font_family("Menlo")
+                    .text_size(size(12.))
+                    .text_color(rgb(palette.muted))
+                    .child(brief),
+            )
+            .when(path.is_some(), |fold| {
+                fold.child(
+                    div()
+                        .flex_shrink_0()
+                        .flex()
+                        .font_family("Menlo")
+                        .text_size(size(11.5))
+                        .child(
+                            div()
+                                .text_color(rgb(palette.user))
+                                .child(format!("+{added}")),
+                        )
+                        .child(
+                            div()
+                                .ml(px(4.))
+                                .text_color(rgb(palette.err))
+                                .child(format!("−{removed}")),
+                        ),
+                )
+            })
+            .when_some(path.clone(), |fold, path| fold.tooltip(path))
+            .on_click(cx.listener(Self::toggle));
+        // Iced offers review only for an absolute path.
+        let review = path.filter(|path| path.starts_with('/')).map(|path| {
+            let action = self.action.clone();
+            Button::new("edit-review")
+                .ghost()
+                .xsmall()
+                .label("Open in review")
+                .debug_selector(move || format!("edit-review-{id}"))
+                .tooltip(format!("Open {path} in the review pane"))
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    action(
+                        crate::interactions::TranscriptAction::OpenFile {
+                            path: std::path::PathBuf::from(&path),
+                            review: true,
+                        },
+                        cx,
+                    );
+                })
+        });
+        let badge = tool.badge.map(|badge| {
+            div()
+                .debug_selector(move || format!("tool-badge-{id}"))
+                .flex_shrink_0()
+                .whitespace_nowrap()
+                .text_size(size(11.))
+                .text_color(rgb(palette.warn))
+                .child(badge)
+        });
+        let summary = div()
+            .flex()
+            .items_baseline()
+            .gap(px(8.))
+            .pl(px(13.))
+            .pr(px(10.))
+            .py(px(5.))
+            .child(fold)
+            .children(review)
+            .children(badge);
+        let mut body = div().pl(px(13.)).pr(px(10.)).pb(px(8.)).flex().flex_col();
+        if edits.is_empty() {
+            let input = crate::model::tool_input_text(&tool);
+            body = body.child(self.tool_label("INPUT")).child(self.tool_pre(
+                (!input.is_empty()).then_some(&self.text),
+                false,
+                format!("tool-input-{id}"),
+            ));
+        } else {
+            body = body
+                .child(self.tool_label("CHANGES"))
+                .children(self.render_edits(cx));
+        }
+        if tool.output.is_some() {
+            body = body
+                .child(self.tool_label(if tool.is_error { "ERROR" } else { "RESULT" }))
+                .child(self.tool_pre(
+                    self.output_text.as_ref(),
+                    tool.is_error,
+                    format!("tool-output-{id}"),
+                ));
+        }
+        div()
+            .debug_selector(move || format!("tool-card-{id}"))
+            .relative()
+            .bg(rgb(palette.base))
+            .border_1()
+            .border_l_0()
+            .border_color(rgb(palette.border))
+            .rounded(px(6.))
+            .text_size(size(13.))
+            // Iced's 3px state-coloured left border.
+            .child(
+                div()
+                    .debug_selector(move || format!("tool-border-{id}"))
+                    .absolute()
+                    .left_0()
+                    .top(px(-1.))
+                    .bottom(px(-1.))
+                    .w(px(3.))
+                    .rounded_l(px(6.))
+                    .bg(rgb(color)),
+            )
+            .child(
+                Collapsible::new()
+                    .open(self.open)
+                    .child(summary)
+                    .content(body),
+            )
+            .into_any_element()
+    }
+    /// Iced's `.block.<kind>` for a pi event.
+    pub(super) fn render_legacy(
+        &self,
+        block: crate::model::LegacyBlock,
+        content: gpui::Div,
+    ) -> gpui::AnyElement {
+        use crate::model::LegacyBlock;
+        let palette = self.appearance.palette();
+        div()
+            .px(px(10.))
+            .py(px(6.))
+            .rounded(px(6.))
+            .border_l_3()
+            .border_color(rgb(match block {
+                LegacyBlock::Tool => palette.tool,
+                LegacyBlock::ToolResult => palette.result,
+                LegacyBlock::Thinking => palette.strong,
+            }))
+            .when(block != LegacyBlock::Thinking, |div| {
+                div.bg(rgb(palette.block))
+            })
+            .when(block == LegacyBlock::Thinking, |div| div.italic())
+            .child(
+                div()
+                    .mb(px(4.))
+                    .opacity(0.85)
+                    .text_size(px(self.appearance.size(11.)))
+                    .child(self.row.title.to_uppercase()),
+            )
+            .child(content)
+            .into_any_element()
     }
     pub(super) fn expand_edit(&mut self, index: usize, cx: &mut Context<Self>) {
         self.expanded_edits.insert(index);
@@ -290,29 +554,136 @@ impl RowView {
         });
         cx.notify();
     }
+    /// Iced's `.ed-block` per edit: a header with its title and counts, then
+    /// the line diff (scrolled past 480px), Show all and its notes.
     pub(super) fn render_edits(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let palette = self.appearance.palette();
-        self.row.edits().iter().enumerate().map(|(index,edit)| {
-            let diff=edit_lines(edit);
-            let expanded=self.expanded_edits.contains(&index);
-            let added=diff.rows.iter().filter(|line|line.sign=='+').count();
-            let removed=diff.rows.iter().filter(|line|line.sign=='-').count();
-            let skip=|n|div().text_color(rgb(palette.muted)).child(format!("⋯ {n} unchanged line{}",if n==1{""}else{"s"}));
-            div().flex().flex_col().gap(px(2.)).font_family("Menlo").text_size(px(self.appearance.size(12.)))
-                .child(format!("{} · {}  +{added} −{removed}",edit.path,crate::interactions::edit_title(&self.row,index)))
-                .children((diff.skipped_before>0).then(||skip(diff.skipped_before)))
+        let size = |n| px(self.appearance.size(n));
+        let id = self.row.id;
+        let note = |text: String| {
+            div()
+                .px(px(8.))
+                .py(px(1.))
+                .text_size(size(11.))
+                .text_color(rgb(palette.muted))
+                .italic()
+                .child(text)
+        };
+        let skip = |n: usize| {
+            note(format!(
+                "⋯ {n} unchanged line{}",
+                if n == 1 { "" } else { "s" }
+            ))
+        };
+        // `color-mix(in srgb, <colour> 13%, transparent)`.
+        let tint = |color: u32| gpui::rgba((color << 8) | 0x21);
+        self.row.edits().iter().enumerate().map(|(index, edit)| {
+            let diff = edit_lines(edit);
+            let expanded = self.expanded_edits.contains(&index);
+            let added = diff.rows.iter().filter(|line| line.sign == '+').count();
+            let removed = diff.rows.iter().filter(|line| line.sign == '-').count();
+            let head = div()
+                .flex()
+                .items_baseline()
+                .gap(px(8.))
+                .px(px(8.))
+                .py(px(2.))
+                .border_b_1()
+                .border_color(rgb(palette.border))
+                .bg(rgb(palette.block))
+                .text_size(size(11.))
+                .text_color(rgb(palette.muted))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(crate::interactions::edit_title(&self.row, index)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_shrink_0()
+                        .font_family("Menlo")
+                        .child(div().text_color(rgb(palette.user)).child(format!("+{added}")))
+                        .child(div().ml(px(4.)).text_color(rgb(palette.err)).child(format!("−{removed}"))),
+                );
+            let lines = div()
+                .id(("ed-lines", index))
+                .debug_selector(move || format!("edit-lines-{id}-{index}"))
+                .max_h(px(480.))
+                .overflow_y_scroll()
+                .font_family("Menlo")
+                .text_size(size(12.))
+                .line_height(gpui::relative(1.45))
+                .children((diff.skipped_before > 0).then(|| skip(diff.skipped_before)))
                 .children(diff.shown(expanded).iter().map(|line| {
-                    div().flex().gap(px(8.)).w_full()
-                        .text_color(rgb(match line.sign {'+'=>palette.user,'-'=>palette.err,_=>palette.muted}))
-                        .when(!self.query.is_empty() && !find_ranges(&line.text,&self.query).is_empty(),|row|row.bg(rgb(0x665c32)))
-                        .child(line.sign.to_string()).child(if line.text.is_empty(){"\u{200b}".into()}else{line.text.clone()})
+                    let sign = match line.sign {
+                        '+' => palette.user,
+                        '-' => palette.err,
+                        _ => palette.muted,
+                    };
+                    div()
+                        .flex()
+                        .w_full()
+                        .when(line.sign == '+', |row| row.bg(tint(palette.user)))
+                        .when(line.sign == '-', |row| row.bg(tint(palette.err)))
+                        .when(
+                            !self.query.is_empty() && !find_ranges(&line.text, &self.query).is_empty(),
+                            |row| row.bg(rgb(0x665c32)),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(self.appearance.size(12.) * 1.6))
+                                .flex()
+                                .justify_center()
+                                .text_color(rgb(sign))
+                                .child(line.sign.to_string()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .pr(px(8.))
+                                .when(!matches!(line.sign, '+' | '-'), |text| {
+                                    text.text_color(rgb(palette.muted))
+                                })
+                                .child(if line.text.is_empty() {
+                                    "\u{200b}".into()
+                                } else {
+                                    line.text.clone()
+                                }),
+                        )
                 }))
-                .children((diff.skipped_after>0).then(||skip(diff.skipped_after)))
-                .children(diff.more_label(expanded).map(|label| Button::new(("edit-more",index)).ghost().small().label(label)
-                    .debug_selector({let id=self.row.id;move||format!("edit-more-{id}-{index}")})
-                    .on_click(cx.listener(move|row,_,_,cx|row.expand_edit(index,cx)))))
-                .children((added==0 && removed==0).then(||div().child("No line changes")))
-                .children(diff.capped.then(||div().child("Too long to compare line by line: shown as all removed, then all added")))
+                .children((diff.skipped_after > 0).then(|| skip(diff.skipped_after)));
+            div()
+                .debug_selector(move || format!("edit-block-{id}-{index}"))
+                .when(index > 0, |block| block.mt(px(6.)))
+                .flex()
+                .flex_col()
+                .border_1()
+                .border_color(rgb(palette.border))
+                .rounded(px(4.))
+                .bg(rgb(palette.alt))
+                .overflow_hidden()
+                .child(head)
+                .child(lines)
+                .children(diff.more_label(expanded).map(|label| {
+                    div().mt(px(4.)).mx(px(8.)).mb(px(6.)).child(
+                        Button::new(("edit-more", index))
+                            .ghost()
+                            .xsmall()
+                            .label(label)
+                            .debug_selector(move || format!("edit-more-{id}-{index}"))
+                            .on_click(cx.listener(move |row, _, _, cx| row.expand_edit(index, cx))),
+                    )
+                }))
+                .children((added == 0 && removed == 0).then(|| note("No line changes".into())))
+                .children(diff.capped.then(|| {
+                    note("Too long to compare line by line: shown as all removed, then all added".into())
+                }))
                 .into_any_element()
         }).collect()
     }
