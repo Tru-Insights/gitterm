@@ -20,8 +20,8 @@ gitterm-gpui-review = { path = "../review" }
 gitterm-gpui-chat = { path = "../chat" }
 # Iced's Claude preset session-id parsing (H5b B10b fixture launches).
 shell-words = "=1.1.1"
-gpui-kit = "=0.9.1"
-gpui-component = "=0.9.1"
+gpui-kit = "=0.11.0"
+gpui-component = "=0.11.0"
 anyhow = "1"
 dirs = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -36,8 +36,8 @@ objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std"
 raw-window-handle = "0.6"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-gpui_test = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }
-gpui-component = { version = "=0.9.1", features = ["test-support"] }
+gpui_test = { package = "gpui-pre", version = "=0.3.14", features = ["test-support"] }
+gpui-component = { version = "=0.11.0", features = ["test-support"] }
 # tests/codex_trust.rs: core's trust cases under this workspace's toml.
 git2 = "0.19"
 toml = "0.8"
