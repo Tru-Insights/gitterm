@@ -49,6 +49,51 @@ fn inline_code_style(appearance: ChatAppearance, assistant: bool) -> StyleRefine
     }
 }
 
+pub(super) fn assistant_highlight_theme() -> Arc<gpui_component::highlighter::HighlightTheme> {
+    use gpui_component::highlighter::{FontStyle, FontWeightContent, SyntaxColors, ThemeStyle};
+
+    let mut theme = (*gpui_component::highlighter::HighlightTheme::default_dark()).clone();
+    theme.name = "Iced chat Catppuccin Mocha".into();
+    // ThemeStyle is non-exhaustive and has no public constructor or Default.
+    let blank: ThemeStyle = serde_json::from_str("{}").expect("empty syntax style is valid");
+    let token = |color, italic| {
+        let mut style = blank;
+        style.color = Some(rgb(color).into());
+        style.font_style = Some(if italic {
+            FontStyle::Italic
+        } else {
+            FontStyle::Normal
+        });
+        style.font_weight = Some(FontWeightContent::Normal);
+        Some(style)
+    };
+    let mut syntax = SyntaxColors::default();
+    syntax.keyword = token(0xcba6f7, false);
+    syntax.string = token(0xa6e3a1, false);
+    syntax.string_escape = syntax.string;
+    syntax.number = token(0xfab387, false);
+    syntax.boolean = syntax.number;
+    syntax.constant = syntax.number;
+    syntax.comment = token(0x6c7086, true);
+    syntax.comment_doc = syntax.comment;
+    syntax.title = token(0x89b4fa, false);
+    syntax.function = syntax.title;
+    syntax.type_ = token(0xf9e2af, false);
+    syntax.constructor = syntax.type_;
+    syntax.enum_ = syntax.type_;
+    syntax.variant = syntax.type_;
+    syntax.attribute = token(0x89dceb, false);
+    syntax.property = syntax.attribute;
+    syntax.variable = token(0xf2cdcd, false);
+    syntax.variable_special = syntax.variable;
+    syntax.preproc = token(0xf5c2e7, false);
+    syntax.string_special_symbol = syntax.preproc;
+    syntax.string_regex = syntax.preproc;
+    syntax.link_uri = syntax.preproc;
+    theme.style.syntax = syntax;
+    Arc::new(theme)
+}
+
 pub(super) fn transcript_text_color(appearance: ChatAppearance, kind: RowKind) -> u32 {
     let palette = appearance.palette();
     match kind {
@@ -61,9 +106,13 @@ pub(super) fn transcript_text_color(appearance: ChatAppearance, kind: RowKind) -
     }
 }
 
+/// Iced's `pre` background for assistant code blocks.
+const ASSISTANT_CODE_BG: u32 = 0x11111b;
+
 pub(super) fn assistant_style(
     appearance: ChatAppearance,
     rem_size: gpui::Pixels,
+    highlight_theme: Arc<gpui_component::highlighter::HighlightTheme>,
 ) -> gpui_component::text::TextViewStyle {
     let palette = appearance.palette();
     let mut style = gpui_component::text::TextViewStyle::default()
@@ -83,7 +132,7 @@ pub(super) fn assistant_style(
                 .px(px(12.))
                 .py(px(10.))
                 .rounded(px(6.))
-                .bg(rgb(0x11111b))
+                .bg(rgb(ASSISTANT_CODE_BG))
                 .border_color(rgb(palette.border))
                 .font_family("Menlo")
                 .text_size(px(appearance.size(12.5)))
@@ -103,8 +152,15 @@ pub(super) fn assistant_style(
                 .py(px(3.))
                 .border_color(rgb(palette.border)),
         );
+    style.highlight_theme = highlight_theme;
     style.heading_base_font_size = px(appearance.font_size);
     style
+}
+
+pub(super) fn assistant_list_style(appearance: ChatAppearance) -> StyleRefinement {
+    StyleRefinement::default()
+        .text_color(rgb(appearance.palette().fg))
+        .font_weight(gpui::FontWeight::NORMAL)
 }
 
 pub(super) fn assistant_quote_style(appearance: ChatAppearance) -> StyleRefinement {
@@ -276,6 +332,8 @@ impl RowView {
 
     pub(super) fn copyable_text(&self, cx: &mut Context<Self>) -> TextView {
         let owner = cx.entity().downgrade();
+        let appearance = self.appearance;
+        let assistant = self.row.kind == RowKind::Assistant && self.row.scope.is_empty();
         let copied: HashSet<_> = self.copied.keys().copied().collect();
         let copy_label_color = rgb(self.appearance.palette().fg);
         let view = TextView::new(self.output_text.as_ref().unwrap_or(&self.text))
@@ -326,7 +384,7 @@ impl RowView {
                             .border_color(rgb(self.appearance.palette().border)),
                     ),
             )
-            .code_block_actions(move |block, _, _| {
+            .code_block_actions(move |block, window, _| {
                 let mut hash = std::hash::DefaultHasher::new();
                 block
                     .span
@@ -337,7 +395,7 @@ impl RowView {
                 let key = hash.finish() as usize;
                 let code = block.code().to_string();
                 let owner = owner.clone();
-                div()
+                let copy = div()
                     .id(("copy-code-hover", key))
                     .debug_selector(|| "copy-code-action".into())
                     // The dependency anchors this wrapper 8px from the code
@@ -369,7 +427,47 @@ impl RowView {
                         .on_click(move |_, _, cx| {
                             _ = owner.update(cx, |view, cx| view.copy_code(key, code.clone(), cx));
                         }),
+                    );
+                // The label sits left of Copy in one row, so hovering never
+                // stacks the button under it; Copy keeps its slot while hidden.
+                // The dependency paints its theme `muted` behind this slot;
+                // on Iced's darker assistant block that shows as an empty
+                // pill, so the row covers it with the block's own fill.
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(6.))
+                    .debug_selector(|| "code-actions-row".into())
+                    .when(assistant, |row| row.bg(rgb(ASSISTANT_CODE_BG)))
+                    .children(
+                        assistant
+                            .then(|| block.lang())
+                            .flatten()
+                            .filter(|lang| !lang.is_empty())
+                            .map(|lang| {
+                                div()
+                                    .debug_selector({
+                                        let lang = lang.clone();
+                                        move || format!("chat-code-language-{lang}")
+                                    })
+                                    .relative()
+                                    .whitespace_nowrap()
+                                    // shortcut: top/right inside the code box; the action
+                                    // slot is right-pinned and overflow-x clips above it.
+                                    // Move to Iced's left/border when an unmasked code
+                                    // decoration hook is available.
+                                    .top(-window.rem_size() * 0.5)
+                                    .font_family(".SystemUIFont")
+                                    .text_size(px(appearance.size(10.)))
+                                    .line_height(gpui::relative(1.5))
+                                    .text_color(rgb(appearance.palette().muted))
+                                    .bg(rgb(appearance.palette().alt))
+                                    .px(px(4.))
+                                    .child(lang)
+                            }),
                     )
+                    .child(copy)
             });
         #[cfg(test)]
         let view = view.table_actions(|_, _, _| {
@@ -584,6 +682,156 @@ mod tests {
     }
 
     #[gpui::test]
+    fn assistant_syntax_theme_matches_iced_tokens_and_italic_comments(_cx: &mut TestAppContext) {
+        for light in [false, true] {
+            let style = assistant_style(
+                ChatAppearance {
+                    light,
+                    font_size: 14.,
+                },
+                px(16.),
+                assistant_highlight_theme(),
+            );
+            for (names, color) in [
+                (&["keyword"][..], 0xcba6f7),
+                (&["string", "string.escape"], 0xa6e3a1),
+                (&["number", "boolean", "constant"], 0xfab387),
+                (&["comment", "comment.doc"], 0x6c7086),
+                (&["title", "function"], 0x89b4fa),
+                (&["type", "constructor", "enum", "variant"], 0xf9e2af),
+                (&["attribute", "property"], 0x89dceb),
+                (&["variable", "variable.special"], 0xf2cdcd),
+                (
+                    &[
+                        "preproc",
+                        "string.special.symbol",
+                        "string.regex",
+                        "link_uri",
+                    ],
+                    0xf5c2e7,
+                ),
+            ] {
+                for name in names {
+                    let token = style.highlight_theme.style(name).unwrap();
+                    assert_eq!(
+                        token.color,
+                        Some(rgb(color).into()),
+                        "{name}, light={light}"
+                    );
+                    assert_eq!(
+                        token.font_style,
+                        Some(if name.starts_with("comment") {
+                            gpui::FontStyle::Italic
+                        } else {
+                            gpui::FontStyle::Normal
+                        }),
+                        "{name}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn assistant_list_markers_use_body_color_and_normal_weight(_cx: &mut TestAppContext) {
+        for light in [false, true] {
+            let appearance = ChatAppearance {
+                light,
+                font_size: 18.,
+            };
+            let style = assistant_list_style(appearance);
+            assert_eq!(style.text.color, Some(rgb(appearance.palette().fg).into()));
+            assert_eq!(style.text.font_weight, Some(gpui::FontWeight::NORMAL));
+        }
+    }
+
+    #[gpui::test]
+    fn explicit_code_language_stays_visible_and_out_of_selection(cx: &mut TestAppContext) {
+        let (chat, cx) = setup(cx);
+        assert!(cx.debug_bounds("chat-code-language-rust").is_some());
+        let text = row(&chat, cx).read_with(cx, |row, _| row.text.clone());
+        text.update_in(cx, |text, window, cx| {
+            text.focus_handle().focus(window, cx);
+            text.select_all(cx);
+        });
+        draw(cx);
+        cx.simulate_keystrokes("cmd-c");
+        draw(cx);
+        let plain = clipboard(cx);
+        assert!(
+            !plain.contains("rust") && !plain.contains("Copy"),
+            "{plain:?}"
+        );
+        let code_row = reply_source(&chat, "```rust\nlet n = 1;\n```", cx);
+        let label = cx.debug_bounds("chat-code-language-rust").unwrap();
+        let block = code_row.read_with(cx, |row, cx| row.text.read(cx).bounds());
+        // Horizontal overflow masks both axes in GPUI: a label above this
+        // box would be mounted but clipped instead of visibly on its border.
+        assert!(
+            label.top() >= block.top(),
+            "label {label:?}, block {block:?}"
+        );
+        // Both sit in the code block's top-right action slot: the hover Copy
+        // must not be stacked under the label.
+        cx.simulate_mouse_move(block.center(), None, gpui::Modifiers::default());
+        draw(cx);
+        let label = cx.debug_bounds("chat-code-language-rust").unwrap();
+        let copy = cx
+            .debug_bounds("copy-code-action")
+            .expect("hovered Copy is painted");
+        assert!(
+            label.right() <= copy.left(),
+            "label {label:?} overlaps Copy {copy:?}"
+        );
+        // The dependency fills the action slot with its theme `muted`; on
+        // the darker assistant block the row must cover it at rest, or an
+        // empty pill shows where the hidden Copy sits.
+        let row_bounds = cx.debug_bounds("code-actions-row").expect("action row");
+        let (quads, scale) = cx.update(|window, _| (window.painted_quads(), window.scale_factor()));
+        let row_bounds = row_bounds.scale(scale);
+        let fill: gpui::Background = rgb(ASSISTANT_CODE_BG).into();
+        assert!(
+            quads
+                .iter()
+                .any(|quad| quad.background == fill && quad.bounds == row_bounds),
+            "action row {row_bounds:?} is painted with the code block fill"
+        );
+        reply_source(&chat, "```\nno language\n```", cx);
+        assert!(cx.debug_bounds("chat-code-language-rust").is_none());
+        assert!(cx.debug_bounds("chat-code-language-text").is_none());
+        reply_source(&chat, "```unknown-fixture\nno highlighting\n```", cx);
+        assert!(
+            cx.debug_bounds("chat-code-language-unknown-fixture")
+                .is_some()
+        );
+    }
+
+    #[gpui::test]
+    fn assistant_top_margin_collapses_with_previous_block(cx: &mut TestAppContext) {
+        let (chat, cx) = setup(cx);
+        chat.read_with(cx, |view, _| {
+            assert_eq!(view.block_top_gap(0), 6.);
+            assert_eq!(block_bottom_margin(&view.model.rows[0]), 10.);
+        });
+        chat.update_in(cx, |view, _, cx| {
+            view.append_record(
+                &Record {
+                    at_ms: None,
+                    entry: Entry::UserPrompt("fixture".into()),
+                },
+                cx,
+            );
+            view.append_event(HarnessEvent::TextDelta("next reply".into()), cx);
+            let last = view.model.rows.len() - 1;
+            assert_eq!(
+                view.block_top_gap(last),
+                0.,
+                "12px user margin already covers 6px"
+            );
+        });
+    }
+
+    #[gpui::test]
     fn assistant_inline_code_has_iced_insets_and_radius(_cx: &mut TestAppContext) {
         let style = inline_code_style(ChatAppearance::default(), true);
         assert_eq!(style.padding.top, Some(px(1.).into()));
@@ -602,7 +850,7 @@ mod tests {
                 light: false,
             };
             for rem_size in [16., 20.] {
-                let style = assistant_style(appearance, px(rem_size));
+                let style = assistant_style(appearance, px(rem_size), assistant_highlight_theme());
                 assert_eq!(style.paragraph_gap.to_pixels(px(rem_size)), px(8.));
                 let heading = style.heading_font_size.as_ref().unwrap();
                 for (level, factor) in [
