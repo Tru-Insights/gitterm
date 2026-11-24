@@ -1853,7 +1853,7 @@ impl RowView {
         cx: &mut Context<Self>,
     ) -> Self {
         let text = cx.new(|cx| {
-            TextViewState::markdown(&display_body(&row), cx)
+            TextViewState::markdown(&copy::markdown_body(&row), cx)
                 .selectable(true)
                 .scrollable(false)
                 .motion(TextViewMotion::default().with_stream_fade(Duration::from_millis(280)))
@@ -1913,7 +1913,7 @@ impl RowView {
     fn set_row(&mut self, row: Row, cx: &mut Context<Self>) {
         let images_changed = self.row.images != row.images;
         self.text
-            .update(cx, |text, cx| text.set_text(&display_body(&row), cx));
+            .update(cx, |text, cx| text.set_text(&copy::markdown_body(&row), cx));
         if self
             .row
             .delegation
@@ -2009,7 +2009,7 @@ impl RowView {
     }
 }
 impl Render for RowView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(visual) = &self.visual
             && visual.read(cx).light != self.appearance.light
         {
@@ -2078,7 +2078,13 @@ impl Render for RowView {
             .when(self.row.delivery.is_some(), |content| {
                 content.pl(px(22.)).pr(px(10.)).pb(px(8.))
             })
-            .child(self.copyable_text(cx))
+            .child(self.copyable_text(cx).when(
+                self.row.kind == RowKind::Assistant && self.row.scope.is_empty(),
+                |text| {
+                    text.style(copy::assistant_style(self.appearance, window.rem_size()))
+                        .blockquote_style(copy::assistant_quote_style(self.appearance))
+                },
+            ))
             .children(self.render_queued_tag());
         let header = div()
             .text_size(px(self.appearance.size(13.)))

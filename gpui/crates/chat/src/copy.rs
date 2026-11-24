@@ -5,6 +5,81 @@ use gpui_component::menu::PopupMenu;
 
 const COPIED_FOR: Duration = Duration::from_millis(1200);
 
+pub(super) fn markdown_body(row: &Row) -> String {
+    let source = display_body(row);
+    if row.kind == RowKind::Assistant && row.scope.is_empty() {
+        crate::markdown::assistant_source(&source)
+    } else {
+        source
+    }
+}
+
+fn inline_code_style(appearance: ChatAppearance, assistant: bool) -> StyleRefinement {
+    let style = StyleRefinement::default()
+        .font_family("Menlo")
+        .text_size(px(appearance.size(12.5)))
+        .bg(rgb(appearance.palette().block));
+    if assistant {
+        style.px(px(4.)).py(px(1.)).rounded(px(4.))
+    } else {
+        style
+    }
+}
+
+pub(super) fn assistant_style(
+    appearance: ChatAppearance,
+    rem_size: gpui::Pixels,
+) -> gpui_component::text::TextViewStyle {
+    let palette = appearance.palette();
+    let mut style = gpui_component::text::TextViewStyle::default()
+        .paragraph_gap(gpui::rems(8. / f32::from(rem_size)))
+        .heading_font_size(|level, body| {
+            body * match level {
+                1 => 1.3,
+                2 => 1.18,
+                3 => 1.06,
+                4 => 1.,
+                5 => 0.83,
+                _ => 0.67,
+            }
+        })
+        .code_block({
+            let mut block = StyleRefinement::default()
+                .px(px(12.))
+                .py(px(10.))
+                .rounded(px(6.))
+                .bg(rgb(0x11111b))
+                .border_color(rgb(palette.border))
+                .font_family("Menlo")
+                .text_size(px(appearance.size(12.5)))
+                .line_height(gpui::relative(1.45));
+            block.overflow.x = Some(gpui::Overflow::Scroll);
+            block
+        })
+        .table(
+            StyleRefinement::default()
+                .rounded(px(0.))
+                .border_color(rgb(palette.border)),
+        )
+        .table_head(StyleRefinement::default().bg(gpui::transparent_black()))
+        .table_cell(
+            StyleRefinement::default()
+                .px(px(8.))
+                .py(px(3.))
+                .border_color(rgb(palette.border)),
+        );
+    style.heading_base_font_size = px(appearance.font_size);
+    style
+}
+
+pub(super) fn assistant_quote_style(appearance: ChatAppearance) -> StyleRefinement {
+    StyleRefinement::default()
+        .pl(px(10.))
+        .border_l(px(3.))
+        .border_color(rgb(appearance.palette().strong))
+        .text_color(rgb(appearance.palette().muted))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum CopyTarget {
     Code(usize),
@@ -167,12 +242,10 @@ impl RowView {
                 },
             ))
             .line_height(gpui::relative(1.5))
-            .inline_code_style(
-                StyleRefinement::default()
-                    .font_family("Menlo")
-                    .text_size(px(self.appearance.size(12.5)))
-                    .bg(rgb(self.appearance.palette().block)),
-            )
+            .inline_code_style(inline_code_style(
+                self.appearance,
+                self.row.kind == RowKind::Assistant && self.row.scope.is_empty(),
+            ))
             .selectable(true)
             .scrollable(false)
             .stream_fade(true)
@@ -286,6 +359,215 @@ mod tests {
         let bounds = cx.debug_bounds(selector).expect(selector);
         cx.simulate_click(bounds.center(), gpui::Modifiers::none());
         draw(cx);
+    }
+
+    fn reply_source(
+        chat: &Entity<ChatView>,
+        source: &str,
+        cx: &mut VisualTestContext,
+    ) -> Entity<RowView> {
+        let row = row(chat, cx);
+        row.update_in(cx, |view, _, cx| {
+            let mut value = view.row.clone();
+            value.body = source.into();
+            view.set_row(value, cx);
+        });
+        draw(cx);
+        row
+    }
+
+    #[gpui::test]
+    fn assistant_policy_preserves_scoped_and_other_row_sources(cx: &mut TestAppContext) {
+        let (chat, cx) = setup(cx);
+        let source = "one\ntwo <b>raw</b> ![](https://example.invalid/a)";
+        row(&chat, cx).read_with(cx, |view, _| {
+            for kind in [
+                RowKind::User,
+                RowKind::Thinking,
+                RowKind::Tool,
+                RowKind::Assistant,
+            ] {
+                let mut row = view.row.clone();
+                row.kind = kind;
+                row.body = source.into();
+                row.scope = "placeholder-worker".into();
+                assert_eq!(markdown_body(&row), source);
+                assert!(!row.find_body().contains("https://example.invalid/a"));
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn assistant_single_newlines_are_hard_breaks(cx: &mut TestAppContext) {
+        let (chat, cx) = setup(cx);
+        let row = reply_source(
+            &chat,
+            "first é\nsecond\r\nthird\rfourth\n\n`inline`\n\n```text\na\nb\n```",
+            cx,
+        );
+        let text = row.read_with(cx, |row, cx| {
+            row.text.read(cx).rendered_text().as_str().to_string()
+        });
+        assert!(text.contains("first é\nsecond\nthird\nfourth"), "{text:?}");
+        assert!(text.contains("inline"), "{text:?}");
+        assert!(text.contains("a\nb"), "fences preserve code: {text:?}");
+    }
+
+    #[gpui::test]
+    fn assistant_raw_html_is_literal_in_blocks_and_inlines(cx: &mut TestAppContext) {
+        let (chat, cx) = setup(cx);
+        let source = "before <b title=\"x\">bold</b> after\n\n<div>\n**literal** &amp;\n</div>\n\n`<i>code</i>`";
+        let row = reply_source(&chat, source, cx);
+        let text = row.read_with(cx, |row, cx| {
+            row.text.read(cx).rendered_text().as_str().to_string()
+        });
+        for expected in [
+            "<b title=\"x\">bold</b>",
+            "<div>",
+            "**literal** &amp;",
+            "</div>",
+            "<i>code</i>",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}: {text:?}");
+        }
+    }
+
+    #[gpui::test]
+    fn assistant_images_are_links_or_alt_text_without_image_nodes(cx: &mut TestAppContext) {
+        let (chat, cx) = setup(cx);
+        let row = row(&chat, cx);
+        let source = "![remote](https://example.invalid/a.png) ![](HTTPS://example.invalid/b.png) ![local](file:///placeholder.png) ![inline](data:image/png;base64,placeholder) ![reference][pic]\n\n[pic]: http://example.invalid/c.png";
+        // Inspect the parser input without drawing an unadapted image (or fetching it).
+        let prepared = row.read_with(cx, |row, _| {
+            let mut value = row.row.clone();
+            value.body = source.into();
+            markdown_body(&value)
+        });
+        fn walk(node: &markdown::mdast::Node, links: &mut Vec<String>, text: &mut String) {
+            use markdown::mdast::Node;
+            assert!(
+                !matches!(node, Node::Image(_) | Node::ImageReference(_)),
+                "{node:?}"
+            );
+            if let Node::Link(link) = node {
+                links.push(link.url.clone());
+            }
+            if let Node::Text(value) = node {
+                text.push_str(&value.value);
+            }
+            if let Some(children) = node.children() {
+                for child in children {
+                    walk(child, links, text);
+                }
+            }
+        }
+        let ast = markdown::to_mdast(&prepared, &markdown::ParseOptions::gfm()).unwrap();
+        let mut links = vec![];
+        let mut text = String::new();
+        walk(&ast, &mut links, &mut text);
+        assert_eq!(
+            links,
+            [
+                "https://example.invalid/a.png",
+                "HTTPS://example.invalid/b.png",
+                "http://example.invalid/c.png"
+            ]
+        );
+        assert_eq!(
+            text,
+            "remote HTTPS://example.invalid/b.png local inline reference"
+        );
+        let row = reply_source(&chat, source, cx);
+        row.read_with(cx, |row, cx| {
+            let rendered = row.text.read(cx).rendered_text();
+            assert!(rendered.as_str().contains("HTTPS://example.invalid/b.png"));
+            assert!(
+                row.row
+                    .find_body()
+                    .contains("HTTPS://example.invalid/b.png")
+            );
+        });
+        row.update_in(cx, |row, window, cx| {
+            row.text.update(cx, |text, cx| {
+                text.focus_handle().focus(window, cx);
+                text.select_all(cx);
+            });
+        });
+        draw(cx);
+        cx.simulate_keystrokes("cmd-shift-c");
+        draw(cx);
+        let copied = clipboard(cx);
+        assert!(
+            copied.contains("[remote](<https://example.invalid/a.png>)"),
+            "{copied:?}"
+        );
+        assert!(!copied.contains("!["), "{copied:?}");
+    }
+
+    #[gpui::test]
+    fn assistant_inline_code_has_iced_insets_and_radius(_cx: &mut TestAppContext) {
+        let style = inline_code_style(ChatAppearance::default(), true);
+        assert_eq!(style.padding.top, Some(px(1.).into()));
+        assert_eq!(style.padding.bottom, Some(px(1.).into()));
+        assert_eq!(style.padding.left, Some(px(4.).into()));
+        assert_eq!(style.padding.right, Some(px(4.).into()));
+        assert_eq!(style.corner_radii.top_left, Some(px(4.).into()));
+        assert_eq!(style.corner_radii.bottom_right, Some(px(4.).into()));
+    }
+
+    #[gpui::test]
+    fn assistant_exposed_markdown_styles_use_iced_css_values(_cx: &mut TestAppContext) {
+        for font_size in [11., 15., 22.] {
+            let appearance = ChatAppearance {
+                font_size,
+                light: false,
+            };
+            for rem_size in [16., 20.] {
+                let style = assistant_style(appearance, px(rem_size));
+                assert_eq!(style.paragraph_gap.to_pixels(px(rem_size)), px(8.));
+                let heading = style.heading_font_size.as_ref().unwrap();
+                for (level, factor) in [
+                    (1, 1.3),
+                    (2, 1.18),
+                    (3, 1.06),
+                    (4, 1.),
+                    (5, 0.83),
+                    (6, 0.67),
+                ] {
+                    assert_eq!(
+                        heading(level, style.heading_base_font_size),
+                        px(font_size * factor)
+                    );
+                }
+                let block = style.code_block;
+                assert_eq!(block.padding.top, Some(px(10.).into()));
+                assert_eq!(block.padding.left, Some(px(12.).into()));
+                assert_eq!(block.corner_radii.top_left, Some(px(6.).into()));
+                assert_eq!(block.background, Some(rgb(0x11111b).into()));
+                assert_eq!(block.text.font_size, Some(px(appearance.size(12.5)).into()));
+                assert_eq!(block.text.line_height, Some(gpui::relative(1.45)));
+                assert_eq!(block.overflow.x, Some(gpui::Overflow::Scroll));
+                assert_eq!(
+                    style.table_head.background,
+                    Some(gpui::transparent_black().into())
+                );
+                assert_eq!(style.table.corner_radii.top_left, Some(px(0.).into()));
+            }
+            let quote = assistant_quote_style(appearance);
+            assert_eq!(quote.padding.left, Some(px(10.).into()));
+            assert_eq!(quote.border_widths.left, Some(px(3.).into()));
+            assert_eq!(
+                quote.border_color,
+                Some(rgb(appearance.palette().strong).into())
+            );
+        }
+        // Other row types keep their existing component insets.
+        assert_eq!(
+            inline_code_style(ChatAppearance::default(), false)
+                .padding
+                .top,
+            None
+        );
     }
 
     #[gpui::test]

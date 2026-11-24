@@ -8,6 +8,7 @@ pub mod events;
 pub mod imported;
 pub mod intents;
 pub mod interactions;
+mod markdown;
 pub mod model;
 pub use intents::{ChatIntent, PermissionDecision, QuestionAnswer};
 
