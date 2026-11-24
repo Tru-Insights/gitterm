@@ -366,11 +366,28 @@ impl ChatView {
             .text_size(px(em))
             .rounded(px(8.))
             .child(
+                // Iced's `input[type=search]`: 4×6 padding, the input
+                // background, a 1px strong border, radius 4, the bar's font.
                 div()
                     .debug_selector(|| "find-query".into())
                     .flex_1()
                     .min_w(px(8. * em))
-                    .child(Input::new(&self.find_input)),
+                    .px(px(6.))
+                    .py(px(4.))
+                    .bg(rgb(palette.alt))
+                    .border_1()
+                    .border_color(rgb(palette.strong))
+                    .rounded(px(4.))
+                    .line_height(gpui::relative(1.2))
+                    .child(
+                        Input::new(&self.find_input)
+                            .appearance(false)
+                            .xsmall()
+                            .h_auto()
+                            .p_0()
+                            .text_size(px(em))
+                            .line_height(gpui::relative(1.2)),
+                    ),
             )
             .child(
                 div()
@@ -382,7 +399,11 @@ impl ChatView {
             .child(
                 Button::new("previous")
                     .small()
-                    .label("↑")
+                    .debug_selector(|| "find-previous".into())
+                    // Iced's buttons take the bar's 12/14 size (`font-size:
+                    // inherit`); a Button label is a fixed `text_sm`.
+                    .accessibility_label("↑")
+                    .child(div().text_size(px(em)).child("↑"))
                     .tooltip("Previous match (Shift+Enter)")
                     .disabled(self.find.matches.is_empty())
                     .on_click(cx.listener(|this, _, window, cx| this.navigate(true, window, cx))),
@@ -390,7 +411,11 @@ impl ChatView {
             .child(
                 Button::new("next")
                     .small()
-                    .label("↓")
+                    .debug_selector(|| "find-next".into())
+                    // Iced's buttons take the bar's 12/14 size (`font-size:
+                    // inherit`); a Button label is a fixed `text_sm`.
+                    .accessibility_label("↓")
+                    .child(div().text_size(px(em)).child("↓"))
                     .tooltip("Next match (Enter)")
                     .disabled(self.find.matches.is_empty())
                     .on_click(cx.listener(|this, _, window, cx| this.navigate(false, window, cx))),
@@ -406,7 +431,11 @@ impl ChatView {
             .child(
                 Button::new("close-find")
                     .small()
-                    .label("×")
+                    .debug_selector(|| "find-close-find".into())
+                    // Iced's buttons take the bar's 12/14 size (`font-size:
+                    // inherit`); a Button label is a fixed `text_sm`.
+                    .accessibility_label("×")
+                    .child(div().text_size(px(em)).child("×"))
                     .tooltip("Close (Esc)")
                     .on_click(
                         cx.listener(|this, _, window, cx| this.close_find(&CloseFind, window, cx)),

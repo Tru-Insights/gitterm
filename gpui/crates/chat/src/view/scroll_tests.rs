@@ -351,6 +351,14 @@ fn find_bar_has_iced_box_minimums_and_wraps(cx: &mut TestAppContext) {
         "10px padding + border"
     );
     assert!(width("find-count", cx) >= 5. * em - 0.5);
+    // The search box: one 12/14 line inside 4px padding and a 1px border.
+    let boxed = f32::from(query.size.height);
+    assert!(boxed <= 1.5 * em + 10. + 0.5, "box {boxed}");
+    // Buttons inherit the bar's 12/14 text: no taller than the search box.
+    for button in ["find-previous", "find-next", "find-close-find"] {
+        let height = f32::from(bounds(button, cx).unwrap().size.height);
+        assert!(height <= boxed + 0.5, "{button} {height} vs {boxed}");
+    }
     let wide = f32::from(bar.size.height);
     cx.simulate_resize(size(px(260.), px(700.)));
     draw(cx);
