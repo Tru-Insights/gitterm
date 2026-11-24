@@ -5,32 +5,27 @@ code audit, not a visual certification. It expands [parity map §4](gpui-iced-pa
 and the [H interaction rows](gpui-iced-interactions.md#chat-transcript-cards-and-roster);
 their broad MATCH labels do not imply identical rendering or lifecycle behavior.
 
-**Summary:** **192 items: 73 same, 102 differs, 14 missing, 3 GPUI-only.** Counts apply to the named properties, not whole features.
+**Summary:** **192 items: 161 same, 24 differs, 5 missing, 2 GPUI-only** (after rounds 1 and 2, #384 to #392; the first audit counted 73 same, 102 differs, 14 missing, 3 GPUI-only). Counts apply to the named properties, not whole features.
 
-The ten differences a user would notice first, in suggested repair order:
+What still differs, grouped by cause:
 
-1. Permission/question requests occupy transcript rows as well as the footer panel;
-   permission rows print input and offered-rule JSON (R01–R03).
-2. Errors have an `Error` heading and ordinary text instead of one red monospace
-   box; warning and session notes also differ (N01–N06).
-3. Live thinking and individual running tools start closed in GPUI; Iced opens
-   them, and closes a tool when its result arrives (O01–O04).
-4. Subagent activity becomes separate indented rows instead of the nested
-   subagent disclosure, tool chips and latest-line preview (S01–S06).
-5. Tool summaries omit the command/path and waiting badge; opened tools lack
-   Iced's 320px output limit and 20,000-character live-output truncation (T03–T07).
-6. Markdown changes while reading: single newlines collapse, headings use different
-   sizes, raw HTML is parsed, and Markdown images render instead of becoming links
-   (A02–A07).
-7. Work folds lose failed counts and per-segment timing; pending requests and
-   background agents can group differently (F04–F08, G04).
-8. After `75f0b19`, Latest floats in the right place, but opening any disclosure
-   pauses follow even when it fits; reflow retains a row offset rather than a text
-   line (V03–V06).
-9. Review findings lack colored P0–P3 badges, and reviewed commits use eight
-   characters instead of seven with no branch-moved warning (D17–D21).
-10. Find uses different highlight colors and counts, searches different card text,
-    and cannot highlight/reveal each finding occurrence precisely (Q02–Q08).
+1. Markdown block layout belongs to gpui-component's `TextView`: block spacing,
+   heading line heights, bold weight 600, list indent, table intrinsic width, code
+   language label and tokens, streaming boundary, parse fallback
+   (A01, A05–A08, A10, A11, A13, A14).
+2. Request panel choices that need a product decision: multiple requests and the
+   sending state (R05, R08).
+3. Actions not wired in the preview yet: Send/Re-run, dismiss, read-only reason,
+   the V5 "Continue here" offer (D25, D26, E05, E06).
+4. Scroll and find details: reflow keeps a row offset, not a text line; table text
+   for find; highlight foreground and outline; diff-line hits (V06, Q05, Q07, Q08).
+5. Fold and run polish: the chevron swaps instead of rotating, run and fold margins,
+   Codex exec cards (G05, F10, S09).
+6. Copy and selection: copy button on hovered code block only, selection across card
+   parts (X02, X06).
+7. History import states: loading and a missing transcript (E02, E03).
+8. GPUI has no letter-spacing or dotted underline: tool and legacy labels, finding
+   locations (T06, N10, D21).
 
 ## Audit scope and how to use the checklist
 
