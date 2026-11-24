@@ -106,6 +106,9 @@ pub(super) fn transcript_text_color(appearance: ChatAppearance, kind: RowKind) -
     }
 }
 
+/// Iced's `pre` background for assistant code blocks.
+const ASSISTANT_CODE_BG: u32 = 0x11111b;
+
 pub(super) fn assistant_style(
     appearance: ChatAppearance,
     rem_size: gpui::Pixels,
@@ -129,7 +132,7 @@ pub(super) fn assistant_style(
                 .px(px(12.))
                 .py(px(10.))
                 .rounded(px(6.))
-                .bg(rgb(0x11111b))
+                .bg(rgb(ASSISTANT_CODE_BG))
                 .border_color(rgb(palette.border))
                 .font_family("Menlo")
                 .text_size(px(appearance.size(12.5)))
@@ -427,11 +430,16 @@ impl RowView {
                     );
                 // The label sits left of Copy in one row, so hovering never
                 // stacks the button under it; Copy keeps its slot while hidden.
+                // The dependency paints its theme `muted` behind this slot;
+                // on Iced's darker assistant block that shows as an empty
+                // pill, so the row covers it with the block's own fill.
                 div()
                     .flex()
                     .flex_row()
                     .items_start()
                     .gap(px(6.))
+                    .debug_selector(|| "code-actions-row".into())
+                    .when(assistant, |row| row.bg(rgb(ASSISTANT_CODE_BG)))
                     .children(
                         assistant
                             .then(|| block.lang())
@@ -774,6 +782,19 @@ mod tests {
         assert!(
             label.right() <= copy.left(),
             "label {label:?} overlaps Copy {copy:?}"
+        );
+        // The dependency fills the action slot with its theme `muted`; on
+        // the darker assistant block the row must cover it at rest, or an
+        // empty pill shows where the hidden Copy sits.
+        let row_bounds = cx.debug_bounds("code-actions-row").expect("action row");
+        let (quads, scale) = cx.update(|window, _| (window.painted_quads(), window.scale_factor()));
+        let row_bounds = row_bounds.scale(scale);
+        let fill: gpui::Background = rgb(ASSISTANT_CODE_BG).into();
+        assert!(
+            quads
+                .iter()
+                .any(|quad| quad.background == fill && quad.bounds == row_bounds),
+            "action row {row_bounds:?} is painted with the code block fill"
         );
         reply_source(&chat, "```\nno language\n```", cx);
         assert!(cx.debug_bounds("chat-code-language-rust").is_none());
