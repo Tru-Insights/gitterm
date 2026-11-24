@@ -198,6 +198,15 @@ fn prepare(source: &str, ast: &Node) -> String {
             crate::model::literal(alt)
         }
     }
+    // Iced's `link` renderer keeps an anchor only for `https?:` and `mailto:`;
+    // any other destination (a path, a fragment, `file:`) leaves just its text.
+    fn link_kept(url: &str) -> bool {
+        let starts = |prefix: &str| {
+            url.get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        };
+        starts("http:") || starts("https:") || starts("mailto:")
+    }
     fn walk(
         node: &Node,
         source: &str,
@@ -209,6 +218,32 @@ fn prepare(source: &str, ast: &Node) -> String {
             return;
         };
         let range = position.start.offset..position.end.offset;
+        let unlinked = match node {
+            Node::Link(link) => !link_kept(&link.url),
+            Node::LinkReference(link) => definitions
+                .get(link.identifier.as_str())
+                .is_some_and(|url| !link_kept(url)),
+            _ => false,
+        };
+        if unlinked {
+            let bounds = node.children().and_then(|children| {
+                Some((
+                    children.first()?.position()?.start.offset,
+                    children.last()?.position()?.end.offset,
+                ))
+            });
+            let Some((first, last)) = bounds else {
+                edits.push((range, String::new()));
+                return;
+            };
+            // Drop the brackets and destination around the label, keep the label.
+            edits.push((range.start..first, String::new()));
+            for child in node.children().into_iter().flatten() {
+                walk(child, source, definitions, edits, quotes);
+            }
+            edits.push((last..range.end, String::new()));
+            return;
+        }
         match node {
             Node::Html(html) => {
                 edits.push((range, crate::model::literal(&html.value)));
@@ -279,6 +314,30 @@ mod tests {
     fn policy_leaves_markdown_and_html_code_samples_unchanged() {
         let source = "```md\n![example](https://example.invalid/a) <b>raw</b>\n```\n\n`![inline](data:placeholder)`";
         assert_eq!(assistant_source(source), source);
+    }
+
+    #[test]
+    fn unsupported_link_schemes_keep_their_text_only() {
+        fn links(node: &Node, out: &mut Vec<String>) {
+            if let Node::Link(link) = node {
+                out.push(link.url.clone());
+            }
+            for child in node.children().into_iter().flatten() {
+                links(child, out);
+            }
+        }
+        let source = "[ftp](ftp://x/a) [rel](./foo.md) [js](javascript:alert(1)) [mail](mailto:a@b.c) [web](HTTP://h.z) [frag](#top) [ref][r] <ftp://auto> **[bold *em*](file:///p)** `[code](ftp://x)`\n\n```\n[fence](ftp://x)\n```\n\n[r]: file:///x";
+        let prepared = assistant_source(source);
+        let ast = markdown::to_mdast(&prepared, &markdown::ParseOptions::gfm()).unwrap();
+        let mut found = vec![];
+        links(&ast, &mut found);
+        assert_eq!(found, ["mailto:a@b.c", "HTTP://h.z"], "{prepared:?}");
+        let plain = crate::model::plain_markdown(&prepared);
+        assert!(
+            plain.contains("ftp rel js mail web frag ref ftp://auto bold em [code](ftp://x)"),
+            "{plain:?}"
+        );
+        assert!(plain.contains("[fence](ftp://x)"), "{plain:?}");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! GPUI's public ListState supplies layout; older history is gated by the host.
 use super::*;
 use gpui::{FollowMode, ListAlignment, ListOffset, ListState, list};
-use gpui_component::scroll::ScrollableElement;
+use gpui_component::scroll::{Scrollbar, ScrollbarMode, ScrollbarThumbStyle};
 
 pub struct TranscriptScrollerState {
     list: ListState,
@@ -128,13 +128,7 @@ impl ChatView {
                         .update(cx, |view, cx| {
                             if !view.find_open && index < view.history_start {
                                 if index + 1 == view.history_start {
-                                    Button::new("show-earlier")
-                                        .debug_selector(|| "show-earlier".into())
-                                        .label(crate::interactions::earlier_label(hidden))
-                                        .on_click(
-                                            cx.listener(|view, _, _, cx| view.show_earlier(cx)),
-                                        )
-                                        .into_any_element()
+                                    view.show_earlier_control(hidden, cx)
                                 } else {
                                     div().h(px(0.)).into_any_element()
                                 }
@@ -154,7 +148,57 @@ impl ChatView {
                 .size_full()
                 .min_h_0(),
             )
-            .vertical_scrollbar(&state)
+            // Iced's `#messages::-webkit-scrollbar`: 10px, always drawn, the
+            // thumb in strong-border with radius 4 (no hover or active change).
+            .child(
+                div().absolute().inset_0().child(
+                    Scrollbar::vertical(&state)
+                        .mode(ScrollbarMode::Always)
+                        .styles(|styles| {
+                            let thumb = |thumb: ScrollbarThumbStyle| {
+                                thumb
+                                    .bg(rgb(self.appearance.palette().strong))
+                                    .width(px(10.))
+                                    .inset(px(0.))
+                                    .radius(px(4.))
+                            };
+                            styles
+                                .track(|track| track.width(px(10.)))
+                                .thumb(thumb)
+                                .thumb_hover(thumb)
+                                .thumb_active(thumb)
+                        }),
+                ),
+            )
+            .into_any_element()
+    }
+    /// Iced's `#messages > .earlier`: a centred pill, block fill, strong
+    /// border, radius 12, padding 3×12, `s(12)`, 10px above the first block.
+    fn show_earlier_control(&self, hidden: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let palette = self.appearance.palette();
+        div()
+            .w_full()
+            .flex()
+            .justify_center()
+            .mb(px(10.))
+            .child(
+                div()
+                    .id("show-earlier")
+                    .debug_selector(|| "show-earlier".into())
+                    .cursor_pointer()
+                    .px(px(12.))
+                    .py(px(3.))
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(rgb(palette.strong))
+                    .bg(rgb(palette.block))
+                    .text_color(rgb(palette.fg))
+                    .text_size(px(self.appearance.size(12.)))
+                    .line_height(gpui::relative(1.5))
+                    .hover(|pill| pill.bg(rgb(palette.border)))
+                    .on_click(cx.listener(|view, _, _, cx| view.show_earlier(cx)))
+                    .child(crate::interactions::earlier_label(hidden)),
+            )
             .into_any_element()
     }
 }

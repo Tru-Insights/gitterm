@@ -166,6 +166,25 @@ impl ChatView {
             });
         }
     }
+    /// Iced restores detached chunks after a fold frees room in the document.
+    pub(super) fn restore_history_after_fold(&mut self, cx: &mut Context<Self>) {
+        if self.find_open || self.history_start == 0 {
+            return;
+        }
+        let starts = scroll::block_starts(&self.model);
+        let hidden = starts.partition_point(|index| *index < self.history_start);
+        let restored =
+            crate::interactions::blocks_restored_by_fold(hidden, starts.len() - hidden);
+        if restored == 0 {
+            return;
+        }
+        let old = self.history_start;
+        self.history_start = starts.get(hidden - restored).copied().unwrap_or(0);
+        self.scroller.update(cx, |state, cx| {
+            state.remeasure_items(self.history_start.saturating_sub(1)..old, cx);
+        });
+        cx.notify();
+    }
     pub(super) fn show_earlier(&mut self, cx: &mut Context<Self>) {
         let old = self.history_start;
         let starts = scroll::block_starts(&self.model);

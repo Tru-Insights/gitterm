@@ -96,6 +96,20 @@ impl ChatView {
         }
         self.copy_selection(markdown, window, cx);
     }
+    /// The dependency's own `Copy` (a focused transcript text) trims the
+    /// selection; Iced copies the browser selection untouched, so the chat
+    /// takes that action first. False leaves it to whoever else handles it.
+    pub(super) fn copy_focused_text(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if window.has_focused_input(cx) {
+            return false;
+        }
+        let text = self.selected_payload(false, window, cx);
+        if text.is_empty() {
+            return false;
+        }
+        self.copy_selected_payload(text, cx);
+        true
+    }
     pub(super) fn copy_selection(
         &mut self,
         markdown: bool,
@@ -150,11 +164,8 @@ impl ChatView {
                 });
             }
         }
-        if markdown {
-            text
-        } else {
-            text.trim().to_owned()
-        }
+        // Iced's Cmd+C copies the browser selection as is: no trimming.
+        text
     }
 
     pub(super) fn selection_menu(

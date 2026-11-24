@@ -51,6 +51,27 @@ pub fn history_start(rows: usize) -> usize {
     rows.saturating_sub(150) / 50 * 50
 }
 
+/// Iced's `foldSegment` tail: after a fold the blocks hidden in detached
+/// 50-block chunks (oldest first, any remainder newest) come back, newest
+/// first, for as long as whole chunks fit in the 150 the document keeps.
+/// Returns how many blocks to restore.
+pub fn blocks_restored_by_fold(hidden: usize, live: usize) -> usize {
+    let mut room = 150usize.saturating_sub(live);
+    let mut sizes = vec![50; hidden / 50];
+    if hidden % 50 > 0 {
+        sizes.push(hidden % 50);
+    }
+    let mut restored = 0;
+    for size in sizes.into_iter().rev() {
+        if size > room {
+            break;
+        }
+        room -= size;
+        restored += size;
+    }
+    restored
+}
+
 pub fn earlier_label(hidden: usize) -> String {
     format!(
         "Show earlier · {hidden} block{} hidden",

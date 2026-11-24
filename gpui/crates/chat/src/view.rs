@@ -38,7 +38,7 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     collapsible::Collapsible,
     input::{
-        Enter as InputEnter, Escape as InputEscape, IndentInline, Input, InputEvent, InputState,
+        Copy as InputCopy, Enter as InputEnter, Escape as InputEscape, IndentInline, Input, InputEvent, InputState,
         MoveDown, MoveUp, TextareaState,
     },
     menu::{ContextMenuExt, PopupMenuItem},
@@ -460,6 +460,15 @@ impl ChatView {
         }
         cx.emit(outcome);
         cx.notify();
+    }
+
+    /// Iced's `__reviewNote`: a warning note in the transcript saying why an
+    /// action was not done.
+    pub fn note_warning(&mut self, text: String, cx: &mut Context<Self>) {
+        let following = self.scroller.read(cx).is_following_tail();
+        let count = self.model.rows.len();
+        let changed = self.model.push_warning(&text);
+        self.refresh_rows(count, following, changed, cx);
     }
 
     pub fn set_status_error(&mut self, error: String, cx: &mut Context<Self>) {
@@ -1533,6 +1542,7 @@ impl ChatView {
         if following && !self.find_open {
             self.trim_history(cx);
         }
+        self.restore_history_after_fold(cx);
         if !changed.is_empty() && !following {
             self.new_messages = true;
         }
@@ -1717,12 +1727,24 @@ impl Render for ChatView {
                     cx.propagate();
                 }
             }))
+            .capture_action(cx.listener(|this, _: &InputCopy, window, cx| {
+                if this.copy_focused_text(window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .on_action(cx.listener(Self::open_find))
             .on_action(cx.listener(|this, action: &CloseFind, window, cx| {
                 if this.review.open {
                     this.close_review(window, cx);
-                } else {
+                } else if this.find_open {
                     this.close_find(action, window, cx);
+                } else if this.composer_state.picker.take().is_some() {
+                    cx.notify();
+                } else if this.model.pending_rows().is_empty() {
+                    // Iced forwards Escape to the host unless a page layer
+                    // (find, a menu, the review popover, the request panel)
+                    // is open.
+                    cx.propagate();
                 }
             }))
             .on_action(
@@ -1820,15 +1842,18 @@ impl Render for ChatView {
                             .child(reason)
                     }))
                     .children(
+                        // A prompt's ambiguous delivery is marked on its bubble
+                        // (Iced's `.delivery-uncertain`), so only its refusal
+                        // reaches the footer; a control command has no bubble.
                         self.submission
                             .iter()
-                            .chain(self.control_receipt.iter())
-                            .filter(|receipt| {
+                            .filter(|receipt| matches!(receipt.state, ReceiptState::Rejected(_)))
+                            .chain(self.control_receipt.iter().filter(|receipt| {
                                 matches!(
                                     receipt.state,
                                     ReceiptState::Rejected(_) | ReceiptState::Uncertain(_)
                                 )
-                            })
+                            }))
                             .enumerate()
                             .map(|(index, receipt)| {
                                 div()
@@ -2613,6 +2638,8 @@ fn running_after(entry: &Entry, previous: bool) -> bool {
     }
 }
 
+#[cfg(test)]
+mod polish_tests;
 #[cfg(test)]
 mod row_tests;
 #[cfg(test)]
