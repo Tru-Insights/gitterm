@@ -15,6 +15,6 @@ if grep -Eq '^name = "(gpui([_-][^"]*)?|lb-wry)"$' Cargo.lock; then
     exit 1
 fi
 gpui_tree=$(scripts/cargo.sh tree --manifest-path gpui/Cargo.toml --locked --target aarch64-apple-darwin -e normal,build --prefix none | awk '{print $1, $2}' | sort -u)
-test "$(echo "$gpui_tree" | grep '^gpui-pre v')" = 'gpui-pre v0.3.12'
-test "$(echo "$gpui_tree" | grep '^gpui-kit v')" = 'gpui-kit v0.9.1'
-echo "Dependency boundary passed; one gpui-pre 0.3.12 and one gpui-kit 0.9.1"
+test "$(echo "$gpui_tree" | grep '^gpui-pre v')" = 'gpui-pre v0.3.14'
+test "$(echo "$gpui_tree" | grep '^gpui-kit v')" = 'gpui-kit v0.11.0'
+echo "Dependency boundary passed; one gpui-pre 0.3.14 and one gpui-kit 0.11.0"

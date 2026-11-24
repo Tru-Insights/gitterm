@@ -8,7 +8,7 @@ license = "MIT"
 
 [dependencies]
 alacritty_terminal = "=0.25.1"
-gpui-kit = { version = "=0.9.1", default-features = false, features = ["component"] }
+gpui-kit = { version = "=0.11.0", default-features = false, features = ["component"] }
 parking_lot = "0.12"
 arboard = "3"
 polling = "3"
@@ -16,6 +16,6 @@ libc = "0.2"
 tempfile = "3"
 
 [dev-dependencies]
-gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }
-gpui-kit = { version = "=0.9.1", features = ["test-support"] }
+gpui = { package = "gpui-pre", version = "=0.3.14", features = ["test-support"] }
+gpui-kit = { version = "=0.11.0", features = ["test-support"] }
 mach2 = "=0.6.0"

@@ -12,12 +12,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-gpui-kit = "=0.9.1"
-gpui-component = { version = "=0.9.1", features = ["syntect"] }
+gpui-kit = "=0.11.0"
+gpui-component = { version = "=0.11.0", features = ["syntect"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-gpui-pre = { version = "=0.3.12", features = ["test-support"] }
-gpui-component = { version = "=0.9.1", features = ["test-support"] }
+gpui-pre = { version = "=0.3.14", features = ["test-support"] }
+gpui-component = { version = "=0.11.0", features = ["test-support"] }
 
 [dev-dependencies]
 tempfile = "3"

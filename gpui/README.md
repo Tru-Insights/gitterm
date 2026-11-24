@@ -116,9 +116,9 @@ Omit `nice -n 10` when the environment does not permit priority changes.
 The separate, ad-hoc-signed bundle is
 `$CARGO_TARGET_DIR/GitTerm GPUI.app` (default: `gpui/target/GitTerm GPUI.app`),
 with identifier `com.cree8.gitterm.gpui`. It does not replace GitTerm V6.
-The pinned stack is gpui-component/gpui-webview/gpui-kit 0.9.1,
-gpui_xterm 0.3.0, and gpui-pre 0.3.12. Cargo tree may print repeated `(*)`
-references; compare distinct package versions, as the dependency check does.
+The pinned stack is gpui-component/gpui-kit 0.11.0 and gpui-pre 0.3.14.
+Cargo tree may print repeated `(*)` references; compare distinct package versions,
+as the dependency check does.
 
 ## Stage 2 shell (TRU-280 / TRU-283)
 
