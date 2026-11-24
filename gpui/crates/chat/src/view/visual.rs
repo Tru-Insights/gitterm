@@ -3,28 +3,9 @@
 //! `Close expanded view`; Esc collapses. The host supplies the native surface
 //! (`VisualHost`); without one the reply shows Iced's unavailable note.
 use super::*;
-use gitterm_core::chat::html_render::HtmlRenderResult;
 use gpui::{Pixels, canvas};
 
-/// Claude's MCP prefix, Antigravity's FQN, OpenCode's server_tool name, and
-/// the unprefixed MCP name, as Iced. Other tool output is never rendered.
-const TOOL_NAMES: [&str; 4] = [
-    "html_render",
-    "mcp__gitterm_tasks__html_render",
-    "mcp_gitterm-tasks_html_render",
-    "gitterm_tasks_html_render",
-];
-
-/// The validated document and height of an html_render result.
-pub(super) fn visual_request(tool: &Tool) -> Option<(String, u32)> {
-    // Iced calls showHtmlRender only for a result that is not an error.
-    if tool.is_error || !TOOL_NAMES.contains(&tool.name.as_str()) {
-        return None;
-    }
-    let result: HtmlRenderResult = serde_json::from_str(tool.output.as_deref()?).ok()?;
-    result.html_render.validate().ok()?;
-    Some((result.html_render.html, result.html_render.height))
-}
+pub(super) use crate::model::visual_request;
 
 /// html_render.js `httpUrl`: only HTTP(S) URLs with a host and no
 /// credentials leave the frame, to the system browser.

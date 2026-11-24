@@ -37,35 +37,52 @@ pub(super) fn group(model: &crate::model::ChatModel, folds: &[super::turns::Work
             start = index + 1;
         }
     }
-    let pending_scopes: HashSet<_> = rows
+    // Iced's `refreshLiveRuns`: only in the turn in flight, and not until
+    // a live event follows a replay. Its `keepsOutOfFold` takes out a failed
+    // tool, a running subagent's card and the card a waiting request is for.
+    let Some(live) = model.live_turn_start() else {
+        runs.sort_by_key(|run| run.range.start);
+        return runs;
+    };
+    let held: HashSet<usize> = rows
         .iter()
-        .filter(|row| row.request.as_ref().is_some_and(|r| !r.resolved))
-        .map(|row| row.scope.as_str())
+        .filter_map(|row| row.request.as_ref())
+        .filter(|request| !request.resolved)
+        .filter_map(|request| request.tool_row)
         .collect();
-    let eligible = |row: &Row| {
+    let eligible = |index: usize| {
+        let row = &rows[index];
         row.kind == RowKind::Tool
-            && row.tool.as_ref().is_some_and(|tool| !tool.is_error)
-            && !pending_scopes.contains(row.scope.as_str())
-            && !row.tool.as_ref().is_some_and(|tool| {
-                matches!(tool.name.as_str(), "Agent" | "Task") && tool.output.is_none()
+            && row.scope.is_empty()
+            && !held.contains(&index)
+            && row.tool.as_ref().is_some_and(|tool| {
+                !tool.is_error
+                    && !tool
+                        .sub
+                        .as_ref()
+                        .is_some_and(|sub| sub.state == crate::model::SubState::Running)
             })
     };
-    let mut index = 0;
+    // Rows Iced has no block for (a request, a withdrawn prompt) do not
+    // break a run.
+    let skipped = |index: usize| rows[index].hidden() || !rows[index].scope.is_empty();
+    let mut index = live;
     while index < rows.len() {
-        if finished(index) || !eligible(&rows[index]) {
+        if finished(index) || !eligible(index) {
             index += 1;
             continue;
         }
         let start = index;
+        let mut end = index + 1;
         index += 1;
-        while index < rows.len()
-            && !finished(index)
-            && rows[index].scope == rows[start].scope
-            && eligible(&rows[index])
-        {
+        while index < rows.len() && !finished(index) && (skipped(index) || eligible(index)) {
             index += 1;
+            if !skipped(index - 1) {
+                end = index;
+            }
         }
-        let tools: Vec<_> = rows[start..index]
+        index = end;
+        let tools: Vec<_> = rows[start..end]
             .iter()
             .filter_map(|row| row.tool.as_ref())
             .collect();
@@ -75,7 +92,7 @@ pub(super) fn group(model: &crate::model::ChatModel, folds: &[super::turns::Work
             label.push_str(salient(tool).unwrap_or(&tool.name));
         }
         runs.push(Run {
-            range: start..index,
+            range: start..end,
             label,
         });
     }
@@ -145,26 +162,7 @@ fn field<'a>(tool: &'a Tool, keys: &[&str]) -> Option<&'a str> {
         .find_map(|key| tool.input[*key].as_str().filter(|s| !s.is_empty()))
 }
 pub(super) fn salient(tool: &Tool) -> Option<&str> {
-    let keys: &[&str] = match tool.name.as_str() {
-        "Bash" => &["command"],
-        "Read" | "Write" | "Edit" | "MultiEdit" => &["file_path"],
-        "NotebookEdit" => &["notebook_path"],
-        "Grep" | "Glob" => &["pattern"],
-        "WebFetch" => &["url"],
-        "WebSearch" => &["query"],
-        "Agent" | "Task" => &["description"],
-        _ => &[
-            "command",
-            "file_path",
-            "filePath",
-            "path",
-            "url",
-            "query",
-            "pattern",
-            "title",
-        ],
-    };
-    field(tool, keys)
+    crate::model::salient(&tool.name, &tool.input)
 }
 fn run_label(tools: &[&Tool]) -> String {
     let mut counts = [0; 5];
@@ -254,11 +252,108 @@ mod tests {
 {"type":"item_started","data":{"id":"c","kind":{"type":"tool_call","name":"Bash","input":{"command":"three"}}}}
 {"type":"text_delta","data":"reply"}
 {"type":"item_started","data":{"id":"d","kind":{"type":"tool_call","name":"Read","input":{"file_path":"a.rs"}}}}"#).unwrap();
-        let model = ChatModel::from_records(&records);
+        // Live, in a running turn: Iced's refreshLiveRuns.
+        let mut model = ChatModel::default();
+        model.apply(&crate::events::Record {
+            at_ms: None,
+            entry: crate::events::Entry::UserPrompt("Go".into()),
+        });
+        for record in &records {
+            model.apply(record);
+        }
         let runs = group(&model, &super::super::turns::work_folds(&model));
         assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].range, 0..3);
+        assert_eq!(runs[0].range, 1..4);
         assert_eq!(runs[0].label, "Ran 3 commands · now: three");
         assert_eq!(runs[1].label, "Read 1 file · now: a.rs");
+    }
+
+    fn live(records: &[crate::events::Record]) -> ChatModel {
+        let mut model = ChatModel::default();
+        for record in records {
+            model.apply(record);
+        }
+        model
+    }
+    fn ranges(model: &ChatModel) -> Vec<Range<usize>> {
+        group(model, &super::super::turns::work_folds(model))
+            .into_iter()
+            .map(|run| run.range)
+            .collect()
+    }
+
+    /// G04: a waiting request takes only its own tool (or its subagent's
+    /// Agent card) out of a live run; the hidden request row does not break it.
+    #[test]
+    fn g04_only_the_requested_tool_leaves_a_live_run() {
+        use crate::events::{Entry, HarnessEvent, Record, RuntimeRequestKind};
+        use crate::model::subagent_tests::{harness, inside, tool};
+        let bash = || serde_json::json!({"command": "check"});
+        let request = |id: &str| HarnessEvent::RuntimeRequest {
+            request_id: id.into(),
+            tool_use_id: id.into(),
+            kind: RuntimeRequestKind::Permission {
+                tool_name: "Bash".into(),
+                input: serde_json::json!({}),
+                suggestions: vec![],
+                decision_reason: None,
+            },
+        };
+        let prompt = Record {
+            at_ms: None,
+            entry: Entry::UserPrompt("Go".into()),
+        };
+        let model = live(&[
+            prompt.clone(),
+            harness(tool("a", "Bash", bash())),
+            harness(tool("b", "Bash", bash())),
+            harness(request("b")),
+            harness(tool("c", "Bash", bash())),
+            harness(tool("d", "Bash", bash())),
+        ]);
+        // Rows: 0 prompt, 1 a, 2 b (waiting), 3 request, 4 c, 5 d.
+        assert_eq!(ranges(&model), [1..2, 4..6]);
+        // A subagent's request holds its Agent card; a resolved one holds nothing.
+        let mut model = live(&[
+            prompt,
+            harness(tool("a", "Bash", bash())),
+            harness(tool("agent", "Agent", serde_json::json!({}))),
+            harness(inside(&["agent"], tool("x", "Bash", bash()))),
+            harness(inside(&["agent"], request("x"))),
+            harness(crate::model::subagent_tests::done("agent", false)),
+            harness(tool("c", "Bash", bash())),
+        ]);
+        // Rows: 0 prompt, 1 a, 2 Agent, 3 request, 4 c.
+        assert_eq!(ranges(&model), [1..2, 4..5]);
+        model.apply(&harness(inside(
+            &["agent"],
+            HarnessEvent::RuntimeRequestResolved {
+                request_id: "x".into(),
+            },
+        )));
+        assert_eq!(ranges(&model), vec![Range { start: 1, end: 5 }]);
+    }
+
+    /// F09: a replayed running turn has no live runs (Iced's refreshLiveRuns
+    /// skips a replay) until the next live event, and nothing groups outside
+    /// a turn.
+    #[test]
+    fn f09_replayed_running_turn_groups_tools_only_after_a_live_event() {
+        use crate::events::{Entry, HarnessEvent, Record};
+        use crate::model::subagent_tests::{harness, tool};
+        let bash = || serde_json::json!({"command": "check"});
+        let records = [
+            Record {
+                at_ms: None,
+                entry: Entry::UserPrompt("Go".into()),
+            },
+            harness(tool("a", "Bash", bash())),
+            harness(tool("b", "Bash", bash())),
+        ];
+        let mut model = ChatModel::from_records(&records);
+        assert!(ranges(&model).is_empty());
+        model.apply(&harness(HarnessEvent::TextDelta("Still".into())));
+        assert_eq!(ranges(&model), vec![Range { start: 1, end: 3 }]);
+        assert!(ranges(&live(&records[1..])).is_empty(), "no turn, no runs");
     }
 }

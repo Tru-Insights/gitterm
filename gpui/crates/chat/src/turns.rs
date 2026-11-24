@@ -40,6 +40,9 @@ pub(super) fn containing(turns: &[Turn], row: usize) -> Option<&Turn> {
 pub(super) struct WorkFold {
     pub range: std::ops::Range<usize>,
     pub label: String,
+    /// Iced's red `N failed`: the segment's failed tool cards, which stay
+    /// outside its folds.
+    pub failed: usize,
 }
 
 pub(super) fn work_folds(model: &crate::model::ChatModel) -> Vec<WorkFold> {
@@ -53,21 +56,30 @@ pub(super) fn work_folds(model: &crate::model::ChatModel) -> Vec<WorkFold> {
     let mut folds = Vec::new();
     for turn in &model.completed_turns {
         let rows = &model.rows[turn.rows.clone()];
-        // shortcut: a turn split by a mid-turn message has one duration and no
-        // per-segment split times, so its folds say "Worked" (Iced times each).
-        let split = rows.iter().any(|row| row.kind == RowKind::User);
-        let label = turn
-            .duration_ms
-            .filter(|_| !split)
-            .map(|ms| format!("Worked for {}", crate::composer::elapsed(ms)))
-            .unwrap_or_else(|| "Worked".into());
         let mut offset = turn.rows.start;
-        // A message sent mid-turn ends one fold and starts the next.
-        for segment in rows.split(|row| row.kind == RowKind::User) {
+        // A message sent mid-turn ends one fold and starts the next; each
+        // segment is timed from its own start to its own end.
+        for (position, segment) in rows.split(|row| row.kind == RowKind::User).enumerate() {
+            let label = match turn.segments.get(position) {
+                Some((Some(start), Some(end))) => format!(
+                    "Worked for {}",
+                    crate::composer::elapsed(end.saturating_sub(*start))
+                ),
+                _ => "Worked".into(),
+            };
+            let failed = segment
+                .iter()
+                .filter(|row| {
+                    row.scope.is_empty()
+                        && !row.hidden()
+                        && row.tool.as_ref().is_some_and(|tool| tool.is_error)
+                })
+                .count();
             for range in fold_segment(segment, offset, &held) {
                 folds.push(WorkFold {
                     range: offset + range.start..offset + range.end,
                     label: label.clone(),
+                    failed,
                 });
             }
             offset += segment.len() + 1;
@@ -118,15 +130,6 @@ fn fold_segment(
             continue;
         }
         start.get_or_insert(index);
-        // Iced appends a visual reply after its tool card, outside the fold.
-        if row
-            .tool
-            .as_ref()
-            .is_some_and(|tool| super::visual::visual_request(tool).is_some())
-            && let Some(start) = start.take()
-        {
-            groups.push(start..index + 1);
-        }
     }
     if let Some(start) = start {
         groups.push(start..end);
@@ -150,16 +153,16 @@ fn waits(row: &Row) -> bool {
             .is_some_and(|r| !r.resolved || r.waiting_at_turn_end)
 }
 
-/// Iced's `keepsOutOfFold`: error blocks, warnings, delegation cards, a failed tool, a
+/// Iced's `keepsOutOfFold`: error blocks, warnings, delegation cards, visual
+/// replies, a failed tool, a
 /// running subagent's card and a card whose request still waits.
 fn keeps_out_of_fold(row: &Row, held: bool) -> bool {
     match row.kind {
-        // Iced: `.error-block, .dlg, .note.warn`.
-        RowKind::Error | RowKind::Warning | RowKind::Delegation => true,
+        // Iced: `.error-block, .dlg, .note.warn, .html-render`.
+        RowKind::Error | RowKind::Warning | RowKind::Delegation | RowKind::Visual => true,
         RowKind::Tool => {
             held || row.tool.as_ref().is_some_and(|tool| {
-                tool.is_error
-                    || (matches!(tool.name.as_str(), "Agent" | "Task") && tool.output.is_none())
+                tool.is_error || tool.sub.as_ref().is_some_and(|sub| sub.running_at_turn_end)
             })
         }
         _ => row.delivery.is_some() || row.delegation.is_some(),
@@ -394,5 +397,224 @@ mod tests {
         assert_eq!(waiting.rows[3].kind, RowKind::Question);
         assert!(waiting.rows[3].request.as_ref().unwrap().resolved);
         assert_eq!(ranges(&waiting), [1..2, 4..5]);
+    }
+
+    fn timing(start_ms: Option<u64>, end_ms: Option<u64>, split_ms: Option<u64>) -> Record {
+        Record {
+            at_ms: None,
+            entry: Entry::TurnTiming {
+                start_ms,
+                end_ms,
+                split_ms,
+            },
+        }
+    }
+    fn prompt(text: &str) -> Record {
+        Record {
+            at_ms: None,
+            entry: Entry::UserPrompt(text.into()),
+        }
+    }
+    fn folds(model: &ChatModel) -> Vec<(std::ops::Range<usize>, String, usize)> {
+        work_folds(model)
+            .into_iter()
+            .map(|fold| (fold.range, fold.label, fold.failed))
+            .collect()
+    }
+
+    /// F05, F07: a mid-turn prompt splits the turn; each segment is timed
+    /// from its own start (the split marker's time) and every fold in it
+    /// carries the segment's failed count, though failed tools stay out.
+    #[test]
+    fn f05_f07_each_segment_has_its_own_duration_and_failed_count() {
+        use crate::model::subagent_tests::{done, harness, tool, turn_done};
+        let bash = || serde_json::json!({"command": "check"});
+        let records = [
+            prompt("Go"),
+            timing(Some(1_000), None, None),
+            harness(tool("a", "Bash", bash())),
+            harness(done("a", false)),
+            harness(tool("b", "Bash", bash())),
+            harness(done("b", true)),
+            harness(tool("c", "Bash", bash())),
+            harness(done("c", false)),
+            timing(None, None, Some(4_000)),
+            prompt("Also this"),
+            harness(tool("d", "Bash", bash())),
+            harness(done("d", false)),
+            harness(crate::events::HarnessEvent::TextDelta("Done.".into())),
+            timing(None, Some(70_500), None),
+            harness(turn_done(crate::events::TurnStatus::Completed)),
+        ];
+        let model = ChatModel::from_records(&records);
+        // Rows: 0 prompt, 1–3 tools (2 failed), 4 prompt, 5 tool, 6 text.
+        assert_eq!(
+            folds(&model),
+            [
+                (1..2, "Worked for 3.0s".into(), 1),
+                (3..4, "Worked for 3.0s".into(), 1),
+                (5..6, "Worked for 1m 6s".into(), 0),
+            ]
+        );
+        // Without markers both segments say "Worked".
+        let untimed: Vec<_> = records
+            .iter()
+            .filter(|record| !matches!(record.entry, Entry::TurnTiming { .. }))
+            .cloned()
+            .collect();
+        let labels: Vec<_> = folds(&ChatModel::from_records(&untimed))
+            .into_iter()
+            .map(|(_, label, _)| label)
+            .collect();
+        assert_eq!(labels, ["Worked", "Worked", "Worked"]);
+    }
+
+    /// F04: Iced keeps out the card of a subagent still running when the
+    /// turn ends (a background one, whose Agent call already returned); a
+    /// foreground one that ended with its call folds. The card stays out
+    /// after the subagent finishes, as Iced's fold does not move.
+    #[test]
+    fn f04_background_subagent_running_at_turn_end_stays_out_of_the_fold() {
+        use crate::events::{HarnessEvent, TurnStatus};
+        use crate::model::subagent_tests::{done, harness, inside, tool, turn_done};
+        let bash = || serde_json::json!({"command": "check"});
+        let turn = |tracked: bool| {
+            let mut records = vec![
+                prompt("Go"),
+                harness(tool("one", "Bash", bash())),
+                harness(done("one", false)),
+                harness(tool("agent", "Agent", serde_json::json!({}))),
+            ];
+            if tracked {
+                records.push(harness(inside(
+                    &["agent"],
+                    HarnessEvent::TurnStarted {
+                        session_id: None,
+                        model: None,
+                    },
+                )));
+            }
+            records.extend([
+                harness(done("agent", false)),
+                harness(tool("two", "Bash", bash())),
+                harness(done("two", false)),
+                harness(HarnessEvent::TextDelta("Done.".into())),
+                harness(turn_done(TurnStatus::Completed)),
+            ]);
+            ChatModel::from_records(&records)
+        };
+        let ranges = |model: &ChatModel| {
+            folds(model)
+                .into_iter()
+                .map(|(range, ..)| range)
+                .collect::<Vec<_>>()
+        };
+        // Rows: 0 prompt, 1 Bash, 2 Agent, 3 Bash, 4 text.
+        assert_eq!(
+            ranges(&turn(false)),
+            vec![std::ops::Range { start: 1, end: 4 }]
+        );
+        let mut background = turn(true);
+        assert_eq!(ranges(&background), [1..2, 3..4]);
+        background.apply(&harness(inside(
+            &["agent"],
+            turn_done(TurnStatus::Completed),
+        )));
+        assert_eq!(ranges(&background), [1..2, 3..4]);
+    }
+
+    /// F08: a process exit folds the turn in flight, and (as Iced folds
+    /// before clearing requests) a request still waiting keeps its card out.
+    #[test]
+    fn f08_process_exit_folds_and_keeps_a_waiting_request_out() {
+        use crate::events::{HarnessEvent, RuntimeRequestKind};
+        use crate::model::subagent_tests::{done, harness, tool};
+        let bash = || serde_json::json!({"command": "check"});
+        let records = [
+            prompt("Go"),
+            harness(tool("one", "Bash", bash())),
+            harness(done("one", false)),
+            harness(tool("two", "Bash", bash())),
+            harness(HarnessEvent::RuntimeRequest {
+                request_id: "r".into(),
+                tool_use_id: "two".into(),
+                kind: RuntimeRequestKind::Permission {
+                    tool_name: "Bash".into(),
+                    input: serde_json::json!({}),
+                    suggestions: vec![],
+                    decision_reason: None,
+                },
+            }),
+            harness(tool("three", "Bash", bash())),
+            harness(done("three", false)),
+            harness(HarnessEvent::ProcessExited { code: Some(1) }),
+        ];
+        let model = ChatModel::from_records(&records);
+        // Rows: 0 prompt, 1 Bash, 2 Bash (waiting), 3 request, 4 Bash.
+        let ranges: Vec<_> = folds(&model).into_iter().map(|(r, ..)| r).collect();
+        assert_eq!(ranges, [1..2, 4..5]);
+    }
+
+    /// F03: a warning note (Iced's `.note.warn`) stays out and splits the fold.
+    #[test]
+    fn f03_warning_note_stays_out_of_the_fold() {
+        use crate::events::{HarnessEvent, TurnStatus};
+        use crate::model::subagent_tests::{done, harness, tool, turn_done};
+        let bash = || serde_json::json!({"command": "check"});
+        let model = ChatModel::from_records(&[
+            prompt("Go"),
+            harness(tool("one", "Bash", bash())),
+            harness(done("one", false)),
+            harness(HarnessEvent::MessageWithdrawRefused {
+                id: "m".into(),
+                reason: "already sent".into(),
+            }),
+            harness(tool("two", "Bash", bash())),
+            harness(done("two", false)),
+            harness(turn_done(TurnStatus::Completed)),
+        ]);
+        assert_eq!(model.rows[2].kind, RowKind::Warning);
+        let ranges: Vec<_> = folds(&model).into_iter().map(|(r, ..)| r).collect();
+        assert_eq!(ranges, [1..2, 3..4]);
+    }
+
+    /// Y02: a visual reply is its own block, appended when the result
+    /// arrives (after what came in meanwhile), and it stays out of the fold.
+    #[test]
+    fn y02_visual_reply_is_its_own_block_at_completion_and_stays_out() {
+        use crate::events::{HarnessEvent, TurnStatus};
+        use crate::model::subagent_tests::{harness, tool, turn_done};
+        let html = serde_json::json!({"html": "<h1>Chart</h1>", "height": 240});
+        let output = serde_json::json!({ "html_render": html }).to_string();
+        let model = ChatModel::from_records(&[
+            prompt("Go"),
+            harness(tool("v", "html_render", html.clone())),
+            harness(tool("b", "Bash", serde_json::json!({"command": "check"}))),
+            harness(HarnessEvent::ItemCompleted {
+                id: "v".into(),
+                output,
+                is_error: false,
+            }),
+            harness(crate::model::subagent_tests::done("b", false)),
+            harness(tool("c", "Bash", serde_json::json!({"command": "check"}))),
+            harness(crate::model::subagent_tests::done("c", false)),
+            harness(HarnessEvent::TextDelta("Done.".into())),
+            harness(turn_done(TurnStatus::Completed)),
+        ]);
+        // Rows: 0 prompt, 1 html_render, 2 Bash, 3 visual, 4 Bash, 5 text.
+        let kinds: Vec<_> = model.rows.iter().map(|row| row.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                RowKind::User,
+                RowKind::Tool,
+                RowKind::Tool,
+                RowKind::Visual,
+                RowKind::Tool,
+                RowKind::Assistant
+            ]
+        );
+        let ranges: Vec<_> = folds(&model).into_iter().map(|(r, ..)| r).collect();
+        assert_eq!(ranges, [1..3, 4..5]);
     }
 }

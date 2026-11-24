@@ -194,6 +194,35 @@ impl ChatView {
         });
         cx.notify();
     }
+    /// Iced's `openFoldsAround`: the work fold and tool run holding a row.
+    pub(super) fn open_folds_around(&mut self, index: usize) {
+        let work_folds = turns::work_folds(&self.model);
+        for fold in work_folds.iter().filter(|fold| fold.range.contains(&index)) {
+            self.open_work.insert(self.model.rows[fold.range.start].id);
+        }
+        for run in tool_runs::group(&self.model, &work_folds)
+            .iter()
+            .filter(|run| run.range.contains(&index))
+        {
+            self.open_runs.insert(self.model.rows[run.range.start].id);
+        }
+    }
+    /// After a replay Iced opens the folds around each subagent that is
+    /// still running or waiting for the human.
+    pub(super) fn open_folds_for_attention(&mut self) {
+        let attention: Vec<usize> = (0..self.model.rows.len())
+            .filter(|&index| {
+                self.model.rows[index]
+                    .tool
+                    .as_ref()
+                    .and_then(|tool| tool.sub.as_ref())
+                    .is_some_and(|sub| sub.state == crate::model::SubState::Running || sub.waiting)
+            })
+            .collect();
+        for index in attention {
+            self.open_folds_around(index);
+        }
+    }
     pub(super) fn reveal_roster(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self
             .model
@@ -245,6 +274,8 @@ impl ChatView {
         self.folded.insert(row_id, true);
         row.update(cx, |row, cx| {
             row.open = true;
+            // Iced also opens a subagent row's own activity block.
+            row.sub_open |= row.row.tool.as_ref().is_some_and(|tool| tool.sub.is_some());
             row.flashed = true;
             cx.notify();
         });
@@ -525,11 +556,27 @@ impl RowView {
                     .rounded_l(px(6.))
                     .bg(rgb(color)),
             )
+            .when(self.flashed, |card| {
+                card.child(super::flash_outline(
+                    id,
+                    [1., 1., 1., 0.],
+                    6.,
+                    palette.accent,
+                ))
+            })
             .child(
-                Collapsible::new()
-                    .open(self.open)
-                    .child(summary)
-                    .content(body),
+                Collapsible::new().open(self.open).child(summary).content(
+                    div()
+                        .flex()
+                        .flex_col()
+                        // Iced's subagent block sits before the card's body.
+                        .children(
+                            tool.sub
+                                .as_ref()
+                                .map(|sub| self.render_subagent(sub, &tool.input, cx)),
+                        )
+                        .child(body),
+                ),
             )
             .into_any_element()
     }

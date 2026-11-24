@@ -7,6 +7,7 @@ mod keys;
 #[path = "review/ui.rs"]
 pub(crate) mod review_ui;
 mod scroll;
+mod subagent;
 mod tool_runs;
 mod transcript;
 pub use scroll::TranscriptScrollerState;
@@ -203,6 +204,10 @@ pub struct ChatView {
     folded_turns: HashSet<u64>,
     open_runs: HashSet<u64>,
     open_work: HashSet<u64>,
+    /// Rows whose nested subagent block is open, kept while a row view is evicted.
+    open_subs: HashSet<u64>,
+    /// Completed turns whose live runs are gone (Iced's `unwrapLiveRun`).
+    completed_seen: usize,
     model: ChatModel,
     row_views: Vec<Option<Entity<RowView>>>,
     scroller: Entity<MessageScrollerState>,
@@ -288,7 +293,7 @@ impl ChatView {
         }
         let mut composer_state = crate::composer::ComposerState::default();
         composer_state.project(&fixture_composer, None);
-        Self {
+        let mut this = Self {
             appearance: ChatAppearance::default(),
             width: Default::default(),
             imported_offer: records
@@ -341,6 +346,8 @@ impl ChatView {
             folded_turns: HashSet::new(),
             open_runs: HashSet::new(),
             open_work: HashSet::new(),
+            open_subs: HashSet::new(),
+            completed_seen: model.completed_turns.len(),
             row_views: vec![None; model.rows.len()],
             model,
             scroller,
@@ -352,7 +359,9 @@ impl ChatView {
             replay: None,
             replay_position: 0,
             _subscriptions: subscriptions,
-        }
+        };
+        this.open_folds_for_attention();
+        this
     }
     /// Change the native column without discarding folds, drafts or selection.
     pub fn set_width(&mut self, width: gitterm_core::settings::ChatWidth, cx: &mut Context<Self>) {
@@ -620,7 +629,9 @@ impl ChatView {
             if self.projection_runtime.is_none() && self.replay.is_none() {
                 let rebuilt = ChatModel::from_records_for(&self.records, Some(backend));
                 if rebuilt.rows.len() == self.model.rows.len() {
+                    let live = self.model.live;
                     self.model = rebuilt;
+                    self.model.live = live;
                     for (index, view) in self.row_views.iter().enumerate() {
                         if let Some(view) = view {
                             let row = self.model.rows[index].clone();
@@ -1074,6 +1085,9 @@ impl ChatView {
                 self.folded_turns.clear();
                 self.open_runs.clear();
                 self.open_work.clear();
+                self.open_subs.clear();
+                self.completed_seen = self.model.completed_turns.len();
+                self.open_folds_for_attention();
                 self.history_start = scroll::initial_start(&self.model);
                 self.scroller
                     .update(cx, |scroller, cx| scroller.reset(self.model.rows.len(), cx));
@@ -1158,6 +1172,11 @@ impl ChatView {
             {
                 let row = view.read(cx);
                 self.folded.insert(row.row.id, row.open);
+                if row.sub_open {
+                    self.open_subs.insert(row.row.id);
+                } else {
+                    self.open_subs.remove(&row.row.id);
+                }
                 self.retained_edit_expansion
                     .insert(row.row.id, row.expanded_edits.clone());
                 if let Some(selected) = &row.selected_findings {
@@ -1208,6 +1227,7 @@ impl ChatView {
             .as_ref()
             .is_some_and(|fold| fold.range.start != index && !work_open);
         let in_work = work.is_some();
+        let work_failed = work.as_ref().map_or(0, |fold| fold.failed);
         let work_summary = work
             .filter(|fold| fold.range.start == index)
             .map(|fold| fold.label);
@@ -1255,6 +1275,7 @@ impl ChatView {
             if let Some(open) = open {
                 view.open = open;
             }
+            view.sub_open = self.open_subs.contains(&view.row.id);
             view.cwd = self.composer_state.checkout_path.clone();
             view.expanded_edits = self
                 .retained_edit_expansion
@@ -1269,6 +1290,7 @@ impl ChatView {
             view.column_width = self.column_width().map(|width| width - 28.);
             view.work_toggle = work_toggle;
             view.work_summary = work_summary;
+            view.work_failed = work_failed;
             view.work_open = work_open;
             view.in_work = in_work;
             view.hidden_by_work = hidden_by_work;
@@ -1310,6 +1332,7 @@ impl ChatView {
             let work_summary = work
                 .filter(|fold| fold.range.start == index)
                 .map(|fold| fold.label.clone());
+            let work_failed = work.map_or(0, |fold| fold.failed);
             let work_open = work.is_none_or(|fold| {
                 self.open_work
                     .contains(&self.model.rows[fold.range.start].id)
@@ -1318,6 +1341,7 @@ impl ChatView {
             let in_work = work.is_some();
             view.update(cx, |view, cx| {
                 if view.work_summary != work_summary
+                    || view.work_failed != work_failed
                     || view.work_open != work_open
                     || view.in_work != in_work
                     || view.hidden_by_work != hidden_by_work
@@ -1327,6 +1351,7 @@ impl ChatView {
                     || view.hidden_by_run != hidden
                 {
                     view.work_summary = work_summary;
+                    view.work_failed = work_failed;
                     view.work_open = work_open;
                     view.in_work = in_work;
                     view.hidden_by_work = hidden_by_work;
@@ -1445,6 +1470,8 @@ impl ChatView {
         self.folded.clear();
         self.open_runs.clear();
         self.open_work.clear();
+        self.open_subs.clear();
+        self.completed_seen = 0;
         self.turn_running = false;
         self.fixture_composer = gitterm_core::chat::state::State::default();
         self.composer_state = crate::composer::ComposerState::default();
@@ -1569,6 +1596,19 @@ impl ChatView {
                 .and_then(|index| self.row_views[index].as_ref())
             {
                 view.update(cx, |view, _| view.open = false);
+            }
+        }
+        // Iced removes a finished turn's live runs; its folds start fresh.
+        for turn in &self.model.completed_turns[self.completed_seen..] {
+            for row in &self.model.rows[turn.rows.clone()] {
+                self.open_runs.remove(&row.id);
+            }
+        }
+        self.completed_seen = self.model.completed_turns.len();
+        // Iced's `openFoldsAround` for a subagent that resumed or asks.
+        for id in std::mem::take(&mut self.model.reopened) {
+            if let Some(index) = self.model.rows.iter().position(|row| row.id == id) {
+                self.open_folds_around(index);
             }
         }
         if following && !self.find_open {
@@ -1996,6 +2036,11 @@ struct RowView {
     text: Entity<TextViewState>,
     output_text: Option<Entity<TextViewState>>,
     open: bool,
+    /// Iced's nested `details.subagent`, closed until the human opens it.
+    sub_open: bool,
+    sub_text: Option<Entity<TextViewState>>,
+    /// Iced's red `N failed` on this row's work fold summary.
+    work_failed: usize,
     query: String,
     active: Option<usize>,
     reveal_pending: bool,
@@ -2069,6 +2114,9 @@ impl RowView {
             text,
             output_text: None,
             open,
+            sub_open: false,
+            sub_text: None,
+            work_failed: 0,
             query: String::new(),
             active: None,
             reveal_pending: false,
@@ -2087,6 +2135,7 @@ impl RowView {
             output_full: false,
         };
         view.update_output_text(cx);
+        view.update_sub_text(cx);
         view.prepare_sent_images(cx);
         view
     }
@@ -2112,6 +2161,7 @@ impl RowView {
         }
         self.row = row;
         self.update_output_text(cx);
+        self.update_sub_text(cx);
         if self.visual.is_none() {
             self.sync_visual(cx);
             if self.visual.is_some() {
@@ -2128,7 +2178,7 @@ impl RowView {
     /// A completed html_render result gets its visual reply once. Called
     /// while the list lays the row out, so the caller remeasures.
     fn sync_visual(&mut self, cx: &mut Context<Self>) {
-        if self.visual.is_some() {
+        if self.visual.is_some() || self.row.kind != RowKind::Visual {
             return;
         }
         let Some(request) = self.row.tool.as_ref().and_then(visual::visual_request) else {
@@ -2200,7 +2250,7 @@ impl Render for RowView {
             let light = self.appearance.light;
             visual.update(cx, |visual, cx| visual.set_light(light, cx));
         }
-        // Iced appends the visual reply after its tool item, outside the fold.
+        // Iced's `.html-render`: its own block, the reply alone.
         let visual = self
             .visual
             .clone()
@@ -2208,7 +2258,10 @@ impl Render for RowView {
         if self.hidden_by_turn || self.row.hidden() {
             return div().h(px(0.)).mb(px(0.)).into_any_element();
         }
-        if self.hidden_by_work || (self.hidden_by_run && self.work_summary.is_none()) {
+        if self.row.kind == RowKind::Visual
+            || self.hidden_by_work
+            || (self.hidden_by_run && self.work_summary.is_none())
+        {
             return div()
                 .w_full()
                 .when_some(self.column_width, |row, width| row.max_w(px(width)))
@@ -2351,6 +2404,15 @@ impl Render for RowView {
                         .items_baseline()
                         .gap(px(6.))
                         .child(label)
+                        // Iced's `.tr-failed`.
+                        .when(self.work_failed > 0, |summary| {
+                            summary.child(
+                                div()
+                                    .debug_selector(move || format!("work-fold-failed-{id}"))
+                                    .text_color(rgb(palette.err))
+                                    .child(format!("{} failed", self.work_failed)),
+                            )
+                        })
                         .child(if self.work_open { "⌄" } else { "›" }),
                 )
                 .on_click(move |_, _, cx| toggle(id, cx))
@@ -2439,9 +2501,14 @@ impl Render for RowView {
                             .border_color(rgb(color)),
                     )
                 })
-                .when(self.flashed, |row| {
-                    row.bg(rgb(palette.border))
-                        .border_color(rgb(palette.accent))
+                // Iced's `.flash`: a 1px accent outline; a tool card draws its own.
+                .when(self.flashed && self.row.kind != RowKind::Tool, |row| {
+                    row.relative().child(flash_outline(
+                        self.row.id,
+                        [1., 1., 1., 3.],
+                        6.,
+                        palette.accent,
+                    ))
                 })
                 // Iced's `title`: a reconnect notice's error.
                 .when_some(self.row.tooltip.clone(), |row, tip| {
@@ -2654,6 +2721,23 @@ impl Render for RowView {
     }
 }
 
+/// Iced's `outline: 1px solid var(--accent)`: drawn over the card, so the
+/// layout does not move. An absolute child is placed from the padding box,
+/// so `border` is the card's border widths (top, right, bottom, left).
+fn flash_outline(id: u64, border: [f32; 4], radius: f32, color: u32) -> gpui::Div {
+    let [top, right, bottom, left] = border.map(|width| px(-(width + 1.)));
+    div()
+        .debug_selector(move || format!("flash-outline-{id}"))
+        .absolute()
+        .top(top)
+        .right(right)
+        .bottom(bottom)
+        .left(left)
+        .rounded(px(radius + 1.))
+        .border_1()
+        .border_color(rgb(color))
+}
+
 /// Iced's bottom margin per block; the next block's smaller top margin
 /// collapses into it.
 fn block_bottom_margin(row: &Row) -> f32 {
@@ -2747,6 +2831,8 @@ fn running_after(entry: &Entry, previous: bool) -> bool {
     }
 }
 
+#[cfg(test)]
+mod fold_tests;
 #[cfg(test)]
 mod polish_tests;
 #[cfg(test)]
