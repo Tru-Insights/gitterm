@@ -207,6 +207,23 @@ impl Provider {
         super::OwnedRuntime,
         tokio::sync::mpsc::UnboundedReceiver<gitterm_core::chat::runtime::RuntimeEvent>,
     )> {
+        let provider = self.clone();
+        self.start_with_preflight(cwd, mcp_servers, move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(provider.check_launch(schema, &managed_root))
+        })
+    }
+    fn start_with_preflight(
+        self: Arc<Self>,
+        cwd: PathBuf,
+        mcp_servers: Vec<ClaudeMcpServer>,
+        preflight: impl FnOnce() -> Result<()> + Send + 'static,
+    ) -> Result<(
+        super::OwnedRuntime,
+        tokio::sync::mpsc::UnboundedReceiver<gitterm_core::chat::runtime::RuntimeEvent>,
+    )> {
         self.validate_workspace(&cwd)?;
         self.prepare()?;
         // The MCP env only adds keys: it never replaces the isolated
@@ -227,12 +244,7 @@ impl Provider {
                 // Runs on the session thread, never GPUI's update/render thread.
                 std::thread::scope(|scope| {
                     scope
-                    .spawn(|| -> Result<()> {
-                        tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()?
-                            .block_on(self.check_launch(schema, &managed_root))
-                    })
+                    .spawn(preflight)
                     .join()
                     .map_err(|_| "Claude preview gate thread panicked".to_string())?
                     .map_err(|e| format!("{e:#}\nSign in once with a personal Pro/Max account in the isolated root:\n{}", self.sign_in_command()))
@@ -593,44 +605,39 @@ mod gate_tests {
         tests::{fixture, script},
     };
     use super::*;
-    #[tokio::test]
-    async fn closing_during_preflight_never_spawns_chat_and_drains_lease() {
+    #[test]
+    fn closing_during_preflight_never_spawns_chat_and_drains_lease() {
         let (dir, preview) = fixture();
-        let entered = dir.path().join("auth-entered");
-        let release = dir.path().join("release-auth");
         let spawned = dir.path().join("chat-spawned");
-        let help = "  --restricted\n  --strict-mcp-config\n  --safe-mode\n  --permission-mode <mode> (choices: \"manual\")\n";
-        let status = serde_json::json!({"fixture_signed_in":true,"fixture_method":"fixture_personal","fixture_plan":"fixture_pro","fixture_root":preview.provider(),"fixture_provider":"fixture_first_party"});
         let fake = script(
             dir.path(),
             "fake-close-gate",
             &format!(
-                "#!/bin/sh\ncase \"$*\" in\n --help) printf '%s' {};;\n 'auth status --json') touch {}; while [ ! -e {} ]; do sleep 0.01; done; printf '%s' {};;\n *) touch {}; exit 97;;\nesac\n",
-                quote(help),
-                quote(entered.to_str().unwrap()),
-                quote(release.to_str().unwrap()),
-                quote(&status.to_string()),
+                "#!/bin/sh\ntouch {}; exit 97\n",
                 quote(spawned.to_str().unwrap())
             ),
         );
         let cwd = dir.path().join("clone");
         super::super::tests::independent_clone(&cwd);
         let provider = Arc::new(Provider::fixture(preview.clone(), &fake).unwrap());
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
         let (runtime, _events) = provider
-            .start_with_policy(cwd, vec![], FIXTURE_SCHEMA, dir.path().join("no-policy"))
+            .start_with_preflight(cwd, vec![], move || {
+                entered.send(()).unwrap();
+                proceed.recv().unwrap();
+                Ok(())
+            })
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            while !entered.exists() {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
+        // Hold the session at the preflight boundary without racing the real
+        // auth subprocess's five-second deadline or polling marker files.
+        started.recv().unwrap();
         let shutdown = super::super::RuntimeShutdown::new();
         assert!(shutdown.enqueue(runtime).is_ok());
-        assert!(super::super::lease::ProviderLease::claim(&preview).is_err());
-        std::fs::write(release, "continue").unwrap();
+        let held_during_preflight = super::super::lease::ProviderLease::claim(&preview).is_err();
+        release.send(()).unwrap();
         shutdown.drain().unwrap();
+        assert!(held_during_preflight);
         assert!(
             !spawned.exists(),
             "a close during auth must not start a chat"

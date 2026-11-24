@@ -45,6 +45,18 @@ impl ProviderLease {
         Ok(())
     }
 }
+impl Drop for ProviderLease {
+    fn drop(&mut self) {
+        // A concurrent fork can retain this open file description until exec.
+        // Ownership ends with the lease, even while that inherited fd exists.
+        if let Err(error) = self.file.unlock() {
+            eprintln!(
+                "Unlock Claude provider lease {}: {error}",
+                self.path.display()
+            );
+        }
+    }
+}
 fn check(path: &Path) -> Result<fs::Metadata> {
     let meta = fs::symlink_metadata(path)?;
     ensure!(
@@ -57,6 +69,24 @@ fn check(path: &Path) -> Result<fs::Metadata> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inherited_descriptor_does_not_extend_lease_ownership() {
+        let (_dir, preview) = super::super::tests::fixture();
+        super::super::provider::Provider::fixture(preview.clone(), Path::new("/fake/claude"))
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let lease = ProviderLease::claim(&preview).unwrap();
+        // dup shares the open file description exactly as fork does, without
+        // depending on another test forking in the drop-to-claim interval.
+        let inherited = lease.file.try_clone().unwrap();
+        drop(lease);
+        let next = ProviderLease::claim(&preview).unwrap();
+        drop(inherited);
+        assert!(ProviderLease::claim(&preview).is_err());
+        drop(next);
+        ProviderLease::claim(&preview).unwrap();
+    }
     #[test]
     fn persistent_stale_marker_has_no_authority_and_aliases_refuse() {
         let (_dir, preview) = super::super::tests::fixture();

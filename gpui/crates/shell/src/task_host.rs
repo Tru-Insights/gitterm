@@ -168,7 +168,7 @@ impl HostConfig {
 /// unlinked: the kernel lock (flock, released by close or process death),
 /// not its contents, owns the host.
 pub(crate) struct HostLock {
-    _file: std::fs::File,
+    file: std::fs::File,
 }
 impl HostLock {
     pub(crate) fn acquire(roots: &Preview) -> Result<Self> {
@@ -208,7 +208,7 @@ impl HostLock {
             );
         }
         match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
+            Ok(()) => Ok(Self { file }),
             Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
                 "another GitTerm GPUI already hosts tasks for {}",
                 roots.root().display()
@@ -217,6 +217,38 @@ impl HostLock {
                 Err(error).with_context(|| format!("lock task host {}", path.display()))
             }
         }
+    }
+}
+impl Drop for HostLock {
+    fn drop(&mut self) {
+        // Forked terminal children may still hold an inherited descriptor.
+        // Release ownership now rather than waiting for their exec/exit.
+        if let Err(error) = self.file.unlock() {
+            eprintln!("Unlock task host: {error}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn inherited_descriptor_does_not_extend_host_ownership() {
+        let dir = tempfile::tempdir_in("/private/tmp").unwrap();
+        let roots = Preview::validate(
+            &dir.path().join("preview"),
+            gitterm_core::preview::ProtectedRoots::new(&dir.path().join("home"), []).unwrap(),
+        )
+        .unwrap();
+        let lock = HostLock::acquire(&roots).unwrap();
+        let inherited = lock.file.try_clone().unwrap();
+        drop(lock);
+        let next = HostLock::acquire(&roots).unwrap();
+        drop(inherited);
+        assert!(HostLock::acquire(&roots).is_err());
+        drop(next);
+        HostLock::acquire(&roots).unwrap();
     }
 }
 /// Iced's file identity for re-seeding: its mtime, `None` while missing.
@@ -648,6 +680,16 @@ impl TaskHostOwner {
         self.servers
             .as_ref()
             .map(|servers| servers.task_mcp.endpoint().to_string())
+    }
+    #[cfg(test)]
+    pub(crate) fn server_tasks(&self) -> Vec<tokio::task::AbortHandle> {
+        self.servers
+            .as_ref()
+            .unwrap()
+            .jobs
+            .iter()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect()
     }
     #[cfg(test)]
     pub(crate) fn log_port(&self) -> Option<u16> {
