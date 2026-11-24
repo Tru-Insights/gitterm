@@ -388,7 +388,7 @@ fn gpui_host_shutdown_resolves_pending_replies(cx: &mut TestAppContext) {
     let app = cx.new_app();
     let (config, sender) = fixture.config();
     let owner = app.update(|cx| TaskHostOwner::start(config, cx)).unwrap();
-    let endpoint = owner.read_with(&app, |owner, _| owner.task_endpoint().unwrap());
+    let servers = owner.read_with(&app, |owner, _| owner.server_tasks());
     // Enqueued, never pumped: the reply is still pending at quit.
     let pending = sender
         .enqueue(
@@ -413,11 +413,10 @@ fn gpui_host_shutdown_resolves_pending_replies(cx: &mut TestAppContext) {
             .is_err()
     );
     // Servers are gone and the lifetime lock is free for the next host.
-    let address = endpoint
-        .strip_prefix("http://")
-        .and_then(|rest| rest.strip_suffix("/mcp"))
-        .unwrap();
-    assert!(std::net::TcpStream::connect(address).is_err());
+    // A released ephemeral port can already belong to another parallel test,
+    // and a concurrent fork can retain a listener fd until exec. Check the
+    // actual server tasks, rather than whether that address accepts TCP.
+    assert!(servers.iter().all(tokio::task::AbortHandle::is_finished));
     HostLock::acquire(&fixture.roots).unwrap();
 }
 
