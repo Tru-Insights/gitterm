@@ -9,6 +9,28 @@ use crate::{
 use gpui::{AppContext as _, Entity, TestAppContext};
 use std::rc::Rc;
 
+#[test]
+fn parked_count_excludes_saved_entries_marked_done_like_iced() {
+    let saved = [
+        SavedPark {
+            name: "still parked".into(),
+            dir: PathBuf::from("/tmp/parked"),
+            note: String::new(),
+            parked_at: "2026-11-01T00:00:00Z".into(),
+            done: false,
+        },
+        SavedPark {
+            name: "done".into(),
+            dir: PathBuf::from("/tmp/done"),
+            note: String::new(),
+            parked_at: "2026-11-02T00:00:00Z".into(),
+            done: true,
+        },
+    ];
+
+    assert_eq!(parked_count(3, &saved, 2, 1), 7);
+}
+
 struct Fixture {
     _root: tempfile::TempDir,
     config: PathBuf,

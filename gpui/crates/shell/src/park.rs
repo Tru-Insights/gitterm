@@ -36,6 +36,21 @@ impl SavedPark {
     pub(crate) fn matches(&self, name: &str, dir: &std::path::Path) -> bool {
         self.name == name && self.dir == dir
     }
+    pub(crate) fn is_parked(&self) -> bool {
+        !self.done
+    }
+}
+
+pub(crate) fn parked_count(
+    closed_parked: usize,
+    saved: &[SavedPark],
+    hidden: usize,
+    running_parked: usize,
+) -> usize {
+    closed_parked
+        + saved.iter().filter(|record| record.is_parked()).count()
+        + hidden
+        + running_parked
 }
 pub(crate) fn validate_saved(records: &[SavedPark]) -> Result<()> {
     let mut keys = std::collections::HashSet::new();
