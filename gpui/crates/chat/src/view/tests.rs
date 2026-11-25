@@ -3048,7 +3048,7 @@ fn c06_c08_rejected_prestart_choice_is_dropped_with_a_notice(cx: &mut TestAppCon
     draw(cx);
     chat.read_with(cx, |view, _| {
         assert!(view.composer_state.prestart.is_empty());
-        assert_eq!(view.composer_state.model, "opus");
+        assert_eq!(view.composer_state.model, "Opus");
         assert_eq!(
             view.composer_state.notice.as_deref(),
             Some("provider said no")
