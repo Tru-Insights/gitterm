@@ -66,6 +66,97 @@ pub const REVIEW_TOOLTIP: &str =
 pub const CHECKOUT_LOCKED_REASON: &str = "Set when the chat started; start a new chat to change it";
 pub const NOT_IN_PREVIEW: &str = "not available in preview";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModeTone {
+    Muted,
+    Accent,
+    Result,
+    Warn,
+    Error,
+}
+
+fn mode_tone(mode: &str) -> ModeTone {
+    match mode {
+        "acceptEdits" => ModeTone::Accent,
+        "plan" => ModeTone::Result,
+        "auto" => ModeTone::Warn,
+        "dontAsk" | "bypassPermissions" => ModeTone::Error,
+        _ => ModeTone::Muted,
+    }
+}
+
+fn iced_model_label(
+    value: &str,
+    backend: Option<gitterm_core::chat::types::AgentBackend>,
+    models: Option<&[serde_json::Value]>,
+) -> String {
+    use gitterm_core::chat::types::AgentBackend;
+    let is_acp = matches!(backend, Some(AgentBackend::Acp(_)));
+    if is_acp {
+        if value == "default" {
+            return match backend {
+                Some(AgentBackend::Acp(agent)) => format!("{} default", agent.label()),
+                _ => value.into(),
+            };
+        }
+        return models
+            .and_then(|models| {
+                models
+                    .iter()
+                    .find(|info| info["value"] == value)
+                    .and_then(|info| info["displayName"].as_str())
+            })
+            .unwrap_or(value)
+            .into();
+    }
+
+    let base = value.strip_suffix("[1m]").unwrap_or(value);
+    let Some(models) = models else {
+        return if base == "default" {
+            "Claude settings".into()
+        } else {
+            base.into()
+        };
+    };
+    let fallback = [
+        ("default", "Default", "Your Claude settings decide"),
+        ("opus", "Opus", ""),
+        ("sonnet", "Sonnet", ""),
+        ("haiku", "Haiku", ""),
+        ("fable", "Fable", ""),
+    ];
+    let info = models.iter().find(|info| info["value"] == base);
+    let fallback_info = if models.is_empty() {
+        fallback
+            .iter()
+            .find(|(fallback_value, _, _)| *fallback_value == base)
+            .map(|(_, display_name, description)| (*display_name, *description))
+    } else {
+        None
+    };
+    let display_name = info
+        .and_then(|info| info["displayName"].as_str())
+        .or(fallback_info.map(|(display_name, _)| display_name));
+    let description = info
+        .and_then(|info| info["description"].as_str())
+        .or(fallback_info.map(|(_, description)| description));
+    if base == "default" {
+        return description
+            .map(|description| {
+                let end = [" · ", " — ", " - "]
+                    .iter()
+                    .filter_map(|separator| description.find(separator))
+                    .min()
+                    .unwrap_or(description.len());
+                description[..end].trim()
+            })
+            .filter(|description| !description.is_empty())
+            .unwrap_or("Claude settings")
+            .into();
+    }
+    display_name.unwrap_or(base).into()
+}
+
 #[derive(Debug, Default)]
 pub struct ComposerState {
     pub queue: Vec<QueuedRow>,
@@ -76,6 +167,7 @@ pub struct ComposerState {
     pub status: String,
     pub model: String,
     pub mode: String,
+    mode_value: String,
     pub effort: String,
     pub checkout: String,
     pub checkout_path: Option<String>,
@@ -345,37 +437,12 @@ impl ComposerState {
                 value.strip_suffix("[1m]").unwrap_or(value)
             }
         });
-        let model_label = |value: &str| -> String {
-            {
-                let info =
-                    ready.and_then(|(models, _)| models.iter().find(|info| info["value"] == value));
-                if self.is_acp() && value == "default" {
-                    if let Some(gitterm_core::chat::types::AgentBackend::Acp(agent)) = self.backend
-                    {
-                        format!("{} default", agent.label())
-                    } else {
-                        value.into()
-                    }
-                } else if value == "default" {
-                    info.and_then(|info| info["description"].as_str())
-                        .map(|description| {
-                            let end = [" · ", " — ", " - "]
-                                .iter()
-                                .filter_map(|separator| description.find(separator))
-                                .min()
-                                .unwrap_or(description.len());
-                            &description[..end]
-                        })
-                        .map(str::trim)
-                        .filter(|description| !description.is_empty())
-                        .unwrap_or("Claude settings")
-                        .into()
-                } else {
-                    info.and_then(|info| info["displayName"].as_str())
-                        .unwrap_or(value)
-                        .into()
-                }
-            }
+        let model_label = |value: &str| {
+            iced_model_label(
+                value,
+                self.backend,
+                ready.map(|(models, _)| models.as_slice()),
+            )
         };
         // Iced's chips read `current → requested…` while one change is pending.
         use gitterm_core::chat::types::SettingChange as Change;
@@ -409,6 +476,7 @@ impl ComposerState {
                     .into()
             }
         };
+        self.mode_value = acknowledged.mode.clone().unwrap_or_default();
         self.mode = acknowledged
             .mode
             .as_deref()
@@ -809,7 +877,8 @@ mod ui {
                                 cx.stop_propagation();
                             }))
                             .px(px(8.)).py(px(4.)).h_auto().bg(rgb(palette.block))
-                            .text_color(rgb(palette.muted)).border_1().border_color(rgb(palette.strong)).rounded(px(6.));
+                            .text_color(rgb(if id == "mode" { mode_color(mode_tone(&self.mode_value), palette) } else { palette.muted }))
+                            .border_1().border_color(rgb(if id == "mode" { mode_border(mode_tone(&self.mode_value), palette) } else { palette.strong })).rounded(px(6.));
                         let icon = match id {
                             "model" => Some(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0.8l1.7 4.6 4.7 1.6-4.7 1.7L8 13.4 6.3 8.7 1.6 7l4.7-1.6z"/></svg>"#.as_slice()),
                             "effort" => Some(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2.5 11.5a5.5 5.5 0 1 1 11 0"/><path d="M8 11.5l2.6-3.4"/></svg>"#.as_slice()),
@@ -876,6 +945,26 @@ mod ui {
                                         .children((!row.description.is_empty()).then(|| div().text_color(rgb(palette.muted)).child(row.description.clone())))))
                         }))
                 }))
+        }
+    }
+
+    fn mode_color(tone: ModeTone, palette: crate::ChatPalette) -> u32 {
+        match tone {
+            ModeTone::Muted => palette.muted,
+            ModeTone::Accent => palette.accent,
+            ModeTone::Result => palette.result,
+            ModeTone::Warn => palette.warn,
+            ModeTone::Error => palette.err,
+        }
+    }
+
+    fn mode_border(tone: ModeTone, palette: crate::ChatPalette) -> u32 {
+        match tone {
+            ModeTone::Muted => palette.strong,
+            ModeTone::Accent => palette.accent,
+            ModeTone::Result => palette.result,
+            ModeTone::Warn => palette.warn,
+            ModeTone::Error => palette.err,
         }
     }
 }
