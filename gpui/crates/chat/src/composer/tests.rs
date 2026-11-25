@@ -91,6 +91,79 @@ fn iced_chips_use_acknowledged_labels_in_reference_order() {
 }
 
 #[test]
+fn c20_model_chip_uses_iced_catalog_names_and_fallbacks() {
+    use gitterm_core::chat::types::{AcpAgent, AgentBackend};
+
+    let claude = Some(AgentBackend::Claude);
+    let empty_catalog: &[serde_json::Value] = &[];
+    let catalog = [
+        json!({"value":"opus", "displayName":"Opus 5.5"}),
+        json!({"value":"gpt-5.1-codex", "displayName":"GPT-5.1-Codex"}),
+        json!({"value":"default", "description":"Opus 5.5 · Your Claude settings decide"}),
+    ];
+    assert_eq!(iced_model_label("opus", claude, None), "opus");
+    assert_eq!(iced_model_label("default", claude, None), "Claude settings");
+    assert_eq!(
+        iced_model_label("opus", claude, Some(empty_catalog)),
+        "Opus"
+    );
+    assert_eq!(
+        iced_model_label("default", claude, Some(empty_catalog)),
+        "Your Claude settings decide"
+    );
+    assert_eq!(iced_model_label("opus", claude, Some(&catalog)), "Opus 5.5");
+    assert_eq!(
+        iced_model_label("opus[1m]", claude, Some(&catalog)),
+        "Opus 5.5"
+    );
+    assert_eq!(
+        iced_model_label("default", claude, Some(&catalog)),
+        "Opus 5.5"
+    );
+    assert_eq!(
+        iced_model_label("unknown-model", claude, Some(&catalog)),
+        "unknown-model"
+    );
+    assert_eq!(
+        iced_model_label("gpt-5.1-codex", claude, Some(&catalog)),
+        "GPT-5.1-Codex"
+    );
+
+    let acp = Some(AgentBackend::Acp(AcpAgent::OpenCode));
+    assert_eq!(iced_model_label("default", acp, None), "OpenCode default");
+    assert_eq!(
+        iced_model_label("gpt-5.1-codex", acp, Some(&catalog)),
+        "GPT-5.1-Codex"
+    );
+    assert_eq!(
+        iced_model_label("unlisted", acp, Some(&catalog)),
+        "unlisted"
+    );
+}
+
+#[test]
+fn c21_mode_chip_tones_match_iced_css_for_every_permission_mode() {
+    for (mode, expected) in [
+        ("default", ModeTone::Muted),
+        ("acceptEdits", ModeTone::Accent),
+        ("plan", ModeTone::Result),
+        ("auto", ModeTone::Warn),
+        ("dontAsk", ModeTone::Error),
+        ("bypassPermissions", ModeTone::Error),
+        ("custom", ModeTone::Muted),
+    ] {
+        assert_eq!(mode_tone(mode), expected, "mode {mode}");
+    }
+
+    let mut state = State::default();
+    state.acknowledged.mode = Some("auto".into());
+    let mut composer = ComposerState::default();
+    composer.project(&state, None);
+    assert_eq!(composer.mode, "Auto mode");
+    assert_eq!(mode_tone(&composer.mode_value), ModeTone::Warn);
+}
+
+#[test]
 fn activity_uses_turn_timing_and_freezes_on_completion() {
     let mut state = State::default();
     state.state = AgentSessionState::Streaming;

@@ -155,7 +155,7 @@ fn s08_roster_flash_outlines_the_card_without_moving_it(cx: &mut TestAppContext)
                 checkout: String::new(),
                 activity: String::new(),
                 state: roster::WorkerState::Running,
-                started_at_ms: 0,
+                started_at_ms: Some(0),
                 ended_at_ms: None,
             }],
             cx,

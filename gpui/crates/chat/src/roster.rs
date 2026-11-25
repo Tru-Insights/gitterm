@@ -26,7 +26,7 @@ pub struct RosterEntry {
     pub checkout: String,
     pub activity: String,
     pub state: WorkerState,
-    pub started_at_ms: u64,
+    pub started_at_ms: Option<u64>,
     pub ended_at_ms: Option<u64>,
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -43,38 +43,27 @@ pub fn rows(input: &[RosterEntry], now_ms: u64) -> Vec<RosterRow> {
     input
         .iter()
         .map(|row| {
-            let backend = row
-                .name
-                .strip_prefix("Worker · ")
-                .or_else(|| row.name.strip_prefix("Consult · "))
-                .or_else(|| row.name.strip_prefix("Review · "))
-                .unwrap_or(&row.name);
-            let backend = match backend {
-                "Codex review" | "Codex consult" => "Codex",
-                other => other,
-            };
-            let checkout = std::path::Path::new(&row.checkout)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(&row.checkout);
-            let what = if checkout.is_empty() {
+            let what = if row.checkout.is_empty() {
                 String::new()
             } else {
-                format!("· in {checkout}")
+                format!("· in {}", row.checkout)
+            };
+            let duration = match (row.state.is_live(), row.started_at_ms) {
+                (true, Some(started_at_ms)) => Some(now_ms.saturating_sub(started_at_ms)),
+                (false, Some(started_at_ms)) => row
+                    .ended_at_ms
+                    .map(|ended_at_ms| ended_at_ms.saturating_sub(started_at_ms)),
+                (_, None) => None,
             };
             RosterRow {
                 id: row.id.clone(),
-                name: if row.model.is_empty() {
-                    backend.into()
+                name: if row.model.is_empty() || row.name.ends_with(&format!(" · {}", row.model)) {
+                    row.name.clone()
                 } else {
-                    format!("{} · {}", backend, row.model)
+                    format!("{} · {}", row.name, row.model)
                 },
                 what,
-                elapsed: elapsed(
-                    row.ended_at_ms
-                        .unwrap_or(now_ms)
-                        .saturating_sub(row.started_at_ms),
-                ),
+                elapsed: duration.map_or_else(String::new, elapsed),
                 state: row.state,
             }
         })
@@ -121,7 +110,6 @@ pub(crate) fn render(
         .id("chat-roster")
         .max_h(px(98.))
         .overflow_y_scroll()
-        .overflow_x_scroll()
         .flex()
         .flex_col()
         .gap(px(2.))
@@ -147,8 +135,6 @@ pub(crate) fn render(
                         .id(gpui::SharedString::from(selector.clone()))
                         .debug_selector(move || selector.clone())
                         .flex()
-                        .flex_shrink_0()
-                        .whitespace_nowrap()
                         .items_center()
                         .gap(px(8.))
                         .px(px(4.))
@@ -180,11 +166,11 @@ pub(crate) fn render(
                         .child(
                             div()
                                 .flex_shrink_0()
+                                .whitespace_nowrap()
                                 .text_color(rgb(palette.fg))
                                 .child(row.name),
                         )
-                        // Iced's `.ro-what`: the checkout shortens with an
-                        // ellipsis so the time and `×` stay inside the footer.
+                        // Iced's `.ro-what` gives checkout the flexible clipped area.
                         .child(
                             div()
                                 .debug_selector({
@@ -194,6 +180,7 @@ pub(crate) fn render(
                                 .flex_1()
                                 .min_w_0()
                                 .overflow_hidden()
+                                .whitespace_nowrap()
                                 .text_ellipsis()
                                 .child(row.what),
                         )
@@ -203,7 +190,7 @@ pub(crate) fn render(
                                     let id = row.id.clone();
                                     move || format!("roster-meta-{id}")
                                 })
-                                .flex_shrink_0()
+                                .whitespace_nowrap()
                                 .child(row.elapsed),
                         )
                         .children(show_dismiss.then(|| {
@@ -259,8 +246,8 @@ mod tests {
         }
     }
     #[test]
-    fn roster_matches_iced_backend_model_worktree_and_elapsed() {
-        let worker = |id: &str, state, started_at_ms, ended_at_ms| RosterEntry {
+    fn roster_matches_iced_role_backend_model_checkout_and_elapsed() {
+        let worker = |id: &str, state, started_at_ms: Option<u64>, ended_at_ms| RosterEntry {
             id: id.into(),
             name: "Worker · Codex".into(),
             model: "gpt-6.1-sol".into(),
@@ -271,36 +258,85 @@ mod tests {
             ended_at_ms,
         };
         let input = vec![
-            worker("new", WorkerState::Running, 2_000, None),
-            worker("old", WorkerState::Running, 1_000, None),
-            worker("done", WorkerState::Done, 10_000, Some(12_000)),
+            worker("new", WorkerState::Running, Some(2_000), None),
+            worker("old", WorkerState::Running, Some(1_000), None),
+            worker("done", WorkerState::Done, Some(10_000), Some(12_000)),
         ];
         let rows = rows(&input, 187_000);
         assert_eq!(
             rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
             ["new", "old", "done"]
         );
-        assert_eq!(rows[0].name, "Codex · gpt-6.1-sol");
-        assert_eq!(rows[0].what, "· in TRU-274");
-        assert!(rows.iter().all(|row| row.what == "· in TRU-274"));
+        assert_eq!(rows[0].name, "Worker · Codex · gpt-6.1-sol");
+        assert_eq!(rows[0].what, "· in /tmp/TRU-274");
+        assert!(rows.iter().all(|row| row.what == "· in /tmp/TRU-274"));
         assert_eq!(rows[1].elapsed, "3m 6s");
         assert_eq!(rows[2].elapsed, "2.0s");
         assert!(super::rows(&[], 0).is_empty());
         assert_eq!(elapsed(0), "0.0s");
         let row = super::rows(
-            &[worker("saved", WorkerState::Blocked, 0, Some(1_014_000))],
+            &[worker(
+                "saved",
+                WorkerState::Blocked,
+                Some(0),
+                Some(1_014_000),
+            )],
             2_000_000,
         )
         .remove(0);
         assert_eq!(
             format!("{} {} {} ×", row.name, row.what, row.elapsed),
-            "Codex · gpt-6.1-sol · in TRU-274 16m 54s ×"
+            "Worker · Codex · gpt-6.1-sol · in /tmp/TRU-274 16m 54s ×"
         );
     }
 
     #[test]
+    fn roster_keeps_review_and_consult_role_labels_and_iced_checkout_text() {
+        let entry = |name: &str, model: &str| RosterEntry {
+            id: name.into(),
+            name: name.into(),
+            model: model.into(),
+            checkout: "/work/TRU-274-long-checkout".into(),
+            activity: String::new(),
+            state: WorkerState::Running,
+            started_at_ms: Some(0),
+            ended_at_ms: None,
+        };
+
+        let rows = rows(
+            &[
+                entry("Review", "claude-sonnet"),
+                entry("Consult", "claude-opus"),
+                entry("Codex review", "gpt-6.1-sol"),
+            ],
+            1_000,
+        );
+
+        assert_eq!(rows[0].name, "Review · claude-sonnet");
+        assert_eq!(rows[1].name, "Consult · claude-opus");
+        assert_eq!(rows[2].name, "Codex review · gpt-6.1-sol");
+        assert!(
+            rows.iter()
+                .all(|row| row.what == "· in /work/TRU-274-long-checkout")
+        );
+        assert!(rows.iter().all(|row| row.elapsed == "1.0s"));
+
+        let missing_time = RosterEntry {
+            started_at_ms: None,
+            ..entry("Worker · Codex", "gpt-6.1-sol")
+        };
+        assert!(super::rows(&[missing_time], 1_000)[0].elapsed.is_empty());
+        let missing_end = RosterEntry {
+            state: WorkerState::Done,
+            started_at_ms: Some(0),
+            ..entry("Worker · Codex", "gpt-6.1-sol")
+        };
+        assert!(super::rows(&[missing_end], 1_000)[0].elapsed.is_empty());
+    }
+
+    #[test]
     fn roster_preserves_iced_order_for_live_waiting_ended_and_finished_rows() {
-        let worker = |id: &str, state, started_at_ms, ended_at_ms| RosterEntry {
+        let worker = |id: &str, state, started_at_ms: Option<u64>, ended_at_ms| RosterEntry {
             id: id.into(),
             name: "Worker · Codex".into(),
             model: "gpt-6.1-sol".into(),
@@ -311,9 +347,14 @@ mod tests {
             ended_at_ms,
         };
         let iced_order = vec![
-            worker("live", WorkerState::Running, 3_000, None),
-            worker("finished", WorkerState::Done, 4_000, Some(5_000)),
-            worker("waiting-ended", WorkerState::Blocked, 2_000, Some(6_000)),
+            worker("live", WorkerState::Running, Some(3_000), None),
+            worker("finished", WorkerState::Done, Some(4_000), Some(5_000)),
+            worker(
+                "waiting-ended",
+                WorkerState::Blocked,
+                Some(2_000),
+                Some(6_000),
+            ),
         ];
 
         let rows = rows(&iced_order, 10_000);

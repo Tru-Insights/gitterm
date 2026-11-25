@@ -1982,10 +1982,12 @@ impl Shell {
             ready_count: facts.ready,
             ready_news_count: facts.news_count,
             // Iced counts both saved parks and open work hidden in Repos.
-            parked_count: facts.parked
-                + self.owner.read(cx).saved_parked().len()
-                + hidden
-                + self.workspaces.iter().filter(|w| !w.on_bar()).count(),
+            parked_count: park::parked_count(
+                facts.parked,
+                &self.owner.read(cx).saved_parked(),
+                hidden,
+                self.workspaces.iter().filter(|w| !w.on_bar()).count(),
+            ),
             terminal_expanded: active.is_some_and(|w| w.store.regions.has_bottom(false)),
             terminal_running: active.is_some_and(|state| {
                 bottom_pane_ids(state, cx).iter().any(|id| {
@@ -5561,7 +5563,7 @@ fn roster_entries(
     let stamp = |s: &str| {
         gitterm_core::work::summary::parse_stamp(s)
             .and_then(|s| s.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_millis() as u64)
+            .map(|d| d.as_millis() as u64)
     };
     let mut workers: Vec<_> = workers
         .iter()
@@ -5672,7 +5674,7 @@ fn roster_entries(
                         &worker.created_at
                     },
                 ),
-                ended_at_ms: (!live).then(|| stamp(&worker.updated_at)),
+                ended_at_ms: (!live).then(|| stamp(&worker.updated_at)).flatten(),
             }
         })
         .collect();
@@ -5865,11 +5867,12 @@ mod tests {
             rows.iter()
                 .all(|row| row.checkout == "/other-repo/worktrees/real-worker-tree")
         );
-        let rendered = gitterm_gpui_chat::model::roster::rows(&rows, rows[0].started_at_ms + 1_000);
+        let rendered =
+            gitterm_gpui_chat::model::roster::rows(&rows, rows[0].started_at_ms.unwrap() + 1_000);
         assert!(
             rendered
                 .iter()
-                .all(|row| row.what == "· in real-worker-tree")
+                .all(|row| row.what == "· in /other-repo/worktrees/real-worker-tree")
         );
         assert_eq!(
             std::fs::read(source.path().join("tasks.json")).unwrap(),
@@ -5923,7 +5926,7 @@ mod tests {
         write_roster_fixture(source.path(), &document);
         let facts = data::RosterFacts::read_from(source.path()).unwrap();
         let rows = fixture_roster(&facts);
-        let start = rows[0].started_at_ms;
+        let start = rows[0].started_at_ms.unwrap();
         let first = gitterm_gpui_chat::model::roster::rows(&rows, start + 10_000);
         let next = gitterm_gpui_chat::model::roster::rows(&rows, start + 11_000);
         let elapsed = |rows: &[gitterm_gpui_chat::model::roster::RosterRow], id: &str| {
