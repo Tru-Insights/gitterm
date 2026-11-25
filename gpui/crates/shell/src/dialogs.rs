@@ -583,3 +583,28 @@ mod interaction_tests {
         assert!(cx.debug_bounds("bottom-quick-0").is_none());
     }
 }
+
+#[gpui::test]
+fn tru274_sidebar_tabs_use_proportional_ui_font_at_ui_size(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    cx.update(|cx| {
+        crate::theme::set_font_sizes(
+            crate::theme::FontSizes {
+                ui: 17.,
+                terminal: 14.,
+            },
+            cx,
+        );
+        for title in ["Work", "Files", "Find"] {
+            let mut button = crate::sidebar_tab_button(title, title, cx);
+            assert_eq!(
+                button.style().text.font_family.as_deref(),
+                Some(".SystemUIFont")
+            );
+            assert_eq!(button.style().text.font_size, Some(px(17.).into()));
+            assert_eq!(button.style().text.text_align, Some(gpui::TextAlign::Left));
+            let mut rail = crate::sidebar_tab_button(title, "▦", cx);
+            assert_eq!(rail.style().text.text_align, Some(gpui::TextAlign::Center));
+        }
+    });
+}

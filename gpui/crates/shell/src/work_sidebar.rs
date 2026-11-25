@@ -21,7 +21,7 @@ use gitterm_core::{
 };
 use gpui::{Entity, EventEmitter, Subscription, Window, div, prelude::*, px, rgb};
 use gpui_component::{
-    Sizable,
+    Disableable, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
 };
@@ -218,9 +218,6 @@ struct Row {
     indent: bool,
     editor: Option<PathBuf>,
     chat: bool,
-    /// Index into `badges` of the one fact that may shrink and ellipsize so
-    /// the row's title keeps its width (a chat's fan-out line).
-    shrinking_badge: Option<usize>,
 }
 
 impl Row {
@@ -656,15 +653,17 @@ impl WorkSidebar {
         let mut title = Row::text(&self.workspace.name);
         title.heading = true;
         title.control("✎", Action::Preview("✎".into()));
+        let reading = pane.is_some() && self.loading;
         title.control(
-            "↻",
-            Action::Emit(WorkSidebarOutcome::Refresh {
-                workspace: self.workspace.id,
-            }),
+            if reading { "reading…" } else { "↻" },
+            if pane.is_some() && !reading {
+                Action::Emit(WorkSidebarOutcome::Refresh {
+                    workspace: self.workspace.id,
+                })
+            } else {
+                Action::Inert
+            },
         );
-        if self.loading {
-            title.badges.push("reading…".into());
-        }
         let mut rows = vec![title];
         if let Some(error) = &self.error {
             rows.push(Row::text(error));
@@ -1552,7 +1551,6 @@ impl WorkSidebar {
             ));
         }
         if let Some(fan_out) = &chat.fan_out {
-            row.shrinking_badge = Some(row.badges.len());
             row.badges.push(summary::shorten(fan_out, 28));
         }
         row.badges.push(chats::format_age(chat.active));
@@ -1771,18 +1769,64 @@ impl WorkSidebar {
         }
     }
 
+    fn pr_number_button(
+        &self,
+        index: usize,
+        number: u64,
+        chars: usize,
+        action: Action,
+        cx: &Context<Self>,
+    ) -> Button {
+        let p = crate::theme::Palette::current(cx);
+        let small = crate::theme::font_sizes(cx).ui - 1.;
+        let mut label = div()
+            .font_family("Menlo")
+            .font_weight(gpui::FontWeight::NORMAL)
+            .text_size(px(small))
+            .text_color(rgb(p.muted))
+            .child(format!("#{number}"));
+        let style = label.style().clone();
+        Button::new(format!("work-pr-number-{index}"))
+            .debug_selector(move || format!("work-pr-number-{index}"))
+            .ghost()
+            .compact()
+            .p_0()
+            .h_auto()
+            .w(px((chars as f32 * small * 0.61).ceil()))
+            .flex_shrink_0()
+            .refine_style(&style)
+            .accessibility_label(format!("#{number}"))
+            .child(label)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.dispatch(action.clone(), window, cx);
+            }))
+    }
+
     fn button(&self, id: String, control: Control, repo_row: bool, cx: &Context<Self>) -> Button {
         let p = crate::theme::Palette::current(cx);
         let run = matches!(
             control.action,
             Action::Emit(WorkSidebarOutcome::RunRepoCommand { .. })
         );
+        let add = matches!(control.action, Action::Emit(WorkSidebarOutcome::AddRepo));
+        let refresh = matches!(control.label.as_str(), "↻" | "reading…");
+        let config = matches!(
+            control.action,
+            Action::Emit(WorkSidebarOutcome::OpenAgentConfig { .. })
+        );
         let mono = run
-            || matches!(
-                control.action,
-                Action::Emit(WorkSidebarOutcome::OpenAgentConfig { .. })
-            );
+            || refresh
+            || (matches!(control.action, Action::Edit(_)) && control.label == "+ run command")
+            || config;
         let color = control_color(&control.action, repo_row, &p);
+        let size = if add {
+            crate::theme::font_sizes(cx).ui - 2.
+        } else if refresh {
+            11.
+        } else {
+            10.
+        };
         let tooltip = match control.label.as_str() {
             "↗" => "Open chat",
             "×" => "Remove or dismiss",
@@ -1790,7 +1834,7 @@ impl WorkSidebar {
             "✎" => "Edit run command",
             "▸" => "Expand",
             "▾" => "Collapse",
-            "↻" => "Refresh",
+            "↻" | "reading…" => "Refresh",
             _ => &control.label,
         }
         .to_string();
@@ -1802,11 +1846,20 @@ impl WorkSidebar {
             .xsmall()
             .px_1()
             .flex_shrink_0()
-            .text_size(px(10.))
-            .when(mono, |button| button.font_family("Menlo"))
-            .when(repo_row && !mono, |button| {
-                button.font_family(".SystemUIFont")
+            .font_family(if mono { "Menlo" } else { ".SystemUIFont" })
+            .font_weight(gpui::FontWeight::NORMAL)
+            .text_size(px(size))
+            .when(config, |button| button.px_0().py(px(2.)))
+            .when(add, |button| {
+                button
+                    .border_1()
+                    .border_color(rgb(p.overlay0))
+                    .rounded(px(6.))
+                    .px(px(8.))
+                    .py(px(3.))
+                    .h_auto()
             })
+            .disabled(matches!(control.action, Action::Inert))
             .text_color(rgb(color))
             .tooltip(tooltip)
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -1833,24 +1886,103 @@ impl WorkSidebar {
                     cx,
                 );
             }))
-            .map(|button| {
-                if repo_row {
-                    // Like Iced, the run command keeps its full width and the
-                    // action slots give way, wrapping their text.
-                    button
-                        .h_auto()
-                        .accessibility_label(control.label.clone())
-                        .map(|button| {
-                            // Buttons keep their intrinsic one-line width; the
-                            // slot clips at the row's right edge instead.
-                            button.whitespace_nowrap().flex_shrink_0()
-                        })
-                        .child(div().whitespace_nowrap().child(control.label))
-                } else {
-                    button.label(control.label)
-                }
-            })
+            .h_auto()
+            .accessibility_label(control.label.clone())
+            // Button's internal label sets its own size; style the child too.
+            .child(
+                div()
+                    .whitespace_nowrap()
+                    .text_size(px(size))
+                    .child(control.label),
+            )
     }
+}
+
+fn chat_mark(index: usize, small: f32, p: &crate::theme::Palette) -> gpui::Div {
+    div()
+        .debug_selector(move || format!("work-chat-mark-{index}"))
+        .font_family(".SystemUIFont")
+        .text_size(px(small))
+        .text_color(rgb(p.mauve))
+        .flex_shrink_0()
+        .child("✦")
+}
+
+fn repo_name_label(label: gpui::Stateful<gpui::Div>, small: f32) -> gpui::Stateful<gpui::Div> {
+    label
+        .font_family(".SystemUIFont")
+        .text_size(px(small))
+        .font_weight(gpui::FontWeight::BOLD)
+        .whitespace_nowrap()
+}
+
+fn heading_label(
+    label: gpui::Stateful<gpui::Div>,
+    workspace: bool,
+    ui: f32,
+    p: &crate::theme::Palette,
+) -> gpui::Stateful<gpui::Div> {
+    label
+        .font_family(".SystemUIFont")
+        .font_weight(gpui::FontWeight::BOLD)
+        .text_size(px(if workspace { ui } else { ui - 1. }))
+        .text_color(rgb(if workspace { p.text } else { p.subtext0 }))
+}
+
+fn row_badge(
+    index: usize,
+    badge_index: usize,
+    badge: String,
+    chat: bool,
+    heading_size: Option<f32>,
+    p: &crate::theme::Palette,
+    warning: gpui::Hsla,
+) -> gpui::Div {
+    let color = if matches!(
+        badge.as_str(),
+        "conflicts" | "not read" | "changes requested" | "✗"
+    ) {
+        rgb(p.red).into()
+    } else if matches!(badge.as_str(), "draft" | "●") {
+        rgb(p.yellow).into()
+    } else if badge == "open" || badge == "✓" {
+        rgb(p.green).into()
+    } else if chat && badge.contains("edit") {
+        rgb(p.blue).into()
+    } else if badge.contains("dirty") {
+        warning
+    } else {
+        rgb(p.muted).into()
+    };
+    div()
+        .debug_selector(move || format!("work-badge-{index}-{badge_index}"))
+        .flex_shrink_0()
+        .font_family(if heading_size.is_some() || (chat && badge == "open") {
+            ".SystemUIFont"
+        } else {
+            "Menlo"
+        })
+        .text_size(px(heading_size.unwrap_or(10.)))
+        .text_color(color)
+        .child(badge)
+}
+
+fn row_detail(
+    index: usize,
+    detail_index: usize,
+    detail: String,
+    repo: bool,
+    chat: bool,
+    small: f32,
+    p: &crate::theme::Palette,
+) -> gpui::Div {
+    let latest = chat && detail.starts_with("↳ ");
+    div()
+        .debug_selector(move || format!("work-facts-{index}-{detail_index}"))
+        .font_family(if repo { "Menlo" } else { ".SystemUIFont" })
+        .text_size(px(if latest { small - 1. } else { 10. }))
+        .text_color(rgb(if latest { p.subtext0 } else { p.muted }))
+        .child(detail)
 }
 
 fn age_label(index: usize, age: String, repo: bool, p: &crate::theme::Palette) -> gpui::Div {
@@ -1886,6 +2018,9 @@ fn control_color(action: &Action, repo_row: bool, p: &crate::theme::Palette) -> 
         | Action::Emit(WorkSidebarOutcome::RemoveRepo { .. }) => p.muted,
         // Iced draws the repo row's Open in editor in text_muted.
         Action::Emit(WorkSidebarOutcome::OpenEditor { .. }) if repo_row => p.muted,
+        Action::Emit(WorkSidebarOutcome::AddRepo) => p.text,
+        Action::Emit(WorkSidebarOutcome::Refresh { .. }) => p.muted,
+        Action::Preview(label) if label == "✎" => p.muted,
         _ => p.blue,
     }
 }
@@ -1921,6 +2056,8 @@ impl Render for WorkSidebar {
             .map(|owner| owner.read(cx).running_work_chats(cx))
             .unwrap_or_default();
         let p = crate::theme::Palette::current(cx);
+        let ui = crate::theme::font_sizes(cx).ui;
+        let small = ui - 1.;
         let mut body = div()
             .id("work-sidebar")
             .debug_selector(|| "work-sidebar".into())
@@ -1934,7 +2071,9 @@ impl Render for WorkSidebar {
             .py_2()
             .bg(rgb(p.base))
             .text_color(rgb(p.text))
-            .text_size(px(12.))
+            .font_family(".SystemUIFont")
+            .font_weight(gpui::FontWeight::NORMAL)
+            .text_size(px(small))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" && this.editing.is_some() {
                     this.editing = None;
@@ -1947,6 +2086,12 @@ impl Render for WorkSidebar {
             let repo = matches!(row.action, Some(Action::Toggle(Fold::Repo(_))));
             let pr = row.pr_number.is_some();
             let compact = row.small || pr || repo;
+            let config = row.controls.iter().any(|c| {
+                matches!(
+                    c.action,
+                    Action::Emit(WorkSidebarOutcome::OpenAgentConfig { .. })
+                )
+            });
             let mut label = div()
                 .id(format!("work-label-{index}"))
                 .debug_selector(|| format!("work-label-{index}"))
@@ -1962,6 +2107,24 @@ impl Render for WorkSidebar {
                         },
                     )]),
                 );
+            } else if row.chat {
+                // Iced Text defaults to word wrapping. GPUI's text fallback
+                // splits oversized words into glyphs, so keep words atomic.
+                // shortcut: whitespace boundaries; use Unicode line-break
+                // spans if titles need punctuation/CJK break opportunities.
+                label = label.flex().flex_wrap().overflow_hidden().children(
+                    row.label
+                        .strip_prefix("✦ ")
+                        .unwrap()
+                        .split_inclusive(char::is_whitespace)
+                        .map(|word| {
+                            div()
+                                .flex_shrink_0()
+                                .whitespace_nowrap()
+                                .child(word.to_string())
+                        })
+                        .collect::<Vec<_>>(),
+                );
             } else {
                 label = label.child(row.label);
             }
@@ -1969,29 +2132,24 @@ impl Render for WorkSidebar {
                 label = label
                     .flex_1()
                     .font_family(".SystemUIFont")
-                    .text_size(px(12.))
+                    .text_size(px(small))
                     .whitespace_normal()
                     .line_clamp(2)
                     .overflow_hidden();
             }
             if row.chat {
-                // Wraps by word like Iced's Fill title. A `flex_1` title has a
-                // basis of zero, so the fixed facts took the whole row and it
-                // wrapped one letter per line. Start from the full row instead
-                // and give way to the facts only down to half of it; the
-                // fan-out line (shrink factor 2) gives way before the title.
+                // Iced's title is Fill; the mark, open, fan-out and age take
+                // their intrinsic widths first (src/main.rs:40545).
                 label = label
-                    .flex_grow(1.)
-                    .flex_shrink(1.)
-                    .flex_basis(gpui::relative(1.))
-                    .min_w(gpui::relative(0.5))
+                    .flex_1()
+                    .min_w_0()
                     .font_family(".SystemUIFont")
-                    .text_size(px(12.))
+                    .text_size(px(small))
                     .whitespace_normal();
             }
             if row.small {
                 label = label
-                    .flex_1()
+                    .when(!config, |label| label.flex_1())
                     .font_family(".SystemUIFont")
                     .text_size(px(10.));
             }
@@ -2000,13 +2158,10 @@ impl Render for WorkSidebar {
             }
             if repo {
                 // Iced's name slot never shrinks, wraps or ellipsizes.
-                label = label
-                    .font_family("Menlo")
-                    .text_size(px(12.))
-                    .whitespace_nowrap();
+                label = repo_name_label(label, small);
             }
-            if row.heading || repo {
-                label = label.font_weight(gpui::FontWeight::BOLD);
+            if row.heading {
+                label = heading_label(label, index == 0, ui, &p);
             }
             if row.indent {
                 // Iced shortens, then lets the branch name wrap in a fill slot.
@@ -2020,25 +2175,16 @@ impl Render for WorkSidebar {
                 .items_center()
                 .gap(px(6.));
             if let Some((number, chars)) = row.pr_number {
-                line = line.child(
-                    self.button(
-                        format!("work-pr-number-{index}"),
-                        Control {
-                            label: format!("#{number}"),
-                            action: row.pr_link.take().expect("PR number has viewer action"),
-                        },
-                        false,
-                        cx,
-                    )
-                    .debug_selector(|| format!("work-pr-number-{index}"))
-                    .p_0()
-                    .h_auto()
-                    .w(px(chars as f32 * 12. * 0.61))
-                    .text_size(px(12.))
-                    .flex_shrink_0()
-                    .font_family("Menlo")
-                    .text_color(rgb(p.muted)),
-                );
+                line = line.child(self.pr_number_button(
+                    index,
+                    number,
+                    chars,
+                    row.pr_link.take().expect("PR number has viewer action"),
+                    cx,
+                ));
+            }
+            if row.chat {
+                line = line.child(chat_mark(index, small, &p));
             }
             if repo {
                 let action = row.action.take().unwrap();
@@ -2057,7 +2203,7 @@ impl Render for WorkSidebar {
                         }))
                         .child(label),
                 );
-            } else {
+            } else if !config {
                 line = line.child(label);
             }
             if let Some(run) = row.run {
@@ -2082,43 +2228,16 @@ impl Render for WorkSidebar {
                         .flex_1(),
                 );
             }
-            let shrinking_badge = row.shrinking_badge;
             for (badge_index, badge) in row.badges.into_iter().enumerate() {
-                let color = if matches!(
-                    badge.as_str(),
-                    "conflicts" | "not read" | "changes requested" | "✗"
-                ) {
-                    rgb(p.red).into()
-                } else if matches!(badge.as_str(), "draft" | "●") {
-                    rgb(p.yellow).into()
-                } else if badge == "open" || badge == "✓" {
-                    rgb(p.green).into()
-                } else if badge.contains("dirty") {
-                    gpui_component::Theme::global(cx).warning
-                } else {
-                    rgb(p.muted).into()
-                };
-                let shrinks = shrinking_badge == Some(badge_index);
-                line = line.child(
-                    div()
-                        .debug_selector(|| format!("work-badge-{index}-{badge_index}"))
-                        .map(|badge| {
-                            if shrinks {
-                                badge
-                                    .flex_shrink(2.)
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                            } else {
-                                badge.flex_shrink_0()
-                            }
-                        })
-                        .font_family("Menlo")
-                        .text_size(px(10.))
-                        .text_color(color)
-                        .child(badge),
-                );
+                line = line.child(row_badge(
+                    index,
+                    badge_index,
+                    badge,
+                    row.chat,
+                    row.heading.then_some(small - 1.),
+                    &p,
+                    gpui_component::Theme::global(cx).warning,
+                ));
             }
             if row.heading {
                 line = line.child(div().flex_1());
@@ -2133,7 +2252,7 @@ impl Render for WorkSidebar {
                 .flex_shrink_1()
                 .overflow_hidden()
                 .items_center()
-                .gap(px(6.));
+                .gap(px(2.));
             // The repo row's × sits beside the disclosure, outside the clipped
             // actions slot, so a narrow sidebar never hides it (TRU-274).
             let mut remove = None;
@@ -2223,6 +2342,7 @@ impl Render for WorkSidebar {
                 .flex_col()
                 .rounded_md()
                 .px_1()
+                .when(config, |block| block.px_0())
                 .py(px(if row.small {
                     0.
                 } else if compact {
@@ -2240,15 +2360,15 @@ impl Render for WorkSidebar {
                 block = block.ml_2();
             }
             for (detail_index, detail) in row.details.into_iter().enumerate() {
-                let mut detail = div()
-                    .debug_selector(|| format!("work-facts-{index}-{detail_index}"))
-                    .text_size(px(10.))
-                    .text_color(rgb(p.muted))
-                    .child(detail);
-                if repo {
-                    detail = detail.font_family("Menlo");
-                }
-                block = block.child(detail);
+                block = block.child(row_detail(
+                    index,
+                    detail_index,
+                    detail,
+                    repo,
+                    row.chat,
+                    small,
+                    &p,
+                ));
             }
             for (detail_index, detail) in row.detail_rows.into_iter().enumerate() {
                 let mut line = div()

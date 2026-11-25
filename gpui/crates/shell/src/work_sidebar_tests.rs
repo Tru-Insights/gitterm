@@ -2746,7 +2746,10 @@ fn expanded_repo_row_name_and_run_never_shrink_but_actions_wrap(cx: &mut gpui::T
     let (name, run) = measure(cx, 300.);
     assert_eq!(name, name_wide, "repo name keeps its full width and height");
     assert_eq!(run, run_wide, "run command keeps its full width and height");
-    assert_eq!(name.height, run.height, "one line each");
+    assert!(
+        name.height >= run.height,
+        "Iced uses UI-small for the name and 10px for the run command"
+    );
     let disclosure = cx
         .debug_bounds(Box::leak(format!("work-fold-{index}-▾").into_boxed_str()))
         .unwrap();
@@ -2885,11 +2888,10 @@ fn long_chat_entry(id: &str, title: &str) -> ChatIndexEntry {
 }
 
 #[gpui::test]
-fn chat_titles_wrap_by_word_in_at_least_half_the_row_at_310pt_and_240pt(
-    cx: &mut gpui::TestAppContext,
-) {
+fn chat_titles_wrap_in_remaining_fill_width_at_310pt_and_240pt(cx: &mut gpui::TestAppContext) {
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
+    cx.update(|cx| crate::theme::apply(true, None, cx));
     let sidebar = fixture(false);
     // "recent" is open in the fixture, so it carries open + fan-out + age.
     replace_entries(
@@ -2931,19 +2933,20 @@ fn chat_titles_wrap_by_word_in_at_least_half_the_row_at_310pt_and_240pt(
             let line = cx
                 .debug_bounds(Box::leak(format!("work-line-{index}").into_boxed_str()))
                 .unwrap();
-            // Iced wraps the Fill title by word; per-letter wrapping made a
-            // ~75-character title dozens of lines tall; by word it is at most 5.
+            // Iced lays out fixed facts first, then wraps the Fill title in
+            // the remaining space. There is no minimum half-row title width;
+            // rich metadata can exhaust that space at 240pt.
             assert!(
                 title.size.height > line_height * 1.5,
                 "{width}pt chat {index} long title wraps like Iced: {title:?}"
             );
             assert!(
-                title.size.height <= line_height * 7.,
-                "{width}pt chat {index} title wraps by word, not per letter: {title:?}"
+                title.size.height <= line_height * 16.,
+                "{width}pt title wraps words, never individual glyphs: {title:?}"
             );
             assert!(
-                title.size.width > line.size.width * 0.5,
-                "{width}pt chat {index} title keeps most of the row: {title:?} in {line:?}"
+                title.size.width >= px(0.) && title.size.width < line.size.width * 0.5,
+                "{width}pt chat {index} title gives way to intrinsic facts: {title:?} in {line:?}"
             );
             for badge_index in 0..badges.len() {
                 let badge = cx
@@ -3011,7 +3014,9 @@ fn at_310pt_expanded_repo_actions_keep_one_line_and_age_wraps_by_word(
     // Name and run command keep their width, so the clipped actions slot may
     // be pushed wholly past the wrapper's edge; it never overlaps ×.
     assert!(
-        actions.right() <= remove.left() || actions.left() >= remove.right(),
+        actions.size.width == px(0.)
+            || actions.right() <= remove.left()
+            || actions.left() >= remove.right(),
         "× clear of actions: {actions:?} vs {remove:?}"
     );
     assert!(remove.right() <= disclosure.left(), "× clear of disclosure");
@@ -3312,4 +3317,349 @@ fn delegation_dismiss_and_stop_go_through_service_context_without_writes(
         "Dismiss · not wired in the GPUI preview"
     );
     stop_preview_host(&owner, cx);
+}
+
+#[test]
+fn tru274_loading_replaces_refresh_control_without_a_title_badge() {
+    let mut sidebar = fixture(true);
+    sidebar.loading = true;
+    let rows = sidebar.rows();
+    assert!(rows[0].badges.is_empty());
+    let refresh = rows[0]
+        .controls
+        .iter()
+        .find(|c| c.label == "reading…")
+        .unwrap();
+    assert_eq!(refresh.action, Action::Inert);
+    sidebar.loading = false;
+    assert_eq!(
+        control(&sidebar, "Parity", "↻"),
+        Action::Emit(WorkSidebarOutcome::Refresh { workspace: 7 })
+    );
+    *sidebar.state.borrow_mut() = State::default();
+    sidebar.loading = true;
+    assert!(sidebar.rows()[0].badges.is_empty());
+    assert_eq!(control(&sidebar, "Parity", "↻"), Action::Inert);
+}
+
+#[gpui::test]
+fn tru274_skills_link_starts_at_the_left_edge(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let (_sidebar, cx) = cx.add_window_view(|_, _| {
+        let mut sidebar = fixture(true);
+        sidebar.agent_line = Some("skills 14 · MCPs 0 · hooks 4".into());
+        sidebar
+    });
+    cx.simulate_resize(gpui::size(px(600.), px(1600.)));
+    draw_sidebar(cx);
+    let link = cx.debug_bounds("work-agent-config").unwrap();
+    let body = cx.debug_bounds("work-sidebar").unwrap();
+    assert_eq!(
+        link.left() - body.left(),
+        px(8.),
+        "Iced content's 8px left padding"
+    );
+}
+
+#[test]
+fn tru274_chat_mark_uses_iced_mauve_in_both_themes() {
+    for (dark, mauve) in [(true, 0xcba6f7), (false, 0x8839ef)] {
+        let p = crate::theme::Palette::for_mode(dark);
+        let mut mark = chat_mark(0, 16., &p);
+        assert_eq!(mark.style().text.color, Some(rgb(mauve).into()));
+        assert_eq!(
+            mark.style().text.font_family.as_deref(),
+            Some(".SystemUIFont")
+        );
+        assert_eq!(mark.style().text.font_size, Some(px(16.).into()));
+    }
+}
+
+#[gpui::test]
+fn tru274_pr_number_tracks_ui_small_size_and_iced_menlo_colour(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let sidebar = cx.new(|_| fixture(true));
+    cx.update(|cx| {
+        crate::theme::set_font_sizes(
+            crate::theme::FontSizes {
+                ui: 17.,
+                terminal: 14.,
+            },
+            cx,
+        );
+        sidebar.update(cx, |sidebar, cx| {
+            let mut number = sidebar.pr_number_button(0, 183, 4, Action::Inert, cx);
+            assert_eq!(number.style().text.font_size, Some(px(16.).into()));
+            assert_eq!(number.style().text.font_family.as_deref(), Some("Menlo"));
+            assert_eq!(
+                number.style().text.color,
+                Some(rgb(crate::theme::Palette::current(cx).muted).into())
+            );
+            assert_eq!(number.style().size.width, Some(px(40.).into()));
+        });
+    });
+}
+
+#[gpui::test]
+fn tru274_add_repo_and_run_command_use_iced_control_styles(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let sidebar = cx.new(|_| fixture(true));
+    cx.update(|cx| {
+        crate::theme::set_font_sizes(
+            crate::theme::FontSizes {
+                ui: 17.,
+                terminal: 14.,
+            },
+            cx,
+        );
+        sidebar.update(cx, |sidebar, cx| {
+            let mut add = sidebar.button(
+                "add".into(),
+                Control {
+                    label: "+ Add repo…".into(),
+                    action: Action::Emit(WorkSidebarOutcome::AddRepo),
+                },
+                false,
+                cx,
+            );
+            assert_eq!(add.style().text.font_size, Some(px(15.).into()));
+            assert_eq!(
+                add.style().text.font_family.as_deref(),
+                Some(".SystemUIFont")
+            );
+            assert_eq!(
+                add.style().text.color,
+                Some(rgb(crate::theme::Palette::current(cx).text).into())
+            );
+            assert_eq!(add.style().border_widths.top, Some(px(1.).into()));
+            let mut run = sidebar.button(
+                "edit".into(),
+                Control {
+                    label: "+ run command".into(),
+                    action: Action::Edit("/fixture".into()),
+                },
+                true,
+                cx,
+            );
+            assert_eq!(run.style().text.font_family.as_deref(), Some("Menlo"));
+        });
+    });
+}
+
+#[gpui::test]
+fn tru274_chat_fanout_keeps_iced_intrinsic_width_at_310pt(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let sidebar = fixture(false);
+    replace_entries(
+        &sidebar,
+        vec![long_chat_entry(
+            "recent",
+            "Revisiting GPUI sidebar parity and keep going on the remaining row layouts",
+        )],
+    );
+    let index = sidebar.rows().iter().position(|r| r.chat).unwrap();
+    let (sidebar, cx) = cx.add_window_view(|_, _| sidebar);
+    let badge_index = sidebar.read_with(cx, |s, _| {
+        s.rows()[index]
+            .badges
+            .iter()
+            .position(|b| b.contains("subagents"))
+            .unwrap()
+    });
+    let selector = Box::leak(format!("work-badge-{index}-{badge_index}").into_boxed_str());
+    cx.simulate_resize(gpui::size(px(1200.), px(1600.)));
+    draw_sidebar(cx);
+    let wide = cx.debug_bounds(selector).unwrap();
+    cx.simulate_resize(gpui::size(px(310.), px(1600.)));
+    draw_sidebar(cx);
+    let narrow = cx.debug_bounds(selector).unwrap();
+    assert_eq!(
+        wide.size.width, narrow.size.width,
+        "fan-out must not gain an extra ellipsis"
+    );
+    let age = cx
+        .debug_bounds(Box::leak(
+            format!("work-badge-{index}-{}", badge_index + 1).into_boxed_str(),
+        ))
+        .unwrap();
+    assert!(age.left() >= narrow.right(), "age follows fan-out");
+}
+
+#[test]
+fn tru274_chat_order_is_shared_latest_root_or_child_then_id() {
+    let sidebar = fixture(false);
+    let now = SystemTime::now();
+    let mut hello = entry("a", "hello", now - Duration::from_secs(3600));
+    let discussion = entry(
+        "z",
+        "Revisiting GPUI discussion",
+        now - Duration::from_secs(60),
+    );
+    let mut child = entry("child", "worker", now);
+    child.root_id = Some(hello.id.clone());
+    hello
+        .facts
+        .as_mut()
+        .unwrap()
+        .children
+        .push(gitterm_core::chat_facts::ChatChild {
+            session_id: child.id.clone(),
+            kind: ChildKind::Worker,
+            delegation_id: None,
+            task_id: None,
+            title: None,
+        });
+    replace_entries(&sidebar, vec![discussion, child, hello]);
+    let titles = || {
+        sidebar
+            .rows()
+            .into_iter()
+            .filter(|r| r.chat)
+            .map(|r| r.label)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(titles(), ["✦ hello", "✦ Revisiting GPUI discussion"]);
+    replace_entries(
+        &sidebar,
+        vec![
+            entry("z", "Revisiting GPUI discussion", now),
+            entry("a", "hello", now),
+        ],
+    );
+    assert_eq!(titles(), ["✦ hello", "✦ Revisiting GPUI discussion"]);
+}
+
+#[test]
+fn tru274_chat_fields_and_badge_styles_match_iced() {
+    let mut sidebar = fixture(true);
+    let now = SystemTime::now();
+    let mut chat = summary::coordinators(
+        &[&long_chat_entry("recent", "A title")],
+        &[long_chat_entry("recent", "A title")],
+        now,
+    )
+    .remove(0);
+    chat.latest = Some("latest line".into());
+    sidebar.open.insert(Fold::Chat("recent".into()));
+    let row = sidebar.chat_row(&chat, false, true, Some(12));
+    assert_eq!(
+        row.badges,
+        [
+            "open".to_string(),
+            "12 edits here".into(),
+            summary::shorten(chat.fan_out.as_ref().unwrap(), 28),
+            chats::format_age(chat.active)
+        ]
+    );
+    assert_eq!(row.details[0], "↳ latest line");
+    assert_eq!(row.controls[0].label, "↗");
+    for dark in [true, false] {
+        let p = crate::theme::Palette::for_mode(dark);
+        for (badge, chat, family, color) in [
+            ("open", true, ".SystemUIFont", p.green),
+            ("12 edits here", true, "Menlo", p.blue),
+            ("3 subagents · 317 workers · …", true, "Menlo", p.muted),
+            ("now", true, "Menlo", p.muted),
+            ("not read", false, "Menlo", p.red),
+            ("conflicts", false, "Menlo", p.red),
+            ("draft", false, "Menlo", p.yellow),
+        ] {
+            let mut badge = row_badge(0, 0, badge.into(), chat, None, &p, rgb(p.yellow).into());
+            assert_eq!(badge.style().text.font_family.as_deref(), Some(family));
+            assert_eq!(badge.style().text.font_size, Some(px(10.).into()));
+            assert_eq!(badge.style().text.color, Some(rgb(color).into()));
+        }
+    }
+}
+
+#[test]
+fn tru274_chat_latest_and_children_use_iced_detail_styles() {
+    for dark in [true, false] {
+        let p = crate::theme::Palette::for_mode(dark);
+        for (index, detail, size, color) in [
+            (0, "↳ latest line", 15., p.subtext0),
+            (1, "   worker · title · now", 10., p.muted),
+            (0, "   worker · no latest · now", 10., p.muted),
+        ] {
+            let mut text = row_detail(0, index, detail.into(), false, true, 16., &p);
+            assert_eq!(
+                text.style().text.font_family.as_deref(),
+                Some(".SystemUIFont")
+            );
+            assert_eq!(text.style().text.font_size, Some(px(size).into()));
+            assert_eq!(text.style().text.color, Some(rgb(color).into()));
+        }
+    }
+}
+
+#[test]
+fn tru274_section_headings_use_iced_secondary_text_and_ui_count() {
+    for dark in [true, false] {
+        let p = crate::theme::Palette::for_mode(dark);
+        let mut section = heading_label(div().id("section"), false, 17., &p);
+        assert_eq!(section.style().text.color, Some(rgb(p.subtext0).into()));
+        assert_eq!(section.style().text.font_size, Some(px(16.).into()));
+        assert_eq!(
+            section.style().text.font_weight,
+            Some(gpui::FontWeight::BOLD)
+        );
+        let mut title = heading_label(div().id("workspace"), true, 17., &p);
+        assert_eq!(title.style().text.color, Some(rgb(p.text).into()));
+        assert_eq!(title.style().text.font_size, Some(px(17.).into()));
+        let mut count = row_badge(
+            0,
+            0,
+            "14".into(),
+            false,
+            Some(15.),
+            &p,
+            rgb(p.yellow).into(),
+        );
+        assert_eq!(
+            count.style().text.font_family.as_deref(),
+            Some(".SystemUIFont")
+        );
+        assert_eq!(count.style().text.font_size, Some(px(15.).into()));
+        assert_eq!(count.style().text.color, Some(rgb(p.muted).into()));
+    }
+}
+
+#[test]
+fn tru274_repo_name_uses_iced_bold_proportional_ui_small() {
+    let mut label = repo_name_label(div().id("name"), 16.);
+    assert_eq!(
+        label.style().text.font_family.as_deref(),
+        Some(".SystemUIFont")
+    );
+    assert_eq!(label.style().text.font_size, Some(px(16.).into()));
+    assert_eq!(label.style().text.font_weight, Some(gpui::FontWeight::BOLD));
+}
+
+#[gpui::test]
+fn tru274_repo_actions_use_iced_two_pixel_spacing(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let (sidebar, cx) = cx.add_window_view(|_, _| {
+        let mut sidebar = fixture(true);
+        sidebar.open.insert(Fold::Repo("/repos/home".into()));
+        sidebar
+    });
+    let index = sidebar.read_with(cx, |s, _| {
+        s.rows().iter().position(|r| r.label == "home").unwrap()
+    });
+    cx.simulate_resize(gpui::size(px(1200.), px(1600.)));
+    draw_sidebar(cx);
+    let editor = cx
+        .debug_bounds(Box::leak(
+            format!("work-control-{index}-0").into_boxed_str(),
+        ))
+        .unwrap();
+    let command = cx
+        .debug_bounds(Box::leak(
+            format!("work-control-{index}-1").into_boxed_str(),
+        ))
+        .unwrap();
+    assert_eq!(command.left() - editor.right(), px(2.));
 }

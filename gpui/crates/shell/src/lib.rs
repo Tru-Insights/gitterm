@@ -92,7 +92,7 @@ use gpui::{
     size,
 };
 use gpui_component::{
-    Root,
+    Root, StyledExt,
     button::{Button, ButtonVariants},
     dock::{
         DockArea, DockEvent, DockLayout, DockPlacement, DockSkin, PanelId, PanelStyle,
@@ -1498,6 +1498,25 @@ fn pane_visible(state: &WorkspaceDock, kind: &str, cx: &App) -> bool {
         cx,
     )
 }
+fn sidebar_tab_button(title: &'static str, label: &'static str, cx: &App) -> Button {
+    let mut text = div()
+        .w_full()
+        .text_align(if label == title {
+            gpui::TextAlign::Left
+        } else {
+            gpui::TextAlign::Center
+        })
+        .font_family(".SystemUIFont")
+        .text_size(px(theme::font_sizes(cx).ui))
+        .font_weight(gpui::FontWeight::NORMAL)
+        .child(label);
+    let style = text.style().clone();
+    Button::new(title)
+        .accessibility_label(label)
+        .refine_style(&style)
+        .child(text)
+}
+
 fn pane_id_visible(state: &WorkspaceDock, id: &str, cx: &App) -> bool {
     use gpui_component::dock::{PanelInfo, PanelState};
     fn visible(node: &PanelState, id: &str) -> bool {
@@ -2429,32 +2448,34 @@ impl Shell {
                         gpui::transparent_black()
                     })
                     .child(
-                        Button::new(title)
-                            .debug_selector(move || title.into())
-                            .ghost()
-                            .label(if regions.sidebar_collapsed {
+                        sidebar_tab_button(
+                            title,
+                            if regions.sidebar_collapsed {
                                 icon
                             } else {
                                 title
-                            })
-                            .h(px(if regions.sidebar_collapsed { 40. } else { 26. }))
-                            .w_full()
-                            .when(!regions.sidebar_collapsed, |s| {
-                                s.justify_start().px(px(10.))
-                            })
-                            .when(regions.sidebar_collapsed, |s| s.justify_center().px_0())
-                            .rounded_none()
-                            .text_size(px(12.))
-                            .text_color(rgb(if selected { p.text } else { p.subtext0 }))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.update_regions(
-                                    |regions| {
-                                        regions.sidebar_mode = mode;
-                                        regions.sidebar_collapsed = false;
-                                    },
-                                    cx,
-                                )
-                            })),
+                            },
+                            cx,
+                        )
+                        .debug_selector(move || title.into())
+                        .ghost()
+                        .h(px(if regions.sidebar_collapsed { 40. } else { 26. }))
+                        .w_full()
+                        .when(!regions.sidebar_collapsed, |s| {
+                            s.justify_start().px(px(10.))
+                        })
+                        .when(regions.sidebar_collapsed, |s| s.justify_center().px_0())
+                        .rounded_none()
+                        .text_color(rgb(if selected { p.text } else { p.subtext0 }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.update_regions(
+                                |regions| {
+                                    regions.sidebar_mode = mode;
+                                    regions.sidebar_collapsed = false;
+                                },
+                                cx,
+                            )
+                        })),
                     ),
             );
         }
