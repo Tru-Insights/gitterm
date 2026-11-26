@@ -5,7 +5,9 @@ use std::sync::OnceLock;
 
 pub const APP_NAME: &str = "GitTerm V6";
 pub const WINDOW_TITLE: &str = "GitTerm V6 Development";
-pub use gitterm_core::config_paths::{default_config_dir, resolve_dir_override, CONFIG_DIR_ENV};
+#[cfg(test)]
+pub use gitterm_core::config_paths::default_config_dir;
+pub use gitterm_core::config_paths::{resolve_dir_override, CONFIG_DIR_ENV};
 pub const INSTANCE_ID_ENV: &str = "GITTERM_V6_INSTANCE_ID";
 
 /// The V5 runtime's config dir and its override variable. V6 only reads
@@ -42,10 +44,9 @@ fn resolve_config_dir_override(raw: Option<std::ffi::OsString>) -> Option<PathBu
 
 /// Get the shared (non-instance-specific) config directory
 pub fn global_config_dir() -> PathBuf {
-    if let Some(dir) = config_dir_override() {
-        return dir.clone();
-    }
-    default_config_dir(&dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+    gitterm_core::config_paths::desktop_config_dir()
+        .expect("resolve desktop state root at startup")
+        .to_path_buf()
 }
 
 /// Get the base config directory for this instance

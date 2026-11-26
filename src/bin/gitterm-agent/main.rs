@@ -62,6 +62,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
 fn parse_serve_config(
     args: impl IntoIterator<Item = String>,
 ) -> Result<AgentServerConfig, Box<dyn Error + Send + Sync>> {
+    let storage = agent_config_dir()?;
     let file_config = AgentConfigFile::load().unwrap_or_default();
     let mut bind_addr = std::env::var(AGENT_ADDR_ENV)
         .ok()
@@ -102,14 +103,13 @@ fn parse_serve_config(
     }
 
     let bind_addr = bind_addr.parse::<SocketAddr>()?;
-    let phone = match phone_bind_addr(bind_addr, phone_addr.as_deref())? {
-        Some((phone_addr, required)) => Some(PhoneServerConfig {
+    let phone = phone_bind_addr(bind_addr, phone_addr.as_deref())?.map(|(phone_addr, required)| {
+        PhoneServerConfig {
             bind_addr: phone_addr,
-            store_dir: agent_config_dir()?,
+            store_dir: storage,
             required,
-        }),
-        None => None,
-    };
+        }
+    });
 
     Ok(AgentServerConfig {
         claude_chat_limits: Default::default(),
@@ -149,7 +149,10 @@ fn phone_bind_addr(
 fn agent_config_dir() -> Result<std::path::PathBuf, Box<dyn Error + Send + Sync>> {
     if let Ok(dir) = std::env::var(AGENT_CONFIG_DIR_ENV) {
         if !dir.trim().is_empty() {
-            return Ok(dir.into());
+            return Ok(gitterm_core::state_lock::separate_agent_root(
+                std::path::Path::new(&dir),
+                gitterm_core::config_paths::desktop_config_dir()?,
+            )?);
         }
     }
     AgentConfigFile::dir().ok_or_else(|| {
@@ -201,6 +204,62 @@ Config:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_storage_override_child() {
+        let Ok(expect) = std::env::var("GITTERM_AGENT_STORAGE_TEST") else {
+            return;
+        };
+        let result =
+            parse_serve_config(["--phone-addr", "off", "--token", "fixture"].map(String::from));
+        if expect == "refuse" {
+            let error = result.err().expect("overlapping override must be refused");
+            assert!(error.to_string().contains("overlaps desktop state root"));
+        } else {
+            if let Err(error) = result {
+                panic!("{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn storage_override_refuses_desktop_ancestors_children_and_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let desktop = temp.path().join("desktop");
+        std::fs::create_dir(&desktop).unwrap();
+        let mut cases = vec![
+            (desktop.clone(), "refuse"),
+            (desktop.join("phones"), "refuse"),
+            (temp.path().to_path_buf(), "refuse"),
+            (temp.path().join("agent"), "allow"),
+        ];
+        #[cfg(unix)]
+        {
+            let alias = temp.path().join("alias");
+            std::os::unix::fs::symlink(&desktop, &alias).unwrap();
+            cases.push((alias.join("phones"), "refuse"));
+        }
+        for (storage, expect) in cases {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::agent_storage_override_child",
+                    "--nocapture",
+                ])
+                .env("GITTERM_AGENT_STORAGE_TEST", expect)
+                .env("HOME", temp.path().join("home"))
+                .env(AGENT_CONFIG_DIR_ENV, storage)
+                .env(gitterm_core::config_paths::CONFIG_DIR_ENV, &desktop)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+        assert_eq!(std::fs::read_dir(&desktop).unwrap().count(), 0);
+    }
 
     #[test]
     fn the_phone_app_defaults_to_the_next_port() {
