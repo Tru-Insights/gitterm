@@ -147,17 +147,18 @@ fn phone_bind_addr(
 }
 
 fn agent_config_dir() -> Result<std::path::PathBuf, Box<dyn Error + Send + Sync>> {
-    if let Ok(dir) = std::env::var(AGENT_CONFIG_DIR_ENV) {
-        if !dir.trim().is_empty() {
-            return Ok(gitterm_core::state_lock::separate_agent_root(
-                std::path::Path::new(&dir),
-                gitterm_core::config_paths::desktop_config_dir()?,
-            )?);
-        }
-    }
-    AgentConfigFile::dir().ok_or_else(|| {
-        format!("no home directory for the agent config dir; set {AGENT_CONFIG_DIR_ENV}").into()
-    })
+    let storage = std::env::var(AGENT_CONFIG_DIR_ENV)
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(AgentConfigFile::dir)
+        .ok_or_else(|| {
+            format!("no home directory for the agent config dir; set {AGENT_CONFIG_DIR_ENV}")
+        })?;
+    Ok(gitterm_core::state_lock::separate_agent_root(
+        &storage,
+        gitterm_core::config_paths::desktop_config_dir()?,
+    )?)
 }
 
 fn next_arg(
@@ -213,13 +214,42 @@ mod tests {
         let result =
             parse_serve_config(["--phone-addr", "off", "--token", "fixture"].map(String::from));
         if expect == "refuse" {
-            let error = result.err().expect("overlapping override must be refused");
+            let error = result.expect_err("overlapping storage must be refused");
             assert!(error.to_string().contains("overlaps desktop state root"));
         } else {
             if let Err(error) = result {
                 panic!("{error}");
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_storage_symlink_to_desktop_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let desktop = temp.path().join("desktop");
+        let home = temp.path().join("home");
+        std::fs::create_dir(&desktop).unwrap();
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        std::os::unix::fs::symlink(&desktop, home.join(".config/gitterm-v6-agent")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::agent_storage_override_child",
+                "--nocapture",
+            ])
+            .env("GITTERM_AGENT_STORAGE_TEST", "refuse")
+            .env("HOME", home)
+            .env_remove(AGENT_CONFIG_DIR_ENV)
+            .env(gitterm_core::config_paths::CONFIG_DIR_ENV, &desktop)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(std::fs::read_dir(&desktop).unwrap().count(), 0);
     }
 
     #[test]

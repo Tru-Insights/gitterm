@@ -15,6 +15,11 @@ fn store_root() -> Result<PathBuf, String> {
 }
 #[cfg(not(test))]
 fn store_root() -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("GITTERM_V6_CONFIG_DIR").filter(|s| !s.is_empty()) {
+        if !Path::new(&path).is_absolute() {
+            return Err("snapshot config directory must be absolute".into());
+        }
+    }
     Ok(gitterm_core::config_paths::desktop_config_dir()
         .map_err(|error| error.to_string())?
         .join("turn-snapshots"))

@@ -80,6 +80,8 @@ pub fn separate_agent_root(agent: &Path, desktop: &Path) -> io::Result<PathBuf> 
         || desktop.starts_with(&agent)
         || directory_contains(&desktop, &agent)?
         || directory_contains(&agent, &desktop)?
+        || component_prefix_ignore_case(&agent, &desktop)
+        || component_prefix_ignore_case(&desktop, &agent)
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -91,6 +93,18 @@ pub fn separate_agent_root(agent: &Path, desktop: &Path) -> io::Result<PathBuf> 
         ));
     }
     Ok(agent)
+}
+
+// Missing tails have no directory identity yet. Conservatively refuse case
+// aliases even on case-sensitive volumes; never fold a lock path or identity.
+fn component_prefix_ignore_case(path: &Path, prefix: &Path) -> bool {
+    let mut parts = path.components();
+    prefix.components().all(|part| {
+        parts.next().is_some_and(|candidate| {
+            candidate.as_os_str().to_string_lossy().to_lowercase()
+                == part.as_os_str().to_string_lossy().to_lowercase()
+        })
+    })
 }
 
 // canonicalize/realpath can preserve alternate casing on macOS. Compare
@@ -565,6 +579,30 @@ mod tests {
         assert!(separate_agent_root(&alias.join("phones"), &desktop).is_err());
         assert!(separate_agent_root(&alias, &desktop.join("missing")).is_err());
         assert_eq!(lock.identity(), directory_identity(&alias).unwrap());
+    }
+
+    #[test]
+    fn missing_case_aliased_agent_storage_overlap_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let desktop = temp.path().join("Desktop");
+        let alias = temp.path().join("DESKTOP");
+        for agent in [&alias, &alias.join("phones")] {
+            assert_eq!(
+                separate_agent_root(agent, &desktop).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(
+                separate_agent_root(&desktop, agent).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+        assert!(!desktop.exists());
+        assert!(!alias.exists());
+        let separate = temp.path().join("DESKTOP-agent");
+        assert_eq!(
+            separate_agent_root(&separate, &desktop).unwrap(),
+            resolve_root(&separate).unwrap()
+        );
     }
 
     #[test]
