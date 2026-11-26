@@ -91,7 +91,6 @@ pub(crate) use launch::with_preassigned_session_id as launch_session_id;
 pub(crate) use launch::{FinalWorkerClose, TerminalExited, TerminalLaunched};
 
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const HOST_LOCK: &str = ".task-host.lock";
 const SEED_STAGING: &str = ".tasks.seed.json";
 const RESEED_POLL: Duration = Duration::from_secs(2);
 /// Bounds quit: the servers were cancelled already; this only lets their
@@ -163,94 +162,8 @@ impl HostConfig {
     }
 }
 
-/// Cross-process lifetime lock on one preview root. It is separate from the
-/// layout writer lease, which locks only around each save. The file is never
-/// unlinked: the kernel lock (flock, released by close or process death),
-/// not its contents, owns the host.
-pub(crate) struct HostLock {
-    file: std::fs::File,
-}
-impl HostLock {
-    pub(crate) fn acquire(roots: &Preview) -> Result<Self> {
-        roots.create_private_dir(roots.root())?;
-        let path = roots.scoped(&roots.root().join(HOST_LOCK))?;
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options
-            .open(&path)
-            .with_context(|| format!("open task host lock {}", path.display()))?;
-        // scoped() refused a symlinked path; this catches a swap since, and
-        // the handle must be the file at the path, as the writer lease checks.
-        let meta = std::fs::symlink_metadata(&path)?;
-        anyhow::ensure!(
-            meta.is_file(),
-            "task host lock is not a regular file: {}",
-            path.display()
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            anyhow::ensure!(
-                meta.nlink() == 1,
-                "task host lock is hard-linked: {}",
-                path.display()
-            );
-            let opened = file.metadata()?;
-            anyhow::ensure!(
-                opened.dev() == meta.dev() && opened.ino() == meta.ino(),
-                "task host lock was replaced: {}",
-                path.display()
-            );
-        }
-        match file.try_lock() {
-            Ok(()) => Ok(Self { file }),
-            Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
-                "another GitTerm GPUI already hosts tasks for {}",
-                roots.root().display()
-            ),
-            Err(std::fs::TryLockError::Error(error)) => {
-                Err(error).with_context(|| format!("lock task host {}", path.display()))
-            }
-        }
-    }
-}
-impl Drop for HostLock {
-    fn drop(&mut self) {
-        // Forked terminal children may still hold an inherited descriptor.
-        // Release ownership now rather than waiting for their exec/exit.
-        if let Err(error) = self.file.unlock() {
-            eprintln!("Unlock task host: {error}");
-        }
-    }
-}
+pub(crate) use gitterm_core::state_lock::StateLock as HostLock;
 
-#[cfg(test)]
-mod lock_tests {
-    use super::*;
-
-    #[test]
-    fn inherited_descriptor_does_not_extend_host_ownership() {
-        let dir = tempfile::tempdir_in("/private/tmp").unwrap();
-        let roots = Preview::validate(
-            &dir.path().join("preview"),
-            gitterm_core::preview::ProtectedRoots::new(&dir.path().join("home"), []).unwrap(),
-        )
-        .unwrap();
-        let lock = HostLock::acquire(&roots).unwrap();
-        let inherited = lock.file.try_clone().unwrap();
-        drop(lock);
-        let next = HostLock::acquire(&roots).unwrap();
-        drop(inherited);
-        assert!(HostLock::acquire(&roots).is_err());
-        drop(next);
-        HostLock::acquire(&roots).unwrap();
-    }
-}
 /// Iced's file identity for re-seeding: its mtime, `None` while missing.
 type Stamp = Option<SystemTime>;
 fn source_stamp(source: &Path) -> std::io::Result<Stamp> {
@@ -433,7 +346,9 @@ impl TaskHostOwner {
             ingress,
         } = config;
         let iced_tasks = TaskStore::path_for_config_root(&iced_config);
-        let lock = HostLock::acquire(&roots)?;
+        roots.create_private_dir(roots.root())?;
+        roots.scoped(&roots.root().join(gitterm_core::state_lock::LOCK_FILE))?;
+        let lock = HostLock::acquire(roots.root())?;
         let (store, stamp) = seed_copy(&roots, &iced_tasks)?;
         let services = if fixtures.is_empty() {
             ServiceContext::preview(roots.clone())

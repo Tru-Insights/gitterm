@@ -279,11 +279,9 @@ pub(crate) fn iced_layout_key(w: &gitterm_core::workspace_config::WorkspaceConfi
 }
 
 pub(crate) fn iced_config_dir() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    gitterm_core::config_paths::iced_config_dir(
-        std::env::var_os(gitterm_core::config_paths::CONFIG_DIR_ENV),
-        &home,
-    )
+    gitterm_core::config_paths::desktop_config_dir()
+        .expect("resolve read-only Iced config root")
+        .to_path_buf()
 }
 
 /// Iced builds its index from harness transcripts, independently of its config

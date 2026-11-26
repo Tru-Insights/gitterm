@@ -15,19 +15,14 @@ fn store_root() -> Result<PathBuf, String> {
 }
 #[cfg(not(test))]
 fn store_root() -> Result<PathBuf, String> {
-    let config = match std::env::var_os("GITTERM_V6_CONFIG_DIR").filter(|s| !s.is_empty()) {
-        Some(path) => {
-            let path = PathBuf::from(path);
-            if !path.is_absolute() {
-                return Err("snapshot config directory must be absolute".into());
-            }
-            path
+    if let Some(path) = std::env::var_os("GITTERM_V6_CONFIG_DIR").filter(|s| !s.is_empty()) {
+        if !Path::new(&path).is_absolute() {
+            return Err("snapshot config directory must be absolute".into());
         }
-        None => dirs::home_dir()
-            .ok_or("snapshot config directory: no home directory")?
-            .join(".config/gitterm-v6"),
-    };
-    Ok(config.join("turn-snapshots"))
+    }
+    Ok(gitterm_core::config_paths::desktop_config_dir()
+        .map_err(|error| error.to_string())?
+        .join("turn-snapshots"))
 }
 
 fn explicit_root() -> Result<SnapshotRoots, String> {

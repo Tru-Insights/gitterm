@@ -417,7 +417,20 @@ fn gpui_host_shutdown_resolves_pending_replies(cx: &mut TestAppContext) {
     // and a concurrent fork can retain a listener fd until exec. Check the
     // actual server tasks, rather than whether that address accepts TCP.
     assert!(servers.iter().all(tokio::task::AbortHandle::is_finished));
-    HostLock::acquire(&fixture.roots).unwrap();
+    HostLock::acquire(fixture.roots.root()).unwrap();
+}
+
+#[gpui::test]
+fn preview_runs_beside_desktop_lifetime_lock(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    fixture.write_iced(vec![task("desktop", TaskLifecycle::Ready)], vec![]);
+    let desktop = HostLock::acquire(&fixture.iced).unwrap();
+    let before = std::fs::read(fixture.source()).unwrap();
+    let (owner, _) = fixture.start(cx);
+    assert_eq!(task_ids(&owner, cx), ["desktop"]);
+    assert_eq!(std::fs::read(fixture.source()).unwrap(), before);
+    assert!(HostLock::acquire(desktop.root()).is_err());
 }
 
 #[gpui::test]
@@ -429,8 +442,11 @@ fn second_process_host_on_same_root_refused(cx: &mut TestAppContext) {
     let seeded = std::fs::read(fixture.copy()).unwrap();
     // A second lock handle is a separate open file: flock refuses it, as it
     // would another process.
-    let error = HostLock::acquire(&fixture.roots).err().unwrap().to_string();
-    assert!(error.contains("already hosts tasks"), "{error}");
+    let error = HostLock::acquire(fixture.roots.root())
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("already in use"), "{error}");
     // A second host fails before seeding or binding anything.
     fixture.write_iced(vec![task("changed", TaskLifecycle::Ready)], vec![]);
     let (config, _) = fixture.config();
@@ -439,7 +455,7 @@ fn second_process_host_on_same_root_refused(cx: &mut TestAppContext) {
         .err()
         .unwrap()
         .to_string();
-    assert!(error.contains("already hosts tasks"), "{error}");
+    assert!(error.contains("already in use"), "{error}");
     assert_eq!(std::fs::read(fixture.copy()).unwrap(), seeded);
 }
 
@@ -452,7 +468,7 @@ fn host_lock_child_holds_until_killed() {
     let root = PathBuf::from(root);
     let protected = ProtectedRoots::new(&root.parent().unwrap().join("fixture-home"), []).unwrap();
     let roots = Preview::validate(&root, protected).unwrap();
-    let _lock = HostLock::acquire(&roots).unwrap();
+    let _lock = HostLock::acquire(roots.root()).unwrap();
     println!("B4-HOST-LOCK-HELD");
     std::io::stdout().flush().unwrap();
     std::thread::sleep(Duration::from_secs(60));
@@ -484,11 +500,11 @@ fn host_lock_released_after_crash() {
             break;
         }
     }
-    assert!(HostLock::acquire(&fixture.roots).is_err());
+    assert!(HostLock::acquire(fixture.roots.root()).is_err());
     // SIGKILL: no destructor runs, only the kernel releases the lock.
     child.kill().unwrap();
     child.wait().unwrap();
-    HostLock::acquire(&fixture.roots).unwrap();
+    HostLock::acquire(fixture.roots.root()).unwrap();
 }
 
 #[cfg(unix)]

@@ -4,10 +4,10 @@
 //! exist yet, the parts of the V5 dir that V6 can use are copied in. The V5
 //! dir is only ever read: nothing is moved, linked or written there.
 //!
-//! The import is staged in a sibling dir and renamed into place at the end,
-//! so a crash mid-import leaves no V6 dir and the next launch retries, and
-//! once the V6 dir exists the import never runs again. A failure on one item
-//! is logged and the rest still import.
+//! The desktop holds the root lock before importing. Entries are staged
+//! inside that root and published individually; the root and lock inode are
+//! never replaced. A ready report allows an interrupted publish to resume,
+//! and an explicit completion marker prevents re-importing user state.
 
 use std::fs;
 use std::io;
@@ -18,6 +18,9 @@ use serde_json::Value;
 use crate::config;
 
 const LOG_PREFIX: &str = "V5 config import";
+const PENDING: &str = ".v5-import-pending";
+const COMPLETE: &str = ".v5-import-complete";
+const READY: &str = "ready.json";
 
 /// What happens to one top-level entry of the V5 config dir.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +76,7 @@ const ITEMS: &[(&str, Plan)] = &[
     ("acp", Plan::Skip("regenerated when an ACP chat starts")),
 ];
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ImportReport {
     /// One line per V5 entry, in order.
     pub lines: Vec<String>,
@@ -84,7 +87,7 @@ pub struct ImportReport {
 
 #[derive(Debug)]
 pub enum ImportOutcome {
-    /// The V6 config dir already exists; nothing was read.
+    /// Existing V6 state or a completed import; nothing was imported.
     AlreadyPresent,
     /// Nothing to import from, with the reason.
     Skipped(String),
@@ -92,12 +95,9 @@ pub enum ImportOutcome {
 }
 
 /// Run the import if this is V6's first launch. Called before anything
-/// else touches the config dir. Never fails the launch: problems are logged.
+/// else writes state in the locked config dir. Problems are logged.
 pub fn import_v5_config_on_first_launch() {
     let dest = config::global_config_dir();
-    if dest.exists() {
-        return;
-    }
     let source = match v5_config_dir() {
         Ok(source) => source,
         Err(reason) => {
@@ -168,10 +168,29 @@ fn import_source(
     Ok(home.join(".config").join(config::V5_CONFIG_DIR_NAME))
 }
 
-/// Import `source` into `dest` unless `dest` exists. `source` is only read.
+/// Import into an absent/lock-only root, or resume a ready import. The
+/// caller must hold the lifetime state lock. Existing user entries are never
+/// replaced, and an existing directory without our journal is left alone.
 pub fn import_if_absent(source: &Path, dest: &Path) -> io::Result<ImportOutcome> {
-    if dest.exists() {
+    let staging = dest.join(PENDING);
+    if dest.join(COMPLETE).try_exists()? {
         return Ok(ImportOutcome::AlreadyPresent);
+    }
+    if staging.try_exists()? {
+        if !fs::symlink_metadata(&staging)?.is_dir() {
+            return Err(io::Error::other("import staging is not a directory"));
+        }
+        if staging.join(READY).try_exists()? {
+            return finish_import(dest);
+        }
+    }
+    if dest.try_exists()? {
+        for entry in fs::read_dir(dest)? {
+            let name = entry?.file_name();
+            if name != gitterm_core::state_lock::LOCK_FILE && name != PENDING {
+                return Ok(ImportOutcome::AlreadyPresent);
+            }
+        }
     }
     if !source.is_dir() {
         return Ok(ImportOutcome::Skipped(format!(
@@ -179,53 +198,61 @@ pub fn import_if_absent(source: &Path, dest: &Path) -> io::Result<ImportOutcome>
             source.display()
         )));
     }
-    if dest.starts_with(source) || source.starts_with(dest) {
+    let resolved_source = gitterm_core::state_lock::resolve_root(source)?;
+    let resolved_dest = gitterm_core::state_lock::resolve_root(dest)?;
+    if resolved_dest.starts_with(&resolved_source) || resolved_source.starts_with(&resolved_dest) {
         return Ok(ImportOutcome::Skipped(format!(
             "V5 dir {} and V6 dir {} overlap",
             source.display(),
             dest.display()
         )));
     }
-    let parent = dest.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("V6 config dir {} has no parent", dest.display()),
-        )
-    })?;
-    fs::create_dir_all(parent)?;
-    let name = dest
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "gitterm".to_string());
-    let staging = parent.join(format!(".{name}.import-{}", std::process::id()));
-    if staging.exists() {
+    fs::create_dir_all(dest)?;
+    // A copy interrupted before READY published no entries; discard only
+    // our staging directory and repeat the read-only copy.
+    if staging.try_exists()? {
         fs::remove_dir_all(&staging)?;
     }
     fs::create_dir(&staging)?;
-    copy_permissions(source, &staging)?;
+    let contents = staging.join("contents");
+    fs::create_dir(&contents)?;
+    copy_permissions(source, dest)?;
+    let report = import_entries(source, &contents, dest)?;
+    let bytes = serde_json::to_vec(&report).map_err(io::Error::other)?;
+    let report_tmp = staging.join("report.tmp");
+    fs::write(&report_tmp, bytes)?;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&report_tmp)?
+        .sync_all()?;
+    fs::rename(&report_tmp, staging.join(READY))?;
+    finish_import(dest)
+}
 
-    let report = match import_entries(source, &staging, dest) {
-        Ok(report) => report,
-        Err(error) => {
-            let _ = fs::remove_dir_all(&staging);
-            return Err(error);
+fn finish_import(dest: &Path) -> io::Result<ImportOutcome> {
+    let staging = dest.join(PENDING);
+    let report: ImportReport =
+        serde_json::from_slice(&fs::read(staging.join(READY))?).map_err(io::Error::other)?;
+    for entry in fs::read_dir(staging.join("contents"))? {
+        let entry = entry?;
+        let target = dest.join(entry.file_name());
+        match fs::symlink_metadata(&target) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("import refuses to replace {}", target.display()),
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
-    };
-    if let Err(error) = fs::rename(&staging, dest) {
-        let _ = fs::remove_dir_all(&staging);
-        if dest.exists() {
-            // Another V6 instance finished its import first.
-            return Ok(ImportOutcome::AlreadyPresent);
-        }
-        return Err(io::Error::new(
-            error.kind(),
-            format!(
-                "could not move the staged import {} to {}: {error}",
-                staging.display(),
-                dest.display()
-            ),
-        ));
+        // If interrupted after rename, the entry is no longer staged and
+        // the next launch leaves the installed entry untouched.
+        fs::rename(entry.path(), target)?;
     }
+    fs::rename(staging.join(READY), dest.join(COMPLETE))?;
+    fs::remove_dir(staging.join("contents"))?;
+    fs::remove_dir(staging)?;
     Ok(ImportOutcome::Imported(report))
 }
 
@@ -626,6 +653,107 @@ mod tests {
             .filter(|name| name.contains(".import-"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn imports_into_lock_only_root_without_replacing_root_or_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("v5");
+        let dest = temp.path().join("v6");
+        v5_fixture(&source);
+        let lock = gitterm_core::state_lock::StateLock::acquire(&dest).unwrap();
+        #[cfg(unix)]
+        let identities = {
+            use std::os::unix::fs::MetadataExt;
+            (
+                fs::metadata(&dest).unwrap().ino(),
+                fs::metadata(dest.join(gitterm_core::state_lock::LOCK_FILE))
+                    .unwrap()
+                    .ino(),
+            )
+        };
+        imported(import_if_absent(&source, &dest).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                identities,
+                (
+                    fs::metadata(&dest).unwrap().ino(),
+                    fs::metadata(dest.join(gitterm_core::state_lock::LOCK_FILE))
+                        .unwrap()
+                        .ino()
+                )
+            );
+        }
+        assert!(dest.join(COMPLETE).is_file());
+        assert!(dest.join("workspaces.json").is_file());
+        assert!(matches!(
+            gitterm_core::state_lock::StateLock::acquire(&dest),
+            Err(gitterm_core::state_lock::LockError::Busy { .. })
+        ));
+        drop(lock);
+        gitterm_core::state_lock::StateLock::acquire(&dest).unwrap();
+    }
+
+    #[test]
+    fn interrupted_copy_and_publish_retry_without_overwriting_installed_state() {
+        for ready in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("v5");
+            let dest = temp.path().join("v6");
+            v5_fixture(&source);
+            let lock = gitterm_core::state_lock::StateLock::acquire(&dest).unwrap();
+            let staging = dest.join(PENDING);
+            let contents = staging.join("contents");
+            fs::create_dir_all(&contents).unwrap();
+            if ready {
+                let report = import_entries(&source, &contents, &dest).unwrap();
+                fs::write(staging.join(READY), serde_json::to_vec(&report).unwrap()).unwrap();
+                fs::rename(contents.join("profiles.json"), dest.join("profiles.json")).unwrap();
+                // Installed entries must never be recopied on retry, even
+                // if the source changes or goes away after publication.
+                fs::write(source.join("profiles.json"), "changed source").unwrap();
+            } else {
+                fs::write(contents.join("profiles.json"), "interrupted partial copy").unwrap();
+                fs::write(staging.join("report.tmp"), "incomplete report").unwrap();
+            }
+            imported(import_if_absent(&source, &dest).unwrap());
+            assert_eq!(
+                fs::read_to_string(dest.join("profiles.json")).unwrap(),
+                "[]"
+            );
+            assert!(dest.join("tokens/build-host.token").is_file());
+            assert!(dest.join(COMPLETE).is_file());
+            assert!(!staging.exists());
+            let after = snapshot(&dest);
+            assert!(matches!(
+                import_if_absent(&source, &dest).unwrap(),
+                ImportOutcome::AlreadyPresent
+            ));
+            assert_eq!(snapshot(&dest), after);
+            assert!(matches!(
+                gitterm_core::state_lock::StateLock::acquire(&dest),
+                Err(gitterm_core::state_lock::LockError::Busy { .. })
+            ));
+            drop(lock);
+        }
+    }
+
+    #[test]
+    fn preexisting_user_state_is_never_imported_over() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("v5");
+        let dest = temp.path().join("v6");
+        v5_fixture(&source);
+        let _lock = gitterm_core::state_lock::StateLock::acquire(&dest).unwrap();
+        fs::write(dest.join("settings.json"), "user state").unwrap();
+        let before = snapshot(&dest);
+        assert!(matches!(
+            import_if_absent(&source, &dest).unwrap(),
+            ImportOutcome::AlreadyPresent
+        ));
+        assert_eq!(snapshot(&dest), before);
     }
 
     #[test]

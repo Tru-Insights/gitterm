@@ -2069,8 +2069,20 @@ fn main() -> iced::Result {
         }
         return Ok(());
     }
-    // First launch: bring V5's workspaces, remotes and tokens across before
-    // anything creates the V6 config dir (TRU-168).
+    // The worker-launch helper above must remain usable while the desktop
+    // owns the root. Every normal startup takes ownership before any write.
+    let _state_lock = match gitterm_core::config_paths::desktop_config_dir()
+        .map_err(|error| error.to_string())
+        .and_then(|root| {
+            gitterm_core::state_lock::StateLock::acquire(root).map_err(|error| error.to_string())
+        }) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    };
+    // First launch imports into the held directory without replacing it.
     config_import::import_v5_config_on_first_launch();
 
     // Print instance information for multi-instance support

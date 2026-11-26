@@ -9,6 +9,7 @@ pub mod harness;
 pub mod park;
 pub mod preview;
 pub mod session;
+pub mod state_lock;
 pub mod status;
 pub mod workspace;
 
