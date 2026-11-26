@@ -1888,6 +1888,71 @@ impl BrowserController {
         }
     }
 
+    /// Application shutdown uses CDP's graceful close, never a process signal.
+    pub async fn disconnect_gracefully(&mut self) -> Result<()> {
+        if let Some(child) = self.child.as_mut() {
+            if child
+                .try_wait()
+                .map_err(|error| {
+                    BrowserControlError::new(format!("inspect owned Chrome child: {error}"))
+                })?
+                .is_some()
+            {
+                self.child.take();
+                self.endpoint = None;
+            } else if self.endpoint.is_none() {
+                return Err(BrowserControlError::new(
+                    "refuse graceful browser shutdown: owned child has no verified endpoint",
+                ));
+            }
+        } else if self.endpoint.is_some() {
+            // A copied DevToolsActivePort file is not authority to close a
+            // browser. An adopted endpoint requires verified manual recovery.
+            return Err(BrowserControlError::new(
+                "refuse graceful browser shutdown: endpoint has no owned Chrome child",
+            ));
+        }
+        if let Some(endpoint) = self.endpoint.clone() {
+            let websocket_url = format!(
+                "ws://127.0.0.1:{}{}",
+                endpoint.port, endpoint.browser_websocket_path
+            );
+            let session = CdpSession::connect(&websocket_url).await?;
+            if let Err(error) = session.command("Browser.close", json!({})).await {
+                if list_page_targets(endpoint.port).await.is_ok() {
+                    return Err(error);
+                }
+            }
+            let deadline = Instant::now() + BROWSER_SHUTDOWN_TIMEOUT;
+            loop {
+                let child_exited = match self.child.as_mut() {
+                    Some(child) => child
+                        .try_wait()
+                        .map_err(|error| {
+                            BrowserControlError::new(format!("wait for Chrome: {error}"))
+                        })?
+                        .is_some(),
+                    None => list_page_targets(endpoint.port).await.is_err(),
+                };
+                if child_exited && verify_profile_released(&self.profile_dir).is_ok() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(BrowserControlError::new("shutdown phase browser-profile: timeout waiting for Chrome/profile release"));
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+        verify_profile_released(&self.profile_dir)
+            .map_err(|error| BrowserControlError::new(error.to_string()))?;
+        self.child.take();
+        let _ = self.finish_stderr_capture().await;
+        self.endpoint = None;
+        self.clear_targets();
+        self.last_exit = None;
+        Ok(())
+    }
+
     pub async fn disconnect(&mut self) -> Result<()> {
         if let Some(mut child) = self.child.take() {
             child.start_kill().map_err(|error| {
@@ -2553,6 +2618,11 @@ impl BrowserControlService {
     /// Every live chat's display label, for its tabs' title prefix.
     pub async fn set_owner_labels(&self, labels: HashMap<String, String>) -> Result<()> {
         self.controller.lock().await.set_owner_labels(labels).await
+    }
+
+    /// Graceful application shutdown, with profile release verified.
+    pub async fn disconnect_gracefully(&self) -> Result<()> {
+        self.controller.lock().await.disconnect_gracefully().await
     }
 
     /// Stop the whole browser: the user's action in GitTerm's UI only.
@@ -3654,6 +3724,30 @@ fn push_bounded<T>(items: &mut VecDeque<T>, item: T, capacity: usize) {
         items.pop_front();
     }
     items.push_back(item);
+}
+
+/// Refuse unresolved profile ownership without adopting, launching or killing
+/// Chrome. Broken singleton symlinks count too: recovery needs verification.
+pub fn verify_profile_released(profile: &Path) -> std::io::Result<()> {
+    for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+        let path = profile.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(std::io::Error::other(format!(
+                    "refuse unresolved browser-profile ownership: {}",
+                    path.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("inspect browser profile {}: {error}", path.display()),
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 fn browser_profile_dir(v6_global_config_dir: &Path) -> PathBuf {
@@ -5153,6 +5247,23 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn graceful_shutdown_refuses_an_endpoint_without_an_owned_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut controller =
+            BrowserController::with_profile_dir(temp.path().into(), DefaultTarget::Never);
+        controller.endpoint = Some(DevToolsEndpoint {
+            port: 9,
+            browser_websocket_path: "/unverified".into(),
+        });
+        let error = controller.disconnect_gracefully().await.unwrap_err();
+        assert!(error.to_string().contains("no owned Chrome child"));
+        assert!(
+            controller.endpoint.is_some(),
+            "refusal retains unresolved ownership"
+        );
+    }
 
     #[test]
     fn browser_profile_is_nested_under_supplied_v6_config_root() {

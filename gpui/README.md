@@ -19,6 +19,22 @@ saved sessions and no remote connections.
 
 GPUI uses only `GITTERM_GPUI_CONFIG_DIR` (absolute; default
 `~/.config/gitterm-gpui`). It never imports or writes V6 workspaces/settings.
+The shell acquires the preview root's lifetime lock before opening its writer,
+seeding tasks, binding servers or starting children. It holds the lock beyond
+GPUI's application loop until the named writer, chat, host/reaper, status/review
+and terminal completion phases finish. Browser shutdown closes tool admission,
+drains accepted requests, stops engine sessions, then gracefully closes Chrome
+and verifies profile release. Each wait is bounded and reports its phase on a
+timeout; no process signalling is added by this ownership barrier.
+
+An interrupted or timed-out shutdown leaves `.gpui-shutdown-pending` in that
+preview root. Replacement startup inspects recorded launch identities and refuses
+before state writers start; even absent recorded roots cannot prove unrecorded
+descendants exited. Recovery is deliberately manual: verify all prior preview
+children have exited and the preview browser profile is released before clearing
+the marker. Unresolved Chrome singleton ownership also refuses startup. The V6
+state root is never locked or recovered by this shell.
+
 Explicit folders are canonicalized, deduplicated and saved by atomic tempfile
 rename to **`local-workspaces.json`**:
 

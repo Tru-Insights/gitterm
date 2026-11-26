@@ -22,13 +22,7 @@ impl PreviewContext {
             // callbacks. Drain synchronously here, before returning the future:
             // the independent disk thread needs no App borrow or UI polling.
             // Only final termination waits; ordinary saves/startup never do.
-            let result = (|| -> Result<()> {
-                writer
-                    .close()?
-                    .blocking_recv()
-                    .context("GPUI quit save queue stopped")??;
-                Ok(())
-            })();
+            let result = writer.drain();
             if let Err(error) = result {
                 eprintln!(
                     "release preview writer {}: {error:#}",
@@ -40,7 +34,9 @@ impl PreviewContext {
         .detach();
     }
     pub fn from_environment(sample: bool) -> Result<Self> {
-        let roots = roots_from_environment(sample)?;
+        Self::from_roots(roots_from_environment(sample)?)
+    }
+    pub(crate) fn from_roots(roots: Arc<Preview>) -> Result<Self> {
         let writer = Writer::new(roots.claim_writer().context("open guarded GPUI writer")?);
         Ok(Self {
             roots,
@@ -108,7 +104,12 @@ pub fn executable(preview: Option<&Preview>, effect: Effect, target: &Path) -> R
 pub(crate) struct Writer {
     core: Arc<WriterLease>,
     sender: std::sync::Mutex<Option<std::sync::mpsc::Sender<SaveCommand>>>,
+    completion: Arc<WriterCompletion>,
 }
+type WriterCompletion = (
+    std::sync::Mutex<Option<std::result::Result<(), String>>>,
+    std::sync::Condvar,
+);
 enum SaveCommand {
     Replace(
         PathBuf,
@@ -129,6 +130,8 @@ impl Writer {
         let core = Arc::new(core);
         let (sender, receiver) = std::sync::mpsc::channel();
         let worker = core.clone();
+        let completion = Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+        let finished = completion.clone();
         std::thread::spawn(move || {
             while let Ok(command) = receiver.recv() {
                 match command {
@@ -146,16 +149,22 @@ impl Writer {
                         let _ = reply.send(result);
                     }
                     SaveCommand::Close(reply) => {
-                        let _ = reply.send(worker.close());
+                        let result = worker.close();
+                        *finished.0.lock().unwrap() =
+                            Some(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+                        let _ = reply.send(result);
+                        finished.1.notify_all();
                         return;
                     }
                 }
             }
-            let _ = worker.close();
+            *finished.0.lock().unwrap() = Some(worker.close().map_err(|error| error.to_string()));
+            finished.1.notify_all();
         });
         Self {
             core,
             sender: std::sync::Mutex::new(Some(sender)),
+            completion,
         }
     }
     pub(crate) fn preview(&self) -> &Arc<Preview> {
@@ -181,6 +190,22 @@ impl Writer {
         self.submit(path.to_path_buf(), bytes.to_vec())?
             .blocking_recv()??;
         Ok(())
+    }
+    pub(crate) fn drain(&self) -> Result<()> {
+        self.close()?;
+        let (done, _) = self
+            .completion
+            .1
+            .wait_timeout_while(
+                self.completion.0.lock().unwrap(),
+                crate::lifetime::DRAIN_TIMEOUT,
+                |done| done.is_none(),
+            )
+            .unwrap();
+        done.as_ref()
+            .context("shutdown phase preview-writer: timeout")?
+            .clone()
+            .map_err(anyhow::Error::msg)
     }
     pub(crate) fn close(&self) -> Result<SaveResult> {
         let (reply, receipt) = tokio::sync::oneshot::channel();

@@ -774,7 +774,9 @@ Path('reaped-marker').write_text('finished')
     assert!(super::lease::ProviderLease::claim(&preview).is_err());
     // Explicit pane close gives up the view, but the application still owns the
     // completion via its queue. This is exactly the prior detached-close gap.
+    let lifetime = crate::lifetime::Lifetime::acquire(&preview).unwrap();
     let mut app = cx.new_app();
+    app.update(|app| app.set_global(lifetime.barrier.clone()));
     let gate = Rc::new(std::cell::RefCell::new(
         None::<std::os::unix::net::UnixStream>,
     ));
@@ -834,6 +836,9 @@ Path('reaped-marker').write_text('finished')
         super::lease::ProviderLease::claim(&preview).expect("lease released after quit drain");
     drop(lease);
     assert!(start.elapsed() > gpui::SHUTDOWN_TIMEOUT);
+    assert!(gitterm_core::state_lock::StateLock::acquire(preview.root()).is_err());
+    lifetime.finish().unwrap();
+    gitterm_core::state_lock::StateLock::acquire(preview.root()).unwrap();
 }
 
 #[gpui::test]

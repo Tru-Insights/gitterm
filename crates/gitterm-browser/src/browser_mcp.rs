@@ -107,6 +107,74 @@ pub fn browser_tool_access(tool: &str) -> BrowserAccess {
         .map_or(BrowserAccess::Interact, |(_, access)| *access)
 }
 
+/// Tool admission and completion share one mutex so shutdown cannot miss a
+/// request that passed admission but has not reached the engine yet.
+#[derive(Default)]
+struct Requests {
+    state: std::sync::Mutex<(bool, usize)>,
+    changed: tokio::sync::Notify,
+}
+impl Requests {
+    fn enter(self: &Arc<Self>) -> Option<RequestGuard> {
+        let mut state = self.state.lock().unwrap();
+        if state.0 {
+            return None;
+        }
+        state.1 += 1;
+        Some(RequestGuard(self.clone()))
+    }
+    fn close(&self) {
+        self.state.lock().unwrap().0 = true;
+    }
+    async fn drain(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self.state.lock().unwrap().1 == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+struct RequestGuard(Arc<Requests>);
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().1 -= 1;
+        self.0.changed.notify_one();
+    }
+}
+
+async fn shutdown_phase<T>(
+    label: &str,
+    timeout: Duration,
+    work: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    let result = tokio::time::timeout(timeout, work)
+        .await
+        .map_err(|_| format!("shutdown phase {label}: timeout after {timeout:?}"))
+        .and_then(|result| result.map_err(|error| format!("shutdown phase {label}: {error}")));
+    if let Err(error) = &result {
+        eprintln!("{error}");
+    }
+    result
+}
+
+async fn shutdown_browser(
+    requests: &Requests,
+    timeout: Duration,
+    sessions: impl Future<Output = Result<(), String>>,
+    disconnect: impl Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    requests.close();
+    shutdown_phase("browser-mcp-requests", timeout, async {
+        requests.drain().await;
+        Ok(())
+    })
+    .await?;
+    shutdown_phase("browser-engine-sessions", timeout, sessions).await?;
+    shutdown_phase("browser-disconnect-profile", timeout, disconnect).await
+}
+
 /// Connection data retained by the app and inherited by local terminals.
 ///
 /// The token is intentionally never serialized or included in `Debug` output.
@@ -116,9 +184,34 @@ pub struct BrowserMcpConnection {
     cancellation: CancellationToken,
     browser: BrowserControlService,
     engine: BrowserEngine,
+    requests: Arc<Requests>,
 }
 
 impl BrowserMcpConnection {
+    /// Close admission, drain accepted tools, stop engine sessions, then release
+    /// Chrome and its profile. Only explicit app shutdown uses this path.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        self.requests.close();
+        shutdown_browser(
+            &self.requests,
+            Duration::from_secs(5),
+            async {
+                self.cancellation.cancel();
+                self.engine
+                    .shutdown_sessions()
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+            async {
+                self.browser
+                    .disconnect_gracefully()
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
@@ -331,12 +424,14 @@ fn codex_config_overrides(endpoint: &str) -> [String; 4] {
 
 impl Drop for BrowserMcpConnection {
     fn drop(&mut self) {
+        self.requests.close();
         self.cancellation.cancel();
     }
 }
 
 pub struct BrowserMcpServer {
     listener: std::net::TcpListener,
+    requests: Arc<Requests>,
     token: String,
     cancellation: CancellationToken,
     engine: BrowserEngine,
@@ -416,6 +511,7 @@ fn serve_on(
     let endpoint = format!("http://{address}/mcp");
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let cancellation = CancellationToken::new();
+    let requests = Arc::new(Requests::default());
     eprintln!("GitTerm V6 browser engine: {}", engine.describe());
     Ok((
         BrowserMcpConnection {
@@ -424,9 +520,11 @@ fn serve_on(
             cancellation: cancellation.clone(),
             browser,
             engine: engine.clone(),
+            requests: requests.clone(),
         },
         BrowserMcpServer {
             listener,
+            requests,
             token,
             cancellation,
             engine,
@@ -465,6 +563,7 @@ impl BrowserMcpServer {
         })?;
         let mut tools = BrowserMcpTools::new(self.engine, self.version);
         tools.services = self.services;
+        tools.requests = self.requests;
         let mcp_service: StreamableHttpService<BrowserMcpTools, LocalSessionManager> =
             StreamableHttpService::new(
                 move || Ok::<_, std::io::Error>(tools.clone()),
@@ -514,6 +613,7 @@ async fn authenticate(
 
 #[derive(Clone)]
 struct BrowserMcpTools {
+    requests: Arc<Requests>,
     engine: BrowserEngine,
     version: &'static str,
     agent_operation_lock: Arc<Mutex<()>>,
@@ -536,6 +636,7 @@ impl BrowserMcpTools {
             engine,
             version,
             agent_operation_lock: Arc::new(Mutex::new(())),
+            requests: Arc::new(Requests::default()),
             services: None,
             tool_router,
         }
@@ -1474,6 +1575,9 @@ impl ServerHandler for BrowserMcpTools {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let Some(_request) = self.requests.enter() else {
+            return Ok(tool_error("browser MCP is shutting down"));
+        };
         if let Err(denied) = self.gate(&request.name) {
             return Ok(tool_error(denied));
         }
@@ -1576,6 +1680,59 @@ mod tests {
         result
             .structured_content
             .expect("successful result must include structured content")
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_accepted_requests_before_sessions_and_profile() {
+        let requests = Arc::new(Requests::default());
+        let accepted = requests.enter().unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let session_events = events.clone();
+        let profile_events = events.clone();
+        let shutdown_requests = requests.clone();
+        let shutdown = tokio::spawn(async move {
+            shutdown_browser(
+                &shutdown_requests,
+                Duration::from_secs(2),
+                async move {
+                    session_events.lock().unwrap().push("sessions");
+                    Ok(())
+                },
+                async move {
+                    profile_events.lock().unwrap().push("disconnect-profile");
+                    Ok(())
+                },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            requests.enter().is_none(),
+            "admission must close before waiting"
+        );
+        assert!(events.lock().unwrap().is_empty());
+        events.lock().unwrap().push("request-completed");
+        drop(accepted);
+        shutdown.await.unwrap().unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["request-completed", "sessions", "disconnect-profile"]
+        );
+        // A failed drain must not run later phases.
+        let requests = Arc::new(Requests::default());
+        let _accepted = requests.enter().unwrap();
+        let error = shutdown_browser(
+            &requests,
+            Duration::from_millis(10),
+            async { panic!("sessions ran before request completion") },
+            async { panic!("profile released before request completion") },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("browser-mcp-requests") && error.contains("timeout"),
+            "{error}"
+        );
     }
 
     #[test]

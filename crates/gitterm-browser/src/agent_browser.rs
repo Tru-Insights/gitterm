@@ -1444,6 +1444,37 @@ impl AgentBrowserEngine {
         }
     }
 
+    /// Stop the engine's owned sessions before the shared Chrome is closed.
+    pub(crate) async fn shutdown_sessions(&self) -> Result<()> {
+        let sessions: Vec<_> = self
+            .state
+            .lock()
+            .await
+            .registry
+            .targets
+            .values()
+            .map(|target| target.session.clone())
+            .collect();
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        let port = self.browser.running_devtools_port().await?;
+        let mut failures = Vec::new();
+        for session in sessions {
+            if let Err(error) = self.run(Some(port), &session, &[AbCommand::Close]).await {
+                failures.push(error.message);
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(BrowserControlError::new(format!(
+                "stop agent-browser sessions: {}",
+                failures.join("; ")
+            )))
+        }
+    }
+
     /// Chats that closed give up their targets (TRU-176). Their tabs stay
     /// open as the user's; their sessions stop.
     pub async fn release_owners(&self, owners: &HashSet<String>) -> Result<()> {

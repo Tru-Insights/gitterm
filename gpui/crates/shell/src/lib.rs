@@ -38,6 +38,7 @@ mod h9_tests;
 #[cfg(test)]
 mod hookup_tests;
 mod layout;
+mod lifetime;
 #[cfg(test)]
 mod modal_input_tests;
 mod owner;
@@ -4744,7 +4745,17 @@ fn install_app_menus(cx: &mut App) {
 
 pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
     let settings = workspace_config::load_iced_settings();
-    let preview = preview::PreviewContext::from_environment(sample)?;
+    let roots = preview::roots_from_environment(sample)?;
+    let lifetime = lifetime::Lifetime::acquire(&roots)?;
+    let preview = preview::PreviewContext::from_roots(roots)?;
+    let writer = preview.writer();
+    lifetime
+        .barrier
+        .register("preview-writer", move || writer.drain());
+    let barrier = lifetime.barrier.clone();
+    let host_lock = lifetime.lock.clone();
+    let startup_error = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let host_error = startup_error.clone();
     let config = preview.roots.layout();
     let mut store = workspace_config::WorkspaceStore::guarded(preview.writer());
     let (model, startup_save) = if sample {
@@ -4780,13 +4791,18 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
     );
     let task_host = (!sample).then(|| task_host::HostConfig::production(preview.roots.clone()));
     gpui_kit::application().run(move |cx| {
+        cx.set_global(barrier);
         preview.release_on_quit(cx);
         // Before the window's workspace owner, so the host's quit callback
         // runs ahead of its chat drains.
         if let Some(config) = task_host {
-            match task_host::TaskHostOwner::start(config, cx) {
+            match task_host::TaskHostOwner::start_locked(config, host_lock, cx) {
                 Ok(owner) => cx.set_global(task_host::GpuiTaskHost(owner)),
-                Err(error) => eprintln!("GitTerm GPUI runs without a task host: {error:#}"),
+                Err(error) => {
+                    *host_error.lock().unwrap() = Some(error);
+                    cx.quit();
+                    return;
+                }
             }
         }
         gpui_kit::init(cx);
@@ -4843,6 +4859,10 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
         cx.on_window_closed(|cx, _| cx.quit()).detach();
         cx.activate(true);
     });
+    lifetime.finish()?;
+    if let Some(error) = startup_error.lock().unwrap().take() {
+        return Err(error.context("start GPUI task host"));
+    }
     Ok(())
 }
 
