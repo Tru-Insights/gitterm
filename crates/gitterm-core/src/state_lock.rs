@@ -76,7 +76,11 @@ pub fn separate_agent_root(agent: &Path, desktop: &Path) -> io::Result<PathBuf> 
     };
     let agent = resolve_root(&agent)?;
     let desktop = resolve_root(desktop)?;
-    if agent.starts_with(&desktop) || desktop.starts_with(&agent) {
+    if agent.starts_with(&desktop)
+        || desktop.starts_with(&agent)
+        || directory_contains(&desktop, &agent)?
+        || directory_contains(&agent, &desktop)?
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -87,6 +91,30 @@ pub fn separate_agent_root(agent: &Path, desktop: &Path) -> io::Result<PathBuf> 
         ));
     }
     Ok(agent)
+}
+
+// canonicalize/realpath can preserve alternate casing on macOS. Compare
+// directory identities along both ancestry chains instead of folding names.
+fn directory_contains(root: &Path, path: &Path) -> io::Result<bool> {
+    let root_identity = match fs::metadata(root) {
+        Ok(meta) if meta.is_dir() => directory_identity(root)?,
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    for ancestor in path.ancestors() {
+        match fs::metadata(ancestor) {
+            Ok(meta) if meta.is_dir() => {
+                if directory_identity(ancestor)? == root_identity {
+                    return Ok(true);
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Debug)]
@@ -515,6 +543,28 @@ mod tests {
             error.to_string().contains("state root was replaced"),
             "{error}"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn case_aliases_use_directory_identity_for_locks_and_agent_overlap() {
+        let temp = tempfile::tempdir().unwrap();
+        let desktop = temp.path().join("Desktop");
+        let alias = temp.path().join("DESKTOP");
+        fs::create_dir(&desktop).unwrap();
+        // Case-sensitive volumes have no alternate-casing alias to exercise.
+        if !alias.exists() {
+            return;
+        }
+        let lock = StateLock::acquire(&desktop).unwrap();
+        assert!(matches!(
+            StateLock::acquire(&alias),
+            Err(LockError::Busy { .. })
+        ));
+        assert!(separate_agent_root(&alias, &desktop).is_err());
+        assert!(separate_agent_root(&alias.join("phones"), &desktop).is_err());
+        assert!(separate_agent_root(&alias, &desktop.join("missing")).is_err());
+        assert_eq!(lock.identity(), directory_identity(&alias).unwrap());
     }
 
     #[test]
