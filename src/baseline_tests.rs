@@ -63,6 +63,7 @@ impl Drop for Trace {
 fn headless(fixture: &Path) -> App {
     let config = Config::default();
     App {
+        shutdown_phase: ShutdownPhase::Running,
         status_jobs: StatusSubscriptionData::new(),
         title: "Synthetic baseline".into(),
         workspaces: Vec::new(),
@@ -1346,4 +1347,109 @@ fn task_and_tab_changes_reach_the_next_attention_items() {
     other.insert(task).unwrap();
     *app.task_host.store_mut() = Some(TaskStore::load(&reloaded).unwrap());
     assert_eq!(task_row(&app), None);
+}
+
+#[test]
+fn window_close_and_native_quit_enter_the_same_barrier_once() {
+    if isolated("window_close_and_native_quit_enter_the_same_barrier_once") {
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    for first in [Event::WindowCloseRequested, Event::QuitRequested] {
+        let mut app = app_with_tabs(fixture.path());
+        assert_eq!(app.shutdown_phase, ShutdownPhase::Running);
+        drop(app.update(first));
+        assert_eq!(app.shutdown_phase, ShutdownPhase::Saving);
+        assert!(app.prs.save_in_flight);
+        assert!(!app.prs.save_again);
+        drop(app.update(Event::WindowCloseRequested));
+        drop(app.update(Event::QuitRequested));
+        assert_eq!(app.shutdown_phase, ShutdownPhase::Saving);
+        assert!(
+            !app.prs.save_again,
+            "a repeated quit must not begin another save"
+        );
+        // An already queued user launch cannot pass closed admissions.
+        let before = app.workspaces.iter().map(|ws| ws.tabs.len()).sum::<usize>();
+        drop(app.update(Event::NewClaudeChatTab));
+        assert_eq!(
+            app.workspaces.iter().map(|ws| ws.tabs.len()).sum::<usize>(),
+            before
+        );
+    }
+}
+
+#[test]
+fn app_drop_drains_admitted_jobs_and_late_session_writers_before_final_save() {
+    if isolated("app_drop_drains_admitted_jobs_and_late_session_writers_before_final_save") {
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(fixture.path());
+    app.workspaces_dirty = true;
+    let path = WorkspacesFile::file_path();
+    let late = path.clone();
+    // Model a session join that starts its final snapshot writer late.
+    gitterm::shutdown::spawn(
+        gitterm::shutdown::Kind::Session,
+        "synthetic session join",
+        move || {
+            std::thread::sleep(Duration::from_millis(40));
+            gitterm::shutdown::spawn(
+                gitterm::shutdown::Kind::Write,
+                "late snapshot writer",
+                move || {
+                    std::thread::sleep(Duration::from_millis(40));
+                    std::fs::write(late, "stale snapshot").map_err(|e| e.to_string())
+                },
+            );
+            Ok(())
+        },
+    );
+    let reduced = fixture.path().join("reduced");
+    let completed = reduced.clone();
+    // This Iced task is never polled: a runtime error bypassed dispatch.
+    drop(shutdown_task(
+        "undispatched final facts writer",
+        async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            std::fs::write(completed, "complete").unwrap();
+        },
+        |_| Event::Pr(PrEvent::Saved(Ok(()))),
+    ));
+    app.prs.save_in_flight = true;
+    app.prs.save_again = true;
+    gitterm::shutdown::activate_desktop();
+    drop(app);
+    gitterm::shutdown::operations().wait();
+    assert!(reduced.exists());
+    assert!(gitterm::shutdown::operations().unfinished().is_empty());
+    let file: WorkspacesFile = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(file.workspaces[0].name, "alpha");
+    assert!(config::global_config_dir().join("pr-watch.json").exists());
+}
+
+#[test]
+fn handled_signal_uses_the_same_shutdown_barrier() {
+    if isolated("handled_signal_uses_the_same_shutdown_barrier") {
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(fixture.path());
+    gitterm::shutdown::activate_desktop();
+    #[cfg(unix)]
+    unsafe {
+        libc::raise(libc::SIGTERM);
+    }
+    #[cfg(unix)]
+    {
+        assert!(gitterm::shutdown::signal_requested());
+        drop(app.update(Event::CheckMenu));
+        assert_eq!(app.shutdown_phase, ShutdownPhase::Saving);
+        drop(app.update(Event::QuitRequested));
+        assert!(!app.prs.save_again);
+    }
+    drop(app);
+    gitterm::shutdown::operations().wait();
+    assert!(gitterm::shutdown::operations().unfinished().is_empty());
 }

@@ -87,14 +87,16 @@ pub fn resolve_claude_program() -> Result<PathBuf, String> {
 /// process down; dropping a remote one on an agent that owns its chats
 /// only detaches (send `Shutdown` first to stop it).
 pub struct ClaudeSession {
-    inner: Session,
+    inner: Option<Session>,
+    remote_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ClaudeSession {
     /// Wrap a host-owned transport port without spawning a local process.
     pub fn from_port(commands: mpsc::UnboundedSender<HarnessCommand>) -> Self {
         Self {
-            inner: Session::from_port(commands, false),
+            inner: Some(Session::from_port(commands, false)),
+            remote_thread: None,
         }
     }
 
@@ -103,7 +105,13 @@ impl ClaudeSession {
             let program = resolve_claude_program()?;
             Ok(local_launch(config, program, token))
         });
-        (Self { inner }, events)
+        (
+            Self {
+                inner: Some(inner),
+                remote_thread: None,
+            },
+            events,
+        )
     }
     /// Iced consumes delivery receipts and harness events in the same order.
     pub fn spawn_runtime(
@@ -116,7 +124,13 @@ impl ClaudeSession {
             let program = resolve_claude_program()?;
             Ok(local_launch(config, program, token))
         });
-        (Self { inner }, events)
+        (
+            Self {
+                inner: Some(inner),
+                remote_thread: None,
+            },
+            events,
+        )
     }
     /// Returns whether actual write receipts will follow channel acceptance.
     pub fn send_chat(
@@ -124,22 +138,24 @@ impl ClaudeSession {
         command: HarnessCommand,
         correlation: gitterm_core::chat::types::CommandCorrelation,
     ) -> Result<bool, String> {
-        if self.inner.supports_correlation() {
+        if self.inner.as_ref().unwrap().supports_correlation() {
             self.inner
+                .as_ref()
+                .unwrap()
                 .send_correlated(command, correlation)
                 .map(|()| true)
         } else {
-            self.inner.send(command).map(|()| false)
+            self.inner.as_ref().unwrap().send(command).map(|()| false)
         }
     }
     pub fn close_turn_snapshots(&self) {
-        self.inner.close_turn_snapshots();
+        self.inner.as_ref().unwrap().close_turn_snapshots();
     }
     pub fn send(&self, command: HarnessCommand) -> Result<(), String> {
-        self.inner.send(command)
+        self.inner.as_ref().unwrap().send(command)
     }
     pub fn local_pid(&self) -> Option<u32> {
-        self.inner.local_pid()
+        self.inner.as_ref().unwrap().local_pid()
     }
 }
 
@@ -286,12 +302,50 @@ impl ClaudeSession {
                 };
                 rt.block_on(run_remote_session(client, config, chat_id, cmd_rx, ev_tx));
             });
-        if let Err(e) = spawn_result {
-            remote_log(&format!("could not spawn remote session thread: {e}"));
-        }
+        let remote_thread = match spawn_result {
+            Ok(thread) => Some(thread),
+            Err(e) => {
+                remote_log(&format!("could not spawn remote session thread: {e}"));
+                None
+            }
+        };
         // An older agent stops the process when the stream closes, which
         // dropping the handle does; a newer one keeps it running.
-        (Self::from_port(cmd_tx), ev_rx)
+        (
+            Self {
+                inner: Some(Session::from_port(cmd_tx, false)),
+                remote_thread,
+            },
+            ev_rx,
+        )
+    }
+}
+
+impl Drop for ClaudeSession {
+    fn drop(&mut self) {
+        let Some(mut session) = self.inner.take() else {
+            return;
+        };
+        session.request_shutdown();
+        let remote_thread = self.remote_thread.take();
+        crate::shutdown::spawn(
+            crate::shutdown::Kind::Session,
+            "Claude session I/O and snapshots",
+            move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("Claude join runtime: {error}"))?;
+                runtime.block_on(session.shutdown())?;
+                drop(session);
+                if let Some(thread) = remote_thread {
+                    thread
+                        .join()
+                        .map_err(|_| "remote Claude session thread panicked".to_string())?;
+                }
+                Ok(())
+            },
+        );
     }
 }
 

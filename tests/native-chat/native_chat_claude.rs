@@ -200,7 +200,8 @@ fn native_chat_local_close_remote_detach_golden() {
     for (local, explicit_close) in [(true, false), (false, false), (false, true)] {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let session = ClaudeSession {
-            inner: Session::from_port(tx, local),
+            inner: Some(Session::from_port(tx, local)),
+            remote_thread: None,
         };
         if explicit_close {
             session.send(HarnessCommand::Shutdown).unwrap();

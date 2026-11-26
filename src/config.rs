@@ -1254,16 +1254,22 @@ mod tests {
 }
 
 /// Clean up this instance's config directory on exit
-pub fn cleanup_instance_config() {
+pub fn cleanup_instance_config() -> Result<(), String> {
     let instance_dir = instance_config_dir();
     if instance_dir.exists() && instance_dir.to_string_lossy().contains(instance_id()) {
-        let _ = std::fs::remove_dir_all(&instance_dir);
+        std::fs::remove_dir_all(&instance_dir).map_err(|error| {
+            format!(
+                "remove instance configuration {}: {error}",
+                instance_dir.display()
+            )
+        })?;
         eprintln!(
             "{APP_NAME} instance {} cleaned up config: {}",
             instance_id(),
             instance_dir.display()
         );
     }
+    Ok(())
 }
 
 // Preserve the facade names, including those currently used only by tests.
@@ -2216,7 +2222,29 @@ impl WorkspacesFile {
     }
 }
 
+fn save_shutdown_json(path: &Path, value: &impl serde::Serialize) -> Result<(), String> {
+    let save = || -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec_pretty(value)?;
+        std::fs::write(path, bytes)?;
+        Ok(())
+    };
+    save().map_err(|error| format!("save {}: {error}", path.display()))
+}
+
+impl WorkspacesFile {
+    pub fn save_for_shutdown(&self) -> Result<(), String> {
+        save_shutdown_json(&Self::file_path(), self)
+    }
+}
+
 impl RemoteSessionsFile {
+    pub fn save_for_shutdown(&self) -> Result<(), String> {
+        save_shutdown_json(&Self::file_path(), self)
+    }
+
     pub fn file_path() -> PathBuf {
         global_config_dir().join("remotes.json")
     }
@@ -2247,9 +2275,14 @@ pub trait RemoteAgentsFileStore: Sized {
     fn file_path() -> PathBuf;
     fn load() -> Option<Self>;
     fn save(&self);
+    fn save_for_shutdown(&self) -> Result<(), String>;
 }
 
 impl RemoteAgentsFileStore for RemoteAgentsFile {
+    fn save_for_shutdown(&self) -> Result<(), String> {
+        save_shutdown_json(&Self::file_path(), self)
+    }
+
     fn file_path() -> PathBuf {
         global_config_dir().join(gitterm_core::remote::config::REMOTE_AGENTS_FILE)
     }

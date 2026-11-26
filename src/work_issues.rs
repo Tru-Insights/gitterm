@@ -134,9 +134,11 @@ impl App {
             keys: due,
             prefixes: self.issues.cache.prefixes.clone(),
         };
-        Task::perform(issue_titles::fetch_round(request), |outcome| {
-            Event::Issue(IssueEvent::Fetched(Box::new(outcome)))
-        })
+        shutdown_task(
+            "poll_issue_titles",
+            issue_titles::fetch_round(request),
+            |outcome| Event::Issue(IssueEvent::Fetched(Box::new(outcome))),
+        )
     }
 
     fn apply_issue_round(&mut self, outcome: RoundOutcome) -> Task<Event> {
@@ -173,7 +175,7 @@ impl App {
     }
 
     /// Writes the cache off the UI thread, one write at a time.
-    fn save_issue_titles(&mut self) -> Task<Event> {
+    pub(super) fn save_issue_titles(&mut self) -> Task<Event> {
         if self.issues.save_in_flight {
             self.issues.save_again = true;
             return Task::none();
@@ -181,9 +183,10 @@ impl App {
         self.issues.save_in_flight = true;
         let file = self.issues.cache.clone();
         let path = IssueTitlesFile::path_in(&config::global_config_dir());
-        Task::perform(
+        shutdown_task(
+            "save_issue_titles",
             async move {
-                tokio::task::spawn_blocking(move || file.save(&path))
+                gitterm::shutdown::blocking("save_issue_titles", move || file.save(&path))
                     .await
                     .unwrap_or_else(|error| Err(format!("issue titles save task failed: {error}")))
             },

@@ -70,6 +70,7 @@ impl EventSink {
 enum CommandPort {
     Local(mpsc::UnboundedSender<RuntimeCommand>),
     Remote(mpsc::UnboundedSender<HarnessCommand>),
+    Closed,
 }
 
 pub struct Session {
@@ -205,6 +206,7 @@ impl Session {
         let accepted = match &self.commands {
             CommandPort::Local(tx) => tx.send(command.into()).is_ok(),
             CommandPort::Remote(tx) => tx.send(command).is_ok(),
+            CommandPort::Closed => false,
         };
         accepted
             .then_some(())
@@ -228,7 +230,7 @@ impl Session {
                     correlation: Some(correlation),
                 })
                 .map_err(|_| "the Claude session has exited".to_string()),
-            CommandPort::Remote(_) => {
+            CommandPort::Remote(_) | CommandPort::Closed => {
                 Err("remote sessions do not support correlated writes".into())
             }
         }
@@ -241,6 +243,23 @@ impl Session {
             0 => None,
             pid => Some(pid),
         }
+    }
+
+    /// Stop an owned local process and join its I/O, snapshots and runtime.
+    /// Remote ports retain their drop policy: detach unless explicitly owned.
+    /// The caller supplies any timeout; cancelling this wait keeps the join
+    /// handle on the session so it can still be awaited later.
+    pub fn request_shutdown(&mut self) {
+        if self.shutdown_on_drop {
+            let _ = self.send(HarnessCommand::Shutdown);
+        }
+        self.commands = CommandPort::Closed;
+        self.shutdown_on_drop = false;
+    }
+
+    pub async fn shutdown(&mut self) -> Result<(), String> {
+        self.request_shutdown();
+        self.completed().await
     }
 
     /// Wait for the entire local loop, final snapshot cleanup, and runtime
@@ -297,4 +316,69 @@ fn reject_command(command: impl Into<RuntimeCommand>, events: &EventSink) {
         command.into().correlation,
         DeliveryOutcome::Rejected("the Claude session exited before executing the command".into()),
     );
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn shutdown_joins_reader_writer_and_supervisor_teardown() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<RuntimeCommand>();
+        let (done, completion) = oneshot::channel();
+        let reader_done = Arc::new(AtomicBool::new(false));
+        let writer_done = Arc::new(AtomicBool::new(false));
+        let supervisor_done = Arc::new(AtomicBool::new(false));
+        let flags = (
+            reader_done.clone(),
+            writer_done.clone(),
+            supervisor_done.clone(),
+        );
+        let thread = std::thread::spawn(move || {
+            assert_eq!(
+                rx.blocking_recv().unwrap().command,
+                HarnessCommand::Shutdown
+            );
+            let reader = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                flags.0.store(true, Ordering::SeqCst);
+            });
+            let writer = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                flags.1.store(true, Ordering::SeqCst);
+            });
+            reader.join().unwrap();
+            writer.join().unwrap();
+            let _ = done.send(());
+            // Completion notification can precede the thread's own teardown.
+            std::thread::sleep(Duration::from_millis(20));
+            flags.2.store(true, Ordering::SeqCst);
+        });
+        let mut session = Session {
+            commands: CommandPort::Local(tx),
+            snapshots_closed: CancellationToken::new(),
+            shutdown_on_drop: true,
+            supports_correlation: false,
+            pid: Default::default(),
+            completion: Some(completion),
+            thread: Some(thread),
+        };
+        session.shutdown().await.unwrap();
+        assert!(reader_done.load(Ordering::SeqCst));
+        assert!(writer_done.load(Ordering::SeqCst));
+        assert!(supervisor_done.load(Ordering::SeqCst));
+        assert!(session.thread.is_none());
+        assert!(session.send(HarnessCommand::Interrupt).is_err());
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_detaches_remote_port_without_stopping_chat() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::from_port(tx, false);
+        session.shutdown().await.unwrap();
+        assert_eq!(rx.recv().await, None);
+    }
 }

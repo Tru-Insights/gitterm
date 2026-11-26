@@ -970,13 +970,19 @@ mod tests {
         for (kind, key, command) in [
             ("hide", "cmd-h", "Hide"),
             ("hide_others", "cmd-alt-h", "HideOthers"),
-            ("quit", "cmd-q", "Quit"),
             ("minimize", "cmd-m", "Minimize"),
             ("fullscreen", "cmd-ctrl-f", "Fullscreen"),
         ] {
             assert!(menu.contains(&format!("PredefinedMenuItem::{kind}(None)")));
             add(&mut rows, key, command);
         }
+        assert!(section(ICED, "let quit = MenuItem::new(", ";").contains("\"Quit GitTerm V6\""));
+        let quit = section(&menu, "letquit=MenuItem::new(", ";");
+        assert!(quit.contains("Some(Accelerator::new(Some(muda::accelerator::Modifiers::META),muda::accelerator::Code::KeyQ,))"));
+        assert!(menu.contains(
+            "&PredefinedMenuItem::show_all(None),&PredefinedMenuItem::separator(),&quit,"
+        ));
+        add(&mut rows, "cmd-q", "Quit");
         for (key, condition, command) in [
             ("j", "Key::Character(\"j\")", "FileSelectByIndex"),
             ("k", "Key::Character(\"k\")", "FileSelectByIndex"),
