@@ -1,4 +1,4 @@
-//! The unchanged workspaces.json wire format shared by hosts. No persistence authority.
+//! The complete workspaces.json wire format shared by hosts.
 use crate::remote::config::{RemoteAgentConfig, WorkspaceLocationConfig};
 use crate::settings::WorkspaceColor;
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,19 @@ pub struct WorkspacesFile<C = WorkspaceColor> {
     /// workspace's own fields.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repos: Vec<RepoConfig>,
+}
+
+impl<C> Default for WorkspacesFile<C> {
+    fn default() -> Self {
+        Self {
+            workspaces: Vec::new(),
+            active_workspace: 0,
+            remote_sessions: Vec::new(),
+            remote_agents: Vec::new(),
+            collapsed_repo_groups: Vec::new(),
+            repos: Vec::new(),
+        }
+    }
 }
 
 /// A repo as `workspaces.json` stores it (TRU-180). Identified by `dir` on

@@ -100,3 +100,6 @@ pub mod remote;
 pub mod agent_config;
 pub mod config_paths;
 pub mod workspace_config;
+
+#[cfg(feature = "runtime")]
+pub mod desktop_store;
