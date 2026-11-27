@@ -1917,13 +1917,6 @@ fn setup_menu_bar() {
 // === Speech-to-Text helpers ===
 
 #[cfg(feature = "stt")]
-const STT_MIN_RECORDING_SECONDS: f32 = 0.25;
-#[cfg(feature = "stt")]
-const STT_MIN_RMS: f32 = 0.001;
-#[cfg(feature = "stt")]
-const STT_MIN_PEAK: f32 = 0.01;
-
-#[cfg(feature = "stt")]
 fn stt_model_path() -> PathBuf {
     config::global_config_dir()
         .join("models")
@@ -1932,185 +1925,25 @@ fn stt_model_path() -> PathBuf {
 
 #[cfg(feature = "stt")]
 fn stt_audio_stats(samples: &[f32]) -> (f32, f32) {
-    if samples.is_empty() {
-        return (0.0, 0.0);
-    }
-
-    let mut sum_squares = 0.0f64;
-    let mut peak = 0.0f32;
-    for &sample in samples {
-        let abs = sample.abs();
-        peak = peak.max(abs);
-        let sample = sample as f64;
-        sum_squares += sample * sample;
-    }
-
-    let rms = (sum_squares / samples.len() as f64).sqrt() as f32;
-    (rms, peak)
+    gitterm_core::dictation::audio_stats(samples)
 }
 
 #[cfg(feature = "stt")]
-fn stt_start_recording(audio_buffer: Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stream, u32), String> {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-
-    let host = cpal::default_host();
-    let default = host.default_input_device();
-    let default_config = default.as_ref().map(|device| device.default_input_config());
-    let (device, config) = match (default, default_config) {
-        (Some(device), Some(Ok(config))) => (device, config),
-        (_, default_err) => {
-            // macOS can leave the default input pointing at a device that
-            // has gone (a headset or iPhone mic that disconnected; seen
-            // 2026-10-23). Record from the first input that answers instead.
-            let reason = match default_err {
-                Some(Err(e)) => format!("the default input device failed ({e})"),
-                _ => "there is no default input device".to_string(),
-            };
-            let fallback = host
-                .input_devices()
-                .map_err(|e| format!("Failed to list input devices after {reason}: {e}"))?
-                .find_map(|device| {
-                    let config = device.default_input_config().ok()?;
-                    Some((device, config))
-                })
-                .ok_or_else(|| format!("No working input device: {reason}"))?;
-            eprintln!(
-                "[STT] {reason}; recording from {} instead",
-                fallback
-                    .0
-                    .name()
-                    .unwrap_or_else(|_| "<unknown input device>".to_string())
-            );
-            fallback
-        }
-    };
-
-    let sample_rate = config.sample_rate().0;
-    let device_name = device
-        .name()
-        .unwrap_or_else(|_| "<unknown input device>".to_string());
-    eprintln!(
-        "[STT] Starting recording: device={} sample_rate={} channels={} format={:?}",
-        device_name,
-        sample_rate,
-        config.channels(),
-        config.sample_format()
-    );
-
-    // Clear existing buffer
-    {
-        let mut buf = audio_buffer.lock().unwrap();
-        buf.clear();
-    }
-
-    let channels = config.channels() as usize;
-    let buf = audio_buffer.clone();
-
-    let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => device
-            .build_input_stream(
-                &config.into(),
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    let mut buf = buf.lock().unwrap();
-                    // Convert to mono by averaging channels
-                    if channels == 1 {
-                        buf.extend_from_slice(data);
-                    } else {
-                        for chunk in data.chunks(channels) {
-                            let sum: f32 = chunk.iter().sum();
-                            buf.push(sum / channels as f32);
-                        }
-                    }
-                },
-                |err| eprintln!("[STT] Audio stream error: {}", err),
-                None,
-            )
-            .map_err(|e| format!("Failed to build input stream: {}", e))?,
-        cpal::SampleFormat::I16 => device
-            .build_input_stream(
-                &config.into(),
-                move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    let mut buf = buf.lock().unwrap();
-                    if channels == 1 {
-                        buf.extend(data.iter().map(|&s| s as f32 / 32768.0));
-                    } else {
-                        for chunk in data.chunks(channels) {
-                            let sum: f32 = chunk.iter().map(|&s| s as f32 / 32768.0).sum();
-                            buf.push(sum / channels as f32);
-                        }
-                    }
-                },
-                |err| eprintln!("[STT] Audio stream error: {}", err),
-                None,
-            )
-            .map_err(|e| format!("Failed to build input stream: {}", e))?,
-        format => return Err(format!("Unsupported sample format: {:?}", format)),
-    };
-
-    stream
-        .play()
-        .map_err(|e| format!("Failed to start stream: {}", e))?;
-
-    Ok((stream, sample_rate))
+fn stt_start_recording(
+    audio_buffer: Arc<Mutex<Vec<f32>>>,
+) -> Result<(gitterm_core::dictation::Recorder, u32), String> {
+    let recorder = gitterm_core::dictation::Recorder::start(None, audio_buffer)?;
+    let sample_rate = recorder.sample_rate();
+    Ok((recorder, sample_rate))
 }
 
 #[cfg(feature = "stt")]
 fn stt_transcribe(
-    ctx: Arc<whisper_rs::WhisperContext>,
+    ctx: Arc<gitterm_core::dictation::Transcriber>,
     mono_samples: Vec<f32>,
     input_sample_rate: u32,
 ) -> Result<String, String> {
-    let input_rate = input_sample_rate as usize;
-    let output_rate = 16000usize;
-
-    // Resample to 16kHz for Whisper using linear interpolation
-    let resampled = if input_rate != output_rate {
-        let ratio = input_rate as f64 / output_rate as f64;
-        let output_len = (mono_samples.len() as f64 / ratio) as usize;
-        let mut output = Vec::with_capacity(output_len);
-        for i in 0..output_len {
-            let src_idx = i as f64 * ratio;
-            let idx0 = src_idx as usize;
-            let frac = src_idx - idx0 as f64;
-            let s0 = mono_samples.get(idx0).copied().unwrap_or(0.0);
-            let s1 = mono_samples.get(idx0 + 1).copied().unwrap_or(s0);
-            output.push(s0 + (s1 - s0) * frac as f32);
-        }
-        output
-    } else {
-        mono_samples
-    };
-
-    // Run Whisper
-    let mut state = ctx
-        .create_state()
-        .map_err(|e| format!("Failed to create whisper state: {}", e))?;
-
-    let mut params =
-        whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
-    params.set_language(Some("en"));
-    params.set_print_special(false);
-    params.set_print_progress(false);
-    params.set_print_realtime(false);
-    params.set_print_timestamps(false);
-    params.set_suppress_blank(true);
-    params.set_no_speech_thold(0.6);
-
-    state
-        .full(params, &resampled)
-        .map_err(|e| format!("Whisper transcription failed: {}", e))?;
-
-    let num_segments = state.full_n_segments();
-    let mut result = String::new();
-    for i in 0..num_segments {
-        if let Some(segment) = state.get_segment(i) {
-            if let Ok(segment_text) = segment.to_str_lossy() {
-                result.push_str(&segment_text);
-            }
-        }
-    }
-
-    Ok(result.trim().to_string())
+    ctx.transcribe(mono_samples, input_sample_rate)
 }
 
 fn main() -> iced::Result {
@@ -8195,11 +8028,11 @@ struct App {
     #[cfg(feature = "stt")]
     stt_recording: bool,
     #[cfg(feature = "stt")]
-    stt_context: Option<Arc<whisper_rs::WhisperContext>>,
+    stt_context: Option<Arc<gitterm_core::dictation::Transcriber>>,
     #[cfg(feature = "stt")]
     stt_audio_buffer: Arc<Mutex<Vec<f32>>>,
     #[cfg(feature = "stt")]
-    stt_stream: Option<cpal::Stream>,
+    stt_stream: Option<gitterm_core::dictation::Recorder>,
     #[cfg(feature = "stt")]
     stt_sample_rate: u32,
     #[cfg(feature = "stt")]
@@ -32669,13 +32502,7 @@ fi
                 if self.stt_recording {
                     // Stop recording, start transcription
                     self.stt_recording = false;
-                    // Drop the stream to stop recording
-                    self.stt_stream = None;
-                    // Take the buffer
-                    let samples = {
-                        let mut buf = self.stt_audio_buffer.lock().unwrap();
-                        std::mem::take(&mut *buf)
-                    };
+                    let samples = self.stt_stream.take().unwrap().stop();
                     if samples.is_empty() {
                         eprintln!("[STT] Recording stopped with no audio samples");
                         return Task::none();
@@ -32690,47 +32517,32 @@ fi
                         rms,
                         peak
                     );
-                    if duration_secs < STT_MIN_RECORDING_SECONDS {
-                        eprintln!(
-                            "[STT] Ignoring recording shorter than {:.2}s",
-                            STT_MIN_RECORDING_SECONDS
-                        );
-                        return Task::none();
-                    }
-                    if rms < STT_MIN_RMS && peak < STT_MIN_PEAK {
-                        eprintln!(
-                            "[STT] Ignoring near-silent recording (rms={:.6}, peak={:.6}); check macOS microphone permission/input device",
-                            rms,
-                            peak
-                        );
+                    if !gitterm_core::dictation::should_transcribe(&samples, self.stt_sample_rate) {
+                        if duration_secs < gitterm_core::dictation::MIN_RECORDING_SECONDS {
+                            eprintln!(
+                                "[STT] Ignoring recording shorter than {:.2}s",
+                                gitterm_core::dictation::MIN_RECORDING_SECONDS
+                            );
+                        } else {
+                            eprintln!(
+                                "[STT] Ignoring near-silent recording (rms={:.6}, peak={:.6}); check macOS microphone permission/input device",
+                                rms,
+                                peak
+                            );
+                        }
                         return Task::none();
                     }
                     self.stt_transcribing = true;
                     // Lazy-init whisper context
                     if self.stt_context.is_none() {
                         let model_path = stt_model_path();
-                        if !model_path.exists() {
-                            self.stt_transcribing = false;
-                            let model_dir = model_path.parent().unwrap_or(&model_path).display();
-                            eprintln!(
-                                "[STT] Model not found. Download it with:\n  \
-                                 mkdir -p \"{model_dir}\" && \\\n  \
-                                 curl -L -o \"{}\" \\\n  \
-                                 https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
-                                model_path.display()
-                            );
-                            return Task::none();
-                        }
-                        match whisper_rs::WhisperContext::new_with_params(
-                            model_path.to_str().unwrap(),
-                            whisper_rs::WhisperContextParameters::default(),
-                        ) {
+                        match gitterm_core::dictation::Transcriber::load(&model_path) {
                             Ok(ctx) => {
                                 self.stt_context = Some(Arc::new(ctx));
                             }
                             Err(e) => {
                                 self.stt_transcribing = false;
-                                eprintln!("[STT] Failed to load model: {}", e);
+                                eprintln!("[STT] {}", e);
                                 return Task::none();
                             }
                         }
