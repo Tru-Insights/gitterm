@@ -8,7 +8,6 @@
 //! dedicated thread and maps `HarnessCommand`s onto stdin frames.
 
 use std::collections::VecDeque;
-use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -43,45 +42,10 @@ pub use gitterm_core::harness::claude::{
 };
 use gitterm_core::harness::claude::{Launch, SnapshotFuture, SnapshotRecorder};
 
-/// Directories where `claude` is commonly installed but that a Finder-
-/// launched app's PATH lacks. Mirrors the PATH GitTerm gives terminal tabs.
-fn extra_bin_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        dirs.push(home.join(".local/bin"));
-        dirs.push(home.join(".cargo/bin"));
-    }
-    dirs.push(PathBuf::from("/opt/homebrew/bin"));
-    dirs.push(PathBuf::from("/usr/local/bin"));
-    dirs
-}
-
-/// The PATH for the child: the inherited PATH plus the usual install dirs.
-pub(super) fn child_path() -> OsString {
-    let mut entries: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
-    for dir in extra_bin_dirs() {
-        if !entries.contains(&dir) {
-            entries.push(dir);
-        }
-    }
-    std::env::join_paths(entries).unwrap_or_default()
-}
-
-/// Locate the `claude` executable on the child PATH.
-pub fn resolve_claude_program() -> Result<PathBuf, String> {
-    let path = child_path();
-    std::env::split_paths(&path)
-        .map(|dir| dir.join("claude"))
-        .find(|candidate| candidate.is_file())
-        .ok_or_else(|| {
-            format!(
-                "could not find the `claude` executable on PATH ({})",
-                path.to_string_lossy()
-            )
-        })
-}
+#[cfg(test)]
+use gitterm_core::harness::local_launch::child_environment;
+pub(super) use gitterm_core::harness::local_launch::child_path;
+pub use gitterm_core::harness::local_launch::resolve_claude_program;
 
 /// Handle to a running Claude session. Dropping a local one shuts the
 /// process down; dropping a remote one on an agent that owns its chats
@@ -917,47 +881,7 @@ fn local_launch(
         config.snapshot_facts_dir.clone(),
     )
     .with_close_token(token);
-    let environment = child_environment(std::env::vars_os(), child_path(), &config.mcp_servers);
-    Launch {
-        flags: Default::default(),
-        config,
-        program,
-        environment,
-        temporary_dir: std::env::temp_dir(),
-        snapshots: Box::new(snapshots),
-    }
-}
-
-fn child_environment(
-    inherited: impl IntoIterator<Item = (OsString, OsString)>,
-    path: OsString,
-    servers: &[ClaudeMcpServer],
-) -> Vec<(OsString, OsString)> {
-    // Command preserves platform environment-key semantics (case-insensitive
-    // on Windows). It is only used to build the explicit map, never executed.
-    let inherited: Vec<_> = inherited.into_iter().collect();
-    let mut command = std::process::Command::new("claude");
-    command
-        .env_clear()
-        .envs(inherited.iter().cloned())
-        .env("PATH", path);
-    for (key, _) in inherited {
-        let key = key.to_string_lossy();
-        if key == "CLAUDECODE" || key.starts_with("CLAUDE_CODE_") || key == "CLAUDE_PID" {
-            command.env_remove(key.as_ref());
-        }
-    }
-    command
-        .env_remove("NODE_OPTIONS")
-        .env("CLAUDE_CODE_ENTRYPOINT", "sdk-ts")
-        .env("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1");
-    for server in servers {
-        command.envs(server.env.iter().map(|(key, value)| (key, value)));
-    }
-    command
-        .get_envs()
-        .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
-        .collect()
+    gitterm_core::harness::local_launch::local_launch(config, program, Box::new(snapshots))
 }
 
 impl SnapshotRecorder for crate::turn_snapshots::Recorder {
