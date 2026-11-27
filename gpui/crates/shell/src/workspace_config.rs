@@ -314,7 +314,7 @@ pub(crate) fn read_iced_chat_index(
 }
 
 // Keep host-owned usage data opaque while parsing the shared settings schema.
-pub(crate) type IcedSettings = gitterm_core::settings::Settings<
+pub(crate) type IcedSettings = gitterm_core::settings::SettingsWithVoice<
     gitterm_core::settings::WorkspaceColor,
     serde_json::Value,
     PathBuf,
@@ -398,7 +398,7 @@ mod iced_tests {
         let fixture = tempfile::tempdir().unwrap();
         let path = fixture.path().join("settings.json");
         let bytes = br#"{ "theme": "light", "ui_font_size": 17, "terminal_font_size": 19,
-            "usage": {"pricing": {"fixture": null}}, "future": true }"#;
+            "usage": {"pricing": {"fixture": null}}, "stt_enabled": false, "future": true }"#;
         std::fs::write(&path, bytes).unwrap();
         let sentinel = fixture.path().join("sentinel");
         std::fs::write(&sentinel, b"unchanged").unwrap();
@@ -409,6 +409,7 @@ mod iced_tests {
             modified(&sentinel),
         );
         let settings = load_iced_settings_from(fixture.path());
+        assert!(!settings.stt_enabled);
         assert_eq!(settings.theme, "light");
         assert_eq!(settings.ui_font_size, 17.);
         assert_eq!(settings.terminal_font_size, 19.);

@@ -423,6 +423,7 @@ pub fn render(input: &Input, c: Colors, emit: Handler<Outcome>) -> gpui::Statefu
     if let Some(mic) = &input.mic {
         metadata = metadata.child(
             div()
+                .debug_selector(|| "pstrip-mic".into())
                 .text_size(px(11.))
                 .text_color(rgb(mic.color))
                 .child(mic.label.clone()),

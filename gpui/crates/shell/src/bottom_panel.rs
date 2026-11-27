@@ -15,7 +15,7 @@
 use std::rc::Rc;
 
 use gitterm_core::{
-    settings::{QuickCommand, Settings},
+    settings::{QuickCommand, SettingsWithVoice as Settings},
     workspace_config::RepoKey,
 };
 use gpui::{
