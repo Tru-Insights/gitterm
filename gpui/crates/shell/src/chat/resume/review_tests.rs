@@ -138,12 +138,13 @@ fn replay(
     runtime: OwnedRuntime,
     events: Vec<RuntimeEvent>,
     cx: &mut Context<ChatPane>,
-) {
+) -> tokio::sync::mpsc::UnboundedSender<RuntimeEvent> {
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     for event in events {
         sender.send(event).unwrap();
     }
     pane.attach_runtime(runtime, receiver, cx);
+    sender
 }
 fn saved(root: &Path) -> WorkspacesFile {
     serde_json::from_slice(&std::fs::read(root.join("workspaces.json")).unwrap()).unwrap()
@@ -417,6 +418,7 @@ fn finding_f5_recoverable_error_and_exit_before_turn(cx: &mut gpui::TestAppConte
     });
     cx.run_until_parked();
     let mut remaining = None;
+    let mut replay_sender = None;
     pane.update(cx, |pane, cx| {
         let (runtime, mut events) = runtime(pane, &services);
         runtime
@@ -425,7 +427,8 @@ fn finding_f5_recoverable_error_and_exit_before_turn(cx: &mut gpui::TestAppConte
         let collected = collect(&mut events, |event| {
             matches!(event, RuntimeEvent::Harness(HarnessEvent::Error(_)))
         });
-        replay(pane, runtime, collected, cx);
+        // Keep this synthetic stream open while the real runtime remains alive.
+        replay_sender = Some(replay(pane, runtime, collected, cx));
         remaining = Some(events);
     });
     cx.run_until_parked();
@@ -460,6 +463,64 @@ fn finding_f5_recoverable_error_and_exit_before_turn(cx: &mut gpui::TestAppConte
         assert_ne!(pane.saved.uid, "errors-caller");
         pane.shutdown.drain().unwrap();
     });
+    drop(replay_sender);
+}
+
+#[gpui::test]
+fn finding_f6_turn_started_clears_resume_before_exit(cx: &mut gpui::TestAppContext) {
+    let Some((root, preview, services, workspace)) = prepare(cx, "started") else {
+        return;
+    };
+    let tab = tab(&root, "started-caller".into(), Some("started-id".into()));
+    let (pane, cx) = cx.add_window_view(|window, cx| {
+        ChatPane::resume_from(
+            RuntimeShutdown::new(),
+            preview,
+            workspace,
+            tab,
+            Some(history("started-id")),
+            window,
+            cx,
+        )
+        .unwrap()
+    });
+    cx.run_until_parked();
+    let mut stream = None;
+    pane.update(cx, |pane, cx| {
+        let (runtime, mut events) = runtime(pane, &services);
+        runtime
+            .send(HarnessCommand::SendUserMessage("resume".into()))
+            .unwrap();
+        let collected = collect(&mut events, |event| {
+            matches!(
+                event,
+                RuntimeEvent::Harness(HarnessEvent::TurnStarted { .. })
+            )
+        });
+        stream = Some(replay(pane, runtime, collected, cx));
+        assert!(pane.awaiting_resume);
+    });
+    cx.run_until_parked();
+    pane.update(cx, |pane, cx| {
+        assert!(!pane.awaiting_resume);
+        assert!(pane.resume_error.is_none());
+        assert_eq!(pane.persisted_id.as_deref(), Some("started-id"));
+        pane.receive_runtime_event(
+            &pane.controller.source.clone(),
+            RuntimeEvent::Harness(HarnessEvent::ProcessExited { code: Some(0) }),
+            cx,
+        );
+        assert!(pane.resume_error.is_none());
+        assert!(pane.controller.runtime.is_none());
+        pane.shutdown.drain().unwrap();
+        assert_eq!(
+            saved(&root).workspaces[0].tabs[0]
+                .chat_session_id
+                .as_deref(),
+            Some("started-id")
+        );
+    });
+    drop(stream);
 }
 
 fn unsent_tab(cwd: &Path, uid: &str) -> WorkspaceTabConfig {

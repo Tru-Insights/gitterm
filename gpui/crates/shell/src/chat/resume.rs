@@ -379,7 +379,7 @@ impl ChatPane {
         {
             return;
         }
-        self.shutdown_runtime();
+        self.shutdown_runtime(cx);
         // Keep the old provider session untouched; only this pane's binding is reset.
         if !self.saved.cwd.is_dir() {
             let Some(tab) = &self.live_tab else {

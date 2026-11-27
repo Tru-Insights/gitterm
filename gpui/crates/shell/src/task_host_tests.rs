@@ -2911,3 +2911,624 @@ mod launch_tests;
 #[cfg(unix)]
 #[path = "task_host_delivery_tests.rs"]
 mod delivery_tests;
+
+// Slice 7 runs each scenario in a fresh process: no process-global HOME or
+// config mutation races with the Preview/fixture tests in this binary.
+#[cfg(unix)]
+mod live_writes {
+    use super::*;
+    use gitterm_core::{preview::service::ServiceContext, tasks::TaskStore};
+    use serde_json::json;
+
+    const CHILD: &str = "GITTERM_LIVE_WRITE_TEST";
+
+    fn child(name: &str) -> bool {
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let root = base.join("v6");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("task_host_tests::live_writes::{name}"),
+                "--nocapture",
+            ])
+            .env(CHILD, name)
+            .env("HOME", &home)
+            .env("GITTERM_V6_CONFIG_DIR", &root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child {name}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    fn fixture() -> (Fixture, GitFixture) {
+        let root = PathBuf::from(std::env::var_os("GITTERM_V6_CONFIG_DIR").unwrap());
+        assert!(root.is_absolute());
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(root.parent(), home.parent());
+        let roots = Arc::new(
+            Preview::validate(
+                &root.parent().unwrap().join("preview"),
+                ProtectedRoots::new(&home, [root.clone()]).unwrap(),
+            )
+            .unwrap(),
+        );
+        let fixture = Fixture {
+            _dir: tempfile::tempdir().unwrap(),
+            roots,
+            iced: root,
+        };
+        fixture.write_iced(vec![], vec![]);
+        let git = GitFixture::new(&fixture);
+        (fixture, git)
+    }
+
+    fn start(
+        fixture: &Fixture,
+        cx: &mut TestAppContext,
+    ) -> (Entity<TaskHostOwner>, TaskControlSender) {
+        let (config, sender) = fixture.config();
+        let lock = Arc::new(HostLock::acquire(&fixture.iced).unwrap());
+        let services = Arc::new(
+            ServiceContext::production(&fixture.iced, std::process::id().to_string())
+                .unwrap()
+                .for_gpui_live(),
+        );
+        let owner = cx
+            .update(|cx| TaskHostOwner::start_live(config, lock, services, cx))
+            .unwrap();
+        // Exercise the same issuance path used by the shell's chat descriptor.
+        assert_eq!(
+            owner
+                .read_with(cx, |owner, _| owner.claude_mcp_servers("caller"))
+                .len(),
+            2
+        );
+        (owner, sender)
+    }
+
+    fn create(
+        cx: &mut TestAppContext,
+        sender: &TaskControlSender,
+        repo: &Path,
+    ) -> serde_json::Value {
+        dispatch(cx, sender, create_in(repo)).unwrap()
+    }
+
+    fn handoff(id: &str, summary: &str) -> TaskControlOperation {
+        TaskControlOperation::UpdateHandoff(req(
+            json!({"task_id": id, "summary": summary, "decisions": ["Use core"], "next_steps": ["Continue"], "blockers": []}),
+        ))
+    }
+
+    fn caller_shell<'a>(
+        fixture: &Fixture,
+        owner: &Entity<TaskHostOwner>,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<crate::Shell>, &'a mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(crate::task_host::GpuiTaskHost(owner.clone()));
+        });
+        cx.add_window_view(|window, cx| {
+            let mut model = crate::workspace_status::WorkspaceStatus::default();
+            model.add(fixture.iced.clone(), Instant::now());
+            let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, None, cx));
+            crate::Shell::with_owner(
+                std::rc::Rc::new(crate::data::LocalData(owner.clone())),
+                owner,
+                fixture.roots.root(),
+                true,
+                window,
+                cx,
+            )
+            .unwrap()
+        })
+    }
+
+    fn add_caller_chat(
+        shell: &Entity<crate::Shell>,
+        owner: &Entity<TaskHostOwner>,
+        fixture: &Fixture,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Entity<crate::chat::ChatPane> {
+        let mut chat = None;
+        shell.update_in(cx, |shell, window, cx| {
+            let saved = crate::chat::SavedChat {
+                uid: "history".into(),
+                cwd: fixture.iced.clone(),
+                provider: fixture.roots.provider(),
+                session_id: None,
+                records: vec![],
+            };
+            let view = cx.new(|cx| {
+                crate::chat::ChatPane::history(
+                    shell.owner.read(cx).chat_shutdown.clone(),
+                    saved,
+                    window,
+                    cx,
+                )
+            });
+            let target = view.read(cx).target();
+            owner.read(cx).claude_mcp_servers(&target.session_uid);
+            let id = crate::data::SessionId(target.tab_id as u64);
+            let pane_id = crate::session_pane_id(id);
+            let workspace = shell.active(cx).workspace.id;
+            let pane = cx.new(|cx| {
+                crate::pane::Pane::new(
+                    pane_id.clone(),
+                    "Chat".into(),
+                    crate::pane::PaneKind::PreviewChat(view.clone()),
+                    workspace,
+                    shell.data.clone(),
+                    window,
+                    cx,
+                )
+            });
+            shell.owner.update(cx, |owner, _| {
+                owner.chats.insert(target.session_uid.clone(), view.clone());
+            });
+            let state = shell
+                .workspaces
+                .iter_mut()
+                .find(|state| state.workspace.id == workspace)
+                .unwrap();
+            state.panes.insert(pane_id, pane);
+            state.sessions.push(crate::data::Session {
+                id,
+                title: "Chat".into(),
+                kind: crate::data::SessionKind::Chat,
+            });
+            chat = Some(view);
+        });
+        chat.unwrap()
+    }
+
+    #[gpui::test]
+    fn closed_chat_refuses_create(cx: &mut TestAppContext) {
+        if child("closed_chat_refuses_create") {
+            return;
+        }
+        cx.background_executor.allow_parking();
+        let (fixture, git) = fixture();
+        let (owner, sender) = start(&fixture, cx);
+        let (shell, cx) = caller_shell(&fixture, &owner, cx);
+        let chat = add_caller_chat(&shell, &owner, &fixture, cx);
+        let _other = add_caller_chat(&shell, &owner, &fixture, cx);
+        let target = chat.read_with(cx, |chat, _| chat.target());
+        shell.update_in(cx, |shell, window, cx| {
+            shell.close_target_with(&target, true, window, cx)
+        });
+        // Retain a handle: authority ends at close, not at eventual entity drop.
+        assert_eq!(
+            dispatch_as(cx, &sender, create_in(&git.repo), Some(&target.session_uid)),
+            Err("The calling GitTerm tab changed; request the delegation again".into())
+        );
+        assert!(
+            TaskStore::load(fixture.source())
+                .unwrap()
+                .tasks()
+                .is_empty()
+        );
+        owner.update(cx, |owner, _| owner.shutdown());
+    }
+
+    #[gpui::test]
+    fn exited_chat_refuses_handoff(cx: &mut TestAppContext) {
+        if child("exited_chat_refuses_handoff") {
+            return;
+        }
+        cx.background_executor.allow_parking();
+        let (fixture, git) = fixture();
+        let (owner, sender) = start(&fixture, cx);
+        let created = create(cx, &sender, &git.repo);
+        let (shell, cx) = caller_shell(&fixture, &owner, cx);
+        let chat = add_caller_chat(&shell, &owner, &fixture, cx);
+        let caller = chat.read_with(cx, |chat, _| chat.target().session_uid);
+        let before = std::fs::read(fixture.source()).unwrap();
+        chat.update(cx, |chat, cx| {
+            chat.receive_runtime_event(
+                &chat.runtime_source(),
+                gitterm_core::chat::runtime::RuntimeEvent::Harness(
+                    gitterm_core::chat::types::HarnessEvent::ProcessExited { code: Some(0) },
+                ),
+                cx,
+            )
+        });
+        assert_eq!(
+            dispatch_as(
+                cx,
+                &sender,
+                handoff(created["task_id"].as_str().unwrap(), "Stale"),
+                Some(&caller)
+            ),
+            Err("The calling GitTerm tab changed; request the delegation again".into())
+        );
+        assert_eq!(std::fs::read(fixture.source()).unwrap(), before);
+        owner.update(cx, |owner, _| owner.shutdown());
+    }
+
+    #[gpui::test]
+    fn closing_one_chat_preserves_other_caller(cx: &mut TestAppContext) {
+        if child("closing_one_chat_preserves_other_caller") {
+            return;
+        }
+        cx.background_executor.allow_parking();
+        let (fixture, git) = fixture();
+        let (owner, sender) = start(&fixture, cx);
+        let (shell, cx) = caller_shell(&fixture, &owner, cx);
+        let first = add_caller_chat(&shell, &owner, &fixture, cx);
+        let second = add_caller_chat(&shell, &owner, &fixture, cx);
+        let target = first.read_with(cx, |chat, _| chat.target());
+        let second = second.read_with(cx, |chat, _| chat.target().session_uid);
+        shell.update_in(cx, |shell, window, cx| {
+            shell.close_target_with(&target, true, window, cx)
+        });
+        assert!(dispatch_as(cx, &sender, create_in(&git.repo), Some(&target.session_uid)).is_err());
+        let created = dispatch_as(cx, &sender, create_in(&git.repo), Some(&second)).unwrap();
+        assert_eq!(
+            dispatch_as(
+                cx,
+                &sender,
+                handoff(created["task_id"].as_str().unwrap(), "Still open"),
+                Some(&second)
+            )
+            .unwrap()["handoff"]["summary"],
+            "Still open"
+        );
+        owner.update(cx, |owner, _| owner.shutdown());
+    }
+
+    #[gpui::test]
+    fn chat_reset_and_workspace_stop_revoke_callers(cx: &mut TestAppContext) {
+        if child("chat_reset_and_workspace_stop_revoke_callers") {
+            return;
+        }
+        cx.background_executor.allow_parking();
+        let (fixture, _) = fixture();
+        let (owner, _) = start(&fixture, cx);
+        let (shell, cx) = caller_shell(&fixture, &owner, cx);
+        let chat = add_caller_chat(&shell, &owner, &fixture, cx);
+        let caller = chat.read_with(cx, |chat, _| chat.target().session_uid);
+        chat.update(cx, |chat, cx| {
+            chat.receive_runtime_event(
+                &chat.runtime_source(),
+                gitterm_core::chat::runtime::RuntimeEvent::Harness(
+                    gitterm_core::chat::types::HarnessEvent::ConversationReset { trigger: None },
+                ),
+                cx,
+            )
+        });
+        owner.read_with(cx, |owner, _| {
+            assert!(
+                owner
+                    .host()
+                    .require_issued_caller(Some(&caller), "task_create")
+                    .is_err()
+            );
+            // Explicit issuance, rather than restored metadata, grants authority again.
+            owner.claude_mcp_servers(&caller);
+            assert!(
+                owner
+                    .host()
+                    .require_issued_caller(Some(&caller), "task_create")
+                    .is_ok()
+            );
+        });
+        shell.update_in(cx, |shell, window, cx| {
+            let target = shell.active(cx).park_target(cx);
+            shell.apply_park(
+                gitterm_core::park::Effect::Park {
+                    target,
+                    mode: gitterm_core::park::Mode::Stop,
+                    info: gitterm_core::park::Info::new("", String::new()),
+                },
+                window,
+                cx,
+            );
+        });
+        owner.read_with(cx, |owner, _| {
+            assert!(
+                owner
+                    .host()
+                    .require_issued_caller(Some(&caller), "task_create")
+                    .is_err()
+            );
+        });
+        owner.update(cx, |owner, _| owner.shutdown());
+    }
+
+    #[gpui::test]
+    fn create_handoff_restart(cx: &mut TestAppContext) {
+        if child("create_handoff_restart") {
+            return;
+        }
+        cx.background_executor.allow_parking();
+        let (fixture, git) = fixture();
+        let (owner, sender) = start(&fixture, cx);
+        let created = create(cx, &sender, &git.repo);
+        let id = created["task_id"].as_str().unwrap();
+        assert!(
+            Path::new(created["worktree"]["path"].as_str().unwrap())
+                .starts_with(fixture.iced.join("worktrees"))
+        );
+        let updated = dispatch(cx, &sender, handoff(id, "Resume here")).unwrap();
+        assert_eq!(updated["handoff"]["summary"], "Resume here");
+        owner.update(cx, |owner, _| owner.shutdown());
+        // A saved process identity is history, even if its PID is currently alive.
+        let mut core = TaskStore::load(fixture.source()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        core.upsert_session(
+            id,
+            req(json!({
+                "task_session_id": "imported-session", "label": "Saved terminal",
+                "launch_identity": {"pid": std::process::id(), "birth": "placeholder"},
+                "created_at": now, "updated_at": now
+            })),
+            &now,
+        )
+        .unwrap();
+        let before = std::fs::read(fixture.source()).unwrap();
+        let (restarted, sender) = start(&fixture, cx);
+        let read = dispatch(
+            cx,
+            &sender,
+            TaskControlOperation::Get(req(json!({"task_id": id}))),
+        )
+        .unwrap();
+        assert_eq!(read["handoff"], updated["handoff"]);
+        assert_eq!(read["task_id"], updated["task_id"]);
+        assert_eq!(std::fs::read(fixture.source()).unwrap(), before);
+        assert!(
+            dispatch_as(
+                cx,
+                &sender,
+                handoff(id, "Imported PID"),
+                Some("imported-session")
+            )
+            .unwrap_err()
+            .contains("calling GitTerm tab changed")
+        );
+        // Saved tasks are writable after admission; no launch/worker authority
+        // is inferred from their history or from their former caller.
+        dispatch(cx, &sender, handoff(id, "After restart")).unwrap();
+        restarted.read_with(cx, |owner, _| {
+            assert!(owner.host().launch_queue().is_empty());
+            assert!(!owns_in_flight_work(owner.host()));
+        });
+        restarted.update(cx, |owner, _| owner.shutdown());
+    }
+
+    #[gpui::test]
+    fn core_reads_live_file_and_custom_worktree_root(cx: &mut TestAppContext) {
+        if child("core_reads_live_file_and_custom_worktree_root") {
+            return;
+        }
+        cx.background_executor.allow_parking();
+        let (fixture, git) = fixture();
+        let custom = fixture.iced.parent().unwrap().join("custom-worktrees");
+        std::fs::write(
+            fixture.iced.join("settings.json"),
+            serde_json::to_vec(&json!({"task_worktree_root": custom})).unwrap(),
+        )
+        .unwrap();
+        let (owner, sender) = start(&fixture, cx);
+        let created = create(cx, &sender, &git.repo);
+        let core = TaskStore::load(TaskStore::path_for_config_root(&fixture.iced)).unwrap();
+        let record = core.get(created["task_id"].as_str().unwrap()).unwrap();
+        let mut expected = serde_json::to_value(record).unwrap();
+        expected["open_sessions"] = json!([]);
+        assert_eq!(created, expected);
+        assert!(record.worktree.path.as_ref().unwrap().starts_with(&custom));
+        assert!(
+            super::git(&git.repo, &["worktree", "list"])
+                .contains(record.worktree.path.as_ref().unwrap().to_str().unwrap())
+        );
+        owner.update(cx, |owner, _| owner.shutdown());
+    }
+
+    #[gpui::test]
+    fn batch_uses_shared_create_with_ordered_partial_results(cx: &mut TestAppContext) {
+        if child("batch_uses_shared_create_with_ordered_partial_results") {
+            return;
+        }
+        cx.background_executor.allow_parking();
+        let (fixture, git) = fixture();
+        let (owner, _) = start(&fixture, cx);
+        let servers = owner.read_with(cx, |owner, _| owner.claude_mcp_servers("caller"));
+        let env = |key: &str| {
+            servers[0]
+                .env
+                .iter()
+                .find(|(name, _)| name == key)
+                .unwrap()
+                .1
+                .clone()
+        };
+        let endpoint = env(gitterm_core::task_mcp::TASK_MCP_URL_ENV);
+        let token = env(gitterm_core::task_mcp::TASK_MCP_TOKEN_ENV);
+        let repo = git.repo.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let client = McpClient::connect(&endpoint, &token);
+            let tasks: Vec<_> = ["First", "", "Third"]
+                .into_iter()
+                .map(|title| {
+                    json!({
+                        "title": title, "objective": "Batch task", "repository_path": repo
+                    })
+                })
+                .collect();
+            send.send(client.call("task_create_batch", json!({"tasks": tasks})))
+                .unwrap();
+        });
+        let result = pump_until(cx, &receive);
+        let results = result["structuredContent"]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        for (row, title, ok) in [(0, "First", true), (1, "", false), (2, "Third", true)] {
+            assert_eq!(results[row]["title"], title);
+            assert_eq!(results[row]["ok"], ok, "{result}");
+        }
+        let core = TaskStore::load(fixture.source()).unwrap();
+        assert_eq!(core.tasks().len(), 2);
+        assert_eq!(core.tasks()[0].title, "First");
+        assert_eq!(core.tasks()[1].title, "Third");
+        owner.update(cx, |owner, _| owner.shutdown());
+    }
+
+    #[gpui::test]
+    fn forged_and_previous_host_callers_refused(cx: &mut TestAppContext) {
+        if child("forged_and_previous_host_callers_refused") {
+            return;
+        }
+        cx.background_executor.allow_parking();
+        let (fixture, git) = fixture();
+        let (owner, sender) = start(&fixture, cx);
+        let created = create(cx, &sender, &git.repo);
+        owner.read_with(cx, |owner, _| owner.claude_mcp_servers("former-caller"));
+        let before = std::fs::read(fixture.source()).unwrap();
+        for caller in [Some("forged"), None] {
+            for operation in [
+                create_in(&git.repo),
+                handoff(created["task_id"].as_str().unwrap(), "Forged"),
+            ] {
+                let error = dispatch_as(cx, &sender, operation, caller).unwrap_err();
+                assert!(!error.contains("not available in preview"), "{error}");
+                assert!(
+                    error.contains("calling GitTerm tab changed") || error.contains("caller"),
+                    "{error}"
+                );
+            }
+        }
+        owner.update(cx, |owner, _| owner.shutdown());
+        let (restarted, sender) = start(&fixture, cx);
+        let error = dispatch_as(
+            cx,
+            &sender,
+            handoff(created["task_id"].as_str().unwrap(), "Former host"),
+            Some("former-caller"),
+        )
+        .unwrap_err();
+        assert!(error.contains("calling GitTerm tab changed"), "{error}");
+        assert_eq!(std::fs::read(fixture.source()).unwrap(), before);
+        restarted.update(cx, |owner, _| owner.shutdown());
+    }
+
+    #[gpui::test]
+    fn failed_save_preserves_file_and_memory(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt;
+        if child("failed_save_preserves_file_and_memory") {
+            return;
+        }
+        cx.background_executor.allow_parking();
+        let (fixture, git) = fixture();
+        let (owner, sender) = start(&fixture, cx);
+        let created = create(cx, &sender, &git.repo);
+        let id = created["task_id"].as_str().unwrap();
+        dispatch(cx, &sender, handoff(id, "Last good handoff")).unwrap();
+        let before = std::fs::read(fixture.source()).unwrap();
+        let record = owner.read_with(cx, |owner, _| {
+            owner
+                .host()
+                .store()
+                .as_ref()
+                .unwrap()
+                .get(id)
+                .unwrap()
+                .clone()
+        });
+        let permissions = std::fs::metadata(&fixture.iced).unwrap().permissions();
+        std::fs::set_permissions(&fixture.iced, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let failed_handoff = dispatch(cx, &sender, handoff(id, "Must not save"));
+        let failed_create = dispatch(
+            cx,
+            &sender,
+            TaskControlOperation::Create(req(json!({
+                "title": "Cannot save", "objective": "Exercise the first store save", "repository_path": git.repo
+            }))),
+        );
+        std::fs::set_permissions(&fixture.iced, permissions).unwrap();
+        for result in [failed_handoff, failed_create] {
+            let error = result.unwrap_err();
+            assert!(error.contains("atomically write"), "{error}");
+            assert!(error.contains("tasks.json"), "{error}");
+        }
+        assert_eq!(std::fs::read(fixture.source()).unwrap(), before);
+        owner.read_with(cx, |owner, _| {
+            let store = owner.host().store().as_ref().unwrap();
+            assert_eq!(store.get(id).unwrap(), &record);
+            assert_eq!(store.tasks().len(), 1);
+        });
+        dispatch(cx, &sender, handoff(id, "Writable again")).unwrap();
+        owner.update(cx, |owner, _| owner.shutdown());
+    }
+
+    #[gpui::test]
+    fn only_task_writes_open(cx: &mut TestAppContext) {
+        use gitterm_core::preview::service::{RunnerEffect, preview_notice};
+        if child("only_task_writes_open") {
+            return;
+        }
+        cx.background_executor.allow_parking();
+        let (fixture, git) = fixture();
+        let (owner, sender) = start(&fixture, cx);
+        let created = create(cx, &sender, &git.repo);
+        let id = created["task_id"].as_str().unwrap();
+        let before = std::fs::read(fixture.source()).unwrap();
+        for (operation, label) in [
+            (
+                TaskControlOperation::LaunchSession(req(json!({"task_id": id}))),
+                "task_launch_session",
+            ),
+            (
+                TaskControlOperation::DelegateTask(req(
+                    json!({"title": "Worker", "objective": "Do work", "repo": git.repo}),
+                )),
+                "delegate_task",
+            ),
+            (
+                TaskControlOperation::RequestReview(req(
+                    json!({"target": "uncommitted", "checkout": git.repo}),
+                )),
+                "review_request",
+            ),
+            (
+                TaskControlOperation::RequestConsult(req(
+                    json!({"brief": "Consult", "checkout": git.repo}),
+                )),
+                "consult_request",
+            ),
+            (
+                TaskControlOperation::MergePlanSet(req(json!({"entries": []}))),
+                "merge_plan_set",
+            ),
+        ] {
+            assert_eq!(dispatch(cx, &sender, operation), Err(preview_notice(label)));
+        }
+        owner.read_with(cx, |owner, _| {
+            for effect in [
+                RunnerEffect::RestoreSession,
+                RunnerEffect::AutomaticDelivery,
+                RunnerEffect::QueuePromotion,
+                RunnerEffect::NotifyIngress,
+            ] {
+                assert!(owner.host().services().runner(effect, None).is_err());
+            }
+            assert!(owner.host().launch_queue().is_empty());
+            assert!(!owns_in_flight_work(owner.host()));
+        });
+        assert_eq!(std::fs::read(fixture.source()).unwrap(), before);
+        owner.update(cx, |owner, _| owner.shutdown());
+    }
+}

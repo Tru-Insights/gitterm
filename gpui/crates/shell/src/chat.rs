@@ -356,6 +356,7 @@ pub(crate) struct ChatPane {
     live_claim: Option<Arc<provider::ConversationClaim>>,
     live_tab: Option<resume::LiveTab>,
     resume_error: Option<String>,
+    awaiting_resume: bool,
     history_loading: bool,
     persisted_id: Option<String>,
     _history_load: Option<gpui::Task<()>>,
@@ -370,6 +371,7 @@ pub(crate) struct ChatPane {
     /// The cards' ids and states when the checkout's HEAD was last read.
     head_read_for: Vec<(String, String)>,
     _head_load: Option<gpui::Task<()>>,
+    _release: gpui::Subscription,
     _roster_subscription: gpui::Subscription,
     _review_subscription: gpui::Subscription,
     _review_context_load: Option<gpui::Task<()>>,
@@ -475,6 +477,7 @@ impl ChatPane {
             live_claim: None,
             live_tab: None,
             resume_error: None,
+            awaiting_resume: false,
             history_loading: false,
             persisted_id: None,
             _history_load: None,
@@ -486,6 +489,7 @@ impl ChatPane {
             held: Default::default(),
             head_read_for: vec![],
             _head_load: None,
+            _release: cx.on_release(|pane, cx| pane.shutdown_runtime(cx)),
             _roster_subscription: roster_subscription,
             _review_subscription: review_subscription,
             _review_context_load: None,
@@ -496,9 +500,12 @@ impl ChatPane {
         match launch {
             None => {}
             Some(Ok((runtime, events))) => pane.attach_runtime(runtime, events, cx),
-            Some(Err(error)) => pane.view.update(cx, |view, cx| {
-                view.set_status_error(format!("Claude unavailable: {error:#}"), cx)
-            }),
+            Some(Err(error)) => {
+                pane.shutdown_runtime(cx);
+                pane.view.update(cx, |view, cx| {
+                    view.set_status_error(format!("Claude unavailable: {error:#}"), cx)
+                });
+            }
         }
         pane
     }
@@ -598,6 +605,7 @@ impl ChatPane {
                 }
             }
             if let Err(error) = self.launch_live(cx) {
+                self.shutdown_runtime(cx);
                 let error = format!("Claude unavailable: {error:#}");
                 let view = self.view.clone();
                 let status = error.clone();
@@ -748,6 +756,7 @@ impl ChatPane {
             live_claim: None,
             live_tab: None,
             resume_error: None,
+            awaiting_resume: false,
             history_loading: false,
             persisted_id: None,
             _history_load: None,
@@ -759,6 +768,7 @@ impl ChatPane {
             held: Default::default(),
             head_read_for: vec![],
             _head_load: None,
+            _release: cx.on_release(|pane, cx| pane.shutdown_runtime(cx)),
             _roster_subscription: roster_subscription,
             _review_subscription: review_subscription,
             _review_context_load: None,
@@ -859,13 +869,17 @@ impl ChatPane {
         self._history_load = None;
         self.live_claim = None;
         self.controller.ready = false;
-        self.shutdown_runtime();
+        self.shutdown_runtime(cx);
         self.view.update(cx, |view, cx| {
             view.set_read_only(Some("Chat closed".into()), cx)
         });
         cx.notify();
     }
-    pub(crate) fn shutdown_runtime(&mut self) {
+    pub(crate) fn shutdown_runtime(&mut self, cx: &gpui::App) {
+        crate::task_host::revoke_caller(&self.controller.target.session_uid, cx);
+        self.enqueue_shutdown();
+    }
+    fn enqueue_shutdown(&mut self) {
         self.controller.ready = false;
         if let Some(runtime) = self.controller.runtime.take()
             && let Err(runtime) = self.shutdown.enqueue(runtime)
@@ -924,6 +938,100 @@ impl ChatPane {
         }
         cx.notify();
     }
+    pub(crate) fn receive_runtime_event(
+        &mut self,
+        source: &RuntimeStamp,
+        event: RuntimeEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .controller
+            .adapter
+            .state()
+            .accepts_stream(source, &self.controller.target)
+        {
+            return;
+        }
+        let exited = matches!(
+            &event,
+            RuntimeEvent::Harness(HarnessEvent::ProcessExited { .. })
+        );
+        let turn_ended = matches!(
+            &event,
+            RuntimeEvent::Harness(HarnessEvent::TurnCompleted { .. })
+        );
+        if let Some(applied) = self
+            .guidelines_status
+            .as_ref()
+            .and_then(|status| status.try_recv().ok())
+        {
+            self.view
+                .update(cx, |view, cx| view.set_guidelines_status(applied, cx));
+        }
+        if self.controller.live {
+            if matches!(
+                &event,
+                RuntimeEvent::Harness(HarnessEvent::TurnStarted { .. })
+            ) {
+                self.awaiting_resume = false;
+            }
+            if let RuntimeEvent::Harness(HarnessEvent::TurnStarted {
+                session_id: Some(id),
+                ..
+            }) = &event
+                && let Err(error) = self.confirm_provider_id(id, cx)
+            {
+                self.shutdown_runtime(cx);
+                self.resume_failed(format!("Cannot resume Claude: {error:#}"), cx);
+                return;
+            }
+        }
+        if matches!(
+            &event,
+            RuntimeEvent::Harness(HarnessEvent::ConversationReset { .. })
+        ) {
+            crate::task_host::revoke_caller(&self.controller.target.session_uid, cx);
+        }
+        let previous_settings = self.controller.adapter.state().acknowledged.clone();
+        if let Some(update) = self.controller.apply_runtime_outcome(source, event) {
+            self.pending.push(update);
+            self.changed(cx);
+        }
+        if self.controller.live
+            && self
+                .live_tab
+                .as_ref()
+                .is_some_and(|tab| tab.tab.chat_session_id.is_some())
+            && self.controller.adapter.state().acknowledged != previous_settings
+            && let Err(error) = self.persist_live_tab(cx)
+        {
+            self.view.update(cx, |view, cx| {
+                view.set_status_error(format!("Save Claude settings: {error:#}"), cx)
+            });
+        }
+        if turn_ended {
+            self.refresh_checkout_head(cx);
+            cx.emit(TurnEnded);
+        }
+        if exited {
+            self.shutdown_runtime(cx);
+            if self.awaiting_resume {
+                self.resume_failed(
+                    "Cannot resume saved Claude session: process exited before the turn started"
+                        .into(),
+                    cx,
+                );
+                return;
+            }
+            let stopped = if self.controller.live {
+                "Claude stopped"
+            } else {
+                "Claude preview stopped"
+            };
+            self.view
+                .update(cx, |view, cx| view.set_read_only(Some(stopped.into()), cx));
+        }
+    }
     #[cfg(test)]
     fn install_runtime(
         &mut self,
@@ -942,87 +1050,23 @@ impl ChatPane {
     ) {
         self.controller.runtime = Some(runtime);
         let source = self.controller.source.clone();
-        let mut awaiting_resume = self.controller.live && self.saved.session_id.is_some();
+        self.awaiting_resume = self.controller.live && self.saved.session_id.is_some();
         cx.spawn(async move |pane, cx| {
             while let Some(event) = events.recv().await {
                 if pane
                     .update(cx, |pane, cx| {
-                        if !pane
-                            .controller
-                            .adapter
-                            .state()
-                            .accepts_stream(&source, &pane.controller.target)
-                        {
-                            return;
-                        }
-                        let exited = matches!(
-                            &event,
-                            RuntimeEvent::Harness(HarnessEvent::ProcessExited { .. })
-                        );
-                        let turn_ended = matches!(
-                            &event,
-                            RuntimeEvent::Harness(HarnessEvent::TurnCompleted { .. })
-                        );
-                        if let Some(applied) = pane
-                            .guidelines_status
-                            .as_ref()
-                            .and_then(|status| status.try_recv().ok())
-                        {
-                            pane.view
-                                .update(cx, |view, cx| view.set_guidelines_status(applied, cx));
-                        }
-                        if pane.controller.live {
-                            if matches!(&event, RuntimeEvent::Harness(HarnessEvent::TurnStarted { .. })) {
-                                awaiting_resume = false;
-                            }
-                            if let RuntimeEvent::Harness(HarnessEvent::TurnStarted {
-                                session_id: Some(id),
-                                ..
-                            }) = &event
-                                && let Err(error) = pane.confirm_provider_id(id, cx)
-                            {
-                                pane.shutdown_runtime();
-                                pane.resume_failed(format!("Cannot resume Claude: {error:#}"), cx);
-                                return;
-                            }
-                        }
-                        let previous_settings = pane.controller.adapter.state().acknowledged.clone();
-                        if let Some(update) = pane.controller.apply_runtime_outcome(&source, event)
-                        {
-                            pane.pending.push(update);
-                            pane.changed(cx);
-                        }
-                        if pane.controller.live
-                            && pane.live_tab.as_ref().is_some_and(|tab| tab.tab.chat_session_id.is_some())
-                            && pane.controller.adapter.state().acknowledged != previous_settings
-                            && let Err(error) = pane.persist_live_tab(cx) {
-                            pane.view.update(cx, |view, cx| view.set_status_error(format!("Save Claude settings: {error:#}"), cx));
-                        }
-                        if turn_ended {
-                            pane.refresh_checkout_head(cx);
-                            cx.emit(TurnEnded);
-                        }
-                        if exited {
-                            pane.shutdown_runtime();
-                            if awaiting_resume {
-                                pane.resume_failed("Cannot resume saved Claude session: process exited before the turn started".into(), cx);
-                                return;
-                            }
-                            let stopped = if pane.controller.live {
-                                "Claude stopped"
-                            } else {
-                                "Claude preview stopped"
-                            };
-                            pane.view.update(cx, |view, cx| {
-                                view.set_read_only(Some(stopped.into()), cx)
-                            });
-                        }
+                        pane.receive_runtime_event(&source, event, cx);
                     })
                     .is_err()
                 {
                     break;
                 }
             }
+            let _ = pane.update(cx, |pane, cx| {
+                if pane.controller.source == source {
+                    pane.shutdown_runtime(cx);
+                }
+            });
         })
         .detach();
         let view = self.view.clone();
@@ -1032,6 +1076,9 @@ impl ChatPane {
 
 #[cfg(test)]
 impl ChatPane {
+    pub(crate) fn runtime_source(&self) -> RuntimeStamp {
+        self.controller.source.clone()
+    }
     /// Starts this pane's runtime on the fake Claude `program` in the pane's
     /// folder, through the fixture provider's probe and launch.
     pub(crate) fn start_fake_runtime(
@@ -1104,7 +1151,7 @@ mod history_projection_tests {
 }
 impl Drop for ChatPane {
     fn drop(&mut self) {
-        self.shutdown_runtime();
+        self.enqueue_shutdown();
     }
 }
 impl gpui::Focusable for ChatPane {

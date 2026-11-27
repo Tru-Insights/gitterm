@@ -1242,7 +1242,7 @@ impl Shell {
             .collect();
         for pane in panes {
             pane.update(cx, |pane, cx| {
-                pane.mark_exited();
+                pane.mark_exited(cx);
                 cx.notify();
             });
         }
@@ -3245,7 +3245,7 @@ impl Shell {
                 .with_exit_callback(move |_, cx| {
                     _ = weak.update(cx, |pane, cx| {
                         if pane.session == target {
-                            pane.exit_pending = true;
+                            pane.mark_exited(cx);
                             cx.notify();
                         }
                     });

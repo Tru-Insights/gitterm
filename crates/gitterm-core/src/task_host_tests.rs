@@ -1102,3 +1102,31 @@ fn closed_chat_results_log_once_until_the_count_changes() {
         1
     );
 }
+
+#[test]
+fn revoked_caller_is_unknown_until_reissued_and_other_callers_survive() {
+    let dir = tempfile::tempdir().unwrap();
+    let (commands, _receiver) = command_channel();
+    let host = TaskHost::new(None, production(&dir), commands);
+    host.issue_caller("closed");
+    host.issue_caller("open");
+    assert!(host
+        .require_issued_caller(Some("closed"), "task_create")
+        .is_ok());
+    host.revoke_caller("closed");
+    host.revoke_caller("closed");
+    assert_eq!(
+        host.require_issued_caller(Some("closed"), "task_create"),
+        host.require_issued_caller(Some("unknown"), "task_create")
+    );
+    assert!(host
+        .require_issued_caller(Some("closed"), "task_create")
+        .is_err());
+    assert!(host
+        .require_issued_caller(Some("open"), "task_create")
+        .is_ok());
+    host.issue_caller("closed");
+    assert!(host
+        .require_issued_caller(Some("closed"), "task_create")
+        .is_ok());
+}
