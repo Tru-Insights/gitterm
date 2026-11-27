@@ -2,7 +2,9 @@
 //! the view deliberately has no persistence or dispatch path yet.
 use std::path::PathBuf;
 
-use gitterm_core::settings::{ChatWidth, ReviewerKind, Settings, WorkspaceColor};
+use gitterm_core::settings::{
+    ChatWidth, ReviewerKind, SettingsWithVoice as Settings, WorkspaceColor,
+};
 use gpui::{div, prelude::*, px};
 
 #[cfg(test)]

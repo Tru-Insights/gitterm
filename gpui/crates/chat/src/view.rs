@@ -503,6 +503,20 @@ impl ChatView {
         self.refresh_rows(count, following, changed, cx);
     }
 
+    /// Insert voice input verbatim into this retained composer. A hidden chat
+    /// keeps its draft without taking focus from the chat now in front.
+    pub fn insert_dictation(
+        &mut self,
+        text: &str,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer.update(cx, |input, cx| {
+            crate::composer::insert_dictation(input, text, focus, window, cx);
+        });
+        cx.notify();
+    }
     pub fn set_status_error(&mut self, error: String, cx: &mut Context<Self>) {
         self.composer_state.notice = Some(error);
         cx.notify();
@@ -544,11 +558,20 @@ impl ChatView {
     /// Enable choosing the launch configuration before the first live turn.
     /// Card, resume and persistence fences remain those set by `set_preview`.
     pub fn set_live_prelaunch(&mut self, cx: &mut Context<Self>) {
+        self.set_live_launch_settings(&Default::default(), cx);
+    }
+    /// Install the saved choices before enabling Send, including before a redraw.
+    pub fn set_live_launch_settings(
+        &mut self,
+        settings: &crate::composer::LaunchSettings,
+        cx: &mut Context<Self>,
+    ) {
+        self.shadow = None;
         self.fixture_composer.acknowledged = gitterm_core::chat::state::AcknowledgedSettings {
-            model: Some("default".into()),
-            mode: Some("default".into()),
+            model: Some(settings.model.clone()),
+            mode: Some(settings.permission_mode.clone()),
             effort: Some(gitterm_core::chat::state::ConfirmedEffort {
-                effort: None,
+                effort: settings.effort.clone(),
                 applied: None,
             }),
         };

@@ -589,7 +589,8 @@ impl WorkSidebar {
     fn emit(&mut self, outcome: WorkSidebarOutcome, cx: &mut Context<Self>) {
         let error = outcome.preview_error().or_else(|| match &outcome {
             WorkSidebarOutcome::OpenChat { chat, .. }
-                if !self.workspace.open_chats.contains(chat) =>
+                if !self.workspace.open_chats.contains(chat)
+                    && !crate::chat::policy::is_live(cx) =>
             {
                 Some("Open chat · not available in preview".into())
             }

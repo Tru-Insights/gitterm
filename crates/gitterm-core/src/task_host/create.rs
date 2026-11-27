@@ -12,6 +12,27 @@ use crate::tasks::{StoppingBoundary, TaskRecord, TaskStore, WorkspaceLocationIde
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+/// Resolve Iced's saved worktree-root setting against the admitted V6 root.
+/// Missing settings use Iced's default; malformed settings are never guessed.
+pub fn saved_task_worktree_root(config_root: &Path) -> Result<PathBuf, String> {
+    let path = config_root.join("settings.json");
+    let settings: crate::settings::DesktopSettings = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| format!("read task worktree root from {}: {error}", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        Err(error) => {
+            return Err(format!(
+                "read task worktree root from {}: {error}",
+                path.display()
+            ))
+        }
+    };
+    Ok(settings
+        .task_worktree_root
+        .0
+        .unwrap_or_else(|| config_root.join("worktrees")))
+}
+
 /// The task MCP's stopping boundary as the store's.
 pub fn stopping_boundary_from_control(boundary: Option<TaskStoppingBoundary>) -> StoppingBoundary {
     match boundary.unwrap_or(TaskStoppingBoundary::ImplementUntilTestsPass) {
@@ -116,6 +137,27 @@ pub fn assemble_task_create(
 mod tests {
     use super::*;
     use crate::task_commands::TaskCreateOrigin;
+
+    #[test]
+    fn saved_worktree_root_uses_iced_default_and_explicit_setting() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        assert_eq!(
+            saved_task_worktree_root(root).unwrap(),
+            root.join("worktrees")
+        );
+        let custom = root.join("custom");
+        std::fs::write(
+            root.join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({"task_worktree_root": custom})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved_task_worktree_root(root).unwrap(), custom);
+        std::fs::write(root.join("settings.json"), b"{").unwrap();
+        assert!(saved_task_worktree_root(root)
+            .unwrap_err()
+            .contains("settings.json"));
+    }
 
     fn create(workspace_name: Option<&str>, base: Option<&str>) -> TaskCreate {
         TaskCreate {

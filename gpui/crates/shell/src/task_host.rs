@@ -2,6 +2,7 @@
 //!
 //! Live takes its already-locked TaskStore directly, shares one restricted
 //! production service context, and never seeds, reseeds, restores or delivers.
+//! Live creates tasks and saves handoffs through core on the locked V6 store.
 //! Later-slice writes and process runners retain the Preview notices.
 //!
 //! One [`TaskHostOwner`] per preview root: a lifetime host lock is taken
@@ -112,6 +113,13 @@ const FIXTURE_WORKTREES: &str = "worktrees";
 pub(crate) struct GpuiTaskHost(pub(crate) Entity<TaskHostOwner>);
 impl Global for GpuiTaskHost {}
 
+/// Session teardown must precede accepting another task write from this caller.
+pub(crate) fn revoke_caller(caller: &str, cx: &gpui::App) {
+    if let Some(host) = cx.try_global::<GpuiTaskHost>() {
+        host.0.read(cx).host.revoke_caller(caller);
+    }
+}
+
 /// Where commands come from. Production takes the process ingress; tests
 /// pass their own channel, because the process receiver is take-once.
 pub(crate) enum Ingress {
@@ -151,8 +159,8 @@ impl Ingress {
 
 pub(crate) struct HostConfig {
     pub roots: Arc<Preview>,
-    /// Iced's config dir, found the way `data.rs` reads it. Its `tasks.json`
-    /// is seeded from; it and the files the reads use are only read.
+    /// Iced's config dir, found the way `data.rs` reads it. Preview seeds
+    /// from it; Live writes tasks under the service context's locked root.
     pub iced_config: PathBuf,
     pub ingress: Ingress,
 }
@@ -283,7 +291,7 @@ pub(crate) struct TaskHostOwner {
     reap_reply: Option<std::sync::mpsc::Sender<Result<()>>>,
     /// Canonical fixture roots; empty in plain preview.
     fixtures: Vec<PathBuf>,
-    /// Fixture creates between their first check and their last save.
+    /// Creates between their first check and their last save.
     creating: usize,
     /// The preview store holds the host's own writes, which a re-seed from
     /// Iced's file would discard.
@@ -293,7 +301,8 @@ pub(crate) struct TaskHostOwner {
     /// Delegations this host stored, with the targets authorized at their
     /// request; only these are started or settled.
     own_delegations: std::collections::HashMap<String, AuthorizedTargets>,
-    /// Tasks this host created; only these are launched.
+    /// Tasks this host created, plus saved tasks admitted at Live startup.
+    /// Admission never imports process ownership or starts a session.
     own_tasks: std::collections::HashSet<String>,
     /// Finished results waiting for a closed chat, by its session uid, as of
     /// the last delivery tick; their log line repeats only when this changes.
@@ -519,6 +528,15 @@ impl TaskHostOwner {
         } else {
             Some(reaped)
         };
+        let own_tasks = if live {
+            store
+                .tasks()
+                .iter()
+                .map(|task| task.task_id.clone())
+                .collect()
+        } else {
+            Default::default()
+        };
         let host = TaskHost::new(Some(store), (*services).clone(), sender);
         Ok(cx.new(|cx| {
             let pump = cx.spawn(async move |owner: gpui::WeakEntity<Self>, cx| {
@@ -598,7 +616,7 @@ impl TaskHostOwner {
                 wrote: false,
                 runs: Default::default(),
                 own_delegations: Default::default(),
-                own_tasks: Default::default(),
+                own_tasks,
                 delegation_waiting_counts: Default::default(),
                 terminals: Default::default(),
                 launched: Default::default(),
@@ -630,6 +648,7 @@ impl TaskHostOwner {
         caller: &str,
     ) -> Vec<gitterm_core::harness::claude::ClaudeMcpServer> {
         self.servers.as_ref().map_or_else(Vec::new, |servers| {
+            self.host.issue_caller(caller);
             vec![
                 servers.task_mcp.claude_mcp_server(Some(caller)),
                 servers.browser.claude_mcp_server(Some(caller)),
@@ -879,18 +898,26 @@ impl TaskHostOwner {
             .collect()
     }
 
-    /// The preview's store for a write: the copy under the preview root,
-    /// re-scoped first so a swapped link never redirects the save. Marks
-    /// the store as the host's own, so no re-seed discards the write.
+    /// Live writes only the locked V6 store. Preview re-scopes its copy so
+    /// a swapped link cannot redirect the save, and marks it as the host's
+    /// own so no re-seed discards a fixture write.
     fn writable_store(&mut self) -> Result<&mut TaskStore, String> {
         // The host lock is released at shutdown; nothing is saved after it.
         if self.is_shut_down() {
             return Err(SHUT_DOWN.to_string());
         }
+        let preview = self.host.services().is_preview();
         let store = self.host.store_mut().as_mut().ok_or(STORE_UNAVAILABLE)?;
-        self.roots
-            .scoped(store.path())
-            .map_err(|error| format!("task store {}: {error}", store.path().display()))?;
+        if preview {
+            self.roots
+                .scoped(store.path())
+                .map_err(|error| format!("task store {}: {error}", store.path().display()))?;
+        } else {
+            let lock = self.lock.as_ref().ok_or(SHUT_DOWN)?;
+            if store.path() != TaskStore::path_for_config_root(lock.root()) {
+                return Err("Live task store differs from locked root".into());
+            }
+        }
         self.wrote = true;
         Ok(store)
     }
@@ -910,6 +937,9 @@ impl TaskHostOwner {
         cx: &App,
     ) -> Result<serde_json::Value, String> {
         self.authorize_write(label, &self.task_worktree(&request.task_id))?;
+        if !self.host.services().is_preview() {
+            self.host.require_issued_caller(caller, label)?;
+        }
         let chats = open_chats(cx);
         // A launched terminal's report is its task session's, as Iced's
         // facts list a task tab.
@@ -1105,9 +1135,8 @@ impl TaskHostOwner {
         Ok(value)
     }
 
-    /// `task_create` (Iced's control create path) in fixture mode: the core
-    /// reducer, resolution and preparation Iced runs, into the preview's
-    /// store, with the worktree under the repository's fixture. Every
+    /// `task_create` runs Iced's core reducer, resolution and preparation.
+    /// Live uses V6's store and worktree root; fixtures use their own. Every
     /// target is authorized before resolution, again with the resolved
     /// repository and worktree before the first save, and rechecked after
     /// preparation; a refusal then fails the task with the notice.
@@ -1142,7 +1171,7 @@ impl TaskHostOwner {
         .detach();
     }
 
-    /// Iced's `pending_task_from_control`, with the fixture's worktree root.
+    /// Iced's `pending_task_from_control`, with the mode's worktree root.
     fn begin_create(
         &mut self,
         reply: TaskControlReply,
@@ -1151,6 +1180,9 @@ impl TaskHostOwner {
         label: &'static str,
     ) -> Result<PendingCreate, String> {
         self.authorize_write(label, std::slice::from_ref(&request.repository_path))?;
+        if !self.host.services().is_preview() {
+            self.host.require_issued_caller(caller.as_deref(), label)?;
+        }
         let mutation = TaskMutation::Create(TaskCreate {
             title: request.title,
             objective: request.objective,
@@ -1171,7 +1203,15 @@ impl TaskHostOwner {
         let assembled = gitterm_core::task_host::assemble_task_create(
             self.host.store().as_ref(),
             input,
-            |repository_path| self.fixture_worktree_root(repository_path, label),
+            |repository_path| {
+                if self.host.services().is_preview() {
+                    self.fixture_worktree_root(repository_path, label)
+                } else {
+                    gitterm_core::task_host::saved_task_worktree_root(
+                        self.host.services().state_root(),
+                    )
+                }
+            },
         )?;
         let targets = vec![
             original_repository_path,
@@ -1694,7 +1734,7 @@ impl OpenChat {
     }
 }
 
-/// A fixture create between its first check and its last save.
+/// A create between its first check and its last save.
 struct PendingCreate {
     reply: TaskControlReply,
     caller: Option<String>,

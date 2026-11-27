@@ -791,6 +791,7 @@ impl TaskHostOwner {
         let Some(launched) = self.launched.get_mut(session_id) else {
             return;
         };
+        self.host.revoke_caller(&launched.target.session_uid);
         let task_id = launched.task_id.clone();
         let was_live = launched.live.take().is_some();
         cx.emit(TerminalExited {
@@ -945,6 +946,7 @@ impl TaskHostOwner {
         let Some(launched) = self.launched.remove(session_id) else {
             return;
         };
+        self.host.revoke_caller(&launched.target.session_uid);
         self.apply_task_session_signal(
             &launched.task_id,
             launched

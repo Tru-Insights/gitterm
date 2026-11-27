@@ -61,6 +61,7 @@ pub struct Pane {
     pub(crate) git: Option<Entity<git_view::GitView>>,
     _terminal_events: Option<Subscription>,
     _quit: Subscription,
+    _release: Subscription,
 }
 impl Pane {
     pub(crate) fn workspace_dir(&self, cx: &App) -> Option<std::path::PathBuf> {
@@ -132,8 +133,7 @@ impl Pane {
                                     if pane.session != exit_target {
                                         return;
                                     }
-                                    pane.exited = true;
-                                    pane.exit_pending = true;
+                                    pane.mark_exited(cx);
                                     cx.notify();
                                 });
                             })
@@ -192,7 +192,9 @@ impl Pane {
                 _ => session,
             },
             _terminal_events: terminal_events,
+            _release: cx.on_release(|pane: &mut Self, cx| pane.revoke_caller(cx)),
             _quit: cx.on_app_quit(|pane: &mut Self, cx| {
+                pane.revoke_caller(cx);
                 if let Some(barrier) = cx.try_global::<crate::lifetime::Barrier>().cloned()
                     && let PaneContent::Terminal(view) = &pane.content
                 {
@@ -266,9 +268,15 @@ impl Pane {
             _ => self.terminal_cwd.clone(),
         }
     }
+    fn revoke_caller(&self, cx: &App) {
+        if let Some(target) = &self.session {
+            crate::task_host::revoke_caller(&target.session_uid, cx);
+        }
+    }
     /// An adopted terminal's child exited: as the exit callback of a pane's
     /// own terminal marks it.
-    pub(crate) fn mark_exited(&mut self) {
+    pub(crate) fn mark_exited(&mut self, cx: &App) {
+        self.revoke_caller(cx);
         self.exited = true;
         self.exit_pending = true;
     }
@@ -276,6 +284,7 @@ impl Pane {
         matches!(self.content, PaneContent::Terminal(_)) && !self.exited
     }
     pub(crate) fn close_terminal(&mut self, cx: &mut App) {
+        self.revoke_caller(cx);
         if let PaneContent::Terminal(view) = &self.content {
             view.update(cx, |view, _| view.backend_mut().cancel());
         }

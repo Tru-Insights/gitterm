@@ -29,8 +29,16 @@ pub(crate) fn install_live(services: ServiceContext, cx: &mut gpui::App) -> Resu
     Ok(())
 }
 
-pub(super) fn current(preview: Arc<Preview>, cx: &gpui::App) -> ChatLaunchPolicy {
+pub(crate) fn current(preview: Arc<Preview>, cx: &gpui::App) -> ChatLaunchPolicy {
     cx.try_global::<Installed>()
         .map(|installed| installed.0.clone())
         .unwrap_or(ChatLaunchPolicy::Preview(preview))
+}
+
+/// Navigation may widen only after the installed production policy is present.
+pub(crate) fn is_live(cx: &gpui::App) -> bool {
+    matches!(
+        cx.try_global::<Installed>(),
+        Some(Installed(ChatLaunchPolicy::Live { .. }))
+    )
 }
