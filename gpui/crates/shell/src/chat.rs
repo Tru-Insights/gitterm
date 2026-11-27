@@ -310,6 +310,7 @@ pub(crate) struct ChatPane {
     /// The cards' ids and states when the checkout's HEAD was last read.
     head_read_for: Vec<(String, String)>,
     _head_load: Option<gpui::Task<()>>,
+    _release: gpui::Subscription,
     _roster_subscription: gpui::Subscription,
     _review_subscription: gpui::Subscription,
     _review_context_load: Option<gpui::Task<()>>,
@@ -389,15 +390,19 @@ impl ChatPane {
             held: Default::default(),
             head_read_for: vec![],
             _head_load: None,
+            _release: cx.on_release(|pane, cx| pane.shutdown_runtime(cx)),
             _roster_subscription: roster_subscription,
             _review_subscription: review_subscription,
             _review_context_load: None,
         };
         match launch {
             Ok((runtime, events)) => pane.install_runtime(runtime, events, window, cx),
-            Err(error) => pane.view.update(cx, |view, cx| {
-                view.set_status_error(format!("Claude unavailable: {error:#}"), cx)
-            }),
+            Err(error) => {
+                pane.shutdown_runtime(cx);
+                pane.view.update(cx, |view, cx| {
+                    view.set_status_error(format!("Claude unavailable: {error:#}"), cx)
+                });
+            }
         }
         pane
     }
@@ -546,6 +551,7 @@ impl ChatPane {
             held: Default::default(),
             head_read_for: vec![],
             _head_load: None,
+            _release: cx.on_release(|pane, cx| pane.shutdown_runtime(cx)),
             _roster_subscription: roster_subscription,
             _review_subscription: review_subscription,
             _review_context_load: None,
@@ -643,13 +649,17 @@ impl ChatPane {
     }
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.controller.ready = false;
-        self.shutdown_runtime();
+        self.shutdown_runtime(cx);
         self.view.update(cx, |view, cx| {
             view.set_read_only(Some("Chat closed".into()), cx)
         });
         cx.notify();
     }
-    pub(crate) fn shutdown_runtime(&mut self) {
+    pub(crate) fn shutdown_runtime(&mut self, cx: &gpui::App) {
+        crate::task_host::revoke_caller(&self.controller.target.session_uid, cx);
+        self.enqueue_shutdown();
+    }
+    fn enqueue_shutdown(&mut self) {
         self.controller.ready = false;
         if let Some(runtime) = self.controller.runtime.take()
             && let Err(runtime) = self.shutdown.enqueue(runtime)
@@ -704,6 +714,49 @@ impl ChatPane {
         cx.emit(self.saved.clone());
         cx.notify();
     }
+    pub(crate) fn receive_runtime_event(
+        &mut self,
+        source: &RuntimeStamp,
+        event: RuntimeEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .controller
+            .adapter
+            .state()
+            .accepts_stream(source, &self.controller.target)
+        {
+            return;
+        }
+        let exited = matches!(
+            &event,
+            RuntimeEvent::Harness(HarnessEvent::ProcessExited { .. })
+        );
+        if matches!(
+            &event,
+            RuntimeEvent::Harness(HarnessEvent::ConversationReset { .. })
+        ) {
+            crate::task_host::revoke_caller(&self.controller.target.session_uid, cx);
+        }
+        let turn_ended = matches!(
+            &event,
+            RuntimeEvent::Harness(HarnessEvent::TurnCompleted { .. })
+        );
+        if let Some(update) = self.controller.apply_runtime_outcome(source, event) {
+            self.pending.push(update);
+            self.changed(cx);
+        }
+        if turn_ended {
+            self.refresh_checkout_head(cx);
+            cx.emit(TurnEnded);
+        }
+        if exited {
+            self.shutdown_runtime(cx);
+            self.view.update(cx, |view, cx| {
+                view.set_read_only(Some("Claude preview stopped".into()), cx)
+            });
+        }
+    }
     fn install_runtime(
         &mut self,
         runtime: OwnedRuntime,
@@ -717,43 +770,18 @@ impl ChatPane {
             while let Some(event) = events.recv().await {
                 if pane
                     .update_in(cx, |pane, _, cx| {
-                        if !pane
-                            .controller
-                            .adapter
-                            .state()
-                            .accepts_stream(&source, &pane.controller.target)
-                        {
-                            return;
-                        }
-                        let exited = matches!(
-                            &event,
-                            RuntimeEvent::Harness(HarnessEvent::ProcessExited { .. })
-                        );
-                        let turn_ended = matches!(
-                            &event,
-                            RuntimeEvent::Harness(HarnessEvent::TurnCompleted { .. })
-                        );
-                        if let Some(update) = pane.controller.apply_runtime_outcome(&source, event)
-                        {
-                            pane.pending.push(update);
-                            pane.changed(cx);
-                        }
-                        if turn_ended {
-                            pane.refresh_checkout_head(cx);
-                            cx.emit(TurnEnded);
-                        }
-                        if exited {
-                            pane.shutdown_runtime();
-                            pane.view.update(cx, |view, cx| {
-                                view.set_read_only(Some("Claude preview stopped".into()), cx)
-                            });
-                        }
+                        pane.receive_runtime_event(&source, event, cx);
                     })
                     .is_err()
                 {
                     break;
                 }
             }
+            let _ = pane.update_in(cx, |pane, _, cx| {
+                if pane.controller.source == source {
+                    pane.shutdown_runtime(cx);
+                }
+            });
         })
         .detach();
         self.view
@@ -763,6 +791,9 @@ impl ChatPane {
 
 #[cfg(test)]
 impl ChatPane {
+    pub(crate) fn runtime_source(&self) -> RuntimeStamp {
+        self.controller.source.clone()
+    }
     /// Starts this pane's runtime on the fake Claude `program` in the pane's
     /// folder, through the fixture provider's probe and launch.
     pub(crate) fn start_fake_runtime(
@@ -835,7 +866,7 @@ mod history_projection_tests {
 }
 impl Drop for ChatPane {
     fn drop(&mut self) {
-        self.shutdown_runtime();
+        self.enqueue_shutdown();
     }
 }
 impl gpui::Focusable for ChatPane {
