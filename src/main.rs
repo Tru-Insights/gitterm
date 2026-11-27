@@ -8645,66 +8645,11 @@ use gitterm_core::remote::phone_panel::{
     self, scope_label as phone_scope_label, PhoneCall, PhoneRequest,
 };
 
-/// Insert or update an agent by id. Updates touch only the fields the
-/// connect form edits; hand-maintained `shell_command` / `session_commands`
-/// on an existing entry are preserved.
-fn upsert_remote_agent_config(definitions: &mut Vec<RemoteAgentConfig>, agent: RemoteAgentConfig) {
-    if let Some(existing) = definitions
-        .iter_mut()
-        .find(|existing| existing.id == agent.id)
-    {
-        existing.name = agent.name;
-        existing.endpoint = agent.endpoint;
-        existing.auth = agent.auth;
-    } else {
-        definitions.push(agent);
-    }
-}
-
-/// Upsert a single agent into remote-agents.json, leaving every other
-/// entry exactly as the user maintains it on disk.
-fn save_remote_agent_to_disk(agent: &RemoteAgentConfig) {
-    let mut file = RemoteAgentsFile::load().unwrap_or_default();
-    upsert_remote_agent_config(&mut file.remote_agents, agent.clone());
-    file.save();
-}
-
-/// Derive a stable id from a display name: lowercase alphanumerics with
-/// single dashes, e.g. "Mac mini" -> "mac-mini".
-fn remote_agent_id_slug(name: &str) -> String {
-    let mut slug = String::new();
-    let mut prev_dash = true;
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch.to_ascii_lowercase());
-            prev_dash = false;
-        } else if !prev_dash {
-            slug.push('-');
-            prev_dash = true;
-        }
-    }
-    let slug = slug.trim_end_matches('-');
-    if slug.is_empty() {
-        "remote".to_string()
-    } else {
-        slug.to_string()
-    }
-}
-
-/// Store a pasted token under ~/.config/gitterm-v6/tokens/<id>.token and
-/// return the path. Owner-only permissions on unix.
-fn write_remote_agent_token(remote_id: &str, token: &str) -> std::io::Result<PathBuf> {
-    let dir = config::global_config_dir().join("tokens");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{remote_id}.token"));
-    std::fs::write(&path, format!("{token}\n"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(path)
-}
+#[cfg(test)]
+use gitterm_core::remote::connect::remote_agent_id_slug;
+use gitterm_core::remote::connect::{
+    save_remote_connect, upsert_remote_agent_config, ConnectDraft,
+};
 
 fn remote_agent_for_session<'a>(
     definitions: &'a [RemoteAgentConfig],
@@ -10773,8 +10718,11 @@ impl App {
             let remotes = RemoteSessionsFile {
                 remote_sessions: remote_sessions.clone(),
             };
+            let mut errors = Vec::new();
             if shutting_down {
-                remotes.save_for_shutdown()?;
+                if let Err(error) = remotes.save_for_shutdown() {
+                    errors.push(error);
+                }
             } else {
                 remotes.save();
             }
@@ -10783,7 +10731,9 @@ impl App {
                     remote_agents: remote_agent_defs.clone(),
                 };
                 if shutting_down {
-                    agents.save_for_shutdown()?;
+                    if let Err(error) = agents.save_for_shutdown() {
+                        errors.push(error);
+                    }
                 } else {
                     agents.save();
                 }
@@ -10797,7 +10747,14 @@ impl App {
                 collapsed_repo_groups,
             };
             if shutting_down {
-                workspaces.save_for_shutdown()
+                if let Err(error) = workspaces.save_for_shutdown() {
+                    errors.push(error);
+                }
+                if errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(errors.join("; "))
+                }
             } else {
                 workspaces.save();
                 Ok(())
@@ -22786,79 +22743,30 @@ impl App {
         let Some(form) = self.remote_connect_form.as_ref() else {
             return Task::none();
         };
-        let name = form.name.trim().to_string();
-        let endpoint_raw = form.endpoint.trim().to_string();
-        let token = form.token.trim().to_string();
-        let saved_id = form.saved_remote_id.clone();
-
-        let fail = |app: &mut Self, message: String| {
-            if let Some(form) = app.remote_connect_form.as_mut() {
-                form.error = Some(message);
-            }
-            Task::none()
-        };
-
-        if name.is_empty() || endpoint_raw.is_empty() || token.is_empty() {
-            return fail(
-                self,
-                "Name, endpoint, and token are all required".to_string(),
-            );
-        }
-        let endpoint = if endpoint_raw.contains("://") {
-            endpoint_raw
-        } else {
-            format!("http://{endpoint_raw}")
-        };
-
-        // Keep the id stable across retries so an edited endpoint/token
-        // updates the entry we already wrote instead of appending another.
-        let id = saved_id.unwrap_or_else(|| {
-            let base = remote_agent_id_slug(&name);
-            let on_disk: Vec<String> = RemoteAgentsFile::load()
-                .map(|file| {
-                    file.remote_agents
-                        .into_iter()
-                        .map(|agent| agent.id)
-                        .collect()
-                })
-                .unwrap_or_default();
-            let taken = |candidate: &str| {
-                on_disk.iter().any(|id| id == candidate)
-                    || self
-                        .remote_agent_defs
-                        .iter()
-                        .any(|agent| agent.id == candidate)
-            };
-            let mut id = base.clone();
-            let mut suffix = 2;
-            while taken(&id) {
-                id = format!("{base}-{suffix}");
-                suffix += 1;
-            }
-            id
+        let saved = form.saved_remote_id.as_deref().and_then(|id| {
+            self.remote_agent_config_by_id(id).and_then(|agent| {
+                gitterm_core::remote::state::Identity::new(id.into(), agent.endpoint.clone()).ok()
+            })
         });
-
-        let token_ref = if token.starts_with("env:")
-            || token.starts_with("file:")
-            || token.starts_with("keychain:")
-        {
-            token
-        } else {
-            match write_remote_agent_token(&id, &token) {
-                Ok(path) => format!("file:{}", path.display()),
-                Err(err) => return fail(self, format!("Could not store token: {err}")),
+        let agent = match save_remote_connect(
+            &config::global_config_dir(),
+            &self.remote_agent_defs,
+            ConnectDraft {
+                name: &form.name,
+                endpoint: &form.endpoint,
+                token: &form.token,
+                saved: saved.as_ref(),
+            },
+        ) {
+            Ok(agent) => agent,
+            Err(error) => {
+                if let Some(form) = self.remote_connect_form.as_mut() {
+                    form.error = Some(error);
+                }
+                return Task::none();
             }
         };
-
-        let agent = RemoteAgentConfig {
-            id: id.clone(),
-            name,
-            endpoint,
-            auth: config::RemoteAgentAuthConfig::Token { token_ref },
-            shell_command: None,
-            session_commands: Default::default(),
-        };
-        save_remote_agent_to_disk(&agent);
+        let id = agent.id.clone();
         upsert_remote_agent_config(&mut self.remote_agent_defs, agent);
         if let Some(form) = self.remote_connect_form.as_mut() {
             form.error = None;

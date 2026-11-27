@@ -253,7 +253,15 @@ impl RemoteAgentBackend {
         let response = client
             .handshake(request)
             .await
-            .map_err(|err| rpc_failed("handshake", err))?
+            .map_err(|err| {
+                // Do not retain peer metadata/details: they can echo credentials too.
+                let message = if token.is_empty() {
+                    err.message().to_string()
+                } else {
+                    err.message().replace(&token, "[redacted]")
+                };
+                rpc_failed("handshake", tonic::Status::new(err.code(), message))
+            })?
             .into_inner();
 
         Ok(RemoteAgentHandshake {
