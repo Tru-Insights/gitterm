@@ -386,3 +386,43 @@ pub mod macos;
 #[cfg(test)]
 #[path = "../../../src/worker_process/tests.rs"]
 mod tests;
+
+/// Persist only an identity captured by this launch's recorder.
+pub fn persist_identity_record(
+    store: &mut crate::tasks::TaskStore,
+    task: &str,
+    session: &str,
+    identity: &LaunchIdentity,
+) -> Result<(), String> {
+    let mut record = store
+        .get(task)
+        .and_then(|task| task.sessions.iter().find(|s| s.task_session_id == session))
+        .cloned()
+        .ok_or_else(|| format!("worker session {session} is missing from task {task}"))?;
+    record.launch_identity = Some(identity.clone());
+    store
+        .upsert_session(task, record, &chrono::Utc::now().to_rfc3339())
+        .map_err(|error| error.to_string())
+}
+
+/// Early executable hook: the recorder must run before any app/state setup.
+pub fn handle_recorder(args: &[std::ffi::OsString]) {
+    if args.first().map(|arg| arg.as_os_str()) != Some(std::ffi::OsStr::new(RECORD_LAUNCH_ARG)) {
+        return;
+    }
+    let result = (|| {
+        let path = args.get(1).ok_or("missing worker launch record path")?;
+        let terminal_shell = args
+            .get(2)
+            .ok_or("missing worker terminal shell PID")?
+            .to_string_lossy()
+            .parse::<u32>()
+            .map_err(|error| format!("invalid worker terminal shell PID: {error}"))?;
+        record_launch(std::path::Path::new(path), terminal_shell)
+    })();
+    if let Err(error) = result {
+        eprintln!("[tasks] {error}");
+        std::process::exit(1);
+    }
+    std::process::exit(0);
+}

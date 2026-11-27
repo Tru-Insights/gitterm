@@ -2,8 +2,12 @@
 //!
 //! Live takes its already-locked TaskStore directly, shares one restricted
 //! production service context, and never seeds, reseeds, restores or delivers.
+//! Live workers use core's Iced terminal command and process identity; headless
+//! reviews/consults use core's production Codex environment. A separate worker
+//! tick persists identities, enforces time limits, promotes queues and closes
+//! final workers after identity-checked TERM/grace. Delivery stays closed.
 //! Live creates tasks and saves handoffs through core on the locked V6 store.
-//! Later-slice writes and process runners retain the Preview notices.
+//! Later-slice writes, restore and delivery retain the Preview notices.
 //!
 //! One [`TaskHostOwner`] per preview root: a lifetime host lock is taken
 //! before anything is seeded or bound, the task store is a seeded copy of
@@ -79,6 +83,9 @@ pub(crate) type ContinuationHook = (&'static str, Box<dyn FnOnce(&mut TaskHostOw
 /// published.
 #[cfg(test)]
 pub(crate) type PublishHook = Box<dyn FnOnce(&mut TaskHostOwner)>;
+#[cfg(test)]
+pub(crate) type TerminalSpecHook =
+    Box<dyn Fn(&mut gitterm_core::task_host::command::TerminalCommand)>;
 
 #[path = "task_host_delegate.rs"]
 mod delegate;
@@ -317,6 +324,8 @@ pub(crate) struct TaskHostOwner {
     pub(crate) before_continuation: Option<ContinuationHook>,
     #[cfg(test)]
     pub(crate) before_publish: Option<PublishHook>,
+    #[cfg(test)]
+    pub(crate) terminal_spec_hook: Option<TerminalSpecHook>,
     /// Replaces writing a delivery into its chat pane.
     #[cfg(test)]
     pub(crate) submit_hook: Option<SubmitHook>,
@@ -325,6 +334,7 @@ pub(crate) struct TaskHostOwner {
     /// Fixture mode's delivery and queue-promotion tick; none in plain
     /// preview.
     _deliver: Option<Task<()>>,
+    _workers: Option<Task<()>>,
     _quit: Subscription,
 }
 
@@ -350,6 +360,22 @@ impl TaskHostOwner {
         cx: &mut App,
     ) -> Result<Entity<Self>> {
         Self::start_with(config, Vec::new(), Some(lock), Some(services), cx)
+    }
+
+    pub(super) fn is_live(&self) -> bool {
+        !self.host.services().is_preview()
+    }
+
+    fn launches(&self) -> bool {
+        self.is_live() || !self.fixtures.is_empty()
+    }
+
+    pub(super) fn process_root(&self) -> &Path {
+        if self.is_live() {
+            self.host.services().state_root()
+        } else {
+            self.roots.root()
+        }
     }
 
     /// [`Self::start`] with a fixture-launch context over `fixtures` (each a
@@ -579,6 +605,21 @@ impl TaskHostOwner {
                     }
                 })
             });
+            let workers = live.then(|| {
+                cx.spawn(async move |owner: gpui::WeakEntity<Self>, cx| {
+                    loop {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(250))
+                            .await;
+                        if owner
+                            .update(cx, |owner, cx| owner.live_worker_tick(cx))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+            });
             // Synchronous: GPUI's quit timeout starts after the callbacks
             // return. Registered before the workspace owner's chat drain.
             let quit = cx.on_app_quit(|owner: &mut Self, cx| {
@@ -624,10 +665,13 @@ impl TaskHostOwner {
                 #[cfg(test)]
                 before_publish: None,
                 #[cfg(test)]
+                terminal_spec_hook: None,
+                #[cfg(test)]
                 submit_hook: None,
                 _pump: pump,
                 _reseed: reseed,
                 _deliver: deliver,
+                _workers: workers,
                 _quit: quit,
             }
         }))
@@ -832,7 +876,7 @@ impl TaskHostOwner {
                 reply,
                 caller,
                 request,
-            } if !self.fixtures.is_empty() => self.request_codex_run(
+            } if self.launches() => self.request_codex_run(
                 reply,
                 caller,
                 runs::CodexRequest::Review(request),
@@ -843,21 +887,21 @@ impl TaskHostOwner {
                 reply,
                 caller,
                 request,
-            } if !self.fixtures.is_empty() => self.request_codex_run(
+            } if self.launches() => self.request_codex_run(
                 reply,
                 caller,
                 runs::CodexRequest::Consult(request),
                 label,
                 cx,
             ),
-            HostEffect::LaunchSession { reply, launch } if !self.fixtures.is_empty() => {
+            HostEffect::LaunchSession { reply, launch } if self.launches() => {
                 self.launch_session(reply, launch, label, cx)
             }
             HostEffect::DelegateTask {
                 reply,
                 caller,
                 request,
-            } if !self.fixtures.is_empty() => self.delegate_task(reply, caller, request, label, cx),
+            } if self.launches() => self.delegate_task(reply, caller, request, label, cx),
             HostEffect::LaunchSession { reply, .. }
             | HostEffect::DelegateTask { reply, .. }
             | HostEffect::RequestReview { reply, .. }
@@ -1039,6 +1083,14 @@ impl TaskHostOwner {
         label: &'static str,
         cx: &App,
     ) -> Result<serde_json::Value, String> {
+        let label = if self.is_live() {
+            if !self.owns_live_worker_session(task_id, session_id) {
+                return Err("notify does not name an open Live worker session".into());
+            }
+            "Worker notify"
+        } else {
+            label
+        };
         self.authorize_write(label, &self.task_worktree(task_id))?;
         // Iced checks every tab, terminals included: a launched terminal of
         // the task's session sets its live state and the task's sessions

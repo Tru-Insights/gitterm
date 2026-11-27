@@ -141,6 +141,8 @@ pub(super) struct Launched {
     needs_input: Arc<AtomicBool>,
     /// Iced's `worker_closing`: its final-worker close is under way.
     closing: bool,
+    shutdown_refused: bool,
+    process: Option<gitterm_core::worker_process::WorkerProcess>,
 }
 
 pub(super) enum Started {
@@ -215,6 +217,9 @@ impl TaskHostOwner {
         cx: &mut Context<Self>,
     ) -> Result<TerminalLaunched, String> {
         const LABEL: &str = "task_launch_session";
+        if self.is_live() {
+            return Err("Saved workers are not adopted after restart".into());
+        }
         if !self.own_tasks.contains(task_id) {
             return Err(preview_notice(LABEL));
         }
@@ -359,6 +364,8 @@ impl TaskHostOwner {
                 live: None,
                 needs_input,
                 closing: false,
+                shutdown_refused: false,
+                process: None,
             },
         );
         self.terminals.insert(session_id.clone(), terminal);
@@ -564,6 +571,17 @@ impl TaskHostOwner {
         };
         let owner = cx.weak_entity();
         let needs_input = Arc::new(AtomicBool::new(false));
+        let process = if self.is_live() && launched_agent {
+            match gitterm_core::worker_process::WorkerProcess::new() {
+                Ok(process) => Some(process),
+                Err(error) => {
+                    self.host.abandon_launch(ticket);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         let prepared = (|| {
             let notify = self
                 .servers
@@ -613,8 +631,20 @@ impl TaskHostOwner {
                 }
                 other => (other, ObjectiveDeliveryState::NotDelivered),
             };
-            let fixture = self.fixture_of(&worktree, label)?;
-            let env = self.terminal_child_env(&fixture, &session_id)?;
+            let env = if self.is_live() {
+                let mut env =
+                    self.live_terminal_env(&task.workspace.name, &worktree, &session_id)?;
+                if let Some(process) = &process {
+                    env.push((
+                        gitterm_core::worker_process::PID_FILE_ENV.into(),
+                        process.pid_file().into_os_string(),
+                    ));
+                }
+                env
+            } else {
+                let fixture = self.fixture_of(&worktree, label)?;
+                self.terminal_child_env(&fixture, &session_id)?
+            };
             let command = command
                 .map(|command| self.runtime_command(&command, &worktree, &env, &task, cx))
                 .transpose()?;
@@ -625,15 +655,64 @@ impl TaskHostOwner {
                 .recheck(&authorized)
                 .and_then(|()| services.recheck_git_work_trees(&authorized, &env))
                 .map_err(|denied| denied.notice().to_string())?;
-            let terminal = spawn_terminal(
-                &worktree,
-                command,
-                env,
-                owner,
-                &session_id,
-                &needs_input,
-                cx,
-            )?;
+            let terminal = if self.is_live() {
+                let readable: Vec<(String, String)> = env
+                    .into_iter()
+                    .map(|(key, value)| {
+                        Ok((
+                            key.into_string()
+                                .map_err(|_| "worker environment name is not UTF-8")?,
+                            value
+                                .into_string()
+                                .map_err(|_| "worker environment value is not UTF-8")?,
+                        ))
+                    })
+                    .collect::<Result<_, String>>()?;
+                let refs: Vec<_> = readable
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str()))
+                    .collect();
+                #[allow(unused_mut)] // Tests replace the executable recorder before spawning.
+                let mut spec = gitterm_core::task_host::command::terminal_command(
+                    &worktree,
+                    command.as_deref(),
+                    &refs,
+                    self.process_root(),
+                    gitterm_browser::browser_mcp::configure_browser_command,
+                );
+                #[cfg(test)]
+                if let Some(hook) = &self.terminal_spec_hook {
+                    hook(&mut spec);
+                }
+                spawn_terminal_launch(
+                    &worktree,
+                    TerminalLaunch {
+                        cwd: Some(spec.cwd),
+                        program: spec.program,
+                        args: spec.args,
+                        env: spec
+                            .env
+                            .into_iter()
+                            .map(|(key, value)| (key, Some(value)))
+                            .collect(),
+                        ..Default::default()
+                    },
+                    owner,
+                    &session_id,
+                    &needs_input,
+                    cx,
+                )?
+            } else {
+                spawn_terminal(
+                    &worktree,
+                    command,
+                    env,
+                    owner,
+                    &session_id,
+                    &needs_input,
+                    cx,
+                )?
+            };
             Ok::<_, String>((terminal, objective_delivery, pre_injection))
         })();
         let (terminal, objective_delivery, pre_injection) = match prepared {
@@ -700,9 +779,16 @@ impl TaskHostOwner {
                 live: launched_agent.then_some(TaskSessionLiveState::Working),
                 needs_input,
                 closing: false,
+                shutdown_refused: false,
+                process,
             },
         );
         self.terminals.insert(session_id.clone(), terminal);
+        if self.is_live() {
+            // Issue only after save + attach succeed. The child's MCP URL
+            // names this session, and Live handoffs require an issued caller.
+            self.host.issue_caller(&session_id);
+        }
         let conversation_id = self
             .host
             .store()
@@ -975,9 +1061,7 @@ impl TaskHostOwner {
                 task_id: Some(&launched.task_id),
                 task_session_id: Some(session_id),
                 closing: launched.closing,
-                // GPUI's close drops the PTY and never verifies a launch
-                // identity first, so no stop is refused.
-                shutdown_refused: false,
+                shutdown_refused: launched.shutdown_refused,
                 live: launched.live,
             };
             if gitterm_core::task_host::final_worker_closes(store, &worker, ready) {
@@ -1009,6 +1093,188 @@ impl TaskHostOwner {
             .filter(|launched| matches!(launched.live, Some(TaskSessionLiveState::Working)))
             .map(|launched| launched.target.session_uid.clone())
             .collect()
+    }
+
+    fn live_terminal_env(
+        &self,
+        workspace: &str,
+        cwd: &Path,
+        session: &str,
+    ) -> Result<Vec<(OsString, OsString)>, String> {
+        let file = self.process_root().join("workspaces.json");
+        let mut env: Vec<(OsString, OsString)> = match std::fs::read(&file) {
+            Ok(bytes) => {
+                let mut file = serde_json::from_slice::<
+                    gitterm_core::workspace_config::WorkspacesFile,
+                >(&bytes)
+                .map_err(|error| {
+                    format!("read workspace environment {}: {error}", file.display())
+                })?;
+                file.normalize_repos();
+                file.workspace_env(workspace, Some(cwd))
+                    .into_iter()
+                    .map(|(k, v)| (k.into(), v.into()))
+                    .collect()
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(format!(
+                    "read workspace environment {}: {error}",
+                    file.display()
+                ));
+            }
+        };
+        let servers = self.servers.as_ref().ok_or(SHUT_DOWN)?;
+        env.extend(
+            servers
+                .browser
+                .terminal_environment(Some(session))
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into())),
+        );
+        env.extend(
+            servers
+                .task_mcp
+                .terminal_environment(Some(session))
+                .map(|(k, v)| (k.into(), v.into())),
+        );
+        Ok(env)
+    }
+
+    /// Live has a worker tick without result delivery (slice 9). Imported
+    /// records carry no process authority and are never adopted or stopped.
+    pub(crate) fn live_worker_tick(&mut self, cx: &mut Context<Self>) {
+        if !self.is_live() || self.is_shut_down() {
+            return;
+        }
+        self.persist_live_worker_identities();
+        self.expire_live_worker_limits();
+        self.close_live_final_workers(cx);
+        self.promote_queued_tasks(cx);
+        self.start_queued_runs(cx);
+    }
+
+    fn persist_live_worker_identities(&mut self) {
+        let Some(store) = self.host.store_mut().as_mut() else {
+            return;
+        };
+        for (session, launched) in &mut self.launched {
+            let Some(process) = &mut launched.process else {
+                continue;
+            };
+            if process.persisted_identity.is_some() {
+                continue;
+            }
+            let saved = (|| {
+                let Some(identity) = process.launch_identity()? else {
+                    return Ok(());
+                };
+                gitterm_core::worker_process::persist_identity_record(
+                    store,
+                    &launched.task_id,
+                    session,
+                    &identity,
+                )?;
+                process.persisted_identity = Some(identity);
+                Ok::<_, String>(())
+            })();
+            if let Err(error) = saved {
+                eprintln!("[tasks] persist worker launch for {session}: {error}");
+            }
+        }
+    }
+
+    fn expire_live_worker_limits(&mut self) {
+        let now = chrono::Utc::now();
+        let Some(store) = self.host.store_mut().as_mut() else {
+            return;
+        };
+        let expired: Vec<_> = store.delegations().iter().filter_map(|delegation| {
+            let gitterm_core::tasks::DelegationChild::TaskSession { task_id, task_session_id: Some(session), .. } = &delegation.child else { return None; };
+            if !self.launched.contains_key(session) { return None; }
+            let expired = match store.worker_time_limit(&delegation.delegation_id) {
+                Ok(Some(timer)) => timer.remaining(now.timestamp_millis()).is_zero(),
+                Ok(None) => false,
+                Err(error) => { eprintln!("[delegation] cannot restore worker time limit: {error}; stopping worker"); true }
+            };
+            expired.then(|| (delegation.delegation_id.clone(), task_id.clone(), delegation.options.time_limit_minutes.unwrap_or_default()))
+        }).collect();
+        for (id, task, minutes) in expired {
+            let place = store
+                .get(&task)
+                .and_then(|task| task.worktree.path.as_deref());
+            let message = gitterm_core::delegations::time_limit_message(minutes, place, true);
+            if let Err(error) = store.stop_delegation_at_time_limit(&id, message, &now.to_rfc3339())
+            {
+                eprintln!("[delegation] {id}: {error}");
+            }
+        }
+    }
+
+    fn close_live_final_workers(&mut self, cx: &mut Context<Self>) {
+        // Automatic delivery is closed in this slice. Stored results therefore
+        // permit final close, just as Iced does with automatic delivery off.
+        let ready = self.host.final_workers_ready(&[], false);
+        let closing = self.start_final_worker_closes(&ready);
+        let sessions: Vec<_> = closing
+            .iter()
+            .filter_map(|target| target.task_session_id.clone())
+            .collect();
+        let ended = self.host.store().as_ref().map_or_else(Vec::new, |store| {
+            gitterm_core::task_host::closed_worker_task_outcomes(store, &sessions)
+        });
+        for (task, state) in ended {
+            if self.task_live_besides_closing(&task) {
+                continue;
+            }
+            if let Err(error) = self.writable_store().and_then(|store| {
+                store
+                    .record_lifecycle_signal(&task, state, None, &chrono::Utc::now().to_rfc3339())
+                    .map_err(|error| error.to_string())
+            }) {
+                eprintln!("[tasks] finalize worker task {task}: {error}");
+            }
+        }
+        for target in closing {
+            let Some(session) = target.task_session_id.clone() else {
+                continue;
+            };
+            let process = self
+                .launched
+                .get_mut(&session)
+                .and_then(|launched| launched.process.take());
+            cx.spawn(async move |owner: gpui::WeakEntity<Self>, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        match process {
+                            Some(process) => process.stop(),
+                            None => {
+                                Err("refuse worker shutdown: no launch record for this tab".into())
+                            }
+                        }
+                    })
+                    .await;
+                let _ = owner.update(cx, |owner, cx| {
+                    if owner.is_shut_down() {
+                        return;
+                    }
+                    if let Err(error) = result {
+                        if let Some(launched) = owner.launched.get_mut(&session) {
+                            launched.closing = false;
+                            launched.shutdown_refused = true;
+                        }
+                        eprintln!("[tasks] keep final worker {session} open: {error}");
+                    } else if owner.terminals.contains_key(&session) {
+                        owner.session_closed(&session, cx);
+                    } else {
+                        cx.emit(FinalWorkerClose { target });
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
     }
 
     /// The whole environment a task terminal's child gets: the fixture
@@ -1055,45 +1321,54 @@ impl TaskHostOwner {
             .iter()
             .filter_map(|(name, value)| Some((name.to_str()?.into(), value.to_str()?.into())))
             .collect();
-        let home = runs::value_of(env, "HOME")
-            .map(PathBuf::from)
-            .ok_or("the fixture child has no HOME")?;
+        let home = if self.is_live() {
+            dirs::home_dir().ok_or("Cannot locate home for worker trust")?
+        } else {
+            runs::value_of(env, "HOME")
+                .map(PathBuf::from)
+                .ok_or("the fixture child has no HOME")?
+        };
         let roots = self.trust_roots(cx);
         let command = command.trim();
-        let command = match provider_for_command(command) {
-            // Iced's validate_claude_trust_launch refuses any
-            // CLAUDE_CONFIG_DIR, and the preview pins one so a fixture child
-            // never reads the real ~/.claude: Iced's checks against the file
-            // it pins, then Iced's trust write into that file, never outside
-            // the preview root.
-            WorkerProvider::Claude => {
-                let config = gitterm_core::workers::claude_pinned_trust_file(command, &readable)?;
-                let config = self.roots.scoped(&config).map_err(|error| {
-                    format!("the fixture's Claude trust file is outside the preview: {error}")
-                })?;
-                if let Some(main) =
-                    gitterm_core::workers::claude_task_trust(worktree, &roots, &config)?
-                {
-                    eprintln!(
-                        "[tasks] accepted Claude workspace trust for {} in $CLAUDE_CONFIG_DIR/.claude.json",
-                        main.display()
-                    );
+        let command = if self.is_live() {
+            gitterm_core::workers::task_trust_command(command, worktree, &home, &roots, &readable)?
+        } else {
+            match provider_for_command(command) {
+                // Iced's validate_claude_trust_launch refuses any
+                // CLAUDE_CONFIG_DIR, and the preview pins one so a fixture child
+                // never reads the real ~/.claude: Iced's checks against the file
+                // it pins, then Iced's trust write into that file, never outside
+                // the preview root.
+                WorkerProvider::Claude => {
+                    let config =
+                        gitterm_core::workers::claude_pinned_trust_file(command, &readable)?;
+                    let config = self.roots.scoped(&config).map_err(|error| {
+                        format!("the fixture's Claude trust file is outside the preview: {error}")
+                    })?;
+                    if let Some(main) =
+                        gitterm_core::workers::claude_task_trust(worktree, &roots, &config)?
+                    {
+                        eprintln!(
+                            "[tasks] accepted Claude workspace trust for {} in $CLAUDE_CONFIG_DIR/.claude.json",
+                            main.display()
+                        );
+                    }
+                    command.to_string()
                 }
-                command.to_string()
-            }
-            WorkerProvider::Codex => {
-                gitterm_core::workers::validate_codex_trust_home(&home, &readable, |_| None)?;
-                match gitterm_core::workers::codex_task_trust(
-                    command,
-                    worktree,
-                    &roots,
-                    &home.join(".codex/config.toml"),
-                )? {
-                    Some(value) => gitterm_core::workers::with_codex_trust(command, &value)?,
-                    None => command.to_string(),
+                WorkerProvider::Codex => {
+                    gitterm_core::workers::validate_codex_trust_home(&home, &readable, |_| None)?;
+                    match gitterm_core::workers::codex_task_trust(
+                        command,
+                        worktree,
+                        &roots,
+                        &home.join(".codex/config.toml"),
+                    )? {
+                        Some(value) => gitterm_core::workers::with_codex_trust(command, &value)?,
+                        None => command.to_string(),
+                    }
                 }
+                WorkerProvider::Other | WorkerProvider::Antigravity => command.to_string(),
             }
-            WorkerProvider::Other | WorkerProvider::Antigravity => command.to_string(),
         };
         let command = if gitterm_core::guidelines::starts_a_harness(&command) {
             match self.launch_instructions(
@@ -1126,7 +1401,7 @@ impl TaskHostOwner {
     /// combined file, live under the preview root (a missing guidelines
     /// file is written there from the default), so Iced's config dir is
     /// never written.
-    pub(super) fn launch_instructions(
+    pub(crate) fn launch_instructions(
         &self,
         cwd: &Path,
         instruction_file: gitterm_core::guidelines::InstructionFile,
@@ -1137,12 +1412,25 @@ impl TaskHostOwner {
         let saved = saved_workspace(workspace, cx);
         let workspace_off = saved.is_some_and(|ws| ws.guidelines_off);
         let places = saved.and_then(gitterm_core::guidelines::config_document_places);
-        let root = self.roots.root();
+        let root = self.process_root();
+        let instance_root = root.join(format!(
+            "instance-{}",
+            self.host.services().task_mcp().instance_id()
+        ));
+        if self.is_live()
+            && let Some(places) = &places
+            && let Err(error) = std::fs::create_dir_all(&places.docs_dir)
+        {
+            eprintln!(
+                "[guidelines] cannot create the work's docs folder {}: {error}",
+                places.docs_dir.display()
+            );
+        }
         gitterm_core::guidelines::launch_instructions(
             gitterm_core::guidelines::for_launch(root, cwd, workspace_off, instruction_file),
             places.as_ref(),
             task_tools,
-            root,
+            if self.is_live() { &instance_root } else { root },
         )
     }
 
@@ -1153,6 +1441,14 @@ impl TaskHostOwner {
         task: &TaskRecord,
         report_back: Option<&str>,
     ) -> Result<PathBuf, String> {
+        if self.is_live() {
+            return gitterm_core::task_host::command::write_task_brief(
+                self.process_root(),
+                session_id,
+                task,
+                report_back,
+            );
+        }
         let dir = self.roots.root().join(BRIEFS);
         let path = dir.join(format!("{session_id}.md"));
         if path.display().to_string().contains('\'') {
@@ -1225,7 +1521,10 @@ impl TaskHostOwner {
         let mut holders: Vec<String> = self
             .launched
             .iter()
-            .filter(|(session, _)| self.session_live(session, cx))
+            .filter(|(session, launched)| {
+                self.session_live(session, cx)
+                    && (!self.is_live() || self.live_session_working(session, launched))
+            })
             .filter_map(|(_, launched)| store.get(&launched.task_id))
             .filter(|task| {
                 task.executor == ExecutorTarget::Local && task.lifecycle == TaskLifecycle::Running
@@ -1250,9 +1549,82 @@ impl TaskHostOwner {
         self.launched
             .iter()
             .filter(|(session, launched)| {
-                launched.provider == Some(provider) && self.session_live(session, cx)
+                launched.provider == Some(provider)
+                    && self.session_live(session, cx)
+                    && (!self.is_live() || self.live_session_working(session, launched))
             })
             .count()
+    }
+
+    fn live_session_working(&self, session: &str, launched: &Launched) -> bool {
+        gitterm_core::task_host::worker_session_is_working(
+            self.host.store().as_ref(),
+            &gitterm_core::task_host::WorkerSession {
+                task_id: Some(&launched.task_id),
+                task_session_id: Some(session),
+                closing: launched.closing,
+                shutdown_refused: launched.shutdown_refused,
+                live: launched.live,
+            },
+        )
+    }
+
+    pub(super) fn owns_live_worker_session(&self, task: &str, session: &str) -> bool {
+        self.launched
+            .get(session)
+            .is_some_and(|launched| launched.task_id == task && launched.view.upgrade().is_some())
+    }
+
+    /// Iced resolves a terminal caller through its owning workspace, even
+    /// when the task worktree lives outside that workspace's home directory.
+    pub(super) fn live_terminal_caller(
+        &self,
+        uid: &str,
+        cx: &App,
+    ) -> Option<gitterm_core::delegation_state::Caller> {
+        if !self.is_live() {
+            return None;
+        }
+        let (session, launched) = self.launched.iter().find(|(_, launched)| {
+            launched.target.session_uid == uid && launched.view.upgrade().is_some()
+        })?;
+        let task = self.host.store().as_ref()?.get(&launched.task_id)?;
+        let WorkspaceLocationIdentity::Local { directory } = &task.workspace.location else {
+            return None;
+        };
+        let workspace = cx
+            .try_global::<crate::work_sidebar::IcedWorkSource>()
+            .and_then(|source| {
+                source
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.name == task.workspace.name)
+            });
+        let home = workspace.map_or_else(
+            || directory.clone(),
+            |workspace| PathBuf::from(workspace.home_dir()),
+        );
+        Some(gitterm_core::delegation_state::Caller {
+            tab: gitterm_core::delegations::CallerTab {
+                session_uid: uid.to_string(),
+                chat_session_id: task
+                    .sessions
+                    .iter()
+                    .find(|record| &record.task_session_id == session)
+                    .and_then(|record| record.conversation.as_ref())
+                    .map(|conversation| conversation.session_id.clone()),
+                workspace: task.workspace.name.clone(),
+                cwd: task.worktree.path.clone()?,
+                remote: false,
+                home: home.clone(),
+                repos: workspace.map_or_else(Vec::new, |workspace| {
+                    workspace.repos.iter().map(PathBuf::from).collect()
+                }),
+            },
+            target: launched.target.clone(),
+            workspace_uid: crate::layout::stable_path_hash(&home),
+            local_root: Some(home),
+        })
     }
 
     /// The local folders of Iced's workspaces, whose repositories a worker
@@ -1332,6 +1704,17 @@ fn spawn_terminal(
         args: command.map_or_else(Vec::new, |command| vec!["-c".into(), command]),
         ..Default::default()
     };
+    spawn_terminal_launch(cwd, launch, owner, session_id, needs_input, cx)
+}
+
+fn spawn_terminal_launch(
+    cwd: &Path,
+    launch: TerminalLaunch,
+    owner: gpui::WeakEntity<TaskHostOwner>,
+    session_id: &str,
+    needs_input: &Arc<AtomicBool>,
+    cx: &mut App,
+) -> Result<HostTerminal, String> {
     // The pane that adopts the terminal delivers its events, so the exit
     // reaches the host once adopted. Deferred: the host reads the view.
     // shortcut: an unadopted terminal's exit is not seen (nothing delivers
@@ -1641,63 +2024,7 @@ fn command_with_initial_prompt(command: &str, brief: &Path) -> String {
 /// Iced's `with_preassigned_session_id`: a new Claude launch gets a session
 /// id, and a preset naming one keeps it.
 pub(crate) fn with_preassigned_session_id(command: &str) -> (String, Option<String>) {
-    if provider_for_command(command) != WorkerProvider::Claude {
-        return (command.to_string(), None);
-    }
-    match claude_preset_session_id(command) {
-        Ok(Some(id)) => (command.to_string(), Some(id)),
-        Err(()) => (command.to_string(), None),
-        Ok(None) => {
-            let id = TaskRecord::fresh_id();
-            (format!("{command} --session-id {id}"), Some(id))
-        }
-    }
-}
-
-/// Iced's `claude_preset_session_id`. `Err` means the preset selects a
-/// session without a safely extractable id.
-fn claude_preset_session_id(command: &str) -> Result<Option<String>, ()> {
-    let words = shell_words::split(command).map_err(|_| ())?;
-    let mut session_id: Option<String> = None;
-    let mut saw_identity_flag = false;
-    for (index, word) in words.iter().enumerate().skip(1) {
-        if word == "--continue" || word == "-c" {
-            return Err(());
-        }
-        let value = if let Some(value) = word
-            .strip_prefix("--resume=")
-            .or_else(|| word.strip_prefix("--session-id="))
-        {
-            saw_identity_flag = true;
-            Some(value)
-        } else if word == "--resume" || word == "-r" || word == "--session-id" {
-            saw_identity_flag = true;
-            Some(
-                words
-                    .get(index + 1)
-                    .filter(|value| !value.starts_with('-'))
-                    .map(String::as_str)
-                    .unwrap_or(""),
-            )
-        } else {
-            None
-        };
-        if let Some(value) = value {
-            if value.is_empty()
-                || session_id
-                    .as_deref()
-                    .is_some_and(|existing| existing != value)
-            {
-                return Err(());
-            }
-            session_id = Some(value.to_string());
-        }
-    }
-    if saw_identity_flag {
-        session_id.map(Some).ok_or(())
-    } else {
-        Ok(None)
-    }
+    gitterm_core::workers::with_preassigned_session_id(command)
 }
 
 #[cfg(test)]
@@ -1721,6 +2048,37 @@ impl TaskHostOwner {
         self.own_delegations.insert(id, authorized);
     }
     /// Sessions whose terminal the host still owns.
+    pub(crate) fn pause_live_worker_tick(&mut self) {
+        self._workers = None;
+    }
+
+    pub(crate) fn test_worker_identity(
+        &mut self,
+        session: &str,
+        replace_birth: Option<&str>,
+    ) -> bool {
+        let Some(launched) = self.launched.get_mut(session) else {
+            return false;
+        };
+        let Some(identity) = launched
+            .process
+            .as_mut()
+            .and_then(|process| process.persisted_identity.as_mut())
+        else {
+            return false;
+        };
+        if let Some(birth) = replace_birth {
+            identity.birth = birth.into();
+        }
+        true
+    }
+
+    pub(crate) fn test_worker_stop_refused(&self, session: &str) -> bool {
+        self.launched
+            .get(session)
+            .is_some_and(|launched| launched.shutdown_refused)
+    }
+
     pub(crate) fn host_terminals(&self) -> Vec<String> {
         self.terminals.keys().cloned().collect()
     }
