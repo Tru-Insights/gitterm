@@ -36,6 +36,17 @@ pub struct WorkerSession<'a> {
     pub live: Option<TaskSessionLiveState>,
 }
 
+/// The working-session predicate used by Iced's local slots and provider
+/// budget counts. A final, closing or refused worker spends no active slot.
+pub fn worker_session_is_working(store: Option<&TaskStore>, session: &WorkerSession) -> bool {
+    session.live == Some(TaskSessionLiveState::Working)
+        && !session.shutdown_refused
+        && !session.closing
+        && !session.task_id.is_some_and(|task| {
+            store.is_some_and(|store| store.worker_session_is_final(task, session.task_session_id))
+        })
+}
+
 /// Iced's `close_final_worker` decision: the session is its worker's final
 /// one (completed or failed, never cancelled), the result is `ready`
 /// ([`worker_delivery_allows_close`]), no close is under way or was
@@ -185,6 +196,30 @@ mod tests {
             shutdown_refused: false,
             live,
         }
+    }
+
+    #[test]
+    fn only_a_working_nonfinal_unrefused_session_spends_a_slot() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut store, id) = store_with_worker(temp.path());
+        let working = worker(Some(TaskSessionLiveState::Working));
+        assert!(worker_session_is_working(Some(&store), &working));
+        for session in [
+            worker(None),
+            worker(Some(TaskSessionLiveState::AwaitingInput)),
+            WorkerSession {
+                closing: true,
+                ..working
+            },
+            WorkerSession {
+                shutdown_refused: true,
+                ..working
+            },
+        ] {
+            assert!(!worker_session_is_working(Some(&store), &session));
+        }
+        complete(&mut store, &id);
+        assert!(!worker_session_is_working(Some(&store), &working));
     }
 
     /// Moved from Iced: a rejected delivery waits for the next tick's

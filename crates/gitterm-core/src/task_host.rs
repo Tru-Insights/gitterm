@@ -46,6 +46,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio_stream::Stream;
 
+pub mod command;
 mod create;
 mod delivery;
 mod final_worker;
@@ -62,7 +63,8 @@ pub use delivery::{
     DeliveryReceipt, DeliveryTick, Dismissal, Submission,
 };
 pub use final_worker::{
-    closed_worker_task_outcomes, final_worker_closes, worker_delivery_allows_close, WorkerSession,
+    closed_worker_task_outcomes, final_worker_closes, worker_delivery_allows_close,
+    worker_session_is_working, WorkerSession,
 };
 pub use launch::{
     cancel_queued_worker_launch, launch_provider, update_queued_task_request, AwaitingWorker,
@@ -70,8 +72,8 @@ pub use launch::{
     QueuedTaskLaunch,
 };
 pub use live::{
-    aggregate_task_live_states, task_session_signal, LinkedSession, TaskSessionLiveState,
-    TaskSessionOutcome,
+    aggregate_task_live_states, input_resumes_waiting, task_session_signal, LinkedSession,
+    TaskSessionLiveState, TaskSessionOutcome,
 };
 pub use restore::{
     conversation_resume_command, prune_phantom_claude_conversations, restored_startup,
@@ -322,8 +324,42 @@ impl TaskHost {
             _ => self.services.operation(&operation, None),
         };
         if let Err(denied) = authorized {
-            reply.send(Err(denied.notice().to_string()));
-            return None;
+            // Live keeps general notify ingress closed. An issued current
+            // worker may report only the lifecycle edge its injected URL names.
+            let worker_notify = match &operation {
+                TaskControlOperation::SessionEvent(request)
+                    if request.event_type == "agent-turn-complete" =>
+                {
+                    self.issued_callers
+                        .lock()
+                        .unwrap()
+                        .contains(&request.session_id)
+                        && self
+                            .store()
+                            .as_ref()
+                            .and_then(|store| store.get(&request.task_id))
+                            .is_some_and(|task| {
+                                task.sessions
+                                    .iter()
+                                    .any(|session| session.task_session_id == request.session_id)
+                                    && self
+                                        .services
+                                        .authorize(
+                                            crate::preview::service::Class {
+                                                label: "Worker notify",
+                                                access: crate::preview::service::Access::Write,
+                                            },
+                                            task.worktree.path.as_deref(),
+                                        )
+                                        .is_ok()
+                            })
+                }
+                _ => false,
+            };
+            if !worker_notify {
+                reply.send(Err(denied.notice().to_string()));
+                return None;
+            }
         }
         use TaskControlOperation as Op;
         Some(match operation {

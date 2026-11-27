@@ -8,6 +8,12 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+/// Same local rollout source for both frontends; never a credential probe.
+#[cfg(feature = "runtime")]
+pub fn local_codex_sessions() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| crate::usage::UsageSources::under(&home).codex_sessions)
+}
+
 pub const CODEX_READ_EVERY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
@@ -106,6 +112,29 @@ impl PlanLimitsState {
     pub fn codex_read_due(&self, now: Instant) -> bool {
         self.codex_read_at
             .is_none_or(|at| now.duration_since(at) >= CODEX_READ_EVERY)
+    }
+
+    /// Iced's periodic observation, including failed-source attempt cadence.
+    #[cfg(feature = "runtime")]
+    pub fn begin_scheduled_codex_read(&mut self, now: Instant) -> Option<CodexReadJob> {
+        if !self.codex_read_due(now) {
+            return None;
+        }
+        self.begin_codex_read(local_codex_sessions(), now)
+    }
+
+    /// Shared completion transition. True asks the host to drain another
+    /// serialized save; failed writes wait for a later poll to retry.
+    pub fn complete_event(&mut self, event: PlanLimitsEvent, path: &Path, now: i64) -> bool {
+        let changed = match event {
+            PlanLimitsEvent::CodexRead(limits) => self.finish_codex_read(limits),
+            PlanLimitsEvent::Saved(result) => return self.finish_save(result, path),
+            PlanLimitsEvent::PinChanged(pin) => self.set_pin(pin),
+        };
+        if changed {
+            self.evaluate(&[], now);
+        }
+        changed
     }
 
     pub fn codex_read_in_flight(&self) -> bool {
