@@ -5,7 +5,7 @@ extern crate gpui_kit as gpui;
 mod macos;
 
 #[cfg(target_os = "macos")]
-mod launch;
+use gitterm_gpui_shell::launch;
 
 #[cfg(target_os = "macos")]
 mod text_smoothing {
@@ -121,7 +121,9 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 fn run() -> Result<(), String> {
-    let route = launch::parse(std::env::args_os().skip(1)).unwrap_or_else(|| usage());
+    let mut args: Vec<_> = std::env::args_os().skip(1).collect();
+    let mode = gitterm_gpui_shell::launch_mode(&mut args).map_err(|error| format!("{error:#}"))?;
+    let route = launch::parse(args).unwrap_or_else(|| usage());
     route
         .authorize(|| {
             gitterm_gpui_shell::preview::roots_from_environment(false)
@@ -138,7 +140,7 @@ fn run() -> Result<(), String> {
         launch::Launch::Review(args) => gitterm_gpui_review::run_fixture(args),
         launch::Launch::ReviewRepo(path) => gitterm_gpui_review::run_repo(path),
         launch::Launch::Shell { folders, sample } => {
-            gitterm_gpui_shell::run(folders, sample).map_err(|error| format!("{error:#}"))?;
+            gitterm_gpui_shell::run(mode, folders, sample).map_err(|error| format!("{error:#}"))?;
         }
     }
     Ok(())
@@ -147,7 +149,7 @@ fn run() -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn usage() -> ! {
     eprintln!(
-        "Usage: gitterm-gpui [--workspace <dir> ... | --sample | --terminal | --chat <fixture.jsonl> | --chat-live <fixture.jsonl> | --review <fixture-dir> | --review-repo <dir>]"
+        "Usage: gitterm-gpui [--live | --preview] [--workspace <dir> ... | --sample | --terminal | --chat <fixture.jsonl> | --chat-live <fixture.jsonl> | --review <fixture-dir> | --review-repo <dir>]"
     );
     std::process::exit(2);
 }
