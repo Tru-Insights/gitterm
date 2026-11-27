@@ -6,6 +6,7 @@ rust-version = "1.99"
 publish = false
 
 [features]
+stt = ["gitterm-core/stt"]
 excalidraw = ["gitterm-core/excalidraw"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -15,6 +16,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 tokio-stream = { version = "0.1", default-features = false }
 # The phone list request (`list_phones`); the same tonic core builds its client with.
 tonic = { version = "0.12", default-features = false }
+git2 = "0.19"
 gitterm-terminal = { path = "../terminal" }
 gitterm-gpui-review = { path = "../review" }
 gitterm-gpui-chat = { path = "../chat" }
@@ -39,5 +41,4 @@ raw-window-handle = "0.6"
 gpui_test = { package = "gpui-pre", version = "=0.3.14", features = ["test-support"] }
 gpui-component = { version = "=0.11.0", features = ["test-support"] }
 # tests/codex_trust.rs: core's trust cases under this workspace's toml.
-git2 = "0.19"
 toml = "0.8"

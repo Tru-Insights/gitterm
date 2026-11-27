@@ -15,6 +15,7 @@ pub mod content;
 mod content_shell_tests;
 pub mod data;
 mod dialogs;
+mod dictation;
 pub mod files;
 mod files_view;
 pub mod find_sidebar;
@@ -135,6 +136,8 @@ struct WorkspaceDock {
     _adopted: Vec<Subscription>,
 }
 pub struct Shell {
+    #[cfg(feature = "stt")]
+    dictation: dictation::Dictation,
     data: Rc<dyn ShellData>,
     content: Entity<content::window::ContentWindow>,
     bottom: Entity<bottom_panel::BottomPanel>,
@@ -465,6 +468,8 @@ impl Shell {
             resize: None,
             task_switcher: None,
             task_panel: None,
+            #[cfg(feature = "stt")]
+            dictation: dictation::Dictation::new(settings.stt_enabled),
             agent_presets: settings.agent_presets.clone(),
             #[cfg(test)]
             blocked_actions: vec![],
@@ -1237,7 +1242,7 @@ impl Shell {
             .collect();
         for pane in panes {
             pane.update(cx, |pane, cx| {
-                pane.mark_exited();
+                pane.mark_exited(cx);
                 cx.notify();
             });
         }
@@ -2307,7 +2312,7 @@ impl Shell {
                 .map(|w| self.data.status(w.workspace.id, cx).branch)
                 .unwrap_or_default(),
             pulse_bright: false,
-            mic: None,
+            mic: self.dictation_indicator(cx),
             worktree_follow: None,
         }
     }
@@ -3240,7 +3245,7 @@ impl Shell {
                 .with_exit_callback(move |_, cx| {
                     _ = weak.update(cx, |pane, cx| {
                         if pane.session == target {
-                            pane.exit_pending = true;
+                            pane.mark_exited(cx);
                             cx.notify();
                         }
                     });
@@ -3446,6 +3451,9 @@ impl Shell {
     fn menu_context(&self, window: &mut Window, cx: &mut App) -> String {
         use gpui_component::WindowExt;
         let mut context = String::from("GitTermShell");
+        if self.dictation_enabled() {
+            context.push_str(" IcedStt");
+        }
         if self.usage_open {
             context.push_str(" IcedUsage");
             return context;
@@ -3596,6 +3604,9 @@ impl Shell {
             .capture_action(cx.listener(Self::modal_escape::<CloseSlash>))
             .capture_action(cx.listener(Self::modal_escape::<CloseFind>))
             .capture_action(cx.listener(Self::modal_escape::<CloseReview>))
+            .on_action(Self::background(cx, |this, _: &SttToggle, w, cx| {
+                this.toggle_dictation(w, cx)
+            }))
             .on_action(Self::background(cx, |_, _: &Minimize, w, _| {
                 w.minimize_window()
             }))
@@ -4845,6 +4856,9 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
         // Before the window's workspace owner, so the host's quit callback
         // runs ahead of its chat drains.
         if let Some(config) = task_host {
+            // Live chat must use the host's own production context (its MCP
+            // namespace included), so keep a copy of the one the host gets.
+            let chat_services = live_services.as_deref().cloned();
             let started = if let Some(services) = live_services {
                 task_host::TaskHostOwner::start_live(config, host_lock, services, cx)
             } else {
@@ -4857,6 +4871,13 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
                     startup_failure::show(cx, &format!("start GPUI task host: {error:#}"));
                     return;
                 }
+            }
+            if let Some(services) = chat_services
+                && let Err(error) = chat::policy::install_live(services, cx)
+            {
+                lifetime::shutdown(cx);
+                startup_failure::show(cx, &format!("start Live chat: {error:#}"));
+                return;
             }
         }
         gpui_kit::init(cx);

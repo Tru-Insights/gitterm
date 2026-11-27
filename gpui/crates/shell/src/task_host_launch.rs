@@ -893,6 +893,7 @@ impl TaskHostOwner {
         let Some(launched) = self.launched.get_mut(session_id) else {
             return;
         };
+        self.host.revoke_caller(&launched.target.session_uid);
         let task_id = launched.task_id.clone();
         let was_live = launched.live.take().is_some();
         cx.emit(TerminalExited {
@@ -1049,6 +1050,7 @@ impl TaskHostOwner {
         let Some(launched) = self.launched.remove(session_id) else {
             return;
         };
+        self.host.revoke_caller(&launched.target.session_uid);
         self.apply_task_session_signal(
             &launched.task_id,
             launched
@@ -2188,6 +2190,9 @@ impl TaskHostOwner {
     }
     pub(crate) fn test_terminal_input(&mut self, session: &str, cx: &mut Context<Self>) {
         self.terminal_input(session, cx);
+    }
+    pub(crate) fn test_terminal_exited(&mut self, session: &str, cx: &mut Context<Self>) {
+        self.terminal_exited(session, cx);
     }
     pub(crate) fn test_worker_counts(&self, cx: &App) -> (usize, usize) {
         (

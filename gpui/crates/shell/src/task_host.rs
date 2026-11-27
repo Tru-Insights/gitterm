@@ -120,6 +120,13 @@ const FIXTURE_WORKTREES: &str = "worktrees";
 pub(crate) struct GpuiTaskHost(pub(crate) Entity<TaskHostOwner>);
 impl Global for GpuiTaskHost {}
 
+/// Session teardown must precede accepting another task write from this caller.
+pub(crate) fn revoke_caller(caller: &str, cx: &gpui::App) {
+    if let Some(host) = cx.try_global::<GpuiTaskHost>() {
+        host.0.read(cx).host.revoke_caller(caller);
+    }
+}
+
 /// Where commands come from. Production takes the process ingress; tests
 /// pass their own channel, because the process receiver is take-once.
 pub(crate) enum Ingress {
@@ -1678,6 +1685,9 @@ impl TaskHostOwner {
     }
 
     fn stop(&mut self, terminals: Vec<gitterm_terminal::Backend>) {
+        for session in self.launched.keys() {
+            self.host.revoke_caller(session);
+        }
         self.host.shutdown();
         let unpublished_stops = std::mem::take(&mut self.unpublished_stops);
         let mut runs: Vec<runs::RunHandle> = self.runs.drain().map(|(_, run)| run).collect();

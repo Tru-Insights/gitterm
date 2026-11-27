@@ -1917,13 +1917,6 @@ fn setup_menu_bar() {
 // === Speech-to-Text helpers ===
 
 #[cfg(feature = "stt")]
-const STT_MIN_RECORDING_SECONDS: f32 = 0.25;
-#[cfg(feature = "stt")]
-const STT_MIN_RMS: f32 = 0.001;
-#[cfg(feature = "stt")]
-const STT_MIN_PEAK: f32 = 0.01;
-
-#[cfg(feature = "stt")]
 fn stt_model_path() -> PathBuf {
     config::global_config_dir()
         .join("models")
@@ -1932,185 +1925,25 @@ fn stt_model_path() -> PathBuf {
 
 #[cfg(feature = "stt")]
 fn stt_audio_stats(samples: &[f32]) -> (f32, f32) {
-    if samples.is_empty() {
-        return (0.0, 0.0);
-    }
-
-    let mut sum_squares = 0.0f64;
-    let mut peak = 0.0f32;
-    for &sample in samples {
-        let abs = sample.abs();
-        peak = peak.max(abs);
-        let sample = sample as f64;
-        sum_squares += sample * sample;
-    }
-
-    let rms = (sum_squares / samples.len() as f64).sqrt() as f32;
-    (rms, peak)
+    gitterm_core::dictation::audio_stats(samples)
 }
 
 #[cfg(feature = "stt")]
-fn stt_start_recording(audio_buffer: Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stream, u32), String> {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-
-    let host = cpal::default_host();
-    let default = host.default_input_device();
-    let default_config = default.as_ref().map(|device| device.default_input_config());
-    let (device, config) = match (default, default_config) {
-        (Some(device), Some(Ok(config))) => (device, config),
-        (_, default_err) => {
-            // macOS can leave the default input pointing at a device that
-            // has gone (a headset or iPhone mic that disconnected; seen
-            // 2026-10-23). Record from the first input that answers instead.
-            let reason = match default_err {
-                Some(Err(e)) => format!("the default input device failed ({e})"),
-                _ => "there is no default input device".to_string(),
-            };
-            let fallback = host
-                .input_devices()
-                .map_err(|e| format!("Failed to list input devices after {reason}: {e}"))?
-                .find_map(|device| {
-                    let config = device.default_input_config().ok()?;
-                    Some((device, config))
-                })
-                .ok_or_else(|| format!("No working input device: {reason}"))?;
-            eprintln!(
-                "[STT] {reason}; recording from {} instead",
-                fallback
-                    .0
-                    .name()
-                    .unwrap_or_else(|_| "<unknown input device>".to_string())
-            );
-            fallback
-        }
-    };
-
-    let sample_rate = config.sample_rate().0;
-    let device_name = device
-        .name()
-        .unwrap_or_else(|_| "<unknown input device>".to_string());
-    eprintln!(
-        "[STT] Starting recording: device={} sample_rate={} channels={} format={:?}",
-        device_name,
-        sample_rate,
-        config.channels(),
-        config.sample_format()
-    );
-
-    // Clear existing buffer
-    {
-        let mut buf = audio_buffer.lock().unwrap();
-        buf.clear();
-    }
-
-    let channels = config.channels() as usize;
-    let buf = audio_buffer.clone();
-
-    let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => device
-            .build_input_stream(
-                &config.into(),
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    let mut buf = buf.lock().unwrap();
-                    // Convert to mono by averaging channels
-                    if channels == 1 {
-                        buf.extend_from_slice(data);
-                    } else {
-                        for chunk in data.chunks(channels) {
-                            let sum: f32 = chunk.iter().sum();
-                            buf.push(sum / channels as f32);
-                        }
-                    }
-                },
-                |err| eprintln!("[STT] Audio stream error: {}", err),
-                None,
-            )
-            .map_err(|e| format!("Failed to build input stream: {}", e))?,
-        cpal::SampleFormat::I16 => device
-            .build_input_stream(
-                &config.into(),
-                move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    let mut buf = buf.lock().unwrap();
-                    if channels == 1 {
-                        buf.extend(data.iter().map(|&s| s as f32 / 32768.0));
-                    } else {
-                        for chunk in data.chunks(channels) {
-                            let sum: f32 = chunk.iter().map(|&s| s as f32 / 32768.0).sum();
-                            buf.push(sum / channels as f32);
-                        }
-                    }
-                },
-                |err| eprintln!("[STT] Audio stream error: {}", err),
-                None,
-            )
-            .map_err(|e| format!("Failed to build input stream: {}", e))?,
-        format => return Err(format!("Unsupported sample format: {:?}", format)),
-    };
-
-    stream
-        .play()
-        .map_err(|e| format!("Failed to start stream: {}", e))?;
-
-    Ok((stream, sample_rate))
+fn stt_start_recording(
+    audio_buffer: Arc<Mutex<Vec<f32>>>,
+) -> Result<(gitterm_core::dictation::Recorder, u32), String> {
+    let recorder = gitterm_core::dictation::Recorder::start(None, audio_buffer)?;
+    let sample_rate = recorder.sample_rate();
+    Ok((recorder, sample_rate))
 }
 
 #[cfg(feature = "stt")]
 fn stt_transcribe(
-    ctx: Arc<whisper_rs::WhisperContext>,
+    ctx: Arc<gitterm_core::dictation::Transcriber>,
     mono_samples: Vec<f32>,
     input_sample_rate: u32,
 ) -> Result<String, String> {
-    let input_rate = input_sample_rate as usize;
-    let output_rate = 16000usize;
-
-    // Resample to 16kHz for Whisper using linear interpolation
-    let resampled = if input_rate != output_rate {
-        let ratio = input_rate as f64 / output_rate as f64;
-        let output_len = (mono_samples.len() as f64 / ratio) as usize;
-        let mut output = Vec::with_capacity(output_len);
-        for i in 0..output_len {
-            let src_idx = i as f64 * ratio;
-            let idx0 = src_idx as usize;
-            let frac = src_idx - idx0 as f64;
-            let s0 = mono_samples.get(idx0).copied().unwrap_or(0.0);
-            let s1 = mono_samples.get(idx0 + 1).copied().unwrap_or(s0);
-            output.push(s0 + (s1 - s0) * frac as f32);
-        }
-        output
-    } else {
-        mono_samples
-    };
-
-    // Run Whisper
-    let mut state = ctx
-        .create_state()
-        .map_err(|e| format!("Failed to create whisper state: {}", e))?;
-
-    let mut params =
-        whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
-    params.set_language(Some("en"));
-    params.set_print_special(false);
-    params.set_print_progress(false);
-    params.set_print_realtime(false);
-    params.set_print_timestamps(false);
-    params.set_suppress_blank(true);
-    params.set_no_speech_thold(0.6);
-
-    state
-        .full(params, &resampled)
-        .map_err(|e| format!("Whisper transcription failed: {}", e))?;
-
-    let num_segments = state.full_n_segments();
-    let mut result = String::new();
-    for i in 0..num_segments {
-        if let Some(segment) = state.get_segment(i) {
-            if let Ok(segment_text) = segment.to_str_lossy() {
-                result.push_str(&segment_text);
-            }
-        }
-    }
-
-    Ok(result.trim().to_string())
+    ctx.transcribe(mono_samples, input_sample_rate)
 }
 
 fn main() -> iced::Result {
@@ -2138,14 +1971,32 @@ fn main() -> iced::Result {
     }
     // The worker-launch helper above must remain usable while the desktop
     // owns the root. Every normal startup takes ownership before any write.
-    let _state_lock = match gitterm_core::config_paths::desktop_config_dir()
-        .map_err(|error| error.to_string())
-        .and_then(|root| {
-            gitterm_core::state_lock::StateLock::acquire(root).map_err(|error| error.to_string())
-        }) {
-        Ok(lock) => lock,
+    let _state_lock = match gitterm_core::config_paths::desktop_config_dir() {
+        Ok(root) => match gitterm_core::state_lock::StateLock::acquire(root) {
+            Ok(lock) => lock,
+            Err(gitterm_core::state_lock::LockError::Busy { root }) => {
+                let error = format!("GitTerm state root is already in use: {}", root.display());
+                eprintln!("{error}");
+                show_state_lock_alert(format!(
+                    "Another GitTerm window is using {}. Quit it first (GitTerm V6 or GitTerm GPUI in Live mode), then open this one again.",
+                    root.display()
+                ));
+                std::process::exit(1);
+            }
+            Err(gitterm_core::state_lock::LockError::Io { root, source }) => {
+                let error = format!("lock GitTerm state root {}: {source}", root.display());
+                eprintln!("{error}");
+                show_state_lock_alert(format!(
+                    "GitTerm could not open its data folder {}: {source}",
+                    root.display()
+                ));
+                std::process::exit(1);
+            }
+        },
         Err(error) => {
+            let error = error.to_string();
             eprintln!("{error}");
+            show_state_lock_alert(format!("GitTerm could not open its data folder: {error}"));
             std::process::exit(1);
         }
     };
@@ -2187,6 +2038,23 @@ fn main() -> iced::Result {
     gitterm::shutdown::operations().wait();
     gitterm::shutdown::log_children();
     result
+}
+
+fn show_state_lock_alert(message: String) {
+    use std::io::IsTerminal;
+
+    if !std::io::stderr().is_terminal()
+        && std::env::var("GITTERM_V6_NO_DIALOG").as_deref() == Ok("1")
+    {
+        return;
+    }
+
+    rfd::MessageDialog::new()
+        .set_title("GitTerm V6 is already open")
+        .set_description(&message)
+        .set_level(rfd::MessageLevel::Warning)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
 }
 
 use gitterm_core::status::{
@@ -7590,10 +7458,15 @@ enum ShutdownPhase {
     Finished,
 }
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "shutdown_tests.rs"]
+mod shutdown_periodic_tests;
+
 // The registry lets App::drop drain the same admitted saves if the window
 // runtime fails before delivering their completion events.
 pub struct ShutdownJob {
     ticket: Arc<gitterm::shutdown::Ticket>,
+    periodic: bool,
     future: Mutex<Option<iced::futures::future::BoxFuture<'static, Event>>>,
     result: Mutex<Option<Event>>,
     done: tokio_util::sync::CancellationToken,
@@ -7617,6 +7490,10 @@ impl ShutdownJob {
         let Some(future) = self.future.lock().unwrap().take() else {
             return;
         };
+        if self.periodic && gitterm::shutdown::operations().started() {
+            self.done.cancel();
+            return;
+        }
         let job = self.clone();
         match gitterm::shutdown::Executor::runtime() {
             Ok(runtime) => {
@@ -7625,7 +7502,11 @@ impl ShutdownJob {
                     match std::panic::AssertUnwindSafe(future).catch_unwind().await {
                         Ok(event) => {
                             if let Some(error) = shutdown_failure(&event) {
-                                job.ticket.fail(error);
+                                if job.periodic && gitterm::shutdown::operations().started() {
+                                    eprintln!("[shutdown] {error}");
+                                } else {
+                                    job.ticket.fail(error);
+                                }
                             }
                             *job.result.lock().unwrap() = Some(event);
                         }
@@ -7642,7 +7523,11 @@ impl ShutdownJob {
     }
 
     fn take(&self) -> Option<Event> {
-        self.result.lock().unwrap().take()
+        let event = self.result.lock().unwrap().take();
+        if self.periodic && gitterm::shutdown::operations().started() {
+            return None;
+        }
+        event
     }
 }
 
@@ -7668,8 +7553,36 @@ fn shutdown_task<A: Send + 'static>(
     future: impl std::future::Future<Output = A> + Send + 'static,
     map: impl FnOnce(A) -> Event + Send + 'static,
 ) -> Task<Event> {
+    tracked_task(name, false, future, map)
+}
+
+fn periodic_task<A: Send + 'static>(
+    name: &'static str,
+    future: impl std::future::Future<Output = A> + Send + 'static,
+    map: impl FnOnce(A) -> Event + Send + 'static,
+) -> Task<Event> {
+    tracked_task(
+        name,
+        true,
+        gitterm::shutdown::periodic_scope(gitterm::shutdown::operations(), future),
+        map,
+    )
+}
+
+fn tracked_task<A: Send + 'static>(
+    name: &'static str,
+    periodic: bool,
+    future: impl std::future::Future<Output = A> + Send + 'static,
+    map: impl FnOnce(A) -> Event + Send + 'static,
+) -> Task<Event> {
+    let kind = if periodic {
+        gitterm::shutdown::Kind::Periodic
+    } else {
+        gitterm::shutdown::Kind::Write
+    };
     let job = Arc::new(ShutdownJob {
-        ticket: gitterm::shutdown::operations().ticket(gitterm::shutdown::Kind::Write, name),
+        ticket: gitterm::shutdown::operations().ticket(kind, name),
+        periodic,
         future: Mutex::new(Some(Box::pin(async move { map(future.await) }))),
         result: Mutex::new(None),
         done: tokio_util::sync::CancellationToken::new(),
@@ -7700,6 +7613,7 @@ fn shutdown_stream<A: Send + 'static>(
             let job = Arc::new(ShutdownJob {
                 ticket: gitterm::shutdown::operations()
                     .ticket(gitterm::shutdown::Kind::Write, "chat event completion"),
+                periodic: false,
                 future: Mutex::new(None),
                 result: Mutex::new(Some(map(value))),
                 done,
@@ -8093,11 +8007,11 @@ struct App {
     #[cfg(feature = "stt")]
     stt_recording: bool,
     #[cfg(feature = "stt")]
-    stt_context: Option<Arc<whisper_rs::WhisperContext>>,
+    stt_context: Option<Arc<gitterm_core::dictation::Transcriber>>,
     #[cfg(feature = "stt")]
     stt_audio_buffer: Arc<Mutex<Vec<f32>>>,
     #[cfg(feature = "stt")]
-    stt_stream: Option<cpal::Stream>,
+    stt_stream: Option<gitterm_core::dictation::Recorder>,
     #[cfg(feature = "stt")]
     stt_sample_rate: u32,
     #[cfg(feature = "stt")]
@@ -11457,10 +11371,13 @@ impl App {
         let window = self.usage_window;
         let pricing = gitterm::usage::Pricing::with_overrides(&self.usage_config);
         let cache = self.usage_cache.clone();
-        shutdown_task(
+        periodic_task(
             "request_usage_scan",
             async move {
                 gitterm::shutdown::blocking("request_usage_scan", move || {
+                    if gitterm::shutdown::periodic_cancelled() {
+                        return Err("usage scan cancelled".into());
+                    }
                     let mut cache = match cache.lock() {
                         Ok(cache) => cache,
                         Err(poisoned) => {
@@ -16776,10 +16693,13 @@ impl App {
             return Task::none();
         }
         let config_dir = config::global_config_dir();
-        shutdown_task(
+        periodic_task(
             "poll_worker_prs",
             async move {
                 gitterm::shutdown::blocking("poll_worker_prs", move || {
+                    if gitterm::shutdown::periodic_cancelled() {
+                        return Ok(Vec::new());
+                    }
                     let home = dirs::home_dir().ok_or("cannot locate home for worker PR scans")?;
                     Ok(gitterm::worker_prs::run(scans, &config_dir, &home))
                 })
@@ -16872,9 +16792,14 @@ impl App {
             return Task::none();
         };
         let root = self.work_notes.root().to_path_buf();
-        shutdown_task(
+        let periodic = matches!(
+            job,
+            gitterm::work_notes::Job::Probe | gitterm::work_notes::Job::Status
+        );
+        tracked_task(
             "poll_work_notes",
-            async move {
+            periodic,
+            gitterm::shutdown::periodic_scope_if(periodic, async move {
                 gitterm::shutdown::blocking("poll_work_notes", move || {
                     gitterm::work_notes::run(&root, job)
                 })
@@ -16882,7 +16807,7 @@ impl App {
                 .unwrap_or_else(|error| {
                     gitterm::work_notes::JobResult::Failed(format!("{job:?} task failed: {error}"))
                 })
-            },
+            }),
             Event::WorkNotesDone,
         )
     }
@@ -16927,7 +16852,7 @@ impl App {
             .collect();
         self.chat_backfill_running = true;
         self.chat_backfill_note = None;
-        shutdown_task(
+        periodic_task(
             "start_chat_facts_backfill",
             async move {
                 gitterm::shutdown::blocking("start_chat_facts_backfill", move || {
@@ -16982,11 +16907,17 @@ impl App {
             .filter_map(|tab| tab.chat_session_id.clone())
             .collect();
         let home = dirs::home_dir();
-        shutdown_task(
+        periodic_task(
             "request_chat_index",
             async move {
                 let build = move || {
+                    if gitterm::shutdown::periodic_cancelled() {
+                        return Vec::new();
+                    }
                     let mut entries = chats::build_local_index();
+                    if gitterm::shutdown::periodic_cancelled() {
+                        return Vec::new();
+                    }
                     chat_facts::catch_up_workspace_prs(
                         &entries,
                         &owned,
@@ -16994,6 +16925,9 @@ impl App {
                         &facts_dir,
                         home.as_deref(),
                     );
+                    if gitterm::shutdown::periodic_cancelled() {
+                        return Vec::new();
+                    }
                     chat_facts::attach_facts(&mut entries, &facts_dir);
                     chat_facts::resolve_tree(&mut entries, &links);
                     entries
@@ -17953,7 +17887,7 @@ impl App {
                     .map(|tab| PathBuf::from(tab.repo_dir.as_ref().unwrap_or(&tab.dir))),
             )
             .collect();
-        shutdown_task(
+        periodic_task(
             "maintain_turn_snapshots",
             gitterm::turn_snapshots::maintain(
                 chat_facts::facts_dir(&config::global_config_dir()),
@@ -20742,10 +20676,13 @@ impl App {
             return Task::none();
         }
         let cwd = tab.repo_path.clone();
-        shutdown_task(
+        periodic_task(
             "refresh_delegation_head",
             async move {
                 gitterm::shutdown::blocking("refresh_delegation_head", move || {
+                    if gitterm::shutdown::periodic_cancelled() {
+                        return Err("HEAD refresh cancelled".into());
+                    }
                     gitterm::delegations::current_head(&cwd)
                 })
                 .await
@@ -31085,8 +31022,8 @@ impl App {
                         ) {
                             Some((generation, plan)) => {
                                 let key = plan.key.clone();
-                                shutdown_task(
-                                    "update_event",
+                                periodic_task(
+                                    "workspace_overview_summary",
                                     build_workspace_overview_summary(
                                         plan,
                                         Arc::clone(&self.chat_index),
@@ -32309,13 +32246,7 @@ impl App {
                 if self.stt_recording {
                     // Stop recording, start transcription
                     self.stt_recording = false;
-                    // Drop the stream to stop recording
-                    self.stt_stream = None;
-                    // Take the buffer
-                    let samples = {
-                        let mut buf = self.stt_audio_buffer.lock().unwrap();
-                        std::mem::take(&mut *buf)
-                    };
+                    let samples = self.stt_stream.take().unwrap().stop();
                     if samples.is_empty() {
                         eprintln!("[STT] Recording stopped with no audio samples");
                         return Task::none();
@@ -32330,47 +32261,32 @@ impl App {
                         rms,
                         peak
                     );
-                    if duration_secs < STT_MIN_RECORDING_SECONDS {
-                        eprintln!(
-                            "[STT] Ignoring recording shorter than {:.2}s",
-                            STT_MIN_RECORDING_SECONDS
-                        );
-                        return Task::none();
-                    }
-                    if rms < STT_MIN_RMS && peak < STT_MIN_PEAK {
-                        eprintln!(
-                            "[STT] Ignoring near-silent recording (rms={:.6}, peak={:.6}); check macOS microphone permission/input device",
-                            rms,
-                            peak
-                        );
+                    if !gitterm_core::dictation::should_transcribe(&samples, self.stt_sample_rate) {
+                        if duration_secs < gitterm_core::dictation::MIN_RECORDING_SECONDS {
+                            eprintln!(
+                                "[STT] Ignoring recording shorter than {:.2}s",
+                                gitterm_core::dictation::MIN_RECORDING_SECONDS
+                            );
+                        } else {
+                            eprintln!(
+                                "[STT] Ignoring near-silent recording (rms={:.6}, peak={:.6}); check macOS microphone permission/input device",
+                                rms,
+                                peak
+                            );
+                        }
                         return Task::none();
                     }
                     self.stt_transcribing = true;
                     // Lazy-init whisper context
                     if self.stt_context.is_none() {
                         let model_path = stt_model_path();
-                        if !model_path.exists() {
-                            self.stt_transcribing = false;
-                            let model_dir = model_path.parent().unwrap_or(&model_path).display();
-                            eprintln!(
-                                "[STT] Model not found. Download it with:\n  \
-                                 mkdir -p \"{model_dir}\" && \\\n  \
-                                 curl -L -o \"{}\" \\\n  \
-                                 https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
-                                model_path.display()
-                            );
-                            return Task::none();
-                        }
-                        match whisper_rs::WhisperContext::new_with_params(
-                            model_path.to_str().unwrap(),
-                            whisper_rs::WhisperContextParameters::default(),
-                        ) {
+                        match gitterm_core::dictation::Transcriber::load(&model_path) {
                             Ok(ctx) => {
                                 self.stt_context = Some(Arc::new(ctx));
                             }
                             Err(e) => {
                                 self.stt_transcribing = false;
-                                eprintln!("[STT] Failed to load model: {}", e);
+                                eprintln!("[STT] {}", e);
                                 return Task::none();
                             }
                         }

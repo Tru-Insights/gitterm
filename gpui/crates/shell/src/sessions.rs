@@ -531,7 +531,7 @@ impl crate::Shell {
             _ => {}
         }
     }
-    fn select_work_chat(
+    pub(crate) fn select_work_chat(
         &mut self,
         workspace: u64,
         chat: &str,
@@ -562,6 +562,20 @@ impl crate::Shell {
         if let Some((workspace, session)) = selected {
             self.select_workspace_id(workspace, window, cx);
             self.select_session_id(session, window, cx);
+        } else if self.live_chat_enabled(cx) {
+            if let Err(error) =
+                self.open_saved_live_chat(crate::WorkspaceId(workspace), chat, None, window, cx)
+            {
+                self.owner.update(cx, |owner, cx| {
+                    owner.error = Some(format!("Resume chat: {error:#}"));
+                    cx.notify();
+                });
+            }
+        } else {
+            self.owner.update(cx, |owner, cx| {
+                owner.error = Some("Conversation resume not available in preview".into());
+                cx.notify();
+            });
         }
     }
 }
@@ -904,6 +918,15 @@ impl crate::Shell {
         ) {
             return;
         }
+        if self.live_chat_enabled(cx) {
+            if let Err(error) = self.mount_live_chat(workspace, tab, Some(id), window, cx) {
+                self.owner.update(cx, |owner, cx| {
+                    owner.error = Some(format!("Resume chat: {error:#}"));
+                    cx.notify();
+                });
+            }
+            return;
+        }
         // Read the task store with the transcript: the shell's roster facts may
         // not be loaded yet when a chat opens at launch.
         let card_source = self.owner.read(cx).iced_catalog().map(|catalog| {
@@ -1206,6 +1229,243 @@ fn read_iced_history(
         session_id: Some(conversation.into()),
         records,
     })
+}
+
+impl crate::Shell {
+    pub(crate) fn live_chat_enabled(&self, cx: &gpui::App) -> bool {
+        self.owner.read(cx).preview().is_some_and(|preview| {
+            matches!(
+                crate::chat::policy::current(preview, cx),
+                crate::chat::policy::ChatLaunchPolicy::Live { .. }
+            )
+        })
+    }
+
+    fn live_chat_location(
+        &self,
+        id: &str,
+        cx: &gpui::App,
+    ) -> Option<(crate::WorkspaceId, crate::data::SessionId)> {
+        self.workspaces.iter().find_map(|state| {
+            state.sessions.iter().find_map(|session| {
+                let pane = state
+                    .panes
+                    .get(&crate::session_pane_id(session.id))?
+                    .read(cx);
+                match &pane.content {
+                    crate::pane::PaneContent::PreviewChat(view)
+                        if view.read(cx).matches_chat(id) =>
+                    {
+                        Some((state.workspace.id, session.id))
+                    }
+                    _ => None,
+                }
+            })
+        })
+    }
+
+    /// One mounting path for restored tabs and saved conversations opened by either rail.
+    fn mount_live_chat(
+        &mut self,
+        workspace: crate::WorkspaceId,
+        tab: gitterm_core::workspace_config::WorkspaceTabConfig,
+        existing: Option<crate::data::SessionId>,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> anyhow::Result<()> {
+        use gpui::AppContext as _;
+        if let Some(id) = &tab.chat_session_id
+            && let Some((workspace, session)) = self.live_chat_location(id, cx)
+        {
+            self.reopen_workspace(workspace, window, cx);
+            self.select_workspace_id(workspace, window, cx);
+            self.select_session_id(session, window, cx);
+            return Ok(());
+        }
+        let owner = self.owner.read(cx);
+        let saved = owner
+            .iced_workspace(workspace)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Saved chat workspace unavailable"))?;
+        anyhow::ensure!(
+            !saved.is_legacy_remote()
+                && !matches!(
+                    saved.location,
+                    Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. })
+                ),
+            "Remote chat resume unavailable"
+        );
+        let preview = owner
+            .preview()
+            .ok_or_else(|| anyhow::anyhow!("Chat context unavailable"))?;
+        let shutdown = owner.chat_shutdown.clone();
+        let fallback = crate::chat::SavedChat {
+            uid: fresh_target().session_uid,
+            cwd: tab.dir.clone().into(),
+            provider: preview.provider(),
+            session_id: tab.chat_session_id.clone(),
+            records: vec![],
+        };
+        let mut error = None;
+        let view = cx.new(|cx| {
+            match crate::chat::ChatPane::resume(shutdown.clone(), preview, saved, tab, window, cx) {
+                Ok(pane) => pane,
+                Err(failure) => {
+                    error = Some(failure);
+                    crate::chat::ChatPane::history(shutdown, fallback, window, cx)
+                }
+            }
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+        self.install_live_pane(workspace, view, existing, window, cx);
+        Ok(())
+    }
+
+    fn install_live_pane(
+        &mut self,
+        workspace: crate::WorkspaceId,
+        view: gpui::Entity<crate::chat::ChatPane>,
+        existing: Option<crate::data::SessionId>,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        use gpui::AppContext as _;
+        let target = view.read(cx).target();
+        self._subscriptions
+            .push(crate::task_host::forward_turn_ends(&view, cx));
+        self.owner.update(cx, |owner, _| {
+            owner.chats.insert(target.session_uid.clone(), view.clone());
+        });
+        let id = existing.unwrap_or_else(|| {
+            let mut id = crate::layout::stable_path_hash(std::path::Path::new(&target.session_uid));
+            while self
+                .workspaces
+                .iter()
+                .any(|w| w.sessions.iter().any(|s| s.id.0 == id))
+            {
+                id = id.wrapping_add(1);
+            }
+            crate::data::SessionId(id)
+        });
+        let pane_id = crate::session_pane_id(id);
+        if let Some(pane) = self.workspace(workspace).panes.get(&pane_id) {
+            pane.update(cx, |pane, cx| {
+                pane.content = crate::pane::PaneContent::PreviewChat(view);
+                cx.notify();
+            });
+        } else {
+            let pane = cx.new(|cx| {
+                crate::pane::Pane::new(
+                    pane_id.clone(),
+                    "Claude".into(),
+                    crate::pane::PaneKind::PreviewChat(view),
+                    workspace,
+                    self.data.clone(),
+                    window,
+                    cx,
+                )
+            });
+            self._subscriptions.push(subscribe(&pane, window, cx));
+            self.registry
+                .borrow_mut()
+                .insert(pane_id.clone(), pane.downgrade());
+            let state = self
+                .workspaces
+                .iter_mut()
+                .find(|state| state.workspace.id == workspace)
+                .expect("selected workspace");
+            state.panes.insert(pane_id.clone(), pane);
+            state.sessions.push(crate::data::Session {
+                id,
+                title: "Claude".into(),
+                kind: crate::data::SessionKind::Chat,
+            });
+        }
+        self.reopen_workspace(workspace, window, cx);
+        self.select_workspace_id(workspace, window, cx);
+        self.select_session_id(id, window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn open_saved_live_chat(
+        &mut self,
+        workspace: crate::WorkspaceId,
+        id: &str,
+        indexed: Option<gitterm_core::chats::ChatIndexEntry>,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.live_chat_enabled(cx),
+            "Conversation resume not available in preview"
+        );
+        if let Some((workspace, session)) = self.live_chat_location(id, cx) {
+            self.reopen_workspace(workspace, window, cx);
+            self.select_workspace_id(workspace, window, cx);
+            self.select_session_id(session, window, cx);
+            return Ok(());
+        }
+        let saved = self
+            .owner
+            .read(cx)
+            .iced_workspace(workspace)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Saved chat workspace unavailable"))?;
+        if let Some(tab) = saved
+            .tabs
+            .iter()
+            .find(|tab| tab.chat_session_id.as_deref() == Some(id))
+            .cloned()
+        {
+            let existing = crate::data::iced_sessions(&saved)
+                .iter()
+                .zip(&saved.tabs)
+                .find(|(_, tab)| tab.chat_session_id.as_deref() == Some(id))
+                .map(|(session, _)| session.id)
+                .filter(|id| {
+                    self.workspace(workspace)
+                        .panes
+                        .get(&crate::session_pane_id(*id))
+                        .is_some_and(|pane| {
+                            matches!(
+                                pane.read(cx).content,
+                                crate::pane::PaneContent::IcedSession(_)
+                            )
+                        })
+                });
+            return self.mount_live_chat(workspace, tab, existing, window, cx);
+        }
+        // A closed tab can still carry the recorded configuration in another
+        // workspace. Prefer it over the index's backend/cwd-only metadata.
+        let recorded = self.owner.read(cx).iced_catalog().and_then(|catalog| catalog.workspaces.iter().enumerate().find_map(|(index, workspace)| {
+            if workspace.is_legacy_remote() || matches!(workspace.location, Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. })) { return None; }
+            workspace.tabs.iter().find(|tab| tab.chat_session_id.as_deref() == Some(id)).cloned().map(|tab| (crate::WorkspaceId(index as u64 + 1), tab))
+        }));
+        if let Some((workspace, tab)) = recorded {
+            return self.mount_live_chat(workspace, tab, None, window, cx);
+        }
+        let indexed = indexed.or_else(|| {
+            self.work_sidebars.get(&workspace).and_then(|sidebar| {
+                sidebar
+                    .read(cx)
+                    .indexed_chats()
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .cloned()
+            })
+        });
+        let indexed = indexed
+            .ok_or_else(|| anyhow::anyhow!("Saved conversation metadata unavailable: {id}"))?;
+        anyhow::ensure!(
+            indexed.backend == gitterm_core::chats::ChatBackend::Claude,
+            "Resume for this recorded backend is unavailable"
+        );
+        let tab =
+            crate::chat::resume::tab(&indexed.cwd, fresh_target().session_uid, Some(id.into()));
+        self.mount_live_chat(workspace, tab, None, window, cx)
+    }
 }
 
 #[cfg(test)]

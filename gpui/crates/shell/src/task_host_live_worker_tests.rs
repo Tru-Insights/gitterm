@@ -288,7 +288,14 @@ fn live_workers_launch_record_identity_and_restart_without_adoption(cx: &mut Tes
                 .any(|record| record.task_session_id == session)
         }));
     }
-    owner.update(cx, |owner, cx| owner.quit(cx));
+    owner.update(cx, |owner, cx| {
+        let callers: Vec<_> = owner.host_terminals();
+        assert_eq!(callers.len(), 2);
+        owner.quit(cx);
+        for caller in callers {
+            assert!(owner.host().require_issued_caller(Some(&caller), "consult_request").is_err());
+        }
+    });
     let (restarted, _) = start(&fixture, cx);
     restarted.read_with(cx, |owner, _| {
         assert!(owner.host_terminals().is_empty());
@@ -358,6 +365,12 @@ fn live_save_failure_stops_unpublished_fake(cx: &mut TestAppContext) {
     live_set_mode(&fixture.iced, 0o700);
     assert!(failed.unwrap_err().contains("atomically write"));
     assert!(owner.read_with(cx, |owner, _| owner.host_terminals().is_empty()));
+    let spec = fake.spec.borrow();
+    let url = &spec.as_ref().unwrap().env["GITTERM_V6_TASK_MCP_URL"];
+    let caller = url.split("caller=").nth(1).unwrap();
+    assert!(owner.read_with(cx, |owner, _| {
+        owner.host().require_issued_caller(Some(caller), "consult_request").is_err()
+    }));
     let pid: u32 = fake.text("pid", 1).trim().parse().unwrap();
     wait_until(cx, |_| {
         gitterm_core::worker_process::macos::info(pid)
@@ -594,6 +607,12 @@ fn live_attach_failure_stops_unpublished_fake(cx: &mut TestAppContext) {
     let failed = launch_live(cx, &sender, id, "Codex").unwrap_err();
     assert!(failed.contains("could not attach"), "{failed}");
     assert!(owner.read_with(cx, |owner, _| owner.host_terminals().is_empty()));
+    let spec = fake.spec.borrow();
+    let url = &spec.as_ref().unwrap().env["GITTERM_V6_TASK_MCP_URL"];
+    let caller = url.split("caller=").nth(1).unwrap();
+    assert!(owner.read_with(cx, |owner, _| {
+        owner.host().require_issued_caller(Some(caller), "consult_request").is_err()
+    }));
     assert!(
         TaskStore::load(fixture.source())
             .unwrap()
@@ -757,6 +776,17 @@ fn live_worker_terminal_can_request_consult_and_delegate(cx: &mut TestAppContext
     .unwrap();
     assert_eq!(second["queued"], false);
     wait_until(cx, |_| fake.file("ready", 3).exists());
+    let child_session = second["task_session_id"].as_str().unwrap();
+    owner.update(cx, |owner, cx| {
+        // Both callers were usable after publication; teardown must revoke
+        // only the ended session, even while another worker stays alive.
+        assert!(owner.host().require_issued_caller(Some(child_session), "consult_request").is_ok());
+        owner.test_terminal_exited(worker, cx);
+        assert!(owner.host().require_issued_caller(Some(worker), "consult_request").is_err());
+        assert!(owner.host().require_issued_caller(Some(child_session), "consult_request").is_ok());
+        owner.session_closed(child_session, cx);
+        assert!(owner.host().require_issued_caller(Some(child_session), "consult_request").is_err());
+    });
     owner.update(cx, |owner, cx| owner.quit(cx));
 }
 

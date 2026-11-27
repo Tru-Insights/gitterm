@@ -227,12 +227,15 @@ impl TaskHost {
         }
     }
 
+    /// Revoke before a frontend session closes, exits or is replaced.
+    pub fn revoke_caller(&self, caller: &str) {
+        self.issued_callers.lock().unwrap().remove(caller);
+    }
+
     pub fn require_issued_caller(&self, caller: Option<&str>, tool: &str) -> Result<(), String> {
         let caller = caller.ok_or_else(|| missing_caller_error(tool))?;
         if !self.issued_callers.lock().unwrap().contains(caller) {
-            return Err(format!(
-                "{tool}: caller {caller:?} was not issued by this task host"
-            ));
+            return Err("The calling GitTerm tab changed; request the delegation again".into());
         }
         Ok(())
     }

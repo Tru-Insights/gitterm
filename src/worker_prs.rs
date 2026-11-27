@@ -111,6 +111,9 @@ pub type RecordedPrs = Vec<(String, Vec<PrRef>)>;
 pub fn run(scans: Vec<Scan>, config: &Path, home: &Path) -> RecordedPrs {
     let mut recorded = Vec::new();
     for scan in scans {
+        if crate::shutdown::periodic_cancelled() {
+            break;
+        }
         match scan_one(&scan, config, home) {
             Ok(Some(prs)) => recorded.push(prs),
             Ok(None) => {}
@@ -163,6 +166,9 @@ fn scan_one(
         mark_scanned(&marker)?;
         return Ok(None);
     };
+    if crate::shutdown::periodic_cancelled() {
+        return Ok(None);
+    }
     let transcript = crate::chats::task_conversation_path_under(home, conversation)?;
     let prs = scan_transcript(&transcript, conversation.backend)
         .map_err(|error| format!("cannot read {}: {error}", transcript.display()))?;
@@ -178,9 +184,14 @@ fn scan_one(
 }
 
 fn mark_scanned(marker: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(marker.parent().expect("marker directory"))
-        .and_then(|()| std::fs::write(marker, b""))
-        .map_err(|error| format!("cannot write {}: {error}", marker.display()))
+    let _write = crate::shutdown::periodic_write("worker PR scan marker")?;
+    std::fs::create_dir_all(marker.parent().expect("marker directory")).map_err(|error| {
+        format!(
+            "cannot create marker directory {}: {error}",
+            marker.display()
+        )
+    })?;
+    crate::merge_plan::write_atomically(marker, b"")
 }
 
 /// Adapters pair actual shell inputs with their output, including Codex's

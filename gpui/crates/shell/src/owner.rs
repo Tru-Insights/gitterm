@@ -175,7 +175,7 @@ impl WorkspaceOwner {
         }
         let chat_quit = cx.on_app_quit(|owner: &mut Self, cx| {
             for chat in owner.chats.values() {
-                chat.update(cx, |chat, _| chat.shutdown_runtime());
+                chat.update(cx, |chat, cx| chat.shutdown_runtime(cx));
             }
             if cx.try_global::<crate::lifetime::Barrier>().is_none()
                 && let Err(error) = owner.chat_shutdown.drain()
@@ -269,6 +269,36 @@ impl WorkspaceOwner {
                     .collect()
             })
             .unwrap_or_default()
+    }
+    pub(crate) fn confirm_live_tab(
+        &mut self,
+        name: &str,
+        dir: &str,
+        tab: gitterm_core::workspace_config::WorkspaceTabConfig,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(catalog) = self.store.as_mut().and_then(|store| store.iced.as_mut())
+            && let Some(workspace) = catalog
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.name == name && workspace.dir == dir)
+        {
+            if !workspace.chats.is_empty()
+                && let Some(id) = &tab.chat_session_id
+                && !workspace.chats.contains(id)
+            {
+                workspace.chats.push(id.clone());
+            }
+            if let Some(saved) = workspace.tabs.iter_mut().find(|saved| {
+                saved.session_uid == tab.session_uid
+                    || (saved.session_uid.is_none() && saved.chat_session_id == tab.chat_session_id)
+            }) {
+                *saved = tab;
+            } else {
+                workspace.tabs.push(tab);
+            }
+            cx.notify();
+        }
     }
     pub(crate) fn save_chat(&mut self, chat: crate::chat::SavedChat, cx: &mut Context<Self>) {
         let Some(preview) = self.preview() else {

@@ -3012,6 +3012,243 @@ mod live_writes {
         ))
     }
 
+    fn caller_shell<'a>(
+        fixture: &Fixture,
+        owner: &Entity<TaskHostOwner>,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<crate::Shell>, &'a mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(crate::task_host::GpuiTaskHost(owner.clone()));
+        });
+        cx.add_window_view(|window, cx| {
+            let mut model = crate::workspace_status::WorkspaceStatus::default();
+            model.add(fixture.iced.clone(), Instant::now());
+            let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, None, cx));
+            crate::Shell::with_owner(
+                std::rc::Rc::new(crate::data::LocalData(owner.clone())),
+                owner,
+                fixture.roots.root(),
+                true,
+                window,
+                cx,
+            )
+            .unwrap()
+        })
+    }
+
+    fn add_caller_chat(
+        shell: &Entity<crate::Shell>,
+        owner: &Entity<TaskHostOwner>,
+        fixture: &Fixture,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Entity<crate::chat::ChatPane> {
+        let mut chat = None;
+        shell.update_in(cx, |shell, window, cx| {
+            let saved = crate::chat::SavedChat {
+                uid: "history".into(),
+                cwd: fixture.iced.clone(),
+                provider: fixture.roots.provider(),
+                session_id: None,
+                records: vec![],
+            };
+            let view = cx.new(|cx| {
+                crate::chat::ChatPane::history(
+                    shell.owner.read(cx).chat_shutdown.clone(),
+                    saved,
+                    window,
+                    cx,
+                )
+            });
+            let target = view.read(cx).target();
+            owner.read(cx).claude_mcp_servers(&target.session_uid);
+            let id = crate::data::SessionId(target.tab_id as u64);
+            let pane_id = crate::session_pane_id(id);
+            let workspace = shell.active(cx).workspace.id;
+            let pane = cx.new(|cx| {
+                crate::pane::Pane::new(
+                    pane_id.clone(),
+                    "Chat".into(),
+                    crate::pane::PaneKind::PreviewChat(view.clone()),
+                    workspace,
+                    shell.data.clone(),
+                    window,
+                    cx,
+                )
+            });
+            shell.owner.update(cx, |owner, _| {
+                owner.chats.insert(target.session_uid.clone(), view.clone());
+            });
+            let state = shell
+                .workspaces
+                .iter_mut()
+                .find(|state| state.workspace.id == workspace)
+                .unwrap();
+            state.panes.insert(pane_id, pane);
+            state.sessions.push(crate::data::Session {
+                id,
+                title: "Chat".into(),
+                kind: crate::data::SessionKind::Chat,
+            });
+            chat = Some(view);
+        });
+        chat.unwrap()
+    }
+
+    #[gpui::test]
+    fn closed_chat_refuses_create(cx: &mut TestAppContext) {
+        if child("closed_chat_refuses_create") {
+            return;
+        }
+        cx.background_executor.allow_parking();
+        let (fixture, git) = fixture();
+        let (owner, sender) = start(&fixture, cx);
+        let (shell, cx) = caller_shell(&fixture, &owner, cx);
+        let chat = add_caller_chat(&shell, &owner, &fixture, cx);
+        let _other = add_caller_chat(&shell, &owner, &fixture, cx);
+        let target = chat.read_with(cx, |chat, _| chat.target());
+        shell.update_in(cx, |shell, window, cx| {
+            shell.close_target_with(&target, true, window, cx)
+        });
+        // Retain a handle: authority ends at close, not at eventual entity drop.
+        assert_eq!(
+            dispatch_as(cx, &sender, create_in(&git.repo), Some(&target.session_uid)),
+            Err("The calling GitTerm tab changed; request the delegation again".into())
+        );
+        assert!(
+            TaskStore::load(fixture.source())
+                .unwrap()
+                .tasks()
+                .is_empty()
+        );
+        owner.update(cx, |owner, _| owner.shutdown());
+    }
+
+    #[gpui::test]
+    fn exited_chat_refuses_handoff(cx: &mut TestAppContext) {
+        if child("exited_chat_refuses_handoff") {
+            return;
+        }
+        cx.background_executor.allow_parking();
+        let (fixture, git) = fixture();
+        let (owner, sender) = start(&fixture, cx);
+        let created = create(cx, &sender, &git.repo);
+        let (shell, cx) = caller_shell(&fixture, &owner, cx);
+        let chat = add_caller_chat(&shell, &owner, &fixture, cx);
+        let caller = chat.read_with(cx, |chat, _| chat.target().session_uid);
+        let before = std::fs::read(fixture.source()).unwrap();
+        chat.update(cx, |chat, cx| {
+            chat.receive_runtime_event(
+                &chat.runtime_source(),
+                gitterm_core::chat::runtime::RuntimeEvent::Harness(
+                    gitterm_core::chat::types::HarnessEvent::ProcessExited { code: Some(0) },
+                ),
+                cx,
+            )
+        });
+        assert_eq!(
+            dispatch_as(
+                cx,
+                &sender,
+                handoff(created["task_id"].as_str().unwrap(), "Stale"),
+                Some(&caller)
+            ),
+            Err("The calling GitTerm tab changed; request the delegation again".into())
+        );
+        assert_eq!(std::fs::read(fixture.source()).unwrap(), before);
+        owner.update(cx, |owner, _| owner.shutdown());
+    }
+
+    #[gpui::test]
+    fn closing_one_chat_preserves_other_caller(cx: &mut TestAppContext) {
+        if child("closing_one_chat_preserves_other_caller") {
+            return;
+        }
+        cx.background_executor.allow_parking();
+        let (fixture, git) = fixture();
+        let (owner, sender) = start(&fixture, cx);
+        let (shell, cx) = caller_shell(&fixture, &owner, cx);
+        let first = add_caller_chat(&shell, &owner, &fixture, cx);
+        let second = add_caller_chat(&shell, &owner, &fixture, cx);
+        let target = first.read_with(cx, |chat, _| chat.target());
+        let second = second.read_with(cx, |chat, _| chat.target().session_uid);
+        shell.update_in(cx, |shell, window, cx| {
+            shell.close_target_with(&target, true, window, cx)
+        });
+        assert!(dispatch_as(cx, &sender, create_in(&git.repo), Some(&target.session_uid)).is_err());
+        let created = dispatch_as(cx, &sender, create_in(&git.repo), Some(&second)).unwrap();
+        assert_eq!(
+            dispatch_as(
+                cx,
+                &sender,
+                handoff(created["task_id"].as_str().unwrap(), "Still open"),
+                Some(&second)
+            )
+            .unwrap()["handoff"]["summary"],
+            "Still open"
+        );
+        owner.update(cx, |owner, _| owner.shutdown());
+    }
+
+    #[gpui::test]
+    fn chat_reset_and_workspace_stop_revoke_callers(cx: &mut TestAppContext) {
+        if child("chat_reset_and_workspace_stop_revoke_callers") {
+            return;
+        }
+        cx.background_executor.allow_parking();
+        let (fixture, _) = fixture();
+        let (owner, _) = start(&fixture, cx);
+        let (shell, cx) = caller_shell(&fixture, &owner, cx);
+        let chat = add_caller_chat(&shell, &owner, &fixture, cx);
+        let caller = chat.read_with(cx, |chat, _| chat.target().session_uid);
+        chat.update(cx, |chat, cx| {
+            chat.receive_runtime_event(
+                &chat.runtime_source(),
+                gitterm_core::chat::runtime::RuntimeEvent::Harness(
+                    gitterm_core::chat::types::HarnessEvent::ConversationReset { trigger: None },
+                ),
+                cx,
+            )
+        });
+        owner.read_with(cx, |owner, _| {
+            assert!(
+                owner
+                    .host()
+                    .require_issued_caller(Some(&caller), "task_create")
+                    .is_err()
+            );
+            // Explicit issuance, rather than restored metadata, grants authority again.
+            owner.claude_mcp_servers(&caller);
+            assert!(
+                owner
+                    .host()
+                    .require_issued_caller(Some(&caller), "task_create")
+                    .is_ok()
+            );
+        });
+        shell.update_in(cx, |shell, window, cx| {
+            let target = shell.active(cx).park_target(cx);
+            shell.apply_park(
+                gitterm_core::park::Effect::Park {
+                    target,
+                    mode: gitterm_core::park::Mode::Stop,
+                    info: gitterm_core::park::Info::new("", String::new()),
+                },
+                window,
+                cx,
+            );
+        });
+        owner.read_with(cx, |owner, _| {
+            assert!(
+                owner
+                    .host()
+                    .require_issued_caller(Some(&caller), "task_create")
+                    .is_err()
+            );
+        });
+        owner.update(cx, |owner, _| owner.shutdown());
+    }
+
     #[gpui::test]
     fn create_handoff_restart(cx: &mut TestAppContext) {
         if child("create_handoff_restart") {
@@ -3061,7 +3298,7 @@ mod live_writes {
                 Some("imported-session")
             )
             .unwrap_err()
-            .contains("not issued")
+            .contains("calling GitTerm tab changed")
         );
         // Saved tasks are writable after admission; no launch/worker authority
         // is inferred from their history or from their former caller.
@@ -3168,7 +3405,10 @@ mod live_writes {
             ] {
                 let error = dispatch_as(cx, &sender, operation, caller).unwrap_err();
                 assert!(!error.contains("not available in preview"), "{error}");
-                assert!(error.contains("caller"), "{error}");
+                assert!(
+                    error.contains("calling GitTerm tab changed") || error.contains("caller"),
+                    "{error}"
+                );
             }
         }
         owner.update(cx, |owner, _| owner.shutdown());
@@ -3180,7 +3420,7 @@ mod live_writes {
             Some("former-caller"),
         )
         .unwrap_err();
-        assert!(error.contains("not issued"), "{error}");
+        assert!(error.contains("calling GitTerm tab changed"), "{error}");
         assert_eq!(std::fs::read(fixture.source()).unwrap(), before);
         restarted.update(cx, |owner, _| owner.shutdown());
     }

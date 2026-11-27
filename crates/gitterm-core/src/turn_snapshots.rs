@@ -49,6 +49,39 @@ async fn checkout_prefix(dir: &Path, chat: &str) -> Result<String, String> {
     ))
 }
 
+/// Host cancellation, scoped only to periodic maintenance.
+#[derive(Clone)]
+pub struct MaintenanceControl {
+    pub cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+tokio::task_local! {
+    static MAINTENANCE: MaintenanceControl;
+}
+
+fn maintenance_checkpoint() -> Result<(), String> {
+    if MAINTENANCE
+        .try_with(|control| (control.cancelled)())
+        .unwrap_or(false)
+    {
+        Err("snapshot maintenance cancelled at shutdown".into())
+    } else {
+        Ok(())
+    }
+}
+
+pub async fn maintain_cancellable(
+    root: &SnapshotRoots,
+    facts_dir: PathBuf,
+    dirs: BTreeSet<PathBuf>,
+    chats: Option<Vec<String>>,
+    control: MaintenanceControl,
+) -> Result<(), String> {
+    MAINTENANCE
+        .scope(control, maintain(root, facts_dir, dirs, chats))
+        .await
+}
+
 async fn git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<u8>, String> {
     git_input(dir, index, args, None).await
 }
@@ -132,6 +165,7 @@ async fn git_run(
         .env("GIT_COMMITTER_NAME", "GitTerm")
         .env("GIT_COMMITTER_EMAIL", "snapshots@gitterm.invalid");
     let operation = format!("snapshot git {args:?} in {}", dir.display());
+    maintenance_checkpoint()?;
     let mut child = command.spawn().map_err(|e| format!("{operation}: {e}"))?;
     let child_id = child.id();
     let run = async {
@@ -169,7 +203,18 @@ async fn git_run(
             stderr: errors,
         })
     };
-    let out = match tokio::time::timeout(TIMEOUT, run).await {
+    let result = {
+        let mut run = std::pin::pin!(run);
+        let result = tokio::time::timeout(TIMEOUT, run.as_mut()).await;
+        // Cancellation abandons maintenance without killing its current child.
+        // Keep draining it under the store lock if the desktop is still alive.
+        if result.is_err() && maintenance_checkpoint().is_err() {
+            Ok(run.await)
+        } else {
+            result
+        }
+    };
+    let out = match result {
         Ok(Ok(out)) => out,
         failed => {
             let error = match failed {
@@ -177,6 +222,13 @@ async fn git_run(
                 Err(_) => "timed out".to_string(),
                 Ok(Ok(_)) => unreachable!(),
             };
+            if maintenance_checkpoint().is_err() {
+                child
+                    .wait()
+                    .await
+                    .map_err(|e| format!("{operation}: {error}; reap child: {e}"))?;
+                return Err(format!("{operation}: {error}"));
+            }
             #[cfg(unix)]
             if let Some(pid) = child_id.and_then(|pid| i32::try_from(pid).ok()) {
                 // SAFETY: this is the separate group created for this Git child.
@@ -215,6 +267,7 @@ async fn git_run(
             return Err(format!("{operation}: {error}"));
         }
     };
+    maintenance_checkpoint()?;
     if !out.status.success() {
         return Err(format!(
             "snapshot git {args:?} in {}: {}",
@@ -383,6 +436,7 @@ impl Drop for TemporaryIndex {
 
 async fn lock_store(store: &Path) -> Result<std::fs::File, String> {
     let path = store.join("gitterm.lock");
+    maintenance_checkpoint()?;
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -392,6 +446,7 @@ async fn lock_store(store: &Path) -> Result<std::fs::File, String> {
         .map_err(|e| format!("open snapshot lock {}: {e}", path.display()))?;
     tokio::time::timeout(TIMEOUT, async {
         loop {
+            maintenance_checkpoint()?;
             match file.try_lock() {
                 Ok(()) => return Ok(file),
                 Err(std::fs::TryLockError::WouldBlock) => {
@@ -859,6 +914,7 @@ fn sweep_pending(store: &Path, chat: Option<&str>) -> Result<(), String> {
                 match file.try_lock() {
                     Ok(()) => {
                         drop(file);
+                        maintenance_checkpoint()?;
                         std::fs::remove_file(&path).map_err(|e| {
                             format!("remove stale snapshot lease {}: {e}", path.display())
                         })?;
@@ -901,6 +957,7 @@ fn sweep_pending(store: &Path, chat: Option<&str>) -> Result<(), String> {
                     .as_ref()
                     .is_some_and(|prefix| path.starts_with(prefix))
             {
+                maintenance_checkpoint()?;
                 match std::fs::remove_file(&path) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -916,9 +973,16 @@ fn sweep_pending(store: &Path, chat: Option<&str>) -> Result<(), String> {
 async fn cleanup_store(store: &Path, chat: Option<&str>, now: i64) -> Result<(), String> {
     let store = store.to_path_buf();
     let chat = chat.map(str::to_owned);
+    let control = MAINTENANCE.try_with(Clone::clone).ok();
     tokio::spawn(async move {
-        let _guard = lock_store(&store).await?;
-        cleanup_store_locked(&store, chat.as_deref(), now).await
+        let cleanup = async {
+            let _guard = lock_store(&store).await?;
+            cleanup_store_locked(&store, chat.as_deref(), now).await
+        };
+        match control {
+            Some(control) => MAINTENANCE.scope(control, cleanup).await,
+            None => cleanup.await,
+        }
     })
     .await
     .map_err(|e| format!("snapshot cleanup task: {e}"))?
@@ -1286,6 +1350,7 @@ pub async fn maintain(
     mut dirs: BTreeSet<PathBuf>,
     chats: Option<Vec<String>>,
 ) -> Result<(), String> {
+    maintenance_checkpoint()?;
     let mut errors = Vec::new();
     match tokio::fs::read_dir(&facts_dir).await {
         Ok(mut entries) => {
@@ -1294,6 +1359,7 @@ pub async fn maintain(
                 .await
                 .map_err(|e| format!("list snapshot checkouts: {e}"))?
             {
+                maintenance_checkpoint()?;
                 if entry.path().extension().is_none_or(|ext| ext != "json") {
                     continue;
                 }
@@ -1320,6 +1386,7 @@ pub async fn maintain(
     }
     let now = chrono::Utc::now().timestamp();
     for dir in dirs {
+        maintenance_checkpoint()?;
         if dir.join(".git").exists() {
             if let Err(e) = remove_legacy_refs(&dir).await {
                 errors.push(e);
@@ -1334,6 +1401,7 @@ pub async fn maintain(
                 .await
                 .map_err(|e| format!("list private snapshot stores {}: {e}", root.display()))?
             {
+                maintenance_checkpoint()?;
                 let path = entry.path();
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
@@ -1342,6 +1410,7 @@ pub async fn maintain(
                 }
                 if let Some(chats) = &chats {
                     for chat in chats {
+                        maintenance_checkpoint()?;
                         if let Err(e) = cleanup_store(&path, Some(chat), now).await {
                             errors.push(e);
                         }

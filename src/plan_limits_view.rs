@@ -210,7 +210,7 @@ impl App {
         let Some(job) = self.plan_limits.begin_codex_read(sessions, Instant::now()) else {
             return Task::none();
         };
-        shutdown_task("read_codex_limits", job.run(), Event::PlanLimits)
+        periodic_task("read_codex_limits", job.run(), Event::PlanLimits)
     }
 
     /// Writes the readings off the UI thread, one write at a time.
