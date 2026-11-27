@@ -2138,14 +2138,32 @@ fn main() -> iced::Result {
     }
     // The worker-launch helper above must remain usable while the desktop
     // owns the root. Every normal startup takes ownership before any write.
-    let _state_lock = match gitterm_core::config_paths::desktop_config_dir()
-        .map_err(|error| error.to_string())
-        .and_then(|root| {
-            gitterm_core::state_lock::StateLock::acquire(root).map_err(|error| error.to_string())
-        }) {
-        Ok(lock) => lock,
+    let _state_lock = match gitterm_core::config_paths::desktop_config_dir() {
+        Ok(root) => match gitterm_core::state_lock::StateLock::acquire(root) {
+            Ok(lock) => lock,
+            Err(gitterm_core::state_lock::LockError::Busy { root }) => {
+                let error = format!("GitTerm state root is already in use: {}", root.display());
+                eprintln!("{error}");
+                show_state_lock_alert(format!(
+                    "Another GitTerm window is using {}. Quit it first (GitTerm V6 or GitTerm GPUI in Live mode), then open this one again.",
+                    root.display()
+                ));
+                std::process::exit(1);
+            }
+            Err(gitterm_core::state_lock::LockError::Io { root, source }) => {
+                let error = format!("lock GitTerm state root {}: {source}", root.display());
+                eprintln!("{error}");
+                show_state_lock_alert(format!(
+                    "GitTerm could not open its data folder {}: {source}",
+                    root.display()
+                ));
+                std::process::exit(1);
+            }
+        },
         Err(error) => {
+            let error = error.to_string();
             eprintln!("{error}");
+            show_state_lock_alert(format!("GitTerm could not open its data folder: {error}"));
             std::process::exit(1);
         }
     };
@@ -2187,6 +2205,23 @@ fn main() -> iced::Result {
     gitterm::shutdown::operations().wait();
     gitterm::shutdown::log_children();
     result
+}
+
+fn show_state_lock_alert(message: String) {
+    use std::io::IsTerminal;
+
+    if !std::io::stderr().is_terminal()
+        && std::env::var("GITTERM_V6_NO_DIALOG").as_deref() == Ok("1")
+    {
+        return;
+    }
+
+    rfd::MessageDialog::new()
+        .set_title("GitTerm V6 is already open")
+        .set_description(&message)
+        .set_level(rfd::MessageLevel::Warning)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
 }
 
 use gitterm_core::status::{
