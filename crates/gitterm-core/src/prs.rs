@@ -898,6 +898,7 @@ pub fn action_command_line(action: PrAction, key: &PrKey, account: Option<&str>)
 /// for `account` when given, else gh's active account.
 #[cfg(feature = "runtime")]
 fn gh_async(token: Option<&str>) -> Result<tokio::process::Command, String> {
+    poll_checkpoint()?;
     let std_command = crate::gh_identity::gh_command().map_err(|error| error.to_string())?;
     let mut command = tokio::process::Command::from(std_command);
     command
@@ -914,11 +915,41 @@ fn gh_async(token: Option<&str>) -> Result<tokio::process::Command, String> {
 }
 
 #[cfg(feature = "runtime")]
+tokio::task_local! {
+    static POLL_CANCELLED: fn() -> bool;
+}
+
+/// The desktop supplies its shutdown flag; other consumers keep normal polling.
+#[cfg(feature = "runtime")]
+pub async fn with_poll_cancellation<T>(
+    cancelled: fn() -> bool,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    POLL_CANCELLED.scope(cancelled, future).await
+}
+
+#[cfg(feature = "runtime")]
+fn poll_checkpoint() -> Result<(), String> {
+    if POLL_CANCELLED
+        .try_with(|cancelled| cancelled())
+        .unwrap_or(false)
+    {
+        Err("PR poll cancelled at shutdown".into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "runtime")]
 async fn output_within(
     mut command: tokio::process::Command,
     what: &str,
 ) -> Result<std::process::Output, String> {
-    match tokio::time::timeout(GH_TIMEOUT, command.output()).await {
+    poll_checkpoint()?;
+    let output = tokio::time::timeout(GH_TIMEOUT, command.output()).await;
+    // Keep an in-flight child alive, but discard its result and start no more calls.
+    poll_checkpoint()?;
+    match output {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(error)) => Err(format!("{what}: {error}")),
         Err(_) => Err(format!("{what}: timed out after {}s", GH_TIMEOUT.as_secs())),
@@ -1575,6 +1606,9 @@ pub async fn poll(request: PollRequest) -> PollOutcome {
             .push(item);
     }
     for (account, items) in by_account {
+        if poll_checkpoint().is_err() {
+            break;
+        }
         let identity = async {
             let token = match account.as_deref() {
                 Some(user) => Some(account_token(user).await?),
@@ -1602,6 +1636,9 @@ pub async fn poll(request: PollRequest) -> PollOutcome {
         };
         outcome.logins.push((account.clone(), login.clone()));
         for item in items {
+            if poll_checkpoint().is_err() {
+                break;
+            }
             if started.elapsed() >= POLL_DEADLINE {
                 outcome.skipped += 1;
                 continue;

@@ -134,9 +134,9 @@ impl App {
             keys: due,
             prefixes: self.issues.cache.prefixes.clone(),
         };
-        shutdown_task(
+        periodic_task(
             "poll_issue_titles",
-            issue_titles::fetch_round(request),
+            gitterm::shutdown::periodic_read(issue_titles::fetch_round(request)),
             |outcome| Event::Issue(IssueEvent::Fetched(Box::new(outcome))),
         )
     }
@@ -176,6 +176,9 @@ impl App {
 
     /// Writes the cache off the UI thread, one write at a time.
     pub(super) fn save_issue_titles(&mut self) -> Task<Event> {
+        if gitterm::shutdown::operations().started() {
+            return Task::none();
+        }
         if self.issues.save_in_flight {
             self.issues.save_again = true;
             return Task::none();
@@ -183,12 +186,15 @@ impl App {
         self.issues.save_in_flight = true;
         let file = self.issues.cache.clone();
         let path = IssueTitlesFile::path_in(&config::global_config_dir());
-        shutdown_task(
+        periodic_task(
             "save_issue_titles",
             async move {
-                gitterm::shutdown::blocking("save_issue_titles", move || file.save(&path))
-                    .await
-                    .unwrap_or_else(|error| Err(format!("issue titles save task failed: {error}")))
+                gitterm::shutdown::blocking("save_issue_titles", move || {
+                    let _write = gitterm::shutdown::periodic_write("issue titles atomic save")?;
+                    file.save(&path)
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("issue titles save task failed: {error}")))
             },
             |result| Event::Issue(IssueEvent::Saved(result)),
         )

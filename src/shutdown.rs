@@ -12,6 +12,8 @@ pub enum Kind {
     Workspace,
     Write,
     Session,
+    /// Cancellable work; only its separately admitted writes hold the barrier.
+    Periodic,
 }
 
 #[derive(Debug, Default)]
@@ -38,6 +40,12 @@ impl Operations {
             return false;
         }
         state.deadline = Some(Instant::now() + timeout);
+        // Snapshot maintenance uses its own cross-process store lock; its
+        // in-flight git child may finish independently of the desktop barrier.
+        state
+            .operations
+            .retain(|_, (kind, _)| *kind != Kind::Periodic);
+        self.0 .1.notify_all();
         true
     }
 
@@ -56,14 +64,30 @@ impl Operations {
 
     pub fn ticket(&self, kind: Kind, name: impl Into<String>) -> Arc<Ticket> {
         let mut state = self.0 .0.lock().unwrap();
+        self.insert(&mut state, kind, name.into())
+    }
+
+    fn insert(&self, state: &mut Pending, kind: Kind, name: String) -> Arc<Ticket> {
         let id = state.next;
         state.next += 1;
-        state.operations.insert(id, (kind, name.into()));
+        if kind != Kind::Periodic || state.deadline.is_none() {
+            state.operations.insert(id, (kind, name));
+        }
         Arc::new(Ticket {
             operations: self.clone(),
             id,
             failed: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Serialize periodic write admission with barrier entry. A write already
+    /// admitted finishes; a cancelled job cannot acquire a new write ticket.
+    pub fn periodic_write(&self, name: impl Into<String>) -> Option<Arc<Ticket>> {
+        let mut state = self.0 .0.lock().unwrap();
+        if state.deadline.is_some() {
+            return None;
+        }
+        Some(self.insert(&mut state, Kind::Write, name.into()))
     }
 
     pub fn pending(&self, kind: Kind) -> bool {
@@ -209,14 +233,85 @@ pub fn desktop_active() -> bool {
     DESKTOP_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+tokio::task_local! {
+    static PERIODIC: Operations;
+}
+thread_local! {
+    static BLOCKING_PERIODIC: std::cell::RefCell<Option<Operations>> = const { std::cell::RefCell::new(None) };
+}
+
+pub async fn periodic_scope<T>(
+    jobs: Operations,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    PERIODIC.scope(jobs, future).await
+}
+
+pub async fn periodic_scope_if<T>(
+    periodic: bool,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    if periodic {
+        periodic_scope(operations(), future).await
+    } else {
+        future.await
+    }
+}
+
+pub fn periodic_operations() -> Option<Operations> {
+    PERIODIC
+        .try_with(Clone::clone)
+        .ok()
+        .or_else(|| BLOCKING_PERIODIC.with(|jobs| jobs.borrow().clone()))
+}
+
+/// Read-only futures may own children with kill-on-drop. After cancellation,
+/// retain the future on the desktop runtime without polling it again: no next
+/// CLI call starts and shutdown neither waits for nor kills the current child.
+pub async fn periodic_read<T>(future: impl std::future::Future<Output = T>) -> T {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(move |cx| {
+        if periodic_cancelled() {
+            std::task::Poll::Pending
+        } else {
+            future.as_mut().poll(cx)
+        }
+    })
+    .await
+}
+
+pub fn periodic_cancelled() -> bool {
+    periodic_operations().is_some_and(|jobs| jobs.started())
+}
+
+/// None is an ordinary writer; Some is a periodic writer, rejected after cancel.
+pub fn periodic_write(name: &str) -> Result<Option<Arc<Ticket>>, String> {
+    periodic_operations().map_or(Ok(None), |jobs| {
+        jobs.periodic_write(name)
+            .map(Some)
+            .ok_or_else(|| format!("{name}: cancelled at shutdown"))
+    })
+}
+
 /// Unlike a future's ticket, this one cannot disappear when Iced cancels the
 /// awaiting task while spawn_blocking continues to write in the background.
 pub async fn blocking<T: Send + 'static>(
     name: &'static str,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, tokio::task::JoinError> {
-    let ticket = operations().ticket(Kind::Write, name);
+    let periodic = periodic_operations();
+    let ticket = periodic
+        .is_none()
+        .then(|| operations().ticket(Kind::Write, name));
     tokio::task::spawn_blocking(move || {
+        BLOCKING_PERIODIC.with(|jobs| *jobs.borrow_mut() = periodic);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                BLOCKING_PERIODIC.with(|jobs| *jobs.borrow_mut() = None);
+            }
+        }
+        let _reset = Reset;
         let result = work();
         drop(ticket);
         result
@@ -435,6 +530,44 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_during_atomic_write_waits_for_replacement_and_rejects_next_write() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("pr-watch.json");
+        std::fs::write(&destination, b"old").unwrap();
+        let jobs = Operations::default();
+        let periodic = jobs.ticket(Kind::Periodic, "periodic save");
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let output = destination.clone();
+        let writer = tokio::spawn(periodic_scope(jobs.clone(), async move {
+            blocking("periodic save", move || {
+                let _write = periodic_write("atomic watch replacement").unwrap();
+                let temporary = output.with_extension("tmp");
+                std::fs::write(&temporary, b"complete").unwrap();
+                started.send(()).unwrap();
+                released.recv().unwrap();
+                std::fs::rename(temporary, output).unwrap();
+            })
+            .await
+            .unwrap();
+        }));
+        ready.await.unwrap();
+        jobs.begin(TIMEOUT);
+        assert!(!jobs.pending(Kind::Periodic));
+        assert!(
+            jobs.pending(Kind::Write),
+            "the admitted atomic write must hold the barrier"
+        );
+        assert!(jobs.periodic_write("next save").is_none());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"old");
+        release.send(()).unwrap();
+        writer.await.unwrap();
+        jobs.wait();
+        assert_eq!(std::fs::read(destination).unwrap(), b"complete");
+        drop(periodic);
     }
 
     #[test]

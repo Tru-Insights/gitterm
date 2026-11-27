@@ -49,7 +49,15 @@ pub async fn maintain(
     dirs: BTreeSet<PathBuf>,
     chats: Option<Vec<String>>,
 ) -> Result<(), String> {
-    core::maintain(&explicit_root()?, facts_dir, dirs, chats).await
+    let root = explicit_root()?;
+    if let Some(jobs) = crate::shutdown::periodic_operations() {
+        let control = core::MaintenanceControl {
+            cancelled: std::sync::Arc::new(move || jobs.started()),
+        };
+        core::maintain_cancellable(&root, facts_dir, dirs, chats, control).await
+    } else {
+        core::maintain(&root, facts_dir, dirs, chats).await
+    }
 }
 
 /// Invalid legacy config disables recording, as failed captures did before.
