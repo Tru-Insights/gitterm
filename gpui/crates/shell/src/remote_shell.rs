@@ -73,6 +73,9 @@ pub(crate) struct RemoteState {
     pub picker_return_focus: Option<gpui::FocusHandle>,
     pub connect: Option<(Entity<ConnectForm>, Subscription)>,
     pub phone: Option<(Entity<PhonePanel>, Subscription)>,
+    /// Closed forms keep their completion subscriptions until their write ends.
+    pending_connect: Vec<(Entity<ConnectForm>, Subscription)>,
+    connection_generations: HashMap<String, u64>,
     pub sessions: RemoteSessions,
     pub remotes: Vec<RemoteAgentConfig>,
     /// One handshake per configured agent id this session.
@@ -92,10 +95,33 @@ impl Default for RemoteState {
             picker_return_focus: None,
             connect: None,
             phone: None,
+            pending_connect: Vec::new(),
+            connection_generations: HashMap::new(),
             sessions: RemoteSessions::default(),
             remotes: vec![],
             connections: HashMap::new(),
         }
+    }
+}
+
+impl RemoteState {
+    fn begin_connection(&mut self, id: &str) -> u64 {
+        let generation = self
+            .connection_generations
+            .entry(id.to_owned())
+            .or_default();
+        *generation += 1;
+        self.connections
+            .insert(id.to_owned(), Connection::Connecting);
+        *generation
+    }
+
+    fn finish_connection(&mut self, id: &str, generation: u64, connection: Connection) -> bool {
+        if self.connection_generations.get(id) != Some(&generation) {
+            return false;
+        }
+        self.connections.insert(id.to_owned(), connection);
+        true
     }
 }
 
@@ -344,6 +370,7 @@ impl Shell {
 
     pub(crate) fn open_connect_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.bar_menu = None;
+        self.retain_pending_connect(cx);
         let live = cx
             .try_global::<crate::connect_form::LiveConnectRoot>()
             .cloned();
@@ -358,16 +385,36 @@ impl Shell {
         let subscription = cx.subscribe_in(
             &form,
             window,
-            |shell, _, outcome: &ConnectFormOutcome, window, cx| match outcome {
+            |shell, form, outcome: &ConnectFormOutcome, window, cx| match outcome {
                 ConnectFormOutcome::Saved { agent, attempt } => {
                     let remotes = shell.reload_remotes(cx);
                     if let Some(picker) = shell.folder_picker().cloned() {
                         picker.update(cx, |picker, cx| picker.set_remotes(remotes, cx));
                     }
-                    shell.connect_saved_remote(agent.clone(), *attempt, cx);
+                    shell.connect_saved_remote(agent.clone(), *attempt, form.clone(), cx);
+                    shell
+                        .remote
+                        .pending_connect
+                        .retain(|(pending, _)| pending != form);
+                }
+                ConnectFormOutcome::SaveFailed(error) => {
+                    if shell.connect_form() != Some(form) {
+                        shell.owner.update(cx, |owner, cx| {
+                            owner.error = Some(format!("Save remote connection: {error}"));
+                            cx.notify();
+                        });
+                    }
+                    shell
+                        .remote
+                        .pending_connect
+                        .retain(|(pending, _)| pending != form);
+                    cx.notify();
                 }
                 ConnectFormOutcome::Close => {
-                    shell.remote.connect = None;
+                    if shell.connect_form() != Some(form) {
+                        return;
+                    }
+                    shell.retain_pending_connect(cx);
                     // The picker beneath keeps its focus target.
                     if let Some(picker) = shell.folder_picker().cloned() {
                         let remotes = shell.reload_remotes(cx);
@@ -385,17 +432,24 @@ impl Shell {
         cx.notify();
     }
 
+    fn retain_pending_connect(&mut self, cx: &gpui::App) {
+        if let Some((form, subscription)) = self.remote.connect.take()
+            && form.read(cx).is_saving()
+        {
+            self.remote.pending_connect.push((form, subscription));
+        }
+    }
+
     /// A form retry forces a fresh handshake. Match the complete saved identity
     /// before consuming its answer or closing the form (including disk edits).
     fn connect_saved_remote(
         &mut self,
         remote: RemoteAgentConfig,
         attempt: u64,
+        form: Entity<ConnectForm>,
         cx: &mut Context<Self>,
     ) {
-        self.remote
-            .connections
-            .insert(remote.id.clone(), Connection::Connecting);
+        let generation = self.remote.begin_connection(&remote.id);
         let client = self.remote.client.clone();
         let root = cx
             .global::<crate::connect_form::LiveConnectRoot>()
@@ -440,17 +494,28 @@ impl Shell {
                     },
                     Err(_) => Connection::Unreachable,
                 };
-                shell
+                if !shell
                     .remote
-                    .connections
-                    .insert(remote.id.clone(), connection);
-                if let Some(form) = shell.connect_form().cloned()
-                    && form.read(cx).saved_matches(&remote, attempt)
+                    .finish_connection(&remote.id, generation, connection)
                 {
+                    return;
+                }
+                if form.read(cx).saved_matches(&remote, attempt) {
+                    let active = shell.connect_form() == Some(&form);
                     match result {
-                        Ok(_) => form.update(cx, |_, cx| cx.emit(ConnectFormOutcome::Close)),
+                        Ok(_) if active => {
+                            form.update(cx, |_, cx| cx.emit(ConnectFormOutcome::Close))
+                        }
+                        Ok(_) => {}
                         Err(error) => {
-                            form.update(cx, |form, cx| form.connection_failed(&error, cx))
+                            form.update(cx, |form, cx| form.connection_failed(&error, cx));
+                            if !active {
+                                let error = form.read(cx).status().map(str::to_owned);
+                                shell.owner.update(cx, |owner, cx| {
+                                    owner.error = error;
+                                    cx.notify();
+                                });
+                            }
                         }
                     }
                 }
@@ -478,9 +543,7 @@ impl Shell {
             .cloned()
             .collect();
         for remote in remotes {
-            self.remote
-                .connections
-                .insert(remote.id.clone(), Connection::Connecting);
+            let generation = self.remote.begin_connection(&remote.id);
             let client = self.remote.client.clone();
             cx.spawn(async move |shell, cx| {
                 let id = remote.id.clone();
@@ -498,7 +561,9 @@ impl Shell {
                     }
                 };
                 _ = shell.update(cx, |shell, cx| {
-                    shell.remote.connections.insert(id, connection);
+                    if !shell.remote.finish_connection(&id, generation, connection) {
+                        return;
+                    }
                     cx.notify();
                 });
             })
@@ -945,6 +1010,97 @@ mod connect_tests {
     use super::*;
     use crate::remote_shell_tests::{click, draw, fixture};
     use gpui::TestAppContext;
+
+    #[test]
+    fn obsolete_handshake_cannot_replace_a_newer_connection() {
+        let mut state = RemoteState::default();
+        let startup = state.begin_connection("mini");
+        let retry = state.begin_connection("mini");
+        let connected = Connection::Connected {
+            capabilities: vec!["phone".into()],
+        };
+        assert!(state.finish_connection("mini", retry, connected.clone()));
+        assert!(!state.finish_connection("mini", startup, Connection::Unreachable));
+        assert_eq!(state.connections.get("mini"), Some(&connected));
+        let other = state.begin_connection("other");
+        assert!(state.finish_connection("other", other, Connection::Unreachable));
+        assert_eq!(state.connections.get("mini"), Some(&connected));
+        let newer = state.begin_connection("mini");
+        assert!(!state.finish_connection("mini", retry, connected));
+        assert!(state.finish_connection("mini", newer, Connection::Unreachable));
+    }
+
+    #[gpui::test]
+    fn closed_form_delivers_save_success_and_failure_to_the_shell(cx: &mut TestAppContext) {
+        let (f, cx) = fixture(cx);
+        let source = f.iced();
+        cx.update(|window, cx| {
+            cx.set_global(crate::connect_form::LiveConnectRoot::new(Arc::new(
+                gitterm_core::state_lock::StateLock::acquire(&source).unwrap(),
+            )));
+            f.shell.update(cx, |shell, cx| {
+                shell.open_folder_picker(FolderPickerPurpose::NewWorkspace, None, window, cx)
+            });
+        });
+        for fail in [false, true] {
+            cx.update(|window, cx| {
+                f.shell
+                    .update(cx, |shell, cx| shell.open_connect_form(window, cx))
+            });
+            click("connect-form-name", cx);
+            cx.simulate_input(if fail { "Failed Mac" } else { "Saved Mac" });
+            click("connect-form-endpoint", cx);
+            cx.simulate_input("127.0.0.1:9");
+            click("connect-form-token", cx);
+            cx.simulate_input("synthetic-closed-form-token");
+            if fail {
+                std::fs::write(source.join("remote-agents.json"), "{ malformed").unwrap();
+            }
+            cx.update(|_, cx| {
+                let form = f.shell.read(cx).connect_form().unwrap().clone();
+                form.update(cx, |form, cx| {
+                    form.submit(cx);
+                    cx.emit(ConnectFormOutcome::Close);
+                });
+            });
+            cx.read(|cx| {
+                assert!(f.shell.read(cx).connect_form().is_none());
+                assert_eq!(f.shell.read(cx).remote.pending_connect.len(), 1);
+            });
+            draw(cx);
+            if !fail {
+                assert!(
+                    cx.debug_bounds("folder-picker-machine-2").is_some(),
+                    "picker did not refresh the saved remote"
+                );
+            }
+            cx.read(|cx| {
+                let shell = f.shell.read(cx);
+                assert!(shell.remote.pending_connect.is_empty());
+                if fail {
+                    let error = shell.owner.read(cx).error.as_deref().unwrap();
+                    assert!(error.contains(gitterm_core::remote::connect::MALFORMED));
+                    assert!(!error.contains("synthetic-closed-form-token"));
+                    assert_eq!(
+                        std::fs::read(source.join("remote-agents.json")).unwrap(),
+                        b"{ malformed"
+                    );
+                } else {
+                    assert!(
+                        shell
+                            .configured_remotes()
+                            .iter()
+                            .any(|remote| remote.id == "saved-mac")
+                    );
+                    assert!(f.fake.calls().contains(&"handshake saved-mac".to_string()));
+                    assert!(matches!(
+                        shell.remote.connections.get("saved-mac"),
+                        Some(Connection::Connected { .. })
+                    ));
+                }
+            });
+        }
+    }
 
     #[gpui::test]
     fn live_form_save_reloads_remotes_and_closes_only_after_matching_handshake(

@@ -10739,8 +10739,11 @@ impl App {
             let remotes = RemoteSessionsFile {
                 remote_sessions: remote_sessions.clone(),
             };
+            let mut errors = Vec::new();
             if shutting_down {
-                remotes.save_for_shutdown()?;
+                if let Err(error) = remotes.save_for_shutdown() {
+                    errors.push(error);
+                }
             } else {
                 remotes.save();
             }
@@ -10749,7 +10752,9 @@ impl App {
                     remote_agents: remote_agent_defs.clone(),
                 };
                 if shutting_down {
-                    agents.save_for_shutdown()?;
+                    if let Err(error) = agents.save_for_shutdown() {
+                        errors.push(error);
+                    }
                 } else {
                     agents.save();
                 }
@@ -10763,7 +10768,14 @@ impl App {
                 collapsed_repo_groups,
             };
             if shutting_down {
-                workspaces.save_for_shutdown()
+                if let Err(error) = workspaces.save_for_shutdown() {
+                    errors.push(error);
+                }
+                if errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(errors.join("; "))
+                }
             } else {
                 workspaces.save();
                 Ok(())

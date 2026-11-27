@@ -19,41 +19,68 @@ use gitterm_core::remote::{
     connect::{ConnectDraft, save_remote_connect},
     state::Identity,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// Installed only after Live admission, while the host retains its root lease.
 #[derive(Clone)]
 pub(crate) struct LiveConnectRoot {
     lease: Arc<gitterm_core::state_lock::StateLock>,
-    closed: Arc<Mutex<bool>>,
+    queue: Arc<(Mutex<SaveQueue>, Condvar)>,
+    serial: Arc<Mutex<()>>,
+}
+#[derive(Default)]
+struct SaveQueue {
+    closed: bool,
+    pending: usize,
+}
+
+/// Admission happens on submit, before the background executor can queue it.
+struct ConnectSave(LiveConnectRoot);
+impl Drop for ConnectSave {
+    fn drop(&mut self) {
+        let (state, drained) = &*self.0.queue;
+        state.lock().unwrap().pending -= 1;
+        drained.notify_all();
+    }
+}
+impl ConnectSave {
+    fn save(
+        self,
+        known: &[RemoteAgentConfig],
+        draft: ConnectDraft<'_>,
+    ) -> Result<RemoteAgentConfig, String> {
+        let _serial = self.0.serial.lock().unwrap();
+        save_remote_connect(self.0.root(), known, draft)
+    }
 }
 impl gpui::Global for LiveConnectRoot {}
 impl LiveConnectRoot {
     pub(crate) fn new(lease: Arc<gitterm_core::state_lock::StateLock>) -> Self {
         Self {
             lease,
-            closed: Arc::new(Mutex::new(false)),
+            queue: Arc::new((Mutex::new(SaveQueue::default()), Condvar::new())),
+            serial: Arc::new(Mutex::new(())),
         }
     }
     pub(crate) fn root(&self) -> &std::path::Path {
         self.lease.root()
     }
     pub(crate) fn close(&self) {
-        // Wait for a current save and refuse queued saves before shutdown can
-        // remove its recovery marker or release the desktop root lease.
-        *self.closed.lock().unwrap() = true;
+        let (state, drained) = &*self.queue;
+        let mut state = state.lock().unwrap();
+        state.closed = true;
+        // Disk writes finish without needing a UI completion to run.
+        while state.pending != 0 {
+            state = drained.wait(state).unwrap();
+        }
     }
-    fn save(
-        &self,
-        known: &[RemoteAgentConfig],
-        draft: ConnectDraft<'_>,
-    ) -> Result<RemoteAgentConfig, String> {
-        // Closing/reopening a form must not let two read/modify/writes overlap.
-        let closed = self.closed.lock().unwrap();
-        if *closed {
+    fn admit(&self) -> Result<ConnectSave, String> {
+        let mut state = self.queue.0.lock().unwrap();
+        if state.closed {
             return Err("Remote connection save refused: GitTerm is shutting down".into());
         }
-        save_remote_connect(self.root(), known, draft)
+        state.pending += 1;
+        Ok(ConnectSave(self.clone()))
     }
 }
 
@@ -62,6 +89,7 @@ pub const CONNECT_UNAVAILABLE: &str = "Connect · not available in preview";
 #[derive(Clone, Debug)]
 pub enum ConnectFormOutcome {
     Close,
+    SaveFailed(String),
     Saved {
         agent: RemoteAgentConfig,
         attempt: u64,
@@ -137,6 +165,10 @@ impl ConnectForm {
         self.live = Some((root, known));
     }
 
+    pub(crate) fn is_saving(&self) -> bool {
+        self.saving
+    }
+
     pub(crate) fn saved_matches(&self, remote: &RemoteAgentConfig, attempt: u64) -> bool {
         self.attempt == attempt
             && self.saved.as_ref().is_some_and(|saved| {
@@ -164,6 +196,14 @@ impl ConnectForm {
         if self.saving {
             return;
         }
+        let save = match root.admit() {
+            Ok(save) => save,
+            Err(error) => {
+                self.status = Some(error);
+                cx.notify();
+                return;
+            }
+        };
         let name = self.name.read(cx).value().to_string();
         let endpoint = self.endpoint.read(cx).value().to_string();
         let token = self.token.read(cx).value().to_string();
@@ -171,21 +211,21 @@ impl ConnectForm {
         self.saving = true;
         self.attempt += 1;
         self.saved_token = token.clone();
+        // Schedule disk work before returning to the UI: quit may drain before
+        // the foreground completion task gets its first poll.
+        let write = cx.background_executor().spawn(async move {
+            save.save(
+                &known,
+                ConnectDraft {
+                    name: &name,
+                    endpoint: &endpoint,
+                    token: &token,
+                    saved: saved.as_ref(),
+                },
+            )
+        });
         cx.spawn(async move |form, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    root.save(
-                        &known,
-                        ConnectDraft {
-                            name: &name,
-                            endpoint: &endpoint,
-                            token: &token,
-                            saved: saved.as_ref(),
-                        },
-                    )
-                })
-                .await;
+            let result = write.await;
             _ = form.update(cx, |form, cx| {
                 form.saving = false;
                 match result {
@@ -200,7 +240,10 @@ impl ConnectForm {
                             attempt: form.attempt,
                         });
                     }
-                    Err(error) => form.status = Some(error),
+                    Err(error) => {
+                        form.status = Some(error.clone());
+                        cx.emit(ConnectFormOutcome::SaveFailed(error));
+                    }
                 }
                 cx.notify();
             });
@@ -385,23 +428,68 @@ mod tests {
         assert!(gitterm_core::state_lock::StateLock::acquire(&root).is_err());
         let queued = writer.clone();
         writer.close();
-        let error = queued
-            .save(
-                &[],
-                ConnectDraft {
-                    name: "Fixture",
-                    endpoint: "fixture.invalid:7777",
-                    token: "synthetic-connect-secret",
-                    saved: None,
-                },
-            )
-            .unwrap_err();
+        let error = queued.admit().err().unwrap();
         assert!(error.contains("shutting down"));
         assert!(!root.join(REMOTE_AGENTS_FILE).exists());
         assert!(!root.join("tokens").exists());
         drop(writer);
         drop(queued);
         assert!(gitterm_core::state_lock::StateLock::acquire(&root).is_ok());
+    }
+
+    #[test]
+    fn shutdown_drains_submitted_saves_waiting_for_the_writer() {
+        let temp = tempfile::tempdir_in("/private/tmp").unwrap();
+        let root = temp.path().join("v6");
+        let writer = LiveConnectRoot::new(Arc::new(
+            gitterm_core::state_lock::StateLock::acquire(&root).unwrap(),
+        ));
+        let first = writer.admit().unwrap();
+        let second = writer.admit().unwrap();
+        let serial = writer.serial.lock().unwrap();
+        let run = |save: ConnectSave, name: &'static str| {
+            std::thread::spawn(move || {
+                save.save(
+                    &[],
+                    ConnectDraft {
+                        name,
+                        endpoint: "127.0.0.1:9",
+                        token: "synthetic-token",
+                        saved: None,
+                    },
+                )
+            })
+        };
+        let first = run(first, "First");
+        let second = run(second, "Second");
+        let closing = writer.clone();
+        let (done, drained) = std::sync::mpsc::channel();
+        let close = std::thread::spawn(move || {
+            closing.close();
+            done.send(()).unwrap();
+        });
+        while !writer.queue.0.lock().unwrap().closed {
+            std::thread::yield_now();
+        }
+        assert!(writer.admit().is_err());
+        assert!(
+            drained.try_recv().is_err(),
+            "drain returned before queued writes"
+        );
+        drop(serial);
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        close.join().unwrap();
+        drained.recv().unwrap();
+        let agents = load_remote_agents(&root).unwrap();
+        assert_eq!(agents.remote_agents.len(), 2);
+        for id in ["first", "second"] {
+            assert!(agents.remote_agents.iter().any(|agent| agent.id == id));
+            assert_eq!(
+                std::fs::read(root.join(format!("tokens/{id}.token"))).unwrap(),
+                b"synthetic-token\n"
+            );
+        }
     }
 
     // No native window or network: GPUI's in-memory test platform.
