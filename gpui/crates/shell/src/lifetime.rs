@@ -57,7 +57,7 @@ pub(crate) struct Lifetime {
     pub(crate) lock: Arc<StateLock>,
     pub(crate) barrier: Barrier,
     marker: PathBuf,
-    roots: Arc<Preview>,
+    roots: Option<Arc<Preview>>,
     active: bool,
 }
 impl Lifetime {
@@ -66,9 +66,27 @@ impl Lifetime {
         roots.scoped(&roots.root().join(gitterm_core::state_lock::LOCK_FILE))?;
         let lock = Arc::new(StateLock::acquire(roots.root())?);
         let marker = roots.scoped(&roots.root().join(RECOVERY))?;
+        Self::check(lock, marker, Some(roots.clone()))?.publish()
+    }
+    pub(crate) fn check_live(root: &std::path::Path) -> Result<CheckedLifetime> {
+        let lock = Arc::new(StateLock::acquire(root)?);
+        let marker = lock.root().join(RECOVERY);
+        Self::check(lock, marker, None)
+    }
+    fn check(
+        lock: Arc<StateLock>,
+        marker: PathBuf,
+        roots: Option<Arc<Preview>>,
+    ) -> Result<CheckedLifetime> {
         let recovering = marker.try_exists()?;
         if recovering {
-            let prior = gitterm_core::tasks::TaskStore::load(roots.scoped(&roots.root().join("tasks.json"))?)
+            let tasks = lock.root().join("tasks.json");
+            let tasks = if let Some(roots) = &roots {
+                roots.scoped(&tasks)?
+            } else {
+                tasks
+            };
+            let prior = gitterm_core::tasks::TaskStore::load(tasks)
                 .with_context(|| format!("refuse GPUI startup: unresolved prior shutdown {}; inspect prior launch identities", marker.display()))?;
             for task in prior.tasks() {
                 for session in &task.sessions {
@@ -90,8 +108,62 @@ impl Lifetime {
                 }
             }
         }
-        let profile = roots.scoped(&roots.root().join("browser-profile"))?;
+        let profile = lock.root().join("browser-profile");
+        let profile = if let Some(roots) = &roots {
+            roots.scoped(&profile)?
+        } else {
+            profile
+        };
         gitterm_browser::browser_control::verify_profile_released(&profile)?;
+        Ok(CheckedLifetime {
+            lock,
+            marker,
+            roots,
+            recovering,
+        })
+    }
+    pub(crate) fn finish(self) -> Result<()> {
+        self.finish_with_timeout(DRAIN_TIMEOUT)
+    }
+    fn finish_with_timeout(mut self, timeout: Duration) -> Result<()> {
+        self.finish_inner(timeout)
+    }
+    fn finish_inner(&mut self, timeout: Duration) -> Result<()> {
+        // Do not retry failed drains in Drop: retain the marker on failure.
+        self.active = false;
+        self.barrier.finish_with_timeout(timeout)?;
+        if let Some(roots) = &self.roots {
+            roots.scoped(&self.marker)?;
+        }
+        let profile = self.lock.root().join("browser-profile");
+        let profile = if let Some(roots) = &self.roots {
+            roots.scoped(&profile)?
+        } else {
+            profile
+        };
+        gitterm_browser::browser_control::verify_profile_released(&profile)?;
+        std::fs::remove_file(&self.marker)
+            .with_context(|| format!("clear GPUI recovery marker {}", self.marker.display()))?;
+        // The guard drops after all completion phases.
+        Ok(())
+    }
+}
+
+/// Holds only a lock and read-only checks; dropping it never removes a marker.
+pub(crate) struct CheckedLifetime {
+    pub(crate) lock: Arc<StateLock>,
+    marker: PathBuf,
+    roots: Option<Arc<Preview>>,
+    recovering: bool,
+}
+impl CheckedLifetime {
+    pub(crate) fn publish(self) -> Result<Lifetime> {
+        let Self {
+            lock,
+            marker,
+            roots,
+            recovering,
+        } = self;
         use std::io::Write as _;
         if recovering {
             // Unlink the old name instead of truncating it: a marker hard-linked
@@ -111,37 +183,16 @@ impl Lifetime {
         if recovering {
             eprintln!(
                 "GitTerm GPUI recovered prior unclean shutdown: {}",
-                roots.root().display()
+                lock.root().display()
             );
         }
-        Ok(Self {
+        Ok(Lifetime {
             lock,
             barrier: Barrier::default(),
             marker,
-            roots: roots.clone(),
+            roots,
             active: true,
         })
-    }
-    pub(crate) fn finish(self) -> Result<()> {
-        self.finish_with_timeout(DRAIN_TIMEOUT)
-    }
-    fn finish_with_timeout(mut self, timeout: Duration) -> Result<()> {
-        self.finish_inner(timeout)
-    }
-    fn finish_inner(&mut self, timeout: Duration) -> Result<()> {
-        // Do not retry failed drains in Drop: retain the marker on failure.
-        self.active = false;
-        self.barrier.finish_with_timeout(timeout)?;
-        self.roots.scoped(&self.marker)?;
-        gitterm_browser::browser_control::verify_profile_released(
-            &self
-                .roots
-                .scoped(&self.lock.root().join("browser-profile"))?,
-        )?;
-        std::fs::remove_file(&self.marker)
-            .with_context(|| format!("clear GPUI recovery marker {}", self.marker.display()))?;
-        // The guard drops after all completion phases.
-        Ok(())
     }
 }
 
@@ -153,7 +204,7 @@ impl Drop for Lifetime {
         {
             eprintln!(
                 "release GPUI lifetime {}: {error:#}",
-                self.roots.root().display()
+                self.lock.root().display()
             );
         }
     }

@@ -470,15 +470,31 @@ pub fn prepare_scoped(
     bind: ListenerBind,
     version: &'static str,
 ) -> std::io::Result<(BrowserMcpConnection, BrowserMcpServer)> {
-    let listener = bind.bind()?;
-    let default_target = if services.is_preview() {
+    prepare_scoped_listener(services, bind.bind()?, version)
+}
+
+/// GPUI Live shares its admitted service context and the production V6 bind.
+pub fn prepare_production_scoped(
+    services: Arc<ServiceContext>,
+    version: &'static str,
+) -> std::io::Result<(BrowserMcpConnection, BrowserMcpServer)> {
+    let listener = bind_v6_loopback_listener(services.task_mcp().instance_id())?;
+    prepare_scoped_listener(services, listener, version)
+}
+
+fn prepare_scoped_listener(
+    services: Arc<ServiceContext>,
+    listener: std::net::TcpListener,
+    version: &'static str,
+) -> std::io::Result<(BrowserMcpConnection, BrowserMcpServer)> {
+    let default_target = if services.browser_read_only() {
         DefaultTarget::Never
     } else {
         DefaultTarget::OpenOnFirstUse
     };
     let browser =
         BrowserControlService::with_profile_dir(services.browser_profile_dir()?, default_target);
-    let engine = if services.is_preview() {
+    let engine = if services.browser_read_only() {
         BrowserEngine::GitTerm(browser.clone())
     } else {
         BrowserEngine::from_shared_config(services.state_root(), browser.clone())
