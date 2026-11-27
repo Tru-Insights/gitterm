@@ -79,6 +79,34 @@ pub fn should_transcribe(samples: &[f32], sample_rate: u32) -> bool {
     !(duration_secs < MIN_RECORDING_SECONDS || (rms < MIN_RMS && peak < MIN_PEAK))
 }
 
+/// Iced's stop diagnostics, including the microphone-permission hint for silence.
+/// Formatting stays shared and can be checked without opening an input device.
+pub fn recording_diagnostics(samples: &[f32], sample_rate: u32) -> String {
+    if samples.is_empty() {
+        return "[STT] Recording stopped with no audio samples".into();
+    }
+    let duration_secs = samples.len() as f32 / sample_rate as f32;
+    let (rms, peak) = audio_stats(samples);
+    let mut message =
+        format!(
+        "[STT] Recording stopped: samples={} sample_rate={} duration={:.2}s rms={:.6} peak={:.6}",
+        samples.len(), sample_rate, duration_secs, rms, peak,
+    );
+    if !should_transcribe(samples, sample_rate) {
+        if duration_secs < MIN_RECORDING_SECONDS {
+            message.push_str(&format!(
+                "\n[STT] Ignoring recording shorter than {:.2}s",
+                MIN_RECORDING_SECONDS,
+            ));
+        } else {
+            message.push_str(&format!(
+                "\n[STT] Ignoring near-silent recording (rms={rms:.6}, peak={peak:.6}); check macOS microphone permission/input device",
+            ));
+        }
+    }
+    message
+}
+
 /// A running microphone stream and its mono sample buffer.
 /// Drop or stop it on the thread where it was started (CPAL's platform contract).
 pub struct Recorder {
@@ -340,6 +368,20 @@ mod tests {
         assert!(resample(vec![], 48000).is_empty());
         assert!(resample(vec![1.0, 2.0], 48000).is_empty());
         assert_eq!(resample(vec![0.0, 1.0, 2.0], 24000), [0.0, 1.5]);
+    }
+
+    #[test]
+    fn recording_diagnostics_match_iced_without_a_microphone() {
+        assert_eq!(
+            recording_diagnostics(&[], 16000),
+            "[STT] Recording stopped with no audio samples"
+        );
+        assert_eq!(recording_diagnostics(&vec![0.5; 4000], 16000),
+            "[STT] Recording stopped: samples=4000 sample_rate=16000 duration=0.25s rms=0.500000 peak=0.500000");
+        assert_eq!(recording_diagnostics(&vec![0.5; 1600], 16000),
+            "[STT] Recording stopped: samples=1600 sample_rate=16000 duration=0.10s rms=0.500000 peak=0.500000\n[STT] Ignoring recording shorter than 0.25s");
+        assert_eq!(recording_diagnostics(&vec![0.0; 4000], 16000),
+            "[STT] Recording stopped: samples=4000 sample_rate=16000 duration=0.25s rms=0.000000 peak=0.000000\n[STT] Ignoring near-silent recording (rms=0.000000, peak=0.000000); check macOS microphone permission/input device");
     }
 
     #[test]

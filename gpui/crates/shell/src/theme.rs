@@ -132,7 +132,7 @@ pub fn set_chat_font_size(size: f32, cx: &mut App) {
 /// Apply persisted font/theme settings without reading or writing a config root.
 /// The host supplies the settings from its existing settings owner.
 pub fn apply_settings<C, U, R>(
-    settings: &gitterm_core::settings::Settings<C, U, R>,
+    settings: &gitterm_core::settings::SettingsWithVoice<C, U, R>,
     window: Option<&mut Window>,
     cx: &mut App,
 ) {
