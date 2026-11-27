@@ -80,6 +80,7 @@ impl WorkspaceOwner {
         })];
         let review_workers = Arc::new(std::sync::Mutex::new(ReviewWorkers::default()));
         let mut quit = None;
+        let managed_shutdown = cx.try_global::<crate::lifetime::Barrier>().is_some();
         if executor.is_some() {
             tasks.push(cx.spawn(async move |owner, cx| {
                 while let Some(outcome) = receiver.recv().await {
@@ -130,10 +131,17 @@ impl WorkspaceOwner {
                 let workers = {
                     let mut workers = workers.lock().unwrap();
                     workers.closed = true;
-                    std::mem::take(&mut workers.jobs)
+                    if managed_shutdown {
+                        Vec::new()
+                    } else {
+                        std::mem::take(&mut workers.jobs)
+                    }
                 };
+                shutdown.close();
                 async move {
-                    shutdown.teardown().await;
+                    if !managed_shutdown {
+                        shutdown.teardown().await;
+                    }
                     for worker in workers {
                         let _ = worker.await;
                     }
@@ -141,11 +149,37 @@ impl WorkspaceOwner {
             }));
         }
         let chat_shutdown = crate::chat::RuntimeShutdown::new();
+        if let Some(barrier) = cx.try_global::<crate::lifetime::Barrier>() {
+            let chats = chat_shutdown.clone();
+            barrier.register("chat-runtimes", move || chats.drain());
+            let jobs = jobs.clone();
+            let workers = review_workers.clone();
+            let executor = executor.clone();
+            barrier.register("status-review-jobs", move || {
+                let workers = {
+                    let mut workers = workers.lock().unwrap();
+                    workers.closed = true;
+                    std::mem::take(&mut workers.jobs)
+                };
+                if let Some(executor) = executor {
+                    executor.block_on(async {
+                        jobs.teardown().await;
+                        for worker in workers {
+                            worker.await.map_err(anyhow::Error::from)?;
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    })?;
+                }
+                Ok(())
+            });
+        }
         let chat_quit = cx.on_app_quit(|owner: &mut Self, cx| {
             for chat in owner.chats.values() {
                 chat.update(cx, |chat, _| chat.shutdown_runtime());
             }
-            if let Err(error) = owner.chat_shutdown.drain() {
+            if cx.try_global::<crate::lifetime::Barrier>().is_none()
+                && let Err(error) = owner.chat_shutdown.drain()
+            {
                 eprintln!("Drain preview Claude runtimes on quit: {error:#}");
             }
             std::future::ready(())

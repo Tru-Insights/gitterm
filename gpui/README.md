@@ -19,6 +19,33 @@ saved sessions and no remote connections.
 
 GPUI uses only `GITTERM_GPUI_CONFIG_DIR` (absolute; default
 `~/.config/gitterm-gpui`). It never imports or writes V6 workspaces/settings.
+The shell acquires the preview root's lifetime lock before opening its writer,
+seeding tasks, binding servers or starting children. App-initiated Quit (including
+⌘Q and the last window closing) runs GPUI's main-thread entity shutdown first,
+then the named writer, chat, host/reaper, status/review and terminal completion
+barrier, releases the marker and lock, and finally requests platform termination.
+Startup errors also drain and release ownership, show a native GPUI error prompt
+with the message and preview root, and exit non-zero after dismissal.
+Browser shutdown closes tool admission, drains accepted requests, stops engine
+sessions even if Chrome has already exited, then gracefully closes owned Chrome.
+Each wait is bounded and reports its phase on a timeout; no process signalling
+is added by this ownership barrier.
+
+An interrupted or timed-out shutdown leaves `.gpui-shutdown-pending` in that
+preview root. Replacement startup checks each recorded launch's PID and birth
+time using native process info. It refuses and names any matching live launch;
+when none remain it starts normally and logs one recovery line. Unrecorded
+surviving descendants cannot be ruled out by this policy. Browser profile
+ownership refuses startup only when Chrome's `SingletonLock` names a live process
+whose executable is Chrome. Stale or broken singleton artifacts are left intact
+for Chrome to handle; GitTerm never deletes them or kills their named processes.
+The V6 state root is never locked or recovered by this shell.
+
+Known gap: macOS Dock Quit/logout can bypass the shell's quit route. GPUI's
+`on_app_quit` futures get only 200 ms, insufficient for the bounded completion
+barrier. Entity shutdown still runs, but the process may exit with its marker
+present; the next launch uses the identity/profile recovery policy above.
+
 Explicit folders are canonicalized, deduplicated and saved by atomic tempfile
 rename to **`local-workspaces.json`**:
 

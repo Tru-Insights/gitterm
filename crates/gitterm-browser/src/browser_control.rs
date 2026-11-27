@@ -1888,6 +1888,71 @@ impl BrowserController {
         }
     }
 
+    /// Application shutdown uses CDP's graceful close, never a process signal.
+    pub async fn disconnect_gracefully(&mut self) -> Result<()> {
+        if let Some(child) = self.child.as_mut() {
+            if child
+                .try_wait()
+                .map_err(|error| {
+                    BrowserControlError::new(format!("inspect owned Chrome child: {error}"))
+                })?
+                .is_some()
+            {
+                self.child.take();
+                self.endpoint = None;
+            } else if self.endpoint.is_none() {
+                return Err(BrowserControlError::new(
+                    "refuse graceful browser shutdown: owned child has no verified endpoint",
+                ));
+            }
+        } else if self.endpoint.is_some() {
+            // A copied DevToolsActivePort file is not authority to close a
+            // browser. An adopted endpoint requires verified manual recovery.
+            return Err(BrowserControlError::new(
+                "refuse graceful browser shutdown: endpoint has no owned Chrome child",
+            ));
+        }
+        if let Some(endpoint) = self.endpoint.clone() {
+            let websocket_url = format!(
+                "ws://127.0.0.1:{}{}",
+                endpoint.port, endpoint.browser_websocket_path
+            );
+            let session = CdpSession::connect(&websocket_url).await?;
+            if let Err(error) = session.command("Browser.close", json!({})).await {
+                if list_page_targets(endpoint.port).await.is_ok() {
+                    return Err(error);
+                }
+            }
+            let deadline = Instant::now() + BROWSER_SHUTDOWN_TIMEOUT;
+            loop {
+                let child_exited = match self.child.as_mut() {
+                    Some(child) => child
+                        .try_wait()
+                        .map_err(|error| {
+                            BrowserControlError::new(format!("wait for Chrome: {error}"))
+                        })?
+                        .is_some(),
+                    None => list_page_targets(endpoint.port).await.is_err(),
+                };
+                if child_exited && verify_profile_released(&self.profile_dir).is_ok() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(BrowserControlError::new("shutdown phase browser-profile: timeout waiting for Chrome/profile release"));
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+        verify_profile_released(&self.profile_dir)
+            .map_err(|error| BrowserControlError::new(error.to_string()))?;
+        self.child.take();
+        let _ = self.finish_stderr_capture().await;
+        self.endpoint = None;
+        self.clear_targets();
+        self.last_exit = None;
+        Ok(())
+    }
+
     pub async fn disconnect(&mut self) -> Result<()> {
         if let Some(mut child) = self.child.take() {
             child.start_kill().map_err(|error| {
@@ -2553,6 +2618,11 @@ impl BrowserControlService {
     /// Every live chat's display label, for its tabs' title prefix.
     pub async fn set_owner_labels(&self, labels: HashMap<String, String>) -> Result<()> {
         self.controller.lock().await.set_owner_labels(labels).await
+    }
+
+    /// Graceful application shutdown, with profile release verified.
+    pub async fn disconnect_gracefully(&self) -> Result<()> {
+        self.controller.lock().await.disconnect_gracefully().await
     }
 
     /// Stop the whole browser: the user's action in GitTerm's UI only.
@@ -3654,6 +3724,134 @@ fn push_bounded<T>(items: &mut VecDeque<T>, item: T, capacity: usize) {
         items.pop_front();
     }
     items.push_back(item);
+}
+
+/// Refuse only a live Chrome named by SingletonLock. Stale singleton artifacts
+/// belong to Chrome: GitTerm neither removes them nor signals their PIDs.
+pub fn verify_profile_released(profile: &Path) -> std::io::Result<()> {
+    verify_profile_owner(profile, chrome_process_path)
+}
+
+fn verify_profile_owner(
+    profile: &Path,
+    process_path: impl FnOnce(u32) -> Option<PathBuf>,
+) -> std::io::Result<()> {
+    let lock = profile.join("SingletonLock");
+    let Ok(target) = std::fs::read_link(&lock) else {
+        return Ok(());
+    };
+    let pid = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.rsplit_once('-'))
+        .and_then(|(_, pid)| pid.parse::<u32>().ok())
+        .filter(|pid| *pid > 0 && *pid <= i32::MAX as u32);
+    if let Some((pid, path)) = pid
+        .and_then(|pid| process_path(pid).map(|path| (pid, path)))
+        .filter(|(_, path)| is_chrome_executable(path))
+    {
+        return Err(std::io::Error::other(format!(
+            "refuse live browser-profile ownership: {} names Chrome PID {pid} ({})",
+            lock.display(),
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn is_chrome_executable(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(
+            "Google Chrome"
+                | "Google Chrome for Testing"
+                | "Google Chrome Canary"
+                | "Google Chrome Beta"
+                | "Google Chrome Dev"
+                | "Chromium"
+                | "chrome"
+                | "chromium"
+                | "chromium-browser"
+                | "chrome.exe"
+                | "chromium.exe"
+        )
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn chrome_process_path(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    // Native birth/process info proves liveness; the executable path is only
+    // refusal evidence. Neither this PID nor the singleton grants kill authority.
+    gitterm_core::worker_process::macos::info(pid)
+        .ok()
+        .flatten()?;
+    unsafe extern "C" {
+        fn proc_pidpath(pid: i32, buffer: *mut std::ffi::c_void, size: u32) -> i32;
+    }
+    // PROC_PIDPATHINFO_MAXSIZE
+    let mut buffer = [0u8; 4096];
+    // SAFETY: buffer is writable for its entire advertised length.
+    let length =
+        unsafe { proc_pidpath(pid as i32, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    if length <= 0 {
+        return None;
+    }
+    let end = buffer.iter().position(|byte| *byte == 0)?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buffer[..end])))
+}
+
+#[cfg(target_os = "linux")]
+fn chrome_process_path(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn chrome_process_path(_: u32) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(all(test, unix))]
+mod profile_owner_tests {
+    use super::*;
+
+    #[test]
+    fn singleton_refuses_only_live_chrome_and_never_removes_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("SingletonLock");
+        std::os::unix::fs::symlink("fixture-host-123", &lock).unwrap();
+        verify_profile_owner(dir.path(), |_| None).unwrap();
+        verify_profile_owner(dir.path(), |_| Some("/usr/bin/unrelated".into())).unwrap();
+        let error = verify_profile_owner(dir.path(), |pid| {
+            assert_eq!(pid, 123);
+            Some("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("Chrome PID 123"));
+        assert_eq!(
+            std::fs::read_link(&lock).unwrap(),
+            Path::new("fixture-host-123")
+        );
+        std::fs::remove_file(&lock).unwrap();
+        std::os::unix::fs::symlink("broken", &lock).unwrap();
+        verify_profile_owner(dir.path(), |_| panic!("broken singleton has no PID")).unwrap();
+        assert!(std::fs::symlink_metadata(&lock).is_ok());
+    }
+
+    #[test]
+    fn chrome_for_testing_counts_as_a_profile_owner() {
+        // `resolve_chrome_executable` accepts it via GITTERM_V6_CHROME_PATH.
+        assert!(is_chrome_executable(Path::new(
+            "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+        )));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_executable_lookup_does_not_mistake_the_test_runner_for_chrome() {
+        let path = chrome_process_path(std::process::id()).unwrap();
+        assert!(!is_chrome_executable(&path), "{}", path.display());
+    }
 }
 
 fn browser_profile_dir(v6_global_config_dir: &Path) -> PathBuf {
@@ -5153,6 +5351,23 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn graceful_shutdown_refuses_an_endpoint_without_an_owned_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut controller =
+            BrowserController::with_profile_dir(temp.path().into(), DefaultTarget::Never);
+        controller.endpoint = Some(DevToolsEndpoint {
+            port: 9,
+            browser_websocket_path: "/unverified".into(),
+        });
+        let error = controller.disconnect_gracefully().await.unwrap_err();
+        assert!(error.to_string().contains("no owned Chrome child"));
+        assert!(
+            controller.endpoint.is_some(),
+            "refusal retains unresolved ownership"
+        );
+    }
 
     #[test]
     fn browser_profile_is_nested_under_supplied_v6_config_root() {

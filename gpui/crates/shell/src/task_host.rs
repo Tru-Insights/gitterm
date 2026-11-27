@@ -269,7 +269,9 @@ pub(crate) struct TaskHostOwner {
     pub(crate) notice: Option<String>,
     servers: Option<Servers>,
     /// Dropped after the servers and their runtime on quit.
-    lock: Option<HostLock>,
+    lock: Option<Arc<HostLock>>,
+    reaped: Option<std::sync::mpsc::Receiver<Result<()>>>,
+    reap_reply: Option<std::sync::mpsc::Sender<Result<()>>>,
     /// Canonical fixture roots; empty in plain preview.
     fixtures: Vec<PathBuf>,
     /// Fixture creates between their first check and their last save.
@@ -316,10 +318,18 @@ pub(crate) struct TaskHostOwner {
 }
 
 impl TaskHostOwner {
-    /// Lock, seed, bind, then create the entity. On any error nothing is
-    /// bound and the caller runs without a host.
+    /// Lock, seed, bind, then create the entity. Startup errors fail closed.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn start(config: HostConfig, cx: &mut App) -> Result<Entity<Self>> {
-        Self::start_with(config, Vec::new(), cx)
+        Self::start_with(config, Vec::new(), None, cx)
+    }
+
+    pub(crate) fn start_locked(
+        config: HostConfig,
+        lock: Arc<HostLock>,
+        cx: &mut App,
+    ) -> Result<Entity<Self>> {
+        Self::start_with(config, Vec::new(), Some(lock), cx)
     }
 
     /// [`Self::start`] with a fixture-launch context over `fixtures` (each a
@@ -332,12 +342,13 @@ impl TaskHostOwner {
         cx: &mut App,
     ) -> Result<Entity<Self>> {
         anyhow::ensure!(!fixtures.is_empty(), "fixture mode needs a fixture root");
-        Self::start_with(config, fixtures, cx)
+        Self::start_with(config, fixtures, None, cx)
     }
 
     fn start_with(
         config: HostConfig,
         fixtures: Vec<PathBuf>,
+        lock: Option<Arc<HostLock>>,
         cx: &mut App,
     ) -> Result<Entity<Self>> {
         let HostConfig {
@@ -348,7 +359,16 @@ impl TaskHostOwner {
         let iced_tasks = TaskStore::path_for_config_root(&iced_config);
         roots.create_private_dir(roots.root())?;
         roots.scoped(&roots.root().join(gitterm_core::state_lock::LOCK_FILE))?;
-        let lock = HostLock::acquire(roots.root())?;
+        let lock = match lock {
+            Some(lock) => {
+                anyhow::ensure!(
+                    lock.root() == roots.root(),
+                    "host lock root differs from preview root"
+                );
+                lock
+            }
+            None => Arc::new(HostLock::acquire(roots.root())?),
+        };
         let (store, stamp) = seed_copy(&roots, &iced_tasks)?;
         let services = if fixtures.is_empty() {
             ServiceContext::preview(roots.clone())
@@ -416,6 +436,18 @@ impl TaskHostOwner {
                 }
             }),
         ];
+        let (reap_reply, reaped) = std::sync::mpsc::channel();
+        let barrier = cx.try_global::<crate::lifetime::Barrier>().cloned();
+        let reaped = if let Some(barrier) = barrier {
+            barrier.register("task-host-reaper", move || {
+                reaped
+                    .recv_timeout(crate::lifetime::DRAIN_TIMEOUT)
+                    .context("shutdown phase task-host-reaper: timeout or worker stopped")?
+            });
+            None
+        } else {
+            Some(reaped)
+        };
         let host = TaskHost::new(Some(store), services, sender);
         Ok(cx.new(|cx| {
             let pump = cx.spawn(async move |owner: gpui::WeakEntity<Self>, cx| {
@@ -486,6 +518,8 @@ impl TaskHostOwner {
                     runtime,
                 }),
                 lock: Some(lock),
+                reaped,
+                reap_reply: Some(reap_reply),
                 fixtures,
                 creating: 0,
                 wrote: false,
@@ -1452,12 +1486,9 @@ impl TaskHostOwner {
         cx.notify();
     }
 
-    /// Quit order: stop ingress (resolving pending replies), kill every
-    /// run's Codex process group and every unadopted task terminal's process
-    /// group, drop both MCP connections, signal the log server, drain the
-    /// servers, then release the host lock. The runs and terminals are
-    /// reaped on a background thread, so a slow child never blocks the UI.
-    /// Chat drains run in the workspace owner's later callback.
+    /// Close ingress and preserve existing run/terminal stop behavior. The
+    /// reaper owns server, browser and child completion; the shell retains its
+    /// lock through that completion and the later chat/job drains.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn shutdown(&mut self) {
         // Dropping each unadopted terminal kills its process group; GPUI
@@ -1490,48 +1521,70 @@ impl TaskHostOwner {
         }) = self.servers.take()
         {
             drop(task_mcp);
-            drop(browser);
             log.shutdown.notify_one();
-            runtime.block_on(async {
-                let _ = tokio::time::timeout(SERVER_DRAIN, async {
-                    for job in jobs {
-                        let _ = job.await;
-                    }
-                })
-                .await;
-            });
+            let lock = self.lock.take();
+            let reply = self.reap_reply.take();
             let reap = move || {
-                // Each killed terminal's child is reaped as its backend drops.
-                drop(terminals);
-                // Each stopped run reaps its Codex child.
-                runtime.block_on(async {
-                    let _ = tokio::time::timeout(RUN_STOP, async {
-                        for run in &mut runs {
-                            let _ = (&mut run.done).await;
-                        }
-                    })
-                    .await;
-                });
-                // A run that did not stop in time is dropped, which still
-                // kills its direct Codex child (`kill_on_drop`).
+                // Retain standalone host ownership until every shutdown phase
+                // completes. Production also has the shell's outer lock guard.
+                let retained_lock = lock;
+                let result = (|| -> Result<()> {
+                    runtime
+                        .block_on(browser.shutdown())
+                        .map_err(anyhow::Error::msg)?;
+                    drop(browser);
+                    runtime.block_on(async {
+                        tokio::time::timeout(SERVER_DRAIN, async {
+                            for job in jobs {
+                                job.await.context("join preview server")?;
+                            }
+                            Ok::<_, anyhow::Error>(())
+                        })
+                        .await
+                        .context("shutdown phase task-host-servers: timeout")?
+                    })?;
+                    drop(terminals);
+                    runtime.block_on(async {
+                        tokio::time::timeout(RUN_STOP, async {
+                            for run in &mut runs {
+                                let _ = (&mut run.done).await;
+                            }
+                        })
+                        .await
+                        .context("shutdown phase task-host-runs: timeout")
+                    })?;
+                    Ok(())
+                })();
+                if let Err(error) = &result {
+                    eprintln!("{error:#}");
+                }
                 for run in runs {
                     run.abort.abort();
                 }
                 runtime.shutdown_timeout(Duration::ZERO);
+                drop(retained_lock);
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
             };
             if let Err(error) = std::thread::Builder::new()
                 .name("gitterm-run-reaper".into())
                 .spawn(reap)
             {
-                // The closure, and the runtime with it, was dropped, which
-                // drops each run and so kills its direct Codex child.
-                eprintln!("[delegation] could not start the run reaper: {error}");
+                eprintln!("shutdown phase task-host-reaper: could not start: {error}");
             }
         }
-        self.lock = None;
+        if let Some(reaped) = self.reaped.take()
+            && let Err(error) = reaped
+                .recv_timeout(crate::lifetime::DRAIN_TIMEOUT)
+                .context("shutdown phase task-host-reaper: timeout or worker stopped")
+                .and_then(|result| result)
+        {
+            eprintln!("{error:#}");
+        }
     }
 
-    /// After [`Self::shutdown`]: the servers are gone and the lock released.
+    /// After stop admission is closed; completion may still be reaping.
     fn is_shut_down(&self) -> bool {
         self.servers.is_none()
     }

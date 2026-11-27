@@ -314,6 +314,13 @@ impl BrowserEngine {
         engine_call!(self, browser => browser.disconnect_owner(owner).await, engine => engine.disconnect_owner(owner).await)
     }
 
+    pub(crate) async fn shutdown_sessions(&self) -> Result<()> {
+        if let Self::AgentBrowser(engine) = self {
+            engine.shutdown_sessions().await?;
+        }
+        Ok(())
+    }
+
     /// The chats that closed give up their targets (TRU-176): the tabs stay
     /// open as the user's, and the agent-browser engine also stops their
     /// sessions. Runs for the refused engine too: it is GitTerm's UI, not

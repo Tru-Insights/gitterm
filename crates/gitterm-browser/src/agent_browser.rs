@@ -1444,6 +1444,20 @@ impl AgentBrowserEngine {
         }
     }
 
+    /// Stop the engine's owned sessions before the shared Chrome is closed.
+    pub(crate) async fn shutdown_sessions(&self) -> Result<()> {
+        let owners = self
+            .state
+            .lock()
+            .await
+            .registry
+            .targets
+            .keys()
+            .map(|key| key.owner.clone())
+            .collect();
+        self.release_owners(&owners).await
+    }
+
     /// Chats that closed give up their targets (TRU-176). Their tabs stay
     /// open as the user's; their sessions stop.
     pub async fn release_owners(&self, owners: &HashSet<String>) -> Result<()> {
@@ -3169,6 +3183,40 @@ mod tests {
         assert!(status.active_target.is_none() && status.target_id.is_none());
         let status = engine.status_for("chat-a").await.unwrap();
         assert_eq!(status.active_target.as_deref(), Some("design"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_sessions_closes_every_session_without_chrome() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempdir().unwrap();
+        let fake = temp.path().join("fake-agent-browser");
+        let calls = temp.path().join("calls");
+        std::fs::write(
+            &fake,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+/bin/cat >> '{}'
+printf '%s\n' '[{{"success":true,"result":{{"streaming":false}}}},{{"success":true,"result":{{}}}}]'
+"#,
+                calls.display(),
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let engine = engine_with_binary(temp.path(), fake);
+        engine.prepare_state_dir().unwrap();
+        engine.insert_test_target("chat-a", "design", "tab-1").await;
+        engine.insert_test_target("chat-b", "work", "tab-2").await;
+        assert!(engine.browser.running_devtools_port().await.is_err());
+        engine.shutdown_sessions().await.unwrap();
+        let calls = std::fs::read_to_string(calls).unwrap();
+        assert!(!calls.contains("--cdp"), "{calls}");
+        assert_eq!(calls.matches("[\"close\"]").count(), 2, "{calls}");
+        assert!(engine.state.lock().await.registry.targets.is_empty());
+        engine.shutdown_sessions().await.unwrap();
     }
 
     fn solid_png(width: u32, height: u32, paint: &[(u32, u32, u32, u32)]) -> Vec<u8> {
