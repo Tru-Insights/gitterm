@@ -972,3 +972,24 @@ mod ui {
 #[cfg(test)]
 #[path = "composer/tests.rs"]
 mod tests;
+
+/// Iced's `__insertComposerText`: the input engine replaces its selection,
+/// emits Change (for auto-grow/slash state), and never emits PressEnter.
+#[cfg(target_os = "macos")]
+pub(crate) fn insert_dictation(
+    input: &mut gpui_component::input::TextareaState,
+    text: &str,
+    focus: bool,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<gpui_component::input::TextareaState>,
+) {
+    use gpui::Focusable as _;
+    if text.is_empty() {
+        return;
+    }
+    input.replace(text.to_owned(), window, cx);
+    cx.emit(gpui_component::input::InputEvent::Change);
+    if focus {
+        input.focus_handle(cx).focus(window, cx);
+    }
+}

@@ -501,6 +501,20 @@ impl ChatView {
         self.refresh_rows(count, following, changed, cx);
     }
 
+    /// Insert voice input verbatim into this retained composer. A hidden chat
+    /// keeps its draft without taking focus from the chat now in front.
+    pub fn insert_dictation(
+        &mut self,
+        text: &str,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer.update(cx, |input, cx| {
+            crate::composer::insert_dictation(input, text, focus, window, cx);
+        });
+        cx.notify();
+    }
     pub fn set_status_error(&mut self, error: String, cx: &mut Context<Self>) {
         self.composer_state.notice = Some(error);
         cx.notify();

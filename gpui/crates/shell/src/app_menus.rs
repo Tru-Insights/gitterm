@@ -690,8 +690,7 @@ impl Sheet {
 
 /// Actions without a host adapter remain unregistered, so GPUI's native menu
 /// validation disables their menu items.
-/// Mirroring has a preview-notice adapter; dictation remains out of scope.
-pub const MISSING_HOST_ACTIONS: &[&str] = &["SttToggle"];
+pub const MISSING_HOST_ACTIONS: &[&str] = &[];
 
 #[cfg(test)]
 mod tests {

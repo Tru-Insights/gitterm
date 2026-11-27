@@ -6,6 +6,7 @@ rust-version = "1.99"
 publish = false
 
 [features]
+stt = ["gitterm-core/stt"]
 excalidraw = ["gitterm-core/excalidraw"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
