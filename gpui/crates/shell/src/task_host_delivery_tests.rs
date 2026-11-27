@@ -271,7 +271,7 @@ fn late_completion_after_timeout_does_not_resubmit(cx: &mut TestAppContext) {
 
 /// A fake Claude that answers the launch and records each user turn in
 /// `prompts.jsonl` in its folder.
-fn fake_claude(dir: &Path) -> PathBuf {
+pub(super) fn fake_claude(dir: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let python = std::process::Command::new("python3")
         .args(["-I", "-S", "-c", "import sys; print(sys.executable)"])

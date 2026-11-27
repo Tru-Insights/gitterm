@@ -1161,7 +1161,7 @@ impl TaskHostOwner {
         Ok(env)
     }
 
-    /// Live has a worker tick without result delivery (slice 9). Imported
+    /// Live worker lifecycle tick, separate from the delivery poll. Imported
     /// records carry no process authority and are never adopted or stopped.
     pub(crate) fn live_worker_tick(&mut self, cx: &mut Context<Self>) {
         if !self.is_live() || self.is_shut_down() {
@@ -1344,9 +1344,9 @@ impl TaskHostOwner {
     }
 
     fn close_live_final_workers(&mut self, cx: &mut Context<Self>) {
-        // Automatic delivery is closed in this slice. Stored results therefore
-        // permit final close, just as Iced does with automatic delivery off.
-        let ready = self.host.final_workers_ready(&[], false);
+        let ready = self
+            .host
+            .final_workers_ready(&super::delivery::delivery_chats(cx), self.auto_tell());
         let closing = self.start_final_worker_closes(&ready);
         let sessions: Vec<_> = closing
             .iter()
