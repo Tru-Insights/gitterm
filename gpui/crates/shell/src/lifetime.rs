@@ -1,4 +1,4 @@
-//! Completion ownership outlives GPUI's application loop and quit timeout.
+//! Complete entity preparation and bounded drains before platform termination.
 use anyhow::{Context as _, Result, ensure};
 use gitterm_core::{preview::Preview, state_lock::StateLock};
 use std::{
@@ -58,6 +58,7 @@ pub(crate) struct Lifetime {
     pub(crate) barrier: Barrier,
     marker: PathBuf,
     roots: Arc<Preview>,
+    active: bool,
 }
 impl Lifetime {
     pub(crate) fn acquire(roots: &Arc<Preview>) -> Result<Self> {
@@ -65,56 +66,70 @@ impl Lifetime {
         roots.scoped(&roots.root().join(gitterm_core::state_lock::LOCK_FILE))?;
         let lock = Arc::new(StateLock::acquire(roots.root())?);
         let marker = roots.scoped(&roots.root().join(RECOVERY))?;
-        // A kernel lock cannot prove a crashed owner's children exited. Refuse
-        // unresolved launches, including unrecorded children, without signalling
-        // or trusting copied PIDs. Recovery must establish their absence first.
-        if marker.try_exists()? {
+        let recovering = marker.try_exists()?;
+        if recovering {
             let prior = gitterm_core::tasks::TaskStore::load(roots.scoped(&roots.root().join("tasks.json"))?)
                 .with_context(|| format!("refuse GPUI startup: unresolved prior shutdown {}; inspect prior launch identities", marker.display()))?;
-            for identity in prior
-                .tasks()
-                .iter()
-                .flat_map(|task| &task.sessions)
-                .filter_map(|session| session.launch_identity.as_ref())
-            {
-                let process = gitterm_core::worker_process::macos::info(identity.pid)
-                    .map_err(anyhow::Error::msg)
-                    .context("inspect prior GPUI launch identity")?;
-                ensure!(
-                    process.is_none_or(|process| process.start_us.to_string() != identity.birth),
-                    "refuse GPUI startup: unresolved prior shutdown {}; recorded launch PID {} is still alive",
-                    marker.display(),
-                    identity.pid
-                );
+            for task in prior.tasks() {
+                for session in &task.sessions {
+                    let Some(identity) = &session.launch_identity else {
+                        continue;
+                    };
+                    let process = gitterm_core::worker_process::macos::info(identity.pid)
+                        .map_err(anyhow::Error::msg)
+                        .context("inspect prior GPUI launch identity")?;
+                    ensure!(
+                        process
+                            .is_none_or(|process| process.start_us.to_string() != identity.birth),
+                        "refuse GPUI startup: unresolved prior shutdown {}; recorded launch PID {} is still alive (task '{}', session '{}')",
+                        marker.display(),
+                        identity.pid,
+                        task.title,
+                        session.label
+                    );
+                }
             }
-            anyhow::bail!(
-                "refuse GPUI startup: unresolved prior shutdown {}; recorded launch roots alone cannot prove all descendants exited; verify prior children and browser-profile ownership before recovery",
-                marker.display()
-            );
         }
         let profile = roots.scoped(&roots.root().join("browser-profile"))?;
         gitterm_browser::browser_control::verify_profile_released(&profile)?;
         use std::io::Write as _;
         let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
+        options.write(true);
+        if recovering {
+            options.truncate(true);
+        } else {
+            options.create_new(true);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
-        options.open(&marker).and_then(|mut file| file.write_all(b"GPUI owner active; remove only after verifying all prior children and profile ownership are released\n"))
+        options.open(&marker).and_then(|mut file| file.write_all(b"GPUI owner active; startup checks recorded launch identities and Chrome ownership\n"))
             .with_context(|| format!("record GPUI lifetime {}", marker.display()))?;
+        if recovering {
+            eprintln!(
+                "GitTerm GPUI recovered prior unclean shutdown: {}",
+                roots.root().display()
+            );
+        }
         Ok(Self {
             lock,
             barrier: Barrier::default(),
             marker,
             roots: roots.clone(),
+            active: true,
         })
     }
     pub(crate) fn finish(self) -> Result<()> {
         self.finish_with_timeout(DRAIN_TIMEOUT)
     }
-    fn finish_with_timeout(self, timeout: Duration) -> Result<()> {
+    fn finish_with_timeout(mut self, timeout: Duration) -> Result<()> {
+        self.finish_inner(timeout)
+    }
+    fn finish_inner(&mut self, timeout: Duration) -> Result<()> {
+        // Do not retry failed drains in Drop: retain the marker on failure.
+        self.active = false;
         self.barrier.finish_with_timeout(timeout)?;
         self.roots.scoped(&self.marker)?;
         gitterm_browser::browser_control::verify_profile_released(
@@ -124,9 +139,73 @@ impl Lifetime {
         )?;
         std::fs::remove_file(&self.marker)
             .with_context(|| format!("clear GPUI recovery marker {}", self.marker.display()))?;
-        // The outer guard drops here, outside entity and quit callback ordering.
+        // The guard drops after all completion phases.
         Ok(())
     }
+}
+
+impl Drop for Lifetime {
+    fn drop(&mut self) {
+        // Covers every early return during startup, before GPUI owns the guard.
+        if self.active
+            && let Err(error) = self.finish_inner(DRAIN_TIMEOUT)
+        {
+            eprintln!(
+                "release GPUI lifetime {}: {error:#}",
+                self.roots.root().display()
+            );
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct Shutdown {
+    owner: std::rc::Rc<std::cell::RefCell<Option<Lifetime>>>,
+    stopping: std::rc::Rc<std::cell::Cell<bool>>,
+}
+impl gpui::Global for Shutdown {}
+impl Shutdown {
+    pub(crate) fn new(lifetime: Lifetime) -> Self {
+        Self {
+            owner: std::rc::Rc::new(std::cell::RefCell::new(Some(lifetime))),
+            stopping: Default::default(),
+        }
+    }
+    pub(crate) fn finish(&self) -> Result<()> {
+        if let Some(lifetime) = self.owner.borrow_mut().take() {
+            lifetime.finish()?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn shutdown(cx: &mut gpui::App) -> bool {
+    let shutdown = cx.try_global::<Shutdown>().cloned();
+    if shutdown
+        .as_ref()
+        .is_some_and(|shutdown| shutdown.stopping.replace(true))
+    {
+        return false;
+    }
+    // Callbacks still have main-thread entity access here. They stop admission,
+    // detach PTYs and start reapers. The barrier waits only on independent work.
+    cx.shutdown();
+    if let Some(shutdown) = shutdown
+        && let Err(error) = shutdown.finish()
+    {
+        eprintln!("GitTerm GPUI shutdown: {error:#}");
+    }
+    true
+}
+
+pub(crate) fn quit(cx: &mut gpui::App) {
+    // Action dispatch may be borrowing a window or entity. Defer until that
+    // borrow ends so shutdown callbacks can update every owner and PTY.
+    cx.defer(|cx| {
+        if shutdown(cx) {
+            cx.quit();
+        }
+    });
 }
 
 #[cfg(test)]
@@ -245,7 +324,7 @@ mod tests {
         assert!(!roots.root().join(RECOVERY).exists());
     }
     #[test]
-    fn timeout_is_labelled_releases_lock_and_refuses_replacement() {
+    fn timeout_is_labelled_retains_marker_and_allows_recovery_without_live_launches() {
         let dir = tempfile::tempdir().unwrap();
         let roots = roots(dir.path());
         let lifetime = Lifetime::acquire(&roots).unwrap();
@@ -265,12 +344,12 @@ mod tests {
         );
         assert!(began.elapsed() < Duration::from_secs(5));
         StateLock::acquire(roots.root()).unwrap();
-        replacement(dir.path());
-        release.send(()).unwrap();
         assert!(roots.root().join(RECOVERY).exists());
+        release.send(()).unwrap();
+        Lifetime::acquire(&roots).unwrap().finish().unwrap();
     }
     #[test]
-    fn simulated_crash_and_profile_survivor_refused_before_writes() {
+    fn crash_refuses_live_identity_recovers_dead_or_reused_pid_and_preserves_stale_profile() {
         let dir = tempfile::tempdir().unwrap();
         let roots = roots(dir.path());
         // Simulate loss of the app guard, with a recorded child surviving it.
@@ -316,8 +395,27 @@ mod tests {
         })
         .unwrap();
         std::fs::write(&tasks, &identities).unwrap();
+        let mut lifetime = lifetime;
+        lifetime.active = false; // Simulate process death, bypassing clean Drop.
         drop(lifetime);
         replacement(dir.path());
+        let error = Lifetime::acquire(&roots).err().unwrap().to_string();
+        assert!(
+            error.contains(&format!("PID {} is still alive", survivor.id())),
+            "{error}"
+        );
+        // A live PID with a different birth time is not the recorded launch.
+        let mut reused: gitterm_core::tasks::TaskStoreDocument =
+            serde_json::from_slice(&identities).unwrap();
+        reused.tasks[0].sessions[0]
+            .launch_identity
+            .as_mut()
+            .unwrap()
+            .birth = "0".into();
+        std::fs::write(&tasks, serde_json::to_vec(&reused).unwrap()).unwrap();
+        Lifetime::acquire(&roots).unwrap().finish().unwrap();
+        std::fs::write(&tasks, &identities).unwrap();
+        std::fs::write(roots.root().join(RECOVERY), b"simulated crash").unwrap();
         assert!(
             survivor.try_wait().unwrap().is_none(),
             "refusal must not signal the survivor"
@@ -325,14 +423,65 @@ mod tests {
         drop(survivor.stdin.take());
         assert!(survivor.wait().unwrap().success());
         assert_eq!(std::fs::read(&tasks).unwrap(), identities);
-        // Even without a marker (an older owner), profile ownership is refused.
-        std::fs::remove_file(roots.root().join(RECOVERY)).unwrap();
+        // A dead recorded launch no longer blocks replacement; stale singleton
+        // files belong to Chrome and must survive both startup and shutdown.
         let profile = roots.root().join("browser-profile");
         std::fs::create_dir(&profile).unwrap();
-        std::fs::write(profile.join("SingletonLock"), b"fixture-owner-123").unwrap();
-        let error = Lifetime::acquire(&roots).err().unwrap().to_string();
-        assert!(error.contains("browser-profile ownership"), "{error}");
+        std::fs::write(profile.join("SingletonLock"), b"broken fixture").unwrap();
+        Lifetime::acquire(&roots).unwrap().finish().unwrap();
+        assert!(profile.join("SingletonLock").exists());
         assert_eq!(std::fs::read(&tasks).unwrap(), identities);
-        assert!(!roots.root().join(".writer").exists());
+    }
+
+    #[test]
+    fn startup_error_releases_marker_and_drains_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = roots(dir.path());
+        let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = (|| -> Result<()> {
+            let lifetime = Lifetime::acquire(&roots)?;
+            let drained = drained.clone();
+            lifetime.barrier.register("startup-writer", move || {
+                drained.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            });
+            anyhow::bail!("startup rejected folders")
+        })();
+        assert!(result.is_err());
+        assert!(drained.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!roots.root().join(RECOVERY).exists());
+        Lifetime::acquire(&roots).unwrap().finish().unwrap();
+    }
+
+    #[gpui::test]
+    fn quit_action_prepares_entities_and_drains_before_platform_quit(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.background_executor.allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let roots = roots(dir.path());
+        let lifetime = Lifetime::acquire(&roots).unwrap();
+        let barrier = lifetime.barrier.clone();
+        let app = cx.new_app();
+        let shutdown = Shutdown::new(lifetime);
+        let surviving = shutdown.clone();
+        let prepared = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed = prepared.clone();
+        app.update(|cx| {
+            cx.set_global(barrier.clone());
+            cx.set_global(shutdown);
+            cx.on_app_quit(move |_| {
+                observed.set(true);
+                barrier.register("entity-prepared", || Ok(()));
+                std::future::ready(())
+            })
+            .detach();
+            crate::install_app_menus(cx);
+            cx.dispatch_action(&crate::app_menus::Quit);
+        });
+        assert!(prepared.get());
+        assert!(surviving.owner.borrow().is_none());
+        assert!(!roots.root().join(RECOVERY).exists());
+        StateLock::acquire(roots.root()).unwrap();
     }
 }

@@ -704,7 +704,7 @@ fn sign_in_command_quotes_provider_and_executable_paths_without_shell_expansion(
 }
 
 #[gpui::test]
-fn quit_drains_a_closed_slow_child_before_gpui_timeout_and_later_observers(
+fn quit_route_drains_a_closed_slow_child_before_platform_termination(
     cx: &mut gpui::TestAppContext,
 ) {
     use std::io::{Read as _, Write as _};
@@ -776,7 +776,10 @@ Path('reaped-marker').write_text('finished')
     // completion via its queue. This is exactly the prior detached-close gap.
     let lifetime = crate::lifetime::Lifetime::acquire(&preview).unwrap();
     let mut app = cx.new_app();
-    app.update(|app| app.set_global(lifetime.barrier.clone()));
+    app.update(|app| {
+        app.set_global(lifetime.barrier.clone());
+        app.set_global(crate::lifetime::Shutdown::new(lifetime));
+    });
     let gate = Rc::new(std::cell::RefCell::new(
         None::<std::os::unix::net::UnixStream>,
     ));
@@ -815,29 +818,44 @@ Path('reaped-marker').write_text('finished')
         "lease must survive pane close"
     );
     let marker = cwd.join("reaped-marker");
+    let root = preview.root().to_path_buf();
     app.update(|app| {
-        app.on_app_quit(move |_| {
-            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "finished");
-            let output = std::process::Command::new("/bin/ps")
-                .args(["-p", &pid.to_string(), "-o", "stat="])
-                .output()
-                .unwrap();
-            assert!(
-                output.stdout.is_empty(),
-                "fake child still exists after quit drain"
+        app.on_app_quit(move |app| {
+            let marker = marker.clone();
+            let root = root.clone();
+            app.global::<crate::lifetime::Barrier>().register(
+                "verify-chat-completion",
+                move || {
+                    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "finished");
+                    let output = std::process::Command::new("/bin/ps")
+                        .args(["-p", &pid.to_string(), "-o", "stat="])
+                        .output()
+                        .unwrap();
+                    assert!(
+                        output.stdout.is_empty(),
+                        "fake child still exists after quit drain"
+                    );
+                    assert!(
+                        gitterm_core::state_lock::StateLock::acquire(&root).is_err(),
+                        "lock released before completion"
+                    );
+                    Ok(())
+                },
             );
             std::future::ready(())
         })
         .detach();
     });
     let start = std::time::Instant::now();
-    app.update(|app| app.shutdown());
+    app.update(crate::lifetime::quit);
     let lease =
         super::lease::ProviderLease::claim(&preview).expect("lease released after quit drain");
     drop(lease);
     assert!(start.elapsed() > gpui::SHUTDOWN_TIMEOUT);
-    assert!(gitterm_core::state_lock::StateLock::acquire(preview.root()).is_err());
-    lifetime.finish().unwrap();
+    assert!(
+        !preview.root().join(".gpui-shutdown-pending").exists(),
+        "quit completion failed"
+    );
     gitterm_core::state_lock::StateLock::acquire(preview.root()).unwrap();
 }
 

@@ -115,7 +115,7 @@ fn main() {
     text_smoothing::initialize();
     if let Err(error) = run() {
         eprintln!("{error}");
-        std::process::exit(1);
+        gitterm_gpui_shell::show_startup_failure(&error);
     }
 }
 

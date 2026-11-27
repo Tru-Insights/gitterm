@@ -39,6 +39,8 @@ mod h9_tests;
 mod hookup_tests;
 mod layout;
 mod lifetime;
+mod startup_failure;
+pub use startup_failure::show_startup_failure;
 #[cfg(test)]
 mod modal_input_tests;
 mod owner;
@@ -4733,7 +4735,7 @@ fn install_app_menus(cx: &mut App) {
     cx.on_action(|_: &app_menus::Hide, cx| cx.hide());
     cx.on_action(|_: &app_menus::HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &app_menus::ShowAll, cx| cx.unhide_other_apps());
-    cx.on_action(|_: &app_menus::Quit, cx| cx.quit());
+    cx.on_action(|_: &app_menus::Quit, cx| lifetime::quit(cx));
     cx.on_action(|_: &app_menus::About, _| {
         #[cfg(not(test))]
         {
@@ -4754,8 +4756,8 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
         .register("preview-writer", move || writer.drain());
     let barrier = lifetime.barrier.clone();
     let host_lock = lifetime.lock.clone();
-    let startup_error = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let host_error = startup_error.clone();
+    let shutdown = lifetime::Shutdown::new(lifetime);
+    let app_shutdown = shutdown.clone();
     let config = preview.roots.layout();
     let mut store = workspace_config::WorkspaceStore::guarded(preview.writer());
     let (model, startup_save) = if sample {
@@ -4792,6 +4794,7 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
     let task_host = (!sample).then(|| task_host::HostConfig::production(preview.roots.clone()));
     gpui_kit::application().run(move |cx| {
         cx.set_global(barrier);
+        cx.set_global(app_shutdown);
         preview.release_on_quit(cx);
         // Before the window's workspace owner, so the host's quit callback
         // runs ahead of its chat drains.
@@ -4799,8 +4802,8 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
             match task_host::TaskHostOwner::start_locked(config, host_lock, cx) {
                 Ok(owner) => cx.set_global(task_host::GpuiTaskHost(owner)),
                 Err(error) => {
-                    *host_error.lock().unwrap() = Some(error);
-                    cx.quit();
+                    lifetime::shutdown(cx);
+                    startup_failure::show(cx, &format!("start GPUI task host: {error:#}"));
                     return;
                 }
             }
@@ -4808,7 +4811,7 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
         gpui_kit::init(cx);
         theme::apply_settings(&settings, None, cx);
         install_app_menus(cx);
-        cx.open_window(
+        let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
@@ -4854,15 +4857,21 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
                 shell.focus_handle(cx).focus(window, cx);
                 cx.new(|cx| Root::new(shell, window, cx))
             },
-        )
-        .expect("open GitTerm GPUI shell window");
-        cx.on_window_closed(|cx, _| cx.quit()).detach();
+        );
+        if let Err(error) = opened {
+            lifetime::shutdown(cx);
+            startup_failure::show(cx, &format!("open GitTerm GPUI shell window: {error:#}"));
+            return;
+        }
+        cx.on_window_closed(|cx, _| {
+            if cx.windows().is_empty() {
+                lifetime::quit(cx);
+            }
+        })
+        .detach();
         cx.activate(true);
     });
-    lifetime.finish()?;
-    if let Some(error) = startup_error.lock().unwrap().take() {
-        return Err(error.context("start GPUI task host"));
-    }
+    shutdown.finish()?;
     Ok(())
 }
 

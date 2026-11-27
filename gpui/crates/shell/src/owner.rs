@@ -177,7 +177,9 @@ impl WorkspaceOwner {
             for chat in owner.chats.values() {
                 chat.update(cx, |chat, _| chat.shutdown_runtime());
             }
-            if let Err(error) = owner.chat_shutdown.drain() {
+            if cx.try_global::<crate::lifetime::Barrier>().is_none()
+                && let Err(error) = owner.chat_shutdown.drain()
+            {
                 eprintln!("Drain preview Claude runtimes on quit: {error:#}");
             }
             std::future::ready(())

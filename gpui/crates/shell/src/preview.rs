@@ -16,6 +16,9 @@ impl PreviewContext {
         self.writer.clone()
     }
     pub(crate) fn release_on_quit(&self, cx: &gpui::App) {
+        if cx.try_global::<crate::lifetime::Barrier>().is_some() {
+            return;
+        }
         let writer = self.writer();
         cx.on_app_quit(move |_| {
             // GPUI 0.3.12 starts its 200ms future timeout AFTER invoking these

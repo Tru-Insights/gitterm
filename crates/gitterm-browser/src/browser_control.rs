@@ -3726,28 +3726,123 @@ fn push_bounded<T>(items: &mut VecDeque<T>, item: T, capacity: usize) {
     items.push_back(item);
 }
 
-/// Refuse unresolved profile ownership without adopting, launching or killing
-/// Chrome. Broken singleton symlinks count too: recovery needs verification.
+/// Refuse only a live Chrome named by SingletonLock. Stale singleton artifacts
+/// belong to Chrome: GitTerm neither removes them nor signals their PIDs.
 pub fn verify_profile_released(profile: &Path) -> std::io::Result<()> {
-    for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
-        let path = profile.join(name);
-        match std::fs::symlink_metadata(&path) {
-            Ok(_) => {
-                return Err(std::io::Error::other(format!(
-                    "refuse unresolved browser-profile ownership: {}",
-                    path.display()
-                )))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(std::io::Error::new(
-                    error.kind(),
-                    format!("inspect browser profile {}: {error}", path.display()),
-                ))
-            }
-        }
+    verify_profile_owner(profile, chrome_process_path)
+}
+
+fn verify_profile_owner(
+    profile: &Path,
+    process_path: impl FnOnce(u32) -> Option<PathBuf>,
+) -> std::io::Result<()> {
+    let lock = profile.join("SingletonLock");
+    let Ok(target) = std::fs::read_link(&lock) else {
+        return Ok(());
+    };
+    let pid = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.rsplit_once('-'))
+        .and_then(|(_, pid)| pid.parse::<u32>().ok())
+        .filter(|pid| *pid > 0 && *pid <= i32::MAX as u32);
+    if let Some((pid, path)) = pid
+        .and_then(|pid| process_path(pid).map(|path| (pid, path)))
+        .filter(|(_, path)| is_chrome_executable(path))
+    {
+        return Err(std::io::Error::other(format!(
+            "refuse live browser-profile ownership: {} names Chrome PID {pid} ({})",
+            lock.display(),
+            path.display()
+        )));
     }
     Ok(())
+}
+
+fn is_chrome_executable(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(
+            "Google Chrome"
+                | "Google Chrome Canary"
+                | "Google Chrome Beta"
+                | "Google Chrome Dev"
+                | "Chromium"
+                | "chrome"
+                | "chromium"
+                | "chromium-browser"
+                | "chrome.exe"
+                | "chromium.exe"
+        )
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn chrome_process_path(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    // Native birth/process info proves liveness; the executable path is only
+    // refusal evidence. Neither this PID nor the singleton grants kill authority.
+    gitterm_core::worker_process::macos::info(pid)
+        .ok()
+        .flatten()?;
+    unsafe extern "C" {
+        fn proc_pidpath(pid: i32, buffer: *mut std::ffi::c_void, size: u32) -> i32;
+    }
+    // PROC_PIDPATHINFO_MAXSIZE
+    let mut buffer = [0u8; 4096];
+    // SAFETY: buffer is writable for its entire advertised length.
+    let length =
+        unsafe { proc_pidpath(pid as i32, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    if length <= 0 {
+        return None;
+    }
+    let end = buffer.iter().position(|byte| *byte == 0)?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buffer[..end])))
+}
+
+#[cfg(target_os = "linux")]
+fn chrome_process_path(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn chrome_process_path(_: u32) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(all(test, unix))]
+mod profile_owner_tests {
+    use super::*;
+
+    #[test]
+    fn singleton_refuses_only_live_chrome_and_never_removes_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("SingletonLock");
+        std::os::unix::fs::symlink("fixture-host-123", &lock).unwrap();
+        verify_profile_owner(dir.path(), |_| None).unwrap();
+        verify_profile_owner(dir.path(), |_| Some("/usr/bin/unrelated".into())).unwrap();
+        let error = verify_profile_owner(dir.path(), |pid| {
+            assert_eq!(pid, 123);
+            Some("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("Chrome PID 123"));
+        assert_eq!(
+            std::fs::read_link(&lock).unwrap(),
+            Path::new("fixture-host-123")
+        );
+        std::fs::remove_file(&lock).unwrap();
+        std::os::unix::fs::symlink("broken", &lock).unwrap();
+        verify_profile_owner(dir.path(), |_| panic!("broken singleton has no PID")).unwrap();
+        assert!(std::fs::symlink_metadata(&lock).is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_executable_lookup_does_not_mistake_the_test_runner_for_chrome() {
+        let path = chrome_process_path(std::process::id()).unwrap();
+        assert!(!is_chrome_executable(&path), "{}", path.display());
+    }
 }
 
 fn browser_profile_dir(v6_global_config_dir: &Path) -> PathBuf {
