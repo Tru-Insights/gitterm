@@ -378,8 +378,8 @@ impl ServiceContext {
         })
     }
 
-    /// Slice 3 admits the production root and endpoints, while later-slice
-    /// writers and process runners retain the Preview notices.
+    /// Live admits task creation and handoffs; later-slice writers and
+    /// process runners retain the Preview notices.
     pub fn for_gpui_live(mut self) -> Self {
         self.gpui_live = true;
         self
@@ -583,7 +583,10 @@ impl ServiceContext {
     }
 
     fn decide(&self, label: &str, access: Access, target: Option<&Path>) -> Result<(), Denied> {
-        if self.gpui_live && !matches!(access, Access::Read | Access::Existing) {
+        let live_task_write =
+            access == Access::Write && matches!(label, "task_create" | "task_update_handoff");
+        if self.gpui_live && !matches!(access, Access::Read | Access::Existing) && !live_task_write
+        {
             return Err(denied(label));
         }
         let allowed = match (&self.mode, access) {
@@ -909,6 +912,22 @@ mod live_tests {
         assert!(!live.is_preview());
         assert!(live.browser_read_only());
         assert_eq!(production.task_mcp().token(), live.task_mcp().token());
+        for label in ["task_create", "task_update_handoff"] {
+            assert!(live.authorize(class(label, Access::Write), None).is_ok());
+        }
+        for label in [
+            "merge_plan_set",
+            "notify",
+            "Save delegation",
+            "Save delivery",
+        ] {
+            assert_eq!(
+                live.authorize(class(label, Access::Write), None)
+                    .unwrap_err()
+                    .notice(),
+                preview_notice(label)
+            );
+        }
         for access in [Access::Write, Access::Process, Access::Outside] {
             let class = Class {
                 label: "Live gated effect",

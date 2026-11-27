@@ -54,8 +54,8 @@ mod live;
 mod restore;
 mod runner;
 pub use create::{
-    assemble_task_create, canonical_task_workspace_directory, stopping_boundary_from_control,
-    AssembledTaskCreate,
+    assemble_task_create, canonical_task_workspace_directory, saved_task_worktree_root,
+    stopping_boundary_from_control, AssembledTaskCreate,
 };
 pub use delivery::{
     waiting_delegation_log_lines, DeliveryChat, DeliveryCompletion, DeliveryEffect,
@@ -189,6 +189,7 @@ pub struct TaskHost {
     commands: TaskControlSender,
     launch_queue: Vec<QueuedTaskLaunch>,
     delegations: crate::delegation_state::State,
+    issued_callers: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl TaskHost {
@@ -205,11 +206,33 @@ impl TaskHost {
             commands,
             launch_queue: Vec::new(),
             delegations: Default::default(),
+            issued_callers: Default::default(),
         }
     }
 
     pub fn services(&self) -> &ServiceContext {
         &self.services
+    }
+
+    /// Register only when the frontend issues this session's MCP descriptors.
+    /// Saved session IDs and imported process IDs are not caller authority.
+    pub fn issue_caller(&self, caller: &str) {
+        if !caller.is_empty() {
+            self.issued_callers
+                .lock()
+                .unwrap()
+                .insert(caller.to_string());
+        }
+    }
+
+    pub fn require_issued_caller(&self, caller: Option<&str>, tool: &str) -> Result<(), String> {
+        let caller = caller.ok_or_else(|| missing_caller_error(tool))?;
+        if !self.issued_callers.lock().unwrap().contains(caller) {
+            return Err(format!(
+                "{tool}: caller {caller:?} was not issued by this task host"
+            ));
+        }
+        Ok(())
     }
 
     /// Transitional frontend seam (see [`TaskAuthority::store`]).
