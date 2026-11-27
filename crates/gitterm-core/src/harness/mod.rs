@@ -7,5 +7,8 @@ pub mod claude_parser;
 #[cfg(feature = "runtime")]
 pub mod claude;
 
+#[cfg(feature = "runtime")]
+pub mod local_launch;
+
 pub mod acp;
 pub mod pi;

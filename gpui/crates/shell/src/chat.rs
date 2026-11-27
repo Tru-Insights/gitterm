@@ -1,4 +1,4 @@
-//! Native preview composition. The shared workspace owner retains these entities;
+//! Native chat composition. The shared workspace owner retains these entities;
 //! docking/hiding never installs another runtime receiver.
 mod auth;
 mod checkout;
@@ -6,8 +6,12 @@ mod fence;
 mod lease;
 mod managed;
 mod navigation;
+pub(crate) mod policy;
 mod provider;
+pub(crate) mod resume;
 pub(crate) use navigation::{Navigation, navigation, worker_tab_target};
+#[cfg(test)]
+mod live_tests;
 #[cfg(test)]
 mod tests;
 use anyhow::{Context as _, Result};
@@ -59,16 +63,18 @@ struct Controller {
     source: RuntimeStamp,
     runtime: Option<OwnedRuntime>,
     ready: bool,
+    live: bool,
     message: u64,
     correlations: HashMap<CommandCorrelation, AttemptId>,
+    config: gitterm_core::chat::types::AgentBackendConfig,
 }
 impl Controller {
     fn new() -> Self {
         let mut adapter = ChatAdapter::default();
         let target = crate::sessions::fresh_target();
         let source = adapter.begin_runtime(target.clone());
-        // As in Iced, Rust confirms the launch configuration before the first
-        // provider acknowledgement. No picker is enabled until Ready.
+        // Rust confirms the launch configuration before the first provider
+        // acknowledgement; Live replaces these defaults on first submission.
         for event in [
             HarnessEvent::ModelChanged("default".into()),
             HarnessEvent::PermissionModeChanged("default".into()),
@@ -91,8 +97,33 @@ impl Controller {
             source,
             runtime: None,
             ready: false,
+            live: false,
             message: 0,
             correlations: HashMap::new(),
+            config: resume::default_config(),
+        }
+    }
+    fn seed_launch(&mut self, settings: &gitterm_gpui_chat::composer::LaunchSettings) {
+        self.config = gitterm_core::chat::types::AgentBackendConfig::Claude {
+            model: settings.model.clone(),
+            permission_mode: Some(settings.permission_mode.clone()),
+            effort: settings.effort.clone(),
+        };
+        for event in [
+            HarnessEvent::ModelChanged(settings.model.clone()),
+            HarnessEvent::PermissionModeChanged(settings.permission_mode.clone()),
+            HarnessEvent::EffortChanged {
+                effort: settings.effort.clone(),
+                applied: None,
+            },
+        ] {
+            self.adapter.receive(
+                &self.source,
+                &self.target,
+                AgentEvent::Harness(event),
+                None,
+                |_, _| {},
+            );
         }
     }
     fn dispatch(&mut self, intent: ChatIntent) -> (Receipt, Update) {
@@ -120,13 +151,9 @@ impl Controller {
                 task_live: false,
                 last_tab: false,
             },
-            config: gitterm_core::chat::types::AgentBackendConfig::Claude {
-                model: String::new(),
-                permission_mode: Some("default".into()),
-                effort: None,
-            },
-            process_running: self.ready && self.runtime.is_some(),
-            just_spawned: false,
+            config: self.config.clone(),
+            process_running: (self.ready || self.live) && self.runtime.is_some(),
+            just_spawned: self.live && !self.ready && self.message == 1,
             message_id: format!("{}-{}", self.target.session_uid, self.message),
         };
         let prepared = match self.adapter.admit(intent, facts) {
@@ -184,6 +211,23 @@ impl Controller {
                 });
             }
         };
+        let config = &mut self.config;
+        let mut observe = |_: &AgentEvent, effects: &gitterm_core::chat::state::EventEffects| {
+            use gitterm_core::chat::types::{AgentBackendConfig, SettingChange};
+            if let AgentBackendConfig::Claude {
+                model,
+                permission_mode,
+                effort,
+            } = config
+            {
+                match &effects.settings_changed {
+                    Some(SettingChange::Model(value)) => model.clone_from(value),
+                    Some(SettingChange::Mode(value)) => *permission_mode = Some(value.clone()),
+                    Some(SettingChange::Effort(value)) => effort.clone_from(value),
+                    None => {}
+                }
+            }
+        };
         // The initialize reply is an authoritative mode acknowledgement too.
         if let HarnessEvent::Ready {
             permission_mode: Some(mode),
@@ -195,7 +239,7 @@ impl Controller {
                 &self.target,
                 AgentEvent::Harness(HarnessEvent::PermissionModeChanged(mode.clone())),
                 Some(now_ms()),
-                |_, _| {},
+                &mut observe,
             );
         }
         let ready = matches!(event, HarnessEvent::Ready { .. });
@@ -205,7 +249,7 @@ impl Controller {
             &self.target,
             AgentEvent::Harness(event),
             Some(now_ms()),
-            |_, _| {},
+            observe,
         )?;
         if ready {
             self.ready = true;
@@ -297,8 +341,25 @@ pub(crate) fn with_held(
         .collect()
 }
 
+struct DeferredLive {
+    services: gitterm_core::preview::service::ServiceContext,
+    preview_root: PathBuf,
+    caller: String,
+    workspace: Option<crate::data::WorkspaceId>,
+    settings: Rc<std::cell::RefCell<gitterm_gpui_chat::composer::LaunchSettings>>,
+}
+
 pub(crate) struct ChatPane {
     controller: Controller,
+    deferred_live: Option<DeferredLive>,
+    guidelines_status: Option<std::sync::mpsc::Receiver<bool>>,
+    live_claim: Option<Arc<provider::ConversationClaim>>,
+    live_tab: Option<resume::LiveTab>,
+    resume_error: Option<String>,
+    awaiting_resume: bool,
+    history_loading: bool,
+    persisted_id: Option<String>,
+    _history_load: Option<gpui::Task<()>>,
     saved: SavedChat,
     view: Entity<ChatView>,
     pending: Vec<Update>,
@@ -341,7 +402,9 @@ impl ChatPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let controller = Controller::new();
+        let mut controller = Controller::new();
+        let policy = policy::current(preview.clone(), cx);
+        controller.live = matches!(policy, policy::ChatLaunchPolicy::Live { .. });
         let saved = SavedChat {
             uid: controller.target.session_uid.clone(),
             cwd,
@@ -355,11 +418,17 @@ impl ChatPane {
             view.set_width(crate::theme::chat_width(cx), cx);
             view.set_preview(cx);
             view.set_backend(gitterm_core::chat::types::AgentBackend::Claude, cx);
-            view.set_read_only(Some("Preview activation unavailable".into()), cx);
+            if controller.live {
+                view.set_live_prelaunch(cx);
+            } else {
+                view.set_read_only(Some("Preview activation unavailable".into()), cx);
+            }
             view
         });
         let roster_subscription = Self::forward_roster(&view, cx);
-        view.update(cx, |view, cx| view.set_dismiss_gate(dismiss_gate(), cx));
+        view.update(cx, |view, cx| {
+            view.set_dismiss_gate(dismiss_gate(controller.live), cx)
+        });
         let review_subscription = Self::handle_review(&view, saved.cwd.clone(), window, cx);
         let callback = Self::intent_callback(cx.weak_entity());
         view.update(cx, |view, cx| view.set_intent_callback(callback, cx));
@@ -372,16 +441,42 @@ impl ChatPane {
         // The caller is this pane's target, fixed here before the gate and
         // launch run; nothing later can re-attribute the chat's task or
         // browser calls.
-        let mcp_servers = mcp_servers(&controller.target.session_uid, cx);
-        let launch = (|| -> Result<_> {
-            let program = claude_program()?;
-            let provider = Arc::new(Provider::new(preview, &program)?);
-            provider.prepare()?;
-            let (runtime, events) = start_runtime(&provider, saved.cwd.clone(), mcp_servers)?;
-            Ok((runtime, events))
-        })();
+        let (deferred_live, launch) = match policy {
+            policy::ChatLaunchPolicy::Live { services } => (
+                Some(DeferredLive {
+                    services,
+                    preview_root: preview.root().to_path_buf(),
+                    caller: controller.target.session_uid.clone(),
+                    workspace: cx
+                        .try_global::<crate::work_sidebar::IcedWorkSource>()
+                        .and_then(|source| source.owner.upgrade())
+                        .and_then(|owner| owner.read(cx).model.active()),
+                    settings: view.read(cx).launch_settings_handle(),
+                }),
+                None,
+            ),
+            policy::ChatLaunchPolicy::Preview(preview) => {
+                let mcp_servers = mcp_servers(&controller.target.session_uid, cx);
+                let launch = (|| -> Result<_> {
+                    let program = claude_program()?;
+                    let provider = Arc::new(Provider::new(preview, &program)?);
+                    provider.prepare()?;
+                    start_runtime(&provider, saved.cwd.clone(), mcp_servers)
+                })();
+                (None, Some(launch))
+            }
+        };
         let mut pane = Self {
             controller,
+            deferred_live,
+            guidelines_status: None,
+            live_claim: None,
+            live_tab: None,
+            resume_error: None,
+            awaiting_resume: false,
+            history_loading: false,
+            persisted_id: None,
+            _history_load: None,
             saved,
             view,
             pending: vec![],
@@ -395,9 +490,13 @@ impl ChatPane {
             _review_subscription: review_subscription,
             _review_context_load: None,
         };
+        if pane.controller.live {
+            pane.init_live_tab(cx);
+        }
         match launch {
-            Ok((runtime, events)) => pane.install_runtime(runtime, events, window, cx),
-            Err(error) => {
+            None => {}
+            Some(Ok((runtime, events))) => pane.attach_runtime(runtime, events, cx),
+            Some(Err(error)) => {
                 pane.shutdown_runtime(cx);
                 pane.view.update(cx, |view, cx| {
                     view.set_status_error(format!("Claude unavailable: {error:#}"), cx)
@@ -483,10 +582,113 @@ impl ChatPane {
         })
     }
     fn dispatch(&mut self, intent: ChatIntent, cx: &mut Context<Self>) -> Receipt {
+        if self.history_loading {
+            return Receipt::rejected("Saved chat history is still loading");
+        }
+        if let Some(error) = &self.resume_error {
+            return Receipt::rejected(error.clone());
+        }
+        if self.deferred_live.is_some()
+            && self.controller.runtime.is_none()
+            && matches!(&intent, ChatIntent::Send { .. })
+        {
+            if let ChatIntent::Send { text, images } = &intent {
+                if text.trim().is_empty() && images.is_empty() {
+                    return Receipt::rejected("The prompt is empty");
+                }
+                if let Err(error) = gitterm_core::chat::types::validate_images(images) {
+                    return Receipt::rejected(error);
+                }
+            }
+            if let Err(error) = self.launch_live(cx) {
+                self.shutdown_runtime(cx);
+                let error = format!("Claude unavailable: {error:#}");
+                let view = self.view.clone();
+                let status = error.clone();
+                let missing_cwd = self.saved.session_id.is_some() && !self.saved.cwd.is_dir();
+                if missing_cwd {
+                    self.resume_error = Some(error.clone());
+                    cx.notify();
+                }
+                cx.defer(move |cx| {
+                    view.update(cx, |view, cx| {
+                        if missing_cwd {
+                            view.set_read_only(Some(status.clone()), cx);
+                        }
+                        view.set_status_error(status, cx)
+                    })
+                });
+                return Receipt::rejected(error);
+            }
+        }
         let (receipt, update) = self.controller.dispatch(intent);
         self.pending.push(update);
         self.changed(cx);
         receipt
+    }
+    fn launch_live(&mut self, cx: &mut Context<Self>) -> Result<()> {
+        let launch = self
+            .deferred_live
+            .as_ref()
+            .context("Live chat already launched")?;
+        // Resolve descriptors while the caller and matching host are still on
+        // the UI thread, before the runtime does any asynchronous preparation.
+        let servers = live_mcp_servers(&launch.services, &launch.caller, cx)?;
+        let settings = launch.settings.borrow().clone();
+        let workspace = cx
+            .try_global::<crate::work_sidebar::IcedWorkSource>()
+            .and_then(|source| source.owner.upgrade())
+            .and_then(|owner| {
+                let owner = owner.read(cx);
+                owner.iced_workspace(launch.workspace?).cloned()
+            });
+        let (status, receiver) = std::sync::mpsc::channel();
+        let mut config = live_config(
+            self.saved.cwd.clone(),
+            &settings,
+            servers,
+            workspace
+                .as_ref()
+                .is_some_and(|workspace| workspace.claude_in_chrome),
+        );
+        config.resume = self.saved.session_id.clone();
+        let claim = match &self.live_claim {
+            Some(claim) => claim.clone(),
+            None => Arc::new(provider::ConversationClaim::claim(
+                &launch.services,
+                &launch.caller,
+            )?),
+        };
+        if let Some(id) = &config.resume {
+            claim.provider_id(id)?;
+        }
+        let (runtime, events) = provider::start_live_claimed(
+            &launch.services,
+            config,
+            launch.preview_root.clone(),
+            claim.clone(),
+            provider::LiveInstructions {
+                workspace_off: workspace
+                    .as_ref()
+                    .is_some_and(|workspace| workspace.guidelines_off),
+                places: workspace
+                    .as_ref()
+                    .and_then(gitterm_core::guidelines::config_document_places),
+                status,
+            },
+        )?;
+        if let Some(tab) = &mut self.live_tab {
+            tab.tab.agent_config = Some(gitterm_core::chat::types::AgentBackendConfig::Claude {
+                model: settings.model.clone(),
+                permission_mode: Some(settings.permission_mode.clone()),
+                effort: settings.effort.clone(),
+            });
+        }
+        self.live_claim = Some(claim);
+        self.controller.seed_launch(&settings);
+        self.guidelines_status = Some(receiver);
+        self.attach_runtime(runtime, events, cx);
+        Ok(())
     }
     /// Sends `text` as a user turn the way the composer does, for the task
     /// host's result delivery. The receipt is the composer's own:
@@ -539,10 +741,21 @@ impl ChatPane {
             view
         });
         let roster_subscription = Self::forward_roster(&view, cx);
-        view.update(cx, |view, cx| view.set_dismiss_gate(dismiss_gate(), cx));
+        view.update(cx, |view, cx| {
+            view.set_dismiss_gate(dismiss_gate(false), cx)
+        });
         let review_subscription = Self::handle_review(&view, saved.cwd.clone(), window, cx);
         Self {
             controller,
+            deferred_live: None,
+            guidelines_status: None,
+            live_claim: None,
+            live_tab: None,
+            resume_error: None,
+            awaiting_resume: false,
+            history_loading: false,
+            persisted_id: None,
+            _history_load: None,
             saved,
             view,
             pending: vec![],
@@ -648,6 +861,9 @@ impl ChatPane {
         self.controller.target.task_session_id = Some(task_session_id.into());
     }
     pub fn close(&mut self, cx: &mut Context<Self>) {
+        self.deferred_live = None;
+        self._history_load = None;
+        self.live_claim = None;
         self.controller.ready = false;
         self.shutdown_runtime(cx);
         self.view.update(cx, |view, cx| {
@@ -669,7 +885,9 @@ impl ChatPane {
         }
     }
     fn changed(&mut self, cx: &mut Context<Self>) {
-        self.saved.session_id = self.controller.adapter.state().session_id.clone();
+        if let Some(id) = self.controller.adapter.state().session_id.clone() {
+            self.saved.session_id = Some(id);
+        }
         self.saved.records = self
             .controller
             .adapter
@@ -711,7 +929,9 @@ impl ChatPane {
                 _ => None,
             })
             .collect();
-        cx.emit(self.saved.clone());
+        if !self.controller.live {
+            cx.emit(self.saved.clone());
+        }
         cx.notify();
     }
     pub(crate) fn receive_runtime_event(
@@ -732,19 +952,58 @@ impl ChatPane {
             &event,
             RuntimeEvent::Harness(HarnessEvent::ProcessExited { .. })
         );
+        let turn_ended = matches!(
+            &event,
+            RuntimeEvent::Harness(HarnessEvent::TurnCompleted { .. })
+        );
+        if let Some(applied) = self
+            .guidelines_status
+            .as_ref()
+            .and_then(|status| status.try_recv().ok())
+        {
+            self.view
+                .update(cx, |view, cx| view.set_guidelines_status(applied, cx));
+        }
+        if self.controller.live {
+            if matches!(
+                &event,
+                RuntimeEvent::Harness(HarnessEvent::TurnStarted { .. })
+            ) {
+                self.awaiting_resume = false;
+            }
+            if let RuntimeEvent::Harness(HarnessEvent::TurnStarted {
+                session_id: Some(id),
+                ..
+            }) = &event
+                && let Err(error) = self.confirm_provider_id(id, cx)
+            {
+                self.shutdown_runtime(cx);
+                self.resume_failed(format!("Cannot resume Claude: {error:#}"), cx);
+                return;
+            }
+        }
         if matches!(
             &event,
             RuntimeEvent::Harness(HarnessEvent::ConversationReset { .. })
         ) {
             crate::task_host::revoke_caller(&self.controller.target.session_uid, cx);
         }
-        let turn_ended = matches!(
-            &event,
-            RuntimeEvent::Harness(HarnessEvent::TurnCompleted { .. })
-        );
+        let previous_settings = self.controller.adapter.state().acknowledged.clone();
         if let Some(update) = self.controller.apply_runtime_outcome(source, event) {
             self.pending.push(update);
             self.changed(cx);
+        }
+        if self.controller.live
+            && self
+                .live_tab
+                .as_ref()
+                .is_some_and(|tab| tab.tab.chat_session_id.is_some())
+            && self.controller.adapter.state().acknowledged != previous_settings
+            && let Err(error) = self.persist_live_tab(cx)
+        {
+            self.view.update(cx, |view, cx| {
+                view.set_status_error(format!("Save Claude settings: {error:#}"), cx)
+            });
         }
         if turn_ended {
             self.refresh_checkout_head(cx);
@@ -752,24 +1011,46 @@ impl ChatPane {
         }
         if exited {
             self.shutdown_runtime(cx);
-            self.view.update(cx, |view, cx| {
-                view.set_read_only(Some("Claude preview stopped".into()), cx)
-            });
+            if self.awaiting_resume {
+                self.resume_failed(
+                    "Cannot resume saved Claude session: process exited before the turn started"
+                        .into(),
+                    cx,
+                );
+                return;
+            }
+            let stopped = if self.controller.live {
+                "Claude stopped"
+            } else {
+                "Claude preview stopped"
+            };
+            self.view
+                .update(cx, |view, cx| view.set_read_only(Some(stopped.into()), cx));
         }
     }
+    #[cfg(test)]
     fn install_runtime(
         &mut self,
         runtime: OwnedRuntime,
+        events: tokio::sync::mpsc::UnboundedReceiver<RuntimeEvent>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.attach_runtime(runtime, events, cx);
+    }
+    fn attach_runtime(
+        &mut self,
+        runtime: OwnedRuntime,
         mut events: tokio::sync::mpsc::UnboundedReceiver<RuntimeEvent>,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.controller.runtime = Some(runtime);
         let source = self.controller.source.clone();
-        cx.spawn_in(window, async move |pane, cx| {
+        self.awaiting_resume = self.controller.live && self.saved.session_id.is_some();
+        cx.spawn(async move |pane, cx| {
             while let Some(event) = events.recv().await {
                 if pane
-                    .update_in(cx, |pane, _, cx| {
+                    .update(cx, |pane, cx| {
                         pane.receive_runtime_event(&source, event, cx);
                     })
                     .is_err()
@@ -777,15 +1058,15 @@ impl ChatPane {
                     break;
                 }
             }
-            let _ = pane.update_in(cx, |pane, _, cx| {
+            let _ = pane.update(cx, |pane, cx| {
                 if pane.controller.source == source {
                     pane.shutdown_runtime(cx);
                 }
             });
         })
         .detach();
-        self.view
-            .update(cx, |view, cx| view.set_read_only(None, cx));
+        let view = self.view.clone();
+        cx.defer(move |cx| view.update(cx, |view, cx| view.set_read_only(None, cx)));
     }
 }
 
@@ -880,6 +1161,7 @@ impl gpui::Focusable for ChatPane {
 struct OwnedRuntime {
     session: Session,
     _lease: Option<Arc<lease::ProviderLease>>,
+    _conversation: Option<Arc<provider::ConversationClaim>>,
 }
 impl std::ops::Deref for OwnedRuntime {
     type Target = Session;
@@ -898,6 +1180,7 @@ impl From<Session> for OwnedRuntime {
         Self {
             session,
             _lease: None,
+            _conversation: None,
         }
     }
 }
@@ -910,6 +1193,10 @@ pub(crate) struct RuntimeShutdown {
 }
 enum ShutdownCommand {
     Session(OwnedRuntime),
+    Persist(
+        Box<resume::LiveTab>,
+        tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    ),
     Drain(std::sync::mpsc::SyncSender<std::result::Result<(), String>>),
 }
 impl RuntimeShutdown {
@@ -929,6 +1216,15 @@ impl RuntimeShutdown {
                                 eprintln!("Reap preview Claude: {error}");
                                 errors.push(error);
                             }
+                        }
+                        ShutdownCommand::Persist(tab, reply) => {
+                            let result = tab.persist().map_err(|error| {
+                                format!("Save confirmed Claude session: {error:#}")
+                            });
+                            if let Err(error) = &result {
+                                errors.push(error.clone());
+                            }
+                            let _ = reply.send(result);
                         }
                         ShutdownCommand::Drain(reply) => {
                             let result = if errors.is_empty() {
@@ -953,7 +1249,7 @@ impl RuntimeShutdown {
             .send(ShutdownCommand::Session(session))
             .map_err(|error| match error.0 {
                 ShutdownCommand::Session(session) => session,
-                ShutdownCommand::Drain(_) => unreachable!(),
+                ShutdownCommand::Drain(_) | ShutdownCommand::Persist(..) => unreachable!(),
             })
     }
     pub(crate) fn drain(&self) -> Result<()> {
@@ -1008,10 +1304,20 @@ impl Render for ChatPane {
             .flex()
             .flex_col()
             .child(div().flex_1().min_h_0().child(self.view.clone()))
+            .children(self.resume_error.clone().map(|error| {
+                div().p_2().child(error).child(
+                    gpui_component::button::Button::new("start-fresh-chat")
+                        .label("Start a fresh chat here")
+                        .on_click(cx.listener(|pane, _, _, cx| pane.fresh_chat(cx))),
+                )
+            }))
     }
 }
-fn dismiss_gate() -> gitterm_gpui_chat::interactions::DismissGate {
-    Rc::new(|request, cx| {
+fn dismiss_gate(live: bool) -> gitterm_gpui_chat::interactions::DismissGate {
+    Rc::new(move |request, cx| {
+        if live {
+            return gitterm_core::preview::service::preview_notice(&request.label);
+        }
         dismiss_notice(
             crate::task_panel::host(cx).map(|host| host.services()),
             request,
@@ -1068,6 +1374,60 @@ fn mcp_servers(
         });
     }
     servers
+}
+fn live_config(
+    cwd: PathBuf,
+    settings: &gitterm_gpui_chat::composer::LaunchSettings,
+    mcp_servers: Vec<gitterm_core::harness::claude::ClaudeMcpServer>,
+    chrome: bool,
+) -> gitterm_core::harness::claude::ClaudeSessionConfig {
+    // Match Iced's AgentSession::claude_session_config default-model policy.
+    gitterm_core::harness::claude::ClaudeSessionConfig {
+        cwd,
+        model: (!settings.model.trim().is_empty() && settings.model.trim() != "default")
+            .then(|| settings.model.trim().to_owned()),
+        permission_mode: settings.permission_mode.clone(),
+        effort: settings.effort.clone(),
+        resume: None,
+        wire_log_dir: None,
+        snapshot_facts_dir: None,
+        mcp_servers,
+        chrome,
+        guidelines_file: None,
+        guidelines_content: None,
+    }
+}
+
+fn live_mcp_servers(
+    services: &gitterm_core::preview::service::ServiceContext,
+    caller: &str,
+    cx: &gpui::App,
+) -> Result<Vec<gitterm_core::harness::claude::ClaudeMcpServer>> {
+    let host = cx
+        .try_global::<crate::task_host::GpuiTaskHost>()
+        .context("Live Claude requires the live task/browser host; it is unavailable")?;
+    let host = host.0.read(cx);
+    validate_live_host(services, host.host().services())?;
+    let servers = host.claude_mcp_servers(caller);
+    anyhow::ensure!(
+        servers.len() == 2,
+        "Live Claude task/browser host has shut down"
+    );
+    Ok(servers)
+}
+fn validate_live_host(
+    services: &gitterm_core::preview::service::ServiceContext,
+    actual: &gitterm_core::preview::service::ServiceContext,
+) -> Result<()> {
+    anyhow::ensure!(
+        !services.is_preview()
+            && !actual.is_preview()
+            && services.state_root() == actual.state_root()
+            && services.task_mcp().instance_id() == actual.task_mcp().instance_id()
+            && services.task_mcp().token() == actual.task_mcp().token(),
+        "Live Claude task/browser host does not match the installed production context"
+    );
+    Ok(())
 }
 fn claude_program() -> Result<PathBuf> {
     find_claude(

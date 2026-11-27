@@ -4845,6 +4845,9 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
         // Before the window's workspace owner, so the host's quit callback
         // runs ahead of its chat drains.
         if let Some(config) = task_host {
+            // Live chat must use the host's own production context (its MCP
+            // namespace included), so keep a copy of the one the host gets.
+            let chat_services = live_services.as_deref().cloned();
             let started = if let Some(services) = live_services {
                 task_host::TaskHostOwner::start_live(config, host_lock, services, cx)
             } else {
@@ -4857,6 +4860,13 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
                     startup_failure::show(cx, &format!("start GPUI task host: {error:#}"));
                     return;
                 }
+            }
+            if let Some(services) = chat_services
+                && let Err(error) = chat::policy::install_live(services, cx)
+            {
+                lifetime::shutdown(cx);
+                startup_failure::show(cx, &format!("start Live chat: {error:#}"));
+                return;
             }
         }
         gpui_kit::init(cx);

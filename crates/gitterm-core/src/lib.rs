@@ -103,5 +103,8 @@ pub mod agent_config;
 pub mod config_paths;
 pub mod workspace_config;
 
+#[cfg(feature = "stt")]
+pub mod dictation;
+
 #[cfg(feature = "runtime")]
 pub mod desktop_store;

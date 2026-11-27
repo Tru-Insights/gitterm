@@ -3663,3 +3663,45 @@ fn tru274_repo_actions_use_iced_two_pixel_spacing(cx: &mut gpui::TestAppContext)
         .unwrap();
     assert_eq!(command.left() - editor.right(), px(2.));
 }
+
+#[gpui::test]
+fn unopened_chat_emits_only_after_live_policy_is_installed(cx: &mut gpui::TestAppContext) {
+    let sidebar = cx.new(|_| fixture(false));
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let received = events.clone();
+    cx.update(|cx| {
+        cx.subscribe(&sidebar, move |_, event: &WorkSidebarOutcome, _| {
+            received.borrow_mut().push(event.clone())
+        })
+        .detach();
+    });
+    let outcome = WorkSidebarOutcome::OpenChat {
+        workspace: 7,
+        chat: "synthetic-unopened".into(),
+    };
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.emit(outcome.clone(), cx);
+        assert!(
+            sidebar
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("not available in preview")
+        );
+    });
+    assert!(events.borrow().is_empty());
+    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    cx.update(|cx| {
+        crate::chat::policy::install_live(
+            gitterm_core::preview::service::ServiceContext::production(
+                root.path(),
+                "work-resume-test",
+            )
+            .unwrap(),
+            cx,
+        )
+        .unwrap()
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.emit(outcome.clone(), cx));
+    assert_eq!(*events.borrow(), [outcome]);
+}

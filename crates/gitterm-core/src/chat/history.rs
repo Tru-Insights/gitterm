@@ -38,6 +38,43 @@ pub fn load_claude_history(path: &Path) -> std::io::Result<Vec<TimedEntry>> {
     Ok(parse_claude_transcript_timed(&text))
 }
 
+/// Locate a saved local Claude session in the effective provider's projects.
+/// Call on a background executor: both directory discovery and parsing do IO.
+pub fn load_claude_session(
+    projects: &Path,
+    session_id: &str,
+    cwd: &Path,
+) -> Result<Vec<HistoryEvent>, String> {
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("Invalid Claude session identity".into());
+    }
+    if !cwd.is_absolute() || !cwd.is_dir() {
+        return Err(format!(
+            "Saved chat directory is missing: {}",
+            cwd.display()
+        ));
+    }
+    let directories = std::fs::read_dir(projects)
+        .map_err(|e| format!("Read Claude projects {}: {e}", projects.display()))?;
+    for directory in directories {
+        let directory = directory.map_err(|e| format!("Read Claude project: {e}"))?;
+        if !directory.file_type().map_err(|e| e.to_string())?.is_dir() {
+            continue;
+        }
+        let path = directory.path().join(format!("{session_id}.jsonl"));
+        match load_claude_history(&path) {
+            Ok(entries) => return Ok(history_timeline(entries, &[])),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("Read saved Claude session {}: {e}", path.display())),
+        }
+    }
+    Err(format!("Saved Claude session not found: {session_id}"))
+}
+
 /// Parse transcript lines into timeline entries. Unparseable lines are
 /// skipped: the file is append-only and the last line may be partial.
 pub fn parse_claude_transcript(text: &str) -> Vec<TranscriptEntry> {
@@ -1078,5 +1115,41 @@ mod tests {
             matches!(e, TranscriptEntry::Harness(HarnessEvent::ItemCompleted { id, .. }) if id == "early")
         });
         assert!(started.unwrap() < completed_after.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod session_restore_tests {
+    use super::*;
+    #[test]
+    fn saved_session_loads_once_from_explicit_root_and_reports_missing_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("cwd");
+        let projects = dir.path().join("provider/projects");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(projects.join("slug")).unwrap();
+        std::fs::write(projects.join("slug/synthetic.jsonl"), concat!(
+            "{\"type\":\"user\",\"message\":{\"content\":\"old prompt\"}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"old reply\"}]}}\n"
+        )).unwrap();
+        let events = load_claude_session(&projects, "synthetic", &cwd).unwrap();
+        assert_eq!(events.iter().filter(|event| matches!(event, HistoryEvent::Other(value) if value["type"] == "user_prompt")).count(), 1);
+        assert_eq!(events.iter().filter(|event| matches!(event, HistoryEvent::Harness(HarnessEvent::TextDelta(text)) if text == "old reply")).count(), 1);
+        assert!(load_claude_session(&projects, "missing", &cwd)
+            .unwrap_err()
+            .contains("not found"));
+        assert!(load_claude_session(&projects, "../synthetic", &cwd)
+            .unwrap_err()
+            .contains("identity"));
+        assert!(
+            load_claude_session(&projects, "synthetic", &cwd.join("gone"))
+                .unwrap_err()
+                .contains("directory is missing")
+        );
+        // A valid empty transcript is still resumable.
+        std::fs::write(projects.join("slug/empty.jsonl"), "").unwrap();
+        assert!(load_claude_session(&projects, "empty", &cwd)
+            .unwrap()
+            .is_empty());
     }
 }

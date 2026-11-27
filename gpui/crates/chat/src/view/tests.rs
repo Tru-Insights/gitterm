@@ -4490,3 +4490,77 @@ fn d17_checkout_head_shows_the_branch_moved_banner(cx: &mut TestAppContext) {
     draw(cx);
     assert!(cx.debug_bounds("delegation-banner-0").is_none());
 }
+
+#[gpui::test]
+fn live_launch_captures_chip_picks_without_poststart_commands(cx: &mut TestAppContext) {
+    use gitterm_core::chat::types::SettingChange;
+    let (chat, cx) = setup(vec![], cx);
+    let commands = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    chat.update_in(cx, |chat, window, cx| {
+        chat.set_backend(gitterm_core::chat::types::AgentBackend::Claude, cx);
+        chat.set_preview(cx);
+        chat.set_live_prelaunch(cx);
+        let output = commands.clone();
+        chat.set_intent_callback(
+            std::rc::Rc::new(move |intent, _| {
+                output.borrow_mut().push(intent);
+                Receipt::rejected("not launched")
+            }),
+            cx,
+        );
+        let captured = chat.launch_settings_handle();
+        for change in [
+            SettingChange::Model("opus".into()),
+            SettingChange::Effort(Some("max".into())),
+            SettingChange::Mode("plan".into()),
+        ] {
+            chat.choose_setting(change, window, cx);
+        }
+        assert!(commands.borrow().is_empty());
+        assert_eq!(
+            *captured.borrow(),
+            crate::composer::LaunchSettings {
+                model: "opus".into(),
+                effort: Some("max".into()),
+                permission_mode: "plan".into(),
+            }
+        );
+        chat.set_guidelines_status(false, cx);
+        assert_eq!(chat.composer_state.chips()[5].1, "guidelines off");
+        chat.set_guidelines_status(true, cx);
+        assert_eq!(chat.composer_state.chips()[5].1, "guidelines on");
+        assert!(
+            chat.preview,
+            "Live retains the unsupported-action card fences"
+        );
+    });
+}
+
+#[gpui::test]
+fn saved_live_settings_reach_first_send_before_a_redraw(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    let chosen = crate::composer::LaunchSettings {
+        model: "opus".into(),
+        permission_mode: "plan".into(),
+        effort: Some("max".into()),
+    };
+    let captured = Rc::new(std::cell::RefCell::new(None));
+    let received = captured.clone();
+    chat.update_in(cx, |view, window, cx| {
+        view.shadow = Some(Default::default());
+        let settings = view.launch_settings_handle();
+        view.set_intent_callback(
+            Rc::new(move |intent, _| {
+                assert!(matches!(intent, ChatIntent::Send { .. }));
+                *received.borrow_mut() = Some(settings.borrow().clone());
+                Receipt::rejected("synthetic first Send")
+            }),
+            cx,
+        );
+        view.set_live_launch_settings(&chosen, cx);
+        view.composer
+            .update(cx, |input, cx| input.set_value("continue", window, cx));
+        view.send(window, cx);
+    });
+    assert_eq!(captured.borrow().as_ref(), Some(&chosen));
+}
