@@ -351,6 +351,8 @@ fn verify_data(destination: &Path, root: &Path) -> io::Result<Manifest> {
     if manifest.root != root {
         return Err(invalid("backup root differs from selected root"));
     }
+    let data = destination.join("state");
+    real_dir(&data)?;
     for entry in &manifest.entries {
         if entry.path.is_absolute()
             || entry
@@ -360,10 +362,22 @@ fn verify_data(destination: &Path, root: &Path) -> io::Result<Manifest> {
         {
             return Err(invalid("invalid backup manifest path"));
         }
+        // O_NOFOLLOW guards only the last component, so every parent directory
+        // must be a real directory too; a symlinked parent could point back at
+        // the live root and pass the hash check with no independent copy.
+        if !matches!(entry.kind, Kind::File { .. } | Kind::Directory) {
+            continue;
+        }
+        let mut dir = data.clone();
+        for component in entry.path.parent().into_iter().flat_map(Path::components) {
+            dir.push(component);
+            real_dir(&dir)?;
+        }
+        if matches!(entry.kind, Kind::Directory) {
+            real_dir(&data.join(&entry.path))?;
+        }
         if let Kind::File { size, ref sha256 } = entry.kind {
-            let actual = hash(&mut read_regular(
-                &destination.join("state").join(&entry.path),
-            )?)?;
+            let actual = hash(&mut read_regular(&data.join(&entry.path))?)?;
             if actual != (size, sha256.clone()) {
                 return Err(invalid(format!(
                     "backup hash mismatch: {}",
@@ -373,6 +387,16 @@ fn verify_data(destination: &Path, root: &Path) -> io::Result<Manifest> {
         }
     }
     Ok(manifest)
+}
+fn real_dir(path: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(path)?.is_dir() {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "backup path is not a real directory: {}",
+            path.display()
+        )))
+    }
 }
 /// A recorded path is reusable only after its durable completion and bytes verify.
 pub fn verify(destination: &Path, root: &Path) -> io::Result<Manifest> {
@@ -443,6 +467,28 @@ mod tests {
         }
         assert_eq!(fs::read(root.join("workspaces.json")).unwrap(), bytes);
         fs::write(backup.join("state/workspaces.json"), b"corrupt").unwrap();
+        assert!(verify(&backup, &root).is_err());
+    }
+    #[test]
+    fn verify_rejects_symlinked_backup_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("v6");
+        let parent = temp.path().join("backups");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::write(root.join("workspaces.json"), b"{}").unwrap();
+        fs::create_dir(root.join("chat-meta")).unwrap();
+        fs::write(root.join("chat-meta/raw"), b"chat").unwrap();
+        let backup = create(&root, &parent, false).unwrap();
+        verify(&backup, &root).unwrap();
+        // A symlinked parent directory inside the copy.
+        fs::remove_dir_all(backup.join("state/chat-meta")).unwrap();
+        std::os::unix::fs::symlink(root.join("chat-meta"), backup.join("state/chat-meta")).unwrap();
+        assert!(verify(&backup, &root).is_err());
+        // The whole state tree replaced with a link to the live root.
+        fs::remove_dir_all(backup.join("state")).ok();
+        fs::remove_file(backup.join("state")).ok();
+        std::os::unix::fs::symlink(&root, backup.join("state")).unwrap();
         assert!(verify(&backup, &root).is_err());
     }
     #[test]
