@@ -932,8 +932,8 @@ impl RuntimeShutdown {
             .send(ShutdownCommand::Drain(reply))
             .map_err(|_| anyhow::anyhow!("preview chat shutdown queue stopped"))?;
         result
-            .recv()
-            .context("preview chat shutdown drain stopped")?
+            .recv_timeout(crate::lifetime::DRAIN_TIMEOUT)
+            .context("shutdown phase chat-runtime: timeout or drain stopped")?
             .map_err(anyhow::Error::msg)
     }
 }

@@ -60,6 +60,7 @@ pub struct Pane {
     files: Option<Entity<crate::files_view::FilesView>>,
     pub(crate) git: Option<Entity<git_view::GitView>>,
     _terminal_events: Option<Subscription>,
+    _quit: Subscription,
 }
 impl Pane {
     pub(crate) fn workspace_dir(&self, cx: &App) -> Option<std::path::PathBuf> {
@@ -191,6 +192,23 @@ impl Pane {
                 _ => session,
             },
             _terminal_events: terminal_events,
+            _quit: cx.on_app_quit(|pane: &mut Self, cx| {
+                if let Some(barrier) = cx.try_global::<crate::lifetime::Barrier>().cloned()
+                    && let PaneContent::Terminal(view) = &pane.content
+                {
+                    let backend = view.update(cx, |view, _| {
+                        std::mem::replace(
+                            view.backend_mut(),
+                            gitterm_terminal::Backend::new_deferred(Default::default()),
+                        )
+                    });
+                    barrier.register("terminal-pty", move || {
+                        drop(backend);
+                        Ok(())
+                    });
+                }
+                std::future::ready(())
+            }),
             id,
             title,
             content,

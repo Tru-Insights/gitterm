@@ -421,6 +421,25 @@ fn gpui_host_shutdown_resolves_pending_replies(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn shell_lifetime_holds_host_lock_beyond_quit_and_reaper(cx: &mut TestAppContext) {
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    let lifetime = crate::lifetime::Lifetime::acquire(&fixture.roots).unwrap();
+    let app = cx.new_app();
+    app.update(|cx| cx.set_global(lifetime.barrier.clone()));
+    let (config, _) = fixture.config();
+    let owner = app
+        .update(|cx| TaskHostOwner::start_locked(config, lifetime.lock.clone(), cx))
+        .unwrap();
+    let servers = owner.read_with(&app, |owner, _| owner.server_tasks());
+    app.quit();
+    assert!(HostLock::acquire(fixture.roots.root()).is_err());
+    lifetime.finish().unwrap();
+    assert!(servers.iter().all(tokio::task::AbortHandle::is_finished));
+    HostLock::acquire(fixture.roots.root()).unwrap();
+}
+
+#[gpui::test]
 fn preview_runs_beside_desktop_lifetime_lock(cx: &mut TestAppContext) {
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
