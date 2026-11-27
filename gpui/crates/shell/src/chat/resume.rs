@@ -235,10 +235,7 @@ impl ChatPane {
             config.backend() == AgentBackend::Claude,
             "Resume for this recorded backend is unavailable"
         );
-        let id = tab
-            .chat_session_id
-            .clone()
-            .context("Saved chat has no provider session identity")?;
+        let id = tab.chat_session_id.clone();
         let policy::ChatLaunchPolicy::Live { services } = policy::current(preview.clone(), cx)
         else {
             anyhow::bail!("Conversation resume not available in preview");
@@ -266,8 +263,8 @@ impl ChatPane {
             .controller
             .adapter
             .begin_runtime(pane.controller.target.clone());
-        pane.controller.adapter.bind_session(Some(id.clone()));
-        pane.saved.session_id = Some(id.clone());
+        pane.controller.adapter.bind_session(id.clone());
+        pane.saved.session_id = id.clone();
         let launch = pane
             .deferred_live
             .as_mut()
@@ -285,7 +282,9 @@ impl ChatPane {
             &services,
             &pane.saved.uid,
         )?);
-        claim.provider_id(&id)?;
+        if let Some(id) = &id {
+            claim.provider_id(id)?;
+        }
         pane.live_claim = Some(claim);
         let mut tab = tab;
         tab.session_uid = Some(pane.saved.uid.clone());
@@ -306,14 +305,24 @@ impl ChatPane {
         *launch.settings.borrow_mut() = settings.clone();
         pane.view.update(cx, |view, cx| {
             view.set_live_launch_settings(&settings, cx);
+        });
+        let history = id
+            .map(|id| {
+                pane.controller
+                    .adapter
+                    .begin_history(pane.controller.target.clone(), config)
+                    .context("Saved chat history cannot be restored")
+                    .map(|(ticket, _)| (id, ticket))
+            })
+            .transpose()?;
+        pane.controller.seed_launch(&settings);
+        // Iced restores an unsent tab as a fresh chat, retaining its caller and tab record.
+        let Some((id, ticket)) = history else {
+            return Ok(pane);
+        };
+        pane.view.update(cx, |view, cx| {
             view.set_read_only(Some("Restoring saved Claude session…".into()), cx);
         });
-        let (ticket, _) = pane
-            .controller
-            .adapter
-            .begin_history(pane.controller.target.clone(), config)
-            .context("Saved chat history cannot be restored")?;
-        pane.controller.seed_launch(&settings);
         pane.history_loading = true;
         let cwd = pane.saved.cwd.clone();
         let load = cx.background_executor().spawn(async move {

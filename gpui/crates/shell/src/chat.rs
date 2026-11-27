@@ -383,6 +383,10 @@ impl EventEmitter<SavedChat> for ChatPane {}
 impl EventEmitter<TurnEnded> for ChatPane {}
 impl EventEmitter<gitterm_gpui_chat::model::roster::RosterOutcome> for ChatPane {}
 impl ChatPane {
+    #[cfg(feature = "stt")]
+    pub(crate) fn dictation_view(&self) -> Entity<ChatView> {
+        self.view.clone()
+    }
     #[cfg(test)]
     pub(crate) fn test_view(&self) -> Entity<ChatView> {
         self.view.clone()

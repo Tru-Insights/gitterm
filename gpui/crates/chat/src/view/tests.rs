@@ -4492,6 +4492,41 @@ fn d17_checkout_head_shows_the_branch_moved_banner(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn dictation_replaces_selection_at_caret_and_never_sends(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+    let captured = calls.clone();
+    chat.update_in(cx, |view, window, cx| {
+        view.set_read_only(None, cx);
+        view.set_intent_callback(
+            std::rc::Rc::new(move |_, _| {
+                captured.set(captured.get() + 1);
+                Receipt::rejected("unexpected send")
+            }),
+            cx,
+        );
+        view.composer.update(cx, |input, cx| {
+            input.set_value("Hello 🌍!", window, cx);
+            input.set_selected_range(6..10, cx); // UTF-8 byte range, including emoji.
+        });
+        view.insert_dictation("voice", true, window, cx);
+        assert_eq!(view.composer.read(cx).value(), "Hello voice!");
+        assert_eq!(view.composer.read(cx).selected_range(), 11..11);
+        view.insert_dictation("\nnext", true, window, cx);
+        assert_eq!(view.composer.read(cx).value(), "Hello voice\nnext!");
+        assert_eq!(view.composer.read(cx).selected_range(), 16..16);
+        view.insert_dictation("", true, window, cx);
+        assert_eq!(view.composer.read(cx).value(), "Hello voice\nnext!");
+        assert_eq!(view.composer.read(cx).selected_range(), 16..16);
+    });
+    draw(cx); // Drain Change/edits subscriptions, including potential send callbacks.
+    assert_eq!(calls.get(), 0);
+    chat.read_with(cx, |view, _| {
+        assert!(view.records.is_empty());
+    });
+}
+
+#[gpui::test]
 fn live_launch_captures_chip_picks_without_poststart_commands(cx: &mut TestAppContext) {
     use gitterm_core::chat::types::SettingChange;
     let (chat, cx) = setup(vec![], cx);

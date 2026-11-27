@@ -11,6 +11,9 @@ resolver = "3"
 members = ["crates/chat", "crates/review", "crates/shell", "crates/terminal"]
 default-members = [".", "crates/chat", "crates/review", "crates/shell", "crates/terminal"]
 
+[features]
+stt = ["gitterm-core/stt", "gitterm-gpui-shell/stt"]
+
 [dependencies]
 gitterm-core = { path = "../crates/gitterm-core", features = ["runtime"] }
 

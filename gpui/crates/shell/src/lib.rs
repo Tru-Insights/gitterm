@@ -15,6 +15,7 @@ pub mod content;
 mod content_shell_tests;
 pub mod data;
 mod dialogs;
+mod dictation;
 pub mod files;
 mod files_view;
 pub mod find_sidebar;
@@ -135,6 +136,8 @@ struct WorkspaceDock {
     _adopted: Vec<Subscription>,
 }
 pub struct Shell {
+    #[cfg(feature = "stt")]
+    dictation: dictation::Dictation,
     data: Rc<dyn ShellData>,
     content: Entity<content::window::ContentWindow>,
     bottom: Entity<bottom_panel::BottomPanel>,
@@ -465,6 +468,8 @@ impl Shell {
             resize: None,
             task_switcher: None,
             task_panel: None,
+            #[cfg(feature = "stt")]
+            dictation: dictation::Dictation::new(settings.stt_enabled),
             agent_presets: settings.agent_presets.clone(),
             #[cfg(test)]
             blocked_actions: vec![],
@@ -2307,7 +2312,7 @@ impl Shell {
                 .map(|w| self.data.status(w.workspace.id, cx).branch)
                 .unwrap_or_default(),
             pulse_bright: false,
-            mic: None,
+            mic: self.dictation_indicator(cx),
             worktree_follow: None,
         }
     }
@@ -3446,6 +3451,9 @@ impl Shell {
     fn menu_context(&self, window: &mut Window, cx: &mut App) -> String {
         use gpui_component::WindowExt;
         let mut context = String::from("GitTermShell");
+        if self.dictation_enabled() {
+            context.push_str(" IcedStt");
+        }
         if self.usage_open {
             context.push_str(" IcedUsage");
             return context;
@@ -3596,6 +3604,9 @@ impl Shell {
             .capture_action(cx.listener(Self::modal_escape::<CloseSlash>))
             .capture_action(cx.listener(Self::modal_escape::<CloseFind>))
             .capture_action(cx.listener(Self::modal_escape::<CloseReview>))
+            .on_action(Self::background(cx, |this, _: &SttToggle, w, cx| {
+                this.toggle_dictation(w, cx)
+            }))
             .on_action(Self::background(cx, |_, _: &Minimize, w, _| {
                 w.minimize_window()
             }))
