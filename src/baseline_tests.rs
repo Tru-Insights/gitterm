@@ -64,6 +64,8 @@ fn headless(fixture: &Path) -> App {
     let config = Config::default();
     App {
         shutdown_phase: ShutdownPhase::Running,
+        shutdown_worker_store_pending: false,
+        shutdown_deferred: Vec::new(),
         status_jobs: StatusSubscriptionData::new(),
         title: "Synthetic baseline".into(),
         workspaces: Vec::new(),
@@ -1452,4 +1454,271 @@ fn handled_signal_uses_the_same_shutdown_barrier() {
     drop(app);
     gitterm::shutdown::operations().wait();
     assert!(gitterm::shutdown::operations().unfinished().is_empty());
+}
+
+#[test]
+fn shutdown_saves_workspaces_and_settings_before_a_hung_session_times_out() {
+    if isolated("shutdown_saves_workspaces_and_settings_before_a_hung_session_times_out") {
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(fixture.path());
+    // Even a clean flag must not gate the first barrier snapshot.
+    app.workspaces_dirty = false;
+    app.workspaces[0].name = "save before timeout".into();
+    app.chat_font_size = 19.0;
+    let operations = gitterm::shutdown::operations();
+    let hung = operations.ticket(gitterm::shutdown::Kind::Session, "hung Pi turn");
+    operations.begin(Duration::from_millis(150));
+    drop(app.begin_shutdown());
+    while !operations.expired() {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(app.poll_shutdown());
+    assert_eq!(app.shutdown_phase, ShutdownPhase::Finished);
+    let file: WorkspacesFile = serde_json::from_slice(
+        &std::fs::read(WorkspacesFile::file_path()).expect("save must run before session timeout"),
+    )
+    .unwrap();
+    assert_eq!(file.workspaces[0].name, "save before timeout");
+    assert_eq!(Config::load().config.chat_font_size, 19.0);
+    assert!(operations.unfinished().contains(&"hung Pi turn".to_owned()));
+    drop(hung);
+}
+
+#[test]
+fn shutdown_resaves_late_workspace_changes_while_a_session_is_still_pending() {
+    if isolated("shutdown_resaves_late_workspace_changes_while_a_session_is_still_pending") {
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(fixture.path());
+    let operations = gitterm::shutdown::operations();
+    let hung = operations.ticket(gitterm::shutdown::Kind::Session, "pending session");
+    drop(app.begin_shutdown());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Ok(bytes) = std::fs::read(WorkspacesFile::file_path()) {
+            if serde_json::from_slice::<WorkspacesFile>(&bytes).is_ok() {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "initial workspace save was gated by a session"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    app.workspaces[0].name = "late completion".into();
+    app.workspaces_dirty = true;
+    loop {
+        drop(app.poll_shutdown());
+        let bytes = std::fs::read(WorkspacesFile::file_path()).unwrap();
+        if serde_json::from_slice::<WorkspacesFile>(&bytes)
+            .unwrap()
+            .workspaces[0]
+            .name
+            == "late completion"
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "late save was gated by a session"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(operations
+        .unfinished()
+        .contains(&"pending session".to_owned()));
+    drop(hung);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn appkit_terminate_callback_cancels_and_enters_the_quit_barrier() {
+    if isolated("appkit_terminate_callback_cancels_and_enters_the_quit_barrier") {
+        return;
+    }
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyObject, ClassBuilder};
+    use objc2::{class, msg_send, msg_send_id};
+    // Exercise Objective-C dispatch with a plain NSObject delegate; no NSApp,
+    // event loop, window, or external process is launched.
+    let class = ClassBuilder::new("GitTermV6QuitTestDelegate", class!(NSObject))
+        .unwrap()
+        .register();
+    native_quit::install_on(class).unwrap();
+    native_quit::install_on(class).unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(fixture.path());
+    unsafe {
+        let delegate: Retained<AnyObject> = msg_send_id![class, new];
+        for _ in 0..2 {
+            let reply: usize = msg_send![&*delegate, applicationShouldTerminate: &*delegate];
+            assert_eq!(reply, 0, "AppKit must cancel its immediate termination");
+            assert!(gitterm::shutdown::signal_requested());
+            drop(app.update(Event::CheckMenu));
+            assert_eq!(app.shutdown_phase, ShutdownPhase::Saving);
+        }
+    }
+    assert!(
+        !app.prs.save_again,
+        "native repeated quit reentered the barrier"
+    );
+    assert!(gitterm::shutdown::operations().started());
+}
+
+#[test]
+fn shutdown_registers_delegation_logging_and_closes_it_without_waiting_for_a_child() {
+    if isolated("shutdown_registers_delegation_logging_and_closes_it_without_waiting_for_a_child") {
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(fixture.path());
+    let operations = gitterm::shutdown::operations();
+    let (task, run) = delegation_run_stream(
+        "logging-fixture".into(),
+        gitterm::codex_runner::CodexRun {
+            kind: gitterm::codex_runner::CodexRunKind::Consult {
+                brief: "unused".into(),
+            },
+            cwd: fixture.path().into(),
+            model: None,
+            guidelines: None,
+            // Reject before resolving or executing any external program.
+            effort: Some(gitterm::workers::ReasoningEffort::Max),
+            time_limit: None,
+            log_path: fixture.path().join("delegation.jsonl"),
+        },
+    );
+    drop(task);
+    app.delegation_runs.insert("logging-fixture".into(), run);
+    assert!(operations
+        .unfinished()
+        .contains(&"delegation logging-fixture in-process logging".into()));
+    drop(app.begin_shutdown());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while operations
+        .unfinished()
+        .iter()
+        .any(|name| name.starts_with("delegation logging-fixture"))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "barrier waited for the external delegation run"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        app.delegation_runs.contains_key("logging-fixture"),
+        "quit must not abort the external run"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shutdown_worker_identity_io_is_tracked_and_cannot_block_the_poll_deadline() {
+    if isolated("shutdown_worker_identity_io_is_tracked_and_cannot_block_the_poll_deadline") {
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(fixture.path());
+    let (mut store, _, _) = tests::final_worker_fixture(fixture.path());
+    store
+        .upsert_session(
+            "task-slot",
+            gitterm::tasks::TaskSessionRecord {
+                task_session_id: "worker".into(),
+                label: "synthetic".into(),
+                harness: None,
+                conversation: None,
+                objective_delivery: gitterm::tasks::ObjectiveDeliveryState::Delivered,
+                launch_identity: None,
+                created_at: "t1".into(),
+                updated_at: "t1".into(),
+            },
+            "t1",
+        )
+        .unwrap();
+    *app.task_host.store_mut() = Some(store);
+    let worker = gitterm::worker_process::WorkerProcess::new().unwrap();
+    let path = worker.pid_file();
+    let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+    let tab = &mut app.workspaces[0].tabs[0];
+    tab.task_id = Some("task-slot".into());
+    tab.task_session_id = Some("worker".into());
+    tab.worker_process = Some(worker);
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        std::fs::write(path, br#"{"pid":12345,"birth":"fixture"}"#).unwrap();
+    });
+    let operations = gitterm::shutdown::operations();
+    operations.begin(Duration::from_millis(100));
+    let start = Instant::now();
+    drop(app.begin_shutdown());
+    let elapsed = start.elapsed();
+    // Drive admitted work just as Iced or App::drop does.
+    let jobs = shutdown_jobs().lock().unwrap().clone();
+    for job in jobs {
+        job.start();
+    }
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "begin_shutdown blocked on worker I/O for {elapsed:?}"
+    );
+    // Independent completions still drain while the worker store is busy.
+    drop(app.update(Event::Pr(PrEvent::Saved(Ok(())))));
+    assert!(app.shutdown_deferred.is_empty());
+    assert!(!app.prs.save_in_flight);
+    // Store consumers must not run against an absent or stale snapshot.
+    drop(app.update(Event::DelegationProgress(
+        "pending-fixture".into(),
+        gitterm::codex_runner::CodexRunEvent::Activity {
+            description: "queued".into(),
+        },
+    )));
+    assert_eq!(app.shutdown_deferred.len(), 1);
+    while !operations.expired() {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(app.update(Event::ShutdownPoll));
+    assert_eq!(app.shutdown_phase, ShutdownPhase::Finished);
+    assert!(operations
+        .unfinished()
+        .iter()
+        .any(|name| name.contains("worker launch identity persistence")));
+    let mut logs = Vec::new();
+    operations.log_timeout(|line| logs.push(line.to_owned()));
+    assert!(logs
+        .iter()
+        .any(|line| line.contains("worker launch identity persistence")));
+    release.join().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while app.shutdown_worker_store_pending {
+        let jobs = shutdown_jobs().lock().unwrap().clone();
+        for job in jobs {
+            if job.done.is_cancelled() {
+                drop(app.update(Event::ShutdownTracked(job)));
+            }
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(app.shutdown_deferred.is_empty());
+    let store = app.task_host.store().as_ref().unwrap();
+    assert_eq!(
+        store.get("task-slot").unwrap().sessions[0]
+            .launch_identity
+            .as_ref()
+            .unwrap()
+            .pid,
+        12345
+    );
+    let disk = TaskStore::load(fixture.path().join("tasks.json")).unwrap();
+    assert_eq!(
+        disk.get("task-slot").unwrap().sessions[0].launch_identity,
+        store.get("task-slot").unwrap().sessions[0].launch_identity
+    );
 }

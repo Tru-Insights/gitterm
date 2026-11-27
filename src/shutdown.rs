@@ -9,6 +9,7 @@ pub const TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
+    Workspace,
     Write,
     Session,
 }
@@ -193,6 +194,10 @@ pub fn activate_desktop() {
 
 #[cfg(unix)]
 extern "C" fn quit_signal(_: libc::c_int) {
+    SIGNAL_QUIT.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn request_quit() {
     SIGNAL_QUIT.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
