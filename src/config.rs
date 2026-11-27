@@ -2212,12 +2212,8 @@ impl WorkspacesFile {
     }
 
     pub fn save(&self) {
-        let path = Self::file_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(path, json);
+        if let Err(error) = self.save_for_shutdown() {
+            eprintln!("{error}");
         }
     }
 }
@@ -2228,7 +2224,7 @@ fn save_shutdown_json(path: &Path, value: &impl serde::Serialize) -> Result<(), 
             std::fs::create_dir_all(parent)?;
         }
         let bytes = serde_json::to_vec_pretty(value)?;
-        std::fs::write(path, bytes)?;
+        gitterm::merge_plan::write_atomically(path, &bytes)?;
         Ok(())
     };
     save().map_err(|error| format!("save {}: {error}", path.display()))

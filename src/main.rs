@@ -1683,7 +1683,7 @@ mod native_quit {
         0
     }
 
-    pub(super) fn install_on(class: &AnyClass) -> Result<(), &'static str> {
+    pub(super) fn install_on(class: &AnyClass) -> bool {
         let selector = sel!(applicationShouldTerminate:);
         if let Some(method) = class.instance_method(selector) {
             if std::ptr::fn_addr_eq(method.implementation(), unsafe {
@@ -1692,9 +1692,10 @@ mod native_quit {
                     objc2::runtime::Imp,
                 >(should_terminate)
             }) {
-                return Ok(());
+                return true;
             }
-            return Err("applicationShouldTerminate: is already implemented");
+            eprintln!("[shutdown] native quit hook disabled: applicationShouldTerminate: is already implemented; native quit bypasses the barrier");
+            return false;
         }
         // winit 0.30 only implements applicationWillTerminate:. Add the
         // optional delegate method without replacing any winit behavior.
@@ -1709,19 +1710,21 @@ mod native_quit {
                 c"Q@:@".as_ptr(),
             )
         };
-        if added {
-            Ok(())
-        } else {
-            Err("could not add applicationShouldTerminate:")
+        if !added {
+            eprintln!("[shutdown] native quit hook disabled: could not add applicationShouldTerminate:; native quit bypasses the barrier");
         }
+        added
     }
 
     pub(super) fn install() {
         unsafe {
             let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
             let delegate: *mut AnyObject = msg_send![app, delegate];
-            let delegate = delegate.as_ref().expect("winit application delegate");
-            install_on(delegate.class()).expect("install native quit barrier");
+            if let Some(delegate) = delegate.as_ref() {
+                install_on(delegate.class());
+            } else {
+                eprintln!("[shutdown] native quit hook disabled: no application delegate; native quit bypasses the barrier");
+            }
         }
     }
 }
@@ -24919,6 +24922,7 @@ fi
                     && matches!(
                         event,
                         Event::DelegationProgress(..)
+                            | Event::ChatIndexLoaded(..)
                             | Event::DelegationFinished(..)
                             | Event::AgentRuntimeEvent(..)
                             | Event::AgentCommandOutcome(..)
@@ -54960,7 +54964,7 @@ mod tests {
         assert!(tab.file_viewer().is_none());
     }
 
-    fn chat_entry(backend: chats::ChatBackend, dead_cwd: bool) -> chats::ChatIndexEntry {
+    pub(super) fn chat_entry(backend: chats::ChatBackend, dead_cwd: bool) -> chats::ChatIndexEntry {
         chats::ChatIndexEntry {
             id: "3f2a".to_string(),
             backend,

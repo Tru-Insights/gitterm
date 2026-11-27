@@ -1548,8 +1548,8 @@ fn appkit_terminate_callback_cancels_and_enters_the_quit_barrier() {
     let class = ClassBuilder::new("GitTermV6QuitTestDelegate", class!(NSObject))
         .unwrap()
         .register();
-    native_quit::install_on(class).unwrap();
-    native_quit::install_on(class).unwrap();
+    assert!(native_quit::install_on(class));
+    assert!(native_quit::install_on(class));
     let fixture = tempfile::tempdir().unwrap();
     let mut app = app_with_tabs(fixture.path());
     unsafe {
@@ -1567,6 +1567,70 @@ fn appkit_terminate_callback_cancels_and_enters_the_quit_barrier() {
         "native repeated quit reentered the barrier"
     );
     assert!(gitterm::shutdown::operations().started());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn appkit_terminate_hook_collision_preserves_the_existing_delegate() {
+    if isolated("appkit_terminate_hook_collision_preserves_the_existing_delegate") {
+        return;
+    }
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyObject, ClassBuilder, Sel};
+    use objc2::{class, msg_send, msg_send_id, sel};
+    extern "C" fn existing(_: *mut AnyObject, _: Sel, _: *mut AnyObject) -> usize {
+        1 // NSTerminateNow: retain the delegate's original native quit behavior.
+    }
+    let mut builder =
+        ClassBuilder::new("GitTermV6QuitCollisionDelegate", class!(NSObject)).unwrap();
+    unsafe {
+        builder.add_method(
+            sel!(applicationShouldTerminate:),
+            existing as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject) -> usize,
+        );
+    }
+    let class = builder.register();
+    assert!(!native_quit::install_on(class));
+    unsafe {
+        let delegate: Retained<AnyObject> = msg_send_id![class, new];
+        let reply: usize = msg_send![&*delegate, applicationShouldTerminate: &*delegate];
+        assert_eq!(reply, 1);
+    }
+    assert!(!gitterm::shutdown::signal_requested());
+}
+
+#[test]
+fn workspace_saves_replace_the_file_without_truncating_existing_readers() {
+    if isolated("workspace_saves_replace_the_file_without_truncating_existing_readers") {
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let app = app_with_tabs(fixture.path());
+    let mut file = WorkspacesFile {
+        workspaces: app.workspace_configs(),
+        repos: Vec::new(),
+        active_workspace: 0,
+        remote_sessions: Vec::new(),
+        remote_agents: Vec::new(),
+        collapsed_repo_groups: Vec::new(),
+    };
+    file.save();
+    for shutdown in [true, false] {
+        let path = WorkspacesFile::file_path();
+        let before = std::fs::read(&path).unwrap();
+        let mut reader = std::fs::File::open(&path).unwrap();
+        file.workspaces[0].name = format!("replacement {shutdown}");
+        if shutdown {
+            file.save_for_shutdown().unwrap();
+        } else {
+            file.save();
+        }
+        let mut pinned = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut pinned).unwrap();
+        assert_eq!(pinned, before, "save truncated an existing reader's file");
+        let saved: WorkspacesFile = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved.workspaces[0].name, file.workspaces[0].name);
+    }
 }
 
 #[test]
@@ -1680,6 +1744,17 @@ fn shutdown_worker_identity_io_is_tracked_and_cannot_block_the_poll_deadline() {
         },
     )));
     assert_eq!(app.shutdown_deferred.len(), 1);
+    app.chat_index_loading = true;
+    let mut entry = tests::chat_entry(chats::ChatBackend::Codex, false);
+    entry.cwd = fixture.path().into();
+    entry.id = "late-history".into();
+    drop(app.update(Event::ChatIndexLoaded(vec![entry])));
+    assert_eq!(app.shutdown_deferred.len(), 2);
+    assert!(
+        app.chat_index_loading,
+        "index was applied without its task store"
+    );
+    assert!(app.chat_index.is_empty());
     while !operations.expired() {
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -1707,6 +1782,8 @@ fn shutdown_worker_identity_io_is_tracked_and_cannot_block_the_poll_deadline() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(app.shutdown_deferred.is_empty());
+    assert!(!app.chat_index_loading);
+    assert_eq!(app.chat_index[0].id, "late-history");
     let store = app.task_host.store().as_ref().unwrap();
     assert_eq!(
         store.get("task-slot").unwrap().sessions[0]
@@ -1717,6 +1794,17 @@ fn shutdown_worker_identity_io_is_tracked_and_cannot_block_the_poll_deadline() {
         12345
     );
     let disk = TaskStore::load(fixture.path().join("tasks.json")).unwrap();
+    assert!(disk
+        .get("task-slot")
+        .unwrap()
+        .sessions
+        .iter()
+        .any(|session| {
+            session
+                .conversation
+                .as_ref()
+                .is_some_and(|conversation| conversation.session_id == "late-history")
+        }));
     assert_eq!(
         disk.get("task-slot").unwrap().sessions[0].launch_identity,
         store.get("task-slot").unwrap().sessions[0].launch_identity
