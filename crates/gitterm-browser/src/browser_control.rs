@@ -3764,6 +3764,7 @@ fn is_chrome_executable(path: &Path) -> bool {
         path.file_name().and_then(|name| name.to_str()),
         Some(
             "Google Chrome"
+                | "Google Chrome for Testing"
                 | "Google Chrome Canary"
                 | "Google Chrome Beta"
                 | "Google Chrome Dev"
@@ -3835,6 +3836,14 @@ mod profile_owner_tests {
         std::os::unix::fs::symlink("broken", &lock).unwrap();
         verify_profile_owner(dir.path(), |_| panic!("broken singleton has no PID")).unwrap();
         assert!(std::fs::symlink_metadata(&lock).is_ok());
+    }
+
+    #[test]
+    fn chrome_for_testing_counts_as_a_profile_owner() {
+        // `resolve_chrome_executable` accepts it via GITTERM_V6_CHROME_PATH.
+        assert!(is_chrome_executable(Path::new(
+            "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+        )));
     }
 
     #[cfg(target_os = "macos")]

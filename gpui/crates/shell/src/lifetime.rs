@@ -93,13 +93,14 @@ impl Lifetime {
         let profile = roots.scoped(&roots.root().join("browser-profile"))?;
         gitterm_browser::browser_control::verify_profile_released(&profile)?;
         use std::io::Write as _;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true);
         if recovering {
-            options.truncate(true);
-        } else {
-            options.create_new(true);
+            // Unlink the old name instead of truncating it: a marker hard-linked
+            // to another file must never overwrite that file.
+            std::fs::remove_file(&marker)
+                .with_context(|| format!("replace GPUI recovery marker {}", marker.display()))?;
         }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
@@ -321,6 +322,19 @@ mod tests {
         done.send(()).unwrap();
         finish.join().unwrap().unwrap();
         StateLock::acquire(roots.root()).unwrap();
+        assert!(!roots.root().join(RECOVERY).exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn recovery_replaces_a_hard_linked_marker_without_writing_through_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = roots(dir.path());
+        std::fs::create_dir_all(roots.root()).unwrap();
+        let other = roots.root().join("settings-fixture.json");
+        std::fs::write(&other, b"keep me").unwrap();
+        std::fs::hard_link(&other, roots.root().join(RECOVERY)).unwrap();
+        Lifetime::acquire(&roots).unwrap().finish().unwrap();
+        assert_eq!(std::fs::read(&other).unwrap(), b"keep me");
         assert!(!roots.root().join(RECOVERY).exists());
     }
     #[test]
