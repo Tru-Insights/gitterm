@@ -555,6 +555,10 @@ fn build_command(
     }
 }
 
+#[cfg(all(test, unix))]
+#[path = "claude_launch_tests.rs"]
+mod claude_launch_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

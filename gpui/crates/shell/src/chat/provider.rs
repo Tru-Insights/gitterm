@@ -265,6 +265,7 @@ impl Provider {
             super::OwnedRuntime {
                 session,
                 _lease: Some(lease),
+                _conversation: None,
             },
             events,
         ))
@@ -379,6 +380,191 @@ impl Provider {
         }
     }
 }
+/// Live deliberately bypasses every Preview preparation, account probe and lease.
+/// The program and environment are composed by the same core policy as Iced.
+pub(super) fn start_live(
+    services: &gitterm_core::preview::service::ServiceContext,
+    config: gitterm_core::harness::claude::ClaudeSessionConfig,
+    preview_root: PathBuf,
+    conversation: &str,
+    instructions: LiveInstructions,
+) -> Result<(
+    super::OwnedRuntime,
+    tokio::sync::mpsc::UnboundedReceiver<gitterm_core::chat::runtime::RuntimeEvent>,
+)> {
+    ensure!(
+        !services.is_preview(),
+        "Live chat requires production services"
+    );
+    validate_live_cwd(&config.cwd)?;
+    let claim = ConversationClaim::claim(services, conversation)?;
+    let root = services.state_root().to_path_buf();
+    let (session, events) = gitterm_core::chat::runtime::Session::spawn_runtime(move |close| {
+        use gitterm_core::{guidelines, harness::local_launch};
+        if close.is_cancelled() {
+            return Err("Claude chat closed before launch".into());
+        }
+        validate_live_cwd(&config.cwd).map_err(|e| format!("{e:#}"))?;
+        let program = local_launch::resolve_claude_program()?;
+        let mut launch = local_launch::local_launch(config, program, Box::new(LiveSnapshots));
+        validate_live_environment(&launch.environment, &preview_root)
+            .map_err(|e| format!("{e:#}"))?;
+        let guidelines = guidelines::for_launch(
+            &root,
+            &launch.config.cwd,
+            instructions.workspace_off,
+            guidelines::InstructionFile::ClaudeMd,
+        );
+        let applied = guidelines.is_some();
+        // Status is sent back to the pane without persisting chat facts.
+        let _ = instructions.status.send(applied);
+        let instructions = guidelines::launch_instructions(
+            guidelines,
+            instructions.places.as_ref(),
+            true,
+            &root.join("launch-instructions"),
+        );
+        launch.config.guidelines_file = instructions.map(|instructions| instructions.path);
+        Ok(launch)
+    });
+    Ok((
+        super::OwnedRuntime {
+            session,
+            _lease: None,
+            _conversation: Some(claim),
+        },
+        events,
+    ))
+}
+
+pub(super) struct LiveInstructions {
+    pub workspace_off: bool,
+    pub places: Option<gitterm_core::guidelines::DocumentPlaces>,
+    pub status: std::sync::mpsc::Sender<bool>,
+}
+
+fn validate_live_cwd(cwd: &Path) -> Result<()> {
+    ensure!(
+        cwd.is_absolute() && cwd.is_dir(),
+        "Claude workspace must be an absolute existing folder: {}",
+        cwd.display()
+    );
+    Ok(())
+}
+
+fn validate_live_environment(
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+    preview_root: &Path,
+) -> Result<()> {
+    use std::ffi::OsStr;
+    let value = |key: &str| {
+        environment
+            .iter()
+            .find(|(name, _)| name == OsStr::new(key))
+            .map(|(_, value)| value)
+    };
+    let home = PathBuf::from(value("HOME").context("Live Claude requires HOME")?);
+    ensure!(
+        home.is_absolute() && home.is_dir(),
+        "Live Claude HOME must be an absolute existing directory"
+    );
+    let config = value("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".claude"));
+    ensure!(
+        config.is_absolute() && (!config.exists() || config.is_dir()),
+        "Live Claude CLAUDE_CONFIG_DIR must select an absolute directory"
+    );
+    let preview = resolve_provider_path(preview_root)?;
+    for path in [&home, &config] {
+        ensure!(
+            !resolve_provider_path(path)?.starts_with(&preview),
+            "Live Claude cannot use Preview provider state"
+        );
+    }
+    Ok(())
+}
+
+/// Preserve missing tails while resolving links and rejecting dangling links.
+fn resolve_provider_path(path: &Path) -> Result<PathBuf> {
+    ensure!(
+        path.is_absolute(),
+        "Live Claude provider path must be absolute"
+    );
+    let mut resolved = PathBuf::new();
+    for part in path.components() {
+        if part == std::path::Component::ParentDir {
+            resolved.pop();
+            continue;
+        }
+        resolved.push(part);
+        match std::fs::symlink_metadata(&resolved) {
+            Ok(_) => resolved = std::fs::canonicalize(&resolved)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(resolved)
+}
+
+/// Retained through runtime completion, so a closing child still owns its conversation.
+pub(super) struct ConversationClaim(String);
+fn conversations() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static OPEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    OPEN.get_or_init(Default::default)
+}
+impl ConversationClaim {
+    fn claim(
+        services: &gitterm_core::preview::service::ServiceContext,
+        conversation: &str,
+    ) -> Result<Self> {
+        ensure!(
+            !conversation.is_empty(),
+            "Live chat requires a conversation identity"
+        );
+        let key = format!("{}:{conversation}", services.state_root().display());
+        ensure!(
+            conversations()
+                .lock()
+                .expect("conversation registry")
+                .insert(key.clone()),
+            "Conversation is already open: {conversation}"
+        );
+        Ok(Self(key))
+    }
+}
+impl Drop for ConversationClaim {
+    fn drop(&mut self) {
+        conversations()
+            .lock()
+            .expect("conversation registry")
+            .remove(&self.0);
+    }
+}
+
+pub(super) struct LiveSnapshots;
+impl gitterm_core::harness::claude::SnapshotRecorder for LiveSnapshots {
+    fn observe(&mut self, _: &gitterm_core::chat::types::HarnessEvent) {}
+    fn invalidate_end(&mut self) {}
+    fn discard_turn(&mut self) {}
+    fn bind<'a>(&'a mut self, _: &'a str) -> gitterm_core::harness::claude::SnapshotFuture<'a> {
+        Box::pin(std::future::ready(()))
+    }
+    fn begin(&mut self) -> gitterm_core::harness::claude::SnapshotFuture<'_> {
+        Box::pin(std::future::ready(()))
+    }
+    fn capture_end(&mut self) -> gitterm_core::harness::claude::SnapshotFuture<'_> {
+        Box::pin(std::future::ready(()))
+    }
+    fn finish(&mut self) -> gitterm_core::harness::claude::SnapshotFuture<'_> {
+        Box::pin(std::future::ready(()))
+    }
+    fn close(&mut self) -> gitterm_core::harness::claude::SnapshotFuture<'_> {
+        Box::pin(std::future::ready(()))
+    }
+}
+
 pub(super) fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -712,6 +898,60 @@ mod gate_tests {
             calls
                 .lines()
                 .all(|line| line == "--help" || line == "auth status --json")
+        );
+    }
+}
+
+#[cfg(test)]
+mod live_validation_tests {
+    use super::*;
+    use std::ffi::OsString;
+    #[test]
+    fn validates_effective_home_and_config_without_overlaying_preview() {
+        let dir = tempfile::tempdir_in("/private/tmp").unwrap();
+        let home = dir.path().join("home");
+        let preview = dir.path().join("preview");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(preview.join("provider")).unwrap();
+        let env = |home: &Path, config: Option<&Path>| {
+            let mut env: Vec<(OsString, OsString)> = vec![("HOME".into(), home.into())];
+            env.extend(config.map(|config| ("CLAUDE_CONFIG_DIR".into(), config.into())));
+            env
+        };
+        assert!(validate_live_environment(&env(&home, None), &preview).is_ok());
+        let missing_preview = dir.path().join("not-prepared-preview");
+        assert!(
+            validate_live_environment(
+                &env(&home, Some(&missing_preview.join("provider"))),
+                &missing_preview
+            )
+            .is_err()
+        );
+        assert!(
+            validate_live_environment(&env(&home, Some(&dir.path().join("custom"))), &preview)
+                .is_ok()
+        );
+        assert!(validate_live_environment(&[], &preview).is_err());
+        assert!(validate_live_environment(&env(Path::new("relative"), None), &preview).is_err());
+        assert!(
+            validate_live_environment(&env(&dir.path().join("absent"), None), &preview).is_err()
+        );
+        assert!(
+            validate_live_environment(&env(&home, Some(Path::new("relative"))), &preview).is_err()
+        );
+        assert!(
+            validate_live_environment(&env(&home, Some(&preview.join("provider"))), &preview)
+                .is_err()
+        );
+        assert!(validate_live_environment(&env(&preview, None), &preview).is_err());
+        let file = dir.path().join("file");
+        std::fs::write(&file, "fixture").unwrap();
+        assert!(validate_live_environment(&env(&home, Some(&file)), &preview).is_err());
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&preview, &alias).unwrap();
+        assert!(
+            validate_live_environment(&env(&home, Some(&alias.join("new-config"))), &preview)
+                .is_err()
         );
     }
 }
