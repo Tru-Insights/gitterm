@@ -1362,7 +1362,10 @@ fn window_close_and_native_quit_enter_the_same_barrier_once() {
         assert_eq!(app.shutdown_phase, ShutdownPhase::Running);
         drop(app.update(first));
         assert_eq!(app.shutdown_phase, ShutdownPhase::Saving);
-        assert!(app.prs.save_in_flight);
+        assert!(
+            !app.prs.save_in_flight,
+            "quit must not start a periodic save"
+        );
         assert!(!app.prs.save_again);
         drop(app.update(Event::WindowCloseRequested));
         drop(app.update(Event::QuitRequested));
@@ -1421,6 +1424,8 @@ fn app_drop_drains_admitted_jobs_and_late_session_writers_before_final_save() {
     ));
     app.prs.save_in_flight = true;
     app.prs.save_again = true;
+    let watch_path = config::global_config_dir().join("pr-watch.json");
+    std::fs::write(&watch_path, b"previous watch state").unwrap();
     gitterm::shutdown::activate_desktop();
     drop(app);
     gitterm::shutdown::operations().wait();
@@ -1428,7 +1433,7 @@ fn app_drop_drains_admitted_jobs_and_late_session_writers_before_final_save() {
     assert!(gitterm::shutdown::operations().unfinished().is_empty());
     let file: WorkspacesFile = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(file.workspaces[0].name, "alpha");
-    assert!(config::global_config_dir().join("pr-watch.json").exists());
+    assert_eq!(std::fs::read(watch_path).unwrap(), b"previous watch state");
 }
 
 #[test]
