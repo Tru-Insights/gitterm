@@ -544,11 +544,20 @@ impl ChatView {
     /// Enable choosing the launch configuration before the first live turn.
     /// Card, resume and persistence fences remain those set by `set_preview`.
     pub fn set_live_prelaunch(&mut self, cx: &mut Context<Self>) {
+        self.set_live_launch_settings(&Default::default(), cx);
+    }
+    /// Install the saved choices before enabling Send, including before a redraw.
+    pub fn set_live_launch_settings(
+        &mut self,
+        settings: &crate::composer::LaunchSettings,
+        cx: &mut Context<Self>,
+    ) {
+        self.shadow = None;
         self.fixture_composer.acknowledged = gitterm_core::chat::state::AcknowledgedSettings {
-            model: Some("default".into()),
-            mode: Some("default".into()),
+            model: Some(settings.model.clone()),
+            mode: Some(settings.permission_mode.clone()),
             effort: Some(gitterm_core::chat::state::ConfirmedEffort {
-                effort: None,
+                effort: settings.effort.clone(),
                 applied: None,
             }),
         };

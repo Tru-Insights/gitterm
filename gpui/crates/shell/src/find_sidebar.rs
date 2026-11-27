@@ -2327,6 +2327,15 @@ impl crate::Shell {
     ) -> Option<ChatRef> {
         // Remote workspaces are intentionally absent from this local-only host.
         let cwd = self.data.terminal_cwd(workspace.workspace.id, cx)?;
+        if self.live_chat_enabled(cx)
+            && let Some(pane) = workspace.panes.get(&crate::session_pane_id(session.id))
+            && let crate::pane::PaneContent::PreviewChat(view) = &pane.read(cx).content
+        {
+            return view
+                .read(cx)
+                .chat_session_id()
+                .map(|id| ChatRef::local(&id));
+        }
         if let Some(saved) = self.owner.read(cx).iced_workspace(workspace.workspace.id)
             && let Some(index) = crate::data::iced_sessions(saved)
                 .iter()
@@ -2745,6 +2754,21 @@ impl crate::Shell {
                 .reduce(Intent::ClosePreview(target_owner));
             self.refresh_find(window, cx);
             cx.notify();
+        } else if self.live_chat_enabled(cx) && id.remote_id.is_none() {
+            let indexed = entry(&self.find_state.borrow(), id).cloned();
+            if let Some(workspace) = self.active_workspace(cx) {
+                match self.open_saved_live_chat(workspace, &id.id, indexed, window, cx) {
+                    Ok(()) => {
+                        self.find_state
+                            .borrow_mut()
+                            .reduce(Intent::ClosePreview(owner.into()));
+                    }
+                    Err(error) => self.owner.update(cx, |owner, cx| {
+                        owner.error = Some(format!("Resume chat: {error:#}"));
+                        cx.notify();
+                    }),
+                }
+            }
         } else {
             self.owner.update(cx, |owner, cx| {
                 owner.error = Some("Conversation resume not available in preview".into());

@@ -347,6 +347,7 @@ fn live_process_child() {
                 .unwrap();
             runtime.completed().await.unwrap();
         }
+        resume_round_trip(&services, &root).await;
         assert!(!root.join("preview").exists());
         assert!(!root.join("config/chat-facts").exists());
         assert!(!root.join("config/turn-snapshots").exists());
@@ -390,4 +391,142 @@ fn live_first_turn_is_admitted_while_initialization_is_pending() {
         .unwrap()
         .block_on(runtime.completed())
         .unwrap();
+}
+
+async fn resume_round_trip(services: &ServiceContext, root: &Path) {
+    use gitterm_core::{chat::types::HarnessCommand, workspace_config::WorkspacesFile};
+    let cwd = root.join("roundtrip");
+    std::fs::create_dir(&cwd).unwrap();
+    let config_file = services.state_root().join("workspaces.json");
+    std::fs::write(&config_file, serde_json::to_vec(&serde_json::json!({
+        "active_workspace":0,"workspaces":[{"name":"Roundtrip","abbrev":"R","color":"blue","dir":cwd,"tabs":[]}]
+    })).unwrap()).unwrap();
+    // Iced creates a session through core's normal launcher and the fake child.
+    let iced_config = config(&cwd);
+    let (mut iced, mut events) = Session::spawn_runtime(move |_| {
+        Ok(gitterm_core::harness::local_launch::local_launch(
+            iced_config,
+            gitterm_core::harness::local_launch::resolve_claude_program()?,
+            Box::new(provider::LiveSnapshots),
+        ))
+    });
+    iced.send(HarnessCommand::SendUserMessage("first turn".into()))
+        .unwrap();
+    let mut confirmed = None;
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event {
+            RuntimeEvent::Harness(HarnessEvent::TurnStarted {
+                session_id: Some(id),
+                ..
+            }) => confirmed = Some(id),
+            RuntimeEvent::Harness(HarnessEvent::TextDelta(_)) => break,
+            RuntimeEvent::Harness(HarnessEvent::Error(error)) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    let id = confirmed.unwrap();
+    iced.send(HarnessCommand::Shutdown).unwrap();
+    iced.completed().await.unwrap();
+    let file: WorkspacesFile =
+        serde_json::from_slice(&std::fs::read(&config_file).unwrap()).unwrap();
+    let mut tab = resume::tab(&cwd, "roundtrip-caller".into(), Some(id.clone()));
+    tab.agent_config = Some(gitterm_core::chat::types::AgentBackendConfig::Claude {
+        model: "sonnet".into(),
+        permission_mode: Some("acceptEdits".into()),
+        effort: Some("high".into()),
+    });
+    resume::LiveTab::new(services.clone(), &file.workspaces[0], tab)
+        .persist()
+        .unwrap();
+    for restart in 0..2 {
+        // The same shared DTO is what GPUI restart and Iced's next launch read.
+        let saved: WorkspacesFile =
+            serde_json::from_slice(&std::fs::read(&config_file).unwrap()).unwrap();
+        let tab = &saved.workspaces[0].tabs[0];
+        assert_eq!(tab.chat_session_id.as_deref(), Some(id.as_str()));
+        let history = gitterm_core::chat::history::load_claude_session(
+            &root.join("provider/projects"),
+            &id,
+            &cwd,
+        )
+        .unwrap();
+        assert_eq!(history.iter().filter(|event| matches!(event, gitterm_core::chat::history::HistoryEvent::Other(value) if value["type"] == "user_prompt")).count(), restart + 1);
+        let claim =
+            Arc::new(provider::ConversationClaim::claim(services, "roundtrip-caller").unwrap());
+        claim.provider_id(&id).unwrap();
+        let competing =
+            provider::ConversationClaim::claim(services, "other-roundtrip-caller").unwrap();
+        assert!(competing.provider_id(&id).is_err());
+        drop(competing);
+        let mut launch = config(Path::new(&tab.dir));
+        launch.resume = tab.chat_session_id.clone();
+        let (status, _) = std::sync::mpsc::channel();
+        let (mut runtime, mut events) = provider::start_live_claimed(
+            services,
+            launch,
+            root.join("preview"),
+            claim.clone(),
+            provider::LiveInstructions {
+                workspace_off: true,
+                places: None,
+                status,
+            },
+        )
+        .unwrap();
+        drop(claim);
+        runtime
+            .send(HarnessCommand::SendUserMessage("first turn".into()))
+            .unwrap();
+        let mut ready = false;
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match event {
+                RuntimeEvent::Harness(HarnessEvent::Ready { session_id, .. }) => {
+                    assert_eq!(session_id.as_deref(), Some(id.as_str()));
+                    ready = true;
+                }
+                RuntimeEvent::Harness(HarnessEvent::TurnStarted { session_id, .. }) => {
+                    assert_eq!(session_id.as_deref(), Some(id.as_str()))
+                }
+                RuntimeEvent::Harness(HarnessEvent::TextDelta(_)) => {
+                    assert!(ready);
+                    break;
+                }
+                RuntimeEvent::Harness(HarnessEvent::Error(error)) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        let actual: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(cwd.join("launch.json")).unwrap()).unwrap();
+        let argv: Vec<String> = serde_json::from_value(actual["argv"].clone()).unwrap();
+        assert!(argv.contains(&format!("--resume={id}")));
+        assert!(argv.windows(2).any(|pair| pair == ["--model", "sonnet"]));
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--permission-mode", "acceptEdits"])
+        );
+        assert!(argv.windows(2).any(|pair| pair == ["--effort", "high"]));
+        assert_eq!(
+            actual["env"]["CLAUDE_CONFIG_DIR"],
+            root.join("provider").to_str().unwrap()
+        );
+        resume::LiveTab::new(services.clone(), &saved.workspaces[0], tab.clone())
+            .persist()
+            .unwrap();
+        runtime.send(HarnessCommand::Shutdown).unwrap();
+        runtime.completed().await.unwrap();
+        // Runtime still owns the provider id until its completion handle drops.
+        let contender =
+            provider::ConversationClaim::claim(services, "post-completion-caller").unwrap();
+        assert!(contender.provider_id(&id).is_err());
+        drop(runtime);
+        contender.provider_id(&id).unwrap();
+    }
 }
