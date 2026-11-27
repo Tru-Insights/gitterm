@@ -395,9 +395,15 @@ impl GitResolver {
         }
         let mut matches = Vec::new();
         for dir in self.listed_repos.clone() {
+            if crate::shutdown::periodic_cancelled() {
+                break;
+            }
             let Some(resolved) = self.resolve(&dir) else {
                 continue;
             };
+            if crate::shutdown::periodic_cancelled() {
+                break;
+            }
             let output = crate::agentd::git::git_command()
                 .args(["config", "--get-regexp", r"^remote\..*\.url$"])
                 .current_dir(&dir)
@@ -440,6 +446,9 @@ impl GitResolver {
     }
 
     pub fn resolve(&mut self, raw: &Path) -> Option<Resolved> {
+        if crate::shutdown::periodic_cancelled() {
+            return None;
+        }
         let path = worktree_follow::resolve_for_match(raw);
         let checkout = self.nearest_checkout_of(&path)?;
         let worktrees = self
@@ -479,6 +488,11 @@ impl GitResolver {
 
 /// Writes `facts` to `path` atomically, creating the directory.
 pub fn write_facts(path: &Path, facts: &ChatFacts) -> Result<(), String> {
+    let _write = crate::shutdown::periodic_write("chat facts atomic save")?;
+    write_facts_inner(path, facts)
+}
+
+fn write_facts_inner(path: &Path, facts: &ChatFacts) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
@@ -828,6 +842,9 @@ pub fn catch_up_workspace_prs(
 ) -> usize {
     let mut total = 0;
     for entry in entries {
+        if crate::shutdown::periodic_cancelled() {
+            break;
+        }
         if entry.backend != ChatBackend::Claude
             || !owned.contains(&entry.id)
             || hosted.contains(&entry.id)
@@ -852,6 +869,9 @@ pub fn catch_up_workspace_prs(
                 continue;
             }
         };
+        if crate::shutdown::periodic_cancelled() {
+            break;
+        }
         let scan = match scan_claude_transcript(&entry.path, home) {
             Ok(scan) => scan,
             Err(error) => {
@@ -881,7 +901,10 @@ pub fn catch_up_workspace_prs(
             let written = std::fs::metadata(&path)
                 .and_then(|meta| meta.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
-            if let Err(error) = write_facts(&path, &facts) {
+            let Ok(_write) = crate::shutdown::periodic_write("workspace PR facts save") else {
+                break;
+            };
+            if let Err(error) = write_facts_inner(&path, &facts) {
                 eprintln!("[chat-facts] PR catch-up {error}");
                 continue;
             }
@@ -968,7 +991,8 @@ pub(crate) fn record_worker_prs(
                 .map_err(|error| {
                     format!("cannot read {} modification time: {error}", path.display())
                 })?;
-            write_facts(&path, &facts)?;
+            let _write = crate::shutdown::periodic_write("worker PR facts save")?;
+            write_facts_inner(&path, &facts)?;
             std::fs::File::options()
                 .write(true)
                 .open(&path)
@@ -2186,6 +2210,9 @@ pub fn backfill_claude(
     let mut report = BackfillReport::default();
     let mut resolver = GitResolver::with_repos(paths.repos);
     for target in targets {
+        if crate::shutdown::periodic_cancelled() {
+            break;
+        }
         if hosted.contains(&target.id) {
             report.hosted += 1;
             continue;
@@ -2225,6 +2252,9 @@ pub fn backfill_claude(
         if report.scanned >= max {
             report.remaining += 1;
             continue;
+        }
+        if crate::shutdown::periodic_cancelled() {
+            break;
         }
         let raw = match scan_claude_transcript(&target.path, paths.home) {
             Ok(scan) => scan,
