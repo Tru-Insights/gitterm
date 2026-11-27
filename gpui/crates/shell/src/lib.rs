@@ -38,9 +38,13 @@ mod h8_tests;
 mod h9_tests;
 #[cfg(test)]
 mod hookup_tests;
+#[path = "../../../src/launch.rs"]
+pub mod launch;
 mod layout;
 mod lifetime;
+mod live;
 mod startup_failure;
+pub use live::launch_mode;
 pub use startup_failure::show_startup_failure;
 #[cfg(test)]
 mod modal_input_tests;
@@ -4756,10 +4760,39 @@ fn install_app_menus(cx: &mut App) {
     });
 }
 
-pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
-    let settings = workspace_config::load_iced_settings();
-    let roots = preview::roots_from_environment(sample)?;
-    let lifetime = lifetime::Lifetime::acquire(&roots)?;
+pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
+    let (settings, roots, lifetime, live_snapshot, live_services) = match mode {
+        launch::LaunchMode::Preview => {
+            let settings = workspace_config::load_iced_settings();
+            let roots = preview::roots_from_environment(sample)?;
+            let lifetime = lifetime::Lifetime::acquire(&roots)?;
+            (settings, roots, lifetime, None, None)
+        }
+        launch::LaunchMode::Live => {
+            ensure!(
+                !sample && folders.is_empty(),
+                "Live uses the V6 workspace catalog; --sample and --workspace are Preview inputs"
+            );
+            let (lifetime, desktop, snapshot, services) = live::prepare()?.publish()?;
+            let settings = match &snapshot.settings.loaded {
+                gitterm_core::desktop_store::LoadState::Valid(settings) => {
+                    serde_json::from_value(serde_json::to_value(settings)?)?
+                }
+                gitterm_core::desktop_store::LoadState::Missing => {
+                    workspace_config::IcedSettings::default()
+                }
+                gitterm_core::desktop_store::LoadState::Refused(error) => {
+                    anyhow::bail!("Live settings refused: {error}")
+                }
+            };
+            lifetime.barrier.register("desktop-store", move || {
+                desktop.drain().wait().map_err(anyhow::Error::msg)
+            });
+            // UI layout remains GPUI-only; the durable V6 owner is DesktopStore.
+            let roots = preview::roots_from_environment(false)?;
+            (settings, roots, lifetime, Some(snapshot), Some(services))
+        }
+    };
     let preview = preview::PreviewContext::from_roots(roots)?;
     let writer = preview.writer();
     lifetime
@@ -4771,7 +4804,20 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
     let app_shutdown = shutdown.clone();
     let config = preview.roots.layout();
     let mut store = workspace_config::WorkspaceStore::guarded(preview.writer());
-    let (model, startup_save) = if sample {
+    let (model, startup_save) = if let Some(snapshot) = live_snapshot {
+        let file = match snapshot.workspaces.loaded {
+            gitterm_core::desktop_store::LoadState::Valid(file) => file,
+            gitterm_core::desktop_store::LoadState::Missing => Default::default(),
+            gitterm_core::desktop_store::LoadState::Refused(error) => {
+                anyhow::bail!("Live workspaces refused: {error}")
+            }
+        };
+        store.load()?;
+        let catalog = workspace_config::IcedCatalog::from_document(host_lock.root(), file);
+        let model = WorkspaceStatus::from_iced(&catalog);
+        store.iced = Some(catalog);
+        (model, None)
+    } else if sample {
         (WorkspaceStatus::default(), None)
     } else {
         ensure!(
@@ -4810,7 +4856,15 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
         // Before the window's workspace owner, so the host's quit callback
         // runs ahead of its chat drains.
         if let Some(config) = task_host {
-            match task_host::TaskHostOwner::start_locked(config, host_lock, cx) {
+            // Live chat must use the host's own production context (its MCP
+            // namespace included), so keep a copy of the one the host gets.
+            let chat_services = live_services.as_deref().cloned();
+            let started = if let Some(services) = live_services {
+                task_host::TaskHostOwner::start_live(config, host_lock, services, cx)
+            } else {
+                task_host::TaskHostOwner::start_locked(config, host_lock, cx)
+            };
+            match started {
                 Ok(owner) => cx.set_global(task_host::GpuiTaskHost(owner)),
                 Err(error) => {
                     lifetime::shutdown(cx);
@@ -4818,10 +4872,20 @@ pub fn run(folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
                     return;
                 }
             }
+            if let Some(services) = chat_services
+                && let Err(error) = chat::policy::install_live(services, cx)
+            {
+                lifetime::shutdown(cx);
+                startup_failure::show(cx, &format!("start Live chat: {error:#}"));
+                return;
+            }
         }
         gpui_kit::init(cx);
         theme::apply_settings(&settings, None, cx);
         install_app_menus(cx);
+        if mode == launch::LaunchMode::Preview {
+            live::install_activation(cx);
+        }
         let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(

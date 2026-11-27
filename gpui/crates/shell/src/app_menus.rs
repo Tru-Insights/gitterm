@@ -24,6 +24,7 @@ actions!(
     gitterm_iced,
     [
         About,
+        UseV6State,
         Hide,
         HideOthers,
         ShowAll,
@@ -136,6 +137,7 @@ pub fn menus() -> Vec<Menu> {
     vec![
         Menu::new("GitTerm V6").items([
             MenuItem::action("About GitTerm V6", About),
+            MenuItem::action("Use V6 state…", UseV6State),
             MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
@@ -599,6 +601,7 @@ shortcuts![
 /// which a modal consumes except for its own keys.
 pub const NATIVE_MENU_ACTIONS: &[&str] = &[
     "About",
+    "UseV6State",
     "Hide",
     "HideOthers",
     "ShowAll",
@@ -812,8 +815,18 @@ mod tests {
             include_str!("../../../../src/config.rs")
                 .contains("pub const APP_NAME: &str = \"GitTerm V6\";")
         );
+        assert!(
+            matches!(&menus[0].items[1], MenuItem::Action { name, action, .. }
+            if name.as_ref() == "Use V6 state…" && action.as_any().is::<UseV6State>())
+        );
         for (menu, variable) in menus.iter().zip(variables) {
-            assert_eq!(actual_menu(menu), source_menu(&source, &variable));
+            // The GPUI activation entry is additional; retain exact parity for
+            // every inherited Iced item and its order/separator/enabled state.
+            let inherited: Vec<_> = actual_menu(menu)
+                .into_iter()
+                .filter(|name| name != "UseV6state…")
+                .collect();
+            assert_eq!(inherited, source_menu(&source, &variable));
         }
     }
 

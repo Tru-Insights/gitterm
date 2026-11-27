@@ -200,9 +200,15 @@ impl IcedCatalog {
         let path = config.join("workspaces.json");
         let bytes = std::fs::read(&path)
             .with_context(|| format!("read Iced workspaces {}", path.display()))?;
-        let mut file: gitterm_core::workspace_config::WorkspacesFile =
+        let file: gitterm_core::workspace_config::WorkspacesFile =
             serde_json::from_slice(&bytes)
                 .with_context(|| format!("parse Iced workspaces {}", path.display()))?;
+        Ok(Self::from_document(config, file))
+    }
+    pub(crate) fn from_document(
+        config: &Path,
+        mut file: gitterm_core::workspace_config::WorkspacesFile,
+    ) -> Self {
         // Normalize legacy repo records in memory, just as Iced does on restore.
         file.normalize_repos();
         let mut open: Vec<_> = file
@@ -228,13 +234,13 @@ impl IcedCatalog {
             _ => 0,
         });
         let active = open.iter().position(|(i, _)| *i == selected).unwrap_or(0);
-        Ok(Self {
+        Self {
             source: config.to_owned(),
             repos: file.repos,
             workspaces: open.into_iter().map(|(_, w)| w).collect(),
             active,
             repos_on_bar: !file.collapsed_repo_groups.iter().any(|g| g == "local"),
-        })
+        }
     }
     pub fn bar_layout(
         &self,
@@ -286,7 +292,6 @@ pub(crate) fn iced_config_dir() -> PathBuf {
 
 /// Later Live startup shares its lifetime lease with the full-document owner.
 /// Preview never calls this constructor and retains read-only Iced readers.
-#[allow(dead_code)] // Live wiring is the next slice.
 pub(crate) fn live_desktop_store(
     lock: std::sync::Arc<gitterm_core::state_lock::StateLock>,
 ) -> Result<gitterm_core::desktop_store::DesktopStore> {

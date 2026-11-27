@@ -157,6 +157,24 @@ fn iced_model_label(
     display_name.unwrap_or(base).into()
 }
 
+/// Values shown by the chips before the process exists. The shell captures
+/// these once for launch; subsequent choices go through acknowledged commands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchSettings {
+    pub model: String,
+    pub permission_mode: String,
+    pub effort: Option<String>,
+}
+impl Default for LaunchSettings {
+    fn default() -> Self {
+        Self {
+            model: "default".into(),
+            permission_mode: "default".into(),
+            effort: None,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ComposerState {
     pub queue: Vec<QueuedRow>,
@@ -185,6 +203,7 @@ pub struct ComposerState {
     pub(crate) prestart_sent: bool,
     pub(crate) confirmed: gitterm_core::chat::state::AcknowledgedSettings,
     pub model_tooltip: String,
+    pub guidelines_status: Option<bool>,
     pub effort_tooltip: String,
     /// Why the checkout can no longer change; `None` until the chat has started.
     pub checkout_locked: Option<String>,
@@ -201,6 +220,35 @@ pub struct ComposerState {
 pub const GUIDELINES_TOOLTIP: &str = "GitTerm adds its change guidelines to this agent's system prompt (workspace settings switch them off)";
 
 impl ComposerState {
+    pub fn launch_settings(&self) -> LaunchSettings {
+        use gitterm_core::chat::types::SettingChange;
+        let mut settings = LaunchSettings {
+            model: self
+                .confirmed
+                .model
+                .clone()
+                .unwrap_or_else(|| "default".into()),
+            permission_mode: self
+                .confirmed
+                .mode
+                .clone()
+                .unwrap_or_else(|| "default".into()),
+            effort: self
+                .confirmed
+                .effort
+                .as_ref()
+                .and_then(|effort| effort.effort.clone()),
+        };
+        for change in &self.prestart {
+            match change {
+                SettingChange::Model(value) => settings.model = value.clone(),
+                SettingChange::Mode(value) => settings.permission_mode = value.clone(),
+                SettingChange::Effort(value) => settings.effort = value.clone(),
+            }
+        }
+        settings
+    }
+
     /// Iced's `harnessName()`.
     fn harness_name(&self) -> &'static str {
         match self.backend {
@@ -633,7 +681,15 @@ impl ComposerState {
                     .clone()
                     .unwrap_or_else(|| self.checkout.clone()),
             ),
-            ("guidelines", "guidelines".into()),
+            (
+                "guidelines",
+                match self.guidelines_status {
+                    Some(true) => "guidelines on",
+                    Some(false) => "guidelines off",
+                    None => "guidelines",
+                }
+                .into(),
+            ),
         ]
     }
 

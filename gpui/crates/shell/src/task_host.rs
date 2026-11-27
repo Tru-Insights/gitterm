@@ -1,4 +1,8 @@
-//! GPUI owns the shared task host (H5b B4) on the preview root only.
+//! GPUI owns the shared task host on Preview copies or an admitted Live root.
+//!
+//! Live takes its already-locked TaskStore directly, shares one restricted
+//! production service context, and never seeds, reseeds, restores or delivers.
+//! Later-slice writes and process runners retain the Preview notices.
 //!
 //! One [`TaskHostOwner`] per preview root: a lifetime host lock is taken
 //! before anything is seeded or bound, the task store is a seeded copy of
@@ -164,6 +168,11 @@ impl HostConfig {
 
 pub(crate) use gitterm_core::state_lock::StateLock as HostLock;
 
+fn direct_store(lock: &HostLock) -> Result<TaskStore> {
+    TaskStore::load(TaskStore::path_for_config_root(lock.root()))
+        .context("load Live task store directly")
+}
+
 /// Iced's file identity for re-seeding: its mtime, `None` while missing.
 type Stamp = Option<SystemTime>;
 fn source_stamp(source: &Path) -> std::io::Result<Stamp> {
@@ -310,7 +319,7 @@ pub(crate) struct TaskHostOwner {
     #[cfg(test)]
     pub(crate) submit_hook: Option<SubmitHook>,
     _pump: Task<()>,
-    _reseed: Task<()>,
+    _reseed: Option<Task<()>>,
     /// Fixture mode's delivery and queue-promotion tick; none in plain
     /// preview.
     _deliver: Option<Task<()>>,
@@ -321,7 +330,7 @@ impl TaskHostOwner {
     /// Lock, seed, bind, then create the entity. Startup errors fail closed.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn start(config: HostConfig, cx: &mut App) -> Result<Entity<Self>> {
-        Self::start_with(config, Vec::new(), None, cx)
+        Self::start_with(config, Vec::new(), None, None, cx)
     }
 
     pub(crate) fn start_locked(
@@ -329,7 +338,16 @@ impl TaskHostOwner {
         lock: Arc<HostLock>,
         cx: &mut App,
     ) -> Result<Entity<Self>> {
-        Self::start_with(config, Vec::new(), Some(lock), cx)
+        Self::start_with(config, Vec::new(), Some(lock), None, cx)
+    }
+
+    pub(crate) fn start_live(
+        config: HostConfig,
+        lock: Arc<HostLock>,
+        services: Arc<ServiceContext>,
+        cx: &mut App,
+    ) -> Result<Entity<Self>> {
+        Self::start_with(config, Vec::new(), Some(lock), Some(services), cx)
     }
 
     /// [`Self::start`] with a fixture-launch context over `fixtures` (each a
@@ -342,13 +360,14 @@ impl TaskHostOwner {
         cx: &mut App,
     ) -> Result<Entity<Self>> {
         anyhow::ensure!(!fixtures.is_empty(), "fixture mode needs a fixture root");
-        Self::start_with(config, fixtures, None, cx)
+        Self::start_with(config, fixtures, None, None, cx)
     }
 
     fn start_with(
         config: HostConfig,
         fixtures: Vec<PathBuf>,
         lock: Option<Arc<HostLock>>,
+        live_services: Option<Arc<ServiceContext>>,
         cx: &mut App,
     ) -> Result<Entity<Self>> {
         let HostConfig {
@@ -356,26 +375,46 @@ impl TaskHostOwner {
             iced_config,
             ingress,
         } = config;
-        let iced_tasks = TaskStore::path_for_config_root(&iced_config);
-        roots.create_private_dir(roots.root())?;
-        roots.scoped(&roots.root().join(gitterm_core::state_lock::LOCK_FILE))?;
-        let lock = match lock {
-            Some(lock) => {
-                anyhow::ensure!(
-                    lock.root() == roots.root(),
-                    "host lock root differs from preview root"
-                );
-                lock
-            }
-            None => Arc::new(HostLock::acquire(roots.root())?),
-        };
-        let (store, stamp) = seed_copy(&roots, &iced_tasks)?;
-        let services = if fixtures.is_empty() {
-            ServiceContext::preview(roots.clone())
+        let live = live_services.is_some();
+        let iced_tasks = if live {
+            live_services
+                .as_ref()
+                .unwrap()
+                .state_root()
+                .join("tasks.json")
         } else {
-            ServiceContext::fixture_launch(roots.clone(), fixtures.iter().cloned())
-        }
-        .context("preview task services")?;
+            TaskStore::path_for_config_root(&iced_config)
+        };
+        let (lock, store, stamp, services) = if let Some(services) = live_services {
+            let lock = lock.context("Live task host requires the admitted V6 lease")?;
+            anyhow::ensure!(
+                lock.root() == services.state_root(),
+                "Live task host root differs from locked root"
+            );
+            let store = direct_store(&lock)?;
+            (lock, store, None, services)
+        } else {
+            roots.create_private_dir(roots.root())?;
+            roots.scoped(&roots.root().join(gitterm_core::state_lock::LOCK_FILE))?;
+            let lock = match lock {
+                Some(lock) => {
+                    anyhow::ensure!(
+                        lock.root() == roots.root(),
+                        "host lock root differs from preview root"
+                    );
+                    lock
+                }
+                None => Arc::new(HostLock::acquire(roots.root())?),
+            };
+            let (store, stamp) = seed_copy(&roots, &iced_tasks)?;
+            let services = if fixtures.is_empty() {
+                ServiceContext::preview(roots.clone())
+            } else {
+                ServiceContext::fixture_launch(roots.clone(), fixtures.iter().cloned())
+            }
+            .context("preview task services")?;
+            (lock, store, stamp, Arc::new(services))
+        };
         // fixture_launch accepted each root as it resolves.
         let fixtures = fixtures
             .iter()
@@ -388,30 +427,75 @@ impl TaskHostOwner {
             .build()
             .context("create GPUI task host runtime")?;
         let (sender, commands) = ingress.open();
-        let (task_mcp, task_server) = gitterm_core::task_mcp::prepare_on(
-            ListenerBind::LoopbackEphemeral,
-            services.task_mcp().token().to_string(),
-            sender.clone(),
-            // The preview context denies RunnerEffect::HtmlPreview: no Chrome.
-            gitterm_browser::browser_control::html_preview_runner_in(&services),
-            SERVER_VERSION,
-        )
-        .context("bind preview task MCP")?;
-        // The browser server gates every call on its own preview context
-        // over the same roots, so its state root and profile are the host's.
-        let browser_services =
-            Arc::new(ServiceContext::preview(roots.clone()).context("preview browser services")?);
-        let (browser, browser_server) = {
-            let _entered = runtime.enter();
-            gitterm_browser::browser_mcp::prepare_scoped(
-                browser_services,
-                ListenerBind::LoopbackEphemeral,
+        let html = gitterm_browser::browser_control::html_preview_runner_in(&services);
+        let (task_mcp, task_server) = if live {
+            gitterm_core::task_mcp::prepare(
+                services.task_mcp().instance_id(),
+                sender.clone(),
+                html,
                 SERVER_VERSION,
             )
-            .context("bind preview browser MCP")?
+        } else {
+            gitterm_core::task_mcp::prepare_on(
+                ListenerBind::LoopbackEphemeral,
+                services.task_mcp().token().to_string(),
+                sender.clone(),
+                html,
+                SERVER_VERSION,
+            )
+        }
+        .context("bind GPUI task MCP")?;
+        let (browser, browser_server) = {
+            let _entered = runtime.enter();
+            if live {
+                gitterm_browser::browser_mcp::prepare_production_scoped(
+                    services.clone(),
+                    SERVER_VERSION,
+                )
+            } else {
+                gitterm_browser::browser_mcp::prepare_scoped(
+                    services.clone(),
+                    ListenerBind::LoopbackEphemeral,
+                    SERVER_VERSION,
+                )
+            }
+            .context("bind GPUI browser MCP")?
         };
         let log = gitterm_core::log_server::ServerState::new();
+        // Establish the log listener before publishing the host or starting MCP
+        // dispatch. Production retains its existing V6 port selection.
+        let log_job = runtime.spawn({
+            let log = log.clone();
+            let instance = services.task_mcp().instance_id().to_owned();
+            async move {
+                if live {
+                    gitterm_core::log_server::start_server(log, &instance).await;
+                } else if let Err(error) =
+                    gitterm_core::log_server::start_server_on(log, ListenerBind::LoopbackEphemeral)
+                        .await
+                {
+                    eprintln!("preview log server: {error}");
+                }
+            }
+        });
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if log.bound_port.lock().unwrap().is_some() {
+                        return Ok(());
+                    }
+                    anyhow::ensure!(
+                        !log_job.is_finished(),
+                        "GPUI log listener failed before startup"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .context("bind GPUI log listener timed out")?
+        })?;
         let jobs = vec![
+            log_job,
             runtime.spawn(async move {
                 if let Err(error) = task_server.run().await {
                     eprintln!("{error}");
@@ -420,19 +504,6 @@ impl TaskHostOwner {
             runtime.spawn(async move {
                 if let Err(error) = browser_server.run().await {
                     eprintln!("{error}");
-                }
-            }),
-            runtime.spawn({
-                let log = log.clone();
-                async move {
-                    if let Err(error) = gitterm_core::log_server::start_server_on(
-                        log,
-                        ListenerBind::LoopbackEphemeral,
-                    )
-                    .await
-                    {
-                        eprintln!("preview log server: {error}");
-                    }
                 }
             }),
         ];
@@ -448,7 +519,7 @@ impl TaskHostOwner {
         } else {
             Some(reaped)
         };
-        let host = TaskHost::new(Some(store), services, sender);
+        let host = TaskHost::new(Some(store), (*services).clone(), sender);
         Ok(cx.new(|cx| {
             let pump = cx.spawn(async move |owner: gpui::WeakEntity<Self>, cx| {
                 let mut commands = commands;
@@ -461,18 +532,20 @@ impl TaskHostOwner {
                     }
                 }
             });
-            let reseed = cx.spawn(async move |owner: gpui::WeakEntity<Self>, cx| {
-                loop {
-                    cx.background_executor().timer(RESEED_POLL).await;
-                    if owner
-                        .update(cx, |owner, cx| {
-                            owner.refresh_seed(cx);
-                        })
-                        .is_err()
-                    {
-                        break;
+            let reseed = (!live).then(|| {
+                cx.spawn(async move |owner: gpui::WeakEntity<Self>, cx| {
+                    loop {
+                        cx.background_executor().timer(RESEED_POLL).await;
+                        if owner
+                            .update(cx, |owner, cx| {
+                                owner.refresh_seed(cx);
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                }
+                })
             });
             let deliver = (!fixtures.is_empty()).then(|| {
                 cx.spawn(async move |owner: gpui::WeakEntity<Self>, cx| {
@@ -1813,4 +1886,80 @@ fn facts_root(
     chat_facts::resolve_tree(&mut index, links);
     let root = chat_facts::root_chat_of(&index, conversation, || links.to_vec());
     (index, root)
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    #[gpui::test]
+    fn live_uses_direct_store_shared_namespace_and_no_fixture_jobs(cx: &mut gpui::TestAppContext) {
+        cx.background_executor.allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let root = base.join("v6");
+        std::fs::create_dir(&root).unwrap();
+        let roots = Arc::new(
+            Preview::validate(
+                &base.join("gpui"),
+                gitterm_core::preview::ProtectedRoots::new(&base.join("home"), [root.clone()])
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        let source = root.join("tasks.json");
+        let bytes = serde_json::to_vec(&gitterm_core::tasks::TaskStoreDocument::default()).unwrap();
+        std::fs::write(&source, &bytes).unwrap();
+        // A prior seed must be left untouched, even when the source is missing.
+        std::fs::create_dir(roots.root()).unwrap();
+        let seed = roots.root().join("tasks.json");
+        std::fs::write(&seed, b"keep old preview seed").unwrap();
+        let lock = Arc::new(HostLock::acquire(&root).unwrap());
+        let services = Arc::new(
+            ServiceContext::production(&root, "274")
+                .unwrap()
+                .for_gpui_live(),
+        );
+        let token = services.task_mcp().token().to_owned();
+        let (sender, receiver) = gitterm_core::task_commands::runtime::command_channel();
+        let config = HostConfig {
+            roots,
+            iced_config: root.clone(),
+            ingress: Ingress::Channel(sender.clone(), receiver),
+        };
+        let owner = cx
+            .update(|cx| TaskHostOwner::start_live(config, lock, services, cx))
+            .unwrap();
+        owner.read_with(cx, |owner, _| {
+            assert_eq!(owner.host.store().as_ref().unwrap().path(), source);
+            assert_eq!(owner.host.services().state_root(), root);
+            assert_eq!(owner.host.services().task_mcp().token(), token);
+            assert!(!owner.host.services().is_preview());
+            assert!(owner._reseed.is_none());
+            assert!(owner._deliver.is_none());
+            assert!(owner.fixtures.is_empty());
+            for effect in [
+                gitterm_core::preview::service::RunnerEffect::HtmlPreview,
+                gitterm_core::preview::service::RunnerEffect::RestoreSession,
+                gitterm_core::preview::service::RunnerEffect::AutomaticDelivery,
+            ] {
+                assert!(
+                    owner
+                        .host
+                        .services()
+                        .runner(effect, None)
+                        .unwrap_err()
+                        .notice()
+                        .ends_with("not available in preview")
+                );
+            }
+        });
+        owner.update(cx, |owner, _| owner.shutdown());
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        assert_eq!(std::fs::read(&seed).unwrap(), b"keep old preview seed");
+        std::fs::remove_file(&source).unwrap();
+        let lock = HostLock::acquire(&root).unwrap();
+        assert!(direct_store(&lock).unwrap().tasks().is_empty());
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&seed).unwrap(), b"keep old preview seed");
+    }
 }

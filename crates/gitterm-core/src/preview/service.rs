@@ -313,6 +313,7 @@ enum Mode {
 #[derive(Clone, Debug)]
 pub struct ServiceContext {
     mode: Mode,
+    gpui_live: bool,
     root: PathBuf,
     task_mcp: TaskMcpNamespace,
 }
@@ -324,6 +325,7 @@ impl ServiceContext {
         let root = preview.scoped(preview.root())?;
         Ok(Self {
             mode: Mode::Preview(preview),
+            gpui_live: false,
             root,
             task_mcp: TaskMcpNamespace::fresh(preview_instance_id()),
         })
@@ -349,6 +351,7 @@ impl ServiceContext {
         let root = preview.scoped(preview.root())?;
         Ok(Self {
             mode: Mode::FixtureLaunch { preview, fixtures },
+            gpui_live: false,
             root,
             task_mcp: TaskMcpNamespace::fresh(preview_instance_id()),
         })
@@ -369,9 +372,22 @@ impl ServiceContext {
         }
         Ok(Self {
             mode: Mode::Production,
+            gpui_live: false,
             root: root.to_path_buf(),
             task_mcp: TaskMcpNamespace::fresh(instance_id.into()),
         })
+    }
+
+    /// Slice 3 admits the production root and endpoints, while later-slice
+    /// writers and process runners retain the Preview notices.
+    pub fn for_gpui_live(mut self) -> Self {
+        self.gpui_live = true;
+        self
+    }
+    /// Browser setup must not open a default target or initialize an external
+    /// engine in Preview, fixtures, or this restricted Live slice.
+    pub fn browser_read_only(&self) -> bool {
+        self.gpui_live || self.is_preview()
     }
 
     pub fn is_preview(&self) -> bool {
@@ -567,6 +583,9 @@ impl ServiceContext {
     }
 
     fn decide(&self, label: &str, access: Access, target: Option<&Path>) -> Result<(), Denied> {
+        if self.gpui_live && !matches!(access, Access::Read | Access::Existing) {
+            return Err(denied(label));
+        }
         let allowed = match (&self.mode, access) {
             (Mode::Production, _) | (_, Access::Existing | Access::Read) => true,
             (Mode::Preview(_), _) | (Mode::FixtureLaunch { .. }, Access::Outside) => false,
@@ -878,3 +897,39 @@ fn git_admin_dirs(checkout: &Path) -> io::Result<(PathBuf, PathBuf)> {
 #[cfg(test)]
 #[path = "service_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    #[test]
+    fn gpui_live_keeps_production_identity_but_closes_later_slice_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let production = ServiceContext::production(temp.path(), "274").unwrap();
+        let live = production.clone().for_gpui_live();
+        assert!(!live.is_preview());
+        assert!(live.browser_read_only());
+        assert_eq!(production.task_mcp().token(), live.task_mcp().token());
+        for access in [Access::Write, Access::Process, Access::Outside] {
+            let class = Class {
+                label: "Live gated effect",
+                access,
+            };
+            assert!(production.authorize(class, None).is_ok());
+            assert_eq!(
+                live.authorize(class, None).unwrap_err().notice(),
+                preview_notice(class.label)
+            );
+        }
+        for access in [Access::Read, Access::Existing] {
+            assert!(live
+                .authorize(
+                    Class {
+                        label: "read",
+                        access
+                    },
+                    None
+                )
+                .is_ok());
+        }
+    }
+}

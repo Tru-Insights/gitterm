@@ -164,6 +164,7 @@ pub struct ChatView {
     flashed_row: Option<u64>,
     flash_timer: Option<Task<()>>,
     preview: bool,
+    launch_settings: std::rc::Rc<std::cell::RefCell<crate::composer::LaunchSettings>>,
     composer: Entity<TextareaState>,
     composer_state: crate::composer::ComposerState,
     pub(crate) review: review_ui::ReviewComposer,
@@ -312,6 +313,7 @@ impl ChatView {
             flash_timer: None,
             records: Arc::new(records),
             preview: false,
+            launch_settings: Default::default(),
             composer,
             composer_state,
             review: review_ui::ReviewComposer::new(window, cx),
@@ -553,6 +555,31 @@ impl ChatView {
         }
         cx.notify();
     }
+    /// Enable choosing the launch configuration before the first live turn.
+    /// Card, resume and persistence fences remain those set by `set_preview`.
+    pub fn set_live_prelaunch(&mut self, cx: &mut Context<Self>) {
+        self.fixture_composer.acknowledged = gitterm_core::chat::state::AcknowledgedSettings {
+            model: Some("default".into()),
+            mode: Some("default".into()),
+            effort: Some(gitterm_core::chat::state::ConfirmedEffort {
+                effort: None,
+                applied: None,
+            }),
+        };
+        self.reproject();
+        self.set_read_only(None, cx);
+    }
+    /// A separate value cell lets a host read settings from inside the send
+    /// callback, while GPUI still has this view borrowed for the key event.
+    pub fn launch_settings_handle(
+        &self,
+    ) -> std::rc::Rc<std::cell::RefCell<crate::composer::LaunchSettings>> {
+        self.launch_settings.clone()
+    }
+    pub fn set_guidelines_status(&mut self, applied: bool, cx: &mut Context<Self>) {
+        self.composer_state.guidelines_status = Some(applied);
+        cx.notify();
+    }
     /// Install the app-owned delivery seam. No session/harness is started by the view.
     pub fn set_intent_callback(&mut self, callback: IntentCallback, cx: &mut Context<Self>) {
         self.callback = Some(callback);
@@ -686,6 +713,7 @@ impl ChatView {
     fn reproject(&mut self) {
         let state = self.shadow.as_ref().unwrap_or(&self.fixture_composer);
         self.composer_state.project(state, None);
+        *self.launch_settings.borrow_mut() = self.composer_state.launch_settings();
     }
     /// Send the next pre-start pick once the session is ready. Deferred, because
     /// the host may be mid-update when it presents the ready state.
