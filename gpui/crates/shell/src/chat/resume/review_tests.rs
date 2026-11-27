@@ -461,3 +461,249 @@ fn finding_f5_recoverable_error_and_exit_before_turn(cx: &mut gpui::TestAppConte
         pane.shutdown.drain().unwrap();
     });
 }
+
+fn unsent_tab(cwd: &Path, uid: &str) -> WorkspaceTabConfig {
+    let mut tab = tab(cwd, uid.into(), None);
+    tab.task_id = Some("saved-task".into());
+    tab.task_session_id = Some("saved-task-session".into());
+    tab.agent_config = Some(AgentBackendConfig::Claude {
+        model: "opus".into(),
+        permission_mode: Some("plan".into()),
+        effort: Some("max".into()),
+    });
+    tab
+}
+
+#[gpui::test]
+fn finding_saved_unsent_claude_is_editable_deferred_and_keeps_launch_settings(
+    cx: &mut gpui::TestAppContext,
+) {
+    let Some((root, preview, _services, workspace)) = prepare(cx, "unsent-mount") else {
+        return;
+    };
+    let repo = git2::Repository::init(root.join("repo")).unwrap();
+    let repo_dir = repo.workdir().unwrap().to_path_buf();
+    let nested = repo_dir.join("nested");
+    let explicit = root.join("explicit");
+    let plain = root.join("plain");
+    for dir in [&nested, &explicit, &plain] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    for (index, (dir, repo_dir, expected)) in [
+        (nested.clone(), Some(explicit.clone()), explicit),
+        (nested, None, repo_dir),
+        (plain.clone(), None, plain),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let uid = format!("unsent-mount-{index}");
+        let mut tab = unsent_tab(&dir, &uid);
+        tab.repo_dir = repo_dir.map(|dir| dir.to_string_lossy().into_owned());
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let pane = cx.new(|cx| {
+                ChatPane::resume_from(
+                    RuntimeShutdown::new(),
+                    preview.clone(),
+                    workspace.clone(),
+                    tab,
+                    None,
+                    window,
+                    cx,
+                )
+                .unwrap()
+            });
+            gpui_component::Root::new(pane, window, cx)
+        });
+        let pane = view.read_with(cx, |view, _| {
+            view.view().clone().downcast::<ChatPane>().unwrap()
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            _ = window.draw(cx);
+        });
+        assert!(cx.debug_bounds("chat-footer").is_some());
+        assert!(cx.debug_bounds("chat-read-only-note").is_none());
+        pane.update(cx, |pane, cx| {
+            assert!(pane.controller.live);
+            assert!(pane.controller.runtime.is_none());
+            assert!(!pane.history_loading);
+            assert!(pane._history_load.is_none());
+            assert!(pane.saved.records.is_empty());
+            assert!(pane.saved.session_id.is_none());
+            assert_eq!(pane.saved.cwd, expected);
+            assert_eq!(pane.saved.uid, uid);
+            assert_eq!(pane.target().task_id.as_deref(), Some("saved-task"));
+            assert_eq!(
+                pane.target().task_session_id.as_deref(),
+                Some("saved-task-session")
+            );
+            let launch = pane.deferred_live.as_ref().unwrap();
+            assert_eq!(launch.caller, uid);
+            let settings = launch.settings.borrow();
+            assert_eq!(settings.model, "opus");
+            assert_eq!(settings.permission_mode, "plan");
+            assert_eq!(settings.effort.as_deref(), Some("max"));
+            assert_eq!(
+                serde_json::to_value(&pane.controller.config).unwrap(),
+                serde_json::to_value(unsent_tab(&dir, &uid).agent_config.unwrap()).unwrap()
+            );
+            assert!(
+                !expected.join("launch.json").exists(),
+                "must not start a child before Send"
+            );
+            drop(settings);
+            pane.close(cx);
+            pane.shutdown.drain().unwrap();
+        });
+    }
+}
+
+// Exercise confirmation through the real fake-child stream, not a direct persistence call.
+fn confirm_unsent(pane: &mut ChatPane, services: &ServiceContext, cx: &mut Context<ChatPane>) {
+    let (runtime, mut events) = runtime(pane, services);
+    runtime
+        .send(HarnessCommand::SendUserMessage("first turn".into()))
+        .unwrap();
+    let collected = collect(&mut events, |event| {
+        matches!(
+            event,
+            RuntimeEvent::Harness(HarnessEvent::TurnStarted { .. })
+        )
+    });
+    replay(pane, runtime, collected, cx);
+}
+
+#[gpui::test]
+fn finding_saved_unsent_turn_updates_the_same_tab(cx: &mut gpui::TestAppContext) {
+    let Some((root, preview, services, mut workspace)) = prepare(cx, "unsent-persist") else {
+        return;
+    };
+    let tab = unsent_tab(&root, "unsent-persist-caller");
+    workspace.tabs = vec![tab.clone()];
+    std::fs::write(
+        root.join("workspaces.json"),
+        serde_json::to_vec(
+            &serde_json::json!({"active_workspace":0,"workspaces":[workspace.clone()]}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let before = std::fs::read(root.join("workspaces.json")).unwrap();
+    let (pane, cx) = cx.add_window_view(|window, cx| {
+        ChatPane::resume_from(
+            RuntimeShutdown::new(),
+            preview,
+            workspace,
+            tab.clone(),
+            None,
+            window,
+            cx,
+        )
+        .unwrap()
+    });
+    cx.run_until_parked();
+    assert_eq!(std::fs::read(root.join("workspaces.json")).unwrap(), before);
+    pane.update(cx, |pane, cx| confirm_unsent(pane, &services, cx));
+    cx.run_until_parked();
+    pane.update(cx, |pane, cx| {
+        pane.shutdown.drain().unwrap();
+        assert!(pane.resume_error.is_none(), "{:?}", pane.resume_error);
+        let file = saved(&root);
+        assert_eq!(file.workspaces[0].tabs.len(), 1);
+        let stored = &file.workspaces[0].tabs[0];
+        assert_eq!(stored.session_uid, tab.session_uid);
+        assert_eq!(stored.task_id, tab.task_id);
+        assert_eq!(stored.task_session_id, tab.task_session_id);
+        assert_eq!(stored.chat_session_id.as_deref(), Some("fresh-id"));
+        assert_eq!(pane.saved.session_id, stored.chat_session_id);
+        let launch: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("launch.json")).unwrap()).unwrap();
+        let args: Vec<String> = serde_json::from_value(launch["argv"].clone()).unwrap();
+        assert!(!args.iter().any(|arg| arg.starts_with("--resume")));
+        for pair in [
+            ["--model", "opus"],
+            ["--permission-mode", "plan"],
+            ["--effort", "max"],
+        ] {
+            assert!(args.windows(2).any(|args| args == pair));
+        }
+        pane.close(cx);
+        pane.shutdown.drain().unwrap();
+    });
+}
+
+#[gpui::test]
+fn finding_saved_unsent_after_confirmation_still_resumes_history(cx: &mut gpui::TestAppContext) {
+    let Some((root, preview, services, workspace)) = prepare(cx, "unsent-resume") else {
+        return;
+    };
+    let (pane, cx) = cx.add_window_view(|window, cx| {
+        ChatPane::resume_from(
+            RuntimeShutdown::new(),
+            preview.clone(),
+            workspace.clone(),
+            unsent_tab(&root, "unsent-resume-caller"),
+            None,
+            window,
+            cx,
+        )
+        .unwrap()
+    });
+    pane.update(cx, |pane, cx| confirm_unsent(pane, &services, cx));
+    cx.run_until_parked();
+    pane.update(cx, |pane, cx| {
+        pane.shutdown.drain().unwrap();
+        pane.close(cx);
+        pane.shutdown.drain().unwrap();
+    });
+    let tab = saved(&root).workspaces[0].tabs[0].clone();
+    assert_eq!(tab.chat_session_id.as_deref(), Some("fresh-id"));
+    cx.update(|window, cx| {
+        pane.update(cx, |pane, cx| {
+            *pane = ChatPane::resume_from(
+                RuntimeShutdown::new(),
+                preview,
+                workspace,
+                tab,
+                Some(history("fresh-id")),
+                window,
+                cx,
+            )
+            .unwrap();
+            assert!(pane.history_loading);
+            assert!(pane.controller.runtime.is_none());
+        })
+    });
+    cx.run_until_parked();
+    pane.update(cx, |pane, cx| {
+        assert!(!pane.history_loading);
+        assert!(pane.resume_error.is_none(), "{:?}", pane.resume_error);
+        assert_eq!(pane.user_prompts(), ["first turn"]);
+        assert_eq!(pane.saved.uid, "unsent-resume-caller");
+        assert_eq!(pane.saved.session_id.as_deref(), Some("fresh-id"));
+        assert!(pane.controller.runtime.is_none());
+        let (runtime, mut events) = runtime(pane, &services);
+        runtime
+            .send(HarnessCommand::SendUserMessage("second turn".into()))
+            .unwrap();
+        collect(&mut events, |event| {
+            matches!(
+                event,
+                RuntimeEvent::Harness(HarnessEvent::TurnStarted { .. })
+            )
+        });
+        let launch: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("launch.json")).unwrap()).unwrap();
+        assert!(
+            launch["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "--resume=fresh-id")
+        );
+        pane.attach_runtime(runtime, events, cx);
+        pane.close(cx);
+        pane.shutdown.drain().unwrap();
+    });
+}
