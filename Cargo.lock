@@ -2289,6 +2289,7 @@ version = "0.1.0"
 dependencies = [
  "axum 0.8.9",
  "chrono",
+ "cpal",
  "dirs",
  "git2",
  "hyper 0.14.32",
@@ -2312,6 +2313,7 @@ dependencies = [
  "url",
  "uuid",
  "warp",
+ "whisper-rs",
 ]
 
 [[package]]
@@ -2321,7 +2323,6 @@ dependencies = [
  "axum 0.8.9",
  "base64 0.22.1",
  "chrono",
- "cpal",
  "dirs",
  "futures-util",
  "git2",
@@ -2362,7 +2363,6 @@ dependencies = [
  "url",
  "uuid",
  "warp",
- "whisper-rs",
  "winres",
  "wry",
 ]
