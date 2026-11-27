@@ -253,6 +253,7 @@ struct Servers {
     browser: BrowserMcpConnection,
     log: gitterm_core::log_server::ServerState,
     jobs: Vec<tokio::task::JoinHandle<()>>,
+    limits_jobs: Vec<tokio::task::JoinHandle<()>>,
     runtime: tokio::runtime::Runtime,
 }
 
@@ -298,9 +299,11 @@ pub(crate) struct TaskHostOwner {
     wrote: bool,
     /// Fixture Codex runs in flight, by delegation id.
     runs: std::collections::HashMap<String, runs::RunHandle>,
-    /// Delegations this host stored, with the targets authorized at their
-    /// request; only these are started or settled.
+    /// Delegations this host stored, with their authorized targets. Preview
+    /// starts or settles only these; Live can explicitly relaunch saved workers.
     own_delegations: std::collections::HashMap<String, AuthorizedTargets>,
+    /// Live observes and saves limits through Iced's shared state/jobs.
+    plan_limits: Option<gitterm_core::limits::PlanLimitsState>,
     /// Tasks this host created, plus saved tasks admitted at Live startup.
     /// Admission never imports process ownership or starts a session.
     own_tasks: std::collections::HashSet<String>,
@@ -335,6 +338,8 @@ pub(crate) struct TaskHostOwner {
     /// preview.
     _deliver: Option<Task<()>>,
     _workers: Option<Task<()>>,
+    /// Failed publications must finish their TERM/KILL grace even at quit.
+    unpublished_stops: Vec<std::thread::JoinHandle<Result<(), String>>>,
     _quit: Subscription,
 }
 
@@ -631,6 +636,8 @@ impl TaskHostOwner {
                 panes: Vec::new(),
                 folder_labels: std::collections::HashMap::new(),
                 roots,
+                plan_limits: live
+                    .then(|| gitterm_core::limits::PlanLimitsState::load(&iced_config)),
                 iced_config,
                 source: iced_tasks,
                 stamp,
@@ -640,6 +647,7 @@ impl TaskHostOwner {
                     browser,
                     log,
                     jobs,
+                    limits_jobs: Vec::new(),
                     runtime,
                 }),
                 lock: Some(lock),
@@ -672,6 +680,7 @@ impl TaskHostOwner {
                 _reseed: reseed,
                 _deliver: deliver,
                 _workers: workers,
+                unpublished_stops: Vec::new(),
                 _quit: quit,
             }
         }))
@@ -817,6 +826,12 @@ impl TaskHostOwner {
         match effect {
             // The plan-limits file is read on the background executor, which
             // sends the reply, so the UI thread never waits on it.
+            HostEffect::PlanLimits { reply } if self.is_live() => {
+                reply.send(
+                    serde_json::to_value(self.policy().report)
+                        .map_err(|error| format!("cannot encode plan_limits result: {error}")),
+                );
+            }
             HostEffect::PlanLimits { reply } => {
                 let iced_config = self.iced_config.clone();
                 cx.background_spawn(async move { reply.send(plan_limits(&iced_config)) })
@@ -1664,6 +1679,7 @@ impl TaskHostOwner {
 
     fn stop(&mut self, terminals: Vec<gitterm_terminal::Backend>) {
         self.host.shutdown();
+        let unpublished_stops = std::mem::take(&mut self.unpublished_stops);
         let mut runs: Vec<runs::RunHandle> = self.runs.drain().map(|(_, run)| run).collect();
         // On Unix this kills each spawned Codex's group before it returns,
         // and a run that has not spawned Codex yet never does.
@@ -1675,6 +1691,7 @@ impl TaskHostOwner {
             browser,
             log,
             jobs,
+            limits_jobs,
             runtime,
         }) = self.servers.take()
         {
@@ -1687,6 +1704,14 @@ impl TaskHostOwner {
                 // completes. Production also has the shell's outer lock guard.
                 let retained_lock = lock;
                 let result = (|| -> Result<()> {
+                    // Save jobs include spawn_blocking writes. Join them before
+                    // releasing the lease, independent of UI completions.
+                    runtime.block_on(async {
+                        for job in limits_jobs {
+                            job.await.context("join plan-limit job")?;
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    })?;
                     runtime
                         .block_on(browser.shutdown())
                         .map_err(anyhow::Error::msg)?;
@@ -1701,6 +1726,11 @@ impl TaskHostOwner {
                         .await
                         .context("shutdown phase task-host-servers: timeout")?
                     })?;
+                    for stop in unpublished_stops {
+                        stop.join()
+                            .map_err(|_| anyhow::anyhow!("unpublished worker shutdown panicked"))?
+                            .map_err(anyhow::Error::msg)?;
+                    }
                     drop(terminals);
                     runtime.block_on(async {
                         tokio::time::timeout(RUN_STOP, async {

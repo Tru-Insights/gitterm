@@ -4,8 +4,8 @@
 //! a preassigned Claude session id, then admission (`TaskHost::admit_launch`,
 //! which may queue), the Codex notify hook, the brief, the terminal child and
 //! last `TaskHost::publish_launch`. The session is announced only after the
-//! store saved it and attached its worker; a failed save drops the child,
-//! which kills its process group.
+//! store saved it and attached its worker; a failed publication revokes the
+//! recorder and stops the recorded worker tree before discarding the terminal.
 //!
 //! The child runs `/bin/sh -c <command>` in a terminal whose environment is
 //! exactly the fixture child environment (every other inherited variable is
@@ -142,6 +142,7 @@ pub(super) struct Launched {
     /// Iced's `worker_closing`: its final-worker close is under way.
     closing: bool,
     shutdown_refused: bool,
+    title: Option<String>,
     process: Option<gitterm_core::worker_process::WorkerProcess>,
 }
 
@@ -365,6 +366,7 @@ impl TaskHostOwner {
                 needs_input,
                 closing: false,
                 shutdown_refused: false,
+                title: None,
                 process: None,
             },
         );
@@ -472,8 +474,8 @@ impl TaskHostOwner {
             }
             None => (None, "Terminal".to_string(), None, None),
         };
-        // The open worker delegation this launch carries out, when this
-        // host stored it.
+        // Explicit Live relaunch carries the saved worker's constraints;
+        // process authority still comes only from the new launch recorder.
         let worker = command
             .as_ref()
             .and_then(|_| {
@@ -482,7 +484,9 @@ impl TaskHostOwner {
                         self.session_live(session, cx)
                     })
             })
-            .filter(|worker| self.own_delegations.contains_key(&worker.delegation_id));
+            .filter(|worker| {
+                self.is_live() || self.own_delegations.contains_key(&worker.delegation_id)
+            });
         let worker_model = worker.as_ref().and_then(|worker| worker.model.clone());
         let options = worker
             .as_ref()
@@ -737,13 +741,17 @@ impl TaskHostOwner {
             session_id,
         });
         let timestamp = chrono::Utc::now().to_rfc3339();
-        // A shut-down host saves nothing; dropping the child stops it.
+        // Revoke and capture the worker before dropping its terminal.
         if let Err(error) = self.writable_store() {
+            if let Some(process) = process {
+                self.discard_unpublished_worker(process)
+                    .map_err(|cleanup| format!("{error}; {cleanup}"))?;
+            }
             drop(terminal);
             self.host.abandon_launch(ticket);
             return Err(error);
         }
-        let terminal = self.host.publish_launch(
+        let published = self.host.publish_launch(
             ticket,
             LaunchedSession {
                 label: child_label.clone(),
@@ -752,8 +760,15 @@ impl TaskHostOwner {
                 objective_delivery,
                 timestamp,
             },
-            terminal,
-        )?;
+            &terminal,
+        );
+        if let Err(error) = published {
+            if let Some(process) = process {
+                self.discard_unpublished_worker(process)
+                    .map_err(|cleanup| format!("{error}; {cleanup}"))?;
+            }
+            return Err(error);
+        }
         if launched_agent {
             // Iced's apply_task_session_signal: a started agent is working.
             if let Err(error) = self.writable_store().and_then(|store| {
@@ -780,6 +795,7 @@ impl TaskHostOwner {
                 needs_input,
                 closing: false,
                 shutdown_refused: false,
+                title: None,
                 process,
             },
         );
@@ -974,9 +990,8 @@ impl TaskHostOwner {
     }
 
     /// Iced's terminal-write arm for a task tab (src/main.rs
-    /// `resumed_blocked`): input into a worker whose delegation is blocked
-    /// makes the session live at once, before its next report or any
-    /// harness title arrives.
+    /// `resumed_blocked`): input answers a blocked worker or notify-driven
+    /// idle, making the session live before its next report arrives.
     pub(super) fn terminal_input(&mut self, session_id: &str, cx: &mut Context<Self>) {
         use gitterm_core::tasks::{DelegationChild, DelegationStatus};
         let Some(task_id) = self
@@ -994,7 +1009,10 @@ impl TaskHostOwner {
                     } if id == session_id)
             })
         });
-        if !resumed_blocked {
+        let resumed_waiting = self.launched.get(session_id).is_some_and(|launched| {
+            gitterm_core::task_host::input_resumes_waiting(launched.live, launched.title.as_deref())
+        });
+        if !resumed_blocked && !resumed_waiting {
             return;
         }
         if let Some(launched) = self.launched.get_mut(session_id) {
@@ -1147,11 +1165,123 @@ impl TaskHostOwner {
         if !self.is_live() || self.is_shut_down() {
             return;
         }
+        self.poll_live_plan_limits(cx);
         self.persist_live_worker_identities();
         self.expire_live_worker_limits();
         self.close_live_final_workers(cx);
         self.promote_queued_tasks(cx);
         self.start_queued_runs(cx);
+    }
+
+    fn discard_unpublished_worker(
+        &mut self,
+        process: gitterm_core::worker_process::WorkerProcess,
+    ) -> Result<(), String> {
+        // Reap completed cleanups while retaining every grace period at quit.
+        let mut pending = Vec::new();
+        for stop in self.unpublished_stops.drain(..) {
+            if stop.is_finished() {
+                match stop.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eprintln!("[tasks] stop unpublished worker: {error}"),
+                    Err(_) => eprintln!("[tasks] unpublished worker shutdown panicked"),
+                }
+            } else {
+                pending.push(stop);
+            }
+        }
+        self.unpublished_stops = pending;
+        if let Some(stop) = process.discard_unpublished()? {
+            self.unpublished_stops.push(stop);
+        }
+        Ok(())
+    }
+
+    /// Iced's poll_plan_limits: same state, cadence, rollout source and
+    /// serialized jobs. Admission reads this state even before a save completes.
+    pub(super) fn poll_live_plan_limits(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.plan_limits.as_mut() else {
+            return;
+        };
+        let Some(servers) = self.servers.as_mut() else {
+            return;
+        };
+        state.evaluate(&[], chrono::Utc::now().timestamp());
+        if let Some(job) = state.begin_scheduled_codex_read(std::time::Instant::now()) {
+            let (done, result) = tokio::sync::oneshot::channel();
+            servers.limits_jobs.retain(|job| !job.is_finished());
+            servers.limits_jobs.push(servers.runtime.spawn(async move {
+                _ = done.send(job.run().await);
+            }));
+            cx.spawn(async move |owner: gpui::WeakEntity<Self>, cx| {
+                let event = result.await.unwrap_or_else(|error| {
+                    eprintln!("[plan-limits] Codex job failed: {error}");
+                    gitterm_core::limits::PlanLimitsEvent::CodexRead(None)
+                });
+                _ = owner.update(cx, |owner, cx| owner.update_live_plan_limits(event, cx));
+            })
+            .detach();
+        }
+        self.save_live_plan_limits(cx);
+    }
+
+    pub(super) fn observe_claude_rate_limit(
+        &mut self,
+        reading: &gitterm_core::chat::types::RateLimitReading,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.plan_limits.as_mut()
+            && state.observe_claude_rate_limit(reading)
+        {
+            state.evaluate(&[], chrono::Utc::now().timestamp());
+            self.save_live_plan_limits(cx);
+        }
+    }
+
+    fn save_live_plan_limits(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.plan_limits.as_mut() else {
+            return;
+        };
+        let Some(servers) = self.servers.as_mut() else {
+            return;
+        };
+        let path = gitterm_core::plan_limits::PlanLimitsFile::path_in(&self.iced_config);
+        let Some(job) = state.begin_save(path) else {
+            return;
+        };
+        let (done, result) = tokio::sync::oneshot::channel();
+        servers.limits_jobs.retain(|job| !job.is_finished());
+        servers.limits_jobs.push(servers.runtime.spawn(async move {
+            _ = done.send(job.run().await);
+        }));
+        cx.spawn(async move |owner: gpui::WeakEntity<Self>, cx| {
+            let event = result.await.unwrap_or_else(|error| {
+                gitterm_core::limits::PlanLimitsEvent::Saved(Err(error.to_string()))
+            });
+            _ = owner.update(cx, |owner, cx| owner.update_live_plan_limits(event, cx));
+        })
+        .detach();
+    }
+
+    fn update_live_plan_limits(
+        &mut self,
+        event: gitterm_core::limits::PlanLimitsEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_shut_down() {
+            return;
+        }
+        let Some(state) = self.plan_limits.as_mut() else {
+            return;
+        };
+        let drain = state.complete_event(
+            event,
+            &gitterm_core::plan_limits::PlanLimitsFile::path_in(&self.iced_config),
+            chrono::Utc::now().timestamp(),
+        );
+        if drain {
+            self.save_live_plan_limits(cx);
+        }
     }
 
     fn persist_live_worker_identities(&mut self) {
@@ -1738,6 +1868,8 @@ fn spawn_terminal_launch(
         }
     })
     .detach();
+    let title_owner = owner.clone();
+    let title_session = session_id.clone();
     let view = cx.new(|cx| {
         TerminalView::launch(launch, Default::default(), cx)
             .with_exit_callback(move |_, cx| {
@@ -1745,6 +1877,18 @@ fn spawn_terminal_launch(
                 let session_id = session_id.clone();
                 cx.defer(move |cx| {
                     _ = owner.update(cx, |owner, cx| owner.terminal_exited(&session_id, cx));
+                });
+            })
+            .with_title_callback(move |_, cx, title| {
+                let title = title.to_string();
+                let owner = title_owner.clone();
+                let session = title_session.clone();
+                cx.defer(move |cx| {
+                    _ = owner.update(cx, |owner, _| {
+                        if let Some(launched) = owner.launched.get_mut(&session) {
+                            launched.title = Some(title);
+                        }
+                    });
                 });
             })
             .with_input_callback(move || {
@@ -2029,6 +2173,29 @@ pub(crate) fn with_preassigned_session_id(command: &str) -> (String, Option<Stri
 
 #[cfg(test)]
 impl TaskHostOwner {
+    pub(crate) fn test_plan_limits(&mut self) -> &mut gitterm_core::limits::PlanLimitsState {
+        self.plan_limits.as_mut().unwrap()
+    }
+    pub(crate) fn test_reset_plan_limits(&mut self, root: &Path) {
+        self.plan_limits = Some(gitterm_core::limits::PlanLimitsState::load(root));
+    }
+    pub(crate) fn test_claude_limit(
+        &mut self,
+        reading: &gitterm_core::chat::types::RateLimitReading,
+        cx: &mut Context<Self>,
+    ) {
+        self.observe_claude_rate_limit(reading, cx);
+    }
+    pub(crate) fn test_terminal_input(&mut self, session: &str, cx: &mut Context<Self>) {
+        self.terminal_input(session, cx);
+    }
+    pub(crate) fn test_worker_counts(&self, cx: &App) -> (usize, usize) {
+        (
+            self.slot_holders(cx).len(),
+            self.running_workers(Provider::Codex, cx),
+        )
+    }
+
     /// Stores `delegation` as this host's own worker, as DelegateTask will.
     pub(crate) fn own_worker(&mut self, delegation: gitterm_core::tasks::Delegation) {
         let targets: Vec<PathBuf> = match &delegation.child {

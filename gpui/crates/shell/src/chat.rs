@@ -316,7 +316,7 @@ pub(crate) struct ChatPane {
 }
 /// The provider finished a turn (Iced's `HarnessEvent::TurnCompleted`).
 #[derive(Clone, Debug)]
-pub(crate) struct TurnEnded;
+pub(crate) struct TurnEnded(pub Option<gitterm_core::chat::types::RateLimitReading>);
 impl EventEmitter<SavedChat> for ChatPane {}
 impl EventEmitter<TurnEnded> for ChatPane {}
 impl EventEmitter<gitterm_gpui_chat::model::roster::RosterOutcome> for ChatPane {}
@@ -729,6 +729,13 @@ impl ChatPane {
                             &event,
                             RuntimeEvent::Harness(HarnessEvent::ProcessExited { .. })
                         );
+                        let rate_limit = match &event {
+                            RuntimeEvent::Harness(HarnessEvent::TurnCompleted {
+                                rate_limit,
+                                ..
+                            }) => rate_limit.clone(),
+                            _ => None,
+                        };
                         let turn_ended = matches!(
                             &event,
                             RuntimeEvent::Harness(HarnessEvent::TurnCompleted { .. })
@@ -740,7 +747,7 @@ impl ChatPane {
                         }
                         if turn_ended {
                             pane.refresh_checkout_head(cx);
-                            cx.emit(TurnEnded);
+                            cx.emit(TurnEnded(rate_limit));
                         }
                         if exited {
                             pane.shutdown_runtime();

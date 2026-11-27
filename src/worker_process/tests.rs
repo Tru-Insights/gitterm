@@ -304,3 +304,12 @@ fn graceful_shutdown_only_escalates_owned_survivors_with_the_same_birth() {
     assert!(stop_tree(&mock, None).is_err());
     assert!(mock.signals.borrow().is_empty());
 }
+
+#[test]
+fn unpublished_rollback_revokes_a_late_recorder_before_harness_start() {
+    let process = WorkerProcess::new().unwrap();
+    let path = process.pid_file();
+    process.discard_unpublished().unwrap();
+    assert!(!path.parent().unwrap().exists());
+    assert!(record_process(&path, std::process::id()).is_err());
+}

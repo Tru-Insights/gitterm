@@ -55,6 +55,18 @@ exec /bin/sleep 60
             spec: Default::default(),
         }
     }
+    fn ignore_hup(&self) {
+        let bin = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".local/bin");
+        for name in ["claude", "codex"] {
+            let path = bin.join(name);
+            let script = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(
+                path,
+                script.replacen("#!/bin/sh\n", "#!/bin/sh\ntrap '' HUP\n", 1),
+            )
+            .unwrap();
+        }
+    }
     fn file(&self, name: &str, run: usize) -> PathBuf {
         self.trace.path().join(format!("{name}-{run}"))
     }
@@ -306,7 +318,10 @@ fn live_plan_hold_and_queue_promotion(cx: &mut TestAppContext) {
     owner.update(cx, |owner, cx| owner.live_worker_tick(cx));
     assert!(!fake.file("ready", 1).exists());
     fresh_limits(&fixture, false);
-    owner.update(cx, |owner, cx| owner.live_worker_tick(cx));
+    owner.update(cx, |owner, cx| {
+        owner.test_reset_plan_limits(&fixture.iced);
+        owner.live_worker_tick(cx);
+    });
     wait_until(cx, |_| fake.file("ready", 1).exists());
     owner.update(cx, |owner, cx| owner.quit(cx));
 }
@@ -318,6 +333,7 @@ fn live_save_failure_stops_unpublished_fake(cx: &mut TestAppContext) {
     }
     cx.background_executor.allow_parking();
     let fake = LiveFake::new();
+    fake.ignore_hup();
     let (fixture, git) = fixture();
     worker_settings(&fixture);
     fresh_limits(&fixture, false);
@@ -337,6 +353,7 @@ fn live_save_failure_stops_unpublished_fake(cx: &mut TestAppContext) {
             live_set_mode(&root, 0o500);
         }))
     });
+    let began = Instant::now();
     let failed = launch_live(cx, &sender, id, "Claude");
     live_set_mode(&fixture.iced, 0o700);
     assert!(failed.unwrap_err().contains("atomically write"));
@@ -347,6 +364,14 @@ fn live_save_failure_stops_unpublished_fake(cx: &mut TestAppContext) {
             .unwrap()
             .is_none()
     });
+    assert!(
+        fake.file("term", 1).exists(),
+        "worker must receive TERM despite ignoring HUP"
+    );
+    assert!(
+        began.elapsed() >= Duration::from_secs(2),
+        "KILL must wait for grace"
+    );
     owner.update(cx, |owner, cx| owner.quit(cx));
 }
 
@@ -526,6 +551,7 @@ fn live_attach_failure_stops_unpublished_fake(cx: &mut TestAppContext) {
     }
     cx.background_executor.allow_parking();
     let fake = LiveFake::new();
+    fake.ignore_hup();
     let (fixture, git) = fixture();
     worker_settings(&fixture);
     fresh_limits(&fixture, false);
@@ -564,6 +590,7 @@ fn live_attach_failure_stops_unpublished_fake(cx: &mut TestAppContext) {
                 .replace_store(Some(TaskStore::load(&path).unwrap()));
         }))
     });
+    let began = Instant::now();
     let failed = launch_live(cx, &sender, id, "Codex").unwrap_err();
     assert!(failed.contains("could not attach"), "{failed}");
     assert!(owner.read_with(cx, |owner, _| owner.host_terminals().is_empty()));
@@ -581,6 +608,14 @@ fn live_attach_failure_stops_unpublished_fake(cx: &mut TestAppContext) {
             .unwrap()
             .is_none()
     });
+    assert!(
+        fake.file("term", 1).exists(),
+        "worker must receive TERM despite ignoring HUP"
+    );
+    assert!(
+        began.elapsed() >= Duration::from_secs(2),
+        "KILL must wait for grace"
+    );
     owner.update(cx, |owner, cx| owner.quit(cx));
 }
 
@@ -775,5 +810,193 @@ fn live_worker_notify_releases_slot_but_imported_notify_stays_closed(cx: &mut Te
     );
     owner.update(cx, |owner, cx| owner.live_worker_tick(cx));
     wait_until(cx, |_| fake.file("ready", 2).exists());
+    owner.update(cx, |owner, cx| owner.quit(cx));
+}
+
+#[gpui::test]
+fn live_observed_limits_hold_later_launches(cx: &mut TestAppContext) {
+    if child("live_observed_limits_hold_later_launches") {
+        return;
+    }
+    cx.background_executor.allow_parking();
+    let fake = LiveFake::new();
+    let (fixture, git) = fixture();
+    worker_settings(&fixture);
+    fresh_limits(&fixture, false);
+    let (owner, sender) = start(&fixture, cx);
+    fake.prepare_recorder(&owner, cx);
+    let now = chrono::Utc::now().timestamp() + 1;
+    let sessions = gitterm_core::limits::local_codex_sessions().unwrap();
+    assert!(sessions.starts_with(std::env::var_os("HOME").unwrap()));
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(sessions.join("rollout-placeholder.jsonl"), serde_json::to_string(&json!({
+        "timestamp": chrono::DateTime::from_timestamp(now, 0).unwrap().to_rfc3339(),
+        "type": "event_msg", "payload": {"type": "token_count", "rate_limits": {
+            "limit_id": "codex", "primary": {"used_percent": 100, "window_minutes": 300, "resets_at": now + 3600},
+            "rate_limit_reached_type": "primary"
+        }}
+    })).unwrap() + "\n").unwrap();
+    let polled_at = Instant::now();
+    owner.update(cx, |owner, cx| owner.live_worker_tick(cx));
+    wait_until(cx, |cx| {
+        owner.update(cx, |owner, _| {
+            owner
+                .test_plan_limits()
+                .file()
+                .codex
+                .as_ref()
+                .is_some_and(|limits| limits.observed_at == now)
+        })
+    });
+    let first = create(cx, &sender, &git.repo);
+    assert_eq!(
+        launch_live(cx, &sender, first["task_id"].as_str().unwrap(), "Codex").unwrap()["queued"],
+        true
+    );
+    owner.update(cx, |owner, cx| {
+        owner.test_claude_limit(
+            &gitterm_core::chat::types::RateLimitReading {
+                observed_at: now,
+                info: json!({
+                    "status": "rejected", "rateLimitType": "five_hour", "resetsAt": now + 3600
+                }),
+            },
+            cx,
+        )
+    });
+    let second = dispatch(cx, &sender, TaskControlOperation::Create(req(json!({
+        "title": "Claude held", "objective": "Placeholder", "repository_path": git.repo, "issue_key": "TRU-274"
+    })))).unwrap();
+    assert_eq!(
+        launch_live(cx, &sender, second["task_id"].as_str().unwrap(), "Claude").unwrap()["queued"],
+        true
+    );
+    assert!(!fake.file("ready", 1).exists());
+    owner.update(cx, |owner, _| {
+        let state = owner.test_plan_limits();
+        assert!(!state.codex_read_due(polled_at + Duration::from_secs(59)));
+        assert!(state.codex_read_due(
+            polled_at + gitterm_core::limits::CODEX_READ_EVERY + Duration::from_secs(1)
+        ));
+    });
+    owner.update(cx, |owner, cx| owner.quit(cx));
+}
+
+#[gpui::test]
+fn live_notify_idle_input_reclaims_worker_capacity(cx: &mut TestAppContext) {
+    if child("live_notify_idle_input_reclaims_worker_capacity") {
+        return;
+    }
+    cx.background_executor.allow_parking();
+    let fake = LiveFake::new();
+    let (fixture, git) = fixture();
+    worker_settings(&fixture);
+    fresh_limits(&fixture, false);
+    let (owner, sender) = start(&fixture, cx);
+    fake.prepare_recorder(&owner, cx);
+    let created = create(cx, &sender, &git.repo);
+    let id = created["task_id"].as_str().unwrap();
+    let launched = launch_live(cx, &sender, id, "Codex").unwrap();
+    let session = launched["session_id"].as_str().unwrap();
+    wait_until(cx, |_| fake.file("ready", 1).exists());
+    dispatch(
+        cx,
+        &sender,
+        TaskControlOperation::SessionEvent(req(json!({
+            "task_id": id, "session_id": session, "event_type": "agent-turn-complete"
+        }))),
+    )
+    .unwrap();
+    owner.update(cx, |owner, cx| {
+        assert_eq!(owner.test_worker_counts(cx), (0, 0));
+        owner.test_terminal_input(session, cx);
+        assert_eq!(owner.test_worker_counts(cx), (1, 1));
+    });
+    assert_eq!(
+        stored_task(&owner, id, cx).lifecycle,
+        TaskLifecycle::Running
+    );
+    owner.update(cx, |owner, cx| owner.quit(cx));
+}
+
+#[gpui::test]
+fn live_explicit_relaunch_attaches_saved_worker_constraints(cx: &mut TestAppContext) {
+    if child("live_explicit_relaunch_attaches_saved_worker_constraints") {
+        return;
+    }
+    cx.background_executor.allow_parking();
+    let fake = LiveFake::new();
+    let (fixture, git) = fixture();
+    std::fs::write(
+        fixture.iced.join("settings.json"),
+        serde_json::to_vec(&json!({
+            "agent_presets": [{"name": "Codex", "command": "codex"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fresh_limits(&fixture, false);
+    let (owner, sender) = start(&fixture, cx);
+    let created = create(cx, &sender, &git.repo);
+    let id = created["task_id"].as_str().unwrap();
+    owner.update(cx, |owner, _| {
+        let mut worker = worker_delegation("saved-worker", id, "old-session");
+        worker.options =
+            req(json!({"effort": "high", "add_dirs": [git.repo], "time_limit_minutes": 5}));
+        owner.own_worker(worker);
+        owner.shutdown();
+    });
+    let (owner, sender) = start(&fixture, cx);
+    fake.prepare_recorder(&owner, cx);
+    let launched = launch_live(cx, &sender, id, "Codex").unwrap();
+    let session = launched["session_id"].as_str().unwrap();
+    wait_until(cx, |_| fake.file("ready", 1).exists());
+    let args = fake.text("args", 1);
+    assert!(args.contains("fixture-model"), "{args}");
+    assert!(args.contains("high"), "{args}");
+    assert!(args.contains(git.repo.to_str().unwrap()), "{args}");
+    let saved = TaskStore::load(fixture.source()).unwrap();
+    let worker = saved.delegation("saved-worker").unwrap();
+    assert!(
+        matches!(&worker.child, gitterm_core::tasks::DelegationChild::TaskSession {
+        task_session_id: Some(attached), ..
+    } if attached == session)
+    );
+    assert!(saved.worker_time_limit("saved-worker").unwrap().is_some());
+    wait_until(cx, |cx| {
+        owner.update(cx, |owner, cx| owner.live_worker_tick(cx));
+        TaskStore::load(fixture.source())
+            .unwrap()
+            .get(id)
+            .unwrap()
+            .sessions
+            .iter()
+            .any(|record| record.task_session_id == session && record.launch_identity.is_some())
+    });
+    owner.update(cx, |owner, cx| {
+        let path = owner.host().store().as_ref().unwrap().path().to_path_buf();
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        document["delegations"][0]["time_limit_deadline_unix_ms"] = json!(1);
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        owner
+            .host_mut()
+            .replace_store(Some(TaskStore::load(&path).unwrap()));
+        owner.live_worker_tick(cx);
+    });
+    assert!(
+        TaskStore::load(fixture.source())
+            .unwrap()
+            .delegation("saved-worker")
+            .unwrap()
+            .time_limit_reached_at
+            .is_some()
+    );
+    wait_until(cx, |cx| {
+        owner.read_with(cx, |owner, _| {
+            !owner.host_terminals().iter().any(|id| id == session)
+        })
+    });
+    assert!(fake.file("term", 1).exists());
     owner.update(cx, |owner, cx| owner.quit(cx));
 }

@@ -72,8 +72,8 @@ pub use launch::{
     QueuedTaskLaunch,
 };
 pub use live::{
-    aggregate_task_live_states, task_session_signal, LinkedSession, TaskSessionLiveState,
-    TaskSessionOutcome,
+    aggregate_task_live_states, input_resumes_waiting, task_session_signal, LinkedSession,
+    TaskSessionLiveState, TaskSessionOutcome,
 };
 pub use restore::{
     conversation_resume_command, prune_phantom_claude_conversations, restored_startup,

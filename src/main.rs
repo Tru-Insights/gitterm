@@ -14755,7 +14755,7 @@ impl App {
         // The host saves the session and attaches the worker before the tab
         // is published; on failure it drops the tab, stopping the terminal.
         // The host's session save and worker attach are store writes.
-        let tab = freeze_span!("task store: publish launch (session + worker attach)", {
+        let published = freeze_span!("task store: publish launch (session + worker attach)", {
             self.task_host.publish_launch(
                 ticket,
                 LaunchedSession {
@@ -14765,9 +14765,28 @@ impl App {
                     objective_delivery,
                     timestamp,
                 },
-                tab,
+                &tab,
             )
-        })?;
+        });
+        if let Err(error) = published {
+            if let Some(process) = tab.worker_process.take() {
+                match process.discard_unpublished() {
+                    Ok(Some(stop)) => gitterm::shutdown::spawn(
+                        gitterm::shutdown::Kind::Session,
+                        "unpublished-worker-stop",
+                        move || {
+                            stop.join()
+                                .map_err(|_| "unpublished worker shutdown panicked".to_string())?
+                        },
+                    ),
+                    Ok(None) => {}
+                    Err(cleanup) => {
+                        return Err(format!("{error}; stopping unpublished worker: {cleanup}"))
+                    }
+                }
+            }
+            return Err(error);
+        }
         self.workspaces[workspace_idx].tabs.push(tab);
         let tab_idx = self.workspaces[workspace_idx].tabs.len() - 1;
         if focus {
@@ -25146,11 +25165,10 @@ impl App {
                                 tab.task_live_state = Some(TaskSessionLiveState::Working);
                                 task_signal = tab.task_id.clone().map(|task_id| (task_id, None));
                             }
-                        } else if tab.task_live_state == Some(TaskSessionLiveState::AwaitingInput)
-                            && tab.terminal_title().is_none_or(|title| {
-                                terminal_title_attention_reason(title).is_none()
-                            })
-                        {
+                        } else if gitterm_core::task_host::input_resumes_waiting(
+                            tab.task_live_state,
+                            tab.terminal_title(),
+                        ) {
                             // A keystroke answers a notify-driven waiting
                             // state (Codex). ✳-titled tabs (Claude/pi) are
                             // excluded — their title adapter owns both

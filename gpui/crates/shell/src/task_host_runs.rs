@@ -708,11 +708,15 @@ impl TaskHostOwner {
             .max_concurrent_reviews
     }
 
-    /// Iced's plan-limit reading, from its file (only read).
+    /// Live admission uses current observations; preview only reads the source file.
     pub(super) fn policy(&self) -> PolicyNow {
         use gitterm_core::plan_limits::{PlanLimitsFile, evaluate_policy};
-        let file = PlanLimitsFile::load(&PlanLimitsFile::path_in(&self.iced_config));
-        let evaluation = evaluate_policy(&file, chrono::Utc::now().timestamp());
+        let evaluation = if let Some(state) = &self.plan_limits {
+            state.evaluation_for_launch()
+        } else {
+            let file = PlanLimitsFile::load(&PlanLimitsFile::path_in(&self.iced_config));
+            evaluate_policy(&file, chrono::Utc::now().timestamp())
+        };
         PolicyNow {
             report: evaluation.report.clone(),
             evaluation,

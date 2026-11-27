@@ -49,6 +49,32 @@ impl WorkerProcess {
             .map_err(|e| format!("decode worker launch identity {}: {e}", path.display()))
     }
 
+    /// Revoke an unpublished launch before its terminal is dropped. Moving
+    /// the recorder directory closes the startup race: a late recorder cannot
+    /// rename its record, so record_shell's `&&` never starts the harness.
+    /// Capture descendants while ancestry is intact; shutdown then uses the
+    /// same birth-checked TERM/grace/KILL path as a published worker.
+    pub fn discard_unpublished(
+        mut self,
+    ) -> Result<Option<std::thread::JoinHandle<Result<(), String>>>, String> {
+        let revoked = self.dir.with_extension("revoked");
+        std::fs::rename(&self.dir, &revoked)
+            .map_err(|e| format!("revoke worker recorder {}: {e}", self.dir.display()))?;
+        self.dir = revoked;
+        let Some(identity) = self.launch_identity()? else {
+            return Ok(None);
+        };
+        let tree = owned_tree(&SystemProcesses, Some(&identity))?;
+        let stop = std::thread::Builder::new()
+            .name("unpublished-worker-stop".into())
+            .spawn(move || {
+                let _record = self;
+                stop_captured_tree(&SystemProcesses, &tree)
+            })
+            .map_err(|e| format!("start unpublished worker shutdown: {e}"))?;
+        Ok(Some(stop))
+    }
+
     pub fn stop(self) -> Result<(), String> {
         stop_on_platform(
             &SystemProcesses,
@@ -172,6 +198,14 @@ fn stop_tree(
     control: &impl ProcessControl,
     identity: Option<&LaunchIdentity>,
 ) -> Result<(), String> {
+    let tree = owned_tree(control, identity)?;
+    stop_captured_tree(control, &tree)
+}
+
+fn owned_tree(
+    control: &impl ProcessControl,
+    identity: Option<&LaunchIdentity>,
+) -> Result<Vec<Process>, String> {
     let identity = identity.ok_or("refuse worker shutdown: missing persisted launch identity")?;
     let root = identity.pid;
     let snapshot = control.snapshot()?;
@@ -211,6 +245,10 @@ fn stop_tree(
             "refuse worker shutdown: launch identity for PID {root} changed during inspection"
         ));
     }
+    Ok(tree)
+}
+
+fn stop_captured_tree(control: &impl ProcessControl, tree: &[Process]) -> Result<(), String> {
     let mut errors = Vec::new();
     for signal in [Signal::Terminate, Signal::Kill] {
         for process in tree.iter().rev() {
