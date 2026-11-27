@@ -1,5 +1,5 @@
-//! Slice 3 integration: call `chat::policy::install_live(services.clone(), cx)`
-//! once, after installing the live task host and before opening chat panes.
+//! Live startup (`crate::run`) calls `install_live` once, after installing
+//! the live task host and before opening chat panes.
 //! The context MUST be the host's original production context (including its
 //! MCP namespace), not a newly constructed production context. No install
 //! means Preview; changing policy never widens an already-open pane.
@@ -15,8 +15,7 @@ pub(crate) enum ChatLaunchPolicy {
 struct Installed(ChatLaunchPolicy);
 impl gpui::Global for Installed {}
 
-/// Shell composition hook for slice 3. Rejects both Preview and fixture contexts.
-#[allow(dead_code)] // Called by the separately integrated live shell composition.
+/// Live startup's hook. Rejects both Preview and fixture contexts.
 pub(crate) fn install_live(services: ServiceContext, cx: &mut gpui::App) -> Result<()> {
     ensure!(
         !services.is_preview(),

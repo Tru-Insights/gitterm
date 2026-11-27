@@ -573,6 +573,44 @@ settings_data!(SettingsWithVoice;
     stt_model_path: Option<String> = None,
 );
 
+/// Complete desktop wire format, including voice fields even in a host without
+/// voice support. `None` remembers an absent field; `Some(None)` remembers null.
+/// An absent worktree root resolves to the owner's root joined with `worktrees`.
+/// It must stay absent on save, just as Iced omits its default root.
+pub type DesktopSettings =
+    DesktopSettingsData<WorkspaceColor, crate::usage::UsageConfig, DesktopWorktreeRoot>;
+
+/// `None` is the omitted, root-relative default; explicit paths use Iced's
+/// non-null string contract. The owner resolves the default without global IO.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct DesktopWorktreeRoot(pub Option<std::path::PathBuf>);
+
+impl<'de> Deserialize<'de> for DesktopWorktreeRoot {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        std::path::PathBuf::deserialize(deserializer).map(|path| Self(Some(path)))
+    }
+}
+
+settings_data!(DesktopSettingsData;
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present_bool")]
+    stt_enabled: Option<bool> = Some(true),
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present_nullable")]
+    stt_model_path: Option<Option<String>> = Some(None),
+);
+
+fn present_bool<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<bool>, D::Error> {
+    bool::deserialize(deserializer).map(Some)
+}
+
+fn present_nullable<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
 fn default_editor() -> String {
     "vscode".to_string()
 }

@@ -200,9 +200,15 @@ impl IcedCatalog {
         let path = config.join("workspaces.json");
         let bytes = std::fs::read(&path)
             .with_context(|| format!("read Iced workspaces {}", path.display()))?;
-        let mut file: gitterm_core::workspace_config::WorkspacesFile =
+        let file: gitterm_core::workspace_config::WorkspacesFile =
             serde_json::from_slice(&bytes)
                 .with_context(|| format!("parse Iced workspaces {}", path.display()))?;
+        Ok(Self::from_document(config, file))
+    }
+    pub(crate) fn from_document(
+        config: &Path,
+        mut file: gitterm_core::workspace_config::WorkspacesFile,
+    ) -> Self {
         // Normalize legacy repo records in memory, just as Iced does on restore.
         file.normalize_repos();
         let mut open: Vec<_> = file
@@ -228,13 +234,13 @@ impl IcedCatalog {
             _ => 0,
         });
         let active = open.iter().position(|(i, _)| *i == selected).unwrap_or(0);
-        Ok(Self {
+        Self {
             source: config.to_owned(),
             repos: file.repos,
             workspaces: open.into_iter().map(|(_, w)| w).collect(),
             active,
             repos_on_bar: !file.collapsed_repo_groups.iter().any(|g| g == "local"),
-        })
+        }
     }
     pub fn bar_layout(
         &self,
@@ -282,6 +288,14 @@ pub(crate) fn iced_config_dir() -> PathBuf {
     gitterm_core::config_paths::desktop_config_dir()
         .expect("resolve read-only Iced config root")
         .to_path_buf()
+}
+
+/// Later Live startup shares its lifetime lease with the full-document owner.
+/// Preview never calls this constructor and retains read-only Iced readers.
+pub(crate) fn live_desktop_store(
+    lock: std::sync::Arc<gitterm_core::state_lock::StateLock>,
+) -> Result<gitterm_core::desktop_store::DesktopStore> {
+    gitterm_core::desktop_store::DesktopStore::with_lock(lock).map_err(anyhow::Error::msg)
 }
 
 /// Iced builds its index from harness transcripts, independently of its config
@@ -739,6 +753,37 @@ mod preview_terminal_restore_test {
         assert_eq!(saved["terminal_sessions"][0]["id"], 777);
         assert_eq!(
             std::fs::read(source.join("workspaces.json")).unwrap(),
+            bytes
+        );
+    }
+}
+
+#[cfg(test)]
+mod live_constructor_tests {
+    use super::*;
+
+    #[test]
+    fn live_constructor_owns_full_document_and_leaves_preview_projection_read_only() {
+        use gitterm_core::desktop_store::LoadState;
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = br#"{"active_workspace":1,"workspaces":[
+            {"name":"Open","abbrev":"O","dir":"/fixture/open","color":"blue","tabs":[]},
+            {"name":"Parked","abbrev":"P","dir":"/fixture/parked","color":"red","active":false,"tabs":[]}
+        ]}"#;
+        std::fs::write(temp.path().join("workspaces.json"), bytes).unwrap();
+        let projection = IcedCatalog::read(temp.path()).unwrap();
+        assert_eq!(projection.workspaces.len(), 1);
+        let lease =
+            std::sync::Arc::new(gitterm_core::state_lock::StateLock::acquire(temp.path()).unwrap());
+        let store = live_desktop_store(lease).unwrap();
+        let LoadState::Valid(file) = store.snapshot().wait().unwrap().workspaces.loaded else {
+            panic!("valid document")
+        };
+        assert_eq!(file.workspaces.len(), 2);
+        assert_eq!(file.active_workspace, 1);
+        store.drain().wait().unwrap();
+        assert_eq!(
+            std::fs::read(temp.path().join("workspaces.json")).unwrap(),
             bytes
         );
     }

@@ -1,6 +1,26 @@
 //! Only explicit routes and folder inputs; no implicit demo or V6 restore.
 use std::{ffi::OsString, path::PathBuf};
 
+/// Fixed for one process lifetime; changing this choice requires a restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchMode {
+    Preview,
+    Live,
+}
+
+pub fn resolve_mode(args: &mut Vec<OsString>, installed: bool, activated: bool) -> LaunchMode {
+    let preview = args.iter().any(|a| a == "--preview");
+    let live = args.iter().any(|a| a == "--live");
+    args.retain(|a| a != "--preview" && a != "--live");
+    if preview {
+        LaunchMode::Preview
+    } else if live || (installed && activated) {
+        LaunchMode::Live
+    } else {
+        LaunchMode::Preview
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Launch {
     Shell { folders: Vec<PathBuf>, sample: bool },
@@ -204,5 +224,42 @@ mod preview_tests {
                 .is_ok()
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+    #[test]
+    fn flags_override_installed_activation_and_dev_defaults_to_preview() {
+        for installed in [false, true] {
+            for activated in [false, true] {
+                assert_eq!(
+                    resolve_mode(&mut vec![], installed, activated),
+                    if installed && activated {
+                        LaunchMode::Live
+                    } else {
+                        LaunchMode::Preview
+                    }
+                );
+                let mut args = vec!["--live".into(), "--workspace".into(), "/fixture".into()];
+                assert_eq!(
+                    resolve_mode(&mut args, installed, activated),
+                    LaunchMode::Live
+                );
+                assert_eq!(
+                    args,
+                    vec![OsString::from("--workspace"), OsString::from("/fixture")]
+                );
+                assert_eq!(
+                    resolve_mode(
+                        &mut vec!["--live".into(), "--preview".into()],
+                        installed,
+                        activated
+                    ),
+                    LaunchMode::Preview
+                );
+            }
+        }
     }
 }

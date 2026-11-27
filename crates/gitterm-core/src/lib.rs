@@ -4,6 +4,8 @@
 //! and persistence. The optional runtime owns status jobs and remote transport;
 //! hosts supply credential resolution and local path display.
 
+#[cfg(unix)]
+pub mod backup;
 pub mod chat;
 pub mod harness;
 pub mod park;
@@ -100,3 +102,9 @@ pub mod remote;
 pub mod agent_config;
 pub mod config_paths;
 pub mod workspace_config;
+
+#[cfg(feature = "stt")]
+pub mod dictation;
+
+#[cfg(feature = "runtime")]
+pub mod desktop_store;

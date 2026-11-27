@@ -249,6 +249,9 @@ where
 {
     let mut results = Vec::new();
     for branch in branches {
+        if gitterm::shutdown::periodic_cancelled() {
+            break;
+        }
         let account = pr_watch::account_for(PrKey::new(&branch.repo, 1).owner(), &accounts);
         let result = lookup(branch.clone(), account).await;
         results.push((branch, result));
@@ -987,7 +990,7 @@ impl App {
             self.prs.take_due(&item.key.id());
         }
         self.prs.in_flight = true;
-        tasks.push(shutdown_task(
+        tasks.push(periodic_task(
             "poll_pr_watch",
             pr_watch::poll(pr_watch::PollRequest { items }),
             |outcome| Event::Pr(PrEvent::Polled(Box::new(outcome))),
@@ -1021,7 +1024,7 @@ impl App {
             return Task::none();
         }
         self.prs.task_branches_in_flight = true;
-        shutdown_task(
+        periodic_task(
             "poll_task_branch_prs",
             lookup_task_branches(
                 branches,
@@ -1103,6 +1106,9 @@ impl App {
 
     /// Writes the watch file off the UI thread, one write at a time.
     pub(super) fn save_pr_watch(&mut self) -> Task<Event> {
+        if gitterm::shutdown::operations().started() {
+            return Task::none();
+        }
         if self.prs.save_in_flight {
             self.prs.save_again = true;
             return Task::none();
@@ -1110,10 +1116,10 @@ impl App {
         self.prs.save_in_flight = true;
         let file = self.prs.watch.clone();
         let path = pr_watch::WatchFile::path_in(&config::global_config_dir());
-        shutdown_task(
+        periodic_task(
             "save_pr_watch",
             async move {
-                gitterm::shutdown::blocking("save_pr_watch", move || file.save(&path))
+                gitterm::shutdown::blocking("save_pr_watch", move || pr_watch::save(&file, &path))
                     .await
                     .unwrap_or_else(|error| Err(format!("watch save task failed: {error}")))
             },
