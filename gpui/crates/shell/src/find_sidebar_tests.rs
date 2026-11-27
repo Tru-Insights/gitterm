@@ -1517,3 +1517,54 @@ fn n10_n11_and_n12b_child_controls_emit_exact_notice_labels(cx: &mut TestAppCont
         }
     }
 }
+
+#[gpui::test]
+fn live_find_mounts_unopened_chat_and_work_reuses_it(cx: &mut TestAppContext) {
+    let (root, shell, cx) = crate::h2_tests::fixture_catalog(cx, false);
+    let id = format!(
+        "unopened-{}",
+        root.path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .replace('.', "")
+    );
+    cx.update(|window, cx| {
+        let services = gitterm_core::preview::service::ServiceContext::production(
+            &root.path().join("iced"),
+            "find-resume-test",
+        )
+        .unwrap();
+        crate::chat::policy::install_live(services, cx).unwrap();
+        shell.update(cx, |shell, cx| {
+            load(
+                &mut shell.find_state.borrow_mut(),
+                None,
+                vec![chat(&id, "/fixture/folder", ChatBackend::Claude)],
+            );
+            let before = shell.active(cx).sessions.len();
+            let owner = shell.find_owner(cx);
+            shell.find_outcome(
+                &owner,
+                &FindOutcome::Resume {
+                    id: ChatRef::local(&id),
+                    mode: ResumeMode::Chat,
+                },
+                window,
+                cx,
+            );
+            assert_eq!(shell.active(cx).sessions.len(), before + 1);
+            let session = shell.active(cx).active_session.unwrap();
+            let pane = shell.active(cx).panes[&crate::session_pane_id(session)].read(cx);
+            let crate::pane::PaneContent::PreviewChat(view) = &pane.content else {
+                panic!("Live pane not mounted")
+            };
+            assert!(view.read(cx).matches_chat(&id));
+            let workspace = shell.active(cx).workspace.id;
+            shell.select_work_chat(workspace.0, &id, window, cx);
+            assert_eq!(shell.active(cx).sessions.len(), before + 1);
+            assert_eq!(shell.active(cx).active_session, Some(session));
+        });
+    });
+    cx.run_until_parked();
+}

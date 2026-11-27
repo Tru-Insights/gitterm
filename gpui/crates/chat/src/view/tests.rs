@@ -4535,3 +4535,32 @@ fn live_launch_captures_chip_picks_without_poststart_commands(cx: &mut TestAppCo
         );
     });
 }
+
+#[gpui::test]
+fn saved_live_settings_reach_first_send_before_a_redraw(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    let chosen = crate::composer::LaunchSettings {
+        model: "opus".into(),
+        permission_mode: "plan".into(),
+        effort: Some("max".into()),
+    };
+    let captured = Rc::new(std::cell::RefCell::new(None));
+    let received = captured.clone();
+    chat.update_in(cx, |view, window, cx| {
+        view.shadow = Some(Default::default());
+        let settings = view.launch_settings_handle();
+        view.set_intent_callback(
+            Rc::new(move |intent, _| {
+                assert!(matches!(intent, ChatIntent::Send { .. }));
+                *received.borrow_mut() = Some(settings.borrow().clone());
+                Receipt::rejected("synthetic first Send")
+            }),
+            cx,
+        );
+        view.set_live_launch_settings(&chosen, cx);
+        view.composer
+            .update(cx, |input, cx| input.set_value("continue", window, cx));
+        view.send(window, cx);
+    });
+    assert_eq!(captured.borrow().as_ref(), Some(&chosen));
+}

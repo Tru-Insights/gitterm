@@ -382,6 +382,7 @@ impl Provider {
 }
 /// Live deliberately bypasses every Preview preparation, account probe and lease.
 /// The program and environment are composed by the same core policy as Iced.
+#[cfg(test)]
 pub(super) fn start_live(
     services: &gitterm_core::preview::service::ServiceContext,
     config: gitterm_core::harness::claude::ClaudeSessionConfig,
@@ -397,7 +398,31 @@ pub(super) fn start_live(
         "Live chat requires production services"
     );
     validate_live_cwd(&config.cwd)?;
-    let claim = ConversationClaim::claim(services, conversation)?;
+    let claim = Arc::new(ConversationClaim::claim(services, conversation)?);
+    if let Some(id) = &config.resume {
+        claim.provider_id(id)?;
+    }
+    start_live_claimed(services, config, preview_root, claim, instructions)
+}
+
+pub(super) fn start_live_claimed(
+    services: &gitterm_core::preview::service::ServiceContext,
+    config: gitterm_core::harness::claude::ClaudeSessionConfig,
+    preview_root: PathBuf,
+    claim: Arc<ConversationClaim>,
+    instructions: LiveInstructions,
+) -> Result<(
+    super::OwnedRuntime,
+    tokio::sync::mpsc::UnboundedReceiver<gitterm_core::chat::runtime::RuntimeEvent>,
+)> {
+    ensure!(
+        !services.is_preview(),
+        "Live chat requires production services"
+    );
+    validate_live_cwd(&config.cwd)?;
+    if let Some(id) = &config.resume {
+        claim.provider_id(id)?;
+    }
     let root = services.state_root().to_path_buf();
     let (session, events) = gitterm_core::chat::runtime::Session::spawn_runtime(move |close| {
         use gitterm_core::{guidelines, harness::local_launch};
@@ -508,39 +533,86 @@ fn resolve_provider_path(path: &Path) -> Result<PathBuf> {
 }
 
 /// Retained through runtime completion, so a closing child still owns its conversation.
-pub(super) struct ConversationClaim(String);
+pub(super) struct ConversationClaim {
+    keys: std::sync::Mutex<std::collections::HashSet<String>>,
+}
 fn conversations() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
     static OPEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
     OPEN.get_or_init(Default::default)
 }
 impl ConversationClaim {
-    fn claim(
+    pub(super) fn claim(
         services: &gitterm_core::preview::service::ServiceContext,
         conversation: &str,
     ) -> Result<Self> {
         ensure!(
+            !services.is_preview(),
+            "Live chat requires production services"
+        );
+        ensure!(
             !conversation.is_empty(),
             "Live chat requires a conversation identity"
         );
-        let key = format!("{}:{conversation}", services.state_root().display());
+        let claim = Self {
+            keys: Default::default(),
+        };
+        claim.insert(format!(
+            "caller:{}:{conversation}",
+            services.state_root().display()
+        ))?;
+        Ok(claim)
+    }
+    fn insert(&self, key: String) -> Result<()> {
+        let mut owned = self.keys.lock().expect("owned conversation keys");
+        if owned.contains(&key) {
+            return Ok(());
+        }
         ensure!(
             conversations()
                 .lock()
                 .expect("conversation registry")
                 .insert(key.clone()),
-            "Conversation is already open: {conversation}"
+            "Conversation is already open"
         );
-        Ok(Self(key))
+        owned.insert(key);
+        Ok(())
+    }
+    pub(super) fn provider_id(&self, id: &str) -> Result<()> {
+        ensure!(!id.is_empty(), "Empty provider session identity");
+        // Namespace comes from the effective provider root. Tests never inspect
+        // the user's provider home when only claiming a synthetic identity.
+        #[cfg(test)]
+        let root = live_provider_root()?;
+        #[cfg(not(test))]
+        let root = resolve_provider_path(&live_provider_root()?)?;
+        self.insert(format!("claude:{}:{id}", root.display()))
     }
 }
 impl Drop for ConversationClaim {
     fn drop(&mut self) {
-        conversations()
-            .lock()
-            .expect("conversation registry")
-            .remove(&self.0);
+        let mut registry = conversations().lock().expect("conversation registry");
+        for key in self
+            .keys
+            .get_mut()
+            .expect("owned conversation keys")
+            .drain()
+        {
+            registry.remove(&key);
+        }
     }
+}
+
+pub(super) fn live_provider_root() -> Result<PathBuf> {
+    let root = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
+        .context("Resolve Claude provider directory")?;
+    ensure!(
+        root.is_absolute(),
+        "Claude provider directory must be absolute"
+    );
+    Ok(root)
 }
 
 pub(super) struct LiveSnapshots;
