@@ -1,7 +1,7 @@
-//! Shell hookup for remote machines, read-only: the in-app folder picker,
+//! Shell hookup for remote machines: the in-app folder picker,
 //! the connection form, legacy remote-session Refresh, "Show {machine}
 //! chats", each configured agent's connection state and the phone panel's
-//! list. Mirrors Iced's handlers; nothing here writes Iced's config.
+//! list. Live connect saves through core; Preview stays read-only.
 
 use std::{
     cell::RefCell,
@@ -344,11 +344,28 @@ impl Shell {
 
     pub(crate) fn open_connect_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.bar_menu = None;
-        let form = cx.new(|cx| ConnectForm::new(window, cx));
+        let live = cx
+            .try_global::<crate::connect_form::LiveConnectRoot>()
+            .cloned();
+        let known = self.configured_remotes().to_vec();
+        let form = cx.new(|cx| {
+            let mut form = ConnectForm::new(window, cx);
+            if let Some(root) = live {
+                form.enable_live(root, known);
+            }
+            form
+        });
         let subscription = cx.subscribe_in(
             &form,
             window,
             |shell, _, outcome: &ConnectFormOutcome, window, cx| match outcome {
+                ConnectFormOutcome::Saved { agent, attempt } => {
+                    let remotes = shell.reload_remotes(cx);
+                    if let Some(picker) = shell.folder_picker().cloned() {
+                        picker.update(cx, |picker, cx| picker.set_remotes(remotes, cx));
+                    }
+                    shell.connect_saved_remote(agent.clone(), *attempt, cx);
+                }
                 ConnectFormOutcome::Close => {
                     shell.remote.connect = None;
                     // The picker beneath keeps its focus target.
@@ -365,6 +382,82 @@ impl Shell {
         );
         self.remote.connect = Some((form, subscription));
         self.cover_sheet(true, window, cx);
+        cx.notify();
+    }
+
+    /// A form retry forces a fresh handshake. Match the complete saved identity
+    /// before consuming its answer or closing the form (including disk edits).
+    fn connect_saved_remote(
+        &mut self,
+        remote: RemoteAgentConfig,
+        attempt: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.remote
+            .connections
+            .insert(remote.id.clone(), Connection::Connecting);
+        let client = self.remote.client.clone();
+        let root = cx
+            .global::<crate::connect_form::LiveConnectRoot>()
+            .root()
+            .to_path_buf();
+        cx.spawn(async move |shell, cx| {
+            let request = remote.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let result = client.handshake(&request);
+                    let current =
+                        crate::remote_client::read_remotes(&root)
+                            .ok()
+                            .is_some_and(|agents| {
+                                agents.iter().any(|agent| {
+                                    agent.id == request.id && agent.endpoint == request.endpoint
+                                })
+                            });
+                    if !current
+                        || result.as_ref().is_ok_and(|h| {
+                            h.remote_id != request.id || h.endpoint != request.endpoint
+                        })
+                    {
+                        Err(gitterm_core::remote::connect::IDENTITY_CHANGED.into())
+                    } else {
+                        result
+                    }
+                })
+                .await;
+            _ = shell.update(cx, |shell, cx| {
+                if !shell
+                    .configured_remotes()
+                    .iter()
+                    .any(|agent| agent.id == remote.id && agent.endpoint == remote.endpoint)
+                {
+                    return;
+                }
+                let connection = match &result {
+                    Ok(h) => Connection::Connected {
+                        capabilities: h.capabilities.clone(),
+                    },
+                    Err(_) => Connection::Unreachable,
+                };
+                shell
+                    .remote
+                    .connections
+                    .insert(remote.id.clone(), connection);
+                if let Some(form) = shell.connect_form().cloned()
+                    && form.read(cx).saved_matches(&remote, attempt)
+                {
+                    match result {
+                        Ok(_) => form.update(cx, |_, cx| cx.emit(ConnectFormOutcome::Close)),
+                        Err(error) => {
+                            form.update(cx, |form, cx| form.connection_failed(&error, cx))
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -844,5 +937,60 @@ impl Shell {
             .chain(self.connect_form().map(|f| f.clone().into()))
             .chain(self.phone_panel().map(|p| p.clone().into()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+    use crate::remote_shell_tests::{click, draw, fixture};
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn live_form_save_reloads_remotes_and_closes_only_after_matching_handshake(
+        cx: &mut TestAppContext,
+    ) {
+        let (f, cx) = fixture(cx);
+        let source = f.iced();
+        cx.update(|window, cx| {
+            cx.set_global(crate::connect_form::LiveConnectRoot::new(Arc::new(
+                gitterm_core::state_lock::StateLock::acquire(&source).unwrap(),
+            )));
+            f.shell
+                .update(cx, |shell, cx| shell.open_connect_form(window, cx));
+        });
+        draw(cx);
+        // Drive the actual fields/buttons, not a second implementation of submit.
+        click("connect-form-name", cx);
+        cx.simulate_input("Another Mac");
+        click("connect-form-endpoint", cx);
+        cx.simulate_input("fixture.invalid:7777");
+        click("connect-form-token", cx);
+        cx.simulate_input("synthetic-connect-secret");
+        click("connect-form-connect", cx);
+        draw(cx);
+        let file = gitterm_core::remote::connect::load_remote_agents(&source).unwrap();
+        let form_state = cx.read(|cx| {
+            f.shell.read(cx).connect_form().map(|form| {
+                (
+                    form.read(cx).draft(cx),
+                    form.read(cx).status().map(str::to_string),
+                )
+            })
+        });
+        assert_eq!(file.remote_agents.len(), 2, "form: {form_state:?}");
+        assert_eq!(file.remote_agents[1].id, "another-mac");
+        assert!(
+            f.fake
+                .calls()
+                .contains(&"handshake another-mac".to_string())
+        );
+        cx.read(|cx| {
+            assert!(f.shell.read(cx).connect_form().is_none());
+            assert!(matches!(
+                f.shell.read(cx).remote.connections.get("another-mac"),
+                Some(Connection::Connected { .. })
+            ));
+        });
     }
 }

@@ -21,7 +21,12 @@ pub fn resolve_token_ref(token_ref: &str) -> Result<String, RemoteAgentClientErr
             ));
         }
         return std::env::var(name).map_err(|err| {
-            RemoteAgentClientError::new(format!("could not read token from env:{name}: {err}"))
+            // VarError::NotUnicode includes the credential value in Display.
+            let detail = match err {
+                std::env::VarError::NotPresent => "environment variable not found",
+                std::env::VarError::NotUnicode(_) => "value is not valid UTF-8",
+            };
+            RemoteAgentClientError::new(format!("could not read token from env:{name}: {detail}"))
         });
     }
 

@@ -4842,6 +4842,16 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
         cx.set_global(barrier);
         cx.set_global(app_shutdown);
         preview.release_on_quit(cx);
+        if live_services.is_some() {
+            let connect = connect_form::LiveConnectRoot::new(host_lock.clone());
+            let draining = connect.clone();
+            cx.global::<lifetime::Barrier>()
+                .register("remote-connect", move || {
+                    draining.close();
+                    Ok(())
+                });
+            cx.set_global(connect);
+        }
         // Before the window's workspace owner, so the host's quit callback
         // runs ahead of its chat drains.
         if let Some(config) = task_host {
