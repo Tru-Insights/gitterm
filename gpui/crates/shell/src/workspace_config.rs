@@ -284,6 +284,15 @@ pub(crate) fn iced_config_dir() -> PathBuf {
         .to_path_buf()
 }
 
+/// Later Live startup shares its lifetime lease with the full-document owner.
+/// Preview never calls this constructor and retains read-only Iced readers.
+#[allow(dead_code)] // Live wiring is the next slice.
+pub(crate) fn live_desktop_store(
+    lock: std::sync::Arc<gitterm_core::state_lock::StateLock>,
+) -> Result<gitterm_core::desktop_store::DesktopStore> {
+    gitterm_core::desktop_store::DesktopStore::with_lock(lock).map_err(anyhow::Error::msg)
+}
+
 /// Iced builds its index from harness transcripts, independently of its config
 /// override. Only the facts directory comes from the resolved Iced catalog.
 /// Both core operations are read-only; catch-up/backfill writers are never run.
@@ -739,6 +748,37 @@ mod preview_terminal_restore_test {
         assert_eq!(saved["terminal_sessions"][0]["id"], 777);
         assert_eq!(
             std::fs::read(source.join("workspaces.json")).unwrap(),
+            bytes
+        );
+    }
+}
+
+#[cfg(test)]
+mod live_constructor_tests {
+    use super::*;
+
+    #[test]
+    fn live_constructor_owns_full_document_and_leaves_preview_projection_read_only() {
+        use gitterm_core::desktop_store::LoadState;
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = br#"{"active_workspace":1,"workspaces":[
+            {"name":"Open","abbrev":"O","dir":"/fixture/open","color":"blue","tabs":[]},
+            {"name":"Parked","abbrev":"P","dir":"/fixture/parked","color":"red","active":false,"tabs":[]}
+        ]}"#;
+        std::fs::write(temp.path().join("workspaces.json"), bytes).unwrap();
+        let projection = IcedCatalog::read(temp.path()).unwrap();
+        assert_eq!(projection.workspaces.len(), 1);
+        let lease =
+            std::sync::Arc::new(gitterm_core::state_lock::StateLock::acquire(temp.path()).unwrap());
+        let store = live_desktop_store(lease).unwrap();
+        let LoadState::Valid(file) = store.snapshot().wait().unwrap().workspaces.loaded else {
+            panic!("valid document")
+        };
+        assert_eq!(file.workspaces.len(), 2);
+        assert_eq!(file.active_workspace, 1);
+        store.drain().wait().unwrap();
+        assert_eq!(
+            std::fs::read(temp.path().join("workspaces.json")).unwrap(),
             bytes
         );
     }
