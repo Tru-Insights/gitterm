@@ -210,16 +210,16 @@ impl App {
         let Some(job) = self.plan_limits.begin_codex_read(sessions, Instant::now()) else {
             return Task::none();
         };
-        Task::perform(job.run(), Event::PlanLimits)
+        shutdown_task("read_codex_limits", job.run(), Event::PlanLimits)
     }
 
     /// Writes the readings off the UI thread, one write at a time.
-    fn save_plan_limits(&mut self) -> Task<Event> {
+    pub(super) fn save_plan_limits(&mut self) -> Task<Event> {
         let path = PlanLimitsFile::path_in(&config::global_config_dir());
         let Some(job) = self.plan_limits.begin_save(path) else {
             return Task::none();
         };
-        Task::perform(job.run(), Event::PlanLimits)
+        shutdown_task("save_plan_limits", job.run(), Event::PlanLimits)
     }
 
     pub(super) fn update_plan_limits(&mut self, event: PlanLimitsEvent) -> Task<Event> {

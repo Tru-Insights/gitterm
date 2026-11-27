@@ -194,6 +194,7 @@ pub fn redact_frame(frame: &Value) -> Value {
 pub struct AcpSession {
     snapshots_closed: tokio_util::sync::CancellationToken,
     commands: mpsc::UnboundedSender<HarnessCommand>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AcpSession {
@@ -223,13 +224,18 @@ impl AcpSession {
                 };
                 rt.block_on(run_session(config, cmd_rx, ev_tx, close_token));
             });
-        if let Err(e) = spawn_result {
-            acp_log(&format!("could not spawn session thread: {e}"));
-        }
+        let thread = match spawn_result {
+            Ok(thread) => Some(thread),
+            Err(e) => {
+                acp_log(&format!("could not spawn session thread: {e}"));
+                None
+            }
+        };
         (
             Self {
                 commands: cmd_tx,
                 snapshots_closed,
+                thread,
             },
             ev_rx,
         )
@@ -249,6 +255,17 @@ impl AcpSession {
 impl Drop for AcpSession {
     fn drop(&mut self) {
         let _ = self.commands.send(HarnessCommand::Shutdown);
+        if let Some(thread) = self.thread.take() {
+            crate::shutdown::spawn(
+                crate::shutdown::Kind::Session,
+                "ACP session I/O and snapshots",
+                move || {
+                    thread
+                        .join()
+                        .map_err(|_| "ACP session thread panicked".to_string())
+                },
+            );
+        }
     }
 }
 
@@ -1078,7 +1095,7 @@ async fn run_session(
         }
     });
     let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::new()));
-    {
+    let stderr_reader = {
         let tail = stderr_tail.clone();
         let agent = config.agent.program();
         tokio::spawn(async move {
@@ -1104,8 +1121,8 @@ async fn run_session(
                     }
                 }
             }
-        });
-    }
+        })
+    };
 
     let mut session = Session {
         snapshots: crate::turn_snapshots::Recorder::new(
@@ -1216,6 +1233,9 @@ async fn run_session(
             None
         }
     };
+    if let Err(error) = stderr_reader.await {
+        acp_log(&format!("{label} stderr reader: {error}"));
+    }
     acp_log(&format!("{label} {pid} exited with {code:?}"));
     let failed_start = session.phase == Phase::Failed;
     if !shutting_down && !failed_start && code != Some(0) {

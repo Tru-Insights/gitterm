@@ -201,6 +201,7 @@ fn native_chat_acp_close_sends_shutdown() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let session = AcpSession {
         commands: tx,
+        thread: None,
         snapshots_closed: tokio_util::sync::CancellationToken::new(),
     };
     drop(session);

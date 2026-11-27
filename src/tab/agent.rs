@@ -355,7 +355,7 @@ pub(crate) fn spawn_agent_task(
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AgentEvent>();
     let stop_slot: Arc<Mutex<Option<oneshot::Sender<()>>>> = Arc::new(Mutex::new(None));
 
-    {
+    let thread = {
         let stop_slot = stop_slot.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -379,9 +379,19 @@ pub(crate) fn spawn_agent_task(
                 event_tx,
                 stop_slot,
             ));
-        });
-    }
+        })
+    };
 
+    // Retain the supervisor join from launch through runtime teardown.
+    gitterm::shutdown::spawn(
+        gitterm::shutdown::Kind::Session,
+        "Pi session I/O and snapshots",
+        move || {
+            thread
+                .join()
+                .map_err(|_| "Pi session thread panicked".to_string())
+        },
+    );
     AgentTaskHandle {
         snapshots_closed,
         input_tx,
@@ -548,6 +558,30 @@ fn build_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_pi_handle_closes_admission_without_requesting_a_stop() {
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+        // The running turn retains the other reference to this slot.
+        let stop_slot = Arc::new(Mutex::new(Some(stop_tx)));
+        let handle = AgentTaskHandle {
+            snapshots_closed: tokio_util::sync::CancellationToken::new(),
+            input_tx,
+            stop_slot: stop_slot.clone(),
+            pending_event_rx: Mutex::new(None),
+        };
+        drop(handle);
+        assert!(matches!(
+            input_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            stop_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(stop_slot.lock().unwrap().is_some());
+    }
 
     #[test]
     fn pi_turns_append_the_guidelines_file_before_the_prompt() {

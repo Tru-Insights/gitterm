@@ -427,8 +427,19 @@ pub async fn run(
     run: CodexRun,
     progress: mpsc::UnboundedSender<CodexRunEvent>,
 ) -> Result<CodexRunOutcome, CodexRunError> {
+    let log = LogWriter::new(run.log_path.clone());
+    run_with_log(run, progress, log).await
+}
+
+/// Run with a caller-owned log handle, so desktop shutdown can flush and close
+/// in-process logging while leaving the external child running.
+pub async fn run_with_log(
+    run: CodexRun,
+    progress: mpsc::UnboundedSender<CodexRunEvent>,
+    log: LogWriter,
+) -> Result<CodexRunOutcome, CodexRunError> {
     match CodexEnvironment::detect() {
-        Ok(environment) => run_with(run, progress, &environment).await,
+        Ok(environment) => run_with_log_environment(run, progress, &environment, log).await,
         Err(error) => {
             send(
                 &progress,
@@ -448,7 +459,17 @@ pub async fn run_with(
     progress: mpsc::UnboundedSender<CodexRunEvent>,
     environment: &CodexEnvironment,
 ) -> Result<CodexRunOutcome, CodexRunError> {
-    let result = run_inner(&run, &progress, environment).await;
+    let log = LogWriter::new(run.log_path.clone());
+    run_with_log_environment(run, progress, environment, log).await
+}
+
+async fn run_with_log_environment(
+    run: CodexRun,
+    progress: mpsc::UnboundedSender<CodexRunEvent>,
+    environment: &CodexEnvironment,
+    log: LogWriter,
+) -> Result<CodexRunOutcome, CodexRunError> {
+    let result = run_inner(&run, &progress, environment, &log).await;
     match &result {
         Ok(_) => send(&progress, CodexRunEvent::Completed),
         Err(error) => send(
@@ -471,6 +492,7 @@ async fn run_inner(
     run: &CodexRun,
     progress: &mpsc::UnboundedSender<CodexRunEvent>,
     environment: &CodexEnvironment,
+    log: &LogWriter,
 ) -> Result<CodexRunOutcome, CodexRunError> {
     if run.effort == Some(crate::workers::ReasoningEffort::Max) {
         return Err(CodexRunError::Io {
@@ -486,24 +508,7 @@ async fn run_inner(
     let last_message_path = run.log_path.with_extension("last.md");
     let (args, stdin_text) = codex_args(run, &last_message_path);
 
-    if let Some(parent) = run.log_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| CodexRunError::Io {
-            context: format!("create the log directory {}", parent.display()),
-            source,
-        })?;
-    }
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&run.log_path)
-        .map_err(|source| CodexRunError::Io {
-            context: format!("open the Codex log {}", run.log_path.display()),
-            source,
-        })?;
-    let log = LogWriter {
-        path: run.log_path.clone(),
-        file: Mutex::new(log_file),
-    };
+    log.open()?;
 
     let mut command = tokio::process::Command::new(&program);
     scope_env(&mut command, environment);
@@ -934,21 +939,84 @@ pub fn describe_target(target: &ReviewTarget) -> String {
     }
 }
 
-struct LogWriter {
+#[derive(Debug, Clone)]
+pub struct LogWriter {
     path: PathBuf,
-    file: Mutex<std::fs::File>,
+    file: std::sync::Arc<Mutex<Option<std::fs::File>>>,
+    closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LogWriter {
-    fn append(&self, line: &str) -> Result<(), CodexRunError> {
-        let mut file = self.file.lock().map_err(|_| CodexRunError::Io {
-            context: format!("write the Codex log {}", self.path.display()),
-            source: std::io::Error::other("log lock poisoned"),
-        })?;
-        writeln!(file, "{line}").map_err(|source| CodexRunError::Io {
-            context: format!("write the Codex log {}", self.path.display()),
+    /// No filesystem work until the runner opens the log off the UI thread.
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            file: Default::default(),
+            closed: Default::default(),
+        }
+    }
+
+    fn io_error(&self, source: std::io::Error) -> CodexRunError {
+        CodexRunError::Io {
+            context: format!("access the Codex log {}", self.path.display()),
             source,
-        })
+        }
+    }
+
+    fn open(&self) -> Result<(), CodexRunError> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| self.io_error(std::io::Error::other("log lock poisoned")))?;
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) || file.is_some() {
+            return Ok(());
+        }
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| self.io_error(error))?;
+        }
+        *file = Some(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .map_err(|error| self.io_error(error))?,
+        );
+        Ok(())
+    }
+
+    /// Stop admission immediately; close() can then run on a bounded worker.
+    pub fn stop_writing(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Flush and close every clone's writer. Closing before open is permanent.
+    /// Further appends are discarded so closing never stops the child runner.
+    pub fn close(&self) -> Result<(), CodexRunError> {
+        self.stop_writing();
+        let mut slot = self
+            .file
+            .lock()
+            .map_err(|_| self.io_error(std::io::Error::other("log lock poisoned")))?;
+        if let Some(mut file) = slot.take() {
+            file.flush().map_err(|error| self.io_error(error))?;
+        }
+        Ok(())
+    }
+
+    fn append(&self, line: &str) -> Result<(), CodexRunError> {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| self.io_error(std::io::Error::other("log lock poisoned")))?;
+        if !self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Some(file) = file.as_mut() {
+                writeln!(file, "{line}").map_err(|error| self.io_error(error))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2945,5 +3013,47 @@ mod tests {
             );
             assert!(!fake.dir.path().join("args").exists());
         }
+    }
+}
+
+#[cfg(test)]
+mod log_shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn close_flushes_the_log_and_prevents_appends_after_state_lock_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = crate::state_lock::StateLock::acquire(dir.path()).unwrap();
+        let path = dir.path().join("delegation.jsonl");
+        let log = LogWriter::new(path.clone());
+        log.open().unwrap();
+        log.append("before barrier").unwrap();
+        let writer = log.clone();
+        let (resume, after_release) = std::sync::mpsc::channel();
+        let stream = std::thread::spawn(move || {
+            after_release.recv().unwrap();
+            for _ in 0..100 {
+                writer.append("after lock release").unwrap();
+            }
+            writer.open().unwrap(); // Closed writers can never reopen.
+            writer.append("after reopen attempt").unwrap();
+        });
+        log.close().unwrap();
+        drop(lock);
+        let _next_owner = crate::state_lock::StateLock::acquire(dir.path()).unwrap();
+        resume.send(()).unwrap();
+        stream.join().unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "before barrier\n");
+    }
+
+    #[test]
+    fn closing_before_runner_preflight_finishes_never_opens_a_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-created/delegation.jsonl");
+        let log = LogWriter::new(path.clone());
+        log.close().unwrap();
+        log.open().unwrap();
+        log.append("late preflight").unwrap();
+        assert!(!path.parent().unwrap().exists());
     }
 }

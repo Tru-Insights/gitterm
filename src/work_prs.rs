@@ -987,7 +987,8 @@ impl App {
             self.prs.take_due(&item.key.id());
         }
         self.prs.in_flight = true;
-        tasks.push(Task::perform(
+        tasks.push(shutdown_task(
+            "poll_pr_watch",
             pr_watch::poll(pr_watch::PollRequest { items }),
             |outcome| Event::Pr(PrEvent::Polled(Box::new(outcome))),
         ));
@@ -1020,7 +1021,8 @@ impl App {
             return Task::none();
         }
         self.prs.task_branches_in_flight = true;
-        Task::perform(
+        shutdown_task(
+            "poll_task_branch_prs",
             lookup_task_branches(
                 branches,
                 self.github_accounts.clone(),
@@ -1100,7 +1102,7 @@ impl App {
     }
 
     /// Writes the watch file off the UI thread, one write at a time.
-    fn save_pr_watch(&mut self) -> Task<Event> {
+    pub(super) fn save_pr_watch(&mut self) -> Task<Event> {
         if self.prs.save_in_flight {
             self.prs.save_again = true;
             return Task::none();
@@ -1108,9 +1110,10 @@ impl App {
         self.prs.save_in_flight = true;
         let file = self.prs.watch.clone();
         let path = pr_watch::WatchFile::path_in(&config::global_config_dir());
-        Task::perform(
+        shutdown_task(
+            "save_pr_watch",
             async move {
-                tokio::task::spawn_blocking(move || file.save(&path))
+                gitterm::shutdown::blocking("save_pr_watch", move || file.save(&path))
                     .await
                     .unwrap_or_else(|error| Err(format!("watch save task failed: {error}")))
             },
@@ -1194,11 +1197,14 @@ impl App {
         let root = plan.root_chat_id.clone();
         self.prs.plan_writes.insert(root.clone());
         self.prs.plan_errors.remove(&root);
-        Task::perform(
+        shutdown_task(
+            "write_merge_plan",
             async move {
-                tokio::task::spawn_blocking(move || merge_plan::write_plan(&dir, &plan))
-                    .await
-                    .unwrap_or_else(|error| Err(format!("plan write task failed: {error}")))
+                gitterm::shutdown::blocking("write_merge_plan", move || {
+                    merge_plan::write_plan(&dir, &plan)
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("plan write task failed: {error}")))
             },
             move |result| {
                 Event::Pr(PrEvent::PlanWritten(Box::new(MergePlanWrite {
@@ -1345,7 +1351,8 @@ impl App {
                 };
                 eprintln!("[pr-watch] user ran: {}", run.command_line());
                 let key = run.key.clone();
-                return Task::perform(
+                return shutdown_task(
+                    "update_prs",
                     pr_watch::run_action(run.action, run.key, run.account),
                     move |result| Event::Pr(PrEvent::ActionDone(key.clone(), result)),
                 );
@@ -1446,9 +1453,10 @@ impl App {
             return save;
         }
         let repo = key.repo.clone();
-        let resolve = Task::perform(
+        let resolve = shutdown_task(
+            "review_pr",
             async move {
-                tokio::task::spawn_blocking(move || {
+                gitterm::shutdown::blocking("review_pr", move || {
                     pr_actions::review_checkout(
                         candidates,
                         &repo,

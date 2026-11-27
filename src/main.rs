@@ -42,7 +42,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "stt")]
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -1658,6 +1657,7 @@ static MENU_IDS: OnceLock<MenuIds> = OnceLock::new();
 
 #[derive(Debug)]
 struct MenuIds {
+    quit: muda::MenuId,
     increase_terminal_font: muda::MenuId,
     decrease_terminal_font: muda::MenuId,
     increase_ui_font: muda::MenuId,
@@ -1671,12 +1671,78 @@ struct MenuIds {
     open_plans_viewer: muda::MenuId,
 }
 
+#[cfg(target_os = "macos")]
+mod native_quit {
+    use objc2::runtime::{AnyClass, AnyObject, Sel};
+    use objc2::{class, msg_send, sel};
+
+    extern "C" fn should_terminate(_: &AnyObject, _: Sel, _: &AnyObject) -> usize {
+        gitterm::shutdown::request_quit();
+        // NSTerminateCancel: Iced will exit after the shared barrier, without
+        // asking AppKit to terminate again.
+        0
+    }
+
+    pub(super) fn install_on(class: &AnyClass) -> bool {
+        let selector = sel!(applicationShouldTerminate:);
+        if let Some(method) = class.instance_method(selector) {
+            if std::ptr::fn_addr_eq(method.implementation(), unsafe {
+                std::mem::transmute::<
+                    extern "C" fn(&AnyObject, Sel, &AnyObject) -> usize,
+                    objc2::runtime::Imp,
+                >(should_terminate)
+            }) {
+                return true;
+            }
+            eprintln!("[shutdown] native quit hook disabled: applicationShouldTerminate: is already implemented; native quit bypasses the barrier");
+            return false;
+        }
+        // winit 0.30 only implements applicationWillTerminate:. Add the
+        // optional delegate method without replacing any winit behavior.
+        let added = unsafe {
+            objc2::ffi::class_addMethod(
+                (class as *const AnyClass).cast_mut().cast(),
+                selector.as_ptr().cast(),
+                Some(std::mem::transmute::<
+                    extern "C" fn(&AnyObject, Sel, &AnyObject) -> usize,
+                    unsafe extern "C" fn(),
+                >(should_terminate)),
+                c"Q@:@".as_ptr(),
+            )
+        };
+        if !added {
+            eprintln!("[shutdown] native quit hook disabled: could not add applicationShouldTerminate:; native quit bypasses the barrier");
+        }
+        added
+    }
+
+    pub(super) fn install() {
+        unsafe {
+            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let delegate: *mut AnyObject = msg_send![app, delegate];
+            if let Some(delegate) = delegate.as_ref() {
+                install_on(delegate.class());
+            } else {
+                eprintln!("[shutdown] native quit hook disabled: no application delegate; native quit bypasses the barrier");
+            }
+        }
+    }
+}
+
 fn setup_menu_bar() {
     // Create native macOS menu bar
     let menu = Menu::new();
 
     // App menu (GitTerm V6)
     let app_menu = Submenu::new(config::APP_NAME, true);
+    let quit = MenuItem::new(
+        "Quit GitTerm V6",
+        true,
+        Some(Accelerator::new(
+            Some(muda::accelerator::Modifiers::META),
+            muda::accelerator::Code::KeyQ,
+        )),
+    );
     app_menu
         .append_items(&[
             &PredefinedMenuItem::about(None, None),
@@ -1687,7 +1753,7 @@ fn setup_menu_bar() {
             &PredefinedMenuItem::hide_others(None),
             &PredefinedMenuItem::show_all(None),
             &PredefinedMenuItem::separator(),
-            &PredefinedMenuItem::quit(None),
+            &quit,
         ])
         .unwrap();
 
@@ -1823,6 +1889,7 @@ fn setup_menu_bar() {
 
     // Store menu IDs for event handling
     let _ = MENU_IDS.set(MenuIds {
+        quit: quit.id().clone(),
         increase_terminal_font: increase_terminal_font.id().clone(),
         decrease_terminal_font: decrease_terminal_font.id().clone(),
         increase_ui_font: increase_ui_font.id().clone(),
@@ -2100,7 +2167,9 @@ fn main() -> iced::Result {
     // Load app icon from embedded PNG
     let icon = iced::window::icon::from_file_data(include_bytes!("../assets/icon.png"), None).ok();
 
-    iced::application(App::new, App::update, App::view)
+    gitterm::shutdown::activate_desktop();
+    let result = iced::application(App::new, App::update, App::view)
+        .executor::<gitterm::shutdown::Executor>()
         .title(App::title)
         .window_size(Size {
             width: 1400.0,
@@ -2108,10 +2177,16 @@ fn main() -> iced::Result {
         })
         .window(iced::window::Settings {
             icon,
+            exit_on_close_request: false,
             ..Default::default()
         })
         .subscription(App::subscription)
-        .run()
+        .run();
+    // App and Iced's executor have dropped. Keep ownership through their
+    // registered blocking writers and chat/child joins, even on runtime error.
+    gitterm::shutdown::operations().wait();
+    gitterm::shutdown::log_children();
+    result
 }
 
 use gitterm_core::status::{
@@ -6778,6 +6853,10 @@ fn collect_file_syntax_highlight(
 
 #[derive(Debug, Clone)]
 pub enum Event {
+    QuitRequested,
+    ShutdownPoll,
+    ShutdownWorkerIdentitiesSaved(Arc<WorkerIdentitySave>),
+    ShutdownTracked(Arc<ShutdownJob>),
     Terminal(usize, iced_term::Event),
     Tick,
     InitMenu,
@@ -7523,7 +7602,147 @@ fn paired_browser_evidence(evidence: &[BrowserEvidence]) -> Vec<&BrowserEvidence
     selected
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ShutdownPhase {
+    #[default]
+    Running,
+    Saving,
+    FinalSave,
+    Finished,
+}
+
+// The registry lets App::drop drain the same admitted saves if the window
+// runtime fails before delivering their completion events.
+pub struct ShutdownJob {
+    ticket: Arc<gitterm::shutdown::Ticket>,
+    future: Mutex<Option<iced::futures::future::BoxFuture<'static, Event>>>,
+    result: Mutex<Option<Event>>,
+    done: tokio_util::sync::CancellationToken,
+}
+
+impl std::fmt::Debug for ShutdownJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShutdownJob")
+            .field("ticket", &self.ticket)
+            .finish()
+    }
+}
+
+fn shutdown_jobs() -> &'static Mutex<Vec<Arc<ShutdownJob>>> {
+    static JOBS: OnceLock<Mutex<Vec<Arc<ShutdownJob>>>> = OnceLock::new();
+    JOBS.get_or_init(Mutex::default)
+}
+
+impl ShutdownJob {
+    fn start(self: &Arc<Self>) {
+        let Some(future) = self.future.lock().unwrap().take() else {
+            return;
+        };
+        let job = self.clone();
+        match gitterm::shutdown::Executor::runtime() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    use iced::futures::FutureExt;
+                    match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+                        Ok(event) => {
+                            if let Some(error) = shutdown_failure(&event) {
+                                job.ticket.fail(error);
+                            }
+                            *job.result.lock().unwrap() = Some(event);
+                        }
+                        Err(_) => job.ticket.fail("admitted task panicked"),
+                    }
+                    job.done.cancel();
+                });
+            }
+            Err(error) => {
+                self.ticket.fail(format!("start save runtime: {error}"));
+                self.done.cancel();
+            }
+        }
+    }
+
+    fn take(&self) -> Option<Event> {
+        self.result.lock().unwrap().take()
+    }
+}
+
+fn shutdown_failure(event: &Event) -> Option<&str> {
+    match event {
+        Event::ChatFactsFlushed(_, Err(error))
+        | Event::ChatFactsBackfilled(Err(error))
+        | Event::TurnSnapshotsCleaned(Err(error))
+        | Event::Pr(PrEvent::Saved(Err(error)))
+        | Event::Issue(IssueEvent::Saved(Err(error)))
+        | Event::PlanLimits(PlanLimitsEvent::Saved(Err(error)))
+        | Event::WorkNotesDone(gitterm::work_notes::JobResult::Failed(error))
+        | Event::WorkNotesDone(gitterm::work_notes::JobResult::Commit(Err(error)))
+        | Event::WorkNotesDone(gitterm::work_notes::JobResult::Push(Err(error))) => Some(error),
+        Event::ShutdownWorkerIdentitiesSaved(save) => save.error.as_deref(),
+        Event::Pr(PrEvent::PlanWritten(write)) => write.result.as_ref().err().map(String::as_str),
+        _ => None,
+    }
+}
+
+fn shutdown_task<A: Send + 'static>(
+    name: &'static str,
+    future: impl std::future::Future<Output = A> + Send + 'static,
+    map: impl FnOnce(A) -> Event + Send + 'static,
+) -> Task<Event> {
+    let job = Arc::new(ShutdownJob {
+        ticket: gitterm::shutdown::operations().ticket(gitterm::shutdown::Kind::Write, name),
+        future: Mutex::new(Some(Box::pin(async move { map(future.await) }))),
+        result: Mutex::new(None),
+        done: tokio_util::sync::CancellationToken::new(),
+    });
+    shutdown_jobs().lock().unwrap().push(job.clone());
+    Task::perform(
+        async move {
+            job.start();
+            job.done.cancelled().await;
+            job
+        },
+        Event::ShutdownTracked,
+    )
+}
+
+fn shutdown_stream<A: Send + 'static>(
+    stream: impl iced::futures::Stream<Item = A> + Send + 'static,
+    mut map: impl FnMut(A) -> Event + Send + 'static,
+) -> Task<Event> {
+    use iced::futures::StreamExt;
+    let stream_ticket = gitterm::shutdown::operations()
+        .ticket(gitterm::shutdown::Kind::Session, "chat event stream drain");
+    Task::run(
+        stream.map(move |value| {
+            let _keep_stream = &stream_ticket;
+            let done = tokio_util::sync::CancellationToken::new();
+            done.cancel();
+            let job = Arc::new(ShutdownJob {
+                ticket: gitterm::shutdown::operations()
+                    .ticket(gitterm::shutdown::Kind::Write, "chat event completion"),
+                future: Mutex::new(None),
+                result: Mutex::new(Some(map(value))),
+                done,
+            });
+            shutdown_jobs().lock().unwrap().push(job.clone());
+            Event::ShutdownTracked(job)
+        }),
+        |event| event,
+    )
+}
+
+#[derive(Debug)]
+pub struct WorkerIdentitySave {
+    store: Mutex<Option<TaskStore>>,
+    identities: Vec<(usize, gitterm::tasks::LaunchIdentity)>,
+    error: Option<String>,
+}
+
 struct App {
+    shutdown_phase: ShutdownPhase,
+    shutdown_worker_store_pending: bool,
+    shutdown_deferred: Vec<Event>,
     status_jobs: StatusSubscriptionData,
     title: String,
     workspaces: Vec<Workspace>,
@@ -7546,7 +7765,7 @@ struct App {
     /// Codex delegation runs in flight, by delegation id. Aborting a handle
     /// drops the run, which kills its Codex process (TRU-142).
     /// The lifecycle state of these runs lives in the task host.
-    delegation_runs: HashMap<String, iced::task::Handle>,
+    delegation_runs: HashMap<String, DelegationRun>,
     worker_pr_scans: gitterm::worker_prs::Scans,
     delegation_waiting_counts: HashMap<String, usize>,
     /// New-chat model/effort defaults and the last selection (config
@@ -9497,11 +9716,319 @@ fn rebuild_workspace_overview(
     }
 }
 
+fn shutdown_completion(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::ChatFactsFlushed(..)
+            | Event::ChatFactsBackfilled(..)
+            | Event::ChatIndexLoaded(..)
+            | Event::WorkerPrsScanned(..)
+            | Event::WorkNotesDone(..)
+            | Event::TurnSnapshotsCleaned(..)
+            | Event::Pr(PrEvent::Saved(_) | PrEvent::PlanWritten(_) | PrEvent::Polled(_))
+            | Event::Issue(IssueEvent::Saved(_) | IssueEvent::Fetched(_))
+            | Event::PlanLimits(_)
+            | Event::DelegationProgress(..)
+            | Event::DelegationFinished(..)
+            | Event::AgentRuntimeEvent(..)
+            | Event::AgentCommandOutcome(..)
+            | Event::AgentEventReceived(..)
+    )
+}
+
+impl App {
+    fn begin_shutdown(&mut self) -> Task<Event> {
+        if self.shutdown_phase != ShutdownPhase::Running {
+            return Task::none();
+        }
+        self.shutdown_phase = ShutdownPhase::Saving;
+        gitterm::shutdown::operations().begin(gitterm::shutdown::TIMEOUT);
+        // Dispatch the snapshot before any teardown or other operation can stall.
+        self.save_shutdown_workspaces();
+        for (id, run) in &self.delegation_runs {
+            run.close_log(id);
+        }
+        // Closing the shared ingress settles every pending reply, including
+        // reply tickets held by work that has not returned to the UI yet.
+        self.task_host.shutdown();
+        self.status_jobs.runtime.close();
+        self.log_server_state.shutdown.notify_one();
+        let worker_save = self.save_shutdown_worker_identities();
+        self.join_shutdown_sessions();
+        let ids: Vec<_> = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| &ws.tabs)
+            .map(|tab| tab.id)
+            .collect();
+        let mut tasks: Vec<_> = ids
+            .into_iter()
+            .map(|id| self.flush_chat_facts(id, true))
+            .collect();
+        tasks.push(worker_save);
+        tasks.push(self.save_pr_watch());
+        tasks.push(self.save_issue_titles());
+        tasks.push(self.save_plan_limits());
+        Task::batch(tasks)
+    }
+
+    fn save_shutdown_worker_identities(&mut self) -> Task<Event> {
+        let workers: Vec<_> = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| &ws.tabs)
+            .filter_map(|tab| {
+                let process = tab.worker_process.as_ref()?;
+                if process.persisted_identity.is_some() {
+                    return None;
+                }
+                Some((
+                    tab.id,
+                    tab.task_id.clone()?,
+                    tab.task_session_id.clone()?,
+                    process.pid_file(),
+                ))
+            })
+            .collect();
+        if workers.is_empty() {
+            return Task::none();
+        }
+        let Some(mut store) = self.task_host.store_mut().take() else {
+            return Task::none();
+        };
+        // Keep one store owner: accepted completion reducers wait for its return,
+        // rather than racing a second snapshot against its whole-file writes.
+        self.shutdown_worker_store_pending = true;
+        shutdown_task(
+            "worker launch identity persistence",
+            async move {
+                match gitterm::shutdown::blocking(
+                    "worker launch identity persistence I/O",
+                    move || {
+                        let mut identities = Vec::new();
+                        let mut errors = Vec::new();
+                        for (tab, task, session, path) in workers {
+                            let result = (|| {
+                                let bytes = match std::fs::read(&path) {
+                                    Ok(bytes) => bytes,
+                                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                        return Ok(())
+                                    }
+                                    Err(error) => {
+                                        return Err(format!("read {}: {error}", path.display()))
+                                    }
+                                };
+                                let identity = serde_json::from_slice(&bytes).map_err(|error| {
+                                    format!("decode {}: {error}", path.display())
+                                })?;
+                                persist_worker_identity_record(
+                                    &mut store, &task, &session, &identity,
+                                )?;
+                                identities.push((tab, identity));
+                                Ok(())
+                            })();
+                            if let Err(error) = result {
+                                errors.push(format!("tab {tab}: {error}"));
+                            }
+                        }
+                        WorkerIdentitySave {
+                            store: Mutex::new(Some(store)),
+                            identities,
+                            error: (!errors.is_empty()).then(|| errors.join("; ")),
+                        }
+                    },
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => WorkerIdentitySave {
+                        store: Mutex::new(None),
+                        identities: Vec::new(),
+                        error: Some(format!("worker identity writer: {error}")),
+                    },
+                }
+            },
+            |save| Event::ShutdownWorkerIdentitiesSaved(Arc::new(save)),
+        )
+    }
+
+    fn record_shutdown_children(&self) {
+        use gitterm::shutdown::OwnedChild;
+        let mut children = Vec::new();
+        for tab in self.workspaces.iter().flat_map(|ws| &ws.tabs) {
+            if tab.terminal().is_none() && tab.worker_process.is_none() {
+                continue;
+            }
+            // Never reopen a worker identity file after the bounded writer
+            // timed out; logging must not reintroduce unbounded shutdown I/O.
+            let identity = tab
+                .worker_process
+                .as_ref()
+                .and_then(|process| process.persisted_identity.clone());
+            children.push(OwnedChild {
+                kind: format!(
+                    "{} PTY tab {}",
+                    if tab.task_id.is_some() {
+                        "worker"
+                    } else {
+                        "terminal"
+                    },
+                    tab.id
+                ),
+                task_id: tab.task_id.clone(),
+                delegation_id: self.task_host.store().as_ref().and_then(|store| {
+                    store
+                        .delegations()
+                        .iter()
+                        .find_map(|delegation| match &delegation.child {
+                            gitterm::tasks::DelegationChild::TaskSession {
+                                task_id,
+                                task_session_id,
+                                ..
+                            } if Some(task_id) == tab.task_id.as_ref()
+                                && task_session_id == &tab.task_session_id =>
+                            {
+                                Some(delegation.delegation_id.clone())
+                            }
+                            _ => None,
+                        })
+                }),
+                identity,
+            });
+        }
+        for id in self.delegation_runs.keys() {
+            children.push(OwnedChild {
+                kind: "Codex delegation".into(),
+                task_id: None,
+                delegation_id: Some(id.clone()),
+                identity: None,
+            });
+        }
+        for terminal in self.workspaces.iter().flat_map(|ws| &ws.bottom_terminals) {
+            if terminal.terminal.is_some() {
+                children.push(OwnedChild {
+                    kind: format!("bottom terminal PTY {}", terminal.id),
+                    task_id: None,
+                    delegation_id: None,
+                    identity: None,
+                });
+            }
+        }
+        gitterm::shutdown::record_children(children);
+    }
+
+    fn join_shutdown_sessions(&mut self) {
+        for session in self
+            .workspaces
+            .iter_mut()
+            .flat_map(|ws| &mut ws.tabs)
+            .filter_map(TabState::agent_session_mut)
+        {
+            // Local drops request shutdown and retain the supervisor join.
+            // Remote Claude drops only close their port, detaching the chat.
+            session.harness.take();
+            session.task_handle.take();
+        }
+    }
+
+    fn save_shutdown_workspaces(&mut self) {
+        let configs = self.workspace_configs();
+        let save = self.workspace_save(configs);
+        let settings = self
+            .settings_refused
+            .is_none()
+            .then(|| self.settings_snapshot());
+        gitterm::shutdown::spawn(
+            gitterm::shutdown::Kind::Workspace,
+            "workspaces and settings save",
+            move || {
+                // Attempt both independent writes even if one fails.
+                let workspace_result = save();
+                let settings_result = settings.map_or(Ok(()), |config| config.save());
+                workspace_result.and(settings_result)
+            },
+        );
+        self.workspaces_dirty = false;
+        self.next_workspace_save_at = None;
+    }
+
+    fn poll_shutdown(&mut self) -> Task<Event> {
+        use gitterm::shutdown::Kind;
+        let operations = gitterm::shutdown::operations();
+        // A session or unrelated writer must never gate a newer snapshot.
+        if self.workspaces_dirty && !operations.pending(Kind::Workspace) {
+            self.save_shutdown_workspaces();
+        }
+        if operations.expired() {
+            self.join_shutdown_sessions();
+            self.shutdown_phase = ShutdownPhase::Finished;
+            return iced::exit();
+        }
+        match self.shutdown_phase {
+            ShutdownPhase::Saving if operations.unfinished().is_empty() => {
+                // Capture after accepted completions, after joining chat sessions,
+                // so workspaces preserve their existing resume semantics.
+                self.save_shutdown_workspaces();
+                self.shutdown_phase = ShutdownPhase::FinalSave;
+                // Session teardown can deliver fresh limits/facts after the
+                // initial flush. Persist that last reduced state as well.
+                let ids: Vec<_> = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| &ws.tabs)
+                    .map(|tab| tab.id)
+                    .collect();
+                let mut tasks: Vec<_> = ids
+                    .into_iter()
+                    .map(|id| self.flush_chat_facts(id, true))
+                    .collect();
+                tasks.push(self.save_pr_watch());
+                tasks.push(self.save_issue_titles());
+                tasks.push(self.save_plan_limits());
+                return Task::batch(tasks);
+            }
+            ShutdownPhase::FinalSave if operations.unfinished().is_empty() => {
+                self.shutdown_phase = ShutdownPhase::Finished;
+                // Instance cleanup is itself a state-root write.
+                gitterm::shutdown::spawn(
+                    Kind::Write,
+                    "instance configuration cleanup",
+                    config::cleanup_instance_config,
+                );
+                return iced::exit();
+            }
+            _ => {}
+        }
+        Task::none()
+    }
+}
+
 impl Drop for App {
     fn drop(&mut self) {
         self.status_jobs.runtime.close();
         if self.task_mcp.is_some() {
             self.task_host.shutdown();
+        }
+        if gitterm::shutdown::desktop_active() {
+            // Runtime errors can bypass the UI poll. Drive the same admitted
+            // jobs and completion reducers here, under the original deadline.
+            if self.shutdown_phase != ShutdownPhase::Finished {
+                drop(self.begin_shutdown());
+                while self.shutdown_phase != ShutdownPhase::Finished {
+                    let jobs = shutdown_jobs().lock().unwrap().clone();
+                    for job in jobs {
+                        job.start();
+                        if job.done.is_cancelled() {
+                            drop(self.update(Event::ShutdownTracked(job)));
+                        }
+                    }
+                    drop(self.poll_shutdown());
+                    if self.shutdown_phase != ShutdownPhase::Finished {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+            self.record_shutdown_children();
         }
     }
 }
@@ -10124,7 +10651,18 @@ impl App {
             return;
         }
         let started = Instant::now();
-        let config = Config {
+        let config = self.settings_snapshot();
+        if let Err(error) = config.save() {
+            eprintln!("[settings] cannot save the settings: {error}");
+        }
+        let elapsed = started.elapsed();
+        if elapsed > Duration::from_millis(100) {
+            freeze_debug!("save_config took {}ms", elapsed.as_millis());
+        }
+    }
+
+    fn settings_snapshot(&self) -> Config {
+        Config {
             editor: self.editor.clone(),
             terminal_font_size: self.terminal_font_size,
             ui_font_size: self.ui_font_size,
@@ -10157,20 +10695,17 @@ impl App {
             pr_watch: self.pr_watch_config.clone(),
             delegations: self.delegations_config.clone(),
             work_notes: self.work_notes_config.clone(),
-        };
-        if let Err(error) = config.save() {
-            eprintln!("[settings] cannot save the settings: {error}");
-        }
-        let elapsed = started.elapsed();
-        if elapsed > Duration::from_millis(100) {
-            freeze_debug!("save_config took {}ms", elapsed.as_millis());
         }
     }
 
     fn save_workspaces(&mut self) {
+        let configs = self.workspace_configs();
+        self.save_workspace_configs(configs);
+    }
+
+    fn workspace_configs(&self) -> Vec<WorkspaceConfig> {
         // Active workspaces from runtime state
-        // A running parked workspace is saved parked (TRU-186): quitting
-        // stops its processes.
+        // A running parked workspace is saved parked (TRU-186).
         let mut configs: Vec<WorkspaceConfig> = self
             .workspaces
             .iter()
@@ -10192,7 +10727,7 @@ impl App {
                 configs.push(closed.clone());
             }
         }
-        self.save_workspace_configs(configs);
+        configs
     }
 
     /// An open workspace as `workspaces.json` stores it: settings, tabs
@@ -10276,53 +10811,33 @@ impl App {
     }
 
     fn save_workspace_configs(&mut self, configs: Vec<WorkspaceConfig>) {
-        let mut remote_session_defs = RemoteSessionsFile::load()
-            .map(|file| remote_session_definitions_from_config(&file.remote_sessions))
-            .unwrap_or_default();
-        for session in &self.remote_session_defs {
-            push_remote_session_definition(&mut remote_session_defs, session.clone());
+        if let Err(error) = self.workspace_save(configs)() {
+            eprintln!("{error}");
         }
+    }
+
+    /// Capture UI state here; the same disk merge and formats are used by
+    /// normal saves and by the final background save under the shutdown deadline.
+    fn workspace_save(
+        &mut self,
+        configs: Vec<WorkspaceConfig>,
+    ) -> impl FnOnce() -> Result<(), String> + Send + 'static {
+        let shutting_down = self.shutdown_phase != ShutdownPhase::Running;
+        let mut sessions = self.remote_session_defs.clone();
         for ws in &self.workspaces {
             if let Some(session) = self.remote_session_for_workspace(ws) {
-                push_remote_session_definition(&mut remote_session_defs, session.clone());
+                push_remote_session_definition(&mut sessions, session.clone());
             }
         }
         for closed in &self.closed_workspace_configs {
-            if let Some(remote_session) = &closed.remote_session {
+            if let Some(session) = &closed.remote_session {
                 push_remote_session_definition(
-                    &mut remote_session_defs,
-                    remote_session_definition_from_config(remote_session),
+                    &mut sessions,
+                    remote_session_definition_from_config(session),
                 );
             }
         }
-        // remote-agents.json is primarily user-maintained: the on-disk file
-        // is authoritative, and this save path only writes it back when this
-        // instance knows agents the file doesn't. (The connect-remote form
-        // does its own targeted upsert via save_remote_agent_to_disk.)
-        // Rewriting unconditionally lets a stale instance clobber hand edits.
-        let mut remote_agent_defs = RemoteAgentsFile::load()
-            .map(|file| file.remote_agents)
-            .unwrap_or_default();
-        let remote_agents_on_disk = remote_agent_defs.len();
-        for agent in &self.remote_agent_defs {
-            push_remote_agent_config(&mut remote_agent_defs, agent.clone());
-        }
-
-        let remote_sessions: Vec<RemoteSessionConfig> = remote_session_defs
-            .iter()
-            .map(remote_session_config_from_definition)
-            .collect();
-        RemoteSessionsFile {
-            remote_sessions: remote_sessions.clone(),
-        }
-        .save();
-        if remote_agent_defs.len() != remote_agents_on_disk {
-            RemoteAgentsFile {
-                remote_agents: remote_agent_defs.clone(),
-            }
-            .save();
-        }
-
+        let agents = self.remote_agent_defs.clone();
         let closed: Vec<WorkspaceConfig> =
             configs.iter().filter(|cfg| !cfg.active).cloned().collect();
         let repos = repos_section(
@@ -10330,29 +10845,71 @@ impl App {
             &self.stored_repos,
             &closed,
         );
-        let selection_commands = self.selection.reduce(
+        let commands = self.selection.reduce(
             SelectionEvent::Persist,
             &self.selection_roster(),
             self.usage_view.open,
             status_now!(),
         );
-        let active_workspace = match selection_commands.as_slice() {
+        let active_workspace = match commands.as_slice() {
             [SelectionCommand::PersistActiveIndex(index)] => *index,
             _ => unreachable!("persistence bridge only returns an index"),
         };
-        let ws_file = WorkspacesFile {
-            workspaces: configs,
-            repos,
-            active_workspace,
-            remote_sessions,
-            remote_agents: remote_agent_defs,
-            collapsed_repo_groups: {
-                let mut keys: Vec<String> = self.collapsed_repo_groups.iter().cloned().collect();
-                keys.sort();
-                keys
-            },
-        };
-        ws_file.save();
+        let mut collapsed_repo_groups: Vec<String> =
+            self.collapsed_repo_groups.iter().cloned().collect();
+        collapsed_repo_groups.sort();
+        move || {
+            let mut remote_session_defs = RemoteSessionsFile::load()
+                .map(|file| remote_session_definitions_from_config(&file.remote_sessions))
+                .unwrap_or_default();
+            for session in sessions {
+                push_remote_session_definition(&mut remote_session_defs, session);
+            }
+            // Preserve user edits: only extend agents from the current on-disk file.
+            let mut remote_agent_defs = RemoteAgentsFile::load()
+                .map(|file| file.remote_agents)
+                .unwrap_or_default();
+            let agents_on_disk = remote_agent_defs.len();
+            for agent in agents {
+                push_remote_agent_config(&mut remote_agent_defs, agent);
+            }
+            let remote_sessions: Vec<RemoteSessionConfig> = remote_session_defs
+                .iter()
+                .map(remote_session_config_from_definition)
+                .collect();
+            let remotes = RemoteSessionsFile {
+                remote_sessions: remote_sessions.clone(),
+            };
+            if shutting_down {
+                remotes.save_for_shutdown()?;
+            } else {
+                remotes.save();
+            }
+            if remote_agent_defs.len() != agents_on_disk {
+                let agents = RemoteAgentsFile {
+                    remote_agents: remote_agent_defs.clone(),
+                };
+                if shutting_down {
+                    agents.save_for_shutdown()?;
+                } else {
+                    agents.save();
+                }
+            }
+            let workspaces = WorkspacesFile {
+                workspaces: configs,
+                repos,
+                active_workspace,
+                remote_sessions,
+                remote_agents: remote_agent_defs,
+                collapsed_repo_groups,
+            };
+            if shutting_down {
+                workspaces.save_for_shutdown()
+            } else {
+                workspaces.save();
+                Ok(())
+            }
+        }
     }
 
     /// Load workspace profiles from ~/.config/gitterm-v6/profiles.json
@@ -10921,9 +11478,10 @@ impl App {
         let window = self.usage_window;
         let pricing = gitterm::usage::Pricing::with_overrides(&self.usage_config);
         let cache = self.usage_cache.clone();
-        Task::perform(
+        shutdown_task(
+            "request_usage_scan",
             async move {
-                tokio::task::spawn_blocking(move || {
+                gitterm::shutdown::blocking("request_usage_scan", move || {
                     let mut cache = match cache.lock() {
                         Ok(cache) => cache,
                         Err(poisoned) => {
@@ -11247,7 +11805,7 @@ impl App {
         session.harness = Some(gitterm::harness::HarnessSession::Claude(claude));
         session.begin_runtime();
         let stamp = session.runtime_stamp(target);
-        let bridge = Task::run(
+        let bridge = shutdown_stream(
             tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
             move |ev| Event::AgentRuntimeEvent(stamp.clone(), tab::AgentEvent::Harness(ev)),
         );
@@ -12951,9 +13509,16 @@ impl App {
                     }
                 };
                 let worktree_request = pending.request.clone();
-                return Task::perform(resolve_task_preparation(worktree_request), move |result| {
-                    Event::TaskMetadataResolved(pending, result.map_err(|error| error.to_string()))
-                });
+                return shutdown_task(
+                    "execute_host_effect",
+                    resolve_task_preparation(worktree_request),
+                    move |result| {
+                        Event::TaskMetadataResolved(
+                            pending,
+                            result.map_err(|error| error.to_string()),
+                        )
+                    },
+                );
             }
             HostEffect::LaunchSession { reply, launch } => {
                 let decision =
@@ -13884,6 +14449,9 @@ impl App {
     /// the Tick cadence and after explicit stops — never from the session
     /// signal hot path.
     fn promote_queued_tasks(&mut self) -> Task<Event> {
+        if self.shutdown_phase != ShutdownPhase::Running {
+            return Task::none();
+        }
         let mut started = Vec::new();
         for _ in 0..self.task_host.launch_queue().len() {
             let running = self.local_running_task_count();
@@ -16193,6 +16761,9 @@ impl App {
     }
 
     fn poll_worker_prs(&mut self) -> Task<Event> {
+        if self.shutdown_phase != ShutdownPhase::Running {
+            return Task::none();
+        }
         let Some(store) = self.task_host.store().as_ref() else {
             return Task::none();
         };
@@ -16207,9 +16778,10 @@ impl App {
             return Task::none();
         }
         let config_dir = config::global_config_dir();
-        Task::perform(
+        shutdown_task(
+            "poll_worker_prs",
             async move {
-                tokio::task::spawn_blocking(move || {
+                gitterm::shutdown::blocking("poll_worker_prs", move || {
                     let home = dirs::home_dir().ok_or("cannot locate home for worker PR scans")?;
                     Ok(gitterm::worker_prs::run(scans, &config_dir, &home))
                 })
@@ -16259,9 +16831,10 @@ impl App {
             .filter(|repo| matches!(repo.location, WorkspaceLocation::Local { .. }))
             .map(|repo| repo.dir.clone())
             .collect();
-        Task::perform(
+        shutdown_task(
+            "flush_chat_facts",
             async move {
-                tokio::task::spawn_blocking(move || {
+                gitterm::shutdown::blocking("flush_chat_facts", move || {
                     let transcript = if catch_up {
                         let found = chats::claude_session_path(&session_id);
                         if found.is_none() {
@@ -16294,19 +16867,23 @@ impl App {
     /// ~/Work's next git job (TRU-201), if one is due and none is running:
     /// on a blocking thread, ending in `WorkNotesDone`.
     fn poll_work_notes(&mut self) -> Task<Event> {
+        if self.shutdown_phase != ShutdownPhase::Running {
+            return Task::none();
+        }
         let Some(job) = self.work_notes.next_job(Instant::now()) else {
             return Task::none();
         };
         let root = self.work_notes.root().to_path_buf();
-        Task::perform(
+        shutdown_task(
+            "poll_work_notes",
             async move {
-                tokio::task::spawn_blocking(move || gitterm::work_notes::run(&root, job))
-                    .await
-                    .unwrap_or_else(|error| {
-                        gitterm::work_notes::JobResult::Failed(format!(
-                            "{job:?} task failed: {error}"
-                        ))
-                    })
+                gitterm::shutdown::blocking("poll_work_notes", move || {
+                    gitterm::work_notes::run(&root, job)
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    gitterm::work_notes::JobResult::Failed(format!("{job:?} task failed: {error}"))
+                })
             },
             Event::WorkNotesDone,
         )
@@ -16352,9 +16929,10 @@ impl App {
             .collect();
         self.chat_backfill_running = true;
         self.chat_backfill_note = None;
-        Task::perform(
+        shutdown_task(
+            "start_chat_facts_backfill",
             async move {
-                tokio::task::spawn_blocking(move || {
+                gitterm::shutdown::blocking("start_chat_facts_backfill", move || {
                     let home = dirs::home_dir();
                     chat_facts::backfill_claude(
                         targets,
@@ -16406,7 +16984,8 @@ impl App {
             .filter_map(|tab| tab.chat_session_id.clone())
             .collect();
         let home = dirs::home_dir();
-        Task::perform(
+        shutdown_task(
+            "request_chat_index",
             async move {
                 let build = move || {
                     let mut entries = chats::build_local_index();
@@ -16421,7 +17000,7 @@ impl App {
                     chat_facts::resolve_tree(&mut entries, &links);
                     entries
                 };
-                match tokio::task::spawn_blocking(build).await {
+                match gitterm::shutdown::blocking("request_chat_index", build).await {
                     Ok(entries) => entries,
                     Err(err) => {
                         eprintln!("[chats] index task failed: {err}");
@@ -17376,7 +17955,8 @@ impl App {
                     .map(|tab| PathBuf::from(tab.repo_dir.as_ref().unwrap_or(&tab.dir))),
             )
             .collect();
-        Task::perform(
+        shutdown_task(
+            "maintain_turn_snapshots",
             gitterm::turn_snapshots::maintain(
                 chat_facts::facts_dir(&config::global_config_dir()),
                 dirs,
@@ -17574,11 +18154,12 @@ impl App {
         path: PathBuf,
         backend: chats::ChatBackend,
     ) -> Task<Event> {
-        Task::perform(
+        shutdown_task(
+            "request_chat_preview",
             async move {
                 // The summary (TRU-155) reads the whole transcript once,
                 // here, next to the preview tail; never in `view`.
-                let (preview, digest) = match tokio::task::spawn_blocking(move || {
+                let (preview, digest) = match gitterm::shutdown::blocking("request_chat_preview", move || {
                     let preview = chats::load_preview(&path, backend);
                     let digest = match backend {
                         chats::ChatBackend::Claude => {
@@ -18472,29 +19053,56 @@ impl App {
     }
 }
 
-/// One Codex delegation run as an Iced stream: its progress events, then
-/// `DelegationFinished`. Dropping the stream (an aborted task, app exit)
-/// drops the run, which kills Codex (TRU-142).
+struct DelegationRun {
+    abort: iced::futures::future::AbortHandle,
+    log: gitterm::codex_runner::LogWriter,
+    ticket: Arc<gitterm::shutdown::Ticket>,
+}
+
+impl DelegationRun {
+    fn abort(self) {
+        self.abort.abort();
+    }
+
+    fn close_log(&self, id: &str) {
+        self.log.stop_writing();
+        let log = self.log.clone();
+        let ticket = self.ticket.clone();
+        gitterm::shutdown::spawn(
+            gitterm::shutdown::Kind::Write,
+            format!("delegation {id} log flush and close"),
+            move || {
+                log.close().map_err(|error| error.to_string())?;
+                ticket.complete();
+                Ok(())
+            },
+        );
+    }
+}
+
+/// Drive the runner independently of Iced's event receiver. Manual dismissal
+/// still aborts it; desktop shutdown only closes its in-process log writer.
 fn delegation_run_stream(
     delegation_id: String,
     run: gitterm::codex_runner::CodexRun,
-) -> iced::futures::stream::BoxStream<'static, Event> {
-    use iced::futures::{SinkExt, StreamExt};
-    iced::stream::channel(32, async move |mut output| {
+) -> (Task<Event>, DelegationRun) {
+    let log = gitterm::codex_runner::LogWriter::new(run.log_path.clone());
+    let ticket = gitterm::shutdown::operations().ticket(
+        gitterm::shutdown::Kind::Session,
+        format!("delegation {delegation_id} in-process logging"),
+    );
+    let (abort, registration) = iced::futures::future::AbortHandle::new_pair();
+    let (output, receiver) = tokio::sync::mpsc::channel(32);
+    let writer = log.clone();
+    let running = ticket.clone();
+    let future = async move {
         let (progress, mut events) = tokio::sync::mpsc::unbounded_channel();
-        let runner = gitterm::codex_runner::run(run, progress);
+        let runner = gitterm::codex_runner::run_with_log(run, progress, writer.clone());
         tokio::pin!(runner);
         let outcome = loop {
             tokio::select! {
                 Some(event) = events.recv() => {
-                    if output
-                        .send(Event::DelegationProgress(delegation_id.clone(), event))
-                        .await
-                        .is_err()
-                    {
-                        // The app is gone; dropping the runner kills Codex.
-                        return;
-                    }
+                    let _ = output.send(Event::DelegationProgress(delegation_id.clone(), event)).await;
                 }
                 outcome = &mut runner => break outcome,
             }
@@ -18504,6 +19112,9 @@ fn delegation_run_stream(
                 .send(Event::DelegationProgress(delegation_id.clone(), event))
                 .await;
         }
+        if let Err(error) = writer.close() {
+            running.fail(error);
+        }
         let outcome = outcome.map(Box::new).map_err(|error| {
             if error.is_time_limit() {
                 gitterm::delegations::RunFailure::TimeLimit
@@ -18511,14 +19122,23 @@ fn delegation_run_stream(
                 gitterm::delegations::RunFailure::Failed(error.to_string())
             }
         });
-        if let Err(error) = output
-            .send(Event::DelegationFinished(delegation_id.clone(), outcome))
-            .await
-        {
-            eprintln!("[delegation] {delegation_id}: the app stopped listening before the result: {error}");
+        let _ = output
+            .send(Event::DelegationFinished(delegation_id, outcome))
+            .await;
+    };
+    match gitterm::shutdown::Executor::runtime() {
+        Ok(runtime) => {
+            runtime.spawn(iced::futures::future::Abortable::new(future, registration));
         }
-    })
-    .boxed()
+        Err(error) => ticket.fail(format!("start delegation runtime: {error}")),
+    }
+    (
+        Task::run(
+            tokio_stream::wrappers::ReceiverStream::new(receiver),
+            |event| event,
+        ),
+        DelegationRun { abort, log, ticket },
+    )
 }
 
 /// Blocking: retain the existing target authorization and capture its Git
@@ -18746,9 +19366,10 @@ impl App {
             _ => unreachable!("request effect"),
         };
         let unchecked = new.clone();
-        Task::perform(
+        shutdown_task(
+            "request_delegation",
             async move {
-                tokio::task::spawn_blocking(move || {
+                gitterm::shutdown::blocking("request_delegation", move || {
                     let mut new = new;
                     let result = check_delegation_run(&mut new, &caller);
                     (new, result)
@@ -18898,6 +19519,9 @@ impl App {
     }
 
     fn start_queued_delegations(&mut self) -> Task<Event> {
+        if self.shutdown_phase != ShutdownPhase::Running {
+            return Task::none();
+        }
         let mut tasks = Vec::new();
         for effect in self.admit_delegations() {
             match effect {
@@ -18906,9 +19530,10 @@ impl App {
                     check,
                     new,
                     caller,
-                } => tasks.push(Task::perform(
+                } => tasks.push(shutdown_task(
+                    "start_queued_delegations",
                     async move {
-                        tokio::task::spawn_blocking(move || {
+                        gitterm::shutdown::blocking("start_queued_delegations", move || {
                             let mut new = *new;
                             check_delegation_run(&mut new, &caller)
                         })
@@ -19007,8 +19632,7 @@ impl App {
             run.cwd.display(),
             run.log_path.display()
         );
-        let (task, handle) =
-            Task::run(delegation_run_stream(id.to_string(), run), |event| event).abortable();
+        let (task, handle) = delegation_run_stream(id.to_string(), run);
         self.delegation_runs.insert(id.to_string(), handle);
         task
     }
@@ -19269,11 +19893,14 @@ impl App {
             );
         }
         let authority = targets.authority;
-        Task::perform(
+        shutdown_task(
+            "delegate_task_requested",
             async move {
-                tokio::task::spawn_blocking(move || check_delegate_targets(targets))
-                    .await
-                    .unwrap_or_else(|error| Err(format!("the target check failed: {error}")))
+                gitterm::shutdown::blocking("delegate_task_requested", move || {
+                    check_delegate_targets(targets)
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("the target check failed: {error}")))
             },
             move |result| Event::DelegateTaskTargetsChecked(authority, result.map(Box::new), reply),
         )
@@ -19927,6 +20554,9 @@ impl App {
     /// Called after durable results have been delivered or queued.
     /// Keep the terminal alive during TERM's grace period, then remove its tab.
     fn close_final_workers(&mut self) -> Task<Event> {
+        if self.shutdown_phase != ShutdownPhase::Running {
+            return Task::none();
+        }
         let Some(store) = self.task_host.store().as_ref() else {
             return Task::none();
         };
@@ -19976,14 +20606,18 @@ impl App {
             }
         }
         Task::batch(closing.into_iter().map(|(session, process)| {
-            Task::perform(
+            shutdown_task(
+                "close_final_workers",
                 async move {
-                    let result = tokio::task::spawn_blocking(move || match process {
-                        Some(process) => process.stop(),
-                        None => Err("refuse worker shutdown: no launch record for this tab".into()),
-                    })
-                    .await
-                    .unwrap_or_else(|e| Err(format!("worker shutdown failed: {e}")));
+                    let result =
+                        gitterm::shutdown::blocking("close_final_workers", move || match process {
+                            Some(process) => process.stop(),
+                            None => {
+                                Err("refuse worker shutdown: no launch record for this tab".into())
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("worker shutdown failed: {e}")));
                     (session, result)
                 },
                 |(session, result)| Event::FinalWorkerStopped(session, result),
@@ -20142,11 +20776,14 @@ impl App {
             return Task::none();
         }
         let cwd = tab.repo_path.clone();
-        Task::perform(
+        shutdown_task(
+            "refresh_delegation_head",
             async move {
-                tokio::task::spawn_blocking(move || gitterm::delegations::current_head(&cwd))
-                    .await
-                    .unwrap_or_else(|error| Err(format!("the HEAD check failed: {error}")))
+                gitterm::shutdown::blocking("refresh_delegation_head", move || {
+                    gitterm::delegations::current_head(&cwd)
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("the HEAD check failed: {error}")))
             },
             move |head| Event::DelegationHeadLoaded(tab_id, head),
         )
@@ -20503,18 +21140,26 @@ fn persist_worker_launch_identity(store: &mut TaskStore, tab: &mut TabState) -> 
     let Some(identity) = process.launch_identity()? else {
         return Ok(());
     };
+    persist_worker_identity_record(store, task, session, &identity)?;
+    process.persisted_identity = Some(identity);
+    Ok(())
+}
+
+fn persist_worker_identity_record(
+    store: &mut TaskStore,
+    task: &str,
+    session: &str,
+    identity: &gitterm::tasks::LaunchIdentity,
+) -> Result<(), String> {
     let mut record = store
         .get(task)
-        .and_then(|task| task.sessions.iter().find(|s| &s.task_session_id == session))
+        .and_then(|task| task.sessions.iter().find(|s| s.task_session_id == session))
         .cloned()
         .ok_or_else(|| format!("worker session {session} is missing from task {task}"))?;
     record.launch_identity = Some(identity.clone());
-    let timestamp = chrono::Utc::now().to_rfc3339();
     store
-        .upsert_session(task, record, &timestamp)
-        .map_err(|e| e.to_string())?;
-    process.persisted_identity = Some(identity);
-    Ok(())
+        .upsert_session(task, record, &chrono::Utc::now().to_rfc3339())
+        .map_err(|error| error.to_string())
 }
 
 fn load_task_store_for_startup(
@@ -20872,6 +21517,10 @@ impl App {
     }
 
     fn new() -> (Self, Task<Event>) {
+        // Iced creates winit's event loop/delegate before booting App. Install
+        // before startup I/O and the first window/menu tasks can receive quit.
+        #[cfg(target_os = "macos")]
+        native_quit::install();
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let config::LoadedSettings {
             config,
@@ -21047,6 +21696,9 @@ impl App {
                 String::from(config::WINDOW_TITLE)
             },
             status_jobs: StatusSubscriptionData::new(),
+            shutdown_phase: ShutdownPhase::Running,
+            shutdown_worker_store_pending: false,
+            shutdown_deferred: Vec::new(),
             workspaces: Vec::new(),
             repos: RepoRegistry::default(),
             stored_repos: Vec::new(),
@@ -24091,6 +24743,9 @@ fi
     }
 
     fn subscription(&self) -> Subscription<Event> {
+        if self.shutdown_phase != ShutdownPhase::Running {
+            return iced::time::every(Duration::from_millis(20)).map(|_| Event::ShutdownPoll);
+        }
         let mut subs = vec![
             // Agent webview IPC bridge — drains the global mpsc into events.
             // Built once via a fn pointer; re-runs are guarded by the
@@ -24220,6 +24875,67 @@ fi
     }
 
     fn update(&mut self, event: Event) -> Task<Event> {
+        if let Event::ShutdownTracked(job) = event {
+            shutdown_jobs()
+                .lock()
+                .unwrap()
+                .retain(|other| !Arc::ptr_eq(other, &job));
+            let task = job
+                .take()
+                .map_or_else(Task::none, |event| self.update(event));
+            job.ticket.complete();
+            return task;
+        }
+        if let Event::ShutdownWorkerIdentitiesSaved(save) = event {
+            if !self.shutdown_worker_store_pending {
+                return Task::none();
+            }
+            *self.task_host.store_mut() = save.store.lock().unwrap().take();
+            self.shutdown_worker_store_pending = false;
+            for (id, identity) in &save.identities {
+                if let Some(process) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| &mut ws.tabs)
+                    .find(|tab| tab.id == *id)
+                    .and_then(|tab| tab.worker_process.as_mut())
+                {
+                    process.persisted_identity = Some(identity.clone());
+                }
+            }
+            let deferred = std::mem::take(&mut self.shutdown_deferred);
+            return Task::batch(deferred.into_iter().map(|event| self.update(event)));
+        }
+        if matches!(event, Event::WindowCloseRequested | Event::QuitRequested)
+            || (matches!(event, Event::CheckMenu) && gitterm::shutdown::signal_requested())
+        {
+            return self.begin_shutdown();
+        }
+        if matches!(event, Event::ShutdownPoll) {
+            return self.poll_shutdown();
+        }
+        if self.shutdown_phase != ShutdownPhase::Running {
+            // Only accepted completions may finish persistence. UI, ingress,
+            // periodic polls and launch completions cannot admit new work.
+            if shutdown_completion(&event) {
+                if self.shutdown_worker_store_pending
+                    && matches!(
+                        event,
+                        Event::DelegationProgress(..)
+                            | Event::ChatIndexLoaded(..)
+                            | Event::DelegationFinished(..)
+                            | Event::AgentRuntimeEvent(..)
+                            | Event::AgentCommandOutcome(..)
+                            | Event::AgentEventReceived(..)
+                    )
+                {
+                    self.shutdown_deferred.push(event);
+                    return Task::none();
+                }
+                return self.update_event(event);
+            }
+            return Task::none();
+        }
         let overlay_was_open = self.webview_overlay_open();
         // Reports/time limits scan immediately; the tick also catches every
         // other terminal worker outcome and performs startup catch-up once.
@@ -25059,6 +25775,9 @@ fi
                 if let Ok(event) = MenuEvent::receiver().try_recv() {
                     freeze_debug!("native menu event received: {:?}", event.id);
                     if let Some(ids) = MENU_IDS.get() {
+                        if event.id == ids.quit {
+                            return self.update(Event::QuitRequested);
+                        }
                         if let Some((_, width)) =
                             ids.chat_width.iter().find(|(id, _)| *id == event.id)
                         {
@@ -26033,21 +26752,24 @@ fi
                     use tokio_stream::wrappers::UnboundedReceiverStream;
                     let stream = UnboundedReceiverStream::new(rx);
                     let stamp = bridge_stamp.expect("installed Pi receiver has runtime identity");
-                    return Task::run(stream, move |ev| {
+                    return shutdown_stream(stream, move |ev| {
                         Event::AgentRuntimeEvent(stamp.clone(), ev)
                     });
                 }
                 if let Some(rx) = runtime_bridge {
                     use tokio_stream::wrappers::UnboundedReceiverStream;
                     let stamp = bridge_stamp.expect("installed runtime receiver has identity");
-                    return Task::run(UnboundedReceiverStream::new(rx), move |event| match event {
-                        RuntimeEvent::Harness(event) => {
-                            Event::AgentRuntimeEvent(stamp.clone(), tab::AgentEvent::Harness(event))
+                    return shutdown_stream(UnboundedReceiverStream::new(rx), move |event| {
+                        match event {
+                            RuntimeEvent::Harness(event) => Event::AgentRuntimeEvent(
+                                stamp.clone(),
+                                tab::AgentEvent::Harness(event),
+                            ),
+                            RuntimeEvent::CommandOutcome {
+                                correlation,
+                                outcome,
+                            } => Event::AgentCommandOutcome(stamp.clone(), correlation, outcome),
                         }
-                        RuntimeEvent::CommandOutcome {
-                            correlation,
-                            outcome,
-                        } => Event::AgentCommandOutcome(stamp.clone(), correlation, outcome),
                     });
                 }
                 if let Some(rx) = harness_bridge {
@@ -26055,7 +26777,7 @@ fi
                     let stream = UnboundedReceiverStream::new(rx);
                     let stamp =
                         bridge_stamp.expect("installed harness receiver has runtime identity");
-                    return Task::run(stream, move |ev| {
+                    return shutdown_stream(stream, move |ev| {
                         Event::AgentRuntimeEvent(stamp.clone(), tab::AgentEvent::Harness(ev))
                     });
                 }
@@ -27361,7 +28083,9 @@ fi
                 if chat_config_changed {
                     self.save_config();
                 }
-                let follow_task = match worktree_candidates {
+                let follow_task = match worktree_candidates
+                    .filter(|_| self.shutdown_phase == ShutdownPhase::Running)
+                {
                     Some((repo_root, candidates)) => {
                         self.consider_worktree_candidates(tab_id, repo_root, candidates)
                     }
@@ -27372,13 +28096,16 @@ fi
                 } else {
                     follow_task
                 };
-                let follow_task = match (woken, wake) {
+                let follow_task = match (
+                    woken.filter(|_| self.shutdown_phase == ShutdownPhase::Running),
+                    wake,
+                ) {
                     (Some(uid), Some(reason)) => {
                         Task::batch([follow_task, self.wake_running_parked(uid, reason)])
                     }
                     _ => follow_task,
                 };
-                if turn_ended {
+                if turn_ended && self.shutdown_phase == ShutdownPhase::Running {
                     // A chat's first turn gives it a title; index it so
                     // the strip can show it (TRU-172).
                     let index = if self.local_chat_tab_untitled(Some(tab_id)) {
@@ -28628,9 +29355,16 @@ fi
                 };
                 form.submitting = true;
                 form.error = None;
-                return Task::perform(resolve_task_preparation(request), move |result| {
-                    Event::TaskMetadataResolved(pending, result.map_err(|error| error.to_string()))
-                });
+                return shutdown_task(
+                    "update_event",
+                    resolve_task_preparation(request),
+                    move |result| {
+                        Event::TaskMetadataResolved(
+                            pending,
+                            result.map_err(|error| error.to_string()),
+                        )
+                    },
+                );
             }
             Event::TaskMetadataResolved(mut pending, result) => {
                 if let Some(worker) = &pending.worker {
@@ -28765,9 +29499,16 @@ fi
                     }
                 }
                 let request = pending.request.clone();
-                return Task::perform(prepare_task_worktree(request), move |result| {
-                    Event::TaskWorktreePrepared(pending, result.map_err(|error| error.to_string()))
-                });
+                return shutdown_task(
+                    "update_event",
+                    prepare_task_worktree(request),
+                    move |result| {
+                        Event::TaskWorktreePrepared(
+                            pending,
+                            result.map_err(|error| error.to_string()),
+                        )
+                    },
+                );
             }
             Event::TaskWorktreePrepared(pending, result) => {
                 if pending.worker.is_some() {
@@ -29262,7 +30003,8 @@ fi
                     deleting: false,
                     error: None,
                 });
-                return Task::perform(
+                return shutdown_task(
+                    "update_event",
                     inspect_task_cleanup(
                         repository_path,
                         worktree_path,
@@ -29323,7 +30065,8 @@ fi
                         let prompt = self.task_worktree_delete_prompt.as_mut().unwrap();
                         prompt.deleting = true;
                         prompt.error = None;
-                        return Task::perform(
+                        return shutdown_task(
+                            "update_event",
                             remove_task_worktree(repository, path, false),
                             move |result| {
                                 Event::TaskWorktreeDeleteCompleted(
@@ -29419,9 +30162,16 @@ fi
                     repository_path: workspace_dir,
                     worktree_path: path.clone(),
                 };
-                return Task::perform(resolve_worktree_adoption(request), move |result| {
-                    Event::WorktreeAdoptResolved(path, result.map_err(|error| error.to_string()))
-                });
+                return shutdown_task(
+                    "update_event",
+                    resolve_worktree_adoption(request),
+                    move |result| {
+                        Event::WorktreeAdoptResolved(
+                            path,
+                            result.map_err(|error| error.to_string()),
+                        )
+                    },
+                );
             }
             Event::WorktreeAdoptResolved(path, result) => {
                 let resolution = match result {
@@ -29569,14 +30319,19 @@ fi
                 return if prunable {
                     // The path is already gone; prune clears the stale
                     // registration instead of failing to remove it.
-                    Task::perform(prune_worktrees(workspace_dir), move |result| {
-                        Event::WorktreeRemoveCompleted(
-                            path,
-                            result.map_err(|error| error.to_string()),
-                        )
-                    })
+                    shutdown_task(
+                        "update_event",
+                        prune_worktrees(workspace_dir),
+                        move |result| {
+                            Event::WorktreeRemoveCompleted(
+                                path,
+                                result.map_err(|error| error.to_string()),
+                            )
+                        },
+                    )
                 } else {
-                    Task::perform(
+                    shutdown_task(
+                        "update_event",
                         remove_task_worktree(workspace_dir, path.clone(), force),
                         move |result| {
                             Event::WorktreeRemoveCompleted(
@@ -30169,7 +30924,8 @@ fi
                     return Task::none();
                 };
                 let state = self.log_server_state.clone();
-                return Task::perform(
+                return shutdown_task(
+                    "update_event",
                     async move {
                         state.files.write().await.insert(tab_id, snapshot);
                         tab_id
@@ -30480,28 +31236,10 @@ fi
                     return self.present_active_tab_surfaces();
                 }
             }
-            Event::WindowCloseRequested => {
-                if self.workspaces_dirty {
-                    self.save_workspaces();
-                    self.workspaces_dirty = false;
-                    self.next_workspace_save_at = None;
-                }
-                self.task_host.shutdown();
-                // Signal the log server to shut down
-                self.log_server_state.shutdown.notify_one();
-                // Clean up instance-specific configuration
-                config::cleanup_instance_config();
-                // Quit must not wait on a slow or hung git: cancel and discard
-                // status jobs (as before the runtime existed) and close now.
-                self.status_jobs.runtime.close();
-                return iced::window::oldest().then(|opt_id| {
-                    if let Some(id) = opt_id {
-                        iced::window::close(id)
-                    } else {
-                        iced::exit()
-                    }
-                });
-            }
+            Event::WindowCloseRequested | Event::QuitRequested => return self.begin_shutdown(),
+            Event::ShutdownPoll => return self.poll_shutdown(),
+            Event::ShutdownWorkerIdentitiesSaved(_) => unreachable!("handled by update"),
+            Event::ShutdownTracked(job) => return self.update(Event::ShutdownTracked(job)),
             Event::WindowUnfocused => {
                 self.window_focused = false;
                 self.terminal_redraws.clear();
@@ -30603,7 +31341,8 @@ fi
                         ) {
                             Some((generation, plan)) => {
                                 let key = plan.key.clone();
-                                Task::perform(
+                                shutdown_task(
+                                    "update_event",
                                     build_workspace_overview_summary(
                                         plan,
                                         Arc::clone(&self.chat_index),
@@ -30780,7 +31519,10 @@ fi
                     !matches!(session.state, tab::AgentSessionState::Streaming)
                 });
                 if tab.chat_facts.has_pending() {
-                    return self.flush_chat_facts(tab_id, idle);
+                    return self.flush_chat_facts(
+                        tab_id,
+                        idle || self.shutdown_phase != ShutdownPhase::Running,
+                    );
                 }
             }
             Event::ChatFactsBackfill => return self.start_chat_facts_backfill(),
@@ -30954,9 +31696,10 @@ fi
                 state.focus = focus.clone();
                 let save = if self.overview_focus_picks.set(&folder, &focus) {
                     let picks = self.overview_focus_picks.clone();
-                    Task::perform(
+                    shutdown_task(
+                        "update_event",
                         async move {
-                            tokio::task::spawn_blocking(move || {
+                            gitterm::shutdown::blocking("update_event", move || {
                                 picks.save(&overview::FocusPicks::path_in(
                                     &config::global_config_dir(),
                                 ))
@@ -31892,7 +32635,7 @@ fi
                     let sample_rate = self.stt_sample_rate;
                     return Task::perform(
                         async move {
-                            tokio::task::spawn_blocking(move || {
+                            gitterm::shutdown::blocking("update_event", move || {
                                 stt_transcribe(ctx, samples, sample_rate)
                             })
                             .await
@@ -33632,7 +34375,7 @@ fi
             session.begin_runtime();
             let stamp = session.runtime_stamp(target);
             use tokio_stream::wrappers::UnboundedReceiverStream;
-            return Task::run(UnboundedReceiverStream::new(rx), move |ev| {
+            return shutdown_stream(UnboundedReceiverStream::new(rx), move |ev| {
                 Event::AgentRuntimeEvent(stamp.clone(), tab::AgentEvent::Harness(ev))
             });
         }
@@ -50974,7 +51717,7 @@ mod tests {
         );
     }
 
-    fn final_worker_fixture(dir: &Path) -> (TaskStore, String, WorkspaceTabConfig) {
+    pub(super) fn final_worker_fixture(dir: &Path) -> (TaskStore, String, WorkspaceTabConfig) {
         use gitterm::tasks::{
             Delegation, DelegationChild, DelegationKind, DelegationParent, NewDelegation,
         };
@@ -54221,7 +54964,7 @@ mod tests {
         assert!(tab.file_viewer().is_none());
     }
 
-    fn chat_entry(backend: chats::ChatBackend, dead_cwd: bool) -> chats::ChatIndexEntry {
+    pub(super) fn chat_entry(backend: chats::ChatBackend, dead_cwd: bool) -> chats::ChatIndexEntry {
         chats::ChatIndexEntry {
             id: "3f2a".to_string(),
             backend,
