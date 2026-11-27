@@ -7,6 +7,9 @@ use gitterm_core::{
 };
 use std::path::Path;
 
+#[cfg(test)]
+mod review_tests;
+
 #[derive(Clone)]
 pub(super) struct LiveTab {
     pub services: ServiceContext,
@@ -75,7 +78,8 @@ impl LiveTab {
             tab["session_uid"] == uid
                 || (tab["chat_session_id"] == id && tab["session_uid"].is_null())
         }) {
-            // Preserve fields a newer desktop may have written.
+            // Iced also drops nested agent_config unknowns by re-serializing its typed config.
+            // Preserve other fields a newer desktop may have written.
             let object = tab.as_object_mut().context("Invalid workspace tab")?;
             for (key, value) in serde_json::to_value(&self.tab)?
                 .as_object()
@@ -116,7 +120,7 @@ pub(super) fn default_config() -> AgentBackendConfig {
 pub(crate) fn tab(cwd: &Path, uid: String, id: Option<String>) -> WorkspaceTabConfig {
     WorkspaceTabConfig {
         dir: cwd.to_string_lossy().into_owned(),
-        repo_dir: None,
+        repo_dir: Some(cwd.to_string_lossy().into_owned()),
         startup_command: None,
         tab_kind: Some("agent".into()),
         agent_config: Some(default_config()),
@@ -158,9 +162,18 @@ impl ChatPane {
             return Ok(());
         }
         tab.tab.chat_session_id = Some(id.into());
+        self.persist_live_tab(cx)
+    }
+    pub(super) fn persist_live_tab(&mut self, cx: &mut Context<Self>) -> Result<()> {
+        let tab = self
+            .live_tab
+            .as_mut()
+            .context("Live chat has no workspace persistence binding")?;
         tab.tab.session_uid = Some(self.saved.uid.clone());
+        tab.tab.repo_dir = Some(self.saved.cwd.to_string_lossy().into_owned());
+        tab.tab.agent_config = Some(self.controller.config.clone());
         let tab = tab.clone();
-        self.persisted_id = Some(id.into());
+        self.persisted_id = tab.tab.chat_session_id.clone();
         let (reply, saved) = tokio::sync::oneshot::channel();
         self.shutdown
             .sender
@@ -230,7 +243,17 @@ impl ChatPane {
         else {
             anyhow::bail!("Conversation resume not available in preview");
         };
-        let mut pane = Self::new(shutdown, preview, PathBuf::from(&tab.dir), window, cx);
+        let cwd = tab
+            .repo_dir
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| {
+                git2::Repository::discover(&tab.dir)
+                    .ok()
+                    .and_then(|repo| repo.workdir().map(PathBuf::from))
+            })
+            .unwrap_or_else(|| PathBuf::from(&tab.dir));
+        let mut pane = Self::new(shutdown, preview, cwd, window, cx);
         pane.controller.target.session_uid = tab
             .session_uid
             .clone()
@@ -342,9 +365,12 @@ impl ChatPane {
         cx.notify();
     }
     pub(super) fn fresh_chat(&mut self, cx: &mut Context<Self>) {
-        if self.history_loading || self.controller.runtime.is_some() {
+        if self.history_loading
+            || (self.controller.runtime.is_some() && self.resume_error.is_none())
+        {
             return;
         }
+        self.shutdown_runtime();
         // Keep the old provider session untouched; only this pane's binding is reset.
         if !self.saved.cwd.is_dir() {
             let Some(tab) = &self.live_tab else {
@@ -395,6 +421,7 @@ impl ChatPane {
             tab.tab.chat_session_id = None;
             tab.tab.session_uid = Some(self.saved.uid.clone());
             tab.tab.dir = self.saved.cwd.to_string_lossy().into_owned();
+            tab.tab.repo_dir = Some(self.saved.cwd.to_string_lossy().into_owned());
         }
         self.pending.push(Update {
             presentation: Some(gitterm_gpui_chat::adapter::Presentation::Replay),
@@ -416,7 +443,7 @@ impl ChatPane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn workspace(dir: &Path) -> WorkspaceConfig {
+    pub(super) fn workspace(dir: &Path) -> WorkspaceConfig {
         serde_json::from_value(serde_json::json!({"name":"Synthetic", "dir":dir, "abbrev":"S", "color":"blue", "tabs":[]})).unwrap()
     }
     #[test]

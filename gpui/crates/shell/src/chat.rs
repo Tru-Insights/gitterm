@@ -211,6 +211,23 @@ impl Controller {
                 });
             }
         };
+        let config = &mut self.config;
+        let mut observe = |_: &AgentEvent, effects: &gitterm_core::chat::state::EventEffects| {
+            use gitterm_core::chat::types::{AgentBackendConfig, SettingChange};
+            if let AgentBackendConfig::Claude {
+                model,
+                permission_mode,
+                effort,
+            } = config
+            {
+                match &effects.settings_changed {
+                    Some(SettingChange::Model(value)) => model.clone_from(value),
+                    Some(SettingChange::Mode(value)) => *permission_mode = Some(value.clone()),
+                    Some(SettingChange::Effort(value)) => effort.clone_from(value),
+                    None => {}
+                }
+            }
+        };
         // The initialize reply is an authoritative mode acknowledgement too.
         if let HarnessEvent::Ready {
             permission_mode: Some(mode),
@@ -222,7 +239,7 @@ impl Controller {
                 &self.target,
                 AgentEvent::Harness(HarnessEvent::PermissionModeChanged(mode.clone())),
                 Some(now_ms()),
-                |_, _| {},
+                &mut observe,
             );
         }
         let ready = matches!(event, HarnessEvent::Ready { .. });
@@ -232,7 +249,7 @@ impl Controller {
             &self.target,
             AgentEvent::Harness(event),
             Some(now_ms()),
-            |_, _| {},
+            observe,
         )?;
         if ready {
             self.ready = true;
@@ -921,6 +938,7 @@ impl ChatPane {
     ) {
         self.controller.runtime = Some(runtime);
         let source = self.controller.source.clone();
+        let mut awaiting_resume = self.controller.live && self.saved.session_id.is_some();
         cx.spawn(async move |pane, cx| {
             while let Some(event) = events.recv().await {
                 if pane
@@ -950,13 +968,8 @@ impl ChatPane {
                                 .update(cx, |view, cx| view.set_guidelines_status(applied, cx));
                         }
                         if pane.controller.live {
-                            if let RuntimeEvent::Harness(HarnessEvent::Error(error)) = &event
-                                && pane.saved.session_id.is_some()
-                            {
-                                pane.resume_failed(
-                                    format!("Cannot resume saved Claude session: {error}"),
-                                    cx,
-                                );
+                            if matches!(&event, RuntimeEvent::Harness(HarnessEvent::TurnStarted { .. })) {
+                                awaiting_resume = false;
                             }
                             if let RuntimeEvent::Harness(HarnessEvent::TurnStarted {
                                 session_id: Some(id),
@@ -969,10 +982,17 @@ impl ChatPane {
                                 return;
                             }
                         }
+                        let previous_settings = pane.controller.adapter.state().acknowledged.clone();
                         if let Some(update) = pane.controller.apply_runtime_outcome(&source, event)
                         {
                             pane.pending.push(update);
                             pane.changed(cx);
+                        }
+                        if pane.controller.live
+                            && pane.live_tab.as_ref().is_some_and(|tab| tab.tab.chat_session_id.is_some())
+                            && pane.controller.adapter.state().acknowledged != previous_settings
+                            && let Err(error) = pane.persist_live_tab(cx) {
+                            pane.view.update(cx, |view, cx| view.set_status_error(format!("Save Claude settings: {error:#}"), cx));
                         }
                         if turn_ended {
                             pane.refresh_checkout_head(cx);
@@ -980,6 +1000,10 @@ impl ChatPane {
                         }
                         if exited {
                             pane.shutdown_runtime();
+                            if awaiting_resume {
+                                pane.resume_failed("Cannot resume saved Claude session: process exited before the turn started".into(), cx);
+                                return;
+                            }
                             let stopped = if pane.controller.live {
                                 "Claude stopped"
                             } else {
