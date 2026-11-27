@@ -1,4 +1,4 @@
-//! Byte-preserving, verified desktop backup. The caller holds the state lease.
+//! Byte-preserving, verified Unix desktop backup. The caller holds the state lease.
 use ring::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -142,11 +142,15 @@ fn excluded(name: &str) -> bool {
         || name.starts_with(".tasks.seed")
         || name.ends_with("-backups")
 }
+fn directory_identity(meta: &fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
 fn scan(
     root: &Path,
     relative: &Path,
     browser_released: bool,
-    worktrees: &[PathBuf],
+    worktrees: &[(u64, u64)],
     entries: &mut Vec<Entry>,
 ) -> io::Result<()> {
     let path = root.join(relative);
@@ -156,7 +160,7 @@ fn scan(
         Kind::Symlink {
             target: fs::read_link(&path)?,
         }
-    } else if excluded(&name) || worktrees.iter().any(|tree| path.starts_with(tree)) {
+    } else if excluded(&name) || (meta.is_dir() && worktrees.contains(&directory_identity(&meta))) {
         Kind::Skipped {
             reason: "lock, worktree, transient state, cache or prior backup".into(),
         }
@@ -208,12 +212,6 @@ fn available(path: &Path) -> io::Result<u64> {
     let bytes = (stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64);
     Ok(bytes)
 }
-#[cfg(not(unix))]
-fn available(_: &Path) -> io::Result<u64> {
-    Err(io::Error::other(
-        "verified backup free-space check is unsupported on this platform",
-    ))
-}
 
 /// `parent` must already exist, outside the source root. Nothing in the source
 /// is created, normalized or rewritten. Failure leaves an incomplete backup.
@@ -228,11 +226,9 @@ fn create_with(
 ) -> io::Result<PathBuf> {
     let root = fs::canonicalize(root)?;
     let parent = fs::canonicalize(parent)?;
-    if parent.starts_with(&root) || root.starts_with(&parent) {
-        return Err(invalid(
-            "backup destination must be outside and separate from the V6 root",
-        ));
-    }
+    // The shared guard also rejects case aliases and overlapping directory
+    // identities on macOS, where canonicalize can retain alternate casing.
+    crate::state_lock::separate_agent_root(&parent, &root)?;
     let mut manifest = Manifest {
         root: root.clone(),
         entries: vec![],
@@ -251,17 +247,32 @@ fn create_with(
                 .filter_map(|task| task.worktree.path.clone()),
         );
     }
-    let resolved_worktrees = manifest
-        .worktrees
-        .iter()
-        .map(|path| crate::state_lock::resolve_root(path))
-        .collect::<io::Result<Vec<_>>>()?;
+    let mut worktree_identities = Vec::new();
+    for path in &manifest.worktrees {
+        match fs::metadata(path) {
+            Ok(meta) if meta.is_dir() => worktree_identities.push(directory_identity(&meta)),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(invalid(format!(
+                    "inspect registered worktree {}: {error}",
+                    path.display()
+                )))
+            }
+        }
+    }
+    if worktree_identities.contains(&directory_identity(&fs::metadata(&root)?)) {
+        return Err(invalid(format!(
+            "registered worktree is the V6 state root {}; refusing an incomplete backup",
+            root.display()
+        )));
+    }
     for entry in fs::read_dir(&root)? {
         scan(
             &root,
             Path::new(&entry?.file_name()),
             browser_released,
-            &resolved_worktrees,
+            &worktree_identities,
             &mut manifest.entries,
         )?;
     }
@@ -367,9 +378,7 @@ fn verify_data(destination: &Path, root: &Path) -> io::Result<Manifest> {
 pub fn verify(destination: &Path, root: &Path) -> io::Result<Manifest> {
     let root = fs::canonicalize(root)?;
     let destination = fs::canonicalize(destination)?;
-    if destination.starts_with(&root) || root.starts_with(&destination) {
-        return Err(invalid("recorded backup overlaps the V6 root"));
-    }
+    crate::state_lock::separate_agent_root(&destination, &root)?;
     let mut marker = Vec::new();
     read_regular(&destination.join(COMPLETE))?.read_to_end(&mut marker)?;
     if marker != b"verified\n" {
@@ -478,22 +487,33 @@ mod tests {
             state: TaskWorktreeState::Ready,
             path: Some(worktree.clone()),
         };
+        let mut ancestor = task.clone();
+        ancestor.task_id = "ancestor-fixture".into();
+        ancestor.worktree.path = Some(root.parent().unwrap().to_owned());
+        let mut document = TaskStoreDocument {
+            tasks: vec![task, ancestor],
+            ..Default::default()
+        };
         fs::write(
             root.join("tasks.json"),
-            serde_json::to_vec(&TaskStoreDocument {
-                tasks: vec![task],
-                ..Default::default()
-            })
-            .unwrap(),
+            serde_json::to_vec(&document).unwrap(),
         )
         .unwrap();
+        fs::write(root.join("settings.json"), b"{ \"future\": true }").unwrap();
         fs::create_dir(root.join("browser-profile")).unwrap();
         fs::write(root.join("browser-profile/Cookies"), b"private fixture").unwrap();
         fs::create_dir(root.join("browser-profile/Cache")).unwrap();
         fs::write(root.join("browser-profile/Cache/regenerable"), b"skip").unwrap();
         let skipped = create(&root, &parent, false).unwrap();
         let manifest = verify(&skipped, &root).unwrap();
-        assert_eq!(manifest.worktrees, [worktree]);
+        assert_eq!(
+            manifest.worktrees,
+            [worktree, root.parent().unwrap().to_owned()]
+        );
+        assert_eq!(
+            fs::read(skipped.join("state/settings.json")).unwrap(),
+            b"{ \"future\": true }"
+        );
         assert!(!skipped.join("state/custom-checkout").exists());
         assert!(manifest
             .entries
@@ -515,6 +535,22 @@ mod tests {
                 .unwrap()
                 .ino()
         );
+        let case_alias = root.with_file_name("V6");
+        if case_alias.exists() {
+            assert!(create(&root, &case_alias, true).is_err());
+        }
+        // A self-referential registry entry must fail closed, never mark an
+        // empty snapshot complete. An ancestor entry above did not omit state.
+        document.tasks[1].worktree.path = Some(root.clone());
+        fs::write(
+            root.join("tasks.json"),
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+        assert!(create(&root, &parent, true)
+            .unwrap_err()
+            .to_string()
+            .contains("state root"));
     }
     #[cfg(unix)]
     #[test]
