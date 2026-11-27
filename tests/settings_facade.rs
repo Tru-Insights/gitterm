@@ -100,3 +100,6 @@ fn core_workspace_dtos_preserve_iced_serialized_bytes() {
         serde_json::from_str(input).unwrap();
     assert_eq!(serde_json::to_string(&core).unwrap(), input);
 }
+
+#[path = "support/desktop_store_parity.rs"]
+mod desktop_store_parity;

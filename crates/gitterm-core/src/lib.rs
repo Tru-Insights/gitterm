@@ -103,3 +103,6 @@ pub mod workspace_config;
 
 #[cfg(feature = "stt")]
 pub mod dictation;
+
+#[cfg(feature = "runtime")]
+pub mod desktop_store;

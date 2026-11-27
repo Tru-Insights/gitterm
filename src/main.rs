@@ -1971,14 +1971,32 @@ fn main() -> iced::Result {
     }
     // The worker-launch helper above must remain usable while the desktop
     // owns the root. Every normal startup takes ownership before any write.
-    let _state_lock = match gitterm_core::config_paths::desktop_config_dir()
-        .map_err(|error| error.to_string())
-        .and_then(|root| {
-            gitterm_core::state_lock::StateLock::acquire(root).map_err(|error| error.to_string())
-        }) {
-        Ok(lock) => lock,
+    let _state_lock = match gitterm_core::config_paths::desktop_config_dir() {
+        Ok(root) => match gitterm_core::state_lock::StateLock::acquire(root) {
+            Ok(lock) => lock,
+            Err(gitterm_core::state_lock::LockError::Busy { root }) => {
+                let error = format!("GitTerm state root is already in use: {}", root.display());
+                eprintln!("{error}");
+                show_state_lock_alert(format!(
+                    "Another GitTerm window is using {}. Quit it first (GitTerm V6 or GitTerm GPUI in Live mode), then open this one again.",
+                    root.display()
+                ));
+                std::process::exit(1);
+            }
+            Err(gitterm_core::state_lock::LockError::Io { root, source }) => {
+                let error = format!("lock GitTerm state root {}: {source}", root.display());
+                eprintln!("{error}");
+                show_state_lock_alert(format!(
+                    "GitTerm could not open its data folder {}: {source}",
+                    root.display()
+                ));
+                std::process::exit(1);
+            }
+        },
         Err(error) => {
+            let error = error.to_string();
             eprintln!("{error}");
+            show_state_lock_alert(format!("GitTerm could not open its data folder: {error}"));
             std::process::exit(1);
         }
     };
@@ -2020,6 +2038,23 @@ fn main() -> iced::Result {
     gitterm::shutdown::operations().wait();
     gitterm::shutdown::log_children();
     result
+}
+
+fn show_state_lock_alert(message: String) {
+    use std::io::IsTerminal;
+
+    if !std::io::stderr().is_terminal()
+        && std::env::var("GITTERM_V6_NO_DIALOG").as_deref() == Ok("1")
+    {
+        return;
+    }
+
+    rfd::MessageDialog::new()
+        .set_title("GitTerm V6 is already open")
+        .set_description(&message)
+        .set_level(rfd::MessageLevel::Warning)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
 }
 
 use gitterm_core::status::{
@@ -7444,10 +7479,15 @@ enum ShutdownPhase {
     Finished,
 }
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "shutdown_tests.rs"]
+mod shutdown_periodic_tests;
+
 // The registry lets App::drop drain the same admitted saves if the window
 // runtime fails before delivering their completion events.
 pub struct ShutdownJob {
     ticket: Arc<gitterm::shutdown::Ticket>,
+    periodic: bool,
     future: Mutex<Option<iced::futures::future::BoxFuture<'static, Event>>>,
     result: Mutex<Option<Event>>,
     done: tokio_util::sync::CancellationToken,
@@ -7471,6 +7511,10 @@ impl ShutdownJob {
         let Some(future) = self.future.lock().unwrap().take() else {
             return;
         };
+        if self.periodic && gitterm::shutdown::operations().started() {
+            self.done.cancel();
+            return;
+        }
         let job = self.clone();
         match gitterm::shutdown::Executor::runtime() {
             Ok(runtime) => {
@@ -7479,7 +7523,11 @@ impl ShutdownJob {
                     match std::panic::AssertUnwindSafe(future).catch_unwind().await {
                         Ok(event) => {
                             if let Some(error) = shutdown_failure(&event) {
-                                job.ticket.fail(error);
+                                if job.periodic && gitterm::shutdown::operations().started() {
+                                    eprintln!("[shutdown] {error}");
+                                } else {
+                                    job.ticket.fail(error);
+                                }
                             }
                             *job.result.lock().unwrap() = Some(event);
                         }
@@ -7496,7 +7544,11 @@ impl ShutdownJob {
     }
 
     fn take(&self) -> Option<Event> {
-        self.result.lock().unwrap().take()
+        let event = self.result.lock().unwrap().take();
+        if self.periodic && gitterm::shutdown::operations().started() {
+            return None;
+        }
+        event
     }
 }
 
@@ -7522,8 +7574,36 @@ fn shutdown_task<A: Send + 'static>(
     future: impl std::future::Future<Output = A> + Send + 'static,
     map: impl FnOnce(A) -> Event + Send + 'static,
 ) -> Task<Event> {
+    tracked_task(name, false, future, map)
+}
+
+fn periodic_task<A: Send + 'static>(
+    name: &'static str,
+    future: impl std::future::Future<Output = A> + Send + 'static,
+    map: impl FnOnce(A) -> Event + Send + 'static,
+) -> Task<Event> {
+    tracked_task(
+        name,
+        true,
+        gitterm::shutdown::periodic_scope(gitterm::shutdown::operations(), future),
+        map,
+    )
+}
+
+fn tracked_task<A: Send + 'static>(
+    name: &'static str,
+    periodic: bool,
+    future: impl std::future::Future<Output = A> + Send + 'static,
+    map: impl FnOnce(A) -> Event + Send + 'static,
+) -> Task<Event> {
+    let kind = if periodic {
+        gitterm::shutdown::Kind::Periodic
+    } else {
+        gitterm::shutdown::Kind::Write
+    };
     let job = Arc::new(ShutdownJob {
-        ticket: gitterm::shutdown::operations().ticket(gitterm::shutdown::Kind::Write, name),
+        ticket: gitterm::shutdown::operations().ticket(kind, name),
+        periodic,
         future: Mutex::new(Some(Box::pin(async move { map(future.await) }))),
         result: Mutex::new(None),
         done: tokio_util::sync::CancellationToken::new(),
@@ -7554,6 +7634,7 @@ fn shutdown_stream<A: Send + 'static>(
             let job = Arc::new(ShutdownJob {
                 ticket: gitterm::shutdown::operations()
                     .ticket(gitterm::shutdown::Kind::Write, "chat event completion"),
+                periodic: false,
                 future: Mutex::new(None),
                 result: Mutex::new(Some(map(value))),
                 done,
@@ -11311,10 +11392,13 @@ impl App {
         let window = self.usage_window;
         let pricing = gitterm::usage::Pricing::with_overrides(&self.usage_config);
         let cache = self.usage_cache.clone();
-        shutdown_task(
+        periodic_task(
             "request_usage_scan",
             async move {
                 gitterm::shutdown::blocking("request_usage_scan", move || {
+                    if gitterm::shutdown::periodic_cancelled() {
+                        return Err("usage scan cancelled".into());
+                    }
                     let mut cache = match cache.lock() {
                         Ok(cache) => cache,
                         Err(poisoned) => {
@@ -16611,10 +16695,13 @@ impl App {
             return Task::none();
         }
         let config_dir = config::global_config_dir();
-        shutdown_task(
+        periodic_task(
             "poll_worker_prs",
             async move {
                 gitterm::shutdown::blocking("poll_worker_prs", move || {
+                    if gitterm::shutdown::periodic_cancelled() {
+                        return Ok(Vec::new());
+                    }
                     let home = dirs::home_dir().ok_or("cannot locate home for worker PR scans")?;
                     Ok(gitterm::worker_prs::run(scans, &config_dir, &home))
                 })
@@ -16707,9 +16794,14 @@ impl App {
             return Task::none();
         };
         let root = self.work_notes.root().to_path_buf();
-        shutdown_task(
+        let periodic = matches!(
+            job,
+            gitterm::work_notes::Job::Probe | gitterm::work_notes::Job::Status
+        );
+        tracked_task(
             "poll_work_notes",
-            async move {
+            periodic,
+            gitterm::shutdown::periodic_scope_if(periodic, async move {
                 gitterm::shutdown::blocking("poll_work_notes", move || {
                     gitterm::work_notes::run(&root, job)
                 })
@@ -16717,7 +16809,7 @@ impl App {
                 .unwrap_or_else(|error| {
                     gitterm::work_notes::JobResult::Failed(format!("{job:?} task failed: {error}"))
                 })
-            },
+            }),
             Event::WorkNotesDone,
         )
     }
@@ -16762,7 +16854,7 @@ impl App {
             .collect();
         self.chat_backfill_running = true;
         self.chat_backfill_note = None;
-        shutdown_task(
+        periodic_task(
             "start_chat_facts_backfill",
             async move {
                 gitterm::shutdown::blocking("start_chat_facts_backfill", move || {
@@ -16817,11 +16909,17 @@ impl App {
             .filter_map(|tab| tab.chat_session_id.clone())
             .collect();
         let home = dirs::home_dir();
-        shutdown_task(
+        periodic_task(
             "request_chat_index",
             async move {
                 let build = move || {
+                    if gitterm::shutdown::periodic_cancelled() {
+                        return Vec::new();
+                    }
                     let mut entries = chats::build_local_index();
+                    if gitterm::shutdown::periodic_cancelled() {
+                        return Vec::new();
+                    }
                     chat_facts::catch_up_workspace_prs(
                         &entries,
                         &owned,
@@ -16829,6 +16927,9 @@ impl App {
                         &facts_dir,
                         home.as_deref(),
                     );
+                    if gitterm::shutdown::periodic_cancelled() {
+                        return Vec::new();
+                    }
                     chat_facts::attach_facts(&mut entries, &facts_dir);
                     chat_facts::resolve_tree(&mut entries, &links);
                     entries
@@ -17788,7 +17889,7 @@ impl App {
                     .map(|tab| PathBuf::from(tab.repo_dir.as_ref().unwrap_or(&tab.dir))),
             )
             .collect();
-        shutdown_task(
+        periodic_task(
             "maintain_turn_snapshots",
             gitterm::turn_snapshots::maintain(
                 chat_facts::facts_dir(&config::global_config_dir()),
@@ -20609,10 +20710,13 @@ impl App {
             return Task::none();
         }
         let cwd = tab.repo_path.clone();
-        shutdown_task(
+        periodic_task(
             "refresh_delegation_head",
             async move {
                 gitterm::shutdown::blocking("refresh_delegation_head", move || {
+                    if gitterm::shutdown::periodic_cancelled() {
+                        return Err("HEAD refresh cancelled".into());
+                    }
                     gitterm::delegations::current_head(&cwd)
                 })
                 .await
@@ -31174,8 +31278,8 @@ fi
                         ) {
                             Some((generation, plan)) => {
                                 let key = plan.key.clone();
-                                shutdown_task(
-                                    "update_event",
+                                periodic_task(
+                                    "workspace_overview_summary",
                                     build_workspace_overview_summary(
                                         plan,
                                         Arc::clone(&self.chat_index),

@@ -1362,11 +1362,21 @@ fn window_close_and_native_quit_enter_the_same_barrier_once() {
         assert_eq!(app.shutdown_phase, ShutdownPhase::Running);
         drop(app.update(first));
         assert_eq!(app.shutdown_phase, ShutdownPhase::Saving);
-        assert!(app.prs.save_in_flight);
+        assert!(
+            !app.prs.save_in_flight,
+            "quit must not start a periodic save"
+        );
         assert!(!app.prs.save_again);
+        // A second barrier entry would dispatch another workspace/settings save.
+        // Keep the first snapshot pending and make a repeated dispatch observable.
+        app.workspaces_dirty = true;
         drop(app.update(Event::WindowCloseRequested));
         drop(app.update(Event::QuitRequested));
         assert_eq!(app.shutdown_phase, ShutdownPhase::Saving);
+        assert!(
+            app.workspaces_dirty,
+            "repeated quit dispatched a second workspace/settings save"
+        );
         assert!(
             !app.prs.save_again,
             "a repeated quit must not begin another save"
@@ -1409,18 +1419,22 @@ fn app_drop_drains_admitted_jobs_and_late_session_writers_before_final_save() {
         },
     );
     let reduced = fixture.path().join("reduced");
-    let completed = reduced.clone();
+    let reducer_ran = reduced.clone();
     // This Iced task is never polled: a runtime error bypassed dispatch.
     drop(shutdown_task(
         "undispatched final facts writer",
         async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            std::fs::write(completed, "complete").unwrap();
         },
-        |_| Event::Pr(PrEvent::Saved(Ok(()))),
+        move |_| {
+            std::fs::write(reducer_ran, "complete").unwrap();
+            Event::Pr(PrEvent::Saved(Ok(())))
+        },
     ));
     app.prs.save_in_flight = true;
     app.prs.save_again = true;
+    let watch_path = config::global_config_dir().join("pr-watch.json");
+    std::fs::write(&watch_path, b"previous watch state").unwrap();
     gitterm::shutdown::activate_desktop();
     drop(app);
     gitterm::shutdown::operations().wait();
@@ -1428,7 +1442,7 @@ fn app_drop_drains_admitted_jobs_and_late_session_writers_before_final_save() {
     assert!(gitterm::shutdown::operations().unfinished().is_empty());
     let file: WorkspacesFile = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(file.workspaces[0].name, "alpha");
-    assert!(config::global_config_dir().join("pr-watch.json").exists());
+    assert_eq!(std::fs::read(watch_path).unwrap(), b"previous watch state");
 }
 
 #[test]
@@ -1554,19 +1568,54 @@ fn appkit_terminate_callback_cancels_and_enters_the_quit_barrier() {
     let mut app = app_with_tabs(fixture.path());
     unsafe {
         let delegate: Retained<AnyObject> = msg_send_id![class, new];
-        for _ in 0..2 {
+        for attempt in 0..2 {
             let reply: usize = msg_send![&*delegate, applicationShouldTerminate: &*delegate];
             assert_eq!(reply, 0, "AppKit must cancel its immediate termination");
             assert!(gitterm::shutdown::signal_requested());
             drop(app.update(Event::CheckMenu));
             assert_eq!(app.shutdown_phase, ShutdownPhase::Saving);
+            if attempt == 0 {
+                app.workspaces_dirty = true;
+            }
         }
     }
     assert!(
         !app.prs.save_again,
         "native repeated quit reentered the barrier"
     );
+    assert!(
+        app.workspaces_dirty,
+        "native repeated quit dispatched a second workspace/settings save"
+    );
     assert!(gitterm::shutdown::operations().started());
+}
+
+#[test]
+fn shutdown_reduces_an_admitted_nonperiodic_completion() {
+    if isolated("shutdown_reduces_an_admitted_nonperiodic_completion") {
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(fixture.path());
+    app.prs.save_in_flight = true;
+    drop(shutdown_task(
+        "admitted non-periodic completion",
+        async {},
+        |_| Event::Pr(PrEvent::Saved(Ok(()))),
+    ));
+    let job = shutdown_jobs().lock().unwrap().last().unwrap().clone();
+    drop(app.begin_shutdown());
+    job.start();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !job.done.is_cancelled() {
+        assert!(Instant::now() < deadline, "completion did not finish");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(app.update(Event::ShutdownTracked(job)));
+    assert!(
+        !app.prs.save_in_flight,
+        "admitted non-periodic PR completion reducer did not run during shutdown"
+    );
 }
 
 #[cfg(target_os = "macos")]
