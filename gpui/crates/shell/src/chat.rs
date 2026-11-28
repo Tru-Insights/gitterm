@@ -373,6 +373,7 @@ pub(crate) struct ChatPane {
     _head_load: Option<gpui::Task<()>>,
     _release: gpui::Subscription,
     _roster_subscription: gpui::Subscription,
+    _delegation_subscription: gpui::Subscription,
     _review_subscription: gpui::Subscription,
     _review_context_load: Option<gpui::Task<()>>,
 }
@@ -430,8 +431,12 @@ impl ChatPane {
             view
         });
         let roster_subscription = Self::forward_roster(&view, cx);
+        let delegation_subscription = Self::handle_delegation(&view, cx);
         view.update(cx, |view, cx| {
-            view.set_dismiss_gate(dismiss_gate(controller.live), cx)
+            view.set_dismiss_gate(dismiss_gate(controller.live), cx);
+            if controller.live {
+                view.enable_delegation_actions(cx);
+            }
         });
         let review_subscription = Self::handle_review(&view, saved.cwd.clone(), window, cx);
         let callback = Self::intent_callback(cx.weak_entity());
@@ -491,6 +496,7 @@ impl ChatPane {
             _head_load: None,
             _release: cx.on_release(|pane, cx| pane.shutdown_runtime(cx)),
             _roster_subscription: roster_subscription,
+            _delegation_subscription: delegation_subscription,
             _review_subscription: review_subscription,
             _review_context_load: None,
         };
@@ -516,6 +522,25 @@ impl ChatPane {
             view,
             |_, _, outcome: &gitterm_gpui_chat::model::roster::RosterOutcome, cx| {
                 cx.emit(outcome.clone());
+            },
+        )
+    }
+    fn handle_delegation(view: &Entity<ChatView>, cx: &mut Context<Self>) -> gpui::Subscription {
+        cx.subscribe(
+            view,
+            |pane, _, action: &gitterm_gpui_chat::interactions::TranscriptAction, cx| {
+                let tab_id = pane.target().tab_id;
+                let action = action.clone();
+                // The host may synchronously submit into this pane. Release both
+                // the view and pane updates before asking it to execute the action.
+                cx.defer(move |cx| {
+                    if let Some(host) = cx
+                        .try_global::<crate::task_host::GpuiTaskHost>()
+                        .map(|h| h.0.clone())
+                    {
+                        host.update(cx, |host, cx| host.card_action(tab_id, action, cx));
+                    }
+                });
             },
         )
     }
@@ -745,6 +770,7 @@ impl ChatPane {
             view
         });
         let roster_subscription = Self::forward_roster(&view, cx);
+        let delegation_subscription = Self::handle_delegation(&view, cx);
         view.update(cx, |view, cx| {
             view.set_dismiss_gate(dismiss_gate(false), cx)
         });
@@ -770,6 +796,7 @@ impl ChatPane {
             _head_load: None,
             _release: cx.on_release(|pane, cx| pane.shutdown_runtime(cx)),
             _roster_subscription: roster_subscription,
+            _delegation_subscription: delegation_subscription,
             _review_subscription: review_subscription,
             _review_context_load: None,
         }

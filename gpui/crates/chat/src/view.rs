@@ -186,6 +186,7 @@ pub struct ChatView {
     shadow: Option<gitterm_core::chat::state::State>,
     checkout_source: Option<crate::composer::CheckoutSource>,
     dismiss_gate: Option<crate::interactions::DismissGate>,
+    delegation_actions_live: bool,
     callback: Option<IntentCallback>,
     images: Vec<gitterm_core::chat::types::ImageAttachment>,
     image_previews: Vec<Option<Arc<gpui::Image>>>,
@@ -232,6 +233,7 @@ pub struct ChatView {
 }
 impl gpui::EventEmitter<roster::RosterOutcome> for ChatView {}
 impl gpui::EventEmitter<crate::review::ReviewOutcome> for ChatView {}
+impl gpui::EventEmitter<crate::interactions::TranscriptAction> for ChatView {}
 
 impl ChatView {
     pub fn new(records: Vec<Record>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -332,6 +334,7 @@ impl ChatView {
             shadow: None,
             checkout_source: None,
             dismiss_gate: None,
+            delegation_actions_live: false,
             callback: None,
             images: vec![],
             image_previews: vec![],
@@ -715,6 +718,12 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) {
         self.checkout_source = Some(source);
+        cx.notify();
+    }
+    /// Live card actions are executed by the owning task host. Preview and
+    /// fixture views retain their existing notices.
+    pub fn enable_delegation_actions(&mut self, cx: &mut Context<Self>) {
+        self.delegation_actions_live = true;
         cx.notify();
     }
     /// The host's gate for delegation card dismissals.

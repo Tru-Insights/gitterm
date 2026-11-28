@@ -133,7 +133,41 @@ impl ChatView {
             .into_any_element()
     }
     pub(super) fn transcript_action(&mut self, action: TranscriptAction, cx: &mut Context<Self>) {
+        if self.delegation_actions_live
+            && matches!(
+                action,
+                TranscriptAction::SendDelegation { .. }
+                    | TranscriptAction::RerunDelegation { .. }
+                    | TranscriptAction::Dismiss(_)
+            )
+        {
+            cx.emit(action);
+            return;
+        }
         match action {
+            TranscriptAction::SendDelegation { id, .. } => {
+                let label = self
+                    .model
+                    .rows
+                    .iter()
+                    .find_map(|row| {
+                        row.delegation
+                            .as_ref()
+                            .filter(|card| card.delegation.delegation_id == id)
+                            .map(|card| {
+                                if card.held {
+                                    "Queued, sends when Claude finishes"
+                                } else {
+                                    "Send to Claude"
+                                }
+                            })
+                    })
+                    .unwrap_or("Send to Claude");
+                self.set_status_error(crate::interactions::preview_notice(label), cx)
+            }
+            TranscriptAction::RerunDelegation { .. } => {
+                self.set_status_error(crate::interactions::preview_notice("Re-run"), cx)
+            }
             TranscriptAction::PreviewOnly { label } => {
                 self.set_status_error(crate::interactions::preview_notice(&label), cx)
             }

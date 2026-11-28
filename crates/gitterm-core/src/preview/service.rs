@@ -378,8 +378,8 @@ impl ServiceContext {
         })
     }
 
-    /// Live admits task writes and worker/review/consult execution. Delivery,
-    /// restore and other later-slice effects retain the Preview notices.
+    /// Live admits task execution and result delivery. General restore and
+    /// notify ingress stay closed; current workers have scoped notify admission.
     pub fn for_gpui_live(mut self) -> Self {
         self.gpui_live = true;
         self
@@ -592,6 +592,8 @@ impl ServiceContext {
                     | "Save delegation"
                     | "Queue session"
                     | "Worker notify"
+                    | "Dismiss delegation"
+                    | "Save delivery"
             );
         let live_task_process = access == Access::Process
             && matches!(
@@ -606,6 +608,8 @@ impl ServiceContext {
                     | "Start queued delegation"
                     | "Start delegation"
                     | "Stop delegation"
+                    | "Automatic delivery"
+                    | "Deliver results"
             );
         if self.gpui_live
             && !matches!(access, Access::Read | Access::Existing)
@@ -960,7 +964,13 @@ mod live_tests {
         ] {
             assert!(live.authorize(class(label, Access::Process), None).is_ok());
         }
-        for label in ["merge_plan_set", "notify", "Save delivery"] {
+        for label in ["Dismiss delegation", "Save delivery"] {
+            assert!(live.authorize(class(label, Access::Write), None).is_ok());
+        }
+        for label in ["Automatic delivery", "Deliver results"] {
+            assert!(live.authorize(class(label, Access::Process), None).is_ok());
+        }
+        for label in ["merge_plan_set", "notify"] {
             assert_eq!(
                 live.authorize(class(label, Access::Write), None)
                     .unwrap_err()

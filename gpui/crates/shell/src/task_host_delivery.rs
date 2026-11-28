@@ -1,4 +1,4 @@
-//! H5b B11: fixture-mode delivery of finished results into the GPUI chat
+//! Delivery of Live and fixture results into the GPUI chat
 //! that requested them, in the order of Iced's `auto_deliver_delegations`,
 //! `flush_held_delegation`, `run_delivery_effects`, `deliver_delegations`
 //! and the `AgentSubmitDelegations` completion.
@@ -11,9 +11,10 @@
 //! on it. A rejection, or a submission that never reached a pane, is
 //! reported rejected, so its results stay undelivered for the next flush.
 //!
-//! Only delegations this host stored (`own_delegations`) are offered to
-//! core, which gates each for the checkout its work ran in: imported
-//! records are never delivered, and plain preview delivers nothing.
+//! Live delivers current and saved reports as Iced does. Fixture delivery
+//! offers only delegations this host stored (`own_delegations`), gated for
+//! the checkout its work ran in; imported fixture records remain inert and
+//! plain Preview delivers nothing.
 //!
 //! As in Iced, delivery runs from two places: the tick
 //! ([`TaskHostOwner::deliver_results`], Iced's `Tick` at src/main.rs
@@ -36,7 +37,7 @@ pub(crate) const DELIVERY_POLL: Duration = Duration::from_secs(5);
 pub(crate) type SubmitHook = Box<dyn FnMut(&Submission) -> Option<bool>>;
 
 impl TaskHostOwner {
-    /// Iced's `auto_deliver_delegations`, from the fixture delivery tick:
+    /// Iced's `auto_deliver_delegations`, from the delivery tick:
     /// collects every finished result at the same moment; idle chats flush
     /// now, busy ones keep their held results until their turn ends
     /// ([`Self::chat_turn_ended`]) or a later tick.
@@ -45,12 +46,14 @@ impl TaskHostOwner {
             return;
         }
         let auto_tell = self.auto_tell();
-        let own = &self.own_delegations;
-        let tick = self
-            .host
-            .deliver_finished_where(&delivery_chats(cx), auto_tell, |delegation| {
-                own.contains_key(&delegation.delegation_id)
-            });
+        let chats = delivery_chats(cx);
+        let tick = if self.is_live() {
+            self.host.deliver_finished(&chats, auto_tell)
+        } else {
+            let own = &self.own_delegations;
+            self.host
+                .deliver_finished_where(&chats, auto_tell, |d| own.contains_key(&d.delegation_id))
+        };
         if let Some(error) = tick.receipt_error {
             eprintln!("[delegation] retry delivery acknowledgements: {error}");
         }
@@ -130,13 +133,18 @@ impl TaskHostOwner {
         cx.notify();
     }
 
-    /// Fixture mode only, while the host runs; a kept receipt may be saved,
-    /// so the store must still be the copy under the preview root.
-    fn delivers(&self) -> bool {
-        if self.fixtures.is_empty() || self.is_shut_down() {
+    /// Live uses the locked durable store; fixture delivery stays scoped to
+    /// its preview copy. Plain Preview never reaches core's receipt retry.
+    fn delivers(&mut self) -> bool {
+        if (!self.is_live() && self.fixtures.is_empty()) || self.is_shut_down() {
             return false;
         }
-        if let Some(store) = self.host.store().as_ref()
+        if self.is_live() {
+            if let Err(error) = self.writable_store() {
+                eprintln!("[delegation] delivery skipped: {error}");
+                return false;
+            }
+        } else if let Some(store) = self.host.store().as_ref()
             && let Err(error) = self.roots.scoped(store.path())
         {
             eprintln!(
@@ -150,7 +158,7 @@ impl TaskHostOwner {
 
     /// Iced's `delegations.auto_tell`, from the host's settings file: in
     /// fixture mode the fixture's, which `HostConfig::iced_config` names.
-    fn auto_tell(&self) -> bool {
+    pub(super) fn auto_tell(&self) -> bool {
         crate::workspace_config::load_iced_settings_from(&self.iced_config)
             .delegations
             .auto_tell
@@ -163,29 +171,131 @@ impl TaskHostOwner {
         if !chats.iter().any(|chat| chat.tab_id == tab_id) {
             eprintln!("[delegation] not sent: requesting chat tab {tab_id} is gone");
         }
-        let own = &self.own_delegations;
-        let effects = self
-            .host
-            .flush_delivery_where(&chats, tab_id, auto_tell, |delegation| {
-                own.contains_key(&delegation.delegation_id)
-            });
+        let effects = if self.is_live() {
+            self.host.flush_delivery(&chats, tab_id, auto_tell)
+        } else {
+            let own = &self.own_delegations;
+            self.host
+                .flush_delivery_where(&chats, tab_id, auto_tell, |d| {
+                    own.contains_key(&d.delegation_id)
+                })
+        };
+        self.run_delivery_effects(tab_id, effects, cx);
+    }
+
+    fn run_delivery_effects(
+        &mut self,
+        tab_id: usize,
+        effects: Vec<DeliveryEffect>,
+        cx: &mut Context<Self>,
+    ) {
         for effect in effects {
             match effect {
-                // The cards are projected from the store on the next render.
                 DeliveryEffect::Refresh(_) => cx.notify(),
-                // Synchronous, so the chat is busy and the receipt recorded
-                // before another tick can flush it again.
                 DeliveryEffect::Submit(submission) => self.submit(submission, cx),
                 DeliveryEffect::NotQueued(error) => {
                     eprintln!("[delegation] chat {tab_id}: cannot queue result: {error}")
                 }
-                // Only a manual send, which preview panes do not offer, gives these.
-                DeliveryEffect::AlreadyDelivered | DeliveryEffect::NotSent(_) => {
-                    unreachable!("manual send effect from a flush")
+                DeliveryEffect::AlreadyDelivered => {
+                    self.card_notice(tab_id, "That result was already sent to Claude.".into(), cx)
+                }
+                DeliveryEffect::NotSent(error) => {
+                    self.card_notice(tab_id, format!("Not sent: {error}"), cx)
                 }
             }
         }
         self.show_held(tab_id, cx);
+    }
+
+    fn card_notice(&self, tab_id: usize, notice: String, cx: &mut Context<Self>) {
+        eprintln!("[delegation] chat {tab_id}: {notice}");
+        if let Some(pane) = chat_pane(tab_id, cx) {
+            pane.update(cx, |pane, cx| pane.show_notice(notice, cx));
+        }
+    }
+
+    /// The same card intents as Iced, all checked against the requesting
+    /// chat before reaching core. Only Live exposes these actions.
+    pub(crate) fn card_action(
+        &mut self,
+        tab_id: usize,
+        action: gitterm_gpui_chat::interactions::TranscriptAction,
+        cx: &mut Context<Self>,
+    ) {
+        use gitterm_gpui_chat::interactions::TranscriptAction as A;
+        if !self.is_live() || !self.delivers() {
+            return;
+        }
+        let chats = delivery_chats(cx);
+        match action {
+            A::SendDelegation { id, finding_ids } => {
+                let effects =
+                    self.host
+                        .send_delegation(&chats, tab_id, &id, &finding_ids, self.auto_tell());
+                self.run_delivery_effects(tab_id, effects, cx);
+            }
+            A::Dismiss(request) => {
+                match self.host.dismiss_delegation(
+                    &chats,
+                    tab_id,
+                    &request.id,
+                    &chrono::Utc::now().to_rfc3339(),
+                ) {
+                    Ok(dismissal) => {
+                        for id in dismissal.abort {
+                            if let Some(run) = self.runs.get(&id) {
+                                // Keep the handle until the child is reaped; a
+                                // cancelled completion cannot overwrite the card.
+                                run.stop.stop();
+                            }
+                        }
+                        if let Err(error) = dismissal.saved {
+                            self.card_notice(tab_id, format!("Not dismissed: {error}"), cx);
+                        }
+                        self.start_queued_runs(cx);
+                        self.show_held(tab_id, cx);
+                        cx.notify();
+                    }
+                    Err(error) => self.card_notice(tab_id, format!("Not dismissed: {error}"), cx),
+                }
+            }
+            A::RerunDelegation { id } => {
+                let Some(chat) = chats.iter().find(|chat| chat.tab_id == tab_id) else {
+                    return;
+                };
+                let label = match self.host.chat_delegation(&chats, tab_id, &id) {
+                    Ok(d) if d.kind == gitterm_core::tasks::DelegationKind::Review => {
+                        "review_request"
+                    }
+                    Ok(_) => "consult_request",
+                    Err(error) => {
+                        self.card_notice(tab_id, error, cx);
+                        return;
+                    }
+                };
+                // Card requests use the same asynchronous admission/reply path
+                // as MCP. Retain its waiter until the check reports its result.
+                let (sender, mut receiver) =
+                    gitterm_core::task_commands::runtime::command_channel();
+                let pending = sender.enqueue((), None).expect("new card request channel");
+                let reply = receiver.try_recv().expect("enqueued card request").reply;
+                self.request_codex_run(
+                    reply,
+                    Some(chat.session_uid.clone()),
+                    super::runs::CodexRequest::Rerun(id),
+                    label,
+                    cx,
+                );
+                cx.spawn(async move |owner: gpui::WeakEntity<Self>, cx| {
+                    if let Err(error) = pending.await {
+                        let _ = owner.update(cx, |owner, cx| owner.card_notice(tab_id, error, cx));
+                    }
+                    drop((receiver, sender));
+                })
+                .detach();
+            }
+            _ => {}
+        }
     }
 
     /// Iced's `delegation_card` `held`: a card whose result waits for its
@@ -315,7 +425,7 @@ pub(crate) fn forward_turn_ends(
 
 /// The GPUI chat panes, as core resolves a result's requesting chat. Every
 /// preview pane runs its provider on this Mac, so none is remote.
-fn delivery_chats(cx: &App) -> Vec<DeliveryChat> {
+pub(super) fn delivery_chats(cx: &App) -> Vec<DeliveryChat> {
     chat_panes(cx)
         .into_iter()
         .map(|pane| {
