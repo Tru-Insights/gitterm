@@ -103,6 +103,7 @@ pub mod remote;
 pub mod agent_config;
 pub mod config_paths;
 pub mod workspace_config;
+pub mod workspace_settings;
 
 #[cfg(feature = "stt")]
 pub mod dictation;

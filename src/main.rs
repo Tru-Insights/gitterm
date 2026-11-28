@@ -8581,6 +8581,7 @@ fn repo_config_of(repo: &RepoState) -> Option<RepoConfig> {
         return None;
     }
     Some(RepoConfig {
+        extra: Default::default(),
         dir: repo_config_dir(repo),
         location: workspace_location_config_from_location(&repo.location),
         run_command: repo.run_command.clone(),
@@ -10514,21 +10515,7 @@ impl App {
     /// Load workspace profiles from ~/.config/gitterm-v6/profiles.json
     /// Returns a map of profile_name -> env vars
     fn load_profiles() -> Option<HashMap<String, HashMap<String, String>>> {
-        let path = config::global_config_dir().join("profiles.json");
-        let contents = std::fs::read_to_string(&path).ok()?;
-        #[derive(serde::Deserialize)]
-        struct Profile {
-            #[allow(dead_code)]
-            description: Option<String>,
-            env: HashMap<String, String>,
-        }
-        let profiles: HashMap<String, Profile> = serde_json::from_str(&contents).ok()?;
-        Some(
-            profiles
-                .into_iter()
-                .map(|(name, p)| (name, p.env))
-                .collect(),
-        )
+        gitterm_core::workspace_settings::load_profiles(&config::global_config_dir())
     }
 
     fn mark_workspaces_dirty(&mut self) {
@@ -15869,35 +15856,21 @@ impl App {
         let Some(ws) = self.workspaces.get_mut(idx) else {
             return;
         };
-        if let Some(overridden) = ws.env_overrides.get_mut(&key) {
-            match value {
-                Some(value) => *overridden = value,
-                None => {
-                    ws.env_overrides.remove(&key);
-                }
-            }
-            return;
-        }
-        let home = ws.home;
-        if let Some(repo) = self.repo_mut(home) {
-            match value {
-                Some(value) => repo.env.insert(key, value),
-                None => repo.env.remove(&key),
-            };
-        }
+        gitterm_core::workspace_settings::EnvEdit::Set { key, value }.apply(
+            &mut ws.env_overrides,
+            self.repos.get_mut(ws.home).map(|repo| &mut repo.env),
+        );
     }
 
-    /// A profile replaces workspace `idx`'s env: its home repo's env
-    /// becomes the profile and its overrides are cleared.
+    /// A profile replaces the home repo's env and clears workspace overrides.
     fn apply_env_profile(&mut self, idx: usize, profile: HashMap<String, String>) {
         let Some(ws) = self.workspaces.get_mut(idx) else {
             return;
         };
-        ws.env_overrides.clear();
-        let home = ws.home;
-        if let Some(repo) = self.repo_mut(home) {
-            repo.env = profile;
-        }
+        gitterm_core::workspace_settings::EnvEdit::Profile(profile).apply(
+            &mut ws.env_overrides,
+            self.repos.get_mut(ws.home).map(|repo| &mut repo.env),
+        );
     }
 
     /// Adds `workspace` to the bar in machine order, makes it active and
@@ -55580,6 +55553,7 @@ mod tests {
     #[test]
     fn the_repos_section_keeps_open_repos_and_those_closed_workspaces_list() {
         let open = vec![RepoConfig {
+            extra: Default::default(),
             dir: "/tmp/tru180-open".into(),
             location: None,
             run_command: None,
@@ -55587,6 +55561,7 @@ mod tests {
             bottom_terminals: Vec::new(),
         }];
         let stored_for = |dir: &str| RepoConfig {
+            extra: Default::default(),
             dir: dir.into(),
             location: None,
             run_command: Some("make".into()),

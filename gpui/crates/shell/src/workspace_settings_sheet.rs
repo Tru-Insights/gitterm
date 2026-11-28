@@ -1,17 +1,13 @@
-//! Iced's workspace settings sheet (A02–A10), display only.
-//!
-//! The host builds a `SheetModel` from the Iced config it already reads and
-//! mounts `WorkspaceSettingsSheet`. Nothing here writes: every control that
-//! would write records a "<label> · not available in preview" notice and emits
-//! `Unavailable` so the host can show its own preview notice. Typing into the
-//! KEY/VALUE and rename inputs only changes a local draft.
+//! Iced's workspace settings sheet (A02–A10). Live writes use DesktopStore;
+//! Preview keeps every write control read-only with its existing notice.
 
 use std::{collections::HashMap, path::Path};
 
 use gitterm_core::{
     checkout_name::repo_name,
     settings::WorkspaceColor,
-    workspace_config::{RepoConfig, WorkspaceConfig},
+    workspace_config::{RepoConfig, WorkspaceConfig, WorkspaceTarget},
+    workspace_settings::{Edit, EnvEdit},
 };
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
@@ -19,10 +15,11 @@ use gpui::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px, rgb, rgba,
 };
 use gpui_component::{
-    Sizable as _,
+    IndexPath, Sizable as _,
     button::Button,
     checkbox::Checkbox,
     input::{Input, InputEvent, InputState},
+    select::{Select, SelectEvent, SelectItem, SelectState},
 };
 
 use crate::theme::Palette;
@@ -46,6 +43,7 @@ pub enum Outcome {
     Close,
     EditGuidelines,
     Rename(String),
+    Edit(Edit),
     /// A control that would write; the label names it for the notice.
     Unavailable(String),
 }
@@ -65,6 +63,7 @@ pub struct SheetModel {
     pub guidelines_repo: Option<(String, bool)>,
     pub chrome: bool,
     pub decisions: String,
+    pub decisions_choices: Vec<(Option<String>, String)>,
 }
 
 impl SheetModel {
@@ -117,6 +116,25 @@ impl SheetModel {
             guidelines_repo,
             chrome: ws.claude_in_chrome,
             decisions: decisions_label(ws),
+            decisions_choices: {
+                let mut choices = vec![(None, "None".into())];
+                if local {
+                    choices.extend(ws.repos.iter().map(|dir| {
+                        (
+                            Some(dir.clone()),
+                            format!("{} · {}", repo_name(Path::new(dir)), dir),
+                        )
+                    }));
+                }
+                if let Some(dir) = &ws.decisions_repo
+                    && !choices
+                        .iter()
+                        .any(|(choice, _)| choice.as_ref() == Some(dir))
+                {
+                    choices.push((Some(dir.clone()), decisions_label(ws)));
+                }
+                choices
+            },
         }
     }
 }
@@ -141,19 +159,14 @@ fn decisions_label(ws: &WorkspaceConfig) -> String {
 }
 
 fn load_profiles(config_dir: &Path, env: &HashMap<String, String>) -> Option<Vec<(String, bool)>> {
-    #[derive(serde::Deserialize)]
-    struct Profile {
-        env: HashMap<String, String>,
-    }
-    let contents = std::fs::read_to_string(config_dir.join("profiles.json")).ok()?;
-    let profiles: HashMap<String, Profile> = serde_json::from_str(&contents).ok()?;
+    let profiles = gitterm_core::workspace_settings::load_profiles(config_dir)?;
     // The first profile (by Iced's map order) whose keys all match is current;
     // with sorted display only one may be marked.
     let mut names: Vec<_> = profiles.keys().cloned().collect();
     names.sort();
     let current = names.iter().find(|name| {
         let p = &profiles[*name];
-        !p.env.is_empty() && p.env.iter().all(|(k, v)| env.get(k) == Some(v))
+        !p.is_empty() && p.iter().all(|(k, v)| env.get(k) == Some(v))
     });
     let current = current.cloned();
     Some(
@@ -167,6 +180,21 @@ fn load_profiles(config_dir: &Path, env: &HashMap<String, String>) -> Option<Vec
     )
 }
 
+#[derive(Clone)]
+struct DecisionsChoice {
+    dir: Option<String>,
+    label: SharedString,
+}
+impl SelectItem for DecisionsChoice {
+    type Value = Option<String>;
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+    fn value(&self) -> &Self::Value {
+        &self.dir
+    }
+}
+
 pub struct WorkspaceSettingsSheet {
     pub(crate) workspace_id: Option<crate::WorkspaceId>,
     model: SheetModel,
@@ -175,6 +203,7 @@ pub struct WorkspaceSettingsSheet {
     value: Entity<InputState>,
     rename: Option<Entity<InputState>>,
     notice: Option<String>,
+    decisions: Entity<SelectState<Vec<DecisionsChoice>>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -200,15 +229,38 @@ impl WorkspaceSettingsSheet {
     pub fn new(model: SheetModel, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let key = cx.new(|cx| InputState::new(window, cx).placeholder("KEY"));
         let value = cx.new(|cx| InputState::new(window, cx).placeholder("VALUE"));
-        let subscriptions = [&key, &value]
+        let mut subscriptions: Vec<_> = [&key, &value]
             .map(|input| {
-                cx.subscribe(input, |this, _, event, cx| {
+                cx.subscribe_in(input, window, |this, _, event, window, cx| {
                     if matches!(event, InputEvent::PressEnter { .. }) {
-                        this.unavailable("Add environment variable", cx);
+                        this.add_env(window, cx);
                     }
                 })
             })
             .into();
+        let choices: Vec<_> = model
+            .decisions_choices
+            .iter()
+            .map(|(dir, label)| DecisionsChoice {
+                dir: dir.clone(),
+                label: label.clone().into(),
+            })
+            .collect();
+        let selected = choices
+            .iter()
+            .position(|choice| choice.label.as_ref() == model.decisions);
+        let decisions = cx.new(|cx| {
+            SelectState::new(
+                choices,
+                selected.map(|row| IndexPath::default().row(row)),
+                window,
+                cx,
+            )
+        });
+        subscriptions.push(cx.subscribe(&decisions, |this, _, event, cx| {
+            let SelectEvent::Confirm(dir) = event;
+            this.edit("Decisions repo", Edit::Decisions(dir.clone().flatten()), cx);
+        }));
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         Self {
@@ -219,6 +271,7 @@ impl WorkspaceSettingsSheet {
             value,
             rename: None,
             notice: None,
+            decisions,
             _subscriptions: subscriptions,
         }
     }
@@ -239,6 +292,37 @@ impl WorkspaceSettingsSheet {
         self.notice = Some(notice.clone());
         cx.emit(Outcome::Unavailable(label.to_owned()));
         cx.notify();
+    }
+
+    fn edit(&mut self, label: &str, edit: Edit, cx: &mut Context<Self>) {
+        if cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .is_none()
+        {
+            self.unavailable(label, cx);
+        } else {
+            cx.emit(Outcome::Edit(edit));
+        }
+    }
+
+    fn add_env(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .is_none()
+        {
+            self.unavailable("Add environment variable", cx);
+            return;
+        }
+        if let Some(edit) = gitterm_core::workspace_settings::env_add(
+            self.key.read(cx).value().as_ref(),
+            self.value.read(cx).value().as_ref(),
+        ) {
+            self.edit("Add environment variable", Edit::Env(edit), cx);
+            self.key
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.value
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
     }
 
     fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -330,7 +414,9 @@ impl Render for WorkspaceSettingsSheet {
                     .border_2()
                     .border_color(if selected { rgb(accent) } else { rgba(0) })
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| this.unavailable("Color", cx))),
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.edit("Color", Edit::Color(color), cx)
+                    })),
             );
         }
 
@@ -343,6 +429,7 @@ impl Render for WorkspaceSettingsSheet {
             Some(list) => {
                 for (index, (name, active)) in list.iter().enumerate() {
                     let label = format!("Profile {name}");
+                    let name_to_apply = name.clone();
                     profiles = profiles.child(
                         mono(name.clone())
                             .id(("settings-profile", index))
@@ -359,9 +446,9 @@ impl Render for WorkspaceSettingsSheet {
                             .bg(if *active { rgb(accent) } else { rgba(0) })
                             .text_color(rgb(if *active { p.base } else { p.text }))
                             .cursor_pointer()
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.unavailable(&label, cx)),
-                            ),
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.edit(&label, Edit::Profile(name_to_apply.clone()), cx)
+                            })),
                     );
                 }
             }
@@ -378,12 +465,12 @@ impl Render for WorkspaceSettingsSheet {
                      checked: bool,
                      label: String,
                      notice: &'static str,
+                     edit: Edit,
                      cx: &mut Context<Self>| {
             div().debug_selector(move || id.into()).child(
-                Checkbox::new(id)
-                    .label(label)
-                    .checked(checked)
-                    .on_click(cx.listener(move |this, _, _, cx| this.unavailable(notice, cx))),
+                Checkbox::new(id).label(label).checked(checked).on_click(
+                    cx.listener(move |this, _, _, cx| this.edit(notice, edit.clone(), cx)),
+                ),
             )
         };
         let mut guidelines = div()
@@ -417,6 +504,7 @@ impl Render for WorkspaceSettingsSheet {
                 model.guidelines_enabled,
                 "Add them to every agent GitTerm starts (all workspaces)".into(),
                 "Guidelines for all workspaces",
+                Edit::GuidelinesEnabled(!model.guidelines_enabled),
                 cx,
             ))
             .child(check(
@@ -424,6 +512,7 @@ impl Render for WorkspaceSettingsSheet {
                 model.guidelines_workspace,
                 "Use them in this workspace".into(),
                 "Guidelines for this workspace",
+                Edit::GuidelinesWorkspace(!model.guidelines_workspace),
                 cx,
             ));
         if let Some((repo, on)) = &model.guidelines_repo {
@@ -432,6 +521,10 @@ impl Render for WorkspaceSettingsSheet {
                 *on,
                 format!("Use them in {repo}"),
                 "Guidelines for this repo",
+                Edit::GuidelinesRepo {
+                    repo: repo.into(),
+                    enabled: !on,
+                },
                 cx,
             ));
         }
@@ -446,6 +539,7 @@ impl Render for WorkspaceSettingsSheet {
                 model.chrome,
                 "Start Claude sessions in this workspace with Claude in Chrome".into(),
                 "Claude in Chrome",
+                Edit::Chrome(!model.chrome),
                 cx,
             ))
             .child(
@@ -466,22 +560,15 @@ impl Render for WorkspaceSettingsSheet {
                     .gap(px(8.))
                     .child(mono("Decisions repo:").text_size(px(12.)).text_color(rgb(p.subtext0)))
                     .child(
-                        mono(model.decisions.clone())
-                            .id("settings-decisions")
-                            .debug_selector(|| "settings-decisions".into())
-                            .flex_1()
-                            .px(px(8.))
-                            .py(px(4.))
-                            .text_size(px(12.))
-                            .text_color(rgb(p.text))
-                            .bg(rgb(p.base))
-                            .border_1()
-                            .border_color(rgb(p.border))
-                            .rounded(px(3.))
-                            .cursor_pointer()
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.unavailable("Decisions repo", cx)),
-                            ),
+                        div().debug_selector(|| "settings-decisions".into()).flex_1().min_w_0()
+                            .child(if cx.try_global::<crate::workspace_config::LiveWorkspaces>().is_some() {
+                                Select::new(&self.decisions).accessibility_label("Decisions repo").small().text_size(px(12.)).w_full().into_any_element()
+                            } else {
+                                mono(model.decisions.clone()).id("settings-decisions-preview")
+                                    .px(px(8.)).py(px(4.)).text_size(px(12.)).text_color(rgb(p.text))
+                                    .bg(rgb(p.base)).border_1().border_color(rgb(p.border)).rounded(px(3.)).cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| this.unavailable("Decisions repo", cx))).into_any_element()
+                            })
                     ),
             )
             .child(
@@ -509,6 +596,7 @@ impl Render for WorkspaceSettingsSheet {
             );
         for (index, (key, value)) in model.env.iter().enumerate() {
             let label = format!("Remove {key}");
+            let remove_key = key.clone();
             env = env.child(
                 div()
                     .flex()
@@ -538,9 +626,16 @@ impl Render for WorkspaceSettingsSheet {
                             .text_size(px(10.))
                             .text_color(rgb(p.red))
                             .cursor_pointer()
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.unavailable(&label, cx)),
-                            ),
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.edit(
+                                    &label,
+                                    Edit::Env(EnvEdit::Set {
+                                        key: remove_key.clone(),
+                                        value: None,
+                                    }),
+                                    cx,
+                                )
+                            })),
                     ),
             );
         }
@@ -573,9 +668,7 @@ impl Render for WorkspaceSettingsSheet {
                         .border_color(rgb(accent))
                         .rounded(px(3.))
                         .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.unavailable("Add environment variable", cx)
-                        })),
+                        .on_click(cx.listener(|this, _, window, cx| this.add_env(window, cx))),
                 ),
         );
 
@@ -722,11 +815,120 @@ impl crate::Shell {
                     cx,
                 ),
                 Outcome::EditGuidelines => shell.edit_guidelines(id, window, cx),
+                Outcome::Edit(edit) => shell.save_sheet_edit(id, edit.clone(), window, cx),
             },
         ));
         self.settings_sheet = Some(sheet);
         self.cover_sheet(true, window, cx);
         cx.notify();
+    }
+
+    fn save_sheet_edit(
+        &mut self,
+        id: crate::WorkspaceId,
+        edit: Edit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .cloned()
+        else {
+            return;
+        };
+        if self.owner.read(cx).workspace_save_pending {
+            return;
+        }
+        let Some(saved) = self.owner.read(cx).iced_workspace(id) else {
+            return;
+        };
+        let target = WorkspaceTarget::of(saved);
+        self.owner.update(cx, |owner, cx| {
+            owner.workspace_save_pending = true;
+            cx.notify();
+        });
+        let root = store.0.root().to_path_buf();
+        let result = cx
+            .background_executor()
+            .spawn(async move { store.0.edit_workspace_settings(target, edit).wait() });
+        cx.spawn_in(window, async move |shell, cx| {
+            let result = result.await;
+            _ = shell.update_in(cx, |shell, window, cx| {
+                shell.owner.update(cx, |owner, cx| {
+                    owner.workspace_save_pending = false;
+                    cx.notify();
+                });
+                match result {
+                    Ok(file) => {
+                        shell.repo_document_saved(&root, file, cx);
+                        let model = {
+                            let owner = shell.owner.read(cx);
+                            owner.iced_workspace(id).zip(owner.iced_catalog()).map(
+                                |(ws, catalog)| {
+                                    SheetModel::read(ws, &catalog.repos, &catalog.source)
+                                },
+                            )
+                        };
+                        if let Some(sheet) = &shell.settings_sheet
+                            && sheet.read(cx).workspace_id == Some(id)
+                        {
+                            sheet.update(cx, |sheet, cx| {
+                                if let Some(model) = model {
+                                    let choices: Vec<_> = model
+                                        .decisions_choices
+                                        .iter()
+                                        .map(|(dir, label)| DecisionsChoice {
+                                            dir: dir.clone(),
+                                            label: label.clone().into(),
+                                        })
+                                        .collect();
+                                    let selected = choices
+                                        .iter()
+                                        .find(|choice| choice.label.as_ref() == model.decisions)
+                                        .and_then(|choice| choice.dir.clone());
+                                    sheet.decisions.update(cx, |select, cx| {
+                                        select.set_items(choices, window, cx);
+                                        select.set_selected_value(&selected, window, cx);
+                                    });
+                                    sheet.model = model;
+                                }
+                                sheet.notice = None;
+                                cx.notify();
+                            });
+                        }
+                        shell.owner.update(cx, |owner, cx| {
+                            owner.error = None;
+                            cx.notify();
+                        });
+                    }
+                    Err(error) => {
+                        if let Some(sheet) = &shell.settings_sheet
+                            && sheet.read(cx).workspace_id == Some(id)
+                        {
+                            sheet.update(cx, |sheet, cx| {
+                                sheet.notice = Some(error.clone());
+                                let selected = sheet
+                                    .model
+                                    .decisions_choices
+                                    .iter()
+                                    .find(|(_, label)| label == &sheet.model.decisions)
+                                    .and_then(|(dir, _)| dir.clone());
+                                sheet.decisions.update(cx, |select, cx| {
+                                    select.set_selected_value(&selected, window, cx)
+                                });
+                                cx.notify();
+                            });
+                        }
+                        shell.owner.update(cx, |owner, cx| {
+                            owner.error = Some(error);
+                            cx.notify();
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn close_settings_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {

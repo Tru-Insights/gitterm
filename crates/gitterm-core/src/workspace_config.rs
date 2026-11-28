@@ -53,6 +53,8 @@ impl<C> Default for WorkspacesFile<C> {
 /// workspace does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoConfig {
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
     pub dir: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<WorkspaceLocationConfig>,
@@ -283,6 +285,7 @@ impl<C> WorkspaceConfig<C> {
     /// hold them. Its terminals stay the workspace's.
     pub fn own_home_repo(&self) -> RepoConfig {
         RepoConfig {
+            extra: Default::default(),
             dir: self.home_dir().to_string(),
             location: self.location.clone(),
             run_command: self.run_command.clone(),
@@ -643,6 +646,7 @@ impl<C> WorkspacesFile<C> {
                 }
                 if self.repo(&key).is_none() {
                     self.repos.push(RepoConfig {
+                        extra: Default::default(),
                         dir,
                         location: None,
                         run_command: detected_command,
@@ -687,6 +691,7 @@ impl<C> WorkspacesFile<C> {
                     // Legacy lists can name an extra repo without a settings
                     // record. Iced's list_repo gives it an empty environment.
                     self.repos.push(RepoConfig {
+                        extra: Default::default(),
                         dir: dir.to_string_lossy().into_owned(),
                         location: None,
                         run_command: None,
