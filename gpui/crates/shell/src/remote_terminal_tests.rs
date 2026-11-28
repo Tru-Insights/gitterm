@@ -13,7 +13,7 @@ fn golive19_start(
     let owner = cx
         .update(|cx| {
             cx.set_global(crate::workspace_config::LiveWorkspaces(desktop));
-            TaskHostOwner::start_live(config, lock, services, cx)
+            TaskHostOwner::start_live_for_test(config, lock, services, cx)
         })
         .unwrap();
     (owner, sender)
