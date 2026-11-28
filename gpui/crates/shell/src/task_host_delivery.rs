@@ -300,10 +300,15 @@ pub(crate) fn forward_turn_ends(
     view: &Entity<crate::chat::ChatPane>,
     cx: &mut App,
 ) -> Subscription {
-    cx.subscribe(view, |view, _: &crate::chat::TurnEnded, cx| {
+    cx.subscribe(view, |view, event: &crate::chat::TurnEnded, cx| {
         let tab_id = view.read(cx).target().tab_id;
         if let Some(host) = cx.try_global::<GpuiTaskHost>().map(|host| host.0.clone()) {
-            host.update(cx, |host, cx| host.chat_turn_ended(tab_id, cx));
+            host.update(cx, |host, cx| {
+                if let Some(reading) = &event.0 {
+                    host.observe_claude_rate_limit(reading, cx);
+                }
+                host.chat_turn_ended(tab_id, cx);
+            });
         }
     })
 }

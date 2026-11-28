@@ -49,6 +49,32 @@ impl WorkerProcess {
             .map_err(|e| format!("decode worker launch identity {}: {e}", path.display()))
     }
 
+    /// Revoke an unpublished launch before its terminal is dropped. Moving
+    /// the recorder directory closes the startup race: a late recorder cannot
+    /// rename its record, so record_shell's `&&` never starts the harness.
+    /// Capture descendants while ancestry is intact; shutdown then uses the
+    /// same birth-checked TERM/grace/KILL path as a published worker.
+    pub fn discard_unpublished(
+        mut self,
+    ) -> Result<Option<std::thread::JoinHandle<Result<(), String>>>, String> {
+        let revoked = self.dir.with_extension("revoked");
+        std::fs::rename(&self.dir, &revoked)
+            .map_err(|e| format!("revoke worker recorder {}: {e}", self.dir.display()))?;
+        self.dir = revoked;
+        let Some(identity) = self.launch_identity()? else {
+            return Ok(None);
+        };
+        let tree = owned_tree(&SystemProcesses, Some(&identity))?;
+        let stop = std::thread::Builder::new()
+            .name("unpublished-worker-stop".into())
+            .spawn(move || {
+                let _record = self;
+                stop_captured_tree(&SystemProcesses, &tree)
+            })
+            .map_err(|e| format!("start unpublished worker shutdown: {e}"))?;
+        Ok(Some(stop))
+    }
+
     pub fn stop(self) -> Result<(), String> {
         stop_on_platform(
             &SystemProcesses,
@@ -172,6 +198,14 @@ fn stop_tree(
     control: &impl ProcessControl,
     identity: Option<&LaunchIdentity>,
 ) -> Result<(), String> {
+    let tree = owned_tree(control, identity)?;
+    stop_captured_tree(control, &tree)
+}
+
+fn owned_tree(
+    control: &impl ProcessControl,
+    identity: Option<&LaunchIdentity>,
+) -> Result<Vec<Process>, String> {
     let identity = identity.ok_or("refuse worker shutdown: missing persisted launch identity")?;
     let root = identity.pid;
     let snapshot = control.snapshot()?;
@@ -211,6 +245,10 @@ fn stop_tree(
             "refuse worker shutdown: launch identity for PID {root} changed during inspection"
         ));
     }
+    Ok(tree)
+}
+
+fn stop_captured_tree(control: &impl ProcessControl, tree: &[Process]) -> Result<(), String> {
     let mut errors = Vec::new();
     for signal in [Signal::Terminate, Signal::Kill] {
         for process in tree.iter().rev() {
@@ -386,3 +424,43 @@ pub mod macos;
 #[cfg(test)]
 #[path = "../../../src/worker_process/tests.rs"]
 mod tests;
+
+/// Persist only an identity captured by this launch's recorder.
+pub fn persist_identity_record(
+    store: &mut crate::tasks::TaskStore,
+    task: &str,
+    session: &str,
+    identity: &LaunchIdentity,
+) -> Result<(), String> {
+    let mut record = store
+        .get(task)
+        .and_then(|task| task.sessions.iter().find(|s| s.task_session_id == session))
+        .cloned()
+        .ok_or_else(|| format!("worker session {session} is missing from task {task}"))?;
+    record.launch_identity = Some(identity.clone());
+    store
+        .upsert_session(task, record, &chrono::Utc::now().to_rfc3339())
+        .map_err(|error| error.to_string())
+}
+
+/// Early executable hook: the recorder must run before any app/state setup.
+pub fn handle_recorder(args: &[std::ffi::OsString]) {
+    if args.first().map(|arg| arg.as_os_str()) != Some(std::ffi::OsStr::new(RECORD_LAUNCH_ARG)) {
+        return;
+    }
+    let result = (|| {
+        let path = args.get(1).ok_or("missing worker launch record path")?;
+        let terminal_shell = args
+            .get(2)
+            .ok_or("missing worker terminal shell PID")?
+            .to_string_lossy()
+            .parse::<u32>()
+            .map_err(|error| format!("invalid worker terminal shell PID: {error}"))?;
+        record_launch(std::path::Path::new(path), terminal_shell)
+    })();
+    if let Err(error) = result {
+        eprintln!("[tasks] {error}");
+        std::process::exit(1);
+    }
+    std::process::exit(0);
+}
