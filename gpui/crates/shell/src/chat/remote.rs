@@ -79,8 +79,11 @@ impl ChatPane {
         self.controller.remote = binding.is_some();
         self.remote = binding;
         if self.remote.is_some() {
-            self.view
-                .update(cx, |view, cx| view.enable_live_permissions(cx));
+            self.defaults_loading = false;
+            self.view.update(cx, |view, cx| {
+                view.enable_live_permissions(cx);
+                view.set_read_only(None, cx);
+            });
         }
     }
     pub(super) fn claim_provider(

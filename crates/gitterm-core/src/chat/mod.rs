@@ -3,6 +3,7 @@
 pub mod types;
 
 pub mod checkout;
+pub mod external;
 
 pub mod history;
 pub mod html_render;

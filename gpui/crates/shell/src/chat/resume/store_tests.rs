@@ -125,11 +125,7 @@ fn chat_write_owner_failure_reaches_caller_and_drain_without_changing_file() {
     let (reply, saved) = tokio::sync::oneshot::channel();
     shutdown
         .sender
-        .send(ShutdownCommand::Persist(
-            Box::new(live),
-            store.clone(),
-            reply,
-        ))
+        .send(ShutdownCommand::Persist(live.submit(&store), reply))
         .unwrap();
     let error = saved.blocking_recv().unwrap().unwrap_err();
     assert!(error.contains("Save confirmed Claude session"), "{error}");
@@ -163,11 +159,7 @@ fn quit_drain_waits_for_pending_chat_write_on_the_live_owner() {
     let (reply, saved) = tokio::sync::oneshot::channel();
     shutdown
         .sender
-        .send(ShutdownCommand::Persist(
-            Box::new(live),
-            store.clone(),
-            reply,
-        ))
+        .send(ShutdownCommand::Persist(live.submit(&store), reply))
         .unwrap();
     // This is the same queue drain registered with the app's quit barrier.
     let (drained, completion) = mpsc::channel();
@@ -247,11 +239,7 @@ fn failed_chat_atomic_save_keeps_file_and_owner_snapshot_intact() {
     let (reply, saved) = tokio::sync::oneshot::channel();
     shutdown
         .sender
-        .send(ShutdownCommand::Persist(
-            Box::new(live),
-            store.clone(),
-            reply,
-        ))
+        .send(ShutdownCommand::Persist(live.submit(&store), reply))
         .unwrap();
     let result = saved.blocking_recv().unwrap();
     std::fs::set_permissions(root.path(), permissions).unwrap();
@@ -365,5 +353,41 @@ fn review_regression_f4_queued_chat_write_resolves_renamed_workspace_by_caller()
     assert_eq!(
         file.workspaces[0].tabs[0].startup_command,
         live.tab.startup_command
+    );
+}
+
+#[test]
+fn live_unsent_save_is_not_reordered_after_close_by_a_blocked_shutdown_queue() {
+    let (root, mut live, _) = fixture();
+    live.tab.chat_session_id = None;
+    let store = DesktopStore::open(root.path()).unwrap();
+    let shutdown = RuntimeShutdown::new();
+    let (release, gate) = std::sync::mpsc::channel();
+    shutdown.sender.send(ShutdownCommand::Wait(gate)).unwrap();
+    let (reply, _saved) = tokio::sync::oneshot::channel();
+    shutdown
+        .sender
+        .send(ShutdownCommand::Persist(live.submit(&store), reply))
+        .unwrap();
+    store
+        .transact_workspaces(|file| {
+            file.workspaces[0]
+                .tabs
+                .retain(|tab| tab.session_uid.as_deref() != Some("caller"));
+            Ok(())
+        })
+        .wait()
+        .unwrap();
+    release.send(()).unwrap();
+    shutdown.drain().unwrap();
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("workspaces.json")).unwrap())
+            .unwrap();
+    assert!(
+        saved["workspaces"][0]["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tab| tab["session_uid"] != "caller")
     );
 }

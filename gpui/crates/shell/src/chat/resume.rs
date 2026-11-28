@@ -34,25 +34,32 @@ impl LiveTab {
             location: workspace.location.clone(),
         }
     }
-    /// Share the workspace lifecycle's serialized owner. The chat shutdown queue
-    /// waits for its receipt, so quit also drains writes not yet submitted here.
-    pub fn persist(&self, store: &gitterm_core::desktop_store::DesktopStore) -> Result<()> {
-        anyhow::ensure!(
-            !self.services.is_preview(),
-            "Cannot persist Live chat in Preview"
-        );
-        anyhow::ensure!(
-            std::fs::canonicalize(self.services.state_root())? == store.root(),
-            "Live chat persistence owner belongs to another state root"
-        );
+    /// Submit before queuing receipt waits behind process shutdown. Tab removal
+    /// uses this same owner, so a slow reaper cannot reorder a save after close.
+    pub fn submit(
+        &self,
+        store: &gitterm_core::desktop_store::DesktopStore,
+    ) -> gitterm_core::desktop_store::Receipt<()> {
         let live = self.clone();
-        store
-            .transact_workspaces(move |file| {
+        let root = store.root().to_path_buf();
+        store.transact_workspaces(move |file| {
+            (|| -> Result<()> {
+                anyhow::ensure!(
+                    !live.services.is_preview(),
+                    "Cannot persist Live chat in Preview"
+                );
+                anyhow::ensure!(
+                    std::fs::canonicalize(live.services.state_root())? == root,
+                    "Live chat persistence owner belongs to another state root"
+                );
                 live.update_document(file)
-                    .map_err(|error| format!("{error:#}"))
-            })
-            .wait()
-            .map_err(anyhow::Error::msg)
+            })()
+            .map_err(|error| format!("{error:#}"))
+        })
+    }
+    #[cfg(test)]
+    pub fn persist(&self, store: &gitterm_core::desktop_store::DesktopStore) -> Result<()> {
+        self.submit(store).wait().map_err(anyhow::Error::msg)
     }
     fn update_document(
         &self,
@@ -96,22 +103,20 @@ impl LiveTab {
             .session_uid
             .as_deref()
             .context("Live chat has no caller identity")?;
-        let id = self
-            .tab
-            .chat_session_id
-            .as_deref()
-            .context("Live chat has no confirmed provider identity")?;
+        // An unsent chat may bind its checkout before a provider identity exists.
+        let id = self.tab.chat_session_id.as_deref();
         anyhow::ensure!(
-            !tabs
-                .iter()
-                .any(|tab| tab.chat_session_id.as_deref() == Some(id)
-                    && tab.session_uid.is_some()
-                    && tab.session_uid.as_deref() != Some(uid)),
+            !tabs.iter().any(|tab| id.is_some()
+                && tab.chat_session_id.as_deref() == id
+                && tab.session_uid.is_some()
+                && tab.session_uid.as_deref() != Some(uid)),
             "Confirmed Claude session already belongs to another tab"
         );
         if let Some(tab) = tabs.iter_mut().find(|tab| {
             tab.session_uid.as_deref() == Some(uid)
-                || (tab.chat_session_id.as_deref() == Some(id) && tab.session_uid.is_none())
+                || (id.is_some()
+                    && tab.chat_session_id.as_deref() == id
+                    && tab.session_uid.is_none())
         }) {
             // Iced also drops nested agent_config unknowns by re-serializing its typed config.
             // Preserve other fields a newer desktop may have written.
@@ -126,13 +131,16 @@ impl LiveTab {
             *tab = serde_json::from_value(value)?;
         } else if !tabs
             .iter()
-            .any(|tab| tab.chat_session_id.as_deref() == Some(id))
+            .any(|tab| id.is_some() && tab.chat_session_id.as_deref() == id)
         {
             tabs.push(self.tab.clone());
         } else {
             anyhow::bail!("Confirmed Claude session already belongs to another tab");
         }
-        if !workspace.chats.is_empty() && !workspace.chats.iter().any(|chat| chat == id) {
+        if let Some(id) = id
+            && !workspace.chats.is_empty()
+            && !workspace.chats.iter().any(|chat| chat == id)
+        {
             workspace.chats.push(id.into());
         }
         Ok(())
@@ -191,6 +199,7 @@ impl ChatPane {
                 &workspace,
                 tab(&self.saved.cwd, self.saved.uid.clone(), None),
             ));
+            self.refresh_live_checkout_source(cx);
         }
     }
     pub(super) fn confirm_provider_id(&mut self, id: &str, cx: &mut Context<Self>) -> Result<()> {
@@ -226,11 +235,7 @@ impl ChatPane {
         let (reply, saved) = tokio::sync::oneshot::channel();
         self.shutdown
             .sender
-            .send(ShutdownCommand::Persist(
-                Box::new(tab.clone()),
-                store,
-                reply,
-            ))
+            .send(ShutdownCommand::Persist(tab.submit(&store), reply))
             .map_err(|_| anyhow::anyhow!("Live chat persistence queue stopped"))?;
         if let Some(owner) = cx
             .try_global::<crate::work_sidebar::IcedWorkSource>()
@@ -336,6 +341,7 @@ impl ChatPane {
             })
             .unwrap_or_else(|| PathBuf::from(&tab.dir));
         let mut pane = Self::new(shutdown, preview, cwd, window, cx);
+        pane.defaults_loading = false;
         pane.bind_remote(remote, cx);
         pane.controller.target.session_uid = tab
             .session_uid
@@ -364,6 +370,7 @@ impl ChatPane {
                     })
                 })
                 .map(|index| crate::data::WorkspaceId(index as u64 + 1));
+        let launch_settings = launch.settings.clone();
         let claim = Arc::new(provider::ConversationClaim::claim(
             &services,
             &pane.saved.uid,
@@ -381,6 +388,7 @@ impl ChatPane {
         let mut tab = tab;
         tab.session_uid = Some(pane.saved.uid.clone());
         pane.live_tab = Some(LiveTab::new(services, &workspace, tab));
+        pane.refresh_live_checkout_source(cx);
         if matches!(config.backend(), AgentBackend::Acp(_)) {
             let restoring = config.read_only_note().is_none() && id.is_some();
             if restoring {
@@ -408,7 +416,7 @@ impl ChatPane {
             permission_mode: permission_mode.clone().unwrap_or_else(|| "default".into()),
             effort: effort.clone(),
         };
-        *launch.settings.borrow_mut() = settings.clone();
+        *launch_settings.borrow_mut() = settings.clone();
         pane.view.update(cx, |view, cx| {
             view.set_live_launch_settings(&settings, cx);
         });

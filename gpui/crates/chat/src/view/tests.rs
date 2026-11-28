@@ -4652,3 +4652,97 @@ fn live_delegation_buttons_emit_the_iced_intents(cx: &mut TestAppContext) {
     }
     assert!(workers.borrow().iter().any(|action| matches!(action, crate::model::roster::RosterOutcome::OpenWorker { id } if id == "review-1")));
 }
+
+#[gpui::test]
+fn live_composer_emits_checkout_and_prelaunch_remember_choices(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captured = events.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&chat, move |_, event: &crate::events::ComposerEvent, _| {
+            captured.borrow_mut().push(event.clone())
+        })
+        .detach()
+    });
+    chat.update_in(cx, |view, window, cx| {
+        view.set_preview(cx);
+        view.set_live_prelaunch(cx);
+        view.enable_delegation_actions(cx);
+        view.set_intent_callback(Rc::new(|_, _| Receipt::rejected("synthetic")), cx);
+        view.choose_setting(
+            gitterm_core::chat::types::SettingChange::Model("opus".into()),
+            window,
+            cx,
+        );
+        view.choose_checkout("/synthetic/worktree", "worktree", window, cx);
+    });
+    cx.run_until_parked();
+    assert!(events.borrow().iter().any(|event|matches!(event,crate::events::ComposerEvent::SettingConfigured(gitterm_core::chat::types::SettingChange::Model(model)) if model=="opus")));
+    assert!(events.borrow().iter().any(|event|matches!(event,crate::events::ComposerEvent::ChooseCheckout(path) if path==std::path::Path::new("/synthetic/worktree"))));
+}
+
+#[gpui::test]
+fn live_outside_tool_codex_run_updates_one_card_and_roster_without_persistence(
+    cx: &mut TestAppContext,
+) {
+    use gitterm_core::chat::external::{Activity, RunState, RunView, SubagentView};
+    let (chat, cx) = setup(vec![], cx);
+    let run = RunView {
+        key: "103-1000".into(),
+        pid: 103,
+        state: RunState::Running,
+        started_at_ms: 1000,
+        ended_at_ms: None,
+        cwd: Some("/synthetic/checkout".into()),
+        checkout: Some("checkout".into()),
+        add_dirs: vec!["/synthetic/notes".into()],
+        sandbox: Some("read-only".into()),
+        model: Some("gpt-fixture".into()),
+        rollout_path: None,
+        thread_id: None,
+        cli_version: None,
+        activity: Some(Activity {
+            at_ms: None,
+            text: "Inspecting fixture".into(),
+        }),
+        subagents: vec![SubagentView {
+            thread_id: "child".into(),
+            nickname: Some("Synthetic".into()),
+            agent_path: Some("/root/check".into()),
+            depth: Some(1),
+            state: "running",
+            activity: None,
+            rollout_path: "/synthetic/rollout.jsonl".into(),
+        }],
+    };
+    chat.update(cx, |view, cx| {
+        view.set_external_runs(vec![run.clone()], cx);
+        assert_eq!(view.model.rows.len(), 1);
+        assert_eq!(view.roster.len(), 2);
+        assert!(
+            view.model.rows[0]
+                .title
+                .contains("Codex (exec) · gpt-fixture · in checkout · running")
+        );
+        assert!(view.model.rows[0].body.contains("cannot stop or adopt"));
+        assert!(
+            crate::model::plain_markdown(&view.model.rows[0].body)
+                .contains("↳ Synthetic (/root/check) · running")
+        );
+        view.set_roster(vec![], cx);
+        assert_eq!(view.roster.len(), 2);
+        let mut done = run;
+        done.state = RunState::Finished;
+        done.ended_at_ms = Some(2000);
+        done.subagents[0].state = "done";
+        view.set_external_runs(vec![done], cx);
+        assert_eq!(view.model.rows.len(), 1);
+        assert!(view.model.rows[0].title.ends_with("finished"));
+        assert!(
+            view.roster
+                .iter()
+                .all(|row| row.state == roster::WorkerState::Done)
+        );
+        assert!(view.fixture_composer.conversation.is_empty());
+    });
+}

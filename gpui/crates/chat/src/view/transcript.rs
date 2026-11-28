@@ -258,12 +258,13 @@ impl ChatView {
         }
     }
     pub(super) fn reveal_roster(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(index) = self
-            .model
-            .rows
-            .iter()
-            .position(|row| row.roster_id.as_deref() == Some(id))
-        else {
+        let Some(index) = self.model.rows.iter().position(|row| {
+            row.roster_id.as_deref() == Some(id)
+                || row
+                    .external_run
+                    .as_ref()
+                    .is_some_and(|run| id.starts_with(&format!("cx:{}:", run.key)))
+        }) else {
             return;
         };
         if index < self.history_start && !self.find_open {

@@ -4,6 +4,9 @@ mod acp;
 mod auth;
 pub(crate) use acp::live_acp_catalog;
 mod checkout;
+mod controls;
+pub(crate) use controls::delegation_workspace;
+mod external;
 mod fence;
 mod lease;
 mod managed;
@@ -110,6 +113,21 @@ impl Controller {
             config: resume::default_config(),
         }
     }
+    fn initialize_checkout(&mut self, path: PathBuf) {
+        let effect = self.adapter.choose_checkout(
+            self.source.clone(),
+            self.target.clone(),
+            gitterm_core::chat::state::CheckoutContext {
+                choices: vec![path.clone()],
+                locked_reason: None,
+                process_running: false,
+            },
+            path,
+        );
+        if let gitterm_core::chat::state::Effect::CheckoutBound { runtime, .. } = effect {
+            self.source = runtime;
+        }
+    }
     fn seed_launch(&mut self, settings: &gitterm_gpui_chat::composer::LaunchSettings) {
         self.config =
             if let gitterm_core::chat::types::AgentBackendConfig::Acp { agent, .. } = self.config {
@@ -149,11 +167,7 @@ impl Controller {
             intent => intent,
         };
         if !self.remote
-            && !(self.live
-                && matches!(
-                    self.config.backend(),
-                    gitterm_core::chat::types::AgentBackend::Acp(_)
-                ))
+            && !self.live
             && matches!(
                 answer,
                 ChatIntent::Permission {
@@ -163,7 +177,7 @@ impl Controller {
             )
         {
             return (
-                Receipt::rejected("Allow and remember · not saved in preview"),
+                Receipt::rejected("Allow and remember · not available in preview"),
                 Update::default(),
             );
         }
@@ -413,6 +427,7 @@ pub(crate) struct ChatPane {
     resume_error: Option<String>,
     awaiting_resume: bool,
     history_loading: bool,
+    defaults_loading: bool,
     persisted_id: Option<String>,
     _history_load: Option<gpui::Task<()>>,
     saved: SavedChat,
@@ -426,6 +441,7 @@ pub(crate) struct ChatPane {
     /// The cards' ids and states when the checkout's HEAD was last read.
     head_read_for: Vec<(String, String)>,
     _head_load: Option<gpui::Task<()>>,
+    _external_watch: Option<gpui::Task<()>>,
     _release: gpui::Subscription,
     _roster_subscription: gpui::Subscription,
     _delegation_subscription: gpui::Subscription,
@@ -473,24 +489,30 @@ impl ChatPane {
             session_id: None,
             records: vec![],
         };
+        controller.initialize_checkout(saved.cwd.clone());
         let view = cx.new(|cx| {
             let mut view = ChatView::new(vec![], window, cx);
             view.set_appearance(crate::theme::chat_appearance(cx), cx);
             view.set_width(crate::theme::chat_width(cx), cx);
             view.set_preview(cx);
             view.set_backend(gitterm_core::chat::types::AgentBackend::Claude, cx);
+            view.set_checkout(saved.cwd.clone(), cx);
             if controller.live {
-                view.set_live_prelaunch(cx);
+                let selection = controls::new_chat_selection(cx);
+                view.set_live_launch_settings(&selection, cx);
+                controller.seed_launch(&selection);
             } else {
                 view.set_read_only(Some("Preview activation unavailable".into()), cx);
             }
             view
         });
+        Self::subscribe_controls(&view, cx);
         let roster_subscription = Self::forward_roster(&view, cx);
         let delegation_subscription = Self::handle_delegation(&view, cx);
         view.update(cx, |view, cx| {
             view.set_dismiss_gate(dismiss_gate(controller.live), cx);
             if controller.live {
+                view.set_live_permissions(cx);
                 view.enable_delegation_actions(cx);
             }
         });
@@ -542,6 +564,7 @@ impl ChatPane {
             resume_error: None,
             awaiting_resume: false,
             history_loading: false,
+            defaults_loading: false,
             persisted_id: None,
             _history_load: None,
             saved,
@@ -552,6 +575,7 @@ impl ChatPane {
             held: Default::default(),
             head_read_for: vec![],
             _head_load: None,
+            _external_watch: None,
             _release: cx.on_release(|pane, cx| pane.quit_runtime(cx)),
             _roster_subscription: roster_subscription,
             _delegation_subscription: delegation_subscription,
@@ -561,6 +585,7 @@ impl ChatPane {
         };
         if pane.controller.live {
             pane.init_live_tab(cx);
+            pane.load_launch_defaults(cx);
         }
         match launch {
             None => {}
@@ -607,7 +632,7 @@ impl ChatPane {
     /// Iced's task store, so rejection leaves its inputs and chat draft intact.
     fn handle_review(
         view: &Entity<ChatView>,
-        cwd: PathBuf,
+        _cwd: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Subscription {
@@ -620,16 +645,11 @@ impl ChatPane {
             move |pane, view, outcome: &gitterm_gpui_chat::review::ReviewOutcome, window, cx| {
                 use gitterm_gpui_chat::review::{ReviewContext, ReviewOutcome};
                 match outcome {
-                    ReviewOutcome::Submit { .. } => {
-                        view.update(cx, |view, cx| {
-                            view.show_review_error(
-                                "Review / Consult is not available in preview".into(),
-                                cx,
-                            )
-                        });
+                    ReviewOutcome::Submit { kind, scope, note } => {
+                        pane.submit_review(*kind, scope.clone(), note.clone(), view, window, cx);
                     }
                     ReviewOutcome::ContextRequested => {
-                        let cwd = cwd.clone();
+                        let cwd = pane.saved.cwd.clone();
                         let config = config.clone();
                         let load = cx.background_executor().spawn(async move {
                             let context = gitterm_core::review_request::review_context(&cwd, None);
@@ -670,6 +690,9 @@ impl ChatPane {
         })
     }
     fn dispatch(&mut self, intent: ChatIntent, cx: &mut Context<Self>) -> Receipt {
+        if self.defaults_loading {
+            return Receipt::rejected("Chat settings are still loading");
+        }
         if self.history_loading {
             return Receipt::rejected("Saved chat history is still loading");
         }
@@ -819,7 +842,8 @@ impl ChatPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let controller = Controller::new();
+        let mut controller = Controller::new();
+        controller.initialize_checkout(saved.cwd.clone());
         let config = cx
             .try_global::<crate::work_sidebar::IcedWorkSource>()
             .and_then(|source| source.owner.upgrade())
@@ -850,6 +874,7 @@ impl ChatPane {
             );
             view
         });
+        Self::subscribe_controls(&view, cx);
         let roster_subscription = Self::forward_roster(&view, cx);
         let delegation_subscription = Self::handle_delegation(&view, cx);
         view.update(cx, |view, cx| {
@@ -867,6 +892,7 @@ impl ChatPane {
             resume_error: None,
             awaiting_resume: false,
             history_loading: false,
+            defaults_loading: false,
             persisted_id: None,
             _history_load: None,
             saved,
@@ -877,6 +903,7 @@ impl ChatPane {
             held: Default::default(),
             head_read_for: vec![],
             _head_load: None,
+            _external_watch: None,
             _release: cx.on_release(|pane, cx| pane.quit_runtime(cx)),
             _roster_subscription: roster_subscription,
             _delegation_subscription: delegation_subscription,
@@ -1192,6 +1219,13 @@ impl ChatPane {
         };
         let previous_settings = self.controller.adapter.state().acknowledged.clone();
         if let Some(update) = self.controller.apply_runtime_outcome(source, event) {
+            if let Some(change) = update
+                .event
+                .as_ref()
+                .and_then(|effect| effect.settings_changed.clone())
+            {
+                self.remember_choice(change, cx);
+            }
             self.pending.push(update);
             if let Some(event) = &attention_event {
                 self.notification_attention.event(
@@ -1267,6 +1301,7 @@ impl ChatPane {
         cx: &mut Context<Self>,
     ) {
         self.controller.runtime = Some(runtime);
+        self.watch_external_runs(cx);
         if self.controller.remote {
             self.controller.source = self
                 .controller
@@ -1427,10 +1462,11 @@ enum ShutdownCommand {
     Session(OwnedRuntime),
     StopRemote(Box<remote::PendingStop>),
     Persist(
-        Box<resume::LiveTab>,
-        gitterm_core::desktop_store::DesktopStore,
+        gitterm_core::desktop_store::Receipt<()>,
         tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     ),
+    #[cfg(test)]
+    Wait(std::sync::mpsc::Receiver<()>),
     Drain(std::sync::mpsc::SyncSender<std::result::Result<(), String>>),
 }
 impl RuntimeShutdown {
@@ -1458,14 +1494,18 @@ impl RuntimeShutdown {
                                 errors.push(error);
                             }
                         }
-                        ShutdownCommand::Persist(tab, store, reply) => {
-                            let result = tab.persist(&store).map_err(|error| {
+                        ShutdownCommand::Persist(receipt, reply) => {
+                            let result = receipt.wait().map_err(|error| {
                                 format!("Save confirmed Claude session: {error:#}")
                             });
                             if let Err(error) = &result {
                                 errors.push(error.clone());
                             }
                             let _ = reply.send(result);
+                        }
+                        #[cfg(test)]
+                        ShutdownCommand::Wait(gate) => {
+                            let _ = gate.recv();
                         }
                         ShutdownCommand::Drain(reply) => {
                             let result = if errors.is_empty() {
@@ -1493,6 +1533,8 @@ impl RuntimeShutdown {
                 ShutdownCommand::Drain(_)
                 | ShutdownCommand::Persist(..)
                 | ShutdownCommand::StopRemote(_) => unreachable!(),
+                #[cfg(test)]
+                ShutdownCommand::Wait(_) => unreachable!(),
             })
     }
     pub(crate) fn drain(&self) -> Result<()> {

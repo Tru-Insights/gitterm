@@ -67,6 +67,7 @@ impl ChatPane {
             permission_mode: mode.clone().unwrap_or_else(|| agent.default_mode().into()),
             effort: effort.clone(),
         };
+        self.defaults_loading = false;
         self.controller.config = config.clone();
         self.controller.seed_launch(&settings);
         if let Some(launch) = &self.deferred_live {
