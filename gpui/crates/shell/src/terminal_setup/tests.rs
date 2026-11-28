@@ -43,6 +43,82 @@ fn terminal_palette_follows_dark_light_and_theme_changes(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+fn empty_start_uses_cwd_workspace_and_terminal_without_writing_iced(cx: &mut TestAppContext) {
+    use crate::{
+        data::ShellData,
+        workspace_config::{IcedCatalog, WorkspaceStore},
+    };
+    let _cleanup = crate::test_app::Cleanup::new(cx);
+    init(cx);
+    let fixture = tempfile::tempdir().unwrap();
+    let cwd = fixture.path().join("example-project");
+    std::fs::create_dir(&cwd).unwrap();
+    for bytes in [
+        None,
+        Some(br#"{"workspaces":[],"active_workspace":0}"#.as_slice()),
+    ] {
+        let path = fixture.path().join("workspaces.json");
+        if let Some(bytes) = bytes {
+            std::fs::write(&path, bytes).unwrap();
+        }
+        let mut file: gitterm_core::workspace_config::WorkspacesFile = bytes
+            .map(|b| serde_json::from_slice(b).unwrap())
+            .unwrap_or_default();
+        file.workspaces
+            .push(gitterm_core::workspace_config::initial_workspace(&cwd));
+        let catalog = IcedCatalog::from_document(fixture.path(), file);
+        let model = crate::workspace_status::WorkspaceStatus::from_iced(&catalog);
+        assert_eq!(model.workspaces.len(), 1);
+        let id = model.active().unwrap();
+        let mut store = WorkspaceStore::new(fixture.path());
+        store.iced = Some(catalog);
+        let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, Some(store), cx));
+        cx.read(|cx| {
+            let data = crate::data::LocalData(owner.clone());
+            assert_eq!(data.workspaces(cx)[0].name, "example-project");
+            assert_eq!(data.terminal_cwd(id, cx), Some(cwd.clone()));
+            let sessions = data.sessions(id, cx);
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].kind, crate::data::SessionKind::Terminal);
+        });
+        let handle = cx.add_window(|window, cx| {
+            let mut shell = crate::Shell::with_owner(
+                std::rc::Rc::new(crate::data::LocalData(owner.clone())),
+                owner,
+                fixture.path(),
+                true,
+                window,
+                cx,
+            )
+            .unwrap();
+            start_initial_terminal(&mut shell, window, cx);
+            shell
+        });
+        handle
+            .update(cx, |shell, _, cx| {
+                let state = shell.active(cx);
+                assert_eq!(state.sessions.len(), 1);
+                let pane = state.panes[&crate::session_pane_id(state.sessions[0].id)].read(cx);
+                let crate::pane::PaneContent::Terminal(view) = &pane.content else {
+                    panic!("initial cwd pane must be a live terminal");
+                };
+                assert!(view.read(cx).backend().child_pid().is_some());
+                assert_eq!(
+                    view.read(cx).backend().state(),
+                    gitterm_terminal::SessionState::Running
+                );
+                assert_eq!(pane.terminal_cwd.as_ref(), Some(&cwd));
+                assert!(pane.session.is_some());
+            })
+            .unwrap();
+        match bytes {
+            Some(bytes) => assert_eq!(std::fs::read(path).unwrap(), bytes),
+            None => assert!(!path.exists()),
+        }
+    }
+}
+
+#[gpui::test]
 fn terminal_scrollback_comes_from_read_only_v6_settings(cx: &mut TestAppContext) {
     let _cleanup = crate::test_app::Cleanup::new(cx);
     init(cx);

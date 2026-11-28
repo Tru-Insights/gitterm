@@ -14,6 +14,78 @@ use std::{
 };
 
 #[gpui::test]
+fn theme_change_recreates_presentation_and_recolors_scrollback_without_restarting_pty(
+    cx: &mut TestAppContext,
+) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    cx.background_executor.allow_parking();
+    let dir = tempfile::tempdir().unwrap();
+    let mut backend = ready_shell(dir.path());
+    send(
+        &backend,
+        "printf '\\033[2J\\033[H\\033[31mSCROLLBACK_COLOR\\033[0m\\n'; for i in {1..30}; do printf 'line\\n'; done; printf 'SCROLL_READY\\n'\r",
+    );
+    text(&mut backend, "SCROLL_READY");
+    backend.handle(crate::Command::Scroll(1000));
+    poll(&mut backend, "scrollback visible", |b| {
+        screen(b).contains("SCROLLBACK_COLOR")
+    });
+    let pid = backend.child_pid().expect("owned PTY");
+    let view = cx.new(|cx| {
+        TerminalView::new(
+            backend,
+            TerminalConfig {
+                colors: crate::ColorPalette::for_theme(true),
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+    view.update(cx, |view, cx| {
+        let snapshot = view.backend.renderable_content().clone();
+        assert!(snapshot.display_offset > 0);
+        let cells: Vec<_> = snapshot
+            .cells
+            .iter()
+            .filter(|c| c.cell.c == 'S')
+            .map(|c| (c.point.column.0, c.cell.clone()))
+            .collect();
+        assert_eq!(cells.len(), 1);
+        let (_, before) = view
+            .renderer
+            .layout_row(0, cells.clone().into_iter(), &snapshot.colors);
+        view.renderer.cell_width = px(999.);
+        let mut config = view.config.clone();
+        config.colors = crate::ColorPalette::for_theme(false);
+        view.update_config(config, cx);
+        assert_ne!(
+            view.renderer.cell_width,
+            px(999.),
+            "rebuild renderer metrics"
+        );
+        let (_, after) = view
+            .renderer
+            .layout_row(0, cells.into_iter(), &snapshot.colors);
+        assert_ne!(before[0].fg_color, after[0].fg_color);
+        let color = after[0].fg_color.to_rgb();
+        assert_eq!(
+            [color.r, color.g, color.b].map(|channel| (channel * 255.).round() as u8),
+            [0xd2, 0x0f, 0x39]
+        );
+        assert_eq!(view.backend.child_pid(), Some(pid));
+        assert_eq!(view.backend.state(), SessionState::Running);
+        assert_eq!(
+            view.backend.renderable_content().display_offset,
+            snapshot.display_offset
+        );
+        assert_eq!(
+            view.backend.renderable_content().cells.len(),
+            snapshot.cells.len()
+        );
+    });
+}
+
+#[gpui::test]
 fn real_tools_osc8_label_reaches_link_callback(cx: &mut TestAppContext) {
     let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();

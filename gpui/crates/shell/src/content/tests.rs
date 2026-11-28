@@ -556,16 +556,22 @@ fn page_policy_wraps_the_shared_decision_like_iced_wry_handlers() {
         github_accounts: [("example".to_string(), "sample-login".to_string())].into(),
         linear_workspaces: ["sample-a".to_string()].into(),
     });
-    // Popups open in the browser and embedded frames load in place, whatever
+    // Popups and embedded frames open in the browser, whatever
     // the decision table says; only HTTP(S) is ever loaded or opened.
     assert!(!policy.decide(Some(origin), true, false));
-    assert!(policy.decide(Some("https://example.com/frame"), false, false));
+    assert!(!policy.decide(Some("https://example.com/frame"), false, false));
     for url in [Some("file:///etc/hosts"), Some("about:blank"), None] {
         for (popup, main) in [(false, true), (true, false), (false, false)] {
             assert!(!policy.decide(url, popup, main), "{url:?}");
         }
     }
-    assert_eq!(policy.drain(), vec![R::External(origin.into())]);
+    assert_eq!(
+        policy.drain(),
+        vec![
+            R::External(origin.into()),
+            R::External("https://example.com/frame".into())
+        ]
+    );
     // Main-frame navigations follow the shared decision.
     let next = "https://github.com/example/gitterm/pull/2";
     assert!(policy.decide(Some(next), false, true));

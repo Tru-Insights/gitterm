@@ -20730,7 +20730,7 @@ impl App {
         // before startup I/O and the first window/menu tasks can receive quit.
         #[cfg(target_os = "macos")]
         native_quit::install();
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let cwd = gitterm_core::workspace_config::initial_directory();
         let config::LoadedSettings {
             config,
             refused: settings_refused,
@@ -21229,11 +21229,8 @@ impl App {
         // If no workspaces were loaded, create one from the current directory
         if app.workspaces.is_empty() {
             let dir = cwd;
-            let name = dir
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "Home".to_string());
-            let mut workspace = Workspace::new(name, dir.clone(), WorkspaceColor::Lavender);
+            let initial = gitterm_core::workspace_config::initial_workspace(&dir);
+            let mut workspace = Workspace::new(initial.name, dir.clone(), initial.color.into());
             app.add_tab_to_workspace(&mut workspace, dir);
             app.open_workspace(workspace);
         }

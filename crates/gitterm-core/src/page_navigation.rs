@@ -26,6 +26,16 @@ pub struct PageNavigationContext {
     pub linear_workspaces: BTreeSet<String>,
 }
 
+/// Iced's wry new-window hook also receives iframe navigations. Both open
+/// HTTP(S) externally and cancel every other scheme.
+pub fn page_new_window_decision(url: &str) -> PageNavigationDecision {
+    if browser_url(url).is_ok() {
+        PageNavigationDecision::External
+    } else {
+        PageNavigationDecision::Cancel
+    }
+}
+
 fn github_sign_in_url(url: &url::Url) -> bool {
     url.host_str() == Some("github.com")
         && matches!(

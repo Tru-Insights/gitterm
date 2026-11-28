@@ -915,6 +915,41 @@ pub fn create_work_folder(base: &Path, name: &str) -> std::io::Result<PathBuf> {
     unreachable!("u32 suffixes exhausted under {}", base.display())
 }
 
+/// Iced's startup directory, including its fallback if the cwd was removed.
+pub fn initial_directory() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Iced's empty-start workspace: the current directory, Lavender, one terminal.
+/// This only builds a value; Preview may use it without writing Iced's catalog.
+pub fn initial_workspace(cwd: &Path) -> WorkspaceConfig {
+    let name = cwd
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Home".to_string());
+    let mut workspace = new_work_config(
+        &name,
+        cwd,
+        WorkspaceColor::Lavender,
+        crate::work::catalog::WorkStart::default(),
+    );
+    workspace.run_command = detect_run_command(cwd);
+    workspace.tabs.push(WorkspaceTabConfig {
+        extra: Default::default(),
+        dir: workspace.dir.clone(),
+        repo_dir: Some(workspace.dir.clone()),
+        startup_command: None,
+        tab_kind: None,
+        agent_config: None,
+        chat_session_id: None,
+        task_id: None,
+        task_session_id: None,
+        worker_shutdown_refused: false,
+        session_uid: None,
+    });
+    workspace
+}
+
 pub fn new_work_config(
     name: &str,
     dir: &Path,
@@ -1266,3 +1301,31 @@ pub fn active_tab_after_removal(active: usize, removed: usize, remaining: usize)
 }
 
 mod workspace_bar;
+
+#[cfg(test)]
+mod initial_workspace_tests {
+    use super::*;
+
+    #[test]
+    fn empty_start_workspace_matches_iced_cwd_name_color_and_terminal() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("example-project");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(cwd.join("Cargo.toml"), "[package]\nname = 'fixture'\n").unwrap();
+        let initial = initial_workspace(&cwd);
+        assert_eq!(initial.name, "example-project");
+        assert_eq!(initial.abbrev, "EX");
+        assert_eq!(initial.color, WorkspaceColor::Lavender);
+        assert_eq!(initial.dir, cwd.to_string_lossy());
+        assert_eq!(initial.run_command, detect_run_command(&cwd));
+        assert_eq!(initial.active_tab, Some(0));
+        assert!(initial.active);
+        assert_eq!(initial.tabs.len(), 1);
+        let tab = &initial.tabs[0];
+        assert_eq!(tab.dir, initial.dir);
+        assert_eq!(tab.repo_dir.as_deref(), Some(initial.dir.as_str()));
+        assert!(tab.tab_kind.is_none() && tab.startup_command.is_none());
+        assert!(!fixture.path().join("workspaces.json").exists());
+        assert_eq!(initial_workspace(Path::new("/")).name, "Home");
+    }
+}

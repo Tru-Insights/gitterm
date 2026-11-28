@@ -5209,14 +5209,30 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
     let app_shutdown = shutdown.clone();
     let config = preview.roots.layout();
     let mut store = workspace_config::WorkspaceStore::guarded(preview.writer());
-    let (model, startup_save) = if let Some(snapshot) = live_snapshot {
-        let file = match snapshot.workspaces.loaded {
+    let (mut model, startup_save) = if let Some(snapshot) = live_snapshot {
+        let mut file = match snapshot.workspaces.loaded {
             gitterm_core::desktop_store::LoadState::Valid(file) => file,
             gitterm_core::desktop_store::LoadState::Missing => Default::default(),
             gitterm_core::desktop_store::LoadState::Refused(error) => {
                 anyhow::bail!("Live workspaces refused: {error}")
             }
         };
+        if !file.workspaces.iter().any(|workspace| workspace.active) {
+            let initial = gitterm_core::workspace_config::initial_workspace(
+                &gitterm_core::workspace_config::initial_directory(),
+            );
+            // Live owns V6 persistence. Preview's fallback below is memory only.
+            file = live_desktop
+                .as_ref()
+                .expect("Live desktop owner")
+                .try_edit_workspaces(move |file| {
+                    file.workspaces.push(initial);
+                    file.active_workspace = 0;
+                    Ok(())
+                })
+                .wait()
+                .map_err(anyhow::Error::msg)?;
+        }
         store.load()?;
         store.parked.clear();
         let catalog = workspace_config::IcedCatalog::from_document(host_lock.root(), file);
@@ -5233,6 +5249,21 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
         let model = workspace_config::load_iced_workspaces(&mut store);
         (model, None)
     };
+    let empty_preview_start = !sample && model.workspaces.is_empty();
+    if empty_preview_start {
+        let catalog = store.iced.as_mut().expect("loaded Iced catalog");
+        if catalog.source.as_os_str().is_empty() {
+            catalog.source = workspace_config::iced_config_dir();
+        }
+        catalog
+            .workspaces
+            .push(gitterm_core::workspace_config::initial_workspace(
+                &gitterm_core::workspace_config::initial_directory(),
+            ));
+        catalog.order = vec![0];
+        catalog.active = 0;
+        model = WorkspaceStatus::from_iced(catalog);
+    }
     let (title_workspace, title_tab) = model
         .active()
         .and_then(|active| {
@@ -5344,10 +5375,13 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
                             owner.update(cx, |owner, cx| owner.watch_save(save, cx));
                         }
                         let data = Rc::new(data::LocalData(owner.clone()));
-                        let shell = Shell::with_owner_settings(
+                        let mut shell = Shell::with_owner_settings(
                             data, owner, &config, true, &settings, window, cx,
                         )
                         .expect("create local shell");
+                        if empty_preview_start {
+                            terminal_setup::start_initial_terminal(&mut shell, window, cx);
+                        }
                         shell.sync_git_visibility(false, cx);
                         shell
                     }
