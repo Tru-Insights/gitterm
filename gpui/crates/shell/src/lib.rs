@@ -2046,63 +2046,11 @@ impl Shell {
                         .map(|w| format!("ssh:{}", w.remote_session.as_ref().unwrap().session_name))
                         .unwrap_or_else(|| "local".into()),
                 };
-                let mut attention = vec![];
-                if let (Some(saved), Some(sidebar)) =
-                    (saved, self.work_sidebars.get(&state.workspace.id))
-                {
-                    use gitterm_core::tasks::{DelegationStatus, TaskAttentionReason};
-                    let sidebar = sidebar.read(cx);
-                    for tab in &saved.tabs {
-                        let task = tab
-                            .task_id
-                            .as_ref()
-                            .and_then(|id| sidebar.tasks().iter().find(|t| &t.task_id == id));
-                        let mut kind = task.and_then(|task| {
-                            if task.attention.reason.is_none() && !task.attention.unread {
-                                return None;
-                            }
-                            Some(match task.attention.reason {
-                                Some(TaskAttentionReason::ExecutionFailed) => {
-                                    workspace_bar::AttentionKind::Failed
-                                }
-                                Some(
-                                    TaskAttentionReason::CompletedUnread
-                                    | TaskAttentionReason::ReadyForReview,
-                                )
-                                | None => workspace_bar::AttentionKind::Review,
-                                _ => workspace_bar::AttentionKind::NeedsYou,
-                            })
-                        });
-                        for worker in sidebar.workers().iter().filter(|worker| {
-                            worker.dismissed_at.is_none()
-                                && tab.session_uid.as_deref()
-                                    == Some(worker.parent.session_uid.as_str())
-                        }) {
-                            let next = match worker.status {
-                                DelegationStatus::Failed { .. } => {
-                                    Some(workspace_bar::AttentionKind::Failed)
-                                }
-                                DelegationStatus::Blocked | DelegationStatus::Interrupted => {
-                                    Some(workspace_bar::AttentionKind::NeedsYou)
-                                }
-                                DelegationStatus::Completed => {
-                                    Some(workspace_bar::AttentionKind::Review)
-                                }
-                                _ => None,
-                            };
-                            let priority = |kind| match kind {
-                                workspace_bar::AttentionKind::NeedsYou => 0,
-                                workspace_bar::AttentionKind::Failed => 1,
-                                workspace_bar::AttentionKind::Review => 2,
-                            };
-                            kind = kind
-                                .into_iter()
-                                .chain(next)
-                                .min_by_key(|kind| priority(*kind));
-                        }
-                        attention.extend(kind);
-                    }
-                }
+                let attention: Vec<_> = state
+                    .sessions
+                    .iter()
+                    .filter_map(|session| self.session_attention(state, session.id, cx).kind)
+                    .collect();
                 workspace_bar::Workspace {
                     id: state.workspace.id,
                     name: state.workspace.name.clone(),
@@ -2133,7 +2081,13 @@ impl Shell {
                             kind: *kind,
                             reason: "Sessions need attention".into(),
                         }),
-                    woke: None,
+                    woke: self
+                        .owner
+                        .read(cx)
+                        .notifications
+                        .as_ref()
+                        .and_then(|s| s.woke.get(&state.runtime_uid))
+                        .copied(),
                     pr_news: None,
                 }
             })
@@ -2163,39 +2117,6 @@ impl Shell {
         let colors = workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark());
         let mut workspaces = self.chrome_workspaces(cx);
         let facts = self.connected_facts(self.saved_facts.snapshot(), colors);
-        for workspace in &mut workspaces {
-            // Iced's chip counts each tab with live attention; a launched
-            // task pane needing input is one, and needs-you outranks.
-            let launched = self
-                .workspaces
-                .iter()
-                .find(|state| state.workspace.id == workspace.id)
-                .map_or(0, |state| {
-                    state
-                        .sessions
-                        .iter()
-                        .filter(|session| session_needs_input(state, session.id, cx))
-                        .count()
-                });
-            let count = facts
-                .attention_counts
-                .get(&workspace.id)
-                .copied()
-                .map_or(launched, |count| count + launched);
-            let count = (count > 0).then_some(count);
-            let kind = workspace
-                .attention
-                .as_ref()
-                .filter(|_| launched == 0)
-                .map_or(workspace_bar::AttentionKind::NeedsYou, |attention| {
-                    attention.kind
-                });
-            workspace.attention = count.map(|count| workspace_bar::Attention {
-                count,
-                kind,
-                reason: "Sessions need attention".into(),
-            });
-        }
         let mut machine_news = facts.machines.clone();
         if let Some(error) = &self.saved_facts_error {
             machine_news.push(error.clone());
@@ -2225,7 +2146,7 @@ impl Shell {
             machine_news,
             repo_machines: facts.repo_machines.clone(),
             remote_workspaces: facts.remote_workspaces.clone(),
-            pulse_bright: false,
+            pulse_bright: self.attention_pulse(cx),
             ready_count: facts.ready,
             ready_news_count: facts.news_count,
             // Iced counts both saved parks and open work hidden in Repos.
@@ -2380,14 +2301,71 @@ impl Shell {
         .detach();
     }
     fn spine_input(&self, cx: &App) -> spine::Input {
+        let tab_attention: Vec<_> = self
+            .workspaces
+            .iter()
+            .flat_map(|state| {
+                state.sessions.iter().filter_map(|session| {
+                    let facts = self.session_attention(state, session.id, cx);
+                    let kind = facts.kind?;
+                    Some(spine::AttentionRow {
+                        workspace: state.workspace.id,
+                        target: spine::Target::Tab(session.id.0),
+                        title: state.panes[&session_pane_id(session.id)]
+                            .read(cx)
+                            .tab_title(),
+                        priority: facts.reason.map_or(
+                            match kind {
+                                workspace_bar::AttentionKind::NeedsYou => 0,
+                                workspace_bar::AttentionKind::Failed => 1,
+                                workspace_bar::AttentionKind::Review => 3,
+                            },
+                            |r| r.priority(),
+                        ),
+                        icon: facts
+                            .reason
+                            .map_or(
+                                match kind {
+                                    workspace_bar::AttentionKind::NeedsYou => "●",
+                                    workspace_bar::AttentionKind::Failed => "!",
+                                    workspace_bar::AttentionKind::Review => "✓",
+                                },
+                                |r| r.icon(),
+                            )
+                            .into(),
+                        label: facts
+                            .reason
+                            .map_or(
+                                match kind {
+                                    workspace_bar::AttentionKind::NeedsYou => {
+                                        "Input or approval needed"
+                                    }
+                                    workspace_bar::AttentionKind::Failed => "Task failed",
+                                    workspace_bar::AttentionKind::Review => "Ready to review",
+                                },
+                                |r| r.label(),
+                            )
+                            .into(),
+                        waiting: facts.waiting,
+                    })
+                })
+            })
+            .collect();
+        let live_limits = cx
+            .try_global::<task_host::GpuiTaskHost>()
+            .and_then(|host| host.0.read(cx).chrome_plan_limits());
+        let (usage_hint, usage_badge) = spine::usage_chrome(
+            live_limits.unwrap_or(&self.usage_input.plan_limits),
+            chrono::Utc::now().timestamp(),
+            workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark()),
+        );
         spine::Input {
             workspaces: self.chrome_workspaces(cx),
             active: self.active_workspace(cx),
             repos_on_bar: self.repos_on_bar(cx),
-            attention: self
-                .workspaces
-                .iter()
-                .flat_map(|state| {
+            attention: tab_attention
+                .into_iter()
+                .chain(self.workspaces.iter().flat_map(|state| {
                     let root = self.data.terminal_cwd(state.workspace.id, cx);
                     self.work_sidebars
                         .get(&state.workspace.id)
@@ -2395,6 +2373,18 @@ impl Shell {
                             spine::task_rows(
                                 state.workspace.id,
                                 sidebar.read(cx).tasks().iter().filter(|task| {
+                                    if self.workspaces.iter().any(|state| {
+                                        state.sessions.iter().any(|session| {
+                                            self.session_task(session.id, cx).as_deref()
+                                                == Some(&task.task_id)
+                                                && self
+                                                    .session_attention(state, session.id, cx)
+                                                    .kind
+                                                    .is_some()
+                                        })
+                                    }) {
+                                        return false;
+                                    }
                                     match &task.workspace.location {
                                         gitterm_core::tasks::WorkspaceLocationIdentity::Local {
                                             directory,
@@ -2406,7 +2396,7 @@ impl Shell {
                             )
                         })
                         .unwrap_or_default()
-                })
+                }))
                 .collect(),
             frontmost: self
                 .workspaces
@@ -2421,24 +2411,16 @@ impl Shell {
                 .iter()
                 .flat_map(|state| {
                     state.sessions.iter().filter_map(|session| {
-                        state
-                            .panes
-                            .get(&session_pane_id(session.id))
-                            .and_then(|pane| match &pane.read(cx).content {
-                                pane::PaneContent::PreviewChat(view)
-                                    if view.read(cx).is_working() =>
-                                {
-                                    Some((state.workspace.id, spine::Target::Tab(session.id.0)))
-                                }
-                                _ => None,
-                            })
+                        self.session_attention(state, session.id, cx)
+                            .running
+                            .then_some((state.workspace.id, spine::Target::Tab(session.id.0)))
                     })
                 })
                 .collect(),
-            pulse_bright: false,
+            pulse_bright: self.attention_pulse(cx),
             usage_open: self.usage_open,
-            usage_hint: "Usage".into(),
-            usage_badge: None,
+            usage_hint,
+            usage_badge,
         }
     }
     fn strip_input(&self, cx: &App) -> session_strip::Input {
@@ -2447,8 +2429,6 @@ impl Shell {
             .iter()
             .find(|w| Some(w.workspace.id) == self.active_workspace(cx));
         let saved = state.and_then(|w| self.owner.read(cx).iced_workspace(w.workspace.id));
-        let needs_input =
-            |id: SessionId| state.is_some_and(|state| session_needs_input(state, id, cx));
         session_strip::Input {
             workspace: state.map(|w| w.workspace.id),
             workspace_name: state.map(|w| w.workspace.name.clone()).unwrap_or_default(),
@@ -2486,23 +2466,10 @@ impl Shell {
                                 .map(|facts| facts.tasks.as_slice())
                         })
                         .unwrap_or_default();
-                    let workers = sidebar
-                        .map(|sidebar| sidebar.workers())
-                        .or_else(|| {
-                            self.roster_facts
-                                .as_ref()
-                                .map(|facts| facts.workers.as_slice())
-                        })
-                        .unwrap_or_default();
                     let task = tab
                         .and_then(|tab| tab.task_id.as_ref())
                         .and_then(|id| tasks.iter().find(|task| &task.task_id == id));
-                    let running = state
-                        .and_then(|state| state.panes.get(&session_pane_id(s.id)))
-                        .is_some_and(|pane| {
-                            matches!(&pane.read(cx).content,
-                            pane::PaneContent::PreviewChat(view) if view.read(cx).is_working())
-                        });
+                    let attention = self.session_attention(state.unwrap(), s.id, cx);
                     session_strip::Session {
                         id: s.id,
                         kind: s.kind,
@@ -2524,20 +2491,9 @@ impl Shell {
                                 })
                                 .map(|session| session.label.clone())
                         }),
-                        // Iced's input-needed tab attention on a launched
-                        // task terminal outranks the durable kinds.
-                        attention: needs_input(s.id)
-                            .then_some(workspace_bar::AttentionKind::NeedsYou)
-                            .or_else(|| {
-                                session_strip::attention(
-                                    task.map(|task| &task.attention),
-                                    workers,
-                                    tab.and_then(|tab| tab.session_uid.as_deref()),
-                                )
-                            }),
-                        running,
-                        // ChatPane does not yet expose its pending-request projection.
-                        pending_requests: 0,
+                        attention: attention.kind,
+                        running: attention.running,
+                        pending_requests: attention.pending,
                     }
                 })
                 .collect(),
@@ -2555,7 +2511,7 @@ impl Shell {
             branch: state
                 .map(|w| self.data.status(w.workspace.id, cx).branch)
                 .unwrap_or_default(),
-            pulse_bright: false,
+            pulse_bright: self.attention_pulse(cx),
             mic: self.dictation_indicator(cx),
             worktree_follow: None,
         }
@@ -5568,8 +5524,9 @@ impl Shell {
             tab,
             |w| self.workspaces[w].sessions.len(),
             |w, t| {
-                self.session_task(self.workspaces[w].sessions[t].id, cx)
-                    .is_some_and(|id| tasks.iter().any(|task| task.task_id == id && needs(task)))
+                self.session_attention(&self.workspaces[w], self.workspaces[w].sessions[t].id, cx)
+                    .kind
+                    .is_some()
             },
         );
         if self.usage_open {

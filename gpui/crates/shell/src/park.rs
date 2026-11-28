@@ -148,9 +148,19 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !pane.update(cx, |pane, _| std::mem::take(&mut pane.exit_pending)) {
+        let chat = match &pane.read(cx).content {
+            crate::pane::PaneContent::PreviewChat(view) => Some(view.clone()),
+            _ => None,
+        };
+        let reason = chat
+            .and_then(|view| view.update(cx, |chat, _| chat.notification_attention.wake.take()))
+            .or_else(|| {
+                pane.update(cx, |pane, _| std::mem::take(&mut pane.exit_pending))
+                    .then_some(park::WakeReason::Finished)
+            });
+        let Some(reason) = reason else {
             return;
-        }
+        };
         let target = self
             .workspaces
             .iter()
@@ -164,7 +174,7 @@ impl Shell {
                 Some(&target),
                 Intent::Return {
                     uid: target.uid,
-                    woke: Some(park::WakeReason::Finished),
+                    woke: Some(reason),
                 },
                 window,
                 cx,
@@ -352,19 +362,37 @@ impl Shell {
                         owner.stopped_workspaces.insert(state.workspace.id);
                     });
                 }
+                // Only events arriving after this park may wake this incarnation.
+                for pane in state.panes.values() {
+                    if let crate::pane::PaneContent::PreviewChat(view) = &pane.read(cx).content {
+                        view.clone()
+                            .update(cx, |chat, _| chat.notification_attention.wake = None);
+                    }
+                }
                 state.parked = Some(Parked {
                     info,
                     running: mode == Mode::KeepRunning,
                     done: false,
                 });
             }
-            Effect::Return { uid, activate, .. } => {
+            Effect::Return {
+                uid,
+                activate,
+                woke,
+            } => {
                 let Some(state) = self.workspaces.iter_mut().find(|state| {
                     state.runtime_uid == uid && state.parked.as_ref().is_some_and(|p| p.running)
                 }) else {
                     return;
                 };
                 state.parked = None;
+                self.owner.update(cx, |owner, _| {
+                    if let Some(notifications) = &mut owner.notifications
+                        && let Some(reason) = woke
+                    {
+                        notifications.woke.insert(uid, reason);
+                    }
+                });
                 if activate {
                     self.owner.update(cx, |owner, cx| {
                         owner.dispatch(

@@ -361,6 +361,11 @@ pub(crate) struct TaskHostOwner {
 }
 
 impl TaskHostOwner {
+    /// Read the existing Live allowance state for the Usage rail projection.
+    pub(crate) fn chrome_plan_limits(&self) -> Option<&gitterm_core::plan_limits::PlanLimitsFile> {
+        self.plan_limits.as_ref().map(|state| state.file())
+    }
+
     /// Lock, seed, bind, then create the entity. Startup errors fail closed.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn start(config: HostConfig, cx: &mut App) -> Result<Entity<Self>> {
