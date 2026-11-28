@@ -1682,6 +1682,92 @@ impl crate::Shell {
         .detach();
     }
 
+    pub(crate) fn reconcile_stopped_workspace(
+        &mut self,
+        workspace: crate::WorkspaceId,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        use gpui::AppContext as _;
+        let mut sessions = self.data.sessions(workspace, cx);
+        let active = self.data.active_session(workspace, cx);
+        let bottom = crate::bottom_pane_ids(self.workspace(workspace), cx);
+        let state = self
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace.id == workspace)
+            .unwrap();
+        // Stop clears runtime targets. Reconstruct missing main panes from the
+        // filtered DTO identities, keeping bottom panes in their own inventory.
+        let removed: Vec<_> = state
+            .sessions
+            .iter()
+            .filter(|old| {
+                !bottom.contains(&crate::session_pane_id(old.id))
+                    && !sessions.iter().any(|s| s.id == old.id)
+            })
+            .map(|s| crate::session_pane_id(s.id))
+            .collect();
+        sessions.extend(
+            state
+                .sessions
+                .iter()
+                .filter(|s| bottom.contains(&crate::session_pane_id(s.id)))
+                .cloned(),
+        );
+        state.sessions = sessions;
+        state.active_session = active;
+        for id in removed {
+            if let Some(pane) = state.panes.remove(&id) {
+                state
+                    .dock
+                    .update(cx, |dock, cx| dock.remove_panel(pane, window, cx));
+            }
+            self.registry.borrow_mut().remove(&id);
+            self.run_tabs.remove(&id);
+        }
+        for session in &state.sessions {
+            let id = crate::session_pane_id(session.id);
+            if state.panes.contains_key(&id) {
+                continue;
+            }
+            let text = self
+                .data
+                .imported_session(workspace, session.id, cx)
+                .expect("saved session");
+            let pane = cx.new(|cx| {
+                crate::pane::Pane::new(
+                    id.clone(),
+                    session.title.clone(),
+                    crate::pane::PaneKind::IcedSession(text),
+                    workspace,
+                    self.data.clone(),
+                    window,
+                    cx,
+                )
+            });
+            self._subscriptions.push(subscribe(&pane, window, cx));
+            self._subscriptions
+                .push(cx.observe_in(&pane, window, |shell, pane, window, cx| {
+                    shell.wake_terminal(pane.clone(), window, cx);
+                    cx.notify();
+                }));
+            self.registry
+                .borrow_mut()
+                .insert(id.clone(), pane.downgrade());
+            state.panes.insert(id, pane.clone());
+            state.dock.update(cx, |dock, cx| {
+                dock.add_panel_view(
+                    crate::panel_handle(pane),
+                    gpui_component::dock::DockPlacement::Center,
+                    None,
+                    window,
+                    cx,
+                )
+            });
+        }
+    }
+
     /// Saved terminal and chat DTOs remain the source of truth when a stopped
     /// workspace is restored. Keep-running parks never reconstruct these panes.
     pub(crate) fn restore_live_workspace_sessions(
@@ -1691,15 +1777,38 @@ impl crate::Shell {
         cx: &mut gpui::Context<Self>,
     ) {
         use gpui::AppContext as _;
-        let tabs = self
-            .owner
-            .read(cx)
-            .iced_workspace(workspace)
-            .map(|w| w.tabs.clone())
-            .unwrap_or_default();
+        let Some(saved) = self.owner.read(cx).iced_workspace(workspace).cloned() else {
+            return;
+        };
+        let imported = crate::data::iced_sessions(&saved);
+        let bottom = crate::bottom_pane_ids(self.workspace(workspace), cx);
         let active = self.workspace(workspace).active_session;
         let sessions = self.workspace(workspace).sessions.clone();
-        for (session, tab) in sessions.iter().zip(tabs) {
+        for session in &sessions {
+            let pane_id = crate::session_pane_id(session.id);
+            let pane = self.workspace(workspace).panes[&pane_id].clone();
+            if bottom.contains(&pane_id) {
+                if !self.run_tabs.contains_key(&pane_id) {
+                    pane.update(cx, |pane, cx| pane.resume_terminal(window, cx));
+                }
+                continue;
+            }
+            let target = pane.read(cx).task_session(cx);
+            let tab = target
+                .as_ref()
+                .and_then(|target| {
+                    saved
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.session_uid.as_deref() == Some(&target.session_uid))
+                })
+                .or_else(|| {
+                    imported
+                        .iter()
+                        .position(|s| s.id == session.id)
+                        .and_then(|i| saved.tabs.get(i))
+                });
+            let Some(tab) = tab.cloned() else { continue };
             if tab.tab_kind.as_deref() == Some("agent") {
                 if matches!(
                     &self.workspace(workspace).panes[&crate::session_pane_id(session.id)]
@@ -1820,6 +1929,24 @@ impl crate::Shell {
 }
 
 impl crate::Shell {
+    pub(crate) fn live_workspace_bottom_terminals(
+        &self,
+        uid: u64,
+        cx: &gpui::App,
+    ) -> Vec<gitterm_core::workspace_config::BottomTerminalConfig> {
+        let Some(state) = self.workspaces.iter().find(|w| w.runtime_uid == uid) else {
+            return vec![];
+        };
+        crate::bottom_pane_ids(state, cx)
+            .into_iter()
+            .filter(|id| !self.run_tabs.contains_key(id))
+            .filter_map(|id| state.panes.get(&id)?.read(cx).task_folder(cx))
+            .map(|dir| gitterm_core::workspace_config::BottomTerminalConfig {
+                dir: dir.to_string_lossy().into_owned(),
+            })
+            .collect()
+    }
+
     pub(crate) fn live_workspace_tabs(
         &self,
         uid: u64,
@@ -1832,9 +1959,14 @@ impl crate::Shell {
             return vec![];
         };
         let imported = crate::data::iced_sessions(saved);
+        let bottom = crate::bottom_pane_ids(state, cx);
         state
             .sessions
             .iter()
+            .filter(|session| {
+                let id = crate::session_pane_id(session.id);
+                !bottom.contains(&id) && !self.run_tabs.contains_key(&id)
+            })
             .filter_map(|session| {
                 let pane = state
                     .panes

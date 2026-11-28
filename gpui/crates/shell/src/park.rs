@@ -898,8 +898,9 @@ impl Shell {
         };
         let action = match &effect {
             Effect::Park { target, info, .. } => key_of(target.uid).map(|key| A::Park {
-                active_tab: self.live_active_tab(target.uid),
+                active_tab: self.live_active_tab(target.uid, cx),
                 tabs: self.live_workspace_tabs(target.uid, cx),
+                bottom_terminals: self.live_workspace_bottom_terminals(target.uid, cx),
                 key,
                 info: info.clone(),
                 done: false,
@@ -924,8 +925,9 @@ impl Shell {
                 stop: Some((target, info)),
                 ..
             } => key_of(target.uid).map(|key| A::Park {
-                active_tab: self.live_active_tab(target.uid),
+                active_tab: self.live_active_tab(target.uid, cx),
                 tabs: self.live_workspace_tabs(target.uid, cx),
+                bottom_terminals: self.live_workspace_bottom_terminals(target.uid, cx),
                 key,
                 info: info.clone(),
                 done: true,
@@ -937,8 +939,9 @@ impl Shell {
                 .nth(*finish)
                 .map(|w| A::Done(w.park_key(cx))),
             Effect::Close { key, target } => Some(A::Park {
-                active_tab: self.live_active_tab(target.uid),
+                active_tab: self.live_active_tab(target.uid, cx),
                 tabs: self.live_workspace_tabs(target.uid, cx),
+                bottom_terminals: self.live_workspace_bottom_terminals(target.uid, cx),
                 key: key.clone(),
                 info: Info::new("", chrono::Utc::now().to_rfc3339()),
                 done: true,
@@ -957,13 +960,18 @@ impl Shell {
 }
 
 impl Shell {
-    fn live_active_tab(&self, uid: u64) -> Option<usize> {
+    fn live_active_tab(&self, uid: u64, cx: &gpui::App) -> Option<usize> {
         self.workspaces
             .iter()
             .find(|w| w.runtime_uid == uid)
             .and_then(|w| {
+                let bottom = crate::bottom_pane_ids(w, cx);
                 w.sessions
                     .iter()
+                    .filter(|s| {
+                        let id = crate::session_pane_id(s.id);
+                        !bottom.contains(&id) && !self.run_tabs.contains_key(&id)
+                    })
                     .position(|s| Some(s.id) == w.active_session)
             })
     }
@@ -1230,3 +1238,6 @@ mod live_tests {
         desktop.drain().wait().unwrap();
     }
 }
+
+#[cfg(test)]
+mod review_tests;

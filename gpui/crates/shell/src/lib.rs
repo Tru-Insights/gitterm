@@ -768,6 +768,14 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        if cx
+            .try_global::<workspace_config::LiveWorkspaces>()
+            .is_some()
+            && self.owner.read(cx).stopped_workspaces.contains(&id)
+            && self.workspaces.iter().any(|w| w.workspace.id == id)
+        {
+            self.reconcile_stopped_workspace(id, window, cx);
+        }
         if !self.workspaces.iter().any(|w| w.workspace.id == id) {
             let workspace = self
                 .data

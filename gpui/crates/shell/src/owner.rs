@@ -293,11 +293,14 @@ impl WorkspaceOwner {
                     .is_some_and(|i| c.claims.contains(&i))
             });
             let save = desktop.transact_workspaces(move |file| {
-                let workspace = file
+                let mut matches = file
                     .workspaces
                     .iter_mut()
-                    .find(|w| w.name == name && w.dir == dir)
-                    .ok_or("Live chat workspace no longer exists")?;
+                    .filter(|w| w.name == name && w.dir == dir);
+                let workspace = matches.next().ok_or("Live chat workspace no longer exists")?;
+                if matches.next().is_some() {
+                    return Err("Several saved workspaces have the same name and folder; this workspace cannot be changed in Live.".into());
+                }
                 let uid = tab
                     .session_uid
                     .as_deref()

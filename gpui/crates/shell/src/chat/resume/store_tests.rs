@@ -54,6 +54,7 @@ fn park(store: &DesktopStore, workspace: WorkspaceConfig) {
                 note: "come back".into(),
                 parked_at: "2026-11-27T00:00:00Z".into(),
             },
+            bottom_terminals: workspace.bottom_terminals,
             tabs: workspace.tabs,
             active_tab: Some(0),
             done: false,

@@ -830,6 +830,7 @@ pub(crate) enum LiveWorkspaceAction {
     Park {
         active_tab: Option<usize>,
         tabs: Vec<gitterm_core::workspace_config::WorkspaceTabConfig>,
+        bottom_terminals: Vec<gitterm_core::workspace_config::BottomTerminalConfig>,
         key: gitterm_core::park::Key,
         info: gitterm_core::park::Info,
         done: bool,
@@ -934,6 +935,7 @@ pub(crate) fn save_live_workspace(
                     info,
                     done,
                     tabs,
+                    bottom_terminals,
                     active_tab,
                 } => {
                     let index = file
@@ -967,6 +969,7 @@ pub(crate) fn save_live_workspace(
                         }
                     }
                     workspace.tabs = tabs;
+                    workspace.bottom_terminals = bottom_terminals;
                     workspace.active_tab = active_tab;
                     if done {
                         workspace.done_at = Some(chrono::Utc::now().to_rfc3339());
@@ -1231,6 +1234,7 @@ mod live_workspace_tests {
                     key: key.clone(),
                     info: info.clone(),
                     done: false,
+                    bottom_terminals: resumed.workspace.bottom_terminals,
                     tabs: resumed.workspace.tabs,
                 },
                 None,
@@ -1465,6 +1469,7 @@ mod live_workspace_tests {
                         info: Info::new("note", "2026-11-27T00:00:00Z".into()),
                         done: false,
                         active_tab: Some(0),
+                        bottom_terminals: file.workspaces[1].bottom_terminals.clone(),
                         tabs: captured,
                     },
                     None,
