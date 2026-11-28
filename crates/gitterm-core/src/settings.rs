@@ -6,6 +6,119 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Iced's settings writer: preserve its serialization and atomic replacement exactly.
+#[cfg(feature = "runtime")]
+pub fn save_to(dir: &std::path::Path, config: &impl Serialize) -> Result<(), String> {
+    let path = dir.join("settings.json");
+    let json = serde_json::to_vec_pretty(config)
+        .map_err(|error| format!("cannot encode {}: {error}", path.display()))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    crate::atomic_file::write_atomically(&path, &json)
+}
+
+/// Live's owner edits known fields without reformatting other fields or dropping
+/// keys added by another desktop version. No second settings snapshot is cached.
+#[cfg(feature = "runtime")]
+/// Iced's writer; `keep` adds back fields this build does not know inside a
+/// rewritten top-level key (untouched keys keep their bytes anyway).
+pub(crate) fn save_desktop_to_keeping(
+    path: &std::path::Path,
+    config: &DesktopSettings,
+    keep: &dyn Fn(&str, &mut serde_json::Value),
+) -> Result<(), String> {
+    let original = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return save_to(path.parent().expect("settings parent"), config);
+        }
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let encode = |error| format!("encode {}: {error}", path.display());
+    let parse = |error| format!("parse {}: {error}", path.display());
+    let before: DesktopSettings = serde_json::from_str(&original).map_err(parse)?;
+    let before = serde_json::to_value(before).map_err(encode)?;
+    let after = serde_json::to_value(config).map_err(encode)?;
+    if before == after {
+        return Ok(());
+    }
+    // The original unflattened Serde schema also accepts sequence inputs.
+    if !original.trim_start().starts_with('{') {
+        return save_to(path.parent().expect("settings parent"), config);
+    }
+    let fields: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
+        serde_json::from_str(&original).map_err(parse)?;
+    let mut replacements = Vec::new();
+    let mut additions = Vec::new();
+    for (key, value) in after.as_object().expect("settings object") {
+        if before.get(key) == Some(value) {
+            continue;
+        }
+        let mut value = value.clone();
+        keep(key, &mut value);
+        let value = serde_json::to_string_pretty(&value).map_err(encode)?;
+        if let Some(raw) = fields.get(key) {
+            let start = raw.get().as_ptr() as usize - original.as_ptr() as usize;
+            replacements.push((start..start + raw.get().len(), value));
+        } else {
+            additions.push(format!(
+                "{}: {value}",
+                serde_json::to_string(key).map_err(encode)?
+            ));
+        }
+    }
+    let removals: Vec<_> = before
+        .as_object()
+        .expect("settings object")
+        .keys()
+        .filter(|key| after.get(*key).is_none() && fields.contains_key(*key))
+        .cloned()
+        .collect();
+    if replacements.is_empty() && additions.is_empty() && removals.is_empty() {
+        return Ok(());
+    }
+    replacements.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    drop(fields);
+    let mut result = original;
+    for (range, value) in replacements {
+        result.replace_range(range, &value);
+    }
+    // Reparse between omissions: adjacent removed members share separators.
+    // Removing one at a time keeps every intermediate document valid.
+    for key in removals {
+        let fields: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
+            serde_json::from_str(&result).map_err(parse)?;
+        let raw = fields[&key];
+        let start = raw.get().as_ptr() as usize - result.as_ptr() as usize;
+        let end = start + raw.get().len();
+        let key_end = result[..start].rfind('"').expect("key end");
+        let key_start = result[..key_end].rfind('"').expect("key start");
+        let next = result[end..]
+            .find(|c: char| !c.is_whitespace())
+            .map(|n| end + n)
+            .unwrap();
+        let range = if result.as_bytes()[next] == b',' {
+            key_start..next + 1
+        } else if let Some(comma) = result[..key_start].rfind(',') {
+            comma..end
+        } else {
+            key_start..end
+        };
+        result.replace_range(range, "");
+    }
+    if !additions.is_empty() {
+        let end = result.rfind('}').expect("settings object end");
+        let fields: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
+            serde_json::from_str(&result).map_err(parse)?;
+        let comma = if fields.is_empty() { "" } else { "," };
+        result.insert_str(end, &format!("{comma}\n  {}\n", additions.join(",\n  ")));
+    }
+    // Validate the assembled document before replacing anything on disk.
+    serde_json::from_str::<DesktopSettings>(&result)
+        .map_err(|error| format!("validate edited {}: {error}", path.display()))?;
+    crate::atomic_file::write_atomically(path, result.as_bytes())
+}
+
 // Default functions for serde
 fn default_agent_color<C: From<WorkspaceColor>>() -> C {
     WorkspaceColor::Lavender.into()
@@ -703,4 +816,150 @@ mod tests {
 
     pin_shape!(voice_enabled_fixtures, SettingsWithVoice, "");
     pin_shape!(voice_disabled_fixtures, Settings, ".no-stt");
+}
+
+#[cfg(all(test, feature = "runtime"))]
+mod view_preferences_tests {
+    use super::*;
+    use crate::desktop_store::DesktopStore;
+
+    #[test]
+    fn iced_settings_writer_keeps_original_saved_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = DesktopSettings::default();
+        save_to(root.path(), &settings).unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("settings.json")).unwrap(),
+            serde_json::to_vec_pretty(&settings).unwrap()
+        );
+    }
+
+    #[test]
+    fn view_preferences_preserve_unknown_and_untouched_bytes_and_noop_saves() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.json");
+        let original = "{\n \"theme\" : \"dark\", \"sidebar_width\":360,\n \"future\" : {\"escaped\": \"雪 \\\" }\", \"values\":[1e2,2]},\n \"usage\" : { \"future\" : [true, null] }\n}\n";
+        std::fs::write(&path, original).unwrap();
+        let store = DesktopStore::open(root.path()).unwrap();
+        store.edit_settings(|_| {}).wait().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        store
+            .edit_settings(|s| {
+                s.theme = "light".into();
+                s.sidebar_width = 450.;
+            })
+            .wait()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original
+                .replace("\"dark\"", "\"light\"")
+                .replace(":360,", ":450.0,")
+        );
+        store.drain().wait().unwrap();
+    }
+
+    #[test]
+    fn view_preferences_add_only_changed_fields_and_migrate_legacy_font() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.json");
+        std::fs::write(&path, "{ \"font_size\" : 18, \"future\":42 }\n").unwrap();
+        let store = DesktopStore::open(root.path()).unwrap();
+        store
+            .edit_settings(|s| {
+                s.font_size = None;
+                s.ui_font_size = 17.;
+                s.terminal_font_size = 19.;
+            })
+            .wait()
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"future\":42"));
+        let actual: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            actual,
+            serde_json::json!({"font_size":null,"future":42,"ui_font_size":17.0,"terminal_font_size":19.0})
+        );
+    }
+
+    #[test]
+    fn view_preferences_normalize_root_without_changing_other_bytes() {
+        for extra in ["", ", \"future\": {\"commas\":[1,2]}"] {
+            let root = tempfile::tempdir_in("/private/tmp").unwrap();
+            let path = root.path().join("settings.json");
+            let configured = serde_json::to_string(&root.path().join("worktrees")).unwrap();
+            std::fs::write(
+                &path,
+                format!("{{ \"task_worktree_root\":{configured}{extra} }}"),
+            )
+            .unwrap();
+            let store = DesktopStore::open(root.path()).unwrap();
+            store
+                .edit_settings(|s| s.theme = "light".into())
+                .wait()
+                .unwrap();
+            let actual: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(actual["theme"], "light");
+            assert!(actual.get("task_worktree_root").is_none());
+            if !extra.is_empty() {
+                assert_eq!(actual["future"], serde_json::json!({"commas":[1,2]}));
+            }
+        }
+    }
+
+    #[test]
+    fn view_preferences_preserve_optional_voice_field_omission() {
+        for original in [
+            r#"{"stt_enabled":true,"stt_model_path":"fixture-model","future" : [1, 2]}"#,
+            r#"{"future" : [1, 2],"stt_enabled":true,"stt_model_path":null}"#,
+            r#"{"stt_enabled":true,"future" : [1, 2],"stt_model_path":null}"#,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("settings.json");
+            std::fs::write(&path, original).unwrap();
+            let store = DesktopStore::open(root.path()).unwrap();
+            store
+                .edit_settings(|settings| {
+                    settings.stt_enabled = None;
+                    settings.stt_model_path = None;
+                })
+                .wait()
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                r#"{"future" : [1, 2]}"#
+            );
+        }
+    }
+
+    #[test]
+    fn view_preferences_keep_iced_sequence_input_compatibility() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.json");
+        std::fs::write(&path, "[\"fixture-editor\"]").unwrap();
+        let store = DesktopStore::open(root.path()).unwrap();
+        store
+            .edit_settings(|settings| settings.theme = "light".into())
+            .wait()
+            .unwrap();
+        let config: DesktopSettings =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(config.editor, "fixture-editor");
+        assert_eq!(config.theme, "light");
+    }
+
+    #[test]
+    fn view_preferences_refuse_newly_malformed_settings_without_overwriting() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+        let store = DesktopStore::open(root.path()).unwrap();
+        std::fs::write(&path, "{ malformed").unwrap();
+        assert!(store
+            .edit_settings(|s| s.theme = "light".into())
+            .wait()
+            .is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "{ malformed");
+    }
 }

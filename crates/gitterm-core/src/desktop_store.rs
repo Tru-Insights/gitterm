@@ -300,7 +300,7 @@ impl DesktopStore {
                     settings.task_worktree_root.0 = None;
                 }
             }
-            save(&mut state.settings, &root.join("settings.json"))
+            save_settings(&mut state.settings, &root.join("settings.json"))
         })
     }
 
@@ -309,14 +309,14 @@ impl DesktopStore {
     }
 
     pub fn save_settings(&self) -> Receipt<()> {
-        self.submit(|state, root| save(&mut state.settings, &root.join("settings.json")))
+        self.submit(|state, root| save_settings(&mut state.settings, &root.join("settings.json")))
     }
 
     pub fn drain(&self) -> Receipt<()> {
         self.submit(|state, root| {
             // Try both files even if one writer is blocked.
             let workspaces = save(&mut state.workspaces, &root.join("workspaces.json"));
-            let settings = save(&mut state.settings, &root.join("settings.json"));
+            let settings = save_settings(&mut state.settings, &root.join("settings.json"));
             let errors: Vec<_> = [workspaces, settings]
                 .into_iter()
                 .filter_map(Result::err)
@@ -457,7 +457,32 @@ fn mutate<T: Default>(state: &mut FileState<T>, edit: impl FnOnce(&mut T)) -> Re
     Ok(())
 }
 
+fn save_settings(state: &mut FileState<DesktopSettings>, path: &Path) -> Result<(), String> {
+    // Iced's writer keeps untouched keys' bytes; nested unknown fields under a
+    // rewritten key are merged back so a newer build's settings survive.
+    let unknown = state.unknown.clone();
+    save_with(state, path, |path, document| {
+        crate::settings::save_desktop_to_keeping(path, document, &|key, value| {
+            if let Some(extra) = unknown.get(key).and_then(|extra| extra.as_object()) {
+                merge_unknown(value, extra);
+            }
+        })
+    })
+}
+
 fn save<T: Serialize>(state: &mut FileState<T>, path: &Path) -> Result<(), String> {
+    save_with(state, path, |path, document| {
+        let bytes = serde_json::to_vec_pretty(document)
+            .map_err(|e| format!("encode {}: {e}", path.display()))?;
+        crate::atomic_file::write_atomically(path, &bytes)
+    })
+}
+
+fn save_with<T>(
+    state: &mut FileState<T>,
+    path: &Path,
+    write: impl FnOnce(&Path, &T) -> Result<(), String>,
+) -> Result<(), String> {
     if let LoadState::Refused(error) = &state.loaded {
         return Err(error.clone());
     }
@@ -470,16 +495,7 @@ fn save<T: Serialize>(state: &mut FileState<T>, path: &Path) -> Result<(), Strin
         let LoadState::Valid(document) = &state.loaded else {
             return Err(format!("no document loaded for {}", path.display()));
         };
-        let bytes = if state.unknown.is_empty() {
-            serde_json::to_vec_pretty(document)
-        } else {
-            serde_json::to_value(document).and_then(|mut value| {
-                merge_unknown(&mut value, &state.unknown);
-                serde_json::to_vec_pretty(&value)
-            })
-        }
-        .map_err(|e| format!("encode {}: {e}", path.display()))?;
-        crate::atomic_file::write_atomically(path, &bytes)
+        write(path, document)
     })();
     match result {
         Ok(()) => {
