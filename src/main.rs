@@ -3854,7 +3854,7 @@ impl AttentionReason {
 
     fn label(self) -> &'static str {
         match self {
-            Self::HumanInputRequired => "Input or approval needed",
+            Self::HumanInputRequired => gitterm_core::attention_notifications::INPUT_REQUIRED,
             Self::AgentFailed => "Agent failed",
             Self::CompletedUnread => "Ready to review",
             Self::DelegationReady(gitterm::tasks::DelegationKind::Review) => "Review ready",
@@ -3863,8 +3863,10 @@ impl AttentionReason {
             Self::DelegationFailed(gitterm::tasks::DelegationKind::Review) => "Review failed",
             Self::DelegationFailed(gitterm::tasks::DelegationKind::Consult) => "Consult failed",
             Self::DelegationFailed(gitterm::tasks::DelegationKind::Implement) => "Worker failed",
-            Self::DelegationBlocked(gitterm::tasks::DelegationKind::Implement) => "Worker blocked",
-            Self::DelegationBlocked(_) => "Delegation blocked",
+            Self::DelegationBlocked(gitterm::tasks::DelegationKind::Implement) => {
+                gitterm_core::attention_notifications::WORKER_BLOCKED
+            }
+            Self::DelegationBlocked(_) => gitterm_core::attention_notifications::DELEGATION_BLOCKED,
         }
     }
 
@@ -4026,149 +4028,14 @@ fn format_attention_age(elapsed_secs: u64) -> String {
     }
 }
 
-/// One look at something that can need the human, fed to
-/// [`NeedsYouNotifier::observe`] (TRU-148).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct NeedsYouObservation {
-    target: AttentionTarget,
-    /// The needs-you reason's label while it waits on the human.
-    needs_you: Option<&'static str>,
-    /// Mid-turn right now.
-    running: bool,
-    /// In front of the user (the active tab of the active workspace).
-    front: bool,
-    /// Its needs-you only counts after it was seen working: a harness
-    /// title's "✳" also means idle at the prompt, which a restored tab
-    /// shows on boot without anything having happened.
-    requires_work: bool,
-}
-
-/// A needs-you transition worth a notification: where, and why.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct NeedsYouNudge {
-    target: AttentionTarget,
-    label: &'static str,
-}
-
-/// Detects background tabs and tasks turning to needs-you, for the macOS
-/// notification (TRU-148). Level-triggered: each observation is compared
-/// with the last, so a reason that stays raised never repeats; one that
-/// clears and comes back is a new transition, held to one notification
-/// per target and reason every [`Self::REPEAT_AFTER`].
-#[derive(Debug)]
-struct NeedsYouNotifier {
-    started: Instant,
-    raised: HashSet<(AttentionTarget, &'static str)>,
-    seen_working: HashSet<AttentionTarget>,
-    last_fired: HashMap<(AttentionTarget, &'static str), Instant>,
-}
-
-impl NeedsYouNotifier {
-    /// Restored tabs settle (titles, requests, task states) in the first
-    /// seconds after launch; nothing then is news.
-    const LAUNCH_GRACE: Duration = Duration::from_secs(5);
-    const REPEAT_AFTER: Duration = Duration::from_secs(60);
-
-    fn new(started: Instant) -> Self {
-        Self {
-            started,
-            raised: HashSet::new(),
-            seen_working: HashSet::new(),
-            last_fired: HashMap::new(),
-        }
-    }
-
-    /// Record what is raised now and return the transitions to announce:
-    /// newly raised, not in front, past the launch grace, worked first when
-    /// that is required, and not announced for the same reason within
-    /// [`Self::REPEAT_AFTER`].
-    fn observe(
-        &mut self,
-        now: Instant,
-        observations: impl IntoIterator<Item = NeedsYouObservation>,
-    ) -> Vec<NeedsYouNudge> {
-        let in_grace = now.saturating_duration_since(self.started) < Self::LAUNCH_GRACE;
-        self.last_fired
-            .retain(|_, fired| now.saturating_duration_since(*fired) < Self::REPEAT_AFTER);
-        let mut raised = HashSet::new();
-        let mut nudges = Vec::new();
-        for observation in observations {
-            if observation.running {
-                self.seen_working.insert(observation.target.clone());
-            }
-            let Some(label) = observation.needs_you else {
-                continue;
-            };
-            let key = (observation.target.clone(), label);
-            raised.insert(key.clone());
-            if self.raised.contains(&key) {
-                continue;
-            }
-            // A transition spends the working mark, announced or not.
-            let worked = self.seen_working.remove(&observation.target);
-            if in_grace
-                || observation.front
-                || (observation.requires_work && !worked)
-                || self.last_fired.contains_key(&key)
-            {
-                continue;
-            }
-            self.last_fired.insert(key, now);
-            nudges.push(NeedsYouNudge {
-                target: observation.target,
-                label,
-            });
-        }
-        self.raised = raised;
-        nudges
-    }
-}
-
-/// `text` as an AppleScript string literal.
-fn applescript_string(text: &str) -> String {
-    let mut literal = String::with_capacity(text.len() + 2);
-    literal.push('"');
-    for ch in text.chars() {
-        match ch {
-            '"' => literal.push_str("\\\""),
-            '\\' => literal.push_str("\\\\"),
-            '\n' | '\r' => literal.push(' '),
-            _ => literal.push(ch),
-        }
-    }
-    literal.push('"');
-    literal
-}
-
-/// The `osascript` source that posts a needs-you notification.
-fn needs_you_notification_script(title: &str, body: &str) -> String {
-    format!(
-        "display notification {} with title {}",
-        applescript_string(body),
-        applescript_string(title)
-    )
-}
-
-/// Post a macOS notification off the UI thread. A plain notification:
-/// `osascript` owns it, so clicking it cannot focus GitTerm's tab.
-fn post_needs_you_notification(title: &str, body: &str) {
-    let script = needs_you_notification_script(title, body);
-    std::thread::spawn(move || {
-        match std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(&script)
-            .output()
-        {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => eprintln!(
-                "[notify] osascript exited {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-            Err(error) => eprintln!("[notify] could not run osascript: {error}"),
-        }
-    });
-}
+use gitterm_core::attention_notifications::post_needs_you_notification;
+#[cfg(test)]
+use gitterm_core::attention_notifications::{applescript_string, needs_you_notification_script};
+type NeedsYouObservation =
+    gitterm_core::attention_notifications::NeedsYouObservation<AttentionTarget>;
+type NeedsYouNotifier = gitterm_core::attention_notifications::NeedsYouNotifier<AttentionTarget>;
+#[cfg(test)]
+type NeedsYouNudge = gitterm_core::attention_notifications::NeedsYouNudge<AttentionTarget>;
 
 /// The Chats overview's snapshot, the key it was built for and when
 /// (TRU-154). A cell because `view` takes `&self` and builds it on first
@@ -4305,38 +4172,14 @@ fn sort_open_tab_rows(rows: &mut [OpenTabRow]) {
     });
 }
 
-/// Whether a harness title says it is working: the leading glyph is one of
-/// the spinner frames [`strip_title_status_glyphs`] documents ("◐"/"◑", the
-/// older sparkle set, braille spinners) — not the idle "✳" or a shell's "*".
-fn terminal_title_shows_working(title: &str) -> bool {
-    title.trim_start().chars().next().is_some_and(|ch| {
-        matches!(ch, '◐' | '◑' | '◒' | '◓' | '✢' | '✶' | '✻' | '✽' | '·')
-            || ('\u{2800}'..='\u{28FF}').contains(&ch)
-    })
-}
+use gitterm_core::attention_notifications::{
+    strip_title_status_glyphs, terminal_title_shows_working,
+};
 
 fn terminal_title_attention_reason(title: &str) -> Option<AttentionReason> {
     title
         .starts_with('✳')
         .then_some(AttentionReason::HumanInputRequired)
-}
-
-/// A harness title with its leading status glyphs removed. Claude Code
-/// writes "✳ <topic>" while it is not working and alternates "◐ <topic>" /
-/// "◑ <topic>" every ~1s while it is; older builds and other harnesses use
-/// the "·✢✶✻✽" sparkle set or braille spinners, and shells may prefix "*".
-/// The topic after the glyph is what a row or progress line should show —
-/// the glyph changes every frame and would make the text churn.
-fn strip_title_status_glyphs(title: &str) -> &str {
-    title
-        .trim_start_matches(|ch: char| {
-            matches!(
-                ch,
-                '✳' | '✢' | '✶' | '✻' | '✽' | '·' | '◐' | '◑' | '◒' | '◓' | '*'
-            ) || ('\u{2800}'..='\u{28FF}').contains(&ch)
-                || ch.is_whitespace()
-        })
-        .trim_end()
 }
 
 /// Row presentation for a task attention reason on the shared priority
@@ -24119,10 +23962,11 @@ impl App {
                 });
             }
         }
-        for nudge in self
-            .needs_you_notifier
-            .observe(Instant::now(), observations)
-        {
+        for nudge in self.needs_you_notifier.observe(
+            Instant::now(),
+            self.notifications_config.needs_you,
+            observations,
+        ) {
             let title = match &nudge.target {
                 AttentionTarget::Tab(tab_id) => self
                     .workspaces
@@ -53226,6 +53070,46 @@ mod tests {
     }
 
     #[test]
+    fn iced_needs_you_notification_keeps_labels_timing_and_script_bytes() {
+        let start = Instant::now();
+        let mut notifier = NeedsYouNotifier::new(start);
+        let label = AttentionReason::HumanInputRequired.label();
+        assert!(notifier
+            .observe(
+                start + Duration::from_secs(4),
+                true,
+                [needs_you_seen(1, Some(label), false, false, false)]
+            )
+            .is_empty());
+        let blocked =
+            AttentionReason::DelegationBlocked(gitterm::tasks::DelegationKind::Implement).label();
+        let nudges = notifier.observe(
+            start + Duration::from_secs(5),
+            true,
+            [
+                needs_you_seen(1, Some(label), false, false, false),
+                needs_you_seen(2, Some(blocked), false, false, false),
+            ],
+        );
+        assert_eq!(
+            nudges,
+            [NeedsYouNudge {
+                target: AttentionTarget::Tab(2),
+                label: "Worker blocked"
+            }]
+        );
+        assert_eq!(
+            needs_you_notification_script("Fixture \"topic\"", nudges[0].label),
+            r#"display notification "Worker blocked" with title "Fixture \"topic\"""#
+        );
+        assert_eq!(label, "Input or approval needed");
+        assert_eq!(
+            task_attention_presentation(TaskAttentionReason::RequiresInput).2,
+            label
+        );
+    }
+
+    #[test]
     fn needs_you_notifies_once_per_background_transition() {
         const INPUT: &str = "Input or approval needed";
         let start = Instant::now();
@@ -53235,11 +53119,16 @@ mod tests {
         // Raised during the launch grace: restored state, never news —
         // and still raised afterwards, so it is no transition later either.
         assert!(notifier
-            .observe(at(1), [needs_you_seen(1, Some(INPUT), true, false, false)])
+            .observe(
+                at(1),
+                true,
+                [needs_you_seen(1, Some(INPUT), true, false, false)]
+            )
             .is_empty());
         assert!(notifier
             .observe(
                 at(10),
+                true,
                 [needs_you_seen(1, Some(INPUT), false, false, false)]
             )
             .is_empty());
@@ -53248,6 +53137,7 @@ mod tests {
         // while it stays raised.
         let nudge = notifier.observe(
             at(10),
+            true,
             [
                 needs_you_seen(1, Some(INPUT), false, false, false),
                 needs_you_seen(2, Some(INPUT), true, false, false),
@@ -53261,20 +53151,32 @@ mod tests {
             }]
         );
         assert!(notifier
-            .observe(at(11), [needs_you_seen(2, Some(INPUT), true, false, false)])
+            .observe(
+                at(11),
+                true,
+                [needs_you_seen(2, Some(INPUT), true, false, false)]
+            )
             .is_empty());
 
         // Cleared and raised again within a minute: debounced.
-        notifier.observe(at(12), [needs_you_seen(2, None, true, false, false)]);
+        notifier.observe(at(12), true, [needs_you_seen(2, None, true, false, false)]);
         assert!(notifier
-            .observe(at(20), [needs_you_seen(2, Some(INPUT), true, false, false)])
+            .observe(
+                at(20),
+                true,
+                [needs_you_seen(2, Some(INPUT), true, false, false)]
+            )
             .is_empty());
 
         // ...but a minute after the last nudge it is news again.
-        notifier.observe(at(30), [needs_you_seen(2, None, true, false, false)]);
+        notifier.observe(at(30), true, [needs_you_seen(2, None, true, false, false)]);
         assert_eq!(
             notifier
-                .observe(at(71), [needs_you_seen(2, Some(INPUT), true, false, false)])
+                .observe(
+                    at(71),
+                    true,
+                    [needs_you_seen(2, Some(INPUT), true, false, false)]
+                )
                 .len(),
             1
         );
@@ -53286,6 +53188,7 @@ mod tests {
             notifier
                 .observe(
                     at(72),
+                    true,
                     [needs_you_seen(2, Some(blocked), false, false, false)]
                 )
                 .len(),
@@ -53303,25 +53206,38 @@ mod tests {
         // Raised while in front: no nudge, and switching away later is not
         // a transition.
         assert!(notifier
-            .observe(at(10), [needs_you_seen(1, Some(INPUT), true, true, false)])
+            .observe(
+                at(10),
+                true,
+                [needs_you_seen(1, Some(INPUT), true, true, false)]
+            )
             .is_empty());
         assert!(notifier
             .observe(
                 at(11),
+                true,
                 [needs_you_seen(1, Some(INPUT), false, false, false)]
             )
             .is_empty());
 
         // A terminal booting to "✳" without ever working: quiet.
-        notifier.observe(at(12), [needs_you_seen(3, None, false, false, true)]);
+        notifier.observe(at(12), true, [needs_you_seen(3, None, false, false, true)]);
         assert!(notifier
-            .observe(at(13), [needs_you_seen(3, Some(INPUT), false, false, true)])
+            .observe(
+                at(13),
+                true,
+                [needs_you_seen(3, Some(INPUT), false, false, true)]
+            )
             .is_empty());
 
         // Worked ("◐"), then idle ("✳") in the background: news.
-        notifier.observe(at(14), [needs_you_seen(3, None, true, false, true)]);
+        notifier.observe(at(14), true, [needs_you_seen(3, None, true, false, true)]);
         assert_eq!(
-            notifier.observe(at(15), [needs_you_seen(3, Some(INPUT), false, false, true)]),
+            notifier.observe(
+                at(15),
+                true,
+                [needs_you_seen(3, Some(INPUT), false, false, true)]
+            ),
             vec![NeedsYouNudge {
                 target: AttentionTarget::Tab(3),
                 label: INPUT
@@ -53330,9 +53246,13 @@ mod tests {
 
         // The working mark is spent by that transition: going idle again
         // after the debounce without new work stays quiet.
-        notifier.observe(at(80), [needs_you_seen(3, None, false, false, true)]);
+        notifier.observe(at(80), true, [needs_you_seen(3, None, false, false, true)]);
         assert!(notifier
-            .observe(at(81), [needs_you_seen(3, Some(INPUT), false, false, true)])
+            .observe(
+                at(81),
+                true,
+                [needs_you_seen(3, Some(INPUT), false, false, true)]
+            )
             .is_empty());
 
         // A task needing input is news without any working signal.
@@ -53343,7 +53263,7 @@ mod tests {
             front: false,
             requires_work: false,
         };
-        assert_eq!(notifier.observe(at(90), [task]).len(), 1);
+        assert_eq!(notifier.observe(at(90), true, [task]).len(), 1);
     }
 
     #[test]

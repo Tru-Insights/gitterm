@@ -993,15 +993,15 @@ impl TaskHostOwner {
     /// reducer and `record_handoff`, so done/blocked for an open worker
     /// delegation is accepted only from the pane (a chat or a launched
     /// terminal) hosting its task session, then the task's lifecycle
-    /// mirrors it. Iced's tab, attention, parent
-    /// and PR-lookup steps are UI and are not run; the report reaches the
+    /// mirrors it. Live also raises the parent's notification attention;
+    /// PR-lookup remains separate. The report reaches the
     /// parent chat through the delivery tick ([`delivery`]), as in Iced.
     fn update_handoff(
         &mut self,
         request: UpdateTaskHandoffRequest,
         caller: Option<&str>,
         label: &'static str,
-        cx: &App,
+        cx: &mut Context<Self>,
     ) -> Result<serde_json::Value, String> {
         self.authorize_write(label, &self.task_worktree(&request.task_id))?;
         if !self.host.services().is_preview() {
@@ -1081,6 +1081,17 @@ impl TaskHostOwner {
             if let Some(session) = hosted_session.as_deref() {
                 self.worker_reported_live(session, status == HandoffStatus::Done);
             }
+        }
+        if self.is_live()
+            && let Some(parent) = report_to.as_deref().and_then(|id| {
+                self.host
+                    .store()
+                    .as_ref()?
+                    .delegation(id)
+                    .map(|d| d.parent.session_uid.clone())
+            })
+        {
+            cx.defer(move |cx| crate::notifications::worker_reported(&parent, status, cx));
         }
         let mut value = self.task_value(&task)?;
         value["handoff_status"] = serde_json::Value::String(status.label().to_string());

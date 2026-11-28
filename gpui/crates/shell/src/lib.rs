@@ -48,6 +48,7 @@ pub use live::launch_mode;
 pub use startup_failure::show_startup_failure;
 #[cfg(test)]
 mod modal_input_tests;
+mod notifications;
 mod owner;
 #[cfg(test)]
 mod page_tests;
@@ -257,6 +258,11 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Result<Self> {
         let client_height = f32::from(window.viewport_size().height);
+        owner.update(cx, |owner, _| {
+            if let Some(notifications) = &mut owner.notifications {
+                notifications.enabled = settings.notifications.needs_you;
+            }
+        });
         let sidebar_width = layout::clamp_sidebar(settings.sidebar_width);
         let bottom = cx.new(|_| {
             bottom_panel::BottomPanel::new(bottom_panel::Input::from_settings(
@@ -867,6 +873,7 @@ impl Shell {
     }
     /// Pushes [`Self::task_panes`] to the task host when they changed.
     fn sync_task_panes(&mut self, cx: &mut Context<Self>) {
+        self.sync_notification_panes(cx);
         let Some(host) = cx
             .try_global::<task_host::GpuiTaskHost>()
             .map(|host| host.0.clone())
