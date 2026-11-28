@@ -1234,7 +1234,7 @@ impl Shell {
                 } else if placement == DockPlacement::Bottom {
                     PaneKind::BottomTerminal(cwd.clone())
                 } else {
-                    PaneKind::CenterTerminal(cwd.clone())
+                    PaneKind::CenterTerminal(cwd.clone(), None)
                 },
                 state.workspace.id,
                 self.data.clone(),
@@ -1837,7 +1837,7 @@ fn build_workspace(
             } else if saved.bottom && host.as_ref().is_some_and(|h| h.read(cx).is_live()) {
                 PaneKind::BottomTerminal(saved.cwd.clone())
             } else {
-                PaneKind::CenterTerminal(saved.cwd.clone())
+                PaneKind::CenterTerminal(saved.cwd.clone(), saved.session_uid.clone())
             }
         } else {
             session.kind.into()

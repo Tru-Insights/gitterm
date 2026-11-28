@@ -453,8 +453,12 @@ impl crate::Shell {
         match outcome {
             O::NewChat if self.local => self.new_claude_chat(None, window, cx),
             O::Terminal if self.local => self.new_terminal(window, cx),
-            O::Cli { preset } => self.launch_agent_preset(*preset, window, cx),
-            O::CliResume { preset, .. } => self.launch_cli_preset(*preset, true, window, cx),
+            O::Cli { preset } if self.live_chat_enabled(cx) => {
+                self.launch_agent_preset(*preset, window, cx)
+            }
+            O::CliResume { preset, .. } if self.live_chat_enabled(cx) => {
+                self.launch_cli_preset(*preset, true, window, cx)
+            }
             O::Continue { task_id, preset } => self.launch_task_child(task_id, *preset, window, cx),
             _ => {
                 self.owner.update(cx, |owner, cx| {
@@ -2003,18 +2007,20 @@ impl crate::Shell {
                 let pane =
                     self.workspace(workspace).panes[&crate::session_pane_id(session.id)].clone();
                 if pane.read(cx).session.is_none() {
-                    let Some(host) = cx
+                    let host = cx
                         .try_global::<crate::task_host::GpuiTaskHost>()
-                        .map(|h| h.0.clone())
-                    else {
-                        continue;
-                    };
+                        .map(|h| h.0.clone());
                     let name = self.workspace(workspace).workspace.name.clone();
-                    let result = host.update(cx, |host, cx| {
-                        host.open_live_terminal(&name, &tab, true, cx)
-                    });
+                    let result = host
+                        .ok_or_else(|| "Live terminal host is unavailable".to_owned())
+                        .and_then(|host| {
+                            let launched = host.update(cx, |host, cx| {
+                                host.open_live_terminal(&name, &tab, true, cx)
+                            })?;
+                            Ok((host, launched))
+                        });
                     match result {
-                        Ok(launched) => {
+                        Ok((host, launched)) => {
                             if let Some(view) =
                                 host.update(cx, |host, _| host.take_terminal(&launched.session_id))
                             {
