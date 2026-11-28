@@ -3495,11 +3495,7 @@ mod live_writes {
             Err(preview_notice("merge_plan_set"))
         );
         owner.read_with(cx, |owner, _| {
-            for effect in [
-                RunnerEffect::RestoreSession,
-                RunnerEffect::AutomaticDelivery,
-                RunnerEffect::NotifyIngress,
-            ] {
+            for effect in [RunnerEffect::RestoreSession, RunnerEffect::NotifyIngress] {
                 assert!(owner.host().services().runner(effect, None).is_err());
             }
             assert!(
@@ -3529,6 +3525,13 @@ mod live_writes {
                         .is_ok()
                 );
             }
+            assert!(
+                owner
+                    .host()
+                    .services()
+                    .runner(RunnerEffect::AutomaticDelivery, None)
+                    .is_ok()
+            );
             assert!(owner.host().launch_queue().is_empty());
             assert!(!owns_in_flight_work(owner.host()));
         });
@@ -3536,6 +3539,9 @@ mod live_writes {
         owner.update(cx, |owner, _| owner.shutdown());
     }
     include!("task_host_live_worker_tests.rs");
+    include!("task_host_live_delivery_tests.rs");
+    include!("task_host_live_terminal_tests.rs");
+    include!("remote_terminal_tests.rs");
 }
 
 #[gpui::test]

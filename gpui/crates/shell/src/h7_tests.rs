@@ -378,6 +378,9 @@ fn saved_run_inventory_restores_plain_shells_once_before_panel_or_workspace_sele
                         startup_command: None,
                         task_id: None,
                         task_session_id: None,
+                        session_uid: None,
+                        chat_session_id: None,
+                        bottom: true,
                     });
                 state.panes.insert(pane_id, pane.clone());
                 state.dock.update(cx, |dock, cx| {
@@ -536,13 +539,13 @@ fn work_repo_row_run_launches_like_iced_without_a_notice(cx: &mut TestAppContext
 #[gpui::test]
 fn title_tracks_workspace_and_sidebar_and_tabs_use_iced_label_alignment(cx: &mut TestAppContext) {
     let (_root, shell, cx) = fixture(cx);
-    for (selector, mode) in [("Files", "Files"), ("Find", "Find"), ("Work", "Work")] {
+    for selector in ["Files", "Find", "Work"] {
         let bounds = cx.debug_bounds(selector).unwrap();
         cx.simulate_click(bounds.center(), gpui::Modifiers::none());
         draw(cx);
         assert_eq!(
-            cx.window_title(),
-            Some(format!("GitTerm V6 Development - H7 - {mode}"))
+            cx.window_title().as_deref(),
+            Some("GitTerm GPUI Preview - H7 - work")
         );
     }
     cx.update(|window, cx| {
@@ -553,7 +556,7 @@ fn title_tracks_workspace_and_sidebar_and_tabs_use_iced_label_alignment(cx: &mut
     draw(cx);
     assert_eq!(
         cx.window_title().as_deref(),
-        Some("GitTerm V6 Development - second - Work")
+        Some("GitTerm GPUI Preview - second - second")
     );
     assert!(cx.debug_bounds("Work").unwrap().origin.x < cx.debug_bounds("Files").unwrap().origin.x);
 }

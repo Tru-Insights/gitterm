@@ -2024,6 +2024,9 @@ mod action_tests {
                         startup_command: None,
                         task_id: None,
                         task_session_id: None,
+                        session_uid: None,
+                        chat_session_id: None,
+                        bottom: false,
                     },
                 );
                 shell
