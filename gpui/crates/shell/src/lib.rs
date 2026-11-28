@@ -1085,7 +1085,26 @@ impl Shell {
         let Some(workspace) = self.active_workspace(cx) else {
             return;
         };
-        let Some(cwd) = self.data.terminal_cwd(workspace, cx) else {
+        let remote = match self.remote_chat_binding(workspace, cx) {
+            Ok(remote) => remote,
+            Err(error) => {
+                self.owner.update(cx, |owner, cx| {
+                    owner.error = Some(format!("Start remote chat: {error:#}"));
+                    cx.notify();
+                });
+                return;
+            }
+        };
+        let cwd = remote
+            .as_ref()
+            .and_then(|_| {
+                self.owner
+                    .read(cx)
+                    .iced_workspace(workspace)
+                    .map(|w| std::path::PathBuf::from(&w.dir))
+            })
+            .or_else(|| self.data.terminal_cwd(workspace, cx));
+        let Some(cwd) = cwd else {
             return;
         };
         let Some(preview) = self.owner.read(cx).preview() else {
@@ -1096,6 +1115,7 @@ impl Shell {
             Some(saved) => chat::ChatPane::history(shutdown, saved, window, cx),
             None => chat::ChatPane::new(shutdown, preview, cwd, window, cx),
         });
+        view.update(cx, |view, cx| view.bind_remote(remote, cx));
         let target = view.read(cx).target();
         let owner = self.owner.clone();
         self._subscriptions.push(

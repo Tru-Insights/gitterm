@@ -3617,7 +3617,7 @@ mod live_writes {
     #[gpui::test]
     fn only_task_writes_open(cx: &mut TestAppContext) {
         let _test_app = crate::test_app::Cleanup::new(cx);
-        use gitterm_core::preview::service::{RunnerEffect, preview_notice};
+        use gitterm_core::preview::service::RunnerEffect;
         if child("only_task_writes_open") {
             return;
         }
@@ -3633,7 +3633,9 @@ mod live_writes {
                 &sender,
                 TaskControlOperation::MergePlanSet(req(json!({"entries": []})))
             ),
-            Err(preview_notice("merge_plan_set"))
+            // Go-live 13 opens merge plans in Live: the write reaches its
+            // handler, which refuses a caller with no GitTerm tab on this Mac.
+            Err("merge_plan_set: no GitTerm tab on this Mac has session caller; merge plans are for this Mac's chats".into())
         );
         owner.read_with(cx, |owner, _| {
             for effect in [RunnerEffect::RestoreSession, RunnerEffect::NotifyIngress] {

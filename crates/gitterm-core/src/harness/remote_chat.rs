@@ -114,7 +114,7 @@ impl RemoteClaudeChatStart {
 /// followed by `ProcessExited { code: None }`. Either way, failing to
 /// reach the agent at all does too.
 pub fn spawn_remote(
-    backend: RemoteAgentBackend,
+    backend: impl RemoteChatTransport,
     config: ClaudeSessionConfig,
 ) -> (Session, mpsc::UnboundedReceiver<HarnessEvent>) {
     remote(backend, config, None)
@@ -127,7 +127,7 @@ pub fn spawn_remote(
 /// message starts one as usual. `config` is the tab's own, for the
 /// start that follows such an exit. Otherwise as `spawn_remote`.
 pub fn attach_remote(
-    backend: RemoteAgentBackend,
+    backend: impl RemoteChatTransport,
     config: ClaudeSessionConfig,
     chat_id: String,
 ) -> (Session, mpsc::UnboundedReceiver<HarnessEvent>) {
@@ -135,7 +135,7 @@ pub fn attach_remote(
 }
 
 fn remote(
-    backend: RemoteAgentBackend,
+    backend: impl RemoteChatTransport,
     config: ClaudeSessionConfig,
     chat_id: Option<String>,
 ) -> (Session, mpsc::UnboundedReceiver<HarnessEvent>) {
@@ -182,8 +182,9 @@ const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 /// the connection lost.
 const SHUTDOWN_DELIVERY_WINDOW: Duration = Duration::from_secs(15);
 
-// Only the wire transport is substituted by synthetic-stream tests.
-trait RemoteChatTransport {
+/// Remote wire boundary. Frontends may substitute synthetic streams without a server.
+#[allow(async_fn_in_trait)]
+pub trait RemoteChatTransport: Send + 'static {
     fn config(&self) -> &RemoteAgentClientConfig;
     async fn handshake(&self) -> Result<RemoteAgentHandshake, RemoteAgentClientError>;
     async fn claude_chat_attach(

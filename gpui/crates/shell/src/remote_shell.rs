@@ -1021,6 +1021,43 @@ impl Shell {
         })
     }
 
+    pub(crate) fn remote_chat_binding(
+        &mut self,
+        workspace: crate::WorkspaceId,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<Option<crate::chat::remote::Binding>> {
+        if !self.live_chat_enabled(cx) {
+            return Ok(None);
+        }
+        let location = self
+            .owner
+            .read(cx)
+            .iced_workspace(workspace)
+            .and_then(|w| self.remote_agent_location(w));
+        let Some(WorkspaceLocationConfig::RemoteAgent { remote_id, .. }) = location else {
+            anyhow::ensure!(
+                !self
+                    .owner
+                    .read(cx)
+                    .iced_workspace(workspace)
+                    .is_some_and(|w| w.is_legacy_remote()),
+                "This remote workspace has no configured agent for native chats"
+            );
+            return Ok(None);
+        };
+        let agent = self
+            .fresh_remote_launch_config(&remote_id, cx)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No remote agent named {remote_id} is configured in remote-agents.json."
+                )
+            })?;
+        Ok(Some(crate::chat::remote::Binding {
+            agent,
+            client: self.remote.client.clone(),
+        }))
+    }
+
     fn fresh_remote_launch_config(
         &mut self,
         id: &str,
@@ -1052,7 +1089,12 @@ impl Shell {
             return;
         }
         if !self.live_chat_enabled(cx) {
-            self.preview_unavailable("Remote terminal", cx);
+            let label = match kind {
+                launch::SessionKind::Shell => "Shell",
+                launch::SessionKind::Codex => "Codex",
+                launch::SessionKind::Claude => "Claude",
+            };
+            self.chrome_unavailable(label, cx);
             return;
         }
         let Some(config) = self.active_remote_session(cx) else {
