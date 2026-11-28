@@ -701,6 +701,7 @@ impl crate::Shell {
             }
             O::ShowMachineChats(key) => self.show_machine_chats(&key, window, cx),
             O::PairPhone(key) => self.open_phone_panel(&key, window, cx),
+            outcome => self.repo_bar_outcome(outcome, window, cx),
         }
     }
     pub(crate) fn spine_outcome(
