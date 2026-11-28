@@ -50,6 +50,7 @@ fn settle(sidebar: &Entity<WorkSidebar>, cx: &mut gpui::VisualTestContext) {
 
 #[gpui::test]
 fn active_login_read_off_thread_and_used_by_own_pr_rule(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (reader, calls) = fake_reader(Ok("Example-Dev".into()));
     let (sidebar, cx, _) = open_panel(cx);
     sidebar.update(cx, |s, cx| {
@@ -79,6 +80,7 @@ fn active_login_read_off_thread_and_used_by_own_pr_rule(cx: &mut gpui::TestAppCo
 
 #[gpui::test]
 fn confirm_panel_shows_login_like_iced(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (reader, _) = fake_reader(Ok("Example-Dev".into()));
     let (sidebar, cx, _) = open_panel(cx);
     sidebar.update(cx, |s, cx| {
@@ -97,6 +99,7 @@ fn confirm_panel_shows_login_like_iced(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn gh_failure_leaves_none_and_logs_once(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let denied = "gh api user: HTTP 401: Bad credentials".to_string();
     let (reader, calls) = fake_reader(Err(denied));
     let (sidebar, cx, _) = open_panel(cx);
@@ -122,6 +125,7 @@ fn gh_failure_leaves_none_and_logs_once(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn default_test_sidebar_never_reads_gh(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (sidebar, cx, _) = open_panel(cx);
     // Leave the default reader in place and count calls through a wrapper
     // that delegates to it.

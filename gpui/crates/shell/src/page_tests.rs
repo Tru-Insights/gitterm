@@ -53,6 +53,7 @@ pub(super) fn page(
 
 #[gpui::test]
 fn page_header_opens_in_browser_and_close_or_escape_return_to_the_session(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = super::h4_tests::fixture(cx);
     let (workspace, session) = cx.read(|cx| {
         let state = shell.read(cx).active(cx);
@@ -99,6 +100,7 @@ fn page_header_opens_in_browser_and_close_or_escape_return_to_the_session(cx: &m
 
 #[gpui::test]
 fn pages_reuse_or_rebuild_by_store_and_refuse_non_http_urls(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = super::h4_tests::fixture(cx);
     let first = "https://github.com/example/gitterm/pull/1";
     let second = "https://github.com/example/gitterm/pull/2";
@@ -160,6 +162,7 @@ fn same(
 
 #[gpui::test]
 fn page_links_follow_the_shared_decision(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = super::h4_tests::fixture(cx);
     let first = "https://github.com/example/gitterm/pull/1";
     open(&shell, first, PageStore::Default, cx);
@@ -202,6 +205,7 @@ fn page_links_follow_the_shared_decision(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn a_closed_page_stays_hidden_and_reopening_reuses_it(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = super::h4_tests::fixture(cx);
     let first = "https://github.com/example/gitterm/pull/1";
     let login = PageStore::GitHub("sample-login".into());

@@ -2073,6 +2073,7 @@ mod live_tests {
     use super::*;
     #[gpui::test]
     fn live_uses_direct_store_shared_namespace_and_no_fixture_jobs(cx: &mut gpui::TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();

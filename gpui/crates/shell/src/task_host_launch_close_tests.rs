@@ -61,6 +61,7 @@ fn report(launches: &Launches, task: &str, session: &str, status: &str, cx: &mut
 /// and the task, with no other live session, stops.
 #[gpui::test]
 fn closing_an_adopted_task_pane_stops_its_task(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let config = tempfile::tempdir().unwrap();
@@ -108,6 +109,7 @@ fn closing_an_adopted_task_pane_stops_its_task(cx: &mut TestAppContext) {
 /// into the terminal clears it, as Iced's input does.
 #[gpui::test]
 fn a_blocked_worker_pane_needs_the_user_until_typed_into(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     launches.runs.owner.update(cx, |owner, _| {
@@ -163,6 +165,7 @@ fn a_blocked_worker_pane_needs_the_user_until_typed_into(cx: &mut TestAppContext
 /// the worker reports, the tick closes nothing.
 #[gpui::test]
 fn a_final_worker_pane_closes_after_its_result_went_out(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     launches.runs.owner.update(cx, |owner, _| {
@@ -275,6 +278,7 @@ fn stop_and_close(
 /// active and the dock shows.
 #[gpui::test]
 fn closing_a_task_pane_lands_on_its_sibling(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let (a, b) = (launches.create(cx), launches.create(cx));
     let config = tempfile::tempdir().unwrap();
@@ -302,6 +306,7 @@ fn closing_a_task_pane_lands_on_its_sibling(cx: &mut TestAppContext) {
 /// selected (its overview).
 #[gpui::test]
 fn closing_a_task_s_last_pane_lands_on_its_overview(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let (a, b) = (launches.create(cx), launches.create(cx));
     let config = tempfile::tempdir().unwrap();
@@ -327,6 +332,7 @@ fn closing_a_task_s_last_pane_lands_on_its_overview(cx: &mut TestAppContext) {
 /// first tab (`unwrap_or(0)`); the Tasks rail opens with the task selected.
 #[gpui::test]
 fn closing_a_task_s_last_pane_with_no_general_pane_lands_on_the_first(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let (a, b) = (launches.create(cx), launches.create(cx));
     let config = tempfile::tempdir().unwrap();
@@ -400,6 +406,7 @@ fn select_and_close(
 /// normal pane keeps its index, so the pane to its right is active and shown.
 #[gpui::test]
 fn closing_the_middle_normal_pane_lands_on_the_right_one(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let config = tempfile::tempdir().unwrap();
     let (shell, vcx, [_, b, c]) = three_normal_panes(&launches, config.path(), cx);
@@ -410,6 +417,7 @@ fn closing_the_middle_normal_pane_lands_on_the_right_one(cx: &mut TestAppContext
 /// Closing the last normal pane lands on the new last one.
 #[gpui::test]
 fn closing_the_last_normal_pane_lands_on_the_new_last(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let config = tempfile::tempdir().unwrap();
     let (shell, vcx, [_, b, c]) = three_normal_panes(&launches, config.path(), cx);
@@ -422,6 +430,7 @@ fn closing_the_last_normal_pane_lands_on_the_new_last(cx: &mut TestAppContext) {
 /// active one shifts its active tab one to the right; GPUI keeps the pane.)
 #[gpui::test]
 fn closing_an_inactive_normal_pane_keeps_the_active_one(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let config = tempfile::tempdir().unwrap();
     let (shell, vcx, [a, b, c]) = three_normal_panes(&launches, config.path(), cx);
@@ -461,6 +470,7 @@ fn blocked_worker<'a>(
 /// launched pane needing input counts once, as needs-you, until typed into.
 #[gpui::test]
 fn a_blocked_worker_pane_counts_in_the_workspace_bar(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let config = tempfile::tempdir().unwrap();
     let (shell, vcx, _, _) = blocked_worker(&launches, config.path(), cx);
@@ -486,6 +496,7 @@ fn a_blocked_worker_pane_counts_in_the_workspace_bar(cx: &mut TestAppContext) {
 /// pane's dock title leads with it while the worker needs input.
 #[gpui::test]
 fn a_blocked_worker_pane_title_shows_the_needs_you_glyph(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let config = tempfile::tempdir().unwrap();
     let (shell, vcx, _, session) = blocked_worker(&launches, config.path(), cx);
@@ -510,6 +521,7 @@ fn a_blocked_worker_pane_title_shows_the_needs_you_glyph(cx: &mut TestAppContext
 /// before its next report.
 #[gpui::test]
 fn typing_into_a_blocked_worker_makes_it_working(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let config = tempfile::tempdir().unwrap();
     let (shell, vcx, task, session) = blocked_worker(&launches, config.path(), cx);

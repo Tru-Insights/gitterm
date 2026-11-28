@@ -1663,6 +1663,7 @@ mod action_tests {
     fn live_open_uses_the_saved_tab_identity_without_duplicate_restoration(
         cx: &mut TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         let (root, shell, cx) = crate::h5_tests::fixture(cx);
         let main = root.path().join("work");
         let linked = root.path().join("linked");
@@ -1857,6 +1858,7 @@ mod action_tests {
     fn review_regression_f5_open_after_restart_focuses_imported_worktree_tab(
         cx: &mut TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let (root, _, linked) = saved_worktree_fixture();
@@ -1928,6 +1930,7 @@ mod action_tests {
     async fn review_regression_f6_adoption_persists_document_and_gpui_terminal_anchors(
         cx: &mut TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         use crate::task_host::{GpuiTaskHost, HostConfig, Ingress, TaskHostOwner};
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
@@ -2071,6 +2074,7 @@ mod action_tests {
 
     #[gpui::test]
     fn force_is_offered_only_for_a_failed_normal_removal(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         let path = PathBuf::from("/fixture/linked");
         let view = cx.new(|cx| GitView::new(WorkspaceId(1), Rc::new(crate::data::SampleData), cx));
         view.update(cx, |view, cx| {

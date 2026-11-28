@@ -176,6 +176,7 @@ fn launch_live(
 
 #[gpui::test]
 fn live_workers_launch_record_identity_and_restart_without_adoption(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_workers_launch_record_identity_and_restart_without_adoption") {
         return;
     }
@@ -306,6 +307,7 @@ fn live_workers_launch_record_identity_and_restart_without_adoption(cx: &mut Tes
 
 #[gpui::test]
 fn live_plan_hold_and_queue_promotion(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_plan_hold_and_queue_promotion") {
         return;
     }
@@ -335,6 +337,7 @@ fn live_plan_hold_and_queue_promotion(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn live_save_failure_stops_unpublished_fake(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_save_failure_stops_unpublished_fake") {
         return;
     }
@@ -412,6 +415,7 @@ fn open_live_caller(
 
 #[gpui::test]
 fn live_review_consult_match_iced_runner_argv_env_cwd(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_review_consult_match_iced_runner_argv_env_cwd") {
         return;
     }
@@ -498,6 +502,7 @@ fn live_review_consult_match_iced_runner_argv_env_cwd(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn live_delegate_final_stop_grace_and_reused_identity_refusal(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_delegate_final_stop_grace_and_reused_identity_refusal") {
         return;
     }
@@ -575,6 +580,7 @@ fn live_delegate_final_stop_grace_and_reused_identity_refusal(cx: &mut TestAppCo
 
 #[gpui::test]
 fn live_attach_failure_stops_unpublished_fake(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_attach_failure_stops_unpublished_fake") {
         return;
     }
@@ -656,6 +662,7 @@ fn live_attach_failure_stops_unpublished_fake(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn live_worker_deadline_uses_iced_time_limit_result_and_stop(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_worker_deadline_uses_iced_time_limit_result_and_stop") {
         return;
     }
@@ -725,6 +732,7 @@ fn live_worker_deadline_uses_iced_time_limit_result_and_stop(cx: &mut TestAppCon
 
 #[gpui::test]
 fn live_worker_terminal_can_request_consult_and_delegate(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_worker_terminal_can_request_consult_and_delegate") {
         return;
     }
@@ -813,6 +821,7 @@ fn live_worker_terminal_can_request_consult_and_delegate(cx: &mut TestAppContext
 
 #[gpui::test]
 fn live_worker_notify_releases_slot_but_imported_notify_stays_closed(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_worker_notify_releases_slot_but_imported_notify_stays_closed") {
         return;
     }
@@ -866,6 +875,7 @@ fn live_worker_notify_releases_slot_but_imported_notify_stays_closed(cx: &mut Te
 
 #[gpui::test]
 fn live_observed_limits_hold_later_launches(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_observed_limits_hold_later_launches") {
         return;
     }
@@ -935,6 +945,7 @@ fn live_observed_limits_hold_later_launches(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn live_notify_idle_input_reclaims_worker_capacity(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_notify_idle_input_reclaims_worker_capacity") {
         return;
     }
@@ -972,6 +983,7 @@ fn live_notify_idle_input_reclaims_worker_capacity(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn live_explicit_relaunch_attaches_saved_worker_constraints(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_explicit_relaunch_attaches_saved_worker_constraints") {
         return;
     }
