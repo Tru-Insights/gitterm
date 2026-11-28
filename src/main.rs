@@ -6544,10 +6544,6 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
 fn format_bytes(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = 1024.0 * 1024.0;
@@ -8572,23 +8568,8 @@ impl TerminalRedrawQueue {
     }
 }
 
-use gitterm_core::remote::token::expand_home_path;
-
 fn remote_session_definition_from_config(config: &RemoteSessionConfig) -> RemoteSessionDefinition {
-    RemoteSessionDefinition {
-        host: RemoteHostConfig {
-            name: config.host_name.clone(),
-            ssh_target: config.ssh_target.clone(),
-            identity_file: expand_home_path(&config.identity_file),
-            tmux_path: config.tmux_path.clone(),
-        },
-        label: config.label.clone(),
-        session_name: config.session_name.clone(),
-        remote_dir: config.remote_dir.clone(),
-        shell_command: config.shell_command.clone(),
-        codex_command: config.codex_command.clone(),
-        claude_command: config.claude_command.clone(),
-    }
+    config.into()
 }
 
 fn remote_session_config_from_definition(
@@ -8693,18 +8674,7 @@ fn remote_tab_title_for_startup_command(
     session: &RemoteSessionDefinition,
     startup_command: Option<&str>,
 ) -> String {
-    let Some(startup_command) = startup_command else {
-        return "Shell".to_string();
-    };
-    if startup_command.contains(&remote_codex_session_name(session)) {
-        "Codex".to_string()
-    } else if startup_command.contains(&remote_claude_session_name(session)) {
-        "Claude".to_string()
-    } else if startup_command.contains(&session.session_name) {
-        "Shell".to_string()
-    } else {
-        "Remote".to_string()
-    }
+    gitterm_core::remote::launch::tab_title(session, startup_command)
 }
 
 fn default_remote_session_definitions() -> Vec<RemoteSessionDefinition> {
@@ -9117,16 +9087,7 @@ pub use gitterm_core::remote::ssh_sessions::{
     RemoteHostConfig, RemoteSessionEntry, RemoteSessionsSnapshot,
 };
 
-#[derive(Debug, Clone)]
-pub struct RemoteSessionDefinition {
-    host: RemoteHostConfig,
-    label: String,
-    session_name: String,
-    remote_dir: String,
-    shell_command: String,
-    codex_command: Option<String>,
-    claude_command: Option<String>,
-}
+pub use gitterm_core::remote::launch::RemoteSessionDefinition;
 
 #[derive(Debug, Clone)]
 pub struct DiffSnapshot {
@@ -21128,7 +21089,12 @@ impl App {
                     if tab_config.startup_command.is_some() {
                         // Legacy SSH/tmux terminal tab: keeps its
                         // remote session dir purely for display.
-                        let local_cwd = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+                        let local_cwd = gitterm_core::remote::launch::restored_terminal_paths(
+                            true,
+                            tab_config,
+                            dirs::home_dir(),
+                        )
+                        .cwd;
                         self.add_tab_to_workspace_with_command(
                             &mut workspace,
                             local_cwd,
@@ -21180,22 +21146,10 @@ impl App {
                     remote_agent_files_tab_added = true;
                     continue;
                 }
-                let tab_dir = PathBuf::from(&tab_config.dir);
-                let repo_dir = tab_config
-                    .repo_dir
-                    .as_ref()
-                    .map(PathBuf::from)
-                    .or_else(|| {
-                        Repository::discover(&tab_dir)
-                            .ok()
-                            .and_then(|repo| repo.workdir().map(PathBuf::from))
-                    })
-                    .unwrap_or_else(|| tab_dir.clone());
-                let current_dir = if tab_dir.is_dir() {
-                    tab_dir
-                } else {
-                    repo_dir.clone()
-                };
+                let gitterm_core::remote::launch::TerminalPaths {
+                    cwd: repo_dir,
+                    current_dir,
+                } = gitterm_core::remote::launch::restored_terminal_paths(false, tab_config, None);
                 // Fixed before the terminal starts so the Codex
                 // notify hook can carry the session identity.
                 let restored_task_session_id = tab_config.task_id.as_ref().map(|_| {
@@ -22081,44 +22035,6 @@ impl App {
             .and_then(|ws| self.remote_agent_id_for_workspace(ws))
             .map(str::to_string)
             .and_then(|remote_id| self.fresh_remote_agent_config(&remote_id));
-        // Preset names like "Claude Code" resolve by full lowercased name,
-        // then by first word ("claude"), against the remote's configured
-        // session_commands; the last resort is the first word on the
-        // remote PATH.
-        let normalized = preset_name.as_deref().map(|name| {
-            let full = name.to_lowercase();
-            let first_word = full
-                .split_whitespace()
-                .next()
-                .unwrap_or("shell")
-                .to_string();
-            (full, first_word)
-        });
-        let kind = normalized
-            .as_ref()
-            .map(|(_, first_word)| first_word.clone())
-            .unwrap_or_else(|| "shell".to_string());
-        let remote_command = match (&normalized, &agent_config) {
-            (Some((full, first_word)), Some(config)) => config
-                .session_commands
-                .get(full)
-                .or_else(|| config.session_commands.get(first_word))
-                .cloned()
-                .unwrap_or_else(|| first_word.clone()),
-            (Some((_, first_word)), None) => first_word.clone(),
-            (None, Some(config)) => config
-                .shell_command
-                .clone()
-                .unwrap_or_else(|| "/bin/zsh -il".to_string()),
-            (None, None) => "/bin/zsh -il".to_string(),
-        };
-        // A Claude launch on the remote gets the workspace's Claude in
-        // Chrome choice too (TRU-181); other commands are unchanged.
-        let remote_command = gitterm::harness::claude::configure_terminal_chrome(
-            &remote_command,
-            self.active_workspace()
-                .is_some_and(|ws| ws.claude_in_chrome),
-        );
         // Start the session in the directory the user is browsing — but
         // only when that browser state belongs to this source (an attach
         // tab's browser is local and would be meaningless on the remote).
@@ -22127,24 +22043,32 @@ impl App {
             root: root.clone(),
             client: client.clone(),
         };
-        let cwd = self
+        let remote_browser_dir = self
             .active_tab()
             .map(|tab| tab.files.dir.clone())
             .filter(|dir| source_for_cwd.owns(dir))
-            .map(|dir| dir.display())
-            .unwrap_or_else(|| root.clone());
+            .map(|dir| dir.display());
+        let launch = gitterm_core::remote::launch::agent_session_launch(
+            preset_name.as_deref(),
+            agent_config.as_ref(),
+            &root,
+            remote_browser_dir.as_deref(),
+            self.active_workspace()
+                .is_some_and(|ws| ws.claude_in_chrome),
+        );
+        let kind = launch.kind.clone();
 
         Task::perform(
             async move {
                 RemoteAgentBackend::new(client)
                     .start_session(
                         workspace_id,
-                        cwd,
+                        launch.cwd,
                         kind.clone(),
-                        vec!["/bin/sh".to_string(), "-lc".to_string(), remote_command],
-                        Vec::new(),
-                        120,
-                        32,
+                        launch.command,
+                        launch.env,
+                        launch.cols,
+                        launch.rows,
                     )
                     .await
                     .map(|session| (session.session_id, kind, None))
@@ -22161,21 +22085,10 @@ impl App {
         let workspace = self.active_workspace()?;
         let remote_id = self.remote_agent_id_for_workspace(workspace)?.to_string();
         let config = self.fresh_remote_agent_config(&remote_id)?;
-        let token_ref = match &config.auth {
-            config::RemoteAgentAuthConfig::Token { token_ref } => token_ref.clone(),
-        };
-        let agent_bin = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join("gitterm-v6-agent")))
-            .filter(|path| path.exists())
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|| "gitterm-v6-agent".to_string());
-        Some(format!(
-            "{} attach --endpoint {} --token-ref {} --session {}",
-            shell_quote(&agent_bin),
-            shell_quote(&config.endpoint),
-            shell_quote(&token_ref),
-            shell_quote(session_id),
+        Some(gitterm_core::remote::launch::remote_session_attach_command(
+            &gitterm_core::remote::launch::agent_binary(),
+            &config,
+            session_id,
         ))
     }
 
@@ -23167,27 +23080,14 @@ impl App {
     }
 
     fn remote_attach_command(
-        &self,
         session: &RemoteSessionDefinition,
         tmux_session_name: &str,
         startup_command: &str,
     ) -> String {
-        let remote_script = format!(
-            "SESSION={}; DIR={}; {} has-session -t \"$SESSION\" 2>/dev/null || {} new-session -d -s \"$SESSION\" -c \"$DIR\" {}; {} set-option -t \"$SESSION\" mouse on >/dev/null 2>&1 || true; exec {} attach -t \"$SESSION\"",
-            shell_quote(tmux_session_name),
-            shell_quote(&session.remote_dir),
-            shell_quote(&session.host.tmux_path),
-            shell_quote(&session.host.tmux_path),
-            shell_quote(startup_command),
-            shell_quote(&session.host.tmux_path),
-            shell_quote(&session.host.tmux_path),
-        );
-
-        format!(
-            "exec ssh -t -i {} -o IdentitiesOnly=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 {} {}",
-            shell_quote(session.host.identity_file.to_string_lossy().as_ref()),
-            shell_quote(&session.host.ssh_target),
-            shell_quote(&remote_script),
+        gitterm_core::remote::launch::remote_attach_command(
+            session,
+            tmux_session_name,
+            startup_command,
         )
     }
 
@@ -23199,7 +23099,7 @@ impl App {
         title_suffix: Option<&str>,
     ) -> Task<Event> {
         let startup_command =
-            self.remote_attach_command(&session, &tmux_session_name, &startup_command);
+            Self::remote_attach_command(&session, &tmux_session_name, &startup_command);
         let ws_idx = self.active_workspace_index();
         if ws_idx >= self.workspaces.len() {
             return Task::none();
@@ -23221,11 +23121,11 @@ impl App {
         }
 
         let workspace_name = self.workspaces[ws_idx].name.clone();
-        let local_cwd = if self.workspace_has_remote_identity(&self.workspaces[ws_idx]) {
-            dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
-        } else {
-            self.workspaces[ws_idx].dir.clone()
-        };
+        let local_cwd = gitterm_core::remote::launch::attach_cwd(
+            self.workspace_has_remote_identity(&self.workspaces[ws_idx]),
+            &self.workspaces[ws_idx].dir,
+            dirs::home_dir(),
+        );
         let mut tab =
             self.create_tab_for_workspace(local_cwd, Some(startup_command), Some(&workspace_name));
         tab.status
@@ -23239,43 +23139,31 @@ impl App {
     }
 
     fn open_remote_session_tab(&mut self, session_name: &str) -> Task<Event> {
-        let Some(session) = self
-            .active_workspace()
-            .and_then(|workspace| self.remote_session_for_workspace(workspace))
-            .filter(|def| def.session_name == session_name)
-            .cloned()
-        else {
-            return Task::none();
-        };
-        self.open_remote_session_tab_with_command(
-            session.clone(),
-            session.session_name.clone(),
-            session.shell_command.clone(),
-            None,
+        self.open_remote_session_kind(
+            session_name,
+            gitterm_core::remote::launch::SessionKind::Shell,
         )
     }
 
     fn open_remote_codex_session_tab(&mut self, session_name: &str) -> Task<Event> {
-        let Some(session) = self
-            .active_workspace()
-            .and_then(|workspace| self.remote_session_for_workspace(workspace))
-            .filter(|def| def.session_name == session_name)
-            .cloned()
-        else {
-            return Task::none();
-        };
-        let Some(codex_command) = session.codex_command.clone() else {
-            return Task::none();
-        };
-        self.open_remote_session_tab_with_command(
-            session.clone(),
-            remote_codex_session_name(&session),
-            codex_command,
-            Some("Codex"),
+        self.open_remote_session_kind(
+            session_name,
+            gitterm_core::remote::launch::SessionKind::Codex,
         )
     }
 
     fn open_remote_claude_session_tab(&mut self, session_name: &str) -> Task<Event> {
+        self.open_remote_session_kind(
+            session_name,
+            gitterm_core::remote::launch::SessionKind::Claude,
+        )
+    }
+
+    fn open_remote_session_kind(
+        &mut self,
+        session_name: &str,
+        kind: gitterm_core::remote::launch::SessionKind,
+    ) -> Task<Event> {
         let Some(session) = self
             .active_workspace()
             .and_then(|workspace| self.remote_session_for_workspace(workspace))
@@ -23284,15 +23172,12 @@ impl App {
         else {
             return Task::none();
         };
-        let Some(claude_command) = session.claude_command.clone() else {
+        let Some((name, command, title)) =
+            gitterm_core::remote::launch::session_command(&session, kind)
+        else {
             return Task::none();
         };
-        self.open_remote_session_tab_with_command(
-            session.clone(),
-            remote_claude_session_name(&session),
-            claude_command,
-            Some("Claude"),
-        )
+        self.open_remote_session_tab_with_command(session, name, command, Some(title))
     }
 
     fn any_tab_requires_attention_pulse(&self) -> bool {
@@ -53511,6 +53396,28 @@ mod tests {
         assert!(summary.starts_with("could not focus managed browser"));
         assert!(summary.ends_with('…'));
         assert!(summary.chars().count() <= 41);
+    }
+
+    #[test]
+    fn golive19_iced_remote_command_pin() {
+        let session = RemoteSessionDefinition {
+            host: RemoteHostConfig {
+                name: "Placeholder".into(),
+                ssh_target: "user@remote.example".into(),
+                identity_file: PathBuf::from("/tmp/placeholder key"),
+                tmux_path: "/opt/bin/tmux".into(),
+            },
+            label: "Placeholder".into(),
+            session_name: "placeholder".into(),
+            remote_dir: "/srv/project folder".into(),
+            shell_command: "/bin/zsh -il".into(),
+            codex_command: None,
+            claude_command: None,
+        };
+        assert_eq!(
+            App::remote_attach_command(&session, "placeholder", "/bin/zsh -il"),
+            r#"exec ssh -t -i '/tmp/placeholder key' -o IdentitiesOnly=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 'user@remote.example' 'SESSION='\''placeholder'\''; DIR='\''/srv/project folder'\''; '\''/opt/bin/tmux'\'' has-session -t "$SESSION" 2>/dev/null || '\''/opt/bin/tmux'\'' new-session -d -s "$SESSION" -c "$DIR" '\''/bin/zsh -il'\''; '\''/opt/bin/tmux'\'' set-option -t "$SESSION" mouse on >/dev/null 2>&1 || true; exec '\''/opt/bin/tmux'\'' attach -t "$SESSION"'"#
+        );
     }
 
     fn test_remote_session() -> RemoteSessionDefinition {

@@ -376,6 +376,8 @@ impl Shell {
                 }
             }
         }
+        subscriptions
+            .push(cx.on_app_quit(|shell: &mut Self, cx| shell.save_remote_tabs_on_quit(cx)));
         subscriptions.push(cx.observe(&owner, |this, _, cx| {
             for workspace in &this.workspaces {
                 for pane in workspace.panes.values() {
@@ -1120,6 +1122,21 @@ impl Shell {
         self.show_pane(&pane_id, window, cx);
     }
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.launch_remote_agent_terminal(None, window, cx) {
+            return;
+        }
+        if self
+            .active_workspace(cx)
+            .and_then(|id| self.owner.read(cx).iced_workspace(id))
+            .is_some_and(|saved| saved.is_legacy_remote())
+        {
+            self.open_remote_session_terminal(
+                gitterm_core::remote::launch::SessionKind::Shell,
+                window,
+                cx,
+            );
+            return;
+        }
         self.new_terminal_in(DockPlacement::Center, window, cx);
     }
     fn new_terminal_in(
@@ -1690,6 +1707,10 @@ fn build_workspace(
     let imported = data
         .local_owner()
         .is_some_and(|owner| owner.read(cx).iced_workspace(workspace.id).is_some());
+    let live_remote = cx.try_global::<task_host::GpuiTaskHost>().is_some_and(|host| host.0.read(cx).is_live())
+        && data.local_owner().is_some_and(|owner| owner.read(cx).iced_workspace(workspace.id).is_some_and(|saved| {
+            saved.is_legacy_remote() || matches!(saved.location, Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. }))
+        }));
     let sessions = if imported {
         let mut sessions = data.sessions(workspace.id, cx);
         let mut terminals = store
@@ -1703,7 +1724,11 @@ fn build_workspace(
             })
             .unwrap_or_default();
         terminals.retain(|terminal| {
-            !session_ids.contains(&terminal.id) && !sessions.iter().any(|s| s.id.0 == terminal.id)
+            // Live remote main tabs restore only from Iced's saved DTOs.
+            // Dock copies use different ids and would attach a second bridge.
+            (!live_remote || terminal.bottom)
+                && !session_ids.contains(&terminal.id)
+                && !sessions.iter().any(|s| s.id.0 == terminal.id)
         });
         sessions.extend(terminals.iter().map(|terminal| {
             Session {
@@ -1901,6 +1926,7 @@ fn adopt_view(
             _ = cwd_pane.update(cx, |pane, cx| {
                 if pane.session.as_ref() == Some(&cwd_target) {
                     pane.terminal_cwd = Some(cwd.into());
+                    pane.terminal_saved_dir = None;
                     cx.notify();
                 }
             });

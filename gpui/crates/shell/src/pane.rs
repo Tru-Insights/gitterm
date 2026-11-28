@@ -57,6 +57,8 @@ pub struct Pane {
     pub(crate) exited: bool,
     pub(crate) exit_pending: bool,
     pub(crate) terminal_cwd: Option<std::path::PathBuf>,
+    /// Iced's restored tracked cwd, until the local shell reports a new cwd.
+    pub(crate) terminal_saved_dir: Option<std::path::PathBuf>,
     workspace: WorkspaceId,
     data: Rc<dyn ShellData>,
     focus: FocusHandle,
@@ -186,6 +188,7 @@ impl Pane {
                                         return;
                                     }
                                     pane.terminal_cwd = Some(cwd.to_path_buf());
+                                    pane.terminal_saved_dir = None;
                                     cx.notify();
                                 });
                             })
@@ -272,6 +275,7 @@ impl Pane {
             exited: false,
             exit_pending: false,
             terminal_cwd,
+            terminal_saved_dir: None,
             workspace,
             data: data.clone(),
             focus: cx.focus_handle(),
