@@ -7,6 +7,7 @@ pub enum TranscriptAction {
     OpenFile {
         path: PathBuf,
         review: bool,
+        line: Option<usize>,
     },
     OpenWorker {
         id: String,

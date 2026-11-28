@@ -27906,8 +27906,7 @@ impl App {
                     return Task::none();
                 };
                 // Open a file in $EDITOR (fallback: vim) in a new tab
-                let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
-                let cmd = format!("{} \"{}\"", editor, path.display());
+                let cmd = editor::terminal_command(std::env::var("EDITOR").ok().as_deref(), &path);
                 if let Some(ws) = self.active_workspace() {
                     let dir = ws
                         .active_tab()
