@@ -16,6 +16,28 @@ use gitterm_core::workspace;
 use gpui::{SharedString, div, prelude::*, px, rgb};
 use gpui_component::tooltip::Tooltip;
 
+/// Iced's Usage rail uses the persisted presentation level, never recomputes
+/// routing or writes a new badge candidate from a render.
+pub(crate) fn usage_chrome(
+    file: &gitterm_core::plan_limits::PlanLimitsFile,
+    now: i64,
+    colors: Colors,
+) -> (String, Option<News>) {
+    use gitterm_core::plan_limits::{self, UsageBadgeLevel};
+    let badge = match file.usage_badge.level {
+        UsageBadgeLevel::Hot => Some(News {
+            label: "hot".into(),
+            color: colors.yellow,
+        }),
+        UsageBadgeLevel::Urgent => Some(News {
+            label: "urgent".into(),
+            color: colors.red,
+        }),
+        UsageBadgeLevel::OnTrack => None,
+    };
+    (plan_limits::usage_tooltip(file, now, &chrono::Local), badge)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Target {
     Tab(u64),
@@ -355,6 +377,7 @@ pub fn render(input: &Input, c: Colors, emit: Handler<Outcome>) -> gpui::Statefu
         usage = usage.child(
             div()
                 .font_family(crate::theme::LABEL_FONT)
+                .h(px(12.))
                 .text_size(px(9.))
                 .text_color(rgb(badge.color))
                 .child(badge.label.clone()),
@@ -603,6 +626,7 @@ mod tests {
     }
     #[gpui::test]
     fn dot_click_jumps_option_click_selects_and_usage_toggles(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let events = Rc::new(RefCell::new(vec![]));
@@ -635,6 +659,76 @@ mod tests {
                 Outcome::SelectWorkspace(WorkspaceId(2)),
                 Outcome::ToggleUsage
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    use gitterm_core::plan_limits::{self, PlanLimitsFile, UsageBadgeLevel};
+
+    #[test]
+    fn tru274_usage_badge_thresholds_and_tooltip_match_iced() {
+        const NOW: i64 = 1_800_000_000;
+        let colors = Colors::new(true);
+        let mut file: PlanLimitsFile = serde_json::from_value(serde_json::json!({
+            "claude": {"provider":"claude", "observed_at":NOW, "local":true, "windows":[{"label":"7d", "used_percent":35.0, "resets_at":NOW + 5 * 86400}]}
+        })).unwrap();
+        let hot = plan_limits::evaluate_policy(&file, NOW);
+        file.usage_badge.observe(&hot.policy, &hot.report, NOW);
+        assert_eq!(usage_chrome(&file, NOW, colors).1, None);
+        file.usage_badge.observe(&hot.policy, &hot.report, NOW + 59);
+        assert_eq!(usage_chrome(&file, NOW, colors).1, None);
+        file.usage_badge.observe(&hot.policy, &hot.report, NOW + 60);
+        assert_eq!(file.usage_badge.level, UsageBadgeLevel::Hot);
+        assert_eq!(
+            usage_chrome(&file, NOW, colors).1,
+            Some(News {
+                label: "hot".into(),
+                color: colors.yellow
+            })
+        );
+        file.claude.as_mut().unwrap().windows[0].used_percent = Some(95.0);
+        let urgent = plan_limits::evaluate_policy(&file, NOW);
+        file.usage_badge
+            .observe(&urgent.policy, &urgent.report, NOW + 61);
+        file.usage_badge
+            .observe(&urgent.policy, &urgent.report, NOW + 121);
+        assert_eq!(file.usage_badge.level, UsageBadgeLevel::Urgent);
+        let (hint, badge) = usage_chrome(&file, NOW, colors);
+        assert_eq!(
+            badge,
+            Some(News {
+                label: "urgent".into(),
+                color: colors.red
+            })
+        );
+        let mut lines = vec!["Usage  ⌘⇧U".to_string(), "Plan usage is urgent".to_string()];
+        lines.extend(plan_limits::tooltip_lines(
+            file.claude.as_ref().unwrap(),
+            &file.history,
+            NOW,
+            &chrono::Local,
+        ));
+        assert_eq!(hint, lines.join("\n"));
+        assert!(hint.contains("Claude Code 7d  95%"));
+        assert!(hint.contains("reset"));
+        // Exact empty and unknown allowance text, independent of local timezone.
+        file = serde_json::from_value(serde_json::json!({
+            "claude": {"provider":"claude", "observed_at":NOW, "windows":[{"label":"5h", "used_percent":80.0}]},
+            "codex": {"provider":"codex", "observed_at":NOW, "windows":[{"label":"7d"}]}
+        })).unwrap();
+        assert_eq!(
+            usage_chrome(&file, NOW, colors),
+            (
+                "Usage  ⌘⇧U\nClaude Code 5h  80%\nCodex 7d  unknown".into(),
+                None
+            )
+        );
+        assert_eq!(
+            usage_chrome(&PlanLimitsFile::default(), NOW, colors),
+            ("Usage  ⌘⇧U".into(), None)
         );
     }
 }

@@ -178,11 +178,11 @@ impl Session {
     pub fn icon(&self, active: bool, pulse: bool, c: Colors) -> (&'static str, u32) {
         let needs = if pulse && !active { c.peach } else { c.yellow };
         if self.kind == SessionKind::Chat {
-            if self.pending_requests > 0 {
-                return ("● ", needs);
-            }
-            if self.running {
-                return ("▶ ", c.green);
+            use gitterm_core::attention::{ChatTabMarker, chat_tab_marker};
+            match chat_tab_marker(self.running, self.pending_requests, active) {
+                Some(ChatTabMarker::NeedsYou { .. }) => return ("● ", needs),
+                Some(ChatTabMarker::Running) => return ("▶ ", c.green),
+                None => {}
             }
         }
         match self.attention {
@@ -707,6 +707,7 @@ mod tests {
     }
     #[gpui::test]
     fn new_session_keeps_its_full_width_when_tabs_overflow(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let (view, cx) = cx.add_window_view(|_, _| View {
@@ -754,6 +755,7 @@ mod tests {
 
     #[gpui::test]
     fn clicks_emit_select_close_picker_and_workspace_close(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let events = Rc::new(RefCell::new(vec![]));
@@ -827,6 +829,7 @@ mod tests {
     fn ordinary_session_tab_keeps_iced_shortcut_and_close_without_attention(
         cx: &mut TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let (view, cx) = cx.add_window_view(|_, _| View {

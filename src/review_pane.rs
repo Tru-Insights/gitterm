@@ -32,12 +32,12 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::workspace_overview::{git_text, DiffSource, GIT_TIMEOUT};
+use crate::workspace_overview::DiffSource;
 
 pub use gitterm_core::review::viewed::{ViewedState, VIEWED_FILE};
 pub use gitterm_core::review::{budget::*, model::*, patch::*};
 
-/// Compatibility adapter retaining the desktop's atomic-write helper.
+/// Compatibility adapter for the desktop's shared viewed-marks store.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ViewedMarks(gitterm_core::review::viewed::ViewedMarks);
@@ -77,10 +77,7 @@ pub fn save_viewed_marks(
     marks: &gitterm_core::review::viewed::ViewedMarks,
     dir: &Path,
 ) -> Result<(), String> {
-    std::fs::create_dir_all(dir)
-        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
-    let json = marks.encode()?;
-    crate::merge_plan::write_atomically(&dir.join(VIEWED_FILE), &json)
+    marks.save(dir)
 }
 
 pub use gitterm_core::review::collect::{branch_commits, commit_diff_endpoints, ReviewLoad};
@@ -256,75 +253,7 @@ pub fn chat_review_path(message: &serde_json::Value) -> Result<PathBuf, String> 
     Ok(PathBuf::from(path))
 }
 
-/// The checkout `file` belongs to: its nearest ancestor holding a `.git`
-/// entry (the directory of a main checkout, or the file a linked worktree
-/// or submodule has). A worktree is its own checkout.
-pub fn checkout_containing(file: &Path) -> Option<PathBuf> {
-    file.ancestors()
-        .skip(1)
-        .find(|dir| dir.join(".git").exists())
-        .map(Path::to_path_buf)
-}
-
-/// `file` relative to `checkout`, `/`-separated as git lists it.
-pub fn checkout_relative(checkout: &Path, file: &Path) -> Result<String, String> {
-    let rel = file
-        .strip_prefix(checkout)
-        .map_err(|_| format!("{} is not inside {}", file.display(), checkout.display()))?;
-    let parts: Vec<String> = rel
-        .components()
-        .map(|part| part.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    if parts.is_empty() {
-        return Err(format!("{} is the checkout itself", file.display()));
-    }
-    Ok(parts.join("/"))
-}
-
-/// Resolves an `open_review` for `file` in `checkout`. `known` is the
-/// overview's row for the checkout when there is one (its owner and base);
-/// otherwise the checkout is read as a row would be. Never call on the UI
-/// thread.
-pub async fn resolve_edit_review(
-    checkout: PathBuf,
-    file: PathBuf,
-    known: Option<ReviewTarget>,
-) -> Result<EditReview, String> {
-    let focus = checkout_relative(&checkout, &file)?;
-    let target = match known {
-        Some(target) => target,
-        None => {
-            let facts = crate::workspace_overview::checkout_facts(&checkout).await?;
-            ReviewTarget {
-                repo: crate::workspace_overview::folder_name(&facts.repo),
-                branch: facts.branch.unwrap_or_else(|| "(detached)".to_string()),
-                owner: "opened from a chat".to_string(),
-                base: facts.base,
-                checkout,
-            }
-        }
-    };
-    let pathspec = format!(":(literal){focus}");
-    let status = git_text(
-        &target.checkout,
-        &[
-            "--no-optional-locks",
-            "status",
-            "--porcelain",
-            "--untracked-files=all",
-            "--",
-            &pathspec,
-        ],
-        GIT_TIMEOUT,
-    )
-    .await?;
-    let source = edit_review_source(!status.trim().is_empty(), target.base.is_some());
-    Ok(EditReview {
-        target,
-        source,
-        focus,
-    })
-}
+pub use gitterm_core::review::edit::{checkout_containing, checkout_relative, resolve_edit_review};
 
 // ---------------------------------------------------------------------------
 // The page.

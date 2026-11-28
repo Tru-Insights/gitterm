@@ -436,6 +436,7 @@ pub(crate) mod tests {
     }
     #[gpui::test]
     fn startup_catalog_delayed_failure_reaches_owner(cx: &mut gpui::TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         use gpui::AppContext;
         cx.background_executor.allow_parking();
         let (_dir, writer) = fixture();
@@ -482,6 +483,7 @@ pub(crate) mod tests {
     }
     #[gpui::test]
     fn quit_drains_beyond_gpui_timeout_before_later_observers(cx: &mut gpui::TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         let (_dir, writer) = fixture();
         let blocker = std::fs::OpenOptions::new()
@@ -532,6 +534,7 @@ pub(crate) mod tests {
     }
     #[gpui::test]
     fn shutdown_releases_lease_while_store_handles_are_still_alive(cx: &mut gpui::TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         let (_dir, writer) = fixture();
         let preview = PreviewContext {
@@ -554,6 +557,7 @@ pub(crate) mod tests {
     }
     #[gpui::test]
     fn normal_startup_restores_existing_terminal_sessions(cx: &mut gpui::TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         use gpui::AppContext;
         use std::{rc::Rc, time::Instant};
         cx.background_executor.allow_parking();

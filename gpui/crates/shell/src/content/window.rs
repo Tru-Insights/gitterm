@@ -223,8 +223,22 @@ impl ContentWindow {
             pane,
             dark,
         } = request;
-        if self.entries.contains_key(&id) {
-            return;
+        if let Some(entry) = self.entries.get(&id) {
+            if matches!(entry.viewer.state(), State::Loading) {
+                return;
+            }
+            let signature = gitterm_core::content::file_version_signature(&root.join(&relative));
+            if signature.is_some()
+                && entry
+                    .viewer
+                    .document()
+                    .is_some_and(|doc| doc.signature == signature)
+            {
+                return;
+            }
+        }
+        if let Some(mut previous) = self.entries.remove(&id) {
+            previous.viewer.clear();
         }
         let host = match WindowHost::new(window, None) {
             Ok(host) => host,
@@ -273,11 +287,12 @@ impl ContentWindow {
                 covers: [None; 3],
             },
         );
+        let font = crate::theme::font_sizes(cx).ui;
         // The root/path/theme travel with the job; never consult active workspace at completion.
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { Document::local_file(&root, &relative, dark) })
+                .spawn(async move { Document::local_file_with_font(&root, &relative, dark, font) })
                 .await;
             _ = this.update(cx, |this, cx| {
                 if let Some(entry) = this.entries.get_mut(&id) {
@@ -439,6 +454,25 @@ impl ContentWindow {
     #[cfg(test)]
     pub(crate) fn page_policy(&self, id: &str) -> Option<Rc<RefCell<PagePolicy>>> {
         self.entries.get(id)?.viewer.host().page.clone()
+    }
+    pub(super) fn displayed_text(&self, root: &Path, relative: &Path) -> Option<&str> {
+        let entry = self.entries.get(self.selected.as_deref()?)?;
+        match &entry.source {
+            Source::Local {
+                root: entry_root,
+                relative: entry_relative,
+            } if entry_root == root && entry_relative == relative => {
+                entry.viewer.document().map(|doc| doc.text.as_str())
+            }
+            _ => None,
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn document(&self, id: &str) -> Option<&Document> {
+        let viewer = &self.entries.get(id)?.viewer;
+        (viewer.state() != State::Loading)
+            .then(|| viewer.document())
+            .flatten()
     }
     pub(super) fn source(&self, id: &str) -> Option<(PathBuf, PathBuf)> {
         match &self.entries.get(id)?.source {
@@ -605,7 +639,64 @@ mod tests {
     }
 
     #[gpui::test]
+    fn copy_snapshot_uses_selected_entry_when_workspaces_share_a_file(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let root = tempfile::tempdir().unwrap();
+        let (view, cx) =
+            cx.add_window_view(|window, cx| TestView(cx.new(|cx| ContentWindow::new(window, cx))));
+        let content = view.read_with(cx, |view, _| view.0.clone());
+        content.update(cx, |content, _| {
+            for (id, workspace, text) in [
+                ("first", 1, "first snapshot"),
+                ("second", 2, "second snapshot"),
+            ] {
+                std::fs::write(root.path().join("shared.txt"), text).unwrap();
+                let mut viewer = RetainedViewer::new(WindowHost {
+                    native: None,
+                    navigation: vec![],
+                    page: None,
+                });
+                let ticket = viewer.begin_content(Origin {
+                    workspace,
+                    pane: workspace,
+                    source: root.path().join("shared.txt"),
+                });
+                viewer.complete_content(
+                    &ticket,
+                    Document::local_file(root.path(), Path::new("shared.txt"), true),
+                );
+                content.entries.insert(
+                    id.into(),
+                    Entry {
+                        source: Source::Local {
+                            root: root.path().to_owned(),
+                            relative: "shared.txt".into(),
+                        },
+                        viewer,
+                        covers: [None; 3],
+                    },
+                );
+            }
+            for (id, expected) in [("first", "first snapshot"), ("second", "second snapshot")] {
+                content.select(Some(id.into()));
+                assert_eq!(
+                    content.displayed_text(root.path(), Path::new("shared.txt")),
+                    Some(expected)
+                );
+            }
+            content.select(None);
+            assert_eq!(
+                content.displayed_text(root.path(), Path::new("shared.txt")),
+                None
+            );
+        });
+    }
+
+    #[gpui::test]
     fn window_covers_reject_closed_surface_and_snapshot_completions(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.update(gpui_component::init);
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a.html"), "<h1>First</h1>").unwrap();

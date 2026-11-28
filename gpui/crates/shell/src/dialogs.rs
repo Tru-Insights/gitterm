@@ -279,6 +279,7 @@ mod interaction_tests {
     }
     #[gpui::test]
     fn more_and_shortcut_open_help_and_every_dismissal_returns_to_shell(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         let (dir, shell, cx) = sample(cx);
         let before = snapshot(dir.path());
         click(cx, "pstrip-more");
@@ -311,6 +312,7 @@ mod interaction_tests {
     }
     #[gpui::test]
     fn preview_controls_only_report_the_label_without_writes_or_sessions(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         let (dir, shell, cx) = sample(cx);
         shell.update(cx, |shell, cx| {
             let mut facts = crate::workspace_bar::SavedFacts {
@@ -328,7 +330,12 @@ mod interaction_tests {
                 connected: false,
                 serves_phones: true,
             });
-            facts.remote_workspaces.push("Fixture:repo".into());
+            facts
+                .remote_workspaces
+                .push(crate::workspace_bar::RemoteWorkspace {
+                    session_name: "fixture-repo".into(),
+                    name: "Fixture:repo".into(),
+                });
             shell.saved_facts.replace(facts);
             cx.notify();
         });
@@ -395,6 +402,7 @@ mod interaction_tests {
     }
     #[gpui::test]
     fn rail_expands_to_each_mode_and_collapse_control_moves_to_bottom(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         let (_dir, shell, cx) = sample(cx);
         let header = cx.debug_bounds("Work").unwrap();
         let collapse = cx.debug_bounds("collapse-sidebar").unwrap();
@@ -422,6 +430,7 @@ mod interaction_tests {
     fn escape_closes_menus_and_help_before_find_preview_then_host_navigation(
         cx: &mut TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         let (_dir, shell, cx) = sample(cx);
         shell.update(cx, |shell, cx| {
             shell.workspaces[0].store.regions.sidebar_mode = crate::SidebarMode::Find;
@@ -512,6 +521,7 @@ mod interaction_tests {
     fn page_local_review_and_find_receive_escape_before_host_quick_commands(
         cx: &mut TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         let (_dir, shell, cx) = mount(cx, true);
         let chat = cx.read(|cx| {
             let pane = &shell.read(cx).workspaces[0].panes["session-11"];
@@ -586,6 +596,7 @@ mod interaction_tests {
 
 #[gpui::test]
 fn tru274_sidebar_tabs_use_proportional_ui_font_at_ui_size(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     cx.update(|cx| {
         crate::theme::set_font_sizes(

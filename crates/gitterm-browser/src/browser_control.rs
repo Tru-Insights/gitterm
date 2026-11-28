@@ -1056,8 +1056,8 @@ impl BrowserController {
         let stderr = child.stderr.take().ok_or_else(|| {
             BrowserControlError::new("failed to capture Chrome stderr for launch diagnostics")
         })?;
-        self.start_stderr_capture(stderr).await;
         self.child = Some(child);
+        self.start_stderr_capture(stderr).await;
         self.clear_targets();
         self.last_exit = None;
 
@@ -1890,6 +1890,33 @@ impl BrowserController {
 
     /// Application shutdown uses CDP's graceful close, never a process signal.
     pub async fn disconnect_gracefully(&mut self) -> Result<()> {
+        // Quit can cancel Open after spawning our child but before it publishes
+        // DevToolsActivePort. Retain ownership and finish endpoint verification
+        // so cancellation cannot turn graceful cleanup into an early refusal.
+        timeout(DEFAULT_STARTUP_TIMEOUT, async {
+            while self.child.is_some() && self.endpoint.is_none() {
+                self.status_snapshot()?;
+                if self.child.is_none() {
+                    break;
+                }
+                if let Some(endpoint) =
+                    read_devtools_active_port(&self.profile_dir.join(DEVTOOLS_ACTIVE_PORT_FILE))?
+                {
+                    if list_page_targets(endpoint.port).await.is_ok() {
+                        self.endpoint = Some(endpoint);
+                        break;
+                    }
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+            Ok::<_, BrowserControlError>(())
+        })
+        .await
+        .map_err(|_| {
+            BrowserControlError::new(
+            "shutdown phase browser-startup: timeout waiting for owned Chrome's verified endpoint",
+        )
+        })??;
         if let Some(child) = self.child.as_mut() {
             if child
                 .try_wait()
@@ -2648,6 +2675,11 @@ impl BrowserControlService {
         controller.registry.mark_active(&key);
     }
 
+    #[cfg(test)]
+    pub(crate) async fn own_test_child(&self, child: Child) {
+        self.controller.lock().await.child = Some(child);
+    }
+
     /// Test seam: treat a `test_support::FakeDevTools` as the running
     /// browser.
     #[cfg(test)]
@@ -2666,6 +2698,11 @@ pub(crate) mod test_support {
     use super::*;
     use tokio::io::AsyncWriteExt;
 
+    type ListGate =
+        Arc<std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>;
+
+    type OnClose = Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
     pub(crate) struct FakeDevTools {
         pub port: u16,
         /// Page target ids Chrome would list; closing one removes it.
@@ -2673,6 +2710,8 @@ pub(crate) mod test_support {
         /// Every CDP method received, with its `targetId` when it has one.
         pub calls: Arc<std::sync::Mutex<Vec<String>>>,
         pub created_target_params: Arc<std::sync::Mutex<Vec<Value>>>,
+        pub on_close: OnClose,
+        pub next_list_gate: ListGate,
         server: JoinHandle<()>,
     }
 
@@ -2699,6 +2738,10 @@ pub(crate) mod test_support {
                 Arc::clone(&calls),
                 Arc::clone(&created_target_params),
             );
+            let on_close: OnClose = Default::default();
+            let server_close = on_close.clone();
+            let next_list_gate: ListGate = Default::default();
+            let server_list_gate = next_list_gate.clone();
             let server = tokio::spawn(async move {
                 loop {
                     let Ok((socket, _)) = listener.accept().await else {
@@ -2709,7 +2752,15 @@ pub(crate) mod test_support {
                         Arc::clone(&server_calls),
                         Arc::clone(&server_created_target_params),
                     );
-                    tokio::spawn(serve(socket, port, pages, calls, created_target_params));
+                    tokio::spawn(serve(
+                        socket,
+                        port,
+                        pages,
+                        calls,
+                        created_target_params,
+                        server_close.clone(),
+                        server_list_gate.clone(),
+                    ));
                 }
             });
             Self {
@@ -2717,6 +2768,8 @@ pub(crate) mod test_support {
                 pages,
                 calls,
                 created_target_params,
+                on_close,
+                next_list_gate,
                 server,
             }
         }
@@ -2728,12 +2781,19 @@ pub(crate) mod test_support {
         pages: Arc<std::sync::Mutex<Vec<String>>>,
         calls: Arc<std::sync::Mutex<Vec<String>>>,
         created_target_params: Arc<std::sync::Mutex<Vec<Value>>>,
+        on_close: OnClose,
+        next_list_gate: ListGate,
     ) {
         let mut head = [0_u8; 16];
         let Ok(read) = socket.peek(&mut head).await else {
             return;
         };
         if head[..read].starts_with(b"GET /json/list") {
+            let gate = next_list_gate.lock().unwrap().take();
+            if let Some((started, release)) = gate {
+                started.notify_one();
+                release.notified().await;
+            }
             let mut request = [0_u8; 4096];
             let _ = socket.read(&mut request).await;
             let listed = pages
@@ -2779,14 +2839,25 @@ pub(crate) mod test_support {
                         .lock()
                         .unwrap()
                         .push(request["params"].clone());
-                    pages.lock().unwrap().push("created-page".to_string());
-                    json!({ "targetId": "created-page" })
+                    let count = created_target_params.lock().unwrap().len();
+                    let target = if count == 1 {
+                        "created-page".to_string()
+                    } else {
+                        format!("created-page-{count}")
+                    };
+                    pages.lock().unwrap().push(target.clone());
+                    json!({ "targetId": target })
                 }
                 _ => json!({}),
             };
             let reply = json!({ "id": request["id"], "result": result }).to_string();
             if websocket.send(Message::Text(reply)).await.is_err() {
                 return;
+            }
+            if method == "Browser.close" {
+                if let Some(close) = on_close.lock().unwrap().take() {
+                    close();
+                }
             }
         }
     }

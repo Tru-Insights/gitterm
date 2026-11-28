@@ -64,6 +64,7 @@ fn process_exists(pid: &str) -> bool {
 
 #[gpui::test]
 fn ordered_sessions_restore_fresh_shells_and_prune_stale_ids(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let folder = tempfile::tempdir().unwrap();
@@ -173,7 +174,15 @@ fn ordered_sessions_restore_fresh_shells_and_prune_stale_ids(cx: &mut TestAppCon
             ids.iter().filter(|id| id.starts_with("session-")).count(),
             3
         );
-        for index in 0..3 {
+        for (index, expected) in expected.iter().enumerate() {
+            assert_eq!(
+                state.panes[&session_pane_id(state.sessions[index].id)]
+                    .read(cx)
+                    .session
+                    .as_ref()
+                    .map(|target| &target.session_uid),
+                expected.session_uid.as_ref()
+            );
             assert!(
                 !view(&restarted, index, cx)
                     .read(cx)
@@ -206,6 +215,7 @@ fn ordered_sessions_restore_fresh_shells_and_prune_stale_ids(cx: &mut TestAppCon
 
 #[gpui::test]
 fn fresh_local_workspace_creates_no_terminal(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let folder = tempfile::tempdir().unwrap();
@@ -233,6 +243,7 @@ fn fresh_local_workspace_creates_no_terminal(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn explicit_terminal_close_reaps_and_hidden_exit_updates_title(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let folder = tempfile::tempdir().unwrap();

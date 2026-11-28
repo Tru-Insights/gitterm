@@ -19,6 +19,7 @@ fn config(cwd: &Path) -> ClaudeSessionConfig {
 
 #[gpui::test]
 fn policy_defaults_to_preview_and_refuses_preview_authority(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (dir, preview) = tests::fixture();
     cx.update(|cx| {
         assert!(matches!(
@@ -47,6 +48,7 @@ fn policy_defaults_to_preview_and_refuses_preview_authority(cx: &mut gpui::TestA
 
 #[gpui::test]
 fn live_pane_defers_and_missing_host_rejects_first_submission(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     let (dir, preview) = tests::fixture();
     let services = ServiceContext::production(&dir.path().join("live"), "live-test").unwrap();

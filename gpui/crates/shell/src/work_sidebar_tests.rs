@@ -74,6 +74,29 @@ pub(super) fn fixture(owned: bool) -> WorkSidebar {
     fixture_with_branch(owned, "tru-274")
 }
 
+#[test]
+fn chat_review_target_reuses_work_row_and_ignores_gone_checkouts() {
+    let sidebar = fixture(true);
+    let target = sidebar
+        .review_target(std::path::Path::new("/repos/api-tru-274"))
+        .unwrap();
+    assert_eq!(target.checkout, PathBuf::from("/repos/api-tru-274"));
+    assert_eq!(target.repo, "api");
+    assert_eq!(target.branch, "tru-274");
+    assert_eq!(target.owner, "coordinator");
+    assert_eq!(target.base, None);
+    assert!(
+        sidebar
+            .review_target(std::path::Path::new("/repos/api-old-branch"))
+            .is_none()
+    );
+    assert!(
+        sidebar
+            .review_target(std::path::Path::new("/unlisted"))
+            .is_none()
+    );
+}
+
 fn fixture_with_branch(owned: bool, first_branch: &str) -> WorkSidebar {
     let now = Instant::now();
     let wall_time = SystemTime::now();
@@ -253,6 +276,7 @@ fn repos_count_and_rows_exclude_the_docs_root() {
 
 #[gpui::test]
 fn chat_title_column_never_overlaps_right_aligned_metadata(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let sidebar = fixture(false);
@@ -331,6 +355,7 @@ fn replace_entries(sidebar: &WorkSidebar, entries: Vec<ChatIndexEntry>) {
 fn w30_more_in_find_switches_host_mode_preserving_filter_without_writes_or_sessions(
     cx: &mut gpui::TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let root = tempfile::tempdir().unwrap();
@@ -407,6 +432,7 @@ fn w30_more_in_find_switches_host_mode_preserving_filter_without_writes_or_sessi
 fn w27_document_copies_suffix_tracks_fold_without_opening_a_document(
     cx: &mut gpui::TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::work::documents::{
         CopySource, Document, DocumentCopy, ScanRequest, ScanResult,
     };
@@ -480,6 +506,7 @@ fn w27_document_copies_suffix_tracks_fold_without_opening_a_document(
 
 #[gpui::test]
 fn w03_and_w15_index_and_owned_chat_only_notice(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let root = tempfile::tempdir().unwrap();
@@ -564,6 +591,7 @@ pub(super) fn click_control(
 
 #[gpui::test]
 fn w12_branch_body_emits_review_and_disclosure_only_folds(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let root = tempfile::tempdir().unwrap();
@@ -615,6 +643,7 @@ fn w12_branch_body_emits_review_and_disclosure_only_folds(cx: &mut gpui::TestApp
 
 #[gpui::test]
 fn w25_focus_menu_uses_iced_suffix_choices_and_closes_on_pick(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let root = tempfile::tempdir().unwrap();
@@ -651,6 +680,7 @@ fn w25_focus_menu_uses_iced_suffix_choices_and_closes_on_pick(cx: &mut gpui::Tes
 
 #[gpui::test]
 fn preview_write_controls_only_show_the_exact_clicked_label(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::{
         merge_plan::{PrKey, PrState},
         prs::{PullCore, WatchedPr},
@@ -753,6 +783,7 @@ fn preview_write_controls_only_show_the_exact_clicked_label(cx: &mut gpui::TestA
 fn w19a_w20_plan_merge_and_hold_controls_match_iced_placement_and_only_notice(
     cx: &mut gpui::TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::{
         merge_plan::{PrKey, PrState},
         prs::{PullCore, WatchedPr},
@@ -873,6 +904,7 @@ fn w19a_w20_plan_merge_and_hold_controls_match_iced_placement_and_only_notice(
 
 #[gpui::test]
 fn repo_name_and_disclosure_toggle_but_only_run_emits_command(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let (sidebar, cx) = cx.add_window_view(|_, _| fixture(false));
@@ -962,6 +994,7 @@ fn repo_name_and_disclosure_toggle_but_only_run_emits_command(cx: &mut gpui::Tes
 fn expanded_repo_disclosure_stays_inside_default_sidebar_and_collapses(
     cx: &mut gpui::TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let repo = PathBuf::from("/repos/api");
@@ -1020,6 +1053,7 @@ fn expanded_repo_disclosure_stays_inside_default_sidebar_and_collapses(
 
 #[gpui::test]
 fn pr_number_click_requests_the_pr_page_in_the_pr_store(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::{merge_plan::PrKey, prs::WatchedPr};
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
@@ -1144,6 +1178,7 @@ fn issue_rows_with_a_url_open_the_page_in_the_workspace_store() {
 
 #[gpui::test]
 fn pr_body_and_disclosure_keep_iced_toggle_targets(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::{merge_plan::PrKey, prs::WatchedPr};
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
@@ -1804,6 +1839,7 @@ fn missing_and_malformed_task_stores_are_read_only_and_errors_are_visible() {
 
 #[gpui::test]
 fn write_outcomes_report_unavailable_without_emitting_events(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let sidebar = cx.new(|_| fixture(false));
     let events = Rc::new(RefCell::new(Vec::new()));
     let received = events.clone();
@@ -1871,6 +1907,7 @@ fn write_outcomes_report_unavailable_without_emitting_events(cx: &mut gpui::Test
 fn owner_catalog_supplies_mounted_sidebar_read_authority_without_a_gui(
     cx: &mut gpui::TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let fixture = IcedFixture::new();
     let before = tree_snapshot(fixture.root.path());
@@ -2618,6 +2655,7 @@ fn partial_index_reads_saved_codex_children_and_repo_work_without_writing() {
 
 #[gpui::test]
 fn long_pr_title_wraps_without_overlapping_number_or_badges(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::{
         merge_plan::{PrKey, PrState},
         prs::{PullCore, WatchedPr},
@@ -2676,6 +2714,7 @@ fn repo_running_subtitle_includes_live_chat_and_avoids_counted_task_twice() {
 
 #[gpui::test]
 fn open_review_checkout_marks_only_its_branch_row_selected(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let mut fixture = fixture(false);
@@ -2714,6 +2753,7 @@ fn open_review_checkout_marks_only_its_branch_row_selected(cx: &mut gpui::TestAp
 
 #[gpui::test]
 fn expanded_repo_row_name_and_run_never_shrink_but_actions_wrap(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let repo = PathBuf::from("/repos/gitterm-v2");
@@ -2807,6 +2847,7 @@ fn page_routes_carry_mapped_owners_and_cached_issue_workspaces() {
 
 #[gpui::test]
 fn long_branch_title_is_shortened_at_iced_limit_then_wraps(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let long = "task/02bf8131-5c35-4939-b33f-bf01dae8aa5c-extra-long-name";
@@ -2835,6 +2876,7 @@ fn long_branch_title_is_shortened_at_iced_limit_then_wraps(cx: &mut gpui::TestAp
 
 #[gpui::test]
 fn at_310pt_branch_title_wraps_to_two_lines_across_the_row(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let long = "task/02bf8131-5c35-4939-b33f-bf01dae8aa5c-extra-long-name";
@@ -2890,6 +2932,7 @@ fn long_chat_entry(id: &str, title: &str) -> ChatIndexEntry {
 
 #[gpui::test]
 fn chat_titles_wrap_in_remaining_fill_width_at_310pt_and_240pt(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     cx.update(|cx| crate::theme::apply(true, None, cx));
@@ -2968,6 +3011,7 @@ fn chat_titles_wrap_in_remaining_fill_width_at_310pt_and_240pt(cx: &mut gpui::Te
 fn at_310pt_expanded_repo_actions_keep_one_line_and_age_wraps_by_word(
     cx: &mut gpui::TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let repo = PathBuf::from("/repos/api");
@@ -3025,6 +3069,7 @@ fn at_310pt_expanded_repo_actions_keep_one_line_and_age_wraps_by_word(
 
 #[gpui::test]
 fn repo_age_text_wraps_when_the_actions_slot_is_squeezed(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let repo = PathBuf::from("/repos/api");
@@ -3165,6 +3210,7 @@ impl IcedFixture {
 
 #[gpui::test]
 fn work_find_counts_match_host(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let fixture = IcedFixture::new();
     let iced = crate::data::TaskSource::iced(&fixture.config);
     let before = fixture.rows(&iced);
@@ -3187,6 +3233,7 @@ fn work_find_counts_match_host(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn delegation_cards_from_host_store(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let fixture = IcedFixture::new();
     let owner = start_preview_host(&fixture.base(), &fixture.config, cx);
     fixture.diverge_iced();
@@ -3219,6 +3266,7 @@ fn delegation_cards_from_host_store(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn panes_fall_back_to_iced_file_when_host_down(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use std::sync::atomic::AtomicBool;
     let fixture = IcedFixture::new();
     let iced = crate::data::TaskSource::iced(&fixture.config);
@@ -3250,6 +3298,7 @@ fn panes_fall_back_to_iced_file_when_host_down(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn no_shell_reader_loads_iced_tasks_json_when_host_up(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let fixture = IcedFixture::new();
     let owner = start_preview_host(&fixture.base(), &fixture.config, cx);
     let seeded = fixture.rows(&crate::data::TaskSource::iced(&fixture.config));
@@ -3271,6 +3320,7 @@ fn no_shell_reader_loads_iced_tasks_json_when_host_up(cx: &mut gpui::TestAppCont
 fn delegation_dismiss_and_stop_go_through_service_context_without_writes(
     cx: &mut gpui::TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_gpui_chat::interactions::{DismissRequest, preview_notice};
     let fixture = IcedFixture::new();
     let owner = start_preview_host(&fixture.base(), &fixture.config, cx);
@@ -3345,6 +3395,7 @@ fn tru274_loading_replaces_refresh_control_without_a_title_badge() {
 
 #[gpui::test]
 fn tru274_skills_link_starts_at_the_left_edge(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let (_sidebar, cx) = cx.add_window_view(|_, _| {
@@ -3379,6 +3430,7 @@ fn tru274_chat_mark_uses_iced_mauve_in_both_themes() {
 
 #[gpui::test]
 fn tru274_pr_number_tracks_ui_small_size_and_iced_menlo_colour(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     let sidebar = cx.new(|_| fixture(true));
     cx.update(|cx| {
@@ -3404,6 +3456,7 @@ fn tru274_pr_number_tracks_ui_small_size_and_iced_menlo_colour(cx: &mut gpui::Te
 
 #[gpui::test]
 fn tru274_add_repo_and_run_command_use_iced_control_styles(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     let sidebar = cx.new(|_| fixture(true));
     cx.update(|cx| {
@@ -3450,6 +3503,7 @@ fn tru274_add_repo_and_run_command_use_iced_control_styles(cx: &mut gpui::TestAp
 
 #[gpui::test]
 fn tru274_chat_fanout_keeps_iced_intrinsic_width_at_310pt(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let sidebar = fixture(false);
@@ -3640,6 +3694,7 @@ fn tru274_repo_name_uses_iced_bold_proportional_ui_small() {
 
 #[gpui::test]
 fn tru274_repo_actions_use_iced_two_pixel_spacing(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let (sidebar, cx) = cx.add_window_view(|_, _| {
@@ -3667,6 +3722,7 @@ fn tru274_repo_actions_use_iced_two_pixel_spacing(cx: &mut gpui::TestAppContext)
 
 #[gpui::test]
 fn unopened_chat_emits_only_after_live_policy_is_installed(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let sidebar = cx.new(|_| fixture(false));
     let events = Rc::new(RefCell::new(Vec::new()));
     let received = events.clone();
@@ -3709,6 +3765,7 @@ fn unopened_chat_emits_only_after_live_policy_is_installed(cx: &mut gpui::TestAp
 
 #[gpui::test]
 fn editor_outcome_is_read_only_safe_and_emitted_in_preview(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let sidebar = cx.new(|_| fixture(false));
     let events = Rc::new(RefCell::new(Vec::new()));
     let received = events.clone();
@@ -3730,6 +3787,7 @@ fn editor_outcome_is_read_only_safe_and_emitted_in_preview(cx: &mut gpui::TestAp
 fn live_repo_controls_emit_writes_and_open_the_existing_inline_editors(
     cx: &mut gpui::TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let root = tempfile::tempdir().unwrap();

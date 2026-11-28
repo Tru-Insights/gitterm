@@ -47,6 +47,64 @@ impl ViewedMarks {
             .map_err(|error| format!("cannot encode viewed marks: {error}"))
     }
 
+    /// Iced's atomic replacement and encoding, with the same path and errors.
+    pub fn save(&self, dir: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(dir)
+            .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+        crate::atomic_file::write_atomically(&dir.join(VIEWED_FILE), &self.encode()?)
+    }
+
+    /// Apply only edits since `previous` to a freshly read shared file. In
+    /// particular, clearing a mark must not clear another client's new marks.
+    /// shortcut: Iced has no interprocess lock, so overlapping read/write windows
+    /// can still race; use a shared lock if strict serialization is required.
+    pub fn save_changes(&self, previous: &Self, dir: &Path) -> Result<(), String> {
+        let mut merged = Self::load(dir)?;
+        let checkouts: BTreeSet<_> = previous
+            .checkouts
+            .keys()
+            .chain(self.checkouts.keys())
+            .collect();
+        for checkout in checkouts {
+            let before = previous.checkouts.get(checkout);
+            let after = self.checkouts.get(checkout);
+            let paths: BTreeSet<_> = before
+                .into_iter()
+                .flat_map(|files| files.keys())
+                .chain(after.into_iter().flat_map(|files| files.keys()))
+                .collect();
+            for path in paths {
+                let old = before.and_then(|files| files.get(path));
+                let new = after.and_then(|files| files.get(path));
+                if old == new {
+                    continue;
+                }
+                match new {
+                    Some(id) => {
+                        merged
+                            .checkouts
+                            .entry(checkout.clone())
+                            .or_default()
+                            .insert(path.clone(), id.clone());
+                    }
+                    None => {
+                        if let Some(files) = merged.checkouts.get_mut(checkout) {
+                            files.remove(path);
+                        }
+                    }
+                }
+            }
+            if merged
+                .checkouts
+                .get(checkout)
+                .is_some_and(|files| files.is_empty())
+            {
+                merged.checkouts.remove(checkout);
+            }
+        }
+        merged.save(dir)
+    }
+
     pub fn state(&self, checkout: &Path, file: &ReviewFile) -> ViewedState {
         let Some(marked) = self
             .checkouts
@@ -106,6 +164,45 @@ impl ViewedMarks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_writes_merge_other_clients_marks_and_clear_only_edited_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial: ViewedMarks =
+            serde_json::from_str(r#"{"checkouts":{"/tmp/checkout":{"a":"1","clear":"1"}}}"#)
+                .unwrap();
+        initial.save(dir.path()).unwrap();
+        let mut iced = initial.clone();
+        iced.checkouts
+            .get_mut("/tmp/checkout")
+            .unwrap()
+            .insert("iced".into(), "2".into());
+        iced.save_changes(&initial, dir.path()).unwrap();
+        let mut gpui = initial.clone();
+        let files = gpui.checkouts.get_mut("/tmp/checkout").unwrap();
+        files.insert("gpui".into(), "3".into());
+        files.remove("clear");
+        gpui.save_changes(&initial, dir.path()).unwrap();
+        let loaded = ViewedMarks::load(dir.path()).unwrap();
+        assert_eq!(
+            loaded.checkouts["/tmp/checkout"],
+            BTreeMap::from([
+                ("a".into(), "1".into()),
+                ("iced".into(), "2".into()),
+                ("gpui".into(), "3".into())
+            ])
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(VIEWED_FILE)).unwrap(),
+            loaded.encode().unwrap()
+        );
+        std::fs::write(dir.path().join(VIEWED_FILE), "broken").unwrap();
+        assert!(gpui.save_changes(&initial, dir.path()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(VIEWED_FILE)).unwrap(),
+            "broken"
+        );
+    }
 
     #[test]
     fn codec_keeps_exact_bytes_defaults_and_malformed_file() {

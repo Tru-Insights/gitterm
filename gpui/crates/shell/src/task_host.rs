@@ -362,6 +362,11 @@ pub(crate) struct TaskHostOwner {
 }
 
 impl TaskHostOwner {
+    /// Read the existing Live allowance state for the Usage rail projection.
+    pub(crate) fn chrome_plan_limits(&self) -> Option<&gitterm_core::plan_limits::PlanLimitsFile> {
+        self.plan_limits.as_ref().map(|state| state.file())
+    }
+
     /// Lock, seed, bind, then create the entity. Startup errors fail closed.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn start(config: HostConfig, cx: &mut App) -> Result<Entity<Self>> {
@@ -721,6 +726,31 @@ impl TaskHostOwner {
                 servers.task_mcp.claude_mcp_server(Some(caller)),
                 servers.browser.claude_mcp_server(Some(caller)),
             ]
+        })
+    }
+
+    /// The chrome uses exactly the MCP host's context, engine and runtime.
+    pub(crate) fn browser_host(&self) -> Option<crate::browser::Host> {
+        let servers = self.servers.as_ref()?;
+        if servers
+            .jobs
+            .iter()
+            .any(tokio::task::JoinHandle::is_finished)
+        {
+            return None;
+        }
+        Some(crate::browser::Host {
+            admission: servers.browser.ui_admission(),
+            browser: servers.browser.browser(),
+            engine: servers.browser.engine(),
+            runtime: servers.runtime.handle().clone(),
+            services: Arc::new(self.host.services().clone()),
+        })
+    }
+
+    pub(crate) fn browser_environment(&self, caller: &str) -> Vec<(String, String)> {
+        self.servers.as_ref().map_or_else(Vec::new, |servers| {
+            servers.browser.terminal_environment(Some(caller)).into()
         })
     }
 
@@ -2073,6 +2103,7 @@ mod live_tests {
     use super::*;
     #[gpui::test]
     fn live_uses_direct_store_shared_namespace_and_no_fixture_jobs(cx: &mut gpui::TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
@@ -2127,20 +2158,18 @@ mod live_tests {
                     )
                     .is_ok()
             );
-            for effect in [
-                gitterm_core::preview::service::RunnerEffect::HtmlPreview,
-                gitterm_core::preview::service::RunnerEffect::RestoreSession,
-            ] {
-                assert!(
-                    owner
-                        .host
-                        .services()
-                        .runner(effect, None)
-                        .unwrap_err()
-                        .notice()
-                        .ends_with("not available in preview")
-                );
-            }
+            assert!(
+                owner
+                    .host
+                    .services()
+                    .runner(
+                        gitterm_core::preview::service::RunnerEffect::RestoreSession,
+                        None
+                    )
+                    .unwrap_err()
+                    .notice()
+                    .ends_with("not available in preview")
+            );
         });
         owner.update(cx, |owner, _| owner.shutdown());
         assert_eq!(std::fs::read(&source).unwrap(), bytes);

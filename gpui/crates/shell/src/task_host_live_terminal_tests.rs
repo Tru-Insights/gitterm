@@ -608,8 +608,9 @@ fn golive10_cli_presets_shortcuts_and_plain_callers(cx: &mut TestAppContext) {
                     "Placeholder",
                     true,
                     cx,
-                ) {
-                    command = gitterm_core::guidelines::configure_terminal_command(&command, &g);
+                )
+            {
+                command = gitterm_core::guidelines::configure_terminal_command(&command, &g);
             }
             command = gitterm_core::harness::claude::configure_terminal_chrome(&command, false);
             let caller = saved.session_uid.as_deref().unwrap();
@@ -733,6 +734,7 @@ fn golive10_task_terminal_restart_resumes_without_objective(cx: &mut TestAppCont
     if child("golive10_task_terminal_restart_resumes_without_objective") {
         return;
     }
+    cx.update(gpui_component::init);
     cx.background_executor.allow_parking();
     let fake = LiveFake::new();
     let (fixture, git) = fixture();

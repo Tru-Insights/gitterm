@@ -52,6 +52,7 @@ fn mode(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> SidebarMode {
 fn agent_link_opens_folded_sections_items_open_the_viewer_and_back_returns(
     cx: &mut TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let home = tempfile::tempdir_in("/private/tmp").unwrap();
     let home = home.path().to_path_buf();
     std::fs::create_dir(home.join("commands")).unwrap();
@@ -153,6 +154,7 @@ fn agent_link_opens_folded_sections_items_open_the_viewer_and_back_returns(
 
 #[gpui::test]
 fn without_an_agent_home_the_pane_reads_nothing_and_work_hides_the_link(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = super::h7_tests::fixture(cx);
     assert!(!shown("work-agent-config", cx));
     let workspace = cx.read(|cx| shell.read(cx).active_workspace(cx).unwrap());

@@ -247,6 +247,7 @@ fn draw(cx: &mut VisualTestContext) {
 
 #[gpui::test]
 fn native_input_arrows_enter_and_reopen_emit_exactly_once(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (view, cx, events) = setup(cx);
     cx.simulate_keystrokes("down enter");
     cx.run_until_parked();
@@ -271,6 +272,7 @@ fn native_input_arrows_enter_and_reopen_emit_exactly_once(cx: &mut TestAppContex
 
 #[gpui::test]
 fn native_escape_cmd_t_backdrop_and_row_click(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (view, cx, events) = setup(cx);
     for key in ["escape", "cmd-t"] {
         cx.simulate_keystrokes(key);
@@ -301,6 +303,7 @@ fn native_escape_cmd_t_backdrop_and_row_click(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn app_menu_actions_and_bound_enter_use_the_same_selection(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (view, cx, events) = setup(cx);
     let background_actions = Rc::new(RefCell::new(0));
     cx.update(|_, cx| {

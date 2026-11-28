@@ -1,9 +1,10 @@
 use crate::{
     data::{SessionKind, ShellData, WorkspaceId},
+    terminal_setup::{self, Placement},
     theme::Palette,
 };
 use gitterm_gpui_chat::{ChatView, events::parse_fixture};
-use gitterm_terminal::{TerminalConfig, TerminalLaunch, TerminalView};
+use gitterm_terminal::{TerminalLaunch, TerminalView};
 use gpui::*;
 use gpui_component::dock::{BasePanel, Panel, PanelEvent, PanelInfo, PanelState};
 use std::rc::Rc;
@@ -16,7 +17,7 @@ pub const PANEL_NAME: &str = "GitTermShellPane";
 pub enum PaneKind {
     IcedSession(String),
     Terminal,
-    CenterTerminal(std::path::PathBuf),
+    CenterTerminal(std::path::PathBuf, Option<String>),
     BottomTerminal(std::path::PathBuf),
     StoppedTerminal(std::path::PathBuf, bool),
     Chat,
@@ -86,22 +87,33 @@ impl Pane {
     ) -> Self {
         let session = matches!(
             kind,
-            PaneKind::Terminal | PaneKind::CenterTerminal(_) | PaneKind::BottomTerminal(_)
+            PaneKind::Terminal | PaneKind::CenterTerminal(..) | PaneKind::BottomTerminal(_)
         )
-        .then(crate::sessions::fresh_target);
+        .then(|| {
+            let mut target = crate::sessions::fresh_target();
+            // Restore the caller before launch env and callbacks capture it.
+            if let PaneKind::CenterTerminal(_, Some(uid)) = &kind {
+                target.session_uid = uid.clone();
+            }
+            target
+        });
         let content = match kind.clone() {
             PaneKind::IcedSession(text) => PaneContent::IcedSession(text),
             PaneKind::StoppedTerminal(..) => PaneContent::Error("Terminal stopped".into()),
-            PaneKind::Terminal | PaneKind::CenterTerminal(_) | PaneKind::BottomTerminal(_) => {
+            PaneKind::Terminal | PaneKind::CenterTerminal(..) | PaneKind::BottomTerminal(_) => {
                 let launch = TerminalLaunch {
                     cwd: match &kind {
-                        PaneKind::CenterTerminal(cwd) | PaneKind::BottomTerminal(cwd) => {
+                        PaneKind::CenterTerminal(cwd, _) | PaneKind::BottomTerminal(cwd) => {
                             Some(cwd.clone())
                         }
                         _ => data.terminal_cwd(workspace, cx).or_else(dirs::home_dir),
                     },
                     ..Default::default()
                 };
+                let mut launch = launch;
+                if let Some(target) = &session {
+                    crate::browser::terminal_environment(&mut launch, &target.session_uid, cx);
+                }
                 // Headless fixtures must not run host rc/session-restore scripts.
                 #[cfg(test)]
                 let launch = TerminalLaunch {
@@ -166,7 +178,7 @@ impl Pane {
                     let exit_target = session.clone();
                     let cwd_target = session.clone();
                     PaneContent::Terminal(cx.new(|cx| {
-                        TerminalView::launch(launch, TerminalConfig::default(), cx)
+                        terminal_setup::launch(launch, Placement::Main, cx)
                             .with_title_callback(move |_, cx, title| {
                                 let _ = pane.update(cx, |pane, cx| {
                                     if pane.session != title_target {
@@ -213,7 +225,7 @@ impl Pane {
             PaneKind::Review(view) => PaneContent::Review(view),
         };
         let terminal_cwd = match &kind {
-            PaneKind::CenterTerminal(cwd)
+            PaneKind::CenterTerminal(cwd, _)
             | PaneKind::BottomTerminal(cwd)
             | PaneKind::StoppedTerminal(cwd, _) => Some(cwd.clone()),
             PaneKind::Terminal => data.terminal_cwd(workspace, cx).or_else(dirs::home_dir),
@@ -224,7 +236,7 @@ impl Pane {
         }
         let terminal_events = if matches!(
             kind,
-            PaneKind::CenterTerminal(_) | PaneKind::BottomTerminal(_) | PaneKind::Terminal
+            PaneKind::CenterTerminal(..) | PaneKind::BottomTerminal(_) | PaneKind::Terminal
         ) {
             if let PaneContent::Terminal(view) = &content {
                 Some(cx.observe_in(view, window, |_, view, window, cx| {
@@ -275,7 +287,7 @@ impl Pane {
             notification_chat_title: None,
             center_terminal: matches!(
                 kind,
-                PaneKind::CenterTerminal(_) | PaneKind::StoppedTerminal(_, true)
+                PaneKind::CenterTerminal(..) | PaneKind::StoppedTerminal(_, true)
             ),
             exited: false,
             exit_pending: false,
@@ -376,7 +388,7 @@ impl Pane {
             self.id.clone(),
             self.title.clone(),
             if self.center_terminal {
-                PaneKind::CenterTerminal(cwd)
+                PaneKind::CenterTerminal(cwd, None)
             } else {
                 PaneKind::BottomTerminal(cwd)
             },

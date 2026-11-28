@@ -454,8 +454,12 @@ impl crate::Shell {
         match outcome {
             O::NewChat if self.local => self.new_claude_chat(None, window, cx),
             O::Terminal if self.local => self.new_terminal(window, cx),
-            O::Cli { preset } => self.launch_agent_preset(*preset, window, cx),
-            O::CliResume { preset, .. } => self.launch_cli_preset(*preset, true, window, cx),
+            O::Cli { preset } if self.live_chat_enabled(cx) => {
+                self.launch_agent_preset(*preset, window, cx)
+            }
+            O::CliResume { preset, .. } if self.live_chat_enabled(cx) => {
+                self.launch_cli_preset(*preset, true, window, cx)
+            }
             O::Continue { task_id, preset } => self.launch_task_child(task_id, *preset, window, cx),
             _ => {
                 self.owner.update(cx, |owner, cx| {
@@ -664,7 +668,7 @@ impl crate::Shell {
             O::OpenReposMenu => self.unavailable("Repos ▾", cx),
             O::OpenReady => self.open_ready_list(window, cx),
             O::OpenParked => self.open_parked_list(window, cx),
-            O::Browser(_) => self.unavailable("Browser", cx),
+            O::Browser(action) => self.browser_action(action, window, cx),
             O::OpenMoreMenu => self.unavailable("Help and browser actions", cx),
             O::ToggleTerminal => self.unavailable("Terminal", cx),
             O::AddWorkspace(key) => {
@@ -687,6 +691,7 @@ impl crate::Shell {
             }
             O::ShowMachineChats(key) => self.show_machine_chats(&key, window, cx),
             O::PairPhone(key) => self.open_phone_panel(&key, window, cx),
+            outcome => self.repo_bar_outcome(outcome, window, cx),
         }
     }
     pub(crate) fn spine_outcome(
@@ -1410,9 +1415,20 @@ impl crate::Shell {
     fn live_chat_location(
         &self,
         id: &str,
+        remote_id: Option<&str>,
         cx: &gpui::App,
     ) -> Option<(crate::WorkspaceId, crate::data::SessionId)> {
         self.workspaces.iter().find_map(|state| {
+            if self
+                .owner
+                .read(cx)
+                .iced_workspace(state.workspace.id)
+                .and_then(crate::workspace_config::workspace_remote_id)
+                .as_deref()
+                != remote_id
+            {
+                return None;
+            }
             state.sessions.iter().find_map(|session| {
                 let pane = state
                     .panes
@@ -1442,7 +1458,15 @@ impl crate::Shell {
     ) -> anyhow::Result<()> {
         use gpui::AppContext as _;
         if let Some(id) = &tab.chat_session_id
-            && let Some((workspace, session)) = self.live_chat_location(id, cx)
+            && let Some((workspace, session)) = self.live_chat_location(
+                id,
+                self.owner
+                    .read(cx)
+                    .iced_workspace(workspace)
+                    .and_then(crate::workspace_config::workspace_remote_id)
+                    .as_deref(),
+                cx,
+            )
         {
             if activate {
                 self.reopen_workspace(workspace, window, cx);
@@ -1456,14 +1480,6 @@ impl crate::Shell {
             .iced_workspace(workspace)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Saved chat workspace unavailable"))?;
-        anyhow::ensure!(
-            !saved.is_legacy_remote()
-                && !matches!(
-                    saved.location,
-                    Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. })
-                ),
-            "Remote chat resume unavailable"
-        );
         let preview = owner
             .preview()
             .ok_or_else(|| anyhow::anyhow!("Chat context unavailable"))?;
@@ -1475,9 +1491,18 @@ impl crate::Shell {
             session_id: tab.chat_session_id.clone(),
             records: vec![],
         };
+        let remote = self.remote_chat_binding(workspace, cx)?;
         let mut error = None;
         let view = cx.new(|cx| {
-            match crate::chat::ChatPane::resume(shutdown.clone(), preview, saved, tab, window, cx) {
+            match crate::chat::ChatPane::resume(
+                shutdown.clone(),
+                preview,
+                saved,
+                tab,
+                remote,
+                window,
+                cx,
+            ) {
                 Ok(pane) => pane,
                 Err(failure) => {
                     error = Some(failure);
@@ -1574,7 +1599,15 @@ impl crate::Shell {
             self.live_chat_enabled(cx),
             "Conversation resume not available in preview"
         );
-        if let Some((workspace, session)) = self.live_chat_location(id, cx) {
+        if let Some((workspace, session)) = self.live_chat_location(
+            id,
+            self.owner
+                .read(cx)
+                .iced_workspace(workspace)
+                .and_then(crate::workspace_config::workspace_remote_id)
+                .as_deref(),
+            cx,
+        ) {
             self.reopen_workspace(workspace, window, cx);
             self.select_workspace_id(workspace, window, cx);
             self.select_session_id(session, window, cx);
@@ -1615,10 +1648,26 @@ impl crate::Shell {
         }
         // A closed tab can still carry the recorded configuration in another
         // workspace. Prefer it over the index's backend/cwd-only metadata.
-        let recorded = self.owner.read(cx).iced_catalog().and_then(|catalog| catalog.workspaces.iter().enumerate().find_map(|(index, workspace)| {
-            if workspace.is_legacy_remote() || matches!(workspace.location, Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. })) { return None; }
-            workspace.tabs.iter().find(|tab| tab.chat_session_id.as_deref() == Some(id)).cloned().map(|tab| (crate::WorkspaceId(index as u64 + 1), tab))
-        }));
+        let recorded = self.owner.read(cx).iced_catalog().and_then(|catalog| {
+            catalog
+                .workspaces
+                .iter()
+                .enumerate()
+                .find_map(|(index, workspace)| {
+                    if workspace.is_legacy_remote() != saved.is_legacy_remote()
+                        || crate::workspace_config::workspace_remote_id(workspace)
+                            != crate::workspace_config::workspace_remote_id(&saved)
+                    {
+                        return None;
+                    }
+                    workspace
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.chat_session_id.as_deref() == Some(id))
+                        .cloned()
+                        .map(|tab| (crate::WorkspaceId(index as u64 + 1), tab))
+                })
+        });
         if let Some((workspace, tab)) = recorded {
             return self.mount_live_chat(workspace, tab, None, true, window, cx);
         }
@@ -1964,17 +2013,17 @@ impl crate::Shell {
         let Some(saved) = self.owner.read(cx).iced_workspace(workspace).cloned() else {
             return;
         };
-        if saved.is_legacy_remote()
+        let remote = saved.is_legacy_remote()
             || matches!(
                 saved.location,
                 Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. })
-            )
-        {
+            );
+        if remote {
             self.restore_remote_terminals(workspace, &saved, window, cx);
-            return;
         }
         let imported = self.owner.read(cx).iced_sessions(&saved);
-        if saved.done_at.is_none()
+        if !remote
+            && saved.done_at.is_none()
             && crate::bottom_pane_ids(self.workspace(workspace), cx).is_empty()
             && !saved.bottom_terminals.is_empty()
         {
@@ -2038,7 +2087,7 @@ impl crate::Shell {
                 });
             let Some(tab) = tab.cloned() else { continue };
             if tab.tab_kind.as_deref() == Some("agent") {
-                if !chats {
+                if !chats && !remote {
                     continue;
                 }
                 if matches!(
@@ -2057,22 +2106,24 @@ impl crate::Shell {
                         cx.notify();
                     });
                 }
-            } else {
+            } else if !remote {
                 let pane =
                     self.workspace(workspace).panes[&crate::session_pane_id(session.id)].clone();
                 if pane.read(cx).session.is_none() {
-                    let Some(host) = cx
+                    let host = cx
                         .try_global::<crate::task_host::GpuiTaskHost>()
-                        .map(|h| h.0.clone())
-                    else {
-                        continue;
-                    };
+                        .map(|h| h.0.clone());
                     let name = self.workspace(workspace).workspace.name.clone();
-                    let result = host.update(cx, |host, cx| {
-                        host.open_live_terminal(&name, &tab, true, cx)
-                    });
+                    let result = host
+                        .ok_or_else(|| "Live terminal host is unavailable".to_owned())
+                        .and_then(|host| {
+                            let launched = host.update(cx, |host, cx| {
+                                host.open_live_terminal(&name, &tab, true, cx)
+                            })?;
+                            Ok((host, launched))
+                        });
                     match result {
-                        Ok(launched) => {
+                        Ok((host, launched)) => {
                             if let Some(view) =
                                 host.update(cx, |host, _| host.take_terminal(&launched.session_id))
                             {
@@ -2217,7 +2268,17 @@ impl crate::Shell {
         let Some(state) = self.workspaces.iter().find(|w| w.runtime_uid == uid) else {
             return vec![];
         };
-        crate::bottom_pane_ids(state, cx)
+        let bottom = crate::bottom_pane_ids(state, cx);
+        if bottom.is_empty()
+            && let Some(saved) = self.owner.read(cx).iced_workspace(state.workspace.id)
+            && (saved.is_legacy_remote()
+                || crate::workspace_config::workspace_remote_id(saved).is_some())
+        {
+            // Remote bottom descriptors have not been mounted without a GPUI
+            // layout. Parking must retain the inventory we did not load.
+            return saved.bottom_terminals.clone();
+        }
+        bottom
             .into_iter()
             .filter(|id| !self.run_tabs.contains_key(id))
             .filter_map(|id| state.panes.get(&id)?.read(cx).task_folder(cx))
@@ -2328,6 +2389,7 @@ impl crate::Shell {
                 }
                 if let crate::pane::PaneContent::PreviewChat(view) = &pane.content {
                     tab.chat_session_id = view.read(cx).chat_session_id();
+                    if view.read(cx).is_remote() { tab.agent_config = Some(view.read(cx).config().clone()); }
                 }
                 Some(tab)
             })
@@ -2406,10 +2468,35 @@ impl crate::Shell {
             }
             return Ok(());
         }
-        anyhow::ensure!(
-            id.remote_id.is_none(),
-            "Remote conversation resume is unavailable"
-        );
+        if id.remote_id.is_some() {
+            // Remote paths belong to the agent; retain its native resume path
+            // without applying local directory checks or folder ownership.
+            let workspace = self
+                .active_workspace(cx)
+                .filter(|&workspace| {
+                    self.owner
+                        .read(cx)
+                        .iced_workspace(workspace)
+                        .and_then(crate::workspace_config::workspace_remote_id)
+                        == id.remote_id
+                })
+                .or_else(|| {
+                    self.workspaces
+                        .iter()
+                        .find(|state| {
+                            self.owner
+                                .read(cx)
+                                .iced_workspace(state.workspace.id)
+                                .and_then(crate::workspace_config::workspace_remote_id)
+                                == id.remote_id
+                        })
+                        .map(|state| state.workspace.id)
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Open a workspace on this remote machine to resume its chat.")
+                })?;
+            return self.open_saved_live_chat(workspace, &id.id, indexed, window, cx);
+        }
         let entry = indexed
             .or_else(|| self.indexed_chat(id, cx))
             .ok_or_else(|| anyhow::anyhow!("Saved conversation metadata unavailable: {}", id.id))?;
@@ -2846,6 +2933,7 @@ mod tests {
     fn live_restore_keeps_selected_tab_when_background_tab_shares_conversation(
         cx: &mut gpui::TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         let live = tempfile::tempdir().unwrap();
         let services = gitterm_core::preview::service::ServiceContext::production(
             live.path(),
@@ -3191,6 +3279,7 @@ mod tests {
     /// a final text; then a second prompt and turn.
     #[gpui::test]
     fn replayed_claude_transcript_folds_each_finished_turn(cx: &mut gpui::TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         use gpui::{AppContext as _, VisualTestContext};
         fn draw(cx: &mut VisualTestContext) {
             cx.run_until_parked();
@@ -3316,6 +3405,7 @@ mod tests {
     /// hook summary, and then a GitTerm delivery and the next turn.
     #[gpui::test]
     fn real_claude_turn_shape_folds_into_one_worked_row(cx: &mut gpui::TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         use gitterm_gpui_chat::model::RowKind;
         use gpui::{AppContext as _, VisualTestContext};
         fn draw(cx: &mut VisualTestContext) {
